@@ -40,6 +40,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                 ON practitioner.source_id = role.source_id
                AND practitioner.resource_id = {{ROLE_PRACTITIONER_RESOURCE_ID_SQL}}
              WHERE COALESCE(role.npi, practitioner.npi) IS NOT NULL
+               AND {{ROLE_BUCKET_SQL}}
         ), qualification_values AS MATERIALIZED (
             SELECT practitioner_rows.*,
                    qualification.value AS qualification
@@ -304,7 +305,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                      )
                    END
               ) AS name(value)
-             WHERE NULLIF(COALESCE(name.value ->> 'text', practitioner.full_name, ''), '') IS NOT NULL
+             WHERE {{NAME_FACT_SCOPE_SQL}}
+               AND NULLIF(COALESCE(name.value ->> 'text', practitioner.full_name, ''), '') IS NOT NULL
 
             UNION ALL
             SELECT practitioner.npi, 'administrative_gender',
@@ -320,7 +322,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    practitioner.active, NULL::varchar, NULL::varchar,
                    practitioner.updated_at
               FROM practitioner_rows AS practitioner
-             WHERE practitioner.administrative_gender IS NOT NULL
+             WHERE {{ADMINISTRATIVE_GENDER_FACT_SCOPE_SQL}}
+               AND practitioner.administrative_gender IS NOT NULL
 
             UNION ALL
             SELECT practitioner.npi, 'age',
@@ -337,7 +340,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    practitioner.active, NULL::varchar, NULL::varchar,
                    practitioner.updated_at
               FROM practitioner_rows AS practitioner
-             WHERE practitioner.age_years IS NOT NULL
+             WHERE {{AGE_FACT_SCOPE_SQL}}
+               AND practitioner.age_years IS NOT NULL
                AND practitioner.age_as_of IS NOT NULL
                AND practitioner.age_years BETWEEN 18 AND 100
 
@@ -368,7 +372,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    practitioner.active, NULL::varchar, NULL::varchar,
                    practitioner.updated_at
               FROM practitioner_rows AS practitioner
-             WHERE practitioner.years_of_practice IS NOT NULL
+             WHERE {{YEARS_OF_PRACTICE_FACT_SCOPE_SQL}}
+               AND practitioner.years_of_practice IS NOT NULL
                AND practitioner.years_of_practice_as_of IS NOT NULL
                AND practitioner.years_of_practice_basis IS NOT NULL
 
@@ -397,6 +402,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    qualification.active, qualification.qualification ->> 'period_start',
                    qualification.qualification ->> 'period_end', qualification.updated_at
               FROM qualification_codings AS qualification
+             WHERE {{QUALIFICATION_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT qualification.npi, 'qualification_detail',
@@ -409,7 +415,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    qualification.active, qualification.qualification ->> 'period_start',
                    qualification.qualification ->> 'period_end', qualification.updated_at
               FROM qualification_values AS qualification
-             WHERE qualification.qualification ?| ARRAY[
+             WHERE {{QUALIFICATION_DETAIL_FACT_SCOPE_SQL}}
+               AND qualification.qualification ?| ARRAY[
                        'issuer_ref', 'issuer_display', 'identifiers',
                        'period_start', 'period_end'
                    ]
@@ -442,6 +449,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                      )
                    END
               ) AS communication(value)
+             WHERE {{LANGUAGE_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT practitioner.npi, 'contact',
@@ -465,7 +473,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               CROSS JOIN LATERAL jsonb_array_elements(
                    COALESCE(practitioner.telecom::jsonb, '[]'::jsonb)
               ) AS contact(value)
-             WHERE NULLIF(contact.value ->> 'value', '') IS NOT NULL
+             WHERE {{CONTACT_FACT_SCOPE_SQL}}
+               AND NULLIF(contact.value ->> 'value', '') IS NOT NULL
 
             UNION ALL
             SELECT role.resolved_npi, 'specialty',
@@ -479,6 +488,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               CROSS JOIN LATERAL jsonb_array_elements(
                    COALESCE(role.specialty_codes::jsonb, '[]'::jsonb)
               ) AS specialty(value)
+             WHERE {{SPECIALTY_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT role.resolved_npi, 'role',
@@ -492,6 +502,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               CROSS JOIN LATERAL jsonb_array_elements(
                    COALESCE(role.code_codes::jsonb, '[]'::jsonb)
               ) AS role_code(value)
+             WHERE {{ROLE_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT role.resolved_npi, 'role_identifier',
@@ -506,6 +517,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               CROSS JOIN LATERAL jsonb_array_elements(
                    COALESCE(role.identifiers::jsonb, '[]'::jsonb)
               ) AS role_identifier(value)
+             WHERE {{ROLE_IDENTIFIER_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT role.resolved_npi, 'role_context',
@@ -541,6 +553,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    role.resource_id, role.active, role.period_start,
                    role.period_end, role.updated_at
               FROM role_rows AS role
+             WHERE {{ROLE_CONTEXT_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT role.resolved_npi, 'new_patient_acceptance',
@@ -558,6 +571,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                        '[]'::jsonb
                    )
               ) AS acceptance(value)
+             WHERE {{NEW_PATIENT_ACCEPTANCE_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT role.resolved_npi, 'telehealth',
@@ -571,6 +585,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               CROSS JOIN LATERAL jsonb_array_elements(
                    COALESCE(role.telehealth::jsonb, '[]'::jsonb)
               ) AS telehealth(value)
+             WHERE {{TELEHEALTH_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT role.resolved_npi, 'accepting_medicaid',
@@ -582,7 +597,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    role.resource_id, role.active, role.period_start,
                    role.period_end, role.updated_at
               FROM role_rows AS role
-             WHERE role.accepting_medicaid IS NOT NULL
+             WHERE {{ACCEPTING_MEDICAID_FACT_SCOPE_SQL}}
+               AND role.accepting_medicaid IS NOT NULL
 
             UNION ALL
             SELECT role.resolved_npi, 'organization',
@@ -604,7 +620,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
               LEFT JOIN {{ORGANIZATION_REF}} AS organization
                 ON organization.source_id = role.source_id
                AND organization.resource_id = {{ROLE_ORGANIZATION_RESOURCE_ID_SQL}}
-             WHERE NULLIF(COALESCE(organization.name, role.organization_ref, ''), '') IS NOT NULL
+             WHERE {{ORGANIZATION_FACT_SCOPE_SQL}}
+               AND NULLIF(COALESCE(organization.name, role.organization_ref, ''), '') IS NOT NULL
 
             UNION ALL
             SELECT affiliation.npi, 'affiliation',
@@ -618,6 +635,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    affiliation.period_start, affiliation.period_end,
                    affiliation.updated_at
               FROM affiliation_rows AS affiliation
+             WHERE {{AFFILIATION_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT service.npi, 'service',
@@ -675,6 +693,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    service.resource_id, service.role_resource_id, service.active,
                    NULL::varchar, NULL::varchar, service.updated_at
               FROM service_rows AS service
+             WHERE {{SERVICE_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT endpoint.npi, 'endpoint',
@@ -726,6 +745,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    endpoint.role_resource_id, endpoint.status = 'active',
                    endpoint.period_start, endpoint.period_end, endpoint.updated_at
               FROM role_endpoint_rows AS endpoint
+             WHERE {{ENDPOINT_FACT_SCOPE_SQL}}
         ), normalized_facts AS MATERIALIZED (
             SELECT DISTINCT ON (
                        npi, fact_type, fact_key, source_id,
@@ -748,6 +768,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
              WHERE npi IS NOT NULL
                AND {{VALID_NPI_SQL}}
                AND {{CURRENT_EVIDENCE_SQL}}
+               AND {{FACT_TYPE_SCOPE_SQL}}
                AND value_json IS NOT NULL
                AND value_json <> '{}'::jsonb
              ORDER BY npi, fact_type, fact_key, source_id,

@@ -320,11 +320,11 @@ async def test_existing_profile_stages_receive_retention_and_currentness_params(
     )
     build = _profile_build()
 
-    await importer._create_provider_directory_profile_evidence_stage(
+    await importer._populate_provider_directory_profile_evidence_stage(
         build,
         has_evidence_target=True,
     )
-    await importer._create_provider_directory_profile_compact_stage(
+    await importer._populate_provider_directory_profile_compact_stage(
         build,
         has_existing_artifacts=True,
     )
@@ -344,7 +344,10 @@ async def test_profile_stage_finalization_supports_deferred_and_immediate_cutove
     monkeypatch,
 ):
     """Return prepared stages when deferred and clean both after immediate cutover."""
-    stages = (SimpleNamespace(stage_table="a"), SimpleNamespace(stage_table="b"))
+    stages = (
+        SimpleNamespace(stage_table="a", resume_checkpoint=None),
+        SimpleNamespace(stage_table="b", resume_checkpoint=None),
+    )
     metric_map = {"profile_rows": 2}
     promote = AsyncMock()
     remove = AsyncMock()
@@ -376,11 +379,147 @@ async def test_profile_stage_finalization_supports_deferred_and_immediate_cutove
 
 
 @pytest.mark.asyncio
-async def test_profile_stage_build_removes_created_stage_after_failure(monkeypatch):
-    """Drop the evidence stage if compact profile construction fails."""
+async def test_artifact_bundle_retains_resumable_stages_until_cutover_succeeds(
+    monkeypatch,
+):
+    """Keep checkpointed Profile stages after failure, then clean after cutover."""
+
+    async def rename_indexes(_schema, _stage):
+        return None
+
+    checkpoint = ("mrf", "profile-build-1")
+    retained_stages = [
+        importer.ProviderDirectoryPreparedArtifactStage(
+            schema="mrf",
+            stage_table=stage_table,
+            target_relation=target_relation,
+            rename_stage_indexes=rename_indexes,
+            retain_on_failed_bundle=True,
+            resume_checkpoint=checkpoint,
+        )
+        for stage_table, target_relation in (
+            ("profile_evidence_stage", profile.PROFILE_EVIDENCE_TABLE),
+            ("profile_stage", profile.PROFILE_TABLE),
+        )
+    ]
+    disposable_stage = importer.ProviderDirectoryPreparedArtifactStage(
+        schema="mrf",
+        stage_table="other_stage",
+        target_relation="other_target",
+        rename_stage_indexes=rename_indexes,
+    )
+    bundle = importer.ProviderDirectoryArtifactBundle(
+        stages=[*retained_stages, disposable_stage]
+    )
+    promotion = AsyncMock(side_effect=RuntimeError("cutover failed"))
+    remove = AsyncMock()
+    delete_checkpoint = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_retry_provider_directory_artifact_bundle_promotion",
+        promotion,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_remove_provider_directory_artifact_stage",
+        remove,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_delete_provider_directory_profile_build_checkpoint",
+        delete_checkpoint,
+    )
+
+    with pytest.raises(RuntimeError, match="cutover failed"):
+        await bundle.promote()
+    await bundle.cleanup()
+
+    assert bundle.promoted is False
+    remove.assert_awaited_once_with(disposable_stage)
+    delete_checkpoint.assert_not_awaited()
+
+    promotion.side_effect = None
+    promotion.reset_mock()
+    remove.reset_mock()
+    assert await bundle.promote() == 3
+    await bundle.cleanup()
+
+    assert bundle.promoted is True
+    promotion.assert_awaited_once_with(tuple(bundle.stages))
+    delete_checkpoint.assert_awaited_once_with(*checkpoint)
+    assert [call.args[0] for call in remove.await_args_list] == list(
+        reversed(bundle.stages)
+    )
+
+
+def test_stale_profile_reaper_rejects_non_deterministic_stage_names():
+    """Never trust checkpoint-provided identifiers as cleanup targets."""
+    build_id = f"pdpb_{'a' * 32}"
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_profile_stale_checkpoint_stage_invalid",
+    ):
+        importer._validated_provider_directory_profile_checkpoint_stage_names(
+            {
+                "build_id": build_id,
+                "evidence_stage": profile.PROFILE_EVIDENCE_TABLE,
+                "profile_stage": profile.PROFILE_TABLE,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_immediate_profile_cutover_failure_retains_checkpointed_stages(
+    monkeypatch,
+):
+    """Do not delete retry state or stages when immediate promotion fails."""
+    stages = (
+        SimpleNamespace(
+            stage_table="evidence_stage",
+            resume_checkpoint=("mrf", "profile-build-1"),
+        ),
+        SimpleNamespace(
+            stage_table="profile_stage",
+            resume_checkpoint=("mrf", "profile-build-1"),
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_retry_provider_directory_artifact_bundle_promotion",
+        AsyncMock(side_effect=RuntimeError("cutover failed")),
+    )
+    remove = AsyncMock()
+    delete_checkpoint = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_remove_provider_directory_artifact_stage",
+        remove,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_delete_provider_directory_profile_build_checkpoint",
+        delete_checkpoint,
+    )
+
+    with pytest.raises(RuntimeError, match="cutover failed"):
+        await importer._finalize_provider_directory_profile_stages(
+            {"profile_rows": 2},
+            stages,
+            defer_cutover=False,
+        )
+
+    remove.assert_not_awaited()
+    delete_checkpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_profile_stage_build_retains_checkpointed_stage_after_failure(
+    monkeypatch,
+):
+    """Retain logged resumable stages and record compact-build failure."""
     build = _profile_build()
     fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
-    remove = AsyncMock()
+    mark_failed = AsyncMock()
     monkeypatch.setattr(
         importer,
         "_has_provider_directory_profile_artifacts",
@@ -388,18 +527,32 @@ async def test_profile_stage_build_removes_created_stage_after_failure(monkeypat
     )
     monkeypatch.setattr(
         importer,
-        "_create_provider_directory_profile_evidence_stage",
+        "_populate_provider_directory_profile_evidence_stage",
         AsyncMock(),
     )
     monkeypatch.setattr(
         importer,
-        "_create_provider_directory_profile_compact_stage",
+        "_populate_provider_directory_profile_compact_stage",
         AsyncMock(side_effect=RuntimeError("compact failed")),
     )
     monkeypatch.setattr(
         importer,
-        "_remove_provider_directory_profile_stage_table",
-        remove,
+        "_claim_provider_directory_profile_build_checkpoint",
+        AsyncMock(
+            return_value=importer._ProviderDirectoryProfileBuildCheckpointState(
+                evidence_next_batch=52,
+                evidence_total_batches=52,
+                profile_next_batch=9,
+                profile_total_batches=400,
+                state="building_profile",
+            )
+        ),
+    )
+    monkeypatch.setattr(importer.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_mark_provider_directory_profile_build_checkpoint_failed",
+        mark_failed,
     )
 
     with pytest.raises(RuntimeError, match="compact failed"):
@@ -409,5 +562,5 @@ async def test_profile_stage_build_removes_created_stage_after_failure(monkeypat
             fence,
         )
 
-    remove.assert_awaited_once_with("mrf", "evidence_stage")
-
+    mark_failed.assert_awaited_once()
+    assert isinstance(mark_failed.await_args.args[1], RuntimeError)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import importlib
 import json
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +27,83 @@ PROFILE_SOURCE_CLASSIFICATIONS = {
     "bulk_acquisition",
     "external",
 }
+
+
+@pytest.mark.asyncio
+async def test_profile_build_identity_resumes_original_as_of_across_days(
+    monkeypatch,
+):
+    """Keep a valid logged checkpoint resumable after the calendar day changes."""
+    dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id="source_a",
+        endpoint_id="endpoint_a",
+        dataset_id="dataset_a",
+        evidence_run_id="run_a",
+        selected_resources=("Practitioner",),
+        expected_resources=("Practitioner",),
+    )
+    dataset_fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
+    evidence_fence = importer.ProviderDirectoryArtifactBuildFence(
+        target_oid=11
+    )
+    profile_fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=12)
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_scope_source_ids",
+        AsyncMock(return_value=(["source_a"], ["source_a"])),
+    )
+    checkpoint = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer.db, "first", checkpoint)
+    monkeypatch.setattr(
+        importer,
+        "_now",
+        lambda: datetime.datetime(2026, 7, 20, tzinfo=datetime.UTC),
+    )
+
+    initial_build = await importer._resolve_provider_directory_profile_build(
+        "mrf",
+        "run-first",
+        dataset_fence,
+        evidence_fence,
+        profile_fence,
+    )
+    checkpoint.return_value = {
+        "build_id": initial_build.build_id,
+        "strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
+        "schema_version": profile.PROFILE_SCHEMA_VERSION,
+        "profile_as_of": "2026-07-19",
+        "source_ids": ["source_a"],
+        "retained_source_ids": ["source_a"],
+        "dataset_ids": ["dataset_a"],
+        "evidence_stage": initial_build.evidence_stage,
+        "profile_stage": initial_build.profile_stage,
+        "evidence_target_oid": 11,
+        "profile_target_oid": 12,
+    }
+    relation_attribute = AsyncMock(side_effect=["p", "p"])
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_relation_attribute",
+        relation_attribute,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_now",
+        lambda: datetime.datetime(2026, 7, 21, tzinfo=datetime.UTC),
+    )
+
+    resumed_build = await importer._resolve_provider_directory_profile_build(
+        "mrf",
+        "run-retry",
+        dataset_fence,
+        evidence_fence,
+        profile_fence,
+    )
+
+    assert resumed_build.build_id == initial_build.build_id
+    assert resumed_build.profile_as_of == "2026-07-19"
+    assert resumed_build.owner_run_id == "run-retry"
+    assert relation_attribute.await_count == 2
 
 
 def test_profile_source_spec_matches_all_reviewed_acquisition_entries():
@@ -215,6 +294,29 @@ def test_profile_aggregation_is_deterministic_and_evidence_bounded():
     assert "'^([^:/?#]+://)[^/?#@]*@'" in sql
 
 
+def test_profile_aggregation_supports_bounded_npi_ranges():
+    sql = profile.profile_insert_sql(
+        evidence_ref='"fixture"."evidence"',
+        target_ref='"fixture"."profile"',
+        old_evidence_ref=None,
+        rebuild_all=True,
+        npi_start=1_000_000_000,
+        npi_end=1_005_000_000,
+    )
+
+    assert "npi >= CAST(:profile_npi_start AS bigint)" in sql
+    assert "npi < CAST(:profile_npi_end AS bigint)" in sql
+
+    with pytest.raises(ValueError, match="requires both bounds"):
+        profile.profile_insert_sql(
+            evidence_ref='"fixture"."evidence"',
+            target_ref='"fixture"."profile"',
+            old_evidence_ref=None,
+            rebuild_all=True,
+            npi_start=1_000_000_000,
+        )
+
+
 def test_profile_source_dataset_pairs_preserve_sorted_alignment():
     datasets = [
         SimpleNamespace(source_id="source_b", dataset_id="dataset_b"),
@@ -277,8 +379,12 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
 async def test_profile_stage_build_creates_logged_tables_without_rewrite(
     monkeypatch,
 ):
-    status = AsyncMock()
+    status = AsyncMock(return_value=1)
     scalar_queries = []
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield None
 
     async def scalar(sql, **_params):
         scalar_queries.append(sql)
@@ -286,6 +392,8 @@ async def test_profile_stage_build_creates_logged_tables_without_rewrite(
 
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(importer.db, "scalar", scalar)
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
+    monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(
         importer,
         "_table_exists",
@@ -373,10 +481,17 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
     build_fence = importer.ProviderDirectoryArtifactBuildFence(
         target_oid=None
     )
-    status = AsyncMock()
+    status = AsyncMock(return_value=1)
     assert_logged = AsyncMock()
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield None
+
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
+    monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(
         importer,
         "_has_provider_directory_profile_artifacts",
@@ -414,6 +529,201 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
 
 
 @pytest.mark.asyncio
+async def test_profile_evidence_population_batches_source_fact_and_affiliation(
+    monkeypatch,
+    caplog,
+):
+    status = AsyncMock(return_value=1)
+    create_indexes = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_create_provider_directory_profile_indexes",
+        create_indexes,
+    )
+    caplog.set_level(logging.INFO, logger=importer.LOGGER.name)
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation",
+        source_ids=("source_a", "source_b"),
+        retained_source_ids=("source_a", "source_b"),
+        dataset_ids=("dataset_a", "dataset_b"),
+        profile_as_of="2026-07-19",
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+
+    await importer._populate_provider_directory_profile_evidence_stage(
+        build,
+        has_evidence_target=False,
+        bounded=True,
+    )
+
+    insert_calls = [
+        call
+        for call in status.await_args_list
+        if "dataset_ids" in call.kwargs
+    ]
+    expected_per_source = (
+        len(profile.PROFILE_EVIDENCE_FACT_TYPES)
+        - 1
+        + profile.PROFILE_AFFILIATION_ROLE_BUCKETS
+    )
+    assert len(insert_calls) == len(build.source_ids) * expected_per_source
+    assert all(len(call.kwargs["source_ids"]) == 1 for call in insert_calls)
+    assert {
+        (call.kwargs["source_ids"][0], call.kwargs["dataset_ids"][0])
+        for call in insert_calls
+    } == {("source_a", "dataset_a"), ("source_b", "dataset_b")}
+    affiliation_calls = [
+        call
+        for call in insert_calls
+        if "fact_type = 'affiliation'" in call.args[0]
+    ]
+    assert {
+        call.kwargs["profile_role_bucket"]
+        for call in affiliation_calls
+        if call.kwargs["source_ids"] == ["source_a"]
+    } == set(range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS))
+    log_messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "source_id=source_a fact_type=name role_bucket=1/1" in message
+        for message in log_messages
+    )
+    assert any(
+        "source_id=source_a fact_type=affiliation role_bucket=32/32"
+        in message
+        for message in log_messages
+    )
+    assert any(
+        "Completed Provider Directory Profile evidence batch" in message
+        and "rows=1 elapsed_seconds=" in message
+        for message in log_messages
+    )
+    assert any(
+        "Completed Provider Directory Profile evidence indexes" in message
+        for message in log_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_compact_population_batches_npi_ranges(
+    monkeypatch,
+    caplog,
+):
+    status = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_create_provider_directory_profile_indexes",
+        AsyncMock(),
+    )
+    caplog.set_level(logging.INFO, logger=importer.LOGGER.name)
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation",
+        source_ids=("source_a",),
+        retained_source_ids=("source_a",),
+        dataset_ids=("dataset_a",),
+        profile_as_of="2026-07-19",
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+
+    await importer._populate_provider_directory_profile_compact_stage(
+        build,
+        has_existing_artifacts=False,
+        npi_batch_size=500_000_000,
+    )
+
+    batch_calls = [
+        call
+        for call in status.await_args_list
+        if "profile_npi_start" in call.kwargs
+    ]
+    assert [
+        (call.kwargs["profile_npi_start"], call.kwargs["profile_npi_end"])
+        for call in batch_calls
+    ] == [
+        (1_000_000_000, 1_500_000_000),
+        (1_500_000_000, 2_000_000_000),
+        (2_000_000_000, 2_500_000_000),
+        (2_500_000_000, 3_000_000_000),
+    ]
+    log_messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "npi_start=1000000000 npi_end=1500000000" in message
+        for message in log_messages
+    )
+    assert any(
+        "Completed Provider Directory Profile compact batch" in message
+        and "rows=1 elapsed_seconds=" in message
+        for message in log_messages
+    )
+    assert any(
+        "Completed Provider Directory Profile compact indexes" in message
+        for message in log_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_population_failure_is_retained_in_checkpoint(
+    monkeypatch,
+):
+    async def status(sql, **_params):
+        if 'INSERT INTO "mrf"."evidence_stage"' in sql:
+            raise RuntimeError("forced evidence failure")
+        return None
+
+    mark_failed = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_has_provider_directory_profile_artifacts",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_claim_provider_directory_profile_build_checkpoint",
+        AsyncMock(
+            return_value=importer._ProviderDirectoryProfileBuildCheckpointState(
+                evidence_next_batch=0,
+                evidence_total_batches=52,
+                profile_next_batch=0,
+                profile_total_batches=400,
+                state="building_evidence",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_mark_provider_directory_profile_build_checkpoint_failed",
+        mark_failed,
+    )
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation",
+        source_ids=("source_a",),
+        retained_source_ids=("source_a",),
+        dataset_ids=("dataset_a",),
+        profile_as_of="2026-07-19",
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+
+    with pytest.raises(RuntimeError, match="forced evidence failure"):
+        await importer._build_provider_directory_profile_stages(
+            build,
+            fence,
+            fence,
+        )
+
+    mark_failed.assert_awaited_once()
+    assert isinstance(mark_failed.await_args.args[1], RuntimeError)
+
+
+@pytest.mark.asyncio
 async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
     dataset = importer.ProviderDirectoryArtifactDataset(
         source_id="source_a",
@@ -438,6 +748,16 @@ async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
         importer,
         "_provider_directory_artifact_build_guard",
         fake_build_guard,
+    )
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_reap_stale_provider_directory_profile_builds",
+        AsyncMock(return_value=0),
     )
     monkeypatch.setattr(
         importer,

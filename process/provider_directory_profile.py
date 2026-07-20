@@ -29,8 +29,34 @@ PROFILE_SPEC_PATH = (
 )
 PROFILE_SQL_PATH = Path(__file__).resolve().parent / "sql"
 PROFILE_SCHEMA_VERSION = 1
+PROFILE_BUILD_STRATEGY_VERSION = "source-fact-role32-npi5m-v1"
 PROFILE_FACT_LIMIT = 100
 PROFILE_FACT_EVIDENCE_LIMIT = 25
+PROFILE_EVIDENCE_FACT_TYPES = (
+    "name",
+    "administrative_gender",
+    "age",
+    "years_of_practice",
+    "taxonomy_qualification",
+    "credential",
+    "qualification",
+    "qualification_detail",
+    "language",
+    "contact",
+    "specialty",
+    "role",
+    "role_identifier",
+    "role_context",
+    "new_patient_acceptance",
+    "telehealth",
+    "accepting_medicaid",
+    "organization",
+    "affiliation",
+    "service",
+    "endpoint",
+)
+PROFILE_AFFILIATION_ROLE_BUCKETS = 32
+PROFILE_NPI_BATCH_SIZE = 5_000_000
 NPI_MIN = 1_000_000_000
 NPI_MAX = 2_999_999_999
 NPI_LUHN_PREFIX_DIGIT_SUM = 24
@@ -305,13 +331,13 @@ def profile_index_statements(
     table_ref = qualified_table(schema, table_name)
     if evidence:
         return (
-            f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'npi_idx'))} ON {table_ref} (npi);",
-            f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'npi_fact_idx'))} ON {table_ref} (npi, fact_type, fact_key);",
-            f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'source_idx'))} ON {table_ref} (source_id, npi);",
-            f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'endpoint_idx'))} ON {table_ref} (endpoint_id, npi);",
+            f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'npi_idx'))} ON {table_ref} (npi);",
+            f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'npi_fact_idx'))} ON {table_ref} (npi, fact_type, fact_key);",
+            f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'source_idx'))} ON {table_ref} (source_id, npi);",
+            f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'endpoint_idx'))} ON {table_ref} (endpoint_id, npi);",
         )
     return (
-        f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'generation_idx'))} ON {table_ref} (generation_id);",
+        f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'generation_idx'))} ON {table_ref} (generation_id);",
     )
 
 
@@ -344,7 +370,8 @@ def copy_existing_evidence_sql(
          WHERE source_id <> ALL(CAST(:source_ids AS varchar[]))
            AND source_id = ANY(CAST(:retained_source_ids AS varchar[]))
            AND {current_profile_evidence_sql()}
-           AND {valid_npi_sql("npi")};
+           AND {valid_npi_sql("npi")}
+        ON CONFLICT (evidence_key) DO NOTHING;
     """
 
 
@@ -377,7 +404,8 @@ def copy_unaffected_profiles_sql(
                 SELECT 1
                   FROM affected_npis
                  WHERE affected_npis.npi = profile.npi
-         );
+         )
+        ON CONFLICT (npi) DO NOTHING;
     """
 
 
@@ -390,8 +418,17 @@ def profile_evidence_insert_sql(
     organization_ref: str,
     service_ref: str,
     endpoint_ref: str | None = None,
+    fact_type: str | None = None,
+    role_bucket_count: int = 1,
+    role_bucket: int = 0,
 ) -> str:
     """Build immutable source evidence from scoped typed FHIR resources."""
+    if fact_type is not None and fact_type not in PROFILE_EVIDENCE_FACT_TYPES:
+        raise ValueError(f"unsupported profile evidence fact type: {fact_type}")
+    if role_bucket_count < 1:
+        raise ValueError("profile role bucket count must be positive")
+    if role_bucket < 0 or role_bucket >= role_bucket_count:
+        raise ValueError("profile role bucket is outside the configured range")
     endpoint_ref = endpoint_ref or service_ref.replace(
         "provider_directory_healthcare_service",
         "provider_directory_endpoint",
@@ -404,6 +441,26 @@ def profile_evidence_insert_sql(
         organization_ref,
         "provider_directory_dataset_affiliation_organization",
     )
+    def branch_scope_sql(*branch_fact_types: str) -> str:
+        return (
+            "TRUE"
+            if fact_type is None or fact_type in branch_fact_types
+            else "FALSE"
+        )
+
+    qualification_scope_sql = branch_scope_sql(
+        "taxonomy_qualification",
+        "credential",
+        "qualification",
+    )
+    if fact_type in {
+        "taxonomy_qualification",
+        "credential",
+        "qualification",
+    }:
+        qualification_scope_sql = (
+            f"qualification.qualification_type = '{fact_type}'"
+        )
     return _render_sql_template(
         "provider_directory_profile_evidence.sql",
         {
@@ -436,6 +493,55 @@ def profile_evidence_insert_sql(
                     "Organization",
                 )
             ),
+            "NAME_FACT_SCOPE_SQL": branch_scope_sql("name"),
+            "ADMINISTRATIVE_GENDER_FACT_SCOPE_SQL": branch_scope_sql(
+                "administrative_gender"
+            ),
+            "AGE_FACT_SCOPE_SQL": branch_scope_sql("age"),
+            "YEARS_OF_PRACTICE_FACT_SCOPE_SQL": branch_scope_sql(
+                "years_of_practice"
+            ),
+            "QUALIFICATION_FACT_SCOPE_SQL": qualification_scope_sql,
+            "QUALIFICATION_DETAIL_FACT_SCOPE_SQL": branch_scope_sql(
+                "qualification_detail"
+            ),
+            "LANGUAGE_FACT_SCOPE_SQL": branch_scope_sql("language"),
+            "CONTACT_FACT_SCOPE_SQL": branch_scope_sql("contact"),
+            "SPECIALTY_FACT_SCOPE_SQL": branch_scope_sql("specialty"),
+            "ROLE_FACT_SCOPE_SQL": branch_scope_sql("role"),
+            "ROLE_IDENTIFIER_FACT_SCOPE_SQL": branch_scope_sql(
+                "role_identifier"
+            ),
+            "ROLE_CONTEXT_FACT_SCOPE_SQL": branch_scope_sql(
+                "role_context"
+            ),
+            "NEW_PATIENT_ACCEPTANCE_FACT_SCOPE_SQL": branch_scope_sql(
+                "new_patient_acceptance"
+            ),
+            "TELEHEALTH_FACT_SCOPE_SQL": branch_scope_sql("telehealth"),
+            "ACCEPTING_MEDICAID_FACT_SCOPE_SQL": branch_scope_sql(
+                "accepting_medicaid"
+            ),
+            "ORGANIZATION_FACT_SCOPE_SQL": branch_scope_sql("organization"),
+            "AFFILIATION_FACT_SCOPE_SQL": branch_scope_sql("affiliation"),
+            "SERVICE_FACT_SCOPE_SQL": branch_scope_sql("service"),
+            "ENDPOINT_FACT_SCOPE_SQL": branch_scope_sql("endpoint"),
+            "FACT_TYPE_SCOPE_SQL": (
+                "TRUE"
+                if fact_type is None
+                else f"fact_type = '{fact_type}'"
+            ),
+            "ROLE_BUCKET_SQL": (
+                "TRUE"
+                if role_bucket_count == 1
+                else (
+                    "MOD("
+                    "hashtextextended(role.resource_id, 0) "
+                    "& 9223372036854775807, "
+                    "CAST(:profile_role_bucket_count AS bigint)"
+                    ") = CAST(:profile_role_bucket AS bigint)"
+                )
+            ),
             "CURRENT_EVIDENCE_SQL": current_profile_evidence_sql(),
             "VALID_NPI_SQL": valid_npi_sql("npi"),
         },
@@ -448,21 +554,47 @@ def profile_insert_sql(
     target_ref: str,
     old_evidence_ref: str | None,
     rebuild_all: bool,
+    npi_start: int | None = None,
+    npi_end: int | None = None,
 ) -> str:
     """Build compact and evidence-rich NPI profiles from normalized facts."""
+    if (npi_start is None) != (npi_end is None):
+        raise ValueError("profile NPI range requires both bounds")
+    if npi_start is not None and (
+        npi_start < NPI_MIN
+        or npi_end is None
+        or npi_end <= npi_start
+        or npi_end > NPI_MAX + 1
+    ):
+        raise ValueError("profile NPI range is outside the assignable bounds")
+    npi_scope_sql = (
+        ""
+        if npi_start is None
+        else (
+            "\n               AND npi >= CAST(:profile_npi_start AS bigint)"
+            "\n               AND npi < CAST(:profile_npi_end AS bigint)"
+        )
+    )
     if rebuild_all or old_evidence_ref is None:
-        affected_npis_sql = f"SELECT DISTINCT npi FROM {evidence_ref}"
+        affected_npis_sql = (
+            f"SELECT DISTINCT npi FROM {evidence_ref} WHERE TRUE"
+            f"{npi_scope_sql}"
+        )
     else:
         affected_npis_sql = f"""
             SELECT npi
               FROM {old_evidence_ref}
-             WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
-                OR source_id <> ALL(CAST(:retained_source_ids AS varchar[]))
-                OR NOT {current_profile_evidence_sql()}
+             WHERE (
+                       source_id = ANY(CAST(:source_ids AS varchar[]))
+                    OR source_id <> ALL(CAST(:retained_source_ids AS varchar[]))
+                    OR NOT {current_profile_evidence_sql()}
+             )
+               {npi_scope_sql}
             UNION
             SELECT npi
               FROM {evidence_ref}
              WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
+               {npi_scope_sql}
         """.strip()
     return _render_sql_template(
         "provider_directory_profile_aggregate.sql",

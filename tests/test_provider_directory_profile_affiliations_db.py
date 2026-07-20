@@ -7,11 +7,13 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import MetaData
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
@@ -42,6 +44,30 @@ def _decoded(json_value: Any) -> Any:
         if isinstance(json_value, str)
         else json_value
     )
+
+
+def _plan_relation_nodes(
+    raw_plan: Any,
+    relation_name: str,
+) -> list[dict[str, Any]]:
+    if isinstance(raw_plan, dict):
+        matches = (
+            [raw_plan]
+            if raw_plan.get("Relation Name") == relation_name
+            else []
+        )
+        return matches + [
+            node
+            for child in raw_plan.values()
+            for node in _plan_relation_nodes(child, relation_name)
+        ]
+    if isinstance(raw_plan, list):
+        return [
+            node
+            for child in raw_plan
+            for node in _plan_relation_nodes(child, relation_name)
+        ]
+    return []
 
 
 async def _require_profile_database(database: Database) -> None:
@@ -82,6 +108,13 @@ async def _create_fixture_tables(
     await database.status(
         profile.profile_table_sql(schema, "profile", logged=True)
     )
+    checkpoint_table = (
+        importer.ProviderDirectoryProfileBuildCheckpoint.__table__.to_metadata(
+            MetaData(),
+            schema=schema,
+        )
+    )
+    await database.create_table(checkpoint_table)
 
 
 async def _insert_typed_resource(
@@ -229,6 +262,81 @@ async def _build_profile_artifacts(
     )
 
 
+async def _build_bounded_profile_artifacts(
+    database: Database,
+    schema: str,
+) -> tuple[str, str]:
+    """Build the same fixture through production-style bounded statements."""
+    table_ref = lambda table_name: profile.qualified_table(schema, table_name)
+    evidence_table = "profile_evidence_bounded"
+    profile_table = "profile_bounded"
+    evidence_ref = table_ref(evidence_table)
+    profile_ref = table_ref(profile_table)
+    await database.status(
+        profile.profile_evidence_table_sql(
+            schema,
+            evidence_table,
+            logged=True,
+        )
+    )
+    await database.status(
+        profile.profile_table_sql(schema, profile_table, logged=True)
+    )
+    evidence_sql_refs = {
+        "target_ref": evidence_ref,
+        "source_ref": table_ref("provider_directory_source"),
+        "practitioner_ref": table_ref("provider_directory_practitioner"),
+        "role_ref": table_ref("provider_directory_practitioner_role"),
+        "organization_ref": table_ref("provider_directory_organization"),
+        "service_ref": table_ref("provider_directory_healthcare_service"),
+        "endpoint_ref": table_ref("provider_directory_endpoint"),
+    }
+    for source_id, dataset_id in (
+        ("profile-source-a", "profile-dataset-a"),
+        ("profile-source-b", "profile-dataset-b"),
+    ):
+        for fact_type in profile.PROFILE_EVIDENCE_FACT_TYPES:
+            role_bucket_count = 2 if fact_type == "affiliation" else 1
+            for role_bucket in range(role_bucket_count):
+                params = {
+                    "source_ids": [source_id],
+                    "dataset_ids": [dataset_id],
+                    "profile_as_of": "2026-07-19",
+                }
+                if role_bucket_count > 1:
+                    params.update(
+                        {
+                            "profile_role_bucket_count": role_bucket_count,
+                            "profile_role_bucket": role_bucket,
+                        }
+                    )
+                await database.status(
+                    profile.profile_evidence_insert_sql(
+                        **evidence_sql_refs,
+                        fact_type=fact_type,
+                        role_bucket_count=role_bucket_count,
+                        role_bucket=role_bucket,
+                    ),
+                    **params,
+                )
+    for npi_start in (1_000_000_000, 2_000_000_000):
+        await database.status(
+            profile.profile_insert_sql(
+                evidence_ref=evidence_ref,
+                target_ref=profile_ref,
+                old_evidence_ref=None,
+                rebuild_all=True,
+                npi_start=npi_start,
+                npi_end=npi_start + 1_000_000_000,
+            ),
+            generation_id="profile-affiliation-test",
+            profile_as_of="2026-07-19",
+            profile_npi_start=npi_start,
+            profile_npi_end=npi_start + 1_000_000_000,
+        )
+    return evidence_ref, profile_ref
+
+
 def _assert_evidence_rows(evidence_rows: list[Any]) -> None:
     """Require only positive current-dataset affiliation witnesses."""
     assert [evidence_row.resource_id for evidence_row in evidence_rows] == [
@@ -324,3 +432,487 @@ async def test_affiliation_profile_requires_participating_org_and_deduplicates_s
     assert profile_row is not None
     _assert_evidence_rows(evidence_rows)
     _assert_deduplicated_profiles(profile_row)
+
+
+@pytest.mark.asyncio
+async def test_bounded_profile_build_matches_monolithic_sql_exactly(monkeypatch):
+    """Prove source/fact and NPI batches preserve the existing contract."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        await _build_profile_artifacts(database, schema)
+        bounded_evidence_ref, bounded_profile_ref = (
+            await _build_bounded_profile_artifacts(database, schema)
+        )
+        baseline_evidence_ref = profile.qualified_table(
+            schema,
+            "profile_evidence",
+        )
+        baseline_profile_ref = profile.qualified_table(schema, "profile")
+        evidence_difference = await database.scalar(
+            f"""
+            SELECT count(*)
+              FROM (
+                    (SELECT * FROM {baseline_evidence_ref}
+                     EXCEPT ALL
+                     SELECT * FROM {bounded_evidence_ref})
+                    UNION ALL
+                    (SELECT * FROM {bounded_evidence_ref}
+                     EXCEPT ALL
+                     SELECT * FROM {baseline_evidence_ref})
+              ) AS difference;
+            """
+        )
+        profile_difference = await database.scalar(
+            f"""
+            SELECT count(*)
+              FROM (
+                    (SELECT npi, profile_json, evidence_json, source_ids,
+                            endpoint_ids, dataset_ids, source_count,
+                            independent_source_count, fact_count, generation_id
+                       FROM {baseline_profile_ref}
+                     EXCEPT ALL
+                     SELECT npi, profile_json, evidence_json, source_ids,
+                            endpoint_ids, dataset_ids, source_count,
+                            independent_source_count, fact_count, generation_id
+                       FROM {bounded_profile_ref})
+                    UNION ALL
+                    (SELECT npi, profile_json, evidence_json, source_ids,
+                            endpoint_ids, dataset_ids, source_count,
+                            independent_source_count, fact_count, generation_id
+                       FROM {bounded_profile_ref}
+                     EXCEPT ALL
+                     SELECT npi, profile_json, evidence_json, source_ids,
+                            endpoint_ids, dataset_ids, source_count,
+                            independent_source_count, fact_count, generation_id
+                       FROM {baseline_profile_ref})
+              ) AS difference;
+            """
+        )
+
+    assert evidence_difference == 0
+    assert profile_difference == 0
+
+
+@pytest.mark.asyncio
+async def test_bounded_fact_plan_prunes_unrelated_resource_branches(monkeypatch):
+    """Keep each fact statement limited to the tables that can produce it."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        table_ref = lambda table_name: profile.qualified_table(
+            schema,
+            table_name,
+        )
+        plan = await database.scalar(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+            + profile.profile_evidence_insert_sql(
+                target_ref=table_ref("profile_evidence"),
+                source_ref=table_ref("provider_directory_source"),
+                practitioner_ref=table_ref(
+                    "provider_directory_practitioner"
+                ),
+                role_ref=table_ref("provider_directory_practitioner_role"),
+                organization_ref=table_ref(
+                    "provider_directory_organization"
+                ),
+                service_ref=table_ref(
+                    "provider_directory_healthcare_service"
+                ),
+                endpoint_ref=table_ref("provider_directory_endpoint"),
+                fact_type="name",
+            ),
+            source_ids=["profile-source-a"],
+            dataset_ids=["profile-dataset-a"],
+            profile_as_of="2026-07-19",
+        )
+
+    practitioner_nodes = _plan_relation_nodes(
+        plan,
+        "provider_directory_practitioner",
+    )
+    assert practitioner_nodes
+    assert any(node["Actual Loops"] > 0 for node in practitioner_nodes)
+    for unrelated_relation in (
+        "provider_directory_practitioner_role",
+        "provider_directory_organization_affiliation",
+        "provider_directory_healthcare_service",
+        "provider_directory_endpoint",
+    ):
+        unused_nodes = _plan_relation_nodes(plan, unrelated_relation)
+        assert unused_nodes
+        assert all(node["Actual Loops"] == 0 for node in unused_nodes)
+        assert all(node["Shared Hit Blocks"] == 0 for node in unused_nodes)
+        assert all(node["Shared Read Blocks"] == 0 for node in unused_nodes)
+
+
+@pytest.mark.asyncio
+async def test_five_million_npi_batch_uses_evidence_range_indexes(monkeypatch):
+    """Prevent every compact-profile range from rescanning all evidence."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        evidence_table = "profile_evidence_plan"
+        profile_table = "profile_plan"
+        evidence_ref = profile.qualified_table(schema, evidence_table)
+        profile_ref = profile.qualified_table(schema, profile_table)
+        await database.status(
+            profile.profile_evidence_table_sql(
+                schema,
+                evidence_table,
+                logged=True,
+            )
+        )
+        await database.status(
+            profile.profile_table_sql(schema, profile_table, logged=True)
+        )
+        await database.status(
+            f"""
+            INSERT INTO {evidence_ref} (
+                evidence_key, npi, fact_type, fact_key, value_json,
+                source_id, endpoint_id, dataset_id, canonical_api_base,
+                source_org_name, source_plan_name, resource_type,
+                resource_id, role_resource_id, active, effective_start,
+                effective_end, observed_at
+            )
+            SELECT md5(value::text),
+                   1000000000 + value * 10000,
+                   'name', md5(('fact-' || value)::text),
+                   jsonb_build_object('text', 'Provider ' || value),
+                   'profile-source-a', 'profile-endpoint-a',
+                   'profile-dataset-a', 'https://payer.test/fhir',
+                   'Example Health Plan', 'Example Plan', 'Practitioner',
+                   'practitioner-' || value, NULL, true, NULL, NULL, now()
+              FROM generate_series(1, 100000) AS value;
+            """
+        )
+        for index_sql in profile.profile_index_statements(
+            schema,
+            evidence_table,
+            evidence=True,
+        ):
+            await database.status(index_sql)
+        await database.status(f"ANALYZE {evidence_ref};")
+        plan = await database.scalar(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+            + profile.profile_insert_sql(
+                evidence_ref=evidence_ref,
+                target_ref=profile_ref,
+                old_evidence_ref=None,
+                rebuild_all=True,
+                npi_start=profile.NPI_MIN,
+                npi_end=profile.NPI_MIN + profile.PROFILE_NPI_BATCH_SIZE,
+            ),
+            generation_id="profile-index-plan",
+            profile_as_of="2026-07-19",
+            profile_npi_start=profile.NPI_MIN,
+            profile_npi_end=(
+                profile.NPI_MIN + profile.PROFILE_NPI_BATCH_SIZE
+            ),
+        )
+
+    evidence_nodes = _plan_relation_nodes(plan, evidence_table)
+    assert evidence_nodes
+    assert all(node["Node Type"] != "Seq Scan" for node in evidence_nodes)
+    assert any("Index Cond" in node for node in evidence_nodes)
+    assert max(node["Actual Rows"] for node in evidence_nodes) < 2_000
+
+
+@pytest.mark.asyncio
+async def test_profile_build_resumes_after_committed_batch_interruption(
+    monkeypatch,
+):
+    """Resume exact logged stages without replaying completed fact batches."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        await _build_profile_artifacts(database, schema)
+        monkeypatch.setattr(importer, "db", database)
+        build = importer._ProviderDirectoryProfileBuild(
+            schema=schema,
+            generation_id="profile-affiliation-test",
+            source_ids=("profile-source-a", "profile-source-b"),
+            retained_source_ids=("profile-source-a", "profile-source-b"),
+            dataset_ids=("profile-dataset-a", "profile-dataset-b"),
+            profile_as_of="2026-07-19",
+            evidence_stage="profile_evidence_resume_stage",
+            profile_stage="profile_resume_stage",
+            build_id="profile-resume-build",
+            owner_run_id="profile-run-first",
+        )
+        fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+        original_status = database.status
+        fact_statement_starts: list[None] = []
+
+        async def interrupting_status(sql: Any, **params: Any):
+            if (
+                f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
+                and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
+            ):
+                if len(fact_statement_starts) == 6:
+                    raise RuntimeError("forced resumable interruption")
+                fact_statement_starts.append(None)
+            return await original_status(sql, **params)
+
+        monkeypatch.setattr(database, "status", interrupting_status)
+        with pytest.raises(RuntimeError, match="forced resumable interruption"):
+            await importer._build_provider_directory_profile_stages(
+                build,
+                fence,
+                fence,
+            )
+
+        checkpoint_ref = profile.qualified_table(
+            schema,
+            "provider_directory_profile_build_checkpoint",
+        )
+        interrupted_checkpoint = await database.first(
+            f"SELECT state, evidence_next_batch, profile_next_batch "
+            f"FROM {checkpoint_ref} WHERE build_id = :build_id;",
+            build_id=build.build_id,
+        )
+        assert interrupted_checkpoint is not None
+        assert interrupted_checkpoint.state == "failed"
+        assert interrupted_checkpoint.evidence_next_batch == 6
+        assert interrupted_checkpoint.profile_next_batch == 0
+        interrupted_evidence_count = int(
+            await database.scalar(
+                f"SELECT count(*) FROM "
+                f"{profile.qualified_table(schema, build.evidence_stage)};"
+            )
+            or 0
+        )
+
+        resumed_fact_statements: list[str] = []
+        compact_statement_starts: list[None] = []
+
+        async def tracking_status(sql: Any, **params: Any):
+            if (
+                f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
+                and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
+            ):
+                resumed_fact_statements.append(str(sql))
+            if (
+                f'INSERT INTO "{schema}"."{build.profile_stage}"' in str(sql)
+                and "ON CONFLICT (npi) DO NOTHING" in str(sql)
+            ):
+                if len(compact_statement_starts) == 120:
+                    raise RuntimeError("forced compact interruption")
+                compact_statement_starts.append(None)
+            return await original_status(sql, **params)
+
+        monkeypatch.setattr(database, "status", tracking_status)
+        resumed_build = replace(
+            build,
+            owner_run_id="profile-run-retry",
+        )
+        with pytest.raises(RuntimeError, match="forced compact interruption"):
+            await importer._build_provider_directory_profile_stages(
+                resumed_build,
+                fence,
+                fence,
+            )
+        compact_checkpoint = await database.first(
+            f"SELECT state, evidence_next_batch, evidence_total_batches, "
+            f"profile_next_batch FROM {checkpoint_ref} "
+            f"WHERE build_id = :build_id;",
+            build_id=build.build_id,
+        )
+        assert compact_checkpoint is not None
+        assert compact_checkpoint.state == "failed"
+        assert (
+            compact_checkpoint.evidence_next_batch
+            == compact_checkpoint.evidence_total_batches
+        )
+        assert compact_checkpoint.profile_next_batch == 120
+        assert len(resumed_fact_statements) == (
+            compact_checkpoint.evidence_total_batches - 6
+        )
+
+        final_evidence_statements: list[str] = []
+        final_profile_statements: list[str] = []
+
+        async def final_status(sql: Any, **params: Any):
+            if (
+                f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
+                and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
+            ):
+                final_evidence_statements.append(str(sql))
+            if (
+                f'INSERT INTO "{schema}"."{build.profile_stage}"' in str(sql)
+                and "ON CONFLICT (npi) DO NOTHING" in str(sql)
+            ):
+                final_profile_statements.append(str(sql))
+            return await original_status(sql, **params)
+
+        monkeypatch.setattr(database, "status", final_status)
+        _metrics, _stages = await importer._build_provider_directory_profile_stages(
+            replace(resumed_build, owner_run_id="profile-run-final"),
+            fence,
+            fence,
+        )
+        completed_checkpoint = await database.first(
+            f"SELECT state, evidence_next_batch, evidence_total_batches, "
+            f"profile_next_batch, profile_total_batches "
+            f"FROM {checkpoint_ref} WHERE build_id = :build_id;",
+            build_id=build.build_id,
+        )
+        assert completed_checkpoint is not None
+        assert final_evidence_statements == []
+        assert len(final_profile_statements) == (
+            completed_checkpoint.profile_total_batches - 120
+        )
+        assert completed_checkpoint.state == "ready"
+        assert (
+            completed_checkpoint.evidence_next_batch
+            == completed_checkpoint.evidence_total_batches
+        )
+        assert (
+            completed_checkpoint.profile_next_batch
+            == completed_checkpoint.profile_total_batches
+        )
+        assert int(
+            await database.scalar(
+                f"SELECT count(*) FROM "
+                f"{profile.qualified_table(schema, build.evidence_stage)};"
+            )
+            or 0
+        ) >= interrupted_evidence_count
+
+        baseline_evidence_ref = profile.qualified_table(
+            schema,
+            "profile_evidence",
+        )
+        resumed_evidence_ref = profile.qualified_table(
+            schema,
+            build.evidence_stage,
+        )
+        baseline_profile_ref = profile.qualified_table(schema, "profile")
+        resumed_profile_ref = profile.qualified_table(
+            schema,
+            build.profile_stage,
+        )
+        assert await database.scalar(
+            f"""
+            SELECT count(*) FROM (
+                (SELECT * FROM {baseline_evidence_ref}
+                 EXCEPT ALL SELECT * FROM {resumed_evidence_ref})
+                UNION ALL
+                (SELECT * FROM {resumed_evidence_ref}
+                 EXCEPT ALL SELECT * FROM {baseline_evidence_ref})
+            ) AS difference;
+            """
+        ) == 0
+        assert await database.scalar(
+            f"""
+            SELECT count(*) FROM (
+                (SELECT npi, profile_json, evidence_json, source_ids,
+                        endpoint_ids, dataset_ids, source_count,
+                        independent_source_count, fact_count, generation_id
+                   FROM {baseline_profile_ref}
+                 EXCEPT ALL
+                 SELECT npi, profile_json, evidence_json, source_ids,
+                        endpoint_ids, dataset_ids, source_count,
+                        independent_source_count, fact_count, generation_id
+                   FROM {resumed_profile_ref})
+                UNION ALL
+                (SELECT npi, profile_json, evidence_json, source_ids,
+                        endpoint_ids, dataset_ids, source_count,
+                        independent_source_count, fact_count, generation_id
+                   FROM {resumed_profile_ref}
+                 EXCEPT ALL
+                 SELECT npi, profile_json, evidence_json, source_ids,
+                        endpoint_ids, dataset_ids, source_count,
+                        independent_source_count, fact_count, generation_id
+                   FROM {baseline_profile_ref})
+            ) AS difference;
+            """
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_profile_build_reaps_failed_stages_after_lineage_changes(
+    monkeypatch,
+):
+    """Drop only superseded logged stages when source/dataset scope changes."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        stale_build_id = f"pdpb_{'1' * 32}"
+        current_build_id = f"pdpb_{'2' * 32}"
+
+        def build(
+            build_id: str,
+            *,
+            source_id: str,
+            dataset_id: str,
+            owner_run_id: str,
+        ) -> importer._ProviderDirectoryProfileBuild:
+            return importer._ProviderDirectoryProfileBuild(
+                schema=schema,
+                generation_id=f"generation-{build_id[-4:]}",
+                source_ids=(source_id,),
+                retained_source_ids=(source_id,),
+                dataset_ids=(dataset_id,),
+                profile_as_of="2026-07-20",
+                evidence_stage=(
+                    profile.profile_evidence_stage_table_name(build_id)
+                ),
+                profile_stage=profile.profile_stage_table_name(build_id),
+                build_id=build_id,
+                owner_run_id=owner_run_id,
+            )
+
+        stale_build = build(
+            stale_build_id,
+            source_id="profile-source-a",
+            dataset_id="profile-dataset-a",
+            owner_run_id="profile-run-stale",
+        )
+        current_build = build(
+            current_build_id,
+            source_id="profile-source-b",
+            dataset_id="profile-dataset-b",
+            owner_run_id="profile-run-current",
+        )
+        fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+        await importer._claim_provider_directory_profile_build_checkpoint(
+            stale_build,
+            has_existing_artifacts=False,
+            evidence_build_fence=fence,
+            profile_build_fence=fence,
+        )
+        await importer._mark_provider_directory_profile_build_checkpoint_failed(
+            stale_build,
+            RuntimeError("forced stale failure"),
+        )
+        await importer._claim_provider_directory_profile_build_checkpoint(
+            current_build,
+            has_existing_artifacts=False,
+            evidence_build_fence=fence,
+            profile_build_fence=fence,
+        )
+
+        assert await importer._reap_stale_provider_directory_profile_builds(
+            schema,
+            current_build_id=current_build_id,
+        ) == 1
+
+        checkpoint_ref = profile.qualified_table(
+            schema,
+            "provider_directory_profile_build_checkpoint",
+        )
+        remaining_build_ids = {
+            row.build_id
+            for row in await database.all(
+                f"SELECT build_id FROM {checkpoint_ref};"
+            )
+        }
+        assert remaining_build_ids == {current_build_id}
+        for stage_table in (
+            stale_build.evidence_stage,
+            stale_build.profile_stage,
+        ):
+            assert await database.scalar(
+                "SELECT to_regclass(:relation_name);",
+                relation_name=f"{schema}.{stage_table}",
+            ) is None
+        for stage_table in (
+            current_build.evidence_stage,
+            current_build.profile_stage,
+        ):
+            assert await database.scalar(
+                "SELECT to_regclass(:relation_name);",
+                relation_name=f"{schema}.{stage_table}",
+            ) is not None

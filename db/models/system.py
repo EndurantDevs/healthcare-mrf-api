@@ -56,6 +56,7 @@ __all__ = (
     "ProviderDirectoryOrganization",
     "ProviderDirectoryOrganizationAffiliation",
     "ProviderDirectoryPaginationCheckpoint",
+    "ProviderDirectoryProfileBuildCheckpoint",
     "ProviderDirectoryPractitioner",
     "ProviderDirectoryPractitionerRole",
     "ProviderDirectoryReverseLookupCheckpoint",
@@ -1493,6 +1494,54 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
     rows_processed = Column(BigInteger, nullable=False, default=0)
     recent_cursor_hashes = Column(JSON, nullable=False, default=list)
     completeness_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(TIMESTAMP, nullable=False)
+    updated_at = Column(TIMESTAMP, nullable=False)
+    completed_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
+    """Durable, lineage-fenced progress for one staged Profile build."""
+
+    __tablename__ = "provider_directory_profile_build_checkpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("build_id"),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = ["build_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("state", "updated_at"),
+            "name": "pd_profile_build_checkpoint_state_idx",
+        },
+        {
+            "index_elements": ("owner_run_id",),
+            "name": "pd_profile_build_checkpoint_owner_idx",
+        },
+    ]
+
+    build_id = Column(String(64), nullable=False)
+    strategy_version = Column(String(64), nullable=False)
+    schema_version = Column(Integer, nullable=False)
+    owner_run_id = Column(String(64))
+    state = Column(String(32), nullable=False)
+    profile_as_of = Column(String(10), nullable=False)
+    source_ids = Column(JSON, nullable=False)
+    retained_source_ids = Column(JSON, nullable=False)
+    dataset_ids = Column(JSON, nullable=False)
+    evidence_stage = Column(String(63), nullable=False)
+    profile_stage = Column(String(63), nullable=False)
+    evidence_target_oid = Column(BigInteger)
+    profile_target_oid = Column(BigInteger)
+    has_existing_artifacts = Column(Boolean, nullable=False)
+    evidence_next_batch = Column(Integer, nullable=False, default=0)
+    evidence_total_batches = Column(Integer, nullable=False)
+    profile_next_batch = Column(Integer, nullable=False, default=0)
+    profile_total_batches = Column(Integer, nullable=False)
+    last_error = Column(TEXT)
     created_at = Column(TIMESTAMP, nullable=False)
     updated_at = Column(TIMESTAMP, nullable=False)
     completed_at = Column(TIMESTAMP)

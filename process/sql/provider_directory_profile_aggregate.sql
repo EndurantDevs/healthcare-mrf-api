@@ -174,4 +174,5 @@ INSERT INTO {{TARGET_REF}} ("npi", "profile_json", "evidence_json", "source_ids"
                now()
           FROM profile_sources
           JOIN profile_categories
-            ON profile_categories.npi = profile_sources.npi;
+            ON profile_categories.npi = profile_sources.npi
+        ON CONFLICT (npi) DO NOTHING;

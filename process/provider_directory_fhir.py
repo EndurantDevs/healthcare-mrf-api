@@ -67,6 +67,7 @@ from db.models import (
     ProviderDirectoryPaginationCheckpoint,
     ProviderDirectoryPractitioner,
     ProviderDirectoryPractitionerRole,
+    ProviderDirectoryProfileBuildCheckpoint,
     ProviderDirectoryReverseLookupCheckpoint,
     ProviderDirectorySource,
     ProviderDirectorySourceResource,
@@ -479,6 +480,7 @@ CANONICAL_RESOURCE_MODELS = (
     ProviderDirectoryBulkAcquisitionCheckpoint,
     ProviderDirectoryBulkOutputCheckpoint,
     ProviderDirectoryPaginationCheckpoint,
+    ProviderDirectoryProfileBuildCheckpoint,
     ProviderDirectoryReverseLookupCheckpoint,
 )
 USER_AGENT = os.getenv(
@@ -7880,6 +7882,8 @@ class ProviderDirectoryPreparedArtifactStage:
     target_relation: str
     rename_stage_indexes: Callable[[str, str], Awaitable[None]]
     build_fence: ProviderDirectoryArtifactBuildFence | None = None
+    retain_on_failed_bundle: bool = False
+    resume_checkpoint: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -7897,6 +7901,7 @@ class ProviderDirectoryArtifactBundle:
     stages: list[ProviderDirectoryPreparedArtifactStage] = field(
         default_factory=list
     )
+    promoted: bool = False
 
     def add(
         self,
@@ -7920,11 +7925,25 @@ class ProviderDirectoryArtifactBundle:
             await _retry_provider_directory_artifact_bundle_promotion(
                 tuple(self.stages)
             )
+        self.promoted = True
+        for schema, build_id in sorted(
+            {
+                stage.resume_checkpoint
+                for stage in self.stages
+                if getattr(stage, "resume_checkpoint", None) is not None
+            }
+        ):
+            await _delete_provider_directory_profile_build_checkpoint(
+                schema,
+                build_id,
+            )
         return len(self.stages)
 
     async def cleanup(self) -> None:
         """Remove every stage name that was not consumed by promotion."""
         for stage in reversed(self.stages):
+            if stage.retain_on_failed_bundle and not self.promoted:
+                continue
             await _remove_provider_directory_artifact_stage(stage)
 
 
@@ -13169,6 +13188,101 @@ class _ProviderDirectoryProfileBuild:
     profile_as_of: str
     evidence_stage: str
     profile_stage: str
+    build_id: str | None = None
+    owner_run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileEvidenceBatch:
+    kind: str
+    source_id: str | None = None
+    dataset_id: str | None = None
+    fact_type: str | None = None
+    role_bucket_count: int = 1
+    role_bucket: int = 0
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileCompactBatch:
+    kind: str
+    npi_start: int | None = None
+    npi_end: int | None = None
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileBuildCheckpointState:
+    evidence_next_batch: int
+    evidence_total_batches: int
+    profile_next_batch: int
+    profile_total_batches: int
+    state: str
+
+
+def _provider_directory_profile_build_id(
+    build: _ProviderDirectoryProfileBuild,
+) -> str:
+    return build.build_id or build.generation_id
+
+
+def _provider_directory_profile_evidence_batches(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    has_existing_artifacts: bool,
+) -> tuple[_ProviderDirectoryProfileEvidenceBatch, ...]:
+    batches: list[_ProviderDirectoryProfileEvidenceBatch] = []
+    if has_existing_artifacts:
+        batches.append(_ProviderDirectoryProfileEvidenceBatch(kind="copy"))
+    for source_id, dataset_id in zip(
+        build.source_ids,
+        build.dataset_ids,
+        strict=True,
+    ):
+        for fact_type in profile_artifact.PROFILE_EVIDENCE_FACT_TYPES:
+            role_bucket_count = (
+                profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS
+                if fact_type == "affiliation"
+                else 1
+            )
+            batches.extend(
+                _ProviderDirectoryProfileEvidenceBatch(
+                    kind="fact",
+                    source_id=source_id,
+                    dataset_id=dataset_id,
+                    fact_type=fact_type,
+                    role_bucket_count=role_bucket_count,
+                    role_bucket=role_bucket,
+                )
+                for role_bucket in range(role_bucket_count)
+            )
+    return tuple(batches)
+
+
+def _provider_directory_profile_compact_batches(
+    *,
+    has_existing_artifacts: bool,
+    npi_batch_size: int,
+) -> tuple[_ProviderDirectoryProfileCompactBatch, ...]:
+    if npi_batch_size < 1:
+        raise ValueError("profile NPI batch size must be positive")
+    batches: list[_ProviderDirectoryProfileCompactBatch] = []
+    if has_existing_artifacts:
+        batches.append(_ProviderDirectoryProfileCompactBatch(kind="copy"))
+    batches.extend(
+        _ProviderDirectoryProfileCompactBatch(
+            kind="npi",
+            npi_start=npi_start,
+            npi_end=min(
+                npi_start + npi_batch_size,
+                profile_artifact.NPI_MAX + 1,
+            ),
+        )
+        for npi_start in range(
+            profile_artifact.NPI_MIN,
+            profile_artifact.NPI_MAX + 1,
+            npi_batch_size,
+        )
+    )
+    return tuple(batches)
 
 
 def _provider_directory_profile_build_ref(
@@ -13182,6 +13296,8 @@ async def _resolve_provider_directory_profile_build(
     schema: str,
     run_id: str | None,
     dataset_fence: ProviderDirectoryArtifactDatasetFence,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
 ) -> _ProviderDirectoryProfileBuild:
     selected_source_ids, retained_source_ids = (
         await _provider_directory_profile_scope_source_ids(
@@ -13193,16 +13309,85 @@ async def _resolve_provider_directory_profile_build(
         dataset_fence.datasets,
         selected_source_ids,
     )
+    build_identity = json.dumps(
+        {
+            "dataset_ids": dataset_ids,
+            "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
+            "retained_source_ids": retained_source_ids,
+            "source_ids": source_ids,
+            "strategy_version": (
+                profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    build_id = "pdpb_" + hashlib.sha256(
+        build_identity.encode("utf-8")
+    ).hexdigest()[:32]
+    evidence_stage = profile_artifact.profile_evidence_stage_table_name(
+        build_id
+    )
+    profile_stage = profile_artifact.profile_stage_table_name(build_id)
     profile_as_of = _now().date().isoformat()
-    generation_id = (
-        _clean_text(run_id)
-        or "pdprofile_"
-        + hashlib.sha1(
-            "|".join(
-                [profile_as_of, *retained_source_ids, *dataset_ids]
-            ).encode("utf-8")
-        ).hexdigest()[:32]
-    )[:64]
+    checkpoint_row = await db.first(
+        f"SELECT * FROM {_provider_directory_profile_checkpoint_ref(schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=build_id,
+    )
+    checkpoint_map = (
+        _pagination_checkpoint_row_mapping(checkpoint_row)
+        if checkpoint_row is not None
+        else {}
+    )
+    checkpoint_as_of = _clean_text(checkpoint_map.get("profile_as_of"))
+    checkpoint_lineage_matches = bool(checkpoint_map) and (
+        _clean_text(checkpoint_map.get("strategy_version"))
+        == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        and int(checkpoint_map.get("schema_version") or -1)
+        == profile_artifact.PROFILE_SCHEMA_VERSION
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("source_ids")
+        )
+        == tuple(source_ids)
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("retained_source_ids")
+        )
+        == tuple(retained_source_ids)
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("dataset_ids")
+        )
+        == tuple(dataset_ids)
+        and _clean_text(checkpoint_map.get("evidence_stage"))
+        == evidence_stage
+        and _clean_text(checkpoint_map.get("profile_stage"))
+        == profile_stage
+        and checkpoint_map.get("evidence_target_oid")
+        == evidence_build_fence.target_oid
+        and checkpoint_map.get("profile_target_oid")
+        == profile_build_fence.target_oid
+    )
+    if checkpoint_lineage_matches and checkpoint_as_of:
+        try:
+            checkpoint_date = datetime.date.fromisoformat(checkpoint_as_of)
+        except ValueError:
+            checkpoint_date = None
+        stages_are_logged = checkpoint_date is not None
+        if stages_are_logged:
+            for stage_table in (evidence_stage, profile_stage):
+                if await _provider_directory_relation_attribute(
+                    schema,
+                    stage_table,
+                    "relpersistence",
+                ) != "p":
+                    stages_are_logged = False
+                    break
+        if stages_are_logged and checkpoint_date is not None:
+            profile_as_of = checkpoint_date.isoformat()
+    generation_identity = f"{build_id}:{profile_as_of}"
+    generation_id = "pdprofile_" + hashlib.sha256(
+        generation_identity.encode("utf-8")
+    ).hexdigest()[:32]
     return _ProviderDirectoryProfileBuild(
         schema=schema,
         generation_id=generation_id,
@@ -13210,73 +13395,663 @@ async def _resolve_provider_directory_profile_build(
         retained_source_ids=tuple(retained_source_ids),
         dataset_ids=tuple(dataset_ids),
         profile_as_of=profile_as_of,
-        evidence_stage=profile_artifact.profile_evidence_stage_table_name(
-            generation_id
-        ),
-        profile_stage=profile_artifact.profile_stage_table_name(generation_id),
+        evidence_stage=evidence_stage,
+        profile_stage=profile_stage,
+        build_id=build_id,
+        owner_run_id=_clean_text(run_id),
     )
 
 
-async def _create_provider_directory_profile_evidence_stage(
+def _provider_directory_profile_checkpoint_ref(schema: str) -> str:
+    return _unscoped_qt(
+        schema,
+        ProviderDirectoryProfileBuildCheckpoint.__tablename__,
+    )
+
+
+def _provider_directory_profile_checkpoint_array(
+    raw_value: Any,
+) -> tuple[str, ...]:
+    if isinstance(raw_value, str):
+        raw_value = json.loads(raw_value)
+    if not isinstance(raw_value, list):
+        return ()
+    return tuple(str(value) for value in raw_value)
+
+
+def _provider_directory_profile_checkpoint_state(
+    checkpoint_map: dict[str, Any],
+) -> _ProviderDirectoryProfileBuildCheckpointState:
+    return _ProviderDirectoryProfileBuildCheckpointState(
+        evidence_next_batch=int(
+            checkpoint_map.get("evidence_next_batch") or 0
+        ),
+        evidence_total_batches=int(
+            checkpoint_map.get("evidence_total_batches") or 0
+        ),
+        profile_next_batch=int(
+            checkpoint_map.get("profile_next_batch") or 0
+        ),
+        profile_total_batches=int(
+            checkpoint_map.get("profile_total_batches") or 0
+        ),
+        state=_clean_text(checkpoint_map.get("state")) or "",
+    )
+
+
+async def _provider_directory_profile_checkpoint_is_reusable(
+    build: _ProviderDirectoryProfileBuild,
+    checkpoint_map: dict[str, Any],
+    *,
+    has_existing_artifacts: bool,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    evidence_total_batches: int,
+    profile_total_batches: int,
+) -> bool:
+    checkpoint_state = _provider_directory_profile_checkpoint_state(
+        checkpoint_map
+    )
+    identity_matches = (
+        _clean_text(checkpoint_map.get("build_id"))
+        == _provider_directory_profile_build_id(build)
+        and _clean_text(checkpoint_map.get("strategy_version"))
+        == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        and int(checkpoint_map.get("schema_version") or -1)
+        == profile_artifact.PROFILE_SCHEMA_VERSION
+        and _clean_text(checkpoint_map.get("profile_as_of"))
+        == build.profile_as_of
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("source_ids")
+        )
+        == build.source_ids
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("retained_source_ids")
+        )
+        == build.retained_source_ids
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("dataset_ids")
+        )
+        == build.dataset_ids
+        and _clean_text(checkpoint_map.get("evidence_stage"))
+        == build.evidence_stage
+        and _clean_text(checkpoint_map.get("profile_stage"))
+        == build.profile_stage
+        and checkpoint_map.get("evidence_target_oid")
+        == evidence_build_fence.target_oid
+        and checkpoint_map.get("profile_target_oid")
+        == profile_build_fence.target_oid
+        and bool(checkpoint_map.get("has_existing_artifacts"))
+        is has_existing_artifacts
+        and checkpoint_state.evidence_total_batches
+        == evidence_total_batches
+        and checkpoint_state.profile_total_batches
+        == profile_total_batches
+        and 0
+        <= checkpoint_state.evidence_next_batch
+        <= evidence_total_batches
+        and 0
+        <= checkpoint_state.profile_next_batch
+        <= profile_total_batches
+    )
+    if not identity_matches:
+        return False
+    for stage_table in (build.evidence_stage, build.profile_stage):
+        if await _provider_directory_relation_attribute(
+            build.schema,
+            stage_table,
+            "relpersistence",
+        ) != "p":
+            return False
+    return True
+
+
+async def _claim_provider_directory_profile_build_checkpoint(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    has_existing_artifacts: bool,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> _ProviderDirectoryProfileBuildCheckpointState:
+    evidence_batches = _provider_directory_profile_evidence_batches(
+        build,
+        has_existing_artifacts=has_existing_artifacts,
+    )
+    profile_batches = _provider_directory_profile_compact_batches(
+        has_existing_artifacts=has_existing_artifacts,
+        npi_batch_size=profile_artifact.PROFILE_NPI_BATCH_SIZE,
+    )
+    checkpoint_ref = _provider_directory_profile_checkpoint_ref(build.schema)
+    build_id = _provider_directory_profile_build_id(build)
+    async with db.transaction():
+        checkpoint_row = await db.first(
+            f"SELECT * FROM {checkpoint_ref} "
+            "WHERE build_id = :build_id FOR UPDATE;",
+            build_id=build_id,
+        )
+        checkpoint_map = (
+            _pagination_checkpoint_row_mapping(checkpoint_row)
+            if checkpoint_row is not None
+            else {}
+        )
+        reusable = bool(checkpoint_map) and (
+            await _provider_directory_profile_checkpoint_is_reusable(
+                build,
+                checkpoint_map,
+                has_existing_artifacts=has_existing_artifacts,
+                evidence_build_fence=evidence_build_fence,
+                profile_build_fence=profile_build_fence,
+                evidence_total_batches=len(evidence_batches),
+                profile_total_batches=len(profile_batches),
+            )
+        )
+        if not reusable:
+            await db.status(
+                f"DROP TABLE IF EXISTS "
+                f"{_provider_directory_profile_build_ref(build, build.profile_stage)};"
+            )
+            await db.status(
+                f"DROP TABLE IF EXISTS "
+                f"{_provider_directory_profile_build_ref(build, build.evidence_stage)};"
+            )
+            await db.status(
+                f"DELETE FROM {checkpoint_ref} WHERE build_id = :build_id;",
+                build_id=build_id,
+            )
+            await db.status(
+                profile_artifact.profile_evidence_table_sql(
+                    build.schema,
+                    build.evidence_stage,
+                    logged=True,
+                )
+            )
+            await db.status(
+                profile_artifact.profile_table_sql(
+                    build.schema,
+                    build.profile_stage,
+                    logged=True,
+                )
+            )
+            await db.status(
+                f"""
+                INSERT INTO {checkpoint_ref} (
+                    build_id, strategy_version, schema_version, owner_run_id,
+                    state, profile_as_of, source_ids, retained_source_ids,
+                    dataset_ids, evidence_stage, profile_stage,
+                    evidence_target_oid, profile_target_oid,
+                    has_existing_artifacts, evidence_next_batch,
+                    evidence_total_batches, profile_next_batch,
+                    profile_total_batches, created_at, updated_at
+                ) VALUES (
+                    :build_id, :strategy_version, :schema_version,
+                    :owner_run_id, 'building_evidence', :profile_as_of,
+                    CAST(:source_ids AS jsonb),
+                    CAST(:retained_source_ids AS jsonb),
+                    CAST(:dataset_ids AS jsonb), :evidence_stage,
+                    :profile_stage, :evidence_target_oid,
+                    :profile_target_oid, :has_existing_artifacts, 0,
+                    :evidence_total_batches, 0, :profile_total_batches,
+                    now(), now()
+                );
+                """,
+                build_id=build_id,
+                strategy_version=(
+                    profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+                ),
+                schema_version=profile_artifact.PROFILE_SCHEMA_VERSION,
+                owner_run_id=build.owner_run_id,
+                profile_as_of=build.profile_as_of,
+                source_ids=json.dumps(list(build.source_ids)),
+                retained_source_ids=json.dumps(
+                    list(build.retained_source_ids)
+                ),
+                dataset_ids=json.dumps(list(build.dataset_ids)),
+                evidence_stage=build.evidence_stage,
+                profile_stage=build.profile_stage,
+                evidence_target_oid=evidence_build_fence.target_oid,
+                profile_target_oid=profile_build_fence.target_oid,
+                has_existing_artifacts=has_existing_artifacts,
+                evidence_total_batches=len(evidence_batches),
+                profile_total_batches=len(profile_batches),
+            )
+            return _ProviderDirectoryProfileBuildCheckpointState(
+                evidence_next_batch=0,
+                evidence_total_batches=len(evidence_batches),
+                profile_next_batch=0,
+                profile_total_batches=len(profile_batches),
+                state="building_evidence",
+            )
+
+        checkpoint_state = _provider_directory_profile_checkpoint_state(
+            checkpoint_map
+        )
+        claimed_state = (
+            "ready"
+            if checkpoint_state.profile_next_batch
+            == checkpoint_state.profile_total_batches
+            else (
+                "building_profile"
+                if checkpoint_state.evidence_next_batch
+                == checkpoint_state.evidence_total_batches
+                else "building_evidence"
+            )
+        )
+        claimed_count = await db.status(
+            f"""
+            UPDATE {checkpoint_ref}
+               SET owner_run_id = :owner_run_id,
+                   state = :state,
+                   last_error = NULL,
+                   updated_at = now()
+             WHERE build_id = :build_id;
+            """,
+            owner_run_id=build.owner_run_id,
+            state=claimed_state,
+            build_id=build_id,
+        )
+        if _coerce_rowcount(claimed_count) != 1:
+            raise RuntimeError(
+                "provider_directory_profile_build_checkpoint_claim_lost"
+            )
+        return replace(checkpoint_state, state=claimed_state)
+
+
+async def _advance_provider_directory_profile_build_checkpoint(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    phase: str,
+    expected_batch: int,
+    total_batches: int,
+) -> None:
+    if phase not in {"evidence", "profile"}:
+        raise ValueError(f"unsupported profile checkpoint phase: {phase}")
+    next_column = f"{phase}_next_batch"
+    total_column = f"{phase}_total_batches"
+    state = "building_evidence" if phase == "evidence" else "building_profile"
+    updated_count = await db.status(
+        f"""
+        UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
+           SET {next_column} = :next_batch,
+               state = :state,
+               last_error = NULL,
+               updated_at = now()
+         WHERE build_id = :build_id
+           AND owner_run_id IS NOT DISTINCT FROM :owner_run_id
+           AND {next_column} = :expected_batch
+           AND {total_column} = :total_batches;
+        """,
+        next_batch=expected_batch + 1,
+        state=state,
+        build_id=_provider_directory_profile_build_id(build),
+        owner_run_id=build.owner_run_id,
+        expected_batch=expected_batch,
+        total_batches=total_batches,
+    )
+    if _coerce_rowcount(updated_count) != 1:
+        raise RuntimeError(
+            "provider_directory_profile_build_checkpoint_ownership_lost"
+        )
+
+
+async def _mark_provider_directory_profile_build_checkpoint_state(
+    build: _ProviderDirectoryProfileBuild,
+    state: str,
+) -> None:
+    updated_count = await db.status(
+        f"""
+        UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
+           SET state = CAST(:state AS varchar),
+               completed_at = CASE
+                   WHEN CAST(:state AS varchar) = 'ready' THEN now()
+                   ELSE NULL
+               END,
+               updated_at = now()
+         WHERE build_id = :build_id
+           AND owner_run_id IS NOT DISTINCT FROM :owner_run_id;
+        """,
+        state=state,
+        build_id=_provider_directory_profile_build_id(build),
+        owner_run_id=build.owner_run_id,
+    )
+    if _coerce_rowcount(updated_count) != 1:
+        raise RuntimeError(
+            "provider_directory_profile_build_checkpoint_ownership_lost"
+        )
+
+
+async def _mark_provider_directory_profile_build_checkpoint_failed(
+    build: _ProviderDirectoryProfileBuild,
+    exc: BaseException,
+) -> None:
+    try:
+        await db.status(
+            f"""
+            UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
+               SET state = 'failed',
+                   last_error = :last_error,
+                   updated_at = now()
+             WHERE build_id = :build_id
+               AND owner_run_id IS NOT DISTINCT FROM :owner_run_id;
+            """,
+            last_error=f"{type(exc).__name__}: {exc}"[:2000],
+            build_id=_provider_directory_profile_build_id(build),
+            owner_run_id=build.owner_run_id,
+        )
+    except Exception:  # pragma: no cover - original error remains primary
+        LOGGER.warning(
+            "Failed to mark Provider Directory Profile checkpoint failed",
+            exc_info=True,
+        )
+
+
+async def _delete_provider_directory_profile_build_checkpoint(
+    schema: str,
+    build_id: str,
+) -> None:
+    try:
+        await db.status(
+            f"DELETE FROM {_provider_directory_profile_checkpoint_ref(schema)} "
+            "WHERE build_id = :build_id;",
+            build_id=build_id,
+        )
+    except Exception:  # pragma: no cover - stale metadata is self-invalidating
+        LOGGER.warning(
+            "Failed to delete completed Provider Directory Profile checkpoint",
+            exc_info=True,
+        )
+
+
+async def _provider_directory_profile_stage_relation_identity(
+    schema: str,
+    stage_table: str,
+) -> tuple[int, str, str] | None:
+    row = await db.first(
+        """
+        SELECT cls.oid::bigint AS relation_oid,
+               cls.relkind::text AS relation_kind,
+               cls.relpersistence::text AS relation_persistence
+          FROM pg_class cls
+          JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+         WHERE ns.nspname = :schema_name
+           AND cls.relname = :relation_name;
+        """,
+        schema_name=schema,
+        relation_name=stage_table,
+    )
+    if row is None:
+        return None
+    row_map = _pagination_checkpoint_row_mapping(row)
+    return (
+        int(row_map["relation_oid"]),
+        str(row_map["relation_kind"]),
+        str(row_map["relation_persistence"]),
+    )
+
+
+def _validated_provider_directory_profile_checkpoint_stage_names(
+    checkpoint_map: dict[str, Any],
+) -> tuple[str, str]:
+    build_id = _clean_text(checkpoint_map.get("build_id"))
+    if not build_id or re.fullmatch(r"pdpb_[0-9a-f]{32}", build_id) is None:
+        raise RuntimeError(
+            "provider_directory_profile_stale_checkpoint_identity_invalid"
+        )
+    evidence_stage = _clean_text(checkpoint_map.get("evidence_stage"))
+    profile_stage = _clean_text(checkpoint_map.get("profile_stage"))
+    expected_evidence_stage = (
+        profile_artifact.profile_evidence_stage_table_name(build_id)
+    )
+    expected_profile_stage = profile_artifact.profile_stage_table_name(
+        build_id
+    )
+    if (
+        evidence_stage != expected_evidence_stage
+        or profile_stage != expected_profile_stage
+        or not evidence_stage.startswith(
+            f"{profile_artifact.PROFILE_EVIDENCE_STAGE_PREFIX}_"
+        )
+        or not profile_stage.startswith(
+            f"{profile_artifact.PROFILE_STAGE_PREFIX}_"
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_stale_checkpoint_stage_invalid"
+        )
+    return evidence_stage, profile_stage
+
+
+async def _reap_stale_provider_directory_profile_builds(
+    schema: str,
+    *,
+    current_build_id: str,
+) -> int:
+    """Remove exact logged stages for superseded Profile build lineages."""
+    checkpoint_ref = _provider_directory_profile_checkpoint_ref(schema)
+    checkpoint_rows = await db.all(
+        f"SELECT build_id FROM {checkpoint_ref} "
+        "WHERE build_id <> :current_build_id ORDER BY created_at, build_id;",
+        current_build_id=current_build_id,
+    )
+    reaped_count = 0
+    for checkpoint_summary in checkpoint_rows:
+        stale_build_id = _clean_text(
+            _pagination_checkpoint_row_mapping(checkpoint_summary).get(
+                "build_id"
+            )
+        )
+        if not stale_build_id or stale_build_id == current_build_id:
+            continue
+        async with db.transaction():
+            checkpoint_row = await db.first(
+                f"SELECT * FROM {checkpoint_ref} "
+                "WHERE build_id = :build_id FOR UPDATE;",
+                build_id=stale_build_id,
+            )
+            if checkpoint_row is None:
+                continue
+            checkpoint_map = _pagination_checkpoint_row_mapping(
+                checkpoint_row
+            )
+            evidence_stage, profile_stage = (
+                _validated_provider_directory_profile_checkpoint_stage_names(
+                    checkpoint_map
+                )
+            )
+            locked_stages: list[str] = []
+            for stage_table in (profile_stage, evidence_stage):
+                initial_identity = (
+                    await _provider_directory_profile_stage_relation_identity(
+                        schema,
+                        stage_table,
+                    )
+                )
+                if initial_identity is None:
+                    continue
+                _relation_oid, relation_kind, relation_persistence = (
+                    initial_identity
+                )
+                if relation_kind != "r" or relation_persistence != "p":
+                    raise RuntimeError(
+                        "provider_directory_profile_stale_stage_not_logged_table"
+                    )
+                await db.status(
+                    f"LOCK TABLE {_unscoped_qt(schema, stage_table)} "
+                    "IN ACCESS EXCLUSIVE MODE;"
+                )
+                locked_identity = (
+                    await _provider_directory_profile_stage_relation_identity(
+                        schema,
+                        stage_table,
+                    )
+                )
+                if locked_identity != initial_identity:
+                    raise RuntimeError(
+                        "provider_directory_profile_stale_stage_identity_changed"
+                    )
+                locked_stages.append(stage_table)
+            for stage_table in locked_stages:
+                await db.status(
+                    f"DROP TABLE {_unscoped_qt(schema, stage_table)};"
+                )
+            deleted_count = await db.status(
+                f"DELETE FROM {checkpoint_ref} "
+                "WHERE build_id = :build_id "
+                "AND evidence_stage = :evidence_stage "
+                "AND profile_stage = :profile_stage;",
+                build_id=stale_build_id,
+                evidence_stage=evidence_stage,
+                profile_stage=profile_stage,
+            )
+            if _coerce_rowcount(deleted_count) != 1:
+                raise RuntimeError(
+                    "provider_directory_profile_stale_checkpoint_delete_lost"
+                )
+            reaped_count += 1
+    return reaped_count
+
+
+async def _populate_provider_directory_profile_evidence_stage(
     build: _ProviderDirectoryProfileBuild,
     *,
     has_evidence_target: bool,
+    bounded: bool = False,
+    start_batch: int = 0,
+    checkpointed: bool = False,
 ) -> None:
-    """Build the logged evidence replacement table and its serving indexes."""
+    """Populate one registered evidence stage and build serving indexes."""
     evidence_stage_ref = _provider_directory_profile_build_ref(
         build, build.evidence_stage
     )
-    await db.status(
-        profile_artifact.profile_evidence_table_sql(
-            build.schema,
-            build.evidence_stage,
-            logged=True,
-        )
+    copy_evidence_sql = profile_artifact.copy_existing_evidence_sql(
+        source_ref=_provider_directory_profile_build_ref(
+            build,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        ),
+        target_ref=evidence_stage_ref,
     )
-    if has_evidence_target:
+    evidence_sql_refs = {
+        "target_ref": evidence_stage_ref,
+        "source_ref": _qt(
+            build.schema,
+            ProviderDirectorySource.__tablename__,
+        ),
+        "practitioner_ref": _qt(
+            build.schema,
+            ProviderDirectoryPractitioner.__tablename__,
+        ),
+        "role_ref": _qt(
+            build.schema,
+            ProviderDirectoryPractitionerRole.__tablename__,
+        ),
+        "organization_ref": _qt(
+            build.schema,
+            ProviderDirectoryOrganization.__tablename__,
+        ),
+        "service_ref": _qt(
+            build.schema,
+            ProviderDirectoryHealthcareService.__tablename__,
+        ),
+        "endpoint_ref": _qt(
+            build.schema,
+            ProviderDirectoryEndpoint.__tablename__,
+        ),
+    }
+    if not bounded:
+        if has_evidence_target:
+            await db.status(
+                copy_evidence_sql,
+                source_ids=list(build.source_ids),
+                retained_source_ids=list(build.retained_source_ids),
+                profile_as_of=build.profile_as_of,
+            )
         await db.status(
-            profile_artifact.copy_existing_evidence_sql(
-                source_ref=_provider_directory_profile_build_ref(
-                    build,
-                    profile_artifact.PROFILE_EVIDENCE_TABLE,
-                ),
-                target_ref=evidence_stage_ref,
-            ),
+            profile_artifact.profile_evidence_insert_sql(**evidence_sql_refs),
             source_ids=list(build.source_ids),
-            retained_source_ids=list(build.retained_source_ids),
+            dataset_ids=list(build.dataset_ids),
             profile_as_of=build.profile_as_of,
         )
-    await db.status(
-        profile_artifact.profile_evidence_insert_sql(
-            target_ref=evidence_stage_ref,
-            source_ref=_qt(
-                build.schema,
-                ProviderDirectorySource.__tablename__,
-            ),
-            practitioner_ref=_qt(
-                build.schema,
-                ProviderDirectoryPractitioner.__tablename__,
-            ),
-            role_ref=_qt(
-                build.schema,
-                ProviderDirectoryPractitionerRole.__tablename__,
-            ),
-            organization_ref=_qt(
-                build.schema,
-                ProviderDirectoryOrganization.__tablename__,
-            ),
-            service_ref=_qt(
-                build.schema,
-                ProviderDirectoryHealthcareService.__tablename__,
-            ),
-            endpoint_ref=_qt(
-                build.schema,
-                ProviderDirectoryEndpoint.__tablename__,
-            ),
-        ),
-        source_ids=list(build.source_ids),
-        dataset_ids=list(build.dataset_ids),
-        profile_as_of=build.profile_as_of,
+    else:
+        batches = _provider_directory_profile_evidence_batches(
+            build,
+            has_existing_artifacts=has_evidence_target,
+        )
+        if start_batch < 0 or start_batch > len(batches):
+            raise RuntimeError(
+                "provider_directory_profile_evidence_checkpoint_invalid"
+            )
+        for batch_number, batch in enumerate(batches):
+            if batch_number < start_batch:
+                continue
+            batch_started_at = time.monotonic()
+            LOGGER.info(
+                "Starting Provider Directory Profile evidence batch "
+                "%d/%d kind=%s source_id=%s fact_type=%s role_bucket=%d/%d",
+                batch_number + 1,
+                len(batches),
+                batch.kind,
+                batch.source_id or "-",
+                batch.fact_type or "-",
+                batch.role_bucket + 1,
+                batch.role_bucket_count,
+            )
+            if batch.kind == "copy":
+                affected_rows = _coerce_rowcount(
+                    await db.status(
+                        copy_evidence_sql,
+                        source_ids=list(build.source_ids),
+                        retained_source_ids=list(build.retained_source_ids),
+                        profile_as_of=build.profile_as_of,
+                    )
+                )
+            else:
+                if not batch.source_id or not batch.dataset_id or not batch.fact_type:
+                    raise RuntimeError(
+                        "provider_directory_profile_evidence_batch_invalid"
+                    )
+                insert_params = {
+                    "source_ids": [batch.source_id],
+                    "dataset_ids": [batch.dataset_id],
+                    "profile_as_of": build.profile_as_of,
+                }
+                if batch.role_bucket_count > 1:
+                    insert_params.update(
+                        {
+                            "profile_role_bucket_count": (
+                                batch.role_bucket_count
+                            ),
+                            "profile_role_bucket": batch.role_bucket,
+                        }
+                    )
+                affected_rows = _coerce_rowcount(
+                    await db.status(
+                        profile_artifact.profile_evidence_insert_sql(
+                            **evidence_sql_refs,
+                            fact_type=batch.fact_type,
+                            role_bucket_count=batch.role_bucket_count,
+                            role_bucket=batch.role_bucket,
+                        ),
+                        **insert_params,
+                    )
+                )
+            if checkpointed:
+                await _advance_provider_directory_profile_build_checkpoint(
+                    build,
+                    phase="evidence",
+                    expected_batch=batch_number,
+                    total_batches=len(batches),
+                )
+            LOGGER.info(
+                "Completed Provider Directory Profile evidence batch "
+                "%d/%d rows=%d elapsed_seconds=%.3f",
+                batch_number + 1,
+                len(batches),
+                affected_rows,
+                time.monotonic() - batch_started_at,
+            )
+    index_started_at = time.monotonic()
+    LOGGER.info(
+        "Starting Provider Directory Profile evidence indexes stage=%s",
+        build.evidence_stage,
     )
     await _create_provider_directory_profile_indexes(
         build.schema,
@@ -13284,14 +14059,30 @@ async def _create_provider_directory_profile_evidence_stage(
         evidence=True,
     )
     await db.status(f"ANALYZE {evidence_stage_ref};")
+    LOGGER.info(
+        "Completed Provider Directory Profile evidence indexes stage=%s "
+        "elapsed_seconds=%.3f",
+        build.evidence_stage,
+        time.monotonic() - index_started_at,
+    )
+    if checkpointed:
+        await _mark_provider_directory_profile_build_checkpoint_state(
+            build,
+            "evidence_complete",
+        )
 
 
-async def _create_provider_directory_profile_compact_stage(
+async def _populate_provider_directory_profile_compact_stage(
     build: _ProviderDirectoryProfileBuild,
     *,
     has_existing_artifacts: bool,
+    npi_batch_size: int | None = None,
+    start_batch: int = 0,
+    checkpointed: bool = False,
 ) -> None:
-    """Build the compact profile stage while preserving unaffected NPIs."""
+    """Populate compact profiles while preserving unaffected NPIs."""
+    if npi_batch_size is not None and npi_batch_size < 1:
+        raise ValueError("profile NPI batch size must be positive")
     evidence_stage_ref = _provider_directory_profile_build_ref(
         build, build.evidence_stage
     )
@@ -13303,42 +14094,109 @@ async def _create_provider_directory_profile_compact_stage(
         build,
         profile_artifact.PROFILE_EVIDENCE_TABLE,
     )
-    await db.status(
-        profile_artifact.profile_table_sql(
-            build.schema,
-            build.profile_stage,
-            logged=True,
-        )
-    )
     should_rebuild_all_profiles = not has_existing_artifacts
-    if has_existing_artifacts:
-        await db.status(
-            profile_artifact.copy_unaffected_profiles_sql(
-                profile_source_ref=_provider_directory_profile_build_ref(
-                    build,
-                    profile_artifact.PROFILE_TABLE,
-                ),
-                evidence_source_ref=evidence_target_ref,
-                evidence_stage_ref=evidence_stage_ref,
-                profile_stage_ref=profile_stage_ref,
-            ),
-            source_ids=list(build.source_ids),
-            retained_source_ids=list(build.retained_source_ids),
-            profile_as_of=build.profile_as_of,
-        )
-    await db.status(
-        profile_artifact.profile_insert_sql(
-            evidence_ref=evidence_stage_ref,
-            target_ref=profile_stage_ref,
-            old_evidence_ref=(
-                evidence_target_ref if has_existing_artifacts else None
-            ),
-            rebuild_all=should_rebuild_all_profiles,
+    copy_profiles_sql = profile_artifact.copy_unaffected_profiles_sql(
+        profile_source_ref=_provider_directory_profile_build_ref(
+            build,
+            profile_artifact.PROFILE_TABLE,
         ),
-        source_ids=list(build.source_ids),
-        retained_source_ids=list(build.retained_source_ids),
-        profile_as_of=build.profile_as_of,
-        generation_id=build.generation_id,
+        evidence_source_ref=evidence_target_ref,
+        evidence_stage_ref=evidence_stage_ref,
+        profile_stage_ref=profile_stage_ref,
+    )
+    profile_sql_args = {
+        "evidence_ref": evidence_stage_ref,
+        "target_ref": profile_stage_ref,
+        "old_evidence_ref": (
+            evidence_target_ref if has_existing_artifacts else None
+        ),
+        "rebuild_all": should_rebuild_all_profiles,
+    }
+    profile_params = {
+        "source_ids": list(build.source_ids),
+        "retained_source_ids": list(build.retained_source_ids),
+        "profile_as_of": build.profile_as_of,
+        "generation_id": build.generation_id,
+    }
+    if npi_batch_size is None:
+        if has_existing_artifacts:
+            await db.status(
+                copy_profiles_sql,
+                source_ids=list(build.source_ids),
+                retained_source_ids=list(build.retained_source_ids),
+                profile_as_of=build.profile_as_of,
+            )
+        await db.status(
+            profile_artifact.profile_insert_sql(**profile_sql_args),
+            **profile_params,
+        )
+    else:
+        batches = _provider_directory_profile_compact_batches(
+            has_existing_artifacts=has_existing_artifacts,
+            npi_batch_size=npi_batch_size,
+        )
+        if start_batch < 0 or start_batch > len(batches):
+            raise RuntimeError(
+                "provider_directory_profile_compact_checkpoint_invalid"
+            )
+        for batch_number, batch in enumerate(batches):
+            if batch_number < start_batch:
+                continue
+            batch_started_at = time.monotonic()
+            LOGGER.info(
+                "Starting Provider Directory Profile compact batch "
+                "%d/%d kind=%s npi_start=%s npi_end=%s",
+                batch_number + 1,
+                len(batches),
+                batch.kind,
+                batch.npi_start if batch.npi_start is not None else "-",
+                batch.npi_end if batch.npi_end is not None else "-",
+            )
+            if batch.kind == "copy":
+                affected_rows = _coerce_rowcount(
+                    await db.status(
+                        copy_profiles_sql,
+                        source_ids=list(build.source_ids),
+                        retained_source_ids=list(build.retained_source_ids),
+                        profile_as_of=build.profile_as_of,
+                    )
+                )
+            else:
+                if batch.npi_start is None or batch.npi_end is None:
+                    raise RuntimeError(
+                        "provider_directory_profile_compact_batch_invalid"
+                    )
+                affected_rows = _coerce_rowcount(
+                    await db.status(
+                        profile_artifact.profile_insert_sql(
+                            **profile_sql_args,
+                            npi_start=batch.npi_start,
+                            npi_end=batch.npi_end,
+                        ),
+                        **profile_params,
+                        profile_npi_start=batch.npi_start,
+                        profile_npi_end=batch.npi_end,
+                    )
+                )
+            if checkpointed:
+                await _advance_provider_directory_profile_build_checkpoint(
+                    build,
+                    phase="profile",
+                    expected_batch=batch_number,
+                    total_batches=len(batches),
+                )
+            LOGGER.info(
+                "Completed Provider Directory Profile compact batch "
+                "%d/%d rows=%d elapsed_seconds=%.3f",
+                batch_number + 1,
+                len(batches),
+                affected_rows,
+                time.monotonic() - batch_started_at,
+            )
+    index_started_at = time.monotonic()
+    LOGGER.info(
+        "Starting Provider Directory Profile compact indexes stage=%s",
+        build.profile_stage,
     )
     await _create_provider_directory_profile_indexes(
         build.schema,
@@ -13346,6 +14204,17 @@ async def _create_provider_directory_profile_compact_stage(
         evidence=False,
     )
     await db.status(f"ANALYZE {profile_stage_ref};")
+    LOGGER.info(
+        "Completed Provider Directory Profile compact indexes stage=%s "
+        "elapsed_seconds=%.3f",
+        build.profile_stage,
+        time.monotonic() - index_started_at,
+    )
+    if checkpointed:
+        await _mark_provider_directory_profile_build_checkpoint_state(
+            build,
+            "ready",
+        )
 
 
 async def _prepare_provider_directory_profile_stages(
@@ -13373,6 +14242,11 @@ async def _prepare_provider_directory_profile_stages(
                 _rename_provider_directory_profile_evidence_indexes
             ),
             build_fence=evidence_build_fence,
+            retain_on_failed_bundle=True,
+            resume_checkpoint=(
+                build.schema,
+                _provider_directory_profile_build_id(build),
+            ),
         ),
         ProviderDirectoryPreparedArtifactStage(
             schema=build.schema,
@@ -13382,6 +14256,11 @@ async def _prepare_provider_directory_profile_stages(
                 _rename_provider_directory_profile_table_indexes
             ),
             build_fence=profile_build_fence,
+            retain_on_failed_bundle=True,
+            resume_checkpoint=(
+                build.schema,
+                _provider_directory_profile_build_id(build),
+            ),
         ),
     )
 
@@ -13424,11 +14303,25 @@ async def _finalize_provider_directory_profile_stages(
 ]:
     if defer_cutover:
         return metrics, stages
+    promoted = False
     try:
         await _retry_provider_directory_artifact_bundle_promotion(stages)
+        promoted = True
+        for schema, build_id in sorted(
+            {
+                    stage.resume_checkpoint
+                    for stage in stages
+                    if getattr(stage, "resume_checkpoint", None) is not None
+            }
+        ):
+            await _delete_provider_directory_profile_build_checkpoint(
+                schema,
+                build_id,
+            )
     finally:
-        for stage in reversed(stages):
-            await _remove_provider_directory_artifact_stage(stage)
+        if promoted:
+            for stage in reversed(stages):
+                await _remove_provider_directory_artifact_stage(stage)
     return metrics
 
 
@@ -13460,19 +14353,30 @@ async def _build_provider_directory_profile_stages(
     has_existing_artifacts = await _has_provider_directory_profile_artifacts(
         build.schema
     )
-    created_stage_tables: list[str] = []
-    try:
-        await _create_provider_directory_profile_evidence_stage(
-            build,
-            has_evidence_target=has_existing_artifacts,
-        )
-        created_stage_tables.append(build.evidence_stage)
-        should_rebuild_all_profiles = not has_existing_artifacts
-        await _create_provider_directory_profile_compact_stage(
+    checkpoint_state = (
+        await _claim_provider_directory_profile_build_checkpoint(
             build,
             has_existing_artifacts=has_existing_artifacts,
+            evidence_build_fence=evidence_build_fence,
+            profile_build_fence=profile_build_fence,
         )
-        created_stage_tables.append(build.profile_stage)
+    )
+    try:
+        await _populate_provider_directory_profile_evidence_stage(
+            build,
+            has_evidence_target=has_existing_artifacts,
+            bounded=True,
+            start_batch=checkpoint_state.evidence_next_batch,
+            checkpointed=True,
+        )
+        should_rebuild_all_profiles = not has_existing_artifacts
+        await _populate_provider_directory_profile_compact_stage(
+            build,
+            has_existing_artifacts=has_existing_artifacts,
+            npi_batch_size=profile_artifact.PROFILE_NPI_BATCH_SIZE,
+            start_batch=checkpoint_state.profile_next_batch,
+            checkpointed=True,
+        )
         metrics = await _provider_directory_profile_metrics(
             build,
             should_rebuild_all_profiles=should_rebuild_all_profiles,
@@ -13483,11 +14387,13 @@ async def _build_provider_directory_profile_stages(
             profile_build_fence,
         )
         return metrics, stages
-    except BaseException:
-        for stage_table in reversed(created_stage_tables):
-            await _remove_provider_directory_profile_stage_table(
-                build.schema,
-                stage_table,
+    except BaseException as exc:
+        with contextlib.suppress(BaseException):
+            await asyncio.shield(
+                _mark_provider_directory_profile_build_checkpoint_failed(
+                    build,
+                    exc,
+                )
             )
         raise
 
@@ -13509,11 +14415,6 @@ async def publish_provider_directory_profile(
     dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
     if dataset_fence is None:
         return {"skipped": True, "reason": "immutable_dataset_scope_required"}
-    build = await _resolve_provider_directory_profile_build(
-        schema,
-        run_id,
-        dataset_fence,
-    )
     async with contextlib.AsyncExitStack() as build_guards:
         evidence_build_fence = await build_guards.enter_async_context(
             _provider_directory_artifact_build_guard(
@@ -13526,6 +14427,17 @@ async def publish_provider_directory_profile(
                 schema,
                 profile_artifact.PROFILE_TABLE,
             )
+        )
+        build = await _resolve_provider_directory_profile_build(
+            schema,
+            run_id,
+            dataset_fence,
+            evidence_build_fence,
+            profile_build_fence,
+        )
+        await _reap_stale_provider_directory_profile_builds(
+            schema,
+            current_build_id=_provider_directory_profile_build_id(build),
         )
         metrics, stages = await _build_provider_directory_profile_stages(
             build,
