@@ -2,6 +2,54 @@
   "campaign_id": "provider-directory-canonical-acquisition-2026-07-10-v2",
   "checked_at": "2026-07-13T14:38:18Z",
   "entries": {
+    "capital-blue-cross": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
+    "devoted-health": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
+    "el-dorado-county-behavioral-health": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
+    "iowa-medicaid": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
+    "pennsylvania-medicaid": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
+    "san-bernardino-county-dbh": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
+    "san-mateo-county-bhrs": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
+    "simpra-advantage": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
     "aetna-commercial-medicare": {
       "access_verification": "not_recorded",
       "checked_at": null,

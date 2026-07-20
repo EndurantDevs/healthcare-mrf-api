@@ -17,7 +17,7 @@ def test_current_dataset_audit_renders_separately_from_acquisition_support():
     )
 
     assert "## Current Published Dataset Audit" in rendered_document
-    assert "Audit as of `2026-07-14`" in rendered_document
+    assert "Audit as of `2026-07-19`" in rendered_document
     assert "Molina (`molina`) | No current dataset | - | Not applicable" in rendered_document
     assert "Texas TMHP (`texas-tmhp`) | Current published (`pdds_87113f97f3f9...`) | 782,642 | Not proven" in rendered_document
     assert "CareSource (`caresource`) | No current dataset | - | Not proven" in rendered_document

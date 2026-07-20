@@ -1,7 +1,15 @@
 {
   "schema_version": 1,
-  "as_of": "2026-07-14",
+  "as_of": "2026-07-19",
   "records": [
+    {"source": "Iowa Medicaid", "entry_id": "iowa-medicaid", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "Candidate acquisition controls are configured, but no exhaustive twin-root proof or current published dataset is recorded."},
+    {"source": "Pennsylvania Medicaid", "entry_id": "pennsylvania-medicaid", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "Candidate acquisition controls are configured, but no exhaustive twin-root proof or current published dataset is recorded."},
+    {"source": "San Bernardino County DBH", "entry_id": "san-bernardino-county-dbh", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "Synthetic offset acquisition is configured, but no exhaustive twin-root proof or current published dataset is recorded."},
+    {"source": "San Mateo County BHRS", "entry_id": "san-mateo-county-bhrs", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "Synthetic offset acquisition is configured, but no exhaustive twin-root proof or current published dataset is recorded."},
+    {"source": "El Dorado County Behavioral Health", "entry_id": "el-dorado-county-behavioral-health", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "No current dataset is claimed while registration semantics and exhaustive twin-root proof remain unresolved."},
+    {"source": "Devoted Health", "entry_id": "devoted-health", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "Opaque-cursor checkpoint support is configured, but no exhaustive twin-root proof or current published dataset is recorded."},
+    {"source": "Simpra Advantage", "entry_id": "simpra-advantage", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "Opaque-cursor checkpoint support is configured, but no exhaustive twin-root proof or current published dataset is recorded."},
+    {"source": "Capital Blue Cross", "entry_id": "capital-blue-cross", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "Acquisition remains disabled because broad exact census requests fail the strict completeness gate; no current dataset is claimed."},
     {"source": "Idaho", "entry_id": "idaho", "dataset_state": "current-published", "dataset_id": "pdds_fc4faaf27524be41f181cc4ccfa81bf5911d9a534c0114b0ecbe6a114685b94f", "resource_count": 1273520, "observed_at": "2026-07-11T14:33:02.944910", "downstream_evidence": "snapshot-ready", "note": "The tracked verification snapshot records promoted address artifacts and ready unified/API evidence."},
     {"source": "Molina", "entry_id": "molina", "dataset_state": "no-current-dataset", "downstream_evidence": "not-applicable", "note": "The endpoint returned HTTP 403; no current dataset is claimed."},
     {"source": "Michigan", "entry_id": "michigan", "dataset_state": "probe-only", "downstream_evidence": "not-applicable", "note": "Completeness remains unproven."},

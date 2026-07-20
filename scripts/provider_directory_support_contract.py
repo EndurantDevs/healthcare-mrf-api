@@ -11,6 +11,7 @@ ACCESS_REQUIREMENTS = {
     "none",
     "oauth2-client-credentials",
     "private-connector",
+    "registration-approval",
     "user-token",
     "unknown",
 }
@@ -79,6 +80,7 @@ def validate_access_review_metadata(entry_id: str, support: dict[str, Any]) -> N
     gated_access_requirements = {
         "oauth2-client-credentials",
         "private-connector",
+        "registration-approval",
         "user-token",
     }
     if access_requirement in gated_access_requirements and not requires_registration:
@@ -178,9 +180,9 @@ def _validate_endpoint_classification(
         raise SupportDocumentationError(
             f"{entry_id}: external support requires documented_resources"
         )
-    if classification != "external" and documented_resources is not None:
+    if classification not in {"external", "probe_only"} and documented_resources is not None:
         raise SupportDocumentationError(
-            f"{entry_id}: documented_resources is reserved for external support"
+            f"{entry_id}: documented_resources is reserved for external or probe-only support"
         )
 
 

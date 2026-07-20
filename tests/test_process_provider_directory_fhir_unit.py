@@ -735,6 +735,41 @@ def test_aetna_commercial_checkpoint_scope_includes_strategy_version():
     ).hexdigest()
 
 
+def test_synthetic_position_checkpoint_scope_versions_page_guard():
+    source_lookup = {
+        "source_id": "iowa-medicaid",
+        "api_base": importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+    }
+
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["iowa-medicaid"],
+        run_id="run_1",
+        retry_of_run_id=None,
+    )
+    expected_scope_payload = json.dumps(
+        {
+            "strategy_version": (
+                importer.SYNTHETIC_POSITION_PAGINATION_STRATEGY_VERSION
+            ),
+            "source_ids": ["iowa-medicaid"],
+            "resource_group": importer._resource_import_group_key(source_lookup),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+    assert checkpoint_context is not None
+    assert importer._pagination_checkpoint_strategy_version(
+        importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+        {},
+    ) == importer.SYNTHETIC_POSITION_PAGINATION_STRATEGY_VERSION
+    assert checkpoint_context.source_scope_hash == hashlib.sha256(
+        expected_scope_payload.encode("utf-8")
+    ).hexdigest()
+
+
 def test_last_updated_partition_checkpoint_scope_includes_partition_identity():
     partition_resources_by_type = {
         "Practitioner": {
@@ -801,7 +836,7 @@ def test_idaho_medicaid_supports_durable_pagination_checkpoints():
     )
 
 
-def test_michigan_probe_only_source_does_not_claim_pagination_checkpoints():
+def test_michigan_probe_only_source_supports_opaque_cursor_checkpoints():
     source_lookup = importer._source_row_from_seed(
         {
             "id": "michigan",
@@ -820,10 +855,13 @@ def test_michigan_probe_only_source_does_not_claim_pagination_checkpoints():
     assert importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE not in (
         importer.PAGINATION_CHECKPOINT_API_BASES
     )
-    assert importer.MICHIGAN_PROVIDER_DIRECTORY_BASE not in (
+    assert importer.MICHIGAN_PROVIDER_DIRECTORY_BASE in (
         importer.PAGINATION_CHECKPOINT_API_BASES
     )
-    assert checkpoint_context is None
+    assert checkpoint_context is not None
+    assert checkpoint_context.canonical_api_base == (
+        importer.MICHIGAN_PROVIDER_DIRECTORY_BASE
+    )
 
 
 def test_contra_costa_catalog_parser_extracts_provider_directory_base_from_external_link():
@@ -871,6 +909,96 @@ def test_health_partners_plans_supplemental_source_is_queryable_by_org():
     assert rows[0]["org_name"] == "Health Partners Plans"
     assert rows[0]["api_base"] == importer.HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE
     assert rows[0]["source"] == "health-partners-plans-fhir-root"
+
+
+def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
+    seed_rows = importer._reviewed_provider_directory_candidate_seed_rows()
+    source_rows = [
+        importer._source_row_from_seed(seed_record)
+        for seed_record in seed_rows
+    ]
+    source_by_base = {
+        source_row["canonical_api_base"]: source_row for source_row in source_rows
+    }
+
+    assert len(source_rows) == 8
+    assert {
+        source_row["source_id"] for source_row in source_rows
+    } == {
+        "pdfhir_fa3c581c79ffdfa5b73b43b9",
+        "pdfhir_5fd73a1218a9b5b73066d000",
+        "pdfhir_29c125ae13aeffa0afe0e121",
+        "pdfhir_0c52480afd14b4c89386df94",
+        "pdfhir_0d7938920b8933d55c1777ae",
+        "pdfhir_46d7d27acc677651b0d3516e",
+        "pdfhir_e3d82f2cd0a10ab4463dbdda",
+        "pdfhir_95d5ad93c689d016351dd088",
+    }
+    blocked_candidate_bases = {
+        importer.CAPITAL_BLUE_CROSS_PROVIDER_DIRECTORY_BASE,
+        importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE,
+    }
+    for source_row in source_rows:
+        metadata = source_row["metadata_json"]
+        if source_row["canonical_api_base"] in blocked_candidate_bases:
+            assert metadata["provider_directory_coverage_mode"] == "probe_only"
+            assert metadata["provider_directory_acquisition_enabled"] is False
+            assert metadata["provider_directory_fully_enumerable_resources"] == []
+            assert importer._resource_acquisition_blocked_reason(source_row) == (
+                importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+            )
+        else:
+            assert metadata["provider_directory_coverage_mode"] == "full"
+            assert metadata["provider_directory_acquisition_enabled"] is True
+            assert metadata["provider_directory_fully_enumerable_resources"]
+            assert metadata["provider_directory_candidate_status"] == (
+                "pending_two_matching_exhaustive_acquisitions"
+            )
+            assert importer._resource_acquisition_blocked_reason(source_row) is None
+
+    el_dorado_source = source_by_base[
+        importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE
+    ]
+    assert el_dorado_source["requires_registration"] is True
+    assert "registration and approval" in el_dorado_source["metadata_json"][
+        "provider_directory_acquisition_blocked_reason"
+    ]
+    assert importer._reviewed_provider_directory_candidate_seed_rows(
+        source_query="Devoted"
+    )[0]["api_base"] == importer.DEVOTED_PROVIDER_DIRECTORY_BASE
+
+
+def test_el_dorado_candidate_prefers_registered_base_and_keeps_legacy_identity():
+    """The current auth-gated endpoint must not erase stable legacy identity."""
+    seed_row = importer._reviewed_provider_directory_candidate_seed_rows(
+        source_query="El Dorado"
+    )[0]
+    source_row = importer._source_row_from_seed(seed_row)
+    metadata = source_row["metadata_json"]
+
+    assert source_row["source_id"] == "pdfhir_0d7938920b8933d55c1777ae"
+    assert source_row["canonical_api_base"] == (
+        importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE
+    )
+    assert source_row["requires_registration"] is True
+    assert source_row["auth_type"] == "oauth2"
+    assert source_row["last_validated_status"] == "auth_required"
+    assert metadata["provider_directory_confirmed_catalog_url"] == (
+        importer.EL_DORADO_COUNTY_DEVELOPER_RESOURCES_URL
+    )
+    assert metadata["provider_directory_confirmed_doc_url"] == (
+        importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_DOCUMENT_URL
+    )
+    assert metadata[
+        "provider_directory_documented_practitioner_probe_status"
+    ] == 401
+    assert metadata["provider_directory_legacy_probe_base"] == (
+        importer.EL_DORADO_COUNTY_LEGACY_PROVIDER_DIRECTORY_BASE
+    )
+    assert metadata[
+        "provider_directory_legacy_practitioner_probe_status"
+    ] == 200
+    assert metadata["provider_directory_legacy_probe_scope"] == "bounded_only"
 
 
 def test_provider_directory_blocker_rows_are_non_importable_catalog_sources():
@@ -1432,6 +1560,299 @@ def test_arkansas_uses_stable_synthetic_skip_pagination():
     )
 
 
+@pytest.mark.parametrize(
+    "api_base",
+    (
+        importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+        importer.PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE,
+    ),
+)
+def test_new_abacus_state_candidates_use_throttled_synthetic_skip(api_base):
+    source_lookup = {"source_id": "state-candidate", "api_base": api_base}
+    start_url = importer._resource_start_url(
+        source_lookup,
+        "PractitionerRole",
+        page_count=100,
+    )
+
+    assert start_url == (
+        f"{api_base}/PractitionerRole?_count=100&_sort=_id&_skip=0"
+    )
+    assert importer._synthetic_skip_pagination_next_url(
+        source_lookup,
+        start_url,
+        100,
+    ) == start_url.replace("_skip=0", "_skip=100")
+    assert importer._source_request_interval_seconds(source_lookup) == 1.0
+    assert importer._pagination_checkpoint_context(
+        source_lookup,
+        ["state-candidate"],
+        run_id="run_candidate",
+        retry_of_run_id=None,
+    ) is not None
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    tuple(sorted(importer.NETSMART_PROVIDER_DIRECTORY_BASES)),
+)
+def test_netsmart_candidates_advance_synthetic_offset_by_bundle_size(api_base):
+    source_lookup = {"source_id": "county-candidate", "api_base": api_base}
+    start_url = importer._resource_start_url(
+        source_lookup,
+        "Practitioner",
+        page_count=100,
+    )
+
+    assert start_url == (
+        f"{api_base}/Practitioner?_count=100&_sort=_id&_offset=0"
+    )
+    assert importer._synthetic_offset_pagination_next_url(
+        source_lookup,
+        start_url,
+        100,
+    ) == start_url.replace("_offset=0", "_offset=100")
+    assert (
+        importer._synthetic_offset_pagination_next_url(
+            source_lookup,
+            start_url,
+            99,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_netsmart_fetch_ignores_overlapping_advertised_next_offset(monkeypatch):
+    api_base = importer.SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE
+    source_lookup = {"source_id": "county-candidate", "api_base": api_base}
+    requested_urls: list[str] = []
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        requested_urls.append(request_url)
+        offset = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(request_url).query
+        )["_offset"][0]
+        resource_ids = ["org-1", "org-2"] if offset == "0" else ["org-3"]
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Organization",
+                            "id": resource_id,
+                        }
+                    }
+                    for resource_id in resource_ids
+                ],
+                "link": [
+                    {
+                        "relation": "next",
+                        "url": (
+                            f"{api_base}/Organization?"
+                            "_count=2&_sort=_id&_offset=1"
+                        ),
+                    }
+                ],
+            },
+            None,
+            5,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_lookup,
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=2,
+        timeout=3,
+        run_id=None,
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == 3
+    assert requested_urls == [
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=0",
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_netsmart_fetch_fails_closed_on_repeated_full_page(monkeypatch):
+    api_base = importer.SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE
+    source_lookup = {"source_id": "county-candidate", "api_base": api_base}
+    requested_urls: list[str] = []
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        requested_urls.append(request_url)
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Organization",
+                            "id": resource_id,
+                        }
+                    }
+                    for resource_id in ("org-1", "org-2")
+                ],
+            },
+            None,
+            timeout,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_lookup,
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=2,
+        timeout=3,
+        run_id=None,
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "pagination_page_repeated"
+    assert fetch_result.rows_fetched == 2
+    assert fetch_result.pages_fetched == 2
+    assert requested_urls == [
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=0",
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_netsmart_fetch_fails_closed_on_nonadjacent_page_cycle(monkeypatch):
+    api_base = importer.SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE
+    source_lookup = {"source_id": "county-candidate", "api_base": api_base}
+    requested_urls: list[str] = []
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        requested_urls.append(request_url)
+        offset = int(
+            urllib.parse.parse_qs(
+                urllib.parse.urlsplit(request_url).query
+            )["_offset"][0]
+        )
+        resource_ids = (
+            ("org-a1", "org-a2")
+            if offset in {0, 4}
+            else ("org-b1", "org-b2")
+        )
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Organization",
+                            "id": resource_id,
+                        }
+                    }
+                    for resource_id in resource_ids
+                ],
+            },
+            None,
+            timeout,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_lookup,
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=2,
+        timeout=3,
+        run_id=None,
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "pagination_page_repeated"
+    assert fetch_result.rows_fetched == 4
+    assert fetch_result.pages_fetched == 3
+    assert requested_urls == [
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=0",
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=2",
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=4",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_synthetic_position_resume_requires_persisted_page_guard(monkeypatch):
+    api_base = importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE
+    source_lookup = {"source_id": "iowa-medicaid", "api_base": api_base}
+    resume_url = (
+        f"{api_base}/Organization?_count=2&_sort=_id&_skip=2"
+    )
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        AsyncMock(
+            return_value=importer.PaginationResumeState(
+                next_url=resume_url,
+                pages_processed=1,
+                rows_processed=2,
+                recent_url_hashes=("prior-url-hash",),
+                resumed=True,
+                completeness={},
+            )
+        ),
+    )
+    fetch_source_json = AsyncMock(
+        side_effect=AssertionError("missing page guard must fail before fetch")
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base=api_base,
+        source_scope_hash="iowa-synthetic-v1",
+        source_ids=("iowa-medicaid",),
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        acquisition_root_run_id="run_original",
+        dataset_id="dataset_iowa",
+        lineage_verified=True,
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_lookup,
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=2,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=AsyncMock(return_value=0),
+        row_batch_size=100,
+        retain_rows=False,
+        pagination_checkpoint=checkpoint_context,
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "pagination_page_guard_missing"
+    assert fetch_result.rows_fetched == 2
+    assert fetch_result.pages_fetched == 1
+    assert fetch_result.next_url_remaining is True
+    fetch_source_json.assert_not_awaited()
+
+
 def test_source_row_from_seed_overrides_hap_stale_provider_directory_path():
     row = importer._source_row_from_seed(
         {
@@ -1798,7 +2219,8 @@ def test_source_row_from_seed_overrides_hap_name_only_seed_row():
 
 
 def test_source_row_from_seed_overrides_scan_developer_portal_base():
-    row = importer._source_row_from_seed(
+    """The SCAN portal seed resolves to its strict partitioned FHIR source."""
+    source_record = importer._source_row_from_seed(
         {
             "id": "scan-1",
             "org_name": "SCAN Health Plan",
@@ -1809,18 +2231,56 @@ def test_source_row_from_seed_overrides_scan_developer_portal_base():
         }
     )
 
-    assert row["api_base"] == importer.SCAN_PROVIDER_DIRECTORY_BASE
-    assert row["canonical_api_base"] == importer.SCAN_PROVIDER_DIRECTORY_BASE
-    assert row["requires_registration"] is False
-    assert row["auth_type"] == "none"
-    assert row["last_validated_status"] == "valid"
-    assert row["metadata_json"]["provider_directory_override"] == "scan_providerdirectory_intersystems"
-    assert row["metadata_json"]["provider_directory_previous_api_base"] == importer.SCAN_DEVELOPER_PORTAL_URL
-    assert row["metadata_json"]["provider_directory_confirmed_doc_url"] == importer.SCAN_PROVIDER_DIRECTORY_DOC_URL
-    assert row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
-    assert row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
+    assert source_record["api_base"] == importer.SCAN_PROVIDER_DIRECTORY_BASE
+    assert source_record["canonical_api_base"] == importer.SCAN_PROVIDER_DIRECTORY_BASE
+    assert source_record["requires_registration"] is False
+    assert source_record["auth_type"] == "none"
+    assert source_record["last_validated_status"] == "valid"
+    assert source_record["metadata_json"]["provider_directory_override"] == "scan_providerdirectory_intersystems"
+    assert source_record["metadata_json"]["provider_directory_previous_api_base"] == importer.SCAN_DEVELOPER_PORTAL_URL
+    assert source_record["metadata_json"]["provider_directory_confirmed_doc_url"] == importer.SCAN_PROVIDER_DIRECTORY_DOC_URL
+    assert source_record["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
+    assert source_record["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
+    assert source_record["metadata_json"]["provider_directory_acquisition_enabled"] is True
+    partition_resources = source_record["metadata_json"][
+        importer.LAST_UPDATED_PARTITION_METADATA_KEY
+    ]["resources"]
+    assert set(partition_resources) == set(importer.DEFAULT_RESOURCES)
+    assert all(
+        resource_config == {
+            "start": "1900-01-01T00:00:00Z",
+            "end": "resolved_now",
+            "ceiling": 1000,
+            "minimum_width_seconds": 1,
+            "page_count": 100,
+            "volatile_metadata_paths": [],
+        }
+        for resource_config in partition_resources.values()
+    )
+    assert importer._resource_acquisition_blocked_reason(
+        source_record,
+        list(importer.DEFAULT_RESOURCES),
+    ) is None
+    for resource_type in importer.DEFAULT_RESOURCES:
+        partition_config, partition_error = importer._last_updated_partition_config(
+            source_record,
+            resource_type,
+        )
+        assert partition_error is None
+        assert partition_config is not None
+        assert partition_config.ceiling == 1000
+        assert partition_config.page_count == 100
+        assert partition_config.end_mode == "resolved_now"
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_record,
+        [source_record["source_id"]],
+        run_id="run_scan_candidate",
+        retry_of_run_id=None,
+    )
+    assert checkpoint_context is not None
+    assert checkpoint_context.canonical_api_base == importer.SCAN_PROVIDER_DIRECTORY_BASE
     assert (
-        row["metadata_json"]["provider_directory_blocked_reason"]
+        source_record["metadata_json"]["provider_directory_blocked_reason"]
         == importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
     )
 
@@ -5429,6 +5889,90 @@ def test_state_directory_empty_core_resource_fails_closed(api_base):
     assert guarded_result.error == importer.EXPECTED_NONEMPTY_RESOURCE_ERROR
 
 
+@pytest.mark.parametrize(
+    ("api_base", "org_name", "expected_resources"),
+    [
+        (
+            importer.MICHIGAN_PROVIDER_DIRECTORY_BASE,
+            "Blue Cross Blue Shield of Michigan",
+            tuple(sorted(importer.MICHIGAN_SUPPORTED_RESOURCES)),
+        ),
+        (
+            importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "SCAN Health Plan",
+            importer.SCAN_EXPECTED_NONEMPTY_RESOURCES,
+        ),
+    ],
+)
+def test_candidate_known_nonempty_resources_fail_closed(
+    api_base,
+    org_name,
+    expected_resources,
+):
+    source_row = importer._source_row_from_seed(
+        {
+            "id": "candidate",
+            "org_name": org_name,
+            "api_base": api_base,
+        }
+    )
+    assert source_row["metadata_json"][
+        "provider_directory_expected_nonempty_resources"
+    ] == list(expected_resources)
+
+    for resource_type in expected_resources:
+        fetch_result = importer.ResourceFetchResult(
+            model=object,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+        )
+
+        guarded_result = importer._fail_closed_on_unexpected_empty_resource(
+            source_row,
+            resource_type,
+            fetch_result,
+        )
+
+        assert guarded_result.complete is False
+        assert guarded_result.error == importer.EXPECTED_NONEMPTY_RESOURCE_ERROR
+
+
+@pytest.mark.parametrize("resource_type", ["HealthcareService", "Endpoint"])
+def test_scan_known_empty_resources_remain_complete(resource_type):
+    source_row = importer._source_row_from_seed(
+        {
+            "id": "scan",
+            "org_name": "SCAN Health Plan",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        }
+    )
+    fetch_result = importer.ResourceFetchResult(
+        model=object,
+        rows=[],
+        rows_fetched=0,
+        rows_written=0,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+    assert importer._fail_closed_on_unexpected_empty_resource(
+        source_row,
+        resource_type,
+        fetch_result,
+    ) is fetch_result
+
+
 @pytest.mark.asyncio
 async def test_probe_sources_records_credential_descriptor_without_secret(monkeypatch):
     monkeypatch.setenv("PAYER_DIRECTORY_TOKEN", "secret-token")
@@ -7431,6 +7975,7 @@ def _artifact_selection_row(
     }
     selection_field_map.update(selection_overrides)
     metadata = {
+        "source_ids": [source_id],
         "selected_resources": ["Location"],
         "expected_resources": ["Location"],
         "resource_diagnostics": {"Location": {"complete": True}},
@@ -9111,6 +9656,8 @@ class _AtomicCandidateInitializationHarness:
         sql_text = str(sql)
         if "pg_advisory_xact_lock" in sql_text:
             self.events.append("lock")
+        elif "provider_directory_api_endpoint" in sql_text:
+            self.events.append("endpoint_lock")
         elif "WHERE dataset_id = :dataset_id" in sql_text:
             self.events.append("candidate_lookup")
         else:
@@ -9173,6 +9720,7 @@ async def test_partition_candidate_and_initial_checkpoint_share_transaction(
     assert harness.events == [
         "begin",
         "lock",
+        "endpoint_lock",
         "candidate_lookup",
         "conflict_lookup",
         "candidate_upsert",
@@ -9783,12 +10331,6 @@ def test_endpoint_dataset_rejects_incomplete_selected_resource(
 @pytest.mark.parametrize(
     "seed_row",
     [
-        {
-            "id": "scan-probe-only",
-            "org_name": "SCAN Health Plan",
-            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
-            "source": "fixture",
-        },
         {
             "id": "centene-probe-only",
             "org_name": "Centene Corporation",
@@ -10707,8 +11249,11 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
         },
     )
 
-    assert metrics["sources_seeded"] == 8
-    assert metrics["supplemental_catalog_sources_considered"] == 7
+    assert metrics["sources_seeded"] == 16
+    assert metrics["supplemental_catalog_sources_considered"] == 15
+    assert metrics["supplemental_catalogs"]["catalogs"][
+        "reviewed_provider_directory_candidates"
+    ]["rows"] == 8
     assert metrics["supplemental_catalogs"]["catalogs"]["amerihealth_caritas"]["rows"] == 1
     assert metrics["supplemental_catalogs"]["catalogs"]["contra_costa"]["rows"] == 1
     assert metrics["supplemental_catalogs"]["catalogs"]["cms_sma_endpoint_directory"]["rows"] == 0
@@ -11588,6 +12133,88 @@ async def test_checkpoint_retry_persists_completion_before_resume_failure(
 
 
 @pytest.mark.asyncio
+async def test_process_data_reports_completed_resource_when_next_resource_starts(
+    monkeypatch,
+):
+    """Progress exposes a completed resource before the next resource finishes."""
+    requested_source_id = "pdfhir_checkpointed"
+    _stub_checkpoint_retry_process(monkeypatch, requested_source_id)
+    completion_snapshots: list[dict[str, list[str]]] = []
+
+    async def fake_mark_progress(
+        _run_id,
+        *,
+        phase,
+        details=None,
+        metrics=None,
+        **_kwargs,
+    ):
+        active_groups = (
+            details.get("active_source_groups", [])
+            if isinstance(details, dict)
+            else []
+        )
+        if (
+            phase == "provider-directory importing resources"
+            and active_groups
+            and active_groups[0].get("current_resource") == "Organization"
+        ):
+            completion_snapshots.append(
+                dict(metrics.get("resource_fetch_completed_source_ids", {}))
+            )
+
+    async def fake_import_resources(
+        _sources,
+        *,
+        resource_completion,
+        progress_callback,
+        **_kwargs,
+    ):
+        await progress_callback(
+            0,
+            1,
+            {"InsurancePlan": 1413, "Organization": 0},
+            {
+                "active_source_groups": [
+                    {
+                        "sample_source_id": requested_source_id,
+                        "current_resource": "InsurancePlan",
+                    }
+                ]
+            },
+        )
+        resource_completion["InsurancePlan"] = {requested_source_id}
+        await progress_callback(
+            0,
+            1,
+            {"InsurancePlan": 1413, "Organization": 0},
+            {
+                "active_source_groups": [
+                    {
+                        "sample_source_id": requested_source_id,
+                        "current_resource": "Organization",
+                    }
+                ]
+            },
+        )
+        return {"InsurancePlan": 1413, "Organization": 0}
+
+    monkeypatch.setattr(importer, "_mark_provider_directory_progress", fake_mark_progress)
+    monkeypatch.setattr(importer, "_import_resources", fake_import_resources)
+    task = _checkpoint_retry_task(requested_source_id)
+    task["resources"] = "InsurancePlan,Organization"
+
+    metrics = await importer.process_data({"context": {}}, task)
+
+    assert completion_snapshots == [
+        {"InsurancePlan": [requested_source_id]}
+    ]
+    assert metrics["resource_fetch_completed_source_ids"] == {
+        "InsurancePlan": [requested_source_id]
+    }
+
+
+@pytest.mark.asyncio
 async def test_process_data_uses_live_probe_success_over_seed_auth_required_status(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
@@ -11982,7 +12609,7 @@ def test_michigan_direct_base_uses_upstream_for_metadata_and_resource_probes():
     )
 
 
-def test_michigan_profile_excludes_non_public_resources_and_records_page_caps():
+def test_michigan_candidate_allows_only_verified_resources_and_records_page_caps():
     source_row = importer._source_row_from_seed(
         {
             "id": "michigan",
@@ -11995,9 +12622,14 @@ def test_michigan_profile_excludes_non_public_resources_and_records_page_caps():
     assert metadata["provider_directory_supported_resources"] == sorted(
         importer.MICHIGAN_SUPPORTED_RESOURCES
     )
-    assert metadata["provider_directory_fully_enumerable_resources"] == []
-    assert metadata["provider_directory_coverage_mode"] == "probe_only"
-    assert metadata["provider_directory_acquisition_enabled"] is False
+    assert metadata["provider_directory_fully_enumerable_resources"] == sorted(
+        importer.MICHIGAN_SUPPORTED_RESOURCES
+    )
+    assert metadata["provider_directory_coverage_mode"] == "full"
+    assert metadata["provider_directory_acquisition_enabled"] is True
+    assert metadata["provider_directory_candidate_status"] == (
+        "pending_two_matching_exhaustive_acquisitions"
+    )
     assert metadata["provider_directory_resource_page_count_caps"] == {
         resource_type: 25 if resource_type == "PractitionerRole" else 100
         for resource_type in sorted(importer.MICHIGAN_SUPPORTED_RESOURCES)
@@ -12010,6 +12642,10 @@ def test_michigan_profile_excludes_non_public_resources_and_records_page_caps():
     assert importer._resource_start_url(source_row, "Location", page_count=500) == (
         f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/Location?_count=100"
     )
+    assert importer._resource_acquisition_blocked_reason(
+        source_row,
+        sorted(importer.MICHIGAN_SUPPORTED_RESOURCES),
+    ) is None
 
 
 def test_michigan_preserves_advertised_opaque_next_link_without_offset_synthesis():
@@ -12031,8 +12667,7 @@ def test_michigan_preserves_advertised_opaque_next_link_without_offset_synthesis
     assert "_getpagesoffset" not in next_url
 
 
-@pytest.mark.asyncio
-async def test_michigan_probe_only_source_refuses_resource_acquisition():
+def test_michigan_candidate_excludes_unsupported_resource_acquisition():
     source_row = importer._source_row_from_seed(
         {
             "id": "michigan",
@@ -12041,22 +12676,25 @@ async def test_michigan_probe_only_source_refuses_resource_acquisition():
         }
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            rf"provider_directory_resource_acquisition_blocked:{source_row['source_id']}"
-            rf":{importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON}"
-        ),
-    ):
-        await importer._import_resources(
-            [source_row],
-            resources=list(importer.MICHIGAN_SUPPORTED_RESOURCES),
-            per_resource_limit=0,
-            page_limit=0,
-            page_count=100,
-            timeout=1,
-            run_id=None,
-        )
+    assert importer._resource_acquisition_blocked_reason(
+        source_row,
+        sorted(importer.MICHIGAN_SUPPORTED_RESOURCES),
+    ) is None
+    assert importer._resource_start_url(
+        source_row,
+        "HealthcareService",
+        page_count=100,
+    ) is None
+    assert importer._resource_start_url(
+        source_row,
+        "InsurancePlan",
+        page_count=100,
+    ) is None
+    assert importer._resource_start_url(
+        source_row,
+        "Endpoint",
+        page_count=100,
+    ) is None
 
 
 def test_washington_source_profile_is_probe_only_and_acquisition_blocked():
@@ -14269,6 +14907,51 @@ async def test_fetch_resource_rows_defers_scan_practitioner_role_reverse_lookup(
     assert operation_result.complete is False
     assert operation_result.error == importer.SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR
     assert operation_result.fetch_mode == "source_specific_deferred"
+
+
+@pytest.mark.asyncio
+async def test_scan_candidate_dispatches_practitioner_role_to_last_updated(monkeypatch):
+    source_row = importer._source_row_from_seed(
+        {
+            "id": "scan",
+            "org_name": "SCAN Health Plan",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        }
+    )
+    expected_result = object()
+    partition_fetch = AsyncMock(return_value=expected_result)
+    monkeypatch.setattr(
+        importer,
+        "_fetch_last_updated_partition_resource_rows",
+        partition_fetch,
+    )
+
+    assert importer._scan_practitioner_role_requires_reverse_lookup(
+        source_row,
+        "PractitionerRole",
+    ) is False
+    assert importer._scan_practitioner_role_reverse_lookup_planned(
+        source_row,
+        list(importer.DEFAULT_RESOURCES),
+    ) is False
+
+    operation_result = await importer._fetch_resource_rows(
+        source_row,
+        "PractitionerRole",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_scan_candidate",
+    )
+
+    assert operation_result is expected_result
+    partition_fetch.assert_awaited_once()
+    assert partition_fetch.await_args.args[:3] == (
+        source_row,
+        "PractitionerRole",
+        ProviderDirectoryPractitionerRole,
+    )
 
 
 @pytest.mark.asyncio
