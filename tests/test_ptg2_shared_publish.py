@@ -636,8 +636,9 @@ async def test_text_stage_copy_verifies_consumed_content(
     path.write_bytes(b"provider metadata")
 
     async def copy_to_table(_table, *, source, **_kwargs):
-        while source.read(3):
-            pass
+        chunk = source.read(3)
+        while chunk:
+            chunk = source.read(3)
 
     @asynccontextmanager
     async def acquire():
@@ -682,25 +683,27 @@ def test_provider_set_metadata_files_reject_invalid_contracts(
     case,
     message,
 ):
-    valid_entry = dict(_provider_set_metadata_entries(tmp_path)[0])
-    if case == "non-mapping":
-        entries = (None,)
-    elif case == "missing":
-        entries = ({**valid_entry, "path": str(tmp_path / "missing.copy")},)
-    elif case == "repeated":
-        entries = (valid_entry, dict(valid_entry))
-    elif case == "boolean-rows":
-        entries = ({**valid_entry, "row_count": True},)
-    elif case == "invalid-rows":
-        entries = ({**valid_entry, "row_count": "bad"},)
-    elif case == "empty":
-        entries = ({**valid_entry, "row_count": 0},)
-    elif case == "format":
-        entries = ({**valid_entry, "version": 2},)
-    elif case == "digest":
-        entries = ({**valid_entry, "sha256": "bad"},)
-    else:
-        entries = ()
+    valid_entry_by_field = dict(_provider_set_metadata_entries(tmp_path)[0])
+    entries_by_case = {
+        "non-mapping": (None,),
+        "missing": (
+            {
+                **valid_entry_by_field,
+                "path": str(tmp_path / "missing.copy"),
+            },
+        ),
+        "repeated": (
+            valid_entry_by_field,
+            dict(valid_entry_by_field),
+        ),
+        "boolean-rows": ({**valid_entry_by_field, "row_count": True},),
+        "invalid-rows": ({**valid_entry_by_field, "row_count": "bad"},),
+        "empty": ({**valid_entry_by_field, "row_count": 0},),
+        "format": ({**valid_entry_by_field, "version": 2},),
+        "digest": ({**valid_entry_by_field, "sha256": "bad"},),
+        "required": (),
+    }
+    entries = entries_by_case[case]
 
     with pytest.raises(RuntimeError, match=message):
         ptg2_shared_publish._provider_set_metadata_files(

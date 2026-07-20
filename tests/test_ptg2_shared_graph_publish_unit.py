@@ -35,15 +35,15 @@ def _conversion(tmp_path):
 
 
 def _block_publication(**overrides):
-    values = {
+    values_by_field = {
         "object_kinds": ("graph_group_npis_v1",),
         "mapping_count": 4,
         "unique_block_count": 3,
         "logical_byte_count": 40,
         "stored_byte_count": 30,
     }
-    values.update(overrides)
-    return SharedBlockStagePublication(**values)
+    values_by_field.update(overrides)
+    return SharedBlockStagePublication(**values_by_field)
 
 
 def _install_graph_publish_mocks(monkeypatch, *, session, block_publication=None):
@@ -275,12 +275,12 @@ async def test_binary_stage_copy_passes_the_exact_file_and_contract(
 ):
     path = tmp_path / "graph.copy"
     path.write_bytes(b"binary graph payload")
-    copied = {}
+    copied_by_field = {}
 
     async def copy_to_table(table, *, source, **kwargs):
-        copied["table"] = table
-        copied["payload"] = source.read()
-        copied["kwargs"] = kwargs
+        copied_by_field["table"] = table
+        copied_by_field["payload"] = source.read()
+        copied_by_field["kwargs"] = kwargs
 
     connection = SimpleNamespace(
         raw_connection=SimpleNamespace(
@@ -301,7 +301,7 @@ async def test_binary_stage_copy_passes_the_exact_file_and_contract(
         columns=("value",),
     )
 
-    assert copied == {
+    assert copied_by_field == {
         "table": "ptg2_v3_graph_stage",
         "payload": b"binary graph payload",
         "kwargs": {

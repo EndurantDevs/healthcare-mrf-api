@@ -79,14 +79,16 @@ def test_graph_artifact_grouping_requires_shard_and_path(entry):
 
 
 def test_graph_artifact_grouping_rejects_duplicate_direction(tmp_path):
-    entry = {
+    entry_by_field = {
         "name": "provider_group_npi",
         "source_shard_id": "file:1",
         "path": str(tmp_path / "graph.copy"),
     }
 
     with pytest.raises(RuntimeError, match="repeats direction"):
-        shared_graph_bundles_from_artifacts([entry, dict(entry)])
+        shared_graph_bundles_from_artifacts(
+            [entry_by_field, dict(entry_by_field)]
+        )
 
 
 def test_strict_v3_graph_artifacts_are_import_scratch_not_serving_storage(
