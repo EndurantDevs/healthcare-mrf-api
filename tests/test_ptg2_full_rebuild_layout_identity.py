@@ -52,6 +52,7 @@ def _serving_index_by_field(*, full_rebuild_scope_digest=None):
         audit_sample={"sample_digest": "a" * 64},
         source_witness={"witness_digest": "b" * 64},
         provider_identifier_quarantine=provider_identifier_quarantine_payload({}),
+        finalizer_block_copy={},
         stored_byte_count=7,
         full_rebuild_scope_digest=full_rebuild_scope_digest,
     )
