@@ -16583,6 +16583,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             expected_nonempty_resources=tuple(
                 sorted(STATE_EXPECTED_NONEMPTY_RESOURCES)
             ),
+            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
         ),
         candidate_row(
             row_id="san-bernardino-county-dbh-reviewed-candidate",

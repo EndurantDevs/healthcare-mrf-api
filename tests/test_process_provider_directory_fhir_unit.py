@@ -1044,8 +1044,22 @@ def test_reviewed_candidate_statuses_match_completed_twin_campaigns():
     assert status_by_base[importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE] == pending_status
     assert (
         status_by_base[importer.PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE]
-        == pending_status
+        == verified_status
     )
+
+
+def test_reverse_lookup_checkpoint_row_requires_canonical_base():
+    """Exercise the fail-closed checkpoint identity guard."""
+    with pytest.raises(
+        ValueError,
+        match="reverse lookup checkpoint requires a canonical API base",
+    ):
+        importer._reverse_lookup_checkpoint_row(
+            {},
+            "Practitioner",
+            "seed-1",
+            "run-1",
+        )
 
 
 def test_reviewed_candidate_rejects_missing_verification_campaign(monkeypatch):
