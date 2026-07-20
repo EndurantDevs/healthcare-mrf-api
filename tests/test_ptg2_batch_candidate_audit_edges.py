@@ -231,7 +231,7 @@ async def test_batch_client_rejects_nonretryable_response(monkeypatch):
 
     with pytest.raises(
         batch_audit.BatchCandidateAuditContractError,
-        match="batch_endpoint_rejected",
+        match="batch_endpoint_rejected_400",
     ):
         await batch_audit._post_batch_request(
             request_payload_by_field={},
