@@ -51,6 +51,7 @@ from process.ptg_parts.ptg2_shared_price import (
     publish_shared_price_artifacts,
 )
 from process.ptg_parts.ptg2_shared_publish import (
+    SharedBlockCopyMetrics,
     _validated_coverage_scope_id,
     copy_shared_block_binary_file,
     create_shared_block_stage,
@@ -117,6 +118,29 @@ class _PreparedPricePublication:
 
     publication: Any
     publish_seconds: float
+
+
+@dataclass(frozen=True)
+class _FinalizerBlockPublicationResult:
+    """Keep durable publication and immutable COPY proof together."""
+
+    publication: Any
+    serving_copy: SharedBlockCopyMetrics
+    price_dictionary_copy: SharedBlockCopyMetrics
+
+    def copy_manifest(self) -> dict[str, Any]:
+        """Return per-lane and total selective-staging proof."""
+
+        total = SharedBlockCopyMetrics.combine(
+            self.serving_copy,
+            self.price_dictionary_copy,
+        )
+        return {
+            "contract": "selective_shared_block_copy_v1",
+            "serving": self.serving_copy.as_dict(),
+            "price_dictionary": self.price_dictionary_copy.as_dict(),
+            "total": total.as_dict(),
+        }
 
 
 def _completed_prepared_price(
@@ -760,6 +784,7 @@ def _physical_serving_index(
     audit_sample: Mapping[str, Any],
     source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
+    finalizer_block_copy: Mapping[str, Any],
     stored_byte_count: int,
     full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
@@ -835,6 +860,7 @@ def _physical_serving_index(
             "block_count": int(graph_publication.block_count),
         },
         "provider_identifier_quarantine": quarantine,
+        "finalizer_block_copy": dict(finalizer_block_copy),
         "audit_sample": dict(audit_sample),
         "source_witness": dict(source_witness),
         "storage_bytes": int(stored_byte_count),
@@ -1020,7 +1046,7 @@ async def _publish_prepared_shared_layout(
                 stage_table=block_stage,
             )
             try:
-                await copy_shared_block_binary_file(
+                serving_copy_metrics = await copy_shared_block_binary_file(
                     _output_file(finalizer_summary_by_field, serving_block_summary),
                     schema_name=schema_name,
                     stage_table=block_stage,
@@ -1031,8 +1057,9 @@ async def _publish_prepared_shared_layout(
                     expected_copy_sha256=str(
                         serving_block_summary.get("copy_sha256") or ""
                     ),
+                    reuse_existing=True,
                 )
-                await copy_shared_block_binary_file(
+                price_copy_metrics = await copy_shared_block_binary_file(
                     _output_file(finalizer_summary_by_field, price_block_summary),
                     schema_name=schema_name,
                     stage_table=block_stage,
@@ -1043,12 +1070,22 @@ async def _publish_prepared_shared_layout(
                     expected_copy_sha256=str(
                         price_block_summary.get("copy_sha256") or ""
                     ),
+                    reuse_existing=True,
                 )
-                return await publish_shared_block_stage(
+                if serving_copy_metrics is None or price_copy_metrics is None:
+                    raise RuntimeError(
+                        "strict V3 finalizer block COPY did not return selective proof"
+                    )
+                publication = await publish_shared_block_stage(
                     schema_name=schema_name,
                     stage_table=block_stage,
                     snapshot_key=int(reserved_snapshot_key),
                     build_token=build_token,
+                )
+                return _FinalizerBlockPublicationResult(
+                    publication=publication,
+                    serving_copy=serving_copy_metrics,
+                    price_dictionary_copy=price_copy_metrics,
                 )
             finally:
                 await db.status(
@@ -1130,7 +1167,7 @@ async def _publish_prepared_shared_layout(
         independent_publish_started_at = time.monotonic()
         try:
             (
-                finalizer_block_publication,
+                finalizer_block_result,
                 graph_publication,
                 price_publication,
                 source_witness_publication,
@@ -1146,6 +1183,8 @@ async def _publish_prepared_shared_layout(
             "independent_publish_wall",
             independent_publish_started_at,
         )
+        finalizer_block_publication = finalizer_block_result.publication
+        finalizer_block_copy_manifest = finalizer_block_result.copy_manifest()
         await touch_build()
         stage_started_at = time.monotonic()
         async with db.transaction() as session:
@@ -1225,6 +1264,7 @@ async def _publish_prepared_shared_layout(
             audit_sample=audit_publication.metadata,
             source_witness=source_witness_publication.metadata,
             provider_identifier_quarantine=quarantine,
+            finalizer_block_copy=finalizer_block_copy_manifest,
             stored_byte_count=stored_byte_count,
             full_rebuild_scope_digest=full_rebuild_scope_digest,
         )

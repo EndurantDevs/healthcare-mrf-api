@@ -519,6 +519,199 @@ class _OneRowResult:
         return self.row[0]
 
 
+def test_shared_publish_rejects_invalid_identifiers_and_summary_values():
+    invalid_operations = (
+        (lambda: ptg2_shared_publish._safe_identifier("mrf;drop"), ValueError, "unsafe"),
+        (
+            lambda: ptg2_shared_publish._validated_coverage_scope_id("not-bytes"),
+            ValueError,
+            "exactly 32 bytes",
+        ),
+        (
+            lambda: ptg2_shared_publish._required_summary_mapping(None, "blocks"),
+            RuntimeError,
+            "missing blocks",
+        ),
+        (
+            lambda: ptg2_shared_publish._required_summary_integer(True, "count"),
+            RuntimeError,
+            "invalid count",
+        ),
+        (
+            lambda: ptg2_shared_publish._required_summary_integer("bad", "count"),
+            RuntimeError,
+            "invalid count",
+        ),
+        (
+            lambda: ptg2_shared_publish._required_summary_integer(-1, "count"),
+            RuntimeError,
+            "negative count",
+        ),
+    )
+
+    for operation, error_type, message in invalid_operations:
+        with pytest.raises(error_type, match=message):
+            operation()
+
+
+def test_finalizer_output_file_rejects_unsafe_or_missing_paths(tmp_path):
+    outside = tmp_path.parent / "outside.copy"
+    outside.write_bytes(b"outside")
+    operations = (
+        (str(outside), "invalid code path"),
+        ("../outside.copy", "escapes its output directory"),
+        ("missing.copy", "output is missing or empty"),
+    )
+
+    for raw_path, message in operations:
+        with pytest.raises(RuntimeError, match=message):
+            ptg2_shared_publish._finalizer_output_file(
+                tmp_path,
+                raw_path,
+                "code",
+            )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_existence_query_rejects_unrequested_hash(monkeypatch):
+    monkeypatch.setattr(
+        ptg2_shared_publish.db,
+        "all",
+        AsyncMock(return_value=[(b"z" * 32,)]),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected hash"):
+        await ptg2_shared_publish._existing_shared_block_hashes(
+            schema_name="mrf",
+            requested_hashes=(b"a" * 32,),
+        )
+
+
+def _copy_connection(copy_to_table=None):
+    driver = object() if copy_to_table is None else SimpleNamespace(
+        copy_to_table=copy_to_table
+    )
+    return SimpleNamespace(
+        raw_connection=SimpleNamespace(driver_connection=driver)
+    )
+
+
+@pytest.mark.asyncio
+async def test_stage_copy_helpers_require_driver_copy_support(tmp_path, monkeypatch):
+    path = tmp_path / "stage.copy"
+    path.write_bytes(b"stage")
+
+    @asynccontextmanager
+    async def acquire():
+        yield _copy_connection()
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "acquire", acquire)
+
+    with pytest.raises(NotImplementedError, match="binary COPY"):
+        await ptg2_shared_publish._copy_binary_file_to_stage(
+            path,
+            schema_name="mrf",
+            stage_table="binary_stage",
+            columns=("value",),
+        )
+    with pytest.raises(NotImplementedError, match="text COPY"):
+        await ptg2_shared_publish._copy_text_file_to_stage(
+            path,
+            schema_name="mrf",
+            stage_table="text_stage",
+            columns=("value",),
+            expected_bytes=path.stat().st_size,
+            expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("digest_matches", [True, False], ids=["stable", "changed"])
+async def test_text_stage_copy_verifies_consumed_content(
+    tmp_path,
+    monkeypatch,
+    digest_matches,
+):
+    path = tmp_path / "stage.copy"
+    path.write_bytes(b"provider metadata")
+
+    async def copy_to_table(_table, *, source, **_kwargs):
+        chunk = source.read(3)
+        while chunk:
+            chunk = source.read(3)
+
+    @asynccontextmanager
+    async def acquire():
+        yield _copy_connection(copy_to_table)
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "acquire", acquire)
+    expected_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    if not digest_matches:
+        expected_sha256 = "0" * 64
+
+    invocation = ptg2_shared_publish._copy_text_file_to_stage(
+        path,
+        schema_name="mrf",
+        stage_table="text_stage",
+        columns=("value",),
+        expected_bytes=path.stat().st_size,
+        expected_sha256=expected_sha256,
+    )
+    if digest_matches:
+        await invocation
+    else:
+        with pytest.raises(RuntimeError, match="changed during publication"):
+            await invocation
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        ("non-mapping", "entry must be an object"),
+        ("missing", "file is missing or repeated"),
+        ("repeated", "file is missing or repeated"),
+        ("boolean-rows", "row count is invalid"),
+        ("invalid-rows", "row count is invalid"),
+        ("empty", "must contain rows"),
+        ("format", "format is incompatible"),
+        ("digest", "digest contract is invalid"),
+        ("required", "metadata is required"),
+    ),
+)
+def test_provider_set_metadata_files_reject_invalid_contracts(
+    tmp_path,
+    case,
+    message,
+):
+    valid_entry_by_field = dict(_provider_set_metadata_entries(tmp_path)[0])
+    entries_by_case = {
+        "non-mapping": (None,),
+        "missing": (
+            {
+                **valid_entry_by_field,
+                "path": str(tmp_path / "missing.copy"),
+            },
+        ),
+        "repeated": (
+            valid_entry_by_field,
+            dict(valid_entry_by_field),
+        ),
+        "boolean-rows": ({**valid_entry_by_field, "row_count": True},),
+        "invalid-rows": ({**valid_entry_by_field, "row_count": "bad"},),
+        "empty": ({**valid_entry_by_field, "row_count": 0},),
+        "format": ({**valid_entry_by_field, "version": 2},),
+        "digest": ({**valid_entry_by_field, "sha256": "bad"},),
+        "required": (),
+    }
+    entries = entries_by_case[case]
+
+    with pytest.raises(RuntimeError, match=message):
+        ptg2_shared_publish._provider_set_metadata_files(
+            entries,
+            required=case == "required",
+        )
+
+
 def _assert_shared_stage_sql(session):
     block_insert_sql = str(session.execute.await_args_list[0].args[0])
     assert "NOT EXISTS" in block_insert_sql
@@ -818,3 +1011,229 @@ async def test_finalizer_provider_metadata_join_decodes_the_smaller_stage(
     assert "((decode(provider_set_global_id_128, 'hex')))" in stage_index_sql
     assert stage_index_sql.count("ANALYZE") == 2
     assert publication.provider_set_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observed_code", "observed_scalars", "message"),
+    (
+        ((1, 2, 1, 1), (2, 2, False), "code dictionary row count changed"),
+        ((2, 1, 1, 2), (2, 2, False), "rate counts do not preserve"),
+        ((2, 2, 1, 2), (1, 2, False), "provider dictionary row count changed"),
+        ((2, 2, 1, 2), (2, 1, False), "metadata row count changed"),
+        ((2, 2, 1, 2), (2, 2, True), "conflicting network names"),
+    ),
+    ids=(
+        "code-count",
+        "rate-count",
+        "provider-count",
+        "metadata-count",
+        "metadata-conflict",
+    ),
+)
+async def test_finalizer_dictionary_rejects_post_copy_count_mismatches(
+    tmp_path,
+    monkeypatch,
+    observed_code,
+    observed_scalars,
+    message,
+):
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[_OneRowResult((7,)), _OneRowResult(observed_code)]
+        ),
+        scalar=AsyncMock(side_effect=observed_scalars),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_copy_binary_file_to_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_copy_text_file_to_stage",
+        AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        await publish_shared_finalizer_dictionaries(
+            _dictionary_summary(tmp_path, row_count=2),
+            schema_name="mrf",
+            snapshot_key=7,
+            build_token="attempt-7",
+            expected_coverage_scope_id=b"e" * 32,
+            provider_set_metadata_entries=_provider_set_metadata_entries(
+                tmp_path,
+                row_count=2,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_finalizer_dictionary_rejects_scope_rows_for_empty_dictionary(
+    tmp_path,
+    monkeypatch,
+):
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                _OneRowResult((7,)),
+                _OneRowResult((0, 0, 1, 0)),
+            ]
+        ),
+        scalar=AsyncMock(return_value=0),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_copy_binary_file_to_stage",
+        AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="empty code dictionary has scope rows"):
+        await publish_shared_finalizer_dictionaries(
+            _dictionary_summary(tmp_path, row_count=0),
+            schema_name="mrf",
+            snapshot_key=7,
+            build_token="attempt-7",
+            expected_coverage_scope_id=b"e" * 32,
+            provider_set_metadata_entries=(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_finalizer_dictionary_rejects_unmatched_provider_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                _OneRowResult((7,)),
+                _OneRowResult((1, 1, 1, 1)),
+                None,
+            ]
+        ),
+        scalar=AsyncMock(side_effect=[1, 1, False, True]),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_copy_binary_file_to_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_copy_text_file_to_stage",
+        AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="does not exactly cover"):
+        await publish_shared_finalizer_dictionaries(
+            _dictionary_summary(tmp_path, row_count=1),
+            schema_name="mrf",
+            snapshot_key=7,
+            build_token="attempt-7",
+            expected_coverage_scope_id=b"e" * 32,
+            provider_set_metadata_entries=_provider_set_metadata_entries(tmp_path),
+        )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_mapping_upsert_counts_stage_when_not_supplied():
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=3),
+        execute=AsyncMock(return_value=_OneRowResult((3,), rowcount=3)),
+    )
+
+    await _upsert_shared_block_mappings(
+        session,
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_proof",
+        snapshot_key=42,
+    )
+
+    session.scalar.assert_awaited_once()
+    session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shared_block_mapping_upsert_rejects_negative_expected_count():
+    session = SimpleNamespace(scalar=AsyncMock(), execute=AsyncMock())
+
+    with pytest.raises(RuntimeError, match="mapping count is invalid"):
+        await _upsert_shared_block_mappings(
+            session,
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_proof",
+            snapshot_key=42,
+            expected_count=-1,
+        )
+
+    session.scalar.assert_not_awaited()
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("aggregate_row", "message"),
+    (
+        ((1, 1, 3, 3, ["serving"], False, True), "conflicts with stored"),
+        ((1, 2, 3, 3, ["serving"], False, False), "invalid aggregates"),
+        ((2, 2, 3, 3, ["z_kind", "a_kind"], False, False), "invalid object kinds"),
+    ),
+    ids=("stored-mismatch", "invalid-counts", "invalid-kinds"),
+)
+async def test_shared_block_stage_rejects_invalid_aggregate_proof(
+    monkeypatch,
+    aggregate_row,
+    message,
+):
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=[None, _OneRowResult(aggregate_row)]),
+        scalar=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_shared_layout_for_dense_write",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_upsert_shared_block_mappings",
+        AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        await publish_shared_block_stage(
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_proof",
+            snapshot_key=42,
+            build_token="build-42",
+        )

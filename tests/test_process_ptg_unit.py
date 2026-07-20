@@ -6671,8 +6671,8 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
     return publish
 
 
-def _reusable_v3_layout_manifest(provider_identifier_quarantine):
-    source_witness_by_field = {
+def _reusable_source_witness():
+    return {
         "contract": "ptg2_v3_source_witness_payload_v5",
         "format_version": 5,
         "selection_method": "bottom_k_independent_occurrence_provider_cohorts_v3",
@@ -6698,6 +6698,23 @@ def _reusable_v3_layout_manifest(provider_identifier_quarantine):
         "payload_bytes": 1_024,
         "compression": "per_record_zlib_shared_evidence_dictionary_v1",
     }
+
+
+def _reusable_finalizer_block_copy():
+    return {
+        "contract": "selective_shared_block_copy_v1",
+        "total": {
+            "source_copy_bytes": 100,
+            "staged_copy_bytes": 70,
+            "reused_payload_bytes": 30,
+        },
+    }
+
+
+def _reusable_v3_layout_manifest(provider_identifier_quarantine):
+    """Build reusable physical layout evidence with stale logical fields."""
+
+    source_witness_by_field = _reusable_source_witness()
     serving_index_by_field = {
         "storage": "manifest_snapshot",
         "type": "ptg2_shared_blocks_v3",
@@ -6713,6 +6730,7 @@ def _reusable_v3_layout_manifest(provider_identifier_quarantine):
         "shared_snapshot_key": 7,
         "serving_rates": 123,
         "provider_graph": {"owner_count": 4},
+        "finalizer_block_copy": _reusable_finalizer_block_copy(),
         "source_witness": source_witness_by_field,
         "plan_id": "stale-plan",
         "source_file_versions": [{"source": "stale"}],
@@ -6742,6 +6760,14 @@ def test_reused_v3_serving_index_copies_only_physical_contract_fields():
     assert serving_result["code_count"] == 17
     assert serving_result["serving_rates"] == 123
     assert serving_result["provider_graph"] == {"owner_count": 4}
+    assert serving_result["finalizer_block_copy"] == {
+        "contract": "selective_shared_block_copy_v1",
+        "total": {
+            "source_copy_bytes": 100,
+            "staged_copy_bytes": 70,
+            "reused_payload_bytes": 30,
+        },
+    }
     assert serving_result["provider_identifier_quarantine"] == quarantine
     assert serving_result["table"] is None
     assert "plan_id" not in serving_result
@@ -6901,13 +6927,66 @@ def test_full_rebuild_failure_metrics_reject_hostile_allowed_key_values():
         "raw_artifacts_reused": -1,
         "logical_artifacts_total": 2,
         "shared_layout_reused": "false",
+        "finalizer_block_source_copy_bytes": 100,
+        "finalizer_block_staged_copy_bytes": "private payload",
         "unknown_metric": "private payload",
     }
 
     assert process_ptg.full_rebuild_failure_metrics(failure) == {
         "full_rebuild": True,
         "logical_artifacts_total": 2,
+        "finalizer_block_source_copy_bytes": 100,
     }
+
+
+def test_full_rebuild_proof_metrics_include_safe_finalizer_copy_totals():
+    stage_counts = process_ptg.PTG2ArtifactStageCounts(
+        artifacts_observed=0,
+        raw_artifacts_total=0,
+        raw_artifacts_reused=0,
+        raw_artifacts_unique=0,
+        raw_artifacts_duplicate_identities=0,
+        logical_artifacts_total=0,
+        logical_artifacts_reused=0,
+        logical_artifacts_unique=0,
+        logical_artifacts_duplicate_identities=0,
+        logical_artifacts_deferred_hashes=0,
+    )
+
+    metrics_by_name = process_ptg._full_rebuild_proof_metrics(
+        stage_counts,
+        full_rebuild_scope_digest="1" * 64,
+        shared_layout_reused=False,
+        shared_layout_reused_at_seal=False,
+        finalizer_block_copy={
+            "contract": "selective_shared_block_copy_v1",
+            "total": {
+                "source_copy_bytes": 100,
+                "staged_copy_bytes": 70,
+                "source_payload_bytes": 50,
+                "staged_payload_bytes": 20,
+                "reused_payload_bytes": 30,
+                "row_count": 4,
+                "staged_payload_row_count": 2,
+                "reused_payload_row_count": 2,
+                "unique_block_count": 3,
+                "existing_block_count": 1,
+                "new_block_count": 2,
+                "duplicate_block_row_count": 1,
+                "copy_seconds": 0.5,
+                "unexpected": "private payload",
+            },
+        },
+    )
+
+    assert metrics_by_name["finalizer_block_source_copy_bytes"] == 100
+    assert metrics_by_name["finalizer_block_staged_copy_bytes"] == 70
+    assert metrics_by_name["finalizer_block_reused_payload_bytes"] == 30
+    assert metrics_by_name["finalizer_block_row_count"] == 4
+    assert metrics_by_name["finalizer_block_unique_block_count"] == 3
+    assert metrics_by_name["finalizer_block_duplicate_block_row_count"] == 1
+    assert "copy_seconds" not in metrics_by_name
+    assert "unexpected" not in metrics_by_name
 
 
 def test_full_rebuild_scope_isolates_snapshot_and_audit_run_identity():

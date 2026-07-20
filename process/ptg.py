@@ -412,6 +412,22 @@ _SAFE_FULL_REBUILD_METRIC_KEYS = frozenset(
         "shared_layout_reused",
         "shared_layout_reused_at_seal",
         "existing_snapshot_reused",
+        "finalizer_block_source_copy_bytes",
+        "finalizer_block_staged_copy_bytes",
+        "finalizer_block_source_payload_bytes",
+        "finalizer_block_staged_payload_bytes",
+        "finalizer_block_reused_payload_bytes",
+        "finalizer_block_durable_reused_payload_bytes",
+        "finalizer_block_same_copy_reused_payload_bytes",
+        "finalizer_block_row_count",
+        "finalizer_block_staged_payload_row_count",
+        "finalizer_block_reused_payload_row_count",
+        "finalizer_block_durable_reused_row_count",
+        "finalizer_block_same_copy_reused_row_count",
+        "finalizer_block_unique_block_count",
+        "finalizer_block_existing_block_count",
+        "finalizer_block_new_block_count",
+        "finalizer_block_duplicate_block_row_count",
     }
 )
 _BOOLEAN_FULL_REBUILD_METRIC_KEYS = frozenset(
@@ -3314,6 +3330,7 @@ _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
         "serving_binary",
         "provider_graph",
         "provider_identifier_quarantine",
+        "finalizer_block_copy",
         "storage_bytes",
         "timings",
         "audit_sample",
@@ -3644,18 +3661,63 @@ def _is_shared_v3_preflight_eligible(
 _shared_v3_preflight_eligible = _is_shared_v3_preflight_eligible
 
 
+def _finalizer_block_copy_terminal_metrics(
+    finalizer_block_copy: Mapping[str, Any] | None,
+) -> dict[str, int]:
+    """Flatten allowlisted integer COPY totals for controlled-run proof."""
+
+    terminal_name_by_copy_metric = {
+        "source_copy_bytes": "finalizer_block_source_copy_bytes",
+        "staged_copy_bytes": "finalizer_block_staged_copy_bytes",
+        "source_payload_bytes": "finalizer_block_source_payload_bytes",
+        "staged_payload_bytes": "finalizer_block_staged_payload_bytes",
+        "reused_payload_bytes": "finalizer_block_reused_payload_bytes",
+        "durable_reused_payload_bytes": (
+            "finalizer_block_durable_reused_payload_bytes"
+        ),
+        "same_copy_reused_payload_bytes": (
+            "finalizer_block_same_copy_reused_payload_bytes"
+        ),
+        "row_count": "finalizer_block_row_count",
+        "staged_payload_row_count": "finalizer_block_staged_payload_row_count",
+        "reused_payload_row_count": "finalizer_block_reused_payload_row_count",
+        "durable_reused_row_count": "finalizer_block_durable_reused_row_count",
+        "same_copy_reused_row_count": "finalizer_block_same_copy_reused_row_count",
+        "unique_block_count": "finalizer_block_unique_block_count",
+        "existing_block_count": "finalizer_block_existing_block_count",
+        "new_block_count": "finalizer_block_new_block_count",
+        "duplicate_block_row_count": "finalizer_block_duplicate_block_row_count",
+    }
+    total_copy_metrics = (
+        finalizer_block_copy.get("total")
+        if isinstance(finalizer_block_copy, Mapping)
+        else None
+    )
+    if not isinstance(total_copy_metrics, Mapping):
+        return {}
+    return {
+        terminal_metric_name: metric_value
+        for copy_metric_name, terminal_metric_name in (
+            terminal_name_by_copy_metric.items()
+        )
+        if type(metric_value := total_copy_metrics.get(copy_metric_name)) is int
+        and metric_value >= 0
+    }
+
+
 def _full_rebuild_proof_metrics(
     stage_counts: PTG2ArtifactStageCounts,
     *,
     full_rebuild_scope_digest: str | None,
     shared_layout_reused: bool,
     shared_layout_reused_at_seal: bool,
+    finalizer_block_copy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe whether a controlled rebuild reused physical input work."""
 
     if full_rebuild_scope_digest is None:
         return {}
-    return {
+    metrics_by_name = {
         "full_rebuild": True,
         "artifacts_observed": stage_counts.artifacts_observed,
         "raw_artifacts_total": stage_counts.raw_artifacts_total,
@@ -3676,6 +3738,10 @@ def _full_rebuild_proof_metrics(
         "shared_layout_reused": bool(shared_layout_reused),
         "shared_layout_reused_at_seal": bool(shared_layout_reused_at_seal),
     }
+    metrics_by_name.update(
+        _finalizer_block_copy_terminal_metrics(finalizer_block_copy)
+    )
+    return metrics_by_name
 
 
 def _assert_full_rebuild_is_fresh(
@@ -5809,6 +5875,11 @@ async def _main_with_artifact_lease(
                         full_rebuild_scope_digest=rebuild_scope_digest,
                         shared_layout_reused=False,
                         shared_layout_reused_at_seal=True,
+                        finalizer_block_copy=(
+                            shared_publication.serving_index.get(
+                                "finalizer_block_copy"
+                            )
+                        ),
                     )
                 )
             serving_index = {
@@ -5841,6 +5912,7 @@ async def _main_with_artifact_lease(
                 shared_layout_reused_at_seal=(
                     shared_publication.layout_reused_at_seal
                 ),
+                finalizer_block_copy=serving_index.get("finalizer_block_copy"),
             )
             failure_report_by_field.update(full_rebuild_metrics)
             await _drop_ptg2_snapshot_table_names(

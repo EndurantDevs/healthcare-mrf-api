@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +46,29 @@ _SHARED_BLOCK_STAGE_COLUMNS = (
     "payload",
 )
 _SHARED_BLOCK_EXISTENCE_BATCH_ROWS = 8_192
+_SHARED_BLOCK_COPY_INTEGER_METRIC_FIELDS = (
+    "source_copy_bytes",
+    "staged_copy_bytes",
+    "source_payload_bytes",
+    "staged_payload_bytes",
+    "reused_payload_bytes",
+    "durable_reused_payload_bytes",
+    "same_copy_reused_payload_bytes",
+    "row_count",
+    "staged_payload_row_count",
+    "reused_payload_row_count",
+    "durable_reused_row_count",
+    "same_copy_reused_row_count",
+    "unique_block_count",
+    "existing_block_count",
+    "new_block_count",
+    "duplicate_block_row_count",
+)
+_SHARED_BLOCK_COPY_TIMING_FIELDS = (
+    "metadata_scan_seconds",
+    "existence_lookup_seconds",
+    "copy_seconds",
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +78,141 @@ class SharedBlockStagePublication:
     unique_block_count: int
     logical_byte_count: int
     stored_byte_count: int
+
+
+@dataclass(frozen=True)
+class SharedBlockCopyMetrics:
+    """Immutable accounting for one authenticated selective block COPY."""
+
+    source_copy_bytes: int
+    staged_copy_bytes: int
+    source_payload_bytes: int
+    staged_payload_bytes: int
+    reused_payload_bytes: int
+    durable_reused_payload_bytes: int
+    same_copy_reused_payload_bytes: int
+    row_count: int
+    staged_payload_row_count: int
+    reused_payload_row_count: int
+    durable_reused_row_count: int
+    same_copy_reused_row_count: int
+    unique_block_count: int
+    existing_block_count: int
+    new_block_count: int
+    duplicate_block_row_count: int
+    metadata_scan_seconds: float
+    existence_lookup_seconds: float
+    copy_seconds: float
+
+    def __post_init__(self) -> None:
+        """Reject incomplete or internally inconsistent COPY accounting."""
+
+        _validate_shared_block_copy_metric_types(self)
+        _validate_shared_block_copy_accounting(self)
+
+    def as_dict(self) -> dict[str, int | float]:
+        """Return a JSON-safe proof mapping with stable field names."""
+
+        return {
+            "source_copy_bytes": self.source_copy_bytes,
+            "staged_copy_bytes": self.staged_copy_bytes,
+            "source_payload_bytes": self.source_payload_bytes,
+            "staged_payload_bytes": self.staged_payload_bytes,
+            "reused_payload_bytes": self.reused_payload_bytes,
+            "durable_reused_payload_bytes": self.durable_reused_payload_bytes,
+            "same_copy_reused_payload_bytes": self.same_copy_reused_payload_bytes,
+            "row_count": self.row_count,
+            "staged_payload_row_count": self.staged_payload_row_count,
+            "reused_payload_row_count": self.reused_payload_row_count,
+            "durable_reused_row_count": self.durable_reused_row_count,
+            "same_copy_reused_row_count": self.same_copy_reused_row_count,
+            "unique_block_count": self.unique_block_count,
+            "existing_block_count": self.existing_block_count,
+            "new_block_count": self.new_block_count,
+            "duplicate_block_row_count": self.duplicate_block_row_count,
+            "metadata_scan_seconds": float(self.metadata_scan_seconds),
+            "existence_lookup_seconds": float(self.existence_lookup_seconds),
+            "copy_seconds": float(self.copy_seconds),
+        }
+
+    @classmethod
+    def combine(cls, *metrics: "SharedBlockCopyMetrics") -> "SharedBlockCopyMetrics":
+        """Combine disjoint finalizer COPY lanes without losing exact accounting."""
+
+        if not metrics:
+            raise ValueError("shared-block COPY metrics require at least one lane")
+        integer_fields = tuple(
+            field_name
+            for field_name in cls.__dataclass_fields__
+            if not field_name.endswith("_seconds")
+        )
+        return cls(
+            **{
+                field_name: sum(getattr(metric, field_name) for metric in metrics)
+                for field_name in (
+                    *integer_fields,
+                    *_SHARED_BLOCK_COPY_TIMING_FIELDS,
+                )
+            }
+        )
+
+
+def _validate_shared_block_copy_metric_types(
+    metrics: SharedBlockCopyMetrics,
+) -> None:
+    if any(
+        type(getattr(metrics, field_name)) is not int
+        or getattr(metrics, field_name) < 0
+        for field_name in _SHARED_BLOCK_COPY_INTEGER_METRIC_FIELDS
+    ):
+        raise ValueError("shared-block COPY metrics require non-negative integers")
+    if any(
+        isinstance(getattr(metrics, field_name), bool)
+        or not isinstance(getattr(metrics, field_name), (int, float))
+        or not math.isfinite(float(getattr(metrics, field_name)))
+        or float(getattr(metrics, field_name)) < 0
+        for field_name in _SHARED_BLOCK_COPY_TIMING_FIELDS
+    ):
+        raise ValueError("shared-block COPY metrics require finite timings")
+
+
+def _validate_shared_block_copy_accounting(
+    metrics: SharedBlockCopyMetrics,
+) -> None:
+    if (
+        metrics.staged_copy_bytes + metrics.reused_payload_bytes
+        != metrics.source_copy_bytes
+    ):
+        raise ValueError("shared-block COPY byte accounting is inconsistent")
+    if (
+        metrics.staged_payload_bytes + metrics.reused_payload_bytes
+        != metrics.source_payload_bytes
+    ):
+        raise ValueError("shared-block payload byte accounting is inconsistent")
+    if (
+        metrics.staged_payload_row_count + metrics.reused_payload_row_count
+        != metrics.row_count
+    ):
+        raise ValueError("shared-block COPY row accounting is inconsistent")
+    if (
+        metrics.durable_reused_payload_bytes + metrics.same_copy_reused_payload_bytes
+        != metrics.reused_payload_bytes
+        or metrics.durable_reused_row_count + metrics.same_copy_reused_row_count
+        != metrics.reused_payload_row_count
+    ):
+        raise ValueError("shared-block reuse accounting is inconsistent")
+    if (
+        metrics.existing_block_count + metrics.new_block_count
+        != metrics.unique_block_count
+    ):
+        raise ValueError("shared-block identity accounting is inconsistent")
+    if (
+        metrics.unique_block_count + metrics.duplicate_block_row_count
+        != metrics.row_count
+    ):
+        raise ValueError("shared-block duplicate accounting is inconsistent")
+    if metrics.staged_payload_row_count != metrics.new_block_count:
+        raise ValueError("shared-block COPY staged more than one payload per new hash")
 
 
 class _DigestingReader:
@@ -253,6 +413,58 @@ async def _existing_shared_block_hashes(
     return existing_hashes
 
 
+def _shared_block_copy_metrics(
+    scanned_copy: Any,
+    existing_hashes: set[bytes],
+    copy_source: Any,
+    observed_byte_count: int,
+    timing_by_name: Mapping[str, float],
+) -> SharedBlockCopyMetrics:
+    """Build validated immutable proof from one completed selective COPY."""
+
+    selective = isinstance(copy_source, SelectiveSharedBlockCopyReader)
+    unique_block_count = len(scanned_copy.block_hashes)
+    return SharedBlockCopyMetrics(
+        source_copy_bytes=observed_byte_count,
+        staged_copy_bytes=(
+            copy_source.output_byte_count if selective else copy_source.byte_count
+        ),
+        source_payload_bytes=scanned_copy.stored_payload_bytes,
+        staged_payload_bytes=(
+            copy_source.copied_payload_bytes
+            if selective
+            else scanned_copy.stored_payload_bytes
+        ),
+        reused_payload_bytes=(copy_source.reused_payload_bytes if selective else 0),
+        durable_reused_payload_bytes=(
+            copy_source.durable_reused_payload_bytes if selective else 0
+        ),
+        same_copy_reused_payload_bytes=(
+            copy_source.same_copy_reused_payload_bytes if selective else 0
+        ),
+        row_count=scanned_copy.row_count,
+        staged_payload_row_count=(
+            copy_source.new_block_count if selective else scanned_copy.row_count
+        ),
+        reused_payload_row_count=(copy_source.reused_row_count if selective else 0),
+        durable_reused_row_count=(
+            copy_source.durable_reused_row_count if selective else 0
+        ),
+        same_copy_reused_row_count=(
+            copy_source.same_copy_reused_row_count if selective else 0
+        ),
+        unique_block_count=unique_block_count,
+        existing_block_count=len(existing_hashes),
+        new_block_count=(
+            copy_source.new_block_count if selective else unique_block_count
+        ),
+        duplicate_block_row_count=scanned_copy.row_count - unique_block_count,
+        metadata_scan_seconds=timing_by_name["metadata_scan_seconds"],
+        existence_lookup_seconds=timing_by_name["existence_lookup_seconds"],
+        copy_seconds=timing_by_name["copy_seconds"],
+    )
+
+
 async def copy_shared_block_binary_file(
     copy_path: str | Path,
     *,
@@ -261,7 +473,7 @@ async def copy_shared_block_binary_file(
     expected_copy_bytes: int | None = None,
     expected_copy_sha256: str | None = None,
     reuse_existing: bool = False,
-) -> None:
+) -> SharedBlockCopyMetrics | None:
     """Validate and binary-COPY a shared-block file into the staging table."""
 
     path = Path(copy_path)
@@ -291,12 +503,24 @@ async def copy_shared_block_binary_file(
         )
     existing_hashes: set[bytes] = set()
     scanned_copy = None
+    timing_by_name = {
+        "metadata_scan_seconds": 0.0,
+        "existence_lookup_seconds": 0.0,
+        "copy_seconds": 0.0,
+    }
     if reuse_existing:
+        scan_started_at = time.monotonic()
         scanned_copy = scan_shared_block_copy(path)
+        timing_by_name["metadata_scan_seconds"] = time.monotonic() - scan_started_at
+        lookup_started_at = time.monotonic()
         existing_hashes = await _existing_shared_block_hashes(
             schema_name=schema_name,
             requested_hashes=scanned_copy.block_hashes,
         )
+        timing_by_name["existence_lookup_seconds"] = (
+            time.monotonic() - lookup_started_at
+        )
+    copy_started_at = time.monotonic()
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
@@ -305,7 +529,10 @@ async def copy_shared_block_binary_file(
             raise NotImplementedError("active database driver does not expose binary COPY")
         with path.open("rb") as source_file:
             copy_source: Any
-            if existing_hashes:
+            if existing_hashes or (
+                scanned_copy is not None
+                and scanned_copy.row_count != len(scanned_copy.block_hashes)
+            ):
                 copy_source = SelectiveSharedBlockCopyReader(
                     source_file,
                     existing_hashes=existing_hashes,
@@ -347,6 +574,16 @@ async def copy_shared_block_binary_file(
                 raise RuntimeError(
                     "strict V3 shared-block COPY filtering changed source aggregates"
                 )
+    timing_by_name["copy_seconds"] = time.monotonic() - copy_started_at
+    if scanned_copy is None:
+        return None
+    return _shared_block_copy_metrics(
+        scanned_copy,
+        existing_hashes,
+        copy_source,
+        observed_byte_count,
+        timing_by_name,
+    )
 
 
 def _required_summary_mapping(value: Any, name: str) -> dict[str, Any]:
@@ -1231,6 +1468,7 @@ async def publish_shared_graph(
 
 
 __all__ = [
+    "SharedBlockCopyMetrics",
     "SharedBlockStagePublication",
     "SharedDictionaryPublication",
     "SharedGraphPublication",

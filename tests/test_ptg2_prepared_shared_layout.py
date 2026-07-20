@@ -13,6 +13,7 @@ from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
 )
 from process.ptg_parts.ptg2_shared_blocks import SharedMappingDigestSummary
+from process.ptg_parts.ptg2_shared_publish import SharedBlockCopyMetrics
 
 
 _FINALIZER_KINDS = (
@@ -33,6 +34,38 @@ _PRICE_KINDS = (
     "provider_set_count_dictionary",
     "provider_set_page_v3_s2",
 )
+
+
+def _copy_metrics(*, reused: bool) -> SharedBlockCopyMetrics:
+    reused_payload_bytes = 2 if reused else 0
+    reused_row_count = 1 if reused else 0
+    source_copy_bytes = 10 if reused else 7
+    source_payload_bytes = 5 if reused else 4
+    row_count = 2 if reused else 1
+    unique_block_count = row_count
+    existing_block_count = reused_row_count
+    new_block_count = unique_block_count - existing_block_count
+    return SharedBlockCopyMetrics(
+        source_copy_bytes=source_copy_bytes,
+        staged_copy_bytes=source_copy_bytes - reused_payload_bytes,
+        source_payload_bytes=source_payload_bytes,
+        staged_payload_bytes=source_payload_bytes - reused_payload_bytes,
+        reused_payload_bytes=reused_payload_bytes,
+        durable_reused_payload_bytes=reused_payload_bytes,
+        same_copy_reused_payload_bytes=0,
+        row_count=row_count,
+        staged_payload_row_count=new_block_count,
+        reused_payload_row_count=reused_row_count,
+        durable_reused_row_count=reused_row_count,
+        same_copy_reused_row_count=0,
+        unique_block_count=unique_block_count,
+        existing_block_count=existing_block_count,
+        new_block_count=new_block_count,
+        duplicate_block_row_count=0,
+        metadata_scan_seconds=0.01,
+        existence_lookup_seconds=0.02,
+        copy_seconds=0.03,
+    )
 
 
 def _finalizer_summary_by_field(tmp_path):
@@ -157,7 +190,12 @@ def _publication_mocks(tmp_path, *, price_kinds, membership_span, seal_reused):
         export_provider_keys=AsyncMock(return_value=tmp_path / "provider-keys.tsv"),
         convert_graph=AsyncMock(),
         create_stage=AsyncMock(),
-        copy_block=AsyncMock(),
+        copy_block=AsyncMock(
+            side_effect=[
+                _copy_metrics(reused=True),
+                _copy_metrics(reused=False),
+            ]
+        ),
         publish_blocks=AsyncMock(return_value=lanes.finalizer),
         publish_graph=AsyncMock(return_value=lanes.graph),
         publish_price=AsyncMock(return_value=lanes.price),
@@ -262,6 +300,13 @@ def _assert_complete_publication(publication, mocks):
     assert publication.serving_index["shared_snapshot_key"] == 17
     assert publication.serving_index["coverage_scope_id"] == (b"c" * 32).hex()
     assert publication.serving_index["storage_bytes"] == 18
+    copy_proof = publication.serving_index["finalizer_block_copy"]
+    assert copy_proof["contract"] == "selective_shared_block_copy_v1"
+    assert copy_proof["serving"]["reused_payload_bytes"] == 2
+    assert copy_proof["price_dictionary"]["reused_payload_bytes"] == 0
+    assert copy_proof["total"]["source_copy_bytes"] == 17
+    assert copy_proof["total"]["staged_copy_bytes"] == 15
+    assert copy_proof["total"]["new_block_count"] == 2
     assert publication.serving_index["audit_sample"] == (
         mocks.publish_audit.return_value.metadata
     )
@@ -289,6 +334,10 @@ async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path):
     assert not exported_path.parent.exists()
     assert mocks.run_finalizer.await_args.kwargs["price_key_map_row_count"] == 2
     assert mocks.copy_block.await_count == 2
+    assert all(
+        call.kwargs["reuse_existing"] is True
+        for call in mocks.copy_block.await_args_list
+    )
     mocks.publish_graph.assert_awaited_once_with(
         mocks.graph_conversion,
         schema_name="mrf",
@@ -301,6 +350,23 @@ async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path):
     seal_args = mocks.seal.await_args.kwargs
     assert seal_args["expected_summary"] == mocks.mapping_summary
     assert seal_args["layout_manifest"]["serving_index"]["shared_snapshot_key"] == 7
+    assert seal_args["layout_manifest"]["serving_index"]["finalizer_block_copy"] == (
+        publication.serving_index["finalizer_block_copy"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepared_layout_requires_selective_copy_proof(monkeypatch, tmp_path):
+    mocks = _prepared_layout_mocks(monkeypatch, tmp_path)
+    mocks.copy_block.side_effect = [None, _copy_metrics(reused=False)]
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await _publish_prepared_layout(mocks, tmp_path)
+
+    assert len(exc_info.value.exceptions) == 1
+    assert "did not return selective proof" in str(exc_info.value.exceptions[0])
+    mocks.publish_blocks.assert_not_awaited()
+    mocks.graph_conversion.cleanup.assert_called_once_with()
 
 
 @pytest.mark.asyncio
