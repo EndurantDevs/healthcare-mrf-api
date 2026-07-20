@@ -44,6 +44,7 @@
         "api/ptg2_candidate_audit_codes.py",
         "api/ptg2_candidate_audit_coordinates.py",
         "api/ptg2_candidate_audit_integrity.py",
+        "api/ptg2_candidate_audit_partition.py",
         "api/ptg2_candidate_audit_projection.py",
         "api/ptg2_candidate_audit_selection.py",
         "api/ptg2_capacity_evidence.py",
@@ -172,12 +173,21 @@
         "process/ptg_parts/ptg2_candidate_audit_batch_response.py",
         "process/ptg_parts/ptg2_candidate_audit_contract.py",
         "process/ptg_parts/ptg2_candidate_audit_evidence.py",
+        "process/ptg_parts/ptg2_candidate_audit_plan_store.py",
         "process/ptg_parts/ptg2_fast_candidate_audit.py",
         "process/ptg_parts/ptg2_fast_candidate_audit_report.py",
         "process/ptg_parts/ptg2_input_artifact_gc.py",
         "process/ptg_parts/ptg2_lifecycle_lock.py",
         "process/ptg_parts/ptg2_manifest_artifacts.py",
         "process/ptg_parts/ptg2_manifest_publish.py",
+        "process/ptg_parts/ptg2_partitioned_candidate_audit.py",
+        "process/ptg_parts/ptg2_partitioned_candidate_audit_contract.py",
+        "process/ptg_parts/ptg2_partitioned_candidate_audit_report.py",
+        "process/ptg_parts/ptg2_partitioned_candidate_audit_report_validation.py",
+        "process/ptg_parts/ptg2_partitioned_candidate_audit_request_contract.py",
+        "process/ptg_parts/ptg2_partitioned_candidate_audit_request_parser.py",
+        "process/ptg_parts/ptg2_partitioned_candidate_audit_result_contract.py",
+        "process/ptg_parts/ptg2_partitioned_candidate_audit_types.py",
         "process/ptg_parts/ptg2_provider_quarantine.py",
         "process/ptg_parts/ptg2_serving_binary_v3.py",
         "process/ptg_parts/ptg2_serving_binary_v3_code_intersection.py",
@@ -242,12 +252,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 20641,
-          "total": 31124
+          "covered": 20931,
+          "total": 31294
         },
         "lines": {
-          "covered": 70379,
-          "total": 89838
+          "covered": 71412,
+          "total": 90633
         }
       },
       "path": "test-coverage-python.json",

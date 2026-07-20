@@ -56,14 +56,17 @@ A representative dev import is required before broad deployment. Record:
 - exact source/API audit results from the original JSON or gzip inputs.
 
 Automatic activation uses the bounded PostgreSQL source-witness audit. After
-the completed reader-first deployment, one authenticated V4 POST makes the
-server derive and reparse independently
-selected cohorts of 10,000 emitted price/provider occurrences and 1,000
-provider records for a large population and validate the complete persisted
-served sample. It requires `aiohttp` on `uvloop`, zero redirects and
-in-attempt retries, and fails closed at 55 seconds. Request-local block,
-evidence, and projection reuse must report zero repeated work and is discarded
-with the response rather than warming an application cache. Deploy readers
+the completed reader-first deployment, one authenticated V4 report is assembled
+from deterministic POST partitions of at most 100 unique source conditions or
+persisted sample coordinates. Every coordinate appears in exactly one partition;
+request starts are limited to two per second with at most eight in flight. The
+partitions collectively reparse independently selected cohorts of 10,000 emitted
+price/provider occurrences and 1,000 provider records for a large population and
+validate the complete persisted served sample. The worker loads the sealed
+witness and sample once, requires `aiohttp` on `uvloop`, and permits zero redirects
+or in-attempt retries. Each endpoint call fails closed at 55 seconds. Request-local
+block and projection ledgers must report zero repeated work and are discarded
+with each response rather than warming an application cache. Deploy readers
 that accept V3 and V4 before the writer cutover; the current worker writes V4
 and rejects new V3 attestations. The report must
 be freshly attested against the sealed witness,

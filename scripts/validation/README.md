@@ -51,9 +51,10 @@ publisher, or serving changes. It is deliberately slower and is not the
 synchronous activation gate for every import. After V4-capable readers are
 fully deployed, automatic activation uses the bounded PostgreSQL source-witness
 audit documented in `docs/imports/ptg.md`; that path submits one authenticated
-V4 POST, derives up
-to 10,000 exact pricing challenges and 1,000 provider records server-side,
-validates the complete served sample, and completes or fails within 55 seconds.
+V4 report assembled from exact max-100 partitions. It derives up to 10,000
+exact pricing challenges and 1,000 provider records, validates the complete
+served sample, starts no more than two requests per second, and applies a
+55-second fail-closed deadline to each endpoint request.
 
 To exercise this deep audit against a still-`validated` candidate, provide its
 exact logical source and market selectors and use `--validated-candidate`:
@@ -333,12 +334,13 @@ The release profile requires all of the following:
 - Candidate audits have at least 30 successful samples and zero errors. Their
   lane count and availability are independent from build lanes, monthly and
   peak utilization must stay at or below 70 percent, maximum queue age is 30
-  minutes, and every executed audit attempt is charged exactly one
-  authenticated V4 POST. Observed request totals, duration, and derived request
-  rate must reconcile with each activation and the contention interval. At the
-  release objective the no-retry baseline is 2,000 audit HTTP requests per
-  month; server-side occurrence, sample, block, witness, and projection work is
-  measured separately and is not projected away.
+  minutes, and every executed audit attempt is charged its exact max-100
+  partition count. Observed planned, started, completed, failed, and retried
+  request totals, duration, concurrency, and start rate must reconcile with each
+  activation and the contention interval. Monthly audit HTTP demand is the sum
+  of those measured per-audit partition counts; server-side occurrence, sample,
+  block, witness, and projection work is measured separately and is not
+  projected away.
 - Peak evidence is a gap-free, fully covered sequence of individually
   timestamped windows spanning at least seven days; every window is at least 30
   minutes. Each window's logical, unique-build, reuse, audit, and queue counts

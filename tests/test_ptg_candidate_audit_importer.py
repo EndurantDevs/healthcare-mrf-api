@@ -562,6 +562,97 @@ async def test_candidate_raw_source_edges(monkeypatch, database_rows, message):
         await ptg_candidate_audit._candidate_raw_sources("candidate-snapshot")
 
 
+@pytest.mark.asyncio
+async def test_candidate_raw_sources_return_dense_validated_digests(monkeypatch):
+    monkeypatch.setattr(
+        ptg_candidate_audit.db,
+        "all",
+        AsyncMock(
+            return_value=[
+                {"source_key": 0, "raw_container_sha256": bytes.fromhex(RAW_DIGEST)}
+            ]
+        ),
+    )
+
+    assert await ptg_candidate_audit._candidate_raw_sources(
+        "candidate-snapshot"
+    ) == (RAW_DIGEST,)
+
+
+def test_candidate_digest_and_current_pointer_edges():
+    with pytest.raises(ValueError, match="candidate digest is invalid"):
+        ptg_candidate_audit._normalized_digest("bad", field="digest")
+    assert ptg_candidate_audit._current_snapshot_row({}) is None
+
+
+@pytest.mark.asyncio
+async def test_equivalent_current_snapshot_requires_valid_attested_target(
+    monkeypatch,
+):
+    with pytest.raises(ValueError, match="deferred activation"):
+        await ptg_candidate_audit._reuse_equivalent_current_target({}, _target())
+
+    with pytest.raises(ValueError, match="superseded by an invalid snapshot"):
+        await ptg_candidate_audit._reuse_equivalent_current_target(
+            {"current_snapshot_id": "active-snapshot"},
+            _target(),
+        )
+
+    current_target = replace(
+        _target(activated=True),
+        audit_report=None,
+        audit_report_digest=None,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_target_from_row",
+        Mock(return_value=current_target),
+    )
+    with pytest.raises(ValueError, match="no audit attestation"):
+        await ptg_candidate_audit._reuse_equivalent_current_target(
+            _candidate_row_with_equivalent_current(),
+            _target(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("candidate_run_id", "candidate_rows", "message"),
+    (
+        ("", [], "candidate_run_id is required"),
+        ("ptg2:missing", [], "did not resolve a candidate"),
+        (
+            "ptg2:ambiguous",
+            [_candidate_row(), _candidate_row()],
+            "does not resolve exactly one candidate",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_candidate_resolution_requires_one_exact_run(
+    monkeypatch,
+    candidate_run_id,
+    candidate_rows,
+    message,
+):
+    rows_loader = AsyncMock(return_value=candidate_rows)
+    monkeypatch.setattr(ptg_candidate_audit, "_candidate_rows", rows_loader)
+
+    with pytest.raises(ValueError, match=message):
+        await ptg_candidate_audit.load_candidate_audit_target(
+            candidate_run_id=candidate_run_id
+        )
+
+    if candidate_run_id:
+        rows_loader.assert_awaited_once_with(candidate_run_id)
+    else:
+        rows_loader.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     ("activated", "candidate_mutator", "message"),
     (
@@ -748,12 +839,72 @@ async def test_legacy_v3_release_audit_remains_explicitly_callable(
     )
 
 
+def test_release_gate_and_quarantine_evidence_fail_closed():
+    with pytest.raises(
+        ptg_candidate_audit.CandidateAuditReleaseGateError,
+        match="did not pass",
+    ):
+        ptg_candidate_audit._require_passing_audit_report(
+            {"status": "fail", "release_gate_eligible": False}
+        )
+
+    for quarantine in ({}, NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE):
+        with pytest.raises(
+            ptg_candidate_audit.CandidateAuditReleaseGateError,
+            match="quarantine",
+        ):
+            ptg_candidate_audit._require_v3_quarantine_match(
+                {"source": {"provider_identifier_quarantine": quarantine}},
+                _target(),
+            )
+
+    for quarantine in (
+        {},
+        provider_identifier_quarantine_evidence(
+            NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+        ),
+    ):
+        with pytest.raises(
+            ptg_candidate_audit.CandidateAuditReleaseGateError,
+            match="quarantine",
+        ):
+            ptg_candidate_audit._require_v4_quarantine_match(
+                {"source": {"provider_identifier_quarantine": quarantine}},
+                _target(),
+            )
+
+
 @pytest.mark.asyncio
-async def test_release_audit_uses_one_batch_and_bounded_http_configuration(
+async def test_legacy_release_audit_translates_scanner_failure(monkeypatch):
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "run_fast_candidate_audit",
+        AsyncMock(
+            side_effect=ptg_candidate_audit.FastCandidateAuditError(
+                "api_contract_mismatch"
+            )
+        ),
+    )
+
+    with pytest.raises(
+        ptg_candidate_audit.CandidateAuditReleaseGateError,
+        match="api_contract_mismatch",
+    ):
+        await ptg_candidate_audit.run_release_audit(
+            _target(),
+            object(),
+            http_config=object(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_release_audit_loads_once_and_uses_partitioned_http_configuration(
     monkeypatch,
 ):
     expected_report = _passing_batch_report()
     runner = AsyncMock(return_value=expected_report)
+    witness = object()
+    persisted_sample = object()
     monkeypatch.setenv(
         "HLTHPRT_PTG2_CANDIDATE_AUDIT_API_BASE_URL",
         "http://candidate-api.default.svc.cluster.local:8080",
@@ -763,7 +914,11 @@ async def test_release_audit_uses_one_batch_and_bounded_http_configuration(
         "true",
     )
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
-    monkeypatch.setattr(ptg_candidate_audit, "run_batch_candidate_audit", runner)
+    witness_loader = AsyncMock(return_value=witness)
+    sample_loader = AsyncMock(return_value=persisted_sample)
+    monkeypatch.setattr(ptg_candidate_audit, "load_shared_source_witness", witness_loader)
+    monkeypatch.setattr(ptg_candidate_audit, "load_persisted_audit_sample", sample_loader)
+    monkeypatch.setattr(ptg_candidate_audit, "run_partitioned_candidate_audit", runner)
 
     report = await ptg_candidate_audit.run_batch_release_audit(_target())
 
@@ -774,13 +929,20 @@ async def test_release_audit_uses_one_batch_and_bounded_http_configuration(
     assert kwargs["audit_target"].source_witness["payload_sha256"] == (
         SOURCE_WITNESS_DIGEST
     )
-    assert kwargs["http_config"].concurrency == 1
+    assert kwargs["witness"] is witness
+    assert kwargs["persisted_sample"] is persisted_sample
+    assert kwargs["http_config"].concurrency == 8
     assert kwargs["http_config"].deadline_seconds == 55.0
     assert kwargs["http_config"].verify_tls is False
     assert kwargs["http_config"].require_uvloop is True
     assert kwargs["http_config"].headers["Authorization"] == (
         "Bearer public-control-token"
     )
+    assert kwargs["http_config"].headers["User-Agent"] == (
+        "ptg2-v3-partitioned-candidate-audit/4.1"
+    )
+    witness_loader.assert_awaited_once()
+    sample_loader.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -794,7 +956,17 @@ async def test_release_audit_accepts_exact_nonempty_provider_quarantine(monkeypa
         "https://public-api.internal.example",
     )
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
-    monkeypatch.setattr(ptg_candidate_audit, "run_batch_candidate_audit", runner)
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_shared_source_witness",
+        AsyncMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_persisted_audit_sample",
+        AsyncMock(return_value=object()),
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "run_partitioned_candidate_audit", runner)
 
     report = await ptg_candidate_audit.run_batch_release_audit(
         _target(
@@ -820,7 +992,17 @@ async def test_release_audit_failure_is_deterministic_and_not_retryable(monkeypa
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
     monkeypatch.setattr(
         ptg_candidate_audit,
-        "run_batch_candidate_audit",
+        "load_shared_source_witness",
+        AsyncMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_persisted_audit_sample",
+        AsyncMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "run_partitioned_candidate_audit",
         AsyncMock(
             side_effect=ptg_candidate_audit.BatchCandidateAuditContractError(
                 "source_witness_missing_from_api"
@@ -845,7 +1027,17 @@ async def test_release_audit_transport_failure_requires_explicit_retry(monkeypat
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "public-control-token")
     monkeypatch.setattr(
         ptg_candidate_audit,
-        "run_batch_candidate_audit",
+        "load_shared_source_witness",
+        AsyncMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_persisted_audit_sample",
+        AsyncMock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "run_partitioned_candidate_audit",
         AsyncMock(
             side_effect=ptg_candidate_audit.BatchCandidateAuditTransportError(
                 "batch_endpoint_transport_failed"
@@ -885,6 +1077,62 @@ async def test_progress_without_control_run_is_a_no_op(monkeypatch):
     )
 
     mark_control_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_progress_reports_phase_for_control_run(monkeypatch):
+    mark_control_run = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "mark_control_run", mark_control_run)
+
+    await ptg_candidate_audit._progress(
+        "control-run",
+        snapshot_id="candidate-snapshot",
+        phase="candidate release audit",
+        message="submitting two requests per second",
+        pct=20,
+    )
+
+    assert mark_control_run.await_args.kwargs["progress"] == {
+        "unit": "phase",
+        "done": 20,
+        "total": 100,
+        "pct": 20,
+        "message": "submitting two requests per second",
+        "phase": "candidate release audit",
+    }
+
+
+@pytest.mark.asyncio
+async def test_rolling_v3_writer_path_loads_witness_once(monkeypatch):
+    witness = Mock(occurrence_records=(object(), object()))
+    report = _passing_report()
+    http_config = object()
+    witness_loader = AsyncMock(return_value=witness)
+    audit = AsyncMock(return_value=report)
+    progress = AsyncMock()
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "PTG2_BATCH_AUDIT_WRITER_ENABLED",
+        False,
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", progress)
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_shared_source_witness",
+        witness_loader,
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "run_release_audit", audit)
+
+    audit_report = await ptg_candidate_audit._execute_release_audit(
+        _target(),
+        control_run_id="control-run",
+        http_config=http_config,
+    )
+
+    assert audit_report is report
+    witness_loader.assert_awaited_once()
+    audit.assert_awaited_once_with(_target(), witness, http_config=http_config)
+    assert progress.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -1003,6 +1251,79 @@ async def test_failing_audit_never_attests_or_activates(monkeypatch):
     attest.assert_not_awaited()
     promote.assert_not_awaited()
     witness_loader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_candidate_activation_requires_completed_promotion(monkeypatch):
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_execute_release_audit",
+        AsyncMock(return_value=_passing_batch_report()),
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "record_candidate_audit_attestation",
+        AsyncMock(return_value={"report_digest": "ef" * 32}),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "promote_ptg2_source_snapshot",
+        AsyncMock(return_value={"status": "unchanged"}),
+    )
+
+    with pytest.raises(RuntimeError, match="promotion did not complete"):
+        await ptg_candidate_audit._audit_and_activate(
+            _target(),
+            control_run_id="control-run",
+        )
+
+
+@pytest.mark.asyncio
+async def test_main_requires_candidate_run_id():
+    with pytest.raises(ValueError, match="candidate_run_id is required"):
+        await ptg_candidate_audit.main(candidate_run_id="")
+
+
+@pytest.mark.asyncio
+async def test_main_runs_new_candidate_with_partitioned_configuration(monkeypatch):
+    @asynccontextmanager
+    async def guard(candidate_run_id):
+        assert candidate_run_id == "ptg2:derived-import"
+        yield
+
+    candidate_target = _target()
+    http_config = object()
+    expected_activation_result_by_field = {"status": "activated"}
+    audit = AsyncMock(return_value=expected_activation_result_by_field)
+    configuration = Mock(return_value=http_config)
+    monkeypatch.setattr(ptg_candidate_audit, "candidate_audit_guard", guard)
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_candidate_audit_target",
+        AsyncMock(return_value=candidate_target),
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "_audit_configuration", configuration)
+    monkeypatch.setattr(ptg_candidate_audit, "_audit_and_activate", audit)
+
+    activation_result = await ptg_candidate_audit.main(
+        candidate_run_id="ptg2:derived-import",
+        snapshot_id="candidate-snapshot",
+        import_id="derived-import",
+        run_id="control-run",
+    )
+
+    assert activation_result is expected_activation_result_by_field
+    configuration.assert_called_once_with(
+        "candidate-snapshot",
+        batch_writer=True,
+    )
+    audit.assert_awaited_once_with(
+        candidate_target,
+        control_run_id="control-run",
+        http_config=http_config,
+    )
 
 
 @pytest.mark.asyncio

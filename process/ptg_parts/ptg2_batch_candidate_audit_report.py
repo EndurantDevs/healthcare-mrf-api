@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Truthful redacted V4 attestation reports for one-request batch audits."""
+"""Truthful redacted V4 attestation reports for bounded batch audits."""
 
 from __future__ import annotations
 

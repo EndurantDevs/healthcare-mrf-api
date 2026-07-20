@@ -221,7 +221,7 @@ async def _candidate_audit_data(
     audit_request: AuditBatchRequest,
     access: PTG2CandidateAuditAccess,
 ) -> _CandidateAuditData:
-    """Load each candidate coordinate family once into bounded indexes."""
+    """Load the sealed V1 witness, then evaluate its exact coordinate scope."""
 
     serving_tables = await snapshot_serving_tables(
         session,
@@ -233,8 +233,29 @@ async def _candidate_audit_data(
         serving_tables,
         audit_request,
     )
-    challenges = witness_scope.challenges
-    persisted_audit_occurrences = witness_scope.persisted_audit_occurrences
+    return await _candidate_data_for_conditions(
+        session,
+        serving_tables,
+        access,
+        challenges=witness_scope.challenges,
+        persisted_audit_occurrences=(
+            witness_scope.persisted_audit_occurrences
+        ),
+        witness_io=witness_scope.ledger,
+    )
+
+
+async def _candidate_data_for_conditions(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    access: PTG2CandidateAuditAccess,
+    *,
+    challenges: Sequence[AuditBatchChallenge],
+    persisted_audit_occurrences: Sequence[PersistedAuditOccurrence],
+    witness_io: Mapping[str, int],
+) -> _CandidateAuditData:
+    """Evaluate one already validated, bounded coordinate partition."""
+
     scope_indexes = await _candidate_scope_indexes(
         session,
         serving_tables,
@@ -263,8 +284,8 @@ async def _candidate_audit_data(
         price_load.data,
     )
     return _CandidateAuditData(
-        challenges=challenges,
-        witness_io=witness_scope.ledger,
+        challenges=tuple(challenges),
+        witness_io=dict(witness_io),
         network_digest_sets_by_condition=availability_index,
         candidate_processing_io=processing_ledger,
         persisted_audit_occurrence_count=len(persisted_audit_occurrences),
@@ -469,4 +490,7 @@ async def audit_candidate_source_witness_batch(
     )
 
 
-__all__ = ["CandidateAuditBatchResult", "audit_candidate_source_witness_batch"]
+__all__ = [
+    "CandidateAuditBatchResult",
+    "audit_candidate_source_witness_batch",
+]

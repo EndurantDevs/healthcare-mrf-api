@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import types
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -207,6 +208,17 @@ def _patch_resolution(monkeypatch, *, atoms=None, sample_count=2):
     return atom_lookup
 
 
+def _serving_tables_for_digest_rows(digest_rows):
+    serving_tables = _serving_tables(sample_count=len(digest_rows))
+    return replace(
+        serving_tables,
+        audit_sample={
+            **serving_tables.audit_sample,
+            "sample_digest": audit_api.persisted_audit_sample_digest(digest_rows),
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences(
     monkeypatch,
@@ -404,6 +416,70 @@ def test_audit_numeric_fragment_matches_scanner_canonical_limit():
     assert json.loads(encoded, parse_int=int)["value"] == int(numeric_text)
 
 
+def test_audit_occurrence_low_level_contract_edges():
+    driver_row = types.SimpleNamespace(_mapping={"value": 1})
+    assert audit_api._row_mapping(driver_row) == {"value": 1}
+    assert audit_api._row_mapping((("value", 2),)) == {"value": 2}
+
+    for invalid_value in (None, "", "null"):
+        with pytest.raises(InvalidUsage, match="limit.*required"):
+            audit_api._required_integer(
+                {"limit": invalid_value},
+                "limit",
+                minimum=1,
+            )
+    with pytest.raises(InvalidUsage, match="limit.*integer"):
+        audit_api._required_integer({"limit": "not-an-integer"}, "limit", minimum=1)
+
+    with pytest.raises(PTG2ManifestArtifactError, match="invalid negotiated rate"):
+        audit_api._numeric_json_fragment("not-a-number")
+    with pytest.raises(PTG2ManifestArtifactError, match="non-finite"):
+        audit_api._numeric_json_fragment("NaN")
+    assert orjson.dumps(audit_api._numeric_json_fragment("-0")) == b"0"
+    with pytest.raises(PTG2ManifestArtifactError, match="too large"):
+        audit_api._numeric_json_fragment("1e131072")
+
+    with pytest.raises(PTG2ManifestArtifactError, match="invalid code identity"):
+        audit_api._canonical_identity(
+            {"reported_code_system": "", "reported_code": ""}
+        )
+    assert audit_api._optional_exact_text({}, "name") is None
+    with pytest.raises(PTG2ManifestArtifactError, match="invalid name metadata"):
+        audit_api._optional_exact_text({"name": 1}, "name")
+    for invalid_network_names in ({}, ["network", 1]):
+        with pytest.raises(PTG2ManifestArtifactError, match="network metadata"):
+            audit_api._exact_network_names(
+                {"network_names": invalid_network_names}
+            )
+    assert audit_api._exact_scalar_or_text_array(None, field_name="codes") == []
+    assert audit_api._exact_scalar_or_text_array("01", field_name="codes") == [
+        "01"
+    ]
+
+
+@pytest.mark.parametrize("provenance_source_key", (True, None, 2))
+def test_audit_source_payload_rejects_inconsistent_physical_key(
+    provenance_source_key,
+):
+    with pytest.raises(PTG2ManifestArtifactError, match="provenance is inconsistent"):
+        audit_api._audit_source_payload(
+            source_artifact_key=1,
+            logical_source_key="logical-source",
+            provenance={"source_key": provenance_source_key},
+        )
+
+
+def test_audit_source_payload_omits_empty_logical_source_key():
+    assert audit_api._audit_source_payload(
+        source_artifact_key=1,
+        logical_source_key=None,
+        provenance={"source_key": 1, "source_type": "in_network"},
+    ) == {
+        "source_artifact_key": 1,
+        "source_type": "in_network",
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("overrides", "message"),
@@ -488,6 +564,148 @@ async def test_audit_endpoint_rejects_source_rows_outside_sealed_source_set(
 
     with pytest.raises(PTG2ManifestArtifactError, match="sealed source set"):
         await audit_api.audit_occurrences_payload(session, _args())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serving_table_changes", "message"),
+    (
+        ({"shared_snapshot_key": None}, "sealed shared-block"),
+        ({"source_set": None}, "sealed complete source set"),
+        ({"database_evidence": None}, "PostgreSQL execution evidence"),
+        ({"audit_sample": None}, "sealed persisted audit sample"),
+    ),
+)
+async def test_audit_endpoint_rejects_incomplete_sealed_metadata(
+    monkeypatch,
+    serving_table_changes,
+    message,
+):
+    _patch_resolution(monkeypatch)
+    monkeypatch.setattr(
+        audit_api,
+        "snapshot_serving_tables",
+        AsyncMock(return_value=replace(_serving_tables(), **serving_table_changes)),
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match=message):
+        await audit_api.audit_occurrences_payload(object(), _args())
+
+
+@pytest.mark.asyncio
+async def test_audit_endpoint_translates_source_set_reader_failure(monkeypatch):
+    _patch_resolution(monkeypatch)
+    monkeypatch.setattr(
+        audit_api,
+        "fetch_snapshot_source_set_metadata",
+        AsyncMock(side_effect=audit_api.PTG2SharedBlockError("source set failed")),
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="source set failed"):
+        await audit_api.audit_occurrences_payload(object(), _args())
+
+
+@pytest.mark.asyncio
+async def test_audit_endpoint_rejects_missing_contract_or_digest_rows(monkeypatch):
+    _patch_resolution(monkeypatch, sample_count=1)
+    with pytest.raises(PTG2ManifestArtifactError, match="no contract row"):
+        await audit_api.audit_occurrences_payload(RecordingSession([]), _args())
+
+    session = RecordingSession(
+        [_row(OCCURRENCE_ONE, atom_ordinal=0, total=1)],
+        digest_rows=[],
+    )
+    with pytest.raises(PTG2ManifestArtifactError, match="sealed sample count"):
+        await audit_api.audit_occurrences_payload(session, _args())
+
+
+@pytest.mark.asyncio
+async def test_audit_endpoint_rejects_duplicate_digest_occurrence_ids(monkeypatch):
+    duplicate_digest_rows = [
+        _row(OCCURRENCE_ONE, atom_ordinal=0),
+        _row(OCCURRENCE_ONE, atom_ordinal=0),
+    ]
+    _patch_resolution(monkeypatch)
+    monkeypatch.setattr(
+        audit_api,
+        "snapshot_serving_tables",
+        AsyncMock(return_value=_serving_tables_for_digest_rows(duplicate_digest_rows)),
+    )
+    session = RecordingSession(
+        [_row(OCCURRENCE_ONE, atom_ordinal=0), _row(OCCURRENCE_TWO, atom_ordinal=1)],
+        digest_rows=duplicate_digest_rows,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="duplicate occurrence ids"):
+        await audit_api.audit_occurrences_payload(session, _args())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_changes", "message"),
+    (
+        ({"occurrence_id": b"short"}, "exactly 32 bytes"),
+        ({"source_key": True}, "invalid source key"),
+        ({"source_key": 2}, "invalid source key"),
+        ({"npi": 0}, "invalid NPI"),
+    ),
+)
+async def test_audit_endpoint_rejects_invalid_persisted_coordinates(
+    monkeypatch,
+    row_changes,
+    message,
+):
+    page_row_by_field = {
+        **_row(OCCURRENCE_ONE, atom_ordinal=0, total=1),
+        **row_changes,
+    }
+    digest_row_by_field = dict(page_row_by_field)
+    serving_tables = _serving_tables_for_digest_rows([digest_row_by_field])
+    _patch_resolution(monkeypatch, sample_count=1)
+    monkeypatch.setattr(
+        audit_api,
+        "snapshot_serving_tables",
+        AsyncMock(return_value=serving_tables),
+    )
+    session = RecordingSession(
+        [page_row_by_field],
+        digest_rows=[digest_row_by_field],
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match=message):
+        await audit_api.audit_occurrences_payload(session, _args())
+
+
+@pytest.mark.asyncio
+async def test_audit_endpoint_translates_source_provenance_reader_failure(monkeypatch):
+    session = RecordingSession([_row(OCCURRENCE_ONE, atom_ordinal=0, total=1)])
+    _patch_resolution(monkeypatch, sample_count=1)
+    monkeypatch.setattr(
+        audit_api,
+        "fetch_snapshot_source_provenance",
+        AsyncMock(side_effect=audit_api.PTG2SharedBlockError("provenance failed")),
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="provenance failed"):
+        await audit_api.audit_occurrences_payload(session, _args())
+
+
+@pytest.mark.asyncio
+async def test_audit_endpoint_reports_market_filter_without_optional_source_query(
+    monkeypatch,
+):
+    session = RecordingSession([_row(OCCURRENCE_ONE, atom_ordinal=0, total=1)])
+    _patch_resolution(monkeypatch, sample_count=1)
+
+    payload = await audit_api.audit_occurrences_payload(
+        session,
+        _args(source_key="", plan_market_type="GROUP"),
+    )
+
+    assert payload["query"]["plan_market_type"] == "group"
+    assert "source_key" not in payload["query"]
+    assert "source_key" not in payload["provenance"]
+    assert "logical_scope.plan_market_type = :plan_market_type" in session.calls[0][0]
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,11 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_SELECTION,
     PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
 )
+from tests.ptg2_attestation_compat_test_support import (
+    writer_evidence_by_field,
+    writer_identity_by_field,
+    writer_report_by_field,
+)
 
 
 EMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload({})
@@ -2011,3 +2016,401 @@ def test_candidate_attestation_v3_check_validation_edges():
     )
     with pytest.raises(ValueError, match="source set is invalid"):
         ptg2_candidate_attestation._validated_v3_witness(mismatched_sections)
+
+
+def test_candidate_attestation_digest_and_sample_validation_edges():
+    """Reject syntactically invalid digests and incompatible sample manifests."""
+
+    for invalid_digest in ("g" * 64, "00 " * 20 + "0000"):
+        with pytest.raises(ValueError, match="field digest is invalid"):
+            ptg2_candidate_attestation._sha256_digest(
+                invalid_digest,
+                field="digest",
+            )
+
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
+        ("aa" * 32,)
+    )
+    with pytest.raises(ValueError, match="audit identity is malformed"):
+        ptg2_candidate_attestation._validated_candidate_physical_identity(
+            {
+                "raw_container_sha256_values": ["aa" * 32],
+                "coverage_scope_id": b"c" * 32,
+            },
+            {
+                "source_set": source_set,
+                "coverage_scope_id": "g" * 64,
+            },
+            {"coverage_scope_id": "g" * 64, "source_count": 1},
+        )
+    with pytest.raises(ValueError, match="audit sample is incompatible"):
+        ptg2_candidate_attestation._validated_candidate_audit_sample({}, {}, 1)
+
+
+def test_locked_candidate_identity_loads_and_validates_database_row(monkeypatch):
+    database_row_by_field = {"status": "validated", "snapshot_key": 17}
+    session = _Session(_Result(database_row_by_field))
+    candidate_identity = Mock(return_value={"snapshot_key": 17})
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_candidate_identity",
+        candidate_identity,
+    )
+
+    identity = asyncio.run(
+        ptg2_candidate_attestation._locked_candidate_identity(
+            session,
+            schema_name="mrf",
+            snapshot_id="snap-new",
+        )
+    )
+
+    assert identity == {"snapshot_key": 17}
+    candidate_identity.assert_called_once_with(database_row_by_field)
+    assert "FOR UPDATE OF snapshot" in session.calls[0][0]
+
+
+def test_locked_candidate_identity_rejects_missing_candidate():
+    session = _Session(_Result(None))
+
+    with pytest.raises(ValueError, match="validated candidate is unavailable"):
+        asyncio.run(
+            ptg2_candidate_attestation._locked_candidate_identity(
+                session,
+                schema_name="mrf",
+                snapshot_id="snap-new",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ("snapshot_id", "source_key", "plan_id", "plan_market_type"),
+)
+def test_record_candidate_attestation_requires_complete_target(missing_field):
+    target_by_field = {
+        "snapshot_id": "snap-new",
+        "source_key": "source-a",
+        "plan_id": "12-3456789",
+        "plan_market_type": "group",
+    }
+    target_by_field[missing_field] = ""
+
+    with pytest.raises(ValueError, match="snapshot, source, plan, and market"):
+        asyncio.run(
+            ptg2_candidate_attestation.record_candidate_audit_attestation(
+                **target_by_field,
+                report={},
+            )
+        )
+
+
+def _install_v4_attestation_writer(
+    monkeypatch,
+    *,
+    session,
+    identity,
+    evidence,
+    database_now,
+):
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "validate_candidate_release_audit_report",
+        Mock(return_value=evidence),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation.db,
+        "transaction",
+        lambda: _Transaction(session),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "acquire_ptg2_lifecycle_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_database_timestamp",
+        AsyncMock(return_value=database_now),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_locked_candidate_identity",
+        AsyncMock(return_value=identity),
+    )
+
+
+def _record_v4_attestation():
+    return ptg2_candidate_attestation.record_candidate_audit_attestation(
+        snapshot_id="snap-new",
+        source_key="source-a",
+        plan_id="12-3456789",
+        plan_market_type="group",
+        report=writer_report_by_field(4),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "message"),
+    (
+        ("target", "target does not match"),
+        ("audit_sample_digest", "sealed candidate sample"),
+        ("source_set_digest", "sealed candidate sources"),
+        ("ordered_source_ordinal_digest", "source ordinals"),
+        ("source_witness_manifest", "metadata does not match"),
+        ("audit_sample_public", "metadata does not match"),
+        ("source_witness_digest", "sealed source witnesses"),
+        ("provider_identifier_quarantine_evidence", "quarantine does not match"),
+    ),
+)
+def test_v4_attestation_writer_rejects_post_lock_identity_changes(
+    monkeypatch,
+    mismatch,
+    message,
+):
+    database_now = datetime.datetime(2026, 7, 20, 12, tzinfo=datetime.timezone.utc)
+    report = writer_report_by_field(4)
+    evidence = writer_evidence_by_field(report, completed_at=database_now)
+    identity = writer_identity_by_field()
+    if mismatch == "target":
+        identity["source_key"] = "different-source"
+    elif mismatch in {"audit_sample_digest", "source_set_digest", "source_witness_digest"}:
+        evidence[mismatch] = b"x" * 32
+    elif mismatch == "ordered_source_ordinal_digest":
+        evidence[mismatch] = "x" * 64
+    elif mismatch in {"source_witness_manifest", "audit_sample_public"}:
+        evidence[mismatch] = {"changed": True}
+    else:
+        evidence[mismatch] = {"changed": True}
+    session = _Session()
+    _install_v4_attestation_writer(
+        monkeypatch,
+        session=session,
+        identity=identity,
+        evidence=evidence,
+        database_now=database_now,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(_record_v4_attestation())
+
+    assert session.calls == []
+
+
+def test_v4_attestation_writer_persists_request_accounting(monkeypatch):
+    database_now = datetime.datetime(2026, 7, 20, 12, tzinfo=datetime.timezone.utc)
+    report = writer_report_by_field(4)
+    evidence = writer_evidence_by_field(report, completed_at=database_now)
+    session = _Session()
+    _install_v4_attestation_writer(
+        monkeypatch,
+        session=session,
+        identity=writer_identity_by_field(),
+        evidence=evidence,
+        database_now=database_now,
+    )
+
+    result = asyncio.run(_record_v4_attestation())
+
+    assert result["status"] == "attested"
+    assert result["batch_api_actual_http_requests"] == 1
+    assert session.calls[0][1]["contract"] == (
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
+    )
+
+
+def test_v4_attestation_writer_rejects_conflicting_existing_evidence(monkeypatch):
+    database_now = datetime.datetime(2026, 7, 20, 12, tzinfo=datetime.timezone.utc)
+    report = writer_report_by_field(4)
+    _install_v4_attestation_writer(
+        monkeypatch,
+        session=_Session(_Result(None)),
+        identity=writer_identity_by_field(),
+        evidence=writer_evidence_by_field(report, completed_at=database_now),
+        database_now=database_now,
+    )
+
+    with pytest.raises(ValueError, match="conflicts with existing evidence"):
+        asyncio.run(_record_v4_attestation())
+
+
+def test_v4_attestation_writer_rejects_expired_evidence_after_lock(monkeypatch):
+    database_now = datetime.datetime(2026, 7, 20, 12, tzinfo=datetime.timezone.utc)
+    report = writer_report_by_field(4)
+    completed_at = database_now - ptg2_candidate_attestation._audit_report_max_age()
+    evidence = writer_evidence_by_field(report, completed_at=completed_at)
+    _install_v4_attestation_writer(
+        monkeypatch,
+        session=_Session(),
+        identity=writer_identity_by_field(),
+        evidence=evidence,
+        database_now=database_now,
+    )
+
+    with pytest.raises(ValueError, match="too old for candidate activation"):
+        asyncio.run(_record_v4_attestation())
+
+
+def _verify_v4_attestation(monkeypatch, *, identity_by_field, query_result):
+    session = _Session(query_result)
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_locked_candidate_identity",
+        AsyncMock(return_value=identity_by_field),
+    )
+    return session, ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
+        session,
+        schema_name="mrf",
+        snapshot_id="snap-new",
+        snapshot_key=17,
+        source_key="source-a",
+        plan_id="12-3456789",
+        plan_market_type="group",
+        coverage_scope_id=b"c" * 32,
+    )
+
+
+def test_v4_attestation_verifier_accepts_unchanged_evidence(monkeypatch):
+    identity_by_field = writer_identity_by_field()
+    report_by_field = writer_report_by_field(4)
+    report_digest = hashlib.sha256(
+        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
+    ).digest()
+    _session, verification = _verify_v4_attestation(
+        monkeypatch,
+        identity_by_field=identity_by_field,
+        query_result=_Result((report_digest, report_by_field)),
+    )
+
+    assert asyncio.run(verification) == report_digest
+
+
+@pytest.mark.parametrize(
+    ("identity_source_key", "stored_row_kind", "message"),
+    (
+        ("different-source", "valid", "identity changed"),
+        ("source-a", "missing", "no current passing"),
+        ("source-a", "invalid_digest", "digest is invalid"),
+    ),
+)
+def test_v4_attestation_verifier_rejects_identity_or_row_drift(
+    monkeypatch,
+    identity_source_key,
+    stored_row_kind,
+    message,
+):
+    """Reject changed identity, missing evidence, and malformed row digests."""
+
+    identity_by_field = writer_identity_by_field()
+    identity_by_field["source_key"] = identity_source_key
+    report_by_field = writer_report_by_field(4)
+    report_digest = hashlib.sha256(
+        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
+    ).digest()
+    stored_rows_by_kind = {
+        "valid": (report_digest, report_by_field),
+        "missing": None,
+        "invalid_digest": (b"x", report_by_field),
+    }
+    _session, verification = _verify_v4_attestation(
+        monkeypatch,
+        identity_by_field=identity_by_field,
+        query_result=_Result(stored_rows_by_kind[stored_row_kind]),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(verification)
+
+
+@pytest.mark.parametrize(
+    ("identity_field", "changed_value", "message"),
+    (
+        (
+            "provider_identifier_quarantine_evidence",
+            {"changed": True},
+            "quarantine changed",
+        ),
+        ("source_witness_digest", b"x" * 32, "source witness changed"),
+        ("ordered_source_ordinal_digest", "x" * 64, "source ordinals changed"),
+    ),
+)
+def test_v4_attestation_verifier_rejects_digest_bound_identity_drift(
+    monkeypatch,
+    identity_field,
+    changed_value,
+    message,
+):
+    """Reject changed quarantine, witness, and source-order evidence."""
+
+    identity_by_field = writer_identity_by_field()
+    identity_by_field[identity_field] = changed_value
+    report_by_field = writer_report_by_field(4)
+    report_digest = hashlib.sha256(
+        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
+    ).digest()
+    _session, verification = _verify_v4_attestation(
+        monkeypatch,
+        identity_by_field=identity_by_field,
+        query_result=_Result((report_digest, report_by_field)),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(verification)
+
+
+@pytest.mark.parametrize(
+    ("manifest_field", "changed_field", "changed_value"),
+    (
+        ("source_witness_manifest", "payload_bytes", 1),
+        ("audit_sample_public", "maximum_rows", 1),
+    ),
+)
+def test_v4_attestation_verifier_rejects_sealed_metadata_drift(
+    monkeypatch,
+    manifest_field,
+    changed_field,
+    changed_value,
+):
+    """Reject witness or audit-sample metadata changed after attestation."""
+
+    identity_by_field = writer_identity_by_field()
+    identity_by_field[manifest_field] = {
+        **identity_by_field[manifest_field],
+        changed_field: changed_value,
+    }
+    report_by_field = writer_report_by_field(4)
+    report_digest = hashlib.sha256(
+        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
+    ).digest()
+    _session, verification = _verify_v4_attestation(
+        monkeypatch,
+        identity_by_field=identity_by_field,
+        query_result=_Result((report_digest, report_by_field)),
+    )
+
+    with pytest.raises(ValueError, match="audit metadata changed"):
+        asyncio.run(verification)
+
+
+@pytest.mark.parametrize("aware_timestamp", (False, True))
+def test_candidate_attestation_consumption_normalizes_time_and_detects_conflict(
+    aware_timestamp,
+):
+    activated_at = datetime.datetime(2026, 7, 20, 12)
+    if aware_timestamp:
+        activated_at = activated_at.replace(tzinfo=datetime.timezone.utc)
+    session = _Session(_Result(None if aware_timestamp else ("snap-new",)))
+    consumption = ptg2_candidate_attestation.consume_candidate_audit_attestation_in_transaction(
+        session,
+        schema_name="mrf",
+        snapshot_id="snap-new",
+        report_digest=b"r" * 32,
+        activated_at=activated_at,
+    )
+
+    if aware_timestamp:
+        with pytest.raises(RuntimeError, match="changed during activation"):
+            asyncio.run(consumption)
+    else:
+        asyncio.run(consumption)
+        assert session.calls[0][1]["activated_at"].tzinfo is datetime.timezone.utc
