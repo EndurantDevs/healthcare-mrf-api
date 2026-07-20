@@ -327,6 +327,75 @@ remote rows once rather than multiplying them by the alias count. Existing
 historical alias copies are intentionally not deleted by this change; their
 cleanup is a separate migration.
 
+Sources whose metadata sets `provider_directory_candidate_status` to
+`pending_two_matching_exhaustive_acquisitions` use automatic twin-root
+verification. The first complete exhaustive root is retained as the immutable,
+non-current `verification_baseline`. It stores completion diagnostics plus the
+ordered overall and per-resource hashes and counts, but it is not selectable
+for artifacts and does not build serving relations.
+
+Exactly one distinct second root may run against a compatible baseline. It
+becomes the sole `validated` candidate only when endpoint identity, source
+aliases, selected and expected resources, overall content, and every
+per-resource proof match exactly; serving relations are built only in that
+validating transaction. A mismatch is retained as terminal
+`verification_mismatch` evidence, remains non-publishable, and fails the run.
+Concurrent roots, a third root, multiple baselines, or incompatible proof are
+rejected. In-progress retries remain bound to their original acquisition root
+and persisted verification requirement. Each pending source must also set a
+nonempty `provider_directory_verification_campaign_id`, identical across every
+alias for that endpoint group. Admission persists that campaign, the acquisition
+source-scope hash, and either `baseline_candidate` or `verification_candidate`.
+A verification candidate is paired to the exact baseline `dataset_id` while the
+endpoint is locked; a failed attempt that was never paired cannot later be
+mistaken for a terminal successor.
+
+Baseline and mismatch finalization are replayable. If the process commits one
+of those immutable states and then loses checkpoint cleanup, an exact-root retry
+validates the persisted proof, retries cleanup, and either returns the recorded
+baseline success or re-raises the recorded mismatch. It never reopens network
+acquisition. After an exact second root is transactionally validated, the
+duplicate `provider_directory_dataset_resource` rows owned by its baseline are
+deleted. The immutable baseline row retains its hash, count, diagnostics, and
+per-resource proof, while the matched successor records the deleted-row count.
+Mismatch evidence does not retire baseline payload.
+
+The campaign ID is the explicit reset boundary. Deconfiguring and later
+re-adding a reviewed candidate must bump this value; old immutable proof remains
+for audit but is ignored by the new generation. Active `acquiring` or
+`incomplete` roots still block across generations. Promotion must replace the
+pending status with
+`verified_two_matching_exhaustive_acquisitions` and retain the exact campaign
+ID; omitting the status is unsafe because source metadata merges can retain the
+old pending value. This is an explicit rollout step; acquisition never changes
+source configuration automatically:
+
+1. Deploy the pending status and a distinct per-source campaign ID.
+2. Run both the baseline root and the exact matching verification root with
+   `publish_after_acquisition=false`.
+3. In a follow-up seed/configuration PR, change only the status to
+   `verified_two_matching_exhaustive_acquisitions`, retaining the campaign ID.
+4. Sync discovery for every alias, then publish the artifact and promote the
+   validated dataset.
+
+The exact matched dataset remains nonpromotable while its registry status is
+pending, including after the second root succeeds. Do not publish it until the
+VERIFIED registry PR is deployed and discovery has synced every alias. While
+source configuration remains pending, another acquisition is correctly rejected
+as a third root; there is no hidden pending-to-verified transition. Artifact
+ranking accepts a reviewed candidate only when its
+persisted pairing, campaign/scope, matched result, empty mismatch list, and
+hash/count proof are exact. Unknown statuses, missing or mixed campaign IDs, and
+cross-generation retries fail closed. Any pagination strategy, resource profile,
+page-count cap, acquisition-enabled or coverage mode, partition configuration,
+alias scope, resource endpoint, credential descriptor, or other acquisition-
+contract change on the same endpoint requires an intentional campaign-ID bump.
+Never reuse an earlier campaign's baseline after one of these changes. Artifact
+eligibility also requires each attached reviewed
+source's configured acquisition endpoint to remain the proven endpoint; its
+serving `endpoint_id` may still point at the incumbent until atomic cutover.
+Proof from a changed canonical base cannot be promoted.
+
 ### Current Dataset Rehydration
 
 Use retained-dataset rehydration when the current published dataset is intact

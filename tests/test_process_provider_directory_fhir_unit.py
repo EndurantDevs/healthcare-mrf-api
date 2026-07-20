@@ -956,15 +956,49 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
             )
             assert importer._resource_acquisition_blocked_reason(source_row) is None
 
-    assert source_by_base[importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE][
-        "requires_registration"
-    ] is True
-    assert "registration and approval" in source_by_base[
+    el_dorado_source = source_by_base[
         importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE
-    ]["metadata_json"]["provider_directory_acquisition_blocked_reason"]
+    ]
+    assert el_dorado_source["requires_registration"] is True
+    assert "registration and approval" in el_dorado_source["metadata_json"][
+        "provider_directory_acquisition_blocked_reason"
+    ]
     assert importer._reviewed_provider_directory_candidate_seed_rows(
         source_query="Devoted"
     )[0]["api_base"] == importer.DEVOTED_PROVIDER_DIRECTORY_BASE
+
+
+def test_el_dorado_candidate_prefers_registered_base_and_keeps_legacy_identity():
+    """The current auth-gated endpoint must not erase stable legacy identity."""
+    seed_row = importer._reviewed_provider_directory_candidate_seed_rows(
+        source_query="El Dorado"
+    )[0]
+    source_row = importer._source_row_from_seed(seed_row)
+    metadata = source_row["metadata_json"]
+
+    assert source_row["source_id"] == "pdfhir_0d7938920b8933d55c1777ae"
+    assert source_row["canonical_api_base"] == (
+        importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE
+    )
+    assert source_row["requires_registration"] is True
+    assert source_row["auth_type"] == "oauth2"
+    assert source_row["last_validated_status"] == "auth_required"
+    assert metadata["provider_directory_confirmed_catalog_url"] == (
+        importer.EL_DORADO_COUNTY_DEVELOPER_RESOURCES_URL
+    )
+    assert metadata["provider_directory_confirmed_doc_url"] == (
+        importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_DOCUMENT_URL
+    )
+    assert metadata[
+        "provider_directory_documented_practitioner_probe_status"
+    ] == 401
+    assert metadata["provider_directory_legacy_probe_base"] == (
+        importer.EL_DORADO_COUNTY_LEGACY_PROVIDER_DIRECTORY_BASE
+    )
+    assert metadata[
+        "provider_directory_legacy_practitioner_probe_status"
+    ] == 200
+    assert metadata["provider_directory_legacy_probe_scope"] == "bounded_only"
 
 
 def test_provider_directory_blocker_rows_are_non_importable_catalog_sources():
@@ -7941,6 +7975,7 @@ def _artifact_selection_row(
     }
     selection_field_map.update(selection_overrides)
     metadata = {
+        "source_ids": [source_id],
         "selected_resources": ["Location"],
         "expected_resources": ["Location"],
         "resource_diagnostics": {"Location": {"complete": True}},
@@ -9621,6 +9656,8 @@ class _AtomicCandidateInitializationHarness:
         sql_text = str(sql)
         if "pg_advisory_xact_lock" in sql_text:
             self.events.append("lock")
+        elif "provider_directory_api_endpoint" in sql_text:
+            self.events.append("endpoint_lock")
         elif "WHERE dataset_id = :dataset_id" in sql_text:
             self.events.append("candidate_lookup")
         else:
@@ -9683,6 +9720,7 @@ async def test_partition_candidate_and_initial_checkpoint_share_transaction(
     assert harness.events == [
         "begin",
         "lock",
+        "endpoint_lock",
         "candidate_lookup",
         "conflict_lookup",
         "candidate_upsert",

@@ -90,6 +90,7 @@ DISPLAY_VALUES = {
     "none": "None",
     "oauth2-client-credentials": "OAuth2 client credentials",
     "private-connector": "Private connector",
+    "registration-approval": "Registration and approval",
     "user-token": "User token",
     "unknown": "Unknown",
     "rest": "REST",

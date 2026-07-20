@@ -483,6 +483,9 @@ jobs:
           tests/test_provider_directory_dataset_serving_relations_db.py
           tests/test_provider_directory_contra_affiliation.py
           tests/test_provider_directory_dataset_artifact_db.py
+          tests/test_provider_directory_twin_root_verification_db.py
+          tests/test_provider_directory_artifact_eligibility_db.py
+          tests/test_provider_directory_artifact_eligibility_refresh_db.py
           tests/test_provider_directory_artifact_scope_bulk_load_db.py
           tests/test_provider_directory_dataset_rehydrate_db.py
           tests/test_provider_directory_two_phase_publication.py

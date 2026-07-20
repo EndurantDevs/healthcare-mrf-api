@@ -11,6 +11,7 @@ ACCESS_REQUIREMENTS = {
     "none",
     "oauth2-client-credentials",
     "private-connector",
+    "registration-approval",
     "user-token",
     "unknown",
 }
@@ -79,6 +80,7 @@ def validate_access_review_metadata(entry_id: str, support: dict[str, Any]) -> N
     gated_access_requirements = {
         "oauth2-client-credentials",
         "private-connector",
+        "registration-approval",
         "user-token",
     }
     if access_requirement in gated_access_requirements and not requires_registration:
