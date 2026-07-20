@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from sanic import Blueprint, response
 from sanic.exceptions import BadRequest, NotFound, SanicException
@@ -22,6 +23,9 @@ from api.control_imports import (
 from api.control_workers import ensure_worker, worker_registry
 from api.control_auth import require_control_auth as _require_control_auth
 from api.provider_directory_sources import provider_directory_source_catalog
+from api.provider_directory_source_outcomes import (
+    enrich_provider_directory_source_catalog,
+)
 from api.mrf_discovery_catalog import (
     DEFAULT_FILE_PAGE_SIZE,
     DEFAULT_SOURCE_PAGE_SIZE,
@@ -43,6 +47,7 @@ from process.ptg_parts.source_snapshot_control import (
 )
 
 blueprint = Blueprint("control", url_prefix="/control/v1")
+logger = logging.getLogger(__name__)
 
 
 @blueprint.listener("before_server_start")
@@ -74,7 +79,15 @@ async def control_importers(request):
 async def control_provider_directory_sources(request):
     """List reviewed FHIR sources from the deployed acquisition contract."""
     _require_control_auth(request)
-    return response.json(provider_directory_source_catalog())
+    catalog = provider_directory_source_catalog()
+    try:
+        catalog = await enrich_provider_directory_source_catalog(catalog)
+    except Exception:
+        logger.warning(
+            "Provider Directory outcome enrichment failed; returning static catalog",
+            exc_info=True,
+        )
+    return response.json(catalog)
 
 
 @blueprint.get("/health/node")

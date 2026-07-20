@@ -1154,6 +1154,9 @@ REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID = {
     ),
 }
 TWIN_ROOT_VERIFICATION_METADATA_KEY = "twin_root_verification_v1"
+PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY = (
+    "outcome_resource_counts_v1"
+)
 TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY = "verification_campaign_id"
 TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY = "verification_source_scope_hash"
 TWIN_ROOT_VERIFICATION_ROLE_KEY = "verification_role"
@@ -34715,14 +34718,46 @@ async def _candidate_endpoint_dataset_content_proof(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> EndpointDatasetContentProof:
-    if candidate.requires_twin_root_verification:
-        return await _endpoint_dataset_content_proof(
-            connection, candidate.dataset_id, candidate.selected_resources
-        )
-    dataset_hash, resource_count = await _endpoint_dataset_content_hash(
-        connection, candidate.dataset_id
+    return await _endpoint_dataset_content_proof(
+        connection,
+        candidate.dataset_id,
+        candidate.selected_resources,
     )
-    return EndpointDatasetContentProof(dataset_hash, resource_count, {}, {})
+
+
+def _outcome_resource_count_proof(
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+) -> dict[str, Any]:
+    """Bind exact per-family counts to one immutable dataset proof."""
+    selected_resources = tuple(sorted(candidate.selected_resources))
+    resource_count_by_type = dict(
+        sorted(content_proof.resource_counts.items())
+    )
+    if (
+        not set(selected_resources).issubset(resource_count_by_type)
+        or not set(resource_count_by_type).issubset(DEFAULT_RESOURCES)
+        or any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+            for count in resource_count_by_type.values()
+        )
+        or sum(resource_count_by_type.values()) != content_proof.resource_count
+    ):
+        raise RuntimeError(
+            "provider_directory_outcome_resource_count_proof_invalid"
+        )
+    return {
+        "complete": True,
+        "version": 1,
+        "dataset_id": candidate.dataset_id,
+        "endpoint_id": candidate.endpoint_id,
+        "acquisition_root_run_id": candidate.acquisition_root_run_id,
+        "dataset_hash": content_proof.dataset_hash,
+        "source_ids": list(candidate.source_ids),
+        "selected_resources": list(candidate.selected_resources),
+        "resource_count": content_proof.resource_count,
+        "resource_counts": resource_count_by_type,
+    }
 
 
 def _twin_root_content_proof(
@@ -35287,6 +35322,42 @@ async def _validate_endpoint_dataset_candidate(
     )
 
 
+async def _endpoint_dataset_validation_proofs(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> tuple[
+    EndpointDatasetContentProof,
+    dict[str, dict[str, Any]],
+    str,
+    dict[str, Any],
+    list[str],
+]:
+    content_proof = await _candidate_endpoint_dataset_content_proof(
+        connection,
+        candidate,
+    )
+    final_status, verification_metadata, mismatch_fields = (
+        await _locked_twin_root_verification_decision(
+            connection, candidate, content_proof
+        )
+    )
+    relation_proof_by_name = {}
+    if final_status == ENDPOINT_DATASET_VALIDATED:
+        relation_proof_by_name = (
+            await _build_endpoint_dataset_serving_relations(
+                connection,
+                candidate,
+            )
+        )
+    return (
+        content_proof,
+        relation_proof_by_name,
+        final_status,
+        verification_metadata,
+        mismatch_fields,
+    )
+
+
 async def _persist_endpoint_dataset_validation(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -35301,27 +35372,29 @@ async def _persist_endpoint_dataset_validation(
         connection, candidate
     )
     candidate_transaction_times = await _validated_endpoint_bulk_transaction_times(
-        connection, candidate, previous_dataset_id, diagnostics
+        connection,
+        candidate,
+        previous_dataset_id,
+        diagnostics,
     )
-    content_proof = await _candidate_endpoint_dataset_content_proof(
-        connection, candidate
-    )
-    final_status, verification_metadata, mismatch_fields = (
-        await _locked_twin_root_verification_decision(
-            connection, candidate, content_proof
-        )
-    )
-    relation_proof_by_name = {}
-    if final_status == ENDPOINT_DATASET_VALIDATED:
-        relation_proof_by_name = await _build_endpoint_dataset_serving_relations(
-            connection, candidate
-        )
+    (
+        content_proof,
+        relation_proof_by_name,
+        final_status,
+        verification_metadata,
+        mismatch_fields,
+    ) = await _endpoint_dataset_validation_proofs(connection, candidate)
     metadata = _endpoint_dataset_publication_metadata(
         candidate,
         diagnostics,
         dataset_hash=content_proof.dataset_hash,
         resource_count=content_proof.resource_count,
         bulk_transaction_times=candidate_transaction_times,
+        **{
+            PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY: (
+                _outcome_resource_count_proof(candidate, content_proof)
+            )
+        },
         **relation_proof_by_name,
         **verification_metadata,
     )

@@ -8,6 +8,7 @@ import json
 import types
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import sqlalchemy as sa
@@ -2838,18 +2839,51 @@ def test_uhc_catalog_reports_supported_resources_without_enabling_import():
 @pytest.mark.asyncio
 async def test_control_provider_directory_sources_endpoint(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    static_catalog_map = {"catalog_digest": "a" * 64, "items": []}
+    enriched_catalog_map = {
+        "catalog_digest": "a" * 64,
+        "items": [{"entry_id": "example", "outcome_summary": {}}],
+    }
     monkeypatch.setattr(
         control,
         "provider_directory_source_catalog",
-        lambda: {"catalog_digest": "a" * 64, "items": []},
+        lambda: static_catalog_map,
+    )
+    outcome_enricher = AsyncMock(return_value=enriched_catalog_map)
+    monkeypatch.setattr(
+        control,
+        "enrich_provider_directory_source_catalog",
+        outcome_enricher,
     )
 
     response = await control.control_provider_directory_sources(authed_request())
 
-    assert json.loads(response.body) == {
-        "catalog_digest": "a" * 64,
-        "items": [],
-    }
+    assert json.loads(response.body) == enriched_catalog_map
+    outcome_enricher.assert_awaited_once_with(static_catalog_map)
+
+
+@pytest.mark.asyncio
+async def test_control_provider_directory_sources_keeps_static_catalog_when_db_fails(
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    static_catalog_map = {"catalog_digest": "b" * 64, "items": []}
+    monkeypatch.setattr(
+        control,
+        "provider_directory_source_catalog",
+        lambda: static_catalog_map,
+    )
+    monkeypatch.setattr(
+        control,
+        "enrich_provider_directory_source_catalog",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    response = await control.control_provider_directory_sources(authed_request())
+
+    assert json.loads(response.body) == static_catalog_map
+    assert "returning static catalog" in caplog.text
 
 
 @pytest.mark.asyncio
