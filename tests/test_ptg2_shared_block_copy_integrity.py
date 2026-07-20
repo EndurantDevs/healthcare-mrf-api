@@ -5,12 +5,16 @@ import io
 import struct
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from process.ptg_parts import ptg2_shared_block_copy as block_copy
 from process.ptg_parts import ptg2_shared_publish
-from process.ptg_parts.ptg2_shared_publish import copy_shared_block_binary_file
+from process.ptg_parts.ptg2_shared_publish import (
+    SharedBlockCopyMetrics,
+    copy_shared_block_binary_file,
+)
 from process.ptg_parts.ptg2_shared_block_copy import (
     binary_copy_rows,
     scan_shared_block_copy,
@@ -68,6 +72,125 @@ def _copy_reader(payload: bytes) -> block_copy.SelectiveSharedBlockCopyReader:
         expected_source_bytes=len(payload),
         expected_source_sha256=hashlib.sha256(payload).hexdigest(),
     )
+
+
+def _install_copy_capture(monkeypatch, *, existing_hashes=()):
+    captured_copy_bytes = bytearray()
+    async def copy_to_table(_table, *, source, **_kwargs):
+        while copy_chunk := source.read(7):
+            captured_copy_bytes.extend(copy_chunk)
+
+    connection = SimpleNamespace(
+        raw_connection=SimpleNamespace(
+            driver_connection=SimpleNamespace(copy_to_table=copy_to_table)
+        )
+    )
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "acquire", acquire)
+    monkeypatch.setattr(
+        ptg2_shared_publish.db,
+        "all",
+        AsyncMock(return_value=[(block_hash,) for block_hash in existing_hashes]),
+    )
+    return captured_copy_bytes
+
+
+def _assert_selective_copy_metrics(
+    metrics,
+    *,
+    source_copy_bytes,
+    staged_copy_bytes,
+    payloads,
+    existing_indexes,
+):
+    expected_staged_payload_bytes = sum(
+        len(payloads[payload_index])
+        for payload_index in range(len(payloads))
+        if payload_index not in existing_indexes
+    )
+    assert metrics is not None
+    assert metrics.source_copy_bytes == source_copy_bytes
+    assert metrics.staged_copy_bytes == staged_copy_bytes
+    assert metrics.source_payload_bytes == sum(map(len, payloads))
+    assert metrics.staged_payload_bytes == expected_staged_payload_bytes
+    assert metrics.reused_payload_bytes == (
+        metrics.source_payload_bytes - expected_staged_payload_bytes
+    )
+    assert metrics.row_count == 2
+    assert metrics.staged_payload_row_count == 2 - len(existing_indexes)
+    assert metrics.reused_payload_row_count == len(existing_indexes)
+    assert metrics.unique_block_count == 2
+    assert metrics.existing_block_count == len(existing_indexes)
+    assert metrics.new_block_count == 2 - len(existing_indexes)
+    assert metrics.duplicate_block_row_count == 0
+    assert metrics.metadata_scan_seconds >= 0
+    assert metrics.existence_lookup_seconds >= 0
+    assert metrics.copy_seconds >= 0
+
+
+def _valid_copy_metric_fields():
+    return {
+        "source_copy_bytes": 20,
+        "staged_copy_bytes": 15,
+        "source_payload_bytes": 10,
+        "staged_payload_bytes": 5,
+        "reused_payload_bytes": 5,
+        "durable_reused_payload_bytes": 3,
+        "same_copy_reused_payload_bytes": 2,
+        "row_count": 3,
+        "staged_payload_row_count": 1,
+        "reused_payload_row_count": 2,
+        "durable_reused_row_count": 1,
+        "same_copy_reused_row_count": 1,
+        "unique_block_count": 2,
+        "existing_block_count": 1,
+        "new_block_count": 1,
+        "duplicate_block_row_count": 1,
+        "metadata_scan_seconds": 0.1,
+        "existence_lookup_seconds": 0.2,
+        "copy_seconds": 0.3,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field_updates", "error"),
+    (
+        ({"source_copy_bytes": -1}, "non-negative integers"),
+        ({"copy_seconds": float("inf")}, "finite timings"),
+        ({"staged_copy_bytes": 14}, "byte accounting"),
+        ({"staged_payload_bytes": 4}, "payload byte accounting"),
+        ({"row_count": 4}, "row accounting"),
+        ({"durable_reused_payload_bytes": 2}, "reuse accounting"),
+        ({"existing_block_count": 0}, "identity accounting"),
+        ({"duplicate_block_row_count": 0}, "duplicate accounting"),
+        (
+            {
+                "staged_payload_row_count": 0, "reused_payload_row_count": 3,
+                "same_copy_reused_row_count": 2,
+            },
+            "more than one payload",
+        ),
+    ),
+)
+def test_shared_block_copy_metrics_reject_inconsistent_proof(field_updates, error):
+    with pytest.raises(ValueError, match=error):
+        SharedBlockCopyMetrics(**{**_valid_copy_metric_fields(), **field_updates})
+
+
+def test_shared_block_copy_metrics_combine_lanes():
+    lane_metrics = SharedBlockCopyMetrics(**_valid_copy_metric_fields())
+
+    combined_metrics = SharedBlockCopyMetrics.combine(lane_metrics, lane_metrics)
+
+    assert combined_metrics.source_copy_bytes == 40
+    assert combined_metrics.staged_payload_row_count == 2
+    assert combined_metrics.reused_payload_row_count == 4
+    assert combined_metrics.copy_seconds == pytest.approx(0.6)
+    with pytest.raises(ValueError, match="at least one lane"):
+        SharedBlockCopyMetrics.combine()
 
 
 @pytest.mark.asyncio
@@ -146,12 +269,14 @@ async def test_shared_block_copy_rejects_digest_change_during_publication(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("existing_indexes", [(0,), (0, 1)])
+@pytest.mark.parametrize("existing_indexes", [(), (0,), (0, 1)])
 async def test_shared_block_copy_omits_only_existing_payloads(
     tmp_path,
     monkeypatch,
     existing_indexes,
 ):
+    """Stage payloads only for hashes absent from durable storage."""
+
     hashes = (b"a" * 32, b"b" * 32)
     payloads = (b"first-payload", b"second-payload")
     block_payload = _block_copy(
@@ -162,29 +287,12 @@ async def test_shared_block_copy_omits_only_existing_payloads(
     )
     path = tmp_path / "blocks.copy"
     path.write_bytes(block_payload)
-    consumed = bytearray()
-
-    async def copy_to_table(_table, *, source, **_kwargs):
-        while chunk := source.read(7):
-            consumed.extend(chunk)
-
-    async def all_rows(_statement, **_params):
-        return [(hashes[index],) for index in existing_indexes]
-
-    connection = SimpleNamespace(
-        raw_connection=SimpleNamespace(
-            driver_connection=SimpleNamespace(copy_to_table=copy_to_table)
-        )
+    captured_copy_bytes = _install_copy_capture(
+        monkeypatch,
+        existing_hashes=tuple(hashes[index] for index in existing_indexes),
     )
 
-    @asynccontextmanager
-    async def acquire():
-        yield connection
-
-    monkeypatch.setattr(ptg2_shared_publish.db, "acquire", acquire)
-    monkeypatch.setattr(ptg2_shared_publish.db, "all", all_rows)
-
-    await copy_shared_block_binary_file(
+    metrics = await copy_shared_block_binary_file(
         path,
         schema_name="mrf",
         stage_table="ptg2_v3_block_stage_test",
@@ -193,7 +301,7 @@ async def test_shared_block_copy_omits_only_existing_payloads(
         reuse_existing=True,
     )
 
-    decoded_copy_rows = binary_copy_rows(bytes(consumed))
+    decoded_copy_rows = binary_copy_rows(bytes(captured_copy_bytes))
     assert len(decoded_copy_rows) == 2
     for index, decoded_copy_row in enumerate(decoded_copy_rows):
         assert decoded_copy_row[0] == hashes[index]
@@ -201,6 +309,59 @@ async def test_shared_block_copy_omits_only_existing_payloads(
         assert decoded_copy_row[9] == (
             None if index in existing_indexes else payloads[index]
         )
+    _assert_selective_copy_metrics(
+        metrics,
+        source_copy_bytes=len(block_payload),
+        staged_copy_bytes=len(captured_copy_bytes),
+        payloads=payloads,
+        existing_indexes=existing_indexes,
+    )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_copy_stages_one_payload_per_repeated_new_hash(
+    tmp_path,
+    monkeypatch,
+):
+    """Emit one payload for a new hash repeated by multiple mappings."""
+
+    hashes = (b"a" * 32, b"a" * 32, b"b" * 32)
+    payloads = (b"same-payload", b"same-payload", b"other-payload")
+    block_payload = _block_copy(
+        *(
+            _block_row(block_hash, index + 1, payloads[index])
+            for index, block_hash in enumerate(hashes)
+        )
+    )
+    path = tmp_path / "blocks.copy"
+    path.write_bytes(block_payload)
+    captured_copy_bytes = _install_copy_capture(monkeypatch)
+
+    metrics = await copy_shared_block_binary_file(
+        path,
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_test",
+        expected_copy_bytes=len(block_payload),
+        expected_copy_sha256=hashlib.sha256(block_payload).hexdigest(),
+        reuse_existing=True,
+    )
+
+    decoded_copy_rows = binary_copy_rows(bytes(captured_copy_bytes))
+    assert [decoded_row[9] for decoded_row in decoded_copy_rows] == [
+        payloads[0],
+        None,
+        payloads[2],
+    ]
+    assert metrics is not None
+    assert metrics.row_count == 3
+    assert metrics.unique_block_count == 2
+    assert metrics.new_block_count == 2
+    assert metrics.duplicate_block_row_count == 1
+    assert metrics.staged_payload_row_count == 2
+    assert metrics.reused_payload_row_count == 1
+    assert metrics.same_copy_reused_row_count == 1
+    assert metrics.same_copy_reused_payload_bytes == len(payloads[1])
+    assert metrics.durable_reused_row_count == 0
 
 
 def test_shared_block_copy_scan_rejects_truncated_payload(tmp_path):

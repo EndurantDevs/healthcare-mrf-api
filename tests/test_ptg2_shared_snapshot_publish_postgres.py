@@ -8,6 +8,7 @@ import json
 import os
 import struct
 import uuid
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -66,6 +67,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
 from process.ptg_parts.ptg2_shared_price import _create_v3_price_key_stage
 from process.ptg_parts.ptg2_shared_publish import (
     _upsert_shared_block_mappings,
+    copy_shared_block_binary_file,
     create_shared_block_stage,
     publish_shared_block_stage,
 )
@@ -90,6 +92,50 @@ MIGRATION_PATHS = (
 )
 SCANNER_TEST_PATH = Path(__file__).with_name("test_ptg2_scanner_v3_runs.py")
 SERVING_RECORD = struct.Struct(">16s16s16sI")
+SHARED_BLOCK_COPY_HEADER = b"PGCOPY\n\xff\r\n\x00" + struct.pack(">ii", 0, 0)
+
+
+def _shared_block_copy_field(value: bytes) -> bytes:
+    return struct.pack(">i", len(value)) + value
+
+
+def _shared_block_copy_row(
+    block_key: int,
+    payload: bytes,
+    entry_count: int = 1,
+) -> bytes:
+    block_hash = shared_block_hash(
+        format_version=2,
+        object_kind="serving",
+        codec="none",
+        payload=payload,
+    )
+    fields = (
+        block_hash,
+        struct.pack(">h", 2),
+        b"serving",
+        struct.pack(">q", block_key),
+        struct.pack(">i", 0),
+        struct.pack(">q", entry_count),
+        b"none",
+        struct.pack(">q", len(payload)),
+        struct.pack(">q", len(payload)),
+        payload,
+    )
+    return struct.pack(">h", len(fields)) + b"".join(
+        _shared_block_copy_field(field) for field in fields
+    )
+
+
+def _shared_block_copy_payload(*rows: tuple[int, bytes, int]) -> bytes:
+    return (
+        SHARED_BLOCK_COPY_HEADER
+        + b"".join(
+            _shared_block_copy_row(block_key, payload, entry_count)
+            for block_key, payload, entry_count in rows
+        )
+        + struct.pack(">h", -1)
+    )
 
 
 class _OpRecorder:
@@ -162,6 +208,121 @@ async def _create_shared_schema(schema_name: str) -> None:
         VALUES ('CPT', '99213', 'Office visit', 'Office visit')
         """
     )
+
+
+async def _create_selective_block_schema(schema_name: str) -> None:
+    quoted_schema = '"' + schema_name.replace('"', '""') + '"'
+    await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {quoted_schema}.ptg2_v3_block (
+            block_hash bytea PRIMARY KEY,
+            format_version smallint NOT NULL,
+            object_kind varchar(64) NOT NULL,
+            codec varchar(16) NOT NULL,
+            entry_count bigint NOT NULL,
+            raw_byte_count bigint NOT NULL,
+            stored_byte_count bigint NOT NULL,
+            payload bytea NOT NULL,
+            created_at timestamp with time zone NOT NULL
+        )
+        """
+    )
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_block (
+            snapshot_key bigint NOT NULL,
+            object_kind varchar(64) NOT NULL,
+            block_key bigint NOT NULL,
+            fragment_no integer NOT NULL,
+            entry_count bigint NOT NULL,
+            block_hash bytea NOT NULL,
+            PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
+        )
+        """
+    )
+
+
+async def _insert_selective_durable_block(
+    schema_name: str,
+    payload: bytes,
+    *,
+    entry_count: int = 1,
+) -> bytes:
+    quoted_schema = '"' + schema_name.replace('"', '""') + '"'
+    block_hash = shared_block_hash(
+        format_version=2,
+        object_kind="serving",
+        codec="none",
+        payload=payload,
+    )
+    await db.status(
+        f"""
+        INSERT INTO {quoted_schema}.ptg2_v3_block
+            (block_hash, format_version, object_kind, codec, entry_count,
+             raw_byte_count, stored_byte_count, payload, created_at)
+        VALUES (:block_hash, 2, 'serving', 'none', :entry_count,
+                :payload_bytes, :payload_bytes, :payload, now())
+        """,
+        block_hash=block_hash,
+        entry_count=entry_count,
+        payload_bytes=len(payload),
+        payload=payload,
+    )
+    return block_hash
+
+
+async def _stage_selective_block_copy(
+    tmp_path: Path,
+    schema_name: str,
+    *block_rows: tuple[int, bytes, int],
+):
+    stage_table = "block_stage"
+    quoted_schema = '"' + schema_name.replace('"', '""') + '"'
+    copy_payload = _shared_block_copy_payload(*block_rows)
+    copy_path = tmp_path / f"{schema_name}.copy"
+    copy_path.write_bytes(copy_payload)
+    await create_shared_block_stage(
+        schema_name=schema_name,
+        stage_table=stage_table,
+    )
+    metrics = await copy_shared_block_binary_file(
+        copy_path,
+        schema_name=schema_name,
+        stage_table=stage_table,
+        expected_copy_bytes=len(copy_payload),
+        expected_copy_sha256=hashlib.sha256(copy_payload).hexdigest(),
+        reuse_existing=True,
+    )
+    assert metrics is not None
+    stage_counts = await db.first(
+        f"""
+        SELECT COUNT(*)::bigint,
+               COUNT(payload)::bigint,
+               COALESCE(SUM(octet_length(payload)), 0)::bigint
+          FROM {quoted_schema}.{stage_table}
+        """
+    )
+    return metrics, tuple(map(int, stage_counts))
+
+
+@asynccontextmanager
+async def _selective_block_database(monkeypatch):
+    schema_name = f"ptg2_selective_{uuid.uuid4().hex[:16]}"
+    quoted_schema = '"' + schema_name + '"'
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_shared_layout_for_dense_write",
+        AsyncMock(),
+    )
+    await db.disconnect()
+    await db.connect()
+    try:
+        await _create_selective_block_schema(schema_name)
+        yield schema_name, quoted_schema
+    finally:
+        await db.status(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+        await db.disconnect()
 
 
 async def _publish_rebuild_scope_proof_layout(
@@ -604,6 +765,224 @@ async def test_real_postgres_shared_block_mapping_upsert_is_idempotent_and_fail_
     finally:
         await db.status(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
         await db.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_selective_copy_stages_each_new_hash_once(
+    tmp_path,
+    monkeypatch,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        metrics, stage_counts = await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"alpha", 1),
+            (2, b"alpha", 1),
+            (3, b"beta", 1),
+        )
+        assert stage_counts == (3, 2, len(b"alpha") + len(b"beta"))
+        assert metrics.unique_block_count == 2
+        assert metrics.new_block_count == 2
+        assert metrics.duplicate_block_row_count == 1
+        assert metrics.same_copy_reused_row_count == 1
+        publication = await publish_shared_block_stage(
+            schema_name=schema_name,
+            stage_table="block_stage",
+            snapshot_key=1,
+            build_token="build-1",
+        )
+        assert publication.mapping_count == 3
+        assert publication.unique_block_count == 2
+        assert int(
+            await db.scalar(f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_block")
+            or 0
+        ) == 2
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_selective_copy_rejects_same_copy_metadata_conflict(
+    tmp_path,
+    monkeypatch,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        metrics, stage_counts = await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"same-hash", 1),
+            (2, b"same-hash", 9),
+        )
+        assert stage_counts == (2, 1, len(b"same-hash"))
+        assert metrics.same_copy_reused_row_count == 1
+        with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
+            await publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table="block_stage",
+                snapshot_key=6,
+                build_token="build-6",
+            )
+        assert int(
+            await db.scalar(f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_block")
+            or 0
+        ) == 0
+        assert int(
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_snapshot_block"
+            )
+            or 0
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_selective_copy_full_reuse(
+    tmp_path,
+    monkeypatch,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (schema_name, _quoted):
+        await _insert_selective_durable_block(schema_name, b"alpha")
+        await _insert_selective_durable_block(schema_name, b"beta")
+        metrics, stage_counts = await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"alpha", 1),
+            (2, b"alpha", 1),
+            (3, b"beta", 1),
+        )
+        assert stage_counts == (3, 0, 0)
+        assert metrics.existing_block_count == 2
+        assert metrics.new_block_count == 0
+        assert metrics.durable_reused_row_count == 3
+        assert metrics.same_copy_reused_row_count == 0
+        publication = await publish_shared_block_stage(
+            schema_name=schema_name,
+            stage_table="block_stage",
+            snapshot_key=2,
+            build_token="build-2",
+        )
+        assert publication.mapping_count == 3
+        assert publication.unique_block_count == 2
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_selective_copy_mixed_reuse(
+    tmp_path,
+    monkeypatch,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (schema_name, _quoted):
+        await _insert_selective_durable_block(schema_name, b"alpha")
+        metrics, stage_counts = await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"alpha", 1),
+            (2, b"beta", 1),
+        )
+        assert stage_counts == (2, 1, len(b"beta"))
+        assert metrics.existing_block_count == 1
+        assert metrics.new_block_count == 1
+        assert metrics.durable_reused_row_count == 1
+        publication = await publish_shared_block_stage(
+            schema_name=schema_name,
+            stage_table="block_stage",
+            snapshot_key=3,
+            build_token="build-3",
+        )
+        assert publication.mapping_count == 2
+        assert publication.unique_block_count == 2
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_selective_copy_fails_if_reused_block_disappears(
+    tmp_path,
+    monkeypatch,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        block_hash = await _insert_selective_durable_block(schema_name, b"gone")
+        metrics, stage_counts = await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"gone", 1),
+        )
+        assert stage_counts == (1, 0, 0)
+        assert metrics.existing_block_count == 1
+        await db.status(
+            f"DELETE FROM {quoted_schema}.ptg2_v3_block WHERE block_hash = :block_hash",
+            block_hash=block_hash,
+        )
+        with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
+            await publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table="block_stage",
+                snapshot_key=4,
+                build_token="build-4",
+            )
+        assert int(
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_snapshot_block"
+            )
+            or 0
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_selective_copy_rejects_durable_metadata_conflict(
+    tmp_path,
+    monkeypatch,
+):
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        await _insert_selective_durable_block(
+            schema_name,
+            b"conflict",
+            entry_count=9,
+        )
+        metrics, stage_counts = await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"conflict", 1),
+        )
+        assert stage_counts == (1, 0, 0)
+        assert metrics.existing_block_count == 1
+        with pytest.raises(RuntimeError, match="conflicts with stored content metadata"):
+            await publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table="block_stage",
+                snapshot_key=5,
+                build_token="build-5",
+            )
+        assert int(
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_snapshot_block"
+            )
+            or 0
+        ) == 0
 
 
 @pytest.mark.asyncio

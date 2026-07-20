@@ -178,12 +178,18 @@ class SelectiveSharedBlockCopyReader:
         self._expected_source_sha256 = str(expected_source_sha256)
         self._sha256 = hashlib.sha256()
         self._source_byte_count = 0
+        self._output_byte_count = 0
         self._output = bytearray()
         self._started = False
         self._finished = False
+        self._new_hashes: set[bytes] = set()
         self.row_count = 0
         self.reused_row_count = 0
         self.reused_payload_bytes = 0
+        self.durable_reused_row_count = 0
+        self.durable_reused_payload_bytes = 0
+        self.same_copy_reused_row_count = 0
+        self.same_copy_reused_payload_bytes = 0
         self.copied_payload_bytes = 0
 
     def _read_source(self, size: int, *, label: str) -> bytes:
@@ -252,9 +258,18 @@ class SelectiveSharedBlockCopyReader:
             self._output.extend(struct.pack(">i", -1))
             self.reused_row_count += 1
             self.reused_payload_bytes += payload_length
+            self.durable_reused_row_count += 1
+            self.durable_reused_payload_bytes += payload_length
+        elif block_hash in self._new_hashes:
+            self._output.extend(struct.pack(">i", -1))
+            self.reused_row_count += 1
+            self.reused_payload_bytes += payload_length
+            self.same_copy_reused_row_count += 1
+            self.same_copy_reused_payload_bytes += payload_length
         else:
             self._output.extend(encoded_payload_length)
             self._output.extend(payload_bytes)
+            self._new_hashes.add(block_hash)
             self.copied_payload_bytes += payload_length
         self.row_count += 1
 
@@ -270,6 +285,7 @@ class SelectiveSharedBlockCopyReader:
         take = len(self._output) if size < 0 else min(size, len(self._output))
         value = bytes(self._output[:take])
         del self._output[:take]
+        self._output_byte_count += len(value)
         return value
 
     @property
@@ -283,6 +299,18 @@ class SelectiveSharedBlockCopyReader:
         """Return the digest of all authenticated source COPY bytes consumed."""
 
         return self._sha256.hexdigest()
+
+    @property
+    def output_byte_count(self) -> int:
+        """Return exact filtered COPY bytes consumed by PostgreSQL."""
+
+        return self._output_byte_count
+
+    @property
+    def new_block_count(self) -> int:
+        """Return unique non-durable hashes emitted with one payload each."""
+
+        return len(self._new_hashes)
 
 
 def binary_copy_rows(copy_payload: bytes) -> tuple[tuple[Any, ...], ...]:
