@@ -152,6 +152,26 @@ def test_failed_candidate_requires_fresh_root_after_checkpoint_generation_change
 
 
 @pytest.mark.asyncio
+async def test_validated_dataset_store_fails_when_candidate_update_is_lost():
+    connection = AsyncMock()
+    connection.status.return_value = "UPDATE 0"
+    candidate = _candidate()
+
+    with pytest.raises(RuntimeError, match="validation_lost"):
+        await importer._store_validated_endpoint_dataset(
+            connection,
+            candidate,
+            candidate.previous_dataset_id,
+            "d" * 64,
+            2,
+            {"verification": "matched"},
+            status=importer.ENDPOINT_DATASET_VALIDATED,
+        )
+
+    assert connection.status.await_args.kwargs["marks_validated"] is True
+
+
+@pytest.mark.asyncio
 async def test_pending_candidate_requires_a_root_run(monkeypatch):
     monkeypatch.setattr(
         importer,
