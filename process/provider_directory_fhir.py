@@ -13357,6 +13357,7 @@ async def _locked_finalized_retry_cleanup_dataset_ids(
 async def _delete_endpoint_dataset_retry_state(
     selected_dataset_ids: list[str],
 ) -> None:
+    """Delete non-content retry rows after finalized parents are locked."""
     await db.status(
         f"""
         DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
@@ -16584,6 +16585,121 @@ def _bound_upsert_session() -> Any | None:
     return transaction_binding.session if transaction_binding is not None else None
 
 
+def _endpoint_dataset_resource_parent_ids(
+    resource_rows: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Return exact sorted parents, rejecting an unscoped child mutation."""
+    dataset_ids: set[str] = set()
+    for resource_row in resource_rows:
+        dataset_id = _clean_text(resource_row.get("dataset_id"))
+        if not dataset_id:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_resource_parent_id_missing"
+            )
+        dataset_ids.add(dataset_id)
+    return sorted(dataset_ids)
+
+
+def _normalized_endpoint_dataset_ids(
+    dataset_ids: Iterable[str],
+) -> list[str]:
+    return sorted(
+        {
+            cleaned_dataset_id
+            for dataset_id in dataset_ids
+            if (cleaned_dataset_id := _clean_text(dataset_id))
+        }
+    )
+
+
+def _endpoint_dataset_statuses_by_id(
+    parent_rows: Iterable[Any],
+) -> dict[str, str | None]:
+    status_by_dataset_id: dict[str, str | None] = {}
+    for parent_row in parent_rows:
+        row_mapping = (
+            parent_row._mapping
+            if hasattr(parent_row, "_mapping")
+            else parent_row
+        )
+        dataset_id = _clean_text(row_mapping.get("dataset_id"))
+        if dataset_id:
+            status_by_dataset_id[dataset_id] = _clean_text(
+                row_mapping.get("status")
+            )
+    return status_by_dataset_id
+
+
+async def _lock_mutable_endpoint_dataset_resource_parents(
+    database_executor: Any,
+    dataset_ids: Iterable[str],
+) -> list[str]:
+    """Share-lock exact dataset parents and reject sealed or missing rows."""
+    selected_dataset_ids = _normalized_endpoint_dataset_ids(dataset_ids)
+    if not selected_dataset_ids:
+        return []
+    parent_rows = await database_executor.all(
+        f"""
+        SELECT dataset_id, status
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))
+         ORDER BY dataset_id
+         FOR SHARE;
+        """,
+        dataset_ids=selected_dataset_ids,
+    )
+    status_by_dataset_id = _endpoint_dataset_statuses_by_id(parent_rows)
+    missing_dataset_ids = [
+        dataset_id
+        for dataset_id in selected_dataset_ids
+        if dataset_id not in status_by_dataset_id
+    ]
+    if missing_dataset_ids:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_parent_missing:"
+            + ",".join(missing_dataset_ids)
+        )
+    immutable_parents = [
+        (dataset_id, status_by_dataset_id[dataset_id])
+        for dataset_id in selected_dataset_ids
+        if status_by_dataset_id[dataset_id]
+        in IMMUTABLE_ENDPOINT_DATASET_STATUSES
+    ]
+    if immutable_parents:
+        immutable_details = ",".join(
+            f"{dataset_id}={status}"
+            for dataset_id, status in immutable_parents
+        )
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_parent_immutable:"
+            + immutable_details
+        )
+    return selected_dataset_ids
+
+
+@contextlib.asynccontextmanager
+async def _mutable_endpoint_dataset_resource_mutation(
+    dataset_ids: Iterable[str],
+    *,
+    database_connection: Any | None = None,
+) -> AsyncIterator[Any]:
+    """Fence one child mutation in its caller's or a new transaction."""
+    selected_dataset_ids = _normalized_endpoint_dataset_ids(dataset_ids)
+    if database_connection is not None:
+        await _lock_mutable_endpoint_dataset_resource_parents(
+            database_connection,
+            selected_dataset_ids,
+        )
+        yield database_connection
+        return
+    async with db.transaction():
+        await _lock_mutable_endpoint_dataset_resource_parents(
+            db,
+            selected_dataset_ids,
+        )
+        yield db
+
+
 def _location_address_key_batch_size() -> int:
     try:
         return max(
@@ -17365,9 +17481,60 @@ async def _upsert_rows(
         {key: resource_row.get(key) for key in columns}
         for resource_row in resource_rows
     ]
-    transaction_options = _transaction_session_options(_bound_upsert_session())
+    if (
+        model is ProviderDirectoryDatasetResource
+        and _bound_upsert_session() is None
+    ):
+        async with db.transaction():
+            return await _upsert_normalized_rows(
+                model,
+                normalized_rows,
+                columns,
+                primary_keys,
+                skip_unchanged=skip_unchanged,
+            )
+    return await _upsert_normalized_rows(
+        model,
+        normalized_rows,
+        columns,
+        primary_keys,
+        skip_unchanged=skip_unchanged,
+    )
+
+
+async def _upsert_normalized_rows(
+    model,
+    normalized_rows: list[dict[str, Any]],
+    columns: list[str],
+    primary_keys: list[str],
+    *,
+    skip_unchanged: bool,
+) -> int:
+    """Apply one normalized upsert inside its already selected boundary."""
+    is_dataset_resource = model is ProviderDirectoryDatasetResource
+    transaction_session = _bound_upsert_session()
+    if is_dataset_resource and transaction_session is None:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_transaction_missing"
+        )
+    if is_dataset_resource:
+        await _lock_mutable_endpoint_dataset_resource_parents(
+            db,
+            _endpoint_dataset_resource_parent_ids(normalized_rows),
+        )
+    transaction_options = _transaction_session_options(transaction_session)
     if _is_copy_upsert_enabled() and len(normalized_rows) >= _copy_upsert_min_rows():
         try:
+            if is_dataset_resource:
+                async with db.transaction():
+                    return await _copy_upsert_rows(
+                        model,
+                        normalized_rows,
+                        columns,
+                        primary_keys,
+                        skip_unchanged=skip_unchanged,
+                        **transaction_options,
+                    )
             return await _copy_upsert_rows(
                 model,
                 normalized_rows,
@@ -27237,6 +27404,10 @@ async def _upsert_dataset_resource_rows_on_connection(
     table = ProviderDirectoryDatasetResource.__table__
     primary_keys = ["dataset_id", "resource_type", "resource_id"]
     row_list = list(rows)
+    await _lock_mutable_endpoint_dataset_resource_parents(
+        connection,
+        _endpoint_dataset_resource_parent_ids(row_list),
+    )
     batch_size = _max_rows_per_statement(len(row_list[0]))
     for offset in range(0, len(row_list), batch_size):
         statement = pg_insert(table).values(
@@ -32958,6 +33129,10 @@ async def _ensure_endpoint_dataset_candidate(
         metadata = _endpoint_dataset_candidate_metadata(candidate)
         await _upsert_endpoint_dataset_candidate(connection, candidate, metadata)
         if not candidate.reused_from_checkpoint:
+            await _lock_mutable_endpoint_dataset_resource_parents(
+                connection,
+                [candidate.dataset_id],
+            )
             await connection.status(
                 f"""
                 DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
@@ -32998,21 +33173,24 @@ async def _clear_uncheckpointed_endpoint_dataset_candidate(
 ) -> None:
     if candidate.reused_from_checkpoint:
         return
-    await db.status(
-        f"""
-        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
-         USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
-         WHERE resource.dataset_id = :dataset_id
-           AND dataset.dataset_id = resource.dataset_id
-           AND dataset.endpoint_id = :endpoint_id
-           AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
-               :acquisition_root_run_id
-           AND dataset.is_current = false;
-        """,
-        dataset_id=candidate.dataset_id,
-        endpoint_id=candidate.endpoint_id,
-        acquisition_root_run_id=candidate.acquisition_root_run_id,
-    )
+    async with _mutable_endpoint_dataset_resource_mutation(
+        [candidate.dataset_id]
+    ) as database_executor:
+        await database_executor.status(
+            f"""
+            DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+             USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+             WHERE resource.dataset_id = :dataset_id
+               AND dataset.dataset_id = resource.dataset_id
+               AND dataset.endpoint_id = :endpoint_id
+               AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
+                   :acquisition_root_run_id
+               AND dataset.is_current = false;
+            """,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id,
+        )
 
 
 def _endpoint_id_for_source_records(
@@ -34252,20 +34430,23 @@ async def _clear_checkpoint_dataset_resource_type(
 ) -> None:
     if not context.dataset_id:
         return
-    database_executor = database_connection or db
-    await database_executor.status(
-        f"""
-        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
-         USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
-         WHERE resource.dataset_id = :dataset_id
-           AND resource.resource_type = :resource_type
-           AND dataset.dataset_id = resource.dataset_id
-           AND dataset.acquisition_root_run_id = :acquisition_root_run_id;
-        """,
-        dataset_id=context.dataset_id,
-        resource_type=resource_type,
-        acquisition_root_run_id=context.acquisition_root_run_id,
-    )
+    async with _mutable_endpoint_dataset_resource_mutation(
+        [context.dataset_id],
+        database_connection=database_connection,
+    ) as database_executor:
+        await database_executor.status(
+            f"""
+            DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+             USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+             WHERE resource.dataset_id = :dataset_id
+               AND resource.resource_type = :resource_type
+               AND dataset.dataset_id = resource.dataset_id
+               AND dataset.acquisition_root_run_id = :acquisition_root_run_id;
+            """,
+            dataset_id=context.dataset_id,
+            resource_type=resource_type,
+            acquisition_root_run_id=context.acquisition_root_run_id,
+        )
 
 
 async def _reset_pagination_checkpoint(
@@ -34276,21 +34457,24 @@ async def _reset_pagination_checkpoint(
     *,
     database_connection: Any | None = None,
 ) -> None:
-    database_executor = database_connection or db
-    await database_executor.status(
-        _pagination_checkpoint_reset_sql(),
-        canonical_api_base=context.canonical_api_base,
-        resource_type=resource_type,
-        source_scope_hash=context.source_scope_hash,
-        dataset_id=context.dataset_id,
-        source_ids=json.dumps(context.source_ids),
-        acquisition_root_run_id=context.acquisition_root_run_id,
-        owner_run_id=context.owner_run_id,
-        retry_of_run_id=context.retry_of_run_id,
-        start_url_hash=start_url_hash,
-        next_url=start_url,
-        state=PAGINATION_CHECKPOINT_ACTIVE,
-    )
+    async with _mutable_endpoint_dataset_resource_mutation(
+        [context.dataset_id] if context.dataset_id else [],
+        database_connection=database_connection,
+    ) as database_executor:
+        await database_executor.status(
+            _pagination_checkpoint_reset_sql(),
+            canonical_api_base=context.canonical_api_base,
+            resource_type=resource_type,
+            source_scope_hash=context.source_scope_hash,
+            dataset_id=context.dataset_id,
+            source_ids=json.dumps(context.source_ids),
+            acquisition_root_run_id=context.acquisition_root_run_id,
+            owner_run_id=context.owner_run_id,
+            retry_of_run_id=context.retry_of_run_id,
+            start_url_hash=start_url_hash,
+            next_url=start_url,
+            state=PAGINATION_CHECKPOINT_ACTIVE,
+        )
 
 
 def _empty_pagination_checkpoint_restart_sql() -> str:
@@ -37184,6 +37368,7 @@ async def _delete_matched_baseline_resource_rows(
     candidate: EndpointDatasetCandidate,
     baseline_dataset_id: str,
 ) -> int:
+    """Retire a locked immutable baseline only after exact successor proof."""
     deleted_status = await connection.status(
         f"""
         DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource

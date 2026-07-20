@@ -10031,6 +10031,19 @@ class _AtomicCandidateInitializationHarness:
             self.events.append("conflict_lookup")
         return None
 
+    async def all(self, sql, **params):
+        sql_text = str(sql)
+        assert "ORDER BY dataset_id" in sql_text
+        assert "FOR SHARE" in sql_text
+        self.events.append("dataset_resource_parent_lock")
+        return [
+            {
+                "dataset_id": dataset_id,
+                "status": importer.ENDPOINT_DATASET_ACQUIRING,
+            }
+            for dataset_id in params["dataset_ids"]
+        ]
+
     async def status(self, sql, **_params):
         sql_text = str(sql)
         if "provider_directory_pagination_checkpoint" in sql_text:
@@ -10091,7 +10104,9 @@ async def test_partition_candidate_and_initial_checkpoint_share_transaction(
         "candidate_lookup",
         "conflict_lookup",
         "candidate_upsert",
+        "dataset_resource_parent_lock",
         "candidate_rows_clear",
+        "dataset_resource_parent_lock",
         "checkpoint_upsert",
         "rollback",
     ]
@@ -10152,7 +10167,17 @@ async def test_uncheckpointed_candidate_cleanup_is_root_fenced(monkeypatch):
         previous_dataset_id=None,
     )
     status_mock = AsyncMock(return_value=1)
-    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    @contextlib.asynccontextmanager
+    async def mutation_fence(dataset_ids, **_kwargs):
+        assert dataset_ids == [candidate.dataset_id]
+        yield type("CleanupExecutor", (), {"status": status_mock})()
+
+    monkeypatch.setattr(
+        importer,
+        "_mutable_endpoint_dataset_resource_mutation",
+        mutation_fence,
+    )
 
     await importer._clear_uncheckpointed_endpoint_dataset_candidate(candidate)
 
@@ -18084,6 +18109,17 @@ def _expired_resume_callbacks(
 def _stub_checkpoint_restart_connection(monkeypatch, *status_results):
     connection = AsyncMock()
     connection.status = AsyncMock(side_effect=status_results)
+
+    async def mutable_dataset_parents(_sql, **params):
+        return [
+            {
+                "dataset_id": dataset_id,
+                "status": importer.ENDPOINT_DATASET_ACQUIRING,
+            }
+            for dataset_id in params["dataset_ids"]
+        ]
+
+    connection.all = AsyncMock(side_effect=mutable_dataset_parents)
 
     @contextlib.asynccontextmanager
     async def acquire_connection():
