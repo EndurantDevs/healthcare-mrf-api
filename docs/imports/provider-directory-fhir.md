@@ -1185,6 +1185,17 @@ fingerprint twice before publication. Metrics report `plan_graph_complete`
 separately from `collection_complete`; the latter remains false so clients and
 operators cannot mistake the curated plan graph for exhaustive raw collections.
 
+Capital Blue Cross publishes seven populated Plan-Net collections and an empty
+`Endpoint` collection at `https://providerdirectory-api.capbluecross.com/r4`.
+US-dev probes succeed over normal verified TLS, but broad exact census requests
+return an HTTP-200 OperationOutcome requiring a search predicate. A `ge1900`
+`_lastUpdated` predicate returns pageable results; populated collections reject
+`ge0001`, `_lastUpdated:missing`, and `_id:missing`, however. The advertised
+CapabilityStatement offers only read, vread, and type search, with no history or
+Bulk Export operation. Because no endpoint-wide witness can cover older or
+missing `meta.lastUpdated` values, Capital remains probe-only, resource
+acquisition stays disabled, and it cannot be published to Profile.
+
 SCAN Health Plan seed rows can point at the developer portal
 `https://developer.scanhealthplan.com`. The portal's embedded Provider Directory
 OpenAPI spec advertises `https://providerdirectory.scanhealthplan.com` as the
