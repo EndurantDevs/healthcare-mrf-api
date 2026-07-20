@@ -98,11 +98,14 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
             dataset_id varchar(96) PRIMARY KEY,
             endpoint_id varchar(64) NOT NULL,
             acquisition_root_run_id varchar(64),
+            previous_dataset_id varchar(96),
             dataset_hash varchar(64),
             status varchar(32) NOT NULL,
             is_current boolean NOT NULL DEFAULT false,
             resource_count bigint NOT NULL DEFAULT 0,
             created_at timestamp DEFAULT now(),
+            validated_at timestamp,
+            published_at timestamp,
             superseded_at timestamp,
             publication_metadata_json jsonb
         );
@@ -433,6 +436,64 @@ async def test_postgres_baseline_lock_and_artifact_selection_are_fail_closed(
             schema_name=schema,
         )
         assert int(status_length) == 32
+    finally:
+        if is_schema_created:
+            await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+        await database.disconnect()
+
+
+async def test_postgres_stores_verification_baseline_without_status_parameter_ambiguity(
+    monkeypatch,
+):
+    """Execute the terminal dataset update through asyncpg's real type inference."""
+    schema = f"provider_directory_status_{uuid.uuid4().hex[:12]}"
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    database = await _disposable_database()
+
+    is_schema_created = False
+    candidate = _candidate()
+    try:
+        await _create_dataset_table(database, schema)
+        is_schema_created = True
+        await database.status(
+            f"""
+            INSERT INTO {schema}.provider_directory_endpoint_dataset (
+                dataset_id, endpoint_id, acquisition_root_run_id,
+                status, is_current, resource_count
+            ) VALUES (:dataset_id, :endpoint_id, :acquisition_root_run_id,
+                      :status, false, 0);
+            """,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id,
+            status=importer.ENDPOINT_DATASET_ACQUIRING,
+        )
+        await importer._store_validated_endpoint_dataset(
+            database,
+            candidate,
+            candidate.previous_dataset_id,
+            "d" * 64,
+            288_056,
+            {"verification": "baseline"},
+            status=importer.ENDPOINT_DATASET_VERIFICATION_BASELINE,
+        )
+        stored = await database.first(
+            f"""
+            SELECT previous_dataset_id, dataset_hash, status, resource_count,
+                   validated_at, publication_metadata_json
+            FROM {schema}.provider_directory_endpoint_dataset
+            WHERE dataset_id = :dataset_id;
+            """,
+            dataset_id=candidate.dataset_id,
+        )
+        assert stored is not None
+        stored_map = stored._mapping
+        assert stored_map["previous_dataset_id"] == candidate.previous_dataset_id
+        assert stored_map["dataset_hash"] == "d" * 64
+        assert stored_map["status"] == importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
+        assert stored_map["resource_count"] == 288_056
+        assert stored_map["validated_at"] is None
+        assert stored_map["publication_metadata_json"] == {"verification": "baseline"}
     finally:
         if is_schema_created:
             await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")

@@ -770,6 +770,41 @@ def test_synthetic_position_checkpoint_scope_versions_page_guard():
     ).hexdigest()
 
 
+def test_netsmart_checkpoint_scope_versions_page_index_semantics():
+    source_lookup = {
+        "source_id": "san-mateo",
+        "api_base": importer.SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE,
+    }
+
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["san-mateo"],
+        run_id="run_1",
+        retry_of_run_id=None,
+    )
+    expected_scope_payload = json.dumps(
+        {
+            "strategy_version": (
+                importer.NETSMART_PAGE_INDEX_PAGINATION_STRATEGY_VERSION
+            ),
+            "source_ids": ["san-mateo"],
+            "resource_group": importer._resource_import_group_key(source_lookup),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+    assert checkpoint_context is not None
+    assert importer._pagination_checkpoint_strategy_version(
+        importer.SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        {},
+    ) == importer.NETSMART_PAGE_INDEX_PAGINATION_STRATEGY_VERSION
+    assert checkpoint_context.source_scope_hash == hashlib.sha256(
+        expected_scope_payload.encode("utf-8")
+    ).hexdigest()
+
+
 def test_last_updated_partition_checkpoint_scope_includes_partition_identity():
     partition_resources_by_type = {
         "Practitioner": {
@@ -1596,7 +1631,7 @@ def test_new_abacus_state_candidates_use_throttled_synthetic_skip(api_base):
     "api_base",
     tuple(sorted(importer.NETSMART_PROVIDER_DIRECTORY_BASES)),
 )
-def test_netsmart_candidates_advance_synthetic_offset_by_bundle_size(api_base):
+def test_netsmart_candidates_advance_synthetic_page_index(api_base):
     source_lookup = {"source_id": "county-candidate", "api_base": api_base}
     start_url = importer._resource_start_url(
         source_lookup,
@@ -1611,7 +1646,7 @@ def test_netsmart_candidates_advance_synthetic_offset_by_bundle_size(api_base):
         source_lookup,
         start_url,
         100,
-    ) == start_url.replace("_offset=0", "_offset=100")
+    ) == start_url.replace("_offset=0", "_offset=1")
     assert (
         importer._synthetic_offset_pagination_next_url(
             source_lookup,
@@ -1623,7 +1658,7 @@ def test_netsmart_candidates_advance_synthetic_offset_by_bundle_size(api_base):
 
 
 @pytest.mark.asyncio
-async def test_netsmart_fetch_ignores_overlapping_advertised_next_offset(monkeypatch):
+async def test_netsmart_fetch_advances_page_index_and_ignores_next_link(monkeypatch):
     api_base = importer.SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE
     source_lookup = {"source_id": "county-candidate", "api_base": api_base}
     requested_urls: list[str] = []
@@ -1679,7 +1714,7 @@ async def test_netsmart_fetch_ignores_overlapping_advertised_next_offset(monkeyp
     assert fetch_result.rows_fetched == 3
     assert requested_urls == [
         f"{api_base}/Organization?_count=2&_sort=_id&_offset=0",
-        f"{api_base}/Organization?_count=2&_sort=_id&_offset=2",
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=1",
     ]
 
 
@@ -1729,7 +1764,7 @@ async def test_netsmart_fetch_fails_closed_on_repeated_full_page(monkeypatch):
     assert fetch_result.pages_fetched == 2
     assert requested_urls == [
         f"{api_base}/Organization?_count=2&_sort=_id&_offset=0",
-        f"{api_base}/Organization?_count=2&_sort=_id&_offset=2",
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=1",
     ]
 
 
@@ -1748,7 +1783,7 @@ async def test_netsmart_fetch_fails_closed_on_nonadjacent_page_cycle(monkeypatch
         )
         resource_ids = (
             ("org-a1", "org-a2")
-            if offset in {0, 4}
+            if offset in {0, 2}
             else ("org-b1", "org-b2")
         )
         return (
@@ -1789,8 +1824,8 @@ async def test_netsmart_fetch_fails_closed_on_nonadjacent_page_cycle(monkeypatch
     assert fetch_result.pages_fetched == 3
     assert requested_urls == [
         f"{api_base}/Organization?_count=2&_sort=_id&_offset=0",
+        f"{api_base}/Organization?_count=2&_sort=_id&_offset=1",
         f"{api_base}/Organization?_count=2&_sort=_id&_offset=2",
-        f"{api_base}/Organization?_count=2&_sort=_id&_offset=4",
     ]
 
 

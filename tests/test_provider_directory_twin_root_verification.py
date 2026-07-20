@@ -126,6 +126,73 @@ def test_current_root_cannot_be_repaired_as_an_acquisition_candidate():
         )
 
 
+def test_failed_candidate_requires_fresh_root_after_checkpoint_generation_change():
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base=importer.SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        source_scope_hash="page-index-scope",
+        source_ids=("san-mateo",),
+        owner_run_id="retry_2",
+        retry_of_run_id="root_candidate",
+        acquisition_root_run_id="root_candidate",
+    )
+    with pytest.raises(RuntimeError, match="uncheckpointed_candidate_exists"):
+        importer._should_repair_empty_endpoint_dataset_orphan(
+            {
+                "endpoint_id": "endpoint_1",
+                "acquisition_root_run_id": "root_candidate",
+                "is_current": False,
+                "status": importer.ENDPOINT_DATASET_FAILED,
+            },
+            "endpoint_1",
+            "root_candidate",
+            None,
+            "root_candidate",
+            checkpoint_context,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validated_dataset_store_fails_when_candidate_update_is_lost():
+    connection = AsyncMock()
+    connection.status.return_value = "UPDATE 0"
+    candidate = _candidate()
+
+    with pytest.raises(RuntimeError, match="validation_lost"):
+        await importer._store_validated_endpoint_dataset(
+            connection,
+            candidate,
+            candidate.previous_dataset_id,
+            "d" * 64,
+            2,
+            {"verification": "matched"},
+            status=importer.ENDPOINT_DATASET_VALIDATED,
+        )
+
+    assert connection.status.await_args.kwargs["marks_validated"] is True
+
+
+@pytest.mark.asyncio
+async def test_verification_baseline_store_does_not_mark_dataset_validated():
+    connection = AsyncMock()
+    connection.status.return_value = "UPDATE 1"
+    candidate = _candidate()
+
+    await importer._store_validated_endpoint_dataset(
+        connection,
+        candidate,
+        candidate.previous_dataset_id,
+        "d" * 64,
+        2,
+        {"verification": "baseline"},
+        status=importer.ENDPOINT_DATASET_VERIFICATION_BASELINE,
+    )
+
+    assert connection.status.await_args.kwargs["status"] == (
+        importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
+    )
+    assert connection.status.await_args.kwargs["marks_validated"] is False
+
+
 @pytest.mark.asyncio
 async def test_pending_candidate_requires_a_root_run(monkeypatch):
     monkeypatch.setattr(
