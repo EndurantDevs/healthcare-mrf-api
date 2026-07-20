@@ -8,6 +8,7 @@ import pytest
 
 from api import ptg2_candidate_audit_batch as batch
 from api import ptg2_candidate_audit_projection as projection
+from api import ptg2_candidate_audit_selection as selection
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     AuditBatchChallenge,
@@ -75,7 +76,7 @@ def test_batch_record_fields_supports_mapping_rows_and_pairs():
     assert batch._record_fields((("value", 2),)) == {"value": 2}
 
 
-def test_provider_filters_union_witness_and_persisted_coordinates():
+def test_provider_filters_prune_and_union_exact_coordinates():
     challenge = _challenge()
     code_index = batch.CandidateCodeIndex(
         by_pair={("CPT", "99213"): ({"code_key": 7}, {"code_key": 8})},
@@ -92,12 +93,93 @@ def test_provider_filters_union_witness_and_persisted_coordinates():
         10,
     )
 
-    assert batch._provider_filters_by_code_key(
-        (challenge,),
+    provider_scope = selection.candidate_provider_scope_by_npi_code(
+        (challenge, challenge),
         code_index,
-        {challenge.npi: (5,)},
+        {challenge.npi: (5, 6)},
+        {5: frozenset((7, 9)), 6: frozenset((8, 9))},
         (persisted,),
-    ) == {7: (5,), 8: (5,), 9: (6,)}
+    )
+
+    assert provider_scope == {
+        (challenge.npi, 7): (5,),
+        (challenge.npi, 8): (6,),
+        (persisted.npi, 9): (6,),
+    }
+    assert selection.provider_filters_by_code_key(provider_scope) == {
+        7: (5,),
+        8: (6,),
+        9: (6,),
+    }
+
+
+def test_provider_code_scope_rejects_persisted_membership_mismatch():
+    challenge = _challenge()
+    persisted = batch.PersistedAuditOccurrence(
+        b"a" * 32,
+        9,
+        6,
+        8,
+        1,
+        challenge.npi,
+        0,
+        10,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="membership is missing"):
+        selection.candidate_provider_scope_by_npi_code(
+            (challenge,),
+            batch.CandidateCodeIndex(
+                by_pair={("CPT", "99213"): ({"code_key": 7},)},
+                by_key={},
+            ),
+            {challenge.npi: (5, 6)},
+            {5: frozenset((7,)), 6: frozenset((8,))},
+            (persisted,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_code_lookup_requires_complete_nonempty_memberships(
+    monkeypatch,
+):
+    lookup = AsyncMock(return_value={5: (7,), 6: (8,)})
+    monkeypatch.setattr(
+        selection,
+        "lookup_shared_provider_code_keys_from_db",
+        lookup,
+    )
+
+    assert (
+        await selection.load_candidate_provider_code_sets(
+            object(),
+            41,
+            (),
+            schema_name="mrf",
+        )
+        == {}
+    )
+    lookup.assert_not_awaited()
+
+    assert await selection.load_candidate_provider_code_sets(
+        object(),
+        41,
+        (5, 5, 6),
+        schema_name="mrf",
+    ) == {5: frozenset((7,)), 6: frozenset((8,))}
+    assert lookup.await_args.args[1] == 41
+    assert lookup.await_args.args[2] == (5, 6)
+    assert lookup.await_args.kwargs["schema_name"] == "mrf"
+
+    for incomplete_memberships in ({5: (7,)}, {5: (7,), 6: ()}):
+        lookup.return_value = incomplete_memberships
+        with pytest.raises(PTG2ManifestArtifactError, match="provider-code artifact"):
+            await selection.load_candidate_provider_code_sets(
+                object(),
+                41,
+                (5, 6),
+                schema_name="mrf",
+            )
 
 
 def test_required_occurrence_keys_preserve_provider_source_correlation():
@@ -121,7 +203,7 @@ def test_required_occurrence_keys_preserve_provider_source_correlation():
     required = batch._required_candidate_occurrence_keys(
         (first, second),
         {("CPT", "99213"): ({"code_key": 7},)},
-        {first.npi: (5,), second.npi: (6,)},
+        {(first.npi, 7): (5,), (second.npi, 7): (6,)},
         (persisted,),
     )
 
@@ -154,7 +236,7 @@ async def test_price_load_filters_exact_coordinates_before_hydration(monkeypatch
         _serving_tables(),
         (first, second),
         {("CPT", "99213"): ({"code_key": 7},)},
-        {first.npi: (5,), second.npi: (6,)},
+        {(first.npi, 7): (5,), (second.npi, 7): (6,)},
         {7: (5, 6), 8: (7,)},
         (persisted,),
     )
@@ -193,7 +275,7 @@ async def test_price_load_rejects_forward_rows_outside_exact_scope(monkeypatch):
             _serving_tables(),
             (first, second),
             {("CPT", "99213"): ({"code_key": 7},)},
-            {first.npi: (5,), second.npi: (6,)},
+            {(first.npi, 7): (5,), (second.npi, 7): (6,)},
             {7: (5, 6), 8: (7,)},
             (persisted,),
         )
@@ -241,11 +323,14 @@ class _NetworkSession:
 @pytest.mark.asyncio
 async def test_provider_network_names_handle_empty_complete_and_incomplete_sets():
     empty_session = _NetworkSession(())
-    assert await batch._provider_network_names_by_key(
-        empty_session,
-        _serving_tables(),
-        (),
-    ) == {}
+    assert (
+        await batch._provider_network_names_by_key(
+            empty_session,
+            _serving_tables(),
+            (),
+        )
+        == {}
+    )
     assert empty_session.calls == 0
 
     complete_session = _NetworkSession(
@@ -269,12 +354,15 @@ async def test_forward_lookup_skips_empty_provider_scope(monkeypatch):
     lookup = AsyncMock()
     monkeypatch.setattr(batch, "lookup_forward_price_index_from_db", lookup)
 
-    assert await batch._candidate_forward_price_keys(
-        object(),
-        _serving_tables(),
-        {},
-        frozenset(),
-    ) == {}
+    assert (
+        await batch._candidate_forward_price_keys(
+            object(),
+            _serving_tables(),
+            {},
+            frozenset(),
+        )
+        == {}
+    )
     lookup.assert_not_awaited()
 
 
@@ -313,7 +401,7 @@ def test_candidate_projection_reuses_one_tuple_and_deduplicates_availability():
     availability, ledger = batch.candidate_availability_index(
         (challenge,),
         {("CPT", "99213"): (code_fields_by_name,)},
-        {challenge.npi: (5, 6)},
+        {(challenge.npi, 7): (5, 6, 7)},
         {5: network_digests, 6: network_digests},
         batch.CandidatePriceData(
             {(7, 5, 0): (8,), (7, 6, 0): (8,)},

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import struct
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
+from process.ptg_parts import ptg2_shared_block_copy as block_copy
 from process.ptg_parts import ptg2_shared_publish
 from process.ptg_parts.ptg2_shared_publish import copy_shared_block_binary_file
 from process.ptg_parts.ptg2_shared_block_copy import (
@@ -16,6 +18,23 @@ from process.ptg_parts.ptg2_shared_block_copy import (
 
 
 _COPY_HEADER = b"PGCOPY\n\xff\r\n\x00" + struct.pack(">ii", 0, 0)
+_VALID_METADATA_FIELDS = (
+    b"a" * 32,
+    struct.pack(">h", 2),
+    b"serving",
+    struct.pack(">q", 1),
+    struct.pack(">i", 0),
+    struct.pack(">q", 1),
+    b"none",
+    struct.pack(">q", 1),
+    struct.pack(">q", 1),
+)
+
+
+def _metadata_with(field_index: int, value: bytes) -> tuple[bytes, ...]:
+    fields = list(_VALID_METADATA_FIELDS)
+    fields[field_index] = value
+    return tuple(fields)
 
 
 def _field(value: bytes) -> bytes:
@@ -40,6 +59,15 @@ def _block_row(block_hash: bytes, block_key: int, payload: bytes) -> bytes:
 
 def _block_copy(*rows: bytes) -> bytes:
     return _COPY_HEADER + b"".join(rows) + struct.pack(">h", -1)
+
+
+def _copy_reader(payload: bytes) -> block_copy.SelectiveSharedBlockCopyReader:
+    return block_copy.SelectiveSharedBlockCopyReader(
+        io.BytesIO(payload),
+        existing_hashes=set(),
+        expected_source_bytes=len(payload),
+        expected_source_sha256=hashlib.sha256(payload).hexdigest(),
+    )
 
 
 @pytest.mark.asyncio
@@ -181,3 +209,131 @@ def test_shared_block_copy_scan_rejects_truncated_payload(tmp_path):
 
     with pytest.raises(RuntimeError, match="truncates"):
         scan_shared_block_copy(path)
+
+
+@pytest.mark.parametrize(
+    ("copy_payload", "error"),
+    (
+        (_COPY_HEADER + struct.pack(">h", 9), "row width changed"),
+        (
+            _COPY_HEADER
+            + _block_row(b"a" * 32, 1, b"payload")[:-11]
+            + struct.pack(">i", 8)
+            + b"payload",
+            "payload length is invalid",
+        ),
+        (_block_copy(), "contains no rows"),
+    ),
+)
+def test_shared_block_copy_scan_rejects_corrupt_framing(
+    tmp_path,
+    copy_payload,
+    error,
+):
+    path = tmp_path / "corrupt.copy"
+    path.write_bytes(copy_payload)
+
+    with pytest.raises(RuntimeError, match=error):
+        scan_shared_block_copy(path)
+
+
+def test_binary_copy_rows_rejects_wrong_row_width():
+    with pytest.raises(RuntimeError, match="row width changed"):
+        binary_copy_rows(_COPY_HEADER + struct.pack(">h", 9))
+
+
+@pytest.mark.parametrize(
+    ("fields", "error"),
+    (
+        (_VALID_METADATA_FIELDS[:-1], "metadata field count changed"),
+        (_metadata_with(0, b"a"), "hash is not 32 bytes"),
+        (_metadata_with(1, struct.pack(">h", 3)), "format version is incompatible"),
+        (_metadata_with(2, b"\xff"), "metadata text is invalid"),
+        (_metadata_with(2, b""), "object kind is invalid"),
+        (_metadata_with(6, b"gzip"), "codec is invalid"),
+        (_metadata_with(3, b"x"), "block key width changed"),
+        (_metadata_with(3, struct.pack(">q", -1)), "block key is negative"),
+    ),
+)
+def test_shared_block_copy_metadata_rejects_corrupt_contract(fields, error):
+    with pytest.raises(RuntimeError, match=error):
+        block_copy._validated_metadata(fields)
+
+
+@pytest.mark.parametrize(
+    ("operation", "error"),
+    (
+        (
+            lambda: block_copy._read_exact(io.BytesIO(b""), 1, label="test"),
+            "truncates test",
+        ),
+        (
+            lambda: block_copy._read_metadata_fields(io.BytesIO(struct.pack(">i", -1))),
+            "metadata cannot be NULL",
+        ),
+        (
+            lambda: block_copy._validate_header(
+                io.BytesIO(b"x" * len(block_copy._COPY_HEADER))
+            ),
+            "header is incompatible",
+        ),
+        (
+            lambda: block_copy._validate_trailer(io.BytesIO(b"x")),
+            "contains trailing bytes",
+        ),
+    ),
+)
+def test_shared_block_copy_framing_rejects_corrupt_contract(operation, error):
+    with pytest.raises(RuntimeError, match=error):
+        operation()
+
+
+@pytest.mark.parametrize(
+    ("operation", "error"),
+    (
+        (
+            lambda: _copy_reader(struct.pack(">i", -1))._read_metadata(),
+            "metadata cannot be NULL",
+        ),
+        (
+            lambda: _copy_reader(b"x" * len(_COPY_HEADER)).read(),
+            "header is incompatible",
+        ),
+        (
+            lambda: _copy_reader(b"x")._verify_source(),
+            "contains trailing bytes",
+        ),
+        (
+            lambda: block_copy.SelectiveSharedBlockCopyReader(
+                io.BytesIO(b""),
+                existing_hashes=set(),
+                expected_source_bytes=1,
+                expected_source_sha256=hashlib.sha256(b"").hexdigest(),
+            )._verify_source(),
+            "content changed during publication",
+        ),
+        (
+            lambda: _copy_reader(_COPY_HEADER + struct.pack(">h", 9)).read(),
+            "row width changed",
+        ),
+        (
+            lambda: _copy_reader(
+                _COPY_HEADER
+                + _block_row(b"a" * 32, 1, b"payload")[:-11]
+                + struct.pack(">i", 8)
+                + b"payload"
+            ).read(),
+            "payload length is invalid",
+        ),
+    ),
+)
+def test_selective_copy_reader_rejects_corrupt_framing(operation, error):
+    with pytest.raises(RuntimeError, match=error):
+        operation()
+
+
+def test_selective_copy_reader_zero_size_does_not_consume_source():
+    reader = _copy_reader(b"")
+
+    assert reader.read(0) == b""
+    assert reader.source_byte_count == 0
