@@ -2711,21 +2711,22 @@ async def test_control_importers_endpoint(monkeypatch):
 
 
 def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
+    """Expose every reviewed runnable and probe-only source exactly once."""
     catalog = provider_directory_source_catalog()
     runnable_items = [entry for entry in catalog["items"] if entry["runnable"]]
     probe_items = [entry for entry in catalog["items"] if not entry["runnable"]]
 
     assert catalog["entry_count"] == 37
-    assert catalog["runnable_count"] == 21
-    assert catalog["profile_source_count"] == 21
+    assert catalog["runnable_count"] == 22
+    assert catalog["profile_source_count"] == 22
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 21
+    assert len(runnable_items) == 22
     assert all(entry["profile_enabled"] for entry in runnable_items)
     assert all(
         entry["supported_resources"] == entry["resources"]
         for entry in runnable_items
     )
-    assert len(probe_items) == 16
+    assert len(probe_items) == 15
     assert all(entry["classification"] == "probe_only" for entry in probe_items)
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
