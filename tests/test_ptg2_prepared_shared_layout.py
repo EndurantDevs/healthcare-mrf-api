@@ -356,6 +356,20 @@ async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_prepared_layout_requires_selective_copy_proof(monkeypatch, tmp_path):
+    mocks = _prepared_layout_mocks(monkeypatch, tmp_path)
+    mocks.copy_block.side_effect = [None, _copy_metrics(reused=False)]
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await _publish_prepared_layout(mocks, tmp_path)
+
+    assert len(exc_info.value.exceptions) == 1
+    assert "did not return selective proof" in str(exc_info.value.exceptions[0])
+    mocks.publish_blocks.assert_not_awaited()
+    mocks.graph_conversion.cleanup.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 async def test_prepared_layout_reuses_early_results(monkeypatch, tmp_path):
     mocks = _prepared_layout_mocks(monkeypatch, tmp_path, seal_reused=True)
     finalizer = snapshot_publish._PreparedFinalizer(

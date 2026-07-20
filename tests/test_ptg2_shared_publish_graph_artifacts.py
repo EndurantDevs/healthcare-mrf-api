@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 from process.ptg_parts.ptg2_shared_publish import (
     shared_graph_bundles_from_artifacts,
 )
@@ -54,6 +56,37 @@ def test_graph_artifact_grouping_fails_closed_on_missing_direction(tmp_path):
         assert "provider_set_group" in str(exc)
     else:
         raise AssertionError("incomplete strict V3 graph shard was accepted")
+
+
+def test_graph_artifact_grouping_ignores_non_graph_entries():
+    with pytest.raises(RuntimeError, match="missing provider membership graph"):
+        shared_graph_bundles_from_artifacts(
+            [None, {"name": "unrelated_artifact", "path": "ignored"}]
+        )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"name": "provider_group_npi", "path": "graph.copy"},
+        {"name": "provider_group_npi", "source_shard_id": "file:1"},
+    ],
+    ids=["missing-shard", "missing-path"],
+)
+def test_graph_artifact_grouping_requires_shard_and_path(entry):
+    with pytest.raises(RuntimeError, match="lacks shard/path metadata"):
+        shared_graph_bundles_from_artifacts([entry])
+
+
+def test_graph_artifact_grouping_rejects_duplicate_direction(tmp_path):
+    entry = {
+        "name": "provider_group_npi",
+        "source_shard_id": "file:1",
+        "path": str(tmp_path / "graph.copy"),
+    }
+
+    with pytest.raises(RuntimeError, match="repeats direction"):
+        shared_graph_bundles_from_artifacts([entry, dict(entry)])
 
 
 def test_strict_v3_graph_artifacts_are_import_scratch_not_serving_storage(
