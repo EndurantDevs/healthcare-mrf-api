@@ -1002,6 +1002,9 @@ MOLINA_QUOTA_DURATION_PATTERN = re.compile(
 STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     {"Location", "Organization", "Practitioner", "PractitionerRole"}
 )
+IOWA_MEDICAID_EXPECTED_NONEMPTY_RESOURCES = frozenset(
+    {"Organization", "Practitioner", "PractitionerRole"}
+)
 EXPECTED_NONEMPTY_RESOURCES_BY_BASE = {
     ARKANSAS_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
     CONTRA_COSTA_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
@@ -16551,7 +16554,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             seed_source=CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
             resources=state_resources,
             expected_nonempty_resources=tuple(
-                sorted(STATE_EXPECTED_NONEMPTY_RESOURCES)
+                sorted(IOWA_MEDICAID_EXPECTED_NONEMPTY_RESOURCES)
             ),
         ),
         candidate_row(

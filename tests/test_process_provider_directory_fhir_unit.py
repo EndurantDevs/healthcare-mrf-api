@@ -1003,6 +1003,22 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
     )[0]["api_base"] == importer.DEVOTED_PROVIDER_DIRECTORY_BASE
 
 
+def test_iowa_reviewed_candidate_current_expected_nonempty_contract():
+    """Guard populated Iowa collections without rejecting its empty Location."""
+    seed_row = importer._reviewed_provider_directory_candidate_seed_rows(
+        source_query="Iowa Medicaid"
+    )[0]
+    source_row = importer._source_row_from_seed(seed_row)
+    expected_nonempty_resources = source_row["metadata_json"][
+        "provider_directory_expected_nonempty_resources"
+    ]
+
+    assert set(expected_nonempty_resources) == (
+        importer.IOWA_MEDICAID_EXPECTED_NONEMPTY_RESOURCES
+    )
+    assert "Location" not in expected_nonempty_resources
+
+
 def test_el_dorado_candidate_prefers_registered_base_and_keeps_legacy_identity():
     """The current auth-gated endpoint must not erase stable legacy identity."""
     seed_row = importer._reviewed_provider_directory_candidate_seed_rows(
@@ -5922,6 +5938,44 @@ def test_state_directory_empty_core_resource_fails_closed(api_base):
 
     assert guarded_result.complete is False
     assert guarded_result.error == importer.EXPECTED_NONEMPTY_RESOURCE_ERROR
+
+
+def test_iowa_current_empty_location_census_remains_complete():
+    """Accept a proven empty Location while retaining populated-core guards."""
+    source_row = importer._source_row_from_seed(
+        importer._reviewed_provider_directory_candidate_seed_rows(
+            source_query="Iowa Medicaid"
+        )[0]
+    )
+    fetch_result = importer.ResourceFetchResult(
+        model=object,
+        rows=[],
+        rows_fetched=0,
+        rows_written=0,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+    location_result = importer._fail_closed_on_unexpected_empty_resource(
+        source_row,
+        "Location",
+        fetch_result,
+    )
+    practitioner_result = importer._fail_closed_on_unexpected_empty_resource(
+        source_row,
+        "Practitioner",
+        fetch_result,
+    )
+
+    assert location_result is fetch_result
+    assert location_result.complete is True
+    assert location_result.error is None
+    assert practitioner_result.complete is False
+    assert practitioner_result.error == importer.EXPECTED_NONEMPTY_RESOURCE_ERROR
 
 
 @pytest.mark.parametrize(
