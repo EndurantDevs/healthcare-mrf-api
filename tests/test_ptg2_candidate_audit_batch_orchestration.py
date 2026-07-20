@@ -187,7 +187,8 @@ async def test_candidate_scope_indexes_resolve_each_coordinate_family_once(
     assert indexes.provider_filters_by_code_key == {7: (5,), 8: (7,)}
     graph_validator.assert_called_once()
     provider_code_lookup.assert_awaited_once()
-    assert provider_code_lookup.await_args.args[2] == {5, 6, 7}
+    assert set(provider_code_lookup.await_args.args[2]) == {5, 6, 7}
+    assert set(provider_code_lookup.await_args.args[3]) == {7, 8}
     network_lookup.assert_awaited_once()
     assert network_lookup.await_args.args[2] == {7: (5,), 8: (7,)}
 
@@ -298,4 +299,5 @@ async def test_candidate_audit_data_runs_each_bounded_index_once(monkeypatch):
     assert audit_data.challenges == (challenge,)
     assert audit_data.persisted_audit_occurrence_count == 1
     assert audit_data.witness_io["payload_reads"] == 1
+    assert audit_data.candidate_processing_io == {"candidate_projection_builds": 1}
     price_validator.assert_called_once_with((persisted,), price_data)

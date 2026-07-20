@@ -2923,14 +2923,70 @@ async def lookup_provider_code_keys_from_db(
 ) -> dict[int, tuple[int, ...]]:
     """Read requested provider-set code memberships from fresh shared blocks."""
 
+    from api.ptg2_db_serving_v3 import _requested_keys
+
+    requested_keys = _requested_keys(provider_set_keys)
+    return await _lookup_provider_code_keys_from_db(
+        session,
+        shared_snapshot_key,
+        requested_keys,
+        schema_name=schema_name,
+    )
+
+
+async def lookup_provider_code_intersections_from_db(
+    session: Any,
+    shared_snapshot_key: int,
+    provider_set_keys: Iterable[int],
+    requested_code_keys: Iterable[int],
+    *,
+    max_retained_memberships: int | None = None,
+    schema_name: str = "mrf",
+) -> dict[int, tuple[int, ...]]:
+    """Validate memberships while retaining only the requested code keys."""
+
+    from api.ptg2_db_serving_v3 import _requested_keys
+
+    return await _lookup_provider_code_keys_from_db(
+        session,
+        shared_snapshot_key,
+        _requested_keys(provider_set_keys),
+        requested_code_key_set=set(_requested_keys(requested_code_keys)),
+        max_retained_memberships=max_retained_memberships,
+        schema_name=schema_name,
+    )
+
+
+async def _lookup_provider_code_keys_from_db(
+    session: Any,
+    shared_snapshot_key: int,
+    requested_keys: tuple[int, ...],
+    *,
+    requested_code_key_set: set[int] | None = None,
+    max_retained_memberships: int | None = None,
+    schema_name: str,
+) -> dict[int, tuple[int, ...]]:
+    """Read each requested provider-code block with one retention policy."""
+
     from api.ptg2_db_serving_v3 import (
         PTG2_SERVING_BINARY_V3_PROVIDER_SET_CODES_KIND,
         PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN,
         _block_keys_for,
-        _requested_keys,
+    )
+    from process.ptg_parts.ptg2_serving_binary_v3_code_intersection import (
+        provider_code_selection,
     )
 
-    requested_keys = _requested_keys(provider_set_keys)
+    requested_code_selection = (
+        provider_code_selection(requested_code_key_set)
+        if requested_code_key_set is not None
+        else None
+    )
+    retention_budget = (
+        _ProviderCodeRetentionBudget(max_retained_memberships)
+        if max_retained_memberships is not None
+        else None
+    )
     logical_blocks = await _shared_logical_blocks_by_key(
         session,
         shared_snapshot_key=shared_snapshot_key,
@@ -2943,14 +2999,113 @@ async def lookup_provider_code_keys_from_db(
     return _provider_code_keys_from_aliases(
         logical_blocks,
         requested_key_set=set(requested_keys),
+        requested_code_selection=requested_code_selection,
+        retention_budget=retention_budget,
         schema_name=schema_name,
     )
+
+
+def _requested_offsets_by_block(
+    requested_key_set: AbstractSet[int],
+    *,
+    block_span: int,
+) -> dict[int, set[int]]:
+    """Partition requested provider offsets once by their logical block."""
+
+    offsets_by_block: dict[int, set[int]] = {}
+    for provider_set_key in requested_key_set:
+        block_key, requested_offset = divmod(provider_set_key, block_span)
+        offsets_by_block.setdefault(block_key, set()).add(requested_offset)
+    return offsets_by_block
+
+
+@dataclass
+class _ProviderCodeRetentionBudget:
+    """Cumulative logical-membership cap shared across decoded blocks."""
+
+    maximum_memberships: int
+    retained_memberships: int = 0
+
+    def __post_init__(self) -> None:
+        if self.maximum_memberships < 1:
+            raise PTG2ManifestArtifactError(
+                "PTG2 provider-code retention limit must be positive"
+            )
+
+    def claim(self, membership_count: int) -> None:
+        """Claim final logical memberships before retaining decoded tuples."""
+
+        self.retained_memberships += membership_count
+        if self.retained_memberships > self.maximum_memberships:
+            raise PTG2ManifestArtifactError(
+                "PTG2 provider-code intersections exceed their retention limit"
+            )
+
+
+def _requested_alias_counts(
+    physical_aliases: Iterable[tuple[int, _SharedLogicalBlock]],
+    requested_offsets_by_block: Mapping[int, AbstractSet[int]],
+) -> dict[int, int]:
+    """Count final logical deliveries for each decoded representative offset."""
+
+    alias_count_by_offset: dict[int, int] = {}
+    for block_key, _alias_block in physical_aliases:
+        for requested_offset in requested_offsets_by_block.get(block_key, ()):
+            alias_count_by_offset[requested_offset] = (
+                alias_count_by_offset.get(requested_offset, 0) + 1
+            )
+    return alias_count_by_offset
+
+
+def _provider_retention_callback(
+    retention_budget: _ProviderCodeRetentionBudget | None,
+    representative_start: int,
+    alias_count_by_offset: Mapping[int, int],
+) -> Callable[[int, tuple[int, ...]], None] | None:
+    """Return an in-decoder claim that budgets all logical alias deliveries."""
+
+    if retention_budget is None:
+        return None
+
+    def claim_retained_code_keys(
+        provider_set_key: int,
+        code_keys: tuple[int, ...],
+    ) -> None:
+        """Charge one decoded representative across its requested aliases."""
+
+        requested_offset = provider_set_key - representative_start
+        retention_budget.claim(
+            len(code_keys) * alias_count_by_offset[requested_offset]
+        )
+
+    return claim_retained_code_keys
+
+
+def _retain_provider_aliases(
+    code_keys_by_provider: dict[int, tuple[int, ...]],
+    physical_aliases: Iterable[tuple[int, _SharedLogicalBlock]],
+    code_keys_by_offset: Mapping[int, tuple[int, ...]],
+    requested_key_set: AbstractSet[int],
+    *,
+    block_span: int,
+) -> None:
+    """Fan out already-budgeted decoded aliases to requested logical keys."""
+
+    for block_key, _alias_block in physical_aliases:
+        block_start = block_key * block_span
+        for requested_offset, code_keys in code_keys_by_offset.items():
+            provider_set_key = block_start + requested_offset
+            if provider_set_key not in requested_key_set:
+                continue
+            code_keys_by_provider[provider_set_key] = code_keys
 
 
 def _provider_code_keys_from_aliases(
     logical_blocks: Mapping[int, _SharedLogicalBlock],
     *,
     requested_key_set: set[int],
+    requested_code_selection: Any | None = None,
+    retention_budget: _ProviderCodeRetentionBudget | None = None,
     schema_name: str,
 ) -> dict[int, tuple[int, ...]]:
     """Parse each distinct logical provider-code payload once and rebase it."""
@@ -2960,56 +3115,53 @@ def _provider_code_keys_from_aliases(
         _decode_provider_code_block,
     )
 
+    block_span = PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
+    requested_offsets_by_block = _requested_offsets_by_block(
+        requested_key_set,
+        block_span=block_span,
+    )
     code_keys_by_provider: dict[int, tuple[int, ...]] = {}
-    for physical_aliases in _logical_blocks_by_physical_identity(
-        logical_blocks
-    ).values():
+    for physical_aliases in _logical_blocks_by_physical_identity(logical_blocks).values():
         representative_key, logical_block = physical_aliases[0]
-        representative_start = (
-            representative_key
-            * PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
+        representative_start = representative_key * block_span
+        alias_count_by_offset = _requested_alias_counts(
+            physical_aliases,
+            requested_offsets_by_block,
         )
-        requested_offsets = {
-            provider_set_key
-            - block_key * PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
-            for block_key, _alias_block in physical_aliases
-            for provider_set_key in requested_key_set
-            if (
-                block_key * PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
-                <= provider_set_key
-                < (block_key + 1)
-                * PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
-            )
-        }
-        _claim_logical_block_processing(
-            logical_block,
-            schema_name=schema_name,
-        )
+        _claim_logical_block_processing(logical_block, schema_name=schema_name)
         decoded_by_representative_key = _decode_provider_code_block(
             logical_block.payload,
             block_key=representative_key,
             entry_count=logical_block.entry_count,
             requested_provider_set_keys={
                 representative_start + requested_offset
-                for requested_offset in requested_offsets
+                for requested_offset in alias_count_by_offset
             },
+            requested_code_selection=requested_code_selection,
+            claim_retained_code_keys=_provider_retention_callback(
+                retention_budget,
+                representative_start,
+                alias_count_by_offset,
+            ),
         )
         code_keys_by_offset = {
             provider_set_key - representative_start: code_keys
             for provider_set_key, code_keys in decoded_by_representative_key.items()
         }
-        for block_key, _alias_block in physical_aliases:
-            block_start = (
-                block_key * PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
-            )
-            for requested_offset, code_keys in code_keys_by_offset.items():
-                provider_set_key = block_start + requested_offset
-                if provider_set_key in requested_key_set:
-                    code_keys_by_provider[provider_set_key] = code_keys
+        _retain_provider_aliases(
+            code_keys_by_provider,
+            physical_aliases,
+            code_keys_by_offset,
+            requested_key_set,
+            block_span=block_span,
+        )
     return code_keys_by_provider
 
 
 lookup_shared_provider_code_keys_from_db = lookup_provider_code_keys_from_db
+lookup_shared_provider_code_intersections_from_db = (
+    lookup_provider_code_intersections_from_db
+)
 
 
 async def lookup_price_atom_memberships_from_db(

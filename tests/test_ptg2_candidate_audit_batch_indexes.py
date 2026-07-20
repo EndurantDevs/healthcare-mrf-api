@@ -140,13 +140,13 @@ def test_provider_code_scope_rejects_persisted_membership_mismatch():
 
 
 @pytest.mark.asyncio
-async def test_provider_code_lookup_requires_complete_nonempty_memberships(
+async def test_provider_code_lookup_requires_complete_filtered_memberships(
     monkeypatch,
 ):
     lookup = AsyncMock(return_value={5: (7,), 6: (8,)})
     monkeypatch.setattr(
         selection,
-        "lookup_shared_provider_code_keys_from_db",
+        "lookup_shared_provider_code_intersections_from_db",
         lookup,
     )
 
@@ -155,6 +155,7 @@ async def test_provider_code_lookup_requires_complete_nonempty_memberships(
             object(),
             41,
             (),
+            (7, 8),
             schema_name="mrf",
         )
         == {}
@@ -165,21 +166,33 @@ async def test_provider_code_lookup_requires_complete_nonempty_memberships(
         object(),
         41,
         (5, 5, 6),
+        (8, 7, 8),
         schema_name="mrf",
     ) == {5: frozenset((7,)), 6: frozenset((8,))}
     assert lookup.await_args.args[1] == 41
     assert lookup.await_args.args[2] == (5, 6)
+    assert lookup.await_args.args[3] == (7, 8)
+    assert lookup.await_args.kwargs["max_retained_memberships"] == 1_000_000
     assert lookup.await_args.kwargs["schema_name"] == "mrf"
 
-    for incomplete_memberships in ({5: (7,)}, {5: (7,), 6: ()}):
-        lookup.return_value = incomplete_memberships
-        with pytest.raises(PTG2ManifestArtifactError, match="provider-code artifact"):
-            await selection.load_candidate_provider_code_sets(
-                object(),
-                41,
-                (5, 6),
-                schema_name="mrf",
-            )
+    lookup.return_value = {5: (7,), 6: ()}
+    assert await selection.load_candidate_provider_code_sets(
+        object(),
+        41,
+        (5, 6),
+        (7,),
+        schema_name="mrf",
+    ) == {5: frozenset((7,)), 6: frozenset()}
+
+    lookup.return_value = {5: (7,)}
+    with pytest.raises(PTG2ManifestArtifactError, match="provider-code artifact"):
+        await selection.load_candidate_provider_code_sets(
+            object(),
+            41,
+            (5, 6),
+            (7,),
+            schema_name="mrf",
+        )
 
 
 def test_required_occurrence_keys_preserve_provider_source_correlation():

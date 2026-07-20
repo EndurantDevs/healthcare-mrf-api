@@ -1,8 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import gc
+import random
+import tracemalloc
+
 import pytest
 
 from process.ptg_parts import ptg2_serving_binary_v3_primitives as primitives
+from process.ptg_parts.ptg2_serving_binary_v3_code_intersection import (
+    intersect_provider_code_set,
+)
 from process.ptg_parts.ptg2_serving_binary_v3 import (
     PTG2_V3_ATOM_KEY_24_BITS,
     PTG2_V3_ATOM_KEY_32_BITS,
@@ -144,6 +151,10 @@ def test_v3_provider_code_container_modes_are_byte_stable():
 
     assert encoded[:20] == bytes.fromhex("0103000103050108dffb030102a01f0401009f1f")
     assert decode_provider_code_set(encoded) == source_codes
+    assert intersect_provider_code_set(
+        encoded,
+        (9, (1 << 16) + 123, (2 << 16) + 222, 999_999),
+    ) == (9, (1 << 16) + 123, (2 << 16) + 222)
     assert stats.code_count == len(source_codes)
     assert stats.container_count == 3
     assert stats.sparse_container_count == 1
@@ -162,6 +173,54 @@ def test_v3_provider_code_set_rejects_noncanonical_order_and_truncation():
         decode_provider_code_set(encoded[:-1])
     with pytest.raises(ValueError, match="version"):
         decode_provider_code_set(b"\x02")
+
+
+def test_v3_provider_code_intersection_retains_only_requested_keys():
+    source_codes = tuple(
+        code_key
+        for high_bits in range(16)
+        for code_key in range(high_bits << 16, (high_bits + 1) << 16)
+    )
+    encoded, _stats = encode_provider_code_set(source_codes)
+    del source_codes
+    gc.collect()
+
+    tracemalloc.start()
+    observed = intersect_provider_code_set(
+        encoded,
+        (3, (2 << 16) + 12_345, (20 << 16) + 1),
+    )
+    _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert observed == (3, (2 << 16) + 12_345)
+    assert peak_bytes < 256 * 1024
+
+
+def test_v3_provider_code_intersection_matches_full_decode():
+    random_source = random.Random(7_420_021)
+    for _case_index in range(40):
+        source_codes = tuple(
+            sorted({random_source.randrange(4 << 16) for _item in range(2_000)})
+        )
+        requested_codes = tuple(
+            sorted({random_source.randrange(5 << 16) for _item in range(128)})
+        )
+        encoded, _stats = encode_provider_code_set(source_codes)
+        requested_code_set = set(requested_codes)
+
+        assert intersect_provider_code_set(encoded, requested_codes) == tuple(
+            code_key
+            for code_key in decode_provider_code_set(encoded)
+            if code_key in requested_code_set
+        )
+
+
+def test_v3_provider_code_intersection_rejects_empty_source_set():
+    encoded, _stats = encode_provider_code_set(())
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        intersect_provider_code_set(encoded, (7,))
 
 
 @pytest.mark.parametrize(

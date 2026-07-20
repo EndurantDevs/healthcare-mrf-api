@@ -1,6 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import pytest
+
 import api.ptg2_db_serving_v3 as db_serving_v3
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_serving_binary_v3_code_intersection import (
+    provider_code_selection,
+)
 from process.ptg_parts.ptg2_serving_binary_v3 import (
     append_uvarint,
     encode_provider_code_set,
@@ -42,3 +48,61 @@ def test_provider_code_block_decodes_only_requested_containers(monkeypatch):
         requested_provider_set_keys={4},
     ) == {4: (7, 8)}
     assert len(decoded_payloads) == 1
+
+
+def test_provider_code_block_retains_only_requested_code_memberships(monkeypatch):
+    block_key, provider_payload = _provider_block(
+        ((3, tuple(range(100_000))), (4, (7, 8)), (5, (9, 10)))
+    )
+    intersections = []
+    payload_views = []
+    original_intersection = db_serving_v3.intersect_provider_code_set
+
+    def tracked_intersection(payload, requested_code_keys):
+        payload_views.append(payload)
+        observed = original_intersection(payload, requested_code_keys)
+        intersections.append(observed)
+        return observed
+
+    monkeypatch.setattr(
+        db_serving_v3,
+        "intersect_provider_code_set",
+        tracked_intersection,
+    )
+
+    assert db_serving_v3._decode_provider_code_block(
+        provider_payload,
+        block_key=block_key,
+        entry_count=3,
+        requested_provider_set_keys={3, 4},
+        requested_code_selection=provider_code_selection((7, 99_999, 200_000)),
+    ) == {3: (7, 99_999), 4: (7,)}
+    assert intersections == [(7, 99_999), (7,)]
+    assert all(
+        isinstance(payload_view, memoryview)
+        and payload_view.obj is provider_payload
+        for payload_view in payload_views
+    )
+
+
+def test_provider_code_block_claims_budget_before_retaining_next_provider():
+    block_key, provider_payload = _provider_block(
+        ((3, tuple(range(100_000))), (4, (7, 8)), (5, (9, 10)))
+    )
+    claimed_memberships = []
+
+    def reject_first_claim(provider_set_key, code_keys):
+        claimed_memberships.append((provider_set_key, code_keys))
+        raise PTG2ManifestArtifactError("retention limit")
+
+    with pytest.raises(PTG2ManifestArtifactError, match="retention limit"):
+        db_serving_v3._decode_provider_code_block(
+            provider_payload,
+            block_key=block_key,
+            entry_count=3,
+            requested_provider_set_keys={3, 4},
+            requested_code_selection=provider_code_selection((7, 99_999)),
+            claim_retained_code_keys=reject_first_claim,
+        )
+
+    assert claimed_memberships == [(3, (7, 99_999))]
