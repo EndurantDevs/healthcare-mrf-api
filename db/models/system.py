@@ -17,6 +17,7 @@ from sqlalchemy import (
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
+    text,
 )
 
 from db.connection import Base
@@ -1411,8 +1412,21 @@ class ProviderDirectoryBulkOutputCheckpoint(Base, JSONOutputMixin):
     output_url_hash = Column(String(64), nullable=False)
     state = Column(String(32), nullable=False)
     rows_written = Column(BigInteger, nullable=False, default=0)
+    content_length_bytes = Column(BigInteger)
+    etag_ciphertext = Column(TEXT)
+    etag_hash = Column(String(64))
+    committed_bytes = Column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    output_expires_at = Column(TIMESTAMP)
+    validator_checked_at = Column(TIMESTAMP)
     attempt_count = Column(Integer, nullable=False, default=0)
     error = Column(TEXT)
+    last_error = Column(TEXT)
+    last_error_at = Column(TIMESTAMP)
     created_at = Column(TIMESTAMP, nullable=False)
     started_at = Column(TIMESTAMP)
     completed_at = Column(TIMESTAMP)

@@ -2814,7 +2814,7 @@ def test_resource_import_source_selection_reports_credentialed_policy_counts():
 
 
 def test_resource_import_source_selection_allows_live_probe_success_over_open_only():
-    source_row = {
+    source_record_by_field = {
         "source_id": "credentialed_valid",
         "api_base": "https://auth.example/fhir",
         "auth_type": "OAuth2 Client Credentials",
@@ -2823,13 +2823,13 @@ def test_resource_import_source_selection_allows_live_probe_success_over_open_on
     }
 
     selected, metrics = importer._select_resource_import_sources(
-        [source_row],
+        [source_record_by_field],
         valid_source_ids={"credentialed_valid"},
         open_only=True,
         include_auth_required=False,
     )
 
-    assert selected == [source_row]
+    assert selected == [source_record_by_field]
     assert metrics["source_import_sources_selected"] == 1
     assert metrics["source_import_sources_selected_live_probe_valid"] == 1
     assert metrics["source_import_sources_selected_declared_credentialed"] == 1
@@ -16019,6 +16019,11 @@ class _BulkCheckpointMemory:
         monkeypatch.setattr(importer, "_record_bulk_export_output_error", self.record_output_error)
         monkeypatch.setattr(importer, "_complete_bulk_export_checkpoint", self.complete_checkpoint)
         monkeypatch.setattr(importer, "_record_bulk_export_checkpoint_error", self.record_checkpoint_error)
+        monkeypatch.setattr(
+            importer,
+            "_repair_terminal_bulk_export_checkpoint",
+            self.repair_terminal_checkpoint,
+        )
 
     def _checkpoint_map(
         self,
@@ -16105,8 +16110,16 @@ class _BulkCheckpointMemory:
             "output_url_hash": output.url_hash,
             "state": state,
             "rows_written": row_count,
+            "content_length_bytes": None,
+            "etag_ciphertext": None,
+            "etag_hash": None,
+            "committed_bytes": 0,
+            "output_expires_at": None,
+            "validator_checked_at": None,
             "attempt_count": 0,
             "error": None,
+            "last_error": None,
+            "last_error_at": None,
         }
 
     async def load(self, identity):
@@ -16196,7 +16209,7 @@ class _BulkCheckpointMemory:
             key=lambda output_checkpoint: output_checkpoint["output_index"],
         )
 
-    async def begin_output(self, identity, output_id):
+    async def begin_output(self, identity, output_id, *, preserve_progress):
         checkpoint_id = identity.checkpoint_id
         assert (
             self.checkpoint_by_id[checkpoint_id]["owner_run_id"]
@@ -16205,21 +16218,41 @@ class _BulkCheckpointMemory:
         output_checkpoint = self.output_by_id[output_id]
         output_checkpoint.update(
             state=importer.BULK_EXPORT_OUTPUT_STREAMING,
-            rows_written=0,
+            rows_written=(
+                output_checkpoint["rows_written"] if preserve_progress else 0
+            ),
+            committed_bytes=(
+                output_checkpoint["committed_bytes"] if preserve_progress else 0
+            ),
             attempt_count=output_checkpoint["attempt_count"] + 1,
             error=None,
         )
         self.event_log.append(("begin", output_id))
 
-    async def record_progress(self, identity, output_id, rows_written):
+    async def record_progress(
+        self,
+        identity,
+        output_id,
+        rows_written,
+        committed_bytes,
+    ):
         assert (
             self.checkpoint_by_id[identity.checkpoint_id]["owner_run_id"]
             == identity.owner_run_id
         )
         self.output_by_id[output_id]["rows_written"] = rows_written
+        self.output_by_id[output_id]["committed_bytes"] = committed_bytes
         self.event_log.append(("progress", rows_written))
 
-    async def complete_output(self, identity, output_id, rows_written):
+    async def complete_output(
+        self,
+        identity,
+        output_id,
+        rows_written,
+        committed_bytes,
+        *,
+        require_validator,
+    ):
         assert (
             self.checkpoint_by_id[identity.checkpoint_id]["owner_run_id"]
             == identity.owner_run_id
@@ -16227,10 +16260,24 @@ class _BulkCheckpointMemory:
         self.output_by_id[output_id].update(
             state=importer.BULK_EXPORT_OUTPUT_COMPLETE,
             rows_written=rows_written,
+            committed_bytes=committed_bytes,
         )
+        if require_validator:
+            assert committed_bytes == self.output_by_id[output_id][
+                "content_length_bytes"
+            ]
         self.event_log.append(("complete_output", output_id))
 
-    async def record_output_error(self, identity, output_id, rows_written, error):
+    async def record_output_error(
+        self,
+        identity,
+        output_id,
+        rows_written,
+        committed_bytes,
+        error,
+        *,
+        record_checkpoint=True,
+    ):
         is_terminal = importer._is_bulk_export_error_terminal(error)
         self.output_by_id[output_id].update(
             state=(
@@ -16239,15 +16286,18 @@ class _BulkCheckpointMemory:
                 else importer.BULK_EXPORT_OUTPUT_PENDING
             ),
             rows_written=rows_written,
+            committed_bytes=committed_bytes,
             error=error,
+            last_error=error,
         )
-        await self.record_checkpoint_error(
-            identity,
-            error,
-            terminal=is_terminal,
-        )
+        if record_checkpoint:
+            await self.record_checkpoint_error(
+                identity,
+                error,
+                terminal=is_terminal,
+            )
 
-    async def complete_checkpoint(self, identity):
+    async def complete_checkpoint(self, identity, *, require_validators):
         checkpoint_id = identity.checkpoint_id
         output_checkpoints = [
             output_checkpoint
@@ -16256,6 +16306,12 @@ class _BulkCheckpointMemory:
         ]
         if not output_checkpoints or any(
             output_checkpoint["state"] != importer.BULK_EXPORT_OUTPUT_COMPLETE
+            for output_checkpoint in output_checkpoints
+        ):
+            raise RuntimeError("bulk_export_checkpoint_completion_lost")
+        if require_validators and any(
+            output_checkpoint["committed_bytes"]
+            != output_checkpoint["content_length_bytes"]
             for output_checkpoint in output_checkpoints
         ):
             raise RuntimeError("bulk_export_checkpoint_completion_lost")
@@ -16269,6 +16325,7 @@ class _BulkCheckpointMemory:
         checkpoint["manifest_ciphertext"] = None
         for output_checkpoint in output_checkpoints:
             output_checkpoint["output_url_ciphertext"] = None
+            output_checkpoint["etag_ciphertext"] = None
         self.event_log.append(("complete_checkpoint", checkpoint_id))
 
     async def record_checkpoint_error(self, identity, error, *, terminal):
@@ -16283,6 +16340,23 @@ class _BulkCheckpointMemory:
             for output_checkpoint in self.output_by_id.values():
                 if output_checkpoint["checkpoint_id"] == checkpoint_id:
                     output_checkpoint["output_url_ciphertext"] = None
+                    output_checkpoint["etag_ciphertext"] = None
+
+    async def repair_terminal_checkpoint(self, identity, terminal_state):
+        checkpoint_id = identity.checkpoint_id
+        checkpoint = self.checkpoint_by_id[checkpoint_id]
+        assert checkpoint["state"] == terminal_state
+        checkpoint["rows_written"] = sum(
+            output_checkpoint["rows_written"]
+            for output_checkpoint in self.output_by_id.values()
+            if output_checkpoint["checkpoint_id"] == checkpoint_id
+        )
+        checkpoint["status_url_ciphertext"] = None
+        checkpoint["manifest_ciphertext"] = None
+        for output_checkpoint in self.output_by_id.values():
+            if output_checkpoint["checkpoint_id"] == checkpoint_id:
+                output_checkpoint["output_url_ciphertext"] = None
+                output_checkpoint["etag_ciphertext"] = None
 
 
 def test_bulk_export_start_url_uses_base_export_operation():
@@ -16387,8 +16461,16 @@ def test_bulk_checkpoint_models_persist_contract():
         "output_url_hash",
         "state",
         "rows_written",
+        "content_length_bytes",
+        "etag_ciphertext",
+        "etag_hash",
+        "committed_bytes",
+        "output_expires_at",
+        "validator_checked_at",
         "attempt_count",
         "error",
+        "last_error",
+        "last_error_at",
         "started_at",
         "completed_at",
     }.issubset(output_columns)
@@ -16514,9 +16596,9 @@ async def test_bulk_checkpoint_initial_flow(monkeypatch, bulk_checkpoint_key):
         requested_events.append("poll")
         return status_payload, None, 2
 
-    async def stream_output(*_args, row_progress_handler, **_request_options):
+    async def stream_output(*_args, resume_options, **_request_options):
         requested_events.append("stream")
-        await row_progress_handler(2)
+        await resume_options.row_progress_handler(2, 0)
         return [], 2, 2, False, None
 
     monkeypatch.setattr(importer, "_bulk_http_get_json", accept_export)
@@ -16688,7 +16770,7 @@ async def test_bulk_checkpoint_skips_completed_output(
 
     async def stream_output(_session, _source_record, output_url, **request_options):
         streamed_urls.append(output_url)
-        await request_options["row_progress_handler"](4)
+        await request_options["resume_options"].row_progress_handler(4, 0)
         return [], 4, 4, False, None
 
     monkeypatch.setattr(importer, "_stream_bulk_export_output_rows", stream_output)
@@ -16734,7 +16816,7 @@ async def test_bulk_checkpoint_restarts_interrupted_output(
 
     async def stream_output(_session, _source_record, output_url, **request_options):
         stream_calls.append(output_url)
-        await request_options["row_progress_handler"](3)
+        await request_options["resume_options"].row_progress_handler(3, 0)
         return [], 3, 3, False, None
 
     monkeypatch.setattr(importer, "_stream_bulk_export_output_rows", stream_output)
@@ -16965,11 +17047,19 @@ async def test_bulk_checkpoint_requires_all_outputs(
     )
     checkpoint_memory.install(monkeypatch)
 
-    async def stream_output(*_args, row_progress_handler, **_request_options):
-        await row_progress_handler(1)
+    async def stream_output(*_args, resume_options, **_request_options):
+        await resume_options.row_progress_handler(1, 0)
         return [], 1, 1, False, None
 
-    async def lose_output_completion(_checkpoint_id, _output_id, _rows_written):
+    async def lose_output_completion(
+        _checkpoint_id,
+        _output_id,
+        _rows_written,
+        _committed_bytes,
+        *,
+        require_validator,
+    ):
+        assert require_validator is False
         return None
 
     monkeypatch.setattr(importer, "_stream_bulk_export_output_rows", stream_output)

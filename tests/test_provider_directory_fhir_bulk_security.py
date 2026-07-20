@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import datetime
+import hashlib
 import importlib
 
 import aiohttp
@@ -62,6 +64,29 @@ def test_bulk_checkpoint_capability_ciphertext_roundtrips_without_plaintext(monk
     assert capability not in ciphertext
     assert "super-secret" not in ciphertext
     assert importer._decrypt_bulk_capability(ciphertext) == capability
+
+
+def test_stored_bulk_validator_roundtrips_encrypted_etag(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY",
+        "bulk-resume-validator-test-key",
+    )
+    etag = '"output-v1"'
+    checkpoint_map = {
+        "content_length_bytes": 4321,
+        "etag_ciphertext": importer._encrypt_bulk_capability(etag),
+        "etag_hash": hashlib.sha256(etag.encode()).hexdigest(),
+        "committed_bytes": 1234,
+        "output_expires_at": None,
+        "validator_checked_at": datetime.datetime(2026, 7, 20, 12),
+    }
+
+    validator = importer._stored_bulk_output_validator(checkpoint_map)
+
+    assert validator is not None
+    assert validator.etag == etag
+    assert validator.content_length_bytes == 4321
+    assert etag not in checkpoint_map["etag_ciphertext"]
 
 
 def test_bulk_checkpoint_decryption_survives_key_rotation(monkeypatch):
@@ -300,6 +325,81 @@ async def test_bulk_worker_guard_conflict_prevents_fetch(monkeypatch):
     assert fetch_result is not None
     assert fetch_result.error == "bulk_export_checkpoint_worker_active"
     owned_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bulk_worker_guard_serializes_probes_but_not_download_work(
+    monkeypatch,
+):
+    """One guard connection serializes probes without serializing downloads."""
+    identity = importer.BulkExportCheckpointIdentity(
+        checkpoint_id="checkpoint-guard-serialization",
+        canonical_api_base=importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+        resource_type="Practitioner",
+        source_scope_hash="scope-security",
+        strategy_version=importer.BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION,
+        acquisition_root_run_id="root-security",
+        owner_run_id="run-security",
+        retry_of_run_id=None,
+        endpoint_id="endpoint-security",
+        dataset_id="dataset-security",
+        start_url="https://providerdirectory.api.aetna.com/fhir/$export",
+        start_url_hash="a" * 64,
+    )
+    concurrency_by_name = {
+        "probe_active": 0,
+        "probe_maximum": 0,
+        "download_active": 0,
+        "download_maximum": 0,
+    }
+
+    class GuardConnection:
+        def execution_options(self, **_options):
+            return self
+
+        async def is_scalar_query_successful(self, statement, _parameters):
+            sql = str(statement)
+            if "pg_try_advisory_lock" in sql or "pg_advisory_unlock" in sql:
+                return True
+            concurrency_by_name["probe_active"] += 1
+            concurrency_by_name["probe_maximum"] = max(
+                concurrency_by_name["probe_maximum"],
+                concurrency_by_name["probe_active"],
+            )
+            try:
+                await asyncio.sleep(0.005)
+            finally:
+                concurrency_by_name["probe_active"] -= 1
+            return True
+
+        scalar = is_scalar_query_successful
+
+    guard_connection = GuardConnection()
+
+    class GuardEngine:
+        @contextlib.asynccontextmanager
+        async def connect(self):
+            yield guard_connection
+
+    monkeypatch.setattr(importer.db, "engine", GuardEngine())
+
+    async with importer._bulk_checkpoint_worker_guard(identity) as probe:
+        async def download_output() -> None:
+            await probe()
+            concurrency_by_name["download_active"] += 1
+            concurrency_by_name["download_maximum"] = max(
+                concurrency_by_name["download_maximum"],
+                concurrency_by_name["download_active"],
+            )
+            try:
+                await asyncio.sleep(0.03)
+            finally:
+                concurrency_by_name["download_active"] -= 1
+
+        await asyncio.gather(*(download_output() for _ in range(8)))
+
+    assert concurrency_by_name["probe_maximum"] == 1
+    assert concurrency_by_name["download_maximum"] > 1
 
 
 @pytest.mark.asyncio

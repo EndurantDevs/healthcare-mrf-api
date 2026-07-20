@@ -26,6 +26,22 @@ NEXT_POLL_MIGRATION_PATH = (
     / "versions"
     / "20260713200000_provider_directory_bulk_next_poll.py"
 )
+OUTPUT_RESUME_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "20260720100000_provider_directory_bulk_output_resume.py"
+)
+OUTPUT_RESUME_COLUMNS = (
+    "content_length_bytes",
+    "etag_ciphertext",
+    "etag_hash",
+    "committed_bytes",
+    "output_expires_at",
+    "validator_checked_at",
+    "last_error",
+    "last_error_at",
+)
 
 
 def _load_migration():
@@ -43,6 +59,17 @@ def _load_next_poll_migration():
     spec = importlib.util.spec_from_file_location(
         "provider_directory_bulk_next_poll_migration",
         NEXT_POLL_MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_output_resume_migration():
+    spec = importlib.util.spec_from_file_location(
+        "provider_directory_bulk_output_resume_migration",
+        OUTPUT_RESUME_MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -148,6 +175,9 @@ def test_bulk_checkpoint_migration_matches_models(monkeypatch):
         model_columns = list(model_cls.__table__.columns.keys())
         if table_name == "provider_directory_bulk_acquisition_checkpoint":
             model_columns.remove("next_poll_at")
+        elif table_name == "provider_directory_bulk_output_checkpoint":
+            for extension_column in OUTPUT_RESUME_COLUMNS:
+                model_columns.remove(extension_column)
         assert tuple(recorded_columns) == tuple(model_columns)
         assert recorder.tables[table_name]["schema"] == model_cls.__table__.schema
 
@@ -196,3 +226,51 @@ def test_bulk_next_poll_migration_extends_acquisition_checkpoint(monkeypatch):
     assert added_column["schema"] == (
         ProviderDirectoryBulkAcquisitionCheckpoint.__table__.schema
     )
+
+
+def test_bulk_output_resume_migration_extends_output_checkpoint(monkeypatch):
+    migration = _load_output_resume_migration()
+    added_columns = []
+    monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
+
+    def record_column(_operations, table_name, column, *, schema):
+        added_columns.append(
+            {
+                "table": table_name,
+                "column": column,
+                "schema": schema,
+            }
+        )
+
+    monkeypatch.setattr(migration, "add_column_if_missing", record_column)
+
+    migration.upgrade()
+
+    assert migration.revision == (
+        "20260720100000_provider_directory_bulk_output_resume"
+    )
+    assert migration.down_revision == (
+        "20260717180000_ptg2_v4_witness_capacity"
+    )
+    assert [entry["column"].name for entry in added_columns] == list(
+        OUTPUT_RESUME_COLUMNS
+    )
+    assert all(
+        entry["table"] == ProviderDirectoryBulkOutputCheckpoint.__tablename__
+        and entry["schema"]
+        == ProviderDirectoryBulkOutputCheckpoint.__table__.schema
+        for entry in added_columns
+    )
+    committed_bytes = next(
+        entry["column"]
+        for entry in added_columns
+        if entry["column"].name == "committed_bytes"
+    )
+    assert committed_bytes.nullable is False
+    assert str(committed_bytes.server_default.arg) == "0"
+    model_default = (
+        ProviderDirectoryBulkOutputCheckpoint.__table__
+        .c.committed_bytes.server_default
+    )
+    assert model_default is not None
+    assert str(model_default.arg) == "0"
