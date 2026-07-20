@@ -174,6 +174,21 @@ def test_finalizer_summary_rejects_unknown_scratch_policies():
         finalizer.validate_v3_finalizer_summary(summary_metadata)
 
 
+@pytest.mark.asyncio
+async def test_finalizer_invocation_rejects_unknown_scratch_policy(tmp_path):
+    with pytest.raises(RuntimeError, match="must be durable or ephemeral"):
+        await finalizer.run_v3_direct_finalizer(
+            work_directory=tmp_path,
+            serving_run_entries=[],
+            code_dictionary_entries=[],
+            provider_set_metadata_entries=[],
+            expected_source_identities=[],
+            price_key_map_input=tmp_path / "missing.copy",
+            price_key_map_row_count=0,
+            scratch_durability="volatile",
+        )
+
+
 def test_finalizer_summary_validates_durable_and_policy_failure_paths():
     summary_metadata = _summary_metadata()
     scratch_metadata = summary_metadata["scratch_durability"]
