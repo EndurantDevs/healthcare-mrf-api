@@ -1041,7 +1041,10 @@ def test_reviewed_candidate_statuses_match_completed_twin_campaigns():
         == verified_status
     )
     pending_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
-    assert status_by_base[importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE] == pending_status
+    assert (
+        status_by_base[importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE]
+        == verified_status
+    )
     assert (
         status_by_base[importer.PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE]
         == verified_status
