@@ -204,8 +204,15 @@ def _mock_validation_dependencies(
     )
     monkeypatch.setattr(
         importer,
-        "_endpoint_dataset_content_hash",
-        AsyncMock(return_value=("dataset-hash", 3)),
+        "_candidate_endpoint_dataset_content_proof",
+        AsyncMock(
+            return_value=importer.EndpointDatasetContentProof(
+                dataset_hash="dataset-hash",
+                resource_count=3,
+                resource_hashes={"InsurancePlan": "resource-hash"},
+                resource_counts={"InsurancePlan": 3},
+            )
+        ),
     )
     monkeypatch.setattr(
         importer,
