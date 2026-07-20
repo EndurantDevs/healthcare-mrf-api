@@ -937,6 +937,7 @@ SCAN_LAST_UPDATED_PARTITION_RESOURCES = {
         "end": "resolved_now",
         "ceiling": 1000,
         "minimum_width_seconds": 1,
+        "boundary_precision_seconds": 1,
         "page_count": 100,
         "volatile_metadata_paths": [],
     }
@@ -1064,7 +1065,7 @@ NETSMART_PAGE_INDEX_PAGINATION_STRATEGY_VERSION = (
     "netsmart-page-index-v1"
 )
 LAST_UPDATED_PARTITION_STRATEGY_VERSION = (
-    "provider-directory-fhir-last-updated-v3"
+    "provider-directory-fhir-last-updated-v4"
 )
 LAST_UPDATED_PARTITION_METADATA_KEY = (
     "provider_directory_last_updated_partition_acquisition"
@@ -1258,6 +1259,7 @@ class LastUpdatedPartitionConfig:
     end_mode: str
     ceiling: int
     minimum_width: datetime.timedelta
+    boundary_precision: datetime.timedelta
     page_count: int
     volatile_metadata_paths: tuple[str, ...]
 
@@ -1273,6 +1275,9 @@ class LastUpdatedPartitionConfig:
             "ceiling": self.ceiling,
             "minimum_width_microseconds": int(
                 self.minimum_width.total_seconds() * 1_000_000
+            ),
+            "boundary_precision_microseconds": int(
+                self.boundary_precision.total_seconds() * 1_000_000
             ),
             "page_count": self.page_count,
             "volatile_metadata_paths": list(self.volatile_metadata_paths),
@@ -2928,6 +2933,12 @@ def _partition_width_value(raw_seconds: Any) -> datetime.timedelta:
     return datetime.timedelta(seconds=raw_seconds)
 
 
+def _partition_boundary_precision_value(raw_seconds: Any) -> datetime.timedelta:
+    if raw_seconds is None:
+        return datetime.timedelta(microseconds=1)
+    return _partition_width_value(raw_seconds)
+
+
 def _partition_page_count(raw_page_count: Any, ceiling: int) -> int:
     if (
         isinstance(raw_page_count, bool)
@@ -2956,6 +2967,9 @@ def _build_partition_config(
     minimum_width = _partition_width_value(
         resource_settings["minimum_width_seconds"]
     )
+    boundary_precision = _partition_boundary_precision_value(
+        resource_settings.get("boundary_precision_seconds")
+    )
     page_count = _partition_page_count(
         resource_settings.get("page_count", min(100, ceiling)),
         ceiling,
@@ -2971,17 +2985,19 @@ def _build_partition_config(
         end_mode=end_mode,
         ceiling=ceiling,
         minimum_width=minimum_width,
+        boundary_precision=boundary_precision,
         page_count=page_count,
         volatile_metadata_paths=volatile_paths,
     )
-    if partition_end is not None:
-        PartitionPlan.create(
-            partition_start,
-            partition_end,
-            ceiling=ceiling,
-            minimum_width=minimum_width,
-            volatile_metadata_paths=volatile_paths,
-        )
+    validation_end = partition_end or (partition_start + minimum_width)
+    PartitionPlan.create(
+        partition_start,
+        validation_end,
+        ceiling=ceiling,
+        minimum_width=minimum_width,
+        volatile_metadata_paths=volatile_paths,
+        boundary_precision=boundary_precision,
+    )
     return partition_config
 
 
@@ -22975,11 +22991,14 @@ def _partition_plan_from_control(
     config_identity = config.identity()
     return PartitionPlan.from_dict(
         {
-            "version": 1,
+            "version": 2,
             "config": {
                 "ceiling": config.ceiling,
                 "minimum_width_microseconds": config_identity[
                     "minimum_width_microseconds"
+                ],
+                "boundary_precision_microseconds": config_identity[
+                    "boundary_precision_microseconds"
                 ],
                 "volatile_metadata_paths": list(config.volatile_metadata_paths),
             },
@@ -23080,6 +23099,7 @@ def _new_last_updated_partition_plan(
         ceiling=config.ceiling,
         minimum_width=config.minimum_width,
         volatile_metadata_paths=config.volatile_metadata_paths,
+        boundary_precision=config.boundary_precision,
     )
 
 

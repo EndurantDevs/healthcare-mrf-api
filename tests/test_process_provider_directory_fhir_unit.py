@@ -847,6 +847,18 @@ def test_last_updated_partition_checkpoint_scope_includes_partition_identity():
     assert checkpoint_context.source_scope_hash == hashlib.sha256(
         expected_scope_payload.encode("utf-8")
     ).hexdigest()
+    partition_resources_by_type["Practitioner"]["boundary_precision_seconds"] = 1
+    second_precision_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["partitioned-source"],
+        run_id="run_2",
+        retry_of_run_id=None,
+    )
+    assert second_precision_context is not None
+    assert (
+        second_precision_context.source_scope_hash
+        != checkpoint_context.source_scope_hash
+    )
 
 
 def test_idaho_medicaid_supports_durable_pagination_checkpoints():
@@ -2351,6 +2363,7 @@ def test_source_row_from_seed_overrides_scan_developer_portal_base():
             "end": "resolved_now",
             "ceiling": 1000,
             "minimum_width_seconds": 1,
+            "boundary_precision_seconds": 1,
             "page_count": 100,
             "volatile_metadata_paths": [],
         }
@@ -2370,6 +2383,7 @@ def test_source_row_from_seed_overrides_scan_developer_portal_base():
         assert partition_config.ceiling == 1000
         assert partition_config.page_count == 100
         assert partition_config.end_mode == "resolved_now"
+        assert partition_config.boundary_precision == datetime.timedelta(seconds=1)
     checkpoint_context = importer._pagination_checkpoint_context(
         source_record,
         [source_record["source_id"]],
@@ -21397,6 +21411,7 @@ def _new_last_updated_partition_resume(partition_config):
             ceiling=partition_config.ceiling,
             minimum_width=partition_config.minimum_width,
             volatile_metadata_paths=partition_config.volatile_metadata_paths,
+            boundary_precision=partition_config.boundary_precision,
         )
     )
 
@@ -21542,6 +21557,63 @@ def test_last_updated_partition_validates_resource_window(
             _last_updated_partition_test_window(),
         )
         == expected_error
+    )
+
+
+def test_scan_second_precision_aligns_live_shaped_fractional_split():
+    """Keep SCAN query bounds aligned while rejecting any truly earlier row."""
+    directory_source = _last_updated_partition_test_source(
+        start="2025-02-10T08:00:24Z",
+        end="2025-02-10T08:00:27.247716Z",
+        minimum_width_seconds=1,
+        boundary_precision_seconds=1,
+    )
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None and partition_config is not None
+
+    plan = importer._new_last_updated_partition_plan(partition_config)
+    plan.observe_count("root", importer.CountObservation.exact(11))
+    right_window = plan.windows["root.1"]
+    returned_resource = _last_updated_partition_test_resource(
+        "scan-practitioner",
+        last_updated="2025-02-10T08:00:26Z",
+    )
+    request_url = importer._last_updated_partition_url(
+        f"{importer.SCAN_PROVIDER_DIRECTORY_BASE}/Practitioner",
+        right_window,
+        page_count=100,
+        count_only=False,
+    )
+
+    assert plan.windows["root"].end == importer.parse_utc_instant(
+        "2025-02-10T08:00:28Z"
+    )
+    assert right_window.start == importer.parse_utc_instant(
+        "2025-02-10T08:00:26Z"
+    )
+    assert urllib.parse.parse_qs(urllib.parse.urlsplit(request_url).query)[
+        "_lastUpdated"
+    ] == [
+        "ge2025-02-10T08:00:26.000000Z",
+        "lt2025-02-10T08:00:28.000000Z",
+    ]
+    assert (
+        importer._last_updated_partition_resource_window_error(
+            returned_resource,
+            right_window,
+        )
+        is None
+    )
+    returned_resource["meta"]["lastUpdated"] = "2025-02-10T08:00:25Z"
+    assert (
+        importer._last_updated_partition_resource_window_error(
+            returned_resource,
+            right_window,
+        )
+        == "resource_last_updated_outside_window"
     )
 
 
@@ -23001,6 +23073,7 @@ def test_last_updated_partition_checkpoint_omits_resource_fingerprints():
         ceiling=partition_config.ceiling,
         minimum_width=partition_config.minimum_width,
         volatile_metadata_paths=partition_config.volatile_metadata_paths,
+        boundary_precision=partition_config.boundary_precision,
     )
     partition_plan.observe_count("root", importer.CountObservation.exact(1))
     partition_plan.record_pass(
@@ -23034,6 +23107,7 @@ def test_last_updated_partition_checkpoint_replays_census_immutably():
         ceiling=partition_config.ceiling,
         minimum_width=partition_config.minimum_width,
         volatile_metadata_paths=partition_config.volatile_metadata_paths,
+        boundary_precision=partition_config.boundary_precision,
     )
     census = importer.LastUpdatedCompletenessCensus(
         unfiltered_pre=4,
@@ -23065,9 +23139,43 @@ def test_last_updated_partition_checkpoint_replays_census_immutably():
         )
 
 
+@pytest.mark.parametrize("identity_drift", ["strategy", "precision"])
+def test_last_updated_partition_checkpoint_rejects_precision_identity_drift(
+    identity_drift,
+):
+    directory_source = _last_updated_partition_test_source(
+        boundary_precision_seconds=1,
+    )
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None and partition_config is not None
+    partition_plan = importer._new_last_updated_partition_plan(partition_config)
+    checkpoint = json.loads(
+        importer._last_updated_partition_checkpoint_payload(
+            partition_config,
+            partition_plan,
+        )
+    )
+    if identity_drift == "strategy":
+        checkpoint["strategy_version"] = "provider-directory-fhir-last-updated-v3"
+    else:
+        checkpoint["config"]["boundary_precision_microseconds"] = 1
+
+    with pytest.raises(RuntimeError, match="checkpoint_invalid"):
+        importer._last_updated_partition_resume_from_checkpoint(
+            json.dumps(checkpoint),
+            partition_config,
+        )
+
+
 @pytest.mark.asyncio
 async def test_last_updated_partition_resolves_root_cutoff_once(monkeypatch):
-    directory_source = _last_updated_partition_test_source(end="resolved_now")
+    directory_source = _last_updated_partition_test_source(
+        end="resolved_now",
+        boundary_precision_seconds=1,
+    )
     partition_config, config_error = importer._last_updated_partition_config(
         directory_source,
         "Practitioner",
@@ -23101,7 +23209,9 @@ async def test_last_updated_partition_resolves_root_cutoff_once(monkeypatch):
 
     after_resolution = datetime.datetime.now(datetime.UTC)
     root_window = resume.plan.windows["root"]
-    assert before_resolution <= root_window.end <= after_resolution
+    assert before_resolution <= root_window.end
+    assert root_window.end < after_resolution + datetime.timedelta(seconds=1)
+    assert root_window.end.microsecond == 0
     durable_payload = reset_checkpoint.await_args.args[2]
     restored_plan = importer._last_updated_partition_plan_from_checkpoint(
         durable_payload,

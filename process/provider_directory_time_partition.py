@@ -4,17 +4,18 @@
 
 from __future__ import annotations
 
-import copy
 import datetime
-import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
-
-class PartitionPlanError(ValueError):
-    """Raised when a plan operation or checkpoint is invalid."""
+from process import provider_directory_time_partition_primitives as _primitives
+from process.provider_directory_time_partition_primitives import (
+    PartitionPlanError,
+    fingerprint_resource,
+    parse_utc_instant,
+)
 
 
 class CountKind(str, Enum):
@@ -92,8 +93,8 @@ class TimeWindow:
     passes: dict[int, WindowPass] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.start = validate_utc_instant(self.start, "window start")
-        self.end = validate_utc_instant(self.end, "window end")
+        self.start = _primitives.validate_utc_instant(self.start, "window start")
+        self.end = _primitives.validate_utc_instant(self.end, "window end")
         if self.start >= self.end:
             raise PartitionPlanError("a window must have start < end")
 
@@ -102,6 +103,7 @@ class PartitionConfig:
     ceiling: int
     minimum_width: datetime.timedelta
     volatile_metadata_paths: tuple[str, ...] = ()
+    boundary_precision: datetime.timedelta = datetime.timedelta(microseconds=1)
 
     def __post_init__(self) -> None:
         if isinstance(self.ceiling, bool) or not isinstance(self.ceiling, int) or self.ceiling < 0:
@@ -110,9 +112,21 @@ class PartitionConfig:
             raise PartitionPlanError("minimum_width must be a timedelta")
         if self.minimum_width <= datetime.timedelta(0):
             raise PartitionPlanError("minimum_width must be positive")
+        if not isinstance(self.boundary_precision, datetime.timedelta):
+            raise PartitionPlanError("boundary_precision must be a timedelta")
+        if self.boundary_precision <= datetime.timedelta(0):
+            raise PartitionPlanError("boundary_precision must be positive")
+        minimum_width_microseconds = _primitives.timedelta_microseconds(self.minimum_width)
+        boundary_precision_microseconds = _primitives.timedelta_microseconds(
+            self.boundary_precision
+        )
+        if minimum_width_microseconds % boundary_precision_microseconds:
+            raise PartitionPlanError(
+                "minimum_width must be an exact multiple of boundary_precision"
+            )
         normalized_paths = tuple(sorted(set(self.volatile_metadata_paths)))
         for path in normalized_paths:
-            _decode_json_pointer(path)
+            _primitives.decode_json_pointer(path)
         object.__setattr__(self, "volatile_metadata_paths", normalized_paths)
 
 
@@ -133,12 +147,32 @@ class PartitionPlan:
         ceiling: int,
         minimum_width: datetime.timedelta,
         volatile_metadata_paths: Iterable[str] = (),
+        boundary_precision: datetime.timedelta = datetime.timedelta(microseconds=1),
     ) -> PartitionPlan:
         """Create a new plan containing one uncounted root window."""
         config = PartitionConfig(
-            ceiling, minimum_width, tuple(volatile_metadata_paths)
+            ceiling=ceiling,
+            minimum_width=minimum_width,
+            volatile_metadata_paths=tuple(volatile_metadata_paths),
+            boundary_precision=boundary_precision,
         )
-        root = TimeWindow("root", start, end)
+        normalized_start = _primitives.validate_utc_instant(start, "window start")
+        normalized_end = _primitives.validate_utc_instant(end, "window end")
+        if normalized_start >= normalized_end:
+            raise PartitionPlanError("a window must have start < end")
+        root = TimeWindow(
+            "root",
+            _primitives.align_partition_boundary(
+                normalized_start,
+                config.boundary_precision,
+                round_up=False,
+            ),
+            _primitives.align_partition_boundary(
+                normalized_end,
+                config.boundary_precision,
+                round_up=True,
+            ),
+        )
         return cls(config=config, windows={root.window_id: root})
 
     @property
@@ -246,10 +280,15 @@ class PartitionPlan:
                 "window_id": self.failure.window_id,
             }
         return {
-            "version": 1,
+            "version": 2,
             "config": {
                 "ceiling": self.config.ceiling,
-                "minimum_width_microseconds": _timedelta_microseconds(self.config.minimum_width),
+                "minimum_width_microseconds": _primitives.timedelta_microseconds(
+                    self.config.minimum_width
+                ),
+                "boundary_precision_microseconds": _primitives.timedelta_microseconds(
+                    self.config.boundary_precision
+                ),
                 "volatile_metadata_paths": list(self.config.volatile_metadata_paths),
             },
             "windows": windows_list,
@@ -263,7 +302,7 @@ class PartitionPlan:
     @classmethod
     def from_dict(cls, checkpoint: Mapping[str, Any]) -> PartitionPlan:
         """Restore and validate a plan from a checkpoint mapping."""
-        if checkpoint.get("version") != 1:
+        if checkpoint.get("version") != 2:
             raise PartitionPlanError("unsupported partition checkpoint version")
         try:
             config_fields = checkpoint["config"]
@@ -271,6 +310,9 @@ class PartitionPlan:
                 ceiling=config_fields["ceiling"],
                 minimum_width=datetime.timedelta(microseconds=config_fields["minimum_width_microseconds"]),
                 volatile_metadata_paths=tuple(config_fields["volatile_metadata_paths"]),
+                boundary_precision=datetime.timedelta(
+                    microseconds=config_fields["boundary_precision_microseconds"]
+                ),
             )
             window_fields_list = checkpoint["windows"]
             windows_by_id = {
@@ -306,7 +348,16 @@ class PartitionPlan:
                 window.window_id,
             )
             return
-        midpoint = window.start + (window.end - window.start) / 2
+        duration_microseconds = _primitives.timedelta_microseconds(
+            window.end - window.start
+        )
+        boundary_microseconds = _primitives.timedelta_microseconds(
+            self.config.boundary_precision
+        )
+        midpoint_units = (duration_microseconds // boundary_microseconds) // 2
+        midpoint = window.start + datetime.timedelta(
+            microseconds=midpoint_units * boundary_microseconds
+        )
         left = TimeWindow(f"{window.window_id}.0", window.start, midpoint)
         right = TimeWindow(f"{window.window_id}.1", midpoint, window.end)
         window.state = WindowState.SPLIT
@@ -365,6 +416,16 @@ class PartitionPlan:
             if previous.end != current.start:
                 raise PartitionPlanError("checkpoint leaf windows are not contiguous")
         for window in self.windows.values():
+            if not _primitives.is_partition_boundary_aligned(
+                window.start,
+                self.config.boundary_precision,
+            ) or not _primitives.is_partition_boundary_aligned(
+                window.end,
+                self.config.boundary_precision,
+            ):
+                raise PartitionPlanError(
+                    "checkpoint window is not aligned to boundary_precision"
+                )
             pass_numbers = set(window.passes)
             if not pass_numbers.issubset({1, 2}) or (2 in pass_numbers and 1 not in pass_numbers):
                 raise PartitionPlanError("checkpoint contains an invalid pass sequence")
@@ -413,8 +474,8 @@ class PartitionPlan:
     def _window_to_dict(window: TimeWindow) -> dict[str, Any]:
         return {
             "window_id": window.window_id,
-            "start": _format_utc_instant(window.start),
-            "end": _format_utc_instant(window.end),
+            "start": _primitives.format_utc_instant(window.start),
+            "end": _primitives.format_utc_instant(window.end),
             "state": window.state.value,
             "count": window.count,
             "passes": {
@@ -437,64 +498,3 @@ class PartitionPlan:
             count=fields["count"],
             passes=passes_by_number,
         )
-
-
-def validate_utc_instant(instant: datetime.datetime, label: str = "instant") -> datetime.datetime:
-    """Validate and normalize an explicitly UTC-aware datetime."""
-    if not isinstance(instant, datetime.datetime):
-        raise PartitionPlanError(f"{label} must be a datetime")
-    if instant.tzinfo is None or instant.utcoffset() != datetime.timedelta(0):
-        raise PartitionPlanError(f"{label} must be explicitly UTC")
-    return instant.astimezone(datetime.UTC)
-
-
-def _format_utc_instant(instant: datetime.datetime) -> str:
-    normalized = validate_utc_instant(instant)
-    return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
-
-
-def parse_utc_instant(text: str) -> datetime.datetime:
-    """Parse an ISO instant and reject naive or non-UTC offsets."""
-    if not isinstance(text, str):
-        raise PartitionPlanError("UTC instant must be a string")
-    try:
-        instant = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise PartitionPlanError("invalid UTC instant") from exc
-    return validate_utc_instant(instant)
-
-
-def fingerprint_resource(resource: Mapping[str, Any], volatile_paths: Iterable[str] = ()) -> str:
-    """Hash canonical resource JSON after removing configured JSON Pointer paths."""
-    canonical = copy.deepcopy(dict(resource))
-    decoded_paths = sorted((_decode_json_pointer(path) for path in volatile_paths), reverse=True)
-    for path_parts in decoded_paths:
-        _remove_path(canonical, path_parts)
-    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _decode_json_pointer(path: str) -> tuple[str, ...]:
-    if not isinstance(path, str) or not path.startswith("/") or path == "/":
-        raise PartitionPlanError("volatile metadata paths must be non-root JSON Pointers")
-    return tuple(part.replace("~1", "/").replace("~0", "~") for part in path[1:].split("/"))
-
-
-def _remove_path(container: Any, path_parts: tuple[str, ...]) -> None:
-    current = container
-    for part in path_parts[:-1]:
-        if isinstance(current, dict) and part in current:
-            current = current[part]
-        elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
-            current = current[int(part)]
-        else:
-            return
-    final = path_parts[-1]
-    if isinstance(current, dict):
-        current.pop(final, None)
-    elif isinstance(current, list) and final.isdigit() and int(final) < len(current):
-        current.pop(int(final))
-
-
-def _timedelta_microseconds(duration: datetime.timedelta) -> int:
-    return duration.days * 86_400_000_000 + duration.seconds * 1_000_000 + duration.microseconds
