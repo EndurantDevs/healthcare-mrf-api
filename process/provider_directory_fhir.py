@@ -16453,6 +16453,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
         requires_registration: bool = False,
         acquisition_enabled: bool = True,
         acquisition_blocked_reason: str | None = None,
+        candidate_status: str = PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
     ) -> dict[str, Any]:
         """Build one fail-closed reviewed candidate seed record."""
         metadata = {
@@ -16481,9 +16482,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
                     "provider_directory_fully_enumerable_resources": list(resources),
                     "provider_directory_coverage_mode": "full",
                     "provider_directory_acquisition_enabled": True,
-                    "provider_directory_candidate_status": (
-                        "pending_two_matching_exhaustive_acquisitions"
-                    ),
+                    "provider_directory_candidate_status": candidate_status,
                     PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY: (
                         verification_campaign_id
                     ),
@@ -16577,6 +16576,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             source_url="https://wp.sbcounty.gov/dbh/developersapis/",
             resources=state_resources,
             expected_nonempty_resources=county_expected_resources,
+            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
         ),
         candidate_row(
             row_id="san-mateo-county-bhrs-reviewed-candidate",
@@ -16588,6 +16588,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             source_url="https://www.smchealth.org/node/6722",
             resources=state_resources,
             expected_nonempty_resources=county_expected_resources,
+            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
         ),
         candidate_row(
             row_id="el-dorado-county-behavioral-health-reviewed-candidate",
@@ -16614,6 +16615,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             source_url="https://www.devoted.com/developers/",
             resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
             expected_nonempty_resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
+            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
         ),
         candidate_row(
             row_id="simpra-advantage-reviewed-candidate",
@@ -16623,6 +16625,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             source_url="https://simpra.healthlx.com/developers",
             resources=AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES,
             expected_nonempty_resources=AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES,
+            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
         ),
         candidate_row(
             row_id="capital-blue-cross-reviewed-candidate",
