@@ -95,14 +95,14 @@ async def fake_plan_snapshot_pairs(_session, _plan_fields):
 
 
 def strict_snapshot_tables(snapshot_id="ptg2:test"):
-    snapshot_keys = {
+    snapshot_key_by_id = {
         "ptg2:test": 17,
         "ptg2:test:ndc": 41,
         "ptg2:test:c2": 42,
     }
     return types.SimpleNamespace(
         uses_shared_blocks=True,
-        shared_snapshot_key=snapshot_keys[snapshot_id],
+        shared_snapshot_key=snapshot_key_by_id[snapshot_id],
     )
 
 

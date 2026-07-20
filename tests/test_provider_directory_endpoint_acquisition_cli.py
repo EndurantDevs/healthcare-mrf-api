@@ -35,7 +35,7 @@ def test_acquisition_cli_verifies_local_operator_input(tmp_path, capsys):
     manifest = acquisition_cli.harness.load_manifest()
     entry = next(manifest_entry for manifest_entry in manifest["entries"] if manifest_entry["resources"])
     source_ids = list(entry["source_ids"])
-    metrics = {
+    metrics_map = {
         "source_ids": source_ids,
         "source_import_sources_selected": len(source_ids),
         "source_import_groups_attempted": 1,
@@ -65,7 +65,7 @@ def test_acquisition_cli_verifies_local_operator_input(tmp_path, capsys):
                         "status": "succeeded",
                         "importer": manifest["importer"],
                         "params": acquisition_cli.harness.entry_params(manifest, entry),
-                        "metrics": metrics,
+                        "metrics": metrics_map,
                     }
                 },
             }

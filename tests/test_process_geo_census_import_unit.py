@@ -241,7 +241,7 @@ async def test_collect_profile_map_merges_and_filters_cbp_non_zcta(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_load_geo_census_lookup_truncates_and_writes(monkeypatch):
-    captured = {"rows": []}
+    captured_rows_by_name = {"rows": []}
 
     async def _fake_collect(*_args, **_kwargs):
         return {
@@ -277,7 +277,7 @@ async def test_load_geo_census_lookup_truncates_and_writes(monkeypatch):
         return None
 
     async def _fake_flush(rows):
-        captured["rows"].extend(rows)
+        captured_rows_by_name["rows"].extend(rows)
         rows.clear()
 
     monkeypatch.setattr(geo_census, "_collect_profile_map", _fake_collect)
@@ -290,6 +290,9 @@ async def test_load_geo_census_lookup_truncates_and_writes(monkeypatch):
     inserted = await geo_census.load_geo_census_lookup(test_mode=False)
 
     assert inserted == 1
-    assert len(captured["rows"]) == 1
-    assert captured["rows"][0]["zip_code"] == "60654"
-    assert captured["rows"][0]["total_employer_establishments"] == 2224
+    assert len(captured_rows_by_name["rows"]) == 1
+    assert captured_rows_by_name["rows"][0]["zip_code"] == "60654"
+    assert (
+        captured_rows_by_name["rows"][0]["total_employer_establishments"]
+        == 2224
+    )

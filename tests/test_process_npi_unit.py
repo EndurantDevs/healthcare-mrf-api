@@ -599,11 +599,11 @@ async def test_startup_initializes_tables(monkeypatch, npi_module):
     monkeypatch.setattr(npi_module.db, "create_table", create_mock)
     monkeypatch.setattr(npi_module.db, "status", status_mock)
 
-    ctx: dict[str, object] = {}
-    await npi_module.startup(ctx)
+    startup_context_map: dict[str, object] = {}
+    await npi_module.startup(startup_context_map)
 
-    assert ctx["import_date"]
-    assert ctx["context"]["run"] == 0
+    assert startup_context_map["import_date"]
+    assert startup_context_map["context"]["run"] == 0
     my_init_mock.assert_awaited_once()
     assert create_mock.await_count >= 1
     assert status_mock.await_count >= 1
@@ -621,10 +621,10 @@ async def test_startup_honors_import_id_override(monkeypatch, npi_module):
     monkeypatch.setattr(npi_module.db, "create_table", AsyncMock())
     monkeypatch.setattr(npi_module.db, "status", AsyncMock())
 
-    ctx: dict[str, object] = {}
-    await npi_module.startup(ctx)
+    startup_context_map: dict[str, object] = {}
+    await npi_module.startup(startup_context_map)
 
-    assert ctx["import_date"] == "addrcanon_npi_timing"
+    assert startup_context_map["import_date"] == "addrcanon_npi_timing"
 
 
 @pytest.mark.asyncio
@@ -682,12 +682,12 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
 
     monkeypatch.setattr(npi_module, "mark_control_run", fake_mark_control_run)
 
-    ctx = {
+    shutdown_context_map = {
         "context": {"run": 1, "start": datetime.datetime.utcnow(), "control_run_id": "npi-run-1"},
         "import_date": "20251108",
     }
 
-    await npi_module.shutdown(ctx)
+    await npi_module.shutdown(shutdown_context_map)
 
     scalar_mock.assert_awaited()
     stamp_address_keys.assert_awaited()

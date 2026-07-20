@@ -9499,6 +9499,131 @@ def test_endpoint_dataset_metadata_has_versioned_completion_proof():
     }
 
 
+def test_endpoint_dataset_source_summary_sql_reads_only_immutable_payload():
+    summary_sql = importer._endpoint_dataset_source_summary_metrics_sql()
+
+    assert "provider_directory_dataset_resource" in summary_sql
+    assert "payload_json::jsonb" in summary_sql
+    assert "provider_directory_practitioner" not in summary_sql
+    assert "provider_directory_location" not in summary_sql
+    assert "COUNT(DISTINCT" in summary_sql
+    assert "MATERIALIZED" not in summary_sql
+    assert "summary_resource_types" in summary_sql
+
+
+def _source_summary_candidate():
+    return dataclasses.replace(
+        _endpoint_dataset_candidate(),
+        selected_resources=(
+            "InsurancePlan",
+            "Location",
+            "Organization",
+            "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+        ),
+    )
+
+
+def _source_summary_content_proof():
+    count_by_resource = {
+        "InsurancePlan": 2,
+        "Location": 4,
+        "Organization": 3,
+        "OrganizationAffiliation": 1,
+        "Practitioner": 5,
+        "PractitionerRole": 7,
+    }
+    return importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=sum(count_by_resource.values()),
+        resource_hashes={
+            resource_type: str(index) * 64
+            for index, resource_type in enumerate(
+                count_by_resource,
+                start=1,
+            )
+        },
+        resource_counts=count_by_resource,
+    )
+
+
+def _source_summary_relation_proof_by_name():
+    return {
+        importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY: {
+            "complete": True,
+            "edge_count": 9,
+        },
+        (
+            importer.PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY
+        ): {"complete": True, "edge_count": 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_source_summary_is_exact_and_dataset_bound():
+    """Expose only counts sealed to the exact immutable dataset proof."""
+    candidate = _source_summary_candidate()
+    content_proof = _source_summary_content_proof()
+    connection = Mock(
+        first=AsyncMock(
+            return_value={
+                "distinct_npis": 6,
+                "address_records": 8,
+                "addressed_locations": 3,
+                "geocoded_locations": 1,
+            }
+        )
+    )
+
+    summary_map = await importer._endpoint_dataset_source_summary(
+        connection,
+        candidate,
+        content_proof,
+        _source_summary_relation_proof_by_name(),
+    )
+
+    assert summary_map["dataset_id"] == candidate.dataset_id
+    assert summary_map["dataset_hash"] == content_proof.dataset_hash
+    assert summary_map["total_resources"] == 22
+    assert summary_map["resource_counts"] == content_proof.resource_counts
+    assert summary_map["distinct_npis"] == 6
+    assert summary_map["individual_practitioners"] == 5
+    assert summary_map["organization_resources"] == 3
+    assert summary_map["practitioner_role_resources"] == 7
+    assert summary_map["network_plan_links"] == 9
+    assert summary_map["organization_affiliation_links"] == 1
+    assert summary_map["intentional_drop_counts"] == {}
+    assert summary_map["unknown_field_counts"] == {}
+    connection.first.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_source_summary_skips_legacy_missing_root():
+    connection = Mock(first=AsyncMock())
+    candidate = dataclasses.replace(
+        _endpoint_dataset_candidate(),
+        acquisition_root_run_id=None,
+    )
+    content_proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=0,
+        resource_hashes={"Practitioner": hashlib.sha256().hexdigest()},
+        resource_counts={"Practitioner": 0},
+    )
+
+    assert (
+        await importer._endpoint_dataset_source_summary(
+            connection,
+            candidate,
+            content_proof,
+            {},
+        )
+        is None
+    )
+    connection.first.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_incomplete_endpoint_dataset_candidate_is_not_published(monkeypatch):
     mark_candidate = AsyncMock()
@@ -9645,6 +9770,14 @@ class _EndpointDatasetPromotionHarness:
         self.events.append("commit" if self.committed else "rollback")
 
     async def first(self, sql, **params):
+        if "AS distinct_npis" in sql:
+            self.events.append("summarize_resources")
+            return {
+                "distinct_npis": 2,
+                "address_records": 0,
+                "addressed_locations": 0,
+                "geocoded_locations": 0,
+            }
         if "provider_directory_api_endpoint" in sql:
             self.events.append("lock_endpoint")
             return {"endpoint_id": params["endpoint_id"]}
@@ -9738,6 +9871,7 @@ async def test_endpoint_dataset_completion_validates_without_superseding_current
         "lock_current",
         "read_resources",
         "read_resources",
+        "summarize_resources",
         "validate",
         "commit",
     ]

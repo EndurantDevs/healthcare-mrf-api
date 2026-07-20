@@ -16,7 +16,7 @@ def npi_module():
 
 
 def _minimal_npi_row() -> dict[str, str]:
-    npi_csv_row = {
+    npi_csv_row_map = {
         "NPI": "1215387113",
         "Entity Type Code": "2",
         "Provider Organization Name (Legal Business Name)": "Example Org",
@@ -39,27 +39,27 @@ def _minimal_npi_row() -> dict[str, str]:
         "Last Update Date": "2024-01-15",
     }
     for idx in range(1, 16):
-        npi_csv_row[f"Healthcare Provider Taxonomy Code_{idx}"] = ""
-        npi_csv_row[f"Provider License Number_{idx}"] = ""
-        npi_csv_row[f"Provider License Number State Code_{idx}"] = ""
-        npi_csv_row[f"Healthcare Provider Primary Taxonomy Switch_{idx}"] = ""
-        npi_csv_row[f"Healthcare Provider Taxonomy Group_{idx}"] = ""
-    npi_csv_row["Healthcare Provider Taxonomy Code_1"] = "207Q00000X"
-    npi_csv_row["Provider License Number_1"] = "TX123"
-    npi_csv_row["Provider License Number State Code_1"] = "TX"
-    npi_csv_row["Healthcare Provider Primary Taxonomy Switch_1"] = "Y"
-    npi_csv_row["Healthcare Provider Taxonomy Group_1"] = "Allopathic & Osteopathic Physicians"
+        npi_csv_row_map[f"Healthcare Provider Taxonomy Code_{idx}"] = ""
+        npi_csv_row_map[f"Provider License Number_{idx}"] = ""
+        npi_csv_row_map[f"Provider License Number State Code_{idx}"] = ""
+        npi_csv_row_map[f"Healthcare Provider Primary Taxonomy Switch_{idx}"] = ""
+        npi_csv_row_map[f"Healthcare Provider Taxonomy Group_{idx}"] = ""
+    npi_csv_row_map["Healthcare Provider Taxonomy Code_1"] = "207Q00000X"
+    npi_csv_row_map["Provider License Number_1"] = "TX123"
+    npi_csv_row_map["Provider License Number State Code_1"] = "TX"
+    npi_csv_row_map["Healthcare Provider Primary Taxonomy Switch_1"] = "Y"
+    npi_csv_row_map["Healthcare Provider Taxonomy Group_1"] = "Allopathic & Osteopathic Physicians"
 
     for idx in range(1, 51):
-        npi_csv_row[f"Other Provider Identifier_{idx}"] = ""
-        npi_csv_row[f"Other Provider Identifier Type Code_{idx}"] = ""
-        npi_csv_row[f"Other Provider Identifier State_{idx}"] = ""
-        npi_csv_row[f"Other Provider Identifier Issuer_{idx}"] = ""
-    npi_csv_row["Other Provider Identifier_1"] = "ALT123"
-    npi_csv_row["Other Provider Identifier Type Code_1"] = "05"
-    npi_csv_row["Other Provider Identifier State_1"] = "TX"
-    npi_csv_row["Other Provider Identifier Issuer_1"] = "Issuer"
-    return npi_csv_row
+        npi_csv_row_map[f"Other Provider Identifier_{idx}"] = ""
+        npi_csv_row_map[f"Other Provider Identifier Type Code_{idx}"] = ""
+        npi_csv_row_map[f"Other Provider Identifier State_{idx}"] = ""
+        npi_csv_row_map[f"Other Provider Identifier Issuer_{idx}"] = ""
+    npi_csv_row_map["Other Provider Identifier_1"] = "ALT123"
+    npi_csv_row_map["Other Provider Identifier Type Code_1"] = "05"
+    npi_csv_row_map["Other Provider Identifier State_1"] = "TX"
+    npi_csv_row_map["Other Provider Identifier Issuer_1"] = "Issuer"
+    return npi_csv_row_map
 
 
 def _write_csv(path, rows: list[dict[str, str]]) -> None:
@@ -140,16 +140,16 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
     monkeypatch.setattr(npi_module, "_load_nucc_taxonomy_int_code_map", AsyncMock(return_value={}))
     monkeypatch.setattr(npi_module, "save_npi_data", fake_save)
 
-    ctx = {
+    worker_context_map = {
         "context": {},
         "redis": SimpleNamespace(enqueue_job=AsyncMock()),
         "import_date": "20260331",
     }
 
-    await npi_module.process_data(ctx, {"test_mode": True})
+    await npi_module.process_data(worker_context_map, {"test_mode": True})
 
-    assert ctx["context"]["run"] == 1
-    assert ctx["context"]["test_mode"] is True
+    assert worker_context_map["context"]["run"] == 1
+    assert worker_context_map["context"]["test_mode"] is True
 
     npi_payload = next(
         candidate_npi_payload

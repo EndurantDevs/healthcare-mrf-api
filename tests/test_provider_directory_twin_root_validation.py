@@ -156,6 +156,13 @@ class _ValidationHarness:
     async def first(self, sql, **_params):
         if "verification_baseline_count" in sql:
             return self.baseline_dataset_map
+        if "WITH immutable_resources AS" in sql:
+            return {
+                "distinct_npis": 0,
+                "address_records": 0,
+                "addressed_locations": 0,
+                "geocoded_locations": 0,
+            }
         if "provider_directory_api_endpoint" in sql:
             return {"endpoint_id": self.candidate.endpoint_id}
         if "SELECT dataset_id, acquisition_root_run_id" in sql:
@@ -199,7 +206,18 @@ async def _validate(
     baseline_dataset_map: dict[str, object] | None = None,
 ):
     harness = _ValidationHarness(candidate, resource_rows, baseline_dataset_map)
-    relations = AsyncMock(return_value={"relation_proof": {"complete": True}})
+    relations = AsyncMock(
+        return_value={
+            importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY: {
+                "complete": True,
+                "edge_count": 0,
+            },
+            importer.PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY: {
+                "complete": True,
+                "edge_count": 0,
+            },
+        }
+    )
     monkeypatch.setattr(importer.db, "acquire", lambda: harness)
     monkeypatch.setattr(
         importer, "_build_endpoint_dataset_serving_relations", relations

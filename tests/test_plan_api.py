@@ -411,11 +411,11 @@ def test_parse_float_invalid():
 
 
 def test_append_filter_skips_empty():
-    applied_filters = {"existing": 1}
-    plan_module._append_filter(applied_filters, "empty", "")
-    assert applied_filters == {"existing": 1}
-    plan_module._append_filter(applied_filters, "filled", 2)
-    assert applied_filters["filled"] == 2
+    applied_filter_map = {"existing": 1}
+    plan_module._append_filter(applied_filter_map, "empty", "")
+    assert applied_filter_map == {"existing": 1}
+    plan_module._append_filter(applied_filter_map, "filled", 2)
+    assert applied_filter_map["filled"] == 2
 
 
 def test_collect_price_bounds_merges():

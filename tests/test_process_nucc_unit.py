@@ -56,8 +56,8 @@ async def test_process_data_extracts_records(monkeypatch, nucc_module, tmp_path)
     monkeypatch.setattr(nucc_module, "make_class", fake_make_class)
     monkeypatch.setattr(nucc_module, "ensure_database", AsyncMock())
 
-    ctx = {"import_date": "20260101"}
-    await nucc_module.process_data(ctx)
+    import_context_map = {"import_date": "20260101"}
+    await nucc_module.process_data(import_context_map)
 
     assert push_calls
     table, rewrite, taxonomy_rows = push_calls[0]
@@ -83,11 +83,13 @@ async def test_startup_sets_context_and_creates_tables(monkeypatch, nucc_module)
     monkeypatch.setattr(nucc_module.db, "status", AsyncMock(side_effect=lambda stmt: status_calls.append(stmt)))
     monkeypatch.setattr(nucc_module, "ensure_database", AsyncMock())
 
-    ctx: dict[str, object] = {}
-    await nucc_module.startup(ctx)
+    startup_context_map: dict[str, object] = {}
+    await nucc_module.startup(startup_context_map)
 
-    assert ctx["context"]["run"] == 0
-    assert (datetime.datetime.utcnow() - ctx["context"]["start"]).total_seconds() < 2
+    assert startup_context_map["context"]["run"] == 0
+    assert (
+        datetime.datetime.utcnow() - startup_context_map["context"]["start"]
+    ).total_seconds() < 2
     assert create_calls
     assert any("DROP TABLE" in stmt for stmt in status_calls)
 
@@ -111,20 +113,24 @@ async def test_shutdown_rotates_tables(monkeypatch, nucc_module):
 
     monkeypatch.setattr(nucc_module.db, "transaction", lambda: fake_tx())
 
-    captured = {}
-    monkeypatch.setattr(nucc_module, "print_time_info", lambda start: captured.setdefault("start", start))
+    captured_time_by_name = {}
+    monkeypatch.setattr(
+        nucc_module,
+        "print_time_info",
+        lambda start: captured_time_by_name.setdefault("start", start),
+    )
 
-    ctx = {
+    shutdown_context_map = {
         "import_date": "20260102",
         "context": {
             "start": datetime.datetime.utcnow() - datetime.timedelta(seconds=5)
         },
     }
 
-    await nucc_module.shutdown(ctx)
+    await nucc_module.shutdown(shutdown_context_map)
 
     assert status_calls
-    assert captured["start"]
+    assert captured_time_by_name["start"]
 
 
 @pytest.mark.asyncio

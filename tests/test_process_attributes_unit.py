@@ -124,16 +124,18 @@ async def test_shutdown_skips_missing_import_tables(monkeypatch):
 
     monkeypatch.setattr(process_attributes.db, "transaction", fake_transaction)
 
-    ctx = {
+    shutdown_context_map = {
         "import_date": "20260214",
         "context": {
             "test_mode": True,
             "start": datetime.datetime.utcnow(),
         },
     }
-    await process_attributes.shutdown(ctx)
+    await process_attributes.shutdown(shutdown_context_map)
 
-    status_sql = [call.args[0] for call in status_mock.await_args_list if call.args]
+    status_statements = [
+        call.args[0] for call in status_mock.await_args_list if call.args
+    ]
     assert status_mock.await_count == 0
-    assert all("CREATE INDEX" not in sql for sql in status_sql)
+    assert all("CREATE INDEX" not in sql for sql in status_statements)
     assert ddl_mock.await_count == 0
