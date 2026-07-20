@@ -2813,6 +2813,28 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     }
 
 
+def test_uhc_catalog_reports_supported_resources_without_enabling_import():
+    """Show the verified UHC surface while its census remains incomplete."""
+    uhc_entry = next(
+        entry
+        for entry in provider_directory_source_catalog()["items"]
+        if entry["entry_id"] == "uhc"
+    )
+
+    assert uhc_entry["resources"] == []
+    assert uhc_entry["runnable"] is False
+    assert uhc_entry["supported_resources"] == [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_control_provider_directory_sources_endpoint(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")

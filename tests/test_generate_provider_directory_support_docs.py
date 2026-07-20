@@ -459,7 +459,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("amerihealth-caritas-carrier", "clears plan_name"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
         ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
-        ("uhc", "plan_graph_complete never satisfies endpoint publication"),
+        ("uhc", "server ignores the :missing modifier"),
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
         ("horizon-nj", "approved Provider Directory API-product subscription"),
         ("missouri", "Practitioner response exceeds the 20 MiB cap"),
