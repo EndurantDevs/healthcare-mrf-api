@@ -85,6 +85,47 @@ def test_recursive_split_produces_ordered_non_overlapping_half_open_windows():
     assert plan.status is PlanStatus.ACQUIRING
 
 
+def test_boundary_precision_aligns_root_and_odd_recursive_splits():
+    precision = datetime.timedelta(seconds=1)
+    plan = PartitionPlan.create(
+        datetime.datetime(2025, 2, 10, 8, 0, 24, 623858, tzinfo=UTC),
+        datetime.datetime(2025, 2, 10, 8, 0, 28, 100000, tzinfo=UTC),
+        ceiling=1,
+        minimum_width=precision,
+        boundary_precision=precision,
+    )
+
+    root = plan.windows["root"]
+    assert root.start == datetime.datetime(2025, 2, 10, 8, 0, 24, tzinfo=UTC)
+    assert root.end == datetime.datetime(2025, 2, 10, 8, 0, 29, tzinfo=UTC)
+
+    plan.observe_count("root", CountObservation.exact(4))
+    plan.observe_count("root.0", CountObservation.exact(2))
+    plan.observe_count("root.1", CountObservation.exact(2))
+
+    assert [(window.start.second, window.end.second) for window in plan.leaf_windows()] == [
+        (24, 25),
+        (25, 26),
+        (26, 27),
+        (27, 29),
+    ]
+    assert all(
+        window.start.microsecond == window.end.microsecond == 0
+        for window in plan.windows.values()
+    )
+
+
+def test_boundary_precision_must_divide_minimum_width():
+    with pytest.raises(PartitionPlanError, match="exact multiple"):
+        PartitionPlan.create(
+            instant(0),
+            instant(1),
+            ceiling=2,
+            minimum_width=datetime.timedelta(milliseconds=1500),
+            boundary_precision=datetime.timedelta(seconds=1),
+        )
+
+
 @pytest.mark.parametrize(
     "observation,code",
     [
@@ -157,6 +198,21 @@ def test_checkpoint_rejects_noncontiguous_leaf_windows():
     checkpoint["windows"][1]["end"] = "2026-01-01T01:00:00.000000Z"
 
     with pytest.raises(PartitionPlanError, match="contiguous"):
+        PartitionPlan.from_dict(checkpoint)
+
+
+def test_checkpoint_rejects_window_outside_configured_boundary_precision():
+    plan = PartitionPlan.create(
+        instant(0),
+        instant(2),
+        ceiling=2,
+        minimum_width=datetime.timedelta(seconds=1),
+        boundary_precision=datetime.timedelta(seconds=1),
+    )
+    checkpoint = plan.to_dict()
+    checkpoint["windows"][0]["start"] = "2026-01-01T00:00:00.500000Z"
+
+    with pytest.raises(PartitionPlanError, match="not aligned"):
         PartitionPlan.from_dict(checkpoint)
 
 
