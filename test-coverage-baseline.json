@@ -121,6 +121,7 @@
         "process/provider_directory_profile.py",
         "process/provider_directory_profile_reference_sql.py",
         "process/provider_directory_time_partition.py",
+        "process/provider_directory_time_partition_primitives.py",
         "process/provider_enrichment.py",
         "process/provider_quality.py",
         "process/provider_quality_parts/__init__.py",
@@ -234,12 +235,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 18809,
-          "total": 30234
+          "covered": 18856,
+          "total": 30246
         },
         "lines": {
-          "covered": 66042,
-          "total": 87223
+          "covered": 66126,
+          "total": 87266
         }
       },
       "path": "test-coverage-python.json",
