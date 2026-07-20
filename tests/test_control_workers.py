@@ -237,6 +237,25 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     assert job["spec"]["activeDeadlineSeconds"] == 43200
 
 
+def test_provider_directory_kubernetes_job_has_six_day_deadline_floor(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "259200")
+    provider_spec = next(
+        spec
+        for spec in control_workers._START_WORKERS
+        if spec.worker_class == "process.ProviderDirectoryFHIR"
+    )
+
+    job = control_workers._worker_job_manifest(
+        provider_spec,
+        {"run_id": "run-provider-directory"},
+        "healthcare-mrf-api:test",
+    )
+
+    assert job["spec"]["activeDeadlineSeconds"] == 518400
+
+
 def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 

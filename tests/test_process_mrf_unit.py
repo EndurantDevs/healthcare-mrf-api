@@ -1821,6 +1821,20 @@ def test_ptg_timeout_default(monkeypatch):
         importlib.reload(process_pkg)
 
 
+def test_provider_directory_timeout_has_six_day_floor(monkeypatch):
+    timeout_name = "HLTHPRT_PROVIDER_DIRECTORY_FHIR_JOB_TIMEOUT"
+    try:
+        monkeypatch.delenv(timeout_name, raising=False)
+        assert importlib.reload(process_pkg).ProviderDirectoryFHIR.job_timeout == 518400
+        monkeypatch.setenv(timeout_name, "259200")
+        assert importlib.reload(process_pkg).ProviderDirectoryFHIR.job_timeout == 518400
+        monkeypatch.setenv(timeout_name, "604800")
+        assert importlib.reload(process_pkg).ProviderDirectoryFHIR.job_timeout == 604800
+    finally:
+        monkeypatch.delenv(timeout_name, raising=False)
+        importlib.reload(process_pkg)
+
+
 def test_ptg_timeout_override(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PTG_JOB_TIMEOUT", "3456")
 

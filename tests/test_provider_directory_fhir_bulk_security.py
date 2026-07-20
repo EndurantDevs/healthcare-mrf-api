@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import importlib
 
 import aiohttp
@@ -62,6 +63,29 @@ def test_bulk_checkpoint_capability_ciphertext_roundtrips_without_plaintext(monk
     assert capability not in ciphertext
     assert "super-secret" not in ciphertext
     assert importer._decrypt_bulk_capability(ciphertext) == capability
+
+
+def test_stored_bulk_validator_roundtrips_encrypted_etag(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY",
+        "bulk-resume-validator-test-key",
+    )
+    etag = '"output-v1"'
+    checkpoint_map = {
+        "content_length_bytes": 4321,
+        "etag_ciphertext": importer._encrypt_bulk_capability(etag),
+        "etag_hash": hashlib.sha256(etag.encode()).hexdigest(),
+        "committed_bytes": 1234,
+        "output_expires_at": None,
+        "validator_checked_at": datetime.datetime(2026, 7, 20, 12),
+    }
+
+    validator = importer._stored_bulk_output_validator(checkpoint_map)
+
+    assert validator is not None
+    assert validator.etag == etag
+    assert validator.content_length_bytes == 4321
+    assert etag not in checkpoint_map["etag_ciphertext"]
 
 
 def test_bulk_checkpoint_decryption_survives_key_rotation(monkeypatch):

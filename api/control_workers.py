@@ -24,6 +24,10 @@ class WorkerSpec:
     role: str = "start"
 
 
+_PROVIDER_DIRECTORY_WORKER_CLASS = "process.ProviderDirectoryFHIR"
+_PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS = 144 * 60 * 60
+
+
 _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:PTG", "process.PTG", ("ptg",)),
     WorkerSpec("arq:PTGSmall", "process.PTGSmall", ("ptg",)),
@@ -649,6 +653,14 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
         },
     }
     active_deadline_seconds = int(os.getenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "0") or "0")
+    if (
+        active_deadline_seconds > 0
+        and spec.worker_class == _PROVIDER_DIRECTORY_WORKER_CLASS
+    ):
+        active_deadline_seconds = max(
+            active_deadline_seconds,
+            _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS,
+        )
     if active_deadline_seconds > 0:
         job_spec_dict["activeDeadlineSeconds"] = active_deadline_seconds
     replicas = _worker_start_replicas(spec)

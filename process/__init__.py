@@ -620,6 +620,9 @@ class ProviderEnrichment_finish:
     job_deserializer = deserialize_job
 
 
+PROVIDER_DIRECTORY_MIN_JOB_TIMEOUT_SECONDS = 144 * 60 * 60
+
+
 class ProviderDirectoryFHIR:
     functions = [process_provider_directory_fhir_data, control_single_job_start]
     on_startup = provider_directory_fhir_startup
@@ -631,10 +634,12 @@ class ProviderDirectoryFHIR:
     )
     queue_read_limit = 2 * max_jobs
     queue_name = "arq:ProviderDirectoryFHIR"
-    job_timeout = (
-        int(os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_FHIR_JOB_TIMEOUT"))
-        if os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_FHIR_JOB_TIMEOUT")
-        else 86400
+    job_timeout = max(
+        _worker_int_env(
+            "HLTHPRT_PROVIDER_DIRECTORY_FHIR_JOB_TIMEOUT",
+            PROVIDER_DIRECTORY_MIN_JOB_TIMEOUT_SECONDS,
+        ),
+        PROVIDER_DIRECTORY_MIN_JOB_TIMEOUT_SECONDS,
     )
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
