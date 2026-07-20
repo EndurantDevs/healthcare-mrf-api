@@ -61,6 +61,7 @@
         "api/ptg2_tables.py",
         "api/ptg2_types.py",
         "api/tier_utils.py",
+        "api/uhc_provider_file_catalog.py",
         "api/utils.py",
         "db/__init__.py",
         "db/connection.py",
@@ -223,6 +224,11 @@
         "process/redis_config.py",
         "process/serialization.py",
         "process/terminology_synonyms.py",
+        "process/uhc_provider_file_catalog.py",
+        "process/uhc_provider_file_catalog_artifacts.py",
+        "process/uhc_provider_file_catalog_contract.py",
+        "process/uhc_provider_file_catalog_store.py",
+        "process/uhc_provider_file_catalog_types.py",
         "process/url_security.py"
       ],
       "format": "coverage.py",
@@ -236,12 +242,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 19926,
-          "total": 30742
+          "covered": 20271,
+          "total": 30966
         },
         "lines": {
-          "covered": 68595,
-          "total": 88687
+          "covered": 69704,
+          "total": 89459
         }
       },
       "path": "test-coverage-python.json",
