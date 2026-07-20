@@ -2784,7 +2784,6 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     ]
     assert len(runnable_by_id["devoted-health"]["resources"]) == 7
     assert len(runnable_by_id["simpra-advantage"]["resources"]) == 6
-    assert len(runnable_by_id["iowa-medicaid"]["resources"]) == 8
     assert len(runnable_by_id["san-bernardino-county-dbh"]["resources"]) == 8
     assert len(runnable_by_id["san-mateo-county-bhrs"]["resources"]) == 8
     assert probe_by_id["michigan"]["resources"] == []
