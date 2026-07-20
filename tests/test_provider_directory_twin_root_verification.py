@@ -172,6 +172,28 @@ async def test_validated_dataset_store_fails_when_candidate_update_is_lost():
 
 
 @pytest.mark.asyncio
+async def test_verification_baseline_store_does_not_mark_dataset_validated():
+    connection = AsyncMock()
+    connection.status.return_value = "UPDATE 1"
+    candidate = _candidate()
+
+    await importer._store_validated_endpoint_dataset(
+        connection,
+        candidate,
+        candidate.previous_dataset_id,
+        "d" * 64,
+        2,
+        {"verification": "baseline"},
+        status=importer.ENDPOINT_DATASET_VERIFICATION_BASELINE,
+    )
+
+    assert connection.status.await_args.kwargs["status"] == (
+        importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
+    )
+    assert connection.status.await_args.kwargs["marks_validated"] is False
+
+
+@pytest.mark.asyncio
 async def test_pending_candidate_requires_a_root_run(monkeypatch):
     monkeypatch.setattr(
         importer,
