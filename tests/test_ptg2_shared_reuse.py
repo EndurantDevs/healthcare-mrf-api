@@ -12,8 +12,9 @@ from process.ptg_parts.domain import (
 from process.ptg_parts.import_rows import _ptg2_source_trace_rows
 from process.ptg_parts.ptg2_shared_reuse import (
     deterministic_source_key_assignments,
-    normalized_physical_artifact_identity,
     is_same_downloaded_physical_input,
+    normalized_full_rebuild_scope_digest,
+    normalized_physical_artifact_identity,
     shared_logical_artifact_metadata,
     shared_physical_artifact_identity,
     shared_physical_input_identity,
@@ -66,7 +67,7 @@ def _downloaded(
     )
 
 
-def _identity(downloaded_jobs):
+def _identity(downloaded_jobs, *, full_rebuild_scope_digest=None):
     return shared_physical_input_identity(
         downloaded_jobs,
         options={
@@ -75,9 +76,53 @@ def _identity(downloaded_jobs):
             "hash_mode": "checksum64",
             "source_key": "logical-owner-is-excluded",
             "toc_urls": ["https://example.invalid/index.json"],
+            **(
+                {"full_rebuild_scope_digest": full_rebuild_scope_digest}
+                if full_rebuild_scope_digest is not None
+                else {}
+            ),
         },
         scanner_canon_version={"version": 7},
     )
+
+
+def test_full_rebuild_scope_is_stable_and_preserves_default_identity():
+    downloaded = _downloaded()
+    legacy = _identity([downloaded])
+    first_scope = _identity(
+        [downloaded],
+        full_rebuild_scope_digest="1" * 64,
+    )
+    same_scope = _identity(
+        [downloaded],
+        full_rebuild_scope_digest="1" * 64,
+    )
+    other_scope = _identity(
+        [downloaded],
+        full_rebuild_scope_digest="2" * 64,
+    )
+
+    assert legacy.semantic_fingerprint.hex() == (
+        "b5630070216be889aa6615cdc271bddc98cf8868272a3b3d0c052aac076126a0"
+    )
+    assert legacy.payload["physical_options"] == {}
+    assert first_scope.semantic_fingerprint == same_scope.semantic_fingerprint
+    assert first_scope.semantic_fingerprint != other_scope.semantic_fingerprint
+    assert first_scope.semantic_fingerprint != legacy.semantic_fingerprint
+    assert first_scope.coverage_scope_id == other_scope.coverage_scope_id
+    assert first_scope.coverage_scope_id == legacy.coverage_scope_id
+    assert first_scope.source_identities == other_scope.source_identities
+    assert first_scope.source_identities == legacy.source_identities
+
+
+def test_full_rebuild_scope_digest_normalizes_and_rejects_invalid_values():
+    assert normalized_full_rebuild_scope_digest(" A" + "B" * 63 + " ") == (
+        "a" + "b" * 63
+    )
+    assert normalized_full_rebuild_scope_digest(None) is None
+
+    with pytest.raises(ValueError, match="full_rebuild_scope_digest"):
+        normalized_full_rebuild_scope_digest("")
 
 
 def test_same_files_and_semantics_reuse_across_logical_owners_and_urls():

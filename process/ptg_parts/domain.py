@@ -262,6 +262,18 @@ class PTG2LogicalArtifact:
     compression: str | None = None
     member_name: str | None = None
     logical_hash_deferred: bool = False
+    reused: bool = False
+
+
+@dataclass(frozen=True)
+class PTG2ArtifactStageObservation:
+    """Safe identity-only evidence emitted after one artifact stage completes."""
+
+    artifact_kind: str
+    identity_sha256: str
+    byte_count: int
+    reused: bool = False
+    logical_hash_deferred: bool = False
 
 
 @dataclass(frozen=True)

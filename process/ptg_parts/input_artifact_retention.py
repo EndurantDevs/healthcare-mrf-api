@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import socket
+import stat
 import tempfile
 import threading
 import uuid
@@ -665,6 +666,399 @@ def publish_artifact_file(
             _clear_unleased_locked(store, relative_path)
         else:
             _mark_unleased_locked(store, relative_path, now=_utcnow())
+    return final
+
+
+_VERIFIED_STAGE_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _VerifiedArtifactStageState:
+    store_root: Path
+    directory_fd: int
+    file_fd: int
+    file_name: str
+    sha256: str
+    byte_count: int
+    sealed_stat: os.stat_result
+
+
+class PTG2VerifiedArtifactStage:
+    """Hold the exact inode whose digest was produced by a trusted stream."""
+
+    __slots__ = (
+        "_closed",
+        "_state",
+    )
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        stage_state: _VerifiedArtifactStageState,
+    ) -> None:
+        if token is not _VERIFIED_STAGE_TOKEN:
+            raise TypeError("Verified artifact stages must come from the stream sealer")
+        self._closed = False
+        self._state = stage_state
+
+    @property
+    def sha256(self) -> str:
+        """Return the digest produced while the held file was streamed."""
+
+        return self._state.sha256
+
+    @property
+    def byte_count(self) -> int:
+        """Return the byte count produced while the held file was streamed."""
+
+        return self._state.byte_count
+
+    def __enter__(self) -> "PTG2VerifiedArtifactStage":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release the held file and private-directory descriptors."""
+
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            os.close(self._state.file_fd)
+        finally:
+            os.close(self._state.directory_fd)
+
+    def _assert_unchanged(self) -> None:
+        if self._closed:
+            raise RuntimeError("Verified artifact stage is closed")
+        held_stat = os.fstat(self._state.file_fd)
+        try:
+            named_stat = os.stat(
+                self._state.file_name,
+                dir_fd=self._state.directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("Verified artifact staging identity changed") from exc
+        expected = _stage_stat_identity(
+            self._state.sealed_stat,
+            include_change_times=True,
+        )
+        if (
+            _stage_stat_identity(held_stat, include_change_times=True) != expected
+            or _stage_stat_identity(named_stat, include_change_times=True) != expected
+        ):
+            raise RuntimeError("Verified artifact staging identity changed")
+
+    def _assert_published_inode(self, published_stat: os.stat_result) -> None:
+        expected = _stage_stat_identity(
+            self._state.sealed_stat,
+            include_change_times=False,
+        )
+        if _stage_stat_identity(published_stat, include_change_times=False) != expected:
+            raise RuntimeError("Verified artifact publication changed inode identity")
+
+
+def _validate_verified_stream_identity(
+    streamed_sha256: str,
+    streamed_byte_count: int,
+) -> None:
+    if (
+        not isinstance(streamed_sha256, str)
+        or len(streamed_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in streamed_sha256)
+    ):
+        raise ValueError("streamed_sha256 must be one canonical SHA-256 digest")
+    if type(streamed_byte_count) is not int or streamed_byte_count < 0:
+        raise ValueError("streamed_byte_count must be a non-negative integer")
+
+
+def _stage_stat_identity(
+    value: os.stat_result,
+    *,
+    include_change_times: bool,
+) -> tuple[int, ...]:
+    identity = (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_nlink,
+        value.st_size,
+    )
+    if not include_change_times:
+        return identity
+    return (*identity, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _open_private_stage_directory(
+    store: PTG2ArtifactStore,
+    temporary: Path,
+) -> int:
+    temporary_parent = temporary.parent
+    try:
+        parent_stat = temporary_parent.lstat()
+    except OSError as exc:
+        raise RuntimeError("Verified artifact staging directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or temporary_parent.is_symlink()
+        or stat.S_IMODE(parent_stat.st_mode) & 0o077
+        or parent_stat.st_uid != os.geteuid()
+    ):
+        raise RuntimeError("Verified artifact staging directory is not private")
+    temporary_root = store.tmp_dir.resolve()
+    if temporary_parent.resolve().parent != temporary_root:
+        raise RuntimeError("Verified artifact staging directory is outside the private root")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(temporary_parent, flags)
+    except OSError as exc:
+        raise RuntimeError("Verified artifact staging directory is unsafe") from exc
+    opened_stat = os.fstat(directory_fd)
+    if (
+        opened_stat.st_dev != parent_stat.st_dev
+        or opened_stat.st_ino != parent_stat.st_ino
+        or stat.S_IFMT(opened_stat.st_mode) != stat.S_IFMT(parent_stat.st_mode)
+    ):
+        os.close(directory_fd)
+        raise RuntimeError("Verified artifact staging directory identity changed")
+    return directory_fd
+
+
+def _capture_streamed_artifact_stage(
+    store: PTG2ArtifactStore,
+    temporary_path: str | Path,
+    *,
+    streamed_sha256: str,
+    streamed_byte_count: int,
+) -> PTG2VerifiedArtifactStage:
+    """Seal a private writer output and retain its exact inode through publish."""
+
+    _validate_verified_stream_identity(streamed_sha256, streamed_byte_count)
+    temporary = Path(temporary_path)
+    directory_fd = _open_private_stage_directory(store, temporary)
+    file_fd: int | None = None
+    try:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        file_fd = os.open(temporary.name, flags, dir_fd=directory_fd)
+        opened_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise RuntimeError("Verified artifact staging does not match its stream")
+        os.fsync(file_fd)
+        held_stat = os.fstat(file_fd)
+        named_stat = os.stat(
+            temporary.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(held_stat.st_mode)
+            or held_stat.st_nlink != 1
+            or held_stat.st_size != streamed_byte_count
+            or _stage_stat_identity(held_stat, include_change_times=True)
+            != _stage_stat_identity(named_stat, include_change_times=True)
+        ):
+            raise RuntimeError("Verified artifact staging does not match its stream")
+        return PTG2VerifiedArtifactStage(
+            token=_VERIFIED_STAGE_TOKEN,
+            stage_state=_VerifiedArtifactStageState(
+                store_root=store.root.resolve(),
+                directory_fd=directory_fd,
+                file_fd=file_fd,
+                file_name=temporary.name,
+                sha256=streamed_sha256,
+                byte_count=streamed_byte_count,
+                sealed_stat=held_stat,
+            ),
+        )
+    except BaseException:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory_fd)
+        raise
+
+
+@contextmanager
+def _managed_artifact_parent_fd(
+    store: PTG2ArtifactStore,
+    relative_parent: Path,
+) -> Iterator[int]:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    current_fd = os.open(store.root.resolve(), flags)
+    try:
+        for component in relative_parent.parts:
+            with suppress(FileExistsError):
+                os.mkdir(component, mode=0o777, dir_fd=current_fd)
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Verified artifact destination contains an unsafe path component"
+                ) from exc
+            os.close(current_fd)
+            current_fd = next_fd
+        yield current_fd
+    finally:
+        os.close(current_fd)
+
+
+def _verified_artifact_destination(
+    store: PTG2ArtifactStore,
+    stage: PTG2VerifiedArtifactStage,
+    *,
+    artifact_kind: str,
+    suffix: str,
+    namespace_sha256: str | None,
+) -> Path:
+    if artifact_kind not in {"raw", "logical"} or suffix not in {"", ".json"}:
+        raise ValueError("Verified artifact destination is invalid")
+    if namespace_sha256 is not None:
+        _validate_verified_stream_identity(namespace_sha256, 0)
+    if artifact_kind == "raw" and namespace_sha256 is not None:
+        raise ValueError("Raw verified artifacts do not accept a namespace")
+    if namespace_sha256 is None:
+        return store.artifact_path(stage.sha256, kind=artifact_kind, suffix=suffix)
+    return (
+        store.root
+        / artifact_kind
+        / namespace_sha256[:2]
+        / namespace_sha256[2:4]
+        / namespace_sha256
+        / f"{stage.sha256}{suffix}"
+    )
+
+
+def _assert_verified_artifact_target(parent_fd: int, final_name: str) -> None:
+    try:
+        existing_stat = os.stat(
+            final_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(existing_stat.st_mode):
+        raise RuntimeError("Verified artifact target is not a regular file")
+
+
+def _record_verified_artifact_protection_locked(
+    store: PTG2ArtifactStore,
+    *,
+    lease_id: str | None,
+    relative_path: str,
+) -> None:
+    if lease_id:
+        marker = _updated_lease_payload_locked(
+            store,
+            lease_id,
+            relative_path=relative_path,
+            prefix=False,
+        )
+        _atomic_write_json(*marker)
+        return
+    _mark_unleased_locked(store, relative_path, now=_utcnow())
+
+
+def _replace_verified_artifact_locked(
+    store: PTG2ArtifactStore,
+    stage: PTG2VerifiedArtifactStage,
+    *,
+    parent_fd: int,
+    final_name: str,
+    relative_path: str,
+    lease_id: str | None,
+) -> None:
+    candidate_name = f".{final_name}.publish-{uuid.uuid4().hex}"
+    has_candidate = False
+    try:
+        os.replace(
+            stage._state.file_name,
+            candidate_name,
+            src_dir_fd=stage._state.directory_fd,
+            dst_dir_fd=parent_fd,
+        )
+        has_candidate = True
+        candidate_stat = os.stat(
+            candidate_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        stage._assert_published_inode(candidate_stat)
+        _record_verified_artifact_protection_locked(
+            store,
+            lease_id=lease_id,
+            relative_path=relative_path,
+        )
+        os.replace(
+            candidate_name,
+            final_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        has_candidate = False
+        published_stat = os.stat(
+            final_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        stage._assert_published_inode(published_stat)
+        os.fsync(parent_fd)
+        if lease_id:
+            _clear_unleased_locked(store, relative_path)
+    finally:
+        if has_candidate:
+            os.unlink(candidate_name, dir_fd=parent_fd)
+
+
+def publish_verified_artifact_stage(
+    store: PTG2ArtifactStore,
+    stage: PTG2VerifiedArtifactStage,
+    *,
+    artifact_kind: str,
+    suffix: str = "",
+    namespace_sha256: str | None = None,
+) -> Path:
+    """Atomically publish one held, stream-verified inode without rereading it."""
+
+    if not isinstance(stage, PTG2VerifiedArtifactStage):
+        raise TypeError("stage must be a sealed PTG2 verified artifact")
+    if stage._state.store_root != store.root.resolve():
+        raise ValueError("Verified artifact stage belongs to another store")
+    final = _verified_artifact_destination(
+        store,
+        stage,
+        artifact_kind=artifact_kind,
+        suffix=suffix,
+        namespace_sha256=namespace_sha256,
+    )
+    relative_path = final.relative_to(store.root).as_posix()
+    _normalized_managed_relative_path(relative_path)
+    lease_id = current_artifact_lease_id()
+    with store.retention_lock():
+        stage._assert_unchanged()
+        with _managed_artifact_parent_fd(
+            store,
+            Path(relative_path).parent,
+        ) as parent_fd:
+            if os.fstat(parent_fd).st_dev != stage._state.sealed_stat.st_dev:
+                raise RuntimeError("Verified artifact staging must share the artifact filesystem")
+            _assert_verified_artifact_target(parent_fd, final.name)
+            _replace_verified_artifact_locked(
+                store,
+                stage,
+                parent_fd=parent_fd,
+                final_name=final.name,
+                relative_path=relative_path,
+                lease_id=lease_id,
+            )
     return final
 
 

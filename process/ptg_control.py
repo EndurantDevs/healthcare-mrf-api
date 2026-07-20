@@ -17,8 +17,12 @@ from process.control_lifecycle import (
     mark_control_run,
 )
 from process.import_status_events import flush_status_events
-from process.ptg import main as ptg_main
 from process.live_progress import write_live_progress
+from process.ptg import (
+    PTG2FullRebuildFreshnessError,
+    full_rebuild_failure_metrics,
+    main as ptg_main,
+)
 from process.ptg_parts.config import (
     PTG2_FILE_PROCESS_CONCURRENCY_ENV,
     PTG2_MANIFEST_MERGE_CHUNK_BYTES_ENV,
@@ -40,6 +44,8 @@ from process.ptg_parts.config import (
 
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
 PTG_CONTROL_HEARTBEAT_SOURCE = "engine-heartbeat"
+_FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
+_FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
 _TERMINAL_RUN_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 
 
@@ -55,6 +61,8 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     stale_result = await _stale_ptg_job_result(run_id)
     if stale_result is not None:
         return stale_result
+    full_rebuild_scope_digest = None
+    full_rebuild_proof_metrics_by_name: dict[str, bool] = {}
     heartbeat_task = None
     heartbeat_stop = None
     try:
@@ -65,6 +73,19 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 _live_progress_heartbeat(run_id, "ptg", "ptg_control_start", started_at)
             )
             heartbeat_stop = _start_threaded_ptg_heartbeat(run_id, started_at)
+        full_rebuild_scope_digest = _full_rebuild_scope_digest(
+            params,
+        )
+        full_rebuild_proof_metrics_by_name = (
+            _full_rebuild_proof_metrics_by_name(full_rebuild_scope_digest)
+        )
+        should_reuse_raw_artifacts = bool(
+            params.get("reuse_raw_artifacts", True)
+        )
+        should_keep_partial_artifacts = params.get("keep_partial_artifacts")
+        if full_rebuild_scope_digest is not None:
+            should_reuse_raw_artifacts = False
+            should_keep_partial_artifacts = False
         await raise_if_cancelled(ctx, task_payload)
         _assert_expected_lane(params)
         with _ptg_lane_environment(params):
@@ -85,48 +106,120 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 plan_market_types=_string_list(params.get("plan_market_types") or params.get("plan_market_type")),
                 file_url_contains=_string_list(params.get("file_url_contains")),
                 source_network_names=_string_list(params.get("source_network_names") or params.get("source_network_name")),
-                reuse_raw_artifacts=bool(params.get("reuse_raw_artifacts", True)),
-                keep_partial_artifacts=params.get("keep_partial_artifacts"),
+                reuse_raw_artifacts=should_reuse_raw_artifacts,
+                keep_partial_artifacts=should_keep_partial_artifacts,
                 control_run_id=run_id,
+                **(
+                    {"full_rebuild_scope_digest": full_rebuild_scope_digest}
+                    if full_rebuild_scope_digest is not None
+                    else {}
+                ),
             )
-    except ImportCancelledError:
-        await mark_control_run(run_id, status="canceled", phase_detail="ptg import canceled", progress_message="canceled")
+    except ImportCancelledError as exc:
+        failure_metrics_by_name = _build_rebuild_terminal_metrics_by_name(
+            exc,
+            full_rebuild_proof_metrics_by_name,
+        )
+        await mark_control_run(
+            run_id,
+            status="canceled",
+            phase_detail="ptg import canceled",
+            progress_message="canceled",
+            **(
+                {"metrics": failure_metrics_by_name}
+                if failure_metrics_by_name
+                else {}
+            ),
+        )
         await _flush_terminal_status_events()
         return {"status": "canceled", "run_id": run_id}
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
+        failure_metrics_by_name = _build_rebuild_terminal_metrics_by_name(
+            exc,
+            full_rebuild_proof_metrics_by_name,
+        )
         await mark_control_run(
             run_id,
             status="failed",
             phase_detail="ptg import interrupted",
             progress_message="interrupted",
             error={"code": "import_interrupted", "message": "worker task was cancelled"},
+            **(
+                {"metrics": failure_metrics_by_name}
+                if failure_metrics_by_name
+                else {}
+            ),
+        )
+        await _flush_terminal_status_events()
+        raise
+    except PTG2FullRebuildFreshnessError as exc:
+        freshness_metrics_by_name = _build_rebuild_terminal_metrics_by_name(
+            exc,
+            full_rebuild_proof_metrics_by_name,
+            reported_metrics_by_name=dict(exc.metrics_by_name),
+        )
+        await mark_control_run(
+            run_id,
+            status="failed",
+            phase_detail="ptg full rebuild freshness failed",
+            progress_message="failed",
+            metrics=freshness_metrics_by_name,
+            error={
+                "code": "ptg_full_rebuild_reuse_detected",
+                "message": "controlled PTG full rebuild reused prior work",
+            },
         )
         await _flush_terminal_status_events()
         raise
     except Exception as exc:
+        failure_metrics_by_name = _build_rebuild_terminal_metrics_by_name(
+            exc,
+            full_rebuild_proof_metrics_by_name,
+        )
+        failure_error_by_name = (
+            {
+                "code": "ptg_full_rebuild_failed",
+                "message": "controlled PTG full rebuild failed",
+            }
+            if full_rebuild_proof_metrics_by_name
+            else {"code": "ptg_import_failed", "message": str(exc)}
+        )
         await mark_control_run(
             run_id,
             status="failed",
             phase_detail="ptg import failed",
             progress_message="failed",
-            error={"code": "ptg_import_failed", "message": str(exc)},
+            error=failure_error_by_name,
+            **(
+                {"metrics": failure_metrics_by_name}
+                if failure_metrics_by_name
+                else {}
+            ),
         )
         await _flush_terminal_status_events()
         raise
     finally:
         _stop_threaded_ptg_heartbeat(heartbeat_stop)
         await _stop_live_progress_heartbeat(heartbeat_task)
-    result_metrics = import_result if isinstance(import_result, dict) else {}
+    result_metrics_by_name = import_result if isinstance(import_result, dict) else {}
+    if full_rebuild_proof_metrics_by_name:
+        result_metrics_by_name = {
+            **result_metrics_by_name,
+            **full_rebuild_proof_metrics_by_name,
+        }
     await mark_control_run(
         run_id,
         status="succeeded",
         phase_detail="ptg import succeeded",
         progress_message="succeeded",
-        metrics=result_metrics or None,
-        snapshot_id=str(result_metrics.get("snapshot_id") or "").strip() or None,
+        metrics=result_metrics_by_name or None,
+        snapshot_id=(
+            str(result_metrics_by_name.get("snapshot_id") or "").strip()
+            or None
+        ),
     )
     await _flush_terminal_status_events()
-    return {**result_metrics, "status": "succeeded", "run_id": run_id}
+    return {**result_metrics_by_name, "status": "succeeded", "run_id": run_id}
 
 
 def _start_threaded_ptg_heartbeat(run_id: str, started_at: str) -> threading.Event:
@@ -203,6 +296,59 @@ def _assert_expected_lane(params: dict[str, Any]) -> None:
     active_class = os.getenv("HLTHPRT_ACTIVE_WORKER_CLASS", "").strip()
     if expected_class and active_class and expected_class != active_class:
         raise RuntimeError(f"PTG payload expected {expected_class}, but active worker class is {active_class}")
+
+
+def _full_rebuild_scope_digest(
+    params: dict[str, Any],
+) -> str | None:
+    """Validate the opaque rebuild scope accepted from the control API."""
+
+    if _FULL_REBUILD_TOKEN_PARAM in params:
+        raise ValueError(
+            "PTG workers accept only an internal full rebuild scope"
+        )
+    if _FULL_REBUILD_SCOPE_PARAM not in params:
+        return None
+    scope_digest = params[_FULL_REBUILD_SCOPE_PARAM]
+    if (
+        not isinstance(scope_digest, str)
+        or len(scope_digest) != 64
+        or scope_digest != scope_digest.lower()
+        or any(character not in "0123456789abcdef" for character in scope_digest)
+    ):
+        raise ValueError("private PTG full rebuild scope digest is invalid")
+    return scope_digest
+
+
+def _full_rebuild_proof_metrics_by_name(
+    scope_digest: str | None,
+) -> dict[str, bool]:
+    """Return safe terminal proof fields when a rebuild scope was accepted."""
+
+    if scope_digest is None:
+        return {}
+    return {
+        "full_rebuild_requested": True,
+        "raw_artifact_reuse_forced_off": True,
+        "partial_artifact_retention_forced_off": True,
+    }
+
+
+def _build_rebuild_terminal_metrics_by_name(
+    error: BaseException,
+    policy_metrics_by_name: dict[str, bool],
+    *,
+    reported_metrics_by_name: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge safe runtime proof with control-plane rebuild policy proof."""
+
+    if not policy_metrics_by_name:
+        return {}
+    return {
+        **dict(reported_metrics_by_name or {}),
+        **full_rebuild_failure_metrics(error),
+        **policy_metrics_by_name,
+    }
 
 
 @contextmanager

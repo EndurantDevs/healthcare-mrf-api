@@ -64,6 +64,7 @@ AUTH_HEADER_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_HEADER"
 AUTH_SCHEME_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_AUTH_SCHEME"
 TRUSTED_CLUSTER_HTTP_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_TRUSTED_CLUSTER_HTTP"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_REBUILD_RUN_SUFFIX_RE = re.compile(r":rebuild-[0-9a-f]{24}$")
 _CANDIDATE_TARGET_SQL = """
     SELECT snapshot.snapshot_id,
            snapshot.import_run_id,
@@ -192,7 +193,8 @@ def _normalized_digest(value: Any, *, field: str) -> str:
 
 
 def _candidate_import_id(candidate_run_id: str) -> str:
-    return candidate_run_id.removeprefix("ptg2:")
+    scoped_import_id = candidate_run_id.removeprefix("ptg2:")
+    return _REBUILD_RUN_SUFFIX_RE.sub("", scoped_import_id)
 
 
 def _validate_corroboration(

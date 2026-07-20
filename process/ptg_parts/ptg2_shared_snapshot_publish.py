@@ -65,6 +65,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
     deterministic_source_key_assignments,
+    normalized_full_rebuild_scope_digest,
 )
 from process.ptg_parts.ptg2_source_witness_store import publish_shared_source_witness
 
@@ -760,6 +761,7 @@ def _physical_serving_index(
     source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
     stored_byte_count: int,
+    full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
     """Build the physical serving index from validated publication summaries."""
 
@@ -791,7 +793,7 @@ def _physical_serving_index(
         **price_encoder,
         "price_set_count": _integer(price_dense.get("count"), "price key count"),
     }
-    return {
+    serving_index = {
         "storage": "manifest_snapshot",
         "type": "ptg2_shared_blocks_v3",
         "snapshot_scoped": True,
@@ -838,6 +840,34 @@ def _physical_serving_index(
         "storage_bytes": int(stored_byte_count),
         "timings": dict(finalizer_summary.get("timings") or {}),
     }
+    normalized_rebuild_digest = normalized_full_rebuild_scope_digest(
+        full_rebuild_scope_digest
+    )
+    if normalized_rebuild_digest is not None:
+        serving_index["full_rebuild_scope_digest"] = normalized_rebuild_digest
+    return serving_index
+
+
+def _shared_layout_support_digest(
+    *,
+    core_support: Mapping[str, Any],
+    audit_sample: Mapping[str, Any],
+    source_witness: Mapping[str, Any],
+    full_rebuild_scope_digest: str | None = None,
+) -> bytes:
+    """Seal support metadata, optionally isolating one controlled rebuild."""
+
+    support_by_field = {
+        **dict(core_support),
+        "audit_sample": dict(audit_sample),
+        "source_witness": dict(source_witness),
+    }
+    normalized_rebuild_digest = normalized_full_rebuild_scope_digest(
+        full_rebuild_scope_digest
+    )
+    if normalized_rebuild_digest is not None:
+        support_by_field["full_rebuild_scope_digest"] = normalized_rebuild_digest
+    return shared_support_digest(support_by_field)
 
 
 async def _publish_prepared_shared_layout(
@@ -865,6 +895,7 @@ async def _publish_prepared_shared_layout(
     prepared_work_directory: str | Path | None = None,
     prepared_finalizer: _PreparedFinalizer | None = None,
     prepared_price_publication: _PreparedPricePublication | None = None,
+    full_rebuild_scope_digest: str | None = None,
 ) -> SharedSnapshotPublication:
     """Finalize, validate, publish, and atomically seal one physical layout."""
 
@@ -1172,12 +1203,11 @@ async def _publish_prepared_shared_layout(
         )
         record_stage("audit_publish", stage_started_at)
         await touch_build()
-        support_digest = shared_support_digest(
-            {
-                **core_support_map,
-                "audit_sample": dict(audit_publication.metadata),
-                "source_witness": dict(source_witness_publication.metadata),
-            }
+        support_digest = _shared_layout_support_digest(
+            core_support=core_support_map,
+            audit_sample=audit_publication.metadata,
+            source_witness=source_witness_publication.metadata,
+            full_rebuild_scope_digest=full_rebuild_scope_digest,
         )
         stored_byte_count = (
             int(finalizer_block_publication.stored_byte_count)
@@ -1196,6 +1226,7 @@ async def _publish_prepared_shared_layout(
             source_witness=source_witness_publication.metadata,
             provider_identifier_quarantine=quarantine,
             stored_byte_count=stored_byte_count,
+            full_rebuild_scope_digest=full_rebuild_scope_digest,
         )
         provisional_serving_index["timings"] = {
             **dict(provisional_serving_index.get("timings") or {}),
@@ -1266,9 +1297,13 @@ async def publish_strict_shared_v3_layout(
     graph_artifact_entries: Iterable[dict[str, Any]],
     provider_identifier_quarantine: Mapping[str, Any],
     scratch_parent: str | Path | None = None,
+    full_rebuild_scope_digest: str | None = None,
 ) -> SharedSnapshotPublication:
     """Prepare exact price ranks once, then publish and clean every temporary map."""
 
+    normalized_rebuild_digest = normalized_full_rebuild_scope_digest(
+        full_rebuild_scope_digest
+    )
     serving_run_entries = tuple(serving_run_entries)
     code_dictionary_entries = tuple(code_dictionary_entries)
     provider_set_metadata_entries = tuple(provider_set_metadata_entries)
@@ -1344,6 +1379,7 @@ async def publish_strict_shared_v3_layout(
                 prepared_work_directory=raw_work_directory,
                 prepared_finalizer=prepared_finalizer,
                 prepared_price_publication=prepared_price_publication,
+                full_rebuild_scope_digest=normalized_rebuild_digest,
             )
         except BaseException:
             cleanup_task = asyncio.create_task(
