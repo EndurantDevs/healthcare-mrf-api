@@ -39,11 +39,11 @@
     "entry_support": {
       "iowa-medicaid": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-20", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public CMS-listed R4 endpoint exposes all eight Plan-Net collections. Live exhaustive acquisition on 2026-07-20 returned a terminal empty Location collection while PractitionerRole, Practitioner, and Organization were populated, so only those three populated collections are guarded as expected-nonempty. Candidate acquisition uses stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. It remains probe-only until two distinct exhaustive roots produce matching per-resource and dataset hashes; no Profile source is published."},
       "pennsylvania-medicaid": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public CMS-listed R4 endpoint exposes all eight Plan-Net collections. Candidate acquisition uses stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. It remains probe-only until two distinct exhaustive roots produce matching per-resource and dataset hashes; no Profile source is published."},
-      "san-bernardino-county-dbh": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public Netsmart R4 endpoint exposes all eight resource families, with five currently populated. Its advertised next offset overlaps the preceding page, so candidate acquisition ignores that link and advances a stable _id-sorted _offset by the exact Bundle entry count. It remains probe-only pending two matching exhaustive roots and Profile publication review."},
-      "san-mateo-county-bhrs": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public Netsmart R4 endpoint exposes all eight resource families, with five currently populated. Its advertised next offset overlaps the preceding page, so candidate acquisition ignores that link and advances a stable _id-sorted _offset by the exact Bundle entry count. It remains probe-only pending two matching exhaustive roots and Profile publication review."},
+      "san-bernardino-county-dbh": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-20", "method": "rest", "limitation": "The public Netsmart R4 endpoint exposes all eight resource families, with five currently populated. Its advertised next offset overlaps the preceding page, so acquisition ignores that link and advances a stable _id-sorted _offset by the exact Bundle entry count. Two distinct exhaustive roots matched at 8,749 resources with dataset hash 195831de9e52b0819f6a97d9a0c775721a8a30f95533c816d2ea254a4627eb3f, and the reviewed dataset was promoted to current publication on dev. Profile inclusion is enabled by this release and must be verified by a post-deploy artifact rebuild."},
+      "san-mateo-county-bhrs": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-20", "method": "rest", "limitation": "The public Netsmart R4 endpoint exposes all eight resource families, with five currently populated. Its advertised next offset overlaps the preceding page, so acquisition ignores that link and advances a stable _id-sorted _offset by the exact Bundle entry count. Two distinct exhaustive roots matched at 5,531 resources with dataset hash 2711c690ae550f814022b45baf95fe31d69f99500d089d02e8447021f188def1, and the reviewed dataset was promoted to current publication on dev. Profile inclusion is enabled by this release and must be verified by a post-deploy artifact rebuild."},
       "el-dorado-county-behavioral-health": {"support_level": "probe-only", "access_requirement": "registration-approval", "requires_registration": true, "reviewed_at": "2026-07-20", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The county's April 2026 documentation names the /provider/system-access/v2 endpoint and requires organization registration and approval. US-dev probes returned HTTP 200 for its R4 CapabilityStatement and HTTP 401 for Practitioner. The older /payer/provider-directory/v2 endpoint still returned anonymous metadata and a bounded sample, but it is retained only as source-identity evidence and is not an authorized exhaustive acquisition path. Acquisition and Profile publication remain disabled until approved access is configured, followed by two matching exhaustive roots."},
-      "devoted-health": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"], "limitation": "The public R4 endpoint exposes seven populated Plan-Net collections and same-origin opaque HAPI continuations. Durable checkpoint support is configured for candidate acquisition, but the source remains probe-only until two distinct exhaustive roots match and downstream Profile publication is reviewed."},
-      "simpra-advantage": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "OrganizationAffiliation"], "limitation": "The public R4 endpoint exposes six populated Plan-Net collections and same-origin opaque HAPI continuations. Durable checkpoint support is configured for candidate acquisition, but the source remains probe-only until two distinct exhaustive roots match and downstream Profile publication is reviewed."},
+      "devoted-health": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-20", "method": "rest", "limitation": "The public R4 endpoint exposes seven populated Plan-Net collections and same-origin opaque HAPI continuations. Durable checkpoints preserved two distinct exhaustive roots with the exact matching count 288,056 and dataset hash 9394cc71409c06ef06b8637cfe3c078b29cab2cd8c13b74f6e8a51e72fc6f26f. The reviewed dataset was promoted to current publication on dev; Profile inclusion is enabled by this release and must be verified by a post-deploy artifact rebuild."},
+      "simpra-advantage": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-20", "method": "rest", "limitation": "The public R4 endpoint exposes six populated Plan-Net collections and same-origin opaque HAPI continuations. Durable checkpoints preserved two distinct exhaustive roots with the exact matching count 214,733 and dataset hash 4242794dd34ff01eef2d82ebe0cf70b9f6d71cd59431c1ac91c12430c69b10dd. The reviewed dataset was promoted to current publication on dev; Profile inclusion is enabled by this release and must be verified by a post-deploy artifact rebuild."},
       "capital-blue-cross": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-20", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The public R4 endpoint exposes seven populated Plan-Net collections and an empty Endpoint collection over normal verified TLS. Broad exact census requests return an HTTP-200 OperationOutcome requiring a search predicate. ge1900 ranged counts work, but populated resources reject ge0001, _lastUpdated:missing, and _id:missing predicates. The CapabilityStatement advertises no history or bulk-export operation, so no endpoint-wide completeness witness is available. Acquisition remains disabled and probe-only."},
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-10", "method": "rest", "limitation": "Accepts api-ida-prd.safhir.io cursor continuations with checkpoints."},
       "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "The first unbounded dev run checkpointed 497,700 Location rows before Molina returned a quota-specific HTTP 403 with an advertised reset delay. The importer records retry_not_before, and the external scheduler defers the exact-source checkpoint retry until that boundary; terminal endpoint-wide proof remains pending."},
@@ -167,10 +167,10 @@
       "owner_id": "san-bernardino-county-dbh",
       "source_ids": ["pdfhir_29c125ae13aeffa0afe0e121"],
       "canonical_base": "https://fhir.netsmartcloud.com/payer/provider-directory/v2/eb7b73e0-836a-4041-9c0c-753079b3518f",
-      "classification": "probe_only",
+      "classification": "acquisition",
       "launch_mode": "create",
-      "resource_profile": "NONE",
-      "resources": []
+      "resource_profile": "R8",
+      "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"]
     },
     {
       "entry_id": "san-mateo-county-bhrs",
@@ -178,10 +178,10 @@
       "owner_id": "san-mateo-county-bhrs",
       "source_ids": ["pdfhir_0c52480afd14b4c89386df94"],
       "canonical_base": "https://fhir.netsmartcloud.com/payer/provider-directory/v2/1639ac79-9144-4699-a38b-eb956f258677",
-      "classification": "probe_only",
+      "classification": "acquisition",
       "launch_mode": "create",
-      "resource_profile": "NONE",
-      "resources": []
+      "resource_profile": "R8",
+      "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"]
     },
     {
       "entry_id": "el-dorado-county-behavioral-health",
@@ -200,10 +200,10 @@
       "owner_id": "devoted-health",
       "source_ids": ["pdfhir_46d7d27acc677651b0d3516e"],
       "canonical_base": "https://fhir.devoted.com/fhir",
-      "classification": "probe_only",
+      "classification": "acquisition",
       "launch_mode": "create",
-      "resource_profile": "NONE",
-      "resources": []
+      "resource_profile": "A7",
+      "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"]
     },
     {
       "entry_id": "simpra-advantage",
@@ -211,10 +211,10 @@
       "owner_id": "simpra-advantage",
       "source_ids": ["pdfhir_e3d82f2cd0a10ab4463dbdda"],
       "canonical_base": "https://data.healthlx.com:8004/SIMPRA",
-      "classification": "probe_only",
+      "classification": "acquisition",
       "launch_mode": "create",
-      "resource_profile": "NONE",
-      "resources": []
+      "resource_profile": "A6",
+      "resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
     },
     {
       "entry_id": "capital-blue-cross",

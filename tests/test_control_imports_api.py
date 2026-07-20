@@ -2716,18 +2716,19 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     probe_items = [entry for entry in catalog["items"] if not entry["runnable"]]
 
     assert catalog["entry_count"] == 37
-    assert catalog["runnable_count"] == 17
-    assert catalog["profile_source_count"] == 17
+    assert catalog["runnable_count"] == 21
+    assert catalog["profile_source_count"] == 21
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 17
+    assert len(runnable_items) == 21
     assert all(entry["profile_enabled"] for entry in runnable_items)
     assert all(
         entry["supported_resources"] == entry["resources"]
         for entry in runnable_items
     )
-    assert len(probe_items) == 20
+    assert len(probe_items) == 16
     assert all(entry["classification"] == "probe_only" for entry in probe_items)
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
+    runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
     assert probe_by_id["capital-blue-cross"]["resources"] == []
     assert probe_by_id["capital-blue-cross"]["supported_resources"] == [
         "InsurancePlan",
@@ -2739,8 +2740,10 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         "OrganizationAffiliation",
         "Endpoint",
     ]
-    assert len(probe_by_id["devoted-health"]["supported_resources"]) == 7
-    assert len(probe_by_id["simpra-advantage"]["supported_resources"]) == 6
+    assert len(runnable_by_id["devoted-health"]["resources"]) == 7
+    assert len(runnable_by_id["simpra-advantage"]["resources"]) == 6
+    assert len(runnable_by_id["san-bernardino-county-dbh"]["resources"]) == 8
+    assert len(runnable_by_id["san-mateo-county-bhrs"]["resources"]) == 8
     assert probe_by_id["michigan"]["resources"] == []
     assert probe_by_id["michigan"]["supported_resources"] == [
         "Location",
