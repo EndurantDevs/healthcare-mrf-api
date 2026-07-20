@@ -319,6 +319,22 @@ def _provider_code_payload(code_key):
     return bytes(payload)
 
 
+def _provider_code_block_payload(provider_code_rows):
+    rows = tuple(provider_code_rows)
+    payload = bytearray()
+    ptg2_serving_binary_v3.append_uvarint(payload, len(rows))
+    for provider_offset, code_keys in rows:
+        encoded_codes, _stats = (
+            ptg2_serving_binary_v3.encode_provider_code_set(code_keys)
+        )
+        ptg2_serving_binary_v3.append_uvarint(payload, provider_offset)
+        ptg2_serving_binary_v3.append_uvarint(
+            payload, len(encoded_codes)
+        )
+        payload.extend(encoded_codes)
+    return bytes(payload)
+
+
 def _partially_aliased_provider_rows():
     object_kind = "provider_set_codes_v3"
     first_payload = _provider_code_payload(1)
@@ -1713,6 +1729,461 @@ async def test_provider_code_intersections_keep_alias_reads_and_processing_once(
     assert ledger["repeated_physical_decodes"] == 0
     assert ledger["repeated_logical_payload_processes"] == 0
     assert ledger["peak_raw_bytes"] == sum(len(raw_part) for raw_part in raw_parts)
+
+
+@pytest.mark.asyncio
+async def test_provider_specific_intersections_avoid_global_cross_product(
+    monkeypatch,
+):
+    provider_payload = _provider_code_block_payload(
+        ((0, (1, 2)), (1, (1, 2)))
+    )
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="provider_set_codes_v3",
+        raw_payload=provider_payload,
+        coordinates=((0, 0),),
+        entry_count=2,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    decoder_spy = Mock(wraps=ptg2_db_serving_v3._decode_provider_code_block)
+    monkeypatch.setattr(
+        ptg2_db_serving_v3,
+        "_decode_provider_code_block",
+        decoder_spy,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        code_keys_by_provider = await (
+            ptg2_db_sidecars.lookup_provider_code_map_from_db(
+                session,
+                12,
+                {0: (1,), 1: (2,)},
+                max_retained_memberships=2,
+                schema_name="mrf",
+            )
+        )
+        scope.assert_processed_once()
+        ledger = scope.ledger
+
+    assert code_keys_by_provider == {0: (1,), 1: (2,)}
+    assert decoder_spy.call_count == 1
+    decoder_kwargs = decoder_spy.call_args.kwargs
+    assert decoder_kwargs["requested_code_selection"] is None
+    assert {
+        provider_set_key: code_selection.requested_keys
+        for provider_set_key, code_selection in decoder_kwargs[
+            "requested_code_selections_by_provider_set"
+        ].items()
+    } == {0: (1,), 1: (2,)}
+    assert decoder_kwargs["claim_retained_code_keys"] is None
+    assert ledger["physical_block_reads"] == 1
+    assert ledger["physical_block_decodes"] == 1
+    assert ledger["logical_payload_processes"] == 1
+    assert ledger["repeated_physical_reads"] == 0
+    assert ledger["repeated_physical_decodes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_specific_requests_normalize_and_bound_before_io():
+    provider_payload = _provider_code_block_payload(
+        ((0, (1, 2)), (1, (1, 2)))
+    )
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="provider_set_codes_v3",
+        raw_payload=provider_payload,
+        coordinates=((0, 0),),
+        entry_count=2,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            session,
+            12,
+            {0: (1, 1), 1: (1,)},
+            max_retained_memberships=2,
+            schema_name="mrf",
+        )
+        scope.assert_processed_once()
+    assert code_keys_by_provider == {0: (1,), 1: (1,)}
+@pytest.mark.asyncio
+async def test_provider_specific_requests_validate_before_io():
+    provider_payload = _provider_code_block_payload(((0, (1, 2)),))
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="provider_set_codes_v3",
+        raw_payload=provider_payload,
+        coordinates=((0, 0), (1, 0)),
+        entry_count=1,
+    )
+    rejected_session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    with pytest.raises(PTG2ManifestArtifactError, match="cannot be negative"):
+        await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            rejected_session,
+            12,
+            {0: (-1,)},
+            max_retained_memberships=1,
+            schema_name="mrf",
+        )
+    with pytest.raises(PTG2ManifestArtifactError, match="must be positive"):
+        await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            rejected_session,
+            12,
+            {0: (1,)},
+            max_retained_memberships=0,
+            schema_name="mrf",
+        )
+    with pytest.raises(PTG2ManifestArtifactError, match="mutually exclusive"):
+        await ptg2_db_sidecars._lookup_provider_code_keys_from_db(
+            rejected_session,
+            12,
+            (),
+            requested_code_key_set=set(),
+            requested_code_keys_by_provider_set={},
+            schema_name="mrf",
+        )
+    with pytest.raises(PTG2ManifestArtifactError, match="retention limit"):
+        await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            rejected_session,
+            12,
+            {0: (1,), 1024: (2,)},
+            max_retained_memberships=1,
+            schema_name="mrf",
+        )
+    with pytest.raises(PTG2ManifestArtifactError, match="cannot be negative"):
+        ptg2_db_sidecars._freeze_provider_code_requests(
+            {0: {-1}},
+            membership_count=1,
+        )
+    with pytest.raises(PTG2ManifestArtifactError, match="inconsistent"):
+        ptg2_db_sidecars._freeze_provider_code_requests(
+            {0: {1}},
+            membership_count=2,
+        )
+    with pytest.raises(PTG2ManifestArtifactError, match="must be positive"):
+        ptg2_db_sidecars._ProviderCodeRetentionBudget(0)
+    assert rejected_session.calls == []
+
+
+@pytest.mark.parametrize(
+    "requested_code_keys_by_provider_set",
+    ({0: (1 << 31,)}, {1 << 31: (1,)}),
+)
+@pytest.mark.asyncio
+async def test_provider_specific_requests_reject_overflow_before_io(
+    requested_code_keys_by_provider_set,
+):
+    rejected_session = _ReadOnceSession(mapping_rows=(), physical_rows=())
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="signed PostgreSQL integers",
+    ):
+        await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            rejected_session,
+            12,
+            requested_code_keys_by_provider_set,
+            max_retained_memberships=1,
+            schema_name="mrf",
+        )
+    assert rejected_session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_specific_requests_drop_empty_coordinates_before_io():
+    provider_payload = _provider_code_block_payload(((0, (1, 2)),))
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="provider_set_codes_v3",
+        raw_payload=provider_payload,
+        coordinates=((0, 0),),
+        entry_count=1,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        assert await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            session,
+            12,
+            {1: (), 2: (), 0: (1,), 3: ()},
+            max_retained_memberships=1,
+            schema_name="mrf",
+        ) == {0: (1,)}
+        scope.assert_processed_once()
+
+    empty_session = _ReadOnceSession(mapping_rows=(), physical_rows=())
+    assert await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+        empty_session,
+        12,
+        {provider_set_key: () for provider_set_key in range(10_000)},
+        max_retained_memberships=1,
+        schema_name="mrf",
+    ) == {}
+    assert empty_session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_prepared_provider_requests_are_budgeted_once_before_io(
+    monkeypatch,
+):
+    lookup = AsyncMock(return_value={0: (1,), 1: (2,)})
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_lookup_provider_code_keys_from_db",
+        lookup,
+    )
+    requests = ptg2_db_sidecars._freeze_provider_code_requests(
+        {0: {1}, 1: {2}},
+        membership_count=2,
+    )
+    with pytest.raises(TypeError):
+        requests.code_keys_by_provider_set[0] = (1, 2)
+
+    assert await ptg2_db_sidecars._lookup_prepared_code_map_from_db(
+        object(),
+        12,
+        requests,
+        max_retained_memberships=2,
+        schema_name="mrf",
+    ) == {0: (1,), 1: (2,)}
+    assert lookup.await_args.kwargs["max_retained_memberships"] is None
+
+    lookup.reset_mock()
+    with pytest.raises(PTG2ManifestArtifactError, match="retention limit"):
+        await ptg2_db_sidecars._lookup_prepared_code_map_from_db(
+            object(),
+            12,
+            requests,
+            max_retained_memberships=1,
+            schema_name="mrf",
+        )
+    lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_specific_intersections_filter_physical_aliases_once(
+    monkeypatch,
+):
+    provider_payload = _provider_code_block_payload(((0, (1, 2)),))
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="provider_set_codes_v3",
+        raw_payload=provider_payload,
+        coordinates=((0, 0), (1, 0)),
+        entry_count=1,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    decoder_spy = Mock(wraps=ptg2_db_serving_v3._decode_provider_code_block)
+    monkeypatch.setattr(
+        ptg2_db_serving_v3,
+        "_decode_provider_code_block",
+        decoder_spy,
+    )
+    intersection_spy = Mock(
+        wraps=ptg2_db_sidecars._ordered_code_intersection
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_ordered_code_intersection",
+        intersection_spy,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        code_keys_by_provider = await (
+            ptg2_db_sidecars.lookup_provider_code_map_from_db(
+                session,
+                12,
+                {0: (1,), 1024: (2,)},
+                max_retained_memberships=2,
+                schema_name="mrf",
+            )
+        )
+        scope.assert_processed_once()
+        ledger = scope.ledger
+
+    assert code_keys_by_provider == {0: (1,), 1024: (2,)}
+    assert decoder_spy.call_count == 1
+    assert [
+        call.args for call in intersection_spy.call_args_list
+    ] == [((1, 2), (1,)), ((1, 2), (2,))]
+    assert ledger["physical_block_reads"] == 1
+    assert ledger["physical_block_decodes"] == 1
+    assert ledger["logical_payload_processes"] == 1
+    assert ledger["repeated_physical_reads"] == 0
+    assert ledger["repeated_physical_decodes"] == 0
+    assert ledger["repeated_logical_payload_processes"] == 0
+
+@pytest.mark.asyncio
+async def test_provider_specific_partial_aliases_read_and_filter_once(
+    monkeypatch,
+):
+    mapping_rows, physical_rows, raw_parts = _partially_aliased_provider_rows()
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    decoder_spy = Mock(wraps=ptg2_db_serving_v3._decode_provider_code_block)
+    monkeypatch.setattr(
+        ptg2_db_serving_v3,
+        "_decode_provider_code_block",
+        decoder_spy,
+    )
+    intersection_spy = Mock(
+        wraps=ptg2_db_sidecars._ordered_code_intersection
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_ordered_code_intersection",
+        intersection_spy,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        code_keys_by_provider = await (
+            ptg2_db_sidecars.lookup_provider_code_map_from_db(
+                session,
+                12,
+                {0: (1,), 1024: (2,)},
+                max_retained_memberships=2,
+                schema_name="mrf",
+            )
+        )
+        scope.assert_processed_once()
+        ledger = scope.ledger
+
+    assert code_keys_by_provider == {0: (1,), 1024: (2,)}
+    assert decoder_spy.call_count == 2
+    assert [
+        call.args for call in intersection_spy.call_args_list
+    ] == [((1,), (1,)), ((2,), (2,))]
+    assert ledger["physical_block_reads"] == 3
+    assert ledger["physical_block_decodes"] == 3
+    assert ledger["logical_payload_processes"] == 2
+    assert ledger["repeated_physical_reads"] == 0
+    assert ledger["repeated_physical_decodes"] == 0
+    assert ledger["repeated_logical_payload_processes"] == 0
+    assert ledger["peak_raw_bytes"] == sum(len(part) for part in raw_parts)
+
+
+@pytest.mark.asyncio
+async def test_provider_specific_aliases_union_only_the_same_offset(monkeypatch):
+    provider_payload = _provider_code_block_payload(
+        ((0, (1, 2)), (1, (1, 2)))
+    )
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="provider_set_codes_v3",
+        raw_payload=provider_payload,
+        coordinates=((0, 0), (1, 0)),
+        entry_count=2,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    decoder_spy = Mock(wraps=ptg2_db_serving_v3._decode_provider_code_block)
+    monkeypatch.setattr(
+        ptg2_db_serving_v3,
+        "_decode_provider_code_block",
+        decoder_spy,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            session,
+            12,
+            {0: (1,), 1025: (2,)},
+            max_retained_memberships=2,
+            schema_name="mrf",
+        )
+        scope.assert_processed_once()
+        ledger = scope.ledger
+
+    assert code_keys_by_provider == {0: (1,), 1025: (2,)}
+    assert decoder_spy.call_count == 1
+    assert ledger["physical_block_reads"] == 1
+    assert ledger["physical_block_decodes"] == 1
+    assert ledger["logical_payload_processes"] == 1
+    assert ledger["repeated_physical_reads"] == 0
+    assert ledger["repeated_physical_decodes"] == 0
+    assert ledger["repeated_logical_payload_processes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_specific_intersections_preserve_empty_and_missing():
+    provider_payload = _provider_code_block_payload(((0, (1, 2)),))
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="provider_set_codes_v3",
+        raw_payload=provider_payload,
+        coordinates=((0, 0),),
+        entry_count=1,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        code_keys_by_provider = await (
+            ptg2_db_sidecars.lookup_provider_code_map_from_db(
+                session,
+                12,
+                {0: (99,), 1: (1,)},
+                schema_name="mrf",
+            )
+        )
+        scope.assert_processed_once()
+
+    assert code_keys_by_provider == {0: ()}
+
+
+def test_ordered_provider_code_intersections_advance_both_inputs():
+    assert ptg2_db_sidecars._ordered_code_intersection((2,), (1,)) == ()
+
+
+def test_provider_specific_fanout_filters_and_budgets_each_alias_once(
+    monkeypatch,
+):
+    intersection_spy = Mock(
+        wraps=ptg2_db_sidecars._ordered_code_intersection
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_ordered_code_intersection",
+        intersection_spy,
+    )
+    code_keys_by_provider = {}
+    budget = ptg2_db_sidecars._ProviderCodeRetentionBudget(3)
+
+    ptg2_db_sidecars._retain_provider_aliases(
+        code_keys_by_provider,
+        ((0, object()), (1, object()), (2, object())),
+        {0: (1, 2), 1: (1, 2), 2: (1, 2)},
+        {0: {0}, 1: {1}, 2: {2}},
+        block_span=1024,
+        requested_code_keys_by_provider_set={
+            0: (1,),
+            1025: (2,),
+            2050: (1,),
+        },
+        retention_budget=budget,
+    )
+
+    assert code_keys_by_provider == {0: (1,), 1025: (2,), 2050: (1,)}
+    assert budget.retained_memberships == 3
+    assert [
+        call.args for call in intersection_spy.call_args_list
+    ] == [((1, 2), (1,)), ((1, 2), (2,)), ((1, 2), (1,))]
 
 
 @pytest.mark.asyncio

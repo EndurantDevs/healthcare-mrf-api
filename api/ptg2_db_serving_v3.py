@@ -29,6 +29,8 @@ PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN = 1024
 PTG2_SERVING_BINARY_V3_PRICE_KEY_BLOCK_SPAN = 512
 PTG2_SERVING_BINARY_V3_ATOM_KEY_BLOCK_SPAN = 512
 
+_ProviderCodeSelections = Mapping[int, ProviderCodeSelection]
+
 
 def _requested_keys(source_keys: Iterable[int]) -> tuple[int, ...]:
     requested_key_values = tuple(sorted({int(source_key) for source_key in source_keys}))
@@ -98,6 +100,31 @@ def _is_key_in_block(key: int, block_key: int, block_span: int) -> bool:
     return block_start <= key < block_start + block_span
 
 
+def _provider_code_selection_for_key(
+    provider_set_key: int,
+    requested_code_selection: ProviderCodeSelection | None,
+    requested_code_selections_by_provider_set: _ProviderCodeSelections | None,
+) -> ProviderCodeSelection | None:
+    """Resolve one unambiguous global or provider-specific code selection."""
+
+    if (
+        requested_code_selection is not None
+        and requested_code_selections_by_provider_set is not None
+    ):
+        raise ValueError("provider-code selections are ambiguous")
+    provider_selection = (
+        requested_code_selections_by_provider_set.get(provider_set_key)
+        if requested_code_selections_by_provider_set is not None
+        else requested_code_selection
+    )
+    if (
+        requested_code_selections_by_provider_set is not None
+        and provider_selection is None
+    ):
+        raise ValueError("requested provider set is missing its code selection")
+    return provider_selection
+
+
 def _decode_provider_code_block(
     block_bytes: bytes,
     *,
@@ -105,6 +132,7 @@ def _decode_provider_code_block(
     entry_count: int,
     requested_provider_set_keys: set[int],
     requested_code_selection: ProviderCodeSelection | None = None,
+    requested_code_selections_by_provider_set: _ProviderCodeSelections | None = None,
     claim_retained_code_keys: Callable[[int, tuple[int, ...]], None] | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Decode requested provider sets without expanding neighboring containers."""
@@ -130,12 +158,17 @@ def _decode_provider_code_block(
                 raise ValueError("provider-set entries are not strictly ordered")
             if provider_set_key in requested_provider_set_keys:
                 encoded_code_set = block_view[cursor:code_bytes_end]
+                provider_code_selection = _provider_code_selection_for_key(
+                    provider_set_key,
+                    requested_code_selection,
+                    requested_code_selections_by_provider_set,
+                )
                 retained_code_keys = (
                     decode_provider_code_set(encoded_code_set)
-                    if requested_code_selection is None
+                    if provider_code_selection is None
                     else intersect_provider_code_set(
                         encoded_code_set,
-                        requested_code_selection,
+                        provider_code_selection,
                     )
                 )
                 if claim_retained_code_keys is not None:
