@@ -781,7 +781,12 @@ def _audit_summary(report: Mapping[str, Any], report_digest: str) -> dict[str, A
             http,
             (
                 "standard_api_actual_http_requests",
+                "batch_api_planned_http_requests",
                 "batch_api_actual_http_requests",
+                "batch_api_completed_http_requests",
+                "batch_api_failed_http_requests",
+                "retry_count",
+                "max_concurrency",
             ),
         )
     )

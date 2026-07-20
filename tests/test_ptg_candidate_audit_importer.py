@@ -206,8 +206,12 @@ def _passing_batch_report(
             "batch_requests_executed": 1,
         },
         "http": {
+            "batch_api_planned_http_requests": 1,
             "batch_api_actual_http_requests": 1,
+            "batch_api_completed_http_requests": 1,
+            "batch_api_failed_http_requests": 0,
             "retry_count": 0,
+            "max_concurrency": 1,
         },
         "batch": {"endpoint_duration_ms": 12_000.0},
         "source": {
@@ -797,6 +801,32 @@ def test_audit_summary_timing_edges():
     )
     assert batch_summary_by_field["audit_timings"] == {
         "endpoint_duration_ms": 1.0
+    }
+
+
+def test_audit_summary_projects_partition_request_accounting():
+    summary_by_field = ptg_candidate_audit._audit_summary(
+        _passing_batch_report(),
+        "d" * 64,
+    )
+
+    assert summary_by_field["audit_counts"] == {
+        "source_witnesses": 11_000,
+        "source_occurrence_witnesses_matched": 10_000,
+        "unique_source_conditions_executed": 9_000,
+        "provider_witnesses_validated": 1_000,
+        "persisted_audit_occurrences_validated": 2_560,
+        "batch_requests_executed": 1,
+        "batch_api_planned_http_requests": 1,
+        "batch_api_actual_http_requests": 1,
+        "batch_api_completed_http_requests": 1,
+        "batch_api_failed_http_requests": 0,
+        "retry_count": 0,
+        "max_concurrency": 1,
+    }
+    assert summary_by_field["audit_timings"] == {
+        "duration_seconds": 12.5,
+        "endpoint_duration_ms": 12_000.0,
     }
 
 

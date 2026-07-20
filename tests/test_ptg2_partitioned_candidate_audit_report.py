@@ -257,6 +257,20 @@ def test_partitioned_report_rejects_forged_request_count():
         )
 
 
+def test_partitioned_report_rejects_invalid_response_binding():
+    report = deepcopy(_report())
+    report["batch"]["response_contract"] = "invalid"
+
+    with pytest.raises(ValueError, match="response binding"):
+        validate_batch_candidate_release_audit_report(
+            report,
+            snapshot_id="candidate-snapshot",
+            source_key="test-source",
+            plan_id="12-3456789",
+            plan_market_type="group",
+        )
+
+
 def test_http_metrics_report_zero_rate_until_two_distinct_starts_exist():
     metrics = PartitionedAuditHttpMetrics(planned_request_count=1)
     assert metrics.start_span_seconds == 0
