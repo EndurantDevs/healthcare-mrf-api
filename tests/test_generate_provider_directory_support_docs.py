@@ -40,9 +40,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 17 |" in rendered_document
+    assert "| Acquisition-configured | 21 |" in rendered_document
     assert "| Externally supported | 0 |" in rendered_document
-    assert "| Probe-only | 20 |" in rendered_document
+    assert "| Probe-only | 16 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
     assert "| Total tracked | 40 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document

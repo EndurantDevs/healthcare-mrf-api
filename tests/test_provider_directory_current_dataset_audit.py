@@ -17,7 +17,7 @@ def test_current_dataset_audit_renders_separately_from_acquisition_support():
     )
 
     assert "## Current Published Dataset Audit" in rendered_document
-    assert "Audit as of `2026-07-19`" in rendered_document
+    assert "Audit as of `2026-07-20`" in rendered_document
     assert "Molina (`molina`) | No current dataset | - | Not applicable" in rendered_document
     assert "Texas TMHP (`texas-tmhp`) | Current published (`pdds_87113f97f3f9...`) | 782,642 | Not proven" in rendered_document
     assert "CareSource (`caresource`) | No current dataset | - | Not proven" in rendered_document
@@ -27,6 +27,9 @@ def test_current_dataset_audit_renders_separately_from_acquisition_support():
     assert "ALOHR (`alohr`) | Current published (`pdds_085b7d2da6de...`) | 319,384 | Contract/live mismatch" in rendered_document
     assert "fresh four-resource acquisition" in rendered_document
     assert "Aetna Commercial and Medicare (`aetna-commercial-medicare`)" in rendered_document
+    assert "Devoted Health (`devoted-health`) | Current published (`pdds_fc4167c03b85...`) | 288,056 | Not proven" in rendered_document
+    assert "San Bernardino County DBH (`san-bernardino-county-dbh`) | Current published (`pdds_f4d01cad21a5...`) | 8,749 | Not proven" in rendered_document
+    assert "pre-release artifact pass excluded this source from Profile" in rendered_document
 
 
 def test_current_dataset_audit_rejects_unknown_manifest_entry():
