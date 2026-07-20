@@ -987,6 +987,7 @@ async def find_active_runs_by_importer(importer: str) -> list[dict[str, Any]]:
 _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY = "import-run-admission:provider-directory-fhir"
 _PROVIDER_DIRECTORY_ACQUISITION = "acquisition"
 _PROVIDER_DIRECTORY_SCOPED_ARTIFACT = "scoped_artifact"
+_PROVIDER_DIRECTORY_SCOPED_SEED = "scoped_seed"
 _PROVIDER_DIRECTORY_EXCLUSIVE = "exclusive"
 
 
@@ -1128,6 +1129,28 @@ def _provider_directory_artifact_scope(params: dict[str, Any]) -> frozenset[str]
     return _provider_directory_source_ids(params.get("source_ids"))
 
 
+def _provider_directory_seed_scope(params: dict[str, Any]) -> frozenset[str] | None:
+    """Return exact source IDs for a metadata-only, non-cleanup seed run."""
+    if params.get("seed_only") is not True:
+        return None
+    incompatible_flags = (
+        "import_resources",
+        "canonical_backfill_only",
+        "contact_backfill_only",
+        "dataset_rehydrate_only",
+        "publish_artifacts_only",
+        "publish_artifacts",
+        "publish_after_acquisition",
+        "publish_corroboration",
+        "full_refresh",
+        "stale_cleanup",
+        "refresh_preset",
+    )
+    if any(params.get(flag_name) for flag_name in incompatible_flags):
+        return None
+    return _provider_directory_source_ids(params.get("source_ids"))
+
+
 def _provider_directory_operation(
     params: dict[str, Any],
     metrics: dict[str, Any] | None = None,
@@ -1139,6 +1162,9 @@ def _provider_directory_operation(
     artifact_source_ids = _provider_directory_artifact_scope(params)
     if artifact_source_ids is not None:
         return _PROVIDER_DIRECTORY_SCOPED_ARTIFACT, artifact_source_ids, None
+    seed_source_ids = _provider_directory_seed_scope(params)
+    if seed_source_ids is not None:
+        return _PROVIDER_DIRECTORY_SCOPED_SEED, seed_source_ids, None
     return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
 
 
@@ -1182,7 +1208,15 @@ def _provider_directory_blocking_run(
             if not requested_source_ids.isdisjoint(active_source_ids):
                 return active_run
             continue
+        if requested_kind == _PROVIDER_DIRECTORY_SCOPED_SEED:
+            if not requested_source_ids.isdisjoint(active_source_ids):
+                return active_run
+            continue
         if active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+            if not requested_source_ids.isdisjoint(active_source_ids):
+                return active_run
+            continue
+        if active_kind == _PROVIDER_DIRECTORY_SCOPED_SEED:
             if not requested_source_ids.isdisjoint(active_source_ids):
                 return active_run
             continue

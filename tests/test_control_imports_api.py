@@ -1650,6 +1650,26 @@ def _provider_directory_artifact_params(source_id, **overrides):
     return params_by_name
 
 
+def _provider_directory_seed_params(*source_ids, **overrides):
+    params_by_name = {
+        "seed_only": True,
+        "source_ids": list(source_ids),
+        "import_resources": False,
+        "canonical_backfill_only": False,
+        "contact_backfill_only": False,
+        "dataset_rehydrate_only": False,
+        "publish_artifacts_only": False,
+        "publish_artifacts": False,
+        "publish_after_acquisition": False,
+        "publish_corroboration": False,
+        "full_refresh": False,
+        "stale_cleanup": False,
+        "refresh_preset": None,
+    }
+    params_by_name.update(overrides)
+    return params_by_name
+
+
 def _provider_directory_active_run(run_id, source_id, endpoint_scope):
     return {
         "run_id": run_id,
@@ -1665,6 +1685,15 @@ def _provider_directory_artifact_run(run_id, source_id):
         "status": "running",
         "importer": "provider-directory-fhir",
         "params": _provider_directory_artifact_params(source_id),
+    }
+
+
+def _provider_directory_seed_run(run_id, *source_ids):
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "importer": "provider-directory-fhir",
+        "params": _provider_directory_seed_params(*source_ids),
     }
 
 
@@ -1815,6 +1844,77 @@ def test_fhir_exclusive_artifact_classifier(unsafe_override):
     operation_kind, _, _ = control_imports._provider_directory_operation(params_by_name)
 
     assert operation_kind == control_imports._PROVIDER_DIRECTORY_EXCLUSIVE
+
+
+def test_fhir_scoped_seed_classifier():
+    params_by_name = _provider_directory_seed_params("pdfhir_devoted", "pdfhir_simpra")
+
+    operation_kind, source_ids, endpoint_scope = control_imports._provider_directory_operation(params_by_name)
+
+    assert operation_kind == control_imports._PROVIDER_DIRECTORY_SCOPED_SEED
+    assert source_ids == frozenset({"pdfhir_devoted", "pdfhir_simpra"})
+    assert endpoint_scope is None
+
+
+@pytest.mark.parametrize(
+    "unsafe_override",
+    [
+        {"source_ids": None},
+        {"source_ids": []},
+        {"source_ids": [""]},
+        {"source_ids": ["pdfhir_one", "pdfhir_one"]},
+        {"source_ids": [123]},
+        {"import_resources": True},
+        {"canonical_backfill_only": True},
+        {"contact_backfill_only": True},
+        {"dataset_rehydrate_only": True},
+        {"publish_artifacts_only": True},
+        {"publish_artifacts": True},
+        {"publish_after_acquisition": True},
+        {"publish_corroboration": True},
+        {"full_refresh": True},
+        {"stale_cleanup": True},
+        {"refresh_preset": "monthly-full"},
+    ],
+)
+def test_fhir_exclusive_seed_classifier(unsafe_override):
+    params_by_name = _provider_directory_seed_params("pdfhir_seed", **unsafe_override)
+
+    operation_kind, _, _ = control_imports._provider_directory_operation(params_by_name)
+
+    assert operation_kind == control_imports._PROVIDER_DIRECTORY_EXCLUSIVE
+
+
+def test_fhir_scoped_seed_conflicts_only_with_overlapping_or_exclusive_work():
+    acquisition_run = _provider_directory_active_run(
+        "run_aetna",
+        "pdfhir_aetna",
+        "https://v2-api.aetna.com/fhir/providerdirectory",
+    )
+    seed_run = _provider_directory_seed_run("run_seed", "pdfhir_devoted", "pdfhir_simpra")
+    verified_seed = _provider_directory_seed_params(
+        "pdfhir_devoted",
+        "pdfhir_simpra",
+        "pdfhir_san_bernardino",
+        "pdfhir_san_mateo",
+    )
+    overlapping_seed = _provider_directory_seed_params("pdfhir_aetna")
+    disjoint_acquisition = _provider_directory_acquisition_params(
+        "pdfhir_aetna",
+        "https://v2-api.aetna.com/fhir/providerdirectory",
+    )
+    overlapping_acquisition = _provider_directory_acquisition_params(
+        "pdfhir_devoted",
+        "https://api.devoted.com/fhir/provider-directory",
+    )
+    exclusive_run = _provider_directory_seed_run("run_exclusive", "pdfhir_other")
+    exclusive_run["params"]["source_ids"] = []
+
+    assert control_imports._provider_directory_blocking_run(verified_seed, [acquisition_run]) is None
+    assert control_imports._provider_directory_blocking_run(overlapping_seed, [acquisition_run]) == acquisition_run
+    assert control_imports._provider_directory_blocking_run(disjoint_acquisition, [seed_run]) is None
+    assert control_imports._provider_directory_blocking_run(overlapping_acquisition, [seed_run]) == seed_run
+    assert control_imports._provider_directory_blocking_run(verified_seed, [exclusive_run]) == exclusive_run
 
 
 def test_fhir_artifact_separate_capacity(monkeypatch):
@@ -2026,6 +2126,55 @@ async def test_create_import_run_allows_disjoint_provider_directory_acquisition(
     assert "pg_advisory_xact_lock" in str(lock_event[1])
     assert lock_event[2] == {"lock_key": control_imports._PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY}
     assert control_imports._PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY != control_imports._IMPORT_RUN_ADVISORY_LOCK_KEY
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_allows_disjoint_provider_directory_seed(monkeypatch):
+    active = _provider_directory_active_run(
+        "run_aetna",
+        "pdfhir_aetna",
+        "https://v2-api.aetna.com/fhir/providerdirectory",
+    )
+
+    async def fake_enqueue(row):
+        assert database.committed is True
+        database.events.append(("enqueue", row["run_id"]))
+        return {
+            "status": "queued",
+            "phase_detail": "enqueued",
+            "heartbeat_at": row["heartbeat_at"],
+            "progress": {"message": "queued"},
+            "metrics": {"queue": "arq:ProviderDirectoryFHIR"},
+            "error": None,
+        }
+
+    database = _install_provider_admission_stubs(monkeypatch, [active])
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
+
+    created_run, created = await create_import_run(
+        {
+            "run_id": "run_verified_seed",
+            "importer": "provider-directory-fhir",
+            "idempotency_key": "verified-provider-seed",
+            "params": _provider_directory_seed_params(
+                "pdfhir_devoted",
+                "pdfhir_simpra",
+                "pdfhir_san_bernardino",
+                "pdfhir_san_mateo",
+            ),
+        }
+    )
+
+    assert created is True
+    assert created_run["run_id"] == "run_verified_seed"
+    assert [event[0] for event in database.events] == [
+        "acquire",
+        "scalar",
+        "status",
+        "commit",
+        "enqueue",
+        "execute",
+    ]
 
 
 @pytest.mark.asyncio
