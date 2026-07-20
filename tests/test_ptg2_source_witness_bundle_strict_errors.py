@@ -94,10 +94,10 @@ def test_source_witness_bundle_rejects_invalid_record_framing():
 
 
 def test_source_witness_bundle_rejects_contract_and_source_digest_changes():
-    invalid_contract = {**_header(), "contract": "invalid"}
+    invalid_header_by_field = {**_header(), "contract": "invalid"}
     with pytest.raises(RuntimeError, match="bundle contract is invalid"):
         bundle._validate_bundle_header(
-            invalid_contract,
+            invalid_header_by_field,
             {"raw_source_sha256": "00" * 32},
         )
 

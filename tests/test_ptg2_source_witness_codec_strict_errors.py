@@ -138,7 +138,7 @@ def test_persisted_source_witness_rejects_invalid_linked_evidence():
 
 
 def test_source_witness_rejects_invalid_record_fields():
-    valid_metadata = {
+    valid_metadata_by_field = {
         "contract": codec.PTG2_V3_SOURCE_WITNESS_RECORD_CONTRACT,
         "kind": "provider_reference",
         "priority": "0000000000000001",
@@ -146,21 +146,24 @@ def test_source_witness_rejects_invalid_record_fields():
         "expected": {},
     }
 
-    invalid_contract = {**valid_metadata, "contract": "invalid"}
+    invalid_contract_by_field = {
+        **valid_metadata_by_field,
+        "contract": "invalid",
+    }
     with pytest.raises(RuntimeError, match="record contract is invalid"):
-        codec._record_fields(invalid_contract)
+        codec._record_fields(invalid_contract_by_field)
 
-    invalid_kind = {**valid_metadata, "kind": "invalid"}
+    invalid_kind_by_field = {**valid_metadata_by_field, "kind": "invalid"}
     with pytest.raises(RuntimeError, match="record kind is invalid"):
-        codec._record_fields(invalid_kind)
+        codec._record_fields(invalid_kind_by_field)
 
-    invalid_priority = {**valid_metadata, "priority": "1"}
+    invalid_priority_by_field = {**valid_metadata_by_field, "priority": "1"}
     with pytest.raises(RuntimeError, match="priority is invalid"):
-        codec._record_fields(invalid_priority)
+        codec._record_fields(invalid_priority_by_field)
 
-    missing_expected = {**valid_metadata, "expected": None}
+    missing_expected_by_field = {**valid_metadata_by_field, "expected": None}
     with pytest.raises(RuntimeError, match="expected evidence is missing"):
-        codec._record_fields(missing_expected)
+        codec._record_fields(missing_expected_by_field)
 
 
 @pytest.mark.parametrize(
