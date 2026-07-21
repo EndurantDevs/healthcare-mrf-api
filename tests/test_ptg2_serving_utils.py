@@ -43,7 +43,7 @@ def test_serving_identity_helpers_cover_empty_and_driver_values():
 
 
 def test_price_filter_clauses_cover_all_exact_filter_families():
-    params = {}
+    params_by_name = {}
 
     clauses, query_values = serving_utils._price_filter_clauses(
         {
@@ -51,7 +51,7 @@ def test_price_filter_clauses_cover_all_exact_filter_families():
             "billing_code_modifier": "26",
             "negotiated_rate": "12.50",
         },
-        params,
+        params_by_name,
     )
 
     assert len(clauses) == 3
@@ -62,7 +62,7 @@ def test_price_filter_clauses_cover_all_exact_filter_families():
         "negotiated_rate": 12.5,
         "rate_tolerance": 0.01,
     }
-    assert params == {
+    assert params_by_name == {
         "price_service_codes": ["11"],
         "price_modifier_codes": ["26"],
         "price_negotiated_rate": serving_utils.Decimal("12.50"),
@@ -71,14 +71,14 @@ def test_price_filter_clauses_cover_all_exact_filter_families():
 
 
 def test_price_filter_clauses_preserve_explicit_rate_tolerance():
-    params = {}
+    params_by_name = {}
 
     clauses, query_values = serving_utils._price_filter_clauses(
         {
             "rate": "8.75",
             "rate_tolerance": "0.25",
         },
-        params,
+        params_by_name,
     )
 
     assert len(clauses) == 1
@@ -86,4 +86,4 @@ def test_price_filter_clauses_preserve_explicit_rate_tolerance():
         "negotiated_rate": 8.75,
         "rate_tolerance": 0.25,
     }
-    assert params["price_rate_tolerance"] == serving_utils.Decimal("0.25")
+    assert params_by_name["price_rate_tolerance"] == serving_utils.Decimal("0.25")

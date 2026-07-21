@@ -239,7 +239,7 @@ async def test_plan_snapshot_resolvers_bind_optional_market_and_source_filters()
     network_session = _RecordingSession(
         _Result(rows=(("source-a", "network-snapshot"),))
     )
-    args = {
+    args_by_name = {
         "plan_id": "12-3456789",
         "plan_market_type": "GROUP",
         "source_key": " Source-A ",
@@ -247,11 +247,11 @@ async def test_plan_snapshot_resolvers_bind_optional_market_and_source_filters()
 
     assert await ptg2_snapshot.current_source_snapshot_id_for_plan(
         plan_session,
-        args,
+        args_by_name,
     ) == "plan-snapshot"
     assert await ptg2_snapshot.current_network_snapshots_for_plan(
         network_session,
-        args,
+        args_by_name,
     ) == [("source-a", "network-snapshot")]
     for _sql, params in (plan_session.calls[0], network_session.calls[0]):
         assert params == {
