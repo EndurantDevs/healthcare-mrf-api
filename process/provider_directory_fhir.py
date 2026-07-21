@@ -79,6 +79,10 @@ from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
+from process.provider_directory_endpoint_admission import (
+    ProviderDirectoryEndpointIdentityError,
+    _admit_provider_directory_endpoint_components,
+)
 from process.provider_directory_dataset_rehydrate import (
     DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
     DatasetScope,
@@ -32465,20 +32469,23 @@ def _provider_directory_api_endpoint_row(
     *,
     observed_at: datetime.datetime | None = None,
 ) -> dict[str, Any] | None:
-    api_base, credential_json, endpoint_signature_items = _resource_import_group_key(
-        source_record
-    )
+    try:
+        api_base, credential_json, endpoint_signature_items = (
+            _resource_import_group_key(source_record)
+        )
+    except (TypeError, UnicodeError, ValueError):
+        return None
     if not api_base or not endpoint_signature_items:
         return None
-    credential_descriptor = json.loads(credential_json or "{}")
-    endpoint_signature_map = dict(endpoint_signature_items)
-    credential_descriptor_hash = _identity_hash(credential_descriptor)
-    endpoint_signature_hash = _identity_hash(endpoint_signature_map)
-    identity_payload_map = {
-        "canonical_api_base": api_base,
-        "credential_descriptor": credential_descriptor,
-        "endpoint_signature": endpoint_signature_map,
-    }
+    try:
+        admitted_fields = _admit_provider_directory_endpoint_components(
+            canonical_api_base=api_base,
+            credential_descriptor_json=json.loads(credential_json or "{}"),
+            endpoint_signature_json=dict(endpoint_signature_items),
+        )
+    except (ProviderDirectoryEndpointIdentityError, TypeError, ValueError):
+        return None
+    endpoint_signature_map = admitted_fields["endpoint_signature_json"]
     now = observed_at or _now()
     connector_contract_json = endpoint_signature_map.get(
         "connector_acquisition_contract"
@@ -32500,11 +32507,15 @@ def _provider_directory_api_endpoint_row(
             connector_contract
         )
     return {
-        "endpoint_id": _identity_hash(identity_payload_map),
-        "canonical_api_base": api_base,
-        "credential_descriptor_hash": credential_descriptor_hash,
-        "endpoint_signature_hash": endpoint_signature_hash,
-        "credential_descriptor_json": credential_descriptor,
+        "endpoint_id": admitted_fields["endpoint_id"],
+        "canonical_api_base": admitted_fields["canonical_api_base"],
+        "credential_descriptor_hash": admitted_fields[
+            "credential_descriptor_hash"
+        ],
+        "endpoint_signature_hash": admitted_fields["endpoint_signature_hash"],
+        "credential_descriptor_json": admitted_fields[
+            "credential_descriptor_json"
+        ],
         "endpoint_signature_json": endpoint_signature_map,
         "first_seen_at": now,
         "last_seen_at": now,
