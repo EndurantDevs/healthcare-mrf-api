@@ -190,36 +190,6 @@ def _lock_schema_objects(
     )
 
 
-def _primary_key_columns(inspector: Any, schema: str) -> tuple[str, ...]:
-    primary_key_record = inspector.get_pk_constraint(
-        CHECKPOINT_TABLE,
-        schema=schema,
-    )
-    return tuple(primary_key_record.get("constrained_columns") or ())
-
-
-def _raise_unknown_primary_key(primary_key_columns: tuple[str, ...]) -> None:
-    raise RuntimeError(
-        "provider_directory_pagination_checkpoint_primary_key_unknown:"
-        + ",".join(primary_key_columns)
-    )
-
-
-def _validate_current_root_identity(
-    sync_connection: Any,
-    checkpoint_ref: str,
-    dataset_ref: str,
-) -> None:
-    if _checkpoint_root_mismatch_count(
-        sync_connection,
-        checkpoint_ref,
-        dataset_ref,
-    ):
-        raise RuntimeError(
-            "provider_directory_pagination_checkpoint_root_mismatch"
-        )
-
-
 def ensure_provider_directory_pagination_root_identity(
     sync_connection: Any,
     schema: str,
@@ -232,30 +202,47 @@ def ensure_provider_directory_pagination_root_identity(
     _validate_schema_objects(inspector, schema)
     checkpoint_ref = _qualified_table(sync_connection, schema, CHECKPOINT_TABLE)
     dataset_ref = _qualified_table(sync_connection, schema, DATASET_TABLE)
-    primary_key_columns = _primary_key_columns(inspector, schema)
+    primary_key_record = inspector.get_pk_constraint(CHECKPOINT_TABLE, schema=schema)
+    primary_key_columns = tuple(primary_key_record.get("constrained_columns") or ())
     if primary_key_columns == ROOT_PRIMARY_KEY_COLUMNS:
-        _validate_current_root_identity(
+        if _checkpoint_root_mismatch_count(
             sync_connection,
             checkpoint_ref,
             dataset_ref,
-        )
+        ):
+            raise RuntimeError(
+                "provider_directory_pagination_checkpoint_root_mismatch"
+            )
         return
     if primary_key_columns != LEGACY_PRIMARY_KEY_COLUMNS:
-        _raise_unknown_primary_key(primary_key_columns)
+        raise RuntimeError(
+            "provider_directory_pagination_checkpoint_primary_key_unknown:"
+            + ",".join(primary_key_columns)
+        )
 
     _lock_schema_objects(sync_connection, checkpoint_ref, dataset_ref)
     locked_inspector = inspect(sync_connection)
-    primary_key_columns = _primary_key_columns(locked_inspector, schema)
+    primary_key_record = locked_inspector.get_pk_constraint(
+        CHECKPOINT_TABLE,
+        schema=schema,
+    )
+    primary_key_columns = tuple(primary_key_record.get("constrained_columns") or ())
     if primary_key_columns == LEGACY_PRIMARY_KEY_COLUMNS:
         _rekey_checkpoint_table(sync_connection, checkpoint_ref, dataset_ref)
         sync_summary_by_kind["constraints"].append(
             f"{schema}.{CHECKPOINT_PRIMARY_KEY}"
         )
     elif primary_key_columns == ROOT_PRIMARY_KEY_COLUMNS:
-        _validate_current_root_identity(
+        if _checkpoint_root_mismatch_count(
             sync_connection,
             checkpoint_ref,
             dataset_ref,
-        )
+        ):
+            raise RuntimeError(
+                "provider_directory_pagination_checkpoint_root_mismatch"
+            )
     else:
-        _raise_unknown_primary_key(primary_key_columns)
+        raise RuntimeError(
+            "provider_directory_pagination_checkpoint_primary_key_unknown:"
+            + ",".join(primary_key_columns)
+        )

@@ -163,6 +163,80 @@ def test_sync_accepts_concurrent_rekey_after_locking(monkeypatch):
     assert results == _results()
 
 
+def test_sync_rejects_concurrent_rekey_with_mismatched_lineage(monkeypatch):
+    """A concurrent repair is accepted only when its lineage is consistent."""
+    inspectors = iter(
+        (
+            _Inspector(schema_sync.LEGACY_PRIMARY_KEY_COLUMNS),
+            _Inspector(schema_sync.ROOT_PRIMARY_KEY_COLUMNS),
+        )
+    )
+    monkeypatch.setattr(schema_sync, "inspect", lambda _connection: next(inspectors))
+    connection = _SyncConnection(mismatch_count=1)
+
+    try:
+        schema_sync.ensure_provider_directory_pagination_root_identity(
+            connection,
+            "mrf",
+            _results(),
+        )
+    except RuntimeError as exc:
+        assert "root_mismatch" in str(exc)
+    else:
+        raise AssertionError("concurrent mismatched identity was accepted")
+
+    executed_sql = "\n".join(statement for statement, _params in connection.executed)
+    assert "SHARE ROW EXCLUSIVE MODE" in executed_sql
+    assert "SELECT count(*)" in executed_sql
+    assert "ALTER TABLE" not in executed_sql
+
+
+def test_sync_skips_database_without_checkpoint_table(monkeypatch):
+    """A database without Provider Directory state requires no repair locks."""
+    inspector = _Inspector(
+        schema_sync.ROOT_PRIMARY_KEY_COLUMNS,
+        missing_tables=(schema_sync.CHECKPOINT_TABLE,),
+    )
+    monkeypatch.setattr(schema_sync, "inspect", lambda _connection: inspector)
+    connection = _SyncConnection()
+
+    schema_sync.ensure_provider_directory_pagination_root_identity(
+        connection,
+        "mrf",
+        _results(),
+    )
+
+    assert connection.executed == []
+
+
+def test_sync_fails_if_key_becomes_unknown_while_waiting(monkeypatch):
+    """A surprising primary-key transition under the repair lock fails closed."""
+    inspectors = iter(
+        (
+            _Inspector(schema_sync.LEGACY_PRIMARY_KEY_COLUMNS),
+            _Inspector(("canonical_api_base", "resource_type")),
+        )
+    )
+    monkeypatch.setattr(schema_sync, "inspect", lambda _connection: next(inspectors))
+    connection = _SyncConnection()
+
+    try:
+        schema_sync.ensure_provider_directory_pagination_root_identity(
+            connection,
+            "mrf",
+            _results(),
+        )
+    except RuntimeError as exc:
+        assert "primary_key_unknown" in str(exc)
+    else:
+        raise AssertionError("unknown key transition was accepted")
+
+    executed_sql = "\n".join(statement for statement, _params in connection.executed)
+    assert "SHARE ROW EXCLUSIVE MODE" in executed_sql
+    assert "ACCESS EXCLUSIVE MODE" in executed_sql
+    assert "ALTER TABLE" not in executed_sql
+
+
 def test_sync_fails_closed_for_unknown_primary_key(monkeypatch):
     """Unknown deployed key shapes are never rewritten automatically."""
     inspector = _Inspector(("canonical_api_base", "resource_type"))
