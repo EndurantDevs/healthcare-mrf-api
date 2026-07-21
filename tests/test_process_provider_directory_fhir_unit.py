@@ -15,6 +15,7 @@ import json
 import importlib
 import string
 import urllib.parse
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -4026,6 +4027,25 @@ async def test_ensure_provider_directory_model_columns_adds_missing_stale_table_
     sql = status_mock.await_args.args[0]
     assert 'ALTER TABLE "mrf"."provider_directory_location" ADD COLUMN IF NOT EXISTS phone_number' in sql
     assert "VARCHAR(15)" in sql
+
+
+@pytest.mark.asyncio
+async def test_ensure_provider_directory_model_columns_ignores_empty_compiled_column(monkeypatch):
+    fake_column = SimpleNamespace(name="missing_column")
+    fake_model = SimpleNamespace(
+        __tablename__="provider_directory_fake",
+        __table__=SimpleNamespace(columns=(fake_column,)),
+    )
+    compiled_column = Mock()
+    compiled_column.compile.return_value = " "
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[]))
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer, "CreateColumn", Mock(return_value=compiled_column))
+
+    await importer._ensure_provider_directory_model_columns(fake_model, "mrf")
+
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -12930,6 +12950,55 @@ async def test_provider_directory_table_ensure_current_schema_runs_no_ddl(
 
 
 @pytest.mark.asyncio
+async def test_provider_directory_table_ensure_repairs_missing_schema_and_table(
+    monkeypatch,
+):
+    index_names = [
+        index["name"]
+        for index in ProviderDirectorySource.__my_additional_indexes__
+    ]
+    status = AsyncMock()
+    create_table = AsyncMock()
+    monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
+    monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
+    monkeypatch.setattr(
+        importer,
+        "_table_exists",
+        AsyncMock(side_effect=(False, False)),
+    )
+    monkeypatch.setattr(importer.db, "create_table", create_table)
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(return_value=[{"indexname": name} for name in index_names]),
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_model_columns",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_source_column_types",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_import_seen_table",
+        AsyncMock(),
+    )
+
+    await importer._ensure_provider_directory_tables()
+
+    status.assert_awaited_once_with('CREATE SCHEMA IF NOT EXISTS "mrf";')
+    create_table.assert_awaited_once_with(
+        ProviderDirectorySource.__table__,
+        checkfirst=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_provider_directory_existing_index_names_ignores_malformed_rows(
     monkeypatch,
 ):
@@ -20471,6 +20540,33 @@ async def test_process_data_reuses_startup_schema_readiness(monkeypatch):
     )
 
     ensure_tables.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_data_routes_dataset_rehydrate_without_acquisition(monkeypatch):
+    ctx = {"context": {"provider_directory_tables_ready": True}}
+    expected_metrics = {"resource_rows": 7}
+    rehydrate = AsyncMock(return_value=expected_metrics)
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_run_provider_directory_dataset_rehydrate", rehydrate)
+
+    result = await importer.process_data(
+        ctx,
+        {
+            "dataset_rehydrate_only": True,
+            "run_id": "run_rehydrate",
+            "source_id": "source_rehydrate",
+        },
+    )
+
+    assert result == expected_metrics
+    awaited_ctx, awaited_task, awaited_run_id, awaited_source_ids = (
+        rehydrate.await_args.args
+    )
+    assert awaited_ctx is ctx
+    assert awaited_task["dataset_rehydrate_only"] is True
+    assert awaited_run_id == "run_rehydrate"
+    assert awaited_source_ids == ["source_rehydrate"]
 
 
 @pytest.mark.asyncio
