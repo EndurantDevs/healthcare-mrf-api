@@ -35,6 +35,10 @@ from db.models import (
     PTG2V3SourceAuditWitness,
     PTG2WitnessPart,
 )
+from db.models._legacy import (
+    _move_address_key_column_to_end,
+    _resolve_ptg2_database_schema,
+)
 from process.ptg_parts.ptg2_shared_gc import (
     require_migration_owned_tables,
 )
@@ -146,6 +150,18 @@ def test_v3_migrations_support_legacy_schema_name(monkeypatch, migration_path):
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
 
     assert migration._schema() == "legacy_schema"
+
+
+def test_legacy_model_schema_helpers_reject_conflicts_and_ignore_missing_tables(
+    monkeypatch,
+):
+    monkeypatch.setenv("DB_SCHEMA", "legacy_schema")
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "runtime_schema")
+
+    with pytest.raises(RuntimeError, match="must identify the same schema"):
+        _resolve_ptg2_database_schema()
+
+    _move_address_key_column_to_end(object())
 
 
 def test_v3_followup_migration_repairs_attestation_snapshot_index(monkeypatch):

@@ -137,6 +137,54 @@ async def test_ptg_control_surfaces_nested_source_witness_budget_failure(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scanner_message",
+    [
+        "conflicting provider_group_id definition: 1232062",
+        "duplicate provider_group_id definition: 1232062",
+    ],
+)
+async def test_ptg_control_classifies_provider_group_definition_failures(
+    monkeypatch, scanner_message
+):
+    marks = []
+
+    async def fake_ptg_main(**_kwargs):
+        raise RuntimeError(
+            "PTG2 Rust compact scanner failed with exit code 1: " + scanner_message
+        )
+
+    async def fake_mark_control_run(*args, **kwargs):
+        marks.append((args, kwargs))
+
+    async def fake_flush_terminal_status_events():
+        return None
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "_flush_terminal_status_events",
+        fake_flush_terminal_status_events,
+    )
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
+
+    with pytest.raises(RuntimeError, match="provider_group_id definition"):
+        await ptg_control.ptg_control_start(
+            {},
+            {"run_id": "", "params": {"source_key": "demo_source"}},
+        )
+
+    assert marks[-1][1]["error"] == {
+        "code": "ptg_provider_group_definition_conflict",
+        "message": (
+            "PTG2 Rust compact scanner failed with exit code 1: "
+            + scanner_message
+        ),
+    }
+
+
+@pytest.mark.asyncio
 async def test_ptg_control_start_records_ptg2_terminal_identity(monkeypatch):
     marks = []
 
