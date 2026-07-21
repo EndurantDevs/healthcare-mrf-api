@@ -67,6 +67,19 @@ def _install_rebuild_mocks(
 
 
 @pytest.mark.asyncio
+async def test_relation_rebuild_can_skip_both_independent_artifacts():
+    assert (
+        await importer._rebuild_one_current_dataset_relation_set(
+            _dataset(),
+            build_run_id="summary-only",
+            should_rebuild_network_plan=False,
+            should_rebuild_affiliation_organization=False,
+        )
+        == {}
+    )
+
+
+@pytest.mark.asyncio
 async def test_missing_summary_is_backfilled_atomically_from_retained_rows(
     monkeypatch,
 ):
