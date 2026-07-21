@@ -21,6 +21,23 @@ economical, auditable, and queryable by agents.
 - plan-scoped provider and negotiated-rate data consumable through the
   surrounding HealthPorta REST API and MCP delivery layers
 
+### Why This Direction Matters
+
+In its [December 19, 2025 Transparency in Coverage proposed rule
+(CMS-9882-P)](https://www.cms.gov/newsroom/fact-sheets/transparency-coverage-proposed-rule-cms-9882-p),
+CMS, DOL, and Treasury identified oversized machine-readable files and
+duplicative data as barriers to usable price transparency. Their proposals
+included reporting one In-network Rate File per provider network rather than
+per plan or policy to reduce both the number and size of files.
+
+PTG V3 is not a payer-side implementation of that proposed rule or a
+CMS-endorsed solution. It is an independent downstream approach aligned with
+the same objective: identical complete input sets can reuse one sealed physical
+layout, while employer-plan identity remains in separate logical bindings and
+source-witness audits gate activation. This demonstrates one way to reduce
+downstream duplication and make current public disclosures practical for APIs
+and AI agents without changing the payer-published files.
+
 ### How We Used Codex and GPT-5.6
 
 Codex and GPT-5.6 helped us navigate the multi-stage pipeline, investigate
