@@ -139,7 +139,7 @@ def _empty_provider_identifier_quarantine_scanner_summary():
     }
 
 
-def test_shared_v3_provider_identifier_quarantine_combines_active_scanners_and_skips_duplicate():
+def test_shared_v3_quarantine_combines_scanners_and_skips_duplicates():
     first_quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
         {-17: 1, 123_456_789: 2}
     )
@@ -184,7 +184,7 @@ def test_shared_v3_provider_identifier_quarantine_combines_active_scanners_and_s
     )
 
 
-def test_shared_v3_provider_identifier_quarantine_fails_closed_when_active_result_omits_evidence():
+def test_shared_v3_quarantine_rejects_missing_active_evidence():
     file_results = [
         _empty_provider_identifier_quarantine_scanner_summary(),
         {"summary": {"scanner": {"summary": {}}}},
@@ -5931,7 +5931,7 @@ def test_manifest_publish_materializes_lean_provider_group_rate_scope(monkeypatc
             "ptg2_provider_set_component_snap",
         }
 
-    async def fake_table_has_rows(_schema, table):
+    async def has_rows_in_fake_table(_schema, table):
         return table == "ptg2_provider_group_rate_scope_snap"
 
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
@@ -5939,7 +5939,7 @@ def test_manifest_publish_materializes_lean_provider_group_rate_scope(monkeypatc
     monkeypatch.setattr(
         ptg_manifest_publish,
         "_has_rows_in_table",
-        fake_table_has_rows,
+        has_rows_in_fake_table,
     )
 
     materialized_table_name = asyncio.run(

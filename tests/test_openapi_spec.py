@@ -127,14 +127,14 @@ class _EndpointCollector(ast.NodeVisitor):
         self.routes: list[dict[str, object]] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._process(node)
+        self._collect_route(node)
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._process(node)
+        self._collect_route(node)
         self.generic_visit(node)
 
-    def _process(self, node: ast.AST) -> None:
+    def _collect_route(self, node: ast.AST) -> None:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return
         query_params = _collect_query_params(node)

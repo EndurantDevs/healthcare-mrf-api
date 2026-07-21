@@ -560,16 +560,9 @@ def test_binary_copy_mapping_digest_rejects_truncated_streams(removed_bytes):
         accumulator.finish_copy()
 
 
-@pytest.mark.asyncio
-async def test_mapping_summary_uses_supplied_session_and_matches_python_digest():
-    """Match the streaming SQL digest to Python using the supplied session."""
-
-    references = [
-        SharedBlockReference("🧪_kind", 9, 1, 5, b"e" * 32, 17),
-        SharedBlockReference("a_kind", 2, 0, 3, b"b" * 32, 11),
-        SharedBlockReference("ž_kind", 4, 2, 7, b"d" * 32, 13),
-        SharedBlockReference("a_kind", 1, 3, 2, b"a" * 32, 7),
-    ]
+def _aggregate_mapping_rows(
+    references: list[SharedBlockReference],
+) -> list[dict[str, object]]:
     aggregate_rows = []
     for object_kind in {reference.object_kind for reference in references}:
         kind_references = [
@@ -593,6 +586,20 @@ async def test_mapping_summary_uses_supplied_session_and_matches_python_digest()
                 ),
             }
         )
+    return aggregate_rows
+
+
+@pytest.mark.asyncio
+async def test_mapping_summary_uses_supplied_session_and_matches_python_digest():
+    """Match the streaming SQL digest to Python using the supplied session."""
+
+    references = [
+        SharedBlockReference("🧪_kind", 9, 1, 5, b"e" * 32, 17),
+        SharedBlockReference("a_kind", 2, 0, 3, b"b" * 32, 11),
+        SharedBlockReference("ž_kind", 4, 2, 7, b"d" * 32, 13),
+        SharedBlockReference("a_kind", 1, 3, 2, b"a" * 32, 7),
+    ]
+    aggregate_rows = _aggregate_mapping_rows(references)
     driver = _MappingCopyDriver(_mapping_streams_by_kind(references))
     session = _MappingCopySession(aggregate_rows, driver)
 

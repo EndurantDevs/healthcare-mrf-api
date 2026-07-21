@@ -5,6 +5,9 @@ import asyncio
 import pytest
 
 from process import ptg_control
+from process.ptg_parts.ptg2_source_witness_contract import (
+    WitnessPayloadLimitError,
+)
 
 
 async def _allow_active_run(_run_id):
@@ -86,6 +89,51 @@ async def test_ptg_control_start_marks_failed_and_reraises_cancelled_ptg_main(mo
         "message": "worker task was cancelled",
     }
     assert flushes == [True]
+
+
+@pytest.mark.asyncio
+async def test_ptg_control_surfaces_nested_source_witness_budget_failure(monkeypatch):
+    marks = []
+
+    async def fake_ptg_main(**_kwargs):
+        raise ExceptionGroup(
+            "publication lanes failed",
+            [
+                WitnessPayloadLimitError(
+                    "strict V3 source witness exceeds its 512 MiB logical "
+                    "payload safety bound"
+                )
+            ],
+        )
+
+    async def fake_mark_control_run(*args, **kwargs):
+        marks.append((args, kwargs))
+
+    async def fake_flush_terminal_status_events():
+        return None
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "_flush_terminal_status_events",
+        fake_flush_terminal_status_events,
+    )
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
+
+    with pytest.raises(ExceptionGroup):
+        await ptg_control.ptg_control_start(
+            {},
+            {"run_id": "", "params": {"source_key": "demo_source"}},
+        )
+
+    assert marks[-1][1]["error"] == {
+        "code": "ptg_source_witness_payload_budget_exceeded",
+        "message": (
+            "strict V3 source witness exceeds its 512 MiB logical "
+            "payload safety bound"
+        ),
+    }
 
 
 @pytest.mark.asyncio
@@ -173,7 +221,8 @@ def test_ptg_thread_heartbeat_preserves_importer_progress_source(monkeypatch):
 
         def wait(self, _interval):
             self.calls += 1
-            return self.calls > 1
+            is_stop_requested = self.calls > 1
+            return is_stop_requested
 
         def set(self):
             self.set_called = True
@@ -359,3 +408,42 @@ async def test_ptg_control_start_rejects_wrong_lane(monkeypatch):
                 },
             },
         )
+
+
+def test_ptg_heartbeat_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "0")
+
+    stop_event = ptg_control._start_threaded_ptg_heartbeat("run", "started")
+
+    assert not stop_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_ptg_stale_and_flush_helpers_skip_absent_work(monkeypatch):
+    assert await ptg_control._stale_ptg_job_result("") is None
+
+    async def no_database_row(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(ptg_control.db, "first", no_database_row)
+    assert await ptg_control._stale_ptg_job_result("run") is None
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "0")
+    await ptg_control._flush_terminal_status_events()
+
+
+def test_ptg_lane_helpers_reject_mismatch_and_restore_environment(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_CLASS", "PTGSmall")
+    with pytest.raises(RuntimeError, match="expected PTGLarge"):
+        ptg_control._assert_expected_lane({"_expected_worker_class": "PTGLarge"})
+
+    environment_name = ptg_control.PTG2_RUST_WORKERS_ENV
+    monkeypatch.setenv(environment_name, "original")
+    with ptg_control._ptg_lane_environment({"_scanner_rust_workers": "2"}):
+        assert ptg_control.os.environ[environment_name] == "2"
+    assert ptg_control.os.environ[environment_name] == "original"
+
+
+def test_ptg_string_list_normalizes_text_and_rejects_other_values():
+    assert ptg_control._string_list(" value ") == ["value"]
+    assert ptg_control._string_list({"value"}) is None

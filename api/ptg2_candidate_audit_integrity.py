@@ -30,6 +30,9 @@ from process.ptg_parts.ptg2_candidate_audit_evidence import (
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_shared_audit import persisted_audit_sample_digest
 from process.ptg_parts.ptg2_source_witness import decode_persisted_source_witness
+from process.ptg_parts.ptg2_source_witness_store import (
+    assemble_source_witness_payload,
+)
 
 
 @dataclass(frozen=True)
@@ -190,26 +193,15 @@ async def _sealed_witness_challenges(
 ) -> CandidateWitnessScope:
     """Read, decode, validate, and group each sealed witness record once."""
 
-    payload_result = await session.execute(
-        text(
-            f"""
-            SELECT payload
-              FROM {PTG2_SCHEMA}.ptg2_v3_source_audit_witness
-             WHERE snapshot_key = :shared_snapshot_key
-            """
-        ),
-        {"shared_snapshot_key": _required_shared_snapshot_key(serving_tables)},
-    )
-    if hasattr(payload_result, "one_or_none"):
-        payload_record = payload_result.one_or_none()
-    else:
-        payload_rows = list(payload_result)
-        payload_record = payload_rows[0] if len(payload_rows) == 1 else None
-    payload_fields = _record_fields(payload_record) if payload_record is not None else {}
     source_witness = serving_tables.source_witness
     try:
+        witness_payload = await _sealed_witness_payload(
+            session,
+            snapshot_key=_required_shared_snapshot_key(serving_tables),
+            expected_payload_sha256=str(source_witness.get("payload_sha256") or ""),
+        )
         loaded_witness = decode_persisted_source_witness(
-            bytes(payload_fields.get("payload") or b""),
+            witness_payload,
             expected_raw_source_sha256=raw_source_sha256,
             expected_metadata=source_witness,
         )
@@ -242,6 +234,49 @@ async def _sealed_witness_challenges(
         raise PTG2ManifestArtifactError(
             "PTG2 candidate persisted source witness is invalid"
         ) from exc
+
+
+async def _sealed_witness_payload(
+    session: Any,
+    *,
+    snapshot_key: int,
+    expected_payload_sha256: str,
+) -> bytes:
+    """Fetch and authenticate all database parts for one sealed witness."""
+
+    payload_result = await session.execute(
+        text(
+            f"""
+            SELECT payload_part.part_number,
+                   payload_part.payload,
+                   payload_part.part_sha256
+              FROM (
+                    SELECT 0 AS part_number,
+                           source_witness.payload,
+                           NULL::bytea AS part_sha256
+                      FROM {PTG2_SCHEMA}.ptg2_v3_source_audit_witness
+                           AS source_witness
+                     WHERE source_witness.snapshot_key = :shared_snapshot_key
+                    UNION ALL
+                    SELECT witness_part.part_number,
+                           witness_part.payload,
+                           witness_part.part_sha256
+                      FROM {PTG2_SCHEMA}.ptg2_v3_source_audit_witness_part
+                           AS witness_part
+                     WHERE witness_part.snapshot_key = :shared_snapshot_key
+                   ) AS payload_part
+             ORDER BY payload_part.part_number
+            """
+        ),
+        {"shared_snapshot_key": snapshot_key},
+    )
+    payload_part_rows = [
+        _record_fields(payload_record) for payload_record in payload_result
+    ]
+    return assemble_source_witness_payload(
+        payload_part_rows,
+        expected_payload_sha256=expected_payload_sha256,
+    )
 
 
 async def validate_persisted_audit_sample(

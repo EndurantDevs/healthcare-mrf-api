@@ -46,6 +46,7 @@ PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (
     "ptg2_v3_price_attr",
     "ptg2_v3_npi_scope",
     "ptg2_v3_audit_occurrence",
+    "ptg2_v3_source_audit_witness_part",
     "ptg2_v3_source_audit_witness",
     "ptg2_v3_candidate_audit_attestation",
     "ptg2_v3_gc_candidate",

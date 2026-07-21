@@ -79,7 +79,7 @@ def test_site_intelligence_pharmacy_geo_stmt_uses_unified_addresses(site_intel_m
 @pytest.mark.asyncio
 async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_intel_module):
     """Verify site intelligence returns trade area metrics."""
-    async def _always_exists(_session, _model):
+    async def _is_always_present(_session, _model):
         return True
 
     session = _FakeSession(
@@ -170,7 +170,11 @@ async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_in
         ]
     )
     monkeypatch.setattr(site_intel_module, "_get_session", lambda _request: session)
-    monkeypatch.setattr(site_intel_module, "_table_exists_cached", _always_exists)
+    monkeypatch.setattr(
+        site_intel_module,
+        "_table_exists_cached",
+        _is_always_present,
+    )
     request = SimpleNamespace(args={"lat": "41.892", "lng": "-87.635"}, ctx=SimpleNamespace())
 
     resp = await site_intel_module.get_site_score(request)
@@ -196,7 +200,7 @@ async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_in
 @pytest.mark.asyncio
 async def test_site_intelligence_target_scripts_gates_recommendation(monkeypatch, site_intel_module):
     """Verify site intelligence target scripts gates recommendation."""
-    async def _always_exists(_session, _model):
+    async def _is_always_present(_session, _model):
         return True
 
     session = _FakeSession(
@@ -278,7 +282,11 @@ async def test_site_intelligence_target_scripts_gates_recommendation(monkeypatch
         ]
     )
     monkeypatch.setattr(site_intel_module, "_get_session", lambda _request: session)
-    monkeypatch.setattr(site_intel_module, "_table_exists_cached", _always_exists)
+    monkeypatch.setattr(
+        site_intel_module,
+        "_table_exists_cached",
+        _is_always_present,
+    )
 
     request = SimpleNamespace(
         args={"lat": "41.892", "lng": "-87.635", "target_scripts_per_day": "250"},

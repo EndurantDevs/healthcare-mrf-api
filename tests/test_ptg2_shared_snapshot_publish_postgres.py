@@ -89,6 +89,10 @@ MIGRATION_PATHS = (
     / "alembic"
     / "versions"
     / "20260716130000_ptg2_v3_multi_plan_scope.py",
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260721150000_ptg2_source_witness_parts.py",
 )
 SCANNER_TEST_PATH = Path(__file__).with_name("test_ptg2_scanner_v3_runs.py")
 SERVING_RECORD = struct.Struct(">16s16s16sI")

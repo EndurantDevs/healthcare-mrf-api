@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
 from process.ptg_parts.ptg2_source_witness_store import (
     load_shared_source_witness,
 )
+from process.ptg_parts import ptg2_source_witness_store as witness_store
 from process.ptg_parts import ptg2_serving_binary_v3
 from tests.ptg2_candidate_audit_batch_postgres_fixture import (
     PLAN_ID,
@@ -251,9 +253,9 @@ async def _load_postgres_partition_plan(
     original_first = db.first
     original_all = db.all
     witness_query = AsyncMock(wraps=original_first)
-    sample_query = AsyncMock(wraps=original_all)
+    collection_query = AsyncMock(wraps=original_all)
     monkeypatch.setattr(db, "first", witness_query)
-    monkeypatch.setattr(db, "all", sample_query)
+    monkeypatch.setattr(db, "all", collection_query)
     try:
         witness = await load_shared_source_witness(
             schema_name=candidate_case.schema_name,
@@ -270,7 +272,13 @@ async def _load_postgres_partition_plan(
         monkeypatch.setattr(db, "first", original_first)
         monkeypatch.setattr(db, "all", original_all)
     witness_query.assert_awaited_once()
-    sample_query.assert_awaited_once()
+    assert collection_query.await_count == 2
+    executed_sql_statements = [
+        str(query_call.args[0])
+        for query_call in collection_query.await_args_list
+    ]
+    assert "ptg2_v3_source_audit_witness_part" in executed_sql_statements[0]
+    assert "ptg2_v3_audit_occurrence" in executed_sql_statements[1]
     return build_candidate_audit_partition_plan(
         audit_target=BatchAuditReportTarget(
             snapshot_id=SNAPSHOT_ID,
@@ -356,6 +364,45 @@ def _assert_partition_aggregate(aggregate) -> None:
     )
 
 
+async def _persist_multipart_witness(
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_case: _CandidateBatchCase,
+    schema: str,
+) -> None:
+    segment_bytes = (len(candidate_case.witness_payload) + 2) // 3
+    monkeypatch.setattr(
+        witness_store,
+        "PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES",
+        segment_bytes,
+    )
+    payload_parts = witness_store.split_source_witness_payload(
+        candidate_case.witness_payload
+    )
+    assert len(payload_parts) == 3
+    await db.status(
+        f"""
+        UPDATE {schema}.ptg2_v3_source_audit_witness
+           SET payload = :payload
+         WHERE snapshot_key = :snapshot_key
+        """,
+        payload=payload_parts[0],
+        snapshot_key=SNAPSHOT_KEY,
+    )
+    for part_number, payload_part in enumerate(payload_parts[1:], start=1):
+        await db.status(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_source_audit_witness_part
+                (snapshot_key, part_number, part_sha256, payload)
+            VALUES
+                (:snapshot_key, :part_number, :part_sha256, :payload)
+            """,
+            snapshot_key=SNAPSHOT_KEY,
+            part_number=part_number,
+            part_sha256=hashlib.sha256(payload_part).digest(),
+            payload=payload_part,
+        )
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_partition_plan_dispatches_every_item_once(
     monkeypatch: pytest.MonkeyPatch,
@@ -377,6 +424,7 @@ async def test_real_postgres_partition_plan_dispatches_every_item_once(
             candidate_case.witness_metadata,
             candidate_case.persisted_audit_rows,
         )
+        await _persist_multipart_witness(monkeypatch, candidate_case, schema)
         plan = await _load_postgres_partition_plan(monkeypatch, candidate_case)
         _assert_exact_partition_dispatch(plan)
         aggregate = await _execute_postgres_partition_plan(

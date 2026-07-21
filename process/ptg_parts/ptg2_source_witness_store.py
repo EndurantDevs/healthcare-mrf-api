@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Mapping, Sequence
 
 from db.connection import db
@@ -18,11 +19,106 @@ from process.ptg_parts.ptg2_source_witness import (
 )
 from process.ptg_parts.ptg2_source_witness_contract import (
     LoadedSourceWitness,
+    PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES,
+    PTG2_V3_SOURCE_WITNESS_MAX_PART_COUNT,
+    PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_SELECTION,
     SourceWitnessPublication,
 )
 from process.ptg_parts.ptg2_source_witness_primitives import nonnegative_int
+
+
+def split_source_witness_payload(witness_payload: bytes) -> tuple[bytes, ...]:
+    """Split one authenticated logical payload into bounded database parts."""
+
+    payload = bytes(witness_payload)
+    if not payload or len(payload) > PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES:
+        raise RuntimeError("strict V3 source witness payload size is invalid")
+    payload_parts = tuple(
+        payload[offset : offset + PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES]
+        for offset in range(0, len(payload), PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES)
+    )
+    if not payload_parts or len(payload_parts) > PTG2_V3_SOURCE_WITNESS_MAX_PART_COUNT:
+        raise RuntimeError("strict V3 source witness part count is invalid")
+    return payload_parts
+
+
+def assemble_source_witness_payload(
+    payload_part_rows: Sequence[Mapping[str, Any] | Any],
+    *,
+    expected_payload_sha256: bytes | str,
+) -> bytes:
+    """Authenticate and join one legacy or segmented database payload."""
+
+    normalized_part_rows = _normalize_payload_part_rows(payload_part_rows)
+    witness_parts = _authenticate_payload_parts(normalized_part_rows)
+    witness_payload = b"".join(witness_parts)
+    if len(witness_payload) > PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES:
+        raise RuntimeError("strict V3 source witness payload exceeds its bound")
+    expected_digest = (
+        bytes.fromhex(expected_payload_sha256)
+        if isinstance(expected_payload_sha256, str)
+        else bytes(expected_payload_sha256)
+    )
+    if (
+        len(expected_digest) != 32
+        or hashlib.sha256(witness_payload).digest() != expected_digest
+    ):
+        raise RuntimeError("strict V3 source witness payload digest is invalid")
+    return witness_payload
+
+
+def _normalize_payload_part_rows(
+    payload_part_rows: Sequence[Mapping[str, Any] | Any],
+) -> tuple[dict[str, Any], ...]:
+    normalized_part_rows = tuple(
+        dict(getattr(payload_part_row, "_mapping", payload_part_row))
+        for payload_part_row in payload_part_rows
+    )
+    if (
+        not normalized_part_rows
+        or len(normalized_part_rows) > PTG2_V3_SOURCE_WITNESS_MAX_PART_COUNT
+    ):
+        raise RuntimeError("strict V3 source witness part count is invalid")
+    expected_part_numbers = list(range(len(normalized_part_rows)))
+    observed_part_numbers = [
+        int(payload_part_row.get("part_number", -1))
+        for payload_part_row in normalized_part_rows
+    ]
+    if observed_part_numbers != expected_part_numbers:
+        raise RuntimeError("strict V3 source witness part order is invalid")
+    return normalized_part_rows
+
+
+def _authenticate_payload_parts(
+    normalized_part_rows: Sequence[Mapping[str, Any]],
+) -> tuple[bytes, ...]:
+    has_segmented_payload = len(normalized_part_rows) > 1
+    authenticated_parts: list[bytes] = []
+    for payload_part_index, payload_part_row in enumerate(normalized_part_rows):
+        payload_part = bytes(payload_part_row.get("payload") or b"")
+        if not payload_part:
+            raise RuntimeError("strict V3 source witness part is empty")
+        if (
+            has_segmented_payload
+            and len(payload_part) > PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES
+        ):
+            raise RuntimeError("strict V3 source witness part exceeds its bound")
+        if (
+            has_segmented_payload
+            and payload_part_index < len(normalized_part_rows) - 1
+            and len(payload_part) != PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES
+        ):
+            raise RuntimeError("strict V3 source witness part framing is invalid")
+        part_sha256 = payload_part_row.get("part_sha256")
+        if payload_part_index > 0 and (
+            not part_sha256
+            or hashlib.sha256(payload_part).digest() != bytes(part_sha256)
+        ):
+            raise RuntimeError("strict V3 source witness part digest is invalid")
+        authenticated_parts.append(payload_part)
+    return tuple(authenticated_parts)
 
 
 def _database_metadata_by_field(row_mapping: Mapping[str, Any]) -> dict[str, Any]:
@@ -79,8 +175,24 @@ async def load_shared_source_witness(
     if database_row is None:
         raise RuntimeError("strict V3 layout has no persisted source witness")
     row_mapping = dict(getattr(database_row, "_mapping", database_row))
+    payload_part_rows = await db.all(
+        f"""
+        SELECT part_number, payload, part_sha256
+          FROM {schema}.ptg2_v3_source_audit_witness_part
+         WHERE snapshot_key = :snapshot_key
+         ORDER BY part_number
+        """,
+        snapshot_key=int(snapshot_key),
+    )
+    witness_payload = assemble_source_witness_payload(
+        [
+            {"part_number": 0, "payload": row_mapping.get("payload")},
+            *payload_part_rows,
+        ],
+        expected_payload_sha256=bytes(row_mapping.get("payload_sha256") or b""),
+    )
     loaded_witness = decode_persisted_source_witness(
-        bytes(row_mapping.get("payload") or b""),
+        witness_payload,
         expected_raw_source_sha256=expected_raw_source_sha256,
         expected_metadata=expected_metadata,
     )
@@ -99,6 +211,32 @@ async def _replace_source_witness_row(
     snapshot_key: int,
     witness_payload: bytes,
     witness_metadata: Mapping[str, Any],
+    session: Any,
+) -> None:
+    """Replace one witness and all of its parts inside the caller transaction."""
+
+    payload_parts = split_source_witness_payload(witness_payload)
+    await _insert_source_witness_parent(
+        schema=schema,
+        snapshot_key=snapshot_key,
+        witness_metadata=witness_metadata,
+        first_payload_part=payload_parts[0],
+        session=session,
+    )
+    await _insert_source_witness_tail_parts(
+        schema=schema,
+        snapshot_key=snapshot_key,
+        tail_payload_parts=payload_parts[1:],
+        session=session,
+    )
+
+
+async def _insert_source_witness_parent(
+    *,
+    schema: str,
+    snapshot_key: int,
+    witness_metadata: Mapping[str, Any],
+    first_payload_part: bytes,
     session: Any,
 ) -> None:
     await session.execute(
@@ -136,9 +274,35 @@ async def _replace_source_witness_row(
             "occurrence_count": int(witness_metadata["occurrence_witness_count"]),
             "provider_count": int(witness_metadata["provider_witness_count"]),
             "payload_sha256": bytes.fromhex(str(witness_metadata["payload_sha256"])),
-            "payload": witness_payload,
+            "payload": first_payload_part,
         },
     )
+
+
+async def _insert_source_witness_tail_parts(
+    *,
+    schema: str,
+    snapshot_key: int,
+    tail_payload_parts: Sequence[bytes],
+    session: Any,
+) -> None:
+    for part_number, payload_part in enumerate(tail_payload_parts, start=1):
+        await session.execute(
+            db.text(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_source_audit_witness_part
+                    (snapshot_key, part_number, part_sha256, payload)
+                VALUES
+                    (:snapshot_key, :part_number, :part_sha256, :payload)
+                """
+            ),
+            {
+                "snapshot_key": snapshot_key,
+                "part_number": part_number,
+                "part_sha256": hashlib.sha256(payload_part).digest(),
+                "payload": payload_part,
+            },
+        )
 
 
 async def publish_shared_source_witness(
@@ -178,4 +342,9 @@ async def publish_shared_source_witness(
     )
 
 
-__all__ = ["load_shared_source_witness", "publish_shared_source_witness"]
+__all__ = [
+    "assemble_source_witness_payload",
+    "load_shared_source_witness",
+    "publish_shared_source_witness",
+    "split_source_witness_payload",
+]

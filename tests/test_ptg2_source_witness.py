@@ -221,8 +221,6 @@ def _provider_record(index: int, *, priority: int | None = None) -> bytes:
 
 
 def test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens(tmp_path):
-    """Keep witness selection stable while retaining source token bytes exactly."""
-
     marker_raw = b'{"note":",\\"raw\\":inside","negotiated_prices":[]}'
     first_compressed_records = [
         _record(
@@ -256,7 +254,6 @@ def test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens(tmp_p
         compressed_records=second_compressed_records,
         occurrence_population_count=len(second_compressed_records),
     )
-
     first_payload, first_metadata = witness.build_persisted_source_witness(
         [entry_b, entry_a],
         expected_raw_source_sha256=[SOURCE_B, SOURCE_A],
@@ -265,7 +262,6 @@ def test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens(tmp_p
         [entry_a, entry_b],
         expected_raw_source_sha256=[SOURCE_A, SOURCE_B],
     )
-
     assert first_payload == second_payload
     assert first_metadata == second_metadata
     assert first_metadata["queryable_occurrence_population_count"] == 10_050
@@ -278,13 +274,9 @@ def test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens(tmp_p
     )
     assert len(loaded.occurrence_records) == 10_000
     assert marker_raw in {
-        witness_record.raw_json
-        for witness_record in loaded.occurrence_records
+        witness_record.raw_json for witness_record in loaded.occurrence_records
     }
-    assert max(
-        witness_record.priority
-        for witness_record in loaded.occurrence_records
-    ) == 9_999
+    assert max(witness_record.priority for witness_record in loaded.occurrence_records) == 9_999
 
 
 def test_source_witness_accepts_large_exact_record_within_aggregate_budget():
@@ -484,7 +476,11 @@ async def test_postgres_loader_preserves_zero_provider_population(
             "payload": witness_payload,
         }
 
+    async def database_parts(_query, **_params):
+        return []
+
     monkeypatch.setattr(witness_store.db, "first", database_row)
+    monkeypatch.setattr(witness_store.db, "all", database_parts)
 
     loaded = await witness_store.load_shared_source_witness(
         schema_name="mrf",
@@ -492,6 +488,5 @@ async def test_postgres_loader_preserves_zero_provider_population(
         expected_raw_source_sha256=[SOURCE_A],
         expected_metadata=witness_metadata,
     )
-
     assert loaded.metadata["provider_population_count"] == 0
     assert loaded.provider_records == ()

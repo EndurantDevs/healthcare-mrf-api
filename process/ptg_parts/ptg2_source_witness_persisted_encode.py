@@ -15,7 +15,7 @@ from process.ptg_parts.ptg2_source_witness_codec import (
 from process.ptg_parts.ptg2_source_witness_contract import (
     CompressedSourceWitnessRecord,
     PERSISTED_PAYLOAD_MAGIC,
-    PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES,
+    PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
     PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION,
@@ -24,6 +24,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_SELECTION,
     PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
     PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
+    WitnessPayloadLimitError,
 )
 from process.ptg_parts.ptg2_source_witness_primitives import U32
 
@@ -148,9 +149,10 @@ def _payload_header(
 
 def _append_payload_part(witness_payload: bytearray, payload_part: bytes) -> None:
     witness_payload.extend(payload_part)
-    if len(witness_payload) > PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES:
-        raise RuntimeError(
-            "strict V3 persisted source witness exceeds its aggregate payload budget"
+    if len(witness_payload) > PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES:
+        raise WitnessPayloadLimitError(
+            "strict V3 persisted source witness exceeds its 512 MiB logical "
+            "payload safety bound"
         )
 
 

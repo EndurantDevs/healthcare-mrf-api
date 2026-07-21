@@ -89,6 +89,17 @@ CANDIDATE_SCHEMA_DDL_TEMPLATES = (
     )
     """,
     """
+    CREATE TABLE {schema}.ptg2_v3_source_audit_witness_part (
+        snapshot_key bigint NOT NULL REFERENCES
+            {schema}.ptg2_v3_source_audit_witness(snapshot_key)
+            ON DELETE CASCADE,
+        part_number integer NOT NULL,
+        part_sha256 bytea NOT NULL,
+        payload bytea NOT NULL,
+        PRIMARY KEY (snapshot_key, part_number)
+    )
+    """,
+    """
     CREATE TABLE {schema}.ptg2_v3_snapshot_scope (
         snapshot_id text PRIMARY KEY,
         coverage_scope_id bytea NOT NULL

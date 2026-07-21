@@ -25,8 +25,16 @@ PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET = (
 PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY = (
     "count_but_exclude_from_npi_api_challenges_v1"
 )
-PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES = 128 * 1024 * 1024
 PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES = 512 * 1024 * 1024
+PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES = 512 * 1024 * 1024
+PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES = 64 * 1024 * 1024
+PTG2_V3_SOURCE_WITNESS_MAX_PART_COUNT = (
+    PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES
+    + PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES
+    - 1
+) // PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES
+# Compatibility name retained for callers that predate segmented persistence.
+PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES = PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES
 PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES = 8 * 1024 * 1024
 PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
 SOURCE_BUNDLE_MAGIC = b"PTG2SW02"
@@ -132,6 +140,10 @@ class CompressedSourceWitnessRecord:
         """Return the source-stable global bottom-k ordering key."""
 
         return self.priority, self.tie_breaker, self.raw_source_sha256
+
+
+class WitnessPayloadLimitError(RuntimeError):
+    """Report a deterministic persisted-witness safety-bound violation."""
 
 
 def source_witness_targets(
@@ -272,7 +284,7 @@ def validate_source_witness_manifest(
         "payload_bytes",
         positive=True,
     )
-    if payload_bytes > PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES:
+    if payload_bytes > PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES:
         raise ValueError("source witness payload exceeds its bound")
     evidence_count = _strict_manifest_int(
         manifest_by_field,
@@ -327,6 +339,9 @@ __all__ = [
     "PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES",
+    "PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES",
+    "PTG2_V3_SOURCE_WITNESS_MAX_PART_COUNT",
+    "PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES",
     "PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET",
     "PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION",
@@ -336,6 +351,7 @@ __all__ = [
     "PTG2_V3_SOURCE_WITNESS_SELECTION",
     "PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET",
     "PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY",
+    "WitnessPayloadLimitError",
     "PTG2_SOURCE_WITNESS_MANIFEST_FIELDS",
     "SOURCE_BUNDLE_MAGIC",
     "SOURCE_RECORD_MAGIC",

@@ -231,7 +231,8 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
             self.values[key] = int(self.values.get(key, 0)) + int(value)
 
         async def expire(self, *_args, **_kwargs):
-            return True
+            is_expiration_set = True
+            return is_expiration_set
 
         async def hsetnx(self, key, field, value):
             values = self.hashes.setdefault(key, {})
@@ -321,7 +322,8 @@ async def test_process_json_index_test_limit_counts_unique_registered_jobs(monke
             self.values[key] = int(self.values.get(key, 0)) + int(value)
 
         async def expire(self, *_args, **_kwargs):
-            return True
+            is_expiration_set = True
+            return is_expiration_set
 
         async def hsetnx(self, key, field, value):
             values = self.hashes.setdefault(key, {})
@@ -394,7 +396,8 @@ async def test_register_mrf_work_counts_unique_work_ids_once():
             self.values[key] = int(self.values.get(key, 0)) + int(value)
 
         async def expire(self, *_args, **_kwargs):
-            return True
+            is_expiration_set = True
+            return is_expiration_set
 
         async def hdel(self, _key, _field):
             return 0
@@ -488,7 +491,8 @@ async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
             self.sets = {}
 
         async def expire(self, *_args, **_kwargs):
-            return True
+            is_expiration_set = True
+            return is_expiration_set
 
         async def hdel(self, _key, _field):
             return 0
