@@ -254,6 +254,19 @@ def test_candidate_artifact_relations_include_every_enabled_safe_target():
     assert importer.profile_artifact.PROFILE_TABLE not in relation_names
 
 
+def test_profile_deferred_relations_are_independent_of_other_targets():
+    """A Profile-only build must not imply unrelated source artifact targets."""
+    relation_names = importer._candidate_artifact_deferred_relations(
+        {"profile"},
+        {"profile": {"published": True}},
+    )
+
+    assert relation_names == {
+        importer.profile_artifact.PROFILE_EVIDENCE_TABLE,
+        importer.profile_artifact.PROFILE_TABLE,
+    }
+
+
 @pytest.mark.asyncio
 async def test_network_catalog_prerequisites_fail_closed_and_complete(monkeypatch):
     """Report the first absent relation and accept a complete schema."""
