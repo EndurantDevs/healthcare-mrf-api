@@ -77,6 +77,11 @@ def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
     )
 
     assert worker_response["status"] == "started"
+    assert worker_response["contract_id"] == (
+        control_workers.WORKER_ENSURE_RUN_IDENTITY_CONTRACT
+    )
+    assert worker_response["run_id"] == "run_1"
+    assert worker_response["items"][0]["run_id"] == "run_1"
     assert worker_response["items"][0]["worker_class"] == "process.ClaimsPricing"
     assert captured_by_field["env"]["HLTHPRT_CONTROL_RUN_ID"] == "run_1"
     assert captured_by_field["start_new_session"] is True
@@ -168,6 +173,25 @@ def test_ensure_worker_rejects_mismatched_explicit_ptg_lane():
     )
 
     assert result["status"] == "unsupported"
+    assert result["contract_id"] == (
+        control_workers.WORKER_ENSURE_RUN_IDENTITY_CONTRACT
+    )
+    assert result["run_id"] == "run_ptg"
+    assert result["items"] == []
+
+
+def test_ensure_worker_without_run_id_does_not_fabricate_run_identity(
+    monkeypatch,
+):
+    monkeypatch.setattr(control_workers, "_resolve_specs", lambda _payload: [])
+
+    result = control_workers.ensure_worker({"importer": "unknown"})
+
+    assert result == {
+        "status": "unsupported",
+        "items": [],
+        "message": "no worker is registered for unknown",
+    }
 
 
 def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
@@ -208,6 +232,11 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     )
 
     assert worker_response["status"] == "started"
+    assert worker_response["contract_id"] == (
+        control_workers.WORKER_ENSURE_RUN_IDENTITY_CONTRACT
+    )
+    assert worker_response["run_id"] == "run_123"
+    assert worker_response["items"][0]["run_id"] == "run_123"
     post = next(call for call in calls if call[0] == "POST")
     job = post[2]
     assert post[1] == "/apis/batch/v1/namespaces/healthporta-dev/jobs"
