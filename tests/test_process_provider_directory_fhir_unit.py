@@ -20544,14 +20544,16 @@ async def test_process_data_reuses_startup_schema_readiness(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_process_data_routes_dataset_rehydrate_without_acquisition(monkeypatch):
-    ctx = {"context": {"provider_directory_tables_ready": True}}
-    expected_metrics = {"resource_rows": 7}
-    rehydrate = AsyncMock(return_value=expected_metrics)
+    worker_context_by_field = {
+        "context": {"provider_directory_tables_ready": True}
+    }
+    expected_metrics_by_field = {"resource_rows": 7}
+    rehydrate = AsyncMock(return_value=expected_metrics_by_field)
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_run_provider_directory_dataset_rehydrate", rehydrate)
 
     result = await importer.process_data(
-        ctx,
+        worker_context_by_field,
         {
             "dataset_rehydrate_only": True,
             "run_id": "run_rehydrate",
@@ -20559,11 +20561,11 @@ async def test_process_data_routes_dataset_rehydrate_without_acquisition(monkeyp
         },
     )
 
-    assert result == expected_metrics
+    assert result == expected_metrics_by_field
     awaited_ctx, awaited_task, awaited_run_id, awaited_source_ids = (
         rehydrate.await_args.args
     )
-    assert awaited_ctx is ctx
+    assert awaited_ctx is worker_context_by_field
     assert awaited_task["dataset_rehydrate_only"] is True
     assert awaited_run_id == "run_rehydrate"
     assert awaited_source_ids == ["source_rehydrate"]
