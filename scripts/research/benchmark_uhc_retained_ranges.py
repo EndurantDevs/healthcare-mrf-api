@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure fresh UHC retained-range admission, including process startup and fsync."""
+"""Measure warm-source, fresh-output UHC admission with startup and fsync."""
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ def _validate_trial_summary(
 def run_trial(args: argparse.Namespace, trial: int) -> dict[str, object]:
     """Run one fresh-output admission and return its wall-clock evidence."""
 
-    with tempfile.TemporaryDirectory(prefix="uhc-retained-cold-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="uhc-retained-fresh-output-") as temporary:
         output_root = Path(temporary)
         started = time.perf_counter()
         completed = subprocess.run(
@@ -149,7 +149,7 @@ def run_trial(args: argparse.Namespace, trial: int) -> dict[str, object]:
 
 
 def main() -> None:
-    """Run all cold trials, emit the distribution, and enforce the speed gate."""
+    """Run warm-source trials with fresh outputs and enforce the speed gate."""
 
     args = parse_args()
     validate_inputs(args)
@@ -158,6 +158,8 @@ def main() -> None:
     walls = [float(result["wall_seconds"]) for result in results]
     summary_map = {
         "record_kind": "uhc_retained_benchmark_summary",
+        "cache_condition": "source_page_cache_warm_after_preflight_sha256",
+        "output_condition": "fresh_output_per_trial",
         "trials": args.trials,
         "minimum_required_rows_per_second": args.minimum_rows_per_second,
         "rows_per_second": {
