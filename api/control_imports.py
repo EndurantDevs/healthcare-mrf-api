@@ -610,17 +610,25 @@ def parse_ptg_toc_preview(preview_payload_map: dict[str, Any]) -> dict[str, Any]
     )
     catalog_entry_list = [asdict(entry) for entry in entries]
     by_domain: dict[str, int] = {}
-    plan_by_identity: dict[tuple[str, str | None], dict[str, Any]] = {}
+    plan_by_identity: dict[tuple[str, ...], dict[str, Any]] = {}
     for catalog_entry in catalog_entry_list:
         domain = str(catalog_entry.get("domain") or "unknown")
         by_domain[domain] = by_domain.get(domain, 0) + 1
-        for plan in catalog_entry.get("plan_info") or ():
-            if not isinstance(plan, dict):
+        for plan_details_by_field in catalog_entry.get("plan_info") or ():
+            if not isinstance(plan_details_by_field, dict):
                 continue
-            plan_id = str(plan.get("plan_id") or "").strip()
-            market_type = plan.get("plan_market_type")
+            plan_id = str(plan_details_by_field.get("plan_id") or "").strip()
+            market_type = plan_details_by_field.get("plan_market_type")
+            engine_plan_hash = str(
+                plan_details_by_field.get("engine_plan_hash") or ""
+            ).strip()
             if plan_id:
-                plan_by_identity[(plan_id, market_type)] = plan
+                plan_identity = (
+                    ("engine_plan_hash", engine_plan_hash)
+                    if engine_plan_hash
+                    else ("legacy", plan_id, str(market_type or ""))
+                )
+                plan_by_identity[plan_identity] = plan_details_by_field
     return {
         "status": "parsed",
         "counts": {

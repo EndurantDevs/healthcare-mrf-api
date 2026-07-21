@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import html
 import re
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
-from process.ptg_parts.canonical import canonicalize_url, normalize_tic_source_url
+from process.ptg_parts.canonical import (
+    canonicalize_url,
+    normalize_tic_source_url,
+    semantic_hash,
+)
 from process.ptg_parts.domain import (
     PTG2_DOMAIN_ALLOWED_AMOUNT,
     PTG2_DOMAIN_DRUG,
@@ -60,7 +65,7 @@ def _catalog_entry_from_file(
     if not _is_file_location_like_download(file_url):
         return None
     plans = _filter_plans(
-        [_plan_payload(plan) for plan in _reporting_plans(file_item)],
+        [_plan_payload(file_item, plan) for plan in _reporting_plans(file_item)],
         plan_ids=plan_ids,
         plan_name_contains=plan_name_contains,
         plan_market_types=plan_market_types,
@@ -170,7 +175,51 @@ def _reporting_plans(file_item: dict[str, Any]) -> list[dict[str, Any]]:
     return [plan for plan in (plans or []) if isinstance(plan, dict)]
 
 
-def _plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
+def healthsparq_plan_engine_hash(
+    file_item: dict[str, Any], plan: dict[str, Any]
+) -> str | None:
+    """Return the shared discovery and control-preview identity for one plan."""
+
+    plan_name = _clean_text(_first_nonempty(plan, "planName", "plan_name", "name"))
+    plan_id = str(_first_nonempty(plan, "planId", "plan_id") or "").strip()
+    market_type = str(
+        _first_nonempty(plan, "planMarketType", "plan_market_type", "marketType")
+        or ""
+    ).strip()
+    if not plan_name or not plan_id or not market_type:
+        return None
+    return semantic_hash(
+        {
+            "reporting_entity_name": _first_nonempty(
+                file_item,
+                "reportingEntityName",
+                "reporting_entity_name",
+                "reportingEntity",
+            ),
+            "reporting_entity_type": _first_nonempty(
+                file_item,
+                "reportingEntityType",
+                "reporting_entity_type",
+            ),
+            "plan_id": plan_id,
+            "plan_id_type": _first_nonempty(plan, "planIdType", "plan_id_type"),
+            "market_type": market_type,
+            "plan_name": plan_name,
+        },
+        domain="healthsparq_plan",
+    )
+
+
+def _clean_text(value: Any) -> str:
+    text = html.unescape(str(value or "")).replace("\xa0", " ")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("**", "").replace("*", "").replace("`", "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _plan_payload(
+    file_item: dict[str, Any], plan: dict[str, Any]
+) -> dict[str, Any]:
     return {
         "plan_name": _first_nonempty(plan, "planName", "plan_name", "name"),
         "plan_id_type": _first_nonempty(plan, "planIdType", "plan_id_type"),
@@ -185,6 +234,7 @@ def _plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
             "plan_sponser_name",
             "sponsor_name",
         ),
+        "engine_plan_hash": healthsparq_plan_engine_hash(file_item, plan),
     }
 
 

@@ -35,6 +35,8 @@ from api.control_imports import (
 )
 from process.ext import utils as process_utils
 
+mrf_source_discovery = importlib.import_module("process.mrf_source_discovery")
+
 CONTROL_HEADERS = {"Authorization": "Bearer secret"}
 
 
@@ -645,6 +647,64 @@ def test_parse_ptg_toc_preview_counts_filtered_file_entries():
     assert preview["counts"]["plans"] == 1
     assert preview["counts"]["by_domain"]["in_network"] == 1
     assert any(item["source_type"] == "in-network" for item in preview["items"])
+
+
+def test_parse_ptg_toc_preview_preserves_distinct_healthsparq_plan_hashes(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_PTG2_HASH_MODE", "checksum64")
+    shared_plan_values_by_field = {
+        "planId": "123456789",
+        "planIdType": "ein",
+        "planMarketType": "group",
+    }
+    source_file_values_by_field = {
+        "reportingEntityName": "Example Health Administrator",
+        "reportingEntityType": "Third Party Administrator_ABC123",
+        "reportingPlans": [
+            {
+                **shared_plan_values_by_field,
+                "planName": "Example Choice Plan",
+            },
+            {
+                **shared_plan_values_by_field,
+                "planName": "Example Dental Plan",
+            },
+        ],
+        "fileSchema": "IN_NETWORK_RATES",
+        "filePath": "rates/example-rates.json.gz",
+    }
+    preview_payload = parse_ptg_toc_preview(
+        {
+            "toc_url": (
+                "https://mrf.healthsparq.com/example/prd/mrf/"
+                "EXAMPLE_I/EXAMPLE/latest_metadata.json"
+            ),
+            "plan_ids": ["123456789"],
+            "toc": {"files": [source_file_values_by_field]},
+        }
+    )
+
+    in_network_catalog_entries = [
+        catalog_entry
+        for catalog_entry in preview_payload["items"]
+        if catalog_entry["source_type"] == "in-network"
+    ]
+    assert len(in_network_catalog_entries) == 1
+    in_network_catalog_entry_by_field = in_network_catalog_entries[0]
+    assert preview_payload["counts"]["plans"] == 2
+    preview_plan_hashes = [
+        plan_details_by_field["engine_plan_hash"]
+        for plan_details_by_field in in_network_catalog_entry_by_field["plan_info"]
+    ]
+    discovery_plan_hashes = [
+        plan_details_by_field["engine_plan_hash"]
+        for plan_details_by_field in mrf_source_discovery._healthsparq_plan_info(
+            source_file_values_by_field
+        )
+    ]
+    assert preview_plan_hashes == discovery_plan_hashes
+    assert preview_plan_hashes == ["47b9fd15cbdb7b9b", "659b1b64eddc7362"]
 
 
 def test_ptg_import_file_payload_maps_contract_to_ptg_import():

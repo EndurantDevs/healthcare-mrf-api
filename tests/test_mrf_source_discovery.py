@@ -14182,3 +14182,218 @@ async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch)
     assert progress_events[-1]["status"] == "failed"
     assert progress_events[-1]["message"] == "catalog write failed"
     assert flush_timeouts == [1.0]
+
+
+def test_discovery_text_url_edge_helpers():
+    assert discovery._parse_size_bytes("not-a-size") is None
+    assert discovery._metadata_text_file_type("table of contents") == (
+        "table-of-contents"
+    )
+    assert discovery._metadata_text_file_type("") == "unknown"
+    assert discovery._magnacare_html_attrs('data-id="a&amp;b"') == {
+        "data-id": "a&b"
+    }
+    assert discovery._normalize_benefit_lines(
+        ["Dental", "dental", "not-a-benefit"]
+    ) == ("dental",)
+    assert discovery._is_auxiant_download_link(
+        "https://example.test/wp-admin/admin-ajax.php?cmd=file",
+        "rates.json.gz",
+    )
+    assert not discovery._is_auxiant_download_link(
+        "https://example.test/wp-admin/admin-ajax.php?cmd=other",
+        "rates.json.gz",
+    )
+    assert discovery._url_with_query_params(
+        "https://example.test/path?old=1",
+        {"old": "2", "empty": None},
+    ) == "https://example.test/path?old=2&empty="
+
+
+def test_discovery_health_ez_query_helpers():
+    assert discovery._healthez_outbound_file_type(
+        "https://example.test/api/outbound/latest?fileType=inNetwork"
+    ) == "in-network"
+    assert discovery._healthez_outbound_file_type(
+        "https://example.test/api/outbound/latest?fileType=outOfNetwork"
+    ) == "allowed-amounts"
+    assert discovery._healthez_plan_label(
+        "https://example.test/api/outbound/latest?network=AP",
+        None,
+    ) == "HealthEZ AP"
+    assert discovery._healthez_plan_label(
+        "https://example.test/api/outbound/latest",
+        "Example Employer",
+    ) == "Example Employer"
+
+
+def test_discovery_link_deduplication_helpers():
+    fchn_url = "https://example.test/PayorSearch/Home/PayorDetail/64647"
+    fchn_html = f'<a href="{fchn_url}">one</a><a href="{fchn_url}">two</a>'
+    assert discovery._fchn_payor_detail_urls_from_html(
+        fchn_html,
+        base_url="https://example.test/PayorSearch",
+    ) == [fchn_url]
+
+    toc_url = (
+        "https://groupadmin.bcbsglobalsolutions.com/"
+        "transparency-in-coverage-toc-json.cfm?planType=medical"
+    )
+    landing_url = (
+        "https://groupadmin.bcbsglobalsolutions.com/"
+        "transparency-in-coverage.cfm"
+    )
+    links_html = f'<a href="{toc_url}">Medical</a><a href="{landing_url}">MRF</a>'
+    assert discovery._bcbs_global_solutions_toc_links_from_html(
+        links_html,
+        base_url=landing_url,
+    ) == [{"url": toc_url, "plan_type": "medical", "label": "Medical"}]
+    assert discovery._bcbs_global_solutions_landing_links_from_html(
+        links_html,
+        base_url=landing_url,
+    ) == [landing_url]
+
+
+def test_discovery_anthem_script_fallbacks():
+    assert discovery._anthem_s3_toc_patterns_from_script(
+        "",
+        source_url="https://www.healthlink.com/mrf",
+    ) == [("healthlink", "healthlink", ".json")]
+    assert discovery._anthem_s3_toc_patterns_from_script(
+        "",
+        source_url="https://example.test/mrf",
+    ) == [("anthem", "anthem", ".json.gz")]
+
+
+def test_refactored_metadata_and_ebms_collectors_reject_noise_and_duplicates():
+    assert discovery._metadata_text_fields(
+        "not-a-field|:missing key| Plan Name : Gold PPO "
+    ) == {"plan name": "Gold PPO"}
+
+    base_url = "https://ebms.example.test/index.html"
+    html = """
+    <a href="https://outside.example.test/client/index.html">Outside</a>
+    <a href="/client/readme.html">Read me</a>
+    <a href="/index.html">Current page</a>
+    <a href="/client/index.html">Client</a>
+    <a href="https://ebms.example.test/client/index.html">Client duplicate</a>
+    """
+
+    assert discovery._ebms_index_page_urls(html, base_url=base_url) == [
+        ("https://ebms.example.test/client/index.html", "Client")
+    ]
+
+
+def test_refactored_directory_collectors_fail_closed_and_dedupe():
+    base_url = "https://example.test/machine-readable-files"
+    assert discovery._html_mrf_directory_urls(
+        """
+        <a href="https://other.example.test/catalog">Documents</a>
+        <a href="/machine-readable-files">Current page</a>
+        <a href="/mrf/catalog/">Catalog</a>
+        <a href="https://example.test/mrf/catalog/">Catalog duplicate</a>
+        """,
+        base_url=base_url,
+    ) == ["https://example.test/mrf/catalog/"]
+
+    duplicate_hcsc_link = (
+        '<a href="https://www.bcbsil.com/asomrf?EIN=361236610">Illinois</a>'
+    )
+    assert discovery._hcsc_asomrf_urls_from_html(
+        duplicate_hcsc_link * 2,
+        base_url="https://www.hcsc.com/transparency-in-coverage",
+    ) == ["https://www.bcbsil.com/asomrf?EIN=361236610"]
+
+    assert discovery._point32_directory_urls_from_html(
+        '<a href="https://plan.z13.web.core.windows.net/catalog">Plan list</a>',
+        base_url=base_url,
+    ) == []
+
+
+def test_refactored_auxiant_and_anthem_parsers_cover_edge_formats():
+    assert discovery._auxiant_container_format(
+        "https://example.test/download?id=1", "archive.7z"
+    ) == "7z"
+    assert discovery._auxiant_container_format(
+        "https://example.test/download?id=2", "rates.json.gz"
+    ) == "gzip"
+    assert not discovery._is_auxiant_download_link(
+        "https://example.test/wp-content/archive.zip"
+    )
+    assert (
+        discovery._auxiant_file_type(
+            "https://example.test/download?id=3", "pharmacy archive.zip"
+        )
+        == "payer-drug"
+    )
+
+    script = """
+    s3url = "https://example-bucket.s3.amazonaws.com/";
+    s3url = "https://example-bucket.s3.amazonaws.com/";
+    var first = s3url + 'anthem/' + year + '-' + month + '-01_plan_index.json.gz';
+    var duplicate = s3url + 'anthem/' + year + '-' + month + '-01_plan_index.json.gz';
+    """
+    assert discovery._anthem_s3_bases_from_script(script) == [
+        "https://example-bucket.s3.amazonaws.com/"
+    ]
+    assert discovery._anthem_s3_toc_patterns_from_script(
+        script,
+        source_url="https://example.test/mrf",
+    ) == [("anthem", "plan", ".json.gz")]
+
+
+def test_refactored_payercompass_plan_index_handles_optional_and_duplicate_data():
+    normalized_plan = discovery._payercompass_normalized_plan_info(
+        {
+            "planId": "12-3456789",
+            "planName": "Gold PPO",
+            "planSponsorName": "Example Employer",
+            "issuerName": "Example Carrier",
+        }
+    )
+
+    assert normalized_plan == {
+        "plan_id": "12-3456789",
+        "plan_id_type": None,
+        "plan_market_type": "group",
+        "plan_name": "Gold PPO",
+        "plan_sponsor_name": "Example Employer",
+        "issuer_name": "Example Carrier",
+    }
+
+    plan_info_by_key = {}
+    discovery._payercompass_add_plan_info(
+        plan_info_by_key,
+        "",
+        [normalized_plan],
+    )
+    discovery._payercompass_add_plan_info(
+        plan_info_by_key,
+        "rates.json.gz",
+        [normalized_plan, dict(normalized_plan)],
+    )
+
+    assert plan_info_by_key == {"rates.json.gz": [normalized_plan]}
+    indexed_plans, metadata = discovery._payercompass_plan_info_by_file_key(
+        {
+            "reporting_entity_name": "Example Carrier",
+            "reporting_structure": [None],
+        }
+    )
+    assert indexed_plans == {}
+    assert metadata["reporting_entity_name"] == "Example Carrier"
+
+
+def test_refactored_frame_collector_rejects_invalid_and_duplicate_sources():
+    html = """
+    <iframe title="missing src"></iframe>
+    <iframe src="#fragment"></iframe>
+    <iframe src="/mrf/transparency"></iframe>
+    <iframe src="https://example.test/mrf/transparency"></iframe>
+    """
+
+    assert discovery._html_mrf_frame_urls(
+        html,
+        base_url="https://example.test/landing",
+    ) == ["https://example.test/mrf/transparency"]
+    assert discovery._is_html_label_fileish(None, "/mrf/file.json")
