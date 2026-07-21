@@ -12842,6 +12842,73 @@ async def test_import_resources_can_preserve_seen_stage_for_publish(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_provider_directory_table_ensure_skips_existing_index_ddl(
+    monkeypatch,
+):
+    existing_index_name = "provider_directory_source_endpoint_id_idx"
+    status_statements: list[str] = []
+
+    async def fake_status(sql, **_params):
+        status_statements.append(str(sql))
+        return 0
+
+    monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
+    monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
+    monkeypatch.setattr(importer.db, "create_table", AsyncMock())
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(return_value=[{"indexname": existing_index_name}]),
+    )
+    monkeypatch.setattr(importer.db, "status", fake_status)
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_model_columns",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_source_column_types",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_import_seen_table",
+        AsyncMock(),
+    )
+
+    await importer._ensure_provider_directory_tables()
+
+    joined_statements = "\n".join(status_statements)
+    assert existing_index_name not in joined_statements
+    assert "provider_directory_source_api_base_idx" in joined_statements
+    importer.db.all.assert_awaited_once()
+    assert importer.db.all.await_args.kwargs == {"schema_name": "mrf"}
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_existing_index_names_ignores_malformed_rows(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(
+            return_value=[
+                {"indexname": " index_a "},
+                {"indexname": ""},
+                {"other": "index_b"},
+                object(),
+            ]
+        ),
+    )
+
+    names = await importer._provider_directory_existing_index_names("mrf")
+
+    assert names == {"index_a"}
+
+
+@pytest.mark.asyncio
 async def test_ensure_provider_directory_seen_table_drops_redundant_prefix_index(monkeypatch):
     statements: list[str] = []
 
