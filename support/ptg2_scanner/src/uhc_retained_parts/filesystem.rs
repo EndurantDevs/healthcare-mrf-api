@@ -287,4 +287,3 @@ impl Drop for RootTemporaryFile {
         }
     }
 }
-

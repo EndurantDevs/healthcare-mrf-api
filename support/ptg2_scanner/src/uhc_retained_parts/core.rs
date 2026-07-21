@@ -217,4 +217,3 @@ pub struct UHCRetainSummary {
     pub manifest_reused: bool,
     pub timings_seconds: UHCRetainTimings,
 }
-

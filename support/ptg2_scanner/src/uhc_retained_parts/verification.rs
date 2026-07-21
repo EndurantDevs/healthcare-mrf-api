@@ -354,4 +354,3 @@ fn range_set_sha256(
     }
     Ok(sha256_hex(&finalize_sha256(digest)))
 }
-

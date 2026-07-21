@@ -253,4 +253,3 @@ pub fn run_uhc_retain_cli(arguments: &[String]) -> io::Result<()> {
     output.write_all(b"\n")?;
     output.flush()
 }
-

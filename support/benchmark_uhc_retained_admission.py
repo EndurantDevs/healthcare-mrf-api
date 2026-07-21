@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark cold native UHC retention through committed PostgreSQL admission."""
+"""Benchmark fresh-output UHC retention through committed PostgreSQL admission."""
 
 from __future__ import annotations
 
@@ -241,7 +241,7 @@ async def _execute_trial(
         request.range_count,
     )
     if verified_source.raw_reused or verified_source.manifest_reused:
-        raise BenchmarkFailure("cold trial unexpectedly reused retained artifacts")
+        raise BenchmarkFailure("fresh-output trial unexpectedly reused retained artifacts")
     rows_per_second = verified_source.raw_artifact.record_count / committed_seconds
     return {
         "trial": request.trial_ordinal,
@@ -454,7 +454,7 @@ async def _run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     provider_path, _scanner_binary, artifact_root_base = _validate_benchmark_inputs(
         args
     )
-    provider_trials, provider_sha256, provider_bytes = await _run_provider_trials(
+    provider_trials, _provider_sha256, provider_bytes = await _run_provider_trials(
         args,
         provider_path=provider_path,
         artifact_root_base=artifact_root_base,
@@ -462,12 +462,10 @@ async def _run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     rates = [float(trial["rows_per_second"]) for trial in provider_trials]
     report_map: dict[str, object] = {
         "record_kind": "uhc_retained_admission_benchmark",
-        "provider_path": str(provider_path),
-        "provider_sha256": provider_sha256,
         "provider_byte_count": provider_bytes,
         "range_count": args.range_count,
         "minimum_rows_per_second_gate": args.minimum_rows_per_second,
-        "full_cold_committed": {
+        "full_fresh_output_committed": {
             "cache_condition": "fresh_output_source_page_cache_warm_after_prehash",
             "minimum_rows_per_second": min(rates),
             "median_rows_per_second": statistics.median(rates),

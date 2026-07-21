@@ -90,7 +90,6 @@ fn validate_existing_manifest(
     }
     Ok(())
 }
-
 struct ManifestPublication {
     producer_build_id: String,
     encoded: Vec<u8>,
@@ -256,4 +255,3 @@ fn reverify_manifest_path(
     }
     Ok(())
 }
-
