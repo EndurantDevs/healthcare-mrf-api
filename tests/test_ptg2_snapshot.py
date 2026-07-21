@@ -183,3 +183,79 @@ async def test_successful_empty_source_pointer_queries_preserve_not_found(
     expected,
 ):
     assert await resolver(_EmptySession(), *args) == expected
+
+
+class _RecordingSession:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def execute(self, statement, params=None):
+        self.calls.append((str(statement), dict(params or {})))
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_snapshot_resolvers_reject_empty_explicit_selectors():
+    session = _RecordingSession(_Result(scalar_value="unused"))
+
+    assert await ptg2_snapshot.current_snapshot_id(
+        session,
+        requested_snapshot_id="snapshot",
+        requested_source_key="   ",
+    ) is None
+    assert await ptg2_snapshot.current_snapshot_id(
+        session,
+        requested_snapshot_id="snapshot",
+        requested_plan_id="   ",
+    ) is None
+    assert await ptg2_snapshot.current_source_snapshot_id(session, "   ") is None
+    assert await ptg2_snapshot.current_source_snapshot_id_for_plan(
+        session,
+        {},
+    ) is None
+    assert await ptg2_snapshot.current_network_snapshots_for_plan(
+        session,
+        {},
+    ) == []
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_global_snapshot_resolution_covers_found_and_missing_results():
+    found_session = _RecordingSession(_Result(scalar_value="global-snapshot"))
+    missing_session = _RecordingSession(_Result())
+
+    assert await ptg2_snapshot.current_snapshot_id(found_session) == "global-snapshot"
+    assert await ptg2_snapshot.resolve_current_ptg2_snapshot_id(
+        missing_session,
+        {},
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_plan_snapshot_resolvers_bind_optional_market_and_source_filters():
+    plan_session = _RecordingSession(_Result(scalar_value="plan-snapshot"))
+    network_session = _RecordingSession(
+        _Result(rows=(("source-a", "network-snapshot"),))
+    )
+    args = {
+        "plan_id": "12-3456789",
+        "plan_market_type": "GROUP",
+        "source_key": " Source-A ",
+    }
+
+    assert await ptg2_snapshot.current_source_snapshot_id_for_plan(
+        plan_session,
+        args,
+    ) == "plan-snapshot"
+    assert await ptg2_snapshot.current_network_snapshots_for_plan(
+        network_session,
+        args,
+    ) == [("source-a", "network-snapshot")]
+    for _sql, params in (plan_session.calls[0], network_session.calls[0]):
+        assert params == {
+            "plan_ids": ["12-3456789", "123456789"],
+            "plan_market_type": "group",
+            "source_key": "source-a",
+        }
