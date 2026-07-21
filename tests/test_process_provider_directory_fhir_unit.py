@@ -15,6 +15,7 @@ import json
 import importlib
 import string
 import urllib.parse
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -4026,6 +4027,25 @@ async def test_ensure_provider_directory_model_columns_adds_missing_stale_table_
     sql = status_mock.await_args.args[0]
     assert 'ALTER TABLE "mrf"."provider_directory_location" ADD COLUMN IF NOT EXISTS phone_number' in sql
     assert "VARCHAR(15)" in sql
+
+
+@pytest.mark.asyncio
+async def test_ensure_provider_directory_model_columns_ignores_empty_compiled_column(monkeypatch):
+    fake_column = SimpleNamespace(name="missing_column")
+    fake_model = SimpleNamespace(
+        __tablename__="provider_directory_fake",
+        __table__=SimpleNamespace(columns=(fake_column,)),
+    )
+    compiled_column = Mock()
+    compiled_column.compile.return_value = " "
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[]))
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer, "CreateColumn", Mock(return_value=compiled_column))
+
+    await importer._ensure_provider_directory_model_columns(fake_model, "mrf")
+
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -12855,6 +12875,7 @@ async def test_provider_directory_table_ensure_skips_existing_index_ddl(
     monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
     monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
     monkeypatch.setattr(importer.db, "create_table", AsyncMock())
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     monkeypatch.setattr(
         importer.db,
         "all",
@@ -12887,6 +12908,97 @@ async def test_provider_directory_table_ensure_skips_existing_index_ddl(
 
 
 @pytest.mark.asyncio
+async def test_provider_directory_table_ensure_current_schema_runs_no_ddl(
+    monkeypatch,
+):
+    index_names = [
+        index["name"]
+        for index in ProviderDirectorySource.__my_additional_indexes__
+    ]
+    status = AsyncMock()
+    create_table = AsyncMock()
+    monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
+    monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer.db, "create_table", create_table)
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(return_value=[{"indexname": name} for name in index_names]),
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_model_columns",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_source_column_types",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_import_seen_table",
+        AsyncMock(),
+    )
+
+    await importer._ensure_provider_directory_tables()
+
+    status.assert_not_awaited()
+    create_table.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_table_ensure_repairs_missing_schema_and_table(
+    monkeypatch,
+):
+    index_names = [
+        index["name"]
+        for index in ProviderDirectorySource.__my_additional_indexes__
+    ]
+    status = AsyncMock()
+    create_table = AsyncMock()
+    monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
+    monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
+    monkeypatch.setattr(
+        importer,
+        "_table_exists",
+        AsyncMock(side_effect=(False, False)),
+    )
+    monkeypatch.setattr(importer.db, "create_table", create_table)
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(return_value=[{"indexname": name} for name in index_names]),
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_model_columns",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_source_column_types",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_import_seen_table",
+        AsyncMock(),
+    )
+
+    await importer._ensure_provider_directory_tables()
+
+    status.assert_awaited_once_with('CREATE SCHEMA IF NOT EXISTS "mrf";')
+    create_table.assert_awaited_once_with(
+        ProviderDirectorySource.__table__,
+        checkfirst=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_provider_directory_existing_index_names_ignores_malformed_rows(
     monkeypatch,
 ):
@@ -12909,21 +13021,62 @@ async def test_provider_directory_existing_index_names_ignores_malformed_rows(
 
 
 @pytest.mark.asyncio
-async def test_ensure_provider_directory_seen_table_drops_redundant_prefix_index(monkeypatch):
+async def test_ensure_provider_directory_seen_table_creates_missing_table(monkeypatch):
     statements: list[str] = []
 
     async def fake_status(sql, **_params):
         statements.append(sql)
         return 0
 
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=False))
     monkeypatch.setattr(importer.db, "status", fake_status)
 
     await importer._ensure_provider_directory_import_seen_table("mrf")
 
     combined = "\n".join(statements)
     assert 'CREATE UNLOGGED TABLE IF NOT EXISTS "mrf"."provider_directory_import_seen"' in combined
-    assert 'DROP INDEX IF EXISTS "mrf"."provider_directory_import_seen_source_idx"' in combined
+    assert "DROP INDEX" not in combined
     assert "CREATE INDEX IF NOT EXISTS provider_directory_import_seen_source_idx" not in combined
+
+
+@pytest.mark.asyncio
+async def test_ensure_provider_directory_seen_table_current_schema_runs_no_ddl(
+    monkeypatch,
+):
+    status = AsyncMock()
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer.db, "status", status)
+
+    await importer._ensure_provider_directory_import_seen_table("mrf")
+
+    status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_provider_directory_seen_stage_requires_run_id(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    stage_table = await importer._ensure_provider_directory_import_seen_stage_table(
+        None,
+        schema="mrf",
+    )
+
+    assert stage_table is None
+    status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_drop_provider_directory_seen_stage_ignores_missing_name(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    await importer._drop_provider_directory_import_seen_stage_table(
+        None,
+        schema="mrf",
+    )
+
+    status.assert_not_awaited()
 
 
 def test_resource_start_url_prefers_endpoint_and_preserves_existing_count():
@@ -20368,6 +20521,54 @@ async def test_process_data_canonical_backfill_only_skips_seed_resolution(monkey
 
     assert result == expected_metrics_map
     backfill.assert_awaited_once_with(resources="Location")
+
+
+@pytest.mark.asyncio
+async def test_process_data_reuses_startup_schema_readiness(monkeypatch):
+    ensure_tables = AsyncMock()
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", ensure_tables)
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_canonical_resources",
+        AsyncMock(return_value={"canonical_rows": 0}),
+    )
+
+    await importer.process_data(
+        {"context": {"provider_directory_tables_ready": True}},
+        {"canonical_backfill_only": True},
+    )
+
+    ensure_tables.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_data_routes_dataset_rehydrate_without_acquisition(monkeypatch):
+    worker_context_by_field = {
+        "context": {"provider_directory_tables_ready": True}
+    }
+    expected_metrics_by_field = {"resource_rows": 7}
+    rehydrate = AsyncMock(return_value=expected_metrics_by_field)
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_run_provider_directory_dataset_rehydrate", rehydrate)
+
+    result = await importer.process_data(
+        worker_context_by_field,
+        {
+            "dataset_rehydrate_only": True,
+            "run_id": "run_rehydrate",
+            "source_id": "source_rehydrate",
+        },
+    )
+
+    assert result == expected_metrics_by_field
+    awaited_ctx, awaited_task, awaited_run_id, awaited_source_ids = (
+        rehydrate.await_args.args
+    )
+    assert awaited_ctx is worker_context_by_field
+    assert awaited_task["dataset_rehydrate_only"] is True
+    assert awaited_run_id == "run_rehydrate"
+    assert awaited_source_ids == ["source_rehydrate"]
 
 
 @pytest.mark.asyncio
