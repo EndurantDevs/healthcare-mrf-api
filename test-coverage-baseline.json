@@ -353,18 +353,18 @@
         }
       },
       "metrics": {
-    "functions": {
-      "covered": 2072,
-      "total": 2738
-    },
-    "lines": {
-      "covered": 31468,
-      "total": 40015
-    },
-    "regions": {
-      "covered": 47474,
-      "total": 59612
-    }
+      "functions": {
+        "covered": 2075,
+        "total": 2739
+      },
+      "lines": {
+        "covered": 31475,
+        "total": 40020
+      },
+      "regions": {
+        "covered": 47481,
+        "total": 59617
+      }
       },
       "path": "test-coverage-rust.json",
       "scope": {
