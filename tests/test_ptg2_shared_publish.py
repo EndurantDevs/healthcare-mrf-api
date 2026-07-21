@@ -461,6 +461,44 @@ async def test_finalizer_dictionary_rejects_non_32_byte_expected_scope_before_da
     status.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("support_digest", "message"),
+    (
+        ("not-hex", "support digest is invalid"),
+        ((b"short").hex(), "support digest must contain 32 bytes"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_finalizer_dictionary_rejects_invalid_support_digest_before_database_work(
+    monkeypatch,
+    support_digest,
+    message,
+):
+    status = AsyncMock()
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", status)
+
+    with pytest.raises(RuntimeError, match=message):
+        await publish_shared_finalizer_dictionaries(
+            {
+                **_finalizer_contract(),
+                "output_directory": "/unused",
+                "dictionaries": {
+                    "code": {"path": "codes.copy", "row_count": 1},
+                    "provider_set": {"path": "providers.copy", "row_count": 1},
+                    "support_digest": support_digest,
+                },
+                "preservation": {"encoded_records": 1},
+            },
+            schema_name="mrf",
+            snapshot_key=7,
+            build_token="attempt-7",
+            expected_coverage_scope_id=b"s" * 32,
+            provider_set_metadata_entries=(),
+        )
+
+    status.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_finalizer_code_stage_uses_fixed_coverage_scope_id(tmp_path, monkeypatch):
     (tmp_path / "codes.copy").write_bytes(b"codes")
