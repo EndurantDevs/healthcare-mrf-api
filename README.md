@@ -32,6 +32,13 @@ We retained responsibility for the product requirements, healthcare-data
 semantics, architectural decisions, code review, and acceptance criteria.
 Timestamped Codex sessions and dated repository history document the work.
 
+Representative Build Week implementation evidence:
+
+- [PR #39 — strict shared PostgreSQL V3 cutover](https://github.com/EndurantDevs/healthcare-mrf-api/pull/39)
+- [PR #109 — bounded source-witness audit and activation](https://github.com/EndurantDevs/healthcare-mrf-api/pull/109)
+- [PR #164 — pipelined strict V3 import publication](https://github.com/EndurantDevs/healthcare-mrf-api/pull/164)
+- [PR #214 — pruned durable block-existence lookups](https://github.com/EndurantDevs/healthcare-mrf-api/pull/214)
+
 ### Representative Measured Result
 
 In one measured case, a 14.85 GB gzip source containing approximately 292 GB of
