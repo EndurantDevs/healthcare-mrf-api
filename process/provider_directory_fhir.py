@@ -16386,9 +16386,12 @@ async def _ensure_provider_directory_tables() -> None:
         await db.create_table(model.__table__, checkfirst=True)
         await _ensure_provider_directory_model_columns(model, schema)
     await _ensure_provider_directory_source_column_types(schema)
+    existing_index_names = await _provider_directory_existing_index_names(schema)
     for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
         for index in getattr(model, "__my_additional_indexes__", []) or []:
             name = index.get("name") or "_".join(index.get("index_elements", ()))
+            if name in existing_index_names:
+                continue
             using = f"USING {index.get('using')} " if index.get("using") else ""
             where = f" WHERE {index.get('where')}" if index.get("where") else ""
             elements = _provider_directory_index_elements_sql(model, index)
@@ -16404,7 +16407,29 @@ async def _ensure_provider_directory_tables() -> None:
                 f"ON {_qt(schema, model.__tablename__)} "
                 f"{using}({elements}){include}{where};"
             )
+            existing_index_names.add(name)
     await _ensure_provider_directory_import_seen_table(schema)
+
+
+async def _provider_directory_existing_index_names(schema: str) -> set[str]:
+    """Read existing index names without taking relation-level DDL locks."""
+    rows = await db.all(
+        """
+        SELECT indexname
+          FROM pg_indexes
+         WHERE schemaname = :schema_name;
+        """,
+        schema_name=schema,
+    )
+    names: set[str] = set()
+    for row in rows:
+        mapping = row._mapping if hasattr(row, "_mapping") else row
+        if not hasattr(mapping, "get"):
+            continue
+        name = _clean_text(mapping.get("indexname"))
+        if name:
+            names.add(name)
+    return names
 
 
 async def _ensure_provider_directory_source_column_types(schema: str) -> None:
