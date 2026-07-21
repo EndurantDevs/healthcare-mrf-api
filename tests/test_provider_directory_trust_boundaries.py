@@ -261,7 +261,7 @@ async def test_deferred_corroboration_requires_unified_address_table(monkeypatch
     """Do not claim a prepared corroboration artifact without its base table."""
     monkeypatch.setattr(
         importer,
-        "_table_exists",
+        "_is_table_present",
         AsyncMock(return_value=False),
     )
 
@@ -459,6 +459,7 @@ async def test_profile_build_resolution_preserves_only_logged_retry_lineage(
                 (
                     importer._ProviderDirectoryProfileSourceContext(
                         source_id="source_a",
+                        endpoint_id="endpoint_a",
                         canonical_api_base="https://example.test/fhir",
                         org_name="Example",
                         plan_name=None,
@@ -1236,7 +1237,7 @@ async def test_profile_stage_preparation_metrics_and_pair_contract(
     assert metrics["incremental"] is True
 
     table_exists = AsyncMock(side_effect=[False, False])
-    monkeypatch.setattr(importer, "_table_exists", table_exists)
+    monkeypatch.setattr(importer, "_is_table_present", table_exists)
     assert not await importer._has_provider_directory_profile_artifacts("mrf")
     table_exists.side_effect = [True, True]
     assert await importer._has_provider_directory_profile_artifacts("mrf")

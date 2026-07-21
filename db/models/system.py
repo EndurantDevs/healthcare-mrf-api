@@ -58,6 +58,9 @@ __all__ = (
     "ProviderDirectoryOrganizationAffiliation",
     "ProviderDirectoryPaginationCheckpoint",
     "ProviderDirectoryProfileBuildCheckpoint",
+    "ProviderDirectoryProfileSelectionAuthority",
+    "ProviderDirectoryProfileSelectionObservation",
+    "ProviderDirectoryProfileSelectionProof",
     "ProviderDirectoryPractitioner",
     "ProviderDirectoryPractitionerRole",
     "ProviderDirectoryReverseLookupCheckpoint",
@@ -1589,6 +1592,100 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     created_at = Column(TIMESTAMP, nullable=False)
     updated_at = Column(TIMESTAMP, nullable=False)
     completed_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryProfileSelectionAuthority(Base, JSONOutputMixin):
+    """Durable monotonic revision authority for global Profile proofs."""
+
+    __tablename__ = "provider_directory_profile_selection_authority"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("authority_key"),
+        CheckConstraint(
+            "authority_key = 'global' AND last_revision >= 0",
+            name="pd_profile_selection_authority_values_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = ["authority_key"]
+
+    authority_key = Column(String(16), nullable=False)
+    last_revision = Column(BigInteger, nullable=False, default=0)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class ProviderDirectoryProfileSelectionProof(Base, JSONOutputMixin):
+    """Stable identity for one exact global Profile input."""
+
+    __tablename__ = "provider_directory_profile_selection_proof"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("input_identity_digest"),
+        UniqueConstraint(
+            "proof_id",
+            name="provider_directory_profile_selection_proof_id_key",
+        ),
+        CheckConstraint(
+            "input_identity_digest ~ '^[0-9a-f]{64}$' "
+            "AND proof_id ~ '^[0-9a-f]{64}$'",
+            name="pd_profile_selection_proof_identity_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = ["input_identity_digest"]
+
+    input_identity_digest = Column(String(64), nullable=False)
+    proof_id = Column(String(64), nullable=False)
+    identity_json = Column(JSON, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class ProviderDirectoryProfileSelectionObservation(Base, JSONOutputMixin):
+    """Immutable monotonic observation of the global Profile input."""
+
+    __tablename__ = "provider_directory_profile_selection_observation"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("authority_revision"),
+        CheckConstraint(
+            "authority_revision > 0",
+            name="pd_profile_selection_observation_revision_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = ["authority_revision"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("input_identity_digest",),
+            "name": "pd_profile_selection_observation_input_idx",
+        }
+    ]
+
+    authority_revision = Column(
+        BigInteger,
+        autoincrement=False,
+        nullable=False,
+    )
+    input_identity_digest = Column(
+        String(64),
+        ForeignKey(
+            ProviderDirectoryProfileSelectionProof.input_identity_digest,
+            name="pd_profile_selection_observation_input_fkey",
+        ),
+        nullable=False,
+    )
+    payload_json = Column(JSON, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
 class ProviderDirectoryReverseLookupCheckpoint(Base, JSONOutputMixin):

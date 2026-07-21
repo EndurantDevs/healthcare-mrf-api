@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 
 import aiohttp
 import asyncpg
@@ -108,6 +108,17 @@ from process.provider_directory_time_partition import (
     parse_utc_instant,
 )
 from process import provider_directory_profile as profile_artifact
+from process.provider_directory_profile_selection import (
+    PROFILE_SELECTION_RESULT_METRIC,
+    ProviderDirectoryProfileExecution,
+    assert_registered_profile_selection_current,
+    assert_profile_selection_current_in_transaction,
+    profile_selection_result,
+    validated_profile_execution,
+)
+from process.provider_directory_profile_selection_snapshot import (
+    _source_context_digest,
+)
 from scripts.provider_directory_support_contract import (
     SupportDocumentationError,
     validate_blocker_registry,
@@ -423,6 +434,7 @@ PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES = {
             "Endpoint",
             "HealthcareService",
             "Organization",
+            "OrganizationAffiliation",
             "Practitioner",
             "PractitionerRole",
         }
@@ -581,6 +593,12 @@ _PROVIDER_DIRECTORY_ARTIFACT_BUNDLE: contextvars.ContextVar[Any | None] = (
         "provider_directory_artifact_bundle",
         default=None,
     )
+)
+_PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION: contextvars.ContextVar[
+    ProviderDirectoryProfileExecution | None
+] = contextvars.ContextVar(
+    "provider_directory_profile_selection_execution",
+    default=None,
 )
 SECRET_ENV_PREFIX = "env:"
 DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
@@ -1258,7 +1276,7 @@ class ResourceFetchResult:
     is_pagination_cooldown_deadline_blocked: bool = False
 
     @property
-    def bounded(self) -> bool:
+    def is_bounded(self) -> bool:
         """Return a fetch result constrained to the requested row limit."""
         return (
             self.row_limit_reached
@@ -4151,7 +4169,7 @@ def _fail_closed_on_unexpected_empty_resource(
         resource_type not in _expected_nonempty_resource_types(source)
         or not result.complete
         or result.error
-        or result.bounded
+        or result.is_bounded
         or result.rows_fetched > 0
         or result.rows_written > 0
     ):
@@ -6908,7 +6926,14 @@ def parse_fhir_resource(
     )
     if resource_type == "InsurancePlan":
         period_start, period_end = _period(resource)
-        plan = next((item for item in resource.get("plan") or [] if isinstance(item, dict)), {})
+        plan = next(
+            (
+                resource_item
+                for resource_item in resource.get("plan") or []
+                if isinstance(resource_item, dict)
+            ),
+            {},
+        )
         identifier = _identifier_value(
             plan,
             "planid",
@@ -6961,7 +6986,13 @@ def parse_fhir_resource(
             ),
             "telecom": _telecom(resource),
             "addresses": _normalized_fhir_addresses(resource.get("address")),
-            "qualification_codes": _codings([item.get("code") for item in resource.get("qualification") or [] if isinstance(item, dict)]),
+            "qualification_codes": _codings(
+                [
+                    resource_item.get("code")
+                    for resource_item in resource.get("qualification") or []
+                    if isinstance(resource_item, dict)
+                ]
+            ),
             "qualifications": _normalized_qualifications(
                 resource.get("qualification")
             ),
@@ -7010,15 +7041,19 @@ def parse_fhir_resource(
             "telecom": telecom,
             "addresses": _normalized_fhir_addresses(resource.get("address")),
             "hours_of_operation": [
-                item
-                for item in resource.get("hoursOfOperation") or []
-                if isinstance(item, dict)
+                resource_item
+                for resource_item in resource.get("hoursOfOperation") or []
+                if isinstance(resource_item, dict)
             ],
             "availability_exceptions": _profile_text(
                 resource.get("availabilityExceptions")
             ),
             "photos": _normalized_photo_metadata(resource.get("photo")),
-            **{key: value for key, value in address.items() if key != "address_json"},
+            **{
+                key: field_value
+                for key, field_value in address.items()
+                if key != "address_json"
+            },
         }
         if normalize_location_contacts:
             resource_row_map.update(_location_contact_fields(telephone_number, fax_number, address.get("country_code")))
@@ -7075,14 +7110,14 @@ def parse_fhir_resource(
             "telecom": _telecom(resource),
             "coverage_area_refs": _references(resource.get("coverageArea")),
             "available_time": [
-                item
-                for item in resource.get("availableTime") or []
-                if isinstance(item, dict)
+                resource_item
+                for resource_item in resource.get("availableTime") or []
+                if isinstance(resource_item, dict)
             ],
             "not_available": [
-                item
-                for item in resource.get("notAvailable") or []
-                if isinstance(item, dict)
+                resource_item
+                for resource_item in resource.get("notAvailable") or []
+                if isinstance(resource_item, dict)
             ],
             "availability_exceptions": _profile_text(
                 resource.get("availabilityExceptions")
@@ -7123,7 +7158,11 @@ def parse_fhir_resource(
             "connection_type_display": _clean_text(connection_type.get("display")),
             "name": _clean_text(resource.get("name")),
             "managing_organization_ref": _first_reference(resource.get("managingOrganization")),
-            "contact": [item for item in contact if isinstance(item, dict)] if isinstance(contact, list) else [],
+            "contact": (
+                [resource_item for resource_item in contact if isinstance(resource_item, dict)]
+                if isinstance(contact, list)
+                else []
+            ),
             "period_start": period_start,
             "period_end": period_end,
             "payload_type_codes": _codings(resource.get("payloadType")),
@@ -7811,7 +7850,7 @@ def provider_directory_address_corroboration_select_sql(db_schema: str | None = 
     return sql.split(marker, 1)[1].strip().rstrip(";")
 
 
-def _drop_provider_directory_address_corroboration_relation_sql(schema: str, relation: str) -> str:
+def _drop_address_corroboration_sql(schema: str, relation: str) -> str:
     relation_ref = _qt(schema, relation)
     return f"""
     DO $$
@@ -8359,7 +8398,7 @@ async def _install_provider_directory_prepared_stage(
         "relkind",
     )
     await db.status(
-        _drop_provider_directory_address_corroboration_relation_sql(
+        _drop_address_corroboration_sql(
             schema,
             old_relation,
         )
@@ -8370,7 +8409,7 @@ async def _install_provider_directory_prepared_stage(
         )
     elif target_kind in {"v", "m"}:
         await db.status(
-            _drop_provider_directory_address_corroboration_relation_sql(
+            _drop_address_corroboration_sql(
                 schema,
                 stage.target_relation,
             )
@@ -8389,7 +8428,7 @@ async def _finish_provider_directory_prepared_stage(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
     await db.status(
-        _drop_provider_directory_address_corroboration_relation_sql(
+        _drop_address_corroboration_sql(
             stage.schema,
             f"{stage.target_relation}_old",
         )
@@ -8409,6 +8448,26 @@ async def _promote_provider_directory_artifact_datasets(
         await _supersede_artifact_dataset_incumbent(dataset)
         await _publish_validated_artifact_dataset(dataset)
     await _cutover_provider_directory_artifact_sources(fence)
+
+
+def _provider_directory_profile_selection_catalog() -> dict[str, Any]:
+    """Load the deployed reviewed catalog without coupling module import order."""
+
+    from api.provider_directory_sources import provider_directory_source_catalog
+
+    return provider_directory_source_catalog()
+
+
+async def _verify_active_profile_selection_at_cutover() -> None:
+    """Recompute a global Profile proof inside the atomic cutover fence."""
+
+    execution = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
+    if execution is None:
+        return
+    await assert_profile_selection_current_in_transaction(
+        execution.attestation,
+        _provider_directory_profile_selection_catalog(),
+    )
 
 
 async def _cutover_provider_directory_artifact_sources(
@@ -8525,6 +8584,7 @@ async def _promote_provider_directory_artifact_stage_transaction(
         await db.status(f"SET LOCAL lock_timeout = '{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';")
         await db.status(f"SET LOCAL statement_timeout = '{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';")
         await _acquire_provider_directory_artifact_cutover_lock(prepared_stage)
+        await _verify_active_profile_selection_at_cutover()
         active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
         if active_fence is not None:
             await _lock_and_verify_artifact_dataset_fence(active_fence)
@@ -8585,6 +8645,7 @@ async def _promote_provider_directory_artifact_bundle_transaction(
         )
         for stage in ordered_stages:
             await _acquire_provider_directory_artifact_cutover_lock(stage)
+        await _verify_active_profile_selection_at_cutover()
         active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
         if active_fence is not None:
             await _lock_and_verify_artifact_dataset_fence(active_fence)
@@ -9127,7 +9188,7 @@ async def backfill_provider_directory_location_coordinates(
     """Repair stored Provider Directory coordinates that can be normalized safely."""
 
     schema = db_schema or _schema()
-    if not await _table_exists(schema, "provider_directory_location"):
+    if not await _is_table_present(schema, "provider_directory_location"):
         return 0
     query_param_dict: dict[str, Any] = {}
     if run_id is not None:
@@ -9510,7 +9571,7 @@ async def _has_address_canon_functions(db_schema: str) -> bool:
     return isinstance(value, str) and bool(value)
 
 
-async def _table_exists(db_schema: str, table_name: str) -> bool:
+async def _is_table_present(db_schema: str, table_name: str) -> bool:
     return bool(
         await db.scalar(
             "SELECT to_regclass(:qualified_name) IS NOT NULL;",
@@ -12110,7 +12171,7 @@ async def publish_provider_directory_location_address_keys(
     schema = db_schema or _schema()
     if not await _has_address_canon_functions(schema):
         return 0
-    restore_state_from_zip = await _table_exists(schema, "geo_zip_lookup")
+    restore_state_from_zip = await _is_table_present(schema, "geo_zip_lookup")
     params_by_name: dict[str, Any] = {}
     if run_id is not None:
         params_by_name["run_id"] = run_id
@@ -13000,6 +13061,252 @@ async def _publish_provider_directory_dataset_artifacts(
     )
 
 
+def _assert_profile_selection_matches_artifact_fence(
+    execution: ProviderDirectoryProfileExecution,
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    """Bind the artifact scope to every authoritative proof pair exactly."""
+
+    expected_pairs = [
+        (
+            pair["source_id"],
+            pair["endpoint_id"],
+            pair["dataset_id"],
+            pair["dataset_hash"],
+            pair["acquisition_root_run_id"],
+            pair["publication_status"],
+            pair["is_current"],
+        )
+        for pair in execution.attestation.pairs
+    ]
+    actual_pairs = sorted(
+        (
+            dataset.source_id,
+            dataset.endpoint_id,
+            dataset.dataset_id,
+            dataset.dataset_hash,
+            dataset.evidence_run_id,
+            dataset.status,
+            dataset.is_current,
+        )
+        for dataset in fence.datasets
+    )
+    if expected_pairs != actual_pairs:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_selection_fence_changed"
+        )
+
+
+def _provider_directory_global_profile_followup(
+    *,
+    source_id: str,
+    dataset_id: str,
+    parent_run_id: str,
+) -> dict[str, Any]:
+    """Return the source-local descriptor consumed by global orchestration."""
+
+    return {
+        "status": "required",
+        "kind": "provider_directory_global_profile",
+        "intent": "ensure_desired_generation_observed",
+        "importer": "provider-directory-fhir",
+        "source_id": source_id,
+        "dataset_id": dataset_id,
+        "parent_run_id": parent_run_id,
+        "idempotency_key": "provider-directory-global-profile:" + dataset_id,
+        "triggered_by": "pd_profile_followup",
+        "params": {
+            "publish_artifacts_only": True,
+            "publish_artifacts_targets": ["profile"],
+            "source_ids": [],
+            "require_complete_global_profile_fence": True,
+            "publish_corroboration": False,
+            "probe": False,
+            "import_resources": False,
+            "provider_directory_profile_parent_run_id": parent_run_id,
+            "provider_directory_profile_dataset_id": dataset_id,
+        },
+    }
+
+
+async def _current_profile_dataset_map(source_id: str) -> dict[str, Any]:
+    database_row = await db.first(
+        f"""
+        SELECT dataset.dataset_id,
+               dataset.acquisition_root_run_id,
+               dataset.dataset_hash,
+               dataset.status,
+               dataset.is_current,
+               dataset.superseded_at,
+               dataset.publication_metadata_json
+          FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)} AS source
+          JOIN {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+            ON dataset.endpoint_id = source.endpoint_id
+         WHERE source.source_id = :source_id
+           AND dataset.status = :published_status
+           AND dataset.is_current = true
+           AND dataset.superseded_at IS NULL
+         ORDER BY dataset.published_at DESC, dataset.dataset_id DESC
+         LIMIT 2;
+        """,
+        source_id=source_id,
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+    )
+    if database_row is None:
+        return {}
+    return dict(_pagination_checkpoint_row_mapping(database_row))
+
+
+def _is_expected_profile_followup_dataset(
+    dataset_state_map: Mapping[str, Any],
+    *,
+    source_id: str,
+    expected_acquisition_root_run_id: str,
+) -> bool:
+    acquisition_root_run_id = _clean_text(
+        dataset_state_map.get("acquisition_root_run_id")
+    )
+    publication_metadata = _json_object(
+        dataset_state_map.get("publication_metadata_json")
+    )
+    publication_source_ids = _clean_source_id_list(
+        publication_metadata.get("source_ids")
+    )
+    return not (
+        _clean_text(dataset_state_map.get("dataset_id")) is None
+        or acquisition_root_run_id != expected_acquisition_root_run_id
+        or _clean_text(dataset_state_map.get("dataset_hash")) is None
+        or source_id not in publication_source_ids
+        or _clean_text(dataset_state_map.get("status"))
+        != ENDPOINT_DATASET_PUBLISHED
+        or dataset_state_map.get("is_current") is not True
+        or dataset_state_map.get("superseded_at") is not None
+    )
+
+
+async def _source_local_profile_followup_if_current(
+    *,
+    source_ids: list[str],
+    expected_acquisition_root_run_id: str | None,
+) -> dict[str, Any] | None:
+    """Describe only an exact source-local dataset that is now current."""
+
+    if (
+        len(source_ids) != 1
+        or expected_acquisition_root_run_id is None
+        or source_ids[0] not in set(profile_artifact.configured_profile_source_ids())
+    ):
+        return None
+    source_id = source_ids[0]
+    dataset_state_map = await _current_profile_dataset_map(source_id)
+    if not _is_expected_profile_followup_dataset(
+        dataset_state_map,
+        source_id=source_id,
+        expected_acquisition_root_run_id=expected_acquisition_root_run_id,
+    ):
+        return None
+    return _provider_directory_global_profile_followup(
+        source_id=source_id,
+        dataset_id=str(dataset_state_map["dataset_id"]),
+        parent_run_id=expected_acquisition_root_run_id,
+    )
+
+
+async def _attested_profile_publication_fence(
+    *,
+    run_id: str | None,
+    metrics: dict[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+    source_ids: list[str],
+) -> ProviderDirectoryArtifactDatasetFence:
+    if execution.attestation.operation == "purge":
+        return ProviderDirectoryArtifactDatasetFence(())
+    return await _prepare_artifact_publication_fence(
+        source_ids,
+        run_id=run_id,
+        metrics=metrics,
+        publish_artifacts_targets={"profile"},
+        publish_corroboration=False,
+        should_select_validated_candidates=False,
+    )
+
+
+def _attach_profile_selection_result(
+    execution: ProviderDirectoryProfileExecution,
+    published_metrics: dict[str, Any],
+) -> None:
+    profile_metrics = published_metrics.get("profile")
+    if not isinstance(profile_metrics, dict):
+        raise RuntimeError("provider_directory_profile_selection_result_missing")
+    profile_generation_id = _clean_text(profile_metrics.get("generation_id"))
+    if profile_generation_id is None:
+        raise RuntimeError(
+            "provider_directory_profile_selection_generation_missing"
+        )
+    profile_rows = int(profile_metrics.get("profile_rows") or 0)
+    evidence_rows = int(profile_metrics.get("evidence_rows") or 0)
+    selected_evidence_rows = int(
+        profile_metrics.get("selected_evidence_rows") or 0
+    )
+    if evidence_rows != selected_evidence_rows:
+        raise RuntimeError(
+            "provider_directory_profile_selection_evidence_scope_incomplete"
+        )
+    published_metrics[PROFILE_SELECTION_RESULT_METRIC] = profile_selection_result(
+        execution,
+        profile_generation_id=profile_generation_id,
+        profile_rows=profile_rows,
+        profile_source_evidence_rows=evidence_rows,
+    )
+
+
+async def _publish_attested_provider_directory_profile(
+    *,
+    run_id: str | None,
+    metrics: dict[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+) -> dict[str, Any]:
+    """Stage and atomically publish or purge one proof-bound global Profile."""
+
+    catalog = _provider_directory_profile_selection_catalog()
+    await assert_registered_profile_selection_current(
+        execution.attestation,
+        catalog,
+    )
+    source_ids = [
+        pair["source_id"] for pair in execution.attestation.pairs
+    ]
+    publish_targets = {"profile"}
+    fence = await _attested_profile_publication_fence(
+        run_id=run_id,
+        metrics=metrics,
+        execution=execution,
+        source_ids=source_ids,
+    )
+    _assert_profile_selection_matches_artifact_fence(execution, fence)
+    artifact_resource_types = _provider_directory_artifact_resource_types(
+        publish_targets,
+        publish_corroboration=False,
+    )
+    execution_token = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
+        execution
+    )
+    try:
+        published_metrics = await _publish_artifact_bundle_from_fence(
+            fence,
+            run_id=run_id,
+            metrics=metrics,
+            source_ids=source_ids,
+            publish_corroboration=False,
+            publish_artifacts_targets=publish_targets,
+            artifact_resource_types=artifact_resource_types,
+        )
+    finally:
+        _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(execution_token)
+    _attach_profile_selection_result(execution, published_metrics)
+    return published_metrics
+
+
 async def _prepare_artifact_publication_fence(
     source_ids: list[str] | tuple[str, ...] | None,
     *,
@@ -13426,12 +13733,12 @@ async def _is_provider_directory_corroboration_artifact_published(
 ) -> bool:
     """Build corroboration from either live artifacts or prepared bundle stages."""
     if artifact_bundle is None:
-        return await publish_provider_directory_address_corroboration_if_available(
+        return await _is_address_corroboration_published(
             refresh_network_catalog=False,
             source_ids=source_ids,
         )
     schema = _schema()
-    if not await _table_exists(schema, "entity_address_unified"):
+    if not await _is_table_present(schema, "entity_address_unified"):
         return False
     cleaned_source_ids = _clean_source_id_list(source_ids)
     with _provider_directory_artifact_relation_scope(
@@ -13461,6 +13768,13 @@ def _profile_source_context_from_row(
     source_id = _clean_text(source_row_map.get("source_id"))
     if not source_id:
         return None
+    endpoint_id = _clean_text(source_row_map.get("endpoint_id"))
+    if endpoint_id is None:
+        raise RuntimeError(
+            "provider_directory_profile_source_context_invalid:"
+            + source_id
+            + ":endpoint_id"
+        )
     context_value_by_field: dict[str, str | None] = {}
     for field_name in ("canonical_api_base", "org_name", "plan_name"):
         if field_name not in source_row_map:
@@ -13487,6 +13801,7 @@ def _profile_source_context_from_row(
         context_value_by_field[field_name] = raw_value
     return _ProviderDirectoryProfileSourceContext(
         source_id=source_id,
+        endpoint_id=endpoint_id,
         canonical_api_base=context_value_by_field["canonical_api_base"],
         org_name=context_value_by_field["org_name"],
         plan_name=context_value_by_field["plan_name"],
@@ -13531,14 +13846,33 @@ async def _provider_directory_profile_scope_source_ids(
         for source_id in retained_source_ids
         if source_id in allowed_source_ids
     ]
+    selected_source_contexts = tuple(
+        source_context_by_id[source_id]
+        for source_id in selected_source_ids
+    )
+    _assert_attested_profile_source_contexts(selected_source_contexts)
     return (
         selected_source_ids,
         retained_source_ids,
-        tuple(
-            source_context_by_id[source_id]
-            for source_id in selected_source_ids
-        ),
+        selected_source_contexts,
     )
+
+
+def _assert_attested_profile_source_contexts(
+    source_contexts: tuple[_ProviderDirectoryProfileSourceContext, ...],
+) -> None:
+    """Reject staged source labels that do not match the active proof."""
+
+    execution = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
+    if execution is None:
+        return
+    source_context_digest = _source_context_digest(
+        [asdict(source_context) for source_context in source_contexts]
+    )
+    if source_context_digest != execution.attestation.source_context_digest:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_source_context_attestation_changed"
+        )
 
 
 async def _create_provider_directory_profile_indexes(
@@ -13654,6 +13988,7 @@ async def _remove_provider_directory_profile_stage_table(
 @dataclass(frozen=True)
 class _ProviderDirectoryProfileSourceContext:
     source_id: str
+    endpoint_id: str
     canonical_api_base: str | None
     org_name: str | None
     plan_name: str | None
@@ -14772,6 +15107,14 @@ async def _populate_provider_directory_profile_evidence_stage(
             build.schema,
             ProviderDirectoryOrganization.__tablename__,
         ),
+        "affiliation_ref": _qt(
+            build.schema,
+            ProviderDirectoryOrganizationAffiliation.__tablename__,
+        ),
+        "affiliation_organization_ref": _qt(
+            build.schema,
+            ProviderDirectoryDatasetAffiliationOrganization.__tablename__,
+        ),
         "service_ref": _qt(
             build.schema,
             ProviderDirectoryHealthcareService.__tablename__,
@@ -15158,11 +15501,11 @@ async def _finalize_provider_directory_profile_stages(
 
 
 async def _has_provider_directory_profile_artifacts(schema: str) -> bool:
-    has_evidence_target = await _table_exists(
+    has_evidence_target = await _is_table_present(
         schema,
         profile_artifact.PROFILE_EVIDENCE_TABLE,
     )
-    has_profile_target = await _table_exists(
+    has_profile_target = await _is_table_present(
         schema,
         profile_artifact.PROFILE_TABLE,
     )
@@ -15379,7 +15722,7 @@ async def _publish_provider_directory_artifacts(
         metrics=metrics,
     )
     if seen_table:
-        await _prepare_provider_directory_import_seen_stage_lookup(seen_table)
+        await _prepare_import_seen_stage_lookup(seen_table)
     should_backfill_resource_id_npis = any(
         is_provider_directory_publish_target_enabled(publish_artifacts_targets, artifact_target_name)
         for artifact_target_name in (
@@ -15535,7 +15878,7 @@ async def _publish_provider_directory_artifacts(
     )
     return metrics
 
-def _provider_directory_location_archive_stage_table_name(run_id: str | None = None) -> str:
+def _location_archive_stage_table_name(run_id: str | None = None) -> str:
     raw = run_id or f"{os.getpid()}_{time.time_ns()}"
     digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return f"{PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX}_{digest}"
@@ -15550,7 +15893,7 @@ def provider_directory_location_archive_stage_sql(
 ) -> str:
     """Build SQL for provider directory location archive stage."""
     schema = db_schema or _schema()
-    stage = stage_table or _provider_directory_location_archive_stage_table_name()
+    stage = stage_table or _location_archive_stage_table_name()
     stage_ref = _qt(schema, stage)
     location_ref = _qt(schema, "provider_directory_location")
     organization_ref = _qt(schema, "provider_directory_organization")
@@ -15747,7 +16090,7 @@ async def _backfill_archive_openaddresses_coordinates(
     stage_table: str,
 ) -> int:
     """Fill null archive coordinates for staged FHIR keys from safe OA matches."""
-    if not await _table_exists(schema, PROVIDER_DIRECTORY_OPENADDRESSES_TABLE):
+    if not await _is_table_present(schema, PROVIDER_DIRECTORY_OPENADDRESSES_TABLE):
         return 0
     parsed_tolerance = _parse_coordinate_number(
         os.getenv("HLTHPRT_OPENADDRESSES_DUPLICATE_COORD_TOLERANCE")
@@ -15776,11 +16119,11 @@ async def publish_provider_directory_location_archive(
     schema = db_schema or _schema()
     if not await _has_address_canon_functions(schema):
         return {"skipped": True, "reason": "canonical_functions_unavailable"}
-    if not await _table_exists(schema, "address_archive_v2"):
+    if not await _is_table_present(schema, "address_archive_v2"):
         return {"skipped": True, "reason": "address_archive_v2_unavailable"}
-    if not await _table_exists(schema, "provider_directory_location"):
+    if not await _is_table_present(schema, "provider_directory_location"):
         return {"skipped": True, "reason": "provider_directory_location_unavailable"}
-    stage = stage_table or _provider_directory_location_archive_stage_table_name(run_id)
+    stage = stage_table or _location_archive_stage_table_name(run_id)
     await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage)};")
     try:
         await db.status(
@@ -15977,7 +16320,7 @@ PROVIDER_DIRECTORY_NETWORK_CATALOG_REQUIRED_TABLES = (
 
 async def _network_catalog_missing_requirement(schema: str) -> str | None:
     for table_name in PROVIDER_DIRECTORY_NETWORK_CATALOG_REQUIRED_TABLES:
-        if not await _table_exists(schema, table_name):
+        if not await _is_table_present(schema, table_name):
             return f"{table_name}_unavailable"
     return None
 
@@ -16359,7 +16702,7 @@ async def publish_provider_directory_network_catalog(
             raise
 
 
-async def publish_provider_directory_address_corroboration_if_available(
+async def _is_address_corroboration_published(
     db_schema: str | None = None,
     *,
     refresh_network_catalog: bool = True,
@@ -16367,7 +16710,7 @@ async def publish_provider_directory_address_corroboration_if_available(
 ) -> bool:
     """Publish provider directory address corroboration if available for provider-directory serving."""
     schema = db_schema or _schema()
-    if not await _table_exists(schema, "entity_address_unified"):
+    if not await _is_table_present(schema, "entity_address_unified"):
         return False
     cleaned_source_ids = _clean_source_id_list(source_ids)
     await publish_provider_directory_address_corroboration_table(
@@ -16380,10 +16723,10 @@ async def publish_provider_directory_address_corroboration_if_available(
 
 async def _ensure_provider_directory_tables() -> None:
     schema = _schema()
-    if not await _table_exists(schema, SOURCE_MODELS[0].__tablename__):
+    if not await _is_table_present(schema, SOURCE_MODELS[0].__tablename__):
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {_q(schema)};")
     for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
-        if not await _table_exists(schema, model.__tablename__):
+        if not await _is_table_present(schema, model.__tablename__):
             await db.create_table(model.__table__, checkfirst=True)
         await _ensure_provider_directory_model_columns(model, schema)
     await _ensure_provider_directory_source_column_types(schema)
@@ -16481,7 +16824,7 @@ async def _ensure_provider_directory_model_columns(model: Any, schema: str) -> N
 
 async def _ensure_provider_directory_import_seen_table(schema: str | None = None) -> None:
     schema = schema or _schema()
-    if await _table_exists(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE):
+    if await _is_table_present(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE):
         return
     seen_ref = _qt(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
     await db.status(
@@ -16498,7 +16841,7 @@ async def _ensure_provider_directory_import_seen_table(schema: str | None = None
     )
 
 
-async def _ensure_provider_directory_import_seen_stage_table(
+async def _ensure_import_seen_stage_table(
     run_id: str | None,
     *,
     schema: str | None = None,
@@ -16506,7 +16849,7 @@ async def _ensure_provider_directory_import_seen_stage_table(
     if not run_id:
         return None
     schema = schema or _schema()
-    stage_table = _provider_directory_import_seen_stage_table_name(run_id)
+    stage_table = _import_seen_stage_table_name(run_id)
     stage_ref = _qt(schema, stage_table)
     await db.status(
         f"""
@@ -16523,7 +16866,7 @@ async def _ensure_provider_directory_import_seen_stage_table(
     return stage_table
 
 
-async def _drop_provider_directory_import_seen_stage_table(
+async def _drop_import_seen_stage_table(
     stage_table: str | None,
     *,
     schema: str | None = None,
@@ -16534,7 +16877,7 @@ async def _drop_provider_directory_import_seen_stage_table(
     await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage_table)};")
 
 
-async def _prepare_provider_directory_import_seen_stage_lookup(
+async def _prepare_import_seen_stage_lookup(
     stage_table: str,
     *,
     schema: str | None = None,
@@ -16761,7 +17104,7 @@ def _stage_table_name() -> str:
     return f"pd_stage_{os.getpid()}_{time.time_ns()}"
 
 
-def _provider_directory_import_seen_stage_table_name(run_id: str) -> str:
+def _import_seen_stage_table_name(run_id: str) -> str:
     digest = hashlib.sha1(run_id.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return f"{PROVIDER_DIRECTORY_IMPORT_SEEN_STAGE_PREFIX}_{digest}"
 
@@ -17817,7 +18160,7 @@ def _is_seed_row_query_match(row: dict[str, Any], source_query: str | None) -> b
     )
 
 
-def _has_seed_row_importable_provider_directory_override(row: dict[str, Any]) -> bool:
+def _has_importable_seed_override(row: dict[str, Any]) -> bool:
     source_row = _source_row_from_seed(row)
     metadata = source_row.get("metadata_json") or {}
     if not metadata.get("provider_directory_override"):
@@ -17826,8 +18169,8 @@ def _has_seed_row_importable_provider_directory_override(row: dict[str, Any]) ->
     return validation in {"", "valid", "auth_required"}
 
 
-def _has_seed_row_recoverable_provider_directory_base(row: dict[str, Any]) -> bool:
-    if _has_seed_row_importable_provider_directory_override(row):
+def _has_recoverable_seed_base(row: dict[str, Any]) -> bool:
+    if _has_importable_seed_override(row):
         return True
     source_row = _source_row_from_seed(row)
     metadata = source_row.get("metadata_json") or {}
@@ -18380,7 +18723,7 @@ def _seed_rows_from_contra_costa_catalog(
     }
 
 
-def _seed_rows_from_cms_sma_endpoint_directory(
+def _cms_sma_seed_rows(
     *,
     source_query: str | None = None,
     timeout: int = 30,
@@ -18745,7 +19088,7 @@ def _seed_rows_from_supplemental_catalogs(
             "error": _short_error(exc),
         }
     try:
-        catalog_rows, catalog_metrics = _seed_rows_from_cms_sma_endpoint_directory(
+        catalog_rows, catalog_metrics = _cms_sma_seed_rows(
             source_query=source_query,
             timeout=timeout,
             catalog_path=cms_sma_endpoint_directory_path,
@@ -18837,7 +19180,7 @@ def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = Non
         }
         if (
             classification not in allowed_classifications
-            and not _has_seed_row_recoverable_provider_directory_base(
+            and not _has_recoverable_seed_base(
                 seed_by_field
             )
         ):
@@ -20098,14 +20441,14 @@ async def _probe_alohr_graphql_connector(
     )
 
 
-def _missing_credential_probe_result(
+def _credential_probe_short_circuit(
     source_record: dict[str, Any],
     metadata_urls: list[tuple[str, str]],
     *,
     run_id: str | None,
 ) -> tuple[dict[str, Any], None] | None:
     """Return an auth-required result without calling a credential-gated source."""
-    are_credentials_required = (
+    is_credential_access_required = (
         _has_source_declared_credentialed_access(source_record)
         or _uses_source_known_onboarding_gateway(source_record)
     )
@@ -20113,7 +20456,7 @@ def _missing_credential_probe_result(
         _credential_request_options_for_source(source_record, metadata_url)["descriptor"]
         for _candidate_base, metadata_url in metadata_urls
     )
-    if not are_credentials_required or has_credentials:
+    if not is_credential_access_required or has_credentials:
         return None
     candidate_base, metadata_url = metadata_urls[0]
     return (
@@ -20149,7 +20492,7 @@ async def _probe_source(source_record: dict[str, Any], *, timeout: int, run_id: 
             "run_id": run_id,
         }
         return source_probe_map, None
-    missing_credential_result = _missing_credential_probe_result(
+    missing_credential_result = _credential_probe_short_circuit(
         source_record,
         metadata_urls,
         run_id=run_id,
@@ -20196,7 +20539,7 @@ def _probe_flush_every() -> int:
 
 
 async def _run_source_probe_batch(
-    sources: list[dict[str, Any]],
+    source_rows: list[dict[str, Any]],
     *,
     timeout: int,
     concurrency: int,
@@ -20209,7 +20552,7 @@ async def _run_source_probe_batch(
     source_updates: list[dict[str, Any]] = []
     valid_source_ids: set[str] = set()
     probe_counts_by_name = {"valid": 0, "probed": 0}
-    total_sources = len(sources)
+    total_sources = len(source_rows)
     report_every = max(1, total_sources // 20)
     flush_every = _probe_flush_every()
     flush_lock = asyncio.Lock()
@@ -20239,47 +20582,50 @@ async def _run_source_probe_batch(
         if source_update_rows:
             await _upsert_rows(ProviderDirectorySource, source_update_rows)
 
-    async def _run_probe(source: dict[str, Any]) -> None:
+    async def _run_probe(source_row: dict[str, Any]) -> None:
         """Probe one source while respecting the shared concurrency limit."""
         async with semaphore:
             started = time.monotonic()
-            hard_timeout = _source_probe_hard_timeout_seconds(source, timeout=timeout)
+            hard_timeout = _source_probe_hard_timeout_seconds(
+                source_row,
+                timeout=timeout,
+            )
             try:
-                probe, capability_payload = await asyncio.wait_for(
-                    _probe_source(source, timeout=timeout, run_id=run_id),
+                probe_map, capability_payload = await asyncio.wait_for(
+                    _probe_source(source_row, timeout=timeout, run_id=run_id),
                     timeout=hard_timeout,
                 )
             except TimeoutError:
-                probe = {
+                probe_map = {
                     "status": "timeout",
                     "http_status": None,
                     "response_time_ms": int((time.monotonic() - started) * 1000),
                     "url": None,
-                    "api_base": _canonical_base(source.get("api_base")),
+                    "api_base": _canonical_base(source_row.get("api_base")),
                     "error": f"source metadata probe exceeded {hard_timeout}s hard deadline",
                     "run_id": run_id,
                     "credential": None,
                 }
                 capability_payload = None
             now = _now()
-            update = {
-                "source_id": source["source_id"],
-                **source,
-                "last_probe_status": probe["status"],
-                "last_probe_status_code": probe.get("http_status"),
-                "last_probe_error": probe.get("error"),
+            update_map = {
+                "source_id": source_row["source_id"],
+                **source_row,
+                "last_probe_status": probe_map["status"],
+                "last_probe_status_code": probe_map.get("http_status"),
+                "last_probe_error": probe_map.get("error"),
                 "last_probe_run_id": run_id,
                 "last_probed_at": now,
-                "last_validated_status": probe["status"],
+                "last_validated_status": probe_map["status"],
                 "last_validated_at": now,
                 "updated_at": now,
             }
-            resolved_api_base = _canonical_base(probe.get("api_base"))
-            original_api_base = _canonical_base(source.get("api_base"))
-            metadata = source.get("metadata_json") if isinstance(source.get("metadata_json"), dict) else {}
-            update["metadata_json"] = {
+            resolved_api_base = _canonical_base(probe_map.get("api_base"))
+            original_api_base = _canonical_base(source_row.get("api_base"))
+            metadata = source_row.get("metadata_json") if isinstance(source_row.get("metadata_json"), dict) else {}
+            update_map["metadata_json"] = {
                 **metadata,
-                "last_metadata_url": probe.get("url"),
+                "last_metadata_url": probe_map.get("url"),
                 **(
                     {
                         "resolved_api_base": resolved_api_base,
@@ -20288,20 +20634,24 @@ async def _run_source_probe_batch(
                     if resolved_api_base and resolved_api_base != original_api_base
                     else {}
                 ),
-                **({"credential": probe.get("credential")} if probe.get("credential") else {}),
+                **(
+                    {"credential": probe_map.get("credential")}
+                    if probe_map.get("credential")
+                    else {}
+                ),
             }
-            if resolved_api_base and probe["status"] == "valid":
-                source["api_base"] = resolved_api_base
-                source["canonical_api_base"] = resolved_api_base
-                update["api_base"] = resolved_api_base
-                update["canonical_api_base"] = resolved_api_base
+            if resolved_api_base and probe_map["status"] == "valid":
+                source_row["api_base"] = resolved_api_base
+                source_row["canonical_api_base"] = resolved_api_base
+                update_map["api_base"] = resolved_api_base
+                update_map["canonical_api_base"] = resolved_api_base
             endpoint_row = _provider_directory_api_endpoint_row(
-                source,
+                source_row,
                 observed_at=now,
             )
             if endpoint_row is not None:
-                source["endpoint_id"] = endpoint_row["endpoint_id"]
-                update["endpoint_id"] = endpoint_row["endpoint_id"]
+                source_row["endpoint_id"] = endpoint_row["endpoint_id"]
+                update_map["endpoint_id"] = endpoint_row["endpoint_id"]
                 endpoint_rows.append(endpoint_row)
             if (
                 capability_payload
@@ -20309,33 +20659,36 @@ async def _run_source_probe_batch(
                 == "CapabilityStatement"
             ):
                 capability_rows.append(
-                    parse_capability(source, capability_payload, probe)
+                    parse_capability(source_row, capability_payload, probe_map)
                 )
-                update["fhir_version"] = _clean_text(
+                update_map["fhir_version"] = _clean_text(
                     capability_payload.get("fhirVersion")
-                ) or update.get("fhir_version")
-                if probe["status"] == "valid":
+                ) or update_map.get("fhir_version")
+                if probe_map["status"] == "valid":
                     probe_counts_by_name["valid"] += 1
-                    valid_source_ids.add(source["source_id"])
+                    valid_source_ids.add(source_row["source_id"])
             else:
                 capability_rows.append(
                     {
-                        "source_id": source["source_id"],
-                        "api_base": source.get("api_base"),
-                        "metadata_url": probe.get("url"),
-                        "probe_status": probe["status"],
-                        "http_status": probe.get("http_status"),
-                        "response_time_ms": probe.get("response_time_ms"),
-                        "auth_required": probe["status"] == "auth_required",
-                        "error": probe.get("error"),
+                        "source_id": source_row["source_id"],
+                        "api_base": source_row.get("api_base"),
+                        "metadata_url": probe_map.get("url"),
+                        "probe_status": probe_map["status"],
+                        "http_status": probe_map.get("http_status"),
+                        "response_time_ms": probe_map.get("response_time_ms"),
+                        "auth_required": probe_map["status"] == "auth_required",
+                        "error": probe_map.get("error"),
                         "probed_at": now,
                         "run_id": run_id,
                     }
                 )
-                if probe["status"] == "valid" and _uses_alohr_graphql_connector(source):
+                if (
+                    probe_map["status"] == "valid"
+                    and _uses_alohr_graphql_connector(source_row)
+                ):
                     probe_counts_by_name["valid"] += 1
-                    valid_source_ids.add(source["source_id"])
-            source_updates.append(update)
+                    valid_source_ids.add(source_row["source_id"])
+            source_updates.append(update_map)
             probe_counts_by_name["probed"] += 1
             await _flush_probe_rows()
             if probe_counts_by_name["probed"] == total_sources or probe_counts_by_name["probed"] % report_every == 0:
@@ -20347,9 +20700,11 @@ async def _run_source_probe_batch(
                     message=f"probed {probe_counts_by_name['probed']}/{total_sources} source(s); valid={probe_counts_by_name['valid']}",
                 )
 
-    await asyncio.gather(*[_run_probe(source) for source in sources])
+    await asyncio.gather(
+        *[_run_probe(source_row) for source_row in source_rows]
+    )
     await _flush_probe_rows(force=True)
-    return len(sources), probe_counts_by_name["valid"], valid_source_ids
+    return len(source_rows), probe_counts_by_name["valid"], valid_source_ids
 
 
 def _is_bundle_payload(payload: dict[str, Any] | None) -> bool:
@@ -23974,7 +24329,7 @@ def _bulk_response_error_for_request(
 
 async def _stream_bulk_export_output_rows(
     session: aiohttp.ClientSession,
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     *,
     model: type,
@@ -23994,7 +24349,7 @@ async def _stream_bulk_export_output_rows(
     requires_access_token: bool | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
     """Stream bulk export output rows without retaining the full export in memory."""
-    rows: list[dict[str, Any]] = []
+    retained_rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
     stream_counts_by_name = {"rows_fetched": 0, "rows_written": 0}
     row_limit_by_name = {"reached": False}
@@ -24041,7 +24396,7 @@ async def _stream_bulk_export_output_rows(
                 else None
             )
         parsed = parse_fhir_resource(
-            source["source_id"],
+            source_record["source_id"],
             resource,
             resource_url=_bulk_capability_log_identity(url),
             acquisition=FHIRAcquisitionContext(
@@ -24053,14 +24408,14 @@ async def _stream_bulk_export_output_rows(
         )
         if not parsed:
             return None
-        parsed_model, row = parsed
+        parsed_model, parsed_row = parsed
         if parsed_model is not model:
             return None
         stream_counts_by_name["rows_fetched"] += 1
         if retain_rows:
-            rows.append(row)
+            retained_rows.append(parsed_row)
         if row_batch_handler:
-            pending_rows.append(row)
+            pending_rows.append(parsed_row)
         if not _can_limit_accept_more(stream_counts_by_name["rows_fetched"], per_resource_limit):
             row_limit_by_name["reached"] = True
         return None
@@ -24069,14 +24424,14 @@ async def _stream_bulk_export_output_rows(
         if resume_options.cancel_probe is not None:
             await resume_options.cancel_probe()
         output_request = _bulk_output_stream_request(
-            source,
+            source_record,
             url,
             requires_access_token=requires_access_token,
             resume_options=resume_options,
         )
         _bulk_export_log(
             "stream_start",
-            source_id=source.get("source_id"),
+            source_id=source_record.get("source_id"),
             resource=resource_type,
             output_url=_bulk_capability_log_identity(url),
             row_batch_size=row_batch_size,
@@ -24094,7 +24449,7 @@ async def _stream_bulk_export_output_rows(
             )
             if response_error:
                 return _bulk_stream_result(
-                    rows,
+                    retained_rows,
                     stream_counts_by_name,
                     row_limit_by_name,
                     response_error,
@@ -24109,35 +24464,35 @@ async def _stream_bulk_export_output_rows(
                     byte_counts_by_name["processed"] += len(line) + 1
                     error = handle_line(line)
                     if error:
-                        return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, error)
+                        return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, error)
                     if row_batch_handler and len(pending_rows) >= max(1, row_batch_size):
                         await flush_pending_rows(byte_counts_by_name["processed"])
                     if row_limit_by_name["reached"]:
                         await flush_pending_rows(byte_counts_by_name["processed"])
-                        return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, None)
+                        return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, None)
             if buffer:
                 byte_counts_by_name["processed"] += len(buffer)
                 error = handle_line(buffer)
                 if error:
-                    return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, error)
+                    return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, error)
             if (
                 resume_options.expected_content_length is not None
                 and byte_counts_by_name["processed"]
                 != resume_options.expected_content_length
             ):
                 return _bulk_stream_result(
-                    rows,
+                    retained_rows,
                     stream_counts_by_name,
                     row_limit_by_name,
                     "bulk_export_output_length_mismatch",
                 )
             await flush_pending_rows(byte_counts_by_name["processed"])
-            return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, None)
+            return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, None)
     except (asyncio.CancelledError, ImportCancelledError):
         raise
     except ValueError as exc:
         return _bulk_stream_result(
-            rows,
+            retained_rows,
             stream_counts_by_name,
             row_limit_by_name,
             str(exc),
@@ -24148,13 +24503,13 @@ async def _stream_bulk_export_output_rows(
             raise
         if error == BULK_EXPORT_STATUS_DEADLINE_EXCEEDED:
             return _bulk_stream_result(
-                rows,
+                retained_rows,
                 stream_counts_by_name,
                 row_limit_by_name,
                 error,
             )
         return _bulk_stream_result(
-            rows,
+            retained_rows,
             stream_counts_by_name,
             row_limit_by_name,
             _bulk_transport_error(exc),
@@ -24162,13 +24517,13 @@ async def _stream_bulk_export_output_rows(
     except OSError as exc:
         if str(exc) == "bulk_export_non_public_dns_address":
             return _bulk_stream_result(
-                rows,
+                retained_rows,
                 stream_counts_by_name,
                 row_limit_by_name,
                 "bulk_export_non_public_dns_address",
             )
         return _bulk_stream_result(
-            rows,
+            retained_rows,
             stream_counts_by_name,
             row_limit_by_name,
             _bulk_transport_error(exc),
@@ -24176,13 +24531,13 @@ async def _stream_bulk_export_output_rows(
     except Exception as exc:
         if "bulk_export_non_public_dns_address" in str(exc):
             return _bulk_stream_result(
-                rows,
+                retained_rows,
                 stream_counts_by_name,
                 row_limit_by_name,
                 "bulk_export_non_public_dns_address",
             )
         return _bulk_stream_result(
-            rows,
+            retained_rows,
             stream_counts_by_name,
             row_limit_by_name,
             _bulk_transport_error(exc),
@@ -31382,7 +31737,7 @@ def _record_resource_fetch_stats(
     if fetch_result.complete:
         resource_stats["sources_completed"] += 1
         resource_stats["collection_complete_sources"] += 1
-    if fetch_result.bounded:
+    if fetch_result.is_bounded:
         resource_stats["sources_bounded"] += 1
     if fetch_result.error:
         resource_stats["sources_failed"] += 1
@@ -31418,7 +31773,12 @@ def _record_resource_fetch_stats(
 
 
 def _is_resource_fetch_complete_for_publish(result: ResourceFetchResult) -> bool:
-    return result.complete and not result.error and not result.bounded and not result.next_url_remaining
+    return (
+        result.complete
+        and not result.error
+        and not result.is_bounded
+        and not result.next_url_remaining
+    )
 
 
 def _record_resource_completion(
@@ -31441,7 +31801,7 @@ def _resource_fetch_diagnostic(
         "complete": fetch_result.complete,
         "collection_complete": fetch_result.complete,
         "plan_graph_complete": False,
-        "bounded": fetch_result.bounded,
+        "bounded": fetch_result.is_bounded,
         "error": fetch_result.error,
         "fetch_mode": fetch_result.fetch_mode,
         "pages_fetched": fetch_result.pages_fetched,
@@ -38215,7 +38575,7 @@ async def _import_resources(
                 and bool(_resource_start_url(source, "PractitionerRole", page_count=page_count))
                 and result.complete
                 and not result.error
-                and not result.bounded
+                and not result.is_bounded
                 and result.rows_fetched == 0
                 and result.rows_written == 0
                 and source_counts.get("Practitioner", 0) > 0
@@ -38410,7 +38770,7 @@ async def _import_resources(
                 resource_type == "PractitionerRole"
                 and result.complete
                 and not result.error
-                and not result.bounded
+                and not result.is_bounded
                 and result.rows_fetched == 0
                 and written_total == 0
             ):
@@ -38504,7 +38864,7 @@ async def _import_resources(
                 if (
                     retry_result.complete
                     and not retry_result.error
-                    and not retry_result.bounded
+                    and not retry_result.is_bounded
                     and retry_result.rows_fetched == 0
                     and retry_written_total == 0
                 ):
@@ -38543,7 +38903,7 @@ async def _import_resources(
                 else None
             )
             if scan_seed_stage_table:
-                await _prepare_provider_directory_import_seen_stage_lookup(scan_seed_stage_table)
+                await _prepare_import_seen_stage_lookup(scan_seed_stage_table)
                 for seed_resource_type in _practitioner_role_reverse_lookup_resources(source):
                     rows_by_resource.pop(seed_resource_type, None)
 
@@ -38671,7 +39031,7 @@ async def _import_resources(
         )
 
     seen_stage_table = (
-        await _ensure_provider_directory_import_seen_stage_table(run_id)
+        await _ensure_import_seen_stage_table(run_id)
         if stale_cleanup and run_id and _is_seen_stage_enabled()
         else None
     )
@@ -38777,7 +39137,7 @@ async def _import_resources(
                 await report_progress(force=True)
 
         if seen_stage_table and stale_ready_source_ids_by_resource:
-            await _prepare_provider_directory_import_seen_stage_lookup(seen_stage_table)
+            await _prepare_import_seen_stage_lookup(seen_stage_table)
             for resource_type, ready_source_ids in stale_ready_source_ids_by_resource.items():
                 model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
                 if model is None:
@@ -38800,7 +39160,7 @@ async def _import_resources(
         raise
     finally:
         if seen_stage_table and not preserve_seen_stage:
-            await _drop_provider_directory_import_seen_stage_table(seen_stage_table)
+            await _drop_import_seen_stage_table(seen_stage_table)
 
 
 def _dataset_rehydrate_resource_types(raw: Any) -> tuple[str, ...]:
@@ -38962,6 +39322,18 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         or task.get("publish_artifact_targets")
         or task.get("publish_targets")
     )
+    profile_execution = (
+        validated_profile_execution(task)
+        if any(
+            field_name in task
+            for field_name in (
+                "provider_directory_profile_contract_id",
+                "provider_directory_profile_generation",
+                "provider_directory_profile_selection_attestation",
+            )
+        )
+        else None
+    )
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
     include_supplemental_catalogs = _is_bool_or_default(task.get("include_supplemental_catalogs"), False)
@@ -39026,7 +39398,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         publish_artifacts=should_publish_artifacts,
     )
     seen_stage_table_for_publish = (
-        _provider_directory_import_seen_stage_table_name(run_id)
+        _import_seen_stage_table_name(run_id)
         if should_publish_artifacts
         and should_cleanup_stale_rows
         and run_id
@@ -39051,13 +39423,20 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "publish_artifacts_only": True,
             "source_ids": requested_source_ids,
         }
-        metrics = await _publish_provider_directory_dataset_artifacts(
-            run_id=run_id,
-            metrics=metrics,
-            source_ids=requested_source_ids,
-            publish_corroboration=should_publish_corroboration,
-            publish_artifacts_targets=publish_artifacts_targets,
-        )
+        if profile_execution is None:
+            metrics = await _publish_provider_directory_dataset_artifacts(
+                run_id=run_id,
+                metrics=metrics,
+                source_ids=requested_source_ids,
+                publish_corroboration=should_publish_corroboration,
+                publish_artifacts_targets=publish_artifacts_targets,
+            )
+        else:
+            metrics = await _publish_attested_provider_directory_profile(
+                run_id=run_id,
+                metrics=metrics,
+                execution=profile_execution,
+            )
         ctx["context"]["audit"] = metrics
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         print("PROVIDER_DIRECTORY_ARTIFACT_PUBLISH_DONE\t" + json.dumps(metrics, sort_keys=True, default=str))
@@ -39447,6 +39826,18 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 metrics["location_address_keys_stamped"] = 0
                 metrics["location_archive"] = {"skipped": True, "reason": "publish_artifacts_disabled"}
                 metrics["ptg_corroboration_view_published"] = False
+            source_local_ids = list(requested_source_ids)
+            if not source_local_ids and len(importable) == 1:
+                source_id = _clean_text(importable[0].get("source_id"))
+                source_local_ids = [source_id] if source_id is not None else []
+            profile_followup = await _source_local_profile_followup_if_current(
+                source_ids=source_local_ids,
+                expected_acquisition_root_run_id=(
+                    pagination_root_run_id or run_id
+                ),
+            )
+            if profile_followup is not None:
+                metrics["profile_followup"] = profile_followup
         ctx["context"]["audit"] = metrics
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         print(
@@ -39460,7 +39851,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         return metrics
     finally:
         if seen_stage_table_for_publish:
-            await _drop_provider_directory_import_seen_stage_table(seen_stage_table_for_publish)
+            await _drop_import_seen_stage_table(seen_stage_table_for_publish)
         await _clear_resource_rows_seen(run_id)
         if tmpdir is not None:
             tmpdir.cleanup()
@@ -41053,7 +41444,7 @@ async def _address_overlay_missing_requirement(schema: str) -> str | None:
     if not await _has_address_canon_functions(schema):
         return "canonical_functions_unavailable"
     for table_name in PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES:
-        if not await _table_exists(schema, table_name):
+        if not await _is_table_present(schema, table_name):
             return f"{table_name}_unavailable"
     return None
 
@@ -41223,7 +41614,7 @@ async def _normalize_address_overlay_stage_countries(stage_ref: str) -> int:
 
 
 async def _backfill_address_overlay_stage_coordinates(schema: str, stage_ref: str) -> int:
-    if not await _table_exists(schema, "address_archive_v2"):
+    if not await _is_table_present(schema, "address_archive_v2"):
         return 0
     return _coerce_rowcount(
         await db.status(

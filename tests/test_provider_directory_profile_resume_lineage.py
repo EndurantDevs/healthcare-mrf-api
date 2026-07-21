@@ -23,12 +23,14 @@ MIGRATION_PATH = (
 
 def _source_context(
     *,
+    endpoint_id: str = "endpoint-a",
     canonical_api_base: str | None = "https://example.test/fhir",
     org_name: str | None = "Example Health",
     plan_name: str | None = "Example Plan",
 ) -> importer._ProviderDirectoryProfileSourceContext:
     return importer._ProviderDirectoryProfileSourceContext(
         source_id="source-a",
+        endpoint_id=endpoint_id,
         canonical_api_base=canonical_api_base,
         org_name=org_name,
         plan_name=plan_name,
@@ -166,6 +168,7 @@ def test_resume_lineage_changes_for_same_id_dataset_contract_drift(
 @pytest.mark.parametrize(
     "changed_context",
     [
+        _source_context(endpoint_id="endpoint-changed"),
         _source_context(canonical_api_base="https://changed.test/fhir"),
         _source_context(org_name="Changed Health"),
         _source_context(plan_name="Changed Plan"),

@@ -40,6 +40,7 @@ def _profile_source_scope(
         (
             importer._ProviderDirectoryProfileSourceContext(
                 source_id="source_a",
+                endpoint_id="endpoint_a",
                 canonical_api_base="https://example.test/fhir",
                 org_name="Example",
                 plan_name=plan_name,
@@ -313,6 +314,10 @@ def test_profile_artifact_scope_materializes_endpoint_resources():
     assert "Endpoint" in importer.PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES[
         "profile"
     ]
+    assert (
+        "OrganizationAffiliation"
+        in importer.PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES["profile"]
+    )
     assert "Endpoint" in importer.PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES
 
 
@@ -402,12 +407,14 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
         return [
             {
                 "source_id": "source_allowed",
+                "endpoint_id": "endpoint_allowed",
                 "canonical_api_base": "https://allowed.test/fhir",
                 "org_name": "Allowed",
                 "plan_name": "Allowed Plan",
             },
             {
                 "source_id": "source_outside_fence",
+                "endpoint_id": "endpoint_outside",
                 "canonical_api_base": "https://outside.test/fhir",
                 "org_name": "Outside",
                 "plan_name": None,
@@ -436,6 +443,7 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
     assert source_contexts == (
         importer._ProviderDirectoryProfileSourceContext(
             source_id="source_allowed",
+            endpoint_id="endpoint_allowed",
             canonical_api_base="https://allowed.test/fhir",
             org_name="Allowed",
             plan_name="Allowed Plan",
@@ -445,7 +453,8 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
         "source_allowed",
         "source_outside_fence",
     ]
-    assert "endpoint_id" in captured_by_name["sql"]
+    assert "SELECT source.source_id," in captured_by_name["sql"]
+    assert "source.endpoint_id," in captured_by_name["sql"]
 
 
 @pytest.mark.asyncio
@@ -471,7 +480,7 @@ async def test_profile_stage_build_creates_logged_tables_without_rewrite(
     _patch_fresh_profile_stage_identity(monkeypatch)
     monkeypatch.setattr(
         importer,
-        "_table_exists",
+        "_is_table_present",
         AsyncMock(return_value=False),
     )
     build = importer._ProviderDirectoryProfileBuild(
@@ -911,7 +920,7 @@ async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
     )
     monkeypatch.setattr(
         importer,
-        "_table_exists",
+        "_is_table_present",
         AsyncMock(side_effect=[True, False]),
     )
     fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(

@@ -26,6 +26,9 @@ from api.provider_directory_sources import provider_directory_source_catalog
 from api.provider_directory_source_outcomes import (
     enrich_provider_directory_source_catalog,
 )
+from api.provider_directory_profile_selection_attestation import (
+    register_profile_selection_route,
+)
 from api.uhc_provider_file_catalog import register_uhc_provider_file_catalog_routes
 from api.mrf_discovery_catalog import (
     DEFAULT_FILE_PAGE_SIZE,
@@ -49,6 +52,7 @@ from process.ptg_parts.source_snapshot_control import (
 
 blueprint = Blueprint("control", url_prefix="/control/v1")
 register_uhc_provider_file_catalog_routes(blueprint)
+register_profile_selection_route(blueprint)
 logger = logging.getLogger(__name__)
 
 

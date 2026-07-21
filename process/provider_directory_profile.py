@@ -345,6 +345,7 @@ def profile_scope_source_ids_sql(source_ref: str) -> str:
     """Select reviewed aliases represented by the active immutable scope."""
     return f"""
         SELECT source.source_id,
+               source.endpoint_id,
                source.canonical_api_base,
                source.org_name,
                source.plan_name
@@ -421,6 +422,8 @@ def profile_evidence_insert_sql(
     organization_ref: str,
     service_ref: str,
     endpoint_ref: str | None = None,
+    affiliation_ref: str | None = None,
+    affiliation_organization_ref: str | None = None,
     fact_type: str | None = None,
     role_bucket_count: int = 1,
     role_bucket: int = 0,
@@ -436,13 +439,16 @@ def profile_evidence_insert_sql(
         "provider_directory_healthcare_service",
         "provider_directory_endpoint",
     )
-    affiliation_ref = sibling_table_ref(
+    affiliation_ref = affiliation_ref or sibling_table_ref(
         organization_ref,
         "provider_directory_organization_affiliation",
     )
-    affiliation_organization_ref = sibling_table_ref(
-        organization_ref,
-        "provider_directory_dataset_affiliation_organization",
+    affiliation_organization_ref = (
+        affiliation_organization_ref
+        or sibling_table_ref(
+            organization_ref,
+            "provider_directory_dataset_affiliation_organization",
+        )
     )
     def branch_scope_sql(*branch_fact_types: str) -> str:
         """Return a literal planner gate for one fact-producing branch."""
