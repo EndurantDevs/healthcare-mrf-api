@@ -123,12 +123,36 @@
         "process/provider_directory_dataset_rehydrate_scope.py",
         "process/provider_directory_dataset_rehydrate_store.py",
         "process/provider_directory_dataset_rehydrate_types.py",
+        "process/provider_directory_endpoint_admission.py",
+        "process/provider_directory_endpoint_identity.py",
         "process/provider_directory_fhir.py",
+        "process/provider_directory_logical_scope.py",
         "process/provider_directory_profile.py",
         "process/provider_directory_profile_reference_sql.py",
         "process/provider_directory_profile_selection.py",
         "process/provider_directory_profile_selection_contract.py",
         "process/provider_directory_profile_selection_snapshot.py",
+        "process/provider_directory_retained_artifact_base.py",
+        "process/provider_directory_retained_artifact_contract.py",
+        "process/provider_directory_retained_artifact_keys.py",
+        "process/provider_directory_retained_campaign_contract.py",
+        "process/provider_directory_retained_catalog_store.py",
+        "process/provider_directory_retained_consumer_claim_store.py",
+        "process/provider_directory_retained_handoff.py",
+        "process/provider_directory_retained_identity_contract.py",
+        "process/provider_directory_retained_layout_contract.py",
+        "process/provider_directory_retained_lease_store.py",
+        "process/provider_directory_retained_private_store.py",
+        "process/provider_directory_retained_request_fence_store.py",
+        "process/provider_directory_retained_seal_contract.py",
+        "process/provider_directory_retained_seal_store.py",
+        "process/provider_directory_retained_sealed_contract.py",
+        "process/provider_directory_retained_status_store.py",
+        "process/provider_directory_retained_store_support.py",
+        "process/provider_directory_retained_stream_store.py",
+        "process/provider_directory_scope_alias.py",
+        "process/provider_directory_scope_protection.py",
+        "process/provider_directory_scope_pseudonym.py",
         "process/provider_directory_source_summary.py",
         "process/provider_directory_source_summary_sql.py",
         "process/provider_directory_time_partition.py",
@@ -270,12 +294,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 22519,
-          "total": 32174
+          "covered": 23212,
+          "total": 32542
         },
         "lines": {
-          "covered": 75605,
-          "total": 93549
+          "covered": 78308,
+          "total": 95194
         }
       },
       "path": "test-coverage-python.json",
