@@ -205,6 +205,132 @@ async def test_fhir_artifact_admission_race(monkeypatch):
         await _drop_import_run_schema()
 
 
+async def test_fhir_disjoint_relation_artifact_admission_race(monkeypatch):
+    await _reset_import_run_schema()
+    try:
+        monkeypatch.setattr(
+            control_imports,
+            "_enqueue_import_start",
+            _fake_enqueue,
+        )
+        relation_targets = (
+            "dataset_network_plan,dataset_affiliation_organization"
+        )
+        admission_requests = [
+            control_imports.create_import_run(
+                {
+                    "run_id": f"run_summary_{index}",
+                    "importer": "provider-directory-fhir",
+                    "params": _artifact_params(
+                        f"pdfhir_summary_{index}",
+                        publish_artifacts_targets=relation_targets,
+                    ),
+                }
+            )
+            for index in range(2)
+        ]
+
+        admission_results = await asyncio.gather(*admission_requests)
+
+        assert sorted(created for _, created in admission_results) == [True, True]
+        active_rows = (
+            await db.execute(
+                select(ImportRun).where(
+                    ImportRun.status.in_(control_imports.ACTIVE_STATUSES)
+                )
+            )
+        ).scalars().all()
+        assert len(active_rows) == 2
+        assert {
+            control_imports._provider_directory_operation(active_row.params)[0]
+            for active_row in active_rows
+        } == {control_imports._PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT}
+    finally:
+        await _drop_import_run_schema()
+
+
+async def test_fhir_overlapping_relation_artifact_admission_race(monkeypatch):
+    await _reset_import_run_schema()
+    try:
+        monkeypatch.setattr(
+            control_imports,
+            "_enqueue_import_start",
+            _fake_enqueue,
+        )
+        admission_requests = [
+            control_imports.create_import_run(
+                {
+                    "run_id": f"run_overlapping_summary_{index}",
+                    "importer": "provider-directory-fhir",
+                    "params": _artifact_params(
+                        "pdfhir_shared_summary",
+                        publish_artifacts_targets="dataset_network_plan",
+                    ),
+                }
+            )
+            for index in range(2)
+        ]
+
+        admission_results = await asyncio.gather(*admission_requests)
+
+        assert sorted(created for _, created in admission_results) == [False, True]
+        active_rows = (
+            await db.execute(
+                select(ImportRun).where(
+                    ImportRun.status.in_(control_imports.ACTIVE_STATUSES)
+                )
+            )
+        ).scalars().all()
+        assert len(active_rows) == 1
+    finally:
+        await _drop_import_run_schema()
+
+
+async def test_fhir_general_and_relation_artifact_admission_race(monkeypatch):
+    await _reset_import_run_schema()
+    try:
+        monkeypatch.setattr(
+            control_imports,
+            "_enqueue_import_start",
+            _fake_enqueue,
+        )
+        admission_requests = [
+            control_imports.create_import_run(
+                {
+                    "run_id": "run_relation_summary",
+                    "importer": "provider-directory-fhir",
+                    "params": _artifact_params(
+                        "pdfhir_relation_summary",
+                        publish_artifacts_targets=(
+                            "dataset_affiliation_organization"
+                        ),
+                    ),
+                }
+            ),
+            control_imports.create_import_run(
+                {
+                    "run_id": "run_general_artifact",
+                    "importer": "provider-directory-fhir",
+                    "params": _artifact_params("pdfhir_general_artifact"),
+                }
+            ),
+        ]
+
+        admission_results = await asyncio.gather(*admission_requests)
+
+        assert sorted(created for _, created in admission_results) == [False, True]
+        active_rows = (
+            await db.execute(
+                select(ImportRun).where(
+                    ImportRun.status.in_(control_imports.ACTIVE_STATUSES)
+                )
+            )
+        ).scalars().all()
+        assert len(active_rows) == 1
+    finally:
+        await _drop_import_run_schema()
+
+
 async def test_duplicate_idempotency_key_uses_real_partial_unique_index(monkeypatch):
     await _reset_import_run_schema()
     try:

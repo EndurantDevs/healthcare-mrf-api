@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "record_kind": "uhc_retained_admission_benchmark_evidence",
+  "measured_date_utc": "2026-07-21",
+  "scope": {
+    "network_requests": 0,
+    "input": "previously retained UHC provider-membership data",
+    "cache_condition": "fresh_output_source_page_cache_warm_after_prehash",
+    "committed_boundary": "native parse/hash/copy, raw fsync, manifest verification, Python verification, and one committed PostgreSQL proof transaction",
+    "excluded_claims": [
+      "cold-disk throughput",
+      "warm artifact replay throughput",
+      "normal-flow UHC publication throughput"
+    ]
+  },
+  "input_identity": {
+    "byte_count": 16754456,
+    "record_count": 18696
+  },
+  "gate": {
+    "minimum_rows_per_second": 100000.0,
+    "trial_count": 8,
+    "passed": true
+  },
+  "committed_rows_per_second": {
+    "minimum": 109923.5557752468,
+    "median": 126933.53792803254,
+    "maximum": 153807.44475022462
+  },
+  "full_committed_seconds": {
+    "minimum": 0.12155458424240351,
+    "median": 0.14729393692687154,
+    "maximum": 0.17008183430880308
+  },
+  "phase_seconds": {
+    "native_total": {
+      "minimum": 0.086218625,
+      "median": 0.1040942495,
+      "maximum": 0.130578916
+    },
+    "native_raw_read_hash_copy": {
+      "minimum": 0.011710001,
+      "median": 0.0132453345,
+      "maximum": 0.015388001
+    },
+    "native_raw_fsync": {
+      "minimum": 0.013315334,
+      "median": 0.0150593125,
+      "maximum": 0.015884916
+    },
+    "native_frame_offset_index": {
+      "minimum": 0.046545376,
+      "median": 0.0514669185,
+      "maximum": 0.058306417
+    },
+    "native_concurrent_range_worker_max": {
+      "minimum": 0.074437583,
+      "median": 0.0784039375,
+      "maximum": 0.090236917
+    },
+    "native_manifest_verify_publish": {
+      "minimum": 0.005337333,
+      "median": 0.0083244585,
+      "maximum": 0.047395625
+    },
+    "native_range_verification": {
+      "minimum": 0.013423,
+      "median": 0.015567688,
+      "maximum": 0.017317166
+    },
+    "subprocess_python_database_overhead": {
+      "minimum": 0.035335959242403514,
+      "median": 0.04060341750893212,
+      "maximum": 0.047219124438886165
+    }
+  },
+  "trials": [
+    {
+      "trial": 0,
+      "rows_per_second": 143550.55143000567,
+      "committed_seconds": 0.13023983407765627
+    },
+    {
+      "trial": 1,
+      "rows_per_second": 153807.44475022462,
+      "committed_seconds": 0.12155458424240351
+    },
+    {
+      "trial": 2,
+      "rows_per_second": 109923.5557752468,
+      "committed_seconds": 0.17008183430880308
+    },
+    {
+      "trial": 3,
+      "rows_per_second": 113619.76665449193,
+      "committed_seconds": 0.1645488329231739
+    },
+    {
+      "trial": 4,
+      "rows_per_second": 126251.03353936701,
+      "committed_seconds": 0.1480859164148569
+    },
+    {
+      "trial": 5,
+      "rows_per_second": 133336.22531916905,
+      "committed_seconds": 0.14021695870906115
+    },
+    {
+      "trial": 6,
+      "rows_per_second": 124010.88618427076,
+      "committed_seconds": 0.15076095797121525
+    },
+    {
+      "trial": 7,
+      "rows_per_second": 127616.04231669809,
+      "committed_seconds": 0.14650195743888617
+    }
+  ],
+  "committed_database_counts_per_trial": {
+    "raw_artifacts": 1,
+    "raw_layouts": 1,
+    "source_bindings": 1,
+    "ranges": 4,
+    "artifact_references": 2
+  }
+}

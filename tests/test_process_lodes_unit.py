@@ -94,7 +94,7 @@ async def test_shutdown_marks_control_run_failed_for_zero_stage_rows(monkeypatch
     async def fake_ensure_database(_test_mode):
         return None
 
-    async def fake_table_exists(_schema, _table):
+    async def is_fake_table_present(_schema, _table):
         return True
 
     class FakeStage:
@@ -103,7 +103,7 @@ async def test_shutdown_marks_control_run_failed_for_zero_stage_rows(monkeypatch
     monkeypatch.setattr(module, "db", FakeDb())
     monkeypatch.setattr(module, "mark_control_run", fake_mark_control_run)
     monkeypatch.setattr(module, "ensure_database", fake_ensure_database)
-    monkeypatch.setattr(module, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(module, "_table_exists", is_fake_table_present)
     monkeypatch.setattr(module, "make_class", lambda _model, _import_date: FakeStage)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
 

@@ -1366,7 +1366,7 @@ async def test_live_score_override_all_modes():
 
 @pytest.mark.asyncio
 async def test_load_provider_quality_profile_sql_has_no_trailing_cte_comma(monkeypatch):
-    async def _table_exists(_session, _table_name):
+    async def _is_table_present(_session, _table_name):
         return True
 
     async def _table_columns(_session, table_name):
@@ -1400,7 +1400,7 @@ async def test_load_provider_quality_profile_sql_has_no_trailing_cte_comma(monke
                 ]
             )
 
-    monkeypatch.setattr(pricing_module, "_table_exists", _table_exists)
+    monkeypatch.setattr(pricing_module, "_table_exists", _is_table_present)
     monkeypatch.setattr(pricing_module, "_table_columns", _table_columns)
 
     profile = await pricing_module._load_provider_quality_profile(

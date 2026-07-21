@@ -44,11 +44,11 @@ def make_request(results, args=None):
 
 @pytest.mark.asyncio
 async def test_get_import_status_returns_aggregates(monkeypatch):
-    async def fake_table_exists(_session, _table_name, schema="mrf"):
+    async def is_fake_table_present(_session, _table_name, schema="mrf"):
         del schema
         return True
 
-    monkeypatch.setattr(pharmacy_license, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(pharmacy_license, "_table_exists", is_fake_table_present)
 
     request = make_request(
         [
@@ -89,11 +89,11 @@ async def test_get_import_status_returns_aggregates(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_coverage_returns_items(monkeypatch):
-    async def fake_table_exists(_session, _table_name, schema="mrf"):
+    async def is_fake_table_present(_session, _table_name, schema="mrf"):
         del schema
         return True
 
-    monkeypatch.setattr(pharmacy_license, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(pharmacy_license, "_table_exists", is_fake_table_present)
 
     request = make_request(
         [
@@ -147,11 +147,11 @@ async def test_get_coverage_returns_items(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypatch):
     """Verify get pharmacy license by npi returns summary and history."""
-    async def fake_table_exists(_session, _table_name, schema="mrf"):
+    async def is_fake_table_present(_session, _table_name, schema="mrf"):
         del schema
         return True
 
-    monkeypatch.setattr(pharmacy_license, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(pharmacy_license, "_table_exists", is_fake_table_present)
 
     request = make_request(
         [

@@ -420,12 +420,16 @@ async def test_rust_materialize_default_on_falls_back_when_binary_missing(monkey
 
 @pytest.mark.asyncio
 async def test_rust_materialize_falls_back_on_version_mismatch(monkeypatch, tmp_path):
-    async def _not_current(_binary):
+    async def _is_not_current(_binary):
         return False
 
     monkeypatch.delenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, raising=False)
     monkeypatch.setattr(address_canon, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
-    monkeypatch.setattr(address_canon, "_rust_canon_version_is_current", _not_current)
+    monkeypatch.setattr(
+        address_canon,
+        "_rust_canon_version_is_current",
+        _is_not_current,
+    )
 
     assert await address_canon._try_materialize_keyed_with_rust(
         None,

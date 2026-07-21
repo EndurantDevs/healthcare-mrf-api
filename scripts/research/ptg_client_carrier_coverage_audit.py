@@ -246,7 +246,7 @@ def audit_carrier_rows(
     matcher: Matcher = discovery_candidate_matches,
 ) -> tuple[list[CarrierCoverageStats], dict[str, list[tuple[str, int]]]]:
     """Classify carrier mentions by benefit line and return unmatched counts."""
-    stats_by_line: list[CarrierCoverageStats] = []
+    coverage_stats_list: list[CarrierCoverageStats] = []
     unmatched_by_line: dict[str, list[tuple[str, int]]] = {}
     csv_rows = list(client_rows)
 
@@ -312,7 +312,7 @@ def audit_carrier_rows(
             key=lambda item: (-item[1], item[0].lower()),
         )
         unmatched_by_line[line] = unmatched
-        stats_by_line.append(
+        coverage_stats_list.append(
             CarrierCoverageStats(
                 line=line,
                 column=column,
@@ -328,7 +328,7 @@ def audit_carrier_rows(
             )
         )
 
-    return stats_by_line, unmatched_by_line
+    return coverage_stats_list, unmatched_by_line
 
 
 def audit_non_importable_carrier_rows(
@@ -424,12 +424,12 @@ async def load_discovery_candidates(
         for candidate in candidates
         if has_catalog_source_candidate(candidate)
     ]
-    importable = [
+    importable_candidates = [
         candidate
         for candidate in catalog_candidates
         if discovery._is_candidate_importable_source(candidate)
     ]
-    return catalog_candidates, importable
+    return catalog_candidates, importable_candidates
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

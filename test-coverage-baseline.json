@@ -242,6 +242,16 @@
         "process/uhc_provider_file_catalog_contract.py",
         "process/uhc_provider_file_catalog_store.py",
         "process/uhc_provider_file_catalog_types.py",
+        "process/uhc_retained_locks.py",
+        "process/uhc_retained_native.py",
+        "process/uhc_retained_native_process.py",
+        "process/uhc_retained_range_manifest.py",
+        "process/uhc_retained_registry_contract.py",
+        "process/uhc_retained_registry_sql.py",
+        "process/uhc_retained_registry_store.py",
+        "process/uhc_retained_registry_store_names.py",
+        "process/uhc_retained_source_registry.py",
+        "process/uhc_retained_types.py",
         "process/url_security.py"
       ],
       "format": "coverage.py",
@@ -255,12 +265,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 21265,
-          "total": 31494
+          "covered": 21662,
+          "total": 31752
         },
         "lines": {
-          "covered": 72244,
-          "total": 91120
+          "covered": 73408,
+          "total": 92069
         }
       },
       "path": "test-coverage-python.json",
@@ -317,6 +327,13 @@
         "support/ptg2_scanner/src/shared_graph.rs",
         "support/ptg2_scanner/src/source_witness.rs",
         "support/ptg2_scanner/src/source_witness_spool.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/core.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/filesystem.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/json_framing.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/publication.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/range_build.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/retain.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/verification.rs",
         "support/ptg2_scanner/src/v3_dense.rs",
         "support/ptg2_scanner/src/v3_runs.rs"
       ],
@@ -332,16 +349,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 1917,
-          "total": 2604
+          "covered": 2052,
+          "total": 2732
         },
         "lines": {
-          "covered": 29329,
-          "total": 38154
+          "covered": 31212,
+          "total": 39851
         },
         "regions": {
-          "covered": 44360,
-          "total": 56999
+          "covered": 47108,
+          "total": 59334
         }
       },
       "path": "test-coverage-rust.json",

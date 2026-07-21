@@ -131,10 +131,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def _fetch_api_payload(url: str, api_key: str | None, timeout: float) -> Any:
-    headers = {"Accept": "application/json", "User-Agent": "healthporta-price-address-assurance/1.0"}
+    request_header_by_name = {
+        "Accept": "application/json",
+        "User-Agent": "healthporta-price-address-assurance/1.0",
+    }
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    request = urllib.request.Request(url, headers=headers)
+        request_header_by_name["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(url, headers=request_header_by_name)
     with urllib.request.urlopen(request, timeout=max(float(timeout), 1.0)) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return json.loads(response.read().decode(charset))
@@ -154,14 +157,14 @@ def _load_api_payload(path: str | None, api_url: str | None, api_key: str | None
 
 
 def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
+    seen_value_set: set[str] = set()
+    deduplicated_values: list[str] = []
     for value in values:
         normalized = str(value or "").strip()
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            out.append(normalized)
-    return out
+        if normalized and normalized not in seen_value_set:
+            seen_value_set.add(normalized)
+            deduplicated_values.append(normalized)
+    return deduplicated_values
 
 
 def _file_uri_to_path(uri: str | None) -> str | None:
@@ -317,10 +320,10 @@ def main() -> int:
         else list(args.source_file_version_id)
     )
     raw_artifact_paths = list(args.raw_artifact)
-    raw_artifact_resolution: list[dict[str, Any]] = []
+    raw_artifact_resolutions: list[dict[str, Any]] = []
     raw_artifact_source_file_version_ids_by_path: dict[str, list[str]] = {}
     if args.resolve_raw_artifacts_from_db:
-        raw_artifact_resolution = asyncio.run(
+        raw_artifact_resolutions = asyncio.run(
             _resolve_raw_artifacts_from_db(
                 source_file_version_ids,
                 host=args.db_host,
@@ -333,10 +336,10 @@ def main() -> int:
         )
         raw_artifact_paths.extend(
             str(resolution["raw_artifact_path"])
-            for resolution in raw_artifact_resolution
+            for resolution in raw_artifact_resolutions
             if resolution.get("status") == "resolved" and resolution.get("raw_artifact_path")
         )
-        for resolution in raw_artifact_resolution:
+        for resolution in raw_artifact_resolutions:
             if resolution.get("status") != "resolved" or not resolution.get("raw_artifact_path"):
                 continue
             path = str(resolution["raw_artifact_path"])
@@ -355,12 +358,12 @@ def main() -> int:
         require_network_bound_address=bool(args.require_network_bound_address),
     )
     report["requested_source_file_version_ids"] = source_file_version_ids
-    report["raw_artifact_resolution"] = raw_artifact_resolution
+    report["raw_artifact_resolution"] = raw_artifact_resolutions
     if args.require_resolved_raw_artifacts:
         report["issues"].extend(
             _raw_artifact_resolution_issues(
                 source_file_version_ids,
-                raw_artifact_resolution,
+                raw_artifact_resolutions,
                 resolve_attempted=bool(args.resolve_raw_artifacts_from_db),
             )
         )
