@@ -15,6 +15,7 @@ from process.ptg_parts.ptg2_shared_audit import persisted_audit_sample_digest
 from process.ptg_parts.ptg2_shared_graph import (
     PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
     PTG2_V3_GRAPH_NPI_TO_GROUP,
+    PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
 )
 from process.ptg_parts.ptg2_shared_reuse import shared_source_set_metadata
 from process.ptg_parts.ptg2_source_witness_contract import (
@@ -321,6 +322,7 @@ async def _seed_graph_and_audit_rows(
     for direction, owner_key, member_count in (
         (PTG2_V3_GRAPH_NPI_TO_GROUP, NPI, 1),
         (PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET, GROUP_KEY, 2),
+        (PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP, PROVIDER_SET_KEY, 1),
     ):
         await db.status(
             f"""
@@ -394,6 +396,11 @@ async def _seed_shared_blocks(schema_name: str) -> None:
                     IRRELEVANT_PROVIDER_SET_KEY,
                 )
             ),
+            ((0, 0),),
+        ),
+        (
+            "graph_provider_set_groups_v1",
+            GROUP_KEY.to_bytes(4, "little"),
             ((0, 0),),
         ),
         (

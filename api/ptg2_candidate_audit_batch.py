@@ -17,6 +17,7 @@ from api.ptg2_candidate_audit_coordinates import (
     validate_persisted_audit_graph_scope,
     validate_persisted_audit_price_scope,
 )
+from api.ptg2_candidate_audit_graph import provider_set_keys_by_npi
 from api.ptg2_candidate_audit_integrity import (
     PersistedAuditOccurrence,
     validate_candidate_source_scope,
@@ -40,10 +41,6 @@ from api.ptg2_serving import (
     _required_source_count,
     _version_three_forward_lookup_hints,
     _version_three_price_hydration,
-)
-from api.ptg2_shared_blocks import (
-    PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
-    PTG2_V3_GRAPH_NPI_TO_GROUP,
 )
 from api.ptg2_tables import snapshot_serving_tables
 from api.ptg2_types import PTG2ServingTables
@@ -116,48 +113,16 @@ async def _provider_set_keys_by_npi(
     challenges: Sequence[AuditBatchChallenge],
     persisted_audit_occurrences: Sequence[PersistedAuditOccurrence] = (),
 ) -> dict[int, tuple[int, ...]]:
-    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
-    npis = tuple(
-        sorted(
-            {challenge.npi for challenge in challenges}
-            | {occurrence.npi for occurrence in persisted_audit_occurrences}
-        )
-    )
-    group_keys_by_npi = await lookup_shared_graph_members_from_db(
+    """Resolve candidate provider scopes through bounded graph reads."""
+
+    return await provider_set_keys_by_npi(
+        lookup_shared_graph_members_from_db,
         session,
-        shared_snapshot_key,
-        PTG2_V3_GRAPH_NPI_TO_GROUP,
-        npis,
-        schema_name=PTG2_SCHEMA,
+        _required_shared_snapshot_key(serving_tables),
+        PTG2_SCHEMA,
+        challenges,
+        persisted_audit_occurrences,
     )
-    group_keys = tuple(
-        sorted(
-            {
-                group_key
-                for npi_group_keys in group_keys_by_npi.values()
-                for group_key in npi_group_keys
-            }
-        )
-    )
-    provider_keys_by_group = await lookup_shared_graph_members_from_db(
-        session,
-        shared_snapshot_key,
-        PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
-        group_keys,
-        schema_name=PTG2_SCHEMA,
-    )
-    return {
-        npi: tuple(
-            sorted(
-                {
-                    provider_set_key
-                    for group_key in group_keys_by_npi.get(npi, ())
-                    for provider_set_key in provider_keys_by_group.get(group_key, ())
-                }
-            )
-        )
-        for npi in npis
-    }
 
 
 async def _provider_network_names_by_key(
