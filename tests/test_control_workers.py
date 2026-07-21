@@ -73,7 +73,11 @@ def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
     monkeypatch.setattr(control_workers, "_is_pid_spec_match", lambda pid, spec: True)
 
     worker_response = control_workers.ensure_worker(
-        {"importer": "claims-pricing", "run_id": "run_1"}
+        {
+            "importer": "claims-pricing",
+            "import_id": "import_1",
+            "run_id": "run_1",
+        }
     )
 
     assert worker_response["status"] == "started"
@@ -83,8 +87,42 @@ def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
     assert worker_response["run_id"] == "run_1"
     assert worker_response["items"][0]["run_id"] == "run_1"
     assert worker_response["items"][0]["worker_class"] == "process.ClaimsPricing"
+    assert captured_by_field["env"]["HLTHPRT_IMPORT_ID_OVERRIDE"] == "import_1"
     assert captured_by_field["env"]["HLTHPRT_CONTROL_RUN_ID"] == "run_1"
     assert captured_by_field["start_new_session"] is True
+
+
+def test_ensure_spec_blocks_competing_finish_workers(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "process")
+    drug_finish = control_workers._BY_QUEUE["arq:DrugClaims_finish"]
+    claims_finish = control_workers._BY_QUEUE["arq:ClaimsPricing_finish"]
+    cases = (
+        (
+            drug_finish,
+            claims_finish,
+            "ClaimsPricing_finish is already running",
+        ),
+        (
+            claims_finish,
+            drug_finish,
+            "DrugClaims_finish is already running",
+        ),
+    )
+
+    for requested_spec, running_spec, message in cases:
+        monkeypatch.setattr(
+            control_workers,
+            "_worker_state",
+            lambda spec, _payload=None, *, active=running_spec: {
+                "running": spec == active,
+                "worker_class": spec.worker_class,
+            },
+        )
+
+        result = control_workers._ensure_spec(requested_spec, {})
+
+        assert result["status"] == "blocked"
+        assert result["message"] == message
 
 
 def test_ensure_worker_uses_finish_role_for_finalizing_run(monkeypatch, tmp_path):
@@ -264,6 +302,148 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     assert "parallelism" not in job["spec"]
     assert "completions" not in job["spec"]
     assert job["spec"]["activeDeadlineSeconds"] == 43200
+
+
+def test_ensure_kubernetes_job_requires_worker_image(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_WORKER_JOB_IMAGE", raising=False)
+    spec = control_workers._BY_QUEUE["arq:ClaimsPricing"]
+
+    result = control_workers._ensure_kubernetes_job(
+        spec,
+        {"run_id": "run_without_image"},
+        {"running": False},
+    )
+
+    assert result == {
+        "running": False,
+        "status": "failed",
+        "message": "HLTHPRT_WORKER_JOB_IMAGE is not configured",
+    }
+
+
+def test_ensure_kubernetes_job_fails_closed_on_terminal_cleanup_error(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "healthcare-mrf-api:test")
+    monkeypatch.setattr(
+        control_workers,
+        "_kubernetes_namespace",
+        lambda: "healthporta-dev",
+    )
+
+    def fail_cleanup(*_args):
+        raise control_workers._KubernetesApiError(500, "cleanup failed")
+
+    monkeypatch.setattr(
+        control_workers,
+        "_delete_terminal_kubernetes_worker_jobs",
+        fail_cleanup,
+    )
+    spec = control_workers._BY_QUEUE["arq:ClaimsPricing"]
+
+    result = control_workers._ensure_kubernetes_job(
+        spec,
+        {"run_id": "run_cleanup_failure"},
+        {"running": False, "job_status": "failed"},
+    )
+
+    assert result["status"] == "failed"
+    assert result["message"] == "cleanup failed"
+
+
+def test_ensure_kubernetes_job_tolerates_missing_terminal_job(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "healthcare-mrf-api:test")
+    monkeypatch.setattr(
+        control_workers,
+        "_kubernetes_namespace",
+        lambda: "healthporta-dev",
+    )
+
+    def missing_cleanup(*_args):
+        raise control_workers._KubernetesApiError(404, "already deleted")
+
+    monkeypatch.setattr(
+        control_workers,
+        "_delete_terminal_kubernetes_worker_jobs",
+        missing_cleanup,
+    )
+    monkeypatch.setattr(
+        control_workers,
+        "_kubernetes_request",
+        lambda *_args: {},
+    )
+    monkeypatch.setattr(
+        control_workers,
+        "_worker_state",
+        lambda *_args: {"running": True, "job_status": "active"},
+    )
+    spec = control_workers._BY_QUEUE["arq:ClaimsPricing"]
+
+    result = control_workers._ensure_kubernetes_job(
+        spec,
+        {"run_id": "run_missing_terminal"},
+        {"running": False, "job_status": "succeeded"},
+    )
+
+    assert result["status"] == "started"
+    assert result["running"] is True
+
+
+def test_ensure_kubernetes_job_reports_post_conflict(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "healthcare-mrf-api:test")
+    monkeypatch.setattr(
+        control_workers,
+        "_kubernetes_namespace",
+        lambda: "healthporta-dev",
+    )
+    monkeypatch.setattr(
+        control_workers,
+        "_kubernetes_request",
+        lambda *_args: (_ for _ in ()).throw(
+            control_workers._KubernetesApiError(409, "already exists")
+        ),
+    )
+    monkeypatch.setattr(
+        control_workers,
+        "_worker_state",
+        lambda *_args: {"running": False, "job_status": "pending"},
+    )
+    spec = control_workers._BY_QUEUE["arq:ClaimsPricing"]
+
+    result = control_workers._ensure_kubernetes_job(
+        spec,
+        {"run_id": "run_conflict"},
+        {"running": False},
+    )
+
+    assert result["status"] == "exists"
+    assert result["running"] is False
+
+
+def test_ensure_kubernetes_job_reports_post_failure(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "healthcare-mrf-api:test")
+    monkeypatch.setattr(
+        control_workers,
+        "_kubernetes_namespace",
+        lambda: "healthporta-dev",
+    )
+    monkeypatch.setattr(
+        control_workers,
+        "_kubernetes_request",
+        lambda *_args: (_ for _ in ()).throw(
+            control_workers._KubernetesApiError(503, "api unavailable")
+        ),
+    )
+    spec = control_workers._BY_QUEUE["arq:ClaimsPricing"]
+
+    result = control_workers._ensure_kubernetes_job(
+        spec,
+        {"run_id": "run_post_failure"},
+        {"running": False},
+    )
+
+    assert result["status"] == "failed"
+    assert result["message"] == "api unavailable"
 
 
 def test_provider_directory_kubernetes_job_has_six_day_deadline_floor(
