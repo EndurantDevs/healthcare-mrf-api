@@ -11,6 +11,10 @@ from sqlalchemy import select, text, update
 from api import control_imports
 from db.models import ImportRun, db
 from process.control_lifecycle import mark_control_run
+from tests.control_imports_cancel_race_support import (
+    finish_cancel_race_run,
+    insert_queued_cancel_race_run,
+)
 
 
 pytestmark = [
@@ -423,6 +427,31 @@ async def test_terminal_status_write_does_not_clobber_canceling_run():
         assert stored_run.phase_detail == "cancel requested"
         assert stored_run.metrics == {"cancel_signal": {"redis": True}}
         assert stored_run.finished_at is None
+    finally:
+        await _drop_import_run_schema()
+
+
+async def test_cancel_request_does_not_clobber_concurrent_terminal_run(
+    monkeypatch,
+):
+    """Preserve worker success when it commits before cancellation persistence."""
+    await _reset_import_run_schema()
+    try:
+        await insert_queued_cancel_race_run()
+        monkeypatch.setattr(
+            control_imports,
+            "_cancel_signal_for_run",
+            finish_cancel_race_run,
+        )
+
+        cancel_result_map = await control_imports.request_cancel(
+            "run_cancel_terminal_race"
+        )
+
+        assert cancel_result_map["status"] == "succeeded"
+        assert cancel_result_map["phase_detail"] == "worker succeeded"
+        assert cancel_result_map["progress"]["message"] == "succeeded"
+        assert cancel_result_map["metrics"] == {"rows": 10}
     finally:
         await _drop_import_run_schema()
 

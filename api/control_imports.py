@@ -1948,7 +1948,10 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
     has_terminalized_active_worker = (
         _has_terminalized_active_worker_cancel_signal(worker_cancel_signal_map)
     )
-    canceled_before_start = is_pending_adapter or is_queued_arq
+    canceled_before_start = is_pending_adapter or (
+        is_queued_arq
+        and _is_queued_arq_cancel_completed(worker_cancel_signal_map)
+    )
     cancel_state_by_name = _cancel_state_by_name(
         canceled_before_start=canceled_before_start,
         has_terminalized_active_worker=has_terminalized_active_worker,
@@ -1973,10 +1976,10 @@ def _cancel_state_by_name(
 
     canceled_now = canceled_before_start or has_terminalized_active_worker
     phase_detail = "cancel requested"
-    if canceled_before_start:
-        phase_detail = "canceled before start"
-    elif has_terminalized_active_worker:
+    if has_terminalized_active_worker:
         phase_detail = "canceled active worker"
+    elif canceled_before_start:
+        phase_detail = "canceled before start"
     return {
         "canceled_now": canceled_now,
         "status": "canceled" if canceled_now else "canceling",
@@ -2000,9 +2003,10 @@ async def _persist_cancel_request(
 
     cancel_progress_by_name = cancel_state_by_name["progress"]
     canceled_now = bool(cancel_state_by_name["canceled_now"])
-    await db.execute(
+    update_result = await db.execute(
         update(ImportRun)
         .where(ImportRun.run_id == run_id)
+        .where(ImportRun.status.not_in(TERMINAL_STATUSES))
         .values(
             status=cancel_state_by_name["status"],
             phase_detail=cancel_state_by_name["phase_detail"],
@@ -2015,6 +2019,8 @@ async def _persist_cancel_request(
         )
     )
     updated = await get_import_run(run_id)
+    if getattr(update_result, "rowcount", 1) == 0:
+        return updated
     if updated:
         _write_run_live_progress(
             {**updated, "progress": cancel_progress_by_name},
@@ -2042,7 +2048,13 @@ async def _cancel_signal_for_run(
     if is_pending_adapter:
         return {"redis": False, "pending_adapter": True}
     if is_queued_arq:
-        return await _remove_queued_job(current_run)
+        cancel_flag_by_name = await _set_cancel_flag(run_id)
+        queued_signal_by_name = await _remove_queued_job(current_run)
+        queued_signal_by_name["cancel_flag"] = cancel_flag_by_name
+        queued_signal_by_name["kubernetes"] = await _delete_active_worker_jobs(
+            current_run
+        )
+        return queued_signal_by_name
     worker_cancel_signal_map = await _set_cancel_flag(run_id)
     worker_cancel_signal_map["kubernetes"] = await _delete_active_worker_jobs(
         current_run
@@ -2085,6 +2097,25 @@ def _has_terminalized_active_worker_cancel_signal(cancel_signal: dict[str, Any])
         isinstance(item, dict) and not item.get("deleted") and item.get("reason") == "terminal"
         for item in items
     )
+
+
+def _is_queued_arq_cancel_completed(cancel_signal: dict[str, Any]) -> bool:
+    """Return whether queued work was removed or its launched worker was fenced."""
+
+    if cancel_signal.get("removed"):
+        return True
+    if _has_terminalized_active_worker_cancel_signal(cancel_signal):
+        return True
+    kubernetes = cancel_signal.get("kubernetes")
+    if not isinstance(kubernetes, dict) or not kubernetes.get("enabled"):
+        return False
+    if kubernetes.get("error") or kubernetes.get("errors"):
+        return False
+    cancel_flag = cancel_signal.get("cancel_flag")
+    if not isinstance(cancel_flag, dict) or not cancel_flag.get("redis"):
+        return False
+    items = kubernetes.get("items")
+    return isinstance(items, list) and not items
 
 
 def _write_run_live_progress(run: dict[str, Any], *, publish_event: bool) -> None:

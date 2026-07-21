@@ -8,7 +8,7 @@ import json
 import types
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import sqlalchemy as sa
@@ -2554,6 +2554,44 @@ def _install_running_cancel_stubs(monkeypatch, source_run: dict[str, object], de
     return database_recorder
 
 
+def _install_queued_cancel_stubs(
+    monkeypatch,
+    source_run_map: dict[str, object],
+    queued_signal_by_name: dict[str, object],
+    kubernetes_signal_by_name: dict[str, object],
+):
+    """Install deterministic queue, cancel-flag, and worker cleanup responses."""
+    database_recorder = _CancelDbUpdateRecorder()
+
+    async def fake_get_import_run(_run_id):
+        database_recorder.lookup_attempts += 1
+        if database_recorder.lookup_attempts == 1:
+            return source_run_map
+        return database_recorder.merged_run(source_run_map)
+
+    remove_queued_job = AsyncMock(return_value=queued_signal_by_name)
+    set_cancel_flag = AsyncMock(
+        return_value={
+            "redis": True,
+            "key": f"cancel:{source_run_map['run_id']}",
+            "ttl_seconds": 10,
+        }
+    )
+    delete_active_worker_jobs = AsyncMock(
+        return_value=kubernetes_signal_by_name
+    )
+    monkeypatch.setattr(control_imports, "db", database_recorder)
+    monkeypatch.setattr(control_imports, "get_import_run", fake_get_import_run)
+    monkeypatch.setattr(control_imports, "_remove_queued_job", remove_queued_job)
+    monkeypatch.setattr(control_imports, "_set_cancel_flag", set_cancel_flag)
+    monkeypatch.setattr(
+        control_imports,
+        "_delete_active_worker_jobs",
+        delete_active_worker_jobs,
+    )
+    return remove_queued_job, set_cancel_flag, delete_active_worker_jobs
+
+
 @pytest.mark.asyncio
 async def test_sync_terminal_worker_failure_persists_oom_evidence(monkeypatch):
     source_run = _running_ptg_cancel_run(
@@ -2604,6 +2642,32 @@ async def test_sync_terminal_worker_failure_persists_oom_evidence(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_request_cancel_returns_missing_and_terminal_runs(monkeypatch):
+    """Leave missing and already terminal runs unchanged."""
+    terminal_run_map = {"run_id": "run_done", "status": "succeeded"}
+    get_import_run = AsyncMock(side_effect=[None, terminal_run_map])
+    monkeypatch.setattr(control_imports, "get_import_run", get_import_run)
+
+    assert await control_imports.request_cancel("run_missing") is None
+    assert await control_imports.request_cancel("run_done") == terminal_run_map
+
+
+def test_invalid_worker_delete_count_is_not_terminalized():
+    """Treat an invalid Kubernetes deletion count as no deletion proof."""
+    cancel_signal_map = {
+        "kubernetes": {
+            "enabled": True,
+            "deleted": object(),
+            "items": [],
+        }
+    }
+
+    assert not control_imports._has_terminalized_active_worker_cancel_signal(
+        cancel_signal_map
+    )
+
+
+@pytest.mark.asyncio
 async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
     request_count_by_kind = {"get": 0}
     current_run_map = {
@@ -2649,7 +2713,7 @@ async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
-    request_count_by_kind = {"get": 0}
+    """Cancel queued ARQ work after fencing both queue and worker launch paths."""
     current_run_map = {
         "run_id": "run_queued",
         "status": "queued",
@@ -2657,46 +2721,280 @@ async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
         "metrics": {"enqueue_adapter": "arq_single_job", "queue": "arq:NPI", "job_id": "job_1"},
         "finished_at": None,
     }
-
-    class FakeResult:
-        def scalar_one_or_none(self):
-            return None
-
-    class FakeDb:
-        async def execute(self, _statement):
-            return FakeResult()
-
-    async def fake_get(_run_id):
-        request_count_by_kind["get"] += 1
-        if request_count_by_kind["get"] == 1:
-            return current_run_map
-        return {
-            **current_run_map,
-            "status": "canceled",
-            "metrics": {
-                **current_run_map["metrics"],
-                "cancel_signal": {
-                    "redis": True,
-                    "queue": "arq:NPI",
-                    "job_id": "job_1",
-                    "removed": True,
-                    "deleted_job_key": True,
-                },
+    remove_queued_job, set_cancel_flag, delete_active_worker_jobs = (
+        _install_queued_cancel_stubs(
+            monkeypatch,
+            current_run_map,
+            {
+                "redis": True,
+                "queue": "arq:NPI",
+                "job_id": "job_1",
+                "removed": True,
+                "deleted_job_key": True,
             },
-        }
-
-    async def fake_remove_queued_job(run):
-        assert run == current_run_map
-        return {"redis": True, "queue": "arq:NPI", "job_id": "job_1", "removed": True, "deleted_job_key": True}
-
-    monkeypatch.setattr(control_imports, "db", FakeDb())
-    monkeypatch.setattr(control_imports, "get_import_run", fake_get)
-    monkeypatch.setattr(control_imports, "_remove_queued_job", fake_remove_queued_job)
+            {"enabled": True, "deleted": 0, "items": []},
+        )
+    )
 
     cancel_result_map = await control_imports.request_cancel("run_queued")
 
     assert cancel_result_map["status"] == "canceled"
     assert cancel_result_map["metrics"]["cancel_signal"]["removed"] is True
+    remove_queued_job.assert_awaited_once_with(current_run_map)
+    set_cancel_flag.assert_awaited_once_with("run_queued")
+    delete_active_worker_jobs.assert_awaited_once_with(current_run_map)
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_deletes_launched_worker_for_queued_arq_run(
+    monkeypatch,
+):
+    """Delete a launched worker even before its queued run marks itself running."""
+    source_run_map = {
+        "run_id": "run_queued_launched",
+        "importer": "provider-directory-fhir",
+        "status": "queued",
+        "progress": {"pct": 0},
+        "metrics": {
+            "enqueue_adapter": "arq_single_job",
+            "queue": "arq:ProviderDirectoryFHIR",
+            "job_id": "job_launched",
+        },
+        "finished_at": None,
+    }
+    remove_queued_job, set_cancel_flag, delete_active_worker_jobs = (
+        _install_queued_cancel_stubs(
+            monkeypatch,
+            source_run_map,
+            {
+                "redis": True,
+                "queue": "arq:ProviderDirectoryFHIR",
+                "job_id": "job_launched",
+                "removed": False,
+                "deleted_job_key": True,
+            },
+            {
+                "enabled": True,
+                "namespace": "healthporta-dev",
+                "deleted": 1,
+                "items": [{"job_name": "worker-job", "deleted": True}],
+            },
+        )
+    )
+
+    cancel_result_map = await control_imports.request_cancel(
+        "run_queued_launched"
+    )
+
+    assert cancel_result_map["status"] == "canceled"
+    assert cancel_result_map["phase_detail"] == "canceled active worker"
+    cancel_signal_by_name = cancel_result_map["metrics"]["cancel_signal"]
+    assert cancel_signal_by_name["removed"] is False
+    assert cancel_signal_by_name["cancel_flag"]["redis"] is True
+    assert cancel_signal_by_name["kubernetes"]["deleted"] == 1
+    remove_queued_job.assert_awaited_once_with(source_run_map)
+    set_cancel_flag.assert_awaited_once_with("run_queued_launched")
+    delete_active_worker_jobs.assert_awaited_once_with(source_run_map)
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_keeps_uncertain_queued_worker_canceling(
+    monkeypatch,
+):
+    """Keep canceling when neither queue removal nor worker cleanup is proven."""
+    source_run_map = {
+        "run_id": "run_queued_uncertain",
+        "importer": "provider-directory-fhir",
+        "status": "queued",
+        "progress": {"pct": 0},
+        "metrics": {
+            "enqueue_adapter": "arq_single_job",
+            "queue": "arq:ProviderDirectoryFHIR",
+            "job_id": "job_uncertain",
+        },
+        "finished_at": None,
+    }
+    _install_queued_cancel_stubs(
+        monkeypatch,
+        source_run_map,
+        {"redis": True, "removed": False, "deleted_job_key": True},
+        {
+            "enabled": True,
+            "deleted": 0,
+            "items": [],
+            "errors": [{"status": 503, "error": "worker lookup failed"}],
+        },
+    )
+
+    cancel_result_map = await control_imports.request_cancel(
+        "run_queued_uncertain"
+    )
+
+    assert cancel_result_map["status"] == "canceling"
+    assert cancel_result_map["phase_detail"] == "cancel requested"
+    assert cancel_result_map["finished_at"] is None
+    assert cancel_result_map["metrics"]["cancel_signal"]["kubernetes"][
+        "errors"
+    ]
+
+
+def test_queued_arq_cancel_completion_requires_a_durable_fence():
+    no_worker_after_cancel_flag_map = {
+        "removed": False,
+        "cancel_flag": {"redis": True},
+        "kubernetes": {"enabled": True, "deleted": 0, "items": []},
+    }
+
+    assert control_imports._is_queued_arq_cancel_completed(
+        no_worker_after_cancel_flag_map
+    )
+    assert not control_imports._is_queued_arq_cancel_completed(
+        {
+            **no_worker_after_cancel_flag_map,
+            "cancel_flag": {"redis": False},
+        }
+    )
+    assert not control_imports._is_queued_arq_cancel_completed(
+        {
+            **no_worker_after_cancel_flag_map,
+            "kubernetes": {"enabled": False, "items": []},
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_persistence_returns_terminal_row_when_cas_loses(
+    monkeypatch,
+):
+    """Suppress synthetic cancel events after a concurrent terminal commit."""
+    terminal_run_map = {
+        "run_id": "run_terminal_won",
+        "status": "succeeded",
+        "progress": {"message": "succeeded"},
+        "metrics": {"rows": 10},
+    }
+    update_result = types.SimpleNamespace(rowcount=0)
+    execute_update = AsyncMock(return_value=update_result)
+    get_import_run = AsyncMock(return_value=terminal_run_map)
+    write_live_progress = Mock()
+    publish_status_event = Mock()
+    monkeypatch.setattr(
+        control_imports,
+        "db",
+        types.SimpleNamespace(execute=execute_update),
+    )
+    monkeypatch.setattr(control_imports, "get_import_run", get_import_run)
+    monkeypatch.setattr(
+        control_imports,
+        "_write_run_live_progress",
+        write_live_progress,
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "enqueue_status_event",
+        publish_status_event,
+    )
+
+    result_map = await control_imports._persist_cancel_request(
+        "run_terminal_won",
+        current_run={"finished_at": None},
+        requested_at=control_imports.utc_now(),
+        cancel_state_by_name={
+            "canceled_now": True,
+            "status": "canceled",
+            "phase_detail": "canceled active worker",
+            "progress": {"message": "canceled"},
+        },
+        run_metrics_by_name={"cancel_signal": {"redis": True}},
+    )
+
+    assert result_map == terminal_run_map
+    write_live_progress.assert_not_called()
+    publish_status_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel_persistence_skips_events_when_updated_row_is_missing(
+    monkeypatch,
+):
+    """Avoid publishing a synthetic event when the updated row disappears."""
+    execute_update = AsyncMock(return_value=types.SimpleNamespace(rowcount=1))
+    write_live_progress = Mock()
+    publish_status_event = Mock()
+    monkeypatch.setattr(
+        control_imports,
+        "db",
+        types.SimpleNamespace(execute=execute_update),
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "get_import_run",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "_write_run_live_progress",
+        write_live_progress,
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "enqueue_status_event",
+        publish_status_event,
+    )
+
+    result_map = await control_imports._persist_cancel_request(
+        "run_removed_after_update",
+        current_run={"finished_at": None},
+        requested_at=control_imports.utc_now(),
+        cancel_state_by_name={
+            "canceled_now": False,
+            "status": "canceling",
+            "phase_detail": "cancel requested",
+            "progress": {"message": "cancel requested"},
+        },
+        run_metrics_by_name={"cancel_signal": {"redis": True}},
+    )
+
+    assert result_map is None
+    write_live_progress.assert_not_called()
+    publish_status_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_queued_arq_cancel_sets_fence_before_cleanup(monkeypatch):
+    """Fence a popped worker before removing queue state or inspecting jobs."""
+    call_order_list = []
+    source_run_map = {"run_id": "run_ordered"}
+
+    async def fake_set_cancel_flag(_run_id):
+        call_order_list.append("cancel_flag")
+        return {"redis": True}
+
+    async def fake_remove_queued_job(_run):
+        call_order_list.append("queue")
+        return {"redis": True, "removed": False}
+
+    async def fake_delete_active_worker_jobs(_run):
+        call_order_list.append("kubernetes")
+        return {"enabled": True, "deleted": 0, "items": []}
+
+    monkeypatch.setattr(control_imports, "_set_cancel_flag", fake_set_cancel_flag)
+    monkeypatch.setattr(control_imports, "_remove_queued_job", fake_remove_queued_job)
+    monkeypatch.setattr(
+        control_imports,
+        "_delete_active_worker_jobs",
+        fake_delete_active_worker_jobs,
+    )
+
+    signal_by_name = await control_imports._cancel_signal_for_run(
+        source_run_map,
+        run_id="run_ordered",
+        is_pending_adapter=False,
+        is_queued_arq=True,
+    )
+
+    assert call_order_list == ["cancel_flag", "queue", "kubernetes"]
+    assert signal_by_name["cancel_flag"] == {"redis": True}
 
 
 @pytest.mark.asyncio
