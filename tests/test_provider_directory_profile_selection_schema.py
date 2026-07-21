@@ -36,6 +36,8 @@ def test_migration_and_models_define_durable_monotonic_authority():
     assert "authority_revision" in migration_source
     assert "provider_directory_profile_selection_observation_pkey" in migration_source
     assert "pd_profile_selection_observation_input_fkey" in migration_source
+    assert migration_source.count("create_table_or_validate(") == 3
+    assert "create_index_if_missing(" in migration_source
     assert (
         selection.ProviderDirectoryProfileSelectionProof.__tablename__
         == "provider_directory_profile_selection_proof"
@@ -43,4 +45,10 @@ def test_migration_and_models_define_durable_monotonic_authority():
     assert (
         selection.ProviderDirectoryProfileSelectionObservation.__tablename__
         == "provider_directory_profile_selection_observation"
+    )
+    assert (
+        selection.ProviderDirectoryProfileSelectionObservation.authority_revision
+        .property.columns[0]
+        .autoincrement
+        is False
     )

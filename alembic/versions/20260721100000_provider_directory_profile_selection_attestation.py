@@ -12,6 +12,9 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from db.migration_adoption import create_table_or_validate
+from db.migration_index_adoption import create_index_if_missing
+
 
 revision = "20260721100000_provider_directory_profile_selection_attestation"
 down_revision = "20260720130000_uhc_retained_artifact_admission"
@@ -25,7 +28,8 @@ def _schema() -> str:
 
 def upgrade() -> None:
     schema = _schema()
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_profile_selection_authority",
         sa.Column("authority_key", sa.String(length=16), nullable=False),
         sa.Column(
@@ -56,7 +60,8 @@ def upgrade() -> None:
         ),
         schema=schema,
     )
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_profile_selection_proof",
         sa.Column("input_identity_digest", sa.String(length=64), nullable=False),
         sa.Column("proof_id", sa.String(length=64), nullable=False),
@@ -82,7 +87,8 @@ def upgrade() -> None:
         ),
         schema=schema,
     )
-    op.create_table(
+    create_table_or_validate(
+        op,
         "provider_directory_profile_selection_observation",
         sa.Column("authority_revision", sa.BigInteger(), nullable=False),
         sa.Column("input_identity_digest", sa.String(length=64), nullable=False),
@@ -111,7 +117,8 @@ def upgrade() -> None:
         ),
         schema=schema,
     )
-    op.create_index(
+    create_index_if_missing(
+        op,
         "pd_profile_selection_observation_input_idx",
         "provider_directory_profile_selection_observation",
         ["input_identity_digest"],

@@ -1614,8 +1614,8 @@ class ProviderDirectoryProfileSelectionAuthority(Base, JSONOutputMixin):
 
     authority_key = Column(String(16), nullable=False)
     last_revision = Column(BigInteger, nullable=False, default=0)
-    created_at = Column(TIMESTAMP, nullable=False)
-    updated_at = Column(TIMESTAMP, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
 class ProviderDirectoryProfileSelectionProof(Base, JSONOutputMixin):
@@ -1644,7 +1644,7 @@ class ProviderDirectoryProfileSelectionProof(Base, JSONOutputMixin):
     input_identity_digest = Column(String(64), nullable=False)
     proof_id = Column(String(64), nullable=False)
     identity_json = Column(JSON, nullable=False)
-    created_at = Column(TIMESTAMP, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
 class ProviderDirectoryProfileSelectionObservation(Base, JSONOutputMixin):
@@ -1671,7 +1671,11 @@ class ProviderDirectoryProfileSelectionObservation(Base, JSONOutputMixin):
         }
     ]
 
-    authority_revision = Column(BigInteger, nullable=False)
+    authority_revision = Column(
+        BigInteger,
+        autoincrement=False,
+        nullable=False,
+    )
     input_identity_digest = Column(
         String(64),
         ForeignKey(
@@ -1681,7 +1685,7 @@ class ProviderDirectoryProfileSelectionObservation(Base, JSONOutputMixin):
         nullable=False,
     )
     payload_json = Column(JSON, nullable=False)
-    created_at = Column(TIMESTAMP, nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
 class ProviderDirectoryReverseLookupCheckpoint(Base, JSONOutputMixin):
