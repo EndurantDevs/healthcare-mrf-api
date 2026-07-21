@@ -1864,7 +1864,8 @@ async def test_plan_code_proof_never_bypasses_strict_validation_for_session_shap
 async def test_route_proof_joins_logical_scope_and_fails_closed_on_no_row():
     class _ScalarResult:
         def scalar(self):
-            return False
+            has_route = False
+            return has_route
 
     class _ScalarSession:
         def __init__(self):

@@ -400,46 +400,45 @@ async def test_get_pharmacy_state_stats_returns_payload(monkeypatch):
 @pytest.mark.asyncio
 async def test_query_pharmacy_state_stats_normalizes_and_zero_fills_states(monkeypatch):
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+    pharmacy_rows = [
+        {
+            "state": "California",
+            "nppes_pharmacies": 10,
+            "nppes_pharmacists": 20,
+            "active_pharmacists": 15,
+            "active_pharmacies": 7,
+            "aca_pharmacies": 8,
+        },
+        {
+            "state": "CA",
+            "nppes_pharmacies": 3,
+            "nppes_pharmacists": 4,
+            "active_pharmacists": 2,
+            "active_pharmacies": 1,
+            "aca_pharmacies": 1,
+        },
+        {
+            "state": "District of Columbia",
+            "nppes_pharmacies": 5,
+            "nppes_pharmacists": 6,
+            "active_pharmacists": 4,
+            "active_pharmacies": 3,
+            "aca_pharmacies": 2,
+        },
+        {
+            "state": "DOHA",
+            "nppes_pharmacies": 999,
+            "nppes_pharmacists": 999,
+            "active_pharmacists": 999,
+            "active_pharmacies": 999,
+            "aca_pharmacies": 999,
+        },
+    ]
 
     class Session:
         async def execute(self, stmt):
             assert "WITH pharmacy_taxonomy AS" in stmt.text
-            return _FakeMappingsResult(
-                [
-                    {
-                        "state": "California",
-                        "nppes_pharmacies": 10,
-                        "nppes_pharmacists": 20,
-                        "active_pharmacists": 15,
-                        "active_pharmacies": 7,
-                        "aca_pharmacies": 8,
-                    },
-                    {
-                        "state": "CA",
-                        "nppes_pharmacies": 3,
-                        "nppes_pharmacists": 4,
-                        "active_pharmacists": 2,
-                        "active_pharmacies": 1,
-                        "aca_pharmacies": 1,
-                    },
-                    {
-                        "state": "District of Columbia",
-                        "nppes_pharmacies": 5,
-                        "nppes_pharmacists": 6,
-                        "active_pharmacists": 4,
-                        "active_pharmacies": 3,
-                        "aca_pharmacies": 2,
-                    },
-                    {
-                        "state": "DOHA",
-                        "nppes_pharmacies": 999,
-                        "nppes_pharmacists": 999,
-                        "active_pharmacists": 999,
-                        "active_pharmacies": 999,
-                        "aca_pharmacies": 999,
-                    },
-                ]
-            )
+            return _FakeMappingsResult(pharmacy_rows)
 
     state_summaries, has_helper = await reports._query_pharmacy_state_stats(Session())
     by_state = {

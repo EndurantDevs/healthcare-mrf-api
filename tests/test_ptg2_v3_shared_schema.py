@@ -271,12 +271,7 @@ async def test_real_postgres_fresh_v3_migrations_have_gc_contract():
             await database.disconnect()
 
 
-def test_ptg2_models_support_db_schema_alias_without_cross_schema_fks():
-    """Verify ptg2 models support db schema alias without cross schema fks."""
-    root = Path(__file__).resolve().parents[1]
-    env = os.environ.copy()
-    env.pop("HLTHPRT_DB_SCHEMA", None)
-    env["DB_SCHEMA"] = "ptg_legacy_schema"
+def _probe_db_schema_aliases(root: Path, env: dict[str, str]):
     script = """
 from db.models import (
     PTG2Plan,
@@ -309,8 +304,7 @@ print(
     )
 )
 """
-
-    completed = subprocess.run(
+    return subprocess.run(
         [sys.executable, "-c", script],
         cwd=root,
         env=env,
@@ -318,6 +312,15 @@ print(
         capture_output=True,
         text=True,
     )
+
+
+def test_ptg2_models_support_db_schema_alias_without_cross_schema_fks():
+    """Verify ptg2 models support db schema alias without cross schema fks."""
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.pop("HLTHPRT_DB_SCHEMA", None)
+    env["DB_SCHEMA"] = "ptg_legacy_schema"
+    completed = _probe_db_schema_aliases(root, env)
 
     schema_line = next(
         line for line in completed.stdout.splitlines() if line.startswith("SCHEMAS=")

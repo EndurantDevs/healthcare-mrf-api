@@ -26,9 +26,11 @@ class _FakeRedis:
 
     async def set(self, key: str, value, ex=None, nx: bool = False):
         if nx and key in self.store:
-            return False
+            is_stored = False
+            return is_stored
         self.store[key] = str(value)
-        return True
+        is_stored = True
+        return is_stored
 
     async def get(self, key: str):
         return self.store.get(key)
@@ -89,7 +91,8 @@ class _FakeRedis:
                 "max_tries": _max_tries,
             }
         )
-        return True
+        is_enqueued = True
+        return is_enqueued
 
     async def rpush(self, key: str, value: str):
         self.list_store.setdefault(key, []).append(str(value))

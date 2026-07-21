@@ -49,7 +49,7 @@ async def _temporary_schema(monkeypatch):
     _require_disposable_database()
     database = Database()
     schema = f"practitioner_address_overlay_{uuid.uuid4().hex[:12]}"
-    schema_created = False
+    is_schema_created = False
     try:
         try:
             await database.connect()
@@ -63,11 +63,11 @@ async def _temporary_schema(monkeypatch):
                 "Practitioner address overlay DB test connected to a non-disposable database"
             )
         await database.status(f'CREATE SCHEMA "{schema}";')
-        schema_created = True
+        is_schema_created = True
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
         yield database, schema
     finally:
-        if schema_created:
+        if is_schema_created:
             await database.status(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         await database.disconnect()
 

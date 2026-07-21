@@ -1,19 +1,19 @@
 {
   "issue_counts": {
-    "ambiguous_function_names": 42,
+    "ambiguous_function_names": 40,
     "ambiguous_variable_names": 278,
-    "boolean_name_mismatch": 158,
+    "boolean_name_mismatch": 142,
     "builtin_shadowing": 1,
     "class_name_shape": 2,
     "collection_name_mismatch": 359,
     "comment_noise": 0,
     "confusable_function_names": 0,
     "deep_nesting": 69,
-    "function_name_shape": 52,
+    "function_name_shape": 50,
     "global_state_usage": 19,
     "inline_suppressions": 4,
     "long_files": 151,
-    "long_functions": 832,
+    "long_functions": 829,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 8,
     "single_letter_names": 34,
@@ -62,9 +62,7 @@
       "ambiguous_function_name:process/ptg.py:main",
       "ambiguous_function_name:process/ptg_candidate_audit.py:main",
       "ambiguous_function_name:scripts/research/price_address_assurance_report.py:main",
-      "ambiguous_function_name:scripts/research/provider_directory_coverage_audit.py:main",
-      "ambiguous_function_name:tests/test_openapi_spec.py:_EndpointCollector._process",
-      "ambiguous_function_name:tests/test_reports_api.py:test_query_pharmacy_state_stats_normalizes_and_zero_fills_states.Session.execute"
+      "ambiguous_function_name:scripts/research/provider_directory_coverage_audit.py:main"
     ],
     "ambiguous_variable_names": [
       "ambiguous_variable_name:api/control.py:_ptg_source_snapshot_refresh_payload:payload",
@@ -488,23 +486,7 @@
       "boolean_name_mismatch:scripts/validation/ptg2_v3_capacity_gate.py:_boolean:function",
       "boolean_name_mismatch:scripts/validation/ptg2_v3_source_api_audit.py:ApiOccurrenceSource.validate_source_set:function",
       "boolean_name_mismatch:scripts/validation/ptg2_v3_source_api_audit.py:HttpApiOccurrenceSource.validate_source_set:function",
-      "boolean_name_mismatch:scripts/validation/ptg2_v3_source_api_audit.py:SourceIndex._consume_zero_npi_marker_event:function",
-      "boolean_name_mismatch:tests/test_address_canonical_unit.py:test_propagate_child_address_keys_can_skip_when_child_already_keyed._FakeDB.scalar:function",
-      "boolean_name_mismatch:tests/test_address_canonical_unit.py:test_stamp_address_keys_can_be_limited_to_null_rows._FakeDB.scalar:function",
-      "boolean_name_mismatch:tests/test_address_canonical_unit.py:test_stamp_address_keys_skips_null_only_work_when_already_keyed._FakeDB.scalar:function",
-      "boolean_name_mismatch:tests/test_process_mrf_unit.py:test_process_json_index_dedupes_provider_url_jobs.FakeRedis.expire:function",
-      "boolean_name_mismatch:tests/test_process_mrf_unit.py:test_process_json_index_marks_terminal_parse_error_done.FakeRedis.expire:function",
-      "boolean_name_mismatch:tests/test_process_mrf_unit.py:test_process_json_index_test_limit_counts_unique_registered_jobs.FakeRedis.expire:function",
-      "boolean_name_mismatch:tests/test_process_mrf_unit.py:test_register_mrf_work_counts_unique_work_ids_once.FakeRedis.expire:function",
-      "boolean_name_mismatch:tests/test_process_provider_quality_unit.py:_FakeRedis.enqueue_job:function",
-      "boolean_name_mismatch:tests/test_process_provider_quality_unit.py:_FakeRedis.set:function",
-      "boolean_name_mismatch:tests/test_process_ptg_unit.py:test_manifest_publish_materializes_lean_provider_group_rate_scope.fake_table_has_rows:function",
-      "boolean_name_mismatch:tests/test_provider_directory_practitioner_address_overlay_db.py:_temporary_schema:schema_created:assignment",
-      "boolean_name_mismatch:tests/test_provider_directory_practitioner_address_overlay_db.py:_temporary_schema:schema_created:assignment",
-      "boolean_name_mismatch:tests/test_ptg2_shared_serving_api.py:test_route_proof_joins_logical_scope_and_fails_closed_on_no_row._ScalarResult.scalar:function",
-      "boolean_name_mismatch:tests/test_ptg_control_unit.py:test_ptg_thread_heartbeat_preserves_importer_progress_source.FakeEvent.wait:function",
-      "boolean_name_mismatch:tests/test_site_intelligence_api.py:test_site_intelligence_returns_trade_area_metrics._always_exists:function",
-      "boolean_name_mismatch:tests/test_site_intelligence_api.py:test_site_intelligence_target_scripts_gates_recommendation._always_exists:function"
+      "boolean_name_mismatch:scripts/validation/ptg2_v3_source_api_audit.py:SourceIndex._consume_zero_npi_marker_event:function"
     ],
     "builtin_shadowing": [
       "builtin_shadowing:process/ext/utils.py:log_error:type"
@@ -997,9 +979,7 @@
       "function_name_shape:process/ptg_parts/source_snapshot_control.py:build_ptg2_source_snapshot_remove_plan:too_many_tokens",
       "function_name_shape:process/ptg_parts/table_setup.py:_ensure_ptg2_price_set_stage_table:too_many_tokens",
       "function_name_shape:process/ptg_parts/table_setup.py:_ensure_ptg2_serving_rate_compact_columns:too_many_tokens",
-      "function_name_shape:process/ptg_parts/table_setup.py:_ensure_ptg2_serving_rate_stage_table:too_many_tokens",
-      "function_name_shape:tests/test_process_ptg_unit.py:test_shared_v3_provider_identifier_quarantine_combines_active_scanners_and_skips_duplicate:too_many_tokens",
-      "function_name_shape:tests/test_process_ptg_unit.py:test_shared_v3_provider_identifier_quarantine_fails_closed_when_active_result_omits_evidence:too_many_tokens"
+      "function_name_shape:process/ptg_parts/table_setup.py:_ensure_ptg2_serving_rate_stage_table:too_many_tokens"
     ],
     "global_state_usage": [
       "global_state_usage:api/endpoint/site_intelligence.py:_zcta_overlap_available:global:86:_ZCTA_OVERLAP_AVAILABLE_CACHE",
@@ -1020,7 +1000,7 @@
       "global_state_usage:tests/test_openaddresses_unit.py:test_openaddresses_remote_sources_load_in_parallel.fake_load_source_item:nonlocal:663:active,max_active",
       "global_state_usage:tests/test_openaddresses_unit.py:test_openaddresses_remote_test_mode_honors_source_concurrency.fake_load_source_item:nonlocal:769:active,max_active",
       "global_state_usage:tests/test_openaddresses_unit.py:test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggregates.fake_refresh:nonlocal:392:active,max_active",
-      "global_state_usage:tests/test_process_provider_quality_unit.py:test_ensure_provider_quality_rx_agg_table_builds_once._capture_scalar:nonlocal:799:scalar_calls"
+      "global_state_usage:tests/test_process_provider_quality_unit.py:test_ensure_provider_quality_rx_agg_table_builds_once._capture_scalar:nonlocal:802:scalar_calls"
     ],
     "inline_suppressions": [
       "inline_suppression:process/entity_address_unified.py:python_pylint_disable:39bc23714fd6",
@@ -1958,7 +1938,6 @@
       "long_function:tests/test_ptg2_serving.py:test_strict_cost_provider_selection_grows_until_page_is_contained",
       "long_function:tests/test_ptg2_shared_blocks.py:test_mapping_summary_real_postgres_uses_same_uncommitted_transaction",
       "long_function:tests/test_ptg2_shared_blocks.py:test_mapping_summary_rejects_join_and_copy_count_anomalies",
-      "long_function:tests/test_ptg2_shared_blocks.py:test_mapping_summary_uses_supplied_session_and_matches_python_digest",
       "long_function:tests/test_ptg2_shared_blocks.py:test_reservation_resumes_only_the_same_build_token",
       "long_function:tests/test_ptg2_shared_gc.py:_SharedGCExecutor.all",
       "long_function:tests/test_ptg2_shared_gc.py:test_real_postgres_candidate_scoped_release_and_sweep_sql",
@@ -1980,7 +1959,6 @@
       "long_function:tests/test_ptg2_shared_snapshot_publish_postgres.py:test_real_postgres_shared_block_publish_preserves_content_conflict_checks",
       "long_function:tests/test_ptg2_shared_snapshot_publish_postgres.py:test_real_postgres_strict_shared_v3_publish_and_cache_free_reads",
       "long_function:tests/test_ptg2_source_snapshot_gc.py:test_real_postgres_stale_cutoff_is_utc_naive_under_non_utc_session",
-      "long_function:tests/test_ptg2_source_witness.py:test_persisted_witness_is_deterministic_and_preserves_exact_raw_tokens",
       "long_function:tests/test_ptg2_v3_audit_occurrences_api.py:test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences",
       "long_function:tests/test_ptg2_v3_bounded_readers.py:test_bounded_code_prefix_matches_eager_rank_and_reads_selected_refs",
       "long_function:tests/test_ptg2_v3_bounded_readers.py:test_sparse_batch_reads_multiple_codes_from_exact_provider_shards",
@@ -1994,7 +1972,6 @@
       "long_function:tests/test_ptg2_v3_migrated_lifecycle_postgres.py:_release_report",
       "long_function:tests/test_ptg2_v3_migrated_lifecycle_postgres.py:test_v3_lifecycle_fails_closed",
       "long_function:tests/test_ptg2_v3_rust_python_forward_bridge.py:test_real_rust_v3_forward_writer_bridges_to_strict_python_reader",
-      "long_function:tests/test_ptg2_v3_shared_schema.py:test_ptg2_models_support_db_schema_alias_without_cross_schema_fks",
       "long_function:tests/test_ptg2_v3_shared_schema.py:test_real_postgres_fresh_v3_migrations_have_gc_contract",
       "long_function:tests/test_ptg2_v3_shared_schema.py:test_v3_shared_migration_emits_tables_constraints_and_32_way_partitions",
       "long_function:tests/test_ptg2_v3_shared_schema.py:test_v3_shared_models_define_checks_indexes_and_partition_intent",

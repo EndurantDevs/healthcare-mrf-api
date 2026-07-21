@@ -635,7 +635,8 @@ async def test_stamp_address_keys_can_be_limited_to_null_rows(monkeypatch):
         async def scalar(self, sql):
             assert "WHERE address_key IS NULL" in sql
             assert "addr_key_v1(" in sql
-            return True
+            has_null_address_keys = True
+            return has_null_address_keys
 
         async def status(self, sql, **kwargs):
             calls.append((sql, kwargs))
@@ -676,7 +677,8 @@ async def test_stamp_address_keys_skips_null_only_work_when_already_keyed(monkey
             calls.append(("scalar", sql))
             assert "WHERE address_key IS NULL" in sql
             assert "addr_key_v1(" in sql
-            return False
+            has_null_address_keys = False
+            return has_null_address_keys
 
         async def status(self, sql, **kwargs):
             calls.append(("status", sql, kwargs))
@@ -838,7 +840,7 @@ async def test_tiger_zip_restore_checks_state(monkeypatch):
             return _FakeSession()
 
         async def __aexit__(self, exc_type, exc, tb):
-            return False
+            return bool(0)
 
     class _FakeDB:
         def transaction(self):
@@ -1021,7 +1023,8 @@ async def test_propagate_child_address_keys_can_skip_when_child_already_keyed(mo
             assert "WHERE child.address_key IS NULL" in sql
             assert "parent.address_key IS NOT NULL" in sql
             assert "child.first_line IS NOT DISTINCT FROM parent.first_line" in sql
-            return False
+            has_unkeyed_child_rows = False
+            return has_unkeyed_child_rows
 
         def transaction(self):
             raise AssertionError("propagation transaction should not start")
