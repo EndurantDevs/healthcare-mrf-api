@@ -1332,11 +1332,13 @@ fn insert_provider_definition(
     key: ProviderRefKey,
     entry: ProviderEntry,
 ) -> io::Result<()> {
-    // TiC provider_group_id definitions are unique; merging duplicates would invent membership.
-    if provider_map.contains_key(&key) {
+    if let Some(existing) = provider_map.get(&key) {
+        if existing == &entry {
+            return Ok(());
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("duplicate provider_group_id definition: {key}"),
+            format!("conflicting provider_group_id definition: {key}"),
         ));
     }
     provider_map.insert(key, entry);
@@ -1345,16 +1347,9 @@ fn insert_provider_definition(
 
 fn validate_preloaded_provider_definition(
     provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
-    seen_keys: &mut HashSet<ProviderRefKey>,
     key: &ProviderRefKey,
     entry: &ProviderEntry,
 ) -> io::Result<()> {
-    if !seen_keys.insert(key.clone()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("duplicate provider_group_id definition: {key}"),
-        ));
-    }
     match provider_map.get(key) {
         Some(preloaded) if preloaded == entry => Ok(()),
         Some(_) => Err(io::Error::new(
@@ -11415,7 +11410,6 @@ fn scan_compact_struson_inner(
             ));
         }
     };
-    let mut preloaded_provider_definition_keys = HashSet::new();
     let mut emitted_price_code_sets: HashSet<String> = HashSet::new();
     let mut emitted_price_atoms: HashSet<GlobalId128> = HashSet::new();
     let mut emitted_price_sets: HashSet<GlobalId128> = HashSet::new();
@@ -11487,12 +11481,7 @@ fn scan_compact_struson_inner(
                     let (key, entry) = provider_entry;
                     let insert_started_at = Instant::now();
                     if provider_references_preloaded {
-                        validate_preloaded_provider_definition(
-                            &provider_map,
-                            &mut preloaded_provider_definition_keys,
-                            &key,
-                            &entry,
-                        )?;
+                        validate_preloaded_provider_definition(&provider_map, &key, &entry)?;
                     } else {
                         insert_provider_definition(&mut provider_map, key, entry)?;
                     }
@@ -23815,37 +23804,48 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_provider_group_ids_are_rejected_without_membership_overwrite() {
+    fn identical_provider_group_ids_are_idempotent_and_conflicts_fail_closed() {
         let provider_ref = valid_provider_reference();
         let (key, entry) = provider_ref_definition(&provider_ref).unwrap();
         let mut provider_map = HashMap::new();
         insert_provider_definition(&mut provider_map, key.clone(), entry.clone()).unwrap();
-        let error = insert_provider_definition(&mut provider_map, key, entry).unwrap_err();
+        insert_provider_definition(&mut provider_map, key.clone(), entry.clone()).unwrap();
+        assert_eq!(provider_map.len(), 1);
+
+        let mut conflicting_ref = provider_ref.clone();
+        conflicting_ref["provider_groups"][0]["npi"] = json!([2222222222_i64]);
+        let conflicting_entry = build_provider_entry(&conflicting_ref).unwrap();
+        let error =
+            insert_provider_definition(&mut provider_map, key.clone(), conflicting_entry.clone())
+                .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error
             .to_string()
-            .contains("duplicate provider_group_id definition: 7"));
+            .contains("conflicting provider_group_id definition: 7"));
         assert_eq!(provider_map.len(), 1);
+        assert_eq!(provider_map.get(&key), Some(&entry));
 
         let mut left = HashMap::new();
-        left.insert(
-            ProviderRefKey::from("7"),
-            build_provider_entry(&provider_ref).unwrap(),
-        );
+        left.insert(key.clone(), entry.clone());
         let mut right = HashMap::new();
-        right.insert(
-            ProviderRefKey::from("7"),
-            build_provider_entry(&provider_ref).unwrap(),
-        );
+        right.insert(key.clone(), entry.clone());
+        let merged = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get(&key), Some(&entry));
+
+        let mut left = HashMap::new();
+        left.insert(key.clone(), entry.clone());
+        let mut right = HashMap::new();
+        right.insert(key, conflicting_entry);
         let error = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error
             .to_string()
-            .contains("duplicate provider_group_id definition: 7"));
+            .contains("conflicting provider_group_id definition: 7"));
     }
 
     #[test]
-    fn raw_provider_reference_worker_rejects_duplicate_group_ids() {
+    fn raw_provider_reference_worker_accepts_identical_group_ids() {
         let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
         let dedupe = SharedDedupe::new(1);
         let mut provider_map = HashMap::new();
@@ -23857,47 +23857,34 @@ mod tests {
             raw_refs.push_current_value_span(start);
         }
 
-        let error =
+        let processed =
             process_provider_ref_raw_batch(&raw_refs, &mut provider_map, &mut sinks, &dedupe)
-                .unwrap_err();
+                .unwrap();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error
-            .to_string()
-            .contains("duplicate provider_group_id definition: 7"));
+        assert_eq!(processed, 2);
         assert_eq!(provider_map.len(), 1);
     }
 
     #[test]
-    fn preloaded_reversed_order_scan_rejects_duplicate_group_ids() {
-        let _env_lock = scanner_env_lock().lock().unwrap();
-        let base = std::env::temp_dir().join(format!(
-            "ptg2-preloaded-duplicate-provider-id-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&base);
-        let input_path = base.join("input.json");
-        let serving_run_directory = base.join("serving-runs");
-        let provider_ref = serde_json::to_string(&valid_provider_reference()).unwrap();
-        std::fs::write(
-            &input_path,
-            format!(r#"{{"in_network":[],"provider_references":[{provider_ref},{provider_ref}]}}"#),
-        )
-        .unwrap();
-        let _strict_env = strict_scan_env(&serving_run_directory);
-        let _env = [
-            TestEnvVar::set("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", "false"),
-            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "0"),
-            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "0"),
-        ];
+    fn preloaded_provider_definitions_are_idempotent_and_conflicts_fail_closed() {
+        let provider_ref = valid_provider_reference();
+        let (key, entry) = provider_ref_definition(&provider_ref).unwrap();
+        let mut provider_map = HashMap::new();
+        provider_map.insert(key.clone(), entry.clone());
+        validate_preloaded_provider_definition(&provider_map, &key, &entry).unwrap();
+        validate_preloaded_provider_definition(&provider_map, &key, &entry).unwrap();
 
-        let error = scan_compact_struson(&input_path).unwrap_err();
+        let mut conflicting_ref = provider_ref.clone();
+        conflicting_ref["provider_groups"][0]["npi"] = json!([2222222222_i64]);
+        let conflicting_entry = build_provider_entry(&conflicting_ref).unwrap();
+
+        let error = validate_preloaded_provider_definition(&provider_map, &key, &conflicting_entry)
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error
             .to_string()
-            .contains("duplicate provider_group_id definition: 7"));
-        let _ = std::fs::remove_dir_all(base);
+            .contains("provider_group_id definition changed after preflight: 7"));
     }
 
     #[test]
@@ -24790,6 +24777,79 @@ mod tests {
             true,
             "JSON",
         );
+    }
+
+    #[test]
+    fn normal_order_parallel_byte_scan_accepts_identical_provider_definitions() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-normal-identical-provider-definitions-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let input_path = base.join("input.json");
+        let serving_path = base.join("serving.copy");
+        let serving_run_directory = base.join("serving-runs");
+        let provider_member_path = base.join("provider-group-member.copy");
+        let provider_reference = valid_provider_reference();
+        std::fs::write(
+            &input_path,
+            format!(
+                r#"{{
+                    "provider_references":[{provider_reference},{provider_reference}],
+                    "in_network":[{{
+                        "billing_code_type":"CPT",
+                        "billing_code":"99213",
+                        "negotiation_arrangement":"ffs",
+                        "negotiated_rates":[{{
+                            "provider_references":[7],
+                            "negotiated_prices":[{{
+                                "negotiated_type":"negotiated",
+                                "negotiated_rate":123.45
+                            }}]
+                        }}]
+                    }}]
+                }}"#
+            ),
+        )
+        .unwrap();
+        let _strict_env = strict_scan_env(&serving_run_directory);
+        let _env = [
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_WORKERS", "2"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_WORK_QUEUE", "8"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS", "1"),
+            TestEnvVar::set("HLTHPRT_PTG2_V3_SERVING_RUN_PARTITIONS", "2"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", "false"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", "true"),
+            TestEnvVar::set(
+                "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH",
+                serving_path.to_str().unwrap(),
+            ),
+            TestEnvVar::set(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH",
+                provider_member_path.to_str().unwrap(),
+            ),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "0"),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "0"),
+        ];
+
+        scan_compact_struson(&input_path).unwrap();
+
+        let serving_run_bytes = std::fs::read_dir(&serving_run_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("-partition-"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        let provider_member_rows = read_worker_copy_text(&provider_member_path).unwrap();
+        assert_eq!(serving_run_bytes, SERVING_RUN_RECORD_BYTES as u64);
+        assert_eq!(provider_member_rows.lines().count(), 1);
+        assert!(provider_member_rows.ends_with("\t1234567890\n"));
+        assert!(!serving_path.exists());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

@@ -50,6 +50,10 @@ PTG_CONTROL_HEARTBEAT_SOURCE = "engine-heartbeat"
 _FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
 _TERMINAL_RUN_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
+_PROVIDER_GROUP_DEFINITION_ERROR_MARKERS = (
+    "conflicting provider_group_id definition:",
+    "duplicate provider_group_id definition:",
+)
 
 
 def _exception_leaves(error: BaseException) -> tuple[BaseException, ...]:
@@ -76,6 +80,22 @@ def _ptg_failure_error(error: BaseException) -> dict[str, str]:
         return {
             "code": "ptg_source_witness_payload_budget_exceeded",
             "message": str(witness_budget_error),
+        }
+    provider_group_error = next(
+        (
+            leaf
+            for leaf in leaves
+            if any(
+                marker in str(leaf)
+                for marker in _PROVIDER_GROUP_DEFINITION_ERROR_MARKERS
+            )
+        ),
+        None,
+    )
+    if provider_group_error is not None:
+        return {
+            "code": "ptg_provider_group_definition_conflict",
+            "message": str(provider_group_error),
         }
     leaf_messages = tuple(
         dict.fromkeys(str(leaf).strip() for leaf in leaves if str(leaf).strip())
