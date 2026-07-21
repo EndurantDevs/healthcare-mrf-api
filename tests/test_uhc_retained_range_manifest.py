@@ -28,7 +28,7 @@ def _fixture(tmp_path: Path):
 
 
 def _load(fixture, **updates):
-    arguments = {
+    expectation_fields_by_name = {
         "raw_path": fixture["raw_path"],
         "manifest_path": fixture["manifest_path"],
         "expected_artifact_sha256": fixture["artifact_sha256"],
@@ -38,8 +38,8 @@ def _load(fixture, **updates):
         "expected_range_count": fixture["range_count"],
         "producer_build_id": fixture["producer_build_id"],
     }
-    arguments.update(updates)
-    return load_verified_range_manifest(**arguments)
+    expectation_fields_by_name.update(updates)
+    return load_verified_range_manifest(**expectation_fields_by_name)
 
 
 def _rewrite_manifest(fixture, mutation) -> None:

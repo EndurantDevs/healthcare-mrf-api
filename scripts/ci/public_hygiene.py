@@ -91,11 +91,11 @@ PATTERN_EXEMPT_PATHS = {
 
 def repository_files(*, include_untracked: bool = False) -> list[Path]:
     """List tracked repository files included in hygiene checks."""
-    command = ["git", "ls-files", "-z", "--cached"]
+    command_parts = ["git", "ls-files", "-z", "--cached"]
     if include_untracked:
-        command.extend(["--others", "--exclude-standard"])
+        command_parts.extend(["--others", "--exclude-standard"])
     result = subprocess.run(
-        command,
+        command_parts,
         check=True,
         stdout=subprocess.PIPE,
     )

@@ -1823,6 +1823,79 @@ def test_fhir_scoped_artifact_classifier(artifact_options):
 
 
 @pytest.mark.parametrize(
+    "relation_targets",
+    [
+        "dataset_network_plan",
+        "dataset_affiliation_organization",
+        "dataset_network_plan,dataset_affiliation_organization",
+        " dataset_affiliation_organization , dataset_network_plan ",
+    ],
+)
+@pytest.mark.parametrize("publish_corroboration", [None, False])
+def test_fhir_source_local_relation_artifact_classifier(
+    relation_targets,
+    publish_corroboration,
+):
+    params_by_name = _provider_directory_artifact_params(
+        "pdfhir_summary",
+        publish_artifacts_targets=relation_targets,
+        publish_corroboration=publish_corroboration,
+    )
+
+    operation_kind, source_ids, endpoint_scope = (
+        control_imports._provider_directory_operation(params_by_name)
+    )
+
+    assert operation_kind == (
+        control_imports._PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT
+    )
+    assert source_ids == frozenset({"pdfhir_summary"})
+    assert endpoint_scope is None
+
+
+@pytest.mark.parametrize(
+    "unsafe_overrides",
+    [
+        {"publish_artifacts_targets": ""},
+        {"publish_artifacts_targets": ","},
+        {"publish_artifacts_targets": "dataset_network_plan,"},
+        {
+            "publish_artifacts_targets": (
+                "dataset_network_plan,dataset_network_plan"
+            )
+        },
+        {"publish_artifacts_targets": "network_catalog"},
+        {"publish_artifacts_targets": ["dataset_network_plan"]},
+        {
+            "publish_artifacts_targets": "dataset_network_plan",
+            "publish_corroboration": True,
+        },
+        {
+            "publish_artifacts_targets": "dataset_network_plan",
+            "publish_corroboration": "false",
+        },
+        {
+            "publish_artifacts_targets": "dataset_network_plan",
+            "publish_corroboration": 0,
+        },
+    ],
+)
+def test_fhir_relation_artifact_classifier_fails_closed(unsafe_overrides):
+    params_by_name = _provider_directory_artifact_params(
+        "pdfhir_summary",
+        **unsafe_overrides,
+    )
+
+    operation_kind, source_ids, endpoint_scope = (
+        control_imports._provider_directory_operation(params_by_name)
+    )
+
+    assert operation_kind == control_imports._PROVIDER_DIRECTORY_SCOPED_ARTIFACT
+    assert source_ids == frozenset({"pdfhir_summary"})
+    assert endpoint_scope is None
+
+
+@pytest.mark.parametrize(
     "unsafe_override",
     [
         {"source_ids": None},
@@ -1840,8 +1913,16 @@ def test_fhir_scoped_artifact_classifier(artifact_options):
         {"publish_artifacts": True},
     ],
 )
-def test_fhir_exclusive_artifact_classifier(unsafe_override):
-    params_by_name = _provider_directory_artifact_params("pdfhir_artifact", **unsafe_override)
+@pytest.mark.parametrize(
+    "artifact_options",
+    [{}, {"publish_artifacts_targets": "dataset_network_plan"}],
+)
+def test_fhir_exclusive_artifact_classifier(unsafe_override, artifact_options):
+    params_by_name = _provider_directory_artifact_params(
+        "pdfhir_artifact",
+        **artifact_options,
+        **unsafe_override,
+    )
 
     operation_kind, _, _ = control_imports._provider_directory_operation(params_by_name)
 
@@ -1975,6 +2056,96 @@ def test_fhir_artifact_conflicts():
     assert control_imports._provider_directory_blocking_run(overlapping_artifact, [acquisition_run]) == acquisition_run
     assert control_imports._provider_directory_blocking_run(second_artifact, [artifact_run]) == artifact_run
     assert control_imports._provider_directory_blocking_run(overlapping_acquisition, [artifact_run]) == artifact_run
+
+
+def test_fhir_source_local_relation_artifacts_allow_only_disjoint_parallel_work():
+    relation_targets = (
+        "dataset_network_plan,dataset_affiliation_organization"
+    )
+    first_params = _provider_directory_artifact_params(
+        "pdfhir_first",
+        publish_artifacts_targets=relation_targets,
+    )
+    first_run = _provider_directory_artifact_run(
+        "run_first_summary",
+        "pdfhir_first",
+    )
+    first_run["params"] = first_params
+    disjoint_params = _provider_directory_artifact_params(
+        "pdfhir_second",
+        publish_artifacts_targets=relation_targets,
+    )
+    overlapping_params_by_name = {
+        **disjoint_params,
+        "source_ids": ["pdfhir_first"],
+    }
+    general_artifact_params = _provider_directory_artifact_params(
+        "pdfhir_third",
+        publish_artifacts_targets="address_archive,entity_address",
+    )
+    general_artifact_run = _provider_directory_artifact_run(
+        "run_general",
+        "pdfhir_general",
+    )
+
+    assert (
+        control_imports._provider_directory_blocking_run(
+            disjoint_params,
+            [first_run],
+        )
+        is None
+    )
+    assert control_imports._provider_directory_blocking_run(
+        overlapping_params_by_name,
+        [first_run],
+    ) == first_run
+    assert control_imports._provider_directory_blocking_run(
+        general_artifact_params,
+        [first_run],
+    ) == first_run
+    assert control_imports._provider_directory_blocking_run(
+        disjoint_params,
+        [general_artifact_run],
+    ) == general_artifact_run
+
+
+def test_fhir_relation_artifacts_share_source_overlap_rules_with_other_work():
+    relation_params = _provider_directory_artifact_params(
+        "pdfhir_relation",
+        publish_artifacts_targets="dataset_network_plan",
+    )
+    relation_run = _provider_directory_artifact_run(
+        "run_relation",
+        "pdfhir_relation",
+    )
+    relation_run["params"] = relation_params
+    disjoint_acquisition = _provider_directory_acquisition_params(
+        "pdfhir_other",
+        "https://other.example.org/fhir",
+    )
+    overlapping_acquisition = _provider_directory_acquisition_params(
+        "pdfhir_relation",
+        "https://relation.example.org/fhir",
+    )
+
+    assert control_imports._provider_directory_blocking_run(
+        disjoint_acquisition,
+        [relation_run],
+    ) is None
+    assert control_imports._provider_directory_blocking_run(
+        overlapping_acquisition,
+        [relation_run],
+    ) == relation_run
+    assert control_imports._provider_directory_blocking_run(
+        relation_params,
+        [
+            _provider_directory_active_run(
+                "run_other",
+                "pdfhir_other",
+                "https://other.example.org/fhir",
+            )
+        ],
+    ) is None
 
 
 def test_provider_directory_legacy_active_group_scope_controls_parallel_admission(monkeypatch):

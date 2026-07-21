@@ -449,6 +449,25 @@ jobs:
         env:
           HLTHPRT_MRF_DISCOVERY_CHECKPOINT_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
         run: python -m pytest -q tests/test_mrf_discovery_checkpoints_postgres.py
+      - name: Run control import admission PostgreSQL gate
+        env:
+          HLTHPRT_DB_DATABASE: control_imports_test_ci_runner
+          PGPASSWORD: ${{ env.HLTHPRT_DB_PASSWORD }}
+        run: |
+          cleanup_database() {
+            dropdb --if-exists \
+              --host "$HLTHPRT_DB_HOST" \
+              --port "$HLTHPRT_DB_PORT" \
+              --username "$HLTHPRT_DB_USER" \
+              control_imports_test_ci_runner
+          }
+          trap cleanup_database EXIT
+          createdb \
+            --host "$HLTHPRT_DB_HOST" \
+            --port "$HLTHPRT_DB_PORT" \
+            --username "$HLTHPRT_DB_USER" \
+            control_imports_test_ci_runner
+          python -m pytest -q tests/test_control_imports_db.py
       - name: Run retained UHC admission PostgreSQL gate
         env:
           HLTHPRT_UHC_RETAINED_ADMISSION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/uhc_retained_admission_test_ci_runner"
@@ -468,7 +487,9 @@ jobs:
             --port "$HLTHPRT_DB_PORT" \
             --username "$HLTHPRT_DB_USER" \
             uhc_retained_admission_test_ci_runner
-          python -m pytest -q tests/test_uhc_retained_admission_postgres.py
+          python -m pytest -q \
+            tests/test_uhc_retained_admission_postgres.py \
+            tests/test_uhc_retained_admission_concurrency_postgres.py
       - name: Run strict shared PTG PostgreSQL publish, graph, and cold-read smoke
         env:
           HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST: "1"

@@ -65,11 +65,11 @@ class _QueryParamCollector(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         if isinstance(func, ast.Attribute) and func.attr in {"get", "getlist"}:
-            if self._resolves_to_request_args(func.value):
+            if self._is_request_args_resolution(func.value):
                 if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     self.params.add(node.args[0].value)
         if isinstance(func, ast.Name) and func.id == "_get_list_param":
-            if node.args and self._resolves_to_request_args(node.args[0]):
+            if node.args and self._is_request_args_resolution(node.args[0]):
                 if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
                     self.params.add(node.args[1].value)
         self.generic_visit(node)
@@ -83,7 +83,7 @@ class _QueryParamCollector(ast.NodeVisitor):
             and node.attr == "args"
         )
 
-    def _resolves_to_request_args(self, node: ast.AST) -> bool:
+    def _is_request_args_resolution(self, node: ast.AST) -> bool:
         if self._is_request_args(node):
             return True
         if isinstance(node, ast.Name) and node.id in self.aliases:

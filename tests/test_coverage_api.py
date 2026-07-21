@@ -42,10 +42,10 @@ def make_request(results=None):
 
 @pytest.mark.asyncio
 async def test_coverage_statistics_success(monkeypatch):
-    async def _all_tables_exist(_session, _table):
+    async def _is_every_table_present(_session, _table):
         return True
 
-    monkeypatch.setattr(coverage_module, "_table_exists", _all_tables_exist)
+    monkeypatch.setattr(coverage_module, "_table_exists", _is_every_table_present)
 
     request = make_request(
         [
@@ -91,10 +91,10 @@ async def test_coverage_statistics_success(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_coverage_statistics_missing_tables_return_zero(monkeypatch):
-    async def _no_tables_exist(_session, _table):
+    async def _is_every_table_missing(_session, _table):
         return False
 
-    monkeypatch.setattr(coverage_module, "_table_exists", _no_tables_exist)
+    monkeypatch.setattr(coverage_module, "_table_exists", _is_every_table_missing)
 
     request = make_request([])
     response = await coverage_statistics(request)

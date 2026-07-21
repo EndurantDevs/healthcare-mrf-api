@@ -1428,7 +1428,7 @@ def test_provider_directory_coverage_audit_reference_id_expr_accepts_absolute_ur
 
 @pytest.mark.asyncio
 async def test_provider_directory_coverage_audit_unified_summary_fast_probe(monkeypatch):
-    async def relation_exists(_conn, _schema, table):
+    async def is_relation_present(_conn, _schema, table):
         return table == "entity_address_unified"
 
     class FakeConn:
@@ -1448,7 +1448,7 @@ async def test_provider_directory_coverage_audit_unified_summary_fast_probe(monk
             }
 
     conn = FakeConn()
-    monkeypatch.setattr(audit, "_has_relation", relation_exists)
+    monkeypatch.setattr(audit, "_has_relation", is_relation_present)
 
     summary = await audit._unified_summary(conn, "mrf", fast_probe=True)
 
@@ -1843,7 +1843,7 @@ def test_plan_context_uses_ref_resources():
 
 @pytest.mark.asyncio
 async def test_provider_directory_coverage_audit_network_catalog_summary(monkeypatch):
-    async def relation_exists(_conn, _schema, table):
+    async def is_relation_present(_conn, _schema, table):
         return table == "provider_directory_network_catalog"
 
     class FakeConn:
@@ -1883,7 +1883,7 @@ async def test_provider_directory_coverage_audit_network_catalog_summary(monkeyp
             ]
 
     conn = FakeConn()
-    monkeypatch.setattr(audit, "_has_relation", relation_exists)
+    monkeypatch.setattr(audit, "_has_relation", is_relation_present)
 
     summary = await audit._network_catalog_summary(conn, "mrf", sample_limit=5)
 
@@ -3094,7 +3094,7 @@ async def test_provider_directory_coverage_audit_fast_readiness_skips_exact_unif
 
 @pytest.mark.asyncio
 async def test_practitioner_role_reimport_gap_summary_flags_missing_roles(monkeypatch):
-    async def relation_exists(_conn, _schema, table):
+    async def is_relation_present(_conn, _schema, table):
         return table in {
             "provider_directory_source",
             "provider_directory_practitioner",
@@ -3140,7 +3140,7 @@ async def test_practitioner_role_reimport_gap_summary_flags_missing_roles(monkey
             ]
 
     conn = FakeConn()
-    monkeypatch.setattr(audit, "_has_relation", relation_exists)
+    monkeypatch.setattr(audit, "_has_relation", is_relation_present)
 
     summary = await audit._practitioner_role_reimport_gap_summary(conn, "mrf", sample_limit=5)
 

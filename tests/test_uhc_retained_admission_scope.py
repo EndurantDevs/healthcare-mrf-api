@@ -21,6 +21,54 @@ def _load_migration():
     return module
 
 
+def _assert_normalized_schema_columns(created_tables) -> None:
+    assert [table[0] for table in created_tables] == [
+        "provider_directory_uhc_raw_artifact",
+        "provider_directory_uhc_raw_layout",
+        "provider_directory_uhc_source_binding",
+        "provider_directory_uhc_raw_range",
+        "provider_directory_uhc_artifact_reference",
+    ]
+    elements_by_table = {
+        name: table_elements
+        for name, table_elements, _kwargs in created_tables
+    }
+    raw_columns = {
+        column.name
+        for column in elements_by_table["provider_directory_uhc_raw_artifact"]
+    }
+    assert "contract_version" not in raw_columns
+    assert "range_set_sha256" not in raw_columns
+    layout_columns = {
+        column.name
+        for column in elements_by_table["provider_directory_uhc_raw_layout"]
+    }
+    assert {
+        "contract_version",
+        "range_count",
+        "range_set_sha256",
+        "manifest_sha256",
+        "producer_build_id",
+    }.issubset(layout_columns)
+    range_columns = {
+        column.name
+        for column in elements_by_table["provider_directory_uhc_raw_range"]
+    }
+    assert {
+        "raw_byte_start",
+        "raw_byte_end",
+        "raw_sha256",
+        "canonical_sha256",
+    }.issubset(range_columns)
+    assert "storage_uri" not in range_columns
+    binding_columns = {
+        column.name
+        for column in elements_by_table["provider_directory_uhc_source_binding"]
+    }
+    assert "contract_version" not in binding_columns
+    assert "range_count" not in binding_columns
+
+
 def test_admission_schema_normalizes_raw_layout_ranges_bindings_and_references(
     monkeypatch,
 ):
@@ -30,8 +78,8 @@ def test_admission_schema_normalizes_raw_layout_ranges_bindings_and_references(
     monkeypatch.setattr(
         migration.op,
         "create_table",
-        lambda name, *items, **kwargs: created_tables.append(
-            (name, items, kwargs)
+        lambda name, *table_elements, **kwargs: created_tables.append(
+            (name, table_elements, kwargs)
         ),
     )
     monkeypatch.setattr(
@@ -42,43 +90,7 @@ def test_admission_schema_normalizes_raw_layout_ranges_bindings_and_references(
 
     migration.upgrade()
 
-    assert [table[0] for table in created_tables] == [
-        "provider_directory_uhc_raw_artifact",
-        "provider_directory_uhc_raw_layout",
-        "provider_directory_uhc_source_binding",
-        "provider_directory_uhc_raw_range",
-        "provider_directory_uhc_artifact_reference",
-    ]
-    item_by_table = {name: items for name, items, _kwargs in created_tables}
-    raw_columns = {item.name for item in item_by_table["provider_directory_uhc_raw_artifact"]}
-    assert "contract_version" not in raw_columns
-    assert "range_set_sha256" not in raw_columns
-    layout_columns = {
-        item.name for item in item_by_table["provider_directory_uhc_raw_layout"]
-    }
-    assert {
-        "contract_version",
-        "range_count",
-        "range_set_sha256",
-        "manifest_sha256",
-        "producer_build_id",
-    }.issubset(layout_columns)
-    range_columns = {
-        item.name for item in item_by_table["provider_directory_uhc_raw_range"]
-    }
-    assert {
-        "raw_byte_start",
-        "raw_byte_end",
-        "raw_sha256",
-        "canonical_sha256",
-    }.issubset(range_columns)
-    assert "storage_uri" not in range_columns
-    binding_columns = {
-        item.name
-        for item in item_by_table["provider_directory_uhc_source_binding"]
-    }
-    assert "contract_version" not in binding_columns
-    assert "range_count" not in binding_columns
+    _assert_normalized_schema_columns(created_tables)
     assert len(created_indexes) == 1
 
 
@@ -107,16 +119,16 @@ def test_schema_primary_keys_allow_shared_raw_and_multiple_layouts():
 
 def test_downgrade_drops_dependents_before_raw_tables(monkeypatch):
     migration = _load_migration()
-    dropped = []
+    dropped_tables = []
     monkeypatch.setattr(
         migration.op,
         "drop_table",
-        lambda table_name, **_kwargs: dropped.append(table_name),
+        lambda table_name, **_kwargs: dropped_tables.append(table_name),
     )
 
     migration.downgrade()
 
-    assert dropped == [
+    assert dropped_tables == [
         "provider_directory_uhc_artifact_reference",
         "provider_directory_uhc_raw_range",
         "provider_directory_uhc_source_binding",

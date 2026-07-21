@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 
 from process.uhc_retained_types import (
@@ -28,6 +29,43 @@ RANGE_CONTRACT_VERSION = 2
 RANGE_CANONICALIZATION_ID = "json-object-remove-crlf-append-lf.v1"
 _MAX_DATABASE_INTEGER = 2**63 - 1
 _MAX_RANGE_MANIFEST_BYTES = 1024 * 1024
+_RANGE_ENTRY_FIELDS = {
+    "range_ordinal",
+    "raw_byte_start",
+    "raw_byte_end",
+    "raw_byte_count",
+    "raw_sha256",
+    "record_start",
+    "record_end",
+    "record_count",
+    "canonical_sha256",
+    "canonical_byte_count",
+}
+_MANIFEST_FIELDS = {
+    "contract_id",
+    "contract_version",
+    "canonicalization_id",
+    "producer_build_id",
+    "raw_artifact",
+    "range_count",
+    "ranges",
+    "range_set_sha256",
+}
+
+
+@dataclass(frozen=True)
+class RangeManifestExpectation:
+    """Exact file identities and contract fields required during verification."""
+
+    raw_path: Path
+    manifest_path: Path
+    artifact_sha256: str
+    artifact_bytes: int
+    manifest_sha256: str
+    manifest_bytes: int
+    range_count: int
+    producer_build_id: str
+    verify_raw_bytes: bool = True
 
 
 def retained_raw_path(output_root: Path, artifact_sha256: str) -> Path:
@@ -55,6 +93,50 @@ def range_manifest_path(
     )
 
 
+def _manifest_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_mode,
+        metadata.st_nlink,
+    )
+
+
+def _read_descriptor_bytes(descriptor: int, byte_count: int) -> bytes:
+    encoded_parts = []
+    remaining_bytes = byte_count
+    while remaining_bytes:
+        encoded_part = os.read(descriptor, min(64 * 1024, remaining_bytes))
+        if not encoded_part:
+            raise UHCRetainedAdmissionError(
+                "retained range manifest changed while reading"
+            )
+        encoded_parts.append(encoded_part)
+        remaining_bytes -= len(encoded_part)
+    return b"".join(encoded_parts)
+
+
+def _read_manifest_descriptor(descriptor: int) -> bytes:
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_mode & 0o022
+    ):
+        raise UHCRetainedAdmissionError("retained range manifest is invalid")
+    if before.st_size <= 0 or before.st_size > _MAX_RANGE_MANIFEST_BYTES:
+        raise UHCRetainedAdmissionError("retained range manifest exceeds byte limit")
+    encoded_manifest = _read_descriptor_bytes(descriptor, before.st_size)
+    if _manifest_file_identity(os.fstat(descriptor)) != _manifest_file_identity(before):
+        raise UHCRetainedAdmissionError(
+            "retained range manifest changed while reading"
+        )
+    return encoded_manifest
+
+
 def _read_manifest_bytes(manifest_path: Path) -> bytes:
     """Read one stable regular manifest under a strict memory cap."""
 
@@ -62,55 +144,7 @@ def _read_manifest_bytes(manifest_path: Path) -> bytes:
     try:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(manifest_path, flags)
-        before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_mode & 0o022
-        ):
-            raise UHCRetainedAdmissionError("retained range manifest is invalid")
-        if before.st_size <= 0 or before.st_size > _MAX_RANGE_MANIFEST_BYTES:
-            raise UHCRetainedAdmissionError(
-                "retained range manifest exceeds byte limit"
-            )
-        encoded_parts = []
-        remaining_bytes = before.st_size
-        while remaining_bytes:
-            encoded_part = os.read(
-                descriptor,
-                min(64 * 1024, remaining_bytes),
-            )
-            if not encoded_part:
-                raise UHCRetainedAdmissionError(
-                    "retained range manifest changed while reading"
-                )
-            encoded_parts.append(encoded_part)
-            remaining_bytes -= len(encoded_part)
-        encoded_manifest = b"".join(encoded_parts)
-        after = os.fstat(descriptor)
-        identity_before = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-            before.st_mode,
-            before.st_nlink,
-        )
-        identity_after = (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-            after.st_mode,
-            after.st_nlink,
-        )
-        if identity_after != identity_before:
-            raise UHCRetainedAdmissionError(
-                "retained range manifest changed while reading"
-            )
-        return encoded_manifest
+        return _read_manifest_descriptor(descriptor)
     except OSError as error:
         raise UHCRetainedAdmissionError(
             "retained range manifest is invalid"
@@ -181,7 +215,7 @@ def range_set_digest(
     return digest.hexdigest()
 
 
-def _range_from_manifest(
+def _decode_range_manifest_entry(
     range_mapping: object,
     *,
     raw_path: Path,
@@ -191,21 +225,11 @@ def _range_from_manifest(
     expected_record_start: int,
     previous_byte_end: int,
 ) -> RawRangeProof:
+    """Decode one exact manifest entry and enforce contiguous bounds."""
+
     if not isinstance(range_mapping, dict):
         raise UHCRetainedAdmissionError("retained range manifest entry is invalid")
-    expected_fields = {
-        "range_ordinal",
-        "raw_byte_start",
-        "raw_byte_end",
-        "raw_byte_count",
-        "raw_sha256",
-        "record_start",
-        "record_end",
-        "record_count",
-        "canonical_sha256",
-        "canonical_byte_count",
-    }
-    if set(range_mapping) != expected_fields:
+    if set(range_mapping) != _RANGE_ENTRY_FIELDS:
         raise UHCRetainedAdmissionError("retained range manifest entry shape is invalid")
     raw_range = RawRangeProof(
         artifact_sha256=artifact_sha256,
@@ -266,7 +290,7 @@ def _ranges_from_manifest(
     expected_record_start = 0
     previous_byte_end = 0
     for range_ordinal, range_mapping in enumerate(range_mappings):
-        raw_range = _range_from_manifest(
+        raw_range = _decode_range_manifest_entry(
             range_mapping,
             raw_path=raw_path,
             artifact_sha256=artifact_sha256,
@@ -312,122 +336,165 @@ def _validate_build_id(build_id: str, *, label: str) -> str:
     return build_id
 
 
-def load_verified_range_manifest(
-    *,
-    raw_path: Path,
-    manifest_path: Path,
-    expected_artifact_sha256: str,
-    expected_artifact_bytes: int,
-    expected_manifest_sha256: str,
-    expected_manifest_bytes: int,
-    expected_range_count: int,
-    producer_build_id: str,
-    verify_raw_bytes: bool = True,
-) -> tuple[RetainedRawArtifactProof, tuple[RawRangeProof, ...]]:
-    """Verify exact files and decode one complete native range proof."""
-
+def _load_verified_manifest_document(
+    expectation: RangeManifestExpectation,
+) -> dict[str, object]:
     _validate_artifact_identity(
-        expected_artifact_sha256,
-        expected_artifact_bytes,
+        expectation.artifact_sha256,
+        expectation.artifact_bytes,
     )
-    _validate_artifact_identity(expected_manifest_sha256, expected_manifest_bytes)
-    _validate_range_count(expected_range_count)
-    _validate_build_id(producer_build_id, label="producer build ID")
-    output_root = raw_path.parent.resolve()
-    expected_raw_path = retained_raw_path(
+    _validate_artifact_identity(
+        expectation.manifest_sha256,
+        expectation.manifest_bytes,
+    )
+    _validate_range_count(expectation.range_count)
+    _validate_build_id(expectation.producer_build_id, label="producer build ID")
+    output_root = expectation.raw_path.parent.resolve()
+    canonical_raw_path = retained_raw_path(
         output_root,
-        expected_artifact_sha256,
+        expectation.artifact_sha256,
     ).resolve()
-    expected_manifest_path = range_manifest_path(
+    canonical_manifest_path = range_manifest_path(
         output_root,
-        expected_artifact_sha256,
-        expected_range_count,
+        expectation.artifact_sha256,
+        expectation.range_count,
     ).resolve()
-    observed_raw_path = output_root / raw_path.name
-    observed_manifest_path = output_root / manifest_path.name
-    if (
-        observed_raw_path != expected_raw_path
-        or observed_manifest_path != expected_manifest_path
+    if output_root / expectation.raw_path.name != canonical_raw_path or (
+        output_root / expectation.manifest_path.name != canonical_manifest_path
     ):
         raise UHCRetainedAdmissionError("retained range artifact path is not canonical")
-    if verify_raw_bytes:
+    if expectation.verify_raw_bytes:
         _verify_artifact(
-            raw_path,
-            expected_artifact_sha256,
-            expected_artifact_bytes,
+            expectation.raw_path,
+            expectation.artifact_sha256,
+            expectation.artifact_bytes,
         )
-    encoded_manifest = _read_manifest_bytes(manifest_path)
-    if (
-        len(encoded_manifest) != expected_manifest_bytes
-        or hashlib.sha256(encoded_manifest).hexdigest() != expected_manifest_sha256
+    encoded_manifest = _read_manifest_bytes(expectation.manifest_path)
+    if len(encoded_manifest) != expectation.manifest_bytes or (
+        hashlib.sha256(encoded_manifest).hexdigest()
+        != expectation.manifest_sha256
     ):
         raise UHCRetainedAdmissionError("retained range manifest proof does not match")
-    manifest = _strict_manifest(encoded_manifest)
-    expected_fields = {
-        "contract_id",
-        "contract_version",
-        "canonicalization_id",
-        "producer_build_id",
-        "raw_artifact",
-        "range_count",
-        "ranges",
-        "range_set_sha256",
-    }
-    if set(manifest) != expected_fields:
+    return _strict_manifest(encoded_manifest)
+
+
+def _decode_manifest_collections(
+    manifest: dict[str, object],
+    expectation: RangeManifestExpectation,
+) -> tuple[int, list[object]]:
+    if set(manifest) != _MANIFEST_FIELDS:
         raise UHCRetainedAdmissionError("retained range manifest shape is invalid")
     if (
         manifest["contract_id"] != RANGE_CONTRACT_ID
         or manifest["contract_version"] != RANGE_CONTRACT_VERSION
         or manifest["canonicalization_id"] != RANGE_CANONICALIZATION_ID
-        or manifest["producer_build_id"] != producer_build_id
-        or manifest["range_count"] != expected_range_count
+        or manifest["producer_build_id"] != expectation.producer_build_id
+        or manifest["range_count"] != expectation.range_count
     ):
         raise UHCRetainedAdmissionError("retained range manifest contract is invalid")
     raw_mapping = manifest["raw_artifact"]
     range_mappings = manifest["ranges"]
     if not isinstance(raw_mapping, dict) or not isinstance(range_mappings, list):
         raise UHCRetainedAdmissionError("retained range manifest shape is invalid")
+    record_count = _required_integer(raw_mapping, "record_count", minimum=1)
     expected_raw_mapping = {
-        "file_name": raw_path.name,
-        "sha256": expected_artifact_sha256,
-        "byte_count": expected_artifact_bytes,
-        "record_count": _required_integer(raw_mapping, "record_count", minimum=1),
+        "file_name": expectation.raw_path.name,
+        "sha256": expectation.artifact_sha256,
+        "byte_count": expectation.artifact_bytes,
+        "record_count": record_count,
     }
     if raw_mapping != expected_raw_mapping:
         raise UHCRetainedAdmissionError("retained range raw identity is invalid")
-    record_count = expected_raw_mapping["record_count"]
-    ranges = _ranges_from_manifest(
-        range_mappings,
-        raw_path=raw_path,
-        artifact_sha256=expected_artifact_sha256,
-        artifact_byte_count=expected_artifact_bytes,
-        record_count=record_count,
-        range_count=expected_range_count,
-    )
-    expected_range_set_sha256 = range_set_digest(
-        expected_artifact_sha256,
-        expected_artifact_bytes,
-        record_count,
-        ranges,
-    )
-    if manifest["range_set_sha256"] != expected_range_set_sha256:
-        raise UHCRetainedAdmissionError("retained range-set identity is invalid")
+    return record_count, range_mappings
+
+
+def _build_retained_artifact_proof(
+    expectation: RangeManifestExpectation,
+    *,
+    record_count: int,
+    retained_ranges: tuple[RawRangeProof, ...],
+    range_set_sha256: str,
+) -> RetainedRawArtifactProof:
     raw_artifact = RetainedRawArtifactProof(
-        path=str(raw_path),
-        sha256=expected_artifact_sha256,
-        byte_count=expected_artifact_bytes,
+        path=str(expectation.raw_path),
+        sha256=expectation.artifact_sha256,
+        byte_count=expectation.artifact_bytes,
         record_count=record_count,
         contract_version=RANGE_CONTRACT_VERSION,
-        range_count=expected_range_count,
-        producer_build_id=producer_build_id,
-        range_set_sha256=expected_range_set_sha256,
+        range_count=expectation.range_count,
+        producer_build_id=expectation.producer_build_id,
+        range_set_sha256=range_set_sha256,
         canonical_byte_count=sum(
-            raw_range.canonical_byte_count for raw_range in ranges
+            raw_range.canonical_byte_count for raw_range in retained_ranges
         ),
-        manifest_path=str(manifest_path),
-        manifest_sha256=expected_manifest_sha256,
-        manifest_byte_count=expected_manifest_bytes,
+        manifest_path=str(expectation.manifest_path),
+        manifest_sha256=expectation.manifest_sha256,
+        manifest_byte_count=expectation.manifest_bytes,
     )
     if raw_artifact.canonical_byte_count > _MAX_DATABASE_INTEGER:
         raise UHCRetainedAdmissionError("retained canonical byte count is invalid")
-    return raw_artifact, ranges
+    return raw_artifact
+
+
+def _load_verified_range_manifest(
+    expectation: RangeManifestExpectation,
+) -> tuple[RetainedRawArtifactProof, tuple[RawRangeProof, ...]]:
+    """Verify exact files and decode one complete native range proof."""
+
+    manifest = _load_verified_manifest_document(expectation)
+    record_count, range_mappings = _decode_manifest_collections(
+        manifest,
+        expectation,
+    )
+    retained_ranges = _ranges_from_manifest(
+        range_mappings,
+        raw_path=expectation.raw_path,
+        artifact_sha256=expectation.artifact_sha256,
+        artifact_byte_count=expectation.artifact_bytes,
+        record_count=record_count,
+        range_count=expectation.range_count,
+    )
+    range_set_sha256 = range_set_digest(
+        expectation.artifact_sha256,
+        expectation.artifact_bytes,
+        record_count,
+        retained_ranges,
+    )
+    if manifest["range_set_sha256"] != range_set_sha256:
+        raise UHCRetainedAdmissionError("retained range-set identity is invalid")
+    return (
+        _build_retained_artifact_proof(
+            expectation,
+            record_count=record_count,
+            retained_ranges=retained_ranges,
+            range_set_sha256=range_set_sha256,
+        ),
+        retained_ranges,
+    )
+
+
+def load_verified_range_manifest(**expectation_fields: object) -> tuple[RetainedRawArtifactProof, tuple[RawRangeProof, ...]]:
+    """Verify exact files using the stable keyword-only manifest contract."""
+
+    if not set(expectation_fields).issubset({
+        "raw_path", "manifest_path", "expected_artifact_sha256",
+        "expected_artifact_bytes", "expected_manifest_sha256",
+        "expected_manifest_bytes", "expected_range_count", "producer_build_id",
+        "verify_raw_bytes",
+    }):
+        raise TypeError("unexpected retained range manifest argument")
+    try:
+        expectation = RangeManifestExpectation(
+            raw_path=expectation_fields["raw_path"],
+            manifest_path=expectation_fields["manifest_path"],
+            artifact_sha256=expectation_fields["expected_artifact_sha256"],
+            artifact_bytes=expectation_fields["expected_artifact_bytes"],
+            manifest_sha256=expectation_fields["expected_manifest_sha256"],
+            manifest_bytes=expectation_fields["expected_manifest_bytes"],
+            range_count=expectation_fields["expected_range_count"],
+            producer_build_id=expectation_fields["producer_build_id"],
+            verify_raw_bytes=expectation_fields.get("verify_raw_bytes", True),
+        )
+    except KeyError as error:
+        raise TypeError("missing retained range manifest argument") from error
+    return _load_verified_range_manifest(expectation)

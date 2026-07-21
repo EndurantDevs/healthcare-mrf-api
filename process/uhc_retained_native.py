@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import math
 import os
@@ -18,7 +17,10 @@ from process.ptg_parts.config import PTG2_RUST_SCANNER_BIN_ENV
 from process.ptg_parts.rust_scanner import (
     _await_cancellation_resistant_cleanup,
     _subprocess_session_options,
-    _terminate_asyncio_subprocess_group,
+)
+from process.uhc_retained_native_process import (
+    cleanup_native_process as _cleanup_native_process,
+    collect_process_output as _collect_process_output,
 )
 from process.uhc_retained_range_manifest import (
     RANGE_CANONICALIZATION_ID,
@@ -73,6 +75,20 @@ class _NativeAttestation:
     proof_identity: tuple[object, ...]
     file_identities: tuple[FileIdentity, FileIdentity]
     consumed: bool = False
+
+
+@dataclass(frozen=True)
+class _NativeSummaryProof:
+    producer_build_id: str
+    verifier_build_id: str
+    record_count: int
+    manifest_sha256: str
+    manifest_byte_count: int
+    raw_path: Path
+    manifest_path: Path
+    raw_reused: bool
+    manifest_reused: bool
+    timings: tuple[tuple[str, float], ...]
 
 
 def _proof_identity(source: VerifiedRetainedSource) -> tuple[object, ...]:
@@ -175,73 +191,6 @@ def _timeout_seconds() -> float:
     return timeout
 
 
-async def _read_bounded(
-    stream: asyncio.StreamReader,
-    *,
-    byte_limit: int,
-    label: str,
-) -> bytes:
-    chunks = bytearray()
-    while True:
-        remaining = byte_limit + 1 - len(chunks)
-        chunk = await stream.read(min(64 * 1024, remaining))
-        if not chunk:
-            return bytes(chunks)
-        chunks.extend(chunk)
-        if len(chunks) > byte_limit:
-            raise UHCRetainedAdmissionError(
-                f"UHC native retention {label} exceeds the byte limit"
-            )
-
-
-async def _collect_process_output(
-    process: asyncio.subprocess.Process,
-) -> tuple[bytes, bytes, int]:
-    if process.stdout is None or process.stderr is None:
-        raise UHCRetainedAdmissionError("UHC native retention pipes are unavailable")
-    stdout_task = asyncio.create_task(
-        _read_bounded(
-            process.stdout,
-            byte_limit=_MAX_STDOUT_BYTES,
-            label="stdout",
-        )
-    )
-    stderr_task = asyncio.create_task(
-        _read_bounded(
-            process.stderr,
-            byte_limit=_MAX_STDERR_BYTES,
-            label="stderr",
-        )
-    )
-    try:
-        stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
-        return_code = await process.wait()
-        return stdout, stderr, int(return_code)
-    finally:
-        for task in (stdout_task, stderr_task):
-            if not task.done():
-                task.cancel()
-        for task in (stdout_task, stderr_task):
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-
-
-async def _cleanup_native_process(
-    process: asyncio.subprocess.Process | None,
-    spawn_task: asyncio.Task[asyncio.subprocess.Process],
-) -> None:
-    if process is None:
-        try:
-            process = await asyncio.shield(spawn_task)
-        except (asyncio.CancelledError, Exception):
-            process = None
-    if process is not None:
-        if process.returncode is None:
-            await _terminate_asyncio_subprocess_group(process)
-        else:
-            await process.wait()
-
-
 async def _run_native(arguments: tuple[str, ...]) -> bytes:
     process: asyncio.subprocess.Process | None = None
     spawn_task = asyncio.create_task(
@@ -255,7 +204,11 @@ async def _run_native(arguments: tuple[str, ...]) -> bytes:
     try:
         process = await asyncio.shield(spawn_task)
         stdout, stderr, return_code = await asyncio.wait_for(
-            _collect_process_output(process),
+            _collect_process_output(
+                process,
+                stdout_limit=_MAX_STDOUT_BYTES,
+                stderr_limit=_MAX_STDERR_BYTES,
+            ),
             timeout=_timeout_seconds(),
         )
         if return_code != 0:
@@ -346,6 +299,8 @@ def _timings(summary: dict[str, object]) -> tuple[tuple[str, float], ...]:
 
 def _strict_summary(encoded_summary: bytes) -> dict[str, object]:
     def reject_non_json_constant(value: str) -> None:
+        """Reject the non-standard numeric constants accepted by json.loads."""
+
         raise ValueError(f"invalid JSON constant: {value}")
 
     try:
@@ -365,22 +320,14 @@ def _strict_summary(encoded_summary: bytes) -> dict[str, object]:
     return summary
 
 
-async def retain_source_native(
-    *,
+def _validated_native_paths(
     source_path: str | Path,
     output_root: str | Path,
-    expected_sha256: str,
-    expected_byte_count: int,
-    range_count: int,
-) -> VerifiedRetainedSource:
-    """Build or verify one retained raw/range layout with the native scanner."""
-
-    _validate_artifact_identity(expected_sha256, expected_byte_count)
-    _validate_range_count(range_count)
-    source = Path(os.path.abspath(source_path))
+) -> tuple[Path, Path]:
+    source_file_path = Path(os.path.abspath(source_path))
     retained_root = Path(os.path.abspath(output_root))
     try:
-        source_stat = os.stat(source, follow_symlinks=False)
+        source_stat = os.stat(source_file_path, follow_symlinks=False)
         root_stat = os.stat(retained_root, follow_symlinks=False)
     except OSError as error:
         raise UHCRetainedAdmissionError(
@@ -388,21 +335,16 @@ async def retain_source_native(
         ) from error
     if not stat.S_ISREG(source_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         raise UHCRetainedAdmissionError("UHC native retention input is invalid")
-    binary = _native_binary()
-    encoded_summary = await _run_native(
-        (
-            str(binary),
-            "--uhc-retain",
-            str(source),
-            str(retained_root),
-            expected_sha256,
-            str(expected_byte_count),
-            str(range_count),
-        )
-    )
-    summary = _strict_summary(encoded_summary)
-    producer_build_id = _build_id(summary, "producer_build_id")
-    verifier_build_id = _build_id(summary, "verifier_build_id")
+    return source_file_path, retained_root
+
+
+def _validate_summary_contract(
+    summary: dict[str, object],
+    *,
+    expected_sha256: str,
+    expected_byte_count: int,
+    range_count: int,
+) -> None:
     if (
         summary["record_kind"] != _SUMMARY_RECORD_KIND
         or summary["contract_id"] != RANGE_CONTRACT_ID
@@ -417,67 +359,134 @@ async def retain_source_native(
         raise UHCRetainedAdmissionError(
             "UHC native retention summary contract is incompatible"
         )
-    record_count = _required_integer(summary, "record_count")
-    manifest_sha256 = _required_string(summary, "manifest_sha256")
-    manifest_byte_count = _required_integer(summary, "manifest_byte_count")
-    raw_path = Path(
-        os.path.abspath(_required_string(summary, "raw_artifact_path"))
-    )
+
+
+def _summary_proof(
+    summary: dict[str, object],
+    *,
+    retained_root: Path,
+    expected_sha256: str,
+    range_count: int,
+) -> _NativeSummaryProof:
+    raw_path = Path(os.path.abspath(_required_string(summary, "raw_artifact_path")))
     manifest_path = Path(os.path.abspath(_required_string(summary, "manifest_path")))
-    expected_raw_path = retained_raw_path(retained_root, expected_sha256)
-    expected_manifest_path = range_manifest_path(
-        retained_root,
-        expected_sha256,
-        range_count,
-    )
-    if raw_path != expected_raw_path or manifest_path != expected_manifest_path:
+    if raw_path != retained_raw_path(retained_root, expected_sha256) or (
+        manifest_path
+        != range_manifest_path(retained_root, expected_sha256, range_count)
+    ):
         raise UHCRetainedAdmissionError(
             "UHC native retention returned a noncanonical artifact path"
         )
-    identities_before = (
-        _file_identity(raw_path),
-        _file_identity(manifest_path),
-    )
-    raw_artifact, ranges = await asyncio.to_thread(
-        load_verified_range_manifest,
+    return _NativeSummaryProof(
+        producer_build_id=_build_id(summary, "producer_build_id"),
+        verifier_build_id=_build_id(summary, "verifier_build_id"),
+        record_count=_required_integer(summary, "record_count"),
+        manifest_sha256=_required_string(summary, "manifest_sha256"),
+        manifest_byte_count=_required_integer(summary, "manifest_byte_count"),
         raw_path=raw_path,
         manifest_path=manifest_path,
+        raw_reused=bool(summary["raw_reused"]),
+        manifest_reused=bool(summary["manifest_reused"]),
+        timings=_timings(summary),
+    )
+
+
+async def _load_attested_source(
+    proof: _NativeSummaryProof,
+    *,
+    expected_sha256: str,
+    expected_byte_count: int,
+    range_count: int,
+) -> VerifiedRetainedSource:
+    identities_before = (
+        _file_identity(proof.raw_path),
+        _file_identity(proof.manifest_path),
+    )
+    raw_artifact, retained_ranges = await asyncio.to_thread(
+        load_verified_range_manifest,
+        raw_path=proof.raw_path,
+        manifest_path=proof.manifest_path,
         expected_artifact_sha256=expected_sha256,
         expected_artifact_bytes=expected_byte_count,
-        expected_manifest_sha256=manifest_sha256,
-        expected_manifest_bytes=manifest_byte_count,
+        expected_manifest_sha256=proof.manifest_sha256,
+        expected_manifest_bytes=proof.manifest_byte_count,
         expected_range_count=range_count,
-        producer_build_id=producer_build_id,
+        producer_build_id=proof.producer_build_id,
         verify_raw_bytes=False,
     )
-    if raw_artifact.record_count != record_count:
+    if raw_artifact.record_count != proof.record_count:
         raise UHCRetainedAdmissionError(
             "UHC native retention summary record count does not match manifest"
         )
     identities_after = (
-        _file_identity(raw_path),
-        _file_identity(manifest_path),
+        _file_identity(proof.raw_path),
+        _file_identity(proof.manifest_path),
     )
     if identities_after != identities_before:
         raise UHCRetainedAdmissionError(
             "native-retained UHC source changed during proof loading"
         )
-    timings = _timings(summary)
-    raw_reused = bool(summary["raw_reused"])
-    manifest_reused = bool(summary["manifest_reused"])
     attestation = _NativeAttestation(
         authority=_ATTESTATION_AUTHORITY,
         proof_identity=(),
         file_identities=identities_after,
     )
-    source = VerifiedRetainedSource(
+    verified_source = VerifiedRetainedSource(
         raw_artifact=raw_artifact,
-        ranges=ranges,
-        raw_reused=raw_reused,
-        manifest_reused=manifest_reused,
-        verifier_build_id=verifier_build_id,
-        timings_seconds=timings,
+        ranges=retained_ranges,
+        raw_reused=proof.raw_reused,
+        manifest_reused=proof.manifest_reused,
+        verifier_build_id=proof.verifier_build_id,
+        timings_seconds=proof.timings,
         attestation=attestation,
     )
-    attestation.proof_identity = _proof_identity(source)
-    return source
+    attestation.proof_identity = _proof_identity(verified_source)
+    return verified_source
+
+
+async def retain_source_native(
+    *,
+    source_path: str | Path,
+    output_root: str | Path,
+    expected_sha256: str,
+    expected_byte_count: int,
+    range_count: int,
+) -> VerifiedRetainedSource:
+    """Build or verify one retained raw/range layout with the native scanner."""
+
+    _validate_artifact_identity(expected_sha256, expected_byte_count)
+    _validate_range_count(range_count)
+    source_file_path, retained_root = _validated_native_paths(
+        source_path,
+        output_root,
+    )
+    encoded_summary = await _run_native(
+        (
+            str(_native_binary()),
+            "--uhc-retain",
+            str(source_file_path),
+            str(retained_root),
+            expected_sha256,
+            str(expected_byte_count),
+            str(range_count),
+        )
+    )
+    summary = _strict_summary(encoded_summary)
+    _validate_summary_contract(
+        summary,
+        expected_sha256=expected_sha256,
+        expected_byte_count=expected_byte_count,
+        range_count=range_count,
+    )
+    proof = _summary_proof(
+        summary,
+        retained_root=retained_root,
+        expected_sha256=expected_sha256,
+        range_count=range_count,
+    )
+    return await _load_attested_source(
+        proof,
+        expected_sha256=expected_sha256,
+        expected_byte_count=expected_byte_count,
+        range_count=range_count,
+    )

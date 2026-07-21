@@ -272,14 +272,14 @@ def _validate_range_proofs(
 
 def _validate_source_proofs(
     binding: SourceBinding,
-    source: VerifiedRetainedSource,
+    verified_source: VerifiedRetainedSource,
     expected_identities: tuple[FileIdentity, FileIdentity],
 ) -> None:
     """Rehash exact native-attested files and validate all immutable fields."""
 
-    raw_artifact = source.raw_artifact
+    raw_artifact = verified_source.raw_artifact
     _validate_binding_identity(binding, raw_artifact)
-    _validate_range_proofs(raw_artifact, source.ranges)
+    _validate_range_proofs(raw_artifact, verified_source.ranges)
     output_root = Path(raw_artifact.path).parent
     if Path(raw_artifact.path) != retained_raw_path(output_root, raw_artifact.sha256):
         raise UHCRetainedAdmissionError("retained raw path is not canonical")
@@ -401,20 +401,20 @@ async def admit_retained_source(
         expected_sha256,
     )
     async with _locked_retained_source(source_lock):
-        source = await retain_source_native(
+        verified_source = await retain_source_native(
             source_path=source_path,
             output_root=output_root,
             expected_sha256=expected_sha256,
             expected_byte_count=expected_byte_count,
             range_count=range_count,
         )
-        if binding.artifact_sha256 != source.raw_artifact.sha256:
+        if binding.artifact_sha256 != verified_source.raw_artifact.sha256:
             raise UHCSourceBindingMismatch(
                 "source binding and native artifact hashes differ"
             )
         await _register_attested_source_under_lock(
             connection,
             binding=binding,
-            source=source,
+            source=verified_source,
         )
-        return source
+        return verified_source

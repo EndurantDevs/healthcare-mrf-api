@@ -1115,8 +1115,15 @@ async def find_active_runs_by_importer(importer: str) -> list[dict[str, Any]]:
 _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY = "import-run-admission:provider-directory-fhir"
 _PROVIDER_DIRECTORY_ACQUISITION = "acquisition"
 _PROVIDER_DIRECTORY_SCOPED_ARTIFACT = "scoped_artifact"
+_PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT = "scoped_relation_artifact"
 _PROVIDER_DIRECTORY_SCOPED_SEED = "scoped_seed"
 _PROVIDER_DIRECTORY_EXCLUSIVE = "exclusive"
+_PROVIDER_DIRECTORY_RELATION_ARTIFACT_TARGETS = frozenset(
+    {
+        "dataset_network_plan",
+        "dataset_affiliation_organization",
+    }
+)
 
 
 def _normalize_connection_run(connection_row: Any) -> dict[str, Any]:
@@ -1257,6 +1264,30 @@ def _provider_directory_artifact_scope(params: dict[str, Any]) -> frozenset[str]
     return _provider_directory_source_ids(params.get("source_ids"))
 
 
+def _provider_directory_relation_artifact_targets(
+    params: dict[str, Any],
+) -> frozenset[str] | None:
+    """Return exact source-local relation targets or fail closed."""
+
+    publish_corroboration = params.get("publish_corroboration")
+    if publish_corroboration is not None and publish_corroboration is not False:
+        return None
+    raw_targets = params.get("publish_artifacts_targets")
+    if not isinstance(raw_targets, str):
+        return None
+    target_values = [target.strip() for target in raw_targets.split(",")]
+    if (
+        not target_values
+        or any(not target for target in target_values)
+        or len(target_values) != len(set(target_values))
+    ):
+        return None
+    targets = frozenset(target_values)
+    if not targets.issubset(_PROVIDER_DIRECTORY_RELATION_ARTIFACT_TARGETS):
+        return None
+    return targets
+
+
 def _provider_directory_seed_scope(params: dict[str, Any]) -> frozenset[str] | None:
     """Return exact source IDs for a metadata-only, non-cleanup seed run."""
     if params.get("seed_only") is not True:
@@ -1290,6 +1321,12 @@ def _provider_directory_operation(
         return _PROVIDER_DIRECTORY_ACQUISITION, source_ids, endpoint_scope
     artifact_source_ids = _provider_directory_artifact_scope(params)
     if artifact_source_ids is not None:
+        if _provider_directory_relation_artifact_targets(params) is not None:
+            return (
+                _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
+                artifact_source_ids,
+                None,
+            )
         return _PROVIDER_DIRECTORY_SCOPED_ARTIFACT, artifact_source_ids, None
     seed_source_ids = _provider_directory_seed_scope(params)
     if seed_source_ids is not None:
@@ -1301,6 +1338,7 @@ def _provider_directory_blocking_run(
     params: dict[str, Any],
     active_runs: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
+    """Return the first active run that conflicts with the requested operation."""
     if not active_runs:
         return None
     requested_kind, requested_source_ids, requested_endpoint = _provider_directory_operation(params)
@@ -1331,8 +1369,17 @@ def _provider_directory_blocking_run(
         return active_acquisitions[0][0]
 
     for active_run, (active_kind, active_source_ids, active_endpoint) in classified_active_runs:
-        if requested_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+        if requested_kind == _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT:
             if active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+                return active_run
+            if not requested_source_ids.isdisjoint(active_source_ids):
+                return active_run
+            continue
+        if requested_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+            if active_kind in {
+                _PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
+                _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
+            }:
                 return active_run
             if not requested_source_ids.isdisjoint(active_source_ids):
                 return active_run
@@ -1342,6 +1389,10 @@ def _provider_directory_blocking_run(
                 return active_run
             continue
         if active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+            if not requested_source_ids.isdisjoint(active_source_ids):
+                return active_run
+            continue
+        if active_kind == _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT:
             if not requested_source_ids.isdisjoint(active_source_ids):
                 return active_run
             continue

@@ -448,7 +448,7 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
     """Run one local importer CLI case and capture its structured metrics."""
     started = time.monotonic()
     python = args.python or sys.executable
-    command = [
+    command_parts = [
         python,
         "main.py",
         "start",
@@ -461,61 +461,61 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         str(args.concurrency),
     ]
     if args.cli_test_mode:
-        command.append("--test")
+        command_parts.append("--test")
     if args.seed_db_path:
-        command.extend(["--seed-db-path", args.seed_db_path])
+        command_parts.extend(["--seed-db-path", args.seed_db_path])
     elif args.seed_db_url:
-        command.extend(["--seed-db-url", args.seed_db_url])
+        command_parts.extend(["--seed-db-url", args.seed_db_url])
     if args.retest_results_path:
-        command.extend(["--retest-results-path", args.retest_results_path])
+        command_parts.extend(["--retest-results-path", args.retest_results_path])
     if args.retest_results_url:
-        command.extend(["--retest-results-url", args.retest_results_url])
+        command_parts.extend(["--retest-results-url", args.retest_results_url])
     if args.credential_config_file:
-        command.extend(["--credential-config-file", args.credential_config_file])
+        command_parts.extend(["--credential-config-file", args.credential_config_file])
     if args.source_query:
-        command.extend(["--source-query", args.source_query])
+        command_parts.extend(["--source-query", args.source_query])
     if args.refresh_preset:
-        command.extend(["--refresh-preset", args.refresh_preset])
+        command_parts.extend(["--refresh-preset", args.refresh_preset])
     if args.include_supplemental_catalogs is True:
-        command.append("--include-supplemental-catalogs")
+        command_parts.append("--include-supplemental-catalogs")
     elif args.include_supplemental_catalogs is False:
-        command.append("--no-include-supplemental-catalogs")
+        command_parts.append("--no-include-supplemental-catalogs")
     if args.import_resources:
-        command.append("--import-resources")
+        command_parts.append("--import-resources")
         if args.full_refresh:
-            command.append("--full-refresh")
+            command_parts.append("--full-refresh")
         if args.stale_cleanup is True:
-            command.append("--stale-cleanup")
+            command_parts.append("--stale-cleanup")
         elif args.stale_cleanup is False:
-            command.append("--no-stale-cleanup")
+            command_parts.append("--no-stale-cleanup")
         if args.resource_limit is not None:
-            command.extend(["--resource-limit", str(args.resource_limit)])
+            command_parts.extend(["--resource-limit", str(args.resource_limit)])
         if args.resource_deadline_seconds is not None:
-            command.extend(["--resource-deadline-seconds", str(args.resource_deadline_seconds)])
+            command_parts.extend(["--resource-deadline-seconds", str(args.resource_deadline_seconds)])
         if args.linked_resource_limit is not None:
-            command.extend(["--linked-resource-limit", str(args.linked_resource_limit)])
+            command_parts.extend(["--linked-resource-limit", str(args.linked_resource_limit)])
         if args.linked_resource_deadline_seconds is not None:
-            command.extend(["--linked-resource-deadline-seconds", str(args.linked_resource_deadline_seconds)])
+            command_parts.extend(["--linked-resource-deadline-seconds", str(args.linked_resource_deadline_seconds)])
         if args.page_limit is not None:
-            command.extend(["--page-limit", str(args.page_limit)])
+            command_parts.extend(["--page-limit", str(args.page_limit)])
         if args.page_count is not None:
-            command.extend(["--page-count", str(args.page_count)])
+            command_parts.extend(["--page-count", str(args.page_count)])
         if args.stream_batch_size is not None:
-            command.extend(["--stream-batch-size", str(args.stream_batch_size)])
+            command_parts.extend(["--stream-batch-size", str(args.stream_batch_size)])
         if args.source_concurrency is not None:
-            command.extend(["--source-concurrency", str(args.source_concurrency)])
+            command_parts.extend(["--source-concurrency", str(args.source_concurrency)])
         if args.publish_artifacts is True:
-            command.append("--publish-artifacts")
+            command_parts.append("--publish-artifacts")
         elif args.publish_artifacts is False:
-            command.append("--no-publish-artifacts")
+            command_parts.append("--no-publish-artifacts")
         if args.resources:
-            command.extend(["--resources", args.resources])
+            command_parts.extend(["--resources", args.resources])
         if args.include_credentialed:
-            command.append("--include-credentialed")
+            command_parts.append("--include-credentialed")
     if args.seed_only:
-        command.append("--seed-only")
+        command_parts.append("--seed-only")
     if args.no_probe:
-        command.append("--no-probe")
+        command_parts.append("--no-probe")
     env = os.environ.copy()
     env.update(
         {
@@ -525,7 +525,7 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
     )
     try:
         proc = subprocess.run(
-            command,
+            command_parts,
             cwd=ROOT,
             env=env,
             text=True,
@@ -543,9 +543,9 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
             status = "failed"
             error = proc.stdout[-4000:]
         metrics["returncode"] = proc.returncode
-        return CaseResult(case_id=case_id, kind="cli", status=status, elapsed_seconds=elapsed, command=command, metrics=metrics, error=error)
+        return CaseResult(case_id=case_id, kind="cli", status=status, elapsed_seconds=elapsed, command=command_parts, metrics=metrics, error=error)
     except Exception as exc:
-        return CaseResult(case_id=case_id, kind="cli", status="failed", elapsed_seconds=time.monotonic() - started, command=command, error=str(exc))
+        return CaseResult(case_id=case_id, kind="cli", status="failed", elapsed_seconds=time.monotonic() - started, command=command_parts, error=str(exc))
 
 
 def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:

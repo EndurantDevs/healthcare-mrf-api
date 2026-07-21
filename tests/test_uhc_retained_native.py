@@ -128,9 +128,9 @@ async def test_native_summary_requires_exact_shape_and_single_strict_json_value(
         b"{}{}",
         b"\xff",
     )
-    for ordinal, payload in enumerate(invalid_payloads):
+    for ordinal, encoded_payload in enumerate(invalid_payloads):
         summary_path = tmp_path / f"invalid-summary-{ordinal}.json"
-        summary_path.write_bytes(payload)
+        summary_path.write_bytes(encoded_payload)
         binary = tmp_path / f"fake-scanner-{ordinal}"
         binary.write_text(
             "#!/usr/bin/env python3\n"

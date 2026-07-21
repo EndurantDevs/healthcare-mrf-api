@@ -44,21 +44,42 @@ async def _fresh_source(fixture):
     )
 
 
+def _assert_first_binding_reference_layouts(connection, first_binding) -> None:
+    reference_layouts = {
+        (key[2], key[3], key[4])
+        for key in connection.rows_by_table["reference"]
+        if key[:2]
+        == (
+            first_binding.catalog_set_sha256,
+            first_binding.source_file_id,
+        )
+    }
+    assert reference_layouts == {
+        ("raw", 0, 0),
+        ("manifest", 2, 4),
+        ("manifest", 2, 8),
+    }
+
+
 @pytest.mark.asyncio
 async def test_registry_persists_normalized_raw_layout_ranges_and_references(
     tmp_path,
     monkeypatch,
 ):
-    fixture, source = await native_verified_source(tmp_path, monkeypatch)
+    fixture, verified_source = await native_verified_source(tmp_path, monkeypatch)
     binding = source_binding(
-        source.raw_artifact.sha256,
-        source.raw_artifact.byte_count,
+        verified_source.raw_artifact.sha256,
+        verified_source.raw_artifact.byte_count,
     )
     connection = FakeRegistryConnection()
     connection.add_catalog(binding)
     _allow_unit_root(monkeypatch)
 
-    await register_verified_source(connection, binding=binding, source=source)
+    await register_verified_source(
+        connection,
+        binding=binding,
+        source=verified_source,
+    )
 
     assert len(connection.rows_by_table["raw"]) == 1
     assert len(connection.rows_by_table["layout"]) == 1
@@ -79,8 +100,8 @@ async def test_registry_persists_normalized_raw_layout_ranges_and_references(
     assert layout_row["record_count"] == fixture["record_count"]
     assert layout_row["manifest_sha256"] == fixture["manifest_sha256"]
     manifest_reference = next(
-        value
-        for key, value in connection.rows_by_table["reference"].items()
+        reference_row
+        for key, reference_row in connection.rows_by_table["reference"].items()
         if key[2] == "manifest"
     )
     assert manifest_reference["layout_artifact_sha256"] == fixture[
@@ -93,7 +114,7 @@ async def test_idempotent_registration_requires_a_fresh_native_attestation(
     tmp_path,
     monkeypatch,
 ):
-    fixture, source = await native_verified_source(tmp_path, monkeypatch)
+    fixture, verified_source = await native_verified_source(tmp_path, monkeypatch)
     binding = source_binding(
         fixture["artifact_sha256"],
         fixture["artifact_byte_count"],
@@ -101,10 +122,18 @@ async def test_idempotent_registration_requires_a_fresh_native_attestation(
     connection = FakeRegistryConnection()
     connection.add_catalog(binding)
     _allow_unit_root(monkeypatch)
-    await register_verified_source(connection, binding=binding, source=source)
+    await register_verified_source(
+        connection,
+        binding=binding,
+        source=verified_source,
+    )
 
     with pytest.raises(UHCRetainedAdmissionError, match="native-verified"):
-        await register_verified_source(connection, binding=binding, source=source)
+        await register_verified_source(
+            connection,
+            binding=binding,
+            source=verified_source,
+        )
 
     fresh_source = await _fresh_source(fixture)
     await register_verified_source(
@@ -112,7 +141,7 @@ async def test_idempotent_registration_requires_a_fresh_native_attestation(
         binding=binding,
         source=fresh_source,
     )
-    assert [len(rows) for rows in connection.rows_by_table.values()] == [
+    assert [len(table_rows) for table_rows in connection.rows_by_table.values()] == [
         1,
         1,
         1,
@@ -128,8 +157,12 @@ async def test_same_raw_supports_two_layouts_and_two_catalog_bindings(
     monkeypatch,
 ):
     retained_root = tmp_path / "retained"
-    records = records_payload(count=16)
-    fixture_four = write_retained_fixture(retained_root, records, range_count=4)
+    retained_records = records_payload(count=16)
+    fixture_four = write_retained_fixture(
+        retained_root,
+        retained_records,
+        range_count=4,
+    )
     source_path = tmp_path / "source.json"
     source_path.write_bytes(fixture_four["source_bytes"])
     install_fake_native(tmp_path, monkeypatch, native_summary(fixture_four))
@@ -159,7 +192,11 @@ async def test_same_raw_supports_two_layouts_and_two_catalog_bindings(
         source=await _fresh_source(fixture_four),
     )
 
-    fixture_eight = write_retained_fixture(retained_root, records, range_count=8)
+    fixture_eight = write_retained_fixture(
+        retained_root,
+        retained_records,
+        range_count=8,
+    )
     install_fake_native(tmp_path, monkeypatch, native_summary(fixture_eight))
     await register_verified_source(
         connection,
@@ -172,23 +209,11 @@ async def test_same_raw_supports_two_layouts_and_two_catalog_bindings(
     assert len(connection.rows_by_table["range"]) == 12
     assert len(connection.rows_by_table["binding"]) == 2
     assert len(connection.rows_by_table["reference"]) == 5
-    first_reference_kinds = {
-        (key[2], key[3], key[4])
-        for key in connection.rows_by_table["reference"]
-        if key[:2] == (
-            first_binding.catalog_set_sha256,
-            first_binding.source_file_id,
-        )
-    }
-    assert first_reference_kinds == {
-        ("raw", 0, 0),
-        ("manifest", 2, 4),
-        ("manifest", 2, 8),
-    }
+    _assert_first_binding_reference_layouts(connection, first_binding)
 
 
 @pytest.mark.parametrize(
-    ("collection_kind", "records"),
+    ("collection_kind", "retained_records"),
     [
         ("provider_membership", records_payload("provider", 16)),
         (
@@ -205,7 +230,7 @@ async def test_integrated_admission_is_generic_for_provider_and_plan_json(
     tmp_path,
     monkeypatch,
     collection_kind,
-    records,
+    retained_records,
 ):
     base_root = tmp_path / "durable-provider-directory"
     fake_system_temp = tmp_path / "unrelated-system-temp"
@@ -216,7 +241,11 @@ async def test_integrated_admission_is_generic_for_provider_and_plan_json(
         lambda: str(fake_system_temp),
     )
     retained_root = source_registry.uhc_retained_artifact_root()
-    fixture = write_retained_fixture(retained_root, records, range_count=4)
+    fixture = write_retained_fixture(
+        retained_root,
+        retained_records,
+        range_count=4,
+    )
     source_path = tmp_path / f"{collection_kind}.json"
     source_path.write_bytes(fixture["source_bytes"])
     install_fake_native(tmp_path, monkeypatch, native_summary(fixture))
@@ -228,7 +257,7 @@ async def test_integrated_admission_is_generic_for_provider_and_plan_json(
     connection = FakeRegistryConnection()
     connection.add_catalog(binding)
 
-    source = await admit_retained_source(
+    verified_source = await admit_retained_source(
         connection,
         binding=binding,
         source_path=source_path,
@@ -237,7 +266,7 @@ async def test_integrated_admission_is_generic_for_provider_and_plan_json(
         range_count=4,
     )
 
-    assert source.raw_artifact.record_count == len(records)
+    assert verified_source.raw_artifact.record_count == len(retained_records)
     binding_row = next(iter(connection.rows_by_table["binding"].values()))
     assert binding_row["collection_kind"] == collection_kind
     assert len(connection.rows_by_table["range"]) == 4
@@ -248,7 +277,7 @@ async def test_registry_rejects_released_reference_without_reactivation(
     tmp_path,
     monkeypatch,
 ):
-    fixture, source = await native_verified_source(tmp_path, monkeypatch)
+    fixture, verified_source = await native_verified_source(tmp_path, monkeypatch)
     binding = source_binding(
         fixture["artifact_sha256"],
         fixture["artifact_byte_count"],
@@ -256,7 +285,11 @@ async def test_registry_rejects_released_reference_without_reactivation(
     connection = FakeRegistryConnection()
     connection.add_catalog(binding)
     _allow_unit_root(monkeypatch)
-    await register_verified_source(connection, binding=binding, source=source)
+    await register_verified_source(
+        connection,
+        binding=binding,
+        source=verified_source,
+    )
     raw_reference_key = (
         binding.catalog_set_sha256,
         binding.source_file_id,

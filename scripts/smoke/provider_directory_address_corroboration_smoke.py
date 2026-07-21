@@ -69,14 +69,14 @@ def _json_value(value: Any) -> Any:
 
 
 def _served_address_verification(row: dict[str, Any], *, network_names: list[str]) -> dict[str, Any]:
-    address_payload = dict(row)
-    address_payload["provider_directory_network_matches"] = _json_value(
-        address_payload.get("provider_directory_network_matches")
+    address_payload_by_field = dict(row)
+    address_payload_by_field["provider_directory_network_matches"] = _json_value(
+        address_payload_by_field.get("provider_directory_network_matches")
     )
-    address_payload["address_verification_evidence"] = _json_value(
-        address_payload.get("address_verification_evidence")
+    address_payload_by_field["address_verification_evidence"] = _json_value(
+        address_payload_by_field.get("address_verification_evidence")
     )
-    item = {
+    provider_item_by_field = {
         "network_names": network_names,
         "address": {
             "first_line": "100 Test St",
@@ -85,7 +85,11 @@ def _served_address_verification(row: dict[str, Any], *, network_names: list[str
             "postal_code": "60601",
         },
     }
-    return _address_verification_payload(item, {}, address_payload)
+    return _address_verification_payload(
+        provider_item_by_field,
+        {},
+        address_payload_by_field,
+    )
 
 
 def parse_args() -> argparse.Namespace:

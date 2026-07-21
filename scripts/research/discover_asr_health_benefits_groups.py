@@ -43,7 +43,7 @@ def _candidate_groups(start: int, end: int) -> list[str]:
 def _read_seed_rows(path: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
-    rows: dict[str, dict[str, str]] = {}
+    row_by_group_number: dict[str, dict[str, str]] = {}
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for lineno, row in enumerate(reader, start=2):
@@ -52,12 +52,12 @@ def _read_seed_rows(path: Path) -> dict[str, dict[str, str]]:
                 continue
             if not group_number.isdigit() or len(group_number) != 4:
                 raise ValueError(f"{path} line {lineno} must contain a 4-digit group_number")
-            rows[group_number] = {
+            row_by_group_number[group_number] = {
                 field: str(row.get(field) or "").strip()
                 for field in SEED_FIELDNAMES
             }
-            rows[group_number]["group_number"] = group_number
-    return rows
+            row_by_group_number[group_number]["group_number"] = group_number
+    return row_by_group_number
 
 
 def _write_seed_rows(
@@ -68,7 +68,7 @@ def _write_seed_rows(
     source_url: str,
     verified_at: str,
 ) -> None:
-    rows = existing_rows or {}
+    row_by_group_number = existing_rows or {}
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SEED_FIELDNAMES)
@@ -76,14 +76,16 @@ def _write_seed_rows(
         for group_number in group_numbers:
             if not group_number.isdigit() or len(group_number) != 4:
                 raise ValueError(f"{group_number} is not a 4-digit group number")
-            row = dict(rows.get(group_number) or {})
-            row["group_number"] = group_number
-            row["status"] = row.get("status") or "active"
-            row["source_url"] = row.get("source_url") or source_url
-            row["first_seen_at"] = row.get("first_seen_at") or verified_at
-            row["last_verified_at"] = verified_at
-            row["notes"] = row.get("notes") or "confirmed public TOC group"
-            writer.writerow({field: row.get(field, "") for field in SEED_FIELDNAMES})
+            seed_row_by_field = dict(row_by_group_number.get(group_number) or {})
+            seed_row_by_field["group_number"] = group_number
+            seed_row_by_field["status"] = seed_row_by_field.get("status") or "active"
+            seed_row_by_field["source_url"] = seed_row_by_field.get("source_url") or source_url
+            seed_row_by_field["first_seen_at"] = seed_row_by_field.get("first_seen_at") or verified_at
+            seed_row_by_field["last_verified_at"] = verified_at
+            seed_row_by_field["notes"] = seed_row_by_field.get("notes") or "confirmed public TOC group"
+            writer.writerow(
+                {field: seed_row_by_field.get(field, "") for field in SEED_FIELDNAMES}
+            )
 
 
 async def _probe_head(
@@ -234,14 +236,14 @@ async def _async_main() -> int:
             source_url=args.base_url.rstrip("/") + "/MRF",
             verified_at=dt.date.today().isoformat(),
         )
-    summary = {
+    summary_by_field = {
         "checked": len(results),
         "found": len(found),
         "groups": found,
         "output": str(args.output) if args.write else None,
         "output_groups": len(output_groups) if args.write else None,
     }
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(json.dumps(summary_by_field, indent=2, sort_keys=True))
     return 0
 
 

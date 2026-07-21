@@ -21,20 +21,20 @@ def test_registry_identifiers_and_file_uris_fail_closed(tmp_path, monkeypatch):
     with pytest.raises(UHCRetainedAdmissionError, match="unsafe"):
         file_uri(directory)
 
-    target = tmp_path / "target.json"
-    target.write_text("[]", encoding="ascii")
+    target_path = tmp_path / "target.json"
+    target_path.write_text("[]", encoding="ascii")
     symlink = tmp_path / "link.json"
-    symlink.symlink_to(target)
+    symlink.symlink_to(target_path)
     with pytest.raises(UHCRetainedAdmissionError, match="unsafe"):
         file_uri(symlink)
 
-    assert file_uri(target) == target.absolute().as_uri()
+    assert file_uri(target_path) == target_path.absolute().as_uri()
 
-    target.chmod(0o666)
+    target_path.chmod(0o666)
     with pytest.raises(UHCRetainedAdmissionError, match="unsafe"):
-        file_uri(target)
-    target.chmod(0o644)
+        file_uri(target_path)
+    target_path.chmod(0o644)
     hard_link = tmp_path / "hard-link.json"
-    hard_link.hardlink_to(target)
+    hard_link.hardlink_to(target_path)
     with pytest.raises(UHCRetainedAdmissionError, match="unsafe"):
-        file_uri(target)
+        file_uri(target_path)

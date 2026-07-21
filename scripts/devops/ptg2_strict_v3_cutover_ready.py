@@ -202,7 +202,9 @@ async def collect_cutover_readiness(
         "invalid_layout_generation_count",
         "mismatched_binding_count",
     )
-    failure_counts = {field: int(pointer.get(field) or 0) for field in failure_fields}
+    failure_count_by_field = {
+        field: int(pointer.get(field) or 0) for field in failure_fields
+    }
     pointer_count = int(pointer.get("pointer_count") or 0)
     active_import_run_count = int(activity.get("active_import_run_count") or 0)
     building_snapshot_count = int(activity.get("building_snapshot_count") or 0)
@@ -210,22 +212,22 @@ async def collect_cutover_readiness(
     stale_building_snapshot_count = int(
         activity.get("stale_building_snapshot_count") or 0
     )
-    ready = (
+    is_ready = (
         pointer_count > 0
-        and not any(failure_counts.values())
+        and not any(failure_count_by_field.values())
         and active_import_run_count == 0
         and building_snapshot_count == 0
     )
     return {
         "contract": "ptg_strict_v3_cutover_ready_v1",
-        "ready": ready,
+        "ready": is_ready,
         "pointer_count": pointer_count,
         "active_import_run_count": active_import_run_count,
         "building_snapshot_count": building_snapshot_count,
         "stale_import_run_count": stale_import_run_count,
         "stale_building_snapshot_count": stale_building_snapshot_count,
         "stale_activity_seconds": stale_seconds,
-        "failure_counts": failure_counts,
+        "failure_counts": failure_count_by_field,
     }
 
 
