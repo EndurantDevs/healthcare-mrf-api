@@ -119,10 +119,10 @@ def test_ensure_spec_blocks_competing_finish_workers(monkeypatch):
             },
         )
 
-        result = control_workers._ensure_spec(requested_spec, {})
+        ensure_response = control_workers._ensure_spec(requested_spec, {})
 
-        assert result["status"] == "blocked"
-        assert result["message"] == message
+        assert ensure_response["status"] == "blocked"
+        assert ensure_response["message"] == message
 
 
 def test_ensure_worker_uses_finish_role_for_finalizing_run(monkeypatch, tmp_path):
@@ -379,14 +379,14 @@ def test_ensure_kubernetes_job_tolerates_missing_terminal_job(monkeypatch):
     )
     spec = control_workers._BY_QUEUE["arq:ClaimsPricing"]
 
-    result = control_workers._ensure_kubernetes_job(
+    ensure_response = control_workers._ensure_kubernetes_job(
         spec,
         {"run_id": "run_missing_terminal"},
         {"running": False, "job_status": "succeeded"},
     )
 
-    assert result["status"] == "started"
-    assert result["running"] is True
+    assert ensure_response["status"] == "started"
+    assert ensure_response["running"] is True
 
 
 def test_ensure_kubernetes_job_reports_post_conflict(monkeypatch):
