@@ -38,6 +38,7 @@ PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES = PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES
 PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES = 8 * 1024 * 1024
 PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
 SOURCE_BUNDLE_MAGIC = b"PTG2SW02"
+SOURCE_DICTIONARY_BUNDLE_MAGIC = b"PTG2SW03"
 SOURCE_RECORD_MAGIC = b"PTG2SWR2"
 PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP5"
 PTG2_SOURCE_WITNESS_MANIFEST_FIELDS = (
@@ -134,6 +135,7 @@ class CompressedSourceWitnessRecord:
     tie_breaker: str
     raw_source_sha256: str
     compressed: bytes
+    evidence_by_sha256: Mapping[str, bytes] | None = None
 
     @property
     def selection_key(self) -> tuple[int, str, str]:
@@ -354,6 +356,7 @@ __all__ = [
     "WitnessPayloadLimitError",
     "PTG2_SOURCE_WITNESS_MANIFEST_FIELDS",
     "SOURCE_BUNDLE_MAGIC",
+    "SOURCE_DICTIONARY_BUNDLE_MAGIC",
     "SOURCE_RECORD_MAGIC",
     "SourceWitnessPublication",
     "SourceWitnessRecord",

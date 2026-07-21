@@ -5,14 +5,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zlib
 from pathlib import Path
 from typing import Any, Mapping
 
-from process.ptg_parts.ptg2_source_witness_codec import decode_record
+from process.ptg_parts.ptg2_source_witness_codec import (
+    decode_persisted_record,
+    decode_record,
+)
 from process.ptg_parts.ptg2_source_witness_contract import (
     CompressedSourceWitnessRecord,
     PTG2_V3_SOURCE_WITNESS_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES,
+    PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
     PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
     PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
@@ -20,6 +25,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
     PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
     SOURCE_BUNDLE_MAGIC,
+    SOURCE_DICTIONARY_BUNDLE_MAGIC,
 )
 from process.ptg_parts.ptg2_source_witness_primitives import (
     nonnegative_int,
@@ -48,14 +54,24 @@ def _json_object(raw_json: bytes, *, field_name: str) -> dict[str, Any]:
 def _compressed_record(
     compressed_bytes: bytes,
     raw_source_sha256: str,
+    evidence_by_sha256: Mapping[str, bytes] | None = None,
 ) -> CompressedSourceWitnessRecord:
-    decoded_record = decode_record(compressed_bytes, raw_source_sha256)
+    decoded_record = (
+        decode_record(compressed_bytes, raw_source_sha256)
+        if evidence_by_sha256 is None
+        else decode_persisted_record(
+            compressed_bytes,
+            raw_source_sha256,
+            evidence_by_sha256=evidence_by_sha256,
+        )
+    )
     return CompressedSourceWitnessRecord(
         kind=decoded_record.kind,
         priority=decoded_record.priority,
         tie_breaker=decoded_record.tie_breaker,
         raw_source_sha256=raw_source_sha256,
         compressed=compressed_bytes,
+        evidence_by_sha256=evidence_by_sha256,
     )
 
 
@@ -76,7 +92,9 @@ def _authenticated_bundle_payload(bundle_entry: Mapping[str, Any]) -> bytes:
         raise RuntimeError("strict V3 source witness bundle digest does not match")
     if bundle_entry.get("byte_count") != bundle_size:
         raise RuntimeError("strict V3 source witness bundle byte count does not match")
-    if not bundle_payload.startswith(SOURCE_BUNDLE_MAGIC):
+    if not bundle_payload.startswith(
+        (SOURCE_BUNDLE_MAGIC, SOURCE_DICTIONARY_BUNDLE_MAGIC)
+    ):
         raise RuntimeError("strict V3 source witness bundle magic is invalid")
     return bundle_payload
 
@@ -87,6 +105,7 @@ def _bundle_records(
     record_count: int,
     record_offset: int,
     raw_source_sha256: str,
+    evidence_by_sha256: Mapping[str, bytes] | None = None,
 ) -> tuple[list[CompressedSourceWitnessRecord], int]:
     compressed_records: list[CompressedSourceWitnessRecord] = []
     for _record_index in range(record_count):
@@ -106,20 +125,93 @@ def _bundle_records(
             _compressed_record(
                 bundle_payload[record_offset:record_end],
                 raw_source_sha256,
+                evidence_by_sha256,
             )
         )
         record_offset = record_end
     return compressed_records, record_offset
 
 
+def _decompress_evidence(compressed: bytes, raw_length: int) -> bytes:
+    if raw_length <= 0 or raw_length > PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES:
+        raise RuntimeError("strict V3 source witness evidence length is invalid")
+    decompressor = zlib.decompressobj()
+    try:
+        raw_evidence = decompressor.decompress(compressed, raw_length + 1)
+        if len(raw_evidence) > raw_length or decompressor.unconsumed_tail:
+            raise RuntimeError(
+                "strict V3 source witness evidence exceeds or violates its framing"
+            )
+        raw_evidence += decompressor.flush(raw_length - len(raw_evidence) + 1)
+    except zlib.error as exc:
+        raise RuntimeError(
+            "strict V3 source witness evidence has invalid zlib framing"
+        ) from exc
+    if (
+        len(raw_evidence) != raw_length
+        or decompressor.unconsumed_tail
+        or not decompressor.eof
+        or decompressor.unused_data
+    ):
+        raise RuntimeError(
+            "strict V3 source witness evidence exceeds or violates its framing"
+        )
+    return raw_evidence
+
+
+def _bundle_evidence_dictionary(
+    bundle_payload: bytes,
+    *,
+    evidence_count: int,
+    evidence_offset: int,
+) -> tuple[dict[str, bytes], int]:
+    evidence_by_sha256: dict[str, bytes] = {}
+    for _evidence_index in range(evidence_count):
+        digest_end = evidence_offset + 32
+        if digest_end > len(bundle_payload):
+            raise RuntimeError("strict V3 source witness evidence digest is truncated")
+        evidence_sha256 = bundle_payload[evidence_offset:digest_end].hex()
+        raw_length, compressed_length_offset = read_u32(
+            bundle_payload,
+            digest_end,
+            field_name="evidence raw length",
+        )
+        compressed_length, compressed_offset = read_u32(
+            bundle_payload,
+            compressed_length_offset,
+            field_name="evidence compressed length",
+        )
+        compressed_end = compressed_offset + compressed_length
+        if (
+            compressed_length <= 0
+            or compressed_length > PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES
+            or compressed_end > len(bundle_payload)
+            or evidence_sha256 in evidence_by_sha256
+        ):
+            raise RuntimeError(
+                "strict V3 source witness evidence dictionary framing is invalid"
+            )
+        raw_evidence = _decompress_evidence(
+            bundle_payload[compressed_offset:compressed_end],
+            raw_length,
+        )
+        if hashlib.sha256(raw_evidence).hexdigest() != evidence_sha256:
+            raise RuntimeError("strict V3 source witness evidence digest is invalid")
+        evidence_by_sha256[evidence_sha256] = raw_evidence
+        evidence_offset = compressed_end
+    return evidence_by_sha256, evidence_offset
+
+
 def _validate_bundle_header(
     bundle_header: Mapping[str, Any],
     bundle_entry: Mapping[str, Any],
+    *,
+    format_version: int = 2,
 ) -> None:
     required_value_by_field = {
         "contract": PTG2_V3_SOURCE_WITNESS_CONTRACT,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
-        "format_version": 2,
+        "format_version": format_version,
         "occurrence_target": PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
         "total_target": PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
         "provider_quota": PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
@@ -196,6 +288,40 @@ def _validate_local_coverage(
             )
 
 
+def _read_bundle_records(
+    bundle_payload: bytes,
+    *,
+    header_end: int,
+    raw_source_sha256: str,
+    uses_evidence_dictionary: bool,
+) -> tuple[list[CompressedSourceWitnessRecord], int]:
+    evidence_by_sha256 = None
+    record_count_offset = header_end
+    if uses_evidence_dictionary:
+        evidence_count, evidence_offset = read_u32(
+            bundle_payload,
+            record_count_offset,
+            field_name="evidence dictionary count",
+        )
+        evidence_by_sha256, record_count_offset = _bundle_evidence_dictionary(
+            bundle_payload,
+            evidence_count=evidence_count,
+            evidence_offset=evidence_offset,
+        )
+    record_count, record_offset = read_u32(
+        bundle_payload,
+        record_count_offset,
+        field_name="record count",
+    )
+    return _bundle_records(
+        bundle_payload,
+        record_count=record_count,
+        record_offset=record_offset,
+        raw_source_sha256=raw_source_sha256,
+        evidence_by_sha256=evidence_by_sha256,
+    )
+
+
 def read_scanner_bundle(
     bundle_entry: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[CompressedSourceWitnessRecord]]:
@@ -214,21 +340,24 @@ def read_scanner_bundle(
         bundle_payload[header_offset:header_end],
         field_name="bundle header",
     )
-    _validate_bundle_header(bundle_header, bundle_entry)
+    uses_evidence_dictionary = bundle_payload.startswith(
+        SOURCE_DICTIONARY_BUNDLE_MAGIC
+    )
+    format_version = 3 if uses_evidence_dictionary else 2
+    _validate_bundle_header(
+        bundle_header,
+        bundle_entry,
+        format_version=format_version,
+    )
     raw_source_sha256 = sha256_hex(
         bundle_header.get("raw_source_sha256"),
         field_name="raw source digest",
     )
-    record_count, record_offset = read_u32(
+    compressed_records, record_offset = _read_bundle_records(
         bundle_payload,
-        header_end,
-        field_name="record count",
-    )
-    compressed_records, record_offset = _bundle_records(
-        bundle_payload,
-        record_count=record_count,
-        record_offset=record_offset,
+        header_end=header_end,
         raw_source_sha256=raw_source_sha256,
+        uses_evidence_dictionary=uses_evidence_dictionary,
     )
     if record_offset != len(bundle_payload) or bundle_entry.get("row_count") != len(
         compressed_records

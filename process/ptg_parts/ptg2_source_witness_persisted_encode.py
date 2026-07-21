@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from process.ptg_parts.ptg2_source_witness_codec import (
+    decode_persisted_record,
     externalize_source_evidence_record,
 )
 from process.ptg_parts.ptg2_source_witness_contract import (
@@ -87,17 +88,39 @@ def _externalize_source_evidence(
     persisted_records: list[_PersistedRecord] = []
     evidence_by_sha256: dict[str, _EvidenceEntry] = {}
     for selected_record in selected_records:
-        persisted_record, record_evidence = externalize_source_evidence_record(
-            selected_record.compressed,
-            selected_record.raw_source_sha256,
-        )
+        if selected_record.evidence_by_sha256 is None:
+            persisted_record, record_evidence_by_sha256 = (
+                externalize_source_evidence_record(
+                    selected_record.compressed,
+                    selected_record.raw_source_sha256,
+                )
+            )
+        else:
+            decoded_record = decode_persisted_record(
+                selected_record.compressed,
+                selected_record.raw_source_sha256,
+                evidence_by_sha256=selected_record.evidence_by_sha256,
+            )
+            persisted_record = selected_record.compressed
+            record_evidence_by_sha256 = {
+                decoded_record.raw_sha256: decoded_record.raw_json,
+            }
+            if decoded_record.linked_provider_sha256 is not None:
+                linked_provider_json = decoded_record.linked_provider_json
+                if linked_provider_json is None:
+                    raise RuntimeError(
+                        "strict V3 linked provider evidence is incomplete"
+                    )
+                record_evidence_by_sha256[
+                    decoded_record.linked_provider_sha256
+                ] = linked_provider_json
         persisted_records.append(
             _PersistedRecord(
                 raw_source_sha256=selected_record.raw_source_sha256,
                 compressed=persisted_record,
             )
         )
-        for evidence_sha256, raw_json in record_evidence.items():
+        for evidence_sha256, raw_json in record_evidence_by_sha256.items():
             _insert_evidence(
                 evidence_by_sha256,
                 evidence_sha256,

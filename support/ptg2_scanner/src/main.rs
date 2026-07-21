@@ -22788,9 +22788,21 @@ mod tests {
     }
 
     fn source_witness_record_metadata(bundle: &[u8]) -> Vec<Value> {
-        assert_eq!(&bundle[..8], b"PTG2SW02");
+        assert_eq!(&bundle[..8], b"PTG2SW03");
         let header_length = u32::from_be_bytes(bundle[8..12].try_into().unwrap()) as usize;
         let mut offset = 12 + header_length;
+        let evidence_count =
+            u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        for _ in 0..evidence_count {
+            offset += 32;
+            let _raw_length =
+                u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let compressed_length =
+                u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4 + compressed_length;
+        }
         let record_count =
             u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
@@ -22814,7 +22826,7 @@ mod tests {
     }
 
     fn source_witness_header(bundle: &[u8]) -> Value {
-        assert_eq!(&bundle[..8], b"PTG2SW02");
+        assert_eq!(&bundle[..8], b"PTG2SW03");
         let header_length = u32::from_be_bytes(bundle[8..12].try_into().unwrap()) as usize;
         serde_json::from_slice(&bundle[12..12 + header_length]).unwrap()
     }

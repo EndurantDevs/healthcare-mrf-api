@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import zlib
 
 import pytest
 
@@ -35,6 +36,18 @@ def _header(raw_source_sha256: str = "00" * 32):
         "unqueryable_rate_policy": bundle.PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
         "raw_source_sha256": raw_source_sha256,
     }
+
+
+def _evidence_entry(raw_evidence: bytes, *, digest: str | None = None) -> bytes:
+    compressed_evidence = zlib.compress(raw_evidence)
+    return b"".join(
+        (
+            bytes.fromhex(digest or _digest(raw_evidence)),
+            U32.pack(len(raw_evidence)),
+            U32.pack(len(compressed_evidence)),
+            compressed_evidence,
+        )
+    )
 
 
 def test_source_witness_bundle_header_json_must_be_an_object():
@@ -90,6 +103,55 @@ def test_source_witness_bundle_rejects_invalid_record_framing():
             record_count=1,
             record_offset=0,
             raw_source_sha256="00" * 32,
+        )
+
+
+@pytest.mark.parametrize(
+    ("compressed_evidence", "raw_length", "expected_error"),
+    (
+        (zlib.compress(b"x"), 0, "length is invalid"),
+        (zlib.compress(b"ab"), 1, "violates its framing"),
+        (zlib.compress(b"a"), 2, "violates its framing"),
+        (b"not-zlib", 1, "invalid zlib framing"),
+    ),
+)
+def test_source_witness_bundle_rejects_invalid_evidence_compression(
+    compressed_evidence,
+    raw_length,
+    expected_error,
+):
+    with pytest.raises(RuntimeError, match=expected_error):
+        bundle._decompress_evidence(compressed_evidence, raw_length)
+
+
+def test_source_witness_bundle_rejects_malformed_evidence_dictionary():
+    with pytest.raises(RuntimeError, match="digest is truncated"):
+        bundle._bundle_evidence_dictionary(
+            b"x" * 31,
+            evidence_count=1,
+            evidence_offset=0,
+        )
+    with pytest.raises(RuntimeError, match="framing is invalid"):
+        bundle._bundle_evidence_dictionary(
+            (b"\x00" * 32) + U32.pack(1) + U32.pack(0),
+            evidence_count=1,
+            evidence_offset=0,
+        )
+    with pytest.raises(RuntimeError, match="digest is invalid"):
+        bundle._bundle_evidence_dictionary(
+            _evidence_entry(b"evidence", digest="00" * 32),
+            evidence_count=1,
+            evidence_offset=0,
+        )
+
+
+def test_source_witness_bundle_rejects_duplicate_evidence_digest():
+    evidence_entry = _evidence_entry(b"evidence")
+    with pytest.raises(RuntimeError, match="framing is invalid"):
+        bundle._bundle_evidence_dictionary(
+            evidence_entry + evidence_entry,
+            evidence_count=2,
+            evidence_offset=0,
         )
 
 
