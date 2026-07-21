@@ -36,6 +36,7 @@ def test_serving_identity_helpers_cover_empty_and_driver_values():
     assert serving_utils._row_mapping({"value": 2}) == {"value": 2}
     assert serving_utils._row_mapping((("value", 3),)) == {"value": 3}
     assert serving_utils._uuid_to_hex(None) == ""
+    assert serving_utils._uuid_to_hex("  ") == ""
     assert serving_utils._uuid_to_hex(
         UUID("12345678-1234-5678-1234-567812345678")
     ) == "12345678123456781234567812345678"
