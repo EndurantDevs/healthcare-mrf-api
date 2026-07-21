@@ -91,6 +91,21 @@ def test_import_and_country_normalization_cover_fallbacks(monkeypatch):
     assert importer._normalize_country_code("Cote d'Ivoire") == "COTE D'IVOIRE"
 
 
+def test_state_coordinate_and_parent_base_boundaries_fail_closed():
+    """Reject malformed US facts while retaining safe non-US coordinates."""
+    assert importer._normalize_state_code("not-a-state") is None
+    assert importer._is_usable_coordinate_pair(10, 20, "CA") is True
+    assert importer._parse_coordinate_number("not-a-number") is None
+    assert importer._parse_coordinate_number("inf") is None
+
+    assert importer._parent_base_url("relative/path") is None
+    assert importer._parent_base_url("https://example.test/") is None
+    assert (
+        importer._resource_or_metadata_parent_base("relative/metadata")
+        is None
+    )
+
+
 def test_resource_page_cap_reads_legacy_and_resource_specific_metadata():
     """Honor both documented cap shapes while rejecting non-positive values."""
     lower_case_source = _source_record(

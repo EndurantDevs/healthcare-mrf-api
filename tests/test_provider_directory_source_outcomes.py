@@ -113,7 +113,9 @@ def _dataset_row(**overrides):
         "dataset_hash": DATASET_HASH,
         "status": "published",
         "is_current": True,
+        "validated_at": dt.datetime(2026, 7, 20, 8, 0),
         "published_at": dt.datetime(2026, 7, 20, 8, 30),
+        "superseded_at": None,
         "resource_count": TOTAL_RESOURCES,
         "publication_metadata": _metadata(),
         "current_source_ids": SOURCE_IDS,
@@ -127,6 +129,7 @@ def _expected_outcome_summary():
         "dataset_id": DATASET_ID,
         "status": "published",
         "is_current": True,
+        "validated_at": "2026-07-20T08:00:00+00:00",
         "published_at": "2026-07-20T08:30:00+00:00",
         "total_resources": TOTAL_RESOURCES,
         "resource_counts": dict(sorted(RESOURCE_COUNTS.items())),
@@ -147,19 +150,6 @@ def test_outcome_normalizers_reject_invalid_and_internal_values():
         ["Practitioner", "LU:Practitioner:pass:1"],
         reject_internal_resources=True,
     ) is None
-
-
-def test_current_dataset_query_is_metadata_only_and_uses_sealed_total():
-    selected_sql = str(outcomes._current_published_dataset_statement())
-
-    assert "provider_directory_endpoint_dataset" in selected_sql
-    assert "provider_directory_dataset_resource" not in selected_sql
-    assert "provider_directory_api_endpoint" not in selected_sql
-    assert "provider_directory_source" in selected_sql
-    assert "array_agg" in selected_sql.lower()
-    assert "resource_count" in selected_sql
-    assert "GROUP BY" not in selected_sql
-    assert "count(" not in selected_sql.lower()
 
 
 @pytest.mark.asyncio
@@ -413,7 +403,7 @@ async def test_catalog_maps_by_exact_source_ids_not_canonical_base(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unknown_or_noncurrent_dataset_is_omitted(monkeypatch):
+async def test_unknown_or_invalid_sealed_dataset_is_omitted(monkeypatch):
     monkeypatch.setattr(
         outcomes.db,
         "execute",

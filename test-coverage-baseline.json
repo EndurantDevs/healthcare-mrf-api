@@ -34,6 +34,7 @@
         "api/mrf_discovery_catalog_paging.py",
         "api/provider_demographic_filters.py",
         "api/provider_directory_profile_selection_attestation.py",
+        "api/provider_directory_source_dataset_selection.py",
         "api/provider_directory_source_outcomes.py",
         "api/provider_directory_source_summary_outcome.py",
         "api/provider_directory_sources.py",
@@ -269,12 +270,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 22025,
-          "total": 31958
+          "covered": 22058,
+          "total": 31966
         },
         "lines": {
-          "covered": 74307,
-          "total": 92671
+          "covered": 74368,
+          "total": 92704
         }
       },
       "path": "test-coverage-python.json",
