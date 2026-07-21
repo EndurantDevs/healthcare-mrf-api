@@ -14,6 +14,7 @@ import io
 import json
 import importlib
 import string
+import urllib.error
 import urllib.parse
 from types import SimpleNamespace
 from typing import Any
@@ -24906,3 +24907,1645 @@ async def test_last_updated_partition_staged_rows_stream_with_keyset(monkeypatch
     assert streamed_count == written_count == 2
     assert row_responder.requested_cursors == ["", "prac-1", "prac-2"]
     assert written_batches == [["prac-1"], ["prac-2"]]
+
+def _checkpoint_context(**overrides):
+    context_by_field = {
+        "canonical_api_base": "https://directory.example.test/fhir",
+        "source_scope_hash": "scope-hash",
+        "source_ids": ("source-a",),
+        "owner_run_id": "run-current",
+        "acquisition_root_run_id": "run-root",
+        "retry_of_run_id": None,
+        "endpoint_id": "endpoint-a",
+        "dataset_id": "dataset-a",
+        "lineage_verified": True,
+    }
+    context_by_field.update(overrides)
+    return importer.PaginationCheckpointContext(**context_by_field)
+
+
+def _resource_fetch_result(*, complete=False, error=None):
+    return importer.ResourceFetchResult(
+        model=importer.ProviderDirectoryOrganization,
+        rows=[],
+        rows_fetched=0,
+        rows_written=0,
+        pages_fetched=0,
+        complete=complete,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=not complete,
+        error=error,
+    )
+
+
+def test_seed_metadata_fallbacks(monkeypatch):
+    assert importer._bool_from_seed("unknown") is None
+    assert importer._is_placeholder_url("") is True
+
+    candidates = importer._candidate_base_urls(
+        {"api_base": "https://directory.example.test/fhir/metadata"}
+    )
+    assert candidates == [
+        "https://directory.example.test/fhir/metadata",
+        "https://directory.example.test/fhir",
+    ]
+    assert importer._candidate_metadata_urls(
+        {"metadata_json": {"metadata_url": "not-an-api-base"}}
+    ) == []
+
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_PAGE_COUNT", "invalid")
+    assert importer._max_page_count() == importer.DEFAULT_MAX_PAGE_COUNT
+    assert (
+        importer._metadata_resource_page_count_cap(
+            {
+                "metadata_json": {
+                    "provider_directory_resource_page_count_cap": {
+                        "practitioner": 17
+                    }
+                }
+            },
+            "Practitioner",
+        )
+        == 17
+    )
+
+
+def test_partition_validation_fail_closed():
+    invalid_calls = (
+        (importer._partition_ceiling_value, (True,)),
+        (importer._partition_width_value, (0,)),
+        (importer._partition_page_count, (3, 2)),
+        (importer._partition_volatile_paths, ("meta.lastUpdated",)),
+    )
+    for function, arguments in invalid_calls:
+        with pytest.raises(ValueError):
+            function(*arguments)
+
+    with pytest.raises(ValueError, match="start_must_precede_end"):
+        importer._build_partition_config(
+            {
+                "start": "2026-01-02T00:00:00Z",
+                "end": "2026-01-02T00:00:00Z",
+                "ceiling": 10,
+                "minimum_width_seconds": 1,
+            }
+        )
+
+    source_lookup = {
+        "metadata_json": {
+            importer.LAST_UPDATED_PARTITION_METADATA_KEY: {
+                "enabled": True,
+                "resources": {"Organization": "not-an-object"},
+            }
+        }
+    }
+    assert importer._last_updated_partition_config(source_lookup, "Organization") == (
+        None,
+        "resource_config_not_object",
+    )
+    source_lookup["metadata_json"][importer.LAST_UPDATED_PARTITION_METADATA_KEY][
+        "resources"
+    ]["Organization"] = {}
+    partition_config, error = importer._last_updated_partition_config(
+        source_lookup, "Organization"
+    )
+    assert partition_config is None
+    assert error.startswith("invalid_config:")
+
+
+def test_sanitized_fhir_metadata_drops_invalid_and_empty_values():
+    codings = importer._sanitized_fhir_meta_codings(
+        [None, {}, {"system": "https://codes.test/system?token=secret", "code": "x"}]
+    )
+    assert codings == [{"system": "https://codes.test/system", "code": "x"}]
+    assert importer._sanitized_fhir_meta_codings("not-a-list") == []
+
+    metadata = importer._sanitized_fhir_meta(
+        {
+            "profile": [None, "https://profiles.test/base?access_token=secret"],
+            "security": [{"userSelected": "true"}],
+            "tag": [{}],
+        }
+    )
+    assert metadata == {"profile": ["https://profiles.test/base"]}
+
+
+def test_json_environment_and_error_helpers_cover_fallbacks(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_ADDRESS_KEY_BATCH_SIZE", "invalid"
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_COORDINATE_BATCH_SIZE", "invalid"
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "invalid"
+    )
+    assert (
+        importer._location_address_key_batch_size()
+        == importer.DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE
+    )
+    assert (
+        importer._location_coordinate_batch_size()
+        == importer.DEFAULT_LOCATION_COORDINATE_BATCH_SIZE
+    )
+    assert importer._copy_upsert_min_rows() == 100
+
+    date_value = datetime.date(2026, 7, 21)
+    assert importer._json_default(date_value) == "2026-07-21"
+    assert importer._json_default(SimpleNamespace(name="value")).startswith(
+        "namespace("
+    )
+    assert importer._strip_postgres_nuls(("a\x00", {"b\x00": "c\x00"})) == (
+        "a",
+        {"b": "c"},
+    )
+    assert importer._short_error(RuntimeError("x" * 300)) == "x" * 240 + "..."
+
+
+class _Response(io.BytesIO):
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_unused):
+        self.close()
+
+
+def test_seed_and_retest_downloads_use_atomic_local_files(monkeypatch, tmp_path):
+    payloads = iter((b"seed-db", b'{"results": []}'))
+    monkeypatch.setattr(
+        importer.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _Response(next(payloads)),
+    )
+    seed_path = tmp_path / "seed" / "provider-directory.db"
+    retest_path = tmp_path / "retest" / "results.json"
+
+    assert importer._download_seed_db("https://example.test/seed", seed_path) == seed_path
+    assert importer._download_retest_results(
+        "https://example.test/retest", retest_path
+    ) == retest_path
+    assert seed_path.read_bytes() == b"seed-db"
+    assert json.loads(retest_path.read_text()) == {"results": []}
+
+
+class _FailingRead:
+    def read(self, *_args, **_kwargs):
+        raise OSError("read failed")
+
+    def close(self):
+        return None
+
+
+def test_sync_http_helpers_normalize_error_responses(monkeypatch):
+    post_error = urllib.error.HTTPError(
+        "https://example.test/post",
+        422,
+        "unprocessable",
+        {},
+        io.BytesIO(b'{"error": "invalid"}'),
+    )
+    monkeypatch.setattr(
+        importer.urllib.request, "urlopen", Mock(side_effect=post_error)
+    )
+    status, response_payload, error, _elapsed = importer._post_json_sync(
+        "https://example.test/post",
+        {"query": "{}"},
+        timeout=1,
+        extra_headers={"X-Test": "yes"},
+    )
+    assert (status, response_payload, error) == (
+        422,
+        {"error": "invalid"},
+        None,
+    )
+
+    unreadable_error = urllib.error.HTTPError(
+        "https://example.test/post", 503, "unavailable", {}, _FailingRead()
+    )
+    monkeypatch.setattr(
+        importer.urllib.request, "urlopen", Mock(side_effect=unreadable_error)
+    )
+    assert importer._post_json_sync(
+        "https://example.test/post", {}, timeout=1
+    )[:3] == (503, None, None)
+
+    monkeypatch.setattr(
+        importer.urllib.request,
+        "urlopen",
+        Mock(side_effect=OSError("offline")),
+    )
+    assert importer._post_json_sync(
+        "https://example.test/post", {}, timeout=1
+    )[2] == "OSError: offline"
+
+    fetch_error = urllib.error.HTTPError(
+        "https://example.test/get",
+        429,
+        "limited",
+        {"Retry-After": "30"},
+        _FailingRead(),
+    )
+    monkeypatch.setattr(
+        importer.urllib.request, "urlopen", Mock(side_effect=fetch_error)
+    )
+    status, response_payload, error, _elapsed = importer._fetch_json_sync(
+        "https://example.test/get", timeout=1
+    )
+    assert status == 429
+    assert response_payload == {importer.SOURCE_RETRY_AFTER_FIELD: "30"}
+    assert error is None
+    assert importer._decode_json_body(b"not-json") is None
+
+
+@pytest.mark.asyncio
+async def test_source_probe_fail_closed_edges(monkeypatch):
+    no_api_probe, capability_payload = await importer._probe_source(
+        {}, timeout=1, run_id="run"
+    )
+    assert no_api_probe["status"] == "no_api"
+    assert capability_payload is None
+
+    monkeypatch.setattr(importer, "_uses_alohr_graphql_connector", lambda _source: True)
+    assert (
+        await importer._probe_resource_access(
+            {},
+            "https://example.test/fhir",
+            {"resourceType": "CapabilityStatement"},
+            timeout=1,
+        )
+        is None
+    )
+    monkeypatch.setattr(importer, "_uses_alohr_graphql_connector", lambda _source: False)
+    assert (
+        await importer._probe_resource_access(
+            {},
+            "https://example.test/fhir",
+            {"resourceType": "CapabilityStatement", "rest": []},
+            timeout=1,
+        )
+        is None
+    )
+    monkeypatch.setattr(importer, "_resource_start_url", lambda *_args, **_kwargs: None)
+    assert (
+        await importer._probe_resource_access(
+            {},
+            "https://example.test/fhir",
+            {
+                "resourceType": "CapabilityStatement",
+                "rest": [{"resource": [{"type": "Practitioner"}]}],
+            },
+            timeout=1,
+        )
+        is None
+    )
+
+
+def test_resource_probe_results_preserve_quota_and_operation_outcomes(monkeypatch):
+    operation_outcome_by_field = {
+        "resourceType": "OperationOutcome",
+        "issue": [],
+    }
+    result = importer._resource_access_probe_result(
+        {},
+        "https://example.test/fhir/Practitioner",
+        "Practitioner",
+        200,
+        operation_outcome_by_field,
+        None,
+        3,
+    )
+    assert result["status"] == "resource_error"
+    assert result["error"] == "resource_search_returned_operation_outcome"
+
+    monkeypatch.setattr(importer, "_is_molina_quota_response", lambda *_args: True)
+    quota_result = importer._resource_access_probe_result(
+        {},
+        "https://example.test/fhir/Practitioner",
+        "Practitioner",
+        200,
+        operation_outcome_by_field,
+        None,
+        4,
+    )
+    assert quota_result["status"] == "quota_exhausted"
+    assert quota_result["error"] == importer.SOURCE_QUOTA_EXHAUSTED_ERROR
+
+
+@pytest.mark.asyncio
+async def test_metadata_probe_reclassifies_unconfigured_credential_access(monkeypatch):
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                {"resourceType": "CapabilityStatement"},
+                None,
+                2,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_credential_request_options_for_source",
+        lambda *_args: {"descriptor": None},
+    )
+    monkeypatch.setattr(
+        importer, "_has_source_declared_credentialed_access", lambda _source: True
+    )
+    monkeypatch.setattr(importer, "_uses_alohr_graphql_connector", lambda _source: False)
+    monkeypatch.setattr(importer, "_probe_resource_access", AsyncMock(return_value=None))
+
+    probe, _payload = await importer._probe_metadata_candidate(
+        {},
+        "https://example.test/fhir",
+        "https://example.test/fhir/metadata",
+        timeout=1,
+        run_id="run",
+    )
+    assert probe["status"] == "auth_required"
+    assert "credentialed" in probe["error"]
+
+    importer._fetch_source_json.return_value = (200, {}, None, 2)
+    monkeypatch.setattr(
+        importer, "_has_source_declared_credentialed_access", lambda _source: False
+    )
+    monkeypatch.setattr(
+        importer, "_uses_source_known_onboarding_gateway", lambda _source: True
+    )
+    probe, _payload = await importer._probe_metadata_candidate(
+        {},
+        "https://example.test/fhir",
+        "https://example.test/fhir/metadata",
+        timeout=1,
+        run_id="run",
+    )
+    assert probe["status"] == "auth_required"
+
+
+@pytest.mark.asyncio
+async def test_graphql_probe_and_timeout_configuration_fallbacks(monkeypatch):
+    monkeypatch.setattr(
+        importer.asyncio,
+        "to_thread",
+        AsyncMock(return_value=(500, {}, None, 7)),
+    )
+    probe, payload = await importer._probe_alohr_graphql_connector(
+        {"api_base": "https://example.test/graphql"},
+        timeout=1,
+        run_id="run",
+    )
+    assert probe["status"] == "graphql_error"
+    assert probe["error"] == "http_500"
+    assert payload is None
+
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PROBE_HARD_TIMEOUT", "invalid"
+    )
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PROBE_FLUSH_EVERY", "invalid")
+    assert importer._source_probe_hard_timeout_seconds({}, timeout=3) == 8
+    assert importer._probe_flush_every() == 50
+
+
+class _GuardConnection:
+    def __init__(self, *, acquire_error=None, unlock_error=None, close_error=None):
+        self.acquire_error = acquire_error
+        self.unlock_error = unlock_error
+        self.close_error = close_error
+        self.fetch_count = 0
+        self.terminated = False
+
+    async def fetchval(self, *_args):
+        self.fetch_count += 1
+        error = self.acquire_error if self.fetch_count == 1 else self.unlock_error
+        if error is not None:
+            raise error
+        return 1
+
+    async def close(self):
+        if self.close_error is not None:
+            raise self.close_error
+
+    def terminate(self):
+        self.terminated = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "error_type", "is_propagated"),
+    [
+        ("acquire", RuntimeError, True),
+        ("unlock", RuntimeError, False),
+        ("unlock", asyncio.CancelledError, True),
+        ("close", RuntimeError, False),
+        ("close", asyncio.CancelledError, True),
+    ],
+)
+async def test_pagination_worker_guard_fails_closed(
+    monkeypatch, phase, error_type, is_propagated
+):
+    error = error_type("guard failure")
+    connection = _GuardConnection(
+        acquire_error=error if phase == "acquire" else None,
+        unlock_error=error if phase == "unlock" else None,
+        close_error=error if phase == "close" else None,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_open_pagination_checkpoint_guard_connection",
+        AsyncMock(return_value=connection),
+    )
+
+    if is_propagated:
+        expected_error = (
+            RuntimeError if phase == "acquire" else asyncio.CancelledError
+        )
+        with pytest.raises(expected_error):
+            async with importer._pagination_checkpoint_worker_guard(
+                _checkpoint_context()
+            ):
+                assert connection.fetch_count == 1
+    else:
+        async with importer._pagination_checkpoint_worker_guard(_checkpoint_context()):
+            assert connection.fetch_count == 1
+    assert connection.terminated is True
+
+
+@pytest.mark.asyncio
+async def test_guard_connection_connects_lazily(monkeypatch):
+    class _URL:
+        def set(self, **_kwargs):
+            return self
+
+        def render_as_string(self, **_kwargs):
+            return "postgresql://db.example.test/healthporta"
+
+    async def connect_database():
+        importer.db.engine = SimpleNamespace(url=_URL())
+
+    monkeypatch.setattr(importer.db, "engine", None)
+    monkeypatch.setattr(importer.db, "connect", AsyncMock(side_effect=connect_database))
+    connect = AsyncMock(return_value=object())
+    monkeypatch.setattr(importer.asyncpg, "connect", connect)
+
+    connection = await importer._open_pagination_checkpoint_guard_connection()
+
+    assert connection is connect.return_value
+    importer.db.connect.assert_awaited_once()
+    connect.assert_awaited_once_with(dsn="postgresql://db.example.test/healthporta")
+
+
+@pytest.mark.asyncio
+async def test_partition_resume_rejects_lineage_and_adopts_prior_owner(monkeypatch):
+    context = _checkpoint_context()
+    config = Mock()
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_checkpoint_resource_type",
+        lambda resource_type: f"{resource_type}:partition",
+    )
+    monkeypatch.setattr(
+        importer, "_has_matching_pagination_checkpoint_identity", lambda *_args: False
+    )
+    with pytest.raises(RuntimeError, match="lineage_conflict"):
+        await importer._resume_partition_plan(
+            context,
+            "Organization",
+            config,
+            {"start_url_hash": "different"},
+            "expected",
+        )
+
+    monkeypatch.setattr(
+        importer, "_has_matching_pagination_checkpoint_identity", lambda *_args: True
+    )
+    adoption = AsyncMock()
+    monkeypatch.setattr(importer, "_adopt_pagination_checkpoint_owner", adoption)
+    resume = importer.LastUpdatedPartitionResume(plan=Mock())
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_resume_from_checkpoint",
+        lambda *_args: resume,
+    )
+    resume_result = await importer._resume_partition_plan(
+        context,
+        "Organization",
+        config,
+        {
+            "start_url_hash": "expected",
+            "owner_run_id": "run-prior",
+            "next_url": "checkpoint-state",
+            "pages_processed": 4,
+            "rows_processed": 9,
+        },
+        "expected",
+    )
+    assert (resume_result.pages_processed, resume_result.rows_processed) == (4, 9)
+    adoption.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partition_fetch_guards_stop_limit_and_replay():
+    stopped = importer.PartitionFetchState(
+        result_model=importer.ProviderDirectoryOrganization,
+        retained_resource_rows=[],
+    )
+    stopped.stop_event.set()
+    assert await importer._can_fetch_partition_url(stopped, "https://x.test/a", max_pages=0) is False
+
+    limited = importer.PartitionFetchState(
+        result_model=importer.ProviderDirectoryOrganization,
+        retained_resource_rows=[],
+        page_count=2,
+    )
+    assert await importer._can_fetch_partition_url(limited, "https://x.test/a", max_pages=2) is False
+    assert limited.hard_page_limit_reached is True
+    assert limited.stop_event.is_set()
+
+    replayed = importer.PartitionFetchState(
+        result_model=importer.ProviderDirectoryOrganization,
+        retained_resource_rows=[],
+        seen_urls={"https://x.test/a?_page_token=secret"},
+    )
+    assert (
+        await importer._can_fetch_partition_url(
+            replayed, "https://x.test/a?_page_token=secret", max_pages=0
+        )
+        is False
+    )
+    assert replayed.error_message == "pagination_cursor_repeated"
+
+
+def _partition_options(**overrides):
+    options_by_field = {
+        "timeout": 1,
+        "run_id": "run",
+        "row_batch_handler": None,
+        "row_batch_size": 1,
+        "retain_rows": True,
+        "deadline_at": None,
+        "max_pages": 0,
+    }
+    options_by_field.update(overrides)
+    return importer.PartitionFetchOptions(**options_by_field)
+
+
+@pytest.mark.asyncio
+async def test_partition_deadline_and_entry_filtering(monkeypatch):
+    state = importer.PartitionFetchState(
+        result_model=importer.ProviderDirectoryOrganization,
+        retained_resource_rows=[],
+    )
+    queue = asyncio.Queue()
+    request = importer.PartitionChainRequest(
+        source_record={"source_id": "source-a"},
+        resource_type="Organization",
+        start_url_queue=queue,
+        state=state,
+        request_url="https://example.test/fhir/Organization",
+        fetch_options=_partition_options(deadline_at=0.0),
+    )
+    assert await importer._should_continue_partition_chain(request, request.request_url) is False
+    assert state.deadline_reached is True
+    assert state.next_url_remaining is True
+
+    parsed_rows = iter(
+        (
+            None,
+            (importer.ProviderDirectoryLocation, {"resource_id": "wrong"}),
+            (importer.ProviderDirectoryOrganization, {"resource_id": "org-1"}),
+        )
+    )
+    monkeypatch.setattr(
+        importer, "parse_fhir_resource", lambda *_args, **_kwargs: next(parsed_rows)
+    )
+    writer = AsyncMock(return_value=1)
+    await importer._consume_partition_entries(
+        state,
+        {"source_id": "source-a"},
+        "Organization",
+        [
+            {"resource": {}},
+            {"resource": {}},
+            {"resource": {}},
+        ],
+        "https://example.test/fhir/Organization",
+        [],
+        _partition_options(row_batch_handler=writer),
+    )
+    assert state.fetched_count == 1
+    assert state.written_count == 1
+    assert state.retained_resource_rows == [{"resource_id": "org-1"}]
+
+
+@pytest.mark.asyncio
+async def test_partition_bundle_validation_records_transport_and_shape_failures(
+    monkeypatch,
+):
+    state = importer.PartitionFetchState(
+        result_model=importer.ProviderDirectoryOrganization,
+        retained_resource_rows=[],
+    )
+    request = importer.PartitionPageRequest(
+        source_record={"source_id": "source-a"},
+        resource_type="Organization",
+        start_url_queue=asyncio.Queue(),
+        state=state,
+        partition_start_url="https://example.test/fhir/Organization",
+        current_url="https://example.test/fhir/Organization",
+        is_residual_only=False,
+        pending_resource_rows=[],
+        fetch_options=_partition_options(),
+    )
+    fetch = AsyncMock(
+        side_effect=[
+            (503, None, "offline", 1),
+            (200, {"resourceType": "OperationOutcome"}, None, 1),
+        ]
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch)
+
+    assert await importer._fetch_valid_partition_bundle(request) is None
+    assert await importer._fetch_valid_partition_bundle(request) is None
+    assert state.partition_error_count == 2
+    assert state.error_message.endswith("non_bundle_payload")
+
+
+@pytest.mark.asyncio
+async def test_linked_resource_import_is_bounded_and_cancels_deadline_work(monkeypatch):
+    assert (
+        await importer._import_linked_resource_rows(
+            {"source_id": "source-a"},
+            {},
+            per_source_limit=0,
+            timeout=1,
+            run_id="run",
+        )
+        == {}
+    )
+
+    refs = [
+        ("Organization", "org-existing", "Organization/org-existing", "org_refs"),
+        ("Organization", "org-new", "Organization/org-new", "org_refs"),
+        ("Organization", "org-over-limit", "Organization/org-over-limit", "org_refs"),
+    ]
+    monkeypatch.setattr(importer, "_linked_resource_refs", lambda _rows: refs)
+    fetch = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer, "_fetch_linked_resource_row", fetch)
+    import_counts = await importer._import_linked_resource_rows(
+        {"source_id": "source-a", "api_base": "https://example.test/fhir"},
+        {"Organization": [{"resource_id": "org-existing"}]},
+        per_source_limit=1,
+        timeout=1,
+        run_id="run",
+    )
+    assert import_counts == {}
+    fetch.assert_awaited_once()
+
+    blocker = asyncio.Event()
+
+    async def blocked_fetch(*_args, **_kwargs):
+        await blocker.wait()
+
+    monkeypatch.setattr(importer, "_fetch_linked_resource_row", blocked_fetch)
+    monotonic_values = iter((0.0, 2.0))
+    monkeypatch.setattr(
+        importer,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+    monkeypatch.setattr(importer.asyncio, "as_completed", lambda tasks: tasks)
+    import_counts = await importer._import_linked_resource_rows(
+        {"source_id": "source-a", "api_base": "https://example.test/fhir"},
+        {},
+        per_source_limit=1,
+        timeout=1,
+        run_id="run",
+        deadline_seconds=1,
+    )
+    assert import_counts == {}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reverse_lookup_builds_and_clears_complete_result(monkeypatch):
+    async def run_lookup(state, _request, _concurrency):
+        state.seed_count = 1
+        state.fetched_count = 2
+        state.page_count = 1
+
+    monkeypatch.setattr(importer, "_run_role_lookup_tasks", run_lookup)
+    clear = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer, "_clear_reverse_lookup_checkpoints", clear)
+    options = importer.ScanPractitionerRoleFetchOptions(
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=10,
+        timeout=1,
+        run_id="run",
+        source={"source_id": "source-a"},
+        resume_completed_seeds=True,
+    )
+    result = await importer._fetch_scan_practitioner_role_rows_concurrent(
+        {"source_id": "source-a"}, {}, options, concurrency=2
+    )
+    assert result.complete is True
+    assert result.rows_fetched == 2
+    clear.assert_awaited_once()
+
+
+def test_reverse_lookup_result_fails_closed_without_seeds():
+    streamed = importer._StreamedResourceRowBuffer(
+        model=importer.ProviderDirectoryPractitionerRole,
+        row_batch_handler=None,
+        row_batch_size=1,
+        pending_row_items=[],
+    )
+    state = importer._PractitionerRoleReverseLookupState(
+        result_model=importer.ProviderDirectoryPractitionerRole,
+        retained_resource_rows=[],
+        streamed_rows=streamed,
+        retain_rows=True,
+        page_limit=1,
+    )
+    result = importer._build_role_lookup_result(
+        importer.ProviderDirectoryPractitionerRole, [], streamed, state
+    )
+    assert result.complete is False
+    assert result.error == importer.SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_rejects_unknown_or_unsupported():
+    assert (
+        await importer._fetch_resource_rows(
+            {},
+            "Patient",
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=1,
+            timeout=1,
+            run_id="run",
+        )
+        is None
+    )
+    assert (
+        await importer._fetch_resource_rows(
+            {
+                "metadata_json": {
+                    "provider_directory_supported_resources": ["Practitioner"]
+                }
+            },
+            "Organization",
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=1,
+            timeout=1,
+            run_id="run",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_rejects_invalid_partition_and_empty_start(
+    monkeypatch,
+):
+    partition_source_lookup = {
+        "metadata_json": {
+            importer.LAST_UPDATED_PARTITION_METADATA_KEY: {
+                "enabled": True,
+                "resources": {"Organization": "invalid"},
+            }
+        }
+    }
+    invalid_partition = await importer._fetch_resource_rows(
+        partition_source_lookup,
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=1,
+        timeout=1,
+        run_id="run",
+    )
+    assert invalid_partition is not None
+    assert invalid_partition.error.endswith("resource_config_not_object")
+
+    monkeypatch.setattr(importer, "_partitioned_resource_start_urls", lambda *_args, **_kwargs: [])
+    assert (
+        await importer._fetch_resource_rows(
+            {"source_id": "source-a"},
+            "Organization",
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=1,
+            timeout=1,
+            run_id="run",
+        )
+        is None
+    )
+
+
+def _configure_completed_resource_checkpoint(monkeypatch):
+    start_url = "https://example.test/fhir/Organization?_count=10"
+    monkeypatch.setattr(
+        importer,
+        "_partitioned_resource_start_urls",
+        lambda *_args, **_kwargs: [start_url],
+    )
+    resume = importer.PaginationResumeState(
+        next_url=None,
+        pages_processed=3,
+        rows_processed=9,
+        recent_url_hashes=(),
+        complete=True,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        AsyncMock(return_value=resume),
+    )
+    return _checkpoint_context()
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_returns_complete_checkpoint(monkeypatch):
+    context = _configure_completed_resource_checkpoint(monkeypatch)
+    fetch_result = await importer._fetch_resource_rows(
+        {"source_id": "source-a"},
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=10,
+        timeout=1,
+        run_id="run",
+        row_batch_handler=AsyncMock(return_value=0),
+        pagination_checkpoint=context,
+    )
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == 9
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_rejects_census_proof_failures(monkeypatch):
+    context = _configure_completed_resource_checkpoint(monkeypatch)
+    monkeypatch.setattr(
+        importer, "_is_caresource_opaque_cursor_census", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        importer, "_prepare_caresource_pre_census", AsyncMock(return_value={})
+    )
+    fetch_result = await importer._fetch_resource_rows(
+        {"source_id": "source-a"},
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=10,
+        timeout=1,
+        run_id="run",
+        row_batch_handler=AsyncMock(return_value=0),
+        pagination_checkpoint=context,
+    )
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error.endswith("checkpoint_completion_proof_missing")
+
+    census_failure = _resource_fetch_result(error="pre_census_failed")
+    importer._prepare_caresource_pre_census.return_value = census_failure
+    fetch_result = await importer._fetch_resource_rows(
+        {"source_id": "source-a"},
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=10,
+        timeout=1,
+        run_id="run",
+        row_batch_handler=AsyncMock(return_value=0),
+        pagination_checkpoint=context,
+    )
+    assert fetch_result is census_failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page_limit", "max_pages", "expected_field"),
+    [(1, 0, "page_limit_reached"), (0, 1, "hard_page_limit_reached")],
+)
+async def test_fetch_resource_rows_enforces_page_bounds(
+    monkeypatch, page_limit, max_pages, expected_field
+):
+    start_url = "https://example.test/fhir/Organization?_count=1"
+    monkeypatch.setattr(
+        importer,
+        "_partitioned_resource_start_urls",
+        lambda *_args, **_kwargs: [start_url],
+    )
+    monkeypatch.setattr(importer, "_env_int", lambda *_args: max_pages)
+    next_url = start_url + "&_page_token=next"
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                {
+                    "resourceType": "Bundle",
+                    "entry": [
+                        {
+                            "resource": {
+                                "resourceType": "Organization",
+                                "id": "org-1",
+                            }
+                        }
+                    ],
+                    "link": [{"relation": "next", "url": next_url}],
+                },
+                None,
+                1,
+            )
+        ),
+    )
+    fetch_result = await importer._fetch_resource_rows(
+        {"source_id": "source-a", "api_base": "https://example.test/fhir"},
+        "Organization",
+        per_resource_limit=0,
+        page_limit=page_limit,
+        page_count=1,
+        timeout=1,
+        run_id="run",
+    )
+    assert fetch_result is not None
+    assert getattr(fetch_result, expected_field) is True
+    assert fetch_result.next_url_remaining is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_detects_replayed_cursor(monkeypatch):
+    start_url = "https://example.test/fhir/Organization?_count=1"
+    monkeypatch.setattr(
+        importer,
+        "_partitioned_resource_start_urls",
+        lambda *_args, **_kwargs: [start_url],
+    )
+    monkeypatch.setattr(importer, "_env_int", lambda *_args: 0)
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                {
+                    "resourceType": "Bundle",
+                    "entry": [],
+                    "link": [{"relation": "next", "url": start_url}],
+                },
+                None,
+                1,
+            )
+        ),
+    )
+    fetch_result = await importer._fetch_resource_rows(
+        {"source_id": "source-a", "api_base": "https://example.test/fhir"},
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=1,
+        timeout=1,
+        run_id="run",
+    )
+    assert fetch_result is not None
+    assert fetch_result.error == "pagination loop detected"
+    assert fetch_result.next_url_remaining is True
+
+
+def _scan_options(**overrides):
+    options_by_field = {
+        "per_resource_limit": 0,
+        "page_limit": 0,
+        "page_count": 10,
+        "timeout": 1,
+        "run_id": "run",
+        "source": {"source_id": "source-a"},
+    }
+    options_by_field.update(overrides)
+    return importer.ScanPractitionerRoleFetchOptions(**options_by_field)
+
+
+def _set_scan_seeds(monkeypatch, values):
+    async def iterate(*_args, **_kwargs):
+        for value in values:
+            yield value
+
+    monkeypatch.setattr(
+        importer, "_iter_scan_practitioner_role_seed_rows", iterate
+    )
+
+
+def _configure_serial_scan(monkeypatch, values):
+    _set_scan_seeds(monkeypatch, values)
+    monkeypatch.setattr(
+        importer, "_mark_checkpointed_reverse_lookup_roles_seen", AsyncMock()
+    )
+    monkeypatch.setattr(
+        importer, "_scan_practitioner_role_reverse_lookup_concurrency", lambda: 1
+    )
+    monkeypatch.setattr(
+        importer,
+        "_scan_practitioner_role_reverse_lookup_url",
+        lambda *_args, **_kwargs: "https://example.test/fhir/PractitionerRole?_count=10",
+    )
+
+
+@pytest.mark.asyncio
+async def test_reverse_lookup_selects_concurrent_path_and_rejects_empty_seed_set(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        importer, "_mark_checkpointed_reverse_lookup_roles_seen", AsyncMock()
+    )
+    monkeypatch.setattr(
+        importer, "_scan_practitioner_role_reverse_lookup_concurrency", lambda: 2
+    )
+    expected = _resource_fetch_result(complete=True)
+    concurrent_fetch = AsyncMock(return_value=expected)
+    monkeypatch.setattr(
+        importer, "_fetch_scan_practitioner_role_rows_concurrent", concurrent_fetch
+    )
+    fetch_result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"}, {}, _scan_options(source=None)
+    )
+    assert fetch_result is expected
+    concurrent_fetch.assert_awaited_once()
+
+    _configure_serial_scan(monkeypatch, [])
+    fetch_result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"}, {}, _scan_options()
+    )
+    assert fetch_result.complete is False
+    assert (
+        fetch_result.error
+        == importer.SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR
+    )
+
+
+@pytest.mark.asyncio
+async def test_reverse_lookup_checks_outer_and_inner_deadlines(monkeypatch):
+    seed = ("practitioner", "Practitioner", "p1")
+    _configure_serial_scan(monkeypatch, [seed])
+    monotonic_values = iter((0.0, 2.0))
+    monkeypatch.setattr(
+        importer,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+    result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"}, {}, _scan_options(deadline_seconds=1)
+    )
+    assert result.error == "deadline_reached"
+    assert result.next_url_remaining is True
+
+    _configure_serial_scan(monkeypatch, [seed])
+    monotonic_values = iter((0.0, 0.0, 2.0))
+    monkeypatch.setattr(
+        importer,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+    result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"}, {}, _scan_options(deadline_seconds=1)
+    )
+    assert result.error == "deadline_reached"
+    assert result.pages_fetched == 0
+
+
+@pytest.mark.asyncio
+async def test_reverse_lookup_checks_cancellation_before_and_during_page(monkeypatch):
+    _configure_serial_scan(
+        monkeypatch, [("practitioner", "Practitioner", "p1")]
+    )
+    cancellation_probe = AsyncMock(
+        side_effect=(None, asyncio.CancelledError("cancelled"))
+    )
+    monkeypatch.setattr(
+        importer, "_raise_if_resource_import_cancelled", cancellation_probe
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await importer._fetch_scan_practitioner_role_rows(
+            {"source_id": "source-a"},
+            {},
+            _scan_options(cancel_ctx={"context": {}}, cancel_task={}),
+        )
+    assert cancellation_probe.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page_limit", "hard_limit", "expected_field"),
+    [(1, 0, "page_limit_reached"), (0, 1, "hard_page_limit_reached")],
+)
+async def test_reverse_lookup_enforces_page_bounds(
+    monkeypatch, page_limit, hard_limit, expected_field
+):
+    _configure_serial_scan(
+        monkeypatch, [("practitioner", "Practitioner", "p1")]
+    )
+    monkeypatch.setattr(importer, "_role_lookup_page_limit", lambda: hard_limit)
+    next_url = "https://example.test/fhir/PractitionerRole?_page_token=next"
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                {
+                    "resourceType": "Bundle",
+                    "entry": [],
+                    "link": [{"relation": "next", "url": next_url}],
+                },
+                None,
+                1,
+            )
+        ),
+    )
+    result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"}, {}, _scan_options(page_limit=page_limit)
+    )
+    assert getattr(result, expected_field) is True
+    assert result.next_url_remaining is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fetch_result", "expected_error"),
+    [
+        ((503, None, "offline", 1), "reverse_lookup_errors_1_last_offline"),
+        (
+            (200, {"resourceType": "OperationOutcome"}, None, 1),
+            "reverse_lookup_errors_1_last_non_bundle_payload",
+        ),
+    ],
+)
+async def test_reverse_lookup_records_transport_and_shape_errors(
+    monkeypatch, fetch_result, expected_error
+):
+    _configure_serial_scan(
+        monkeypatch, [("practitioner", "Practitioner", "p1")]
+    )
+    monkeypatch.setattr(
+        importer, "_fetch_source_json", AsyncMock(return_value=fetch_result)
+    )
+    result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"}, {}, _scan_options()
+    )
+    assert result.complete is False
+    assert result.error == expected_error
+
+
+@pytest.mark.asyncio
+async def test_reverse_lookup_filters_entries_and_clears_complete_checkpoints(
+    monkeypatch,
+):
+    _configure_serial_scan(
+        monkeypatch, [("practitioner", "Practitioner", "p1")]
+    )
+    entries = [{"resource": {}} for _unused in range(6)]
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(200, {"resourceType": "Bundle", "entry": entries}, None, 1)
+        ),
+    )
+    parsed_rows = iter(
+        (
+            None,
+            (importer.ProviderDirectoryOrganization, {"resource_id": "wrong"}),
+            (importer.ProviderDirectoryPractitionerRole, {}),
+            (importer.ProviderDirectoryPractitionerRole, {"resource_id": "role-1"}),
+            (importer.ProviderDirectoryPractitionerRole, {"resource_id": "role-1"}),
+            (importer.ProviderDirectoryPractitionerRole, {"resource_id": "role-2"}),
+        )
+    )
+    monkeypatch.setattr(
+        importer, "parse_fhir_resource", lambda *_args, **_kwargs: next(parsed_rows)
+    )
+    clear = AsyncMock(return_value=2)
+    monkeypatch.setattr(importer, "_clear_reverse_lookup_checkpoints", clear)
+    fetch_result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"},
+        {},
+        _scan_options(resume_completed_seeds=True),
+    )
+    assert fetch_result.complete is True
+    assert [
+        role_row["resource_id"] for role_row in fetch_result.rows
+    ] == ["role-1", "role-2"]
+    clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reverse_lookup_row_limit_and_invalid_next_cursor_are_bounded(
+    monkeypatch,
+):
+    _configure_serial_scan(
+        monkeypatch, [("practitioner", "Practitioner", "p1")]
+    )
+    entries = [{"resource": {}}, {"resource": {}}]
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(200, {"resourceType": "Bundle", "entry": entries}, None, 1)
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "parse_fhir_resource",
+        lambda *_args, **_kwargs: (
+            importer.ProviderDirectoryPractitionerRole,
+            {"resource_id": "role"},
+        ),
+    )
+    fetch_result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"}, {}, _scan_options(per_resource_limit=1)
+    )
+    assert fetch_result.row_limit_reached is True
+
+    _configure_serial_scan(
+        monkeypatch, [("practitioner", "Practitioner", "p1")]
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(return_value=(200, {"resourceType": "Bundle", "entry": []}, None, 1)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resolved_fhir_next_url",
+        Mock(side_effect=ValueError("cursor rejected")),
+    )
+    fetch_result = await importer._fetch_scan_practitioner_role_rows(
+        {"source_id": "source-a"}, {}, _scan_options()
+    )
+    assert fetch_result.error == "reverse_lookup_errors_1_last_cursor rejected"
+    assert fetch_result.next_url_remaining is True
+
+
+def test_legacy_fhir_parsers_reject_malformed_nested_values():
+    generated_id = importer._resource_id({"resourceType": "Organization"})
+    assert generated_id.startswith("generated-")
+    assert importer._codings([None, {"coding": []}]) == []
+    assert importer._references([None, {"reference": "Organization/org-1"}]) == [
+        "Organization/org-1"
+    ]
+    assert importer._extension_references(
+        {"extension": [None, {"url": "ignored", "extension": None}]},
+        "https://example.test/expected",
+    ) == []
+
+    capability = importer.parse_capability(
+        {"source_id": "source-a", "api_base": "https://example.test/fhir"},
+        {
+            "resourceType": "CapabilityStatement",
+            "rest": [
+                None,
+                {
+                    "resource": [
+                        None,
+                        {},
+                        {"type": "Organization", "searchParam": []},
+                    ]
+                },
+            ],
+        },
+        {"status": "valid", "url": "https://example.test/fhir/metadata"},
+    )
+    assert capability["supported_resources"] == ["Organization"]
+
+
+def test_checkpoint_text_and_identity_helpers_fail_closed():
+    assert importer._json_text_list("not-json") == []
+    assert importer._pagination_checkpoint_row_mapping(
+        SimpleNamespace(_mapping={"dataset_id": "dataset-a"})
+    ) == {"dataset_id": "dataset-a"}
+    assert (
+        importer._pagination_checkpoint_context(
+            {},
+            ["source-a"],
+            run_id=None,
+            retry_of_run_id=None,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="fresh_root_mismatch"):
+        importer._pagination_checkpoint_root_run_id(
+            "run-current", None, "run-other"
+        )
+    with pytest.raises(ValueError, match="no source identity"):
+        importer._compatibility_storage_source([])
+    assert (
+        importer._compatible_pagination_resume_state(
+            {
+                "source_ids": ["source-a"],
+                "owner_run_id": "run-current",
+                "acquisition_root_run_id": "run-root",
+                "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+                "start_url_hash": "start-hash",
+                "next_url": None,
+            },
+            _checkpoint_context(),
+            "start-hash",
+        )
+        is None
+    )
+    assert importer._endpoint_dataset_expected_resources([]) == ()
+
+
+def test_reverse_lookup_seed_rows_skip_unusable_and_duplicate_identifiers(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        importer,
+        "_practitioner_role_reverse_lookup_resources",
+        lambda _source: ("Unknown", "Practitioner"),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_practitioner_role_reverse_lookup_params",
+        lambda _source: {"Practitioner": "practitioner"},
+    )
+    rows = list(
+        importer._scan_practitioner_role_seed_rows(
+            {},
+            {
+                "Practitioner": [
+                    {},
+                    {"resource_id": "p1"},
+                    {"resource_id": "p1"},
+                ]
+            },
+        )
+    )
+    assert rows == [("practitioner", "Practitioner", "p1")]
+
+
+@pytest.mark.asyncio
+async def test_database_seed_iteration_is_bounded_and_skips_empty_rows(monkeypatch):
+    empty_options = _scan_options(existing_seed_source_ids=())
+    assert [seed async for seed in importer._scan_role_db_seed_rows(empty_options)] == []
+
+    monkeypatch.setattr(
+        importer,
+        "_practitioner_role_reverse_lookup_resources",
+        lambda _source: ("Unknown", "Practitioner"),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_practitioner_role_reverse_lookup_params",
+        lambda _source: {"Practitioner": "practitioner"},
+    )
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(side_effect=[[('',), ("p1",)], []]),
+    )
+    options = _scan_options(existing_seed_source_ids=("source-a",), seed_page_size=2)
+    rows = [seed async for seed in importer._scan_role_db_seed_rows(options)]
+    assert rows == [("practitioner", "Practitioner", "p1")]
+
+
+@pytest.mark.asyncio
+async def test_reverse_lookup_checkpoint_cleanup_and_partition_flush(monkeypatch):
+    assert await importer._clear_reverse_lookup_checkpoints({}) == 0
+    monkeypatch.setattr(
+        importer, "_partition_checkpoint_owner_run_id", lambda *_args: "run-root"
+    )
+    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=3))
+    deleted = await importer._clear_reverse_lookup_checkpoints(
+        {"api_base": "https://example.test/fhir"},
+        seed_resource_type="Practitioner",
+        run_id="run",
+    )
+    assert deleted == 3
+    assert importer.db.status.await_args.kwargs["checkpoint_owner_run_id"] == "run-root"
+
+    state = importer.PartitionFetchState(
+        result_model=importer.ProviderDirectoryOrganization,
+        retained_resource_rows=[],
+        completed_partition_identities={"partition-a"},
+    )
+    monkeypatch.setattr(
+        importer, "_uhc_partition_identity", lambda *_args: "partition-a"
+    )
+    monkeypatch.setattr(
+        importer, "_uhc_partition_checkpoint_type", lambda *_args: "partition-type"
+    )
+    await importer._record_partition_checkpoint(
+        state,
+        {"source_id": "source-a", "api_base": "https://x.test/fhir"},
+        "Organization",
+        "https://x.test",
+        "run",
+    )
+    assert state.pending_partition_checkpoint_rows == []
+
+    state.completed_partition_identities.clear()
+    monkeypatch.setattr(importer, "_partition_checkpoint_flush_rows", lambda: 1)
+    upsert = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer, "_upsert_rows", upsert)
+    await importer._record_partition_checkpoint(
+        state,
+        {"source_id": "source-a", "api_base": "https://x.test/fhir"},
+        "Organization",
+        "https://x.test",
+        "run",
+    )
+    assert state.pending_partition_checkpoint_rows == []
+    upsert.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_mark_seen_rows_handles_empty_and_copy_paths(monkeypatch):
+    model = importer.ProviderDirectoryOrganization
+    assert await importer._mark_resource_rows_seen(model, [], "run") == 0
+    assert await importer._mark_resource_rows_seen(model, [{}], "run") == 0
+    copy_seen = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer, "_copy_mark_resource_rows_seen", copy_seen)
+    monkeypatch.setattr(importer, "_is_copy_upsert_enabled", lambda: True)
+    monkeypatch.setattr(importer, "_copy_upsert_min_rows", lambda: 1)
+    result = await importer._mark_resource_rows_seen(
+        model,
+        [{}, {"source_id": "source-a", "resource_id": "org-1"}],
+        "run",
+    )
+    assert result == 1
+    copy_seen.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_linked_resource_fetch_skips_failed_empty_and_mismatched_reads(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        importer,
+        "_linked_resource_candidate_urls",
+        lambda *_args, **_kwargs: ["https://x.test/one", "https://x.test/two", "https://x.test/three"],
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            side_effect=[
+                (503, None, "offline", 1),
+                (200, {"resourceType": "Bundle", "entry": []}, None, 1),
+                (200, {"resourceType": "Organization", "id": "other"}, None, 1),
+            ]
+        ),
+    )
+    result = await importer._fetch_linked_resource_row(
+        {"source_id": "source-a", "api_base": "https://x.test"},
+        "Organization",
+        "wanted",
+        reference="Organization/wanted",
+        timeout=1,
+        run_id="run",
+    )
+    assert result is None
+
+
+def _endpoint_candidate(**overrides):
+    candidate_by_field = {
+        "endpoint_id": "endpoint-a",
+        "dataset_id": "dataset-a",
+        "acquisition_root_run_id": "run-root",
+        "source_ids": ("source-a",),
+        "selected_resources": ("Organization",),
+        "import_run_id": "run",
+        "previous_dataset_id": None,
+    }
+    candidate_by_field.update(overrides)
+    return importer.EndpointDatasetCandidate(**candidate_by_field)
+
+
+@pytest.mark.asyncio
+async def test_locked_endpoint_candidate_rejects_conflicts_and_validates_repairs(
+    monkeypatch,
+):
+    connection = SimpleNamespace(first=AsyncMock(return_value={"dataset_id": "dataset-a"}))
+    with pytest.raises(RuntimeError, match="active_conflict"):
+        await importer._assert_locked_endpoint_candidate(
+            connection, _endpoint_candidate()
+        )
+
+    connection.first.return_value = {
+        "dataset_id": "dataset-a",
+        "endpoint_id": "endpoint-a",
+        "acquisition_root_run_id": "different-root",
+        "status": importer.ENDPOINT_DATASET_ACQUIRING,
+        "is_current": False,
+    }
+    with pytest.raises(RuntimeError, match="candidate_stale"):
+        await importer._assert_locked_endpoint_candidate(
+            connection, _endpoint_candidate(reused_from_checkpoint=True)
+        )
+
+    identity_check = Mock()
+    monkeypatch.setattr(
+        importer, "_assert_empty_orphan_candidate_identity", identity_check
+    )
+    connection.first.return_value = {
+        "endpoint_id": "endpoint-a",
+        "acquisition_root_run_id": "run-root",
+        "status": importer.ENDPOINT_DATASET_ACQUIRING,
+        "is_current": False,
+    }
+    candidate = _endpoint_candidate(repair_empty_orphan=True)
+    await importer._assert_locked_endpoint_candidate(connection, candidate)
+    identity_check.assert_called_once()
+
+
+def test_endpoint_dataset_finalization_rejects_inconsistent_state(monkeypatch):
+    with pytest.raises(RuntimeError, match="root_mismatch"):
+        importer._assert_endpoint_dataset_root_identity({}, "endpoint-a", "run-root")
+
+    with pytest.raises(RuntimeError, match="finalized_state_invalid"):
+        importer._published_endpoint_dataset_selection(
+            {
+                "status": importer.ENDPOINT_DATASET_PUBLISHED,
+                "is_current": False,
+            },
+            "dataset-a",
+            "endpoint-a",
+            "run-root",
+            requires_twin_root_verification=False,
+            verification_campaign_id=None,
+            verification_source_scope_hash=None,
+        )
+
+    with pytest.raises(RuntimeError, match="published_metadata_invalid"):
+        importer._published_endpoint_dataset_selection(
+            {
+                "status": importer.ENDPOINT_DATASET_PUBLISHED,
+                "is_current": True,
+                "endpoint_id": "endpoint-a",
+                "acquisition_root_run_id": "run-root",
+                "publication_metadata_json": [],
+            },
+            "dataset-a",
+            "endpoint-a",
+            "run-root",
+            requires_twin_root_verification=False,
+            verification_campaign_id=None,
+            verification_source_scope_hash=None,
+        )
+
+    monkeypatch.setattr(
+        importer,
+        "_persisted_endpoint_dataset_verification_fields",
+        lambda *_args, **_kwargs: {
+            "requires_twin_root_verification": True,
+            "verification_role": "baseline",
+        },
+    )
+    with pytest.raises(RuntimeError, match="promoted_replay_invalid"):
+        importer._finalized_endpoint_dataset_verification_fields(
+            {},
+            {},
+            requires_twin_root_verification=False,
+            verification_campaign_id=None,
+            verification_source_scope_hash=None,
+        )
+
+
+def test_partition_initializations_require_valid_config_and_checkpoint(monkeypatch):
+    source_records = [{"source_id": "source-a"}]
+    candidate = _endpoint_candidate()
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_config",
+        lambda *_args: (None, "invalid_config"),
+    )
+    with pytest.raises(RuntimeError, match="invalid_config"):
+        importer._candidate_partition_initializations(source_records, candidate)
+
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_config",
+        lambda *_args: (Mock(), None),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_initialization",
+        lambda *_args: importer.LastUpdatedPartitionInitialization(
+            resource_type="Organization",
+            checkpoint_resource_type="Organization:partition",
+            start_url_hash="hash",
+            checkpoint_payload="{}",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="checkpoint_context_missing"):
+        importer._candidate_partition_initializations(source_records, candidate)
