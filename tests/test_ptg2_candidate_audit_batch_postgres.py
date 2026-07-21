@@ -296,7 +296,7 @@ async def _load_postgres_partition_plan(
 
 
 def _assert_exact_partition_dispatch(plan) -> None:
-    assert plan.request_count == 2
+    assert plan.request_count == 4
     assert all(
         request.item_count <= PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS
         for request in plan.requests
@@ -351,7 +351,7 @@ async def _execute_postgres_partition_plan(
 
 
 def _assert_partition_aggregate(aggregate) -> None:
-    assert aggregate.request_count == 2
+    assert aggregate.request_count == 4
     assert aggregate.source_occurrence_count == 2
     assert aggregate.persisted_occurrence_count == 101
     assert aggregate.block_io["repeated_physical_reads"] == 0

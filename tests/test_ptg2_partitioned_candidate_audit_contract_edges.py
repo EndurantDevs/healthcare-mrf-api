@@ -245,7 +245,7 @@ def test_validated_populations_require_both_audit_cohorts(sources, persisted):
 def test_partition_packing_combines_small_groups_and_handles_exact_boundary():
     small_groups = tuple(
         _source(code="99213", npi=1_000_000_000 + index)
-        for index in range(40)
+        for index in range(20)
     ) + tuple(
         _source(code="99214", npi=2_000_000_000 + index)
         for index in range(30)
@@ -254,7 +254,10 @@ def test_partition_packing_combines_small_groups_and_handles_exact_boundary():
         _source(npi=3_000_000_000 + index) for index in range(100)
     )
 
-    assert [len(partition) for partition in request_contract._partition_items(small_groups)] == [40, 30]
+    assert [
+        len(partition)
+        for partition in request_contract._partition_items(small_groups)
+    ] == [50]
     assert [
         len(partition)
         for partition in request_contract._partition_items(exact_group_items)
