@@ -8,6 +8,7 @@ import asyncio
 from dataclasses import replace
 import hashlib
 import itertools
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +44,20 @@ def _verified_fixture(tmp_path: Path):
     )
     binding = source_binding(raw_artifact.sha256, raw_artifact.byte_count)
     return fixture, raw_artifact, retained_ranges, binding
+
+
+def _catalog_record(binding):
+    return {
+        "family": binding.family,
+        "collection_kind": binding.collection_kind,
+        "file_name": binding.file_name,
+        "source_url": binding.source_url,
+        "catalog_modified_at": binding.catalog_modified_at,
+        "size_bytes": binding.size_bytes,
+        "catalog_entry_sha256": binding.catalog_entry_sha256,
+        "availability": "published",
+        "catalog_support": "cataloged",
+    }
 
 
 @pytest.mark.parametrize(
@@ -273,4 +288,195 @@ async def test_store_rejects_an_empty_database_return(tmp_path):
             binding=binding,
             raw_artifact=raw_artifact,
             ranges=retained_ranges,
+        )
+
+
+def test_range_manifest_rejects_outer_bounds_and_database_overflow(tmp_path):
+    fixture, raw_artifact, retained_ranges, _binding = _verified_fixture(tmp_path)
+    range_mapping_list = json.loads(fixture["manifest_path"].read_bytes())["ranges"]
+    range_arguments_by_name = {
+        "raw_path": fixture["raw_path"],
+        "artifact_sha256": raw_artifact.sha256,
+        "range_count": raw_artifact.range_count,
+    }
+    with pytest.raises(UHCRetainedAdmissionError, match="exceeds"):
+        range_manifest._ranges_from_manifest(
+            range_mapping_list,
+            artifact_byte_count=int(range_mapping_list[-1]["raw_byte_end"]) - 1,
+            record_count=raw_artifact.record_count,
+            **range_arguments_by_name,
+        )
+    with pytest.raises(UHCRetainedAdmissionError, match="coverage"):
+        range_manifest._ranges_from_manifest(
+            range_mapping_list,
+            artifact_byte_count=raw_artifact.byte_count,
+            record_count=raw_artifact.record_count + 1,
+            **range_arguments_by_name,
+        )
+
+    expectation = range_manifest.RangeManifestExpectation(
+        raw_path=fixture["raw_path"],
+        manifest_path=fixture["manifest_path"],
+        artifact_sha256=raw_artifact.sha256,
+        artifact_bytes=raw_artifact.byte_count,
+        manifest_sha256=raw_artifact.manifest_sha256,
+        manifest_bytes=raw_artifact.manifest_byte_count,
+        range_count=raw_artifact.range_count,
+        producer_build_id=raw_artifact.producer_build_id,
+    )
+    oversized_ranges = (
+        replace(
+            retained_ranges[0],
+            canonical_byte_count=range_manifest._MAX_DATABASE_INTEGER + 1,
+        ),
+        *retained_ranges[1:],
+    )
+    with pytest.raises(UHCRetainedAdmissionError, match="canonical byte count"):
+        range_manifest._build_retained_artifact_proof(
+            expectation,
+            record_count=raw_artifact.record_count,
+            retained_ranges=oversized_ranges,
+            range_set_sha256=raw_artifact.range_set_sha256,
+        )
+
+
+def test_registry_rejects_changed_files_and_recomputed_catalog_drift(
+    tmp_path,
+    monkeypatch,
+):
+    _fixture, raw_artifact, _retained_ranges, binding = _verified_fixture(tmp_path)
+    with pytest.raises(UHCRetainedAdmissionError, match="changed"):
+        source_registry._source_file_identity_snapshot(
+            replace(raw_artifact, path=str(tmp_path / "missing.json"))
+        )
+
+    raw_path = Path(raw_artifact.path)
+    raw_path.chmod(0o666)
+    try:
+        with pytest.raises(UHCRetainedAdmissionError, match="changed"):
+            source_registry._source_file_identity_snapshot(raw_artifact)
+    finally:
+        raw_path.chmod(0o644)
+
+    catalog_record = _catalog_record(binding)
+    with pytest.raises(registry_contract.UHCSourceBindingMismatch, match="fields"):
+        registry_store._assert_exact_catalog_record(
+            catalog_record,
+            replace(binding, source_file_id="0" * 64),
+            raw_artifact,
+        )
+    with pytest.raises(registry_contract.UHCSourceBindingMismatch, match="byte count"):
+        registry_store._assert_exact_catalog_record(
+            catalog_record,
+            binding,
+            replace(raw_artifact, byte_count=raw_artifact.byte_count + 1),
+        )
+
+    durable_root = tmp_path / "durable-root"
+    monkeypatch.setattr(
+        source_registry,
+        "uhc_retained_artifact_root",
+        lambda: durable_root,
+    )
+    source_registry._require_durable_retained_root(durable_root)
+
+
+def test_source_proof_rejects_noncanonical_raw_and_manifest_paths(tmp_path):
+    _fixture, raw_artifact, retained_ranges, binding = _verified_fixture(tmp_path)
+    wrong_raw_path = str(Path(raw_artifact.path).with_name("wrong-raw.json"))
+    changed_ranges = tuple(
+        replace(raw_range, path=wrong_raw_path)
+        for raw_range in retained_ranges
+    )
+    changed_source = SimpleNamespace(
+        raw_artifact=replace(raw_artifact, path=wrong_raw_path),
+        ranges=changed_ranges,
+    )
+    with pytest.raises(UHCRetainedAdmissionError, match="raw path"):
+        source_registry._validate_source_proofs(binding, changed_source, ((), ()))
+
+    changed_source = SimpleNamespace(
+        raw_artifact=replace(
+            raw_artifact,
+            manifest_path=str(Path(raw_artifact.manifest_path).with_name("wrong.json")),
+        ),
+        ranges=retained_ranges,
+    )
+    with pytest.raises(UHCRetainedAdmissionError, match="manifest path"):
+        source_registry._validate_source_proofs(binding, changed_source, ((), ()))
+
+
+@pytest.mark.asyncio
+async def test_pending_lock_acquire_cleanup_handles_every_terminal_state():
+    class CountingLock:
+        def __init__(self):
+            self.release_count = 0
+
+        def release(self):
+            self.release_count += 1
+
+    async def finish():
+        await asyncio.sleep(0)
+
+    async def cancel():
+        raise asyncio.CancelledError
+
+    async def fail():
+        raise RuntimeError("injected acquire failure")
+
+    for acquire, expected_releases in ((finish, 1), (cancel, 0), (fail, 0)):
+        acquire_task = asyncio.create_task(acquire())
+        lock = CountingLock()
+        await source_registry._release_after_pending_acquire(acquire_task, lock)
+        assert lock.release_count == expected_releases
+
+
+@pytest.mark.asyncio
+async def test_locked_source_propagates_failure_and_rejects_forged_proof():
+    class FailingLock:
+        def acquire(self):
+            raise RuntimeError("injected acquire failure")
+
+        def release(self):
+            raise AssertionError("failed acquire must not release")
+
+    with pytest.raises(RuntimeError, match="injected acquire failure"):
+        async with source_registry._locked_retained_source(FailingLock()):
+            raise AssertionError("failed acquire must not enter")
+
+    with pytest.raises(UHCRetainedAdmissionError, match="native-verified"):
+        await source_registry._register_attested_source_under_lock(
+            None,
+            binding=SimpleNamespace(),
+            source=SimpleNamespace(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_admission_rejects_native_hash_drift(tmp_path, monkeypatch):
+    class Lock:
+        def acquire(self):
+            return None
+
+        def release(self):
+            return None
+
+    async def drifted_source(**_arguments):
+        return SimpleNamespace(raw_artifact=SimpleNamespace(sha256="b" * 64))
+
+    monkeypatch.setattr(
+        source_registry,
+        "uhc_retained_artifact_root",
+        lambda: tmp_path,
+    )
+    monkeypatch.setattr(source_registry, "retained_source_lock", lambda *_args: Lock())
+    monkeypatch.setattr(source_registry, "retain_source_native", drifted_source)
+    with pytest.raises(registry_contract.UHCSourceBindingMismatch, match="hashes"):
+        await source_registry.admit_retained_source(
+            None,
+            binding=SimpleNamespace(artifact_sha256="a" * 64),
+            source_path=tmp_path / "source.json",
+            expected_sha256="a" * 64,
+            expected_byte_count=1,
+            range_count=4,
         )
