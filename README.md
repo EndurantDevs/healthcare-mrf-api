@@ -4,6 +4,49 @@
 
 It combines multiple public programs into one operational service so applications can query provider directories, plan data, procedure pricing, pharmacy activity, quality benchmarks, and enrollment-derived enrichment from a consistent API layer.
 
+## OpenAI Build Week 2026
+
+This repository existed before OpenAI Build Week. During the submission period,
+we used Codex and GPT-5.6 to build and harden PTG V3: our third-generation
+pipeline for making publicly disclosed U.S. employer-plan pricing data
+economical, auditable, and queryable by agents.
+
+### What We Added During Build Week
+
+- strict shared PostgreSQL V3 storage for negotiated-rate data
+- employer-plan-specific physical and logical data separation
+- bounded Rust scanning and Python publication orchestration
+- source-witness auditing before atomic activation
+- performance and storage optimization for large payer files
+- plan-scoped provider and negotiated-rate data consumable through the
+  surrounding HealthPorta REST API and MCP delivery layers
+
+### How We Used Codex and GPT-5.6
+
+Codex and GPT-5.6 helped us navigate the multi-stage pipeline, investigate
+bottlenecks, compare architectural options, implement changes, create regression
+and adversarial tests, and verify live imports, audits, deployment provenance,
+and API behavior.
+
+We retained responsibility for the product requirements, healthcare-data
+semantics, architectural decisions, code review, and acceptance criteria.
+Timestamped Codex sessions and dated repository history document the work.
+
+### Representative Measured Result
+
+In one measured case, a 14.85 GB gzip source containing approximately 292 GB of
+expanded JSON and 516,338,771 serving-rate records became 2.48 GB of encoded
+serving payload. The import completed in 8m54s. A separate 70.56-second
+candidate audit passed with zero failed requests or retries before automatic
+activation.
+
+This is one representative case, not a universal throughput claim. The 2.48 GB
+figure measures encoded serving payload, not total PostgreSQL table, index,
+metadata, dictionary, audit, or operational storage. See the
+[PTG import contract](./docs/imports/ptg.md) and
+[PTG V3 optimization and measurement notes](./docs/research/ptg2_optimization.md)
+for the architecture and evidence boundaries.
+
 ## What This Repository Provides
 
 The service brings together:
