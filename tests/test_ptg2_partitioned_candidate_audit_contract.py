@@ -112,12 +112,12 @@ def _result(request):
     )
 
 
-def test_plan_is_deterministic_max_100_and_exact_once():
+def test_plan_is_deterministic_max_50_and_exact_once():
     plan = _plan()
     repeated = _plan()
 
     assert plan == repeated
-    assert [request.item_count for request in plan.requests] == [100, 100, 3]
+    assert [request.item_count for request in plan.requests] == [50, 50, 50, 50, 3]
     assert all(
         request.item_count
         <= contract.PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS
@@ -132,7 +132,7 @@ def test_plan_is_deterministic_max_100_and_exact_once():
     assert len(ordinals) == len(set(ordinals))
     assert sum(request.source_occurrence_count for request in plan.requests) == 201
     assert sum(len(request.persisted_occurrences) for request in plan.requests) == 2
-    assert len({request.request_digest for request in plan.requests}) == 3
+    assert len({request.request_digest for request in plan.requests}) == 5
     assert all(
         contract.parse_partitioned_candidate_audit_request(request.payload)
         == request
@@ -161,7 +161,7 @@ def test_plan_preserves_code_groups_when_they_fit():
         persisted_occurrences=_persisted_items(1),
     )
 
-    assert [request.item_count for request in plan.requests] == [81, 30]
+    assert [request.item_count for request in plan.requests] == [50, 31, 30]
     first_codes = {
         (audit_item.code_system, audit_item.code)
         for audit_item in (
@@ -192,14 +192,15 @@ def test_request_rejects_mutated_counts_items_and_digests(mutation):
 
 def test_request_rejects_more_than_100_explicit_items():
     payload = deepcopy(_plan().requests[0].payload)
-    extra = deepcopy(payload["source_challenges"][0])
-    extra["ordinal"] = 999
-    extra["npi"] = 9_000_000_000
-    extra["tuple_digest"] = "f" * 64
-    payload["source_challenges"].append(extra)
-    payload["source_challenge_count"] += 1
-    payload["source_occurrence_count"] += 1
-    payload["item_count"] += 1
+    for index in range(51):
+        extra = deepcopy(payload["source_challenges"][0])
+        extra["ordinal"] = 999 + index
+        extra["npi"] = 9_000_000_000 + index
+        extra["tuple_digest"] = f"{index + 10_000:064x}"
+        payload["source_challenges"].append(extra)
+        payload["source_challenge_count"] += 1
+        payload["source_occurrence_count"] += 1
+        payload["item_count"] += 1
 
     with pytest.raises(ValueError, match="item_count"):
         contract.parse_partitioned_candidate_audit_request(payload)
@@ -221,11 +222,11 @@ def test_results_parse_and_aggregate_complete_plan():
         tuple(reversed(parsed_results)),
     )
 
-    assert aggregate.request_count == 3
+    assert aggregate.request_count == 5
     assert aggregate.source_challenge_count == 201
     assert aggregate.source_occurrence_count == 201
     assert aggregate.persisted_occurrence_count == 2
-    assert aggregate.block_io["physical_block_reads"] == 3
+    assert aggregate.block_io["physical_block_reads"] == 5
     assert aggregate.block_io["peak_raw_bytes"] == 1024
 
 

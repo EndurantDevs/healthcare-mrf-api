@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 from process.ptg_parts.ptg2_partitioned_candidate_audit_types import (
     PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS,
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_TARGET_ITEMS,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_NETWORK_DIGESTS,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
     PartitionedCandidateAuditBinding,
@@ -217,7 +218,7 @@ def _partition_items(
     for item_group in item_groups:
         remaining_items = list(item_group)
         available_count = (
-            PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS
+            PTG2_PARTITIONED_CANDIDATE_AUDIT_TARGET_ITEMS
             - len(current_items)
         )
         if current_items and len(remaining_items) <= available_count:
@@ -228,17 +229,17 @@ def _partition_items(
             current_items = []
         while (
             len(remaining_items)
-            >= PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS
+            >= PTG2_PARTITIONED_CANDIDATE_AUDIT_TARGET_ITEMS
         ):
             partitions.append(
                 tuple(
                     remaining_items[
-                        :PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS
+                        :PTG2_PARTITIONED_CANDIDATE_AUDIT_TARGET_ITEMS
                     ]
                 )
             )
             del remaining_items[
-                :PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS
+                :PTG2_PARTITIONED_CANDIDATE_AUDIT_TARGET_ITEMS
             ]
         current_items = remaining_items
     if current_items:
@@ -411,7 +412,7 @@ def build_partitioned_candidate_audit_plan(
     source_challenges: Sequence[PartitionedSourceChallenge],
     persisted_occurrences: Sequence[PartitionedPersistedOccurrence],
 ) -> PartitionedCandidateAuditPlan:
-    """Build a code-aware, max-100, exact-once request plan."""
+    """Build a code-aware, max-50, exact-once request plan."""
 
     validated_binding = _validated_binding(binding)
     validated_challenges, validated_occurrences = (
