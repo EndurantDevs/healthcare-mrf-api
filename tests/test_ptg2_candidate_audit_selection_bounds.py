@@ -218,3 +218,36 @@ async def test_prepared_provider_requests_reach_lookup_by_identity(monkeypatch):
         schema_name="mrf",
     ) == {5: frozenset((7,))}
     assert lookup.await_args.args[2] is requests
+
+
+@pytest.mark.asyncio
+async def test_prepared_provider_requests_reject_empty_code_scope(monkeypatch):
+    lookup = AsyncMock()
+    monkeypatch.setattr(
+        selection,
+        "_lookup_prepared_code_map_from_db",
+        lookup,
+    )
+
+    assert await selection._load_candidate_provider_code_sets_prepared(
+        object(),
+        41,
+        selection._freeze_provider_code_requests({}, membership_count=0),
+        schema_name="mrf",
+    ) == {}
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="no requested codes",
+    ):
+        await selection._load_candidate_provider_code_sets_prepared(
+            object(),
+            41,
+            selection._freeze_provider_code_requests(
+                {5: set()},
+                membership_count=0,
+            ),
+            schema_name="mrf",
+        )
+
+    lookup.assert_not_awaited()
