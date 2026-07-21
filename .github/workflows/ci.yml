@@ -164,6 +164,7 @@ jobs:
     needs:
       - python-tests
       - capacity-evidence
+      - address-canonical-db-tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -185,9 +186,17 @@ jobs:
         with:
           name: mrf-python-coverage-capacity
           path: coverage-data/capacity
+      - name: Download PostgreSQL coverage data
+        uses: actions/download-artifact@v8
+        with:
+          name: mrf-python-coverage-postgres
+          path: coverage-data/postgres
       - name: Combine coverage data
         run: |
-          python -m coverage combine coverage-data/main coverage-data/capacity
+          python -m coverage combine \
+            coverage-data/main \
+            coverage-data/capacity \
+            coverage-data/postgres
           python -m coverage json --rcfile=test-coverage.ini -o test-coverage-python.json
       - name: Test coverage ratchet
         env:
@@ -381,6 +390,11 @@ jobs:
           --health-timeout 5s
           --health-retries 25
     env:
+      COVERAGE_FILE: .coverage.postgres
+      PYTEST_ADDOPTS: >-
+        --cov-config=test-coverage.ini
+        --cov=api --cov=db --cov=process --cov=service --cov=main
+        --cov-branch --cov-report= --cov-append
       HLTHPRT_DB_DRIVER: asyncpg
       HLTHPRT_DB_HOST: 127.0.0.1
       HLTHPRT_DB_PORT: "5432"
@@ -512,6 +526,8 @@ jobs:
           HLTHPRT_PTG2_CROSS_PLAN_POSTGRES_TEST: "1"
         run: python -m pytest -q tests/test_ptg2_v3_cross_plan_reuse.py
       - name: Run address and Provider Directory DB tests
+        env:
+          HLTHPRT_RETAINED_ARTIFACT_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
         run: >
           python -m pytest -q
           -o asyncio_default_test_loop_scope=session
@@ -535,3 +551,23 @@ jobs:
           tests/test_provider_directory_contract_identity_cutover.py
           tests/test_provider_directory_retry_cleanup.py
           tests/test_provider_directory_artifact_cutover_reconciliation.py
+          tests/test_provider_directory_retained_campaign_contract.py
+          tests/test_provider_directory_retained_private_locator_contract.py
+          tests/test_provider_directory_retained_contract_keys.py
+          tests/test_provider_directory_retained_private_key_binding.py
+          tests/test_provider_directory_retained_sealed_contract.py
+          tests/test_provider_directory_retained_source_neutrality.py
+          tests/test_provider_directory_retained_core_postgres.py
+          tests/test_provider_directory_retained_core_state_guards.py
+          tests/test_provider_directory_retained_seal_claim_guards.py
+          tests/test_provider_directory_retained_binding_guards.py
+          tests/test_provider_directory_retained_root_ledger_guards.py
+          tests/test_provider_directory_retained_retry_gc_guards.py
+          tests/test_provider_directory_retained_key_fence_status.py
+      - name: Upload PostgreSQL coverage data
+        uses: actions/upload-artifact@v7
+        with:
+          name: mrf-python-coverage-postgres
+          path: .coverage.postgres
+          include-hidden-files: true
+          retention-days: 1
