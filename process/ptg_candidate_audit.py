@@ -932,7 +932,7 @@ async def _execute_release_audit(
             snapshot_id=candidate_target.snapshot_id,
             phase="candidate release audit",
             message=(
-                "submitting authenticated 100-result API partitions for "
+                "submitting authenticated 50-result API partitions for "
                 f"{int(candidate_target.source_witness['occurrence_witness_count']):,} "
                 "sealed source occurrences"
             ),

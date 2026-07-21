@@ -254,11 +254,11 @@ def test_partition_packing_combines_small_groups_and_handles_exact_boundary():
         _source(npi=3_000_000_000 + index) for index in range(100)
     )
 
-    assert [len(partition) for partition in request_contract._partition_items(small_groups)] == [70]
+    assert [len(partition) for partition in request_contract._partition_items(small_groups)] == [40, 30]
     assert [
         len(partition)
         for partition in request_contract._partition_items(exact_group_items)
-    ] == [100]
+    ] == [50, 50]
 
 
 def test_partition_plan_processes_each_source_and_persisted_record_once(monkeypatch):

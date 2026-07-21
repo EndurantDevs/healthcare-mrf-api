@@ -187,11 +187,11 @@ def _report():
         partition_results,
     )
     metrics = audit.PartitionedAuditHttpMetrics(
-        planned_request_count=3,
-        started_request_count=3,
-        completed_request_count=3,
+        planned_request_count=5,
+        started_request_count=5,
+        completed_request_count=5,
         peak_in_flight=2,
-        start_times=[0.0, 0.5, 1.0],
+        start_times=[0.0, 0.5, 1.0, 1.5, 2.0],
     )
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     return build_partitioned_audit_report(
@@ -237,10 +237,10 @@ def test_partitioned_report_validates_dynamic_request_count_and_wall_time():
         plan_market_type="group",
     )
 
-    assert report["checks"]["batch_requests_executed"] == 3
-    assert report["http"]["batch_api_actual_http_requests"] == 3
+    assert report["checks"]["batch_requests_executed"] == 5
+    assert report["http"]["batch_api_actual_http_requests"] == 5
     assert report["duration_seconds"] == 2
-    assert evidence["batch_api_actual_http_requests"] == 3
+    assert evidence["batch_api_actual_http_requests"] == 5
 
 
 def test_partitioned_report_rejects_forged_request_count():
