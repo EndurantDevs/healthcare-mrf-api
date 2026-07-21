@@ -44,11 +44,19 @@ class _TestResourceConfiguration:
         return {"test_resource_configuration": True}
 
 
-async def _wait_for_file(path: Path, timeout: float = 5.0) -> None:
+async def _wait_for_file_text(path: Path, timeout: float = 5.0) -> str:
+    """Wait until a subprocess has populated a coordination file."""
+
     deadline = asyncio.get_running_loop().time() + timeout
-    while not path.exists():
+    while True:
+        try:
+            value = path.read_text().strip()
+        except FileNotFoundError:
+            value = ""
+        if value:
+            return value
         if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(f"timed out waiting for {path}")
+            raise AssertionError(f"timed out waiting for populated {path}")
         await asyncio.sleep(0.01)
 
 
@@ -194,10 +202,8 @@ async def test_finalizer_cancellation_reaps_group_and_allows_same_directory_retr
     first_attempt = asyncio.create_task(
         finalizer.run_v3_direct_finalizer(**finalizer_argument_map)
     )
-    await _wait_for_file(parent_pid_path)
-    await _wait_for_file(child_pid_path)
-    parent_pid = int(parent_pid_path.read_text())
-    child_pid = int(child_pid_path.read_text())
+    parent_pid = int(await _wait_for_file_text(parent_pid_path))
+    child_pid = int(await _wait_for_file_text(child_pid_path))
 
     if cancel_mode == "cancel":
         first_attempt.cancel()

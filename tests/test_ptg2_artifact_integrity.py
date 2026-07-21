@@ -46,7 +46,12 @@ async def _download_from_handler(tmp_path: Path, handler, prepare=None, *, query
 def _zip_bytes(payload: bytes = b'{"in_network":[]}') -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("rates.json", payload)
+        zip_entry = zipfile.ZipInfo(
+            "rates.json",
+            date_time=(1980, 1, 1, 0, 0, 0),
+        )
+        zip_entry.compress_type = zipfile.ZIP_DEFLATED
+        archive.writestr(zip_entry, payload)
     return output.getvalue()
 
 
