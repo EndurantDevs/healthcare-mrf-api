@@ -3123,6 +3123,53 @@ class PTG2V3SourceAuditWitness(Base, JSONOutputMixin):
     )
 
 
+class PTG2WitnessPart(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v3_source_audit_witness_part"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "part_number",
+            name="ptg2_v3_source_audit_witness_part_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v3_source_audit_witness.snapshot_key"
+            ],
+            name="ptg2_v3_source_audit_witness_part_parent_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "part_number BETWEEN 1 AND 7",
+            name="ptg2_v3_source_audit_witness_part_number_check",
+        ),
+        CheckConstraint(
+            "octet_length(part_sha256) = 32",
+            name="ptg2_v3_source_audit_witness_part_sha256_check",
+        ),
+        CheckConstraint(
+            "octet_length(payload) BETWEEN 1 AND 67108864",
+            name="ptg2_v3_source_audit_witness_part_payload_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    part_number = Column(Integer, nullable=False)
+    part_sha256 = Column(LargeBinary(32), nullable=False)
+    payload = Column(LargeBinary, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("transaction_timestamp()"),
+    )
+
+
 class PTG2V3GCCandidate(Base, JSONOutputMixin):
     __tablename__ = "ptg2_v3_gc_candidate"
     __main_table__ = __tablename__

@@ -258,7 +258,7 @@ def test_persisted_witness_fits_repeated_large_source_evidence_within_budget(
     )
     monkeypatch.setattr(
         witness_encoder,
-        "PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES",
+        "PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES",
         payload_budget,
     )
     witness_payload, witness_metadata = encode_persisted_source_witness(

@@ -5,6 +5,9 @@ import asyncio
 import pytest
 
 from process import ptg_control
+from process.ptg_parts.ptg2_source_witness_contract import (
+    WitnessPayloadLimitError,
+)
 
 
 async def _allow_active_run(_run_id):
@@ -86,6 +89,51 @@ async def test_ptg_control_start_marks_failed_and_reraises_cancelled_ptg_main(mo
         "message": "worker task was cancelled",
     }
     assert flushes == [True]
+
+
+@pytest.mark.asyncio
+async def test_ptg_control_surfaces_nested_source_witness_budget_failure(monkeypatch):
+    marks = []
+
+    async def fake_ptg_main(**_kwargs):
+        raise ExceptionGroup(
+            "publication lanes failed",
+            [
+                WitnessPayloadLimitError(
+                    "strict V3 source witness exceeds its 512 MiB logical "
+                    "payload safety bound"
+                )
+            ],
+        )
+
+    async def fake_mark_control_run(*args, **kwargs):
+        marks.append((args, kwargs))
+
+    async def fake_flush_terminal_status_events():
+        return None
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "_flush_terminal_status_events",
+        fake_flush_terminal_status_events,
+    )
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
+
+    with pytest.raises(ExceptionGroup):
+        await ptg_control.ptg_control_start(
+            {},
+            {"run_id": "", "params": {"source_key": "demo_source"}},
+        )
+
+    assert marks[-1][1]["error"] == {
+        "code": "ptg_source_witness_payload_budget_exceeded",
+        "message": (
+            "strict V3 source witness exceeds its 512 MiB logical "
+            "payload safety bound"
+        ),
+    }
 
 
 @pytest.mark.asyncio

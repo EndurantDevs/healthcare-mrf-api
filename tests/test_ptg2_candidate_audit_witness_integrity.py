@@ -39,10 +39,13 @@ async def test_sealed_witness_reads_validates_and_groups_one_payload(monkeypatch
     provider_validator = Mock()
     condition_builder = Mock(return_value=condition)
     challenge_grouper = Mock(return_value=(challenge,))
-    payload_result = SimpleNamespace(
-        one_or_none=Mock(return_value={"payload": b"sealed"})
+    payload_result = (
+        {"part_number": 0, "payload": b"sealed"},
+        {"part_number": 1, "payload": b"part", "part_sha256": b"x" * 32},
     )
     session = SimpleNamespace(execute=AsyncMock(return_value=payload_result))
+    assembler = Mock(return_value=b"sealed")
+    monkeypatch.setattr(integrity, "assemble_source_witness_payload", assembler)
     monkeypatch.setattr(integrity, "decode_persisted_source_witness", decoder)
     monkeypatch.setattr(integrity, "validate_provider_witness", provider_validator)
     monkeypatch.setattr(integrity, "source_audit_condition", condition_builder)
@@ -67,6 +70,7 @@ async def test_sealed_witness_reads_validates_and_groups_one_payload(monkeypatch
         parsed_evidence_by_sha256=loaded_witness.evidence_by_sha256,
     )
     challenge_grouper.assert_called_once_with(("a" * 64,), (condition,))
+    assembler.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -86,6 +90,11 @@ async def test_sealed_witness_accepts_iterable_result_without_provider_records(
         integrity,
         "decode_persisted_source_witness",
         Mock(return_value=loaded_witness),
+    )
+    monkeypatch.setattr(
+        integrity,
+        "assemble_source_witness_payload",
+        Mock(return_value=b"sealed"),
     )
     monkeypatch.setattr(
         integrity,
@@ -112,6 +121,11 @@ async def test_sealed_witness_wraps_decode_failure(monkeypatch):
         integrity,
         "decode_persisted_source_witness",
         Mock(side_effect=ValueError("invalid witness")),
+    )
+    monkeypatch.setattr(
+        integrity,
+        "assemble_source_witness_payload",
+        Mock(return_value=b"invalid"),
     )
 
     with pytest.raises(PTG2ManifestArtifactError, match="persisted source witness"):

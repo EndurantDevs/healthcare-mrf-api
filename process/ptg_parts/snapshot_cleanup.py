@@ -54,6 +54,7 @@ _STRICT_V3_SHARED_TABLE_NAMES = (
     "ptg2_v3_price_attr",
     "ptg2_v3_npi_scope",
     "ptg2_v3_audit_occurrence",
+    "ptg2_v3_source_audit_witness_part",
     "ptg2_v3_source_audit_witness",
 )
 _COVERAGE_SCOPE_ID_RE = re.compile(r"^[0-9a-f]{64}$")

@@ -41,6 +41,7 @@ PTG2_V3_DENSE_LAYOUT_TABLES = (
     "ptg2_v3_price_attr",
     "ptg2_v3_npi_scope",
     "ptg2_v3_audit_occurrence",
+    "ptg2_v3_source_audit_witness_part",
     "ptg2_v3_source_audit_witness",
 )
 _BLOCK_HASH_DOMAIN = b"PTG2V3BLOCK\x01"

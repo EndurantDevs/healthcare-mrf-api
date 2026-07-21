@@ -14,7 +14,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     LoadedSourceWitness,
     PERSISTED_PAYLOAD_MAGIC,
     PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES,
-    PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES,
+    PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
     PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
     PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION,
@@ -419,7 +419,7 @@ def decode_persisted_source_witness(
     payload_bytes = bytes(witness_payload)
     if (
         not payload_bytes
-        or len(payload_bytes) > PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES
+        or len(payload_bytes) > PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES
         or not payload_bytes.startswith(PERSISTED_PAYLOAD_MAGIC)
     ):
         raise RuntimeError("strict V3 persisted source witness framing is invalid")

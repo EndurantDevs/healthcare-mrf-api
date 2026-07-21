@@ -484,7 +484,11 @@ async def test_postgres_loader_preserves_zero_provider_population(
             "payload": witness_payload,
         }
 
+    async def database_parts(_query, **_params):
+        return []
+
     monkeypatch.setattr(witness_store.db, "first", database_row)
+    monkeypatch.setattr(witness_store.db, "all", database_parts)
 
     loaded = await witness_store.load_shared_source_witness(
         schema_name="mrf",
@@ -492,6 +496,5 @@ async def test_postgres_loader_preserves_zero_provider_population(
         expected_raw_source_sha256=[SOURCE_A],
         expected_metadata=witness_metadata,
     )
-
     assert loaded.metadata["provider_population_count"] == 0
     assert loaded.provider_records == ()

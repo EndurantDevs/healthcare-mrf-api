@@ -33,6 +33,7 @@ from db.models import (
     PTG2V3SnapshotScope,
     PTG2V3SnapshotSource,
     PTG2V3SourceAuditWitness,
+    PTG2WitnessPart,
 )
 from process.ptg_parts.ptg2_shared_gc import (
     require_migration_owned_tables,
@@ -178,7 +179,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260721100000_provider_directory_profile_selection_attestation"
+        "20260721150000_ptg2_source_witness_parts"
     ]
 
 
@@ -352,6 +353,7 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
         PTG2V3NPIScope,
         PTG2V3AuditOccurrence,
         PTG2V3SourceAuditWitness,
+        PTG2WitnessPart,
         PTG2V3CandidateAuditAttestation,
         PTG2V3GCCandidate,
     )
@@ -486,6 +488,13 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
             "payload",
             "created_at",
         ),
+        "ptg2_v3_source_audit_witness_part": (
+            "snapshot_key",
+            "part_number",
+            "part_sha256",
+            "payload",
+            "created_at",
+        ),
         "ptg2_v3_candidate_audit_attestation": (
             "snapshot_id",
             "snapshot_key",
@@ -576,6 +585,7 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
         assert isinstance(column.type, sa.BigInteger)
     attestation = PTG2V3CandidateAuditAttestation.__table__
     source_witness = PTG2V3SourceAuditWitness.__table__
+    source_witness_part = PTG2WitnessPart.__table__
     for column in (
         attestation.c.coverage_scope_id,
         attestation.c.source_set_digest,
@@ -586,6 +596,8 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
         source_witness.c.sample_digest,
         source_witness.c.payload_sha256,
         source_witness.c.payload,
+        source_witness_part.c.part_sha256,
+        source_witness_part.c.payload,
     ):
         assert isinstance(column.type, sa.LargeBinary)
     assert isinstance(attestation.c.report.type, JSONB)
@@ -603,6 +615,7 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
         attestation.c.expires_at,
         attestation.c.activated_at,
         source_witness.c.created_at,
+        source_witness_part.c.created_at,
     )
     assert all(isinstance(column.type, sa.DateTime) for column in timezone_columns)
     assert all(column.type.timezone is True for column in timezone_columns)
@@ -636,6 +649,7 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
         PTG2V3NPIScope: ("snapshot_key", "npi"),
         PTG2V3AuditOccurrence: ("snapshot_key", "occurrence_id"),
         PTG2V3SourceAuditWitness: ("snapshot_key",),
+        PTG2WitnessPart: ("snapshot_key", "part_number"),
         PTG2V3CandidateAuditAttestation: ("snapshot_id",),
         PTG2V3GCCandidate: ("block_hash",),
     }
@@ -648,6 +662,7 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
     scope_target = f"{schema}.ptg2_v3_snapshot_scope.snapshot_id"
     snapshot_target = f"{schema}.ptg2_snapshot.snapshot_id"
     trace_set_target = f"{schema}.ptg2_source_trace_set.source_trace_set_hash"
+    witness_target = f"{schema}.ptg2_v3_source_audit_witness.snapshot_key"
     expected_foreign_keys_by_model = {
         PTG2V3LayoutFingerprint: {
             "ptg2_v3_layout_fingerprint_snapshot_key_fkey": (
@@ -716,6 +731,13 @@ def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
                 ("snapshot_key",),
                 (layout_target,),
                 "RESTRICT",
+            ),
+        },
+        PTG2WitnessPart: {
+            "ptg2_v3_source_audit_witness_part_parent_fkey": (
+                ("snapshot_key",),
+                (witness_target,),
+                "CASCADE",
             ),
         },
     }
@@ -860,6 +882,7 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
         ),
     }
     assert _index_shapes(PTG2V3SourceAuditWitness.__table__) == {}
+    assert _index_shapes(PTG2WitnessPart.__table__) == {}
 
     expected_check_names_by_model = {
         PTG2V3SnapshotLayout: {
@@ -940,6 +963,11 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
             "ptg2_v3_source_audit_witness_provider_count_check",
             "ptg2_v3_source_audit_witness_total_count_check",
             "ptg2_v3_source_audit_witness_payload_check",
+        },
+        PTG2WitnessPart: {
+            "ptg2_v3_source_audit_witness_part_number_check",
+            "ptg2_v3_source_audit_witness_part_sha256_check",
+            "ptg2_v3_source_audit_witness_part_payload_check",
         },
         PTG2V3CandidateAuditAttestation: {
             "ptg2_v3_candidate_audit_attestation_scope_check",

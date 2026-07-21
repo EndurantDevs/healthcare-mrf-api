@@ -123,6 +123,7 @@ REQUIRED_TABLES = {
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
     "ptg2_v3_source_audit_witness",
+    "ptg2_v3_source_audit_witness_part",
 }
 
 EMPTY_BEFORE_WRITE_TABLES = (
@@ -138,6 +139,7 @@ EMPTY_BEFORE_WRITE_TABLES = (
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
     "ptg2_v3_source_audit_witness",
+    "ptg2_v3_source_audit_witness_part",
 )
 
 FINAL_EMPTY_TABLES = (
@@ -162,6 +164,7 @@ FINAL_EMPTY_TABLES = (
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_source",
     "ptg2_v3_source_audit_witness",
+    "ptg2_v3_source_audit_witness_part",
 )
 
 

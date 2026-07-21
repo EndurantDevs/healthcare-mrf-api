@@ -41,12 +41,49 @@ from process.ptg_parts.config import (
     PTG2_RUST_WORK_QUEUE_ENV,
     PTG2_RUST_WORKERS_ENV,
 )
+from process.ptg_parts.ptg2_source_witness_contract import (
+    WitnessPayloadLimitError,
+)
 
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
 PTG_CONTROL_HEARTBEAT_SOURCE = "engine-heartbeat"
 _FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
 _TERMINAL_RUN_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
+
+
+def _exception_leaves(error: BaseException) -> tuple[BaseException, ...]:
+    if isinstance(error, BaseExceptionGroup):
+        return tuple(
+            leaf
+            for nested_error in error.exceptions
+            for leaf in _exception_leaves(nested_error)
+        )
+    return (error,)
+
+
+def _ptg_failure_error(error: BaseException) -> dict[str, str]:
+    leaves = _exception_leaves(error)
+    witness_budget_error = next(
+        (
+            leaf
+            for leaf in leaves
+            if isinstance(leaf, WitnessPayloadLimitError)
+        ),
+        None,
+    )
+    if witness_budget_error is not None:
+        return {
+            "code": "ptg_source_witness_payload_budget_exceeded",
+            "message": str(witness_budget_error),
+        }
+    leaf_messages = tuple(
+        dict.fromkeys(str(leaf).strip() for leaf in leaves if str(leaf).strip())
+    )
+    return {
+        "code": "ptg_import_failed",
+        "message": "; ".join(leaf_messages) if leaf_messages else str(error),
+    }
 
 
 async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
@@ -182,7 +219,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 "message": "controlled PTG full rebuild failed",
             }
             if full_rebuild_proof_metrics_by_name
-            else {"code": "ptg_import_failed", "message": str(exc)}
+            else _ptg_failure_error(exc)
         )
         await mark_control_run(
             run_id,

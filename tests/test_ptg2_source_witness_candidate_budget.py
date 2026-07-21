@@ -8,6 +8,8 @@ from process.ptg_parts import ptg2_source_witness_bundle as witness_bundle
 from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES,
     PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES,
+    PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES,
+    PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES,
     SOURCE_BUNDLE_MAGIC,
     source_witness_targets,
 )
@@ -16,30 +18,36 @@ from process.ptg_parts.ptg2_source_witness_selection import (
 )
 
 
-def test_scanner_bundle_has_a_separate_larger_intermediate_budget(
+def test_scanner_bundle_and_logical_payload_have_independent_bounds(
     tmp_path,
     monkeypatch,
 ):
-    payload = SOURCE_BUNDLE_MAGIC + (b"x" * 64)
+    bundle_payload = SOURCE_BUNDLE_MAGIC + (b"x" * 64)
     bundle_path = tmp_path / "candidate.bin"
-    bundle_path.write_bytes(payload)
+    bundle_path.write_bytes(bundle_payload)
     bundle_entry_by_field = {
         "path": str(bundle_path),
-        "sha256": hashlib.sha256(payload).hexdigest(),
-        "byte_count": len(payload),
+        "sha256": hashlib.sha256(bundle_payload).hexdigest(),
+        "byte_count": len(bundle_payload),
     }
     monkeypatch.setattr(
         witness_bundle,
         "PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES",
-        len(payload),
+        len(bundle_payload),
     )
 
-    assert PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES > (
-        PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES
+    assert PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES == (
+        PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES
+    )
+    assert PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES == (
+        PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES
+    )
+    assert PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES < (
+        PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES
     )
     assert (
         witness_bundle._authenticated_bundle_payload(bundle_entry_by_field)
-        == payload
+        == bundle_payload
     )
 
 
