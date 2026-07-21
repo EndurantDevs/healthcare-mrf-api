@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import os
@@ -10,6 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -204,6 +206,60 @@ async def _insert_raw_fhir_fixture(
     )
 
 
+async def _archive_profile_dataset_a(database: Database, schema: str) -> None:
+    """Retain exact typed payloads for the attested A dataset."""
+    await database.status(
+        f"""
+        CREATE TABLE {schema}.provider_directory_endpoint_dataset (
+            dataset_id varchar(96) PRIMARY KEY,
+            created_at timestamp,
+            validated_at timestamp,
+            published_at timestamp
+        );
+        """
+    )
+    await database.status(
+        f"""
+        CREATE TABLE {schema}.provider_directory_dataset_resource (
+            dataset_id varchar(96) NOT NULL,
+            resource_type varchar(64) NOT NULL,
+            resource_id varchar(256) NOT NULL,
+            payload_hash varchar(64) NOT NULL,
+            payload_json jsonb NOT NULL,
+            PRIMARY KEY (dataset_id, resource_type, resource_id)
+        );
+        """
+    )
+    await database.status(
+        f"""
+        INSERT INTO {schema}.provider_directory_endpoint_dataset
+            (dataset_id, created_at, validated_at, published_at)
+        VALUES ('profile-dataset-a', now(), now(), now());
+        """
+    )
+    for resource_type, table_name in (
+        ("PractitionerRole", "provider_directory_practitioner_role"),
+        ("Organization", "provider_directory_organization"),
+        (
+            "OrganizationAffiliation",
+            "provider_directory_organization_affiliation",
+        ),
+    ):
+        await database.status(
+            f"""
+            INSERT INTO {schema}.provider_directory_dataset_resource (
+                dataset_id, resource_type, resource_id,
+                payload_hash, payload_json
+            )
+            SELECT 'profile-dataset-a', :resource_type, resource_id,
+                   repeat('a', 64), to_jsonb(resource)
+              FROM {schema}.{table_name} AS resource
+             WHERE source_id = 'profile-source-a';
+            """,
+            resource_type=resource_type,
+        )
+
+
 @asynccontextmanager
 async def _profile_database(monkeypatch):
     """Yield an isolated schema and remove it after the DB regression."""
@@ -260,6 +316,199 @@ async def _build_profile_artifacts(
         generation_id="profile-affiliation-test",
         profile_as_of="2026-07-19",
     )
+
+
+def _attested_a_fence():
+    return importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            importer.ProviderDirectoryArtifactDataset(
+                source_id="profile-source-a",
+                endpoint_id="profile-endpoint-1",
+                dataset_id="profile-dataset-a",
+                evidence_run_id="run-profile-source-a",
+                selected_resources=(
+                    "Organization",
+                    "OrganizationAffiliation",
+                    "PractitionerRole",
+                ),
+            ),
+        )
+    )
+
+
+async def _materialize_attested_a_scope(database, schema, monkeypatch):
+    async def materialize_fixture_source(
+        scope_schema: str,
+        table_name: str,
+        source_ids: list[str],
+    ) -> None:
+        await database.status(
+            f"CREATE UNLOGGED TABLE {scope_schema}.{table_name} AS "
+            f"SELECT * FROM {scope_schema}.provider_directory_source "
+            "WHERE source_id = ANY(CAST(:source_ids AS varchar[]));",
+            source_ids=source_ids,
+        )
+
+    monkeypatch.setattr(
+        importer,
+        "_materialize_provider_directory_artifact_source_scope",
+        materialize_fixture_source,
+    )
+    return await importer._materialize_artifact_scope_tables(
+        schema,
+        "attested-a",
+        _attested_a_fence(),
+        importer.PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES["profile"],
+    )
+
+
+async def _overwrite_live_b_and_continue_disjoint(database, schema):
+    await database.status(
+        f"UPDATE {schema}.provider_directory_organization_affiliation "
+        "SET network_refs = '[\"Organization/network-b\"]'::jsonb "
+        "WHERE source_id = 'profile-source-a' "
+        "AND resource_id = 'aff-positive';"
+    )
+    await asyncio.wait_for(
+        database.status(
+            f"UPDATE {schema}.provider_directory_source "
+            "SET plan_name = 'Disjoint C continued' "
+            "WHERE source_id = 'profile-source-b';"
+        ),
+        timeout=1,
+    )
+
+
+def _attested_a_profile_build(schema):
+    return importer._ProviderDirectoryProfileBuild(
+        schema=schema,
+        generation_id="attested-a",
+        source_ids=("profile-source-a",),
+        retained_source_ids=("profile-source-a",),
+        dataset_ids=("profile-dataset-a",),
+        profile_as_of="2026-07-19",
+        evidence_stage="profile_evidence",
+        profile_stage="profile",
+    )
+
+
+async def _assert_attested_a_evidence(database, schema):
+    evidence_row = await database.first(
+        f"SELECT value_json FROM {schema}.profile_evidence "
+        "WHERE source_id = 'profile-source-a' "
+        "AND fact_type = 'affiliation' "
+        "AND resource_id = 'aff-positive';"
+    )
+    assert evidence_row is not None
+    assert _decoded(evidence_row.value_json)["network_refs"] == [
+        "Organization/network-1"
+    ]
+
+
+def _attested_a_source_context_digest():
+    return importer._source_context_digest(
+        [
+            {
+                "source_id": "profile-source-a",
+                "endpoint_id": "profile-endpoint-1",
+                "canonical_api_base": "https://payer-1.test/fhir",
+                "org_name": "Example Health Plan",
+                "plan_name": "Example Plan 1",
+            }
+        ]
+    )
+
+
+async def _set_profile_source_labels(database, schema, org_name, plan_name):
+    await database.status(
+        f"UPDATE {schema}.provider_directory_source "
+        "SET org_name = :org_name, plan_name = :plan_name "
+        "WHERE source_id = 'profile-source-a';",
+        org_name=org_name,
+        plan_name=plan_name,
+    )
+
+
+@pytest.mark.asyncio
+async def test_attested_a_resume_ignores_live_b_overwrite_and_disjoint_work(
+    monkeypatch,
+):
+    """Resume from A staging after mutable typed rows already contain B."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        await _archive_profile_dataset_a(database, schema)
+        relation_overrides, created_tables = await _materialize_attested_a_scope(
+            database,
+            schema,
+            monkeypatch,
+        )
+        try:
+            await _overwrite_live_b_and_continue_disjoint(database, schema)
+            with importer._provider_directory_artifact_relation_scope(
+                relation_overrides
+            ):
+                await importer._populate_provider_directory_profile_evidence_stage(
+                    _attested_a_profile_build(schema),
+                    has_evidence_target=False,
+                )
+        finally:
+            await importer._drop_artifact_scope_tables(schema, created_tables)
+        await _assert_attested_a_evidence(database, schema)
+
+
+@pytest.mark.asyncio
+async def test_source_context_aba_is_rejected_before_profile_evidence(
+    monkeypatch,
+):
+    """Reject B labels staged between an A proof and restored A live rows."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        monkeypatch.setattr(
+            profile,
+            "configured_profile_source_ids",
+            lambda: ("profile-source-a",),
+        )
+        await _archive_profile_dataset_a(database, schema)
+        await _set_profile_source_labels(database, schema, "Candidate B", "B")
+        overrides, created_tables = await _materialize_attested_a_scope(
+            database,
+            schema,
+            monkeypatch,
+        )
+        await _set_profile_source_labels(
+            database,
+            schema,
+            "Example Health Plan",
+            "Example Plan 1",
+        )
+        execution = SimpleNamespace(
+            attestation=SimpleNamespace(
+                source_context_digest=_attested_a_source_context_digest()
+            )
+        )
+        execution_token = (
+            importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
+                execution
+            )
+        )
+        try:
+            with importer._provider_directory_artifact_relation_scope(overrides):
+                with pytest.raises(
+                    importer.ProviderDirectoryArtifactBuildStale,
+                    match="source_context_attestation_changed",
+                ):
+                    await importer._provider_directory_profile_scope_source_ids(
+                        schema,
+                        {"profile-source-a"},
+                    )
+        finally:
+            importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(
+                execution_token
+            )
+            await importer._drop_artifact_scope_tables(schema, created_tables)
+        assert await database.scalar(
+            f"SELECT count(*) FROM {schema}.profile_evidence;"
+        ) == 0
 
 
 async def _build_bounded_profile_artifacts(

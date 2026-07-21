@@ -256,13 +256,13 @@ async def test_address_overlay_prerequisites_cover_function_and_table_gates(
         AsyncMock(return_value=True),
     )
     table_exists = AsyncMock(side_effect=[False])
-    monkeypatch.setattr(importer, "_table_exists", table_exists)
+    monkeypatch.setattr(importer, "_is_table_present", table_exists)
     assert await importer._address_overlay_missing_requirement("mrf") == (
         "provider_directory_organization_unavailable"
     )
 
     table_exists = AsyncMock(return_value=True)
-    monkeypatch.setattr(importer, "_table_exists", table_exists)
+    monkeypatch.setattr(importer, "_is_table_present", table_exists)
     assert await importer._address_overlay_missing_requirement("mrf") is None
     assert table_exists.await_count == len(
         importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES

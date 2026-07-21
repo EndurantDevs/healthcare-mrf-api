@@ -103,6 +103,25 @@ def test_profile_evidence_sql_supports_bounded_fact_and_role_scopes():
     assert "CAST(:profile_role_bucket AS bigint)" in sql
 
 
+def test_profile_evidence_sql_accepts_exact_dataset_scoped_affiliations():
+    sql = profile.profile_evidence_insert_sql(
+        target_ref='"fixture"."evidence"',
+        source_ref='"fixture"."source_scope"',
+        practitioner_ref='"fixture"."practitioner_scope"',
+        role_ref='"fixture"."role_scope"',
+        organization_ref='"fixture"."organization_scope"',
+        affiliation_ref='"fixture"."affiliation_scope_a"',
+        affiliation_organization_ref='"fixture"."affiliation_edge"',
+        service_ref='"fixture"."service_scope"',
+        endpoint_ref='"fixture"."endpoint_scope"',
+    )
+
+    assert 'JOIN "fixture"."affiliation_scope_a" AS affiliation' in sql
+    assert 'JOIN "fixture"."affiliation_edge" AS affiliation_edge' in sql
+    assert "provider_directory_organization_affiliation" not in sql
+    assert "affiliation_edge.dataset_id = role_rows.dataset_id" in sql
+
+
 def test_profile_evidence_sql_rejects_invalid_bounded_scopes():
     sql_refs_by_name = {
         "target_ref": '"fixture"."evidence"',

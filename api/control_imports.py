@@ -20,6 +20,11 @@ from arq import create_pool
 from sqlalchemy import and_, insert, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
+from process.provider_directory_profile_selection import (
+    ProviderDirectoryProfileSelectionError,
+    validated_profile_execution,
+)
+
 from db.models import ImportRun, db
 from process.import_status_events import enqueue_status_event, isoformat_utc
 from process.live_progress import enqueue_live_progress, estimate_payload_from_live, progress_payload_from_live, read_live_progress
@@ -1117,6 +1122,7 @@ _PROVIDER_DIRECTORY_ACQUISITION = "acquisition"
 _PROVIDER_DIRECTORY_SCOPED_ARTIFACT = "scoped_artifact"
 _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT = "scoped_relation_artifact"
 _PROVIDER_DIRECTORY_SCOPED_SEED = "scoped_seed"
+_PROVIDER_DIRECTORY_GLOBAL_PROFILE = "global_profile"
 _PROVIDER_DIRECTORY_EXCLUSIVE = "exclusive"
 _PROVIDER_DIRECTORY_RELATION_ARTIFACT_TARGETS = frozenset(
     {
@@ -1315,6 +1321,19 @@ def _provider_directory_operation(
     params: dict[str, Any],
     metrics: dict[str, Any] | None = None,
 ) -> tuple[str, frozenset[str], str | None]:
+    if any(
+        field_name in params
+        for field_name in (
+            "provider_directory_profile_contract_id",
+            "provider_directory_profile_generation",
+            "provider_directory_profile_selection_attestation",
+        )
+    ):
+        try:
+            validated_profile_execution(params)
+        except ProviderDirectoryProfileSelectionError:
+            return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
+        return _PROVIDER_DIRECTORY_GLOBAL_PROFILE, frozenset(), None
     acquisition_scope = _provider_directory_acquisition_scope(params, metrics)
     if acquisition_scope is not None:
         source_ids, endpoint_scope = acquisition_scope
@@ -1369,6 +1388,23 @@ def _provider_directory_blocking_run(
         return active_acquisitions[0][0]
 
     for active_run, (active_kind, active_source_ids, active_endpoint) in classified_active_runs:
+        if requested_kind == _PROVIDER_DIRECTORY_GLOBAL_PROFILE:
+            if active_kind in {
+                _PROVIDER_DIRECTORY_GLOBAL_PROFILE,
+                _PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
+                _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
+                _PROVIDER_DIRECTORY_SCOPED_SEED,
+            }:
+                return active_run
+            continue
+        if active_kind == _PROVIDER_DIRECTORY_GLOBAL_PROFILE:
+            if requested_kind in {
+                _PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
+                _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
+                _PROVIDER_DIRECTORY_SCOPED_SEED,
+            }:
+                return active_run
+            continue
         if requested_kind == _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT:
             if active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
                 return active_run
@@ -1425,6 +1461,27 @@ def _is_parallel_active_importer_run_allowed(
     return bool(source_file_import_id and idempotency_key)
 
 
+def _validate_provider_directory_profile_execution_params(
+    importer: str,
+    params: dict[str, Any],
+) -> None:
+    """Reject malformed proof-bearing Profile work before durable admission."""
+
+    if importer != "provider-directory-fhir" or not any(
+        field_name in params
+        for field_name in (
+            "provider_directory_profile_contract_id",
+            "provider_directory_profile_generation",
+            "provider_directory_profile_selection_attestation",
+        )
+    ):
+        return
+    try:
+        validated_profile_execution(params)
+    except ProviderDirectoryProfileSelectionError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _normalize_triggered_by(value: Any) -> str:
     triggered_by = str(value or "api").strip() or "api"
     return triggered_by[:MAX_TRIGGERED_BY_LENGTH].rstrip("-_:. ") or "api"
@@ -1463,6 +1520,12 @@ async def create_import_run(
     if importer not in importer_names():
         raise ValueError(f"unknown importer: {importer}")
     _assert_ptg_rebuild_request_params(
+        importer,
+        request_payload_map.get("params")
+        if isinstance(request_payload_map.get("params"), dict)
+        else {},
+    )
+    _validate_provider_directory_profile_execution_params(
         importer,
         request_payload_map.get("params")
         if isinstance(request_payload_map.get("params"), dict)

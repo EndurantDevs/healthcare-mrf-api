@@ -66,10 +66,14 @@ def _checkpoint_map(
 def test_profile_source_context_validation_edges():
     assert importer._profile_source_context_from_row({"source_id": None}) is None
 
+    with pytest.raises(RuntimeError, match="source_context_invalid"):
+        importer._profile_source_context_from_row({"source_id": "source-a"})
+
     with pytest.raises(RuntimeError, match="source_context_missing"):
         importer._profile_source_context_from_row(
             {
                 "source_id": "source-a",
+                "endpoint_id": "endpoint-a",
                 "canonical_api_base": "https://example.test/fhir",
                 "org_name": "Example Health",
             }
@@ -79,6 +83,7 @@ def test_profile_source_context_validation_edges():
         importer._profile_source_context_from_row(
             {
                 "source_id": "source-a",
+                "endpoint_id": "endpoint-a",
                 "canonical_api_base": "https://example.test/fhir",
                 "org_name": None,
                 "plan_name": None,
@@ -90,6 +95,7 @@ def test_profile_source_context_validation_edges():
 async def test_profile_scope_blank_and_duplicate_rows(monkeypatch):
     valid_source_by_field = {
         "source_id": "source-a",
+        "endpoint_id": "endpoint-a",
         "canonical_api_base": "https://example.test/fhir",
         "org_name": "Example Health",
         "plan_name": None,

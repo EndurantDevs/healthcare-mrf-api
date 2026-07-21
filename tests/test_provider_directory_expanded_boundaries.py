@@ -258,14 +258,14 @@ def test_candidate_artifact_relations_include_every_enabled_safe_target():
 async def test_network_catalog_prerequisites_fail_closed_and_complete(monkeypatch):
     """Report the first absent relation and accept a complete schema."""
     table_exists = AsyncMock(side_effect=[False])
-    monkeypatch.setattr(importer, "_table_exists", table_exists)
+    monkeypatch.setattr(importer, "_is_table_present", table_exists)
     assert (
         await importer._network_catalog_missing_requirement("mrf")
         == "provider_directory_source_unavailable"
     )
 
     table_exists = AsyncMock(return_value=True)
-    monkeypatch.setattr(importer, "_table_exists", table_exists)
+    monkeypatch.setattr(importer, "_is_table_present", table_exists)
     assert await importer._network_catalog_missing_requirement("mrf") is None
     assert table_exists.await_count == len(
         importer.PROVIDER_DIRECTORY_NETWORK_CATALOG_REQUIRED_TABLES

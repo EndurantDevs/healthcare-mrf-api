@@ -33,6 +33,7 @@
         "api/mrf_discovery_catalog_filters.py",
         "api/mrf_discovery_catalog_paging.py",
         "api/provider_demographic_filters.py",
+        "api/provider_directory_profile_selection_attestation.py",
         "api/provider_directory_source_outcomes.py",
         "api/provider_directory_source_summary_outcome.py",
         "api/provider_directory_sources.py",
@@ -124,6 +125,9 @@
         "process/provider_directory_fhir.py",
         "process/provider_directory_profile.py",
         "process/provider_directory_profile_reference_sql.py",
+        "process/provider_directory_profile_selection.py",
+        "process/provider_directory_profile_selection_contract.py",
+        "process/provider_directory_profile_selection_snapshot.py",
         "process/provider_directory_source_summary.py",
         "process/provider_directory_source_summary_sql.py",
         "process/provider_directory_time_partition.py",
@@ -265,12 +269,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 21716,
-          "total": 31778
+          "covered": 21987,
+          "total": 31940
         },
         "lines": {
-          "covered": 73424,
-          "total": 92030
+          "covered": 74286,
+          "total": 92679
         }
       },
       "path": "test-coverage-python.json",

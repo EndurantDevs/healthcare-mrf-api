@@ -3668,7 +3668,7 @@ async def test_publish_provider_directory_location_address_keys_batches_without_
             self._mapping = values
 
     monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     first = AsyncMock(
         side_effect=[
             Row(candidate_rows=2, updated_rows=2, last_source_id="source_a", last_resource_id="loc-2"),
@@ -3700,7 +3700,7 @@ async def test_publish_provider_directory_location_address_keys_batches_with_see
             self._mapping = values
 
     monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     first = AsyncMock(
         side_effect=[
             Row(candidate_rows=2, updated_rows=1, last_source_id="source_a", last_resource_id="loc-2"),
@@ -3757,7 +3757,7 @@ async def test_backfill_provider_directory_location_coordinates_batches(monkeypa
         def __init__(self, **values):
             self._mapping = values
 
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     first = AsyncMock(
         side_effect=[
             Row(candidate_rows=2, updated_rows=2, last_source_id="source_a", last_resource_id="loc-2"),
@@ -9310,7 +9310,7 @@ async def test_corroboration_bundle_reads_prepared_overlay_and_network(monkeypat
         ) == '"mrf"."network_stage"'
         return {"rows": 11}, corroboration_stage
 
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     monkeypatch.setattr(
         importer,
         "publish_provider_directory_address_corroboration_table",
@@ -11310,7 +11310,7 @@ async def test_publish_provider_directory_location_address_keys_runs_canonical_u
 
     monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
     table_exists = AsyncMock(return_value=True)
-    monkeypatch.setattr(importer, "_table_exists", table_exists)
+    monkeypatch.setattr(importer, "_is_table_present", table_exists)
     first = AsyncMock(
         side_effect=[
             Row(candidate_rows=7, updated_rows=7, last_source_id="source_a", last_resource_id="loc-7"),
@@ -11410,7 +11410,7 @@ def test_provider_directory_openaddresses_archive_backfill_sql_is_exact_and_guar
 
 @pytest.mark.asyncio
 async def test_provider_directory_openaddresses_archive_backfill_skips_without_source(monkeypatch):
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=False))
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
 
@@ -11426,7 +11426,7 @@ async def test_provider_directory_openaddresses_archive_backfill_skips_without_s
 @pytest.mark.asyncio
 async def test_publish_provider_directory_location_archive_resolves_and_cleans_stage(monkeypatch):
     monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     status = AsyncMock(return_value=0)
     monkeypatch.setattr(importer.db, "status", status)
 
@@ -11481,7 +11481,7 @@ async def test_location_archive_holds_active_dataset_fence_through_resolve(monke
     resolve = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("resolve") or Stats())
     backfill = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("backfill") or 2)
     monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=0))
     monkeypatch.setattr(importer.db, "transaction", lambda: _recording_transaction(events))
     monkeypatch.setattr(
@@ -11518,7 +11518,7 @@ async def test_publish_provider_directory_location_archive_skips_without_archive
     async def is_table_existing(_schema, table_name):
         return table_name != "address_archive_v2"
 
-    monkeypatch.setattr(importer, "_table_exists", is_table_existing)
+    monkeypatch.setattr(importer, "_is_table_present", is_table_existing)
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
 
@@ -11532,11 +11532,11 @@ async def test_publish_provider_directory_location_archive_skips_without_archive
 async def test_corroboration_skips_without_unified_addresses(
     monkeypatch,
 ):
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=False))
     publish = AsyncMock()
     monkeypatch.setattr(importer, "publish_provider_directory_address_corroboration_table", publish)
 
-    published = await importer.publish_provider_directory_address_corroboration_if_available("mrf")
+    published = await importer._is_address_corroboration_published("mrf")
 
     assert published is False
     publish.assert_not_awaited()
@@ -11546,11 +11546,11 @@ async def test_corroboration_skips_without_unified_addresses(
 async def test_corroboration_publishes_with_unified_addresses(
     monkeypatch,
 ):
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     publish = AsyncMock()
     monkeypatch.setattr(importer, "publish_provider_directory_address_corroboration_table", publish)
 
-    published = await importer.publish_provider_directory_address_corroboration_if_available("mrf")
+    published = await importer._is_address_corroboration_published("mrf")
 
     assert published is True
     publish.assert_awaited_once_with("mrf", refresh_network_catalog=True)
@@ -11879,7 +11879,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
     monkeypatch.setattr(importer, "publish_provider_directory_network_catalog", AsyncMock(return_value={"rows": 8}))
     monkeypatch.setattr(
         importer,
-        "publish_provider_directory_address_corroboration_if_available",
+        "_is_address_corroboration_published",
         AsyncMock(return_value=True),
     )
 
@@ -11924,9 +11924,9 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
     assert importer.publish_provider_directory_address_overlay.await_args.kwargs["run_id"] == "run_full"
     importer.publish_provider_directory_network_catalog.assert_awaited_once()
     assert importer.publish_provider_directory_network_catalog.await_args.kwargs["run_id"] == "run_full"
-    importer.publish_provider_directory_address_corroboration_if_available.assert_awaited_once()
+    importer._is_address_corroboration_published.assert_awaited_once()
     assert (
-        importer.publish_provider_directory_address_corroboration_if_available.await_args.kwargs[
+        importer._is_address_corroboration_published.await_args.kwargs[
             "refresh_network_catalog"
         ]
         is False
@@ -11993,7 +11993,7 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
     }
     for artifact_name, artifact_mock in artifact_mock_map.items():
         monkeypatch.setattr(importer, artifact_name, artifact_mock)
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
 
     metrics = await importer.process_data(
         {"context": {}},
@@ -12059,7 +12059,7 @@ def _mock_artifact_only_publishers(monkeypatch) -> dict[str, AsyncMock]:
         "publish_provider_directory_location_archive": AsyncMock(return_value={"inserted": 0}),
         "publish_provider_directory_address_overlay": AsyncMock(return_value={"rows": 0}),
         "publish_provider_directory_network_catalog": AsyncMock(return_value={"rows": 8}),
-        "publish_provider_directory_address_corroboration_if_available": AsyncMock(return_value=True),
+        "_is_address_corroboration_published": AsyncMock(return_value=True),
     }
     for publisher_name, publisher_mock in artifact_publish_mocks_by_name.items():
         monkeypatch.setattr(importer, publisher_name, publisher_mock)
@@ -12109,7 +12109,7 @@ async def test_process_data_publish_artifacts_only_can_target_network_catalog(mo
         skipped_stage_mock.assert_not_awaited()
     artifact_publish_mocks_by_name["publish_provider_directory_network_catalog"].assert_awaited_once()
     assert artifact_publish_mocks_by_name["publish_provider_directory_network_catalog"].await_args.kwargs["run_id"] is None
-    artifact_publish_mocks_by_name["publish_provider_directory_address_corroboration_if_available"].assert_not_awaited()
+    artifact_publish_mocks_by_name["_is_address_corroboration_published"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -12157,7 +12157,7 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
     )
     monkeypatch.setattr(
         importer,
-        "publish_provider_directory_address_corroboration_if_available",
+        "_is_address_corroboration_published",
         AsyncMock(return_value=True),
     )
 
@@ -12187,7 +12187,7 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
     importer.backfill_provider_directory_location_coordinates.assert_not_awaited()
     importer.publish_provider_directory_location_address_keys.assert_not_awaited()
     importer.publish_provider_directory_location_archive.assert_not_awaited()
-    importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
+    importer._is_address_corroboration_published.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -12653,7 +12653,7 @@ async def test_process_data_uses_live_probe_success_over_seed_auth_required_stat
     monkeypatch.setattr(importer, "publish_provider_directory_location_archive", AsyncMock(return_value={"inserted": 0}))
     monkeypatch.setattr(
         importer,
-        "publish_provider_directory_address_corroboration_if_available",
+        "_is_address_corroboration_published",
         AsyncMock(return_value=True),
     )
 
@@ -12841,8 +12841,8 @@ async def test_copy_mark_rows_seen_appends_without_indexed_merge(monkeypatch):
 async def test_import_resources_can_preserve_seen_stage_for_publish(monkeypatch):
     ensure_stage = AsyncMock(return_value="provider_directory_import_seen_stage_test")
     drop_stage = AsyncMock()
-    monkeypatch.setattr(importer, "_ensure_provider_directory_import_seen_stage_table", ensure_stage)
-    monkeypatch.setattr(importer, "_drop_provider_directory_import_seen_stage_table", drop_stage)
+    monkeypatch.setattr(importer, "_ensure_import_seen_stage_table", ensure_stage)
+    monkeypatch.setattr(importer, "_drop_import_seen_stage_table", drop_stage)
 
     counts = await importer._import_resources(
         [],
@@ -12875,7 +12875,7 @@ async def test_provider_directory_table_ensure_skips_existing_index_ddl(
     monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
     monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
     monkeypatch.setattr(importer.db, "create_table", AsyncMock())
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     monkeypatch.setattr(
         importer.db,
         "all",
@@ -12919,7 +12919,7 @@ async def test_provider_directory_table_ensure_current_schema_runs_no_ddl(
     create_table = AsyncMock()
     monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
     monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     monkeypatch.setattr(importer.db, "create_table", create_table)
     monkeypatch.setattr(
         importer.db,
@@ -12963,7 +12963,7 @@ async def test_provider_directory_table_ensure_repairs_missing_schema_and_table(
     monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
     monkeypatch.setattr(
         importer,
-        "_table_exists",
+        "_is_table_present",
         AsyncMock(side_effect=(False, False)),
     )
     monkeypatch.setattr(importer.db, "create_table", create_table)
@@ -13028,7 +13028,7 @@ async def test_ensure_provider_directory_seen_table_creates_missing_table(monkey
         statements.append(sql)
         return 0
 
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=False))
     monkeypatch.setattr(importer.db, "status", fake_status)
 
     await importer._ensure_provider_directory_import_seen_table("mrf")
@@ -13044,7 +13044,7 @@ async def test_ensure_provider_directory_seen_table_current_schema_runs_no_ddl(
     monkeypatch,
 ):
     status = AsyncMock()
-    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
     monkeypatch.setattr(importer.db, "status", status)
 
     await importer._ensure_provider_directory_import_seen_table("mrf")
@@ -13057,7 +13057,7 @@ async def test_ensure_provider_directory_seen_stage_requires_run_id(monkeypatch)
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
 
-    stage_table = await importer._ensure_provider_directory_import_seen_stage_table(
+    stage_table = await importer._ensure_import_seen_stage_table(
         None,
         schema="mrf",
     )
@@ -13071,7 +13071,7 @@ async def test_drop_provider_directory_seen_stage_ignores_missing_name(monkeypat
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
 
-    await importer._drop_provider_directory_import_seen_stage_table(
+    await importer._drop_import_seen_stage_table(
         None,
         schema="mrf",
     )
@@ -15481,7 +15481,7 @@ async def test_fetch_resource_rows_stops_at_deadline(monkeypatch):
     assert location_fetch_result is not None
     assert location_fetch_result.rows_fetched == 1
     assert location_fetch_result.complete is False
-    assert location_fetch_result.bounded is True
+    assert location_fetch_result.is_bounded is True
     assert location_fetch_result.deadline_reached is True
     assert location_fetch_result.next_url_remaining is True
     assert location_fetch_result.error == "deadline_reached"
@@ -20622,7 +20622,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
     monkeypatch.setattr(importer, "publish_provider_directory_network_catalog", AsyncMock(return_value={"rows": 8}))
     monkeypatch.setattr(
         importer,
-        "publish_provider_directory_address_corroboration_if_available",
+        "_is_address_corroboration_published",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
@@ -20677,7 +20677,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
         source_ids=[],
         defer_cutover=True,
     )
-    importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
+    importer._is_address_corroboration_published.assert_not_awaited()
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):
     fixture_case_result = harness._run_fixture_case()
