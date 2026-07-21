@@ -148,6 +148,7 @@ mod tests {
             br#"{"number":NaN}"#.as_slice(),
             br#"{"number":Infinity}"#.as_slice(),
             br#"{"number":-Infinity}"#.as_slice(),
+            br#"[]"#.as_slice(),
             br#"{"ok":true} trailing"#.as_slice(),
             b"{\"bad\":\"\xff\"}".as_slice(),
         ] {
@@ -198,6 +199,42 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+        assert!(some_or_invalid_data::<u64>(None, "missing proof").is_err());
+        for build_id in ["", "control\nbyte", "provider-☃"] {
+            assert!(validate_build_id(build_id).is_err());
+        }
+        assert!(validate_build_id(&"x".repeat(MAX_BUILD_ID_BYTES + 1)).is_err());
+        assert!(checked_i64_domain(i64::MAX as u64 + 1, "byte_count").is_err());
+
+        let fixture = Fixture::new(FIXTURE);
+        let mut request = fixture.request(4);
+        request.expected_byte_count = 0;
+        assert!(request.validate().is_err());
+        request.expected_byte_count = i64::MAX as u64 + 1;
+        assert!(request.validate().is_err());
+
+        let source_file = File::open(&fixture.source).expect("open source fixture");
+        let source_identity = FileIdentity::from_file(&source_file).expect("source identity");
+        assert!(require_stable_regular_file(
+            &source_file,
+            source_identity,
+            fixture.byte_count + 1,
+            "source",
+        )
+        .is_err());
+        let directory_file = File::open(&fixture.output).expect("open retained directory");
+        let directory_identity =
+            FileIdentity::from_file(&directory_file).expect("directory identity");
+        assert!(require_stable_regular_file(
+            &directory_file,
+            directory_identity,
+            0,
+            "source",
+        )
+        .is_err());
+        assert!(open_regular_nofollow(&fixture.output, "source").is_err());
+        let relative_root = RootDirectory::open(Path::new(".")).expect("open relative root");
+        assert!(relative_root.path.is_absolute());
     }
 
     #[test]
