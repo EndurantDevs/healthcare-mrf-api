@@ -9,13 +9,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, select
-
+from api.provider_directory_source_dataset_selection import (
+    _source_local_dataset_statement as _current_published_dataset_statement,
+)
 from api.provider_directory_source_summary_outcome import source_summary_outcome_counts
-from db.models import ProviderDirectoryEndpointDataset, ProviderDirectorySource, db
+from db.models import db
 from process.import_status_events import isoformat_utc
 
 _PUBLISHED_DATASET_STATUS = "published"
+_SUPERSEDED_DATASET_STATUS = "superseded"
+_VALIDATED_DATASET_STATUS = "validated"
 _OUTCOME_RESOURCE_COUNTS_METADATA_KEY = "outcome_resource_counts_v1"
 _TWIN_ROOT_VERIFICATION_METADATA_KEY = "twin_root_verification_v1"
 _INTERNAL_RESOURCE_TYPE_PREFIX = "LU:"
@@ -39,7 +42,9 @@ class _CurrentPublishedDataset:
     dataset_hash: str | None
     status: str
     is_current: bool
-    published_at: dt.datetime
+    sealed_at: dt.datetime
+    validated_at: dt.datetime | None
+    published_at: dt.datetime | None
     resource_count: int
     publication_metadata: Mapping[str, Any]
 
@@ -100,45 +105,32 @@ def _normalized_text_tuple(
     return tuple(sorted(normalized_values))
 
 
-def _current_published_dataset_statement():
-    current_source_ids = (
-        select(func.array_agg(ProviderDirectorySource.source_id))
-        .where(ProviderDirectorySource.endpoint_id
-               == ProviderDirectoryEndpointDataset.endpoint_id)
-        .correlate(ProviderDirectoryEndpointDataset)
-        .scalar_subquery()
-    )
-    return (
-        select(
-            ProviderDirectoryEndpointDataset.endpoint_id.label("endpoint_id"),
-            ProviderDirectoryEndpointDataset.dataset_id.label("dataset_id"),
-            ProviderDirectoryEndpointDataset.acquisition_root_run_id.label(
-                "acquisition_root_run_id"
-            ),
-            ProviderDirectoryEndpointDataset.dataset_hash.label("dataset_hash"),
-            ProviderDirectoryEndpointDataset.status.label("status"),
-            ProviderDirectoryEndpointDataset.is_current.label("is_current"),
-            ProviderDirectoryEndpointDataset.published_at.label("published_at"),
-            ProviderDirectoryEndpointDataset.resource_count.label(
-                "resource_count"
-            ),
-            ProviderDirectoryEndpointDataset.publication_metadata_json.label(
-                "publication_metadata"
-            ),
-            current_source_ids.label("current_source_ids"),
-        )
-        .where(
-            ProviderDirectoryEndpointDataset.status
-            == _PUBLISHED_DATASET_STATUS,
-            ProviderDirectoryEndpointDataset.is_current.is_(True),
-            ProviderDirectoryEndpointDataset.published_at.is_not(None),
-        )
-        .order_by(
-            ProviderDirectoryEndpointDataset.published_at.desc(),
-            ProviderDirectoryEndpointDataset.dataset_id.desc(),
-            ProviderDirectoryEndpointDataset.endpoint_id.desc(),
-        )
-    )
+def _sealed_dataset_state(
+    dataset_record: Mapping[str, Any],
+) -> tuple[str, bool, dt.datetime, dt.datetime | None, dt.datetime | None] | None:
+    status = _clean_text(dataset_record.get("status"))
+    validated_at = _utc_datetime(dataset_record.get("validated_at"))
+    published_at = _utc_datetime(dataset_record.get("published_at"))
+    superseded_at = _utc_datetime(dataset_record.get("superseded_at"))
+    dataset_state = {
+        _VALIDATED_DATASET_STATUS: (False, validated_at)
+        if published_at is None and superseded_at is None else (False, None),
+        _PUBLISHED_DATASET_STATUS: (
+            True,
+            published_at if superseded_at is None else None,
+        ),
+        _SUPERSEDED_DATASET_STATUS: (
+            False,
+            published_at if superseded_at is not None else None,
+        ),
+    }.get(status or "")
+    if (
+        dataset_state is None
+        or dataset_record.get("is_current") is not dataset_state[0]
+        or dataset_state[1] is None
+    ):
+        return None
+    return status, dataset_state[0], dataset_state[1], validated_at, published_at
 
 
 def _current_dataset_from_row(
@@ -151,25 +143,24 @@ def _current_dataset_from_row(
         if isinstance(publication_metadata, Mapping)
         else None
     )
+    state = _sealed_dataset_state(dataset_record)
     endpoint_id = _clean_text(dataset_record.get("endpoint_id"))
     dataset_id = _clean_text(dataset_record.get("dataset_id"))
-    published_at = _utc_datetime(dataset_record.get("published_at"))
     resource_count = _valid_nonnegative_count(
         dataset_record.get("resource_count")
     )
-    current_source_ids = _normalized_text_tuple(
-        dataset_record.get("current_source_ids")
-    )
     if (
         source_ids not in expected_source_id_groups
+        or state is None
         or endpoint_id is None
         or dataset_id is None
-        or dataset_record.get("status") != _PUBLISHED_DATASET_STATUS
-        or dataset_record.get("is_current") is not True
-        or published_at is None
         or resource_count is None
         or not isinstance(publication_metadata, Mapping)
-        or current_source_ids is None
+        or (
+            current_source_ids := _normalized_text_tuple(
+                dataset_record.get("current_source_ids")
+            )
+        ) is None
         or not set(source_ids).issubset(current_source_ids)
     ):
         return None
@@ -181,16 +172,20 @@ def _current_dataset_from_row(
             dataset_record.get("acquisition_root_run_id")
         ),
         dataset_hash=_clean_text(dataset_record.get("dataset_hash")),
-        status=_PUBLISHED_DATASET_STATUS,
-        is_current=True,
-        published_at=published_at,
+        status=state[0],
+        is_current=state[1],
+        sealed_at=state[2],
+        validated_at=state[3],
+        published_at=state[4],
         resource_count=resource_count,
         publication_metadata=publication_metadata,
     )
 
 
-def _dataset_order_key(dataset: _CurrentPublishedDataset) -> tuple[dt.datetime, str, str]:
-    return dataset.published_at, dataset.dataset_id, dataset.endpoint_id
+def _dataset_order_key(
+    dataset: _CurrentPublishedDataset,
+) -> tuple[dt.datetime, str, str]:
+    return dataset.sealed_at, dataset.dataset_id, dataset.endpoint_id
 
 
 async def _current_published_dataset_by_source_ids(
@@ -198,7 +193,9 @@ async def _current_published_dataset_by_source_ids(
 ) -> dict[tuple[str, ...], _CurrentPublishedDataset]:
     if not source_id_groups:
         return {}
-    query_result = await db.execute(_current_published_dataset_statement())
+    query_result = await db.execute(
+        _current_published_dataset_statement(source_id_groups)
+    )
     selected_by_source_ids: dict[
         tuple[str, ...],
         _CurrentPublishedDataset,
@@ -441,9 +438,12 @@ def _outcome_summary(dataset: _CurrentPublishedDataset) -> dict[str, Any]:
         "dataset_id": dataset.dataset_id,
         "status": dataset.status,
         "is_current": dataset.is_current,
-        "published_at": isoformat_utc(dataset.published_at),
         "total_resources": dataset.resource_count,
     }
+    if dataset.validated_at is not None:
+        summary_map["validated_at"] = isoformat_utc(dataset.validated_at)
+    if dataset.published_at is not None:
+        summary_map["published_at"] = isoformat_utc(dataset.published_at)
     resource_counts = _exact_resource_counts(dataset)
     if resource_counts is not None:
         summary_map["resource_counts"] = resource_counts
@@ -476,7 +476,7 @@ def _catalog_source_id_groups(
 async def enrich_provider_directory_source_catalog(
     catalog: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Attach current-dataset outcomes without scanning immutable resources."""
+    """Attach latest sealed source outcomes without scanning resource rows."""
     raw_items = catalog.get("items")
     if not isinstance(raw_items, list):
         return dict(catalog)

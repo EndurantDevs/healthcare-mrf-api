@@ -109,6 +109,26 @@ def test_fhir_meta_url_collections_and_values_are_strictly_bounded():
     ) == 2048
 
 
+def test_fhir_identity_and_meta_edge_cases_remain_replay_safe():
+    assert (
+        importer._sanitized_fhir_url_identity(
+            "https://example.test:not-a-port/Practitioner"
+        )
+        is None
+    )
+    assert (
+        importer._sanitized_fhir_url_identity("Practitioner/123")
+        == "Practitioner/123"
+    )
+    assert importer._sanitized_fhir_url_identity(
+        "https://[2001:db8::1]/fhir/Practitioner"
+    ) == "https://[2001:db8::1]/fhir/Practitioner"
+    assert importer._sanitized_fhir_meta_codings([None]) == []
+    assert importer._sanitized_fhir_meta(
+        {"profile": "https://example.test/Profile/provider"}
+    ) == {"profile": ["https://example.test/Profile/provider"]}
+
+
 def test_codings_preserve_each_codeable_concept_text():
     assert importer._codings(
         [
