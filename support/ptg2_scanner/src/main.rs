@@ -23600,6 +23600,23 @@ mod tests {
     }
 
     #[test]
+    fn scanner_failure_and_hash_helpers_cover_terminal_edges() {
+        let payload: &(dyn Any + Send + 'static) = &"worker panic";
+        assert_eq!(panic_payload_message(payload), "worker panic");
+        log_worker_failure(0, "test", "expected diagnostic");
+
+        let codes = vec!["11".to_string(), "22".to_string()];
+        assert_eq!(
+            price_code_set_hash(&codes),
+            hash_string_list("price_code_set", &codes)
+        );
+
+        let missing_input =
+            std::env::temp_dir().join(format!("ptg2-scanner-missing-input-{}", std::process::id()));
+        assert!(scan(&missing_input, &[]).is_err());
+    }
+
+    #[test]
     fn source_provenance_bitpacking_matches_width_boundaries() {
         let cases = [
             (1, vec![0], Vec::new()),
