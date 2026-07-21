@@ -461,6 +461,44 @@ async def test_finalizer_dictionary_rejects_non_32_byte_expected_scope_before_da
     status.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("support_digest", "message"),
+    (
+        ("not-hex", "support digest is invalid"),
+        ((b"short").hex(), "support digest must contain 32 bytes"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_finalizer_dictionary_rejects_invalid_support_digest_before_database_work(
+    monkeypatch,
+    support_digest,
+    message,
+):
+    status = AsyncMock()
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", status)
+
+    with pytest.raises(RuntimeError, match=message):
+        await publish_shared_finalizer_dictionaries(
+            {
+                **_finalizer_contract(),
+                "output_directory": "/unused",
+                "dictionaries": {
+                    "code": {"path": "codes.copy", "row_count": 1},
+                    "provider_set": {"path": "providers.copy", "row_count": 1},
+                    "support_digest": support_digest,
+                },
+                "preservation": {"encoded_records": 1},
+            },
+            schema_name="mrf",
+            snapshot_key=7,
+            build_token="attempt-7",
+            expected_coverage_scope_id=b"s" * 32,
+            provider_set_metadata_entries=(),
+        )
+
+    status.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_finalizer_code_stage_uses_fixed_coverage_scope_id(tmp_path, monkeypatch):
     (tmp_path / "codes.copy").write_bytes(b"codes")
@@ -585,6 +623,40 @@ async def test_shared_block_existence_query_rejects_unrequested_hash(monkeypatch
             schema_name="mrf",
             requested_hashes=(b"a" * 32,),
         )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_existence_query_uses_exact_lateral_batches(monkeypatch):
+    batch_rows = ptg2_shared_publish._SHARED_BLOCK_EXISTENCE_BATCH_ROWS
+    requested_hashes = {
+        index.to_bytes(32, "big") for index in range(batch_rows + 1)
+    }
+    observed_batches = []
+    observed_statements = []
+
+    async def return_requested_hashes(statement, *, block_hashes):
+        observed_statements.append(str(statement))
+        observed_batches.append(tuple(block_hashes))
+        return [(block_hash,) for block_hash in block_hashes]
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "all", return_requested_hashes)
+
+    existing_hashes = await ptg2_shared_publish._existing_shared_block_hashes(
+        schema_name="mrf",
+        requested_hashes=requested_hashes,
+    )
+
+    assert existing_hashes == requested_hashes
+    assert list(map(len, observed_batches)) == [batch_rows, 1]
+    assert len(set().union(*map(set, observed_batches))) == sum(
+        map(len, observed_batches)
+    )
+    assert all("CROSS JOIN LATERAL" in statement for statement in observed_statements)
+    assert all(
+        "candidate.block_hash = requested.block_hash" in statement
+        for statement in observed_statements
+    )
+    assert all("LIMIT 1" in statement for statement in observed_statements)
 
 
 def _copy_connection(copy_to_table=None):

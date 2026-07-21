@@ -18,6 +18,11 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
 )
 
 
+def test_snapshot_publish_rejects_missing_summary_mapping():
+    with pytest.raises(RuntimeError, match="missing blocks"):
+        shared_snapshot_publish._mapping(None, "blocks")
+
+
 @pytest.mark.asyncio
 async def test_independent_publication_lanes_start_together():
     started_lanes: set[str] = set()

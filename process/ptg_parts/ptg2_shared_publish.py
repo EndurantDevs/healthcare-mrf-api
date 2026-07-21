@@ -392,12 +392,20 @@ async def _existing_shared_block_hashes(
                 min(len(remaining_hashes), _SHARED_BLOCK_EXISTENCE_BATCH_ROWS)
             )
         ]
+        # Keep scalar equality inside LATERAL so generic plans can prune to one
+        # hash partition per requested block instead of walking every partition.
         block_hash_rows = await db.all(
             db.text(
                 f"""
-                SELECT block_hash
-                  FROM {schema}.ptg2_v3_block
-                 WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
+                SELECT stored.block_hash
+                  FROM unnest(CAST(:block_hashes AS bytea[]))
+                           AS requested(block_hash)
+                 CROSS JOIN LATERAL (
+                           SELECT candidate.block_hash
+                             FROM {schema}.ptg2_v3_block AS candidate
+                            WHERE candidate.block_hash = requested.block_hash
+                            LIMIT 1
+                       ) AS stored
                 """
             ),
             block_hashes=batch_block_hashes,
