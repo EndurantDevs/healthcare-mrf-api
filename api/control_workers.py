@@ -88,6 +88,9 @@ _ENGINE_LABEL = "mrf"
 _K8S_API_TOKEN = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _K8S_API_CA = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 _K8S_API_NAMESPACE = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+WORKER_ENSURE_RUN_IDENTITY_CONTRACT = (
+    "healthporta.worker-ensure-run-identity.v1"
+)
 
 
 def worker_registry() -> list[dict[str, Any]]:
@@ -103,11 +106,15 @@ def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
     if not specs:
         importer = str(payload.get("importer") or "").strip()
         queue = str(payload.get("queue") or "").strip()
-        return {
-            "status": "unsupported",
-            "items": [],
-            "message": f"no worker is registered for {queue or importer or 'request'}",
-        }
+        return _worker_ensure_response(
+            payload,
+            status="unsupported",
+            items=[],
+            message=(
+                "no worker is registered for "
+                f"{queue or importer or 'request'}"
+            ),
+        )
 
     items = [_ensure_spec(spec, payload) for spec in specs]
     status = "already_running"
@@ -115,7 +122,39 @@ def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
         status = "started"
     if any(item["status"] in {"failed", "blocked", "unsupported"} for item in items):
         status = "failed"
-    return {"status": status, "items": items}
+    return _worker_ensure_response(
+        payload,
+        status=status,
+        items=items,
+    )
+
+
+def _worker_ensure_response(
+    payload: dict[str, Any],
+    *,
+    status: str,
+    items: list[dict[str, Any]],
+    message: str | None = None,
+) -> dict[str, Any]:
+    """Bind successful worker evidence to the exact requested control run."""
+
+    response_by_field: dict[str, Any] = {
+        "status": status,
+        "items": items,
+    }
+    if message is not None:
+        response_by_field["message"] = message
+    run_id = str(payload.get("run_id") or "").strip()
+    if not run_id:
+        return response_by_field
+    response_by_field.update(
+        {
+            "contract_id": WORKER_ENSURE_RUN_IDENTITY_CONTRACT,
+            "run_id": run_id,
+            "items": [{**item, "run_id": run_id} for item in items],
+        }
+    )
+    return response_by_field
 
 
 def worker_state(payload: dict[str, Any]) -> dict[str, Any]:
