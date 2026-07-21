@@ -64,6 +64,7 @@ from process.mrf_discovery_checkpoints import (
     execute_checkpointed_source_batch,
 )
 from process.ptg_parts.canonical import canonicalize_url, semantic_hash
+from process.ptg_parts.healthsparq_source_jobs import healthsparq_plan_engine_hash
 from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
 SOURCE_CONFIG_ENV = "HLTHPRT_MRF_DISCOVERY_SOURCE_CONFIG"
@@ -403,8 +404,8 @@ def _load_seed_list_rows(name: str | None) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = set(reader.fieldnames or ())
-        required = {"group_number", "status"}
-        missing = sorted(required - fieldnames)
+        required_fields = {"group_number", "status"}
+        missing = sorted(required_fields - fieldnames)
         if missing:
             raise ValueError(
                 f"seed list {name} missing required column(s): {', '.join(missing)}"
@@ -878,7 +879,7 @@ def _parse_size_bytes(size_value: Any) -> int | None:
         return None
     number = float(match.group("number"))
     unit = (match.group("unit") or "b").lower()
-    multipliers = {
+    multipliers_by_unit = {
         "b": 1,
         "byte": 1,
         "bytes": 1,
@@ -893,7 +894,7 @@ def _parse_size_bytes(size_value: Any) -> int | None:
         "tib": 1024**4,
         "pib": 1024**5,
     }
-    multiplier = multipliers.get(unit)
+    multiplier = multipliers_by_unit.get(unit)
     return int(number * multiplier) if multiplier else None
 
 
@@ -1860,15 +1861,15 @@ def _master_list_note_values(notes: str, label_pattern: str) -> tuple[str, ...]:
     except (csv.Error, StopIteration):
         parsed_values = raw_values.split(",")
     values: list[str] = []
-    seen: set[str] = set()
+    seen_values: set[str] = set()
     for raw_value in parsed_values:
         value = _clean_text(raw_value)
         if not value:
             continue
         key = value.lower()
-        if key in seen:
+        if key in seen_values:
             continue
-        seen.add(key)
+        seen_values.add(key)
         values.append(value)
     return tuple(values)
 
@@ -1926,14 +1927,14 @@ _BENEFIT_LINE_ALIASES = {
 
 def _normalize_benefit_lines(values: Iterable[Any]) -> tuple[str, ...]:
     lines: list[str] = []
-    seen: set[str] = set()
+    seen_lines: set[str] = set()
     for value in values:
         for raw_part in re.split(r"[,/]+|\band\b", str(value or ""), flags=re.I):
             key = _clean_text(raw_part).lower().replace(" ", "_")
             normalized = _BENEFIT_LINE_ALIASES.get(key)
-            if not normalized or normalized in seen:
+            if not normalized or normalized in seen_lines:
                 continue
-            seen.add(normalized)
+            seen_lines.add(normalized)
             lines.append(normalized)
     return tuple(lines)
 
@@ -3487,15 +3488,15 @@ def _is_direct_mrf_body_url(url: str | None) -> bool:
 
 
 def _metadata_text_fields(line: str) -> dict[str, str]:
-    fields: dict[str, str] = {}
+    text_by_field: dict[str, str] = {}
     for cell in line.split("|"):
         if ":" not in cell:
             continue
         key, value = cell.split(":", 1)
         key = _clean_text(key).lower()
         if key:
-            fields[key] = _clean_text(value)
-    return fields
+            text_by_field[key] = _clean_text(value)
+    return text_by_field
 
 
 def _metadata_text_rows_from_content(
@@ -4818,14 +4819,16 @@ def _magnacare_download_url(base_url: str, run_history_id: str, ip_address: str)
 
 
 def _magnacare_html_attrs(fragment: str) -> dict[str, str]:
-    attrs: dict[str, str] = {}
+    attributes_by_name: dict[str, str] = {}
     for match in re.finditer(
         r"""\b(?P<name>[a-zA-Z0-9_-]+)\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
         fragment or "",
         flags=re.S,
     ):
-        attrs[match.group("name").lower()] = html.unescape(match.group("value"))
-    return attrs
+        attributes_by_name[match.group("name").lower()] = html.unescape(
+            match.group("value")
+        )
+    return attributes_by_name
 
 
 def _magnacare_file_type(
@@ -5066,13 +5069,17 @@ async def _resolve_magnacare_transparency_mrf(
 
 
 def _asr_group_number_from_url(url: str | None) -> str | None:
-    query = {
+    query_params_by_name = {
         key.lower(): value
         for key, value in parse_qsl(
             urlsplit(str(url or "")).query, keep_blank_values=True
         )
     }
-    group_number = str(query.get("groupnumber") or query.get("g") or "").strip()
+    group_number = str(
+        query_params_by_name.get("groupnumber")
+        or query_params_by_name.get("g")
+        or ""
+    ).strip()
     return group_number or None
 
 
@@ -5467,11 +5474,11 @@ def _is_auxiant_download_link(url: str | None, label: str | None = None) -> bool
     if path.startswith(("/wp-content/", "/wp-includes/")):
         return False
     if path.startswith("/wp-admin/admin-ajax.php"):
-        query = {
+        query_params_by_name = {
             key.lower(): value
             for key, value in parse_qsl(parsed.query, keep_blank_values=True)
         }
-        return query.get("cmd") == "file"
+        return query_params_by_name.get("cmd") == "file"
     return True
 
 
@@ -6921,7 +6928,7 @@ async def _resolve_wordpress_elfinder_mrf_links(
 
 def _ebms_index_page_urls(html_text: str, *, base_url: str) -> list[tuple[str, str]]:
     urls: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     base_host = urlsplit(base_url).netloc.lower()
     base_key = _canonical_or_none(base_url) or base_url
     for candidate in _html_link_candidates(html_text, base_url=base_url):
@@ -6932,9 +6939,9 @@ def _ebms_index_page_urls(html_text: str, *, base_url: str) -> list[tuple[str, s
         if not parsed.path.lower().endswith("/index.html"):
             continue
         key = _canonical_or_none(url) or url
-        if key == base_key or key in seen:
+        if key == base_key or key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append((url, _clean_text(candidate.get("label"))))
     return urls
 
@@ -7055,7 +7062,7 @@ async def _resolve_ebms_caa_directory(
 def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
     """Extract likely MRF directory URLs from an HTML page."""
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     base_key = _canonical_or_none(base_url) or base_url
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "")
@@ -7109,9 +7116,9 @@ def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
         ):
             continue
         key = _canonical_or_none(url) or url
-        if key == base_key or key in seen:
+        if key == base_key or key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append(url)
     return urls
 
@@ -7477,16 +7484,16 @@ def _is_html_cloudflare_challenge(html_text: str) -> bool:
 
 def _fchn_payor_detail_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "")
         path = urlsplit(url).path.lower()
         if "/payorsearch/home/payordetail/" not in path:
             continue
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append(url)
     return urls
 
@@ -7816,13 +7823,13 @@ def _payercompass_add_plan_info(
     if not key:
         return
     existing = index.setdefault(key, [])
-    seen = {_payercompass_plan_key(plan) for plan in existing}
+    seen_plans = {_payercompass_plan_key(plan) for plan in existing}
     for plan in plans:
         plan_key = _payercompass_plan_key(plan)
-        if plan_key in seen:
+        if plan_key in seen_plans:
             continue
         existing.append(plan)
-        seen.add(plan_key)
+        seen_plans.add(plan_key)
 
 
 def _payercompass_plan_info_by_file_key(
@@ -9112,7 +9119,7 @@ def _is_html_mrf_body_reference(url: str | None, label: str | None = None) -> bo
 
 def _html_mrf_frame_urls(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     base_key = _canonical_or_none(base_url) or base_url
     for match in re.finditer(
         r"<iframe\b(?P<attrs>[^>]*)>", html_text or "", flags=re.I | re.S
@@ -9138,9 +9145,9 @@ def _html_mrf_frame_urls(html_text: str, *, base_url: str) -> list[str]:
         ):
             continue
         key = _canonical_or_none(url) or url
-        if key == base_key or key in seen:
+        if key == base_key or key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append(url)
     return urls
 
@@ -9376,7 +9383,7 @@ def _embedded_mrf_host_urls(raw_html_text: str | None) -> list[str]:
 
 def _delegated_mrf_source_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     candidates = [
         str(item.get("url") or "")
         for item in _html_link_candidates(html_text, base_url=base_url)
@@ -9385,7 +9392,7 @@ def _delegated_mrf_source_urls_from_html(html_text: str, *, base_url: str) -> li
     source_key = _canonical_or_none(base_url) or base_url
     for url in candidates:
         key = _canonical_or_none(url) or url
-        if not url or key == source_key or key in seen:
+        if not url or key == source_key or key in seen_urls:
             continue
         platform = classify_hosting_platform(url)
         if not platform or platform in {
@@ -9398,29 +9405,29 @@ def _delegated_mrf_source_urls_from_html(html_text: str, *, base_url: str) -> li
             continue
         if not _platform_resolver_config(platform):
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append(url)
     return urls
 
 
 def _hcsc_asomrf_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "")
         if "/asomrf" not in urlsplit(url).path.lower():
             continue
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append(url)
     return urls
 
 
 def _point32_directory_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     candidates = [
         str(item.get("url") or "")
         for item in _html_link_candidates(html_text, base_url=base_url)
@@ -9434,9 +9441,9 @@ def _point32_directory_urls_from_html(html_text: str, *, base_url: str) -> list[
         if "mrf" not in host and "mrf" not in parsed.path.lower():
             continue
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append(url)
     return urls
 
@@ -10183,7 +10190,7 @@ def _anthem_s3_status_urls_from_script(script_text: str) -> list[str]:
 
 def _anthem_s3_bases_from_script(script_text: str) -> list[str]:
     bases: list[str] = []
-    seen: set[str] = set()
+    seen_bases: set[str] = set()
     for match in re.finditer(
         r"""s3url\s*=\s*(?P<quote>["'])(?P<url>https?://.*?/)(?P=quote)""",
         script_text or "",
@@ -10191,9 +10198,9 @@ def _anthem_s3_bases_from_script(script_text: str) -> list[str]:
     ):
         url = html.unescape(match.group("url"))
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_bases:
             continue
-        seen.add(key)
+        seen_bases.add(key)
         bases.append(url)
     return bases
 
@@ -10202,7 +10209,7 @@ def _anthem_s3_toc_patterns_from_script(
     script_text: str, *, source_url: str
 ) -> list[tuple[str, str, str]]:
     patterns: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen_patterns: set[tuple[str, str, str]] = set()
     regex = re.compile(
         r"""s3url\s*\+\s*["'](?P<prefix>[^"']+/)["']\s*\+\s*year\s*\+\s*["']-["']\s*\+\s*month\s*\+\s*["']-01_(?P<slug>[^"']+)_index\.json(?P<gzip>\.gz)?["']""",
         flags=re.I,
@@ -10213,8 +10220,8 @@ def _anthem_s3_toc_patterns_from_script(
             match.group("slug"),
             ".json.gz" if match.group("gzip") else ".json",
         )
-        if pattern not in seen:
-            seen.add(pattern)
+        if pattern not in seen_patterns:
+            seen_patterns.add(pattern)
             patterns.append(pattern)
     if patterns:
         return patterns
@@ -10511,7 +10518,7 @@ def _healthcarebluebook_link_items_from_context(
     html_text: str, *, base_url: str
 ) -> list[dict[str, Any]]:
     link_item_list: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen_links: set[str] = set()
     for candidate in _html_link_candidates(html_text or "", base_url=base_url):
         link_url = str(candidate.get("url") or "").strip()
         if not link_url:
@@ -10523,9 +10530,9 @@ def _healthcarebluebook_link_items_from_context(
         ):
             continue
         key = _canonical_or_none(link_url) or link_url
-        if key in seen:
+        if key in seen_links:
             continue
-        seen.add(key)
+        seen_links.add(key)
         context_html = ""
         start = candidate.get("html_start")
         end = candidate.get("html_end")
@@ -11380,7 +11387,7 @@ def _limit_crawl_targets_round_robin(
 def _bcbs_global_solutions_toc_links_from_html(
     html_text: str, *, base_url: str
 ) -> list[dict[str, str]]:
-    links: dict[str, dict[str, str]] = {}
+    links_by_url: dict[str, dict[str, str]] = {}
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "").strip()
         parsed = urlsplit(url)
@@ -11391,15 +11398,15 @@ def _bcbs_global_solutions_toc_links_from_html(
         plan_type = (parse_qs(parsed.query).get("planType") or [""])[0].strip()
         label = _clean_text(candidate.get("label")) or plan_type or "BCBS Global TOC"
         key = _canonical_or_none(url) or url
-        links[key] = {"url": url, "plan_type": plan_type, "label": label}
-    return list(links.values())
+        links_by_url[key] = {"url": url, "plan_type": plan_type, "label": label}
+    return list(links_by_url.values())
 
 
 def _bcbs_global_solutions_landing_links_from_html(
     html_text: str, *, base_url: str
 ) -> list[str]:
     urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "").strip()
         parsed = urlsplit(url)
@@ -11408,9 +11415,9 @@ def _bcbs_global_solutions_landing_links_from_html(
         if parsed.path.lower() != "/transparency-in-coverage.cfm":
             continue
         key = _canonical_or_none(url) or url
-        if key in seen:
+        if key in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(key)
         urls.append(url)
     return urls
 
@@ -11989,10 +11996,10 @@ async def _resolve_azure_mrf_listing(
 
 def _url_with_query_params(url: str, params: dict[str, Any]) -> str:
     parsed = urlsplit(str(url or ""))
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query_params_by_name = dict(parse_qsl(parsed.query, keep_blank_values=True))
     for key, value in params.items():
-        query[str(key)] = "" if value is None else str(value)
-    return parsed._replace(query=urlencode(query)).geturl()
+        query_params_by_name[str(key)] = "" if value is None else str(value)
+    return parsed._replace(query=urlencode(query_params_by_name)).geturl()
 
 
 def _triples_mtt_latest_year_month(payload: Any) -> tuple[str | None, str | None]:
@@ -12322,8 +12329,10 @@ async def _resolve_healthspace_machine_readable_files(
 
 def _healthez_outbound_file_type(url: str | None, label: str | None = None) -> str | None:
     parsed = urlsplit(str(url or ""))
-    query = {key.lower(): value for key, value in parse_qsl(parsed.query)}
-    file_type = str(query.get("filetype") or "").strip().lower()
+    query_params_by_name = {
+        key.lower(): value for key, value in parse_qsl(parsed.query)
+    }
+    file_type = str(query_params_by_name.get("filetype") or "").strip().lower()
     if file_type == "innetwork":
         return "in-network"
     if file_type == "outofnetwork":
@@ -12355,8 +12364,10 @@ def _healthez_normalized_outbound_url(url: str | None) -> str | None:
 
 
 def _healthez_plan_label(url: str, label: str | None) -> str:
-    query = {key.lower(): value for key, value in parse_qsl(urlsplit(url).query)}
-    network = str(query.get("network") or "").strip().upper()
+    query_params_by_name = {
+        key.lower(): value for key, value in parse_qsl(urlsplit(url).query)
+    }
+    network = str(query_params_by_name.get("network") or "").strip().upper()
     if network in {"AP", "AE"}:
         return f"HealthEZ {network}"
     cleaned = _clean_text(label)
@@ -12713,36 +12724,6 @@ def _healthsparq_target(
     )
 
 
-def _healthsparq_plan_engine_hash(
-    file_item: dict[str, Any], plan: dict[str, Any]
-) -> str | None:
-    plan_name = _clean_text(
-        _healthsparq_plan_value(plan, "planName", "plan_name", "name")
-    )
-    plan_id = str(
-        _healthsparq_plan_value(plan, "planId", "plan_id") or ""
-    ).strip()
-    market_type = str(
-        _healthsparq_plan_value(plan, "planMarketType", "plan_market_type", "marketType")
-        or ""
-    ).strip()
-    if not plan_name or not plan_id or not market_type:
-        return None
-    return semantic_hash(
-        {
-            "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
-            "reporting_entity_type": _healthsparq_reporting_entity_type(file_item),
-            "plan_id": plan_id,
-            "plan_id_type": _healthsparq_plan_value(
-                plan, "planIdType", "plan_id_type"
-            ),
-            "market_type": market_type,
-            "plan_name": plan_name,
-        },
-        domain="healthsparq_plan",
-    )
-
-
 def _healthsparq_query_plan_label(
     plan_name: Any, target_query: str | None
 ) -> tuple[str | None, str | None]:
@@ -12857,26 +12838,26 @@ def _healthsparq_plan_info(
     file_item: dict[str, Any], *, target_query: str | None = None
 ) -> list[dict[str, Any]]:
     reporting_plans = _healthsparq_reporting_plans(file_item)
-    items: list[dict[str, Any]] = []
+    plan_info_records: list[dict[str, Any]] = []
     for plan in reporting_plans:
         plan_name, sponsor_name = _healthsparq_query_plan_label(
             _healthsparq_plan_value(plan, "planName", "plan_name", "name"),
             target_query,
         )
-        item = {
+        plan_info_by_field = {
             "plan_id": _healthsparq_plan_value(plan, "planId", "plan_id"),
             "plan_id_type": _healthsparq_plan_value(plan, "planIdType", "plan_id_type"),
             "plan_market_type": _healthsparq_plan_value(
                 plan, "planMarketType", "plan_market_type", "marketType"
             ),
             "plan_name": plan_name,
-            "engine_plan_hash": _healthsparq_plan_engine_hash(file_item, plan),
+            "engine_plan_hash": healthsparq_plan_engine_hash(file_item, plan),
         }
         if sponsor_name:
-            item["plan_sponsor_name"] = sponsor_name
-            item["company_name"] = sponsor_name
-        items.append(item)
-    return items
+            plan_info_by_field["plan_sponsor_name"] = sponsor_name
+            plan_info_by_field["company_name"] = sponsor_name
+        plan_info_records.append(plan_info_by_field)
+    return plan_info_records
 
 
 def _is_healthsparq_file_query_match(

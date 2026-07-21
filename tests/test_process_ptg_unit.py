@@ -37,6 +37,9 @@ ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_copy_load = importlib.import_module("process.ptg_parts.copy_load")
 ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
+healthsparq_source_jobs = importlib.import_module(
+    "process.ptg_parts.healthsparq_source_jobs"
+)
 ptg_import_rows = importlib.import_module("process.ptg_parts.import_rows")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_live_progress = importlib.import_module("process.ptg_parts.live_progress")
@@ -1968,8 +1971,9 @@ def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
     assert entries[3].description == "Allowed 2"
 
 
-def test_ptg2_toc_parser_accepts_healthsparq_metadata_files():
+def test_ptg2_toc_parser_accepts_healthsparq_metadata_files(monkeypatch):
     """HealthSparq metadata entries should become normal PTG catalog entries."""
+    monkeypatch.setenv("HLTHPRT_PTG2_HASH_MODE", "checksum64")
     metadata_url = (
         "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/"
         "prd/mrf/AETNACVS_I/ASA/latest_metadata.json"
@@ -2009,6 +2013,138 @@ def test_ptg2_toc_parser_accepts_healthsparq_metadata_files():
     )
     assert in_network_catalog_entries[0].description == "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz"
     assert in_network_catalog_entries[0].plan_info[0]["plan_id"] == "123456789"
+    assert (
+        in_network_catalog_entries[0].plan_info[0]["engine_plan_hash"]
+        == "5c283e9b979b6d5c"
+    )
+
+
+@pytest.mark.parametrize("missing_key", ["planName", "planId", "planMarketType"])
+def test_healthsparq_plan_engine_hash_requires_complete_identity(missing_key):
+    source_file_values_by_field = {
+        "reportingEntityName": "Example Health Administrator",
+        "reportingEntityType": "Third Party Administrator_ABC123",
+    }
+    plan_values_by_field = {
+        "planName": "Example Dental Plan",
+        "planId": "123456789",
+        "planIdType": "ein",
+        "planMarketType": "group",
+    }
+    plan_values_by_field.pop(missing_key)
+
+    assert (
+        healthsparq_source_jobs.healthsparq_plan_engine_hash(
+            source_file_values_by_field,
+            plan_values_by_field,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("file_schema", "expected_source_type"),
+    [
+        ("IN_NETWORK_RATES", "in-network"),
+        ("allowed amounts", "allowed-amounts"),
+        ("table-of-contents", "table-of-contents"),
+        ("prescription drug file", "payer-drug"),
+        ("unknown", None),
+    ],
+)
+def test_healthsparq_source_schema_families(
+    file_schema,
+    expected_source_type,
+):
+    source_type_and_domain = healthsparq_source_jobs._source_type_and_domain(
+        file_schema
+    )
+
+    if expected_source_type is None:
+        assert source_type_and_domain is None
+    else:
+        assert source_type_and_domain[0] == expected_source_type
+
+
+def test_healthsparq_metadata_edge_shapes():
+    metadata_file_by_field = {"filePath": "rates.json.gz"}
+
+    assert healthsparq_source_jobs._metadata_files(
+        {"data": {"files": [metadata_file_by_field]}}
+    ) == [metadata_file_by_field]
+    assert healthsparq_source_jobs._metadata_files(
+        {"data": [metadata_file_by_field]}
+    ) == [metadata_file_by_field]
+    assert healthsparq_source_jobs._file_url("https://example.test/meta.json", {}) == ""
+    assert healthsparq_source_jobs._file_url(
+        "https://example.test/meta.json",
+        {"filePath": "https://cdn.example.test/rates.json.gz"},
+    ) == "https://cdn.example.test/rates.json.gz"
+
+
+@pytest.mark.parametrize(
+    ("location", "expected_result"),
+    [
+        ("", False),
+        ("file:///tmp/rates.json.gz", False),
+        ("https://example.test/download?file=rates.json.gz", True),
+    ],
+)
+def test_healthsparq_download_location_validation(location, expected_result):
+    assert (
+        healthsparq_source_jobs._is_file_location_like_download(location)
+        is expected_result
+    )
+
+
+@pytest.mark.parametrize(
+    "source_file_values_by_field",
+    [
+        {"fileSchema": "unknown"},
+        {"fileSchema": "IN_NETWORK_RATES", "filePath": ""},
+        {
+            "fileSchema": "IN_NETWORK_RATES",
+            "filePath": "rates.json.gz",
+            "reportingPlans": [],
+        },
+    ],
+)
+def test_healthsparq_catalog_entry_rejects_non_importable_files(
+    source_file_values_by_field,
+):
+    assert (
+        healthsparq_source_jobs._catalog_entry_from_file(
+            source_file_values_by_field,
+            "https://example.test/latest_metadata.json",
+            {"reporting_entity_name": "Example", "reporting_entity_type": "payer"},
+            plan_ids=None,
+            plan_name_contains=None,
+            plan_market_types=None,
+        )
+        is None
+    )
+
+
+def test_healthsparq_filter_mismatches():
+    plan_values_by_field = {
+        "plan_id": "123456789",
+        "plan_market_type": "group",
+        "plan_name": "Example Dental Plan",
+        "plan_sponsor_name": "Example Employer",
+    }
+
+    assert not healthsparq_source_jobs._is_plan_matching_filters(
+        plan_values_by_field,
+        plan_ids=["987654321"],
+        plan_name_contains=None,
+        plan_market_types=None,
+    )
+    assert not healthsparq_source_jobs._is_plan_matching_filters(
+        plan_values_by_field,
+        plan_ids=None,
+        plan_name_contains=None,
+        plan_market_types=["individual"],
+    )
 
 
 def test_ptg2_toc_parser_rejects_non_pricing_payload():
