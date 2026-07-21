@@ -7,6 +7,7 @@ import pytest
 
 from api import ptg2_candidate_audit_batch as batch
 from api import ptg2_candidate_audit_codes as codes
+from api import ptg2_candidate_audit_graph as candidate_graph
 from api import ptg2_candidate_audit_selection as selection
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
 from api.ptg2_candidate_audit_integrity import (
@@ -87,7 +88,8 @@ async def test_provider_graph_lookup_unions_witness_and_persisted_npis(monkeypat
     graph_lookup = AsyncMock(
         side_effect=[
             {1234567890: (2, 3), 1111111111: (4,)},
-            {2: (5,), 3: (6,), 4: (7,)},
+            {2: (5,), 3: (6,)},
+            {7: (4,)},
         ]
     )
     monkeypatch.setattr(batch, "lookup_shared_graph_members_from_db", graph_lookup)
@@ -103,6 +105,105 @@ async def test_provider_graph_lookup_unions_witness_and_persisted_npis(monkeypat
         1111111111: (7,),
         1234567890: (5, 6),
     }
+    assert graph_lookup.await_count == 3
+    assert [call.args[2] for call in graph_lookup.await_args_list] == [
+        candidate_graph.PTG2_V3_GRAPH_NPI_TO_GROUP,
+        candidate_graph.PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+        candidate_graph.PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+    ]
+    assert tuple(graph_lookup.await_args_list[1].args[3]) == (2, 3)
+    assert tuple(graph_lookup.await_args_list[2].args[3]) == (7,)
+
+
+@pytest.mark.asyncio
+async def test_persisted_provider_membership_uses_only_bounded_reverse_graph(
+    monkeypatch,
+):
+    persisted = _persisted_occurrence()
+    npi_groups = tuple(range(1, 15_314))
+
+    async def graph_lookup(
+        _session,
+        _snapshot_key,
+        direction,
+        owner_keys,
+        **_kwargs,
+    ):
+        requested_keys = tuple(owner_keys)
+        if direction == candidate_graph.PTG2_V3_GRAPH_NPI_TO_GROUP:
+            assert requested_keys == (persisted.npi,)
+            return {persisted.npi: npi_groups}
+        if direction == candidate_graph.PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP:
+            assert requested_keys == (persisted.provider_set_key,)
+            return {persisted.provider_set_key: (15_000,)}
+        raise AssertionError("persisted-only audit expanded the forward group graph")
+
+    monkeypatch.setattr(batch, "lookup_shared_graph_members_from_db", graph_lookup)
+
+    provider_keys_by_npi = await batch._provider_set_keys_by_npi(
+        object(),
+        _serving_tables(),
+        (),
+        (persisted,),
+    )
+
+    assert provider_keys_by_npi == {persisted.npi: (persisted.provider_set_key,)}
+
+
+@pytest.mark.asyncio
+async def test_persisted_provider_membership_rejects_disjoint_reverse_graph(
+    monkeypatch,
+):
+    persisted = _persisted_occurrence()
+    graph_lookup = AsyncMock(
+        side_effect=[
+            {persisted.npi: (4,)},
+            {persisted.provider_set_key: (5,)},
+        ]
+    )
+    monkeypatch.setattr(batch, "lookup_shared_graph_members_from_db", graph_lookup)
+
+    provider_keys_by_npi = await batch._provider_set_keys_by_npi(
+        object(),
+        _serving_tables(),
+        (),
+        (persisted,),
+    )
+
+    assert provider_keys_by_npi == {persisted.npi: ()}
+
+
+@pytest.mark.asyncio
+async def test_challenge_graph_reuses_an_already_resolved_persisted_provider(
+    monkeypatch,
+):
+    challenge = _challenge()
+    persisted = PersistedAuditOccurrence(
+        occurrence_id=b"q" * 32,
+        code_key=8,
+        provider_set_key=7,
+        price_key=9,
+        source_artifact_key=1,
+        npi=challenge.npi,
+        atom_ordinal=0,
+        atom_key=10,
+    )
+    graph_lookup = AsyncMock(
+        side_effect=[
+            {challenge.npi: (4,)},
+            {4: (7,)},
+        ]
+    )
+    monkeypatch.setattr(batch, "lookup_shared_graph_members_from_db", graph_lookup)
+
+    provider_keys_by_npi = await batch._provider_set_keys_by_npi(
+        object(),
+        _serving_tables(),
+        (challenge,),
+        (persisted,),
+    )
+
+    assert provider_keys_by_npi == {challenge.npi: (persisted.provider_set_key,)}
     assert graph_lookup.await_count == 2
 
 
