@@ -23095,6 +23095,123 @@ mod tests {
     }
 
     #[test]
+    fn worker_copy_paths_suffix_every_worker_owned_output() {
+        let coverage_scope_id = [7_u8; COVERAGE_SCOPE_ID_BYTES];
+        let paths = CopyPathConfig {
+            compact: Some("compact.copy".to_string()),
+            manifest_serving: Some("manifest-serving.copy".to_string()),
+            manifest_lean_serving: Some("manifest-lean-serving.copy".to_string()),
+            v3_serving_run_directory: Some("serving-runs".to_string()),
+            v3_coverage_scope_id: Some(coverage_scope_id),
+            manifest_provider_forward_sidecar: Some("provider-forward.copy".to_string()),
+            manifest_provider_inverted_sidecar: Some("provider-inverted.copy".to_string()),
+            manifest_provider_npi_sidecar: Some("provider-npi.copy".to_string()),
+            manifest_price_forward_sidecar: Some("price-forward.copy".to_string()),
+            manifest_price_atom: Some("manifest-price-atom.copy".to_string()),
+            manifest_price_set_atom: Some("manifest-price-set-atom.copy".to_string()),
+            manifest_price_set_summary: Some("manifest-price-set-summary.copy".to_string()),
+            manifest_provider_group_member: Some("manifest-provider-group-member.copy".to_string()),
+            manifest_code_count: Some("manifest-code-count.copy".to_string()),
+            manifest_provider_set_dictionary: Some(
+                "manifest-provider-set-dictionary.copy".to_string(),
+            ),
+            procedure: Some("procedure.copy".to_string()),
+            price_code_set: Some("price-code-set.copy".to_string()),
+            price_atom: Some("price-atom.copy".to_string()),
+            price_set_entry: Some("price-set-entry.copy".to_string()),
+            provider_set: Some("provider-set.copy".to_string()),
+            provider_set_component: Some("provider-set-component.copy".to_string()),
+            provider_set_entry: Some("provider-set-entry.copy".to_string()),
+            provider_entry_component: Some("provider-entry-component.copy".to_string()),
+            provider_group_member: Some("provider-group-member.copy".to_string()),
+            manifest_only: true,
+        };
+
+        assert!(paths.has_file_paths());
+        assert!(paths.has_manifest_sidecar_paths());
+
+        let worker_paths = paths.for_worker(12);
+        let suffix = ".worker0012";
+        for (original, worker) in [
+            (&paths.compact, &worker_paths.compact),
+            (&paths.manifest_serving, &worker_paths.manifest_serving),
+            (
+                &paths.manifest_lean_serving,
+                &worker_paths.manifest_lean_serving,
+            ),
+            (
+                &paths.manifest_price_atom,
+                &worker_paths.manifest_price_atom,
+            ),
+            (
+                &paths.manifest_price_set_atom,
+                &worker_paths.manifest_price_set_atom,
+            ),
+            (
+                &paths.manifest_price_set_summary,
+                &worker_paths.manifest_price_set_summary,
+            ),
+            (
+                &paths.manifest_provider_group_member,
+                &worker_paths.manifest_provider_group_member,
+            ),
+            (
+                &paths.manifest_code_count,
+                &worker_paths.manifest_code_count,
+            ),
+            (
+                &paths.manifest_provider_set_dictionary,
+                &worker_paths.manifest_provider_set_dictionary,
+            ),
+            (&paths.procedure, &worker_paths.procedure),
+            (&paths.price_code_set, &worker_paths.price_code_set),
+            (&paths.price_atom, &worker_paths.price_atom),
+            (&paths.price_set_entry, &worker_paths.price_set_entry),
+            (&paths.provider_set, &worker_paths.provider_set),
+            (
+                &paths.provider_set_component,
+                &worker_paths.provider_set_component,
+            ),
+            (&paths.provider_set_entry, &worker_paths.provider_set_entry),
+            (
+                &paths.provider_entry_component,
+                &worker_paths.provider_entry_component,
+            ),
+            (
+                &paths.provider_group_member,
+                &worker_paths.provider_group_member,
+            ),
+        ] {
+            assert_eq!(
+                worker.as_deref(),
+                Some(format!("{}{suffix}", original.as_deref().unwrap()).as_str())
+            );
+        }
+        assert_eq!(
+            worker_paths.v3_serving_run_directory,
+            paths.v3_serving_run_directory
+        );
+        assert_eq!(worker_paths.v3_coverage_scope_id, Some(coverage_scope_id));
+        assert_eq!(
+            worker_paths.manifest_provider_forward_sidecar,
+            paths.manifest_provider_forward_sidecar
+        );
+        assert_eq!(
+            worker_paths.manifest_provider_inverted_sidecar,
+            paths.manifest_provider_inverted_sidecar
+        );
+        assert_eq!(
+            worker_paths.manifest_provider_npi_sidecar,
+            paths.manifest_provider_npi_sidecar
+        );
+        assert_eq!(
+            worker_paths.manifest_price_forward_sidecar,
+            paths.manifest_price_forward_sidecar
+        );
+        assert!(worker_paths.manifest_only);
+    }
+
+    #[test]
     fn failed_scan_guard_removes_only_new_serving_run_files() {
         let base =
             std::env::temp_dir().join(format!("ptg2-serving-run-guard-{}", std::process::id()));
@@ -23603,6 +23720,10 @@ mod tests {
     fn scanner_failure_and_hash_helpers_cover_terminal_edges() {
         let payload: &(dyn Any + Send + 'static) = &"worker panic";
         assert_eq!(panic_payload_message(payload), "worker panic");
+        let owned_payload = "owned worker panic".to_string();
+        assert_eq!(panic_payload_message(&owned_payload), "owned worker panic");
+        assert_eq!(panic_payload_message(&7_u32), "non-string panic payload");
+        assert_eq!(compressed_mib_per_second(1024, 0.0), 0.0);
         log_worker_failure(0, "test", "expected diagnostic");
 
         let codes = vec!["11".to_string(), "22".to_string()];
@@ -23614,6 +23735,20 @@ mod tests {
         let missing_input =
             std::env::temp_dir().join(format!("ptg2-scanner-missing-input-{}", std::process::id()));
         assert!(scan(&missing_input, &[]).is_err());
+    }
+
+    #[test]
+    fn manifest_global_id_cache_reuses_canonical_provider_set_identity() {
+        let groups = [7_i64, 3_i64];
+        let networks = ["Aetna PPO".to_string(), "Choice POS".to_string()];
+        let expected =
+            provider_set_global_id_from_group_hashes_and_network_names(&groups, &networks);
+        let mut cache = ManifestGlobalIdCache::default();
+        assert_eq!(
+            cache.provider_set_id("provider-set", &groups, &networks),
+            expected
+        );
+        assert_eq!(cache.provider_set_id("provider-set", &[], &[]), expected);
     }
 
     #[test]
