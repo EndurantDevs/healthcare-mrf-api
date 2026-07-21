@@ -207,9 +207,9 @@ def _mock_validation_dependencies(
         "_candidate_endpoint_dataset_content_proof",
         AsyncMock(
             return_value=importer.EndpointDatasetContentProof(
-                dataset_hash="dataset-hash",
+                dataset_hash="a" * 64,
                 resource_count=3,
-                resource_hashes={"InsurancePlan": "resource-hash"},
+                resource_hashes={"InsurancePlan": "b" * 64},
                 resource_counts={"InsurancePlan": 3},
             )
         ),
@@ -401,6 +401,14 @@ async def test_validation_builds_edges_before_storing_and_uses_root_identity(
 ):
     transaction_events = []
     connection_executor = types.SimpleNamespace(
+        first=AsyncMock(
+            return_value={
+                "distinct_npis": 0,
+                "address_records": 0,
+                "addressed_locations": 0,
+                "geocoded_locations": 0,
+            }
+        ),
         scalar=AsyncMock(),
         status=AsyncMock(),
     )

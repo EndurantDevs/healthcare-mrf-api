@@ -19,7 +19,7 @@ MODULE_SPEC.loader.exec_module(drug_claims)
 
 
 def test_find_dataset_normalizes_landing_page():
-    catalog = {
+    catalog_map = {
         "dataset": [
             {
                 "landingPage": "https://data.cms.gov/x/y/data",
@@ -28,12 +28,12 @@ def test_find_dataset_normalizes_landing_page():
             }
         ]
     }
-    result = drug_claims._find_dataset(catalog, "https://data.cms.gov/x/y")
+    result = drug_claims._find_dataset(catalog_map, "https://data.cms.gov/x/y")
     assert result["title"] == "dataset-1"
 
 
 def test_resolve_sources_extracts_urls_and_years():
-    catalog = {
+    catalog_map = {
         "dataset": [
             {
                 "landingPage": (
@@ -61,7 +61,7 @@ def test_resolve_sources_extracts_urls_and_years():
             },
         ]
     }
-    resolved = drug_claims._resolve_sources(catalog)
+    resolved = drug_claims._resolve_sources(catalog_map)
     assert [entry["reporting_year"] for entry in resolved["provider_drug"]] == [2023]
     assert [entry["reporting_year"] for entry in resolved["drug_spending"]] == [2023]
     assert resolved["drug_spending"][0]["url"].startswith("https://example.com/")

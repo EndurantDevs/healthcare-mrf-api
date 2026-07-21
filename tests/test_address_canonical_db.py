@@ -125,10 +125,16 @@ async def test_address_sql_is_parallel_safe():
             "addr_unit_value_valid_v1",
         ],
     )
-    flags = {source_row.proname: (source_row.provolatile, source_row.proparallel) for source_row in source_rows}
+    function_flags_by_name = {
+        source_row.proname: (source_row.provolatile, source_row.proparallel)
+        for source_row in source_rows
+    }
 
-    assert flags
-    assert all(canonical_value == ("i", "s") for canonical_value in flags.values())
+    assert function_flags_by_name
+    assert all(
+        canonical_value == ("i", "s")
+        for canonical_value in function_flags_by_name.values()
+    )
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('Puerto Rico');") == "PR"
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('Armed Forces Pacific');") == "AP"
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('calif');") is None
@@ -857,7 +863,7 @@ async def test_python_and_sql_address_canonical_golden_corpus_match():
     cases = _golden_cases()
     assert len(cases) >= 200
 
-    group_keys: dict[str, tuple[str | None, str | None]] = {}
+    group_key_by_name: dict[str, tuple[str | None, str | None]] = {}
     for case in cases:
         canonical_value_by_field = {
             "first_line": case.get("first_line"),
@@ -930,8 +936,8 @@ async def test_python_and_sql_address_canonical_golden_corpus_match():
 
         if group := case.get("equivalence_group"):
             current = (canonical_data_by_case["identity_key"], canonical_data_by_case["address_key"])
-            group_keys.setdefault(group, current)
-            assert group_keys[group] == current, case["id"]
+            group_key_by_name.setdefault(group, current)
+            assert group_key_by_name[group] == current, case["id"]
 
 
 @pytest.mark.asyncio(loop_scope="session")

@@ -12075,7 +12075,7 @@ async def test_kaiser_inventory_uses_previous_month_per_missing_category(monkeyp
         "payer_id": "payer_1",
         "display_name": "Kaiser Permanente",
     }
-    resolver = {
+    resolver_config_map = {
         **discovery._source_config()["platform_resolvers"]["kaiser_mrf_inventory"],
         "month_offsets": [0, -1],
     }
@@ -12107,7 +12107,7 @@ async def test_kaiser_inventory_uses_previous_month_per_missing_category(monkeyp
     inventory_targets = await discovery._resolve_kaiser_monthly_inventory(
         source_by_field,
         "https://healthy.kaiserpermanente.org/front-door/machine-readable",
-        resolver,
+        resolver_config_map,
         None,
     )
 

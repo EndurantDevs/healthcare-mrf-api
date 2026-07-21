@@ -41,29 +41,29 @@ class FakeSessionContext:
 
 
 def _build_result_row(npi_value: int):
-    row = [npi_value]
+    result_row_list = [npi_value]
     for column in NPIData.__table__.columns:
         if column.key == "npi":
-            row.append(npi_value)
+            result_row_list.append(npi_value)
         elif column.key == "do_business_as":
-            row.append(["DBA"])
+            result_row_list.append(["DBA"])
         else:
-            row.append(f"data_{column.key}")
+            result_row_list.append(f"data_{column.key}")
     for column in NPIAddress.__table__.columns:
         if column.key == "npi":
-            row.append(npi_value)
+            result_row_list.append(npi_value)
         elif column.key == "checksum":
-            row.append(111)
+            result_row_list.append(111)
         elif column.key == "type":
-            row.append("primary")
+            result_row_list.append("primary")
         else:
-            row.append(f"addr_{column.key}")
+            result_row_list.append(f"addr_{column.key}")
     for column in NPIDataTaxonomy.__table__.columns:
         if column.key in {"npi", "checksum"}:
-            row.append(None)
+            result_row_list.append(None)
         else:
-            row.append(f"tax_{column.key}")
-    return row
+            result_row_list.append(f"tax_{column.key}")
+    return result_row_list
 
 
 def test_serialize_ffs_reassignment_row_keeps_counterparty_only():

@@ -86,6 +86,18 @@ from process.provider_directory_dataset_rehydrate import (
     RehydrationRuntime,
     rehydrate_current_dataset,
 )
+from process.provider_directory_source_summary import (
+    SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID,
+    SOURCE_SUMMARY_METADATA_KEY,
+    SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
+    ProviderDirectorySourceSummaryError,
+    ProviderDirectorySourceSummaryBinding,
+    build_source_summary,
+    validate_semantic_source_summary,
+)
+from process.provider_directory_source_summary_sql import (
+    source_summary_metrics_sql,
+)
 from process.provider_directory_time_partition import (
     CountKind,
     CountObservation,
@@ -1158,6 +1170,9 @@ REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID = {
 TWIN_ROOT_VERIFICATION_METADATA_KEY = "twin_root_verification_v1"
 PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY = (
     "outcome_resource_counts_v1"
+)
+PROVIDER_DIRECTORY_FHIR_SOURCE_SUMMARY_SEMANTIC_CONTRACT_ID = (
+    SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID
 )
 TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY = "verification_campaign_id"
 TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY = "verification_source_scope_hash"
@@ -12248,6 +12263,19 @@ async def _record_current_dataset_serving_relation_proof(
     metadata_key: str,
     proof: dict[str, Any],
 ) -> None:
+    await _record_current_dataset_publication_proof(
+        dataset,
+        metadata_key,
+        proof,
+    )
+
+
+async def _record_current_dataset_publication_proof(
+    dataset: ProviderDirectoryArtifactDataset,
+    metadata_key: str,
+    proof: dict[str, Any],
+) -> None:
+    """Write one additive proof while the exact dataset row is locked."""
     dataset_ref = _qt(
         _schema(),
         ProviderDirectoryEndpointDataset.__tablename__,
@@ -12284,6 +12312,257 @@ async def _record_current_dataset_serving_relation_proof(
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_endpoint_dataset_metadata_changed"
         )
+
+
+def _artifact_dataset_source_summary_source_ids(
+    publication_metadata: dict[str, Any],
+    dataset: ProviderDirectoryArtifactDataset,
+    required_source_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    raw_source_ids = publication_metadata.get("source_ids")
+    normalized_source_ids = (
+        tuple(sorted(raw_source_ids))
+        if isinstance(raw_source_ids, list)
+        and all(
+            isinstance(source_id, str)
+            and bool(source_id)
+            and source_id == source_id.strip()
+            for source_id in raw_source_ids
+        )
+        else ()
+    )
+    if (
+        not normalized_source_ids
+        or len(normalized_source_ids) != len(set(normalized_source_ids))
+        or not set(required_source_ids).issubset(normalized_source_ids)
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_source_summary_source_ids_invalid:"
+            + dataset.dataset_id
+        )
+    return normalized_source_ids
+
+
+def _artifact_source_summary_candidate_sql() -> str:
+    dataset_ref = _unscoped_qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
+    return f"""
+        SELECT acquisition_root_run_id, publication_metadata_json
+          FROM {dataset_ref}
+         WHERE dataset_id = :dataset_id
+           AND endpoint_id = :endpoint_id
+           AND COALESCE(acquisition_root_run_id, import_run_id)
+               IS NOT DISTINCT FROM :evidence_run_id
+           AND previous_dataset_id IS NOT DISTINCT FROM :previous_dataset_id
+           AND dataset_hash IS NOT DISTINCT FROM :dataset_hash
+           AND is_current = :is_current
+           AND status = :expected_status
+           AND superseded_at IS NULL;
+    """
+
+
+async def _current_artifact_dataset_source_summary_candidate(
+    executor: Any,
+    dataset: ProviderDirectoryArtifactDataset,
+    required_source_ids: tuple[str, ...],
+) -> tuple[EndpointDatasetCandidate, dict[str, Any]]:
+    """Load one exact locked dataset binding for retained summary work."""
+    metadata_record = await executor.first(
+        _artifact_source_summary_candidate_sql(),
+        dataset_id=dataset.dataset_id,
+        endpoint_id=dataset.endpoint_id,
+        evidence_run_id=dataset.evidence_run_id,
+        previous_dataset_id=dataset.previous_dataset_id,
+        dataset_hash=dataset.dataset_hash,
+        is_current=dataset.is_current,
+        expected_status=dataset.status,
+    )
+    return _source_summary_candidate_from_metadata_record(
+        metadata_record,
+        dataset,
+        required_source_ids,
+    )
+
+
+def _source_summary_candidate_from_metadata_record(
+    metadata_record: Any,
+    dataset: ProviderDirectoryArtifactDataset,
+    required_source_ids: tuple[str, ...],
+) -> tuple[EndpointDatasetCandidate, dict[str, Any]]:
+    """Validate lineage and preserve the dataset's complete source scope."""
+    metadata_record_map = _pagination_checkpoint_row_mapping(metadata_record)
+    publication_metadata = _json_object(
+        metadata_record_map.get("publication_metadata_json")
+    )
+    acquisition_root_run_id = _clean_text(
+        metadata_record_map.get("acquisition_root_run_id")
+    )
+    if acquisition_root_run_id != dataset.evidence_run_id:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_source_summary_lineage_missing:"
+            + dataset.dataset_id
+        )
+    source_ids = _artifact_dataset_source_summary_source_ids(
+        publication_metadata,
+        dataset,
+        required_source_ids,
+    )
+    return (
+        EndpointDatasetCandidate(
+            endpoint_id=dataset.endpoint_id,
+            dataset_id=dataset.dataset_id,
+            acquisition_root_run_id=acquisition_root_run_id,
+            source_ids=source_ids,
+            selected_resources=dataset.selected_resources,
+            import_run_id=dataset.evidence_run_id,
+            previous_dataset_id=dataset.previous_dataset_id,
+            expected_resources=dataset.expected_resources,
+        ),
+        publication_metadata,
+    )
+
+
+def _assert_artifact_dataset_content_proof(
+    dataset: ProviderDirectoryArtifactDataset,
+    content_proof: EndpointDatasetContentProof,
+) -> None:
+    if (
+        dataset.dataset_hash is None
+        or dataset.resource_count is None
+        or content_proof.dataset_hash != dataset.dataset_hash
+        or content_proof.resource_count != dataset.resource_count
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_content_changed"
+        )
+
+
+def _validated_existing_artifact_dataset_source_summary(
+    publication_metadata: dict[str, Any],
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, Any] | None:
+    """Validate a retained summary without changing its semantic type."""
+    raw_source_summary = publication_metadata.get(
+        SOURCE_SUMMARY_METADATA_KEY
+    )
+    if raw_source_summary is None:
+        return None
+    try:
+        source_summary = validate_semantic_source_summary(
+            raw_source_summary,
+            expected_by_field={
+                "dataset_id": dataset.dataset_id,
+                "endpoint_id": dataset.endpoint_id,
+                "acquisition_root_run_id": dataset.evidence_run_id,
+                "dataset_hash": dataset.dataset_hash,
+                "source_ids": list(candidate.source_ids),
+                "selected_resources": list(candidate.selected_resources),
+                "total_resources": dataset.resource_count,
+            },
+        )
+    except ProviderDirectorySourceSummaryError as error:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_source_summary_invalid:"
+            + dataset.dataset_id
+        ) from error
+    return source_summary
+
+
+def _is_summary_relation_proof_exact(
+    source_summary: dict[str, Any],
+    relation_proof_by_name: dict[str, dict[str, Any]],
+) -> bool:
+    expected_relation_count_by_field = {
+        "network_plan_links": _source_summary_relation_edge_count(
+            relation_proof_by_name,
+            PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
+        ),
+        "organization_affiliation_links": (
+            _source_summary_relation_edge_count(
+                relation_proof_by_name,
+                PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY,
+            )
+        ),
+    }
+    return all(
+        source_summary.get(field_name) == expected_count
+        for field_name, expected_count in expected_relation_count_by_field.items()
+    )
+
+
+def _existing_artifact_dataset_source_summary(
+    publication_metadata: dict[str, Any],
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: EndpointDatasetCandidate,
+    relation_proof_by_name: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Reuse one exact FHIR or UHC summary without semantic retyping."""
+    source_summary = _validated_existing_artifact_dataset_source_summary(
+        publication_metadata,
+        dataset,
+        candidate,
+    )
+    if source_summary is None:
+        return None
+    outcome_proof = publication_metadata.get(
+        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
+    )
+    if not _is_existing_source_summary_outcome_proof(
+        outcome_proof,
+        dataset,
+        candidate,
+        source_summary,
+    ):
+        if (
+            source_summary["semantic_contract_id"]
+            == SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_uhc_source_summary_outcome_invalid:"
+                + dataset.dataset_id
+            )
+        return None
+    if (
+        source_summary["semantic_contract_id"]
+        != SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID
+    ):
+        return source_summary
+    return (
+        source_summary
+        if _is_summary_relation_proof_exact(
+            source_summary,
+            relation_proof_by_name,
+        )
+        else None
+    )
+
+
+def _is_existing_source_summary_outcome_proof(
+    raw_proof: Any,
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: EndpointDatasetCandidate,
+    source_summary: dict[str, Any],
+) -> bool:
+    return bool(
+        isinstance(raw_proof, dict)
+        and raw_proof.get("complete") is True
+        and type(raw_proof.get("version")) is int
+        and raw_proof.get("version") == 1
+        and raw_proof.get("dataset_id") == dataset.dataset_id
+        and raw_proof.get("endpoint_id") == dataset.endpoint_id
+        and raw_proof.get("acquisition_root_run_id")
+        == dataset.evidence_run_id
+        and raw_proof.get("dataset_hash") == dataset.dataset_hash
+        and raw_proof.get("source_ids") == list(candidate.source_ids)
+        and raw_proof.get("selected_resources")
+        == list(candidate.selected_resources)
+        and raw_proof.get("resource_count") == dataset.resource_count
+        and raw_proof.get("resource_counts")
+        == source_summary.get("resource_counts")
+    )
 
 
 def _dataset_network_plan_aggregate_proof(
@@ -12419,36 +12698,136 @@ def _aggregate_dataset_serving_relation_proofs(
     return aggregate_by_relation
 
 
+async def _refresh_current_artifact_dataset_source_summary(
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: EndpointDatasetCandidate,
+    publication_metadata: dict[str, Any],
+    relation_proof_by_name: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Reuse a sealed summary or rebuild it from verified retained rows."""
+    source_summary = _existing_artifact_dataset_source_summary(
+        publication_metadata,
+        dataset,
+        candidate,
+        relation_proof_by_name,
+    )
+    if source_summary is not None:
+        return source_summary
+    content_proof = await _endpoint_dataset_content_proof(
+        db,
+        dataset.dataset_id,
+        dataset.selected_resources,
+        verify_payload_hashes=True,
+    )
+    _assert_artifact_dataset_content_proof(dataset, content_proof)
+    await _record_current_dataset_publication_proof(
+        dataset,
+        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
+        _outcome_resource_count_proof(candidate, content_proof),
+    )
+    source_summary = await _endpoint_dataset_source_summary(
+        db,
+        candidate,
+        content_proof,
+        relation_proof_by_name,
+    )
+    if source_summary is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_source_summary_lineage_missing"
+        )
+    await _record_current_dataset_publication_proof(
+        dataset,
+        SOURCE_SUMMARY_METADATA_KEY,
+        source_summary,
+    )
+    return source_summary
+
+
+async def _rebuild_one_current_dataset_artifacts(
+    dataset: ProviderDirectoryArtifactDataset,
+    dataset_fence: ProviderDirectoryArtifactDatasetFence,
+    *,
+    build_run_id: str | None,
+    should_rebuild_network_plan: bool,
+    should_rebuild_affiliation_organization: bool,
+    should_rebuild_source_summary: bool,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None]:
+    """Rebuild one dataset's proofs in a single stable transaction."""
+    async with db.transaction():
+        if should_rebuild_source_summary:
+            await db.status(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"
+            )
+        await _lock_and_verify_artifact_dataset_fence(dataset_fence, db)
+        await _lock_dataset_serving_relation_build(db, dataset.dataset_id)
+        summary_context = None
+        if should_rebuild_source_summary:
+            required_source_ids = tuple(
+                sorted(alias.source_id for alias in dataset_fence.datasets)
+            )
+            summary_context = (
+                await _current_artifact_dataset_source_summary_candidate(
+                    db,
+                    dataset,
+                    required_source_ids,
+                )
+            )
+        relation_proof_by_name = (
+            await _rebuild_one_current_dataset_relation_set(
+                dataset,
+                build_run_id=build_run_id,
+                should_rebuild_network_plan=should_rebuild_network_plan,
+                should_rebuild_affiliation_organization=(
+                    should_rebuild_affiliation_organization
+                ),
+            )
+        )
+        source_summary = (
+            await _refresh_current_artifact_dataset_source_summary(
+                dataset,
+                summary_context[0],
+                summary_context[1],
+                relation_proof_by_name,
+            )
+            if summary_context is not None
+            else None
+        )
+        return relation_proof_by_name, source_summary
+
+
 async def _rebuild_current_dataset_serving_relations(
     fence: ProviderDirectoryArtifactDatasetFence,
     *,
     build_run_id: str | None,
     should_rebuild_network_plan: bool,
     should_rebuild_affiliation_organization: bool,
+    should_rebuild_source_summary: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Refresh selected dataset relations without global-table cutover."""
     selected_datasets = _unique_artifact_datasets(fence)
     proof_list_by_relation: dict[str, list[dict[str, Any]]] = {}
+    source_summaries: list[dict[str, Any]] = []
     for dataset in selected_datasets:
         dataset_fence = _artifact_fence_for_dataset(fence, dataset.dataset_id)
-        async with db.transaction():
-            await _lock_and_verify_artifact_dataset_fence(dataset_fence, db)
-            await _lock_dataset_serving_relation_build(db, dataset.dataset_id)
-            proof_by_relation = (
-                await _rebuild_one_current_dataset_relation_set(
-                    dataset,
-                    build_run_id=build_run_id,
-                    should_rebuild_network_plan=should_rebuild_network_plan,
-                    should_rebuild_affiliation_organization=(
-                        should_rebuild_affiliation_organization
-                    ),
-                )
+        relation_proof_by_name, source_summary = (
+            await _rebuild_one_current_dataset_artifacts(
+                dataset,
+                dataset_fence,
+                build_run_id=build_run_id,
+                should_rebuild_network_plan=should_rebuild_network_plan,
+                should_rebuild_affiliation_organization=(
+                    should_rebuild_affiliation_organization
+                ),
+                should_rebuild_source_summary=should_rebuild_source_summary,
             )
-            for relation_name, relation_proof in proof_by_relation.items():
-                proof_list_by_relation.setdefault(
-                    relation_name,
-                    [],
-                ).append(relation_proof)
+        )
+        if source_summary is not None:
+            source_summaries.append(source_summary)
+        for relation_name, relation_proof in relation_proof_by_name.items():
+            proof_list_by_relation.setdefault(
+                relation_name,
+                [],
+            ).append(relation_proof)
     for relation_name, should_rebuild in (
         (
             PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
@@ -12461,10 +12840,24 @@ async def _rebuild_current_dataset_serving_relations(
     ):
         if should_rebuild:
             proof_list_by_relation.setdefault(relation_name, [])
-    return _aggregate_dataset_serving_relation_proofs(
+    aggregate_proof_by_name = _aggregate_dataset_serving_relation_proofs(
         proof_list_by_relation,
         build_run_id=build_run_id,
     )
+    if source_summaries:
+        aggregate_proof_by_name[SOURCE_SUMMARY_METADATA_KEY] = {
+            "complete": True,
+            "version": 1,
+            "dataset_count": len(source_summaries),
+            "dataset_ids": [
+                summary["dataset_id"] for summary in source_summaries
+            ],
+            "summary_sha256_by_dataset": {
+                summary["dataset_id"]: summary["summary_sha256"]
+                for summary in source_summaries
+            },
+        }
+    return aggregate_proof_by_name
 
 
 async def _publish_current_dataset_relation_artifacts(
@@ -12493,6 +12886,10 @@ async def _publish_current_dataset_relation_artifacts(
                 should_rebuild_network_plan=should_rebuild_network_plan,
                 should_rebuild_affiliation_organization=(
                     should_rebuild_affiliation_organization
+                ),
+                should_rebuild_source_summary=(
+                    should_rebuild_network_plan
+                    and should_rebuild_affiliation_organization
                 ),
             )
         )
@@ -12960,6 +13357,7 @@ async def _locked_finalized_retry_cleanup_dataset_ids(
 async def _delete_endpoint_dataset_retry_state(
     selected_dataset_ids: list[str],
 ) -> None:
+    """Delete non-content retry rows after finalized parents are locked."""
     await db.status(
         f"""
         DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
@@ -16187,6 +16585,121 @@ def _bound_upsert_session() -> Any | None:
     return transaction_binding.session if transaction_binding is not None else None
 
 
+def _endpoint_dataset_resource_parent_ids(
+    resource_rows: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Return exact sorted parents, rejecting an unscoped child mutation."""
+    dataset_ids: set[str] = set()
+    for resource_row in resource_rows:
+        dataset_id = _clean_text(resource_row.get("dataset_id"))
+        if not dataset_id:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_resource_parent_id_missing"
+            )
+        dataset_ids.add(dataset_id)
+    return sorted(dataset_ids)
+
+
+def _normalized_endpoint_dataset_ids(
+    dataset_ids: Iterable[str],
+) -> list[str]:
+    return sorted(
+        {
+            cleaned_dataset_id
+            for dataset_id in dataset_ids
+            if (cleaned_dataset_id := _clean_text(dataset_id))
+        }
+    )
+
+
+def _endpoint_dataset_statuses_by_id(
+    parent_rows: Iterable[Any],
+) -> dict[str, str | None]:
+    status_by_dataset_id: dict[str, str | None] = {}
+    for parent_row in parent_rows:
+        row_mapping = (
+            parent_row._mapping
+            if hasattr(parent_row, "_mapping")
+            else parent_row
+        )
+        dataset_id = _clean_text(row_mapping.get("dataset_id"))
+        if dataset_id:
+            status_by_dataset_id[dataset_id] = _clean_text(
+                row_mapping.get("status")
+            )
+    return status_by_dataset_id
+
+
+async def _lock_mutable_endpoint_dataset_resource_parents(
+    database_executor: Any,
+    dataset_ids: Iterable[str],
+) -> list[str]:
+    """Share-lock exact dataset parents and reject sealed or missing rows."""
+    selected_dataset_ids = _normalized_endpoint_dataset_ids(dataset_ids)
+    if not selected_dataset_ids:
+        return []
+    parent_rows = await database_executor.all(
+        f"""
+        SELECT dataset_id, status
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))
+         ORDER BY dataset_id
+         FOR SHARE;
+        """,
+        dataset_ids=selected_dataset_ids,
+    )
+    status_by_dataset_id = _endpoint_dataset_statuses_by_id(parent_rows)
+    missing_dataset_ids = [
+        dataset_id
+        for dataset_id in selected_dataset_ids
+        if dataset_id not in status_by_dataset_id
+    ]
+    if missing_dataset_ids:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_parent_missing:"
+            + ",".join(missing_dataset_ids)
+        )
+    immutable_parents = [
+        (dataset_id, status_by_dataset_id[dataset_id])
+        for dataset_id in selected_dataset_ids
+        if status_by_dataset_id[dataset_id]
+        in IMMUTABLE_ENDPOINT_DATASET_STATUSES
+    ]
+    if immutable_parents:
+        immutable_details = ",".join(
+            f"{dataset_id}={status}"
+            for dataset_id, status in immutable_parents
+        )
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_parent_immutable:"
+            + immutable_details
+        )
+    return selected_dataset_ids
+
+
+@contextlib.asynccontextmanager
+async def _mutable_endpoint_dataset_resource_mutation(
+    dataset_ids: Iterable[str],
+    *,
+    database_connection: Any | None = None,
+) -> AsyncIterator[Any]:
+    """Fence one child mutation in its caller's or a new transaction."""
+    selected_dataset_ids = _normalized_endpoint_dataset_ids(dataset_ids)
+    if database_connection is not None:
+        await _lock_mutable_endpoint_dataset_resource_parents(
+            database_connection,
+            selected_dataset_ids,
+        )
+        yield database_connection
+        return
+    async with db.transaction():
+        await _lock_mutable_endpoint_dataset_resource_parents(
+            db,
+            selected_dataset_ids,
+        )
+        yield db
+
+
 def _location_address_key_batch_size() -> int:
     try:
         return max(
@@ -16968,9 +17481,60 @@ async def _upsert_rows(
         {key: resource_row.get(key) for key in columns}
         for resource_row in resource_rows
     ]
-    transaction_options = _transaction_session_options(_bound_upsert_session())
+    if (
+        model is ProviderDirectoryDatasetResource
+        and _bound_upsert_session() is None
+    ):
+        async with db.transaction():
+            return await _upsert_normalized_rows(
+                model,
+                normalized_rows,
+                columns,
+                primary_keys,
+                skip_unchanged=skip_unchanged,
+            )
+    return await _upsert_normalized_rows(
+        model,
+        normalized_rows,
+        columns,
+        primary_keys,
+        skip_unchanged=skip_unchanged,
+    )
+
+
+async def _upsert_normalized_rows(
+    model,
+    normalized_rows: list[dict[str, Any]],
+    columns: list[str],
+    primary_keys: list[str],
+    *,
+    skip_unchanged: bool,
+) -> int:
+    """Apply one normalized upsert inside its already selected boundary."""
+    is_dataset_resource = model is ProviderDirectoryDatasetResource
+    transaction_session = _bound_upsert_session()
+    if is_dataset_resource and transaction_session is None:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_transaction_missing"
+        )
+    if is_dataset_resource:
+        await _lock_mutable_endpoint_dataset_resource_parents(
+            db,
+            _endpoint_dataset_resource_parent_ids(normalized_rows),
+        )
+    transaction_options = _transaction_session_options(transaction_session)
     if _is_copy_upsert_enabled() and len(normalized_rows) >= _copy_upsert_min_rows():
         try:
+            if is_dataset_resource:
+                async with db.transaction():
+                    return await _copy_upsert_rows(
+                        model,
+                        normalized_rows,
+                        columns,
+                        primary_keys,
+                        skip_unchanged=skip_unchanged,
+                        **transaction_options,
+                    )
             return await _copy_upsert_rows(
                 model,
                 normalized_rows,
@@ -19661,7 +20225,7 @@ async def _run_source_probe_batch(
             started = time.monotonic()
             hard_timeout = _source_probe_hard_timeout_seconds(source, timeout=timeout)
             try:
-                probe, payload = await asyncio.wait_for(
+                probe, capability_payload = await asyncio.wait_for(
                     _probe_source(source, timeout=timeout, run_id=run_id),
                     timeout=hard_timeout,
                 )
@@ -19676,7 +20240,7 @@ async def _run_source_probe_batch(
                     "run_id": run_id,
                     "credential": None,
                 }
-                payload = None
+                capability_payload = None
             now = _now()
             update = {
                 "source_id": source["source_id"],
@@ -19719,9 +20283,17 @@ async def _run_source_probe_batch(
                 source["endpoint_id"] = endpoint_row["endpoint_id"]
                 update["endpoint_id"] = endpoint_row["endpoint_id"]
                 endpoint_rows.append(endpoint_row)
-            if payload and payload.get("resourceType") == "CapabilityStatement":
-                capability_rows.append(parse_capability(source, payload, probe))
-                update["fhir_version"] = _clean_text(payload.get("fhirVersion")) or update.get("fhir_version")
+            if (
+                capability_payload
+                and capability_payload.get("resourceType")
+                == "CapabilityStatement"
+            ):
+                capability_rows.append(
+                    parse_capability(source, capability_payload, probe)
+                )
+                update["fhir_version"] = _clean_text(
+                    capability_payload.get("fhirVersion")
+                ) or update.get("fhir_version")
                 if probe["status"] == "valid":
                     probe_counts_by_name["valid"] += 1
                     valid_source_ids.add(source["source_id"])
@@ -26832,6 +27404,10 @@ async def _upsert_dataset_resource_rows_on_connection(
     table = ProviderDirectoryDatasetResource.__table__
     primary_keys = ["dataset_id", "resource_type", "resource_id"]
     row_list = list(rows)
+    await _lock_mutable_endpoint_dataset_resource_parents(
+        connection,
+        _endpoint_dataset_resource_parent_ids(row_list),
+    )
     batch_size = _max_rows_per_statement(len(row_list[0]))
     for offset in range(0, len(row_list), batch_size):
         statement = pg_insert(table).values(
@@ -32553,6 +33129,10 @@ async def _ensure_endpoint_dataset_candidate(
         metadata = _endpoint_dataset_candidate_metadata(candidate)
         await _upsert_endpoint_dataset_candidate(connection, candidate, metadata)
         if not candidate.reused_from_checkpoint:
+            await _lock_mutable_endpoint_dataset_resource_parents(
+                connection,
+                [candidate.dataset_id],
+            )
             await connection.status(
                 f"""
                 DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
@@ -32593,21 +33173,24 @@ async def _clear_uncheckpointed_endpoint_dataset_candidate(
 ) -> None:
     if candidate.reused_from_checkpoint:
         return
-    await db.status(
-        f"""
-        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
-         USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
-         WHERE resource.dataset_id = :dataset_id
-           AND dataset.dataset_id = resource.dataset_id
-           AND dataset.endpoint_id = :endpoint_id
-           AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
-               :acquisition_root_run_id
-           AND dataset.is_current = false;
-        """,
-        dataset_id=candidate.dataset_id,
-        endpoint_id=candidate.endpoint_id,
-        acquisition_root_run_id=candidate.acquisition_root_run_id,
-    )
+    async with _mutable_endpoint_dataset_resource_mutation(
+        [candidate.dataset_id]
+    ) as database_executor:
+        await database_executor.status(
+            f"""
+            DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+             USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+             WHERE resource.dataset_id = :dataset_id
+               AND dataset.dataset_id = resource.dataset_id
+               AND dataset.endpoint_id = :endpoint_id
+               AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
+                   :acquisition_root_run_id
+               AND dataset.is_current = false;
+            """,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id,
+        )
 
 
 def _endpoint_id_for_source_records(
@@ -33847,20 +34430,23 @@ async def _clear_checkpoint_dataset_resource_type(
 ) -> None:
     if not context.dataset_id:
         return
-    database_executor = database_connection or db
-    await database_executor.status(
-        f"""
-        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
-         USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
-         WHERE resource.dataset_id = :dataset_id
-           AND resource.resource_type = :resource_type
-           AND dataset.dataset_id = resource.dataset_id
-           AND dataset.acquisition_root_run_id = :acquisition_root_run_id;
-        """,
-        dataset_id=context.dataset_id,
-        resource_type=resource_type,
-        acquisition_root_run_id=context.acquisition_root_run_id,
-    )
+    async with _mutable_endpoint_dataset_resource_mutation(
+        [context.dataset_id],
+        database_connection=database_connection,
+    ) as database_executor:
+        await database_executor.status(
+            f"""
+            DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+             USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+             WHERE resource.dataset_id = :dataset_id
+               AND resource.resource_type = :resource_type
+               AND dataset.dataset_id = resource.dataset_id
+               AND dataset.acquisition_root_run_id = :acquisition_root_run_id;
+            """,
+            dataset_id=context.dataset_id,
+            resource_type=resource_type,
+            acquisition_root_run_id=context.acquisition_root_run_id,
+        )
 
 
 async def _reset_pagination_checkpoint(
@@ -33871,21 +34457,24 @@ async def _reset_pagination_checkpoint(
     *,
     database_connection: Any | None = None,
 ) -> None:
-    database_executor = database_connection or db
-    await database_executor.status(
-        _pagination_checkpoint_reset_sql(),
-        canonical_api_base=context.canonical_api_base,
-        resource_type=resource_type,
-        source_scope_hash=context.source_scope_hash,
-        dataset_id=context.dataset_id,
-        source_ids=json.dumps(context.source_ids),
-        acquisition_root_run_id=context.acquisition_root_run_id,
-        owner_run_id=context.owner_run_id,
-        retry_of_run_id=context.retry_of_run_id,
-        start_url_hash=start_url_hash,
-        next_url=start_url,
-        state=PAGINATION_CHECKPOINT_ACTIVE,
-    )
+    async with _mutable_endpoint_dataset_resource_mutation(
+        [context.dataset_id] if context.dataset_id else [],
+        database_connection=database_connection,
+    ) as database_executor:
+        await database_executor.status(
+            _pagination_checkpoint_reset_sql(),
+            canonical_api_base=context.canonical_api_base,
+            resource_type=resource_type,
+            source_scope_hash=context.source_scope_hash,
+            dataset_id=context.dataset_id,
+            source_ids=json.dumps(context.source_ids),
+            acquisition_root_run_id=context.acquisition_root_run_id,
+            owner_run_id=context.owner_run_id,
+            retry_of_run_id=context.retry_of_run_id,
+            start_url_hash=start_url_hash,
+            next_url=start_url,
+            state=PAGINATION_CHECKPOINT_ACTIVE,
+        )
 
 
 def _empty_pagination_checkpoint_restart_sql() -> str:
@@ -35966,7 +36555,11 @@ def _endpoint_dataset_hash_identity(resource_row: Any) -> tuple[str, str, str]:
     )
 
 
-def _endpoint_dataset_hash_page_sql(has_cursor: bool) -> str:
+def _endpoint_dataset_hash_page_sql(
+    has_cursor: bool,
+    *,
+    include_payload_json: bool = False,
+) -> str:
     cursor_filter = ""
     if has_cursor:
         cursor_filter = """
@@ -35978,8 +36571,9 @@ def _endpoint_dataset_hash_page_sql(has_cursor: bool) -> str:
                 )
            )
         """
+    payload_projection = ", payload_json" if include_payload_json else ""
     return f"""
-        SELECT resource_type, resource_id, payload_hash
+        SELECT resource_type, resource_id, payload_hash{payload_projection}
           FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
          WHERE dataset_id = :dataset_id
            AND resource_type NOT LIKE 'LU:%:pass:%'
@@ -35993,6 +36587,8 @@ async def _endpoint_dataset_content_proof(
     connection: Any,
     dataset_id: str,
     resource_types: tuple[str, ...] = (),
+    *,
+    verify_payload_hashes: bool = False,
 ) -> EndpointDatasetContentProof:
     """Hash an ordered dataset and each resource family with bounded pages."""
     content_hash = hashlib.sha256()
@@ -36005,23 +36601,19 @@ async def _endpoint_dataset_content_proof(
     after_resource_id: str | None = None
     batch_size = max(1, ENDPOINT_DATASET_HASH_BATCH_SIZE)
     while True:
-        query_params_by_name: dict[str, Any] = {
-            "dataset_id": dataset_id,
-            "batch_size": batch_size,
-        }
-        has_cursor = after_resource_type is not None
-        if has_cursor:
-            query_params_by_name.update(
-                after_resource_type=after_resource_type,
-                after_resource_id=after_resource_id,
-            )
-        resource_rows = await connection.all(
-            _endpoint_dataset_hash_page_sql(has_cursor),
-            **query_params_by_name,
+        resource_rows = await _endpoint_dataset_content_page(
+            connection,
+            dataset_id,
+            batch_size,
+            after_resource_type,
+            after_resource_id,
+            include_payload_json=verify_payload_hashes,
         )
         if not resource_rows:
             break
         for resource_row in resource_rows:
+            if verify_payload_hashes:
+                _assert_endpoint_dataset_resource_payload_hash(resource_row)
             if resource_count:
                 content_hash.update(b"\n")
             identity = _endpoint_dataset_hash_identity(resource_row)
@@ -36046,6 +36638,62 @@ async def _endpoint_dataset_content_proof(
     return _completed_endpoint_dataset_content_proof(
         content_hash, resource_count, resource_hasher_by_type, resource_count_by_type
     )
+
+
+async def _endpoint_dataset_content_page(
+    connection: Any,
+    dataset_id: str,
+    batch_size: int,
+    after_resource_type: str | None,
+    after_resource_id: str | None,
+    *,
+    include_payload_json: bool,
+) -> list[Any]:
+    """Read one stable ordered page for the immutable content proof."""
+    query_params_by_name: dict[str, Any] = {
+        "dataset_id": dataset_id,
+        "batch_size": batch_size,
+    }
+    has_cursor = after_resource_type is not None
+    if has_cursor:
+        query_params_by_name.update(
+            after_resource_type=after_resource_type,
+            after_resource_id=after_resource_id,
+        )
+    return await connection.all(
+        _endpoint_dataset_hash_page_sql(
+            has_cursor,
+            include_payload_json=include_payload_json,
+        ),
+        **query_params_by_name,
+    )
+
+
+def _assert_endpoint_dataset_resource_payload_hash(resource_row: Any) -> None:
+    resource_map = _pagination_checkpoint_row_mapping(resource_row)
+    raw_payload = resource_map.get("payload_json")
+    if isinstance(raw_payload, str):
+        try:
+            raw_payload = json.loads(raw_payload)
+        except json.JSONDecodeError as exc:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_endpoint_dataset_payload_invalid"
+            ) from exc
+    if not isinstance(raw_payload, dict):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_payload_invalid"
+        )
+    payload_hash = hashlib.sha256(
+        json.dumps(
+            raw_payload,
+            sort_keys=True,
+            default=_json_default,
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload_hash != _clean_text(resource_map.get("payload_hash")):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_payload_hash_mismatch"
+        )
 
 
 def _completed_endpoint_dataset_content_proof(
@@ -36121,6 +36769,163 @@ def _outcome_resource_count_proof(
         "resource_count": content_proof.resource_count,
         "resource_counts": resource_count_by_type,
     }
+
+
+def _endpoint_dataset_source_summary_metrics_sql() -> str:
+    """Aggregate display metrics once from the immutable dataset payload."""
+    return source_summary_metrics_sql(
+        _qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)
+    )
+
+
+def _source_summary_metric_count(
+    metric_row: dict[str, Any],
+    field_name: str,
+) -> int:
+    metric_value = metric_row.get(field_name)
+    if (
+        isinstance(metric_value, bool)
+        or not isinstance(metric_value, int)
+        or metric_value < 0
+    ):
+        raise RuntimeError(
+            f"provider_directory_source_summary_{field_name}_invalid"
+        )
+    return metric_value
+
+
+def _source_summary_relation_edge_count(
+    relation_proof_by_name: dict[str, dict[str, Any]],
+    metadata_key: str,
+) -> int:
+    relation_proof = relation_proof_by_name.get(metadata_key)
+    if (
+        not isinstance(relation_proof, dict)
+        or relation_proof.get("complete") is not True
+    ):
+        raise RuntimeError(
+            "provider_directory_source_summary_relation_proof_missing"
+        )
+    edge_count = relation_proof.get("edge_count")
+    if (
+        isinstance(edge_count, bool)
+        or not isinstance(edge_count, int)
+        or edge_count < 0
+    ):
+        raise RuntimeError(
+            "provider_directory_source_summary_relation_count_invalid"
+        )
+    return edge_count
+
+
+def _source_summary_counts(
+    content_proof: EndpointDatasetContentProof,
+    relation_proof_by_name: dict[str, dict[str, Any]],
+    metric_row: dict[str, Any],
+) -> dict[str, int]:
+    return {
+        "individual_practitioners": content_proof.resource_counts.get(
+            "Practitioner", 0
+        ),
+        "organization_resources": content_proof.resource_counts.get(
+            "Organization", 0
+        ),
+        "practitioner_role_resources": content_proof.resource_counts.get(
+            "PractitionerRole", 0
+        ),
+        "network_plan_links": _source_summary_relation_edge_count(
+            relation_proof_by_name,
+            PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
+        ),
+        "organization_affiliation_links": (
+            _source_summary_relation_edge_count(
+                relation_proof_by_name,
+                PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY,
+            )
+        ),
+        **{
+            field_name: _source_summary_metric_count(metric_row, field_name)
+            for field_name in (
+                "distinct_npis",
+                "address_records",
+                "addressed_locations",
+                "geocoded_locations",
+            )
+        },
+    }
+
+
+def _build_endpoint_dataset_source_summary(
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+    count_by_field: dict[str, int],
+    acquisition_root_run_id: str,
+) -> dict[str, Any]:
+    return build_source_summary(
+        binding=ProviderDirectorySourceSummaryBinding(
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=acquisition_root_run_id,
+            dataset_hash=content_proof.dataset_hash,
+        ),
+        source_ids=candidate.source_ids,
+        selected_resources=candidate.selected_resources,
+        count_by_resource=content_proof.resource_counts,
+        hash_by_resource=content_proof.resource_hashes,
+        count_by_field=count_by_field,
+        count_by_category={
+            "intentional_drop_counts": {},
+            "unknown_field_counts": {},
+        },
+        identity_by_field={
+            "semantic_contract_id": (
+                PROVIDER_DIRECTORY_FHIR_SOURCE_SUMMARY_SEMANTIC_CONTRACT_ID
+            )
+        },
+    )
+
+
+async def _endpoint_dataset_source_summary(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+    relation_proof_by_name: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Build one immutable source-local summary during dataset validation."""
+    acquisition_root_run_id = _clean_text(
+        candidate.acquisition_root_run_id
+    )
+    if acquisition_root_run_id is None:
+        return None
+    metric_record = await connection.first(
+        _endpoint_dataset_source_summary_metrics_sql(),
+        dataset_id=candidate.dataset_id,
+        summary_resource_types=[
+            "HealthcareService",
+            "Location",
+            "Organization",
+            "Practitioner",
+            "PractitionerRole",
+        ],
+        npi_resource_types=[
+            "HealthcareService",
+            "Organization",
+            "Practitioner",
+            "PractitionerRole",
+        ],
+        normalized_address_resource_types=["Location", "Practitioner"],
+    )
+    count_by_field = _source_summary_counts(
+        content_proof,
+        relation_proof_by_name,
+        _pagination_checkpoint_row_mapping(metric_record),
+    )
+    return _build_endpoint_dataset_source_summary(
+        candidate,
+        content_proof,
+        count_by_field,
+        acquisition_root_run_id,
+    )
 
 
 def _twin_root_content_proof(
@@ -36563,6 +37368,7 @@ async def _delete_matched_baseline_resource_rows(
     candidate: EndpointDatasetCandidate,
     baseline_dataset_id: str,
 ) -> int:
+    """Retire a locked immutable baseline only after exact successor proof."""
     deleted_status = await connection.status(
         f"""
         DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
@@ -36721,6 +37527,88 @@ async def _endpoint_dataset_validation_proofs(
     )
 
 
+async def _endpoint_dataset_source_summary_metadata(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+    relation_proof_by_name: dict[str, dict[str, Any]],
+    final_status: str,
+) -> dict[str, Any]:
+    if final_status != ENDPOINT_DATASET_VALIDATED:
+        return {}
+    source_summary = await _endpoint_dataset_source_summary(
+        connection,
+        candidate,
+        content_proof,
+        relation_proof_by_name,
+    )
+    return (
+        {SOURCE_SUMMARY_METADATA_KEY: source_summary}
+        if source_summary is not None
+        else {}
+    )
+
+
+def _dataset_validation_metadata(
+    candidate: EndpointDatasetCandidate,
+    diagnostics: dict[str, dict[str, Any]],
+    content_proof: EndpointDatasetContentProof,
+    bulk_transaction_times: dict[str, str],
+    relation_proof_by_name: dict[str, dict[str, Any]],
+    verification_metadata: dict[str, Any],
+    source_summary_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return _endpoint_dataset_publication_metadata(
+        candidate,
+        diagnostics,
+        dataset_hash=content_proof.dataset_hash,
+        resource_count=content_proof.resource_count,
+        bulk_transaction_times=bulk_transaction_times,
+        **{
+            PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY: (
+                _outcome_resource_count_proof(candidate, content_proof)
+            )
+        },
+        **relation_proof_by_name,
+        **verification_metadata,
+        **source_summary_metadata,
+    )
+
+
+async def _store_dataset_validation_state(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    previous_dataset_id: str | None,
+    content_proof: EndpointDatasetContentProof,
+    relation_proof_by_name: dict[str, Any],
+    final_status: str,
+    mismatch_fields: list[str],
+    metadata: dict[str, Any],
+) -> tuple[
+    str | None, EndpointDatasetContentProof, dict[str, Any],
+    str, list[str], int,
+]:
+    await _store_endpoint_dataset_verification_result(
+        connection,
+        candidate,
+        previous_dataset_id,
+        content_proof,
+        metadata,
+        final_status,
+    )
+    retired_row_count = await _retire_matched_twin_root_baseline_payload(
+        connection, candidate, metadata, final_status
+    )
+    return (
+        previous_dataset_id,
+        content_proof,
+        relation_proof_by_name,
+        final_status,
+        mismatch_fields,
+        retired_row_count,
+    )
+
+
 async def _persist_endpoint_dataset_validation(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -36747,38 +37635,31 @@ async def _persist_endpoint_dataset_validation(
         verification_metadata,
         mismatch_fields,
     ) = await _endpoint_dataset_validation_proofs(connection, candidate)
-    metadata = _endpoint_dataset_publication_metadata(
-        candidate,
-        diagnostics,
-        dataset_hash=content_proof.dataset_hash,
-        resource_count=content_proof.resource_count,
-        bulk_transaction_times=candidate_transaction_times,
-        **{
-            PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY: (
-                _outcome_resource_count_proof(candidate, content_proof)
-            )
-        },
-        **relation_proof_by_name,
-        **verification_metadata,
-    )
-    await _store_endpoint_dataset_verification_result(
+    source_summary_metadata = await _endpoint_dataset_source_summary_metadata(
         connection,
         candidate,
-        previous_dataset_id,
         content_proof,
-        metadata,
+        relation_proof_by_name,
         final_status,
     )
-    retired_row_count = await _retire_matched_twin_root_baseline_payload(
-        connection, candidate, metadata, final_status
+    metadata = _dataset_validation_metadata(
+        candidate,
+        diagnostics,
+        content_proof,
+        candidate_transaction_times,
+        relation_proof_by_name,
+        verification_metadata,
+        source_summary_metadata,
     )
-    return (
+    return await _store_dataset_validation_state(
+        connection,
+        candidate,
         previous_dataset_id,
         content_proof,
         relation_proof_by_name,
         final_status,
         mismatch_fields,
-        retired_row_count,
+        metadata,
     )
 
 

@@ -45,7 +45,7 @@ def test_umls_download_url_redaction_keeps_api_key_out_of_errors():
 
 def test_build_clinical_area_rows_maps_mesh_and_rxnorm_to_areas():
     """Verify build clinical area rows maps mesh and rxnorm to areas."""
-    concepts = {
+    concept_by_key = {
         ("MESH", "D006331"): {
             "code_system": "MESH",
             "code": "D006331",
@@ -77,7 +77,7 @@ def test_build_clinical_area_rows_maps_mesh_and_rxnorm_to_areas():
             "display_name": "Example Drug",
         },
     }
-    relationships = {
+    relationship_by_key = {
         ("MESH", "D006331", "has_tree_number", "MESH_TREE", "C14"): {
             "from_system": "MESH",
             "from_code": "D006331",
@@ -115,7 +115,10 @@ def test_build_clinical_area_rows_maps_mesh_and_rxnorm_to_areas():
         },
     }
 
-    areas, area_conditions, area_treatments = _build_clinical_area_rows(concepts, relationships)
+    areas, area_conditions, area_treatments = _build_clinical_area_rows(
+        concept_by_key,
+        relationship_by_key,
+    )
 
     assert {clinical_area_row["clinical_area_id"] for clinical_area_row in areas} == {"mesh:C14", "mesh:E04"}
     assert {

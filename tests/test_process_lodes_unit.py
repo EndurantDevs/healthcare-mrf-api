@@ -20,11 +20,11 @@ def test_block_to_zcta_requires_crosswalk_mapping():
 
 def test_lodes_crosswalk_requires_tract_geoid():
     module = importlib.import_module("process.lodes")
-    crosswalk = {}
+    tract_zip_by_geoid = {}
 
-    assert module._add_tract_zip_mapping(crosswalk, "36103", "11797") is False
-    assert module._add_tract_zip_mapping(crosswalk, "17031010100", "60654") is True
-    assert crosswalk == {"17031010100": "60654"}
+    assert module._add_tract_zip_mapping(tract_zip_by_geoid, "36103", "11797") is False
+    assert module._add_tract_zip_mapping(tract_zip_by_geoid, "17031010100", "60654") is True
+    assert tract_zip_by_geoid == {"17031010100": "60654"}
 
 
 @pytest.mark.asyncio

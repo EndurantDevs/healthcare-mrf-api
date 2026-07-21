@@ -11,9 +11,9 @@ from typing import Any
 
 from sqlalchemy import func, select
 
+from api.provider_directory_source_summary_outcome import source_summary_outcome_counts
 from db.models import ProviderDirectoryEndpointDataset, ProviderDirectorySource, db
 from process.import_status_events import isoformat_utc
-
 
 _PUBLISHED_DATASET_STATUS = "published"
 _OUTCOME_RESOURCE_COUNTS_METADATA_KEY = "outcome_resource_counts_v1"
@@ -30,8 +30,6 @@ _RELATION_COUNT_FIELDS = (
     ("dataset_affiliation_organization", "OrganizationAffiliation",
      "affiliation_resource_count", "organization_affiliation_links"),
 )
-
-
 @dataclass(frozen=True)
 class _CurrentPublishedDataset:
     source_ids: tuple[str, ...]
@@ -450,7 +448,12 @@ def _outcome_summary(dataset: _CurrentPublishedDataset) -> dict[str, Any]:
     if resource_counts is not None:
         summary_map["resource_counts"] = resource_counts
         summary_map.update(
-            _precomputed_relation_counts(dataset, resource_counts)
+            source_summary_outcome_counts(
+                dataset,
+                _selected_resources(dataset) or (),
+                resource_counts,
+                _precomputed_relation_counts(dataset, resource_counts),
+            )
         )
     return summary_map
 

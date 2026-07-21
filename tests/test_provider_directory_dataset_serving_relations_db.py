@@ -32,7 +32,14 @@ async def _create_tables(database: Database, schema: str) -> None:
         "dataset_id varchar(96) PRIMARY KEY, "
         "endpoint_id varchar(64) NOT NULL, "
         "acquisition_root_run_id varchar(64), "
-        "import_run_id varchar(64) NOT NULL"
+        "import_run_id varchar(64) NOT NULL, "
+        "previous_dataset_id varchar(96), "
+        "dataset_hash varchar(64), "
+        "resource_count bigint, "
+        "status varchar(32) NOT NULL DEFAULT 'published', "
+        "is_current boolean NOT NULL DEFAULT true, "
+        "superseded_at timestamptz, "
+        "publication_metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb"
         ");"
     )
     await database.status(

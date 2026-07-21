@@ -12,16 +12,11 @@ DATASET_ID = "pdds_current"
 ENDPOINT_ID = "endpoint-current"
 ROOT_RUN_ID = "root-current"
 DATASET_HASH = "a" * 64
-SELECTED_RESOURCES = (
-    "InsurancePlan",
-    "OrganizationAffiliation",
-    "Practitioner",
-)
 RESOURCE_COUNTS = {
-    "InsurancePlan": 2,
-    "OrganizationAffiliation": 1,
-    "Practitioner": 4,
+    "InsurancePlan": 2, "Location": 2, "Organization": 3,
+    "OrganizationAffiliation": 1, "Practitioner": 4, "PractitionerRole": 7,
 }
+SELECTED_RESOURCES = tuple(sorted(RESOURCE_COUNTS))
 TOTAL_RESOURCES = sum(RESOURCE_COUNTS.values())
 
 
@@ -223,7 +218,12 @@ async def test_versioned_proof_reports_linked_supported_resources(monkeypatch):
         "execute",
         AsyncMock(
             return_value=_MappingResult(
-                [_dataset_row(publication_metadata=publication_metadata)]
+                [
+                    _dataset_row(
+                        resource_count=7,
+                        publication_metadata=publication_metadata,
+                    )
+                ]
             )
         ),
     )

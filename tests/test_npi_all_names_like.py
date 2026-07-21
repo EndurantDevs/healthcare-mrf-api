@@ -19,12 +19,12 @@ class RecordingConnection:
         self.sql_calls = []
 
     async def all(self, sql, **params):
+        sql_text = str(sql)
         self.calls += 1
-        self.last_sql = str(sql)
+        self.last_sql = sql_text
         self.last_params = params
-        self.sql_calls.append((str(sql), dict(params)))
-        # first call: count; second call: results
-        if self.calls == 1:
+        self.sql_calls.append((sql_text, dict(params)))
+        if "COUNT(DISTINCT c.npi)" in sql_text:
             return [(5,)]
         return []
 
@@ -199,8 +199,15 @@ async def test_get_all_q_filter(monkeypatch):
     assert response_body["page"] == 1
     assert response_body["limit"] == 50
     assert response_body["offset"] == 0
-    assert "b.npi" in conn.last_sql and "name_like_0" in conn.last_params
-    assert conn.last_params["limit"] > 0  # limit expanded from 0
+    data_calls = [
+        (sql, params)
+        for sql, params in conn.sql_calls
+        if "COUNT(DISTINCT c.npi)" not in sql
+    ]
+    assert len(data_calls) == 1
+    data_sql, data_params = data_calls[0]
+    assert "b.npi" in data_sql and "name_like_0" in data_params
+    assert data_params["limit"] > 0  # limit expanded from 0
 
 
 @pytest.mark.asyncio
@@ -1201,9 +1208,9 @@ async def test_get_all_handles_sparse_positional_rows_without_crashing(monkeypat
         def __init__(self):
             self.calls = 0
 
-        async def all(self, *_args, **_kwargs):
+        async def all(self, sql, **_kwargs):
             self.calls += 1
-            if self.calls == 1:
+            if "COUNT(DISTINCT c.npi)" in str(sql):
                 return [(1,)]
 
             # Simulate legacy/sparse row shape where address payload has fewer

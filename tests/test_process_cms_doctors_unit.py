@@ -82,8 +82,8 @@ async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_do
         SimpleNamespace(ClientSession=lambda: _FakeClient(zip_payload)),
     )
 
-    ctx = {"import_date": "20260321", "context": {}}
-    await cms_doctors_module.process_data(ctx, {"test_mode": True})
+    import_context_map = {"import_date": "20260321", "context": {}}
+    await cms_doctors_module.process_data(import_context_map, {"test_mode": True})
 
     assert len(pushed_rows) == 2
     assert len({pushed_doctor_row["address_checksum"] for pushed_doctor_row in pushed_rows}) == 2
@@ -116,8 +116,8 @@ async def test_process_data_accepts_current_cms_lowercase_schema(monkeypatch, cm
         SimpleNamespace(ClientSession=lambda: _FakeClient(zip_payload)),
     )
 
-    ctx = {"import_date": "20260321", "context": {}}
-    await cms_doctors_module.process_data(ctx, {"test_mode": True})
+    import_context_map = {"import_date": "20260321", "context": {}}
+    await cms_doctors_module.process_data(import_context_map, {"test_mode": True})
 
     assert pushed_rows == [
         {
