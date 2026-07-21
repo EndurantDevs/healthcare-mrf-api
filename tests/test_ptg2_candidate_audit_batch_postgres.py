@@ -407,7 +407,7 @@ async def _persist_multipart_witness(
 async def test_real_postgres_partition_plan_dispatches_every_item_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prove two bounded V2 requests over one worker-side PostgreSQL load."""
+    """Prove four bounded V2 requests over one worker-side PostgreSQL load."""
 
     if os.getenv("HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST=1")
@@ -432,7 +432,7 @@ async def test_real_postgres_partition_plan_dispatches_every_item_once(
             plan,
         )
         _assert_partition_aggregate(aggregate)
-        assert snapshot_descriptor.await_count == 2
+        assert snapshot_descriptor.await_count == 4
     finally:
         try:
             await db.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
