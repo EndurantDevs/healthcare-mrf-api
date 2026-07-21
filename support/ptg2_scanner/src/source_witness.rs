@@ -24,8 +24,12 @@ pub const SOURCE_WITNESS_UNQUERYABLE_POLICY: &str = "count_but_exclude_from_npi_
 const SOURCE_WITNESS_MAGIC: &[u8; 8] = b"PTG2SW02";
 const SOURCE_WITNESS_RECORD_MAGIC: &[u8; 8] = b"PTG2SWR2";
 const SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES: usize = 8 * 1024 * 1024;
-const SOURCE_WITNESS_MAX_COMPRESSED_RATE_CANDIDATE_BYTES: u64 = 512 * 1024 * 1024;
-const SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
+// Scanner bundles are temporary bottom-k merge inputs. They still contain repeated
+// source evidence that the persisted encoder deduplicates before enforcing its
+// independent 512 MiB logical-payload safety bound.
+const SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
+const SOURCE_WITNESS_MAX_COMPRESSED_RATE_CANDIDATE_BYTES: u64 =
+    SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SourceWitnessCoordinate {
@@ -1346,6 +1350,18 @@ mod tests {
         let selected = sampler.take_sorted().unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].compressed_record, compressed_record);
+    }
+
+    #[test]
+    fn intermediate_candidate_budget_has_deduplication_headroom() {
+        assert_eq!(
+            SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES,
+            1024 * 1024 * 1024,
+        );
+        assert_eq!(
+            SOURCE_WITNESS_MAX_COMPRESSED_RATE_CANDIDATE_BYTES,
+            SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES,
+        );
     }
 
     #[test]
