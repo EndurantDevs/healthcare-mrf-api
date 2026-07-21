@@ -80,7 +80,6 @@ from process.ext.contact_canon import canonicalize_batch as canonicalize_contact
 from process.ext.utils import ensure_database
 from process.provider_directory_dataset_rehydrate import (
     DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
-    DatasetRehydrationError,
     DatasetScope,
     RehydrationRequest,
     RehydrationRuntime,
@@ -16381,9 +16380,11 @@ async def publish_provider_directory_address_corroboration_if_available(
 
 async def _ensure_provider_directory_tables() -> None:
     schema = _schema()
-    await db.status(f"CREATE SCHEMA IF NOT EXISTS {_q(schema)};")
+    if not await _table_exists(schema, SOURCE_MODELS[0].__tablename__):
+        await db.status(f"CREATE SCHEMA IF NOT EXISTS {_q(schema)};")
     for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
-        await db.create_table(model.__table__, checkfirst=True)
+        if not await _table_exists(schema, model.__tablename__):
+            await db.create_table(model.__table__, checkfirst=True)
         await _ensure_provider_directory_model_columns(model, schema)
     await _ensure_provider_directory_source_column_types(schema)
     existing_index_names = await _provider_directory_existing_index_names(schema)
@@ -16480,6 +16481,8 @@ async def _ensure_provider_directory_model_columns(model: Any, schema: str) -> N
 
 async def _ensure_provider_directory_import_seen_table(schema: str | None = None) -> None:
     schema = schema or _schema()
+    if await _table_exists(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE):
+        return
     seen_ref = _qt(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
     await db.status(
         f"""
@@ -16491,14 +16494,6 @@ async def _ensure_provider_directory_import_seen_table(schema: str | None = None
             seen_at timestamp NOT NULL DEFAULT now(),
             PRIMARY KEY (run_id, resource_type, source_id, resource_id)
         );
-        """
-    )
-    # The primary key is (run_id, resource_type, source_id, resource_id), so it
-    # already supports the stale-delete prefix lookup. The old prefix index only
-    # doubled index writes during large imports.
-    await db.status(
-        f"""
-        DROP INDEX IF EXISTS {_qt(schema, "provider_directory_import_seen_source_idx")};
         """
     )
 
@@ -38928,7 +38923,9 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     ctx["context"]["test_mode"] = test_mode
 
     await ensure_database(test_mode)
-    await _ensure_provider_directory_tables()
+    if not ctx["context"].get("provider_directory_tables_ready"):
+        await _ensure_provider_directory_tables()
+        ctx["context"]["provider_directory_tables_ready"] = True
 
     run_id = _clean_text(task.get("run_id")) or _clean_text(ctx.get("control_run_id"))
     retry_of_run_id = _clean_text(task.get("retry_of_run_id"))
@@ -38944,12 +38941,9 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         or task.get("provider_directory_source_id")
     )
     if bool(task.get("dataset_rehydrate_only")):
-        try:
-            return await _run_provider_directory_dataset_rehydrate(
-                ctx, task, run_id, requested_source_ids
-            )
-        except DatasetRehydrationError:
-            raise
+        return await _run_provider_directory_dataset_rehydrate(
+            ctx, task, run_id, requested_source_ids
+        )
     limit = int(task.get("limit") or 0) or None
     source_query = _clean_text(task.get("source_query"))
     timeout = int(task.get("timeout") or os.getenv("HLTHPRT_PROVIDER_DIRECTORY_TIMEOUT", "15"))
@@ -39482,6 +39476,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["import_date"] = _normalize_import_id(ctx.get("import_date"))
     await ensure_database(bool(ctx["context"].get("test_mode", False)))
     await _ensure_provider_directory_tables()
+    ctx["context"]["provider_directory_tables_ready"] = True
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
