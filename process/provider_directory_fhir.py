@@ -42,6 +42,7 @@ from sqlalchemy import case, func, or_, text as sa_text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.schema import CreateColumn
 from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
@@ -1950,7 +1951,7 @@ class _PractitionerRoleReverseLookupState:
                 request.options,
             ):
                 if request.options.cancel_ctx is not None:
-                    await raise_if_cancelled(
+                    await _raise_if_resource_import_cancelled(
                         request.options.cancel_ctx,
                         request.options.cancel_task,
                     )
@@ -1994,7 +1995,10 @@ class _PractitionerRoleReverseLookupState:
         )
         while next_lookup_url:
             if request.options.cancel_ctx is not None:
-                await raise_if_cancelled(request.options.cancel_ctx, request.options.cancel_task)
+                await _raise_if_resource_import_cancelled(
+                    request.options.cancel_ctx,
+                    request.options.cancel_task,
+                )
             if _is_lookup_deadline_elapsed(request.deadline_at):
                 await self.mark_deadline_reached()
                 return
@@ -22477,7 +22481,7 @@ async def _bulk_cancel_probe(
     deadline_at: float | None,
 ) -> None:
     if cancel_ctx is not None:
-        await raise_if_cancelled(cancel_ctx, cancel_task)
+        await _raise_if_resource_import_cancelled(cancel_ctx, cancel_task)
     if deadline_at is not None and time.monotonic() >= deadline_at:
         raise RuntimeError(BULK_EXPORT_STATUS_DEADLINE_EXCEEDED)
 
@@ -24488,7 +24492,11 @@ async def _stream_bulk_export_output_rows(
                 )
             await flush_pending_rows(byte_counts_by_name["processed"])
             return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, None)
-    except (asyncio.CancelledError, ImportCancelledError):
+    except (
+        asyncio.CancelledError,
+        ImportCancelledError,
+        ResourceImportControlPlaneFailure,
+    ):
         raise
     except ValueError as exc:
         return _bulk_stream_result(
@@ -25181,7 +25189,11 @@ def _completed_bulk_output_error(
         active_item_by_task.pop(completed_task)
         try:
             task_error = completed_task.result()
-        except (ImportCancelledError, asyncio.CancelledError):
+        except (
+            ImportCancelledError,
+            asyncio.CancelledError,
+            ResourceImportControlPlaneFailure,
+        ):
             raise
         except RuntimeError as exc:
             if str(exc) in BULK_EXPORT_FENCING_ERRORS:
@@ -26317,7 +26329,7 @@ async def _should_continue_partition_chain(
 ) -> bool:
     """Check cancellation, deadline, and page bounds before one request."""
     if request.fetch_options.cancel_ctx is not None:
-        await raise_if_cancelled(
+        await _raise_if_resource_import_cancelled(
             request.fetch_options.cancel_ctx,
             request.fetch_options.cancel_task,
         )
@@ -27444,7 +27456,7 @@ async def _fetch_last_updated_partition_window(
     current_url: str | None = request_url
     while current_url:
         if cancel_ctx is not None:
-            await raise_if_cancelled(cancel_ctx, cancel_task)
+            await _raise_if_resource_import_cancelled(cancel_ctx, cancel_task)
         stop_result = _last_updated_window_stop_result(
             collected_resources,
             pages_fetched,
@@ -29685,7 +29697,10 @@ async def _fetch_resource_rows(
         url = start_url
         while url and _can_limit_accept_more(rows_fetched, per_resource_limit):
             if cancel_ctx is not None:
-                await raise_if_cancelled(cancel_ctx, cancel_task)
+                await _raise_if_resource_import_cancelled(
+                    cancel_ctx,
+                    cancel_task,
+                )
             if deadline_at is not None and time.monotonic() >= deadline_at:
                 is_deadline_reached = True
                 has_next_url = True
@@ -30120,7 +30135,10 @@ async def _fetch_scan_practitioner_role_rows(
     ):
         seed_count += 1
         if options.cancel_ctx is not None:
-            await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
+            await _raise_if_resource_import_cancelled(
+                options.cancel_ctx,
+                options.cancel_task,
+            )
         if not _can_limit_accept_more(rows_fetched, options.per_resource_limit):
             break
         if deadline_at is not None and time.monotonic() >= deadline_at:
@@ -30136,7 +30154,10 @@ async def _fetch_scan_practitioner_role_rows(
         )
         while url and _can_limit_accept_more(rows_fetched, options.per_resource_limit):
             if options.cancel_ctx is not None:
-                await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
+                await _raise_if_resource_import_cancelled(
+                    options.cancel_ctx,
+                    options.cancel_task,
+                )
             if deadline_at is not None and time.monotonic() >= deadline_at:
                 is_deadline_reached = True
                 has_next_url = True
@@ -38235,6 +38256,70 @@ ResourceImportGroupResult = tuple[
 ]
 
 
+@dataclass(frozen=True)
+class ResourceImportGroupFailure:
+    """Describe one settled source-group failure without retaining its payload."""
+
+    source_ids: tuple[str, ...]
+    error_type: str
+
+
+class ResourceImportProgressFailure(RuntimeError):
+    """Keep shared progress failures batch-fatal across source isolation."""
+
+
+class ResourceImportControlPlaneFailure(RuntimeError):
+    """Keep cancellation-authority failures batch-fatal across source isolation."""
+
+
+async def _raise_if_resource_import_cancelled(
+    cancel_ctx: dict[str, Any] | None,
+    cancel_task: dict[str, Any] | None,
+) -> None:
+    """Preserve cancellation while classifying its backend outage as global."""
+    if cancel_ctx is None:
+        return
+    try:
+        await raise_if_cancelled(cancel_ctx, cancel_task)
+    except (asyncio.CancelledError, ImportCancelledError):
+        raise
+    except Exception as failure:
+        raise ResourceImportControlPlaneFailure(
+            "provider_directory_cancellation_probe_failed"
+        ) from failure
+
+
+def _resource_import_failure_source_id(raw_source_id: Any) -> str:
+    """Return a bounded, log-safe source identity for aggregate errors."""
+    source_id = _clean_text(raw_source_id) or "unknown-source"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", source_id)[:128]
+
+
+def _resource_import_group_failure(
+    source_records: list[dict[str, Any]],
+    failure: Exception,
+) -> ResourceImportGroupFailure:
+    """Convert a source-local exception into a deterministic safe result."""
+    source_ids = tuple(
+        sorted(
+            {
+                _resource_import_failure_source_id(source.get("source_id"))
+                for source in source_records
+            }
+        )
+    )
+    error_type = type(failure).__name__
+    LOGGER.warning(
+        "Provider Directory source group failed: source_ids=%s error_type=%s",
+        ",".join(source_ids),
+        error_type,
+    )
+    return ResourceImportGroupFailure(
+        source_ids=source_ids,
+        error_type=error_type,
+    )
+
+
 def _finalized_endpoint_dataset_import_summary(
     candidate: EndpointDatasetCandidate,
     resource_completion: dict[str, set[str]] | None = None,
@@ -38403,8 +38488,6 @@ async def _import_resources(
 ) -> dict[str, int]:
     """Import resources into the provider-directory snapshot."""
     counts: dict[str, int] = {resource: 0 for resource in resources}
-    for source_record in sources:
-        _assert_resource_acquisition_allowed(source_record, resources)
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
     _validate_provider_directory_endpoint_scope(
         sources,
@@ -38488,7 +38571,19 @@ async def _import_resources(
                 snapshot = progress_counts_snapshot()
                 details = {"active_source_groups": active_group_snapshot()}
         if snapshot is not None:
-            await progress_callback(completed_groups, total_groups, snapshot, details)
+            try:
+                await progress_callback(
+                    completed_groups,
+                    total_groups,
+                    snapshot,
+                    details,
+                )
+            except (asyncio.CancelledError, ImportCancelledError):
+                raise
+            except Exception as failure:
+                raise ResourceImportProgressFailure(
+                    "provider_directory_progress_callback_failed"
+                ) from failure
 
     async def maybe_report_partial_progress(
         group_key: int,
@@ -38513,8 +38608,7 @@ async def _import_resources(
         source_group: list[dict[str, Any]],
     ) -> ResourceImportGroupResult:
         """Import, validate, and finalize one provider-directory source group."""
-        if cancel_ctx is not None:
-            await raise_if_cancelled(cancel_ctx, cancel_task)
+        await _raise_if_resource_import_cancelled(cancel_ctx, cancel_task)
         group_key = id(source_group)
         source_ids = sorted(item["source_id"] for item in source_group)
         _validate_provider_directory_endpoint_scope(
@@ -38641,8 +38735,7 @@ async def _import_resources(
             )
             return import_summary
         for resource_type in _source_resource_fetch_order(source, resources):
-            if cancel_ctx is not None:
-                await raise_if_cancelled(cancel_ctx, cancel_task)
+            await _raise_if_resource_import_cancelled(cancel_ctx, cancel_task)
             if (
                 resource_type == "PractitionerRole"
                 and _needs_practitioner_role_reverse_lookup(source, "PractitionerRole")
@@ -39098,10 +39191,47 @@ async def _import_resources(
             finally:
                 await clear_partial_progress(id(prepared_source_records))
 
+    async def run_isolated_group(
+        source_records: list[dict[str, Any]],
+    ) -> ResourceImportGroupResult | ResourceImportGroupFailure:
+        """Settle ordinary source failures while preserving batch-fatal signals."""
+        try:
+            for source_record in source_records:
+                _assert_resource_acquisition_allowed(source_record, resources)
+            return await run_with_limit(source_records)
+        except (
+            asyncio.CancelledError,
+            ImportCancelledError,
+            ResourceImportControlPlaneFailure,
+            ResourceImportProgressFailure,
+            asyncpg.PostgresError,
+            asyncpg.InterfaceError,
+            SQLAlchemyError,
+        ):
+            raise
+        except Exception as failure:
+            if total_groups == 1:
+                raise
+            return _resource_import_group_failure(source_records, failure)
+
     tasks: list[asyncio.Task] = []
+    failed_source_ids: set[str] = set()
     try:
-        tasks = [asyncio.create_task(run_with_limit(source_group)) for source_group in source_groups]
+        tasks = [
+            asyncio.create_task(run_isolated_group(source_group))
+            for source_group in source_groups
+        ]
         for task in asyncio.as_completed(tasks):
+            group_result = await task
+            if isinstance(group_result, ResourceImportGroupFailure):
+                failed_source_ids.update(group_result.source_ids)
+                completed_groups += 1
+                if progress_callback is not None and (
+                    completed_groups == total_groups
+                    or completed_groups % report_every == 0
+                ):
+                    await report_progress(force=True)
+                continue
             (
                 source_ids,
                 source_resource_diagnostics,
@@ -39110,7 +39240,7 @@ async def _import_resources(
                 source_resource_stats,
                 source_stale_counts,
                 source_stale_ready_source_ids,
-            ) = await task
+            ) = group_result
             await _update_source_resource_import_metadata(
                 source_ids,
                 run_id=run_id,
@@ -39151,6 +39281,11 @@ async def _import_resources(
                     )
                     if stale_deleted and stale_counts is not None:
                         stale_counts[resource_type] = stale_counts.get(resource_type, 0) + stale_deleted
+        if failed_source_ids:
+            raise RuntimeError(
+                "provider_directory_source_groups_failed:"
+                + ",".join(sorted(failed_source_ids))
+            )
         return counts
     except BaseException:
         for task in tasks:
@@ -39244,7 +39379,7 @@ def _dataset_rehydration_runtime(
 
     async def cancelled() -> None:
         """Raise when the owning control run is cancelled."""
-        await raise_if_cancelled(ctx, task)
+        await _raise_if_resource_import_cancelled(ctx, task)
 
     async def report(progress: dict[str, Any]) -> None:
         """Publish bounded row progress without failing the import."""
@@ -39277,7 +39412,7 @@ def _dataset_rehydration_runtime(
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
     task = _apply_provider_directory_refresh_preset(task or {})
-    await raise_if_cancelled(ctx, task)
+    await _raise_if_resource_import_cancelled(ctx, task)
     ctx.setdefault("context", {})
     test_mode = bool(task.get("test") or task.get("test_mode") or ctx["context"].get("test_mode"))
     ctx["context"]["test_mode"] = test_mode

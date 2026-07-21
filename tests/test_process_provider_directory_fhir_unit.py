@@ -9719,6 +9719,97 @@ async def test_endpoint_dataset_checkpoint_clears_only_after_validation(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("remaining_count", [0, 1])
+async def test_finalized_dataset_checkpoint_cleanup_is_verified(
+    monkeypatch,
+    remaining_count,
+):
+    """Reject finalized checkpoint cleanup when any row remains."""
+    connection = Mock(
+        status=AsyncMock(return_value="DELETE 2"),
+        scalar=AsyncMock(return_value=remaining_count),
+    )
+    monkeypatch.setattr(
+        importer.db,
+        "acquire",
+        lambda: _FakeAcquire(connection),
+    )
+
+    if remaining_count:
+        with pytest.raises(
+            RuntimeError,
+            match="provider_directory_finalized_dataset_checkpoint_cleanup_incomplete",
+        ):
+            await importer._clear_finalized_dataset_checkpoints(
+                _endpoint_dataset_candidate()
+            )
+    else:
+        assert (
+            await importer._clear_finalized_dataset_checkpoints(
+                _endpoint_dataset_candidate()
+            )
+            == 2
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_endpoint_dataset_marking_never_masks_source_failure(
+    monkeypatch,
+):
+    """Ignore bookkeeping failures while retaining candidate diagnostics."""
+    mark_candidate = AsyncMock(
+        side_effect=[None, RuntimeError("metadata backend unavailable")]
+    )
+    monkeypatch.setattr(
+        importer,
+        "_mark_endpoint_dataset_candidate",
+        mark_candidate,
+    )
+    failure = RuntimeError("source failed")
+
+    await importer._mark_failed_endpoint_dataset_without_masking(None, {}, failure)
+    await importer._mark_failed_endpoint_dataset_without_masking(
+        _endpoint_dataset_candidate(),
+        {"Location": {"complete": False}},
+        failure,
+    )
+    await importer._mark_failed_endpoint_dataset_without_masking(
+        _endpoint_dataset_candidate(),
+        {},
+        failure,
+    )
+
+    assert mark_candidate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_prepare_resource_group_omits_checkpoint_owner_without_run(
+    monkeypatch,
+):
+    """Do not invent a partition checkpoint owner outside a run lineage."""
+    prepare_candidate = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        importer,
+        "_prepare_endpoint_dataset_candidate",
+        prepare_candidate,
+    )
+
+    prepared_sources, candidate = (
+        await importer._prepare_resource_import_source_group(
+            [{"source_id": "source_a"}],
+            ["Location"],
+            run_id=None,
+            retry_of_run_id=None,
+            pagination_root_run_id=None,
+            is_checkpointing_enabled=False,
+        )
+    )
+
+    assert candidate is None
+    assert prepared_sources == [{"source_id": "source_a"}]
+
+
+@pytest.mark.asyncio
 async def test_failed_endpoint_dataset_candidate_does_not_change_current_pointer(
     monkeypatch,
 ):
@@ -10376,6 +10467,49 @@ def _assert_validated_replay_completion(candidate):
     assert completions_by_resource == {
         "Practitioner": {"fresh_source", "source_a"}
     }
+
+
+@pytest.mark.parametrize(
+    ("resource_diagnostics", "error_suffix"),
+    [
+        ({}, "diagnostics_incomplete"),
+        (
+            {
+                "Practitioner": {
+                    "complete": False,
+                    "bounded": False,
+                    "error": "upstream_failed",
+                    "next_url_remaining": False,
+                }
+            },
+            "completion_proof_invalid",
+        ),
+    ],
+)
+def test_finalized_endpoint_dataset_summary_rejects_invalid_diagnostics(
+    resource_diagnostics,
+    error_suffix,
+):
+    metadata = _published_endpoint_dataset_metadata_by_field()
+    metadata["resource_diagnostics"] = resource_diagnostics
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint_1",
+        dataset_id="dataset_1",
+        acquisition_root_run_id="run_original",
+        source_ids=("source_a",),
+        selected_resources=("Practitioner",),
+        import_run_id="run_retry",
+        previous_dataset_id=None,
+        expected_resources=("Practitioner",),
+        already_validated=True,
+        validated_metadata=metadata,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"provider_directory_endpoint_dataset_validated_{error_suffix}",
+    ):
+        importer._finalized_endpoint_dataset_import_summary(candidate)
 
 
 def _install_published_endpoint_dataset_mocks(monkeypatch):
@@ -15096,14 +15230,14 @@ async def test_single_partition_worker_checks_cancellation_before_fetch(monkeypa
     )
 
     async def cancel_partition(_cancel_ctx, _cancel_task):
-        raise RuntimeError("partition canceled")
+        raise importer.ImportCancelledError("partition canceled")
 
     monkeypatch.setattr(importer, "_partitioned_resource_start_urls", lambda *_args, **_kwargs: start_urls)
     monkeypatch.setattr(importer, "_partition_fetch_concurrency", lambda: 1)
     monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
     monkeypatch.setattr(importer, "raise_if_cancelled", cancel_partition)
 
-    with pytest.raises(RuntimeError, match="partition canceled"):
+    with pytest.raises(importer.ImportCancelledError, match="partition canceled"):
         await importer._fetch_resource_rows(
             {"source_id": "source_a", "api_base": "https://example.test/fhir"},
             "Practitioner",
@@ -20256,20 +20390,536 @@ async def test_import_resources_honors_source_concurrency(monkeypatch):
     assert stats_by_resource["Location"]["rows_fetched"] == 3
 
 
+async def _import_location_source_groups(
+    source_ids: list[str],
+    **import_options: Any,
+) -> dict[str, int]:
+    source_records = [
+        {
+            "source_id": source_id,
+            "api_base": (
+                f"https://{source_id.replace('_', '-')}.example/fhir"
+            ),
+        }
+        for source_id in source_ids
+    ]
+    return await importer._import_resources(
+        source_records,
+        resources=["Location"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        source_concurrency=2,
+        **import_options,
+    )
+
+
+class _SourceIsolationState:
+    def __init__(self):
+        self.lifecycle_events: list[str] = []
+        self.metadata_source_ids: list[list[str]] = []
+        self.all_failures_observed = asyncio.Event()
+
+    def assert_acquisition_allowed(self, source, _resources):
+        if source["source_id"].startswith("source_bad"):
+            self.lifecycle_events.append(f"{source['source_id']}_failed")
+            if source["source_id"] == "source_bad_a":
+                self.all_failures_observed.set()
+            raise RuntimeError("credential=must-not-escape")
+
+    async def fetch_resource_rows(self, source, resource_type, **_kwargs):
+        assert source["source_id"] == "source_good"
+        assert resource_type == "Location"
+        self.lifecycle_events.append("source_good_started")
+        await self.all_failures_observed.wait()
+        self.lifecycle_events.append("source_good_fetched")
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryLocation,
+            rows=[{"source_id": source["source_id"], "resource_id": "location-good"}],
+            rows_fetched=1,
+            rows_written=0,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            retry_not_before="2026-07-22T00:00:00Z",
+        )
+
+    async def upsert_rows(self, model, rows, **_kwargs):
+        if model is ProviderDirectoryLocation:
+            self.lifecycle_events.append("source_good_persisted")
+        return len(rows)
+
+    async def mark_resource_rows_seen(self, *_args, **_kwargs):
+        return None
+
+    async def delete_stale_resource_rows(
+        self, _model, source_id, _run_id, **_kwargs
+    ):
+        assert source_id == "source_good"
+        self.lifecycle_events.append("source_good_cleaned")
+        return 3
+
+    async def update_source_metadata(self, source_ids, **_kwargs):
+        self.metadata_source_ids.append(source_ids)
+        self.lifecycle_events.append("source_good_metadata")
+
+
+@pytest.mark.asyncio
+async def test_import_resources_finishes_healthy_source_before_aggregate_failure(
+    monkeypatch,
+):
+    isolation_state = _SourceIsolationState()
+    stale_counts_by_resource: dict[str, int] = {}
+    retry_not_before_by_resource: dict[str, str] = {}
+    progress_events: list[tuple[int, int]] = []
+
+    async def progress_callback(done, total, _counts, _details=None):
+        progress_events.append((done, total))
+
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE", "0")
+    monkeypatch.setattr(importer, "_assert_resource_acquisition_allowed", isolation_state.assert_acquisition_allowed)
+    monkeypatch.setattr(importer, "_fetch_resource_rows", isolation_state.fetch_resource_rows)
+    monkeypatch.setattr(importer, "_upsert_rows", isolation_state.upsert_rows)
+    monkeypatch.setattr(importer, "_mark_resource_rows_seen", isolation_state.mark_resource_rows_seen)
+    monkeypatch.setattr(importer, "_delete_stale_resource_rows", isolation_state.delete_stale_resource_rows)
+    monkeypatch.setattr(importer, "_update_source_resource_import_metadata", isolation_state.update_source_metadata)
+
+    with pytest.raises(RuntimeError) as failure_info:
+        await _import_location_source_groups(
+            ["source_bad_z", "source_good", "source_bad_a"],
+            progress_callback=progress_callback,
+            resource_retry_not_before=retry_not_before_by_resource,
+            stale_counts=stale_counts_by_resource,
+            stale_cleanup=True,
+        )
+
+    assert str(failure_info.value) == "provider_directory_source_groups_failed:source_bad_a,source_bad_z"
+    assert "credential" not in str(failure_info.value)
+    assert isolation_state.lifecycle_events == [
+        "source_bad_z_failed", "source_good_started", "source_bad_a_failed",
+        "source_good_fetched", "source_good_persisted", "source_good_cleaned",
+        "source_good_metadata",
+    ]
+    assert isolation_state.metadata_source_ids == [["source_good"]]
+    assert stale_counts_by_resource == {"Location": 3}
+    assert retry_not_before_by_resource == {
+        "Location": "2026-07-22T00:00:00Z"
+    }
+    assert progress_events[-1] == (3, 3)
+
+
+@pytest.mark.asyncio
+async def test_import_resources_aggregates_failures_without_progress_callback(
+    monkeypatch,
+):
+    """Settle ordinary source failures even when progress is disabled."""
+
+    def reject_source(source, _resources):
+        raise RuntimeError(f"reject {source['source_id']}")
+
+    monkeypatch.setattr(
+        importer,
+        "_assert_resource_acquisition_allowed",
+        reject_source,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_source_groups_failed:source_bad_a,source_bad_b",
+    ):
+        await _import_location_source_groups(
+            ["source_bad_b", "source_bad_a"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_import_resources_keeps_latest_retry_boundary(monkeypatch):
+    """Merge equal retry boundaries without depending on task completion order."""
+    _stub_resource_import_metadata(monkeypatch)
+    retry_not_before_by_resource: dict[str, str] = {}
+
+    async def fetch_with_retry(source, _resource_type, **_kwargs):
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryLocation,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            retry_not_before="2026-07-22T00:00:00Z",
+        )
+
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fetch_with_retry)
+
+    await _import_location_source_groups(
+        ["source_a", "source_b", "source_c"],
+        resource_retry_not_before=retry_not_before_by_resource,
+    )
+
+    assert retry_not_before_by_resource == {
+        "Location": "2026-07-22T00:00:00Z"
+    }
+
+
+@pytest.mark.asyncio
+async def test_import_resources_propagates_progress_cancellation(monkeypatch):
+    """Treat progress cancellation as a batch-fatal control-plane signal."""
+    _stub_resource_import_metadata(monkeypatch)
+
+    async def cancel_progress(*_args, **_kwargs):
+        raise importer.ImportCancelledError("progress owner cancelled")
+
+    with pytest.raises(
+        importer.ImportCancelledError,
+        match="progress owner cancelled",
+    ):
+        await _import_location_source_groups(
+            ["source_a"],
+            progress_callback=cancel_progress,
+        )
+
+
+@pytest.mark.asyncio
+async def test_import_resources_replays_finalized_candidate(monkeypatch):
+    """Replay a finalized dataset without reacquiring its endpoint."""
+    _stub_resource_import_metadata(monkeypatch)
+    candidate = dataclasses.replace(
+        _endpoint_dataset_candidate(),
+        already_validated=True,
+    )
+    replay_result = (
+        ["source_a"],
+        {},
+        {"Location": 4},
+        {},
+        {},
+        {},
+        {},
+    )
+    prepare_group = AsyncMock(
+        return_value=(
+            [{"source_id": "source_a", "api_base": "https://a.example/fhir"}],
+            candidate,
+        )
+    )
+    replay_candidate = AsyncMock(return_value=replay_result)
+    monkeypatch.setattr(
+        importer,
+        "_prepare_resource_import_source_group",
+        prepare_group,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_replay_finalized_candidate_and_clear_checkpoints",
+        replay_candidate,
+    )
+
+    counts = await _import_location_source_groups(["source_a"])
+
+    assert counts == {"Location": 4}
+    replay_candidate.assert_awaited_once_with(candidate, None)
+
+
+@pytest.mark.asyncio
+async def test_import_resources_skips_empty_fetch_result(monkeypatch):
+    """Allow a connector to report no fetch result without failing siblings."""
+    _stub_resource_import_metadata(monkeypatch)
+    monkeypatch.setattr(
+        importer,
+        "_fetch_resource_rows",
+        AsyncMock(return_value=None),
+    )
+
+    counts = await _import_location_source_groups(["source_a"])
+
+    assert counts == {"Location": 0}
+
+
+@pytest.mark.asyncio
+async def test_import_resources_isolates_alohr_connector_path(monkeypatch):
+    """Run a connector-specific source through the same group settlement path."""
+    _stub_resource_import_metadata(monkeypatch)
+    alohr_summary = (
+        ["source_alohr"],
+        {"Location": {"complete": True}},
+        {"Location": 3},
+        {},
+        {},
+        {},
+        {},
+    )
+    import_alohr = AsyncMock(return_value=alohr_summary)
+    monkeypatch.setattr(
+        importer,
+        "_uses_alohr_graphql_connector",
+        lambda _source: True,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_import_alohr_graphql_source_group",
+        import_alohr,
+    )
+
+    counts = await _import_location_source_groups(["source_alohr"])
+
+    assert counts == {"Location": 3}
+    import_alohr.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_import_resources_staged_cleanup_handles_unknown_resource(
+    monkeypatch,
+):
+    """Skip unknown models and preserve zero-deletion cleanup results."""
+    _stub_resource_import_metadata(monkeypatch)
+    ensure_stage = AsyncMock(return_value="seen_stage")
+    prepare_stage = AsyncMock()
+    delete_stale = AsyncMock(return_value=0)
+    drop_stage = AsyncMock()
+
+    async def fetch_complete(_source, _resource_type, **_kwargs):
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryLocation,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+        )
+
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE", "1")
+    monkeypatch.setattr(importer, "_ensure_import_seen_stage_table", ensure_stage)
+    monkeypatch.setattr(importer, "_prepare_import_seen_stage_lookup", prepare_stage)
+    monkeypatch.setattr(importer, "_delete_stale_resource_rows", delete_stale)
+    monkeypatch.setattr(importer, "_drop_import_seen_stage_table", drop_stage)
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fetch_complete)
+    monkeypatch.setattr(
+        importer,
+        "_upsert_resource_rows",
+        AsyncMock(return_value=0),
+    )
+
+    counts = await importer._import_resources(
+        [{"source_id": "source_a", "api_base": "https://a.example/fhir"}],
+        resources=["Location", "FutureResource"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        stale_cleanup=True,
+        stale_counts={},
+    )
+
+    assert counts == {"Location": 0, "FutureResource": 0}
+    prepare_stage.assert_awaited_once_with("seen_stage")
+    delete_stale.assert_awaited_once()
+    drop_stage.assert_awaited_once_with("seen_stage")
+
+
+@pytest.mark.asyncio
+async def test_import_resources_owner_cancel_stops_sibling_promptly(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    wait_forever = asyncio.Event()
+
+    async def fake_fetch_resource_rows(source, _resource_type, **_kwargs):
+        if source["source_id"] == "source_cancelled":
+            await sibling_started.wait()
+            raise importer.ImportCancelledError("owner cancelled run_1")
+        sibling_started.set()
+        try:
+            await wait_forever.wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+    monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=0))
+
+    with pytest.raises(importer.ImportCancelledError, match="owner cancelled run_1"):
+        await asyncio.wait_for(
+            _import_location_source_groups(
+                ["source_cancelled", "source_sibling"]
+            ),
+            timeout=1,
+        )
+
+    assert sibling_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_import_resources_cancel_probe_failure_stops_siblings(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+    sibling_probe_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    wait_forever = asyncio.Event()
+    probe_counts_by_name = {"calls": 0}
+
+    async def fake_raise_if_cancelled(_cancel_ctx, _cancel_task):
+        probe_counts_by_name["calls"] += 1
+        if probe_counts_by_name["calls"] == 1:
+            await sibling_probe_started.wait()
+            raise ConnectionError("redis backend unavailable")
+        sibling_probe_started.set()
+
+    async def fake_fetch_resource_rows(source, _resource_type, **_kwargs):
+        assert source["source_id"] == "source_sibling"
+        try:
+            await wait_forever.wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    monkeypatch.setattr(importer, "raise_if_cancelled", fake_raise_if_cancelled)
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+
+    with pytest.raises(
+        importer.ResourceImportControlPlaneFailure,
+        match="provider_directory_cancellation_probe_failed",
+    ):
+        await asyncio.wait_for(
+            _import_location_source_groups(
+                ["source_control", "source_sibling"],
+                cancel_ctx={"redis": object()},
+                cancel_task={"run_id": "run_1"},
+            ),
+            timeout=1,
+        )
+
+    assert probe_counts_by_name["calls"] >= 3
+    assert sibling_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_import_resources_database_failure_stops_siblings(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    wait_forever = asyncio.Event()
+    prepare_source_group = importer._prepare_resource_import_source_group
+
+    async def fake_prepare_source_group(source_records, resources, **kwargs):
+        if source_records[0]["source_id"] == "source_database":
+            await sibling_started.wait()
+            raise importer.SQLAlchemyError("database unavailable")
+        return await prepare_source_group(source_records, resources, **kwargs)
+
+    async def fake_fetch_resource_rows(source, _resource_type, **_kwargs):
+        assert source["source_id"] == "source_sibling"
+        sibling_started.set()
+        try:
+            await wait_forever.wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    monkeypatch.setattr(
+        importer,
+        "_prepare_resource_import_source_group",
+        fake_prepare_source_group,
+    )
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+
+    with pytest.raises(importer.SQLAlchemyError, match="database unavailable"):
+        await asyncio.wait_for(
+            _import_location_source_groups(
+                ["source_database", "source_sibling"]
+            ),
+            timeout=1,
+        )
+
+    assert sibling_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_import_resources_progress_failure_stops_siblings(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+    sibling_admitted = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    wait_forever = asyncio.Event()
+    callback_counts_by_name = {"calls": 0}
+
+    def fake_assert_resource_acquisition_allowed(source, _resources):
+        if source["source_id"] == "source_sibling":
+            sibling_admitted.set()
+
+    async def progress_callback(_done, _total, _counts, _details=None):
+        callback_counts_by_name["calls"] += 1
+        if callback_counts_by_name["calls"] == 1:
+            await sibling_admitted.wait()
+            raise RuntimeError("progress backend unavailable")
+
+    async def fake_fetch_resource_rows(source, _resource_type, **_kwargs):
+        assert source["source_id"] == "source_sibling"
+        try:
+            await wait_forever.wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    monkeypatch.setattr(
+        importer,
+        "_assert_resource_acquisition_allowed",
+        fake_assert_resource_acquisition_allowed,
+    )
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+
+    with pytest.raises(
+        importer.ResourceImportProgressFailure,
+        match="provider_directory_progress_callback_failed",
+    ):
+        await asyncio.wait_for(
+            _import_location_source_groups(
+                ["source_progress", "source_sibling"],
+                progress_callback=progress_callback,
+            ),
+            timeout=1,
+        )
+
+    assert callback_counts_by_name["calls"] >= 2
+    assert sibling_cancelled.is_set()
+
+
+async def _write_two_location_batches(source_id, row_batch_handler):
+    first_written = await row_batch_handler(
+        ProviderDirectoryLocation,
+        [{"source_id": source_id, "resource_id": "loc-1"}],
+    )
+    second_written = await row_batch_handler(
+        ProviderDirectoryLocation,
+        [{"source_id": source_id, "resource_id": "loc-2"}],
+    )
+    return first_written + second_written
+
+
 @pytest.mark.asyncio
 async def test_import_resources_reports_streaming_partial_progress(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 
     async def fake_fetch_resource_rows(source, _resource_type, **kwargs):
-        row_batch_handler = kwargs["row_batch_handler"]
-        written = await row_batch_handler(
-            ProviderDirectoryLocation,
-            [{"source_id": source["source_id"], "resource_id": "loc-1"}],
+        written = await _write_two_location_batches(
+            source["source_id"],
+            kwargs["row_batch_handler"],
         )
         return importer.ResourceFetchResult(
             model=ProviderDirectoryLocation,
             rows=[],
-            rows_fetched=1,
+            rows_fetched=2,
             rows_written=written,
             pages_fetched=1,
             complete=True,
@@ -20302,7 +20952,7 @@ async def test_import_resources_reports_streaming_partial_progress(monkeypatch):
         progress_callback=progress_callback,
     )
 
-    assert counts == {"Location": 1}
+    assert counts == {"Location": 2}
     assert progress_events[0][:3] == (0, 1, {"Location": 0})
     first_active = progress_events[0][3]["active_source_groups"][0]
     assert first_active["sample_source_id"] == "source_a"
@@ -20313,7 +20963,7 @@ async def test_import_resources_reports_streaming_partial_progress(monkeypatch):
         and event[3]["active_source_groups"][0]["current_resource"] == "Location"
         for event in progress_events
     )
-    assert progress_events[-1][:3] == (1, 1, {"Location": 1})
+    assert progress_events[-1][:3] == (1, 1, {"Location": 2})
     assert progress_events[-1][3]["active_source_groups"] == []
 
 
