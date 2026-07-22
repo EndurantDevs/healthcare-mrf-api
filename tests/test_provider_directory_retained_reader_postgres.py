@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from process.provider_directory_retained_artifact_contract import (
 )
 from process.provider_directory_retained_consumer_claim_store import (
     release_retained_campaign_consumer,
+)
+from process.provider_directory_retained_blob_store import (
+    retained_artifact_blob_components,
 )
 from process.provider_directory_retained_reader import (
     MAX_READER_CHUNK_BYTES,
@@ -37,6 +41,36 @@ _collect_new_stream = reader_test_support.collect_new_stream
 _drain_started_stream = reader_test_support.drain_started_stream
 _assert_reader_claim_released = reader_test_support.assert_reader_claim_released
 pytest_plugins = ("tests.provider_directory_retained_reader_fixtures",)
+
+
+@pytest.mark.asyncio
+async def test_canonical_producer_blob_streams_through_claimed_reader(
+    monkeypatch,
+    retained_artifact_test_root: Path,
+) -> None:
+    async with retained_database(monkeypatch) as (connection, _schema_name):
+        retained_item, campaign_id, artifact_bytes, blob_path = (
+            await _sealed_reader_campaign(
+                connection,
+                retained_artifact_test_root,
+                "canonical-producer-reader",
+            )
+        )
+        artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+        assert blob_path == retained_artifact_test_root.joinpath(
+            *retained_artifact_blob_components(artifact_sha256)
+        )
+        async with claimed_retained_artifact_reader(
+            connection,
+            campaign_id=campaign_id,
+            consumer_recipe_id=READER_RECIPE_ID,
+        ) as reader:
+            byte_stream = await reader.iter_full(
+                retained_item.source_item_id,
+                chunk_bytes=3,
+            )
+            assert await _collect_new_stream(byte_stream) == artifact_bytes
+        await _assert_reader_claim_released(connection, campaign_id)
 
 
 @pytest.mark.asyncio

@@ -138,7 +138,10 @@
         "process/provider_directory_retained_artifact_base.py",
         "process/provider_directory_retained_artifact_contract.py",
         "process/provider_directory_retained_artifact_keys.py",
+        "process/provider_directory_retained_blob_install_support.py",
+        "process/provider_directory_retained_blob_producer.py",
         "process/provider_directory_retained_blob_store.py",
+        "process/provider_directory_retained_blob_verification.py",
         "process/provider_directory_retained_campaign_contract.py",
         "process/provider_directory_retained_catalog_store.py",
         "process/provider_directory_retained_consumer_claim_store.py",
@@ -303,12 +306,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 23731,
-          "total": 32788
+          "covered": 23907,
+          "total": 32866
         },
         "lines": {
-          "covered": 79765,
-          "total": 96227
+          "covered": 80396,
+          "total": 96700
         }
       },
       "path": "test-coverage-python.json",
