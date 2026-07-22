@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod normalize;
 pub mod output;
 pub mod progress;
+pub mod provider_directory_projection;
 pub mod shared_graph;
 pub mod uhc_retained;
 pub mod v3_dense;
@@ -130,5 +131,51 @@ mod python_api {
         m.add_function(wrap_pyfunction!(canonicalize_contact_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn python_module_exports_real_address_contact_and_version_payloads() {
+            Python::initialize();
+            Python::attach(|py| {
+                let addresses = canonicalize_batch(
+                    py,
+                    vec![(
+                        Some("123 Main Street".to_owned()),
+                        Some("Suite 2".to_owned()),
+                        Some("Austin".to_owned()),
+                        Some("TX".to_owned()),
+                        Some("78701".to_owned()),
+                        Some("US".to_owned()),
+                    )],
+                )
+                .unwrap();
+                assert_eq!(addresses.bind(py).len(), 1);
+
+                let contacts = canonicalize_contact_batch(
+                    py,
+                    vec![(
+                        Some("+1 (202) 555-0199 ext 4".to_owned()),
+                        Some("202-555-0100".to_owned()),
+                        Some("US".to_owned()),
+                    )],
+                )
+                .unwrap();
+                assert_eq!(contacts.bind(py).len(), 1);
+
+                let version = canon_version(py).unwrap();
+                assert!(version.bind(py).contains("ruleset_version").unwrap());
+                assert!(version.bind(py).contains("pub28_sha256").unwrap());
+
+                let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+                ptg2_address_canon(&module).unwrap();
+                assert!(module.hasattr("canonicalize_batch").unwrap());
+                assert!(module.hasattr("canonicalize_contact_batch").unwrap());
+                assert!(module.hasattr("canon_version").unwrap());
+            });
+        }
     }
 }

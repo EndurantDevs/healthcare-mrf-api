@@ -32,9 +32,9 @@ from process.provider_directory_physical_projection import (
 
 
 class _WalCompressionDatabase:
-    def __init__(self, *, permitted: bool = True, supports_zstd: bool = True):
+    def __init__(self, *, permitted: bool = True, algorithm: str = "zstd"):
         self.permitted = permitted
-        self.supports_zstd = supports_zstd
+        self.algorithm = algorithm
         self.status_statements: list[str] = []
 
     async def scalar(self, statement: str):
@@ -43,9 +43,9 @@ class _WalCompressionDatabase:
         if "has_parameter_privilege" in statement:
             return self.permitted
         if "ANY(enumvals)" in statement:
-            return self.supports_zstd
+            return self.algorithm
         if "current_setting('wal_compression')" in statement:
-            return "pglz"
+            return "pglz" if self.algorithm == "on" else self.algorithm
         raise AssertionError(statement)
 
     async def status(self, statement: str):
@@ -165,9 +165,13 @@ def test_projection_wal_compression_is_bounded_and_privilege_aware(monkeypatch):
     assert asyncio.run(set_local_projection_wal_compression(database)) == "zstd"
     assert database.status_statements == ["SET LOCAL wal_compression = zstd;"]
 
-    fallback = _WalCompressionDatabase(supports_zstd=False)
-    assert asyncio.run(set_local_projection_wal_compression(fallback)) == "on"
-    assert fallback.status_statements == ["SET LOCAL wal_compression = on;"]
+    lz4_fallback = _WalCompressionDatabase(algorithm="lz4")
+    assert asyncio.run(set_local_projection_wal_compression(lz4_fallback)) == "lz4"
+    assert lz4_fallback.status_statements == ["SET LOCAL wal_compression = lz4;"]
+
+    pglz_fallback = _WalCompressionDatabase(algorithm="on")
+    assert asyncio.run(set_local_projection_wal_compression(pglz_fallback)) == "on"
+    assert pglz_fallback.status_statements == ["SET LOCAL wal_compression = on;"]
 
     unavailable = _WalCompressionDatabase(permitted=False)
     assert asyncio.run(set_local_projection_wal_compression(unavailable)) is None
@@ -297,6 +301,8 @@ def test_recipe_reuse_requires_exact_artifact_and_transform_contract_hashes():
 
 
 def test_public_facade_exposes_only_structural_projection_foundation():
+    """Expose only supported structural and materialization contracts."""
+
     structural_symbols = {
         "PROJECTION_ADMISSION_CONTRACT_ID",
         "PROJECTION_INPUT_BLOCK_MAX_BYTES",
@@ -305,6 +311,7 @@ def test_public_facade_exposes_only_structural_projection_foundation():
         "PROJECTION_MIXED_RESOURCE_TYPE",
         "PROJECTION_RECIPE_CONTRACT_ID",
         "PhysicalProjectionRecipeIdentity",
+        "ProjectionChildStreamFactory",
         "ProjectionAdmissionIdentity",
         "ProjectionAdmissionInputBlock",
         "ProjectionAdmissionTerminalZero",
@@ -322,6 +329,7 @@ def test_public_facade_exposes_only_structural_projection_foundation():
         "claim_projection_shard",
         "heartbeat_projection_lease",
         "heartbeat_projection_shard",
+        "materialize_projection_shards",
         "projection_admission_consumer_id",
         "projection_admission_identity",
         "projection_admission_input_block",
@@ -351,9 +359,7 @@ def test_public_facade_exposes_only_structural_projection_foundation():
     }
 
     assert set(projection_facade.__all__) == structural_symbols
-    assert all(
-        not hasattr(projection_facade, symbol) for symbol in candidate_symbols
-    )
+    assert all(not hasattr(projection_facade, symbol) for symbol in candidate_symbols)
 
 
 def test_candidate_projection_identity_covers_content_counts_and_scope():

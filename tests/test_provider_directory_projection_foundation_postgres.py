@@ -152,19 +152,26 @@ def _fixture_input_block(
     )
 
 
-def _fixture_projection_recipe(input_blocks, resource_type, completeness):
+def _fixture_projection_recipe(
+    input_blocks,
+    resource_type,
+    completeness,
+    *,
+    decoder_contract_id="fixture-fhir-r4-decoder.v1",
+    transform_contract_id="fixture-normalization.v1",
+):
     """Build the common source-neutral recipe used by PostgreSQL fixtures."""
 
     input_set_sha256 = projection_input_set_sha256(
         input_blocks,
-        decoder_contract_id="fixture-fhir-r4-decoder.v1",
+        decoder_contract_id=decoder_contract_id,
     )
     return projection_recipe_identity(
-        decoder_contract_id="fixture-fhir-r4-decoder.v1",
+        decoder_contract_id=decoder_contract_id,
         acquisition_adapter_id="fixture-fhir-rest.v1",
         input_set_sha256=input_set_sha256,
         source_ids=("fixture-source",),
-        transform_contract_id="fixture-normalization.v1",
+        transform_contract_id=transform_contract_id,
         scope_contract_id="healthporta.provider-directory.global-scope.v1",
         transform_context={
             "as_of_date": "2026-07-22",
@@ -241,6 +248,8 @@ def _projection_fixture(
     retained_binding: _RetainedBinding | None = None,
     artifact_label: str = "projection-shared-artifact",
     completeness_row_delta: int = 0,
+    decoder_contract_id: str = "fixture-fhir-r4-decoder.v1",
+    transform_contract_id: str = "fixture-normalization.v1",
 ):
     """Build one locator-free recipe, input block, and shard fixture."""
 
@@ -266,7 +275,11 @@ def _projection_fixture(
         source_partition_ordinal=0,
     )
     recipe = _fixture_projection_recipe(
-        (input_block,), identity.resource_type, completeness
+        (input_block,),
+        identity.resource_type,
+        completeness,
+        decoder_contract_id=decoder_contract_id,
+        transform_contract_id=transform_contract_id,
     )
     shard = projection_shard_spec(
         recipe=recipe, partition_ordinal=0, input_block=input_block
@@ -1591,34 +1604,15 @@ async def _sealed_retained_binding(
     )
 
 
-async def _registered_projection_context(
+async def _register_projection_fixture_context(
     postgres,
-    campaign_label: str,
-    *,
-    completeness_row_delta: int = 0,
-    reuse_verified_artifact: bool = False,
-    artifact_label: str = "projection-shared-artifact",
+    recipe,
+    admission_block,
+    shard,
+    claim_generation,
 ):
-    def admission_consumer_id(binding):
-        bound_recipe, bound_block, _ = _projection_fixture(
-            retained_binding=binding,
-            artifact_label=artifact_label,
-            completeness_row_delta=completeness_row_delta,
-        )
-        return projection_admission_consumer_id(bound_recipe, (bound_block,))
+    """Persist one recipe workset and admission, returning runtime coordinates."""
 
-    retained_binding = await _sealed_retained_binding(
-        postgres,
-        campaign_label=campaign_label,
-        artifact_label=artifact_label,
-        consumer_recipe_id=admission_consumer_id,
-        reuse_verified_artifact=reuse_verified_artifact,
-    )
-    recipe, admission_block, shard = _projection_fixture(
-        retained_binding=retained_binding,
-        artifact_label=artifact_label,
-        completeness_row_delta=completeness_row_delta,
-    )
     projection_claim = await claim_projection_recipe(
         recipe,
         database=postgres.database,
@@ -1636,12 +1630,59 @@ async def _registered_projection_context(
         recipe,
         (admission_block,),
         (shard,),
-        claim_generation=retained_binding.consumer_claim_generation,
+        claim_generation=claim_generation,
         database=postgres.database,
         schema=postgres.schema,
     )
+    return projection_claim.lease, admission_id
+
+
+async def _registered_projection_context(
+    postgres,
+    campaign_label: str,
+    *,
+    completeness_row_delta: int = 0,
+    reuse_verified_artifact: bool = False,
+    artifact_label: str = "projection-shared-artifact",
+    decoder_contract_id: str = "fixture-fhir-r4-decoder.v1",
+    transform_contract_id: str = "fixture-normalization.v1",
+):
+    """Register one retained fixture under selectable projection contracts."""
+
+    fixture_option_map = {
+        "artifact_label": artifact_label,
+        "completeness_row_delta": completeness_row_delta,
+        "decoder_contract_id": decoder_contract_id,
+        "transform_contract_id": transform_contract_id,
+    }
+
+    def admission_consumer_id(binding):
+        bound_recipe, bound_block, _ = _projection_fixture(
+            retained_binding=binding,
+            **fixture_option_map,
+        )
+        return projection_admission_consumer_id(bound_recipe, (bound_block,))
+
+    retained_binding = await _sealed_retained_binding(
+        postgres,
+        campaign_label=campaign_label,
+        artifact_label=artifact_label,
+        consumer_recipe_id=admission_consumer_id,
+        reuse_verified_artifact=reuse_verified_artifact,
+    )
+    recipe, admission_block, shard = _projection_fixture(
+        retained_binding=retained_binding,
+        **fixture_option_map,
+    )
+    projection_lease, admission_id = await _register_projection_fixture_context(
+        postgres,
+        recipe,
+        admission_block,
+        shard,
+        retained_binding.consumer_claim_generation,
+    )
     return (
-        projection_claim.lease,
+        projection_lease,
         retained_binding,
         admission_block,
         shard,

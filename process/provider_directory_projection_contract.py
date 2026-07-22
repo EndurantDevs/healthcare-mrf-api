@@ -20,6 +20,7 @@ from process.provider_directory_projection_types import (
     ProjectionInputBlock,
     ProjectionProofShard,
     ProjectionRecipeIdentity,
+    ProjectionShardClaim,
     ProjectionSemanticOutcomeProof,
     ProjectionShardSpec,
     PROJECTION_MIXED_RESOURCE_TYPE,
@@ -1601,6 +1602,219 @@ def prepare_projection_proof_shard(
         proof={**proof_dict, "partition_id": normalized_partition_id},
     )
     return shard, ordered_resources
+
+
+_CLAIMED_PROOF_FIELDS = frozenset(
+    {
+        "attempt",
+        "canonical_row_sha256",
+        "contract_id",
+        "first_identity",
+        "input_sha256",
+        "last_identity",
+        "partition_attempt",
+        "partition_id",
+        "partition_ordinal",
+        "recipe_id",
+        "resource_count",
+        "resource_counts",
+        "resource_type",
+    }
+)
+
+
+def _claimed_proof_identity(candidate: Any, field_name: str) -> tuple[str, str]:
+    """Validate one exact two-part resource identity from native proof."""
+
+    if type(candidate) not in {list, tuple} or len(candidate) != 2:
+        raise ProviderDirectoryProjectionError(
+            f"provider_directory_projection_{field_name}_invalid"
+        )
+    return (
+        _canonical_text(candidate[0], field_name, limit=64),
+        _canonical_text(candidate[1], field_name, limit=256),
+    )
+
+
+def _claimed_proof_coordinate_map(
+    claim: ProjectionShardClaim,
+    recipe: PhysicalProjectionRecipeIdentity,
+) -> dict[str, Any]:
+    return {
+        "contract_id": PROJECTION_PROOF_SHARD_CONTRACT_ID,
+        "recipe_id": recipe.recipe_id,
+        "attempt": claim.recipe_lease.attempt,
+        "partition_attempt": claim.partition_attempt,
+        "partition_id": claim.shard.partition_id,
+        "partition_ordinal": claim.shard.partition_ordinal,
+        "resource_type": claim.shard.resource_type,
+        "input_sha256": claim.shard.input_sha256,
+    }
+
+
+def _claimed_resource_count_map(
+    proof: Mapping[str, Any],
+    claim: ProjectionShardClaim,
+    recipe: PhysicalProjectionRecipeIdentity,
+    resource_count: int,
+) -> dict[str, int]:
+    resource_count_map = proof.get("resource_counts")
+    if (
+        resource_count < 1
+        or not isinstance(resource_count_map, Mapping)
+        or set(resource_count_map) != set(recipe.selected_resources)
+        or any(
+            type(family_count) is not int or family_count < 0
+            for family_count in resource_count_map.values()
+        )
+        or sum(resource_count_map.values()) != resource_count
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shard_resource_counts_invalid"
+        )
+    if claim.shard.resource_type == PROJECTION_MIXED_RESOURCE_TYPE:
+        is_family_census_valid = any(resource_count_map.values())
+    else:
+        is_family_census_valid = (
+            resource_count_map.get(claim.shard.resource_type) == resource_count
+        )
+    if not is_family_census_valid:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shard_resource_counts_invalid"
+        )
+    return {
+        resource_type: resource_count_map[resource_type]
+        for resource_type in recipe.selected_resources
+    }
+
+
+def _claimed_proof_identity_bounds(
+    proof: Mapping[str, Any],
+    recipe: PhysicalProjectionRecipeIdentity,
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    first_identity = _claimed_proof_identity(
+        proof.get("first_identity"),
+        "first_identity",
+    )
+    last_identity = _claimed_proof_identity(
+        proof.get("last_identity"),
+        "last_identity",
+    )
+    if (
+        first_identity > last_identity
+        or first_identity[0] not in recipe.selected_resources
+        or last_identity[0] not in recipe.selected_resources
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shard_identity_invalid"
+        )
+    return first_identity, last_identity
+
+
+def _claimed_producer_proof_map(proof: Mapping[str, Any]) -> dict[str, Any] | None:
+    if "producer_proof" not in proof:
+        return None
+    producer_proof = proof["producer_proof"]
+    if not isinstance(producer_proof, Mapping):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_producer_proof_invalid"
+        )
+    producer_proof_map = dict(producer_proof)
+    try:
+        stable_json(producer_proof_map)
+    except (RecursionError, TypeError, ValueError) as error:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_producer_proof_invalid"
+        ) from error
+    return producer_proof_map
+
+
+def _normalized_claimed_proof_map(
+    proof: Mapping[str, Any],
+    claim: ProjectionShardClaim,
+    recipe: PhysicalProjectionRecipeIdentity,
+) -> dict[str, Any]:
+    coordinate_map = _claimed_proof_coordinate_map(claim, recipe)
+    if any(
+        proof.get(coordinate_name) != coordinate_value
+        for coordinate_name, coordinate_value in coordinate_map.items()
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shard_coordinate_mismatch"
+        )
+    resource_count = _canonical_nonnegative_integer(
+        proof.get("resource_count"),
+        "resource_count",
+    )
+    resource_count_map = _claimed_resource_count_map(
+        proof,
+        claim,
+        recipe,
+        resource_count,
+    )
+    first_identity, last_identity = _claimed_proof_identity_bounds(
+        proof,
+        recipe,
+    )
+    normalized_proof_map = {
+        **coordinate_map,
+        "canonical_row_sha256": _canonical_hash(
+            proof.get("canonical_row_sha256"),
+            "canonical_row_sha256",
+        ),
+        "resource_count": resource_count,
+        "resource_counts": resource_count_map,
+        "first_identity": list(first_identity),
+        "last_identity": list(last_identity),
+    }
+    producer_proof_map = _claimed_producer_proof_map(proof)
+    if producer_proof_map is not None:
+        normalized_proof_map["producer_proof"] = producer_proof_map
+    return normalized_proof_map
+
+
+def claimed_projection_proof_shard(
+    proof: Mapping[str, Any],
+    *,
+    claim: ProjectionShardClaim,
+) -> ProjectionProofShard:
+    """Bind one streaming/native shard proof to its exact live generation."""
+
+    if not isinstance(proof, Mapping):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shard_invalid"
+        )
+    proof_fields = set(proof)
+    if proof_fields not in (
+        set(_CLAIMED_PROOF_FIELDS),
+        set(_CLAIMED_PROOF_FIELDS | {"producer_proof"}),
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shard_invalid"
+        )
+    recipe = validated_physical_projection_recipe_identity(
+        claim.recipe_lease.recipe
+    )
+    normalized_proof_map = _normalized_claimed_proof_map(proof, claim, recipe)
+    if dict(proof) != normalized_proof_map:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shard_not_canonical"
+        )
+    resource_count = normalized_proof_map["resource_count"]
+    return ProjectionProofShard(
+        recipe_id=recipe.recipe_id,
+        attempt=claim.recipe_lease.attempt,
+        partition_attempt=claim.partition_attempt,
+        partition_id=claim.shard.partition_id,
+        partition_ordinal=claim.shard.partition_ordinal,
+        resource_type=claim.shard.resource_type,
+        input_sha256=claim.shard.input_sha256,
+        canonical_row_sha256=normalized_proof_map["canonical_row_sha256"],
+        resource_count=resource_count,
+        first_identity=tuple(normalized_proof_map["first_identity"]),
+        last_identity=tuple(normalized_proof_map["last_identity"]),
+        proof=normalized_proof_map,
+    )
 
 
 def projection_proof_shard(

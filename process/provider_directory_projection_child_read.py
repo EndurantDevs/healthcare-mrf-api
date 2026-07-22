@@ -28,6 +28,24 @@ from process.provider_directory_projection_types import (
 LOGGER = logging.getLogger(__name__)
 
 
+async def _release_child_after_failure(
+    lease: ProjectionRetainedChildLease,
+    *,
+    database: Any,
+    schema: str,
+) -> None:
+    """Best-effort release without replacing the triggering failure."""
+
+    try:
+        await release_projection_child_read_lease(
+            lease,
+            database=database,
+            schema=schema,
+        )
+    except BaseException:
+        LOGGER.exception("provider_directory_projection_child_cleanup_failed")
+
+
 @asynccontextmanager
 async def claimed_projection_child_read_lease(
     claim: ProjectionShardClaim,
@@ -47,18 +65,26 @@ async def claimed_projection_child_read_lease(
     try:
         yield validated_child_read_lease(lease)
     except BaseException:
+        await _release_child_after_failure(
+            lease,
+            database=database,
+            schema=schema,
+        )
+        raise
+    else:
         try:
-            await release_projection_child_read_lease(
+            await assert_verified_projection_child_read_lease(
                 lease,
                 database=database,
                 schema=schema,
             )
-        except Exception:
-            LOGGER.exception(
-                "provider_directory_projection_child_cleanup_failed"
+        except BaseException:
+            await _release_child_after_failure(
+                lease,
+                database=database,
+                schema=schema,
             )
-        raise
-    else:
+            raise
         await release_projection_child_read_lease(
             lease,
             database=database,

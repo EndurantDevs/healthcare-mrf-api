@@ -50,6 +50,7 @@ use ptg2_scanner::normalize::{
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
 use ptg2_scanner::progress::emit_progress;
+use ptg2_scanner::provider_directory_projection::run_provider_directory_materialization_stdio_v2_cli;
 use ptg2_scanner::shared_graph::{
     convert_shared_provider_graph, MembershipArtifactDescriptor, MembershipMetadata,
     SharedGraphShardDescriptor,
@@ -31675,6 +31676,9 @@ fn main() -> io::Result<()> {
     }
     if first_arg == "--uhc-retain" {
         return run_uhc_retain_cli(&args.collect::<Vec<_>>());
+    }
+    if first_arg == "--provider-directory-materialize-stdio-v2" {
+        return run_provider_directory_materialization_stdio_v2_cli(&args.collect::<Vec<_>>());
     }
     if first_arg == "--finalize-v3-runs" {
         return run_v3_finalizer(&args.collect::<Vec<_>>());

@@ -155,13 +155,23 @@
         "process/provider_directory_projection_child_read_store.py",
         "process/provider_directory_projection_contract.py",
         "process/provider_directory_projection_contribution.py",
+        "process/provider_directory_projection_copy_summary.py",
         "process/provider_directory_projection_db.py",
+        "process/provider_directory_projection_fhir_values.py",
         "process/provider_directory_projection_inline_profile.py",
+        "process/provider_directory_projection_json.py",
         "process/provider_directory_projection_lease.py",
+        "process/provider_directory_projection_materializer.py",
+        "process/provider_directory_projection_materializer_config.py",
+        "process/provider_directory_projection_native.py",
+        "process/provider_directory_projection_native_copy.py",
         "process/provider_directory_projection_semantic_evidence.py",
+        "process/provider_directory_projection_stage.py",
         "process/provider_directory_projection_summary.py",
+        "process/provider_directory_projection_transform.py",
         "process/provider_directory_projection_typed_evidence.py",
         "process/provider_directory_projection_types.py",
+        "process/provider_directory_projection_worker_admission.py",
         "process/provider_directory_projection_workset.py",
         "process/provider_directory_retained_artifact_base.py",
         "process/provider_directory_retained_artifact_contract.py",
@@ -334,12 +344,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 26013,
-          "total": 34204
+          "covered": 26621,
+          "total": 34670
         },
         "lines": {
-          "covered": 85986,
-          "total": 100751
+          "covered": 87555,
+          "total": 101997
         }
       },
       "path": "test-coverage-python.json",
@@ -393,6 +403,15 @@
         "support/ptg2_scanner/src/normalize.rs",
         "support/ptg2_scanner/src/output.rs",
         "support/ptg2_scanner/src/progress.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/canonical.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/contracts.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/encode.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/fhir_values.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/input.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/pg_copy.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/references.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/semantics.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/stdio.rs",
         "support/ptg2_scanner/src/shared_graph.rs",
         "support/ptg2_scanner/src/source_witness.rs",
         "support/ptg2_scanner/src/source_witness_spool.rs",
@@ -418,16 +437,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 2104,
-          "total": 2761
+          "covered": 2356,
+          "total": 2991
         },
         "lines": {
-          "covered": 32044,
-          "total": 40516
+          "covered": 34196,
+          "total": 42566
         },
         "regions": {
-          "covered": 48233,
-          "total": 60296
+          "covered": 51845,
+          "total": 63759
         }
       },
       "path": "test-coverage-rust.json",
