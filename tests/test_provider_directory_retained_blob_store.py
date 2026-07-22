@@ -10,8 +10,12 @@ from pathlib import Path
 
 import pytest
 
+from process import provider_directory_retained_blob_producer as blob_producer
 from process import provider_directory_retained_blob_store as blob_store
 from process.provider_directory_retained_artifact_contract import RetainedArtifactError
+from process.provider_directory_retained_blob_producer import (
+    install_retained_artifact_blob,
+)
 from process.provider_directory_retained_blob_store import (
     ARTIFACT_ROOT_ENV,
     _open_retained_artifact_blob,
@@ -41,6 +45,162 @@ def test_blob_path_is_canonical_and_does_not_create_read_directories(
     with pytest.raises(RetainedArtifactError, match="path_unsafe"):
         _open_retained_artifact_blob(artifact_sha256, 1)
     assert not blob_path.parent.exists()
+
+
+def test_producer_installs_canonical_blob_durably_and_idempotently(
+    retained_artifact_test_root: Path,
+) -> None:
+    artifact_bytes = b"canonical producer bytes\n"
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    source_path = retained_artifact_test_root / "producer-source"
+    second_source_path = retained_artifact_test_root / "producer-source-second"
+    source_path.write_bytes(artifact_bytes)
+    second_source_path.write_bytes(artifact_bytes)
+
+    install_retained_artifact_blob(
+        source_path,
+        artifact_sha256=artifact_sha256,
+        artifact_byte_count=len(artifact_bytes),
+    )
+    install_retained_artifact_blob(
+        second_source_path,
+        artifact_sha256=artifact_sha256,
+        artifact_byte_count=len(artifact_bytes),
+    )
+
+    blob_path = retained_artifact_test_root.joinpath(
+        *retained_artifact_blob_components(artifact_sha256)
+    )
+    assert blob_path.read_bytes() == artifact_bytes
+    assert list(blob_path.parent.glob("*.partial")) == []
+
+
+@pytest.mark.parametrize("mismatch_kind", ("digest", "size"))
+def test_producer_rejects_mismatched_source_without_installing_blob(
+    retained_artifact_test_root: Path,
+    mismatch_kind: str,
+) -> None:
+    expected_bytes = b"expected producer bytes\n"
+    source_bytes = (
+        b"X" * len(expected_bytes) if mismatch_kind == "digest" else expected_bytes
+    )
+    artifact_sha256 = hashlib.sha256(expected_bytes).hexdigest()
+    expected_byte_count = len(expected_bytes) + (mismatch_kind == "size")
+    source_path = retained_artifact_test_root / f"producer-{mismatch_kind}"
+    source_path.write_bytes(source_bytes)
+
+    with pytest.raises(RetainedArtifactError, match="source_mismatch"):
+        install_retained_artifact_blob(
+            source_path,
+            artifact_sha256=artifact_sha256,
+            artifact_byte_count=expected_byte_count,
+        )
+
+    blob_path = retained_artifact_test_root.joinpath(
+        *retained_artifact_blob_components(artifact_sha256)
+    )
+    assert not blob_path.exists()
+
+
+@pytest.mark.parametrize("symlink_kind", ("parent", "leaf"))
+def test_producer_does_not_follow_source_symlinks(
+    retained_artifact_test_root: Path,
+    symlink_kind: str,
+) -> None:
+    artifact_bytes = b"producer source safety\n"
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    actual_directory = retained_artifact_test_root / "actual-source"
+    actual_directory.mkdir()
+    actual_source = actual_directory / "artifact"
+    actual_source.write_bytes(artifact_bytes)
+    if symlink_kind == "parent":
+        linked_directory = retained_artifact_test_root / "linked-source"
+        linked_directory.symlink_to(actual_directory, target_is_directory=True)
+        source_path = linked_directory / actual_source.name
+    else:
+        source_path = retained_artifact_test_root / "linked-artifact"
+        source_path.symlink_to(actual_source)
+
+    with pytest.raises(RetainedArtifactError, match="path_unsafe"):
+        install_retained_artifact_blob(
+            source_path,
+            artifact_sha256=artifact_sha256,
+            artifact_byte_count=len(artifact_bytes),
+        )
+
+
+def test_producer_rejects_unsafe_target_shard_and_corrupt_existing_blob(
+    retained_artifact_test_root: Path,
+) -> None:
+    artifact_bytes = b"producer target safety\n"
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    source_path = retained_artifact_test_root / "producer-target-source"
+    source_path.write_bytes(artifact_bytes)
+    blob_components = retained_artifact_blob_components(artifact_sha256)
+    blob_root = retained_artifact_test_root / blob_components[0]
+    outside_path = retained_artifact_test_root.parent / f"outside-{uuid.uuid4().hex}"
+    outside_path.mkdir()
+    blob_root.mkdir()
+    (blob_root / blob_components[1]).symlink_to(
+        outside_path, target_is_directory=True
+    )
+    try:
+        with pytest.raises(RetainedArtifactError, match="path_unsafe"):
+            install_retained_artifact_blob(
+                source_path,
+                artifact_sha256=artifact_sha256,
+                artifact_byte_count=len(artifact_bytes),
+            )
+    finally:
+        shutil.rmtree(blob_root)
+        shutil.rmtree(outside_path)
+
+    corrupt_blob_path = retained_artifact_test_root.joinpath(*blob_components)
+    corrupt_blob_path.parent.mkdir(parents=True)
+    corrupt_bytes = b"X" * len(artifact_bytes)
+    corrupt_blob_path.write_bytes(corrupt_bytes)
+    with pytest.raises(RetainedArtifactError, match="identity_mismatch"):
+        install_retained_artifact_blob(
+            source_path,
+            artifact_sha256=artifact_sha256,
+            artifact_byte_count=len(artifact_bytes),
+        )
+    assert corrupt_blob_path.read_bytes() == corrupt_bytes
+
+
+def test_producer_detects_canonical_ancestor_replacement_during_install(
+    retained_artifact_test_root: Path,
+    monkeypatch,
+) -> None:
+    artifact_bytes = b"producer ancestor identity\n"
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    source_path = retained_artifact_test_root / "producer-ancestor-source"
+    source_path.write_bytes(artifact_bytes)
+    blob_root = retained_artifact_test_root / "blobs"
+    parked_blob_root = retained_artifact_test_root / "blobs.parked"
+    original_publish = blob_producer._publish_temporary_blob
+
+    def publish_then_replace(temporary, target):
+        publication = original_publish(temporary, target)
+        blob_root.rename(parked_blob_root)
+        blob_root.mkdir()
+        return publication
+
+    monkeypatch.setattr(
+        blob_producer,
+        "_publish_temporary_blob",
+        publish_then_replace,
+    )
+    try:
+        with pytest.raises(RetainedArtifactError, match="identity_changed"):
+            install_retained_artifact_blob(
+                source_path,
+                artifact_sha256=artifact_sha256,
+                artifact_byte_count=len(artifact_bytes),
+            )
+    finally:
+        shutil.rmtree(blob_root)
+        parked_blob_root.rename(blob_root)
 
 
 @pytest.mark.parametrize("configured_root", (None, "", "relative/root", "/"))
