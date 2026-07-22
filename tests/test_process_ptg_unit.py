@@ -7563,6 +7563,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     """Verify this PTG import regression contract."""
     pushed_list = []
     publish_source_pointers = AsyncMock()
+    publish_source_dictionary = AsyncMock()
 
     async def fake_push(rows, cls, **_kwargs):
         pushed_list.extend((getattr(cls, "__name__", str(cls)), report_row) for report_row in rows)
@@ -7603,7 +7604,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     monkeypatch.setattr(
         process_ptg,
         "_publish_shared_v3_source_dictionary",
-        AsyncMock(),
+        publish_source_dictionary,
     )
     _install_strict_v3_publish_mocks(monkeypatch, serving_rates=987)
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
@@ -7643,6 +7644,9 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     published_snapshot = publish_source_pointers.await_args.kwargs["snapshot_attributes"]
     assert published_snapshot["manifest"]["serving_rates"] == 987
     assert published_snapshot["manifest"]["serving_index"]["source_set"] == (
+        final_report["serving_index"]["source_set"]
+    )
+    assert publish_source_dictionary.await_args.kwargs["expected_source_set"] == (
         final_report["serving_index"]["source_set"]
     )
 

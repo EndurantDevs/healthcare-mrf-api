@@ -3596,6 +3596,7 @@ async def _publish_shared_v3_source_dictionary(
     shared_input_identity: Any,
     identity_trace_pairs: Iterable[Mapping[str, Any]],
     snapshot_id: str,
+    expected_source_set: Mapping[str, Any],
 ) -> tuple[Any, ...]:
     assignments, trace_set_rows = shared_snapshot_source_assignments(
         identity_trace_pairs,
@@ -3603,17 +3604,28 @@ async def _publish_shared_v3_source_dictionary(
     )
     now = _utcnow()
     await _push_ptg2_objects(
-        [{**row, "created_at": now} for row in trace_set_rows],
+        [
+            {**trace_set_row, "created_at": now}
+            for trace_set_row in trace_set_rows
+        ],
         PTG2SourceTraceSet,
         rewrite=True,
     )
-    await publish_shared_v3_snapshot_sources(
+    published_source_records = await publish_shared_v3_snapshot_sources(
         schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
         snapshot_id=snapshot_id,
         plan_scopes=shared_input_identity.logical_plans,
         coverage_scope_id=shared_input_identity.coverage_scope_id,
         assignments=assignments,
     )
+    published_source_set = shared_source_set_metadata(
+        source_record["raw_container_sha256"]
+        for source_record in published_source_records
+    )
+    if published_source_set != dict(expected_source_set):
+        raise RuntimeError(
+            "strict V3 logical snapshot source-set seal changed during publication"
+        )
     return assignments
 
 
@@ -3937,6 +3949,7 @@ async def _publish_reused_shared_v3_snapshot(
         shared_input_identity=shared_input_identity,
         identity_trace_pairs=source_provenance_entries,
         snapshot_id=snapshot_id,
+        expected_source_set=source_set,
     )
     serving_index["source_set"] = source_set
     await validate_reused_snapshot_sources(
@@ -5741,6 +5754,7 @@ async def _main_with_artifact_lease(
             shared_input_identity=shared_input_identity,
             identity_trace_pairs=source_identity_traces,
             snapshot_id=snapshot_id,
+            expected_source_set=source_set,
         )
 
         await flush_error_log(classes["ImportLog"])

@@ -118,6 +118,7 @@ def strict_serving_index(snapshot_key=41):
 def strict_snapshot_row(serving_index=None, **overrides):
     serving_index = dict(serving_index or strict_serving_index())
     snapshot_source_set = serving_index.pop("source_set", None)
+    snapshot_source_set_digest = (snapshot_source_set or {}).get("raw_container_sha256_digest")
     coverage_scope_id = serving_index.get("coverage_scope_id")
     snapshot_row_map = {
         "layout_serving_index": serving_index,
@@ -128,7 +129,7 @@ def strict_snapshot_row(serving_index=None, **overrides):
         "snapshot_coverage_scope_id": coverage_scope_id,
         "attested_source_key": "source-a",
         "attested_coverage_scope_id": coverage_scope_id,
-        "attested_source_set_digest": snapshot_source_set["raw_container_sha256_digest"],
+        "attested_source_set_digest": snapshot_source_set_digest,
         "attested_audit_sample_digest": "a" * 64,
         "source_row_count": serving_index.get("source_count"),
         "distinct_source_key_count": serving_index.get("source_count"),
