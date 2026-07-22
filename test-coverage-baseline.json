@@ -277,6 +277,9 @@
         "process/uhc_provider_file_catalog_contract.py",
         "process/uhc_provider_file_catalog_store.py",
         "process/uhc_provider_file_catalog_types.py",
+        "process/uhc_provider_file_identity.py",
+        "process/uhc_provider_file_semantic_identity.py",
+        "process/uhc_provider_file_source_identity.py",
         "process/uhc_retained_locks.py",
         "process/uhc_retained_native.py",
         "process/uhc_retained_native_process.py",
@@ -300,12 +303,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 23513,
-          "total": 32678
+          "covered": 23731,
+          "total": 32788
         },
         "lines": {
-          "covered": 79180,
-          "total": 95768
+          "covered": 79765,
+          "total": 96227
         }
       },
       "path": "test-coverage-python.json",
