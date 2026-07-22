@@ -11698,7 +11698,6 @@ async def _lock_artifact_fence_aliases(
 ) -> list[Any]:
     """Lock and return the source aliases explicitly selected by the fence."""
     source_ref = _unscoped_qt(_schema(), ProviderDirectorySource.__tablename__)
-    await executor.status(f"LOCK TABLE {source_ref} IN SHARE MODE;")
     return await executor.all(
         f"""
         SELECT source.source_id,

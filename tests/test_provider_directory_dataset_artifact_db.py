@@ -86,6 +86,13 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
             model.__tablename__,
         ):
             await database.status(statement)
+    await database.status(
+        f"ALTER TABLE {schema}.provider_directory_source "
+        "ADD CONSTRAINT provider_directory_source_endpoint_id_fkey "
+        "FOREIGN KEY (endpoint_id) REFERENCES "
+        f"{schema}.provider_directory_api_endpoint(endpoint_id) "
+        "ON DELETE SET NULL;"
+    )
 
 
 async def _insert_fixture_sources(database: Database, schema: str) -> None:
@@ -416,6 +423,35 @@ async def test_real_postgres_explicit_dataset_fence_ignores_unselected_alias_joi
 
         async with database.transaction():
             await importer._lock_and_verify_artifact_dataset_fence(fence)
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_cutover_fence_allows_disjoint_source_seed(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"]
+        )
+        seed_database = Database()
+        await seed_database.connect()
+
+        try:
+            async with database.transaction():
+                await importer._lock_and_verify_artifact_dataset_fence(fence)
+                await asyncio.wait_for(
+                    seed_database.status(
+                        f"UPDATE {schema}.provider_directory_source "
+                        "SET plan_name = 'Disjoint seed update' "
+                        "WHERE source_id = 'source_catalog_only';"
+                    ),
+                    timeout=2,
+                )
+        finally:
+            await seed_database.disconnect()
+
+        assert await database.scalar(
+            f"SELECT plan_name FROM {schema}.provider_directory_source "
+            "WHERE source_id = 'source_catalog_only';"
+        ) == "Disjoint seed update"
 
 
 @pytest.mark.asyncio
