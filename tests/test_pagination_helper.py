@@ -14,6 +14,17 @@ def test_parse_pagination_defaults_to_page_mode():
     assert params.source == "page"
 
 
+def test_parse_pagination_replaces_zero_limit_with_default():
+    params = parse_pagination(
+        {"limit": "0"},
+        default_limit=50,
+        max_limit=200,
+        default_page=1,
+    )
+
+    assert params.limit == 50
+
+
 def test_parse_pagination_accepts_page_size_alias():
     params = parse_pagination(
         {"page": "2", "page_size": "25"},

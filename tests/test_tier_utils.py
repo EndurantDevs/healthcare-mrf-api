@@ -15,6 +15,7 @@ def test_normalize_tier_unknown_inputs():
 def test_normalize_numeric_tiers():
     assert normalize_drug_tier_slug("Tier 1") == "tier_1"
     assert normalize_drug_tier_slug("tier 3 something") == "tier_3"
+    assert normalize_drug_tier_slug("tier 7 specialty") == "specialty"
 
 
 def test_normalize_specialty_tiers():
