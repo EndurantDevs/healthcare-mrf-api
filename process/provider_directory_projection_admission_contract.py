@@ -34,13 +34,14 @@ from process.provider_directory_projection_workset import (
 PROJECTION_ADMISSION_CONTRACT_ID = (
     "healthporta.provider-directory.projection-acquisition-admission.v2"
 )
-_BINDING_SET_DOMAIN = b"provider-directory-projection-admission-binding-set-v3\x00"
+_BINDING_SET_DOMAIN = b"provider-directory-projection-admission-binding-set-v4\x00"
 _STREAM_SET_DOMAIN = b"provider-directory-projection-admission-stream-set-v1\x00"
 
 
 @dataclass(frozen=True)
 class _AdmissionBase:
     recipe: ProjectionRecipeIdentity
+    outcome_kind: str
     retained_campaign_id: str
     retained_campaign_sha256: str
     physical_blocks: tuple[ProjectionInputBlock, ...]
@@ -64,6 +65,8 @@ def admission_binding_fields(
         "retained_artifact_sha256": admission_block.block.upstream_artifact_id,
         "retained_layout_sha256": admission_block.block.source_object_id,
         "retained_range_ordinal": admission_block.retained_range_ordinal,
+        "stream_identity_sha256": admission_block.stream_identity_sha256,
+        "sequence_ordinal": admission_block.sequence_ordinal,
         "resource_type": admission_block.resource_type,
         "partition_key_hash": admission_block.partition_key_hash,
         "source_partition_ordinal": admission_block.source_partition_ordinal,
@@ -134,6 +137,8 @@ def _validated_positive_bindings(
             retained_campaign_sha256=admission_block.retained_campaign_sha256,
             retained_source_item_id=admission_block.retained_source_item_id,
             retained_range_ordinal=admission_block.retained_range_ordinal,
+            stream_identity_sha256=admission_block.stream_identity_sha256,
+            sequence_ordinal=admission_block.sequence_ordinal,
             resource_type=admission_block.resource_type,
             partition_key_hash=admission_block.partition_key_hash,
             source_partition_ordinal=admission_block.source_partition_ordinal,
@@ -341,6 +346,111 @@ def _validate_stream_census(
             )
 
 
+def _validate_payload_stream_census(
+    recipe: ProjectionRecipeIdentity,
+    admission_blocks: Sequence[ProjectionAdmissionInputBlock],
+) -> None:
+    """Bind every ordered payload item to its exact terminal stream coordinate."""
+
+    terminal_by_coordinate = {
+        _terminal_coordinate(terminal): terminal
+        for terminal in recipe.completeness_manifest["terminal_partitions"]
+    }
+    stream_by_coordinate = {
+        coordinate: terminal["retained_stream"]
+        for coordinate, terminal in terminal_by_coordinate.items()
+        if "retained_stream" in terminal
+    }
+    if not stream_by_coordinate:
+        return
+    source_item_by_sequence: dict[tuple[str, int], str] = {}
+    for admission_block in admission_blocks:
+        coordinate = (
+            admission_block.resource_type,
+            admission_block.partition_key_hash,
+            admission_block.source_partition_ordinal,
+        )
+        retained_stream = stream_by_coordinate.get(coordinate)
+        sequence_coordinate = (
+            admission_block.stream_identity_sha256,
+            admission_block.sequence_ordinal,
+        )
+        prior_source_item = source_item_by_sequence.setdefault(
+            sequence_coordinate,
+            admission_block.retained_source_item_id,
+        )
+        if (
+            retained_stream is None
+            or admission_block.stream_identity_sha256
+            != retained_stream["identity_sha256"]
+            or admission_block.sequence_ordinal
+            >= retained_stream["terminal_sequence_ordinal"]
+            or prior_source_item != admission_block.retained_source_item_id
+        ):
+            raise ProviderDirectoryProjectionError(
+                "provider_directory_projection_admission_payload_stream_mismatch"
+            )
+
+
+def _admission_outcome_kind(
+    recipe: ProjectionRecipeIdentity,
+    physical_blocks: Sequence[ProjectionInputBlock],
+    stream_fields: Sequence[Mapping[str, Any]],
+) -> str:
+    """Select the dedicated no-input outcome only for an exact ordered zero set."""
+
+    if physical_blocks:
+        return "physical_workset"
+    terminal_partitions = recipe.completeness_manifest["terminal_partitions"]
+    if (
+        not terminal_partitions
+        or len(stream_fields) != len(terminal_partitions)
+        or any("retained_stream" not in terminal for terminal in terminal_partitions)
+        or any(
+            terminal[count_field] != 0
+            for terminal in terminal_partitions
+            for count_field in ("block_count", "row_count", "byte_count")
+        )
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_no_input_outcome_invalid"
+        )
+    return "no_input"
+
+
+def _retained_consumer_id(
+    recipe: ProjectionRecipeIdentity,
+    outcome_kind: str,
+    retained_campaign_id: str,
+    retained_campaign_sha256: str,
+    binding_set_sha256: str,
+    stream_set_sha256: str,
+    stream_count: int,
+) -> str:
+    """Hash the exact retained evidence consumed by one admission."""
+
+    return stable_hash(
+        {
+            "contract_id": PROJECTION_ADMISSION_CONTRACT_ID,
+            "planned_recipe_id": recipe.recipe_id,
+            "recipe_id": (
+                recipe.recipe_id if outcome_kind == "physical_workset" else None
+            ),
+            "outcome_kind": outcome_kind,
+            "acquisition_adapter_id": recipe.acquisition_adapter_id,
+            "source_scope_hash": recipe.source_scope_hash,
+            "source_ids": list(recipe.source_ids),
+            "completeness_manifest_hash": recipe.completeness_manifest_hash,
+            "retained_campaign_id": retained_campaign_id,
+            "retained_campaign_sha256": retained_campaign_sha256,
+            "binding_set_sha256": binding_set_sha256,
+            "stream_set_sha256": stream_set_sha256,
+            "stream_count": stream_count,
+        },
+        domain="provider-directory-projection-admission-consumer-id-v2",
+    )
+
+
 def _admission_base(
     recipe: ProjectionRecipeIdentity,
     blocks: Sequence[ProjectionAdmissionInputBlock],
@@ -364,6 +474,8 @@ def _admission_base(
         )
     _validate_admission_census(recipe, blocks)
     _validate_stream_census(recipe, terminal_zeros)
+    _validate_payload_stream_census(recipe, blocks)
+    outcome_kind = _admission_outcome_kind(recipe, physical_blocks, stream_fields)
     binding_set_sha256 = _binding_set_sha256(block_fields, stream_fields)
     stream_set_sha256 = _stream_set_sha256(stream_fields)
     input_set_hash = projection_input_set_sha256(
@@ -374,24 +486,18 @@ def _admission_base(
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_input_manifest_hash_mismatch"
         )
-    retained_consumer_id = stable_hash(
-        {
-            "contract_id": PROJECTION_ADMISSION_CONTRACT_ID,
-            "recipe_id": recipe.recipe_id,
-            "acquisition_adapter_id": recipe.acquisition_adapter_id,
-            "source_scope_hash": recipe.source_scope_hash,
-            "source_ids": list(recipe.source_ids),
-            "completeness_manifest_hash": recipe.completeness_manifest_hash,
-            "retained_campaign_id": retained_campaign_id,
-            "retained_campaign_sha256": retained_campaign_sha256,
-            "binding_set_sha256": binding_set_sha256,
-            "stream_set_sha256": stream_set_sha256,
-            "stream_count": len(stream_fields),
-        },
-        domain="provider-directory-projection-admission-consumer-id-v2",
+    retained_consumer_id = _retained_consumer_id(
+        recipe,
+        outcome_kind,
+        retained_campaign_id,
+        retained_campaign_sha256,
+        binding_set_sha256,
+        stream_set_sha256,
+        len(stream_fields),
     )
     return _AdmissionBase(
         recipe=recipe,
+        outcome_kind=outcome_kind,
         retained_campaign_id=retained_campaign_id,
         retained_campaign_sha256=retained_campaign_sha256,
         physical_blocks=physical_blocks,
@@ -427,7 +533,13 @@ def projection_admission_identity(
     )
     return ProjectionAdmissionIdentity(
         admission_id=admission_id,
-        recipe_id=base.recipe.recipe_id,
+        planned_recipe_id=base.recipe.recipe_id,
+        recipe_id=(
+            base.recipe.recipe_id
+            if base.outcome_kind == "physical_workset"
+            else None
+        ),
+        outcome_kind=base.outcome_kind,
         acquisition_adapter_id=base.recipe.acquisition_adapter_id,
         source_scope_hash=base.recipe.source_scope_hash,
         source_ids=base.recipe.source_ids,
@@ -529,9 +641,20 @@ def admission_registration_inputs(
     )
     physical_by_id = {binding.block.block_id: binding.block for binding in blocks}
     physical_blocks = [physical_by_id[key] for key in sorted(physical_by_id)]
-    block_fields, shard_fields, block_set_hash, _shard_set_hash = (
-        _normalized_workset(recipe, physical_blocks, shards)
-    )
+    if identity.outcome_kind == "no_input":
+        if physical_blocks or shards:
+            raise ProviderDirectoryProjectionError(
+                "provider_directory_projection_no_input_outcome_invalid"
+            )
+        block_fields: list[dict[str, Any]] = []
+        shard_fields: list[dict[str, Any]] = []
+        block_set_hash = projection_input_set_sha256(
+            (), decoder_contract_id=recipe.decoder_contract_id
+        )
+    else:
+        block_fields, shard_fields, block_set_hash, _shard_set_hash = (
+            _normalized_workset(recipe, physical_blocks, shards)
+        )
     if block_set_hash != identity.input_block_set_sha256:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_input_manifest_hash_mismatch"

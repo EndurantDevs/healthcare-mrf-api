@@ -85,6 +85,8 @@ def _admission_block(block=None, **overrides):
         "retained_campaign_sha256": _digest("campaign-proof"),
         "retained_source_item_id": _digest("source-item"),
         "retained_range_ordinal": 0,
+        "stream_identity_sha256": _digest("stream-item"),
+        "sequence_ordinal": 0,
         "resource_type": "Organization",
         "partition_key_hash": _digest("partition"),
         "source_partition_ordinal": 0,

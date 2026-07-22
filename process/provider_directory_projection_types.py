@@ -147,7 +147,9 @@ class ProjectionAdmissionIdentity:
     """One immutable acquisition proof bound many-to-one to a recipe."""
 
     admission_id: str
-    recipe_id: str
+    planned_recipe_id: str
+    recipe_id: str | None
+    outcome_kind: str
     acquisition_adapter_id: str
     source_scope_hash: str
     source_ids: tuple[str, ...]
@@ -204,6 +206,8 @@ class ProjectionAdmissionInputBlock:
     retained_campaign_sha256: str
     retained_source_item_id: str
     retained_range_ordinal: int | None
+    stream_identity_sha256: str
+    sequence_ordinal: int
     resource_type: str
     partition_key_hash: str
     source_partition_ordinal: int

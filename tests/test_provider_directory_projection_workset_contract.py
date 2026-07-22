@@ -104,10 +104,21 @@ def _admission_block(
     campaign_sha256: str = CAMPAIGN_SHA256,
     source_item_id: str | None = None,
     retained_range_ordinal: int | None = 0,
-    resource_type: str = "Organization",
-    partition_key_hash: str = PARTITION_KEY_HASH,
-    source_partition_ordinal: int = 0,
+    stream_identity_sha256: str = _digest("stream-item"),
+    sequence_ordinal: int = 0,
+    **coordinate_by_field,
 ):
+    resource_type = coordinate_by_field.pop("resource_type", "Organization")
+    partition_key_hash = coordinate_by_field.pop(
+        "partition_key_hash",
+        PARTITION_KEY_HASH,
+    )
+    source_partition_ordinal = coordinate_by_field.pop(
+        "source_partition_ordinal",
+        0,
+    )
+    if coordinate_by_field:
+        raise TypeError(f"unexpected coordinate fields: {sorted(coordinate_by_field)}")
     return projection_admission_input_block(
         block,
         retained_campaign_id=campaign_id,
@@ -116,6 +127,8 @@ def _admission_block(
             f"source-item:{block.block_id}"
         ),
         retained_range_ordinal=retained_range_ordinal,
+        stream_identity_sha256=stream_identity_sha256,
+        sequence_ordinal=sequence_ordinal,
         resource_type=resource_type,
         partition_key_hash=partition_key_hash,
         source_partition_ordinal=source_partition_ordinal,

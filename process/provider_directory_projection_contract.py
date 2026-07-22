@@ -909,52 +909,71 @@ def _validated_admission_coordinate(
     )
 
 
-def projection_admission_input_block(
-    block: ProjectionInputBlock,
-    *,
+def _admission_coordinate_fields(
+    coordinate_by_field: Mapping[str, Any],
+) -> tuple[str, str, int]:
+    """Require the exact keyword-only terminal coordinate fields."""
+
+    expected_fields = {
+        "resource_type",
+        "partition_key_hash",
+        "source_partition_ordinal",
+    }
+    if set(coordinate_by_field) != expected_fields:
+        raise TypeError(
+            "projection_admission_input_block() requires resource_type, "
+            "partition_key_hash, and source_partition_ordinal"
+        )
+    return (
+        coordinate_by_field["resource_type"],
+        coordinate_by_field["partition_key_hash"],
+        coordinate_by_field["source_partition_ordinal"],
+    )
+
+
+def _validated_admission_owner_fields(
     retained_campaign_id: str,
     retained_campaign_sha256: str,
     retained_source_item_id: str,
-    retained_range_ordinal: int | None,
-    resource_type: str,
-    partition_key_hash: str,
-    source_partition_ordinal: int,
-) -> ProjectionAdmissionInputBlock:
-    """Bind one physical block to a campaign-owned terminal coordinate."""
+    stream_identity_sha256: str,
+    sequence_ordinal: int,
+) -> tuple[str, str, str, str, int]:
+    """Validate retained campaign ownership and ordered payload coordinates."""
 
-    block = _validated_projection_input_block(block)
-    retained_range_ordinal, resource_type, partition_key_hash, _ = (
-        _validated_admission_coordinate(
-            retained_range_ordinal,
-            resource_type,
-            partition_key_hash,
-            source_partition_ordinal,
+    if type(sequence_ordinal) is not int or sequence_ordinal < 0:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_admission_coordinate_invalid"
         )
+    return (
+        required_hash(retained_campaign_id, "retained_campaign_id"),
+        required_hash(retained_campaign_sha256, "retained_campaign_sha256"),
+        required_hash(retained_source_item_id, "retained_source_item_id"),
+        required_hash(stream_identity_sha256, "stream_identity_sha256"),
+        sequence_ordinal,
     )
-    retained_campaign_id = required_hash(retained_campaign_id, "retained_campaign_id")
-    retained_campaign_sha256 = required_hash(
-        retained_campaign_sha256,
-        "retained_campaign_sha256",
-    )
-    retained_source_item_id = required_hash(
-        retained_source_item_id,
-        "retained_source_item_id",
-    )
-    binding_values = (
-        block.block_id,
+
+
+def _admission_input_record(
+    block: ProjectionInputBlock,
+    binding_id: str,
+    owner_fields: tuple[str, str, str, str, int],
+    coordinate_fields: tuple[int | None, str, str, int],
+) -> ProjectionAdmissionInputBlock:
+    """Assemble one validated retained-to-physical binding record."""
+
+    (
         retained_campaign_id,
+        retained_campaign_sha256,
         retained_source_item_id,
-        block.upstream_artifact_id,
-        block.source_object_id,
+        stream_identity_sha256,
+        sequence_ordinal,
+    ) = owner_fields
+    (
         retained_range_ordinal,
         resource_type,
         partition_key_hash,
         source_partition_ordinal,
-    )
-    binding_id = _pipe_identity_hash(
-        "provider-directory-projection-admission-input-binding-v1",
-        binding_values,
-    )
+    ) = coordinate_fields
     return ProjectionAdmissionInputBlock(
         binding_id=binding_id,
         block=block,
@@ -962,9 +981,79 @@ def projection_admission_input_block(
         retained_campaign_sha256=retained_campaign_sha256,
         retained_source_item_id=retained_source_item_id,
         retained_range_ordinal=retained_range_ordinal,
+        stream_identity_sha256=stream_identity_sha256,
+        sequence_ordinal=sequence_ordinal,
         resource_type=resource_type,
         partition_key_hash=partition_key_hash,
         source_partition_ordinal=source_partition_ordinal,
+    )
+
+
+def _admission_input_binding_id(
+    block: ProjectionInputBlock,
+    owner_fields: tuple[str, str, str, str, int],
+    coordinate_fields: tuple[int | None, str, str, int],
+) -> str:
+    """Hash the exact retained owner, physical block, and terminal coordinate."""
+
+    campaign_id, _, source_item_id, stream_id, sequence_ordinal = owner_fields
+    retained_range_ordinal, resource_type, partition_hash, source_ordinal = (
+        coordinate_fields
+    )
+    binding_values = (
+        block.block_id,
+        campaign_id,
+        source_item_id,
+        block.upstream_artifact_id,
+        block.source_object_id,
+        retained_range_ordinal,
+        stream_id,
+        sequence_ordinal,
+        resource_type,
+        partition_hash,
+        source_ordinal,
+    )
+    return _pipe_identity_hash(
+        "provider-directory-projection-admission-input-binding-v2",
+        binding_values,
+    )
+
+
+def projection_admission_input_block(
+    block: ProjectionInputBlock,
+    *,
+    retained_campaign_id: str,
+    retained_campaign_sha256: str,
+    retained_source_item_id: str,
+    retained_range_ordinal: int | None,
+    stream_identity_sha256: str,
+    sequence_ordinal: int,
+    **coordinate_by_field: Any,
+) -> ProjectionAdmissionInputBlock:
+    """Bind one physical block to a campaign-owned terminal coordinate."""
+
+    block = _validated_projection_input_block(block)
+    coordinate_fields = _validated_admission_coordinate(
+        retained_range_ordinal,
+        *_admission_coordinate_fields(coordinate_by_field),
+    )
+    owner_fields = _validated_admission_owner_fields(
+        retained_campaign_id,
+        retained_campaign_sha256,
+        retained_source_item_id,
+        stream_identity_sha256,
+        sequence_ordinal,
+    )
+    binding_id = _admission_input_binding_id(
+        block,
+        owner_fields,
+        coordinate_fields,
+    )
+    return _admission_input_record(
+        block,
+        binding_id,
+        owner_fields,
+        coordinate_fields,
     )
 
 

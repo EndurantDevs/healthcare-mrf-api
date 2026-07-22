@@ -41,6 +41,10 @@ from process.provider_directory_projection_contract import (
     projection_admission_terminal_zero,
 )
 from process.provider_directory_projection_types import (
+    ProjectionAdmissionInputBlock,
+    ProjectionAdmissionTerminalZero,
+    ProjectionRecipeIdentity,
+    ProjectionShardSpec,
     ProviderDirectoryProjectionError,
     stable_json,
 )
@@ -84,6 +88,8 @@ class _RetainedBinding:
     consumer_claim_generation: int
     family: str
     partition_metadata_sha256: str
+    stream_identity_sha256: str
+    sequence_ordinal: int
 
 
 @dataclass(frozen=True)
@@ -97,6 +103,22 @@ class _OrderedStreamItems:
     @property
     def retained_items(self) -> tuple[RetainedCampaignItem, ...]:
         return (self.payload_item, self.positive_terminal, self.zero_terminal)
+
+
+@dataclass(frozen=True)
+class _OrderedAdmissionContext:
+    recipe: ProjectionRecipeIdentity
+    admission_block: ProjectionAdmissionInputBlock
+    shard: ProjectionShardSpec
+    terminal_zeros: tuple[ProjectionAdmissionTerminalZero, ...]
+    claim_generation: int
+
+
+@dataclass(frozen=True)
+class _AllZeroAdmissionContext:
+    recipe: ProjectionRecipeIdentity
+    terminal_zeros: tuple[ProjectionAdmissionTerminalZero, ...]
+    claim_generation: int
 
 
 def _fixture_input_block(
@@ -180,6 +202,12 @@ def _projection_fixture(
         if retained_binding
         else _digest("provisional-retained-source-item")
     )
+    stream_identity_sha256 = (
+        retained_binding.stream_identity_sha256
+        if retained_binding
+        else _digest("provisional-retained-stream")
+    )
+    sequence_ordinal = retained_binding.sequence_ordinal if retained_binding else 0
     resource_type = (
         retained_binding.family if retained_binding else "PractitionerRole"
     )
@@ -227,6 +255,8 @@ def _projection_fixture(
         retained_campaign_sha256=retained_campaign_sha256,
         retained_source_item_id=retained_source_item_id,
         retained_range_ordinal=retained_range.range_ordinal,
+        stream_identity_sha256=stream_identity_sha256,
+        sequence_ordinal=sequence_ordinal,
         resource_type=resource_type,
         partition_key_hash=partition_key_hash,
         source_partition_ordinal=0,
@@ -422,6 +452,8 @@ def _shared_block_fixture(
             retained_campaign_sha256=binding.campaign_sha256,
             retained_source_item_id=binding.source_item_id,
             retained_range_ordinal=retained_range.range_ordinal,
+            stream_identity_sha256=binding.stream_identity_sha256,
+            sequence_ordinal=binding.sequence_ordinal,
             resource_type=resource_type,
             partition_key_hash=partition_key_hash,
             source_partition_ordinal=0,
@@ -516,6 +548,8 @@ async def _sealed_shared_artifact_bindings(
             consumer_claim_generation=1,
             family=retained_item.family,
             partition_metadata_sha256=retained_item.partition_metadata_sha256,
+            stream_identity_sha256=retained_item.stream_identity_sha256,
+            sequence_ordinal=retained_item.sequence_ordinal,
         )
         for retained_item in retained_items
     )
@@ -605,6 +639,8 @@ def _range_subset_fixture(
             retained_campaign_sha256=binding.campaign_sha256,
             retained_source_item_id=binding.source_item_id,
             retained_range_ordinal=retained_range.range_ordinal,
+            stream_identity_sha256=binding.stream_identity_sha256,
+            sequence_ordinal=binding.sequence_ordinal,
             resource_type=binding.family,
             partition_key_hash=binding.partition_metadata_sha256,
             source_partition_ordinal=0,
@@ -795,6 +831,24 @@ def _ordered_stream_items(campaign_label: str) -> _OrderedStreamItems:
     )
 
 
+def _stream_ordinal_by_identity(
+    positive_terminal: RetainedCampaignItem,
+    zero_terminal: RetainedCampaignItem,
+) -> dict[str, int]:
+    """Assign deterministic ordinals to both ordered fixture streams."""
+
+    stream_identities = sorted(
+        (
+            positive_terminal.stream_identity_sha256,
+            zero_terminal.stream_identity_sha256,
+        )
+    )
+    return {
+        stream_identity: stream_ordinal
+        for stream_ordinal, stream_identity in enumerate(stream_identities)
+    }
+
+
 def _ordered_zero_stream_fixture(
     *,
     campaign_id: str,
@@ -807,17 +861,10 @@ def _ordered_zero_stream_fixture(
     """Build exact positive and zero-only admission evidence."""
 
     retained_range = produced_artifact.ranges[0]
-    stream_ordinal_by_identity = {
-        stream_identity: stream_ordinal
-        for stream_ordinal, stream_identity in enumerate(
-            sorted(
-                (
-                    positive_terminal.stream_identity_sha256,
-                    zero_terminal.stream_identity_sha256,
-                )
-            )
-        )
-    }
+    stream_ordinal_by_identity = _stream_ordinal_by_identity(
+        positive_terminal,
+        zero_terminal,
+    )
     input_block = _fixture_input_block(produced_artifact, retained_range)
     admission_block = projection_admission_input_block(
         input_block,
@@ -825,6 +872,8 @@ def _ordered_zero_stream_fixture(
         retained_campaign_sha256=campaign_sha256,
         retained_source_item_id=payload_item.source_item_id,
         retained_range_ordinal=retained_range.range_ordinal,
+        stream_identity_sha256=payload_item.stream_identity_sha256,
+        sequence_ordinal=payload_item.sequence_ordinal,
         resource_type=payload_item.family,
         partition_key_hash=payload_item.partition_metadata_sha256,
         source_partition_ordinal=0,
@@ -856,16 +905,18 @@ def _ordered_zero_stream_fixture(
     return recipe, admission_block, shard, terminal_zeros
 
 
-async def _ordered_zero_stream_context(postgres, campaign_label: str):
-    """Seal and claim one positive plus one terminal-zero-only stream."""
+async def _ordered_fixture_campaign(
+    connection,
+    campaign_label: str,
+    stream_items: _OrderedStreamItems,
+) -> tuple[str, object]:
+    """Initialize and append every item in one ordered retained campaign."""
 
-    connection = postgres.retained_connection
-    stream_items = _ordered_stream_items(campaign_label)
     plan = replace(
         ordered_campaign_plan(campaign_label, stream_items.positive_stream),
-        expected_stream_identities=tuple(sorted(
-            (stream_items.positive_stream, stream_items.zero_stream)
-        )),
+        expected_stream_identities=tuple(
+            sorted((stream_items.positive_stream, stream_items.zero_stream))
+        ),
     ).validate()
     campaign_id = await initialize_retained_artifact_campaign(connection, plan=plan)
     campaign_lease = await acquire_campaign_lease(
@@ -880,6 +931,19 @@ async def _ordered_zero_stream_context(postgres, campaign_label: str):
             campaign_lease=campaign_lease,
             item=retained_item,
         )
+    return campaign_id, campaign_lease
+
+
+async def _ordered_zero_stream_context(postgres, campaign_label: str):
+    """Seal and claim one positive plus one terminal-zero-only stream."""
+
+    connection = postgres.retained_connection
+    stream_items = _ordered_stream_items(campaign_label)
+    campaign_id, campaign_lease = await _ordered_fixture_campaign(
+        connection,
+        campaign_label,
+        stream_items,
+    )
     produced_artifact = registry_artifact(
         f"{campaign_label}-payload",
         stream_items.payload_item.artifact_kind,
@@ -903,7 +967,7 @@ async def _ordered_zero_stream_context(postgres, campaign_label: str):
         zero_terminal=stream_items.zero_terminal,
         produced_artifact=produced_artifact,
     )
-    recipe, admission_block, _shard, terminal_zeros = fixture
+    recipe, admission_block, shard, terminal_zeros = fixture
     consumer_id = projection_admission_consumer_id(
         recipe,
         (admission_block,),
@@ -914,7 +978,493 @@ async def _ordered_zero_stream_context(postgres, campaign_label: str):
         campaign_id=campaign_id,
         consumer_recipe_id=consumer_id,
     )
-    return fixture, claimed_campaign.consumer_claim_generation
+    return _OrderedAdmissionContext(
+        recipe=recipe,
+        admission_block=admission_block,
+        shard=shard,
+        terminal_zeros=terminal_zeros,
+        claim_generation=claimed_campaign.consumer_claim_generation,
+    )
+
+
+def _all_zero_ordered_recipe(
+    campaign_sha256: str,
+    terminal_items: Sequence[RetainedCampaignItem],
+    stream_ordinal_by_identity: Mapping[str, int],
+):
+    """Build a no-input recipe and exact terminal evidence for zero streams."""
+
+    terminal_partitions = tuple(
+        {
+            "resource_type": terminal_item.family,
+            "partition_key_hash": terminal_item.partition_metadata_sha256,
+            "source_partition_ordinal": source_partition_ordinal,
+            "terminal_cursor_hmac": _digest(
+                f"all-zero-cursor:{source_partition_ordinal}"
+            ),
+            "terminal": True,
+            "block_count": 0,
+            "row_count": 0,
+            "byte_count": 0,
+            "zero_row_proof_sha256": terminal_item.terminal_proof_sha256,
+            "retained_stream": _retained_stream_descriptor(
+                terminal_item,
+                stream_ordinal_by_identity[
+                    terminal_item.stream_identity_sha256
+                ],
+            ),
+        }
+        for source_partition_ordinal, terminal_item in enumerate(terminal_items)
+    )
+    completeness = projection_completeness_manifest(
+        endpoint_campaign_hash=campaign_sha256,
+        partition_strategy_contract_id="fixture-all-zero-ordered.v1",
+        selected_resources=(terminal_items[0].family,),
+        required_resources=(terminal_items[0].family,),
+        terminal_partitions=terminal_partitions,
+        complete=True,
+    )
+    return _fixture_projection_recipe(
+        (), terminal_items[0].family, completeness
+    )
+
+
+def _all_zero_terminal_evidence(
+    campaign_id: str,
+    campaign_sha256: str,
+    terminal_items: Sequence[RetainedCampaignItem],
+    stream_ordinal_by_identity: Mapping[str, int],
+):
+    return tuple(
+        projection_admission_terminal_zero(
+            retained_campaign_id=campaign_id,
+            retained_campaign_sha256=campaign_sha256,
+            retained_source_item_id=terminal_item.source_item_id,
+            resource_type=terminal_item.family,
+            partition_key_hash=terminal_item.partition_metadata_sha256,
+            source_partition_ordinal=source_partition_ordinal,
+            retained_stream=_retained_stream_descriptor(
+                terminal_item,
+                stream_ordinal_by_identity[
+                    terminal_item.stream_identity_sha256
+                ],
+            ),
+        )
+        for source_partition_ordinal, terminal_item in enumerate(terminal_items)
+    )
+
+
+def _all_zero_stream_items(
+    campaign_label: str,
+) -> tuple[tuple[str, ...], tuple[RetainedCampaignItem, ...]]:
+    """Build deterministic terminal-only items for two ordered streams."""
+
+    stream_identities = tuple(
+        sorted(_digest(f"{campaign_label}:stream:{ordinal}") for ordinal in range(2))
+    )
+    terminal_items = tuple(
+        _ordered_item(
+            f"{campaign_label}-terminal-{ordinal}",
+            stream_identity=stream_identity,
+            sequence_ordinal=0,
+            item_role=TERMINAL_ZERO,
+            partition_label=f"zero-{ordinal}",
+        )
+        for ordinal, stream_identity in enumerate(stream_identities)
+    )
+    return stream_identities, terminal_items
+
+
+async def _all_zero_ordered_context(postgres, campaign_label: str):
+    """Seal, describe, and claim a campaign containing only terminal-zero items."""
+
+    connection = postgres.retained_connection
+    stream_identities, terminal_items = _all_zero_stream_items(campaign_label)
+    plan = replace(
+        ordered_campaign_plan(campaign_label, stream_identities[0]),
+        expected_stream_identities=stream_identities,
+    ).validate()
+    campaign_id = await initialize_retained_artifact_campaign(connection, plan=plan)
+    campaign_lease = await acquire_campaign_lease(
+        connection,
+        campaign_id=campaign_id,
+        owner=f"projection-{campaign_label}",
+    )
+    for terminal_item in terminal_items:
+        await append_ordered_stream_item(
+            connection,
+            campaign_id=campaign_id,
+            campaign_lease=campaign_lease,
+            item=terminal_item,
+        )
+    sealed_summary = await seal_retained_artifact_campaign(
+        connection,
+        campaign_id=campaign_id,
+        campaign_lease=campaign_lease,
+    )
+    stream_ordinal_by_identity = {
+        stream_identity: stream_ordinal
+        for stream_ordinal, stream_identity in enumerate(stream_identities)
+    }
+    recipe = _all_zero_ordered_recipe(
+        sealed_summary["campaign_sha256"],
+        terminal_items,
+        stream_ordinal_by_identity,
+    )
+    terminal_zeros = _all_zero_terminal_evidence(
+        campaign_id,
+        sealed_summary["campaign_sha256"],
+        terminal_items,
+        stream_ordinal_by_identity,
+    )
+    consumer_id = projection_admission_consumer_id(
+        recipe,
+        (),
+        terminal_zeros=terminal_zeros,
+    )
+    claimed_campaign = await claim_sealed_retained_campaign(
+        connection,
+        campaign_id=campaign_id,
+        consumer_recipe_id=consumer_id,
+    )
+    return _AllZeroAdmissionContext(
+        recipe=recipe,
+        terminal_zeros=terminal_zeros,
+        claim_generation=claimed_campaign.consumer_claim_generation,
+    )
+
+
+async def _register_ordered_workset(
+    postgres,
+    context: _OrderedAdmissionContext,
+) -> None:
+    """Register the physical half of an ordered admission fixture."""
+
+    projection_claim = await claim_projection_recipe(
+        context.recipe,
+        database=postgres.database,
+        schema=postgres.schema,
+    )
+    assert projection_claim.lease is not None
+    await register_projection_workset(
+        projection_claim.lease,
+        (context.admission_block.block,),
+        (context.shard,),
+        database=postgres.database,
+        schema=postgres.schema,
+    )
+
+
+def _rebound_ordered_payload(
+    context: _OrderedAdmissionContext,
+    stream_identity_sha256: str,
+    sequence_ordinal: int,
+) -> ProjectionAdmissionInputBlock:
+    """Rebind one retained payload to a deliberately supplied stream coordinate."""
+
+    admission_block = context.admission_block
+    return projection_admission_input_block(
+        admission_block.block,
+        retained_campaign_id=admission_block.retained_campaign_id,
+        retained_campaign_sha256=admission_block.retained_campaign_sha256,
+        retained_source_item_id=admission_block.retained_source_item_id,
+        retained_range_ordinal=admission_block.retained_range_ordinal,
+        stream_identity_sha256=stream_identity_sha256,
+        sequence_ordinal=sequence_ordinal,
+        resource_type=admission_block.resource_type,
+        partition_key_hash=admission_block.partition_key_hash,
+        source_partition_ordinal=admission_block.source_partition_ordinal,
+    )
+
+
+def _forged_ordered_payloads(
+    context: _OrderedAdmissionContext,
+) -> tuple[ProjectionAdmissionInputBlock, ProjectionAdmissionInputBlock]:
+    """Return wrong-stream and fabricated-sequence variants of one payload."""
+
+    return (
+        _rebound_ordered_payload(
+            context,
+            context.terminal_zeros[1].stream_identity_sha256,
+            context.admission_block.sequence_ordinal,
+        ),
+        _rebound_ordered_payload(
+            context,
+            context.admission_block.stream_identity_sha256,
+            context.admission_block.sequence_ordinal + 100,
+        ),
+    )
+
+
+async def _assert_forged_mapping_rejected(
+    postgres,
+    monkeypatch,
+    context: _OrderedAdmissionContext,
+    forged_binding: ProjectionAdmissionInputBlock,
+    insert_mappings,
+) -> None:
+    """Replace one persisted mapping and require the SQL fence to reject it."""
+
+    async def insert_forged_mapping(database, schema, mappings):
+        forged_mapping = dict(mappings[0])
+        forged_mapping.update(
+            binding_id=forged_binding.binding_id,
+            stream_identity_sha256=forged_binding.stream_identity_sha256,
+            sequence_ordinal=forged_binding.sequence_ordinal,
+        )
+        await insert_mappings(database, schema, (forged_mapping,))
+
+    monkeypatch.setattr(
+        projection_admission_store,
+        "_insert_admission_mappings",
+        insert_forged_mapping,
+    )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_admission_map_unfenced",
+    ):
+        await register_projection_admission(
+            context.recipe,
+            (context.admission_block,),
+            (context.shard,),
+            claim_generation=context.claim_generation,
+            terminal_zeros=context.terminal_zeros,
+            database=postgres.database,
+            schema=postgres.schema,
+        )
+
+
+async def _register_ordered_admission(
+    postgres,
+    context: _OrderedAdmissionContext,
+) -> str:
+    """Register one untampered ordered admission fixture."""
+
+    return await register_projection_admission(
+        context.recipe,
+        (context.admission_block,),
+        (context.shard,),
+        claim_generation=context.claim_generation,
+        terminal_zeros=context.terminal_zeros,
+        database=postgres.database,
+        schema=postgres.schema,
+    )
+
+
+async def _stored_payload_coordinate(postgres, admission_id: str) -> tuple[str, int]:
+    """Read the stream identity and sequence fenced for one payload mapping."""
+
+    stored_coordinate = await postgres.database.first(
+        f"""
+        SELECT stream_identity_sha256, sequence_ordinal
+          FROM "{postgres.schema}".
+               provider_directory_projection_admission_input_block
+         WHERE admission_id = :admission_id;
+        """,
+        admission_id=admission_id,
+    )
+    return tuple(stored_coordinate)
+
+
+async def _register_all_zero_admission(
+    postgres,
+    context: _AllZeroAdmissionContext,
+) -> str:
+    """Register an exact no-input admission from terminal-only streams."""
+
+    return await register_projection_admission(
+        context.recipe,
+        (),
+        (),
+        claim_generation=context.claim_generation,
+        terminal_zeros=context.terminal_zeros,
+        database=postgres.database,
+        schema=postgres.schema,
+    )
+
+
+async def _assert_mixed_no_input_descriptor_rejected(
+    postgres,
+    monkeypatch,
+    context: _AllZeroAdmissionContext,
+    identity,
+) -> None:
+    """Require SQL to reject a no-input manifest missing one stream descriptor."""
+
+    insert_admission = projection_admission_store._insert_admission
+    mixed_manifest = copy.deepcopy(dict(identity.completeness_manifest))
+    mixed_manifest["terminal_partitions"][1].pop("retained_stream")
+    mixed_descriptor_identity = replace(
+        identity,
+        completeness_manifest=mixed_manifest,
+    )
+
+    async def insert_mixed_descriptor_admission(
+        database,
+        table,
+        _identity,
+        lease_token,
+        lease_seconds,
+    ):
+        await insert_admission(
+            database,
+            table,
+            mixed_descriptor_identity,
+            lease_token,
+            lease_seconds,
+        )
+
+    monkeypatch.setattr(
+        projection_admission_store,
+        "_insert_admission",
+        insert_mixed_descriptor_admission,
+    )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_admission_insert_invalid",
+    ):
+        await _register_all_zero_admission(postgres, context)
+    monkeypatch.setattr(
+        projection_admission_store,
+        "_insert_admission",
+        insert_admission,
+    )
+
+
+async def _assert_incomplete_no_input_streams_rejected(
+    postgres,
+    monkeypatch,
+    context: _AllZeroAdmissionContext,
+) -> None:
+    """Require SQL to reject a no-input admission missing one terminal stream."""
+
+    insert_streams = projection_admission_store._insert_admission_streams
+
+    async def insert_incomplete_streams(database, schema, streams):
+        await insert_streams(database, schema, streams[:-1])
+
+    monkeypatch.setattr(
+        projection_admission_store,
+        "_insert_admission_streams",
+        insert_incomplete_streams,
+    )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_admission_transition_invalid",
+    ):
+        await _register_all_zero_admission(postgres, context)
+    monkeypatch.setattr(
+        projection_admission_store,
+        "_insert_admission_streams",
+        insert_streams,
+    )
+
+
+async def _assert_stored_no_input_outcome(
+    postgres,
+    context: _AllZeroAdmissionContext,
+    admission_id: str,
+) -> None:
+    """Verify the sealed outcome and absence of all physical recipe rows."""
+
+    stored_outcome = await postgres.database.first(
+        f"""
+        SELECT status, outcome_kind, recipe_id, planned_recipe_id,
+               input_block_count, stream_count
+          FROM "{postgres.schema}".
+               provider_directory_projection_admission
+         WHERE admission_id = :admission_id;
+        """,
+        admission_id=admission_id,
+    )
+    assert tuple(stored_outcome) == (
+        "sealed",
+        "no_input",
+        None,
+        context.recipe.recipe_id,
+        0,
+        2,
+    )
+    physical_work_count = await postgres.database.scalar(
+        f"""
+        SELECT
+            (SELECT count(*) FROM "{postgres.schema}".
+                provider_directory_projection_recipe
+             WHERE recipe_id = :recipe_id)
+          + (SELECT count(*) FROM "{postgres.schema}".
+                provider_directory_projection_input_block
+             WHERE recipe_id = :recipe_id)
+          + (SELECT count(*) FROM "{postgres.schema}".
+                provider_directory_projection_proof_shard
+             WHERE recipe_id = :recipe_id);
+        """,
+        recipe_id=context.recipe.recipe_id,
+    )
+    assert physical_work_count == 0
+
+
+async def _assert_no_input_recipe_guards(
+    postgres,
+    context: _AllZeroAdmissionContext,
+) -> None:
+    """Verify physical claiming and migration downgrade both fail closed."""
+
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_no_input_recipe_conflict",
+    ):
+        await claim_projection_recipe(
+            context.recipe,
+            database=postgres.database,
+            schema=postgres.schema,
+        )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_downgrade_has_live_state",
+    ):
+        await postgres.downgrade()
+
+
+def _forged_all_zero_recipe(
+    terminal_zeros: Sequence[ProjectionAdmissionTerminalZero],
+) -> ProjectionRecipeIdentity:
+    """Describe an all-zero recipe over a campaign that retained a payload."""
+
+    terminal_partitions = tuple(
+        {
+            "resource_type": terminal.resource_type,
+            "partition_key_hash": terminal.partition_key_hash,
+            "source_partition_ordinal": terminal.source_partition_ordinal,
+            "terminal_cursor_hmac": _digest(
+                f"zero-forged-cursor:{terminal.source_partition_ordinal}"
+            ),
+            "terminal": True,
+            "block_count": 0,
+            "row_count": 0,
+            "byte_count": 0,
+            "zero_row_proof_sha256": terminal.terminal_proof_sha256,
+            "retained_stream": {
+                "identity_sha256": terminal.stream_identity_sha256,
+                "stream_ordinal": terminal.stream_ordinal,
+                "terminal_sequence_ordinal": terminal.terminal_sequence_ordinal,
+                "terminal_proof_sha256": terminal.terminal_proof_sha256,
+            },
+        }
+        for terminal in terminal_zeros
+    )
+    completeness = projection_completeness_manifest(
+        endpoint_campaign_hash=terminal_zeros[0].retained_campaign_sha256,
+        partition_strategy_contract_id="fixture-forged-all-zero.v1",
+        selected_resources=(terminal_zeros[0].resource_type,),
+        required_resources=(terminal_zeros[0].resource_type,),
+        terminal_partitions=terminal_partitions,
+        complete=True,
+    )
+    return _fixture_projection_recipe(
+        (),
+        terminal_zeros[0].resource_type,
+        completeness,
+    )
 
 
 async def _sealed_retained_binding(
@@ -974,6 +1524,8 @@ async def _sealed_retained_binding(
                 consumer_claim_generation=1,
                 family=retained_item.family,
                 partition_metadata_sha256=retained_item.partition_metadata_sha256,
+                stream_identity_sha256=retained_item.stream_identity_sha256,
+                sequence_ordinal=retained_item.sequence_ordinal,
             )
         )
     claimed_campaign = await claim_sealed_retained_campaign(
@@ -988,6 +1540,8 @@ async def _sealed_retained_binding(
         consumer_claim_generation=claimed_campaign.consumer_claim_generation,
         family=retained_item.family,
         partition_metadata_sha256=retained_item.partition_metadata_sha256,
+        stream_identity_sha256=retained_item.stream_identity_sha256,
+        sequence_ordinal=retained_item.sequence_ordinal,
     )
 
 
@@ -1963,28 +2517,11 @@ async def test_admission_seals_zero_stream_and_rejects_terminal_omission(
 
     async with projection_foundation_postgres(monkeypatch) as postgres:
         await postgres.upgrade()
-        (
-            recipe,
-            admission_block,
-            shard,
-            terminal_zeros,
-        ), claim_generation = await _ordered_zero_stream_context(
+        context = await _ordered_zero_stream_context(
             postgres,
             "ordered-zero-stream",
         )
-        projection_claim = await claim_projection_recipe(
-            recipe,
-            database=postgres.database,
-            schema=postgres.schema,
-        )
-        assert projection_claim.lease is not None
-        await register_projection_workset(
-            projection_claim.lease,
-            (admission_block.block,),
-            (shard,),
-            database=postgres.database,
-            schema=postgres.schema,
-        )
+        await _register_ordered_workset(postgres, context)
         insert_streams = projection_admission_store._insert_admission_streams
 
         async def insert_incomplete_streams(database, schema, streams):
@@ -1999,29 +2536,13 @@ async def test_admission_seals_zero_stream_and_rejects_terminal_omission(
             DBAPIError,
             match="provider_directory_projection_admission_transition_invalid",
         ):
-            await register_projection_admission(
-                recipe,
-                (admission_block,),
-                (shard,),
-                claim_generation=claim_generation,
-                terminal_zeros=terminal_zeros,
-                database=postgres.database,
-                schema=postgres.schema,
-            )
+            await _register_ordered_admission(postgres, context)
         monkeypatch.setattr(
             projection_admission_store,
             "_insert_admission_streams",
             insert_streams,
         )
-        admission_id = await register_projection_admission(
-            recipe,
-            (admission_block,),
-            (shard,),
-            claim_generation=claim_generation,
-            terminal_zeros=terminal_zeros,
-            database=postgres.database,
-            schema=postgres.schema,
-        )
+        admission_id = await _register_ordered_admission(postgres, context)
         stored_counts = await postgres.database.first(
             f"""
             SELECT admission.binding_count, admission.stream_count,
@@ -2040,6 +2561,122 @@ async def test_admission_seals_zero_stream_and_rejects_terminal_omission(
             admission_id=admission_id,
         )
         assert tuple(stored_counts) == (3, 2, 2, 1)
+
+
+@pytest.mark.asyncio
+async def test_ordered_payload_mapping_rejects_forged_stream_coordinates(
+    monkeypatch,
+) -> None:
+    """SQL rechecks stream identity and sequence after binding recomputation."""
+
+    async with projection_foundation_postgres(monkeypatch) as postgres:
+        await postgres.upgrade()
+        context = await _ordered_zero_stream_context(
+            postgres,
+            "ordered-swapped-payload",
+        )
+        await _register_ordered_workset(postgres, context)
+        insert_mappings = projection_admission_store._insert_admission_mappings
+        for forged_binding in _forged_ordered_payloads(context):
+            await _assert_forged_mapping_rejected(
+                postgres,
+                monkeypatch,
+                context,
+                forged_binding,
+                insert_mappings,
+            )
+        monkeypatch.setattr(
+            projection_admission_store,
+            "_insert_admission_mappings",
+            insert_mappings,
+        )
+        admission_id = await _register_ordered_admission(postgres, context)
+        assert await _stored_payload_coordinate(postgres, admission_id) == (
+            context.admission_block.stream_identity_sha256,
+            context.admission_block.sequence_ordinal,
+        )
+
+
+@pytest.mark.asyncio
+async def test_all_zero_ordered_admission_seals_without_physical_recipe(
+    monkeypatch,
+) -> None:
+    """An exact all-zero campaign seals before and excludes recipe claiming."""
+
+    async with projection_foundation_postgres(monkeypatch) as postgres:
+        await postgres.upgrade()
+        context = await _all_zero_ordered_context(postgres, "all-zero-ordered")
+        identity = projection_admission_identity(
+            context.recipe,
+            (),
+            claim_generation=context.claim_generation,
+            terminal_zeros=context.terminal_zeros,
+        )
+        assert identity.outcome_kind == "no_input"
+        assert identity.recipe_id is None
+        await _assert_mixed_no_input_descriptor_rejected(
+            postgres,
+            monkeypatch,
+            context,
+            identity,
+        )
+        await _assert_incomplete_no_input_streams_rejected(
+            postgres,
+            monkeypatch,
+            context,
+        )
+        admission_id = await _register_all_zero_admission(postgres, context)
+        await _assert_stored_no_input_outcome(postgres, context, admission_id)
+        await _assert_no_input_recipe_guards(postgres, context)
+
+
+@pytest.mark.asyncio
+async def test_no_input_admission_rejects_retained_positive_payload(
+    monkeypatch,
+) -> None:
+    """A zero manifest cannot hide an admitted payload item in its campaign."""
+
+    async with projection_foundation_postgres(monkeypatch) as postgres:
+        await postgres.upgrade()
+        context = await _ordered_zero_stream_context(
+            postgres,
+            "zero-manifest-positive-payload",
+        )
+        terminal_zeros = context.terminal_zeros
+        recipe = _forged_all_zero_recipe(terminal_zeros)
+        consumer_id = projection_admission_consumer_id(
+            recipe,
+            (),
+            terminal_zeros=terminal_zeros,
+        )
+        claimed_campaign = await claim_sealed_retained_campaign(
+            postgres.retained_connection,
+            campaign_id=terminal_zeros[0].retained_campaign_id,
+            consumer_recipe_id=consumer_id,
+        )
+
+        with pytest.raises(
+            DBAPIError,
+            match="provider_directory_projection_admission_transition_invalid",
+        ):
+            await register_projection_admission(
+                recipe,
+                (),
+                (),
+                claim_generation=claimed_campaign.consumer_claim_generation,
+                terminal_zeros=terminal_zeros,
+                database=postgres.database,
+                schema=postgres.schema,
+            )
+        assert await postgres.database.scalar(
+            f"""
+            SELECT count(*)
+              FROM "{postgres.schema}".
+                   provider_directory_projection_admission
+             WHERE planned_recipe_id = :planned_recipe_id;
+            """,
+            planned_recipe_id=recipe.recipe_id,
+        ) == 0
 
 
 @pytest.mark.asyncio

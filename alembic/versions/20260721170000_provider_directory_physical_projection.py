@@ -122,7 +122,8 @@ _CHECKS_BY_TABLE = {
     "provider_directory_projection_admission": {
         "pd_projection_admission_digest_check": (
             "admission_id ~ '^[0-9a-f]{64}$' "
-            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND planned_recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND (recipe_id IS NULL OR recipe_id ~ '^[0-9a-f]{64}$') "
             "AND source_scope_hash ~ '^[0-9a-f]{64}$' "
             "AND completeness_manifest_hash ~ '^[0-9a-f]{64}$' "
             "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
@@ -145,10 +146,15 @@ _CHECKS_BY_TABLE = {
             "AND completeness_manifest_json -> 'complete' = 'true'::jsonb"
         ),
         "pd_projection_admission_state_check": (
-            "acquisition_adapter_id <> '' "
+            "outcome_kind IN ('physical_workset', 'no_input') "
+            "AND acquisition_adapter_id <> '' "
             "AND retained_consumer_recipe_id <> '' "
             "AND claim_generation > 0 AND input_block_count >= 0 "
             "AND binding_count > 0 AND stream_count >= 0 "
+            "AND ((outcome_kind = 'physical_workset' "
+            "AND recipe_id = planned_recipe_id AND input_block_count > 0) "
+            "OR (outcome_kind = 'no_input' AND recipe_id IS NULL "
+            "AND input_block_count = 0 AND stream_count > 0)) "
             "AND attempt > 0 AND status IN ('building', 'sealed', 'released') "
             "AND ((status = 'building' AND lease_token IS NOT NULL "
             "AND lease_expires_at IS NOT NULL "
@@ -172,11 +178,13 @@ _CHECKS_BY_TABLE = {
             "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
             "AND retained_artifact_sha256 ~ '^[0-9a-f]{64}$' "
             "AND retained_layout_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND stream_identity_sha256 ~ '^[0-9a-f]{64}$' "
             "AND partition_key_hash ~ '^[0-9a-f]{64}$'"
         ),
         "pd_projection_admission_block_values_check": (
             "retained_consumer_recipe_id <> '' "
             "AND claim_generation > 0 "
+            "AND sequence_ordinal >= 0 "
             "AND resource_type <> '' AND source_partition_ordinal >= 0 "
             "AND (retained_range_ordinal IS NULL "
             "OR retained_range_ordinal >= 0)"
@@ -185,7 +193,7 @@ _CHECKS_BY_TABLE = {
     "provider_directory_projection_admission_stream": {
         "pd_projection_admission_stream_digest_check": (
             "admission_id ~ '^[0-9a-f]{64}$' "
-            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND (recipe_id IS NULL OR recipe_id ~ '^[0-9a-f]{64}$') "
             "AND binding_id ~ '^[0-9a-f]{64}$' "
             "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
             "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
@@ -1018,7 +1026,9 @@ def _create_tables(schema: str) -> None:
         op,
         "provider_directory_projection_admission",
         sa.Column("admission_id", sa.String(length=64), nullable=False),
-        sa.Column("recipe_id", sa.String(length=64), nullable=False),
+        sa.Column("planned_recipe_id", sa.String(length=64), nullable=False),
+        sa.Column("recipe_id", sa.String(length=64), nullable=True),
+        sa.Column("outcome_kind", sa.String(length=32), nullable=False),
         sa.Column("acquisition_adapter_id", sa.String(length=128), nullable=False),
         sa.Column("source_scope_hash", sa.String(length=64), nullable=False),
         sa.Column("source_ids_json", postgresql.JSONB(), nullable=False),
@@ -1049,7 +1059,8 @@ def _create_tables(schema: str) -> None:
         _timestamp("released_at", nullable=True),
         sa.CheckConstraint(
             "admission_id ~ '^[0-9a-f]{64}$' "
-            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND planned_recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND (recipe_id IS NULL OR recipe_id ~ '^[0-9a-f]{64}$') "
             "AND source_scope_hash ~ '^[0-9a-f]{64}$' "
             "AND completeness_manifest_hash ~ '^[0-9a-f]{64}$' "
             "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
@@ -1074,10 +1085,15 @@ def _create_tables(schema: str) -> None:
             name="pd_projection_admission_json_check",
         ),
         sa.CheckConstraint(
-            "acquisition_adapter_id <> '' "
+            "outcome_kind IN ('physical_workset', 'no_input') "
+            "AND acquisition_adapter_id <> '' "
             "AND retained_consumer_recipe_id <> '' "
             "AND claim_generation > 0 AND input_block_count >= 0 "
             "AND binding_count > 0 AND stream_count >= 0 "
+            "AND ((outcome_kind = 'physical_workset' "
+            "AND recipe_id = planned_recipe_id AND input_block_count > 0) "
+            "OR (outcome_kind = 'no_input' AND recipe_id IS NULL "
+            "AND input_block_count = 0 AND stream_count > 0)) "
             "AND attempt > 0 AND status IN ('building', 'sealed', 'released') "
             "AND ((status = 'building' AND lease_token IS NOT NULL "
             "AND lease_expires_at IS NOT NULL "
@@ -1129,6 +1145,13 @@ def _create_tables(schema: str) -> None:
     )
     create_index_if_missing(
         op,
+        "pd_projection_admission_planned_recipe_idx",
+        "provider_directory_projection_admission",
+        ["planned_recipe_id", "outcome_kind", "status"],
+        schema=schema,
+    )
+    create_index_if_missing(
+        op,
         "pd_projection_admission_lease_idx",
         "provider_directory_projection_admission",
         ["status", "lease_expires_at"],
@@ -1152,6 +1175,8 @@ def _create_tables(schema: str) -> None:
         sa.Column("retained_artifact_sha256", sa.String(length=64), nullable=False),
         sa.Column("retained_layout_sha256", sa.String(length=64), nullable=False),
         sa.Column("retained_range_ordinal", sa.Integer(), nullable=True),
+        sa.Column("stream_identity_sha256", sa.String(length=64), nullable=False),
+        sa.Column("sequence_ordinal", sa.Integer(), nullable=False),
         sa.Column("claim_generation", sa.BigInteger(), nullable=False),
         sa.Column("resource_type", sa.String(length=64), nullable=False),
         sa.Column("partition_key_hash", sa.String(length=64), nullable=False),
@@ -1166,12 +1191,14 @@ def _create_tables(schema: str) -> None:
             "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
             "AND retained_artifact_sha256 ~ '^[0-9a-f]{64}$' "
             "AND retained_layout_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND stream_identity_sha256 ~ '^[0-9a-f]{64}$' "
             "AND partition_key_hash ~ '^[0-9a-f]{64}$'",
             name="pd_projection_admission_block_digest_check",
         ),
         sa.CheckConstraint(
             "retained_consumer_recipe_id <> '' "
             "AND claim_generation > 0 "
+            "AND sequence_ordinal >= 0 "
             "AND resource_type <> '' AND source_partition_ordinal >= 0 "
             "AND (retained_range_ordinal IS NULL "
             "OR retained_range_ordinal >= 0)",
@@ -1215,6 +1242,19 @@ def _create_tables(schema: str) -> None:
             name="pd_projection_admission_block_item_fkey",
         ),
         sa.ForeignKeyConstraint(
+            [
+                "retained_campaign_id",
+                "stream_identity_sha256",
+                "sequence_ordinal",
+            ],
+            [
+                f"{schema}.provider_directory_retained_artifact_campaign_item.campaign_id",
+                f"{schema}.provider_directory_retained_artifact_campaign_item.stream_identity_sha256",
+                f"{schema}.provider_directory_retained_artifact_campaign_item.sequence_ordinal",
+            ],
+            name="pd_projection_admission_block_stream_item_fkey",
+        ),
+        sa.ForeignKeyConstraint(
             ["retained_artifact_sha256"],
             [f"{schema}.provider_directory_retained_artifact.artifact_sha256"],
             name="pd_projection_admission_block_artifact_fkey",
@@ -1247,7 +1287,7 @@ def _create_tables(schema: str) -> None:
         op,
         "provider_directory_projection_admission_stream",
         sa.Column("admission_id", sa.String(length=64), nullable=False),
-        sa.Column("recipe_id", sa.String(length=64), nullable=False),
+        sa.Column("recipe_id", sa.String(length=64), nullable=True),
         sa.Column("binding_id", sa.String(length=64), nullable=False),
         sa.Column("retained_campaign_id", sa.String(length=64), nullable=False),
         sa.Column("retained_source_item_id", sa.String(length=64), nullable=False),
@@ -1262,7 +1302,7 @@ def _create_tables(schema: str) -> None:
         _timestamp("created_at"),
         sa.CheckConstraint(
             "admission_id ~ '^[0-9a-f]{64}$' "
-            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND (recipe_id IS NULL OR recipe_id ~ '^[0-9a-f]{64}$') "
             "AND binding_id ~ '^[0-9a-f]{64}$' "
             "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
             "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
@@ -1278,10 +1318,9 @@ def _create_tables(schema: str) -> None:
             name="pd_projection_admission_stream_values_check",
         ),
         sa.ForeignKeyConstraint(
-            ["admission_id", "recipe_id"],
+            ["admission_id"],
             [
                 f"{schema}.provider_directory_projection_admission.admission_id",
-                f"{schema}.provider_directory_projection_admission.recipe_id",
             ],
             name="pd_projection_admission_stream_admission_fkey",
         ),
@@ -2925,6 +2964,8 @@ def _create_fences(schema: str) -> None:
             candidate_artifact_sha256 text,
             candidate_layout_sha256 text,
             candidate_range_ordinal integer,
+            candidate_stream_identity_sha256 text,
+            candidate_sequence_ordinal integer,
             candidate_resource_type text,
             candidate_partition_key_hash text,
             candidate_source_partition_ordinal integer
@@ -2932,7 +2973,7 @@ def _create_fences(schema: str) -> None:
             SELECT encode(
                 sha256(
                     convert_to(
-                        'provider-directory-projection-admission-input-binding-v1',
+                        'provider-directory-projection-admission-input-binding-v2',
                         'UTF8'
                     )
                     || decode('00', 'hex')
@@ -2943,6 +2984,8 @@ def _create_fences(schema: str) -> None:
                         candidate_artifact_sha256 || '|' ||
                         candidate_layout_sha256 || '|' ||
                         COALESCE(candidate_range_ordinal::text, '~') || '|' ||
+                        candidate_stream_identity_sha256 || '|' ||
+                        candidate_sequence_ordinal::text || '|' ||
                         candidate_resource_type || '|' ||
                         candidate_partition_key_hash || '|' ||
                         candidate_source_partition_ordinal::text,
@@ -2996,7 +3039,7 @@ def _create_fences(schema: str) -> None:
             SELECT encode(
                 sha256(
                     convert_to(
-                        'provider-directory-projection-admission-binding-set-v3',
+                        'provider-directory-projection-admission-binding-set-v4',
                         'UTF8'
                     )
                     || decode('00', 'hex')
@@ -3073,6 +3116,8 @@ def _create_fences(schema: str) -> None:
             candidate_artifact_sha256 text,
             candidate_layout_sha256 text,
             candidate_range_ordinal integer,
+            candidate_stream_identity_sha256 text,
+            candidate_sequence_ordinal integer,
             candidate_claim_generation bigint,
             candidate_resource_type text,
             candidate_partition_key_hash text,
@@ -3124,7 +3169,8 @@ def _create_fences(schema: str) -> None:
                     ON retained_range.layout_sha256 = layout.layout_sha256
                    AND retained_range.range_ordinal = candidate_range_ordinal
                  WHERE admission.admission_id = candidate_admission_id
-                   AND admission.recipe_id = candidate_recipe_id
+                   AND admission.recipe_id IS NOT DISTINCT FROM
+                       candidate_recipe_id
                    AND candidate_binding_id = {quoted_schema}.
                        provider_directory_projection_admission_input_binding_id(
                            candidate_block_id,
@@ -3133,6 +3179,8 @@ def _create_fences(schema: str) -> None:
                            candidate_artifact_sha256,
                            candidate_layout_sha256,
                            candidate_range_ordinal,
+                           candidate_stream_identity_sha256,
+                           candidate_sequence_ordinal,
                            candidate_resource_type,
                            candidate_partition_key_hash,
                            candidate_source_partition_ordinal
@@ -3160,6 +3208,9 @@ def _create_fences(schema: str) -> None:
                    AND campaign.complete
                    AND campaign.campaign_sha256 =
                        admission.retained_campaign_sha256
+                   AND admission.completeness_manifest_json ->>
+                       'endpoint_campaign_hash' =
+                       admission.retained_campaign_sha256
                    AND campaign.released_at IS NULL
                    AND consumer.claimed_campaign_sha256 =
                        admission.retained_campaign_sha256
@@ -3180,6 +3231,10 @@ def _create_fences(schema: str) -> None:
                    AND campaign_item.family = candidate_resource_type
                    AND campaign_item.partition_metadata_sha256 =
                        candidate_partition_key_hash
+                   AND campaign_item.stream_identity_sha256 =
+                       candidate_stream_identity_sha256
+                   AND campaign_item.sequence_ordinal =
+                       candidate_sequence_ordinal
                    AND artifact.registry_status = 'verified'
                    AND artifact.released_at IS NULL
                    AND layout.registry_status = 'verified'
@@ -3187,6 +3242,55 @@ def _create_fences(schema: str) -> None:
                    AND core_block.upstream_artifact_id =
                        candidate_artifact_sha256
                    AND core_block.source_object_id = candidate_layout_sha256
+                   AND (
+                        campaign.census_mode = 'fixed_catalog'
+                        OR (
+                            campaign.census_mode = 'ordered_streams'
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM {quoted_schema}.
+                                       provider_directory_retained_artifact_campaign_stream
+                                       AS payload_stream
+                                 WHERE payload_stream.campaign_id =
+                                       candidate_campaign_id
+                                   AND payload_stream.stream_identity_sha256 =
+                                       candidate_stream_identity_sha256
+                                   AND payload_stream.complete
+                                   AND payload_stream.completed_at IS NOT NULL
+                                   AND candidate_sequence_ordinal <
+                                       payload_stream.terminal_sequence_ordinal
+                            )
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM jsonb_array_elements(
+                                      admission.completeness_manifest_json ->
+                                          'terminal_partitions'
+                                  ) AS ordered_terminal
+                                 WHERE ordered_terminal ->> 'resource_type' =
+                                       candidate_resource_type
+                                   AND ordered_terminal ->>
+                                       'partition_key_hash' =
+                                       candidate_partition_key_hash
+                                   AND (
+                                       ordered_terminal ->>
+                                           'source_partition_ordinal'
+                                   )::integer =
+                                       candidate_source_partition_ordinal
+                                   AND jsonb_typeof(
+                                       ordered_terminal -> 'retained_stream'
+                                   ) = 'object'
+                                   AND ordered_terminal ->
+                                       'retained_stream' ->>
+                                       'identity_sha256' =
+                                       candidate_stream_identity_sha256
+                                   AND candidate_sequence_ordinal < (
+                                       ordered_terminal ->
+                                           'retained_stream' ->>
+                                           'terminal_sequence_ordinal'
+                                   )::integer
+                            )
+                        )
+                   )
                    AND (
                         (
                             candidate_range_ordinal IS NULL
@@ -3261,7 +3365,8 @@ def _create_fences(schema: str) -> None:
                     ON terminal_item.campaign_id = campaign.campaign_id
                    AND terminal_item.source_item_id = candidate_source_item_id
                  WHERE admission.admission_id = candidate_admission_id
-                   AND admission.recipe_id = candidate_recipe_id
+                   AND admission.recipe_id IS NOT DISTINCT FROM
+                       candidate_recipe_id
                    AND candidate_binding_id = {quoted_schema}.
                        provider_directory_projection_admission_terminal_binding_id(
                            candidate_campaign_id,
@@ -3446,7 +3551,71 @@ def _create_fences(schema: str) -> None:
             SELECT COALESCE(bool_and(scope_exact), false)
               FROM (
                 SELECT
-                    admission.input_block_count = (
+                    (
+                        (
+                            admission.outcome_kind = 'physical_workset'
+                            AND admission.recipe_id =
+                                admission.planned_recipe_id
+                            AND admission.input_block_count > 0
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM {quoted_schema}.
+                                       provider_directory_projection_recipe
+                                       AS physical_recipe
+                                 WHERE physical_recipe.recipe_id =
+                                       admission.recipe_id
+                                   AND physical_recipe.workset_registered_at
+                                       IS NOT NULL
+                                   AND physical_recipe.input_block_set_sha256 =
+                                       admission.input_block_set_sha256
+                                   AND physical_recipe.input_block_count =
+                                       admission.input_block_count
+                                   AND physical_recipe.selected_resources_json =
+                                       admission.completeness_manifest_json ->
+                                           'selected_resources'
+                                   AND physical_recipe.required_resources_json =
+                                       admission.completeness_manifest_json ->
+                                           'required_resources'
+                            )
+                        )
+                        OR (
+                            admission.outcome_kind = 'no_input'
+                            AND admission.recipe_id IS NULL
+                            AND admission.input_block_count = 0
+                            AND admission.census_mode = 'ordered_streams'
+                            AND (
+                                admission.completeness_manifest_json ->>
+                                    'block_count'
+                            )::bigint = 0
+                            AND (
+                                admission.completeness_manifest_json ->>
+                                    'row_count'
+                            )::bigint = 0
+                            AND (
+                                admission.completeness_manifest_json ->>
+                                    'byte_count'
+                            )::bigint = 0
+                            AND NOT EXISTS (
+                                SELECT 1
+                                  FROM {quoted_schema}.
+                                       provider_directory_projection_recipe
+                                 WHERE recipe_id = admission.planned_recipe_id
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                  FROM {quoted_schema}.
+                                       provider_directory_projection_input_block
+                                 WHERE recipe_id = admission.planned_recipe_id
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                  FROM {quoted_schema}.
+                                       provider_directory_projection_proof_shard
+                                 WHERE recipe_id = admission.planned_recipe_id
+                            )
+                        )
+                    )
+                    AND admission.input_block_count = (
                         SELECT count(*)
                           FROM {quoted_schema}.
                                provider_directory_projection_input_block
@@ -3480,7 +3649,21 @@ def _create_fences(schema: str) -> None:
                         OR
                         (admission.census_mode = 'ordered_streams'
                          AND admission.stream_count =
-                             admission.expected_stream_count)
+                             admission.expected_stream_count
+                         AND admission.expected_stream_count = (
+                             admission.completeness_manifest_json ->>
+                                 'partition_count'
+                         )::integer
+                         AND NOT EXISTS (
+                             SELECT 1
+                               FROM jsonb_array_elements(
+                                   admission.completeness_manifest_json ->
+                                       'terminal_partitions'
+                               ) AS ordered_terminal
+                              WHERE jsonb_typeof(
+                                  ordered_terminal -> 'retained_stream'
+                              ) IS DISTINCT FROM 'object'
+                         ))
                     )
                     AND admission.expected_item_count = (
                         SELECT count(*)
@@ -3589,6 +3772,8 @@ def _create_fences(schema: str) -> None:
                                    mapping.retained_artifact_sha256,
                                    mapping.retained_layout_sha256,
                                    mapping.retained_range_ordinal,
+                                   mapping.stream_identity_sha256,
+                                   mapping.sequence_ordinal,
                                    mapping.claim_generation,
                                    mapping.resource_type,
                                    mapping.partition_key_hash,
@@ -3977,14 +4162,20 @@ def _create_fences(schema: str) -> None:
         BEGIN
             IF TG_OP = 'INSERT'
                AND action_setting = 'admission_map'
+               AND recipe_id_setting = (
+                    SELECT planned_recipe_id
+                      FROM {quoted_schema}.
+                           provider_directory_projection_admission
+                     WHERE admission_id = NEW.admission_id
+               )
                AND admission_id_setting = NEW.admission_id
                AND admission_attempt_setting ~ '^[1-9][0-9]*$'
                AND admission_lease_setting ~ '^[0-9a-f]{{64}}$'
                AND EXISTS (
                     SELECT 1
-                      FROM {quoted_schema}.provider_directory_projection_admission
+                     FROM {quoted_schema}.provider_directory_projection_admission
                      WHERE admission_id = NEW.admission_id
-                       AND recipe_id = NEW.recipe_id
+                       AND recipe_id IS NOT DISTINCT FROM NEW.recipe_id
                        AND attempt = admission_attempt_setting::integer
                        AND status = 'building'
                        AND lease_token = admission_lease_setting
@@ -4007,6 +4198,8 @@ def _create_fences(schema: str) -> None:
                        NEW.retained_artifact_sha256,
                        NEW.retained_layout_sha256,
                        NEW.retained_range_ordinal,
+                       NEW.stream_identity_sha256,
+                       NEW.sequence_ordinal,
                        NEW.claim_generation,
                        NEW.resource_type,
                        NEW.partition_key_hash,
@@ -4064,6 +4257,12 @@ def _create_fences(schema: str) -> None:
         BEGIN
             IF TG_OP = 'INSERT'
                AND action_setting = 'admission_map'
+               AND recipe_id_setting = (
+                    SELECT planned_recipe_id
+                      FROM {quoted_schema}.
+                           provider_directory_projection_admission
+                     WHERE admission_id = NEW.admission_id
+               )
                AND admission_id_setting = NEW.admission_id
                AND admission_attempt_setting ~ '^[1-9][0-9]*$'
                AND admission_lease_setting ~ '^[0-9a-f]{{64}}$'
@@ -4071,7 +4270,7 @@ def _create_fences(schema: str) -> None:
                     SELECT 1
                       FROM {quoted_schema}.provider_directory_projection_admission
                      WHERE admission_id = NEW.admission_id
-                       AND recipe_id = NEW.recipe_id
+                       AND recipe_id IS NOT DISTINCT FROM NEW.recipe_id
                        AND attempt = admission_attempt_setting::integer
                        AND status = 'building'
                        AND lease_token = admission_lease_setting
@@ -4147,7 +4346,11 @@ def _create_fences(schema: str) -> None:
             );
         BEGIN
             IF TG_OP = 'INSERT' THEN
+                PERFORM pg_advisory_xact_lock(
+                    hashtextextended(NEW.planned_recipe_id, 1732050807)
+                );
                 IF action_setting <> 'admission_insert'
+                   OR recipe_id_setting <> NEW.planned_recipe_id
                    OR admission_id_setting <> NEW.admission_id
                    OR admission_attempt_setting <> NEW.attempt::text
                    OR admission_lease_setting <> NEW.lease_token
@@ -4161,31 +4364,16 @@ def _create_fences(schema: str) -> None:
                    OR NOT EXISTS (
                         SELECT 1
                           FROM {quoted_schema}.
-                               provider_directory_projection_recipe AS recipe
-                          JOIN {quoted_schema}.
                                provider_directory_retained_artifact_campaign
                                AS campaign
-                            ON campaign.campaign_id = NEW.retained_campaign_id
                           JOIN {quoted_schema}.
                                provider_directory_retained_artifact_consumer
                                AS consumer
                             ON consumer.campaign_id = campaign.campaign_id
                            AND consumer.consumer_recipe_id =
                                NEW.retained_consumer_recipe_id
-                         WHERE recipe.recipe_id = NEW.recipe_id
-                           AND recipe.status IN (
-                               'building', 'proof_ready', 'sealed'
-                           )
-                           AND recipe.workset_registered_at IS NOT NULL
-                           AND recipe.input_block_set_sha256 =
-                               NEW.input_block_set_sha256
-                           AND recipe.input_block_count = NEW.input_block_count
-                           AND recipe.selected_resources_json =
-                               NEW.completeness_manifest_json ->
-                                   'selected_resources'
-                           AND recipe.required_resources_json =
-                               NEW.completeness_manifest_json ->
-                                   'required_resources'
+                         WHERE campaign.campaign_id =
+                               NEW.retained_campaign_id
                            AND campaign.state = 'complete'
                            AND campaign.complete
                            AND campaign.campaign_sha256 =
@@ -4198,7 +4386,99 @@ def _create_fences(schema: str) -> None:
                                NEW.retained_campaign_sha256
                            AND consumer.claim_generation = NEW.claim_generation
                            AND consumer.released_at IS NULL
-                         FOR SHARE OF recipe, campaign, consumer
+                           AND (
+                               (
+                                   NEW.outcome_kind = 'physical_workset'
+                                   AND NEW.recipe_id = NEW.planned_recipe_id
+                                   AND NEW.input_block_count > 0
+                                   AND EXISTS (
+                                       SELECT 1
+                                         FROM {quoted_schema}.
+                                              provider_directory_projection_recipe
+                                              AS recipe
+                                        WHERE recipe.recipe_id = NEW.recipe_id
+                                          AND recipe.status IN (
+                                              'building', 'proof_ready', 'sealed'
+                                          )
+                                          AND recipe.workset_registered_at
+                                              IS NOT NULL
+                                          AND recipe.input_block_set_sha256 =
+                                              NEW.input_block_set_sha256
+                                          AND recipe.input_block_count =
+                                              NEW.input_block_count
+                                          AND recipe.selected_resources_json =
+                                              NEW.completeness_manifest_json ->
+                                                  'selected_resources'
+                                          AND recipe.required_resources_json =
+                                              NEW.completeness_manifest_json ->
+                                                  'required_resources'
+                                   )
+                               )
+                               OR (
+                                   NEW.outcome_kind = 'no_input'
+                                   AND NEW.recipe_id IS NULL
+                                   AND NEW.input_block_count = 0
+                                   AND NEW.stream_count > 0
+                                   AND NEW.binding_count = NEW.stream_count
+                                   AND campaign.census_mode = 'ordered_streams'
+                                   AND campaign.expected_stream_count =
+                                       NEW.stream_count
+                                   AND (
+                                       NEW.completeness_manifest_json ->>
+                                           'partition_count'
+                                   )::integer = NEW.stream_count
+                                   AND (
+                                       NEW.completeness_manifest_json ->>
+                                           'block_count'
+                                   )::bigint = 0
+                                   AND (
+                                       NEW.completeness_manifest_json ->>
+                                           'row_count'
+                                   )::bigint = 0
+                                   AND (
+                                       NEW.completeness_manifest_json ->>
+                                           'byte_count'
+                                   )::bigint = 0
+                                   AND NOT EXISTS (
+                                       SELECT 1
+                                         FROM jsonb_array_elements(
+                                             NEW.completeness_manifest_json ->
+                                                 'terminal_partitions'
+                                         ) AS zero_terminal
+                                        WHERE jsonb_typeof(
+                                            zero_terminal -> 'retained_stream'
+                                        ) IS DISTINCT FROM 'object'
+                                           OR (
+                                               zero_terminal ->> 'block_count'
+                                           )::bigint <> 0
+                                           OR (
+                                               zero_terminal ->> 'row_count'
+                                           )::bigint <> 0
+                                           OR (
+                                               zero_terminal ->> 'byte_count'
+                                           )::bigint <> 0
+                                   )
+                                   AND NOT EXISTS (
+                                       SELECT 1
+                                         FROM {quoted_schema}.
+                                              provider_directory_projection_recipe
+                                        WHERE recipe_id = NEW.planned_recipe_id
+                                   )
+                                   AND NOT EXISTS (
+                                       SELECT 1
+                                         FROM {quoted_schema}.
+                                              provider_directory_projection_input_block
+                                        WHERE recipe_id = NEW.planned_recipe_id
+                                   )
+                                   AND NOT EXISTS (
+                                       SELECT 1
+                                         FROM {quoted_schema}.
+                                              provider_directory_projection_proof_shard
+                                        WHERE recipe_id = NEW.planned_recipe_id
+                                   )
+                               )
+                           )
+                         FOR SHARE OF campaign, consumer
                    ) THEN
                     RAISE EXCEPTION
                         'provider_directory_projection_admission_insert_invalid'
@@ -4236,7 +4516,9 @@ def _create_fences(schema: str) -> None:
                     USING ERRCODE = '55000';
             END IF;
             IF OLD.admission_id IS DISTINCT FROM NEW.admission_id
+               OR OLD.planned_recipe_id IS DISTINCT FROM NEW.planned_recipe_id
                OR OLD.recipe_id IS DISTINCT FROM NEW.recipe_id
+               OR OLD.outcome_kind IS DISTINCT FROM NEW.outcome_kind
                OR OLD.acquisition_adapter_id IS DISTINCT FROM
                   NEW.acquisition_adapter_id
                OR OLD.source_scope_hash IS DISTINCT FROM NEW.source_scope_hash
@@ -4267,7 +4549,8 @@ def _create_fences(schema: str) -> None:
                     USING ERRCODE = '55000';
             END IF;
             IF action_setting <> 'gc' AND (
-                admission_id_setting <> OLD.admission_id
+                recipe_id_setting <> OLD.planned_recipe_id
+                OR admission_id_setting <> OLD.admission_id
                 OR admission_attempt_setting <> OLD.attempt::text
             ) THEN
                 RAISE EXCEPTION
@@ -4318,47 +4601,8 @@ def _create_fences(schema: str) -> None:
                    'status', 'lease_token', 'lease_expires_at',
                    'lease_heartbeat_at', 'sealed_at', 'updated_at'
                ]
-               AND EXISTS (
-                    SELECT 1
-                      FROM {quoted_schema}.provider_directory_projection_recipe
-                           AS recipe
-                      JOIN {quoted_schema}.
-                           provider_directory_retained_artifact_campaign
-                           AS campaign
-                        ON campaign.campaign_id = NEW.retained_campaign_id
-                      JOIN {quoted_schema}.
-                           provider_directory_retained_artifact_consumer
-                           AS consumer
-                        ON consumer.campaign_id = campaign.campaign_id
-                       AND consumer.consumer_recipe_id =
-                           NEW.retained_consumer_recipe_id
-                     WHERE recipe.recipe_id = NEW.recipe_id
-                       AND recipe.workset_registered_at IS NOT NULL
-                       AND recipe.input_block_set_sha256 =
-                           NEW.input_block_set_sha256
-                       AND recipe.input_block_count = NEW.input_block_count
-                       AND recipe.selected_resources_json =
-                           NEW.completeness_manifest_json ->
-                               'selected_resources'
-                       AND recipe.required_resources_json =
-                           NEW.completeness_manifest_json ->
-                               'required_resources'
-                       AND NEW.completeness_manifest_json ->> 'contract_id' =
-                           'healthporta.provider-directory.acquisition-completeness.v1'
-                       AND NEW.completeness_manifest_json ->>
-                           'endpoint_campaign_hash' =
-                           NEW.retained_campaign_sha256
-                       AND campaign.state = 'complete'
-                       AND campaign.complete
-                       AND campaign.campaign_sha256 =
-                           NEW.retained_campaign_sha256
-                       AND campaign.released_at IS NULL
-                       AND consumer.claimed_campaign_sha256 =
-                           NEW.retained_campaign_sha256
-                       AND consumer.claim_generation = NEW.claim_generation
-                       AND consumer.released_at IS NULL
-                     FOR SHARE OF recipe, campaign, consumer
-               )
+               AND NEW.completeness_manifest_json ->> 'contract_id' =
+                   'healthporta.provider-directory.acquisition-completeness.v1'
                AND {quoted_schema}.
                    provider_directory_projection_admission_scope_is_exact(
                        NEW.admission_id
@@ -4408,6 +4652,20 @@ def _create_fences(schema: str) -> None:
             );
         BEGIN
             IF TG_OP = 'INSERT' THEN
+                PERFORM pg_advisory_xact_lock(
+                    hashtextextended(NEW.recipe_id, 1732050807)
+                );
+                IF EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.
+                           provider_directory_projection_admission
+                     WHERE planned_recipe_id = NEW.recipe_id
+                       AND outcome_kind = 'no_input'
+                ) THEN
+                    RAISE EXCEPTION
+                        'provider_directory_projection_no_input_recipe_conflict'
+                        USING ERRCODE = '55000';
+                END IF;
                 IF action_setting <> 'recipe_insert'
                    OR recipe_id_setting <> NEW.recipe_id
                    OR recipe_attempt_setting <> NEW.attempt::text
@@ -5013,6 +5271,9 @@ def downgrade() -> None:
                 SELECT 1 FROM
                     {quoted_schema}.provider_directory_projection_recipe
             ) OR EXISTS (
+                SELECT 1 FROM
+                    {quoted_schema}.provider_directory_projection_admission
+            ) OR EXISTS (
                 SELECT 1
                   FROM pg_inherits AS inheritance_record
                  WHERE inheritance_record.inhparent =
@@ -5124,8 +5385,8 @@ def downgrade() -> None:
     op.execute(
         "DROP FUNCTION "
         f"{quoted_schema}.provider_directory_projection_admission_mapping_is_exact("
-        "text, text, text, text, text, text, text, text, text, integer, bigint, "
-        "text, text, integer)"
+        "text, text, text, text, text, text, text, text, text, integer, text, "
+        "integer, bigint, text, text, integer)"
     )
     op.execute(
         "DROP FUNCTION "
@@ -5145,7 +5406,8 @@ def downgrade() -> None:
     op.execute(
         "DROP FUNCTION "
         f"{quoted_schema}.provider_directory_projection_admission_input_binding_id("
-        "text, text, text, text, text, integer, text, text, integer)"
+        "text, text, text, text, text, integer, text, integer, text, text, "
+        "integer)"
     )
     op.execute(
         "DROP FUNCTION "

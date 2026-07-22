@@ -49,7 +49,9 @@ _AdmissionRegistration = tuple[
 def _admission_database_identity(database_fields: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "admission_id": database_fields.get("admission_id"),
+        "planned_recipe_id": database_fields.get("planned_recipe_id"),
         "recipe_id": database_fields.get("recipe_id"),
+        "outcome_kind": database_fields.get("outcome_kind"),
         "acquisition_adapter_id": database_fields.get("acquisition_adapter_id"),
         "source_scope_hash": database_fields.get("source_scope_hash"),
         "source_ids": json_value(database_fields.get("source_ids_json")),
@@ -79,7 +81,9 @@ def _admission_database_identity(database_fields: Mapping[str, Any]) -> dict[str
 def _admission_identity_fields(identity: ProjectionAdmissionIdentity) -> dict[str, Any]:
     return {
         "admission_id": identity.admission_id,
+        "planned_recipe_id": identity.planned_recipe_id,
         "recipe_id": identity.recipe_id,
+        "outcome_kind": identity.outcome_kind,
         "acquisition_adapter_id": identity.acquisition_adapter_id,
         "source_scope_hash": identity.source_scope_hash,
         "source_ids": list(identity.source_ids),
@@ -108,7 +112,8 @@ async def _insert_admission(
     await database.status(
         f"""
         INSERT INTO {table} (
-            admission_id, recipe_id, acquisition_adapter_id,
+            admission_id, planned_recipe_id, recipe_id, outcome_kind,
+            acquisition_adapter_id,
             source_scope_hash, source_ids_json, completeness_manifest_hash,
             completeness_manifest_json, retained_campaign_id,
             retained_campaign_sha256, retained_consumer_recipe_id,
@@ -117,7 +122,8 @@ async def _insert_admission(
             status, attempt, lease_token, lease_expires_at,
             lease_heartbeat_at, created_at, updated_at
         ) VALUES (
-            :admission_id, :recipe_id, :acquisition_adapter_id,
+            :admission_id, :planned_recipe_id, :recipe_id, :outcome_kind,
+            :acquisition_adapter_id,
             :source_scope_hash, CAST(:source_ids_json AS jsonb),
             :completeness_manifest_hash,
             CAST(:completeness_manifest_json AS jsonb),
@@ -132,7 +138,9 @@ async def _insert_admission(
         ) ON CONFLICT (admission_id) DO NOTHING;
         """,
         admission_id=identity.admission_id,
+        planned_recipe_id=identity.planned_recipe_id,
         recipe_id=identity.recipe_id,
+        outcome_kind=identity.outcome_kind,
         acquisition_adapter_id=identity.acquisition_adapter_id,
         source_scope_hash=identity.source_scope_hash,
         source_ids_json=stable_json(identity.source_ids),
@@ -164,7 +172,8 @@ async def _insert_admission_mappings(
             admission_id, recipe_id, binding_id, block_id, retained_campaign_id,
             retained_consumer_recipe_id, retained_source_item_id,
             retained_artifact_sha256, retained_layout_sha256,
-            retained_range_ordinal, claim_generation, resource_type,
+            retained_range_ordinal, stream_identity_sha256,
+            sequence_ordinal, claim_generation, resource_type,
             partition_key_hash, source_partition_ordinal, created_at
         )
         SELECT mapping.admission_id, mapping.recipe_id, mapping.binding_id,
@@ -175,6 +184,7 @@ async def _insert_admission_mappings(
                mapping.retained_artifact_sha256,
                mapping.retained_layout_sha256,
                mapping.retained_range_ordinal,
+               mapping.stream_identity_sha256, mapping.sequence_ordinal,
                mapping.claim_generation, mapping.resource_type,
                mapping.partition_key_hash, mapping.source_partition_ordinal,
                now()
@@ -186,7 +196,9 @@ async def _insert_admission_mappings(
                retained_source_item_id varchar(64),
                retained_artifact_sha256 varchar(64),
                retained_layout_sha256 varchar(64),
-               retained_range_ordinal integer, claim_generation bigint,
+               retained_range_ordinal integer,
+               stream_identity_sha256 varchar(64), sequence_ordinal integer,
+               claim_generation bigint,
                resource_type varchar(64), partition_key_hash varchar(64),
                source_partition_ordinal integer);
         """,
@@ -240,6 +252,16 @@ async def _validated_recipe_attempt(
     expected_blocks: Sequence[Mapping[str, Any]],
     expected_shards: Sequence[Mapping[str, Any]],
 ) -> int:
+    """Verify that admission targets exact registered work or exact no-input."""
+
+    if identity.outcome_kind == "no_input":
+        return await _validated_no_input_recipe_attempt(
+            database,
+            schema,
+            identity,
+            expected_blocks,
+            expected_shards,
+        )
     recipe_fields = row_mapping(
         await database.first(
             f"SELECT * FROM {table_ref(schema, 'provider_directory_projection_recipe')} "
@@ -266,6 +288,41 @@ async def _validated_recipe_attempt(
             "provider_directory_projection_admission_workset_mismatch"
         )
     return recipe_attempt
+
+
+async def _validated_no_input_recipe_attempt(
+    database: Any,
+    schema: str,
+    identity: ProjectionAdmissionIdentity,
+    expected_blocks: Sequence[Mapping[str, Any]],
+    expected_shards: Sequence[Mapping[str, Any]],
+) -> int:
+    """Require an exact no-input admission with no physical recipe state."""
+
+    if expected_blocks or expected_shards or identity.recipe_id is not None:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_no_input_outcome_invalid"
+        )
+    existing_work_count = await database.scalar(
+        f"""
+        SELECT
+            (SELECT count(*) FROM
+                {table_ref(schema, 'provider_directory_projection_recipe')}
+             WHERE recipe_id = :planned_recipe_id)
+          + (SELECT count(*) FROM
+                {table_ref(schema, 'provider_directory_projection_input_block')}
+             WHERE recipe_id = :planned_recipe_id)
+          + (SELECT count(*) FROM
+                {table_ref(schema, 'provider_directory_projection_proof_shard')}
+             WHERE recipe_id = :planned_recipe_id);
+        """,
+        planned_recipe_id=identity.planned_recipe_id,
+    )
+    if existing_work_count != 0:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_no_input_recipe_conflict"
+        )
+    return 1
 
 
 async def _claim_admission_attempt(
@@ -328,7 +385,7 @@ async def _locked_admission_fields(
     await set_local_projection_action(
         database,
         "admission_insert",
-        recipe_id=identity.recipe_id,
+        recipe_id=identity.planned_recipe_id,
         recipe_attempt=recipe_attempt,
         admission_id=identity.admission_id,
         admission_attempt=1,
@@ -371,7 +428,7 @@ async def _reclaim_admission(
     await set_local_projection_action(
         database,
         "admission_reclaim",
-        recipe_id=identity.recipe_id,
+        recipe_id=identity.planned_recipe_id,
         recipe_attempt=recipe_attempt,
         admission_id=identity.admission_id,
         admission_attempt=admission_attempt,
@@ -418,6 +475,7 @@ async def _ensure_admission_mappings(
                    retained_campaign_id, retained_consumer_recipe_id,
                    retained_source_item_id, retained_artifact_sha256,
                    retained_layout_sha256, retained_range_ordinal,
+                   stream_identity_sha256, sequence_ordinal,
                    claim_generation, resource_type, partition_key_hash,
                    source_partition_ordinal
               FROM {mapping_table}
@@ -436,7 +494,7 @@ async def _ensure_admission_mappings(
     await set_local_projection_action(
         database,
         "admission_map",
-        recipe_id=identity.recipe_id,
+        recipe_id=identity.planned_recipe_id,
         recipe_attempt=recipe_attempt,
         admission_id=identity.admission_id,
         admission_attempt=admission_attempt,
@@ -488,7 +546,7 @@ async def _ensure_admission_streams(
     await set_local_projection_action(
         database,
         "admission_map",
-        recipe_id=identity.recipe_id,
+        recipe_id=identity.planned_recipe_id,
         recipe_attempt=recipe_attempt,
         admission_id=identity.admission_id,
         admission_attempt=admission_attempt,
@@ -508,7 +566,7 @@ async def _seal_admission(
     await set_local_projection_action(
         database,
         "admission_seal",
-        recipe_id=identity.recipe_id,
+        recipe_id=identity.planned_recipe_id,
         recipe_attempt=recipe_attempt,
         admission_id=identity.admission_id,
         admission_attempt=admission_attempt,
