@@ -1,7 +1,7 @@
 aiocsv
 aiofile
 aiohappyeyeballs>=2.7.1
-aiohttp>=3.14.1
+aiohttp>=3.14.2
 aiohttp-socks>=0.11.0
 aioshutil
 aiosignal>=1.4.0
@@ -44,10 +44,10 @@ sanic_ext>=25.12.0
 shapely>=2.1.2
 socksio
 SQLAlchemy>=2.0.51
-tracerite>=2.5.0,<2.6.0
+tracerite>=2.6.3,<2.7.0
 tzdata>=2026.3
 unicode-slugify
 unidecode>=1.4.0
 us
 uvloop>=0.22.1
-yarl>=1.24.2
+yarl>=1.24.5
