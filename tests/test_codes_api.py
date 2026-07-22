@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime
+from decimal import Decimal
 import types
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -189,3 +190,102 @@ async def test_get_related_codes_success():
     payload = json.loads(response.body)
     assert payload["input_code"]["code_system"] == "CPT"
     assert len(payload["related"]["forward"]) == 1
+
+
+def test_code_helpers_reject_missing_context_and_serialize_scalar_edges(
+    monkeypatch,
+):
+    with pytest.raises(RuntimeError, match="session not available"):
+        codes_module._get_session(
+            types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=None))
+        )
+
+    mapping_row = types.SimpleNamespace(_mapping={"amount": Decimal("1.25")})
+    assert codes_module._row_to_dict(mapping_row) == {"amount": Decimal("1.25")}
+    assert codes_module._json_safe_value(Decimal("1.25")) == 1.25
+    with pytest.raises(sanic.exceptions.InvalidUsage, match="either 'asc' or 'desc'"):
+        codes_module._normalize_order("sideways")
+
+    monkeypatch.setenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES", "true")
+    assert codes_module._restricted_public_filter(
+        codes_module.code_catalog_table.c.code_system
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_list_codes_supports_unfiltered_descending_and_source_scopes(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES", "true")
+    unfiltered_request = make_request(
+        [FakeResult(scalar=0), FakeResult(rows=[])],
+        args={"order": "desc"},
+    )
+
+    unfiltered_response = await list_codes(unfiltered_request)
+
+    assert json.loads(unfiltered_response.body)["query"] == {
+        "code_system": None,
+        "q": None,
+        "source": None,
+        "order_by": "code",
+        "order": "desc",
+    }
+    unfiltered_sql = "\n".join(
+        str(call_args[0][0])
+        for call_args in unfiltered_request.ctx.sa_session.calls
+    )
+    assert " WHERE " not in unfiltered_sql
+
+    source_request = make_request(
+        [FakeResult(scalar=0), FakeResult(rows=[])],
+        args={"source": "  CMS  "},
+    )
+    source_response = await list_codes(source_request)
+    assert json.loads(source_response.body)["query"]["source"] == "cms"
+    assert "lower(mrf.code_catalog.source)" in str(
+        source_request.ctx.sa_session.calls[0][0][0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_codes_rejects_unknown_order_column():
+    request = make_request([], args={"order_by": "unknown"})
+
+    with pytest.raises(sanic.exceptions.InvalidUsage, match="Unsupported order_by"):
+        await list_codes(request)
+
+
+@pytest.mark.asyncio
+async def test_code_detail_rejects_empty_identity_and_missing_record():
+    with pytest.raises(sanic.exceptions.InvalidUsage, match="Path parameters"):
+        await get_code(make_request([]), "", "")
+
+    with pytest.raises(sanic.exceptions.NotFound, match="Code not found"):
+        await get_code(make_request([FakeResult(rows=[])]), "cpt", "99213")
+
+
+@pytest.mark.asyncio
+async def test_related_codes_reject_invalid_or_restricted_identity(monkeypatch):
+    with pytest.raises(sanic.exceptions.InvalidUsage, match="Path parameters"):
+        await get_related_codes(make_request([]), "", "")
+
+    monkeypatch.delenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES", raising=False)
+    with pytest.raises(sanic.exceptions.NotFound, match="Code not found"):
+        await get_related_codes(make_request([]), "snomed", "123")
+
+
+@pytest.mark.asyncio
+async def test_related_codes_allows_restricted_system_when_explicitly_enabled(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES", "true")
+    request = make_request([FakeResult(rows=[]), FakeResult(rows=[])])
+
+    related_response = await get_related_codes(request, "snomed", "123")
+
+    related_payload = json.loads(related_response.body)
+    assert related_payload["input_code"] == {
+        "code_system": "SNOMEDCT_US",
+        "code": "123",
+    }

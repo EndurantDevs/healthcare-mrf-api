@@ -3768,3 +3768,90 @@ async def test_control_finalize_import_returns_accepted(monkeypatch):
 
     assert response.status == 202
     assert payload == {"run_id": "run_1", "status": "finalizing", "params": {"import_id": "20260603"}}
+
+
+@pytest.mark.asyncio
+async def test_control_attestation_requires_report_object(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+
+    with pytest.raises(BadRequest, match="report must be an object"):
+        await control.control_ptg_source_snapshot_attest(
+            authed_request(json={"report": []})
+        )
+
+
+@pytest.mark.asyncio
+async def test_control_import_lookup_and_cancel_return_not_found(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    monkeypatch.setattr(control, "get_import_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(control, "request_cancel", AsyncMock(return_value=None))
+
+    with pytest.raises(NotFound, match="import run not found"):
+        await control.control_get_import(authed_request(), "run_missing")
+    with pytest.raises(NotFound, match="import run not found"):
+        await control.control_cancel_import(authed_request(), "run_missing")
+
+    get_import_result = AsyncMock(return_value={"run_id": "run_present"})
+    monkeypatch.setattr(control, "get_import_run", get_import_result)
+    present_response = await control.control_get_import(
+        authed_request(),
+        "run_present",
+    )
+    assert present_response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_control_retry_covers_missing_and_existing_run(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    retry_result = AsyncMock(return_value=None)
+    monkeypatch.setattr(control, "retry_import_run", retry_result)
+
+    with pytest.raises(NotFound, match="import run not found"):
+        await control.control_retry_import(
+            authed_request(json={}),
+            "run_missing",
+        )
+
+    retry_result.return_value = ({"run_id": "run_retry"}, False)
+    retry_response = await control.control_retry_import(
+        authed_request(json={}),
+        "run_existing",
+    )
+    assert retry_response.status == 409
+
+
+@pytest.mark.asyncio
+async def test_control_finalize_missing_run_returns_not_found(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    monkeypatch.setattr(
+        control,
+        "finalize_import_run",
+        AsyncMock(return_value=None),
+    )
+
+    with pytest.raises(NotFound, match="import run not found"):
+        await control.control_finalize_import(
+            authed_request(json={}),
+            "run_missing",
+        )
+
+
+def test_address_refresh_payload_rejects_scalar_and_inherits_parent_option():
+    with pytest.raises(ValueError, match="address_refresh must be an object"):
+        control._ptg_source_snapshot_refresh_payload(
+            {"address_refresh": "yes"},
+            source_key="source-a",
+            snapshot_id="snapshot-a",
+        )
+
+    refresh_payload = control._ptg_source_snapshot_refresh_payload(
+        {"address_refresh": {}, "test_mode": True},
+        source_key="source-a",
+        snapshot_id="snapshot-a",
+    )
+    assert refresh_payload["params"]["test_mode"] is True
+
+
+def test_request_id_falls_back_to_request_attribute():
+    request = types.SimpleNamespace(headers={}, id="request-fallback")
+    assert control._request_id(request) == "request-fallback"

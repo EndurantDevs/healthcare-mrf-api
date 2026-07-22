@@ -113,6 +113,41 @@ async def test_get_issuer_data(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_issuer_data_deduplicates_plan_rows_without_network_data():
+    issuer_row = FakeRow(
+        {"issuer_id": 1001, "issuer_name": "Issuer", "state": "WI"}
+    )
+    plan_row = FakeRow(
+        {
+            "plan_id": "P123",
+            "year": 2024,
+            "issuer_id": 1001,
+            "network": None,
+            "network_checksum": None,
+            "network_tier_value": None,
+        }
+    )
+    session = FakeSession(
+        [
+            FakeResult([issuer_row]),
+            FakeResult(scalar_value=0),
+            FakeResult([plan_row, plan_row]),
+            FakeResult([]),
+            FakeResult([]),
+        ]
+    )
+
+    response = await get_issuer_data(
+        types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=session)),
+        "1001",
+    )
+
+    issuer_payload = json.loads(response.body)
+    assert issuer_payload["plans_count"] == 1
+    assert issuer_payload["plans"][0]["network"] == {"cmsgov_network": None}
+
+
+@pytest.mark.asyncio
 async def test_get_issuers_not_found(monkeypatch):
     with pytest.raises(sanic.exceptions.NotFound):
         await get_issuers(

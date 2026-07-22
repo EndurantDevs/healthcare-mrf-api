@@ -5,6 +5,7 @@ import sys
 import types
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from asyncpg import UndefinedColumnError, UndefinedTableError
@@ -672,3 +673,163 @@ async def test_geo_state_lookup_rejects_invalid_limit():
     request = types.SimpleNamespace(args={"limit": "bad"}, ctx=types.SimpleNamespace(sa_session=FakeSession([])))
     with pytest.raises(InvalidUsage):
         await geo_module.get_top_cities_by_state(request, "CA")
+
+
+def _programming_error(original_error):
+    database_error = ProgrammingError("select", {}, None)
+    database_error.orig = original_error
+    return database_error
+
+
+def test_geo_scalar_helpers_cover_empty_invalid_and_logged_values():
+    assert geo_module._serialize_places_row(None) is None
+    updated_at = geo_module.datetime(2026, 7, 22, 8, 30)
+    assert geo_module._serialize_places_row(
+        {"measure_id": "M1", "updated_at": updated_at}
+    )["updated_at"] == "2026-07-22T08:30:00"
+    assert geo_module._density_per_1000(None, 100) is None
+    assert geo_module._density_per_1000(10, 0) is None
+    assert geo_module._density_per_1000("bad", 100) is None
+
+    warning_logger = types.SimpleNamespace(warning=Mock())
+    request = types.SimpleNamespace(app=types.SimpleNamespace(logger=warning_logger))
+    geo_module._log_geo_warning(request, "lookup failed: %s", "timeout")
+    warning_logger.warning.assert_called_once_with(
+        "lookup failed: %s",
+        "timeout",
+    )
+
+
+@pytest.mark.asyncio
+async def test_geo_optional_lookup_errors_fail_closed_and_other_errors_raise():
+    missing_table = _programming_error(UndefinedTableError("missing"))
+    other_error = _programming_error(RuntimeError("broken"))
+
+    assert await geo_module._lookup_svi_profile(
+        FakeSession([missing_table]),
+        "60654",
+    ) is None
+    assert await geo_module._lookup_svi_profile(
+        FakeSession([FakeResult(row=None)]),
+        "60654",
+    ) is None
+    with pytest.raises(ProgrammingError):
+        await geo_module._lookup_svi_profile(FakeSession([other_error]), "60654")
+
+    with pytest.raises(ProgrammingError):
+        await geo_module._execute_provider_count_stmt(
+            FakeSession([other_error]),
+            object(),
+        )
+    with pytest.raises(ProgrammingError):
+        await geo_module._lookup_census_profile(
+            FakeSession([other_error]),
+            "60654",
+        )
+
+
+@pytest.mark.asyncio
+async def test_census_profile_without_svi_preserves_density():
+    census_row = MappingRow(total_population=2000)
+    session = FakeSession(
+        [
+            FakeResult(row=census_row),
+            FakeResult(row=None),
+            FakeResult(scalar_value=50),
+        ]
+    )
+
+    profile_map = await geo_module._lookup_census_profile(session, "60654")
+
+    assert profile_map["provider_count"] == 50
+    assert profile_map["provider_density_per_1000"] == 25.0
+    assert profile_map["svi_overall"] is None
+
+
+@pytest.mark.asyncio
+async def test_places_year_honors_explicit_value_and_optional_schema():
+    assert await geo_module._resolve_places_year(FakeSession([]), "60654", 2025) == 2025
+    missing_column = _programming_error(UndefinedColumnError("missing"))
+    assert await geo_module._resolve_places_year(
+        FakeSession([missing_column]),
+        "60654",
+        None,
+    ) is None
+    with pytest.raises(ProgrammingError):
+        await geo_module._resolve_places_year(
+            FakeSession([_programming_error(RuntimeError("broken"))]),
+            "60654",
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_geo_local_optional_schema_falls_back_but_other_errors_raise():
+    optional_request = types.SimpleNamespace(
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [
+                    FakeResult(row=None),
+                    _programming_error(UndefinedTableError("missing")),
+                    FakeResult(row=("60654", "41.9", "-87.6", "IL")),
+                ]
+            )
+        ),
+        app=types.SimpleNamespace(),
+    )
+    optional_response = await geo_module.get_geo(optional_request, "60654")
+    assert json.loads(optional_response.body)["state"] == "IL"
+
+    failing_request = types.SimpleNamespace(
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [
+                    FakeResult(row=None),
+                    _programming_error(RuntimeError("broken")),
+                ]
+            )
+        ),
+        app=types.SimpleNamespace(),
+    )
+    with pytest.raises(ProgrammingError):
+        await geo_module.get_geo(failing_request, "60654")
+
+
+@pytest.mark.asyncio
+async def test_places_lookup_handles_filters_schema_errors_and_empty_rows():
+    missing_table_request = types.SimpleNamespace(
+        args={"year": "2025", "measure_id": "M1"},
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [_programming_error(UndefinedTableError("missing"))]
+            )
+        ),
+    )
+    missing_response = await geo_module.get_places_by_zip(
+        missing_table_request,
+        "60654",
+    )
+    assert missing_response.status == 404
+
+    failing_request = types.SimpleNamespace(
+        args={"year": "2025"},
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [_programming_error(RuntimeError("broken"))]
+            )
+        ),
+    )
+    with pytest.raises(ProgrammingError):
+        await geo_module.get_places_by_zip(failing_request, "60654")
+
+    empty_row_request = types.SimpleNamespace(
+        args={"year": "2025"},
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession([FakeResult(rows=[None])])
+        ),
+    )
+    empty_response = await geo_module.get_places_by_zip(
+        empty_row_request,
+        "60654",
+    )
+    assert empty_response.status == 404
