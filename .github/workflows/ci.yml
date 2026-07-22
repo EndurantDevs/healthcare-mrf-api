@@ -528,6 +528,7 @@ jobs:
       - name: Run address and Provider Directory DB tests
         env:
           HLTHPRT_RETAINED_ARTIFACT_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+          HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
         run: >
           python -m pytest -q
           -o asyncio_default_test_loop_scope=session
@@ -569,6 +570,7 @@ jobs:
           tests/test_provider_directory_retained_root_ledger_guards.py
           tests/test_provider_directory_retained_retry_gc_guards.py
           tests/test_provider_directory_retained_key_fence_status.py
+          tests/test_provider_directory_projection_foundation_postgres.py
       - name: Upload PostgreSQL coverage data
         uses: actions/upload-artifact@v7
         with:
