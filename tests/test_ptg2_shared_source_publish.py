@@ -26,10 +26,18 @@ class _Rows:
 
 
 class _Session:
-    def __init__(self, *, scope, observed, snapshot_state=None):
+    def __init__(
+        self,
+        *,
+        scope,
+        observed,
+        snapshot_state=None,
+        snapshot_source_set=None,
+    ):
         self.scope = scope
         self.observed = observed
         self.snapshot_state = snapshot_state
+        self.snapshot_source_set = snapshot_source_set
         self.calls = []
 
     async def execute(self, statement, params=None):
@@ -41,6 +49,19 @@ class _Session:
             return _Rows(self.observed)
         if "SELECT snapshot.status" in sql:
             return _Rows([self.snapshot_state] if self.snapshot_state is not None else [])
+        if "WITH expected_source_set AS" in sql:
+            expected_source_set_by_field = {
+                "contract": params["source_set_contract"],
+                "source_count": params["source_set_count"],
+                "raw_container_sha256_digest": params["source_set_digest"],
+            }
+            if self.snapshot_source_set not in (
+                None,
+                expected_source_set_by_field,
+            ):
+                return _Rows()
+            self.snapshot_source_set = expected_source_set_by_field
+            return _Rows([{"snapshot_source_set": expected_source_set_by_field}])
         return _Rows()
 
 
@@ -110,7 +131,14 @@ async def test_fresh_snapshot_source_publication_is_insert_only(monkeypatch):
         yield session
 
     monkeypatch.setattr(publication.db, "transaction", transaction)
-    rows = await publication.publish_shared_v3_snapshot_sources(
+    published_rows = await publication.publish_shared_v3_snapshot_sources(
+        schema_name="mrf",
+        snapshot_id="snapshot-fresh",
+        plan_scopes=[SharedLogicalPlanScope("plan-1", "ein", "group")],
+        coverage_scope_id=b"s" * 32,
+        assignments=[assignment],
+    )
+    replayed_rows = await publication.publish_shared_v3_snapshot_sources(
         schema_name="mrf",
         snapshot_id="snapshot-fresh",
         plan_scopes=[SharedLogicalPlanScope("plan-1", "ein", "group")],
@@ -118,26 +146,33 @@ async def test_fresh_snapshot_source_publication_is_insert_only(monkeypatch):
         assignments=[assignment],
     )
 
-    assert rows == (_row("snapshot-fresh", assignment),)
+    assert published_rows == (_row("snapshot-fresh", assignment),)
+    assert replayed_rows == published_rows
+    assert session.snapshot_source_set == shared_source_set_metadata(
+        [assignment.raw_container_sha256]
+    )
     source_insert = next(sql for sql, _params in session.calls if "INSERT INTO \"mrf\".ptg2_v3_snapshot_source" in sql)
     assert "ON CONFLICT (snapshot_id, source_key) DO NOTHING" in source_insert
     assert "DO UPDATE" not in source_insert
+    source_set_update = next(
+        sql for sql, _params in session.calls if "WITH expected_source_set AS" in sql
+    )
+    assert "ptg2_v3_snapshot_layout" not in source_set_update
 
 
 @pytest.mark.asyncio
 async def test_reused_layout_snapshots_keep_independent_trace_and_wrapper_rows(monkeypatch):
     first = _assignment(trace_set_hash="1" * 64, raw_sha="2" * 64)
     second = _assignment(trace_set_hash="3" * 64, raw_sha="4" * 64)
-    sessions = [
-        _Session(
-            scope={"plan_id": "plan-1", "plan_market_type": "group", "coverage_scope_id": b"s" * 32},
-            observed=[_row("snapshot-one", first)],
-        ),
-        _Session(
-            scope={"plan_id": "plan-2", "plan_market_type": "group", "coverage_scope_id": b"s" * 32},
-            observed=[_row("snapshot-two", second)],
-        ),
-    ]
+    first_session = _Session(
+        scope={"plan_id": "plan-1", "plan_market_type": "group", "coverage_scope_id": b"s" * 32},
+        observed=[_row("snapshot-one", first)],
+    )
+    second_session = _Session(
+        scope={"plan_id": "plan-2", "plan_market_type": "group", "coverage_scope_id": b"s" * 32},
+        observed=[_row("snapshot-two", second)],
+    )
+    sessions = [first_session, second_session]
 
     @asynccontextmanager
     async def transaction():
@@ -162,6 +197,43 @@ async def test_reused_layout_snapshots_keep_independent_trace_and_wrapper_rows(m
     assert first_rows[0]["identity_sha256"] == second_rows[0]["identity_sha256"]
     assert first_rows[0]["source_trace_set_hash"] != second_rows[0]["source_trace_set_hash"]
     assert first_rows[0]["raw_container_sha256"] != second_rows[0]["raw_container_sha256"]
+    assert first_session.snapshot_source_set == shared_source_set_metadata(
+        [first.raw_container_sha256]
+    )
+    assert second_session.snapshot_source_set == shared_source_set_metadata(
+        [second.raw_container_sha256]
+    )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_source_set_conflict_fails_without_overwrite(monkeypatch):
+    assignment = _assignment(trace_set_hash="d" * 64)
+    conflicting_source_set = shared_source_set_metadata(["f" * 64])
+    session = _Session(
+        scope={
+            "plan_id": "plan-1",
+            "plan_market_type": "group",
+            "coverage_scope_id": b"s" * 32,
+        },
+        observed=[_row("snapshot-conflict", assignment)],
+        snapshot_source_set=conflicting_source_set,
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(publication.db, "transaction", transaction)
+    with pytest.raises(RuntimeError, match="conflicting logical source-set seal"):
+        await publication.publish_shared_v3_snapshot_sources(
+            schema_name="mrf",
+            snapshot_id="snapshot-conflict",
+            plan_scopes=[SharedLogicalPlanScope("plan-1", "ein", "group")],
+            coverage_scope_id=b"s" * 32,
+            assignments=[assignment],
+        )
+
+    assert session.snapshot_source_set == conflicting_source_set
 
 
 @pytest.mark.asyncio

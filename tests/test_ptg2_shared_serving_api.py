@@ -16,6 +16,31 @@ from api import (
 )
 from api.ptg2_shared_blocks import SharedBlockPayload
 from process.ptg_parts.ptg2_shared_blocks import shared_block_hash
+from process.ptg_parts.ptg2_shared_source_set import (
+    shared_source_set_metadata,
+)
+
+
+def _strict_source_identity_rows():
+    return [
+        {
+            "source_key": 0,
+            "source_type": "in_network",
+            "identity_kind": "logical_json_sha256_v1",
+            "identity_sha256": "2" * 64,
+            "raw_container_sha256": "1" * 64,
+            "logical_json_sha256": "2" * 64,
+            "logical_hash_deferred": False,
+            "source_trace_set_hash": "5" * 64,
+        }
+    ]
+
+
+def _strict_source_set():
+    return shared_source_set_metadata(
+        row["raw_container_sha256"]
+        for row in _strict_source_identity_rows()
+    )
 
 
 def test_shared_v3_object_kinds_and_block_format_are_fail_closed():
@@ -56,7 +81,9 @@ def _strict_source_witness():
             "count_but_exclude_from_npi_api_challenges_v1"
         ),
         "source_count": 1,
-        "source_set_digest": "b" * 64,
+        "source_set_digest": _strict_source_set()[
+            "raw_container_sha256_digest"
+        ],
         "occurrence_target": 10_000,
         "total_target": 11_000,
         "provider_quota": 1_000,
@@ -101,11 +128,7 @@ def _strict_serving_index(snapshot_key=41):
         "serving_multiplicity_semantics": "source_multiset_v1",
         "shared_snapshot_key": snapshot_key,
         "source_count": 1,
-        "source_set": {
-            "contract": "sorted_raw_container_sha256_bytes_v1",
-            "source_count": 1,
-            "raw_container_sha256_digest": "b" * 64,
-        },
+        "source_set": _strict_source_set(),
         "source_witness": _strict_source_witness(),
         "code_count": 1,
         "coverage_scope_id": "c" * 64,
@@ -310,20 +333,27 @@ async def test_shared_snapshot_metadata_is_never_process_cached():
 
         def one_or_none(self):
             serving_index = self.value["serving_index"]
+            snapshot_source_set = serving_index["source_set"]
+            layout_serving_index = dict(serving_index)
+            layout_serving_index.pop("source_set")
             return {
-                "layout_serving_index": serving_index,
+                "layout_serving_index": layout_serving_index,
+                "snapshot_source_set": snapshot_source_set,
                 "bound_snapshot_key": serving_index["shared_snapshot_key"],
                 "snapshot_plan_id": "TEST-PLAN-001",
                 "snapshot_plan_market_type": "group",
                 "snapshot_coverage_scope_id": "c" * 64,
                 "attested_source_key": "source-a",
                 "attested_coverage_scope_id": "c" * 64,
-                "attested_source_set_digest": "b" * 64,
+                "attested_source_set_digest": snapshot_source_set[
+                    "raw_container_sha256_digest"
+                ],
                 "attested_audit_sample_digest": "a" * 64,
                 "source_row_count": 1,
                 "distinct_source_key_count": 1,
                 "minimum_source_key": 0,
                 "maximum_source_key": 0,
+                "source_identity_rows": _strict_source_identity_rows(),
                 "postgres_server_version_num": 160004,
                 "database_selected": True,
                 "backend_session_active": True,

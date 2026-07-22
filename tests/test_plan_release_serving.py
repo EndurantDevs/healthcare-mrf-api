@@ -128,7 +128,13 @@ class _Session:
         return list(self.rows)
 
 
-def test_release_resolver_requires_complete_published_pinned_binding_set():
+async def _is_serving_binding_ready(_session, _binding):
+    return True
+
+
+def test_release_resolver_requires_complete_published_pinned_binding_set(
+    monkeypatch,
+):
     release_rows = [
         _binding_row(expected_binding_count=2),
         _binding_row(
@@ -140,6 +146,11 @@ def test_release_resolver_requires_complete_published_pinned_binding_set():
         ),
     ]
     session = _Session(release_rows)
+    monkeypatch.setattr(
+        plan_release_serving,
+        "is_release_binding_serving_ready",
+        _is_serving_binding_ready,
+    )
 
     selection = asyncio.run(
         plan_release_serving.resolve_plan_release_serving(

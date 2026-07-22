@@ -12,7 +12,7 @@ from api.ptg2_response import (
     _catalog_detail,
     _catalog_key,
     _missing_modifier_detail,
-    _request_bool,
+    _is_request_flag_enabled,
     _summarize_price_payload,
 )
 from api.ptg2_serving_utils import _row_mapping
@@ -27,7 +27,7 @@ async def _enrich_ptg2_code_details(
 ) -> dict[str, Any]:
     """Attach requested code-catalog details to a PTG pricing response."""
 
-    if not _request_bool(args.get("include_code_details")):
+    if not _is_request_flag_enabled(args.get("include_code_details")):
         return response_payload
 
     lookup_keys: set[tuple[str, str]] = set()
