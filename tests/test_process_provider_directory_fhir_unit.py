@@ -8828,7 +8828,7 @@ async def test_artifact_cutover_locks_endpoint_and_rejects_alias_repoint(monkeyp
     alias_lock_sql = lookup.await_args_list[1].args[0]
     assert "FOR UPDATE" in endpoint_lock_sql
     assert "provider_directory_api_endpoint" in endpoint_lock_sql
-    assert status.await_args.args[0].startswith("LOCK TABLE")
+    status.assert_not_awaited()
     assert "FOR SHARE OF source" in alias_lock_sql
     assert "source.source_id = ANY" in alias_lock_sql
     assert lookup.await_args_list[1].kwargs["source_ids"] == ["source_a"]

@@ -12,7 +12,7 @@ def _exact_source_scope_predicate(dataset_model, source_ids):
     metadata_source_ids = cast(
         dataset_model.publication_metadata_json,
         JSONB,
-    )["source_ids"]
+    ).op("->")("source_ids")
     requested_source_ids = cast(list(source_ids), JSONB)
     return and_(
         case(
@@ -25,7 +25,45 @@ def _exact_source_scope_predicate(dataset_model, source_ids):
     )
 
 
-def _source_scope_dataset_statement(source_ids, current_source_ids):
+def _sealed_dataset_predicate(dataset_model):
+    """Return the accepted states for the latest source-local outcome."""
+
+    return or_(
+        and_(
+            dataset_model.status == "validated",
+            dataset_model.is_current.is_(False),
+            dataset_model.validated_at.is_not(None),
+            dataset_model.published_at.is_(None),
+            dataset_model.superseded_at.is_(None),
+        ),
+        and_(
+            dataset_model.status.in_(("published", "superseded")),
+            dataset_model.is_current
+            == (dataset_model.status == "published"),
+            dataset_model.published_at.is_not(None),
+            dataset_model.superseded_at.is_not(None)
+            == (dataset_model.status == "superseded"),
+        ),
+    )
+
+
+def _current_published_dataset_predicate(dataset_model):
+    """Match the authoritative dataset state used by Profile selection."""
+
+    return and_(
+        dataset_model.status == "published",
+        dataset_model.is_current.is_(True),
+        dataset_model.published_at.is_not(None),
+        dataset_model.superseded_at.is_(None),
+    )
+
+
+def _source_scope_dataset_statement(
+    source_ids,
+    current_source_ids,
+    *,
+    current_published_only=False,
+):
     dataset_model = ProviderDirectoryEndpointDataset
     source_model = ProviderDirectorySource
     bound_endpoint_ids = (
@@ -54,23 +92,9 @@ def _source_scope_dataset_statement(source_ids, current_source_ids):
             dataset_model.endpoint_id.in_(bound_endpoint_ids),
             _exact_source_scope_predicate(dataset_model, source_ids),
             dataset_model.resource_count >= 0,
-            or_(
-                and_(
-                    dataset_model.status == "validated",
-                    dataset_model.is_current.is_(False),
-                    dataset_model.validated_at.is_not(None),
-                    dataset_model.published_at.is_(None),
-                    dataset_model.superseded_at.is_(None),
-                ),
-                and_(
-                    dataset_model.status.in_(("published", "superseded")),
-                    dataset_model.is_current
-                    == (dataset_model.status == "published"),
-                    dataset_model.published_at.is_not(None),
-                    dataset_model.superseded_at.is_not(None)
-                    == (dataset_model.status == "superseded"),
-                ),
-            ),
+            _current_published_dataset_predicate(dataset_model)
+            if current_published_only
+            else _sealed_dataset_predicate(dataset_model),
         )
         .order_by(
             func.coalesce(
@@ -84,7 +108,11 @@ def _source_scope_dataset_statement(source_ids, current_source_ids):
     )
 
 
-def _source_local_dataset_statement(source_id_groups):
+def _source_local_dataset_statement(
+    source_id_groups,
+    *,
+    current_published_only=False,
+):
     dataset_model = ProviderDirectoryEndpointDataset
     source_model = ProviderDirectorySource
     current_source_ids = (
@@ -94,9 +122,22 @@ def _source_local_dataset_statement(source_id_groups):
         .scalar_subquery()
     )
     scope_statements = [
-        _source_scope_dataset_statement(source_ids, current_source_ids)
+        _source_scope_dataset_statement(
+            source_ids,
+            current_source_ids,
+            current_published_only=current_published_only,
+        )
         for source_ids in sorted(source_id_groups)
     ]
     if len(scope_statements) == 1:
         return scope_statements[0]
     return union_all(*scope_statements)
+
+
+def _source_local_current_published_dataset_statement(source_id_groups):
+    """Select one bounded current published dataset per exact source scope."""
+
+    return _source_local_dataset_statement(
+        source_id_groups,
+        current_published_only=True,
+    )

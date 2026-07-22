@@ -86,6 +86,13 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
             model.__tablename__,
         ):
             await database.status(statement)
+    await database.status(
+        f"ALTER TABLE {schema}.provider_directory_source "
+        "ADD CONSTRAINT provider_directory_source_endpoint_id_fkey "
+        "FOREIGN KEY (endpoint_id) REFERENCES "
+        f"{schema}.provider_directory_api_endpoint(endpoint_id) "
+        "ON DELETE SET NULL;"
+    )
 
 
 async def _insert_fixture_sources(database: Database, schema: str) -> None:

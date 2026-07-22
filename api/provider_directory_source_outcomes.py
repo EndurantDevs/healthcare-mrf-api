@@ -458,43 +458,13 @@ def _outcome_summary(dataset: _CurrentPublishedDataset) -> dict[str, Any]:
     return summary_map
 
 
-def _catalog_source_id_groups(
-    catalog_items: list[dict[str, Any]],
-) -> set[tuple[str, ...]]:
-    return {
-        source_ids
-        for catalog_entry in catalog_items
-        if (
-            source_ids := _normalized_text_tuple(
-                catalog_entry.get("source_ids")
-            )
-        )
-        is not None
-    }
-
-
 async def enrich_provider_directory_source_catalog(
     catalog: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Attach latest sealed source outcomes without scanning resource rows."""
-    raw_items = catalog.get("items")
-    if not isinstance(raw_items, list):
-        return dict(catalog)
-    catalog_items = [
-        dict(catalog_entry)
-        for catalog_entry in raw_items
-        if isinstance(catalog_entry, Mapping)
-    ]
-    dataset_by_source_ids = await _current_published_dataset_by_source_ids(
-        _catalog_source_id_groups(catalog_items)
+    """Attach latest sealed and current published source outcomes."""
+
+    from api.provider_directory_source_catalog_outcomes import (
+        enrich_provider_directory_source_catalog as enrich_catalog,
     )
 
-    enriched_items: list[dict[str, Any]] = []
-    for catalog_entry in catalog_items:
-        enriched_entry_map = dict(catalog_entry)
-        source_ids = _normalized_text_tuple(catalog_entry.get("source_ids"))
-        dataset = dataset_by_source_ids.get(source_ids or ())
-        if dataset is not None:
-            enriched_entry_map["outcome_summary"] = _outcome_summary(dataset)
-        enriched_items.append(enriched_entry_map)
-    return {**dict(catalog), "items": enriched_items}
+    return await enrich_catalog(catalog)

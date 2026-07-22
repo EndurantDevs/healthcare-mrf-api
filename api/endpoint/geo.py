@@ -199,32 +199,32 @@ async def _lookup_svi_profile(session, zip_code):
         .limit(1)
     )
     try:
-        result = await session.execute(stmt)
+        svi_result = await session.execute(stmt)
     except ProgrammingError as exc:
         if _is_optional_schema_error(exc):
             return None
         raise
-    row = _row_mapping(result.first())
-    if row is None:
+    svi_row = _row_mapping(svi_result.first())
+    if svi_row is None:
         return None
     return {
-        "svi_overall": row.get("svi_overall"),
-        "svi_socioeconomic": row.get("svi_socioeconomic"),
-        "svi_household": row.get("svi_household"),
-        "svi_minority": row.get("svi_minority"),
-        "svi_housing": row.get("svi_housing"),
+        "svi_overall": svi_row.get("svi_overall"),
+        "svi_socioeconomic": svi_row.get("svi_socioeconomic"),
+        "svi_household": svi_row.get("svi_household"),
+        "svi_minority": svi_row.get("svi_minority"),
+        "svi_housing": svi_row.get("svi_housing"),
     }
 
 
 async def _execute_provider_count_stmt(session, stmt):
     try:
-        result = await session.execute(stmt)
+        count_result = await session.execute(stmt)
     except ProgrammingError as exc:
         if _is_optional_schema_error(exc):
             await _rollback_session(session)
             return None
         raise
-    return result.scalar()
+    return count_result.scalar()
 
 
 async def _lookup_provider_count_legacy(session, zip_code):
@@ -316,12 +316,12 @@ async def _lookup_census_profile(session, zip_code):
         .where(geo_census_table.c.zip_code == zip_code)
     )
     try:
-        result = await session.execute(stmt)
+        census_result = await session.execute(stmt)
     except ProgrammingError as exc:
         if _is_optional_schema_error(exc):
             return None
         raise
-    profile = _serialize_census_row(_row_mapping(result.first()))
+    profile = _serialize_census_row(_row_mapping(census_result.first()))
     if profile is None:
         return None
 
@@ -349,12 +349,12 @@ async def _resolve_places_year(session, zip_code, requested_year):
         .where(pricing_places_zcta_table.c.zcta == zip_code)
     )
     try:
-        result = await session.execute(stmt)
+        year_result = await session.execute(stmt)
     except ProgrammingError as exc:
         if _is_optional_schema_error(exc):
             return None
         raise
-    return result.scalar()
+    return year_result.scalar()
 
 
 async def _lookup_zip_from_tiger(session, zip_code):
@@ -375,22 +375,22 @@ async def _lookup_zip_from_tiger(session, zip_code):
     )
 
     try:
-        result = await session.execute(stmt)
+        tiger_result = await session.execute(stmt)
     except ProgrammingError as exc:
         if _is_optional_schema_error(exc):
             raise TigerUnavailableError() from exc
         raise
 
-    data = result.first()
-    if not data:
+    tiger_row = tiger_result.first()
+    if not tiger_row:
         return None
 
     try:
         return {
-            'zip_code': data[0],
-            'lat': float(data[1]),
-            'long': float(data[2]),
-            'state': data[3],
+            'zip_code': tiger_row[0],
+            'lat': float(tiger_row[1]),
+            'long': float(tiger_row[2]),
+            'state': tiger_row[3],
         }
     except (IndexError, ValueError, TypeError):
         return None
@@ -446,22 +446,22 @@ async def get_geo(request, zip_code):
             raise
         local_row = None
     if local_row:
-        payload = _serialize_geo_row(local_row)
-        if payload.get("lat") is None:
-            payload["lat"] = local_row.get("latitude")
-        if payload.get("long") is None:
-            payload["long"] = local_row.get("longitude")
-        payload["census_profile"] = census_profile
-        return response.json(payload)
+        geo_payload = _serialize_geo_row(local_row)
+        if geo_payload.get("lat") is None:
+            geo_payload["lat"] = local_row.get("latitude")
+        if geo_payload.get("long") is None:
+            geo_payload["long"] = local_row.get("longitude")
+        geo_payload["census_profile"] = census_profile
+        return response.json(geo_payload)
 
     try:
-        payload = await _lookup_zip_from_tiger(session, zip_code)
+        geo_payload = await _lookup_zip_from_tiger(session, zip_code)
     except TigerUnavailableError:
         return response.json({"error": "tiger schema not available"}, status=503)
-    if payload is None:
+    if geo_payload is None:
         return response.json({'error': 'Not found'}, status=404)
-    payload["census_profile"] = census_profile
-    return response.json(payload)
+    geo_payload["census_profile"] = census_profile
+    return response.json(geo_payload)
 
 
 @blueprint.get('/city', name='get_geo_by_city')
@@ -497,32 +497,32 @@ async def get_geo_by_city(request):
     if state:
         stmt = stmt.where(geo_zip_table.c.state == state)
 
-    result = await session.execute(stmt)
-    rows = [_row_mapping(row) for row in result.all() if _row_mapping(row)]
-    if not rows:
+    city_result = await session.execute(stmt)
+    city_rows = [_row_mapping(city_row) for city_row in city_result.all() if _row_mapping(city_row)]
+    if not city_rows:
         return response.json({"items": []}, status=404)
 
-    items = []
-    for row in rows:
-        items.append(
+    city_items = []
+    for city_row in city_rows:
+        city_items.append(
             {
-                "zip_code": row.get("zip_code"),
-                "state": row.get("state"),
-                "state_name": row.get("state_name"),
-                "city": row.get("city"),
-                "county_name": row.get("county_name"),
-                "population": row.get("population"),
-                "lat": row.get("latitude"),
-                "long": row.get("longitude"),
-                "timezone": row.get("timezone"),
+                "zip_code": city_row.get("zip_code"),
+                "state": city_row.get("state"),
+                "state_name": city_row.get("state_name"),
+                "city": city_row.get("city"),
+                "county_name": city_row.get("county_name"),
+                "population": city_row.get("population"),
+                "lat": city_row.get("latitude"),
+                "long": city_row.get("longitude"),
+                "timezone": city_row.get("timezone"),
             }
         )
 
     return response.json(
         {
-            "normalized_city": rows[0].get("city"),
+            "normalized_city": city_rows[0].get("city"),
             "state": state or None,
-            "items": items,
+            "items": city_items,
         }
     )
 
@@ -566,15 +566,15 @@ async def get_places_by_zip(request, zip_code):
         stmt = stmt.where(pricing_places_zcta_table.c.measure_id == measure_id)
 
     try:
-        result = await session.execute(stmt)
+        places_result = await session.execute(stmt)
     except ProgrammingError as exc:
         if isinstance(getattr(exc, "orig", None), UndefinedTableError):
             return response.json({"error": "Not found"}, status=404)
         raise
 
     metrics = []
-    for row in result.all():
-        payload_row = _serialize_places_row(_row_mapping(row))
+    for place_row in places_result.all():
+        payload_row = _serialize_places_row(_row_mapping(place_row))
         if payload_row:
             metrics.append(payload_row)
     if not metrics:
@@ -698,8 +698,8 @@ async def list_geo_states(request):
     top_zip_rows = (await session.execute(top_zip_stmt)).all()
 
     zip_map = {}
-    for row in top_zip_rows:
-        mapping = _row_mapping(row)
+    for top_zip_row in top_zip_rows:
+        mapping = _row_mapping(top_zip_row)
         state_key = mapping.get("state")
         if not state_key:
             continue
@@ -713,11 +713,11 @@ async def list_geo_states(request):
             }
         )
 
-    states_payload = []
-    for row in state_rows:
-        mapping = _row_mapping(row)
+    state_items = []
+    for state_row in state_rows:
+        mapping = _row_mapping(state_row)
         state_key = mapping.get("state")
-        states_payload.append(
+        state_items.append(
             {
                 "state": state_key,
                 "state_name": mapping.get("state_name"),
@@ -737,7 +737,7 @@ async def list_geo_states(request):
             "page": pagination.page,
             "limit": limit,
             "offset": offset,
-            "states": states_payload,
+            "states": state_items,
         }
     )
 
@@ -795,21 +795,25 @@ async def get_top_cities_by_state(request, state):
         .limit(limit)
     )
 
-    result = await session.execute(stmt)
-    rows = [_row_mapping(row) for row in result.all() if _row_mapping(row)]
-    if not rows:
+    city_result = await session.execute(stmt)
+    city_rows = [
+        _row_mapping(city_row)
+        for city_row in city_result.all()
+        if _row_mapping(city_row)
+    ]
+    if not city_rows:
         return response.json({"error": "Not found"}, status=404)
 
-    items = []
-    for row in rows:
-        items.append(
+    city_items = []
+    for city_row in city_rows:
+        city_items.append(
             {
-                "city": row.get("city"),
-                "state": row.get("state"),
-                "zip_count": int(row.get("zip_count") or 0),
-                "population": int(row.get("population") or 0),
-                "avg_lat": row.get("avg_lat"),
-                "avg_long": row.get("avg_long"),
+                "city": city_row.get("city"),
+                "state": city_row.get("state"),
+                "zip_count": int(city_row.get("zip_count") or 0),
+                "population": int(city_row.get("population") or 0),
+                "avg_lat": city_row.get("avg_lat"),
+                "avg_long": city_row.get("avg_long"),
             }
         )
 
@@ -820,6 +824,6 @@ async def get_top_cities_by_state(request, state):
             "page": pagination.page,
             "limit": limit,
             "offset": offset,
-            "items": items,
+            "items": city_items,
         }
     )

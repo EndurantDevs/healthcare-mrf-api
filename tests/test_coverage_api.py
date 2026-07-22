@@ -40,6 +40,15 @@ def make_request(results=None):
     return types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=session))
 
 
+def test_coverage_helpers_require_session_and_use_default_schema():
+    with pytest.raises(RuntimeError, match="session not available"):
+        coverage_module._get_session(
+            types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=None))
+        )
+    table = types.SimpleNamespace(schema=None, name="sample")
+    assert coverage_module._qualified_table_name(table) == "mrf.sample"
+
+
 @pytest.mark.asyncio
 async def test_coverage_statistics_success(monkeypatch):
     async def _is_every_table_present(_session, _table):
@@ -122,3 +131,41 @@ async def test_coverage_statistics_missing_tables_return_zero(monkeypatch):
     for field in int_fields:
         assert response_payload[field] == 0
         assert isinstance(response_payload[field], int)
+
+
+@pytest.mark.asyncio
+async def test_coverage_statistics_uses_snapshot_and_procedure_fallbacks(
+    monkeypatch,
+):
+    present_table_names = {
+        coverage_module.import_history_table.name,
+        coverage_module.pricing_provider_table.name,
+        coverage_module.provider_enrichment_summary_table.name,
+    }
+
+    async def _is_selected_table_present(_session, table):
+        return table.name in present_table_names
+
+    monkeypatch.setattr(
+        coverage_module,
+        "_table_exists",
+        _is_selected_table_present,
+    )
+    request = make_request(
+        [
+            FakeResult(None),
+            FakeResult(100),
+            FakeResult(20),
+            FakeResult(30),
+            FakeResult(4),
+        ]
+    )
+
+    response = await coverage_statistics(request)
+    response_payload = json.loads(response.body)
+
+    assert response_payload["provider_coverage_profiles"] == 100
+    assert response_payload["zip_codes_with_procedure_coverage"] == 20
+    assert response_payload["providers_with_procedure_history"] == 30
+    assert response_payload["hospitals_with_medicare_enrollment"] == 4
+    assert response_payload["medicare_clinicians"] == 0

@@ -86,7 +86,7 @@ async def list_codes(request):
 
     code_system = _normalize_code_system(args.get("code_system"))
     q = str(args.get("q", "")).strip().lower()
-    source = str(args.get("source", "")).strip().lower()
+    source_name = str(args.get("source", "")).strip().lower()
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "code").strip().lower()
 
@@ -96,8 +96,8 @@ async def list_codes(request):
         filters.append(restricted_filter)
     if code_system:
         filters.append(func.upper(code_catalog_table.c.code_system) == code_system)
-    if source:
-        filters.append(func.lower(code_catalog_table.c.source) == source)
+    if source_name:
+        filters.append(func.lower(code_catalog_table.c.source) == source_name)
     if q:
         q_like = f"%{q}%"
         filters.append(
@@ -129,24 +129,26 @@ async def list_codes(request):
     if where_clause is not None:
         query = query.where(where_clause)
 
-    order_fields = {
+    order_column_by_name = {
         "code": code_catalog_table.c.code,
         "code_system": code_catalog_table.c.code_system,
         "display_name": code_catalog_table.c.display_name,
     }
-    order_column = order_fields.get(order_by)
+    order_column = order_column_by_name.get(order_by)
     if order_column is None:
-        allowed = ", ".join(sorted(order_fields.keys()))
+        allowed = ", ".join(sorted(order_column_by_name.keys()))
         raise InvalidUsage(f"Unsupported order_by '{order_by}'. Allowed: {allowed}")
     query = query.order_by(order_column.desc() if order == "desc" else order_column.asc())
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    result = await session.execute(query)
-    items = [_json_safe_row(_row_to_dict(row)) for row in result]
+    code_result = await session.execute(query)
+    code_items = [
+        _json_safe_row(_row_to_dict(code_row)) for code_row in code_result
+    ]
 
     return response.json(
         {
-            "items": items,
+            "items": code_items,
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
@@ -156,7 +158,7 @@ async def list_codes(request):
             "query": {
                 "code_system": code_system or None,
                 "q": q or None,
-                "source": source or None,
+                "source": source_name or None,
                 "order_by": order_by,
                 "order": order,
             },
@@ -220,8 +222,14 @@ async def get_related_codes(request, code_system: str, code: str):
     forward_result = await session.execute(forward_query)
     reverse_result = await session.execute(reverse_query)
 
-    forward_items = [_json_safe_row(_row_to_dict(row)) for row in forward_result]
-    reverse_items = [_json_safe_row(_row_to_dict(row)) for row in reverse_result]
+    forward_items = [
+        _json_safe_row(_row_to_dict(crosswalk_row))
+        for crosswalk_row in forward_result
+    ]
+    reverse_items = [
+        _json_safe_row(_row_to_dict(crosswalk_row))
+        for crosswalk_row in reverse_result
+    ]
 
     return response.json(
         {

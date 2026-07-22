@@ -190,7 +190,7 @@ async def test_versioned_proof_adds_exact_current_dataset_outcome(monkeypatch):
     assert enriched_catalog["items"][0]["outcome_summary"] == (
         _expected_outcome_summary()
     )
-    database_execute.assert_awaited_once()
+    assert database_execute.await_count == 2
 
 
 @pytest.mark.asyncio
