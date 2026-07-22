@@ -2197,14 +2197,14 @@ async def test_projection_migration_adopts_in_place_and_downgrades_empty(
             predecessor_catalog[catalog_kind]
             for catalog_kind in predecessor_catalog
         )
-        await postgres.upgrade()
+        await postgres.upgrade(schema_on_search_path=True)
         first_oids = await postgres.relation_oids()
         first_catalog = await postgres.catalog_snapshot()
         assert set(first_oids) == set(PROJECTION_RELATIONS)
         assert all(relation_oid is not None for relation_oid in first_oids.values())
         assert all(first_catalog[catalog_kind] for catalog_kind in first_catalog)
 
-        await postgres.upgrade()
+        await postgres.upgrade(schema_on_search_path=True)
         assert await postgres.relation_oids() == first_oids
         assert await postgres.catalog_snapshot() == first_catalog
 
@@ -2848,7 +2848,7 @@ async def test_projection_migration_rejects_bypassed_trigger_adoption(
     monkeypatch,
 ) -> None:
     async with projection_foundation_postgres(monkeypatch) as postgres:
-        await postgres.upgrade()
+        await postgres.upgrade(schema_on_search_path=True)
         schema = postgres.schema
         await postgres.database.status(
             f"""
@@ -2871,7 +2871,35 @@ async def test_projection_migration_rejects_bypassed_trigger_adoption(
             RuntimeError,
             match="existing_schema_trigger_mismatch",
         ):
-            await postgres.upgrade()
+            await postgres.upgrade(schema_on_search_path=True)
+
+
+@pytest.mark.asyncio
+async def test_projection_migration_recreates_a_missing_trigger(
+    monkeypatch,
+) -> None:
+    async with projection_foundation_postgres(monkeypatch) as postgres:
+        await postgres.upgrade(schema_on_search_path=True)
+        schema = postgres.schema
+        trigger_name = "provider_directory_projection_source_summary_guard"
+        table_name = "provider_directory_physical_projection_source_summary"
+        trigger_key = f"{table_name}.{trigger_name}"
+        original_trigger_oid = (await postgres.catalog_snapshot())["triggers"][
+            trigger_key
+        ][0]
+        await postgres.database.status(
+            f"""
+            DROP TRIGGER {trigger_name}
+                ON "{schema}".{table_name};
+            """
+        )
+
+        await postgres.upgrade(schema_on_search_path=True)
+
+        repaired_trigger_oid = (await postgres.catalog_snapshot())["triggers"][
+            trigger_key
+        ][0]
+        assert repaired_trigger_oid != original_trigger_oid
 
 
 @pytest.mark.asyncio

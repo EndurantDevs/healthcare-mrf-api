@@ -470,8 +470,7 @@ def _validate_trigger(
                    ),
                    encode(trigger_record.tgargs, 'hex'),
                    trigger_record.tgoldtable,
-                   trigger_record.tgnewtable,
-                   pg_get_triggerdef(trigger_record.oid, true)
+                   trigger_record.tgnewtable
               FROM pg_trigger AS trigger_record
               JOIN pg_class AS table_record
                 ON table_record.oid = trigger_record.tgrelid
@@ -509,15 +508,13 @@ def _validate_trigger(
         trigger_arguments,
         old_transition_table,
         new_transition_table,
-        trigger_definition,
     ) = tuple(trigger_record)
     if isinstance(enabled, bytes):
         enabled = enabled.decode("ascii")
-    normalized_definition = " ".join(
-        str(trigger_definition).replace('"', "").lower().split()
-    )
-    expected_relation = f" on {schema}.{table_name} "
-    expected_function = f"execute function {schema}.{function_name}()"
+    # PostgreSQL deparses visible relations and functions without their schema,
+    # so pg_get_triggerdef() is not stable across connection search paths.  The
+    # catalogs below are the canonical trigger contract and retain exact schema
+    # identity without relying on presentation SQL.
     if (
         str(actual_function) != function_name
         or str(function_schema) != schema
@@ -528,13 +525,6 @@ def _validate_trigger(
         or str(trigger_arguments or "") != ""
         or old_transition_table is not None
         or new_transition_table is not None
-        or not normalized_definition.startswith(
-            f"create trigger {trigger_name.lower()} "
-        )
-        or expected_relation.lower() not in normalized_definition
-        or expected_function.lower() not in normalized_definition
-        or " when " in normalized_definition
-        or " update of " in normalized_definition
     ):
         raise RuntimeError(
             f"existing_schema_trigger_mismatch:{schema}.{table_name}.{trigger_name}"

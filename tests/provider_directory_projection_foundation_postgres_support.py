@@ -104,8 +104,13 @@ class ProjectionFoundationPostgres:
     retained_connection: asyncpg.Connection
     schema: str
 
-    async def upgrade(self) -> None:
+    async def upgrade(self, *, schema_on_search_path: bool = False) -> None:
         async with self.migration_engine.begin() as migration_connection:
+            if schema_on_search_path:
+                quoted_schema = '"' + self.schema.replace('"', '""') + '"'
+                await migration_connection.exec_driver_sql(
+                    f"SET LOCAL search_path TO {quoted_schema}, public"
+                )
             await migration_connection.run_sync(
                 lambda sync_connection: _run_migration(sync_connection, "upgrade")
             )
