@@ -21,13 +21,13 @@ def test_graph_providers_by_set_deduplicates_npis_per_provider_set():
             {"npi": 2, "location_hash": "second"},
             {"npi": 3, "location_hash": "unmapped"},
         ],
-        group_ids_by_npi={1: {"group-a"}, 2: {"group-b"}},
+        provider_set_keys_by_npi={1: {10, 11}, 2: {10}},
     )
 
     provider_set_ids, providers_by_set = serving._graph_providers_by_set(
         candidates,
         {1: {"npi": 1, "provider_name": "One"}},
-        {"group-a": ("set-a", "set-b"), "group-b": ("set-a",)},
+        {10: "set-a", 11: "set-b"},
         "npi_address",
     )
 

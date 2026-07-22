@@ -3895,6 +3895,34 @@ async def _shared_rate_provider_groups(
 ) -> tuple[str, ...]:
     """Resolve the shared-graph groups that carry one plan/code rate."""
 
+    provider_set_scope = await _shared_rate_provider_set_keys(
+        session,
+        serving_tables,
+        plan_id=plan_id,
+        plan_market_type=plan_market_type,
+        reported_code=reported_code,
+        code_system=code_system,
+        provider_set_keys=provider_set_keys,
+    )
+    return await _shared_group_ids_for_set_keys(
+        session,
+        serving_tables,
+        provider_set_scope,
+    )
+
+
+async def _shared_rate_provider_set_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    plan_id: str,
+    plan_market_type: str = "",
+    reported_code: str,
+    code_system: str | None,
+    provider_set_keys: Iterable[int] | None = None,
+) -> tuple[int, ...]:
+    """Resolve a plan/code rate to dense provider-set keys only."""
+
     _require_strict_shared_v3(serving_tables)
     if not plan_id or not reported_code:
         return ()
@@ -3946,10 +3974,13 @@ async def _shared_rate_provider_groups(
         code_rows,
         provider_set_keys=provider_set_keys,
     )
-    return await _shared_group_ids_for_set_keys(
-        session,
-        serving_tables,
-        [forward_entry.provider_set_key for forward_entry in forward_rows],
+    return tuple(
+        sorted(
+            {
+                int(forward_entry.provider_set_key)
+                for forward_entry in forward_rows
+            }
+        )
     )
 
 
@@ -6145,20 +6176,79 @@ async def _membership_location_rows(
 @dataclass
 class _GraphLocationCandidates:
     location_rows: list[dict[str, Any]]
-    group_ids_by_npi: dict[int, set[str]]
+    provider_set_keys_by_npi: dict[int, set[int]]
     taxonomy_filtered: bool = False
+
+
+async def _shared_provider_set_keys_by_npi(
+    session,
+    serving_tables: PTG2ServingTables,
+    candidate_npis: Iterable[int],
+    rate_provider_set_keys: Iterable[int],
+) -> dict[int, set[int]]:
+    """Intersect candidate NPIs with a rate scope using dense graph keys."""
+
+    normalized_npis = tuple(sorted({int(npi) for npi in candidate_npis}))
+    allowed_provider_set_keys = frozenset(
+        int(provider_set_key) for provider_set_key in rate_provider_set_keys
+    )
+    if not normalized_npis or not allowed_provider_set_keys:
+        return {}
+    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+    group_keys_by_npi = await lookup_shared_graph_members_from_db(
+        session,
+        shared_snapshot_key,
+        PTG2_V3_GRAPH_NPI_TO_GROUP,
+        normalized_npis,
+        schema_name=PTG2_SCHEMA,
+    )
+    group_keys = tuple(
+        sorted(
+            {
+                int(group_key)
+                for npi_group_keys in group_keys_by_npi.values()
+                for group_key in npi_group_keys
+            }
+        )
+    )
+    if not group_keys:
+        return {}
+    provider_set_keys_by_group = await lookup_shared_graph_members_from_db(
+        session,
+        shared_snapshot_key,
+        PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+        group_keys,
+        schema_name=PTG2_SCHEMA,
+    )
+    if set(provider_set_keys_by_group) != set(group_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 shared graph is missing a group-to-provider-set owner"
+        )
+    matches_by_npi: dict[int, set[int]] = {}
+    for npi in normalized_npis:
+        matches = {
+            int(provider_set_key)
+            for group_key in group_keys_by_npi.get(npi, ())
+            for provider_set_key in provider_set_keys_by_group.get(
+                int(group_key), ()
+            )
+            if int(provider_set_key) in allowed_provider_set_keys
+        }
+        if matches:
+            matches_by_npi[npi] = matches
+    return matches_by_npi
 
 
 async def _append_rate_matched_locations(
     session,
     serving_tables: PTG2ServingTables,
-    rate_scope: _ManifestRateScope,
+    rate_provider_set_keys: frozenset[int],
     candidate_location_rows: list[dict[str, Any]],
     matched_location_rows: list[dict[str, Any]],
-    group_ids_by_npi: dict[int, set[str]],
+    provider_set_keys_by_npi: dict[int, set[int]],
     seen_candidate_npis: set[int],
 ) -> int:
-    """Append newly encountered locations whose provider groups carry the rate."""
+    """Append locations whose dense NPI graph intersects the rate scope."""
     new_location_rows = [
         location
         for location in candidate_location_rows
@@ -6168,22 +6258,19 @@ async def _append_rate_matched_locations(
         return 0
     prior_match_count = len(matched_location_rows)
     seen_candidate_npis.update(int(location["npi"]) for location in new_location_rows)
-    owner_ids = tuple(_ptg2_npi_member_id(int(location["npi"])) for location in new_location_rows)
-    group_ids_by_owner = await _shared_graph_members_by_id(
+    matches_by_npi = await _shared_provider_set_keys_by_npi(
         session,
         serving_tables,
-        "provider_npi_group",
-        owner_ids,
+        (int(location["npi"]) for location in new_location_rows),
+        rate_provider_set_keys,
     )
-    for location_data, owner_id in zip(new_location_rows, owner_ids):
+    for location_data in new_location_rows:
         npi = int(location_data["npi"])
-        matching_group_ids = {
-            group_id
-            for group_id in group_ids_by_owner.get(owner_id, ())
-            if _has_rate_scope_group(rate_scope, group_id)
-        }
-        if matching_group_ids:
-            group_ids_by_npi[npi].update(matching_group_ids)
+        matching_provider_set_keys = matches_by_npi.get(npi, set())
+        if matching_provider_set_keys:
+            provider_set_keys_by_npi[npi].update(
+                matching_provider_set_keys
+            )
             matched_location_rows.append(location_data)
     return len(matched_location_rows) - prior_match_count
 
@@ -6214,7 +6301,9 @@ async def _direct_group_ids_by_npi(
 @dataclass
 class _GraphLocationProbeState:
     matched_location_rows: list[dict[str, Any]] = field(default_factory=list)
-    group_ids_by_npi: dict[int, set[str]] = field(default_factory=lambda: defaultdict(set))
+    provider_set_keys_by_npi: dict[int, set[int]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
     seen_candidate_npis: set[int] = field(default_factory=set)
     filtered_candidates: _GraphLocationCandidates | None = None
 
@@ -6223,7 +6312,7 @@ class _GraphLocationProbeState:
         session,
         serving_tables: PTG2ServingTables,
         args: dict[str, Any],
-        rate_scope: _ManifestRateScope,
+        rate_provider_set_keys: frozenset[int],
         candidate_location_rows: list[dict[str, Any]],
         *,
         taxonomy_filter_requested: bool,
@@ -6233,17 +6322,17 @@ class _GraphLocationProbeState:
         appended_count = await _append_rate_matched_locations(
             session,
             serving_tables,
-            rate_scope,
+            rate_provider_set_keys,
             candidate_location_rows,
             self.matched_location_rows,
-            self.group_ids_by_npi,
+            self.provider_set_keys_by_npi,
             self.seen_candidate_npis,
         )
         if not appended_count:
             return False
         current_candidates = _GraphLocationCandidates(
             self.matched_location_rows,
-            dict(self.group_ids_by_npi),
+            dict(self.provider_set_keys_by_npi),
         )
         if not taxonomy_filter_requested:
             return len(self.matched_location_rows) >= candidate_limit
@@ -6265,7 +6354,10 @@ class _GraphLocationProbeState:
         """Build the final candidate view after the bounded probe loop."""
         if taxonomy_filter_requested:
             return self.filtered_candidates or _GraphLocationCandidates([], {}, taxonomy_filtered=True)
-        return _GraphLocationCandidates(self.matched_location_rows, dict(self.group_ids_by_npi))
+        return _GraphLocationCandidates(
+            self.matched_location_rows,
+            dict(self.provider_set_keys_by_npi),
+        )
 
 
 def _graph_location_probe_batch_size(
@@ -6318,7 +6410,7 @@ async def _paged_graph_candidates(
     session,
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
-    rate_scope: _ManifestRateScope,
+    rate_provider_set_keys: frozenset[int],
     candidate_limit: int,
 ) -> _GraphLocationCandidates | None:
     """Scan indexed addresses in bounded pages and reverse-check graph membership."""
@@ -6346,7 +6438,7 @@ async def _paged_graph_candidates(
             session,
             serving_tables,
             args,
-            rate_scope,
+            rate_provider_set_keys,
             candidate_location_rows,
             taxonomy_filter_requested=is_provider_filter_requested,
             candidate_limit=candidate_limit,
@@ -6379,26 +6471,17 @@ async def _graph_location_candidates(
     session,
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
-    rate_scope: _ManifestRateScope,
+    rate_provider_set_keys: frozenset[int],
     candidate_limit: int,
 ) -> _GraphLocationCandidates | None:
-    """Choose direct or address-first traversal based on rate-scope cardinality."""
-    direct_groups_by_npi = await _direct_group_ids_by_npi(session, serving_tables, rate_scope)
-    if direct_groups_by_npi is None:
-        return await _paged_graph_candidates(session, serving_tables, args, rate_scope, candidate_limit)
-    location_rows = await _membership_location_rows(
+    """Resolve nearby NPIs before intersecting the dense rate scope."""
+
+    return await _paged_graph_candidates(
         session,
         serving_tables,
         args,
-        candidate_npis=tuple(direct_groups_by_npi),
-        limit=max(int(candidate_limit), 1),
-    )
-    if location_rows is None:
-        return None
-    return _GraphLocationCandidates(
-        location_rows,
-        direct_groups_by_npi,
-        taxonomy_filtered=_is_ptg2_provider_filter_requested(args),
+        rate_provider_set_keys,
+        candidate_limit,
     )
 
 
@@ -6426,13 +6509,15 @@ async def _taxonomy_filtered_candidates(
         for location in candidates.location_rows
         if int(location["npi"]) in matching_npis
     ][:candidate_limit]
-    filtered_groups_by_npi = {
-        int(location["npi"]): candidates.group_ids_by_npi.get(int(location["npi"]), set())
+    filtered_provider_set_keys_by_npi = {
+        int(location["npi"]): candidates.provider_set_keys_by_npi.get(
+            int(location["npi"]), set()
+        )
         for location in filtered_location_rows
     }
     return _GraphLocationCandidates(
         filtered_location_rows,
-        filtered_groups_by_npi,
+        filtered_provider_set_keys_by_npi,
         taxonomy_filtered=True,
     )
 
@@ -6482,23 +6567,29 @@ def _has_street_address_payload(address_payload: Any) -> bool:
 def _graph_providers_by_set(
     candidates: _GraphLocationCandidates,
     provider_data_by_npi: dict[int, dict[str, Any]],
-    provider_sets_by_group: dict[str, tuple[str, ...]],
+    provider_set_ids_by_key: Mapping[int, str],
     location_source: str,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]]:
-    """Project matched graph groups back onto priced provider sets."""
+    """Project matched dense provider-set keys onto response IDs."""
     provider_set_ids: set[str] = set()
     providers_by_set: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen_npis_by_set: dict[str, set[int]] = defaultdict(set)
     for location_data in candidates.location_rows:
         npi = int(location_data["npi"])
         provider_data = _graph_provider_data(location_data, provider_data_by_npi.get(npi), location_source)
-        for group_id in candidates.group_ids_by_npi.get(npi, ()):
-            for provider_set_id in provider_sets_by_group.get(group_id, ()):
-                if npi in seen_npis_by_set[provider_set_id]:
-                    continue
-                seen_npis_by_set[provider_set_id].add(npi)
-                provider_set_ids.add(provider_set_id)
-                providers_by_set[provider_set_id].append(provider_data)
+        for provider_set_key in candidates.provider_set_keys_by_npi.get(
+            npi, ()
+        ):
+            provider_set_id = provider_set_ids_by_key.get(
+                int(provider_set_key)
+            )
+            if provider_set_id is None:
+                continue
+            if npi in seen_npis_by_set[provider_set_id]:
+                continue
+            seen_npis_by_set[provider_set_id].add(npi)
+            provider_set_ids.add(provider_set_id)
+            providers_by_set[provider_set_id].append(provider_data)
     return provider_set_ids, dict(providers_by_set)
 
 
@@ -6511,17 +6602,27 @@ async def _project_graph_candidates(
     snapshot_id: str | None,
     source_key: str | None,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
-    """Enrich candidate NPIs and map their groups to provider sets."""
-    group_ids = tuple(
-        dict.fromkeys(
-            group_id
-            for matching_group_ids in candidates.group_ids_by_npi.values()
-            for group_id in matching_group_ids
+    """Enrich candidate NPIs and map dense provider-set keys to IDs."""
+    provider_set_keys = tuple(
+        sorted(
+            {
+                int(provider_set_key)
+                for matching_provider_set_keys in (
+                    candidates.provider_set_keys_by_npi.values()
+                )
+                for provider_set_key in matching_provider_set_keys
+            }
         )
     )
-    provider_sets_by_group = await _manifest_sets_by_group(session, serving_tables, group_ids)
-    if provider_sets_by_group is None:
-        return None
+    provider_set_ids_by_key = await _provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        provider_set_keys,
+    )
+    if set(provider_set_ids_by_key) != set(provider_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 shared graph references a missing provider-set dictionary key"
+        )
     enriched_provider_rows = await _enriched_provider_rows_for_npis(
         session,
         npis=tuple(int(location["npi"]) for location in candidates.location_rows),
@@ -6540,13 +6641,17 @@ async def _project_graph_candidates(
         require_legacy_available=True,
     )
     location_source = _ptg2_address_location_source(address_table or f"{PTG2_SCHEMA}.npi_address")
-    return _graph_providers_by_set(candidates, provider_data_by_npi, provider_sets_by_group, location_source)
+    return _graph_providers_by_set(
+        candidates,
+        provider_data_by_npi,
+        provider_set_ids_by_key,
+        location_source,
+    )
 
 
 @dataclass(frozen=True)
 class _ExplicitNpiGraphScope:
     npi: int
-    group_ids: tuple[str, ...]
     provider_set_keys: tuple[int, ...]
 
 
@@ -6571,16 +6676,7 @@ async def _version_three_explicit_npi_graph_scope(
     )
     group_keys = tuple(sorted(group_keys_by_npi.get(requested_npi, ())))
     if not group_keys:
-        return _ExplicitNpiGraphScope(requested_npi, (), ())
-    group_id_by_key = await _shared_provider_group_ids_for_keys(
-        session,
-        serving_tables,
-        group_keys,
-    )
-    if set(group_id_by_key) != set(group_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 provider-group dictionary is missing an NPI-referenced group"
-        )
+        return _ExplicitNpiGraphScope(requested_npi, ())
     provider_set_keys_by_group = await lookup_shared_graph_members_from_db(
         session,
         shared_snapshot_key,
@@ -6588,6 +6684,10 @@ async def _version_three_explicit_npi_graph_scope(
         group_keys,
         schema_name=PTG2_SCHEMA,
     )
+    if set(provider_set_keys_by_group) != set(group_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 shared graph is missing a group-to-provider-set owner"
+        )
     provider_set_keys = tuple(
         sorted(
             {
@@ -6599,7 +6699,6 @@ async def _version_three_explicit_npi_graph_scope(
     )
     return _ExplicitNpiGraphScope(
         requested_npi,
-        tuple(group_id_by_key[group_key] for group_key in group_keys),
         provider_set_keys,
     )
 
@@ -6608,7 +6707,7 @@ async def _graph_candidates_for_rate_scope(
     session,
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
-    rate_scope: _ManifestRateScope,
+    rate_provider_set_keys: frozenset[int],
     candidate_limit: int,
     explicit_npi_scope: _ExplicitNpiGraphScope | None,
 ) -> _GraphLocationCandidates | None:
@@ -6619,15 +6718,13 @@ async def _graph_candidates_for_rate_scope(
             session,
             serving_tables,
             args,
-            rate_scope,
+            rate_provider_set_keys,
             candidate_limit,
         )
-    matching_group_ids = {
-        group_id
-        for group_id in explicit_npi_scope.group_ids
-        if _has_rate_scope_group(rate_scope, group_id)
-    }
-    if not matching_group_ids:
+    matching_provider_set_keys = rate_provider_set_keys.intersection(
+        explicit_npi_scope.provider_set_keys
+    )
+    if not matching_provider_set_keys:
         return _GraphLocationCandidates([], {})
     location_rows = await _membership_location_rows(
         session,
@@ -6640,7 +6737,11 @@ async def _graph_candidates_for_rate_scope(
         return None
     return _GraphLocationCandidates(
         location_rows,
-        {explicit_npi_scope.npi: matching_group_ids},
+        {
+            explicit_npi_scope.npi: set(
+                matching_provider_set_keys
+            )
+        },
     )
 
 
@@ -6680,26 +6781,32 @@ async def _graph_candidates_for_request(
         )
     if scoped_provider_set_keys is not None and not scoped_provider_set_keys:
         return _GraphLocationCandidates([], {})
-    rate_scope = await _shared_rate_scope(
-        session,
-        serving_tables,
-        plan_id=plan_id,
-        plan_market_type=args.get("plan_market_type") or args.get("market_type") or "",
-        reported_code=requested_code,
-        code_system=requested_system,
-        provider_set_keys=(
-            tuple(sorted(scoped_provider_set_keys))
-            if scoped_provider_set_keys is not None
-            else None
-        ),
+    rate_provider_set_keys = frozenset(
+        await _shared_rate_provider_set_keys(
+            session,
+            serving_tables,
+            plan_id=plan_id,
+            plan_market_type=(
+                args.get("plan_market_type")
+                or args.get("market_type")
+                or ""
+            ),
+            reported_code=requested_code,
+            code_system=requested_system,
+            provider_set_keys=(
+                tuple(sorted(scoped_provider_set_keys))
+                if scoped_provider_set_keys is not None
+                else None
+            ),
+        )
     )
-    if rate_scope.id_count == 0:
+    if not rate_provider_set_keys:
         return _GraphLocationCandidates([], {})
     return await _graph_candidates_for_rate_scope(
         session,
         serving_tables,
         args,
-        rate_scope,
+        rate_provider_set_keys,
         candidate_limit,
         explicit_npi_scope,
     )

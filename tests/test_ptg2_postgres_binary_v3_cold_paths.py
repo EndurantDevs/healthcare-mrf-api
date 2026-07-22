@@ -271,7 +271,6 @@ async def test_v3_page_skips_forward_block(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_v3_explicit_npi_scope_resolves_dense_provider_keys(monkeypatch):
-    group_id = "00000000000000000000000000000021"
     serving_tables = _version_three_tables()
     graph_probe = AsyncMock(
         side_effect=(
@@ -284,10 +283,13 @@ async def test_v3_explicit_npi_scope_resolves_dense_provider_keys(monkeypatch):
         "lookup_shared_graph_members_from_db",
         graph_probe,
     )
+    group_dictionary_probe = AsyncMock(
+        side_effect=AssertionError("dense traversal must not hydrate group IDs")
+    )
     monkeypatch.setattr(
         ptg2_serving,
         "_shared_provider_group_ids_for_keys",
-        AsyncMock(return_value={2: group_id}),
+        group_dictionary_probe,
     )
 
     scope = await ptg2_serving._version_three_explicit_npi_graph_scope(
@@ -298,9 +300,9 @@ async def test_v3_explicit_npi_scope_resolves_dense_provider_keys(monkeypatch):
 
     assert scope == ptg2_serving._ExplicitNpiGraphScope(
         npi=1234567890,
-        group_ids=(group_id,),
         provider_set_keys=(3,),
     )
+    group_dictionary_probe.assert_not_awaited()
     assert [call.args[2] for call in graph_probe.await_args_list] == [
         ptg2_serving.PTG2_V3_GRAPH_NPI_TO_GROUP,
         ptg2_serving.PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
@@ -342,14 +344,11 @@ async def test_v3_provider_set_scope_uses_dense_graph_keys(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_v3_exact_npi_graph_filters_code_before_location_scan(monkeypatch):
-    group_id = "00000000000000000000000000000021"
     explicit_scope = ptg2_serving._ExplicitNpiGraphScope(
         npi=1234567890,
-        group_ids=(group_id,),
         provider_set_keys=(3,),
     )
-    rate_scope = ptg2_serving._ptg2_build_rate_scope((group_id,))
-    rate_scope_probe = AsyncMock(return_value=rate_scope)
+    rate_scope_probe = AsyncMock(return_value=(3,))
     location_rows = [{"npi": 1234567890}]
     projected_result = ({"provider-set"}, {"provider-set": location_rows})
     explicit_scope_probe = AsyncMock(
@@ -362,8 +361,13 @@ async def test_v3_exact_npi_graph_filters_code_before_location_scan(monkeypatch)
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_shared_rate_scope",
+        "_shared_rate_provider_set_keys",
         rate_scope_probe,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_shared_rate_scope",
+        AsyncMock(side_effect=AssertionError("location search must stay dense")),
     )
     monkeypatch.setattr(
         ptg2_serving,
