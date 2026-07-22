@@ -85,9 +85,11 @@ async def all_of_nucc(request):
         )
         stmt = stmt.offset(pagination.offset).limit(pagination.limit)
 
-    result = await session.execute(stmt)
-    rows = result.scalars().all()
-    items = [row.to_json_dict() for row in rows]
+    taxonomy_result = await session.execute(stmt)
+    taxonomy_rows = taxonomy_result.scalars().all()
+    taxonomy_items = [
+        taxonomy_row.to_json_dict() for taxonomy_row in taxonomy_rows
+    ]
 
     if include_meta and pagination is not None:
         return response.json(
@@ -96,7 +98,7 @@ async def all_of_nucc(request):
                 "page": pagination.page,
                 "limit": pagination.limit,
                 "offset": pagination.offset,
-                "items": items,
+                "items": taxonomy_items,
                 "applied_filters": {
                     "limit": pagination.limit,
                     "page": pagination.page,
@@ -106,4 +108,4 @@ async def all_of_nucc(request):
             }
         )
 
-    return response.json(items)
+    return response.json(taxonomy_items)

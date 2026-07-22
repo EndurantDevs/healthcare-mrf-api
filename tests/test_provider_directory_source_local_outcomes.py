@@ -13,6 +13,9 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql import ClauseElement, Executable
 
 from api import provider_directory_source_outcomes as outcomes
+from api.provider_directory_source_dataset_selection import (
+    _source_local_current_published_dataset_statement,
+)
 from db.connection import Database
 from tests.test_provider_directory_source_outcomes import (
     DATASET_ID,
@@ -280,6 +283,21 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
     assert "GROUP BY" in selected_sql
 
 
+def test_current_source_local_query_uses_exact_profile_publication_state():
+    statement = _source_local_current_published_dataset_statement({SOURCE_IDS})
+    selected_sql = str(statement)
+    bound_values = statement.compile().params.values()
+
+    assert "status =" in selected_sql
+    assert "is_current IS true" in selected_sql
+    assert "published_at IS NOT NULL" in selected_sql
+    assert "superseded_at IS NULL" in selected_sql
+    assert "validated_at IS NOT NULL" not in selected_sql
+    assert "LIMIT" in selected_sql
+    assert "provider_directory_dataset_resource" not in selected_sql
+    assert "published" in bound_values
+
+
 @pytest.mark.asyncio
 async def test_newer_validated_source_local_dataset_is_reported(monkeypatch):
     validated_at = dt.datetime(2026, 7, 21, 10, 0, tzinfo=dt.UTC)
@@ -381,6 +399,13 @@ async def test_ranked_selector_is_bounded_on_disposable_postgres():
         )
         query_result = await database.execute(translated_statement)
         selected_row_maps = query_result.mappings().all()
+        current_statement = (
+            _source_local_current_published_dataset_statement(
+                source_id_groups
+            ).execution_options(schema_translate_map={"mrf": schema})
+        )
+        current_result = await database.execute(current_statement)
+        current_row_maps = current_result.mappings().all()
         explain_result = await database.execute(
             _PostgresExplain(translated_statement)
         )
@@ -392,6 +417,12 @@ async def test_ranked_selector_is_bounded_on_disposable_postgres():
         "validated-candidate",
     ]
     assert len(selected_row_maps) == len(source_id_groups)
+    assert [row_map["dataset_id"] for row_map in current_row_maps] == [
+        "multi-current",
+        "published-current",
+        "reassigned-current",
+        "validated-incumbent",
+    ]
     plan_map = explain_result.scalars().one()[0]["Plan"]
     plan_node_maps = list(_plan_nodes(plan_map))
     assert plan_map["Plan Rows"] <= len(source_id_groups)
