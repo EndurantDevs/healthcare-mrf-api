@@ -6671,7 +6671,7 @@ def _serving_readiness_exit_code(report: dict[str, Any], *, require_serving_read
     return 1
 
 
-def main(argv: list[str] | None = None) -> int:
+def run_provider_directory_coverage_audit(argv: list[str] | None = None) -> int:
     """Build the audit and write requested JSON and Markdown outputs."""
     args = parse_args(argv)
     report = asyncio.run(build_report(args))
@@ -6705,6 +6705,11 @@ def main(argv: list[str] | None = None) -> int:
             f"(status={status}, required_fail_count={required_fail_count}).\n"
         )
     return exit_code
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the Provider Directory coverage audit CLI."""
+    return run_provider_directory_coverage_audit(argv)
 
 
 if __name__ == "__main__":

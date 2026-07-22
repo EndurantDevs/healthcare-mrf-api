@@ -790,7 +790,7 @@ async def test_ensure_provider_quality_rx_agg_table_builds_once(monkeypatch):
         __tablename__ = "pricing_qpp_provider_stage_test"
 
     statements: list[str] = []
-    scalar_calls = 0
+    scalar_calls_by_metric = {"total": 0}
 
     async def is_table_existing(_schema: str, table: str) -> bool:
         return table == "pricing_provider_prescription"
@@ -799,8 +799,7 @@ async def test_ensure_provider_quality_rx_agg_table_builds_once(monkeypatch):
         statements.append(statement)
 
     async def _capture_scalar(_statement, **_kwargs):
-        nonlocal scalar_calls
-        scalar_calls += 1
+        scalar_calls_by_metric["total"] += 1
         return 0
 
     monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
@@ -813,7 +812,7 @@ async def test_ensure_provider_quality_rx_agg_table_builds_once(monkeypatch):
         (2023,),
     )
 
-    assert scalar_calls == 1
+    assert scalar_calls_by_metric["total"] == 1
     assert any("CREATE TABLE IF NOT EXISTS mrf.pricing_provider_quality_rx_agg_stage_test" in statement_sql for statement_sql in statements)
     assert any("FROM mrf.pricing_provider_prescription r" in statement_sql for statement_sql in statements)
     assert any("WHERE r.year IN (2023)" in statement_sql for statement_sql in statements)

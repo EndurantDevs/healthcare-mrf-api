@@ -128,7 +128,7 @@ def is_placeholder_carrier(value: str) -> bool:
     return bool(PLACEHOLDER_RE.match(normalize_carrier(value)))
 
 
-def discovery_candidate_matches(candidate: Any, carrier: str) -> bool:
+def is_discovery_candidate_match(candidate: Any, carrier: str) -> bool:
     """Return whether discovery's payer text filter matches the carrier label."""
     return discovery._is_candidate_text_filter_match(
         candidate,
@@ -137,7 +137,7 @@ def discovery_candidate_matches(candidate: Any, carrier: str) -> bool:
     )
 
 
-def candidate_supports_benefit_line(candidate: Any, line: str) -> bool:
+def supports_candidate_benefit_line(candidate: Any, line: str) -> bool:
     """Return whether a candidate can cover the requested benefit line."""
     benefit_lines = getattr(candidate, "benefit_lines", None)
     if not benefit_lines:
@@ -194,7 +194,7 @@ def _filter_candidates_by_line(
     return [
         candidate
         for candidate in source_candidates
-        if candidate_supports_benefit_line(candidate, line)
+        if supports_candidate_benefit_line(candidate, line)
     ]
 
 
@@ -243,7 +243,7 @@ def audit_carrier_rows(
     all_candidates: Sequence[Any],
     importable_candidates: Sequence[Any],
     line_columns: Sequence[tuple[str, str]] = DEFAULT_LINE_COLUMNS,
-    matcher: Matcher = discovery_candidate_matches,
+    matcher: Matcher = is_discovery_candidate_match,
 ) -> tuple[list[CarrierCoverageStats], dict[str, list[tuple[str, int]]]]:
     """Classify carrier mentions by benefit line and return unmatched counts."""
     coverage_stats_list: list[CarrierCoverageStats] = []
@@ -337,7 +337,7 @@ def audit_non_importable_carrier_rows(
     all_candidates: Sequence[Any],
     importable_candidates: Sequence[Any],
     line_columns: Sequence[tuple[str, str]] = DEFAULT_LINE_COLUMNS,
-    matcher: Matcher = discovery_candidate_matches,
+    matcher: Matcher = is_discovery_candidate_match,
 ) -> dict[str, list[tuple[str, int]]]:
     """Return carrier labels that have catalog evidence but no importable source."""
     csv_rows = list(client_rows)
@@ -372,7 +372,7 @@ def audit_non_importable_reason_summary(
     all_candidates: Sequence[Any],
     importable_candidates: Sequence[Any],
     line_columns: Sequence[tuple[str, str]] = DEFAULT_LINE_COLUMNS,
-    matcher: Matcher = discovery_candidate_matches,
+    matcher: Matcher = is_discovery_candidate_match,
 ) -> dict[str, dict[str, dict[str, int]]]:
     """Return aggregate-only reasons for catalog matches lacking importable sources."""
     csv_rows = list(client_rows)
@@ -465,7 +465,7 @@ def _add_optional_report_sections(
     all_candidates: Sequence[Any],
     importable_candidates: Sequence[Any],
     unmatched: Mapping[str, Sequence[tuple[str, int]]],
-    matcher: Matcher = discovery_candidate_matches,
+    matcher: Matcher = is_discovery_candidate_match,
 ) -> None:
     display_carrier = lambda label: (
         f"carrier:{hashlib.sha256(normalize_carrier(label).encode('utf-8')).hexdigest()[:12]}"
@@ -560,45 +560,45 @@ def _print_human_report(
 async def async_main(argv: Sequence[str] | None = None) -> int:
     """Run the audit command and emit its selected report format."""
     args = build_arg_parser().parse_args(argv)
-    rows = read_csv_rows(args.csv_path)
+    client_carrier_rows = read_csv_rows(args.csv_path)
     all_candidates, importable_candidates = await load_discovery_candidates(
         provider=args.provider,
         limit=args.candidate_limit,
     )
     stats, unmatched = audit_carrier_rows(
-        rows,
+        client_carrier_rows,
         all_candidates=all_candidates,
         importable_candidates=importable_candidates,
     )
-    payload = {
+    report_by_field = {
         "csv_path": "<redacted>" if args.redact_labels else str(args.csv_path),
-        "rows": len(rows),
+        "rows": len(client_carrier_rows),
         "provider": args.provider,
         "candidates": len(all_candidates),
         "importable_candidates": len(importable_candidates),
-        "coverage": [item.to_dict() for item in stats],
+        "coverage": [coverage_stat.to_dict() for coverage_stat in stats],
     }
     if args.json:
-        payload["non_importable_reason_summary"] = (
+        report_by_field["non_importable_reason_summary"] = (
             audit_non_importable_reason_summary(
-                rows,
+                client_carrier_rows,
                 all_candidates=all_candidates,
                 importable_candidates=importable_candidates,
             )
         )
     _add_optional_report_sections(
-        payload,
+        report_by_field,
         parsed_args=args,
-        client_rows=rows,
+        client_rows=client_carrier_rows,
         all_candidates=all_candidates,
         importable_candidates=importable_candidates,
         unmatched=unmatched,
     )
     if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(json.dumps(report_by_field, indent=2, sort_keys=True))
     else:
         _print_human_report(
-            payload,
+            report_by_field,
             show_unmatched=args.show_unmatched,
             show_non_importable=args.show_non_importable,
         )

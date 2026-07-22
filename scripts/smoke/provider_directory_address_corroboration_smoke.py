@@ -273,7 +273,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         await _seed(conn, schema)
         await conn.execute(provider_directory_address_corroboration_sql(schema))
-        rows = await conn.fetch(
+        corroboration_rows = await conn.fetch(
             f"""
             SELECT npi,
                    address_network_binding,
@@ -288,49 +288,53 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
              ORDER BY npi;
             """
         )
-        payload = [dict(row) for row in rows]
-        for row in payload:
-            row["provider_directory_network_matches"] = _json_value(row["provider_directory_network_matches"])
-        if len(payload) != 3:
-            raise AssertionError(f"expected 3 corroboration rows, got {payload!r}")
-        plan_match, address_only, service_linked = payload
-        assert plan_match["npi"] == 1234567890, payload
-        assert plan_match["address_network_binding"] == "provider_directory_address", payload
-        assert plan_match["provider_directory_plan_context_matched"] is False, payload
-        assert plan_match["provider_directory_network_names"] == ["C2"], payload
-        assert plan_match["provider_directory_network_matches"][0]["name"] == "C2", payload
-        assert plan_match["matched_on"] == "npi_address_key_role_location", payload
-        assert plan_match["provider_directory_telephone_number"] == "312-555-0100", payload
-        assert address_only["npi"] == 1234567891, payload
-        assert address_only["address_network_binding"] == "provider_directory_address", payload
-        assert address_only["provider_directory_plan_context_matched"] is False, payload
-        assert address_only["provider_directory_network_context_present"] is True, payload
-        assert address_only["provider_directory_network_names"] == ["C2"], payload
-        assert address_only["provider_directory_network_matches"][0]["name"] == "C2", payload
-        assert address_only["matched_on"] == "npi_address_key_role_location", payload
-        assert address_only["provider_directory_telephone_number"] == "312-555-0200", payload
-        assert service_linked["npi"] == 1234567892, payload
-        assert service_linked["address_network_binding"] == "provider_directory_address", payload
-        assert service_linked["provider_directory_plan_context_matched"] is False, payload
-        assert service_linked["provider_directory_network_context_present"] is True, payload
-        assert service_linked["provider_directory_network_names"] == ["C2"], payload
-        assert service_linked["provider_directory_network_matches"][0]["name"] == "C2", payload
-        assert service_linked["matched_on"] == "npi_address_key_role_location", payload
-        assert service_linked["provider_directory_telephone_number"] == "312-555-0300", payload
+        corroboration_records = [dict(corroboration_row) for corroboration_row in corroboration_rows]
+        for corroboration_row in corroboration_records:
+            corroboration_row["provider_directory_network_matches"] = _json_value(
+                corroboration_row["provider_directory_network_matches"]
+            )
+        if len(corroboration_records) != 3:
+            raise AssertionError(
+                f"expected 3 corroboration rows, got {corroboration_records!r}"
+            )
+        plan_match, address_only, service_linked = corroboration_records
+        assert plan_match["npi"] == 1234567890, corroboration_records
+        assert plan_match["address_network_binding"] == "provider_directory_address", corroboration_records
+        assert plan_match["provider_directory_plan_context_matched"] is False, corroboration_records
+        assert plan_match["provider_directory_network_names"] == ["C2"], corroboration_records
+        assert plan_match["provider_directory_network_matches"][0]["name"] == "C2", corroboration_records
+        assert plan_match["matched_on"] == "npi_address_key_role_location", corroboration_records
+        assert plan_match["provider_directory_telephone_number"] == "312-555-0100", corroboration_records
+        assert address_only["npi"] == 1234567891, corroboration_records
+        assert address_only["address_network_binding"] == "provider_directory_address", corroboration_records
+        assert address_only["provider_directory_plan_context_matched"] is False, corroboration_records
+        assert address_only["provider_directory_network_context_present"] is True, corroboration_records
+        assert address_only["provider_directory_network_names"] == ["C2"], corroboration_records
+        assert address_only["provider_directory_network_matches"][0]["name"] == "C2", corroboration_records
+        assert address_only["matched_on"] == "npi_address_key_role_location", corroboration_records
+        assert address_only["provider_directory_telephone_number"] == "312-555-0200", corroboration_records
+        assert service_linked["npi"] == 1234567892, corroboration_records
+        assert service_linked["address_network_binding"] == "provider_directory_address", corroboration_records
+        assert service_linked["provider_directory_plan_context_matched"] is False, corroboration_records
+        assert service_linked["provider_directory_network_context_present"] is True, corroboration_records
+        assert service_linked["provider_directory_network_names"] == ["C2"], corroboration_records
+        assert service_linked["provider_directory_network_matches"][0]["name"] == "C2", corroboration_records
+        assert service_linked["matched_on"] == "npi_address_key_role_location", corroboration_records
+        assert service_linked["provider_directory_telephone_number"] == "312-555-0300", corroboration_records
         plan_verification = _served_address_verification(plan_match, network_names=[])
-        assert plan_verification["address_network_binding"] == "inferred_from_provider_identity", payload
-        assert plan_verification["address_evidence_level"] == "provider_directory_address", payload
-        assert plan_verification["network_bound_address"] is False, payload
-        assert plan_verification["provider_directory_plan_context_matched"] is False, payload
-        assert plan_verification["provider_directory_network_names"] == ["C2"], payload
-        assert plan_verification.get("provider_directory_network_name_matched") is None, payload
-        assert "provider_directory_network_matches" not in plan_verification, payload
+        assert plan_verification["address_network_binding"] == "inferred_from_provider_identity", corroboration_records
+        assert plan_verification["address_evidence_level"] == "provider_directory_address", corroboration_records
+        assert plan_verification["network_bound_address"] is False, corroboration_records
+        assert plan_verification["provider_directory_plan_context_matched"] is False, corroboration_records
+        assert plan_verification["provider_directory_network_names"] == ["C2"], corroboration_records
+        assert plan_verification.get("provider_directory_network_name_matched") is None, corroboration_records
+        assert "provider_directory_network_matches" not in plan_verification, corroboration_records
         network_verification = _served_address_verification(address_only, network_names=["C2"])
-        assert network_verification["address_network_binding"] == "payer_directory_corroborated_location", payload
-        assert network_verification["address_evidence_level"] == "payer_directory_network_location", payload
-        assert network_verification["network_bound_address"] is True, payload
-        assert network_verification["provider_directory_plan_context_matched"] is False, payload
-        assert network_verification["address_verification_evidence"]["matched_on"].endswith("_network_name"), payload
+        assert network_verification["address_network_binding"] == "payer_directory_corroborated_location", corroboration_records
+        assert network_verification["address_evidence_level"] == "payer_directory_network_location", corroboration_records
+        assert network_verification["network_bound_address"] is True, corroboration_records
+        assert network_verification["provider_directory_plan_context_matched"] is False, corroboration_records
+        assert network_verification["address_verification_evidence"]["matched_on"].endswith("_network_name"), corroboration_records
         assert network_verification["provider_directory_network_matches"] == [
             {
                 "ptg_network_name": "C2",
@@ -348,13 +352,13 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "provider_directory_issuer_key": "examplepayer",
                 "provider_directory_issuer_network_match_key": "examplepayer:c2",
             }
-        ], payload
+        ], corroboration_records
         address_only_verification = _served_address_verification(address_only, network_names=["Other Network"])
-        assert address_only_verification["address_network_binding"] == "inferred_from_provider_identity", payload
-        assert address_only_verification["address_evidence_level"] == "provider_directory_address", payload
-        assert address_only_verification["network_bound_address"] is False, payload
-        assert "provider_directory_network_matches" not in address_only_verification, payload
-        return {"schema": schema, "rows": payload}
+        assert address_only_verification["address_network_binding"] == "inferred_from_provider_identity", corroboration_records
+        assert address_only_verification["address_evidence_level"] == "provider_directory_address", corroboration_records
+        assert address_only_verification["network_bound_address"] is False, corroboration_records
+        assert "provider_directory_network_matches" not in address_only_verification, corroboration_records
+        return {"schema": schema, "rows": corroboration_records}
     finally:
         if not args.keep_schema:
             await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')

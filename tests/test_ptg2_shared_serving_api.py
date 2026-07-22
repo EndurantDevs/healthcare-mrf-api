@@ -909,7 +909,6 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
 def _exact_npi_graph_scope():
     return ptg2_serving._ExplicitNpiGraphScope(
         1234567890,
-        ("04" * 16,),
         (3,),
     )
 
@@ -1025,7 +1024,6 @@ async def test_explicit_npi_search_intersects_provider_sets_before_reading_rows(
 
     merge_rows = AsyncMock(return_value=[])
     monkeypatch.setattr(ptg2_serving, "_merge_manifest_code_variant_rows", merge_rows)
-    provider_set_id = "03" * 16
     monkeypatch.setattr(
         ptg2_serving,
         "_version_three_explicit_npi_graph_scope",
@@ -1775,7 +1773,6 @@ async def test_shaped_row_provenance_lookup_uses_source_artifact_key(monkeypatch
 async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch):
     """Ensure location-rate candidates use the logical snapshot's plan scope."""
 
-    provider_group_id = "00000000000000000000000000000009"
     monkeypatch.setattr(
         ptg2_serving,
         "_version_three_explicit_npi_graph_scope",
@@ -1789,7 +1786,11 @@ async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch
     monkeypatch.setattr(
         ptg2_serving,
         "_shared_group_ids_for_set_keys",
-        AsyncMock(return_value=(provider_group_id,)),
+        AsyncMock(
+            side_effect=AssertionError(
+                "location lookup must not expand provider sets to group IDs"
+            )
+        ),
     )
     expected_candidates = object()
     graph_candidates = AsyncMock(return_value=expected_candidates)
@@ -1838,6 +1839,7 @@ async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch
     assert code_params["plan_id"] == "plan-a"
     assert code_params["plan_market_type"] == "group"
     graph_candidates.assert_awaited_once()
+    assert graph_candidates.await_args.args[3] == frozenset({3})
 
 
 @pytest.mark.asyncio

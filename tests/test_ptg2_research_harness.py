@@ -850,6 +850,8 @@ def test_api_latency_probe_config_preserves_zero_warmup():
 
     assert config["warmup"] == 0
     assert config["iterations"] == 1
+    assert config["zip5"] == "60652"
+    assert config["radius_miles"] == 25.0
 
 
 def test_dry_run_writes_report(tmp_path):
