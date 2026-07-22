@@ -6,6 +6,9 @@ import pytest
 
 from api import ptg2_tables
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
+from process.ptg_parts.ptg2_shared_source_set import (
+    shared_source_set_metadata,
+)
 
 
 class FakeResult:
@@ -30,6 +33,38 @@ class FakeSession:
         return value if isinstance(value, FakeResult) else FakeResult(value)
 
 
+def strict_source_identity_rows():
+    return [
+        {
+            "source_key": 0,
+            "source_type": "in_network",
+            "identity_kind": "logical_json_sha256_v1",
+            "identity_sha256": "2" * 64,
+            "raw_container_sha256": "1" * 64,
+            "logical_json_sha256": "2" * 64,
+            "logical_hash_deferred": False,
+            "source_trace_set_hash": "5" * 64,
+        },
+        {
+            "source_key": 1,
+            "source_type": "in_network",
+            "identity_kind": "raw_container_sha256_v1",
+            "identity_sha256": "3" * 64,
+            "raw_container_sha256": "3" * 64,
+            "logical_json_sha256": None,
+            "logical_hash_deferred": True,
+            "source_trace_set_hash": "6" * 64,
+        },
+    ]
+
+
+def strict_source_set():
+    return shared_source_set_metadata(
+        row["raw_container_sha256"]
+        for row in strict_source_identity_rows()
+    )
+
+
 def strict_serving_index(snapshot_key=41):
     audit_sample_map = {
         "contract": "persisted_served_occurrence_sample_v2",
@@ -52,11 +87,7 @@ def strict_serving_index(snapshot_key=41):
         "coverage_scope_id": "c" * 64,
         "storage_generation": "shared_blocks_v3",
         "source_count": 2,
-        "source_set": {
-            "contract": "sorted_raw_container_sha256_bytes_v1",
-            "source_count": 2,
-            "raw_container_sha256_digest": "b" * 64,
-        },
+        "source_set": strict_source_set(),
         "code_count": 2,
         "cold_lookup_contract": "ptg_v3_cold_v2",
         "serving_multiplicity_semantics": "source_multiset_v1",
@@ -95,12 +126,15 @@ def strict_snapshot_row(serving_index=None, **overrides):
         "snapshot_coverage_scope_id": coverage_scope_id,
         "attested_source_key": "source-a",
         "attested_coverage_scope_id": coverage_scope_id,
-        "attested_source_set_digest": "b" * 64,
+        "attested_source_set_digest": serving_index.get("source_set", {}).get(
+            "raw_container_sha256_digest"
+        ),
         "attested_audit_sample_digest": "a" * 64,
         "source_row_count": serving_index.get("source_count"),
         "distinct_source_key_count": serving_index.get("source_count"),
         "minimum_source_key": 0,
         "maximum_source_key": int(serving_index.get("source_count") or 0) - 1,
+        "source_identity_rows": strict_source_identity_rows(),
         "postgres_server_version_num": 160004,
         "database_selected": True,
         "backend_session_active": True,
@@ -162,6 +196,11 @@ async def test_snapshot_serving_tables_requires_published_and_never_caches_v3_me
     assert "ptg2_v3_snapshot_scope" in sql
     assert "ptg2_v3_candidate_audit_attestation" in sql
     assert "ptg2_v3_snapshot_source" in sql
+    assert "JSON_AGG(" in sql
+    assert "raw_container_sha256" in sql
+    assert "logical_hash_deferred" in sql
+    assert "source_trace_set_hash" in sql
+    assert "pgcrypto" not in sql
     assert "snapshot.manifest" not in sql
     assert "current_setting('server_version_num')" in sql
     assert "txid_current_snapshot()" in sql

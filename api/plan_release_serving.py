@@ -10,6 +10,9 @@ from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 
+from api.plan_release_readiness import is_release_binding_serving_ready
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+
 
 def _projection_schema() -> str:
     """Use the same explicit schema contract as the projection migration/ORM."""
@@ -342,6 +345,21 @@ def _selection_from_rows(
     )
 
 
+async def _is_release_binding_set_serving_ready(
+    session: Any,
+    selection: PlanReleaseServingSelection,
+) -> bool:
+    """Require every frozen binding to pass the normal PTG2 serving guard."""
+
+    try:
+        for binding in selection.bindings:
+            if not await is_release_binding_serving_ready(session, binding):
+                return False
+    except PTG2ManifestArtifactError:
+        return False
+    return True
+
+
 async def resolve_plan_release_serving(
     session: Any,
     plan_release_id: Any,
@@ -358,7 +376,13 @@ async def resolve_plan_release_serving(
             "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
         },
     )
-    return _selection_from_rows(normalized_release_id, result)
+    selection = _selection_from_rows(normalized_release_id, result)
+    if selection is None or not await _is_release_binding_set_serving_ready(
+        session,
+        selection,
+    ):
+        return None
+    return selection
 
 
 def binding_query_args(

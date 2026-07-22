@@ -10116,24 +10116,58 @@ async def _search_plan_release_index(
     )
 
 
-async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -> dict[str, Any] | None:
-    """Resolve current plan snapshots and execute a single or multi-network query."""
+_RELEASE_SELECTION_UNSET = object()
+
+
+async def _plan_release_route_selection(
+    session,
+    args: Mapping[str, Any],
+    supplied_selection: PlanReleaseServingSelection | None | object,
+) -> tuple[bool, PlanReleaseServingSelection | None]:
+    """Resolve or validate the exact release selection for one route."""
 
     requested_release_id = str(args.get("plan_release_id") or "").strip()
-    if requested_release_id:
-        if has_conflicting_release_selectors(args):
-            return None
-        release_selection = await resolve_plan_release_serving(
+    if not requested_release_id:
+        return supplied_selection is not _RELEASE_SELECTION_UNSET, None
+    if has_conflicting_release_selectors(args):
+        return True, None
+    if supplied_selection is _RELEASE_SELECTION_UNSET:
+        return True, await resolve_plan_release_serving(
             session,
             requested_release_id,
         )
-        if release_selection is None:
+    if (
+        not isinstance(supplied_selection, PlanReleaseServingSelection)
+        or supplied_selection.plan_release_id != requested_release_id
+    ):
+        return True, None
+    return True, supplied_selection
+
+
+async def search_current_ptg2_index(
+    session,
+    args: dict[str, Any],
+    pagination,
+    *,
+    release_selection: PlanReleaseServingSelection | None | object = (
+        _RELEASE_SELECTION_UNSET
+    ),
+) -> dict[str, Any] | None:
+    """Resolve current plan snapshots and execute a single or multi-network query."""
+
+    has_release_route, selected_release = await _plan_release_route_selection(
+        session,
+        args,
+        release_selection,
+    )
+    if has_release_route:
+        if selected_release is None:
             return None
         return await _search_plan_release_index(
             session,
             args,
             pagination,
-            release_selection,
+            selected_release,
         )
     explicit_snapshot = str(args.get("snapshot_id") or "").strip()
     explicit_source = str(args.get("source_key") or "").strip()

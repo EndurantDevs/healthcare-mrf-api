@@ -80,6 +80,7 @@ from api.plan_release_serving import (
     normalize_plan_release_id,
     resolve_plan_release_serving,
 )
+from api.plan_release_readiness import is_release_binding_serving_scope_exact
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_demographic_filters import (
@@ -6236,20 +6237,49 @@ async def _allowed_amount_response_from_page(
     )
 
 
+_RELEASE_SELECTION_UNSET = object()
+
+
+def _release_selection_args_by_name(
+    release_selection: PlanReleaseServingSelection | None | object,
+) -> dict[str, object]:
+    """Pass an explicitly pre-resolved release selection when supplied."""
+
+    if release_selection is _RELEASE_SELECTION_UNSET:
+        return {}
+    return {"release_selection": release_selection}
+
+
 async def _resolve_allowed_amount_route(
     session,
     args: Mapping[str, Any],
+    *,
+    release_selection: PlanReleaseServingSelection | None | object = (
+        _RELEASE_SELECTION_UNSET
+    ),
 ) -> tuple[Mapping[str, Any], PlanReleaseServingSelection | None] | None:
     requested_release_id = str(args.get("plan_release_id") or "").strip()
+    is_release_selection_supplied = (
+        release_selection is not _RELEASE_SELECTION_UNSET
+    )
+    if is_release_selection_supplied and (
+        not isinstance(release_selection, PlanReleaseServingSelection)
+        or not requested_release_id
+        or release_selection.plan_release_id != requested_release_id
+    ):
+        return None
     if not requested_release_id:
         return args, None
     if has_conflicting_release_selectors(args):
         return None
-    release_selection = await resolve_plan_release_serving(
-        session,
-        requested_release_id,
-    )
+    if not is_release_selection_supplied:
+        release_selection = await resolve_plan_release_serving(
+            session,
+            requested_release_id,
+        )
     if release_selection is None:
+        return None
+    if not isinstance(release_selection, PlanReleaseServingSelection):
         return None
     allowed_bindings = release_selection.allowed_amount_bindings
     if not allowed_bindings:
@@ -6290,14 +6320,43 @@ async def _allowed_amount_snapshot_rows(
     )
 
 
+def _allowed_amount_release_response(
+    response_payload: dict[str, Any] | None,
+    resolved_args: Mapping[str, Any],
+    pagination,
+    release_selection: PlanReleaseServingSelection | None,
+    search_scope: tuple[str, str, str, int | None],
+) -> dict[str, Any] | None:
+    """Annotate a canonical allowed result or preserve an ordinary response."""
+
+    if release_selection is None:
+        return response_payload
+    if response_payload is None:
+        return _allowed_amount_no_match_response(
+            resolved_args,
+            pagination,
+            release_selection,
+            search_scope=search_scope,
+        )
+    return annotate_plan_release_response(response_payload, release_selection)
+
+
 async def _search_ptg_allowed_amount_evidence(
     session,
     args: Mapping[str, Any],
     pagination,
+    *,
+    release_selection: PlanReleaseServingSelection | None | object = (
+        _RELEASE_SELECTION_UNSET
+    ),
 ) -> dict[str, Any] | None:
     """Search current or canonically pinned strict-V3 allowed evidence."""
 
-    resolved_route = await _resolve_allowed_amount_route(session, args)
+    resolved_route = await _resolve_allowed_amount_route(
+        session,
+        args,
+        **_release_selection_args_by_name(release_selection),
+    )
     if resolved_route is None:
         return None
     resolved_args, release_selection = resolved_route
@@ -6334,19 +6393,13 @@ async def _search_ptg_allowed_amount_evidence(
         page_rows=page_rows,
         query_parameter_map=query_parameter_map,
     )
-    if release_selection is not None:
-        if response_payload is None:
-            return _allowed_amount_no_match_response(
-                resolved_args,
-                pagination,
-                release_selection,
-                search_scope=search_scope,
-            )
-        return annotate_plan_release_response(
-            response_payload,
-            release_selection,
-        )
-    return response_payload
+    return _allowed_amount_release_response(
+        response_payload,
+        resolved_args,
+        pagination,
+        release_selection,
+        search_scope,
+    )
 
 
 def _allowed_amount_rows_by_npi(
@@ -7141,24 +7194,9 @@ async def group_plan_providers(request):
                 )
             pair_plan_id = release_binding.plan_id
             pair_market_type = release_binding.plan_market_type
-            serving_plan_id = str(
-                getattr(pair_tables, "plan_id", None) or ""
-            ).strip()
-            serving_market_type = str(
-                getattr(pair_tables, "plan_market_type", None) or ""
-            ).strip().lower()
-            serving_source_key = str(
-                getattr(pair_tables, "source_key", None) or ""
-            ).strip().lower()
-            if (
-                serving_plan_id
-                not in set(ein_plan_id_variants(release_binding.plan_id))
-                or not serving_market_type
-                or serving_market_type
-                != release_binding.plan_market_type.strip().lower()
-                or not serving_source_key
-                or serving_source_key
-                != release_binding.source_key.strip().lower()
+            if not is_release_binding_serving_scope_exact(
+                pair_tables,
+                release_binding,
             ):
                 raise PTG2ManifestArtifactError(
                     "canonical plan release binding does not match the "
@@ -10763,13 +10801,19 @@ async def list_providers_by_procedure(request):
         ):
             _raise_unresolved_specialty(specialty_probe)
     broad_expansion_market_type = plan_market_type
+    release_selection = None
+    release_selection_args_by_name = {}
     if plan_release_id:
+        release_selection = await resolve_plan_release_serving(
+            session,
+            plan_release_id,
+        )
+        release_selection_args_by_name = _release_selection_args_by_name(
+            release_selection
+        )
         broad_expansion_market_type = (
             _release_market_type_for_guard(
-                await resolve_plan_release_serving(
-                    session,
-                    plan_release_id,
-                )
+                release_selection
             )
         )
     _reject_broad_group_plan_provider_expansion(
@@ -10870,6 +10914,7 @@ async def list_providers_by_procedure(request):
             session,
             ptg_args_by_name,
             pagination,
+            **release_selection_args_by_name,
         )
         if ptg2_payload is None:
             if include_allowed_amounts:
@@ -10878,6 +10923,7 @@ async def list_providers_by_procedure(request):
                         session,
                         ptg_args_by_name,
                         pagination,
+                        **release_selection_args_by_name,
                     )
                 )
                 if allowed_amount_payload is not None:
@@ -10964,6 +11010,7 @@ async def list_providers_by_procedure(request):
                 session,
                 ptg_args_by_name,
                 pagination,
+                **release_selection_args_by_name,
             )
             if allowed_amount_payload is not None:
                 _annotate_ptg2_query_payload(

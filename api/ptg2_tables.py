@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import text
@@ -23,7 +24,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_GENERATION,
 )
-from process.ptg_parts.ptg2_shared_reuse import PTG2_V3_SOURCE_SET_CONTRACT
+from process.ptg_parts.ptg2_shared_source_set import (
+    PTG2_V3_SOURCE_SET_CONTRACT,
+    shared_source_set_metadata,
+)
 from process.ptg_parts.ptg2_source_witness_contract import (
     validate_source_witness_manifest,
 )
@@ -229,6 +233,102 @@ def _strict_v3_source_set(
         "source_count": source_count,
         "raw_container_sha256_digest": digest,
     }
+
+
+def _validated_published_source_identity(
+    raw_source_row: Any,
+) -> tuple[int, str]:
+    """Validate one persisted source identity used by a published layout."""
+
+    if not isinstance(raw_source_row, Mapping):
+        raise PTG2ManifestArtifactError(
+            "PTG2 published source identity row is malformed"
+        )
+    source_key = _optional_integer(raw_source_row.get("source_key"))
+    source_type = raw_source_row.get("source_type")
+    identity_kind = raw_source_row.get("identity_kind")
+    identity_sha256 = raw_source_row.get("identity_sha256")
+    raw_container_sha256 = raw_source_row.get("raw_container_sha256")
+    logical_json_sha256 = raw_source_row.get("logical_json_sha256")
+    logical_hash_deferred = raw_source_row.get("logical_hash_deferred")
+    source_trace_set_hash = raw_source_row.get("source_trace_set_hash")
+    if (
+        source_key is None
+        or not isinstance(source_type, str)
+        or not source_type.strip()
+        or not isinstance(identity_kind, str)
+        or not isinstance(identity_sha256, str)
+        or not _COVERAGE_SCOPE_ID_RE.fullmatch(identity_sha256)
+        or not isinstance(raw_container_sha256, str)
+        or not _COVERAGE_SCOPE_ID_RE.fullmatch(raw_container_sha256)
+        or not isinstance(logical_hash_deferred, bool)
+        or not isinstance(source_trace_set_hash, str)
+        or not _COVERAGE_SCOPE_ID_RE.fullmatch(source_trace_set_hash)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 published source identity row is invalid"
+        )
+    if logical_hash_deferred:
+        has_consistent_identity = (
+            identity_kind == "raw_container_sha256_v1"
+            and identity_sha256 == raw_container_sha256
+            and logical_json_sha256 is None
+        )
+    else:
+        has_consistent_identity = (
+            identity_kind == "logical_json_sha256_v1"
+            and isinstance(logical_json_sha256, str)
+            and bool(_COVERAGE_SCOPE_ID_RE.fullmatch(logical_json_sha256))
+            and identity_sha256 == logical_json_sha256
+        )
+    if not has_consistent_identity:
+        raise PTG2ManifestArtifactError(
+            "PTG2 published source identity evidence is inconsistent"
+        )
+    return source_key, raw_container_sha256
+
+
+def _validated_published_source_set(
+    raw_source_rows: Any,
+    *,
+    expected_source_count: int,
+) -> dict[str, Any]:
+    """Recompute one published source-set seal from persisted identities."""
+
+    if isinstance(raw_source_rows, str):
+        try:
+            raw_source_rows = json.loads(raw_source_rows)
+        except json.JSONDecodeError as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 published source identity rows are malformed"
+            ) from exc
+    if (
+        not isinstance(raw_source_rows, list)
+        or len(raw_source_rows) != expected_source_count
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 published source identity rows are incomplete"
+        )
+
+    source_keys: set[int] = set()
+    raw_container_hashes: list[str] = []
+    for raw_source_row in raw_source_rows:
+        source_key, raw_container_sha256 = (
+            _validated_published_source_identity(raw_source_row)
+        )
+        source_keys.add(source_key)
+        raw_container_hashes.append(raw_container_sha256)
+
+    if source_keys != set(range(expected_source_count)):
+        raise PTG2ManifestArtifactError(
+            "PTG2 published source identity ordinals are not complete and dense"
+        )
+    try:
+        return shared_source_set_metadata(raw_container_hashes)
+    except ValueError as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 published source-set identity is invalid"
+        ) from exc
 
 
 def _database_execution_evidence(row_fields: Any) -> dict[str, Any]:
@@ -555,6 +655,7 @@ async def snapshot_serving_tables(
                    source_summary.distinct_source_key_count,
                    source_summary.minimum_source_key,
                    source_summary.maximum_source_key,
+                   source_summary.source_identity_rows,
                    current_setting('server_version_num')::integer
                        AS postgres_server_version_num,
                    current_database() IS NOT NULL AS database_selected,
@@ -578,7 +679,24 @@ async def snapshot_serving_tables(
                          COUNT(DISTINCT source.source_key)::bigint
                              AS distinct_source_key_count,
                          MIN(source.source_key) AS minimum_source_key,
-                         MAX(source.source_key) AS maximum_source_key
+                         MAX(source.source_key) AS maximum_source_key,
+                         JSON_AGG(
+                             JSON_BUILD_OBJECT(
+                                 'source_key', source.source_key,
+                                 'source_type', source.source_type,
+                                 'identity_kind', source.identity_kind,
+                                 'identity_sha256', source.identity_sha256,
+                                 'raw_container_sha256',
+                                     source.raw_container_sha256,
+                                 'logical_json_sha256',
+                                     source.logical_json_sha256,
+                                 'logical_hash_deferred',
+                                     source.logical_hash_deferred,
+                                 'source_trace_set_hash',
+                                     source.source_trace_set_hash
+                             )
+                             ORDER BY source.source_key
+                         ) AS source_identity_rows
                     FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_source source
                    WHERE source.snapshot_id = snapshot.snapshot_id
               ) source_summary
@@ -755,18 +873,29 @@ async def snapshot_serving_tables(
             raise PTG2ManifestArtifactError(
                 "PTG2 published source dictionary is not complete and dense"
             )
-        source_set_digest = str(
+        manifest_source_set = _strict_v3_source_set(
+            serving_index,
+            source_count=source_count,
+        )
+        if manifest_source_set is None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 published source set is missing from its sealed layout"
+            )
+        source_set_by_field = _validated_published_source_set(
+            row_fields.get("source_identity_rows"),
+            expected_source_count=source_count,
+        )
+        attested_source_set_digest = str(
             row_fields.get("attested_source_set_digest") or ""
         )
-        if not _COVERAGE_SCOPE_ID_RE.fullmatch(source_set_digest):
+        if (
+            manifest_source_set != source_set_by_field
+            or attested_source_set_digest
+            != source_set_by_field["raw_container_sha256_digest"]
+        ):
             raise PTG2ManifestArtifactError(
-                "PTG2 published source-set attestation is invalid"
+                "PTG2 published source set does not match its manifest and attestation"
             )
-        source_set_by_field = {
-            "contract": PTG2_V3_SOURCE_SET_CONTRACT,
-            "source_count": source_count,
-            "raw_container_sha256_digest": source_set_digest,
-        }
         source_key = (
             str(row_fields.get("attested_source_key") or "").strip() or None
         )
