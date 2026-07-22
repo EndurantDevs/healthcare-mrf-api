@@ -15,7 +15,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Mapping, NamedTuple
+from typing import Any, BinaryIO, Callable, Iterable, Mapping, NamedTuple
 
 try:
     import orjson
@@ -64,6 +64,11 @@ _SCANNER_PROGRESS_BASE_KEYS = {
     "eta_seconds",
     "objects",
     "done",
+    "progress_basis",
+    "indexed_objects_completed",
+    "indexed_objects_total",
+    "in_network_objects_completed",
+    "in_network_objects_total",
 }
 _SCANNER_METRIC_RECORD_KINDS = {"scanner_config", "scanner_summary"}
 _V3_SERVING_RUN_FORMAT = "ptg2_v3_serving_run"
@@ -1202,6 +1207,9 @@ class _ScannerProgress(NamedTuple):
     scanner_object_count_by_kind: dict[str, int]
     scanner_path: str | None
     is_done: bool
+    progress_basis: str
+    work_done: int | None
+    work_total: int | None
 
 
 def _parse_scanner_progress(fields: dict[str, str]) -> _ScannerProgress:
@@ -1211,17 +1219,44 @@ def _parse_scanner_progress(fields: dict[str, str]) -> _ScannerProgress:
         if key not in _SCANNER_PROGRESS_BASE_KEYS
         and (count := _coerce_progress_int(value)) is not None
     }
+    compressed_bytes = _coerce_progress_int(fields.get("compressed_bytes"))
+    total_bytes = _coerce_progress_int(fields.get("total_bytes"))
+    object_count = _coerce_progress_int(fields.get("objects"))
+    declared_basis = str(fields.get("progress_basis") or "").strip()
+    if declared_basis == "indexed_objects":
+        progress_basis = declared_basis
+        work_done = _coerce_progress_int(fields.get("indexed_objects_completed"))
+        work_total = _coerce_progress_int(fields.get("indexed_objects_total"))
+    elif declared_basis == "plain_reordered_objects":
+        progress_basis = declared_basis
+        work_done = _coerce_progress_int(fields.get("in_network_objects_completed"))
+        work_total = _coerce_progress_int(fields.get("in_network_objects_total"))
+    elif compressed_bytes is not None and compressed_bytes > 0:
+        progress_basis = "compressed_bytes"
+        work_done = compressed_bytes
+        work_total = total_bytes
+    elif object_count is not None:
+        progress_basis = "objects"
+        work_done = object_count
+        work_total = None
+    else:
+        progress_basis = declared_basis or "compressed_bytes"
+        work_done = compressed_bytes
+        work_total = total_bytes
     return _ScannerProgress(
-        compressed_bytes=_coerce_progress_int(fields.get("compressed_bytes")),
-        total_bytes=_coerce_progress_int(fields.get("total_bytes")),
+        compressed_bytes=compressed_bytes,
+        total_bytes=total_bytes,
         percent=_coerce_progress_float(fields.get("percent")),
         eta_seconds=_coerce_progress_float(fields.get("eta_seconds")),
         elapsed_seconds=_coerce_progress_float(fields.get("elapsed_seconds")),
         compressed_mib_s=_coerce_progress_float(fields.get("compressed_mib_s")),
-        object_count=_coerce_progress_int(fields.get("objects")),
+        object_count=object_count,
         scanner_object_count_by_kind=scanner_object_count_by_kind,
         scanner_path=fields.get("path"),
         is_done=str(fields.get("done") or "").lower() == "true",
+        progress_basis=progress_basis,
+        work_done=work_done,
+        work_total=work_total,
     )
 
 
@@ -1262,11 +1297,52 @@ def _scanner_object_progress_message(
     return ", ".join(message_parts), object_rate
 
 
+def _scanner_bounded_progress_message(
+    phase: str,
+    progress: _ScannerProgress,
+) -> tuple[str, float | None]:
+    message_parts = [
+        f"{phase} {progress.percent:.2f}%"
+        if progress.percent is not None
+        else phase
+    ]
+    if progress.work_done is not None:
+        work_label = progress.progress_basis.replace("_", " ")
+        if progress.work_total is not None:
+            message_parts.append(
+                f"{work_label}={progress.work_done:,}/{progress.work_total:,}"
+            )
+        else:
+            message_parts.append(f"{work_label}={progress.work_done:,}")
+    if progress.object_count is not None:
+        message_parts.append(f"objects={progress.object_count:,}")
+    for counter_name, counter_value in sorted(
+        progress.scanner_object_count_by_kind.items()
+    ):
+        message_parts.append(
+            f"{counter_name.replace('_', ' ')}={counter_value:,}"
+        )
+    if progress.compressed_mib_s is not None:
+        message_parts.append(f"{progress.compressed_mib_s:.2f} MiB/s")
+    work_rate = (
+        progress.work_done / progress.elapsed_seconds
+        if progress.work_done is not None
+        and progress.elapsed_seconds is not None
+        and progress.elapsed_seconds > 0
+        else None
+    )
+    formatted_elapsed = _format_progress_duration(progress.elapsed_seconds)
+    if formatted_elapsed:
+        message_parts.append(f"elapsed={formatted_elapsed}")
+    return ", ".join(message_parts), work_rate
+
+
 def _emit_scanner_live_progress(
     line: str,
     *,
     phase: str,
     live_progress_context: dict[str, Any] | None = None,
+    progress_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Parse a scanner progress frame and publish scaled live-progress fields."""
     fields = _scanner_progress_fields(line)
@@ -1278,13 +1354,21 @@ def _emit_scanner_live_progress(
         for context_key, context_value in (live_progress_context or {}).items()
         if context_value not in (None, "")
     }
-    use_object_progress = bool(
+    use_unbounded_object_progress = bool(
         not progress.is_done
-        and progress.object_count is not None
-        and progress.object_count > 0
-        and (progress.compressed_bytes is None or progress.compressed_bytes <= 0)
+        and progress.progress_basis == "objects"
+        and progress.work_done is not None
+        and progress.work_done > 0
+        and progress.work_total is None
     )
-    phase_pct = None if use_object_progress else progress.percent
+    phase_pct = None if use_unbounded_object_progress else progress.percent
+    if (
+        phase_pct is None
+        and progress.work_done is not None
+        and progress.work_total is not None
+        and progress.work_total > 0
+    ):
+        phase_pct = min(progress.work_done * 100.0 / progress.work_total, 100.0)
     overall_pct = _scale_stage_progress_pct(
         phase_pct,
         progress_context_map.get("overall_progress_start_pct"),
@@ -1292,7 +1376,7 @@ def _emit_scanner_live_progress(
     )
     pct = overall_pct if overall_pct is not None else phase_pct
     object_rate = None
-    if use_object_progress:
+    if use_unbounded_object_progress:
         pct = _coerce_progress_float(
             progress_context_map.get("overall_progress_start_pct")
         )
@@ -1308,21 +1392,10 @@ def _emit_scanner_live_progress(
         progress_total = None
         progress_eta = None
     else:
-        message_parts = [
-            f"{phase} {progress.percent:.2f}%" if progress.percent is not None else phase,
-            (
-                f"read {_format_progress_mib(progress.compressed_bytes)} "
-                f"of {_format_progress_mib(progress.total_bytes)}"
-            ),
-        ]
-        if progress.object_count is not None:
-            message_parts.append(f"objects={progress.object_count}")
-        if progress.compressed_mib_s is not None:
-            message_parts.append(f"{progress.compressed_mib_s:.2f} MiB/s")
-        message = ", ".join(message_parts)
-        progress_unit = "compressed_bytes"
-        progress_done = progress.compressed_bytes
-        progress_total = progress.total_bytes
+        message, object_rate = _scanner_bounded_progress_message(phase, progress)
+        progress_unit = progress.progress_basis
+        progress_done = progress.work_done
+        progress_total = progress.work_total
         progress_eta = progress.eta_seconds
     progress_value_by_field: dict[str, Any] = {
         **progress_context_map,
@@ -1332,6 +1405,14 @@ def _emit_scanner_live_progress(
         "total": progress_total,
         "pct": pct,
         "phase_pct": phase_pct,
+        "stage_id": phase,
+        "stage_pct": phase_pct,
+        "basis": progress.progress_basis,
+        "denominator_state": (
+            "known" if progress.work_total is not None else "unknown"
+        ),
+        "work_done": progress.work_done,
+        "work_total": progress.work_total,
         "eta_seconds": progress_eta,
         "elapsed_seconds": progress.elapsed_seconds,
         "message": message,
@@ -1341,11 +1422,23 @@ def _emit_scanner_live_progress(
         "scanner_path": progress.scanner_path,
         "scanner_done": progress.is_done,
         "scanner_objects": progress.scanner_object_count_by_kind or None,
-        "scanner_progress_basis": progress_unit,
+        "counters": progress.scanner_object_count_by_kind or None,
+        "scanner_progress_basis": progress.progress_basis,
         "scanner_object_rate": object_rate,
+        "throughput": (
+            {
+                "unit": f"{progress.progress_basis}_per_second",
+                "value": object_rate,
+            }
+            if object_rate is not None
+            else None
+        ),
     }
     try:
-        write_live_progress(**progress_value_by_field)
+        if progress_observer is not None:
+            progress_observer(progress_value_by_field)
+        else:
+            write_live_progress(**progress_value_by_field)
     except Exception:
         logger.debug("Failed to write PTG2 scanner live progress", exc_info=True)
 
@@ -1382,6 +1475,7 @@ def _emit_scanner_metric_progress(
     metric_fields: dict[str, Any],
     *,
     live_progress_context: dict[str, Any] | None = None,
+    progress_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     if record_kind not in _SCANNER_METRIC_RECORD_KINDS:
         return
@@ -1395,7 +1489,7 @@ def _emit_scanner_metric_progress(
         if context_value not in (None, "")
     }
     try:
-        write_live_progress(
+        progress_payload = dict(
             **progress_context_map,
             phase="compact-serving scanner",
             message=message,
@@ -1406,6 +1500,10 @@ def _emit_scanner_metric_progress(
             scanner_execution_mode=metric_fields.get("execution_mode"),
             scanner_fallback_reason=metric_fields.get("top_level_byte_scan_fallback_reason"),
         )
+        if progress_observer is not None:
+            progress_observer(progress_payload)
+        else:
+            write_live_progress(**progress_payload)
     except Exception:
         logger.debug("Failed to write PTG2 scanner metric progress", exc_info=True)
 
@@ -1532,6 +1630,7 @@ def _iter_compact_serving_records_rust(
     source_network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     manifest_only: bool | None = None,
     live_progress_context: dict[str, Any] | None = None,
+    progress_observer: Callable[[dict[str, Any]], None] | None = None,
     _process_control: _ScannerProcessControl | None = None,
 ):
     """Run the Rust compact scanner and yield validated decoded record frames."""
@@ -1704,6 +1803,7 @@ def _iter_compact_serving_records_rust(
                             line,
                             phase="compact-serving scanner",
                             live_progress_context=live_progress_context,
+                            progress_observer=progress_observer,
                         )
                 else:
                     logger.warning("PTG2 Rust compact scanner stderr: %s", line)
@@ -1812,6 +1912,7 @@ def _iter_compact_serving_records_rust(
                     record_kind,
                     frame_field_map,
                     live_progress_context=live_progress_context,
+                    progress_observer=progress_observer,
                 )
             yield record_kind, frame_field_map
         if not has_scanner_config or not has_scanner_summary:
@@ -1880,6 +1981,7 @@ async def _aiter_compact_serving_records_rust(
     manifest_provider_set_dictionary_copy_path: str | Path | None = None,
     source_network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     manifest_only: bool | None = None,
+    progress_observer: Callable[[dict[str, Any]], None] | None = None,
 ):
     """Yield compact scanner records asynchronously through a bounded queue."""
     live_progress_context = current_live_progress_context()
@@ -1919,6 +2021,7 @@ async def _aiter_compact_serving_records_rust(
         source_network_names=source_network_names,
         manifest_only=manifest_only,
         live_progress_context=live_progress_context,
+        progress_observer=progress_observer,
         _process_control=process_control,
     )
     event_queue: queue.Queue[Any] = queue.Queue(

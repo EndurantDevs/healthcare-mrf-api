@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
+import threading
 from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import mock_open
@@ -50,6 +52,7 @@ class _LoopProbe:
     def __init__(self, *, fail_create: bool = False):
         self.fail_create = fail_create
         self.created = 0
+        self.timers: list[SimpleNamespace] = []
 
     def create_task(self, coroutine):
         self.created += 1
@@ -58,11 +61,28 @@ class _LoopProbe:
             raise RuntimeError("task scheduling failed")
         return SimpleNamespace(done=lambda: False)
 
+    def call_soon(self, callback, *args):
+        callback(*args)
+
+    def call_later(self, _delay, callback, *args):
+        timer = SimpleNamespace(
+            cancelled_value=False,
+            cancel=lambda: setattr(timer, "cancelled_value", True),
+            cancelled=lambda: timer.cancelled_value,
+            fire=lambda: callback(*args),
+        )
+        self.timers.append(timer)
+        return timer
+
 
 @pytest.fixture(autouse=True)
 def _reset_status_publisher():
     status_events._publisher_state.queue = None
     status_events._publisher_state.worker = None
+    status_events._publisher_state.loop = None
+    status_events._publisher_state.pending.clear()
+    status_events._publisher_state.coalesced_by_run.clear()
+    status_events._publisher_state.flush_handle_by_run.clear()
     status_events._last_sent_by_run.clear()
     yield
     worker = status_events._publisher_state.worker
@@ -70,6 +90,10 @@ def _reset_status_publisher():
         worker.cancel()
     status_events._publisher_state.queue = None
     status_events._publisher_state.worker = None
+    status_events._publisher_state.loop = None
+    status_events._publisher_state.pending.clear()
+    status_events._publisher_state.coalesced_by_run.clear()
+    status_events._publisher_state.flush_handle_by_run.clear()
     status_events._last_sent_by_run.clear()
 
 
@@ -153,6 +177,89 @@ def test_status_enqueue_handles_absent_sink_and_event_loop(monkeypatch):
 
     monkeypatch.setattr(status_events.asyncio, "get_running_loop", no_running_loop)
     status_events.enqueue_status_event({"run_id": "run-1", "status": "succeeded"})
+
+
+@pytest.mark.asyncio
+async def test_status_event_bridge_delivers_worker_thread_and_prebound_events(
+    monkeypatch,
+):
+    posted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        status_events, "_status_event_url", lambda: "https://sink.invalid/events"
+    )
+    monkeypatch.setattr(status_events, "_post_event", posted.append)
+    monkeypatch.setattr(status_events, "_throttle_seconds", lambda: 0.0)
+
+    thread = threading.Thread(
+        target=status_events.enqueue_status_event,
+        args=({"run_id": "run-before-bind", "status": "running"},),
+    )
+    thread.start()
+    thread.join()
+    assert not posted
+
+    status_events.bind_status_event_loop()
+    await asyncio.to_thread(
+        status_events.enqueue_status_event,
+        {"run_id": "run-from-thread", "status": "running"},
+    )
+    await status_events.flush_status_events()
+
+    assert [event["run_id"] for event in posted] == [
+        "run-before-bind",
+        "run-from-thread",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_status_event_bridge_worker_loop_cannot_steal_bound_owner(monkeypatch):
+    posted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        status_events, "_status_event_url", lambda: "https://sink.invalid/events"
+    )
+    monkeypatch.setattr(status_events, "_post_event", posted.append)
+    monkeypatch.setattr(status_events, "_throttle_seconds", lambda: 0.0)
+    status_events.bind_status_event_loop()
+    owner_loop = status_events._publisher_state.loop
+
+    async def worker_loop() -> None:
+        status_events.bind_status_event_loop()
+        status_events.enqueue_status_event(
+            {"run_id": "run-from-worker-loop", "status": "running"}
+        )
+
+    await asyncio.to_thread(lambda: asyncio.run(worker_loop()))
+    await status_events.flush_status_events()
+
+    assert status_events._publisher_state.loop is owner_loop
+    assert [event["run_id"] for event in posted] == ["run-from-worker-loop"]
+
+
+@pytest.mark.asyncio
+async def test_status_event_bridge_coalesces_latest_progress_at_fixed_rate(
+    monkeypatch,
+):
+    posted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        status_events, "_status_event_url", lambda: "https://sink.invalid/events"
+    )
+    monkeypatch.setattr(status_events, "_post_event", posted.append)
+    monkeypatch.setattr(status_events, "_throttle_seconds", lambda: 0.02)
+    status_events.bind_status_event_loop()
+
+    for event_seq in (1, 2, 3):
+        status_events.enqueue_status_event(
+            {
+                "run_id": "run-coalesced",
+                "status": "running",
+                "phase_detail": "scan",
+                "progress": {"event_seq": event_seq, "pct": event_seq},
+            }
+        )
+    await asyncio.sleep(0.03)
+    await status_events.flush_status_events()
+
+    assert [event["progress"]["event_seq"] for event in posted] == [1, 3]
 
 
 @pytest.mark.asyncio
@@ -387,6 +494,84 @@ def test_live_progress_recovers_previous_metadata_and_terminal_totals(monkeypatc
     assert '"label": "example.test/file.ndjson"' in writes[0][2]
 
 
+def test_live_progress_emits_central_event_when_local_redis_is_unavailable(
+    monkeypatch,
+):
+    events: list[dict[str, object]] = []
+
+    class FailingRedis:
+        def get(self, _key):
+            raise OSError("redis unavailable")
+
+        def setex(self, *_args):
+            raise OSError("redis unavailable")
+
+    monkeypatch.setattr(live_progress, "_redis", lambda: FailingRedis())
+    monkeypatch.setattr(live_progress, "enqueue_status_event", events.append)
+
+    live_progress.write_live_progress(
+        run_id="run-without-redis",
+        importer="ptg",
+        status="running",
+        stage_id="scan",
+        stage_ordinal=3,
+        pct=12,
+    )
+
+    assert events[0]["run_id"] == "run-without-redis"
+    assert events[0]["progress"]["pct"] == 12
+
+
+def test_live_progress_heartbeat_advances_observation_not_work(monkeypatch):
+    stored: dict[str, str] = {}
+    instants = iter(
+        (
+            dt.datetime(2026, 7, 23, 10, 0, 0),
+            dt.datetime(2026, 7, 23, 10, 0, 15),
+        )
+    )
+
+    class FakeRedis:
+        def get(self, key):
+            return stored.get(key)
+
+        def setex(self, key, _ttl, value):
+            stored[key] = value
+
+    monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
+    monkeypatch.setattr(live_progress, "_utc_now", lambda: next(instants))
+    monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
+
+    live_progress.write_live_progress(
+        run_id="run-heartbeat-v2",
+        importer="ptg",
+        status="running",
+        source="ptg2-scanner-progress",
+        stage_id="scan",
+        stage_ordinal=3,
+        pct=12,
+    )
+    first = json.loads(stored["import:progress:run-heartbeat-v2"])
+    live_progress.write_live_progress(
+        run_id="run-heartbeat-v2",
+        importer="ptg",
+        status="running",
+        source="engine-heartbeat",
+        phase="ptg_control_start running",
+        unit="run",
+        done=0,
+        total=1,
+        pct=0,
+    )
+    heartbeat = json.loads(stored["import:progress:run-heartbeat-v2"])
+
+    assert heartbeat["event_seq"] > first["event_seq"]
+    assert heartbeat["progress_seq"] == first["progress_seq"]
+    assert heartbeat["progressed_at"] == first["progressed_at"]
+    assert heartbeat["observed_at"] > first["observed_at"]
+    assert heartbeat["pct"] == 12
+
+
 def test_live_progress_scheduling_reads_and_parsing_edges(monkeypatch):
     read_payload = live_progress._read_live_progress_payload
     writes: list[dict[str, object]] = []
@@ -455,3 +640,15 @@ def test_live_progress_normalization_and_safe_display_edges():
     aware = dt.datetime(2026, 7, 22, tzinfo=dt.timezone(dt.timedelta(hours=2)))
     assert live_progress._parse_datetime(aware).tzinfo is None
     assert live_progress._parse_datetime("invalid") is None
+
+
+def test_live_progress_sequence_cache_is_bounded():
+    cache = live_progress.OrderedDict()
+    limit = live_progress._SEQUENCE_CACHE_MAX_PER_STRIPE
+
+    for index in range(limit + 3):
+        live_progress._remember_sequence(cache, f"run-{index}", index)
+
+    assert len(cache) == limit
+    assert "run-0" not in cache
+    assert cache[f"run-{limit + 2}"] == limit + 2

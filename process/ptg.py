@@ -19,7 +19,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import ijson
 from sqlalchemy import cast, func, literal
@@ -142,7 +142,8 @@ from process.ptg_parts.input_artifact_retention import (
     guard_artifact_lease,
     release_current_artifact_lease,
 )
-from process.ptg_parts.progress import (_artifact_progress_position,
+from process.ptg_parts.progress import (PTGFileProgressCoordinator,
+                                        _artifact_progress_position,
                                         _format_duration,
                                         _maybe_log_artifact_progress,
                                         _scale_stage_progress_pct, _utcnow)
@@ -232,6 +233,7 @@ from process.ptg_parts.source_download import (PTG2_DEFAULT_MAX_BYTES,
                                                _emit_download_progress,
                                                _format_eta_seconds,
                                                _iter_downloaded_ptg_jobs,
+                                               _progress_job_index,
                                                _probe_http_range_support,
                                                download_raw_artifact,
                                                fetch_head_metadata,
@@ -1237,6 +1239,7 @@ async def _parse_strict_v3_file(
     max_items: int | None = None,
     ptg2_manifest_stage_table: str | None = None,
     source_network_names: list[str] | str | None = None,
+    progress_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Scan one file into strict V3 COPY artifacts and clean incomplete scratch state."""
 
@@ -1501,6 +1504,7 @@ async def _parse_strict_v3_file(
             manifest_provider_set_dictionary_copy_path=manifest_provider_set_metadata_copy_path,
             source_network_names=source_network_name_values,
             manifest_only=True,
+            progress_observer=progress_observer,
         ):
             if record_kind == "dedupe_summary":
                 rust_dedupe_summary_by_field = dict(record_row or {})
@@ -2218,6 +2222,7 @@ async def _process_in_network_file(
     raw_artifact: PTG2RawArtifact | None = None,
     logical_artifact: PTG2LogicalArtifact | None = None,
     recorded_provenance: Mapping[str, Any] | None = None,
+    progress_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> PTG2FileProcessResult:
     """Scan one in-network job into strict V3 staging and return its result."""
     url = job["url"]
@@ -2270,6 +2275,7 @@ async def _process_in_network_file(
             max_items=max_items,
             ptg2_manifest_stage_table=ptg2_manifest_stage_table,
             source_network_names=source_network_name_values,
+            progress_observer=progress_observer,
         )
     if not test_mode and int((parse_summary or {}).get("serving_rates") or 0) <= 0:
         no_data_summary_by_field = dict(parse_summary or {})
@@ -4239,6 +4245,9 @@ async def _load_allowed_file_result(
 def _write_allowed_file_progress(
     successful_file_count: int,
     attempted_file_count: int,
+    *,
+    progress_start_pct: float = 20.0,
+    progress_end_pct: float = 90.0,
 ) -> None:
     write_live_progress(
         phase="processing allowed amounts",
@@ -4246,12 +4255,12 @@ def _write_allowed_file_progress(
         done=successful_file_count,
         total=attempted_file_count,
         pct=min(
-            90.0,
-            20.0
+            progress_end_pct,
+            progress_start_pct
             + (
                 successful_file_count / max(attempted_file_count, 1)
             )
-            * 70.0,
+            * (progress_end_pct - progress_start_pct),
         ),
         message=(
             f"processed {successful_file_count} of {attempted_file_count} "
@@ -4282,6 +4291,8 @@ async def _process_allowed_snapshot_files(
     context: _AllowedFileProcessingContext,
     failure_report_by_field: dict[str, Any],
     artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
+    progress_start_pct: float = 20.0,
+    progress_end_pct: float = 90.0,
 ) -> list[dict[str, Any]]:
     """Download and parse the full allowed-only strict-V3 file set."""
 
@@ -4294,7 +4305,7 @@ async def _process_allowed_snapshot_files(
         unit="files",
         done=0,
         total=attempted_file_count,
-        pct=20,
+        pct=progress_start_pct,
         message=f"processing {attempted_file_count} allowed-amount file(s)",
     )
     async for downloaded in _iter_downloaded_ptg_jobs(
@@ -4302,6 +4313,8 @@ async def _process_allowed_snapshot_files(
         reuse_raw_artifacts=context.reuse_raw_artifacts,
         max_bytes=context.max_bytes,
         keep_partial_artifacts=context.keep_partial_artifacts,
+        progress_start_pct=5.0,
+        progress_end_pct=progress_start_pct,
         **(
             {"artifact_stage_observer": artifact_stage_observer}
             if artifact_stage_observer is not None
@@ -4315,6 +4328,8 @@ async def _process_allowed_snapshot_files(
             _write_allowed_file_progress(
                 len(successful_files),
                 attempted_file_count,
+                progress_start_pct=progress_start_pct,
+                progress_end_pct=progress_end_pct,
             )
         else:
             failed_files.append(file_by_field)
@@ -5041,7 +5056,6 @@ async def _main_with_artifact_lease(
         write_live_progress(
             status="failed",
             phase="failed",
-            pct=100,
             eta_seconds=0,
             message=progress_message or "PTG import failed; inspect worker logs",
         )
@@ -5261,6 +5275,8 @@ async def _main_with_artifact_lease(
                 allowed_jobs,
                 processing_context,
                 allowed_lane_report_by_field,
+                progress_start_pct=5.0 if selected_jobs else 20.0,
+                progress_end_pct=20.0 if selected_jobs else 90.0,
                 **(
                     {
                         "artifact_stage_observer": (
@@ -5312,6 +5328,8 @@ async def _main_with_artifact_lease(
         setup_stage_timer.mark("manifest_stage_table")
         processed_file_count_map = {"done": 0}
         attempted_files = len(selected_jobs)
+        download_start_pct = 20.0 if allowed_jobs else 5.0
+        scan_start_pct = 30.0 if allowed_jobs else 20.0
         for progress_index, job in enumerate(selected_jobs):
             job["_ptg_progress_index"] = progress_index
             job["_ptg_progress_total"] = max(attempted_files, 1)
@@ -5320,7 +5338,7 @@ async def _main_with_artifact_lease(
             unit="files",
             done=0,
             total=attempted_files,
-            pct=5 if attempted_files else 20,
+            pct=download_start_pct if attempted_files else scan_start_pct,
             message=f"downloading {attempted_files} PTG file(s)",
         )
         failed_files: list[dict[str, Any]] = []
@@ -5340,27 +5358,32 @@ async def _main_with_artifact_lease(
                 f"\tvalue={file_process_concurrency}"
                 f"\tfiles={attempted_files}"
             )
-        processing_tasks: set[asyncio.Task[PTG2FileProcessResult | None]] = set()
+        processing_tasks: set[
+            asyncio.Task[tuple[PTG2DownloadedJob, PTG2FileProcessResult | None]]
+        ] = set()
+        file_progress_coordinator: PTGFileProgressCoordinator | None = None
 
-        async def record_file_result(file_result: PTG2FileProcessResult | None) -> None:
+        async def record_file_result(
+            downloaded: PTG2DownloadedJob,
+            file_result: PTG2FileProcessResult | None,
+        ) -> None:
             """Classify a file result and update completion progress."""
             if file_result is None:
                 return
             if file_result.success:
+                if file_progress_coordinator is not None:
+                    file_progress_coordinator.complete(
+                        _progress_job_index(downloaded.job),
+                        message=(
+                            f"processed {processed_file_count_map['done'] + 1} "
+                            f"of {attempted_files} PTG file(s)"
+                        ),
+                    )
                 if file_result.skipped:
                     skipped_files.append(asdict(file_result))
                 else:
                     processed_file_count_map["done"] += 1
                     successful_files.append(asdict(file_result))
-                    if attempted_files:
-                        write_live_progress(
-                            phase="processing files",
-                            unit="files",
-                            done=processed_file_count_map["done"],
-                            total=attempted_files,
-                            pct=min(90.0, 20.0 + (processed_file_count_map["done"] / attempted_files) * 70.0),
-                            message=f"processed {processed_file_count_map['done']} of {attempted_files} PTG file(s)",
-                        )
             else:
                 failed_files.append(asdict(file_result))
 
@@ -5377,28 +5400,25 @@ async def _main_with_artifact_lease(
             processing_tasks.clear()
             processing_tasks.update(pending)
             for task in done:
-                await record_file_result(task.result())
+                downloaded, file_result = task.result()
+                await record_file_result(downloaded, file_result)
 
-        def file_progress_context(job: dict[str, Any], *, start_pct: float, end_pct: float) -> dict[str, Any]:
-            """Map one job's index onto its allocated overall progress interval."""
-            try:
-                job_index = max(int(job.get("_ptg_progress_index") or 0), 0)
-            except (TypeError, ValueError):
-                job_index = 0
-            try:
-                job_total = max(int(job.get("_ptg_progress_total") or attempted_files or 1), 1)
-            except (TypeError, ValueError):
-                job_total = max(attempted_files, 1)
+        def file_progress_context(job: dict[str, Any]) -> dict[str, Any]:
+            """Attach safe file context without assigning an independent run range."""
+            job_index = _progress_job_index(job)
             return {
                 **current_live_progress_context(),
-                "overall_progress_start_pct": start_pct + (job_index / job_total) * (end_pct - start_pct),
-                "overall_progress_end_pct": start_pct + ((job_index + 1) / job_total) * (end_pct - start_pct),
+                "file_index": job_index + 1,
+                "file_count": attempted_files,
+                "file_name": str(job.get("url") or ""),
             }
 
-        async def process_downloaded_job(downloaded) -> PTG2FileProcessResult | None:
+        async def process_downloaded_job(
+            downloaded: PTG2DownloadedJob,
+        ) -> tuple[PTG2DownloadedJob, PTG2FileProcessResult | None]:
             """Process a downloaded in-network artifact under its progress context."""
             job = downloaded.job
-            token = set_live_progress_context(**file_progress_context(job, start_pct=20.0, end_pct=90.0))
+            token = set_live_progress_context(**file_progress_context(job))
             try:
                 if job.get("type") == "in_network":
                     if shared_input_identity is None:
@@ -5419,6 +5439,13 @@ async def _main_with_artifact_lease(
                         source_network_names=job.get("source_network_names"),
                         raw_artifact=downloaded.raw_artifact,
                         logical_artifact=downloaded.logical_artifact,
+                        progress_observer=(
+                            file_progress_coordinator.observer(
+                                _progress_job_index(job)
+                            )
+                            if file_progress_coordinator is not None
+                            else None
+                        ),
                     )
                     file_result = _claim_strict_v3_file_result(
                         pending_strict_v3,
@@ -5426,8 +5453,8 @@ async def _main_with_artifact_lease(
                         shared_physical_artifact_identity(downloaded),
                         shared_logical_artifact_metadata(downloaded),
                     )
-                    return file_result
-                return None
+                    return downloaded, file_result
+                return downloaded, None
             finally:
                 reset_live_progress_context(token)
 
@@ -5438,6 +5465,8 @@ async def _main_with_artifact_lease(
                 reuse_raw_artifacts=should_reuse_raw_artifacts,
                 max_bytes=max_bytes,
                 keep_partial_artifacts=should_keep_partial_artifacts,
+                progress_start_pct=download_start_pct,
+                progress_end_pct=scan_start_pct,
                 **(
                     {
                         "artifact_stage_observer": (
@@ -5506,7 +5535,7 @@ async def _main_with_artifact_lease(
                 unit="files",
                 done=len(buffered_downloads),
                 total=len(buffered_downloads),
-                pct=20,
+                pct=scan_start_pct,
                 message="checking for an identical shared PostgreSQL layout",
             )
             shared_input_identity = shared_physical_input_identity(
@@ -5600,6 +5629,56 @@ async def _main_with_artifact_lease(
                     candidate_stage_flags_by_name=candidate_stage_flags_by_name,
                 )
 
+            progress_weights: list[int] = [0] * attempted_files
+            progress_labels: list[str] = ["PTG file"] * attempted_files
+            unique_downloads_by_logical_hash: dict[
+                str, list[PTG2DownloadedJob]
+            ] = {}
+            for buffered_download in buffered_downloads:
+                assert buffered_download.raw_artifact is not None
+                assert buffered_download.logical_artifact is not None
+                logical_hash = buffered_download.logical_artifact.logical_sha256
+                duplicate_physical_input = any(
+                    is_same_downloaded_physical_input(previous, buffered_download)
+                    for previous in unique_downloads_by_logical_hash.get(
+                        logical_hash,
+                        (),
+                    )
+                )
+                progress_index = _progress_job_index(buffered_download.job)
+                progress_weights[progress_index] = (
+                    0
+                    if duplicate_physical_input
+                    else max(
+                        int(
+                            getattr(
+                                buffered_download.raw_artifact,
+                                "byte_count",
+                                getattr(
+                                    buffered_download.logical_artifact,
+                                    "byte_count",
+                                    1,
+                                ),
+                            )
+                        ),
+                        1,
+                    )
+                )
+                progress_labels[progress_index] = (
+                    str(buffered_download.job.get("url") or "PTG file")
+                )
+                if not duplicate_physical_input:
+                    unique_downloads_by_logical_hash.setdefault(
+                        logical_hash,
+                        [],
+                    ).append(buffered_download)
+            file_progress_coordinator = PTGFileProgressCoordinator(
+                progress_weights,
+                progress_labels,
+                stage_start_pct=scan_start_pct,
+                stage_end_pct=90.0,
+            )
+
             async def iter_downloaded_jobs():
                 """Yield the fully validated download batch in discovery order."""
 
@@ -5679,7 +5758,7 @@ async def _main_with_artifact_lease(
                         [],
                     ).append(downloaded)
                 if file_result is not None:
-                    await record_file_result(file_result)
+                    await record_file_result(downloaded, file_result)
                     continue
 
                 processing_tasks.add(asyncio.create_task(process_downloaded_job(downloaded)))

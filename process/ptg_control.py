@@ -16,7 +16,7 @@ from process.control_lifecycle import (
     _stop_live_progress_heartbeat,
     mark_control_run,
 )
-from process.import_status_events import flush_status_events
+from process.import_status_events import bind_status_event_loop, flush_status_events
 from process.live_progress import write_live_progress
 from process.ptg import (
     PTG2FullRebuildFreshnessError,
@@ -108,6 +108,7 @@ def _ptg_failure_error(error: BaseException) -> dict[str, str]:
 
 async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     """Run one PTG control task with cancellation and heartbeat handling."""
+    bind_status_event_loop()
     task_payload = task if isinstance(task, dict) else {}
     run_id = str(task_payload.get("run_id") or "").strip()
     params = (

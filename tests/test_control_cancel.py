@@ -85,6 +85,8 @@ async def test_control_single_job_start_marks_success(monkeypatch):
             "importer": "process_data",
             "status": "running",
             "started_at": live_contexts[0]["started_at"],
+            "attempt_id": f"run_1:{live_contexts[0]['started_at']}",
+            "attempt_started_at": live_contexts[0]["started_at"],
         }
     ]
     assert "source" not in live_contexts[0]

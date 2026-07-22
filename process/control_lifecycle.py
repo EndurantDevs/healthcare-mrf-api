@@ -18,7 +18,12 @@ from sqlalchemy import func, update
 
 from db.models import ImportRun, db
 from process.control_cancel import ImportCancelledError
-from process.import_status_events import enqueue_status_event, flush_status_events, isoformat_utc
+from process.import_status_events import (
+    bind_status_event_loop,
+    enqueue_status_event,
+    flush_status_events,
+    isoformat_utc,
+)
 from process.live_progress import (
     enqueue_live_progress,
     progress_payload_from_live,
@@ -40,6 +45,7 @@ async def control_single_job_start(
 ) -> dict[str, Any]:
     """Run a single-job importer while updating the unified import_run registry."""
     payload = task if isinstance(task, dict) else {}
+    bind_status_event_loop()
     run_id = str(payload.get("run_id") or "").strip()
     importer = str(payload.get("importer") or payload.get("target_function") or "unknown").strip()
     target_module = str(payload.get("target_module") or "").strip()
@@ -70,6 +76,8 @@ async def control_single_job_start(
             importer=importer,
             status="running",
             started_at=started_at,
+            attempt_id=f"{run_id}:{started_at}",
+            attempt_started_at=started_at,
         )
         heartbeat_task = asyncio.create_task(_live_progress_heartbeat(run_id, importer, target_function, started_at))
 
@@ -348,16 +356,42 @@ async def mark_control_run(
     if not run_id:
         return
     now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
-    done = 1 if status in {"succeeded", "failed", "canceled", "dead_letter"} else 0
-    progress_payload = progress or {
-        "unit": "run",
-        "total": 1,
-        "done": done,
-        "pct": 100 if done else 0,
-        "message": progress_message,
+    is_terminal = status in {
+        "succeeded",
+        "failed",
+        "canceled",
+        "cancelled",
+        "dead_letter",
     }
+    if progress is not None:
+        progress_payload = progress
+    elif status == "succeeded":
+        progress_payload = {
+            "unit": "run",
+            "total": 1,
+            "done": 1,
+            "pct": 100,
+            "message": progress_message,
+        }
+    elif is_terminal:
+        live_progress = read_live_progress(run_id) or {}
+        progress_payload = progress_payload_from_live(live_progress) or {
+            "unit": "run",
+            "total": 1,
+            "done": 0,
+            "pct": 0,
+        }
+        progress_payload["message"] = progress_message
+    else:
+        progress_payload = {
+            "unit": "run",
+            "total": 1,
+            "done": 0,
+            "pct": 0,
+            "message": progress_message,
+        }
     live_started_at = now if status == "running" else None
-    live_finished_at = now if done and not preserve_finished_at else None
+    live_finished_at = now if is_terminal and not preserve_finished_at else None
     values: dict[str, Any] = {
         "status": status,
         "phase_detail": phase_detail,
@@ -372,7 +406,7 @@ async def mark_control_run(
     if status == "running":
         values["started_at"] = func.coalesce(ImportRun.started_at, now)
         values["finished_at"] = None
-    if done and not preserve_finished_at:
+    if is_terminal and not preserve_finished_at:
         values["finished_at"] = now
     if await _should_update_control_run_db(
         run_id=run_id,

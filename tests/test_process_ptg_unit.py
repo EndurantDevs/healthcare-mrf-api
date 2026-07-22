@@ -431,6 +431,94 @@ def test_progress_split_keeps_facade_helpers_stable():
     assert ptg_progress._scale_stage_progress_pct(50, 5, 20) == 12.5
 
 
+def test_weighted_file_progress_tracks_dominant_input_without_regression(
+    monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        ptg_progress,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+    coordinator = ptg_progress.PTGFileProgressCoordinator(
+        [1, 99],
+        ["https://payer.test/small.json.gz", "https://payer.test/large.json.gz"],
+        stage_start_pct=20,
+        stage_end_pct=90,
+    )
+
+    coordinator.observe(
+        0,
+        {
+            "phase_pct": 80,
+            "counters": {"provider_references": 100},
+        },
+    )
+    coordinator.complete(0)
+    assert events[-1]["pct"] == pytest.approx(20.7)
+    assert events[-1]["counters"]["provider_references"] == 100
+    coordinator.observe(
+        1,
+        {
+            "phase": "compact-serving scanner",
+            "phase_pct": 50,
+            "counters": {
+                "provider_references": 50,
+                "indexed_rates_completed": 900,
+            },
+        },
+    )
+    assert events[-1]["pct"] == pytest.approx(55.35)
+    assert events[-1]["file_index"] == 2
+    assert events[-1]["file_count"] == 2
+    assert events[-1]["file_name"] == "large.json.gz"
+    assert events[-1]["dominant_file"] is True
+    assert events[-1]["file_weight_pct"] == pytest.approx(99)
+    assert events[-1]["counters"]["provider_references"] == 150
+    assert events[-1]["counters"]["indexed_rates_completed"] == 900
+
+    coordinator.observe(
+        1,
+        {
+            "phase_pct": 40,
+            "message": "delayed",
+            "counters": {"indexed_rates_completed": 800},
+        },
+    )
+    assert events[-1]["pct"] == pytest.approx(55.35)
+    assert events[-1]["counters"]["indexed_rates_completed"] == 900
+    coordinator.observe(1, {"message": "scanner summary"})
+    assert events[-1]["counters"]["provider_references"] == 150
+    coordinator.observe(1, {"phase_pct": 100, "message": "scanner done"})
+    assert events[-1]["pct"] < 90
+    coordinator.complete(1)
+    assert events[-1]["pct"] == 90
+    assert events[-1]["done"] == events[-1]["total"]
+    assert events[-1]["counters"]["indexed_rates_completed"] == 900
+
+
+def test_weighted_file_progress_zero_weight_duplicate_does_not_add_work(
+    monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        ptg_progress,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+    coordinator = ptg_progress.PTGFileProgressCoordinator(
+        [100, 0],
+        ["source.json.gz", "duplicate.json.gz"],
+        stage_start_pct=30,
+        stage_end_pct=90,
+    )
+
+    coordinator.complete(1)
+    assert events[-1]["pct"] == 30
+    assert events[-1]["total"] == 100
+    assert events[-1]["counters"]["files_completed"] == 1
+
+
 def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch):
     writes = []
     events = []
@@ -883,6 +971,39 @@ def test_source_download_progress_scales_to_overall_run_progress(monkeypatch):
     assert events[0]["detail"].startswith("download 50.00%")
 
 
+def test_multi_file_download_progress_keeps_per_file_pct_out_of_stage_ordering(
+    monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        ptg_source_download,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+    token = ptg_live_progress.set_live_progress_context(
+        run_id="run_ptg",
+        overall_progress_start_pct=5,
+        overall_progress_end_pct=5,
+        run_progress_hold_pct=5,
+        file_count=2,
+    )
+    try:
+        for completed_bytes in (90, 10):
+            ptg_source_download._emit_download_progress(
+                url=f"https://example.com/rates-{completed_bytes}.json.gz",
+                bytes_read=completed_bytes,
+                total_bytes=100,
+                started_at=time.monotonic() - 1,
+                done=False,
+            )
+    finally:
+        ptg_live_progress.reset_live_progress_context(token)
+
+    assert [event["pct"] for event in events] == [5, 5]
+    assert [event["stage_pct"] for event in events] == [0, 0]
+    assert [event["phase_pct"] for event in events] == [90, 10]
+
+
 def test_download_worker_propagates_live_progress_context(monkeypatch):
     captured_map = {}
 
@@ -1308,6 +1429,67 @@ def test_rust_scanner_progress_uses_object_throughput_when_bytes_are_deferred(mo
     assert "throughput=1.03M objects/s" in progress_update["message"]
     assert "elapsed=1m 59s" in progress_update["message"]
     assert "input=14,274.6 MiB" in progress_update["message"]
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected_basis", "expected_done", "expected_total", "counter_name"),
+    (
+        (
+            "progress_basis=indexed_objects\tindexed_objects_completed=75\t"
+            "indexed_objects_total=100\tindexed_rates_completed=900\t"
+            "indexed_raw_bytes_completed=4096",
+            "indexed_objects",
+            75,
+            100,
+            "indexed_rates_completed",
+        ),
+        (
+            "progress_basis=plain_reordered_objects\t"
+            "in_network_objects_completed=30\tin_network_objects_total=40\t"
+            "negotiated_rates_completed=800",
+            "plain_reordered_objects",
+            30,
+            40,
+            "negotiated_rates_completed",
+        ),
+    ),
+)
+def test_rust_scanner_progress_preserves_indexed_and_plain_denominators(
+    monkeypatch,
+    frame,
+    expected_basis,
+    expected_done,
+    expected_total,
+    counter_name,
+):
+    events = []
+    monkeypatch.setattr(
+        ptg_rust_scanner,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+
+    ptg_rust_scanner._emit_scanner_live_progress(
+        "PTG2_SCANNER_PROGRESS\tpath=/work/raw/rates.json.gz\t"
+        f"{frame}\tpercent=75.00\telapsed_seconds=3\teta_seconds=1\tdone=false",
+        phase="compact-serving scanner",
+        live_progress_context={
+            "run_id": "run-ptg-progress-v2",
+            "overall_progress_start_pct": 20,
+            "overall_progress_end_pct": 90,
+        },
+    )
+
+    [progress] = events
+    assert progress["unit"] == expected_basis
+    assert progress["basis"] == expected_basis
+    assert progress["done"] == expected_done
+    assert progress["total"] == expected_total
+    assert progress["phase_pct"] == 75
+    assert progress["pct"] == 72.5
+    assert progress["counters"][counter_name] > 0
+    assert "indexed_objects_completed" not in progress["counters"]
+    assert "in_network_objects_completed" not in progress["counters"]
 
 
 def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
@@ -3835,9 +4017,13 @@ def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(monkeypat
 
 def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
     started_list = []
+    progress_contexts = []
 
     def fake_download(job, **_kwargs):
         started_list.append(job["url"])
+        progress_contexts.append(
+            ptg_live_progress.current_live_progress_context()
+        )
         if "slow" in job["url"]:
             time.sleep(0.05)
         return process_ptg.PTG2DownloadedJob(job=job)
@@ -3867,6 +4053,16 @@ def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
     ]
     assert yielded[0] == "https://example.test/fast.json.gz"
     assert yielded[1] == "https://example.test/slow.json.gz"
+    assert {context["run_progress_hold_pct"] for context in progress_contexts} == {
+        5.0
+    }
+    assert {context["file_index"] for context in progress_contexts} == {1, 2}
+    assert all(
+        context["overall_progress_start_pct"]
+        == context["overall_progress_end_pct"]
+        == 5.0
+        for context in progress_contexts
+    )
 
 
 def test_cancel_and_wait_tasks_joins_cancelled_children():

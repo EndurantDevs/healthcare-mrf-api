@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import datetime
 import logging
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from process.ptg_parts.config import (
     PTG2_EXPECTED_IN_NETWORK_ITEMS_ENV,
@@ -19,6 +21,219 @@ from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.screen import _emit_screen_line
 
 logger = logging.getLogger(__name__)
+
+
+class PTGFileProgressCoordinator:
+    """Aggregate concurrent file progress using exact compressed input weights."""
+
+    def __init__(
+        self,
+        file_weights: Sequence[int],
+        file_labels: Sequence[str],
+        *,
+        stage_start_pct: float,
+        stage_end_pct: float,
+        stage_id: str = "processing_files",
+        stage_ordinal: int = 3,
+    ) -> None:
+        if len(file_weights) != len(file_labels) or not file_weights:
+            raise ValueError("PTG progress files require matching nonempty weights and labels")
+        weights = tuple(max(int(weight), 0) for weight in file_weights)
+        if sum(weights) <= 0:
+            raise ValueError("PTG progress files require positive aggregate weight")
+        if stage_end_pct <= stage_start_pct:
+            raise ValueError("PTG progress stage end must be greater than its start")
+        self._weights = weights
+        self._labels = tuple(_safe_progress_file_label(label) for label in file_labels)
+        self._stage_start_pct = float(stage_start_pct)
+        self._stage_end_pct = float(stage_end_pct)
+        self._stage_id = stage_id
+        self._stage_ordinal = int(stage_ordinal)
+        self._total_weight = sum(weights)
+        self._dominant_index = max(range(len(weights)), key=weights.__getitem__)
+        self._fraction_by_index = [0.0 for _ in weights]
+        self._counters_by_index: list[dict[str, Any]] = [
+            {} for _ in weights
+        ]
+        self._completed_indices: set[int] = set()
+        self._lock = threading.Lock()
+
+    def observer(self, file_index: int):
+        """Return a scanner callback bound to one zero-based file index."""
+
+        self._validate_index(file_index)
+
+        def observe(payload: dict[str, Any]) -> None:
+            self.observe(file_index, payload)
+
+        return observe
+
+    def observe(self, file_index: int, payload: Mapping[str, Any]) -> None:
+        """Publish one monotonic weighted scanner observation."""
+
+        self._validate_index(file_index)
+        with self._lock:
+            counters = payload.get("counters")
+            if isinstance(counters, Mapping):
+                _merge_file_progress_counters(
+                    self._counters_by_index[file_index],
+                    counters,
+                )
+            candidate = _file_progress_fraction(payload)
+            if candidate is not None:
+                self._fraction_by_index[file_index] = max(
+                    self._fraction_by_index[file_index],
+                    min(candidate, 0.999),
+                )
+            self._publish_locked(file_index, payload)
+
+    def complete(self, file_index: int, *, message: str | None = None) -> None:
+        """Advance one file to 100 percent only after successful processing."""
+
+        self._validate_index(file_index)
+        with self._lock:
+            self._fraction_by_index[file_index] = 1.0
+            self._completed_indices.add(file_index)
+            self._publish_locked(
+                file_index,
+                {
+                    "phase": "processing files",
+                    "phase_pct": 100.0,
+                    "message": message or "file processing complete",
+                    "source": "ptg-file-progress-coordinator",
+                    "confidence": "measured",
+                },
+            )
+
+    def _publish_locked(
+        self,
+        file_index: int,
+        payload: Mapping[str, Any],
+    ) -> None:
+        weighted_done = sum(
+            weight * fraction
+            for weight, fraction in zip(
+                self._weights,
+                self._fraction_by_index,
+                strict=True,
+            )
+        )
+        stage_fraction = weighted_done / self._total_weight
+        run_pct = self._stage_start_pct + (
+            (self._stage_end_pct - self._stage_start_pct) * stage_fraction
+        )
+        file_weight_pct = self._weights[file_index] * 100.0 / self._total_weight
+        counters = _aggregate_file_progress_counters(self._counters_by_index)
+        counters.update(
+            {
+                "files_completed": len(self._completed_indices),
+                "files_total": len(self._weights),
+                "active_file_weight_pct": file_weight_pct,
+                "dominant_file_weight_pct": (
+                    self._weights[self._dominant_index] * 100.0
+                    / self._total_weight
+                ),
+            }
+        )
+        original_message = str(
+            payload.get("message") or payload.get("phase") or "processing"
+        )
+        weight_label = f"{file_weight_pct:.1f}% of compressed input"
+        if file_index == self._dominant_index:
+            weight_label += "; largest file"
+        progress_payload = {
+            **dict(payload),
+            "stage_id": self._stage_id,
+            "stage_ordinal": self._stage_ordinal,
+            "stage_pct": stage_fraction * 100.0,
+            "unit": "compressed_input_bytes",
+            "basis": "weighted_compressed_input_bytes",
+            "denominator_state": "known",
+            "done": int(weighted_done),
+            "total": self._total_weight,
+            "work_done": int(weighted_done),
+            "work_total": self._total_weight,
+            "pct": min(run_pct, self._stage_end_pct),
+            "file_index": file_index + 1,
+            "file_count": len(self._weights),
+            "file_name": self._labels[file_index],
+            "file_weight": self._weights[file_index],
+            "file_weight_pct": file_weight_pct,
+            "dominant_file": file_index == self._dominant_index,
+            "counters": counters,
+            "message": (
+                f"File {file_index + 1}/{len(self._weights)} "
+                f"({weight_label}): {original_message}"
+            )[:512],
+        }
+        write_live_progress(**progress_payload)
+
+    def _validate_index(self, file_index: int) -> None:
+        if file_index < 0 or file_index >= len(self._weights):
+            raise IndexError("PTG progress file index is out of range")
+
+
+def _file_progress_fraction(payload: Mapping[str, Any]) -> float | None:
+    for field_name in ("phase_pct", "stage_pct"):
+        try:
+            value = float(payload.get(field_name))
+        except (TypeError, ValueError):
+            continue
+        if value == value:
+            return max(0.0, min(value / 100.0, 1.0))
+    try:
+        done = float(payload.get("done"))
+        total = float(payload.get("total"))
+    except (TypeError, ValueError):
+        return None
+    if total <= 0 or done != done or total != total:
+        return None
+    return max(0.0, min(done / total, 1.0))
+
+
+def _merge_file_progress_counters(
+    retained: dict[str, Any],
+    incoming: Mapping[str, Any],
+) -> None:
+    """Retain each file's latest monotonic scanner counters."""
+
+    for raw_name, value in incoming.items():
+        name = str(raw_name)
+        previous = retained.get(name)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isinstance(previous, (int, float))
+            and not isinstance(previous, bool)
+        ):
+            retained[name] = max(previous, value)
+        else:
+            retained[name] = value
+
+
+def _aggregate_file_progress_counters(
+    counters_by_index: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Sum numeric per-file counters while retaining simple shared metadata."""
+
+    aggregated: dict[str, Any] = {}
+    for file_counters in counters_by_index:
+        for name, value in file_counters.items():
+            if isinstance(value, bool):
+                aggregated[name] = bool(aggregated.get(name, False) or value)
+            elif isinstance(value, (int, float)):
+                aggregated[name] = aggregated.get(name, 0) + value
+            elif name not in aggregated:
+                aggregated[name] = value
+    return aggregated
+
+
+def _safe_progress_file_label(value: str) -> str:
+    raw = str(value or "").strip()
+    parsed = urlsplit(raw)
+    if parsed.scheme and parsed.netloc:
+        return parsed.path.rsplit("/", 1)[-1] or parsed.netloc
+    return Path(raw).name or raw[:256] or "PTG file"
 
 
 def _utcnow() -> datetime.datetime:

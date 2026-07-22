@@ -526,7 +526,13 @@ def _emit_download_progress(
         live_context.get("overall_progress_start_pct"),
         live_context.get("overall_progress_end_pct"),
     )
-    pct = overall_pct if overall_pct is not None else percent
+    held_run_pct = _coerce_download_float(live_context.get("run_progress_hold_pct"))
+    pct = (
+        held_run_pct
+        if held_run_pct is not None
+        else overall_pct if overall_pct is not None else percent
+    )
+    aggregate_stage_pct = 0.0 if held_run_pct is not None else percent
     phase_detail = (
         f"download {percent:.2f}% "
         f"({bytes_read / (1024 ** 2):.1f} MiB/{(total_bytes or 0) / (1024 ** 2):.1f} MiB)"
@@ -535,17 +541,36 @@ def _emit_download_progress(
     )
     write_live_progress(
         phase="download",
+        stage_id=str(live_context.get("stage_id") or "download"),
+        stage_ordinal=live_context.get("stage_ordinal") or 2,
+        stage_pct=aggregate_stage_pct,
         unit="bytes",
+        basis="compressed_bytes",
+        denominator_state="known" if total_bytes else "unknown",
         done=bytes_read,
         total=total_bytes,
+        work_done=bytes_read,
+        work_total=total_bytes,
         pct=pct,
         phase_pct=percent,
         rate={"mib_s": mib_s},
+        throughput={"unit": "mib_per_second", "value": mib_s},
         eta_seconds=eta if total_bytes and total_bytes > 0 else None,
         message=f"downloading {_safe_download_label(url)}",
         detail=phase_detail,
         label=url,
+        file_index=live_context.get("file_index"),
+        file_count=live_context.get("file_count"),
+        file_name=live_context.get("file_name"),
     )
+
+
+def _coerce_download_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def _safe_download_label(url: str) -> str:
@@ -1664,6 +1689,8 @@ async def _iter_downloaded_ptg_jobs(
     max_bytes: int | None,
     keep_partial_artifacts: bool | None,
     artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
+    progress_start_pct: float = 5.0,
+    progress_end_pct: float = 20.0,
 ):
     """Yield PTG jobs after acquiring their retained artifacts."""
     download_tasks = max(_env_int(PTG2_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_DOWNLOAD_TASKS), 1)
@@ -1676,22 +1703,39 @@ async def _iter_downloaded_ptg_jobs(
     base_live_progress_context = current_live_progress_context()
     artifact_lease_id = current_artifact_lease_id()
     job_count = max(len(jobs), 1)
+    scheduled_job_count = 0
 
     def schedule_more() -> None:
         """Start downloads until the configured in-flight task limit is reached."""
+        nonlocal scheduled_job_count
         while len(pending_tasks) < download_tasks:
             try:
                 job = next(job_iter)
             except StopIteration:
                 return
-            job_index = _progress_job_index(job)
+            job_index = (
+                _progress_job_index(job)
+                if "_ptg_progress_index" in job
+                else scheduled_job_count
+            )
+            scheduled_job_count += 1
             job_total = max(_progress_job_total(job, job_count), 1)
-            progress_start = 5.0 + (job_index / job_total) * 15.0
-            progress_end = 5.0 + ((job_index + 1) / job_total) * 15.0
+            if job_count == 1 and progress_end_pct > progress_start_pct:
+                progress_start = progress_start_pct
+                progress_end = progress_end_pct
+                hold_pct = None
+            else:
+                progress_start = progress_start_pct
+                progress_end = progress_start_pct
+                hold_pct = progress_start_pct
             job_live_progress_context_map = {
                 **base_live_progress_context,
                 "overall_progress_start_pct": progress_start,
                 "overall_progress_end_pct": progress_end,
+                "run_progress_hold_pct": hold_pct,
+                "file_index": job_index + 1,
+                "file_count": job_total,
+                "file_name": _safe_download_label(str(job.get("url") or "")),
             }
             download_options_by_name = {
                 "reuse_raw_artifacts": reuse_raw_artifacts,
