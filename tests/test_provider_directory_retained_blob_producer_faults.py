@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -278,6 +279,22 @@ def test_producer_wraps_install_io_failures(
             artifact_sha256=artifact_sha256,
             artifact_byte_count=len(artifact_bytes),
         )
+
+
+def test_producer_wraps_unexpected_publish_oserror(monkeypatch) -> None:
+    monkeypatch.setattr(
+        blob_producer,
+        "_link_open_descriptor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError()),
+    )
+    temporary = SimpleNamespace(descriptor=11)
+    target = SimpleNamespace(
+        directory_chain=SimpleNamespace(parent_descriptor=12),
+        leaf_name="canonical",
+    )
+
+    with pytest.raises(RetainedArtifactError, match="publish_failed"):
+        blob_producer._publish_temporary_blob(temporary, target)
 
 
 def test_producer_accepts_concurrent_identical_publish(
