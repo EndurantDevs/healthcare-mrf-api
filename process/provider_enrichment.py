@@ -188,11 +188,13 @@ def _safe_datetime(raw: Any) -> datetime.datetime | None:
 
 
 def _sql_varchar_array_literal(values: list[str]) -> str:
-    normalized = [str(v) for v in values if str(v).strip()]
-    if not normalized:
+    normalized_values = [str(v) for v in values if str(v).strip()]
+    if not normalized_values:
         return "ARRAY[]::varchar[]"
-    escaped = ["'" + value.replace("'", "''") + "'" for value in normalized]
-    return f"ARRAY[{', '.join(escaped)}]::varchar[]"
+    escaped_values = [
+        "'" + value.replace("'", "''") + "'" for value in normalized_values
+    ]
+    return f"ARRAY[{', '.join(escaped_values)}]::varchar[]"
 
 
 def _is_csv_distribution(obj: dict[str, Any]) -> bool:
@@ -511,12 +513,12 @@ def _collect_csv_distributions(dataset_obj: dict[str, Any]) -> list[dict[str, An
 
 async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list[str]]:
     """Discover registered CMS enrollment datasets and unmapped catalog titles."""
-    payload = await download_it(CATALOG_URL)
-    catalog = json.loads(payload)
+    catalog_payload = await download_it(CATALOG_URL)
+    catalog = json.loads(catalog_payload)
     datasets = catalog.get("dataset") or []
 
-    unmapped: set[str] = set()
-    discovered: list[dict[str, Any]] = []
+    unmapped_titles: set[str] = set()
+    discovered_sources: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
 
     async def _discover_ffs_resource_bundle() -> None:
@@ -579,7 +581,7 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
                 latest_distribution.get("modified") if latest_distribution else None,
             ) or datetime.datetime.utcnow().year
 
-            discovered.append(
+            discovered_sources.append(
                 {
                     "spec_key": spec["key"],
                     "dataset_title": ffs_dataset.get("title"),
@@ -617,7 +619,7 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
         spec = _match_spec(dataset_title)
         if spec is None:
             if _looks_like_provider_enrollment_title(dataset_title):
-                unmapped.add(dataset_title)
+                unmapped_titles.add(dataset_title)
             continue
 
         csv_distributions = _collect_csv_distributions(dataset)
@@ -652,7 +654,7 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
                 or datetime.datetime.utcnow().year
             )
 
-            discovered.append(
+            discovered_sources.append(
                 {
                     "spec_key": spec["key"],
                     "dataset_title": dataset_title,
@@ -668,12 +670,14 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
 
     if STRICT_SOURCE_PRESENCE:
         for spec in CATALOG_DISCOVERY_SPECS:
-            if not any(src.get("spec_key") == spec["key"] for src in discovered):
+            if not any(
+                src.get("spec_key") == spec["key"] for src in discovered_sources
+            ):
                 raise RuntimeError(
                     f"No sources discovered for registered dataset '{spec['label']}' ({spec['key']})."
                 )
 
-    discovered.sort(
+    discovered_sources.sort(
         key=lambda src: (
             str(src.get("spec_key") or ""),
             src.get("reporting_year") or 0,
@@ -681,21 +685,22 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
         ),
         reverse=True,
     )
-    return discovered, sorted(unmapped)
+    return discovered_sources, sorted(unmapped_titles)
 
 
 def _validate_headers(headers: list[str], spec: dict[str, Any], source_name: str) -> None:
     header_set = set(headers)
-    missing: list[str] = []
+    missing_headers: list[str] = []
     for field in spec["fields"]:
         if not field.get("required"):
             continue
         aliases = field.get("aliases") or ()
         if not any(alias in header_set for alias in aliases):
-            missing.append(field["name"])
-    if missing:
+            missing_headers.append(field["name"])
+    if missing_headers:
         raise RuntimeError(
-            f"Schema mismatch for {source_name}: missing required mapped fields: {', '.join(sorted(missing))}"
+            f"Schema mismatch for {source_name}: missing required mapped fields: "
+            f"{', '.join(sorted(missing_headers))}"
         )
 
 
@@ -747,103 +752,126 @@ def _base_source_payload(source: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_enrollment_row_payload(
-    row: dict[str, Any],
+    source_row_map: dict[str, Any],
     spec: dict[str, Any],
-    source: dict[str, Any],
+    source_map: dict[str, Any],
     model_columns: set[str],
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Normalize one enrollment source row for its destination model."""
-    canonical: dict[str, Any] = {}
+    canonical_row_map: dict[str, Any] = {}
     for field in spec["fields"]:
-        canonical[field["name"]] = _resolve_header(row, tuple(field["aliases"]))
+        canonical_row_map[field["name"]] = _resolve_header(
+            source_row_map,
+            tuple(field["aliases"]),
+        )
 
-    npi = _safe_int(canonical.get("npi"))
+    npi = _safe_int(canonical_row_map.get("npi"))
     if not npi:
         return None, "missing_npi"
 
-    payload: dict[str, Any] = {
+    row_payload_map: dict[str, Any] = {
         "npi": int(npi),
-        **_base_source_payload(source),
-        "enrollment_id": _safe_text(canonical.get("enrollment_id")),
-        "enrollment_state": _safe_state(canonical.get("enrollment_state")),
-        "provider_type_code": _safe_text(canonical.get("provider_type_code")),
-        "provider_type_text": _safe_text(canonical.get("provider_type_text")),
-        "multiple_npi_flag": _safe_text(canonical.get("multiple_npi_flag")),
-        "ccn": _safe_text(canonical.get("ccn")),
-        "associate_id": _safe_text(canonical.get("associate_id")),
-        "organization_name": _safe_text(canonical.get("organization_name")),
-        "doing_business_as_name": _safe_text(canonical.get("doing_business_as_name")),
-        "incorporation_date": _safe_date(canonical.get("incorporation_date")),
-        "incorporation_state": _safe_state(canonical.get("incorporation_state")),
-        "organization_type_structure": _safe_text(canonical.get("organization_type_structure")),
-        "organization_other_type_text": _safe_text(canonical.get("organization_other_type_text")),
-        "proprietary_nonprofit": _safe_text(canonical.get("proprietary_nonprofit")),
-        "address_line_1": _safe_text(canonical.get("address_line_1")),
-        "address_line_2": _safe_text(canonical.get("address_line_2")),
-        "city": _safe_text(canonical.get("city")),
-        "state": _safe_state(canonical.get("state")),
-        "zip_code": _safe_zip(canonical.get("zip_code")),
+        **_base_source_payload(source_map),
+        "enrollment_id": _safe_text(canonical_row_map.get("enrollment_id")),
+        "enrollment_state": _safe_state(canonical_row_map.get("enrollment_state")),
+        "provider_type_code": _safe_text(canonical_row_map.get("provider_type_code")),
+        "provider_type_text": _safe_text(canonical_row_map.get("provider_type_text")),
+        "multiple_npi_flag": _safe_text(canonical_row_map.get("multiple_npi_flag")),
+        "ccn": _safe_text(canonical_row_map.get("ccn")),
+        "associate_id": _safe_text(canonical_row_map.get("associate_id")),
+        "organization_name": _safe_text(canonical_row_map.get("organization_name")),
+        "doing_business_as_name": _safe_text(canonical_row_map.get("doing_business_as_name")),
+        "incorporation_date": _safe_date(canonical_row_map.get("incorporation_date")),
+        "incorporation_state": _safe_state(canonical_row_map.get("incorporation_state")),
+        "organization_type_structure": _safe_text(canonical_row_map.get("organization_type_structure")),
+        "organization_other_type_text": _safe_text(canonical_row_map.get("organization_other_type_text")),
+        "proprietary_nonprofit": _safe_text(canonical_row_map.get("proprietary_nonprofit")),
+        "address_line_1": _safe_text(canonical_row_map.get("address_line_1")),
+        "address_line_2": _safe_text(canonical_row_map.get("address_line_2")),
+        "city": _safe_text(canonical_row_map.get("city")),
+        "state": _safe_state(canonical_row_map.get("state")),
+        "zip_code": _safe_zip(canonical_row_map.get("zip_code")),
     }
 
     if "pecos_asct_cntl_id" in model_columns:
-        payload["pecos_asct_cntl_id"] = _safe_text(canonical.get("pecos_asct_cntl_id"))
+        row_payload_map["pecos_asct_cntl_id"] = _safe_text(
+            canonical_row_map.get("pecos_asct_cntl_id")
+        )
     if "first_name" in model_columns:
-        payload["first_name"] = _safe_text(canonical.get("first_name"))
+        row_payload_map["first_name"] = _safe_text(canonical_row_map.get("first_name"))
     if "middle_name" in model_columns:
-        payload["middle_name"] = _safe_text(canonical.get("middle_name"))
+        row_payload_map["middle_name"] = _safe_text(canonical_row_map.get("middle_name"))
     if "last_name" in model_columns:
-        payload["last_name"] = _safe_text(canonical.get("last_name"))
+        row_payload_map["last_name"] = _safe_text(canonical_row_map.get("last_name"))
     if "org_name" in model_columns:
-        payload["org_name"] = _safe_text(canonical.get("org_name"))
+        row_payload_map["org_name"] = _safe_text(canonical_row_map.get("org_name"))
 
     if "practice_location_type" in model_columns:
-        payload["practice_location_type"] = _safe_text(canonical.get("practice_location_type"))
+        row_payload_map["practice_location_type"] = _safe_text(
+            canonical_row_map.get("practice_location_type")
+        )
     if "location_other_type_text" in model_columns:
-        payload["location_other_type_text"] = _safe_text(canonical.get("location_other_type_text"))
+        row_payload_map["location_other_type_text"] = _safe_text(
+            canonical_row_map.get("location_other_type_text")
+        )
 
     if "subgroup_general" in model_columns:
-        payload["subgroup_general"] = _safe_text(canonical.get("subgroup_general"))
-        payload["subgroup_acute_care"] = _safe_text(canonical.get("subgroup_acute_care"))
-        payload["subgroup_alcohol_drug"] = _safe_text(canonical.get("subgroup_alcohol_drug"))
-        payload["subgroup_childrens"] = _safe_text(canonical.get("subgroup_childrens"))
-        payload["subgroup_long_term"] = _safe_text(canonical.get("subgroup_long_term"))
-        payload["subgroup_psychiatric"] = _safe_text(canonical.get("subgroup_psychiatric"))
-        payload["subgroup_rehabilitation"] = _safe_text(canonical.get("subgroup_rehabilitation"))
-        payload["subgroup_short_term"] = _safe_text(canonical.get("subgroup_short_term"))
-        payload["subgroup_swing_bed_approved"] = _safe_text(canonical.get("subgroup_swing_bed_approved"))
-        payload["subgroup_psychiatric_unit"] = _safe_text(canonical.get("subgroup_psychiatric_unit"))
-        payload["subgroup_rehabilitation_unit"] = _safe_text(canonical.get("subgroup_rehabilitation_unit"))
-        payload["subgroup_specialty_hospital"] = _safe_text(canonical.get("subgroup_specialty_hospital"))
-        payload["subgroup_other"] = _safe_text(canonical.get("subgroup_other"))
-        payload["subgroup_other_text"] = _safe_text(canonical.get("subgroup_other_text"))
-        payload["reh_conversion_flag"] = _safe_text(canonical.get("reh_conversion_flag"))
-        payload["reh_conversion_date"] = _safe_date(canonical.get("reh_conversion_date"))
-        payload["cah_or_hospital_ccn"] = _safe_text(canonical.get("cah_or_hospital_ccn"))
+        for field_name in (
+            "subgroup_general",
+            "subgroup_acute_care",
+            "subgroup_alcohol_drug",
+            "subgroup_childrens",
+            "subgroup_long_term",
+            "subgroup_psychiatric",
+            "subgroup_rehabilitation",
+            "subgroup_short_term",
+            "subgroup_swing_bed_approved",
+            "subgroup_psychiatric_unit",
+            "subgroup_rehabilitation_unit",
+            "subgroup_specialty_hospital",
+            "subgroup_other",
+            "subgroup_other_text",
+            "reh_conversion_flag",
+            "cah_or_hospital_ccn",
+        ):
+            row_payload_map[field_name] = _safe_text(canonical_row_map.get(field_name))
+        row_payload_map["reh_conversion_date"] = _safe_date(
+            canonical_row_map.get("reh_conversion_date")
+        )
 
     if "telephone_number" in model_columns:
-        payload["telephone_number"] = _safe_text(canonical.get("telephone_number"))
+        row_payload_map["telephone_number"] = _safe_text(
+            canonical_row_map.get("telephone_number")
+        )
 
     if "nursing_home_provider_name" in model_columns:
-        payload["nursing_home_provider_name"] = _safe_text(canonical.get("nursing_home_provider_name"))
-        payload["affiliation_entity_name"] = _safe_text(canonical.get("affiliation_entity_name"))
-        payload["affiliation_entity_id"] = _safe_text(canonical.get("affiliation_entity_id"))
+        for field_name in (
+            "nursing_home_provider_name",
+            "affiliation_entity_name",
+            "affiliation_entity_id",
+        ):
+            row_payload_map[field_name] = _safe_text(canonical_row_map.get(field_name))
 
-    payload = {key: value for key, value in payload.items() if key in model_columns}
+    row_payload_map = {
+        key: field_value
+        for key, field_value in row_payload_map.items()
+        if key in model_columns
+    }
 
     checksum_fields = [
         spec["key"],
-        payload.get("npi"),
-        payload.get("enrollment_id"),
-        payload.get("ccn"),
-        payload.get("associate_id"),
-        payload.get("address_line_1"),
-        payload.get("zip_code"),
-        payload.get("reporting_period_start"),
-        payload.get("source_distribution_title"),
+        row_payload_map.get("npi"),
+        row_payload_map.get("enrollment_id"),
+        row_payload_map.get("ccn"),
+        row_payload_map.get("associate_id"),
+        row_payload_map.get("address_line_1"),
+        row_payload_map.get("zip_code"),
+        row_payload_map.get("reporting_period_start"),
+        row_payload_map.get("source_distribution_title"),
     ]
-    payload["record_hash"] = return_checksum(checksum_fields)
+    row_payload_map["record_hash"] = return_checksum(checksum_fields)
 
-    return payload, None
+    return row_payload_map, None
 
 
 def _build_ffs_additional_npi_row_payload(
@@ -872,68 +900,86 @@ def _build_ffs_additional_npi_row_payload(
 
 
 def _build_ffs_address_row_payload(
-    row: dict[str, Any],
+    source_row_map: dict[str, Any],
     spec: dict[str, Any],
-    source: dict[str, Any],
+    source_map: dict[str, Any],
     model_columns: set[str],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    enrollment_id = _safe_text(_resolve_header(row, ("ENRLMT_ID", "ENROLLMENT ID")))
+    enrollment_id = _safe_text(
+        _resolve_header(source_row_map, ("ENRLMT_ID", "ENROLLMENT ID"))
+    )
     if not enrollment_id:
         return None, "missing_enrollment_id"
 
-    payload = {
-        **_base_source_payload(source),
+    row_payload_map = {
+        **_base_source_payload(source_map),
         "enrollment_id": enrollment_id,
-        "city": _safe_text(_resolve_header(row, ("CITY_NAME", "CITY"))),
-        "state": _safe_state(_resolve_header(row, ("STATE_CD", "STATE"))),
-        "zip_code": _safe_zip(_resolve_header(row, ("ZIP_CD", "ZIP CODE"))),
+        "city": _safe_text(_resolve_header(source_row_map, ("CITY_NAME", "CITY"))),
+        "state": _safe_state(_resolve_header(source_row_map, ("STATE_CD", "STATE"))),
+        "zip_code": _safe_zip(
+            _resolve_header(source_row_map, ("ZIP_CD", "ZIP CODE"))
+        ),
     }
-    if not payload.get("zip_code"):
+    if not row_payload_map.get("zip_code"):
         return None, "missing_zip_code"
-    payload = {key: value for key, value in payload.items() if key in model_columns}
-    payload["record_hash"] = return_checksum(
+    row_payload_map = {
+        key: field_value
+        for key, field_value in row_payload_map.items()
+        if key in model_columns
+    }
+    row_payload_map["record_hash"] = return_checksum(
         [
             spec["key"],
-            payload.get("enrollment_id"),
-            payload.get("city"),
-            payload.get("state"),
-            payload.get("zip_code"),
-            payload.get("reporting_year"),
+            row_payload_map.get("enrollment_id"),
+            row_payload_map.get("city"),
+            row_payload_map.get("state"),
+            row_payload_map.get("zip_code"),
+            row_payload_map.get("reporting_year"),
         ]
     )
-    return payload, None
+    return row_payload_map, None
 
 
 def _build_ffs_secondary_specialty_row_payload(
-    row: dict[str, Any],
+    source_row_map: dict[str, Any],
     spec: dict[str, Any],
-    source: dict[str, Any],
+    source_map: dict[str, Any],
     model_columns: set[str],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    enrollment_id = _safe_text(_resolve_header(row, ("ENRLMT_ID", "ENROLLMENT ID")))
-    provider_type_code = _safe_text(_resolve_header(row, ("PROVIDER_TYPE_CD",)))
+    enrollment_id = _safe_text(
+        _resolve_header(source_row_map, ("ENRLMT_ID", "ENROLLMENT ID"))
+    )
+    provider_type_code = _safe_text(
+        _resolve_header(source_row_map, ("PROVIDER_TYPE_CD",))
+    )
     if not enrollment_id:
         return None, "missing_enrollment_id"
     if not provider_type_code:
         return None, "missing_provider_type_code"
 
-    payload = {
-        **_base_source_payload(source),
+    row_payload_map = {
+        **_base_source_payload(source_map),
         "enrollment_id": enrollment_id,
         "provider_type_code": provider_type_code,
-        "provider_type_text": _safe_text(_resolve_header(row, ("PROVIDER_TYPE_DESC",))),
+        "provider_type_text": _safe_text(
+            _resolve_header(source_row_map, ("PROVIDER_TYPE_DESC",))
+        ),
     }
-    payload = {key: value for key, value in payload.items() if key in model_columns}
-    payload["record_hash"] = return_checksum(
+    row_payload_map = {
+        key: field_value
+        for key, field_value in row_payload_map.items()
+        if key in model_columns
+    }
+    row_payload_map["record_hash"] = return_checksum(
         [
             spec["key"],
-            payload.get("enrollment_id"),
-            payload.get("provider_type_code"),
-            payload.get("provider_type_text"),
-            payload.get("reporting_year"),
+            row_payload_map.get("enrollment_id"),
+            row_payload_map.get("provider_type_code"),
+            row_payload_map.get("provider_type_text"),
+            row_payload_map.get("reporting_year"),
         ]
     )
-    return payload, None
+    return row_payload_map, None
 
 
 def _build_ffs_reassignment_row_payload(
@@ -997,18 +1043,24 @@ async def _download_source(url: str, target_path: str) -> None:
 
 
 async def _prepare_staging_tables(import_date: str, db_schema: str) -> None:
-    tables = {}
+    staging_table_by_name = {}
 
     for cls in PROCESSING_CLASSES:
-        tables[cls.__main_table__] = make_class(cls, import_date)
-        obj = tables[cls.__main_table__]
+        staging_table_by_name[cls.__main_table__] = make_class(cls, import_date)
+        staging_model = staging_table_by_name[cls.__main_table__]
         try:
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
-            await db.create_table(obj.__table__, checkfirst=True)
-            if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
+            await db.status(
+                f"DROP TABLE IF EXISTS {db_schema}.{staging_model.__tablename__};"
+            )
+            await db.create_table(staging_model.__table__, checkfirst=True)
+            if (
+                hasattr(staging_model, "__my_index_elements__")
+                and staging_model.__my_index_elements__
+            ):
                 await db.status(
-                    f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary "
-                    f"ON {db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});"
+                    f"CREATE UNIQUE INDEX {staging_model.__tablename__}_idx_primary "
+                    f"ON {db_schema}.{staging_model.__tablename__} "
+                    f"({', '.join(staging_model.__my_index_elements__)});"
                 )
 
             if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
@@ -1018,8 +1070,9 @@ async def _prepare_staging_tables(import_date: str, db_schema: str) -> None:
                     unique = " UNIQUE " if index.get("unique") else " "
                     where = f" WHERE {index.get('where')} " if index.get("where") else ""
                     create_index_sql = (
-                        f"CREATE{unique}INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
-                        f"ON {db_schema}.{obj.__tablename__} {using}"
+                        f"CREATE{unique}INDEX IF NOT EXISTS "
+                        f"{staging_model.__tablename__}_idx_{index_name} "
+                        f"ON {db_schema}.{staging_model.__tablename__} {using}"
                         f"({', '.join(index.get('index_elements'))}){where};"
                     )
                     print(create_index_sql)
@@ -1032,7 +1085,7 @@ async def _prepare_staging_tables(import_date: str, db_schema: str) -> None:
 
 async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
     """Audit current NPPES headers for fields missing from enrichment models."""
-    report = {
+    gap_report_map = {
         "checked": False,
         "source_zip": None,
         "unmapped_fields": [],
@@ -1044,18 +1097,20 @@ async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
     base_url = os.getenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR")
     listing_file = os.getenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE")
     if not base_url or not listing_file:
-        report["error"] = "HLTHPRT_NPPES_DOWNLOAD_URL_DIR/FILE are not configured"
-        return report
+        gap_report_map["error"] = (
+            "HLTHPRT_NPPES_DOWNLOAD_URL_DIR/FILE are not configured"
+        )
+        return gap_report_map
 
     try:
         html_source = await download_it(f"{base_url}{listing_file}")
         zip_candidates = re.findall(r"(NPPES_Data_Dissemination.*?_V2\.zip)", html_source)
         if not zip_candidates:
-            report["error"] = "no NPPES dissemination zip links found"
-            return report
+            gap_report_map["error"] = "no NPPES dissemination zip links found"
+            return gap_report_map
 
         zip_name = zip_candidates[0]
-        report["source_zip"] = zip_name
+        gap_report_map["source_zip"] = zip_name
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             zip_path = str(PurePath(tmpdirname, zip_name))
@@ -1068,8 +1123,10 @@ async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
                         npi_csv_name = name
                         break
                 if not npi_csv_name:
-                    report["error"] = "npidata_pfile*.csv was not found in the NPPES zip"
-                    return report
+                    gap_report_map["error"] = (
+                        "npidata_pfile*.csv was not found in the NPPES zip"
+                    )
+                    return gap_report_map
 
                 with archive.open(npi_csv_name, "r") as header_file:
                     line = header_file.readline().decode("utf-8-sig", errors="ignore")
@@ -1082,21 +1139,25 @@ async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
                 continue
             mapped_headers.add(_normalize_nppes_header(header))
 
-        mapped_to_npi = {column.name for column in NPIData.__table__.columns}
-        ignored = {
+        npi_mapped_headers = {column.name for column in NPIData.__table__.columns}
+        ignored_headers = {
             "do_business_as_text",
         }
         unmapped = sorted(
-            field for field in mapped_headers if field and field not in mapped_to_npi and field not in ignored
+            field
+            for field in mapped_headers
+            if field
+            and field not in npi_mapped_headers
+            and field not in ignored_headers
         )
         medical_school = sorted(
             header for header in headers if "medical" in str(header).lower() and "school" in str(header).lower()
         )
 
-        report["checked"] = True
-        report["unmapped_fields"] = unmapped
-        report["unmapped_field_count"] = len(unmapped)
-        report["medical_school_headers"] = medical_school
+        gap_report_map["checked"] = True
+        gap_report_map["unmapped_fields"] = unmapped
+        gap_report_map["unmapped_field_count"] = len(unmapped)
+        gap_report_map["medical_school_headers"] = medical_school
 
         if unmapped:
             print(
@@ -1109,13 +1170,17 @@ async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
                 f"{', '.join(medical_school)}"
             )
 
-        ctx.setdefault("context", {}).setdefault("audit", {})["nppes_gap_report"] = report
-        return report
+        ctx.setdefault("context", {}).setdefault("audit", {})[
+            "nppes_gap_report"
+        ] = gap_report_map
+        return gap_report_map
     except Exception as exc:
-        report["error"] = str(exc)
+        gap_report_map["error"] = str(exc)
         print(f"[warn] NPPES gap check failed: {exc}")
-        ctx.setdefault("context", {}).setdefault("audit", {})["nppes_gap_report"] = report
-        return report
+        ctx.setdefault("context", {}).setdefault("audit", {})[
+            "nppes_gap_report"
+        ] = gap_report_map
+        return gap_report_map
 
 
 async def process_data(ctx, task=None):  # pragma: no cover
@@ -1156,13 +1221,18 @@ async def process_data(ctx, task=None):  # pragma: no cover
             "error": None,
         }
 
-    sources, unmapped = await _discover_sources(test_mode=test_mode)
-    audit["unmapped_datasets"] = unmapped
+    discovered_sources, unmapped_datasets = await _discover_sources(
+        test_mode=test_mode
+    )
+    audit["unmapped_datasets"] = unmapped_datasets
 
-    if not sources:
+    if not discovered_sources:
         raise RuntimeError("No registered provider-enrichment sources were discovered from the CMS catalog.")
 
-    print(f"Provider enrichment discovery: sources={len(sources)} unmapped={len(unmapped)}")
+    print(
+        "Provider enrichment discovery: "
+        f"sources={len(discovered_sources)} unmapped={len(unmapped_datasets)}"
+    )
     if run_id:
         enqueue_live_progress(
             run_id=run_id,
@@ -1171,8 +1241,8 @@ async def process_data(ctx, task=None):  # pragma: no cover
             phase="provider-enrichment sources discovered",
             unit="sources",
             done=0,
-            total=len(sources),
-            message=f"{len(sources)} sources discovered",
+            total=len(discovered_sources),
+            message=f"{len(discovered_sources)} sources discovered",
         )
 
     batch_size = _env_positive_int(
@@ -1192,8 +1262,8 @@ async def process_data(ctx, task=None):  # pragma: no cover
             coros.clear()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
-        for source_idx, source in enumerate(sources):
-            spec_key = source["spec_key"]
+        for source_idx, source_map in enumerate(discovered_sources):
+            spec_key = source_map["spec_key"]
             spec = SPEC_BY_KEY[spec_key]
             model_cls = spec["model"]
             task_key = spec["task_key"]
@@ -1202,7 +1272,8 @@ async def process_data(ctx, task=None):  # pragma: no cover
             local_path = str(PurePath(tmpdirname, f"provider_enrichment_{spec_key}_{source_idx}.csv"))
             print(
                 "Downloading provider-enrichment source "
-                f"[{source_idx + 1}/{len(sources)}] {spec_key} {source.get('distribution_title')}"
+                f"[{source_idx + 1}/{len(discovered_sources)}] {spec_key} "
+                f"{source_map.get('distribution_title')}"
             )
             if run_id:
                 enqueue_live_progress(
@@ -1212,19 +1283,26 @@ async def process_data(ctx, task=None):  # pragma: no cover
                     phase=f"provider-enrichment loading {spec_key}",
                     unit="sources",
                     done=source_idx,
-                    total=len(sources),
+                    total=len(discovered_sources),
                     message=f"loading {spec_key}",
-                    label=str(source.get("distribution_title") or spec_key),
+                    label=str(source_map.get("distribution_title") or spec_key),
                 )
-            await _download_source(str(source["download_url"]), local_path)
+            await _download_source(str(source_map["download_url"]), local_path)
 
             csv_encoding = _select_csv_encoding(local_path)
             headers = _read_csv_header(local_path, csv_encoding)
-            _validate_headers(headers, spec, str(source.get("distribution_title") or source.get("dataset_title")))
+            _validate_headers(
+                headers,
+                spec,
+                str(
+                    source_map.get("distribution_title")
+                    or source_map.get("dataset_title")
+                ),
+            )
             if csv_encoding != CSV_PRIMARY_ENCODING:
                 print(
                     "Provider-enrichment source using fallback CSV encoding "
-                    f"'{csv_encoding}': {source.get('distribution_title')}"
+                    f"'{csv_encoding}': {source_map.get('distribution_title')}"
                 )
 
             rows_accepted = 0
@@ -1235,15 +1313,20 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
             async with async_open(local_path, "r", encoding=csv_encoding) as handle:
                 reader = AsyncDictReader(handle, delimiter=",")
-                async for row in reader:
+                async for source_row_map in reader:
                     processed_rows += 1
-                    obj, drop_reason = _build_row_payload(row, spec, source, model_columns)
-                    if obj is None:
+                    row_payload_map, drop_reason = _build_row_payload(
+                        source_row_map,
+                        spec,
+                        source_map,
+                        model_columns,
+                    )
+                    if row_payload_map is None:
                         if drop_reason == "missing_npi":
                             rows_dropped_missing_npi += 1
                         continue
 
-                    payload_rows.append(obj)
+                    payload_rows.append(row_payload_map)
                     rows_accepted += 1
 
                     if len(payload_rows) >= batch_size:
@@ -1262,10 +1345,10 @@ async def process_data(ctx, task=None):  # pragma: no cover
             dataset_stats = audit["dataset_stats"].setdefault(spec_key, [])
             dataset_stats.append(
                 {
-                    "dataset_title": source.get("dataset_title"),
-                    "distribution_title": source.get("distribution_title"),
-                    "download_url": source.get("download_url"),
-                    "reporting_year": source.get("reporting_year"),
+                    "dataset_title": source_map.get("dataset_title"),
+                    "distribution_title": source_map.get("distribution_title"),
+                    "download_url": source_map.get("download_url"),
+                    "reporting_year": source_map.get("reporting_year"),
                     "rows_processed": processed_rows,
                     "rows_accepted": rows_accepted,
                     "rows_dropped_missing_npi": rows_dropped_missing_npi,
@@ -1285,9 +1368,9 @@ async def process_data(ctx, task=None):  # pragma: no cover
                     phase=f"provider-enrichment loaded {spec_key}",
                     unit="sources",
                     done=source_idx + 1,
-                    total=len(sources),
+                    total=len(discovered_sources),
                     message=f"loaded {spec_key}",
-                    label=str(source.get("distribution_title") or spec_key),
+                    label=str(source_map.get("distribution_title") or spec_key),
                 )
 
     context["run"] = context.get("run", 0) + 1
@@ -1364,7 +1447,10 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
         """
 
     nppes_unmapped_count = int(nppes_report.get("unmapped_field_count") or 0)
-    nppes_medical_school_fields = [str(v) for v in (nppes_report.get("medical_school_headers") or [])]
+    nppes_medical_school_fields = [
+        str(field_name)
+        for field_name in (nppes_report.get("medical_school_headers") or [])
+    ]
     nppes_unmapped_count_sql = str(nppes_unmapped_count)
     nppes_medical_school_fields_sql = _sql_varchar_array_literal(nppes_medical_school_fields)
 
@@ -1572,7 +1658,7 @@ async def shutdown(ctx):  # pragma: no cover
     await ensure_database(bool(context.get("test_mode")))
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
 
-    tables = {}
+    staging_table_by_name = {}
     processing_classes = PROCESSING_CLASSES
 
     async def archive_index(index_name: str) -> str:
@@ -1584,7 +1670,7 @@ async def shutdown(ctx):  # pragma: no cover
 
     for cls in processing_classes:
         stage_obj = make_class(cls, import_date)
-        tables[cls.__main_table__] = stage_obj
+        staging_table_by_name[cls.__main_table__] = stage_obj
         if not await _table_exists(db_schema, stage_obj.__tablename__):
             raise RuntimeError(
                 f"Staging table {db_schema}.{stage_obj.__tablename__} is missing; "
@@ -1598,22 +1684,28 @@ async def shutdown(ctx):  # pragma: no cover
         ProviderEnrollmentFFSSecondarySpecialty,
         ProviderEnrollmentFFSReassignment,
     )
-    stage_counts: dict[str, int] = {}
+    stage_count_by_table: dict[str, int] = {}
     for cls in required_nonempty_tables:
-        stage_obj = tables[cls.__main_table__]
+        stage_obj = staging_table_by_name[cls.__main_table__]
         row_count = await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_obj.__tablename__};")
-        stage_counts[cls.__main_table__] = int(row_count or 0)
-        print(f"Provider-enrichment staging rows: {stage_obj.__tablename__}={stage_counts[cls.__main_table__]:,}")
-        if not stage_counts[cls.__main_table__]:
+        stage_count_by_table[cls.__main_table__] = int(row_count or 0)
+        print(
+            "Provider-enrichment staging rows: "
+            f"{stage_obj.__tablename__}="
+            f"{stage_count_by_table[cls.__main_table__]:,}"
+        )
+        if not stage_count_by_table[cls.__main_table__]:
             raise RuntimeError(
                 f"Required staging table {db_schema}.{stage_obj.__tablename__} is empty; "
                 "aborting provider-enrichment publish."
             )
 
-    address_stats = {}
+    address_stat_by_source = {}
     if source_enabled("provider_enrichment") or source_enabled("provider_enrollment_ffs"):
-        ffs_stage = tables[ProviderEnrollmentFFS.__main_table__]
-        ffs_address_stage = tables[ProviderEnrollmentFFSAddress.__main_table__]
+        ffs_stage = staging_table_by_name[ProviderEnrollmentFFS.__main_table__]
+        ffs_address_stage = staging_table_by_name[
+            ProviderEnrollmentFFSAddress.__main_table__
+        ]
         await stamp_address_keys(
             ffs_stage.__tablename__,
             {
@@ -1626,7 +1718,7 @@ async def shutdown(ctx):  # pragma: no cover
             },
             schema=db_schema,
         )
-        address_stats["provider_enrollment_ffs"] = (
+        address_stat_by_source["provider_enrollment_ffs"] = (
             await resolve_into_archive(
                 ffs_stage.__tablename__,
                 {
@@ -1654,7 +1746,7 @@ async def shutdown(ctx):  # pragma: no cover
             },
             schema=db_schema,
         )
-        address_stats["provider_enrollment_ffs_address"] = (
+        address_stat_by_source["provider_enrollment_ffs_address"] = (
             await resolve_into_archive(
                 ffs_address_stage.__tablename__,
                 {
@@ -1670,50 +1762,66 @@ async def shutdown(ctx):  # pragma: no cover
                 schema=db_schema,
             )
         ).__dict__
-        print(f"Provider-enrichment canonical address resolve complete: {address_stats}")
+        print(
+            "Provider-enrichment canonical address resolve complete: "
+            f"{address_stat_by_source}"
+        )
 
     await _materialize_summary(
         import_date,
         db_schema,
         context.get("audit", {}).get("nppes_gap_report", {}),
     )
-    summary_stage = tables[ProviderEnrichmentSummary.__main_table__]
+    summary_stage = staging_table_by_name[ProviderEnrichmentSummary.__main_table__]
     summary_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{summary_stage.__tablename__};") or 0)
 
     async with db.transaction():
         for cls in processing_classes:
-            obj = tables[cls.__main_table__]
+            staging_model = staging_table_by_name[cls.__main_table__]
             if hasattr(cls, "__my_additional_indexes__") and cls.__my_additional_indexes__:
                 for index in cls.__my_additional_indexes__:
                     index_name = index.get("name", "_".join(index.get("index_elements")))
                     using = f"USING {index.get('using')} " if index.get("using") else ""
                     where_clause = f" WHERE {index.get('where')}" if index.get("where") else ""
                     create_index_sql = (
-                        f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
-                        f"ON {db_schema}.{obj.__tablename__} {using}"
+                        f"CREATE INDEX IF NOT EXISTS "
+                        f"{staging_model.__tablename__}_idx_{index_name} "
+                        f"ON {db_schema}.{staging_model.__tablename__} {using}"
                         f"({', '.join(index.get('index_elements'))}){where_clause};"
                     )
                     print(create_index_sql)
                     await db.status(create_index_sql)
 
-    async def analyze_table(obj):
+    async def analyze_table(staging_model):
         """Refresh planner statistics after rebuilding table indexes."""
-        print(f"Post-Index ANALYZE {db_schema}.{obj.__tablename__};")
-        await db.execute_ddl(f"ANALYZE {db_schema}.{obj.__tablename__};")
+        print(f"Post-Index ANALYZE {db_schema}.{staging_model.__tablename__};")
+        await db.execute_ddl(
+            f"ANALYZE {db_schema}.{staging_model.__tablename__};"
+        )
 
-    await asyncio.gather(*(analyze_table(tables[cls.__main_table__]) for cls in processing_classes))
+    await asyncio.gather(
+        *(
+            analyze_table(staging_table_by_name[cls.__main_table__])
+            for cls in processing_classes
+        )
+    )
 
     async with db.transaction():
         for cls in processing_classes:
-            obj = tables[cls.__main_table__]
-            table = obj.__main_table__
+            staging_model = staging_table_by_name[cls.__main_table__]
+            table = staging_model.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{staging_model.__tablename__} "
+                f"RENAME TO {table};"
+            )
 
             await archive_index(f"{table}_idx_primary")
             await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{obj.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
+                f"ALTER INDEX IF EXISTS "
+                f"{db_schema}.{staging_model.__tablename__}_idx_primary "
+                f"RENAME TO {table}_idx_primary;"
             )
 
             move_indexes = []
@@ -1726,7 +1834,8 @@ async def shutdown(ctx):  # pragma: no cover
                 index_name = index.get("name", "_".join(index.get("index_elements")))
                 await archive_index(f"{table}_idx_{index_name}")
                 await db.status(
-                    f"ALTER INDEX IF EXISTS {db_schema}.{obj.__tablename__}_idx_{index_name} "
+                    f"ALTER INDEX IF EXISTS "
+                    f"{db_schema}.{staging_model.__tablename__}_idx_{index_name} "
                     f"RENAME TO {table}_idx_{index_name};"
                 )
 
@@ -1744,12 +1853,16 @@ async def shutdown(ctx):  # pragma: no cover
             "phase": "provider-enrichment published",
         },
         metrics={
-            "stage_rows": stage_counts,
+            "stage_rows": stage_count_by_table,
             "summary_rows": summary_rows,
             "datasets": len(context.get("audit", {}).get("dataset_stats", {}) or {}),
             "rows_accepted": int(context.get("audit", {}).get("rows_accepted") or 0),
             "rows_dropped_missing_npi": int(context.get("audit", {}).get("rows_dropped_missing_npi") or 0),
-            **({"address_resolve": address_stats} if address_stats else {}),
+            **(
+                {"address_resolve": address_stat_by_source}
+                if address_stat_by_source
+                else {}
+            ),
         },
     )
     print_time_info(context.get("start"))

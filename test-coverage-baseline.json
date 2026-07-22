@@ -138,11 +138,24 @@
         "process/provider_directory_endpoint_identity.py",
         "process/provider_directory_fhir.py",
         "process/provider_directory_logical_scope.py",
+        "process/provider_directory_physical_projection.py",
         "process/provider_directory_profile.py",
         "process/provider_directory_profile_reference_sql.py",
         "process/provider_directory_profile_selection.py",
         "process/provider_directory_profile_selection_contract.py",
         "process/provider_directory_profile_selection_snapshot.py",
+        "process/provider_directory_projection_admission.py",
+        "process/provider_directory_projection_admission_contract.py",
+        "process/provider_directory_projection_contract.py",
+        "process/provider_directory_projection_contribution.py",
+        "process/provider_directory_projection_db.py",
+        "process/provider_directory_projection_inline_profile.py",
+        "process/provider_directory_projection_lease.py",
+        "process/provider_directory_projection_semantic_evidence.py",
+        "process/provider_directory_projection_summary.py",
+        "process/provider_directory_projection_typed_evidence.py",
+        "process/provider_directory_projection_types.py",
+        "process/provider_directory_projection_workset.py",
         "process/provider_directory_retained_artifact_base.py",
         "process/provider_directory_retained_artifact_contract.py",
         "process/provider_directory_retained_artifact_keys.py",
@@ -314,12 +327,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 24685,
-          "total": 33368
+          "covered": 25395,
+          "total": 33948
         },
         "lines": {
-          "covered": 82315,
-          "total": 98127
+          "covered": 84382,
+          "total": 99838
         }
       },
       "path": "test-coverage-python.json",

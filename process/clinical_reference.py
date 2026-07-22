@@ -137,13 +137,16 @@ def _download_url(url: str, path: Path, *, api_key: str | None = None, force: bo
     if path.exists() and path.stat().st_size > 0 and not force:
         return path
     _raise_if_cancelled(run_id)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
     request_url = url
     if api_key:
         request_url = _umls_download_url(url, api_key)
     request = urllib.request.Request(request_url, headers={"User-Agent": "HealthPorta terminology importer"})
     try:
-        with urllib.request.urlopen(request, timeout=3600) as response, tmp.open("wb") as out:
+        with urllib.request.urlopen(
+            request,
+            timeout=3600,
+        ) as response, temporary_path.open("wb") as out:
             while True:
                 _raise_if_cancelled(run_id)
                 chunk = response.read(1024 * 1024)
@@ -153,14 +156,17 @@ def _download_url(url: str, path: Path, *, api_key: str | None = None, force: bo
     except Exception as exc:
         raise RuntimeError(f"download failed for {_redact_sensitive_url(request_url)}: {_redact_sensitive_url(str(exc))}") from exc
     _raise_if_cancelled(run_id)
-    tmp.replace(path)
-    manifest = {
+    temporary_path.replace(path)
+    manifest_map = {
         "source_url": url,
         "downloaded_at": _now().isoformat() + "Z",
         "byte_count": path.stat().st_size,
         "sha256": _sha256_file(path),
     }
-    path.with_suffix(path.suffix + ".manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    path.with_suffix(path.suffix + ".manifest.json").write_text(
+        json.dumps(manifest_map, indent=2),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -330,11 +336,11 @@ def _build_clinical_area_rows(
     """Build clinical area rows."""
     mesh_tree_by_code: dict[str, set[str]] = {}
     mesh_code_by_tree: dict[str, str] = {}
-    for row in relationships.values():
-        if row["from_system"] != "MESH" or row["relationship"] != "has_tree_number" or row["to_system"] != "MESH_TREE":
+    for relationship_map in relationships.values():
+        if relationship_map["from_system"] != "MESH" or relationship_map["relationship"] != "has_tree_number" or relationship_map["to_system"] != "MESH_TREE":
             continue
-        code = row["from_code"]
-        tree_number = str(row["to_code"]).upper()
+        code = relationship_map["from_code"]
+        tree_number = str(relationship_map["to_code"]).upper()
         mesh_tree_by_code.setdefault(code, set()).add(tree_number)
         mesh_code_by_tree.setdefault(tree_number, code)
 
@@ -355,9 +361,9 @@ def _build_clinical_area_rows(
         area_id = f"mesh:{root}"
         area_rows_by_id[area_id] = _area_row(area_id, root_concept["display_name"], root)
 
-    condition_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
-    treatment_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
-    mesh_condition_areas: dict[str, set[str]] = {}
+    condition_row_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+    treatment_row_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+    condition_area_ids_by_mesh_code: dict[str, set[str]] = {}
 
     for mesh_code, tree_numbers in mesh_tree_by_code.items():
         concept = concepts.get(("MESH", mesh_code))
@@ -376,20 +382,20 @@ def _build_clinical_area_rows(
             if root.startswith("C") or root == "F03":
                 if code_type == "condition":
                     key = (area_id, "MESH", mesh_code)
-                    condition_rows[key] = _area_condition_row(area_id, "MESH", mesh_code, "nlm_mesh_tree")
-                    mesh_condition_areas.setdefault(mesh_code, set()).add(area_id)
+                    condition_row_by_identity[key] = _area_condition_row(area_id, "MESH", mesh_code, "nlm_mesh_tree")
+                    condition_area_ids_by_mesh_code.setdefault(mesh_code, set()).add(area_id)
             elif root.startswith("E") and code_type == "treatment":
                 key = (area_id, "MESH", mesh_code)
-                treatment_rows[key] = _area_treatment_row(area_id, "MESH", mesh_code, "nlm_mesh_tree")
+                treatment_row_by_identity[key] = _area_treatment_row(area_id, "MESH", mesh_code, "nlm_mesh_tree")
 
-    for row in relationships.values():
-        if row["from_system"] != "RXNORM" or row["relationship"] != "may_treat" or row["to_system"] != "MESH":
+    for relationship_map in relationships.values():
+        if relationship_map["from_system"] != "RXNORM" or relationship_map["relationship"] != "may_treat" or relationship_map["to_system"] != "MESH":
             continue
-        for area_id in mesh_condition_areas.get(row["to_code"], set()):
-            key = (area_id, "RXNORM", row["from_code"])
-            treatment_rows[key] = _area_treatment_row(area_id, "RXNORM", row["from_code"], "rxclass_medrt_area")
+        for area_id in condition_area_ids_by_mesh_code.get(relationship_map["to_code"], set()):
+            key = (area_id, "RXNORM", relationship_map["from_code"])
+            treatment_row_by_identity[key] = _area_treatment_row(area_id, "RXNORM", relationship_map["from_code"], "rxclass_medrt_area")
 
-    return list(area_rows_by_id.values()), list(condition_rows.values()), list(treatment_rows.values())
+    return list(area_rows_by_id.values()), list(condition_row_by_identity.values()), list(treatment_row_by_identity.values())
 
 
 def _parse_icd10cm(path: Path, test_limit: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
@@ -424,8 +430,8 @@ def _mesh_text(element: ET.Element, path: str) -> str:
     return (found.text or "").strip() if found is not None and found.text else ""
 
 
-def _parse_mesh_file(path: Path, source: str, test_limit: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
-    rows: list[dict[str, Any]] = []
+def _parse_mesh_file(path: Path, source_name: str, test_limit: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+    concept_rows: list[dict[str, Any]] = []
     synonyms: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
     open_fn = gzip.open if path.suffix == ".gz" else open
@@ -454,25 +460,25 @@ def _parse_mesh_file(path: Path, source: str, test_limit: int | None = None) -> 
                 code_type = "qualifier"
                 term_nodes = elem.findall("./ConceptList/Concept/TermList/Term/String")
             if code and display:
-                rows.append(_concept_row("MESH", code, code_type, display, source, "2026", attribution=NLM_ATTRIBUTION))
-                synonyms.append(_synonym_row("MESH", code, display, "preferred", source, NLM_ATTRIBUTION))
+                concept_rows.append(_concept_row("MESH", code, code_type, display, source_name, "2026", attribution=NLM_ATTRIBUTION))
+                synonyms.append(_synonym_row("MESH", code, display, "preferred", source_name, NLM_ATTRIBUTION))
                 for term_node in term_nodes:
                     term = (term_node.text or "").strip()
                     if term and term != display:
-                        synonyms.append(_synonym_row("MESH", code, term, "synonym", source, NLM_ATTRIBUTION))
+                        synonyms.append(_synonym_row("MESH", code, term, "synonym", source_name, NLM_ATTRIBUTION))
                 for tree_number in tree_numbers:
-                    relationships.append(_relationship_row("MESH", code, "has_tree_number", "MESH_TREE", tree_number, source))
+                    relationships.append(_relationship_row("MESH", code, "has_tree_number", "MESH_TREE", tree_number, source_name))
             elem.clear()
-            if test_limit and len(rows) >= test_limit:
+            if test_limit and len(concept_rows) >= test_limit:
                 break
-    return rows, synonyms, relationships
+    return concept_rows, synonyms, relationships
 
 
 def _parse_rxnorm(path: Path, test_limit: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     rows_by_rxcui: dict[str, dict[str, Any]] = {}
     synonyms: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
-    tty_priority = {"IN": 1, "PIN": 2, "SCD": 3, "SBD": 4, "BN": 5, "MIN": 6}
+    tty_priority_by_type = {"IN": 1, "PIN": 2, "SCD": 3, "SBD": 4, "BN": 5, "MIN": 6}
     seen_synonyms: set[tuple[str, str, str]] = set()
     with zipfile.ZipFile(path) as zf:
         conso_name = next(name for name in zf.namelist() if name.endswith("RXNCONSO.RRF"))
@@ -485,10 +491,10 @@ def _parse_rxnorm(path: Path, test_limit: int | None = None) -> tuple[list[dict]
                 if lat != "ENG" or sab != "RXNORM" or suppress not in {"N", ""} or not rxcui or not term:
                     continue
                 current = rows_by_rxcui.get(rxcui)
-                if current is None or tty_priority.get(tty, 99) < current["_priority"]:
+                if current is None or tty_priority_by_type.get(tty, 99) < current["_priority"]:
                     rows_by_rxcui[rxcui] = {
                         **_concept_row("RXNORM", rxcui, "drug", term, "nlm_rxnorm", None, attribution=NLM_ATTRIBUTION),
-                        "_priority": tty_priority.get(tty, 99),
+                        "_priority": tty_priority_by_type.get(tty, 99),
                     }
                 key = (rxcui, term, tty or "atom")
                 if key not in seen_synonyms:
@@ -510,11 +516,11 @@ def _parse_rxnorm(path: Path, test_limit: int | None = None) -> tuple[list[dict]
                         relationships.append(_relationship_row("RXNORM", rxcui1, rela or rel or "related", "RXNORM", rxcui2, "nlm_rxnorm"))
                     if test_limit and len(relationships) >= test_limit:
                         break
-    rows = []
-    for row in rows_by_rxcui.values():
-        row.pop("_priority", None)
-        rows.append(row)
-    return rows, synonyms, relationships
+    concept_rows = []
+    for concept_row_map in rows_by_rxcui.values():
+        concept_row_map.pop("_priority", None)
+        concept_rows.append(concept_row_map)
+    return concept_rows, synonyms, relationships
 
 
 def _parse_snomed(path: Path, test_limit: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
@@ -528,20 +534,23 @@ def _parse_snomed(path: Path, test_limit: int | None = None) -> tuple[list[dict]
         concept_name = next(name for name in zf.namelist() if "/Snapshot/" in name and "sct2_Concept_Snapshot" in name and name.endswith(".txt"))
         with zf.open(concept_name) as raw:
             reader = csv.DictReader((line.decode("utf-8", errors="replace") for line in raw), delimiter="\t")
-            for row in reader:
-                if row.get("active") == "1":
-                    active_concepts.add(row["id"])
+            for concept_row_map in reader:
+                if concept_row_map.get("active") == "1":
+                    active_concepts.add(concept_row_map["id"])
                     if test_limit and len(active_concepts) >= test_limit:
                         break
         description_name = next(name for name in zf.namelist() if "/Snapshot/" in name and "sct2_Description_Snapshot" in name and name.endswith(".txt"))
         with zf.open(description_name) as raw:
             reader = csv.DictReader((line.decode("utf-8", errors="replace") for line in raw), delimiter="\t")
-            for row in reader:
-                concept_id = row.get("conceptId")
-                if row.get("active") != "1" or concept_id not in active_concepts:
+            for description_row_map in reader:
+                concept_id = description_row_map.get("conceptId")
+                if (
+                    description_row_map.get("active") != "1"
+                    or concept_id not in active_concepts
+                ):
                     continue
-                term = row.get("term") or ""
-                type_id = row.get("typeId") or ""
+                term = description_row_map.get("term") or ""
+                type_id = description_row_map.get("typeId") or ""
                 if type_id == SNOMED_FSN_TYPE_ID:
                     display_by_code.setdefault(concept_id, re.sub(r"\s+\([^)]*\)$", "", term).strip() or term)
                     type_by_code[concept_id] = _code_type_for_snomed(term)
@@ -553,16 +562,16 @@ def _parse_snomed(path: Path, test_limit: int | None = None) -> tuple[list[dict]
         if relationship_name:
             with zf.open(relationship_name) as raw:
                 reader = csv.DictReader((line.decode("utf-8", errors="replace") for line in raw), delimiter="\t")
-                for row in reader:
-                    if row.get("active") == "1" and row.get("sourceId") in active_concepts and row.get("destinationId") in active_concepts:
-                        relationships.append(_relationship_row("SNOMEDCT_US", row["sourceId"], row.get("typeId") or "related", "SNOMEDCT_US", row["destinationId"], "nlm_snomedct_us"))
+                for relationship_row_map in reader:
+                    if relationship_row_map.get("active") == "1" and relationship_row_map.get("sourceId") in active_concepts and relationship_row_map.get("destinationId") in active_concepts:
+                        relationships.append(_relationship_row("SNOMEDCT_US", relationship_row_map["sourceId"], relationship_row_map.get("typeId") or "related", "SNOMEDCT_US", relationship_row_map["destinationId"], "nlm_snomedct_us"))
                     if test_limit and len(relationships) >= test_limit:
                         break
-    rows = [
+    concept_rows = [
         _concept_row("SNOMEDCT_US", code, type_by_code.get(code, "concept"), display_by_code.get(code, code), "nlm_snomedct_us", None, attribution=NLM_ATTRIBUTION)
         for code in active_concepts
     ]
-    return rows, synonyms, relationships
+    return concept_rows, synonyms, relationships
 
 
 def _parse_snomed_icd_map(path: Path, test_limit: int | None = None) -> list[dict[str, Any]]:
@@ -606,15 +615,19 @@ async def _load_product_rxcuis(test_limit: int | None = None) -> list[str]:
                 password=os.getenv("HLTHPRT_RX_DB_PASSWORD") or os.getenv("HLTHPRT_DRUG_DB_PASSWORD") or os.getenv("HLTHPRT_DB_PASSWORD") or "",
                 database=rx_database,
             )
-            rows = await connection.fetch(
+            rxcui_rows = await connection.fetch(
                 f"""
                 SELECT DISTINCT unnest(rxnorm_ids) AS rxcui
                   FROM {rx_schema}.product
                  WHERE rxnorm_ids IS NOT NULL
                 """
             )
-            values = [str(row["rxcui"]) for row in rows if row["rxcui"]]
-            return values[:test_limit] if test_limit else values
+            rxcui_values = [
+                str(rxcui_row["rxcui"])
+                for rxcui_row in rxcui_rows
+                if rxcui_row["rxcui"]
+            ]
+            return rxcui_values[:test_limit] if test_limit else rxcui_values
         except Exception as exc:
             print(f"MED-RT source skipped: {rx_schema}.product unavailable in {rx_database} ({exc})")
             return []
@@ -622,7 +635,7 @@ async def _load_product_rxcuis(test_limit: int | None = None) -> list[str]:
             if connection is not None:
                 await connection.close()
     try:
-        rows = await db.all(
+        rxcui_rows = await db.all(
             """
             SELECT DISTINCT unnest(rxnorm_ids) AS rxcui
               FROM rx_data.product
@@ -632,8 +645,10 @@ async def _load_product_rxcuis(test_limit: int | None = None) -> list[str]:
     except Exception as exc:
         print(f"MED-RT source skipped: rx_data.product unavailable ({exc})")
         return []
-    values = [str(row[0]) for row in rows if row[0]]
-    return values[:test_limit] if test_limit else values
+    rxcui_values = [
+        str(rxcui_row[0]) for rxcui_row in rxcui_rows if rxcui_row[0]
+    ]
+    return rxcui_values[:test_limit] if test_limit else rxcui_values
 
 
 def _rxclass_for_rxcui(rxcui: str) -> list[dict[str, Any]]:
@@ -658,8 +673,8 @@ async def _load_medrt_from_rxclass(test_mode: bool) -> tuple[list[dict], list[di
     limit = int(os.getenv("HLTHPRT_MEDRT_RXCUI_LIMIT") or os.getenv("HLTHPRT_MEDRT_TEST_RXCUI_LIMIT") or default_limit)
     concurrency = max(1, int(os.getenv("HLTHPRT_MEDRT_RXCLASS_CONCURRENCY", "24")))
     rxcuis = await _load_product_rxcuis(limit if limit > 0 else None)
-    rows: dict[tuple[str, str], dict[str, Any]] = {}
-    synonyms: dict[tuple[str, str, str], dict[str, Any]] = {}
+    concept_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    synonym_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
     relationships: list[dict[str, Any]] = []
     semaphore = asyncio.Semaphore(concurrency)
     completed = 0
@@ -679,20 +694,24 @@ async def _load_medrt_from_rxclass(test_mode: bool) -> tuple[list[dict], list[di
         rxcui, infos = await task
         completed += 1
         for info in infos:
-            item = info.get("rxclassMinConceptItem") or {}
-            class_id = item.get("classId")
-            class_name = item.get("className")
-            class_type = item.get("classType") or "CLASS"
+            class_concept_map = info.get("rxclassMinConceptItem") or {}
+            class_id = class_concept_map.get("classId")
+            class_name = class_concept_map.get("className")
+            class_type = class_concept_map.get("classType") or "CLASS"
             if not class_id or not class_name:
                 continue
             system = "MESH" if class_id.startswith("D") else "MEDRT"
             code_type = "condition" if class_type == "DISEASE" else "concept"
-            rows[(system, class_id)] = _concept_row(system, class_id, code_type, class_name, "rxclass_medrt", None, attribution=NLM_ATTRIBUTION)
-            synonyms[(system, class_id, class_name)] = _synonym_row(system, class_id, class_name, "preferred", "rxclass_medrt", NLM_ATTRIBUTION)
+            concept_by_identity[(system, class_id)] = _concept_row(system, class_id, code_type, class_name, "rxclass_medrt", None, attribution=NLM_ATTRIBUTION)
+            synonym_by_identity[(system, class_id, class_name)] = _synonym_row(system, class_id, class_name, "preferred", "rxclass_medrt", NLM_ATTRIBUTION)
             relationships.append(_relationship_row("RXNORM", rxcui, info.get("rela") or "may_treat", system, class_id, "rxclass_medrt"))
         if completed % 250 == 0 or completed == len(rxcuis):
             print(f"RxClass MEDRT progress: {completed}/{len(rxcuis)} RXCUIs")
-    return list(rows.values()), list(synonyms.values()), relationships
+    return (
+        list(concept_by_identity.values()),
+        list(synonym_by_identity.values()),
+        relationships,
+    )
 
 
 async def _ensure_schema_exists(schema: str) -> None:
@@ -747,8 +766,11 @@ async def _publish_table(model_cls, stage_cls, schema: str) -> None:
 
 
 async def _merge_code_catalog_stage(stage_cls, schema: str) -> None:
-    sources = _source_sql_list()
-    await db.status(f"DELETE FROM {schema}.{CodeCatalog.__tablename__} WHERE source IN ({sources});")
+    source_sql = _source_sql_list()
+    await db.status(
+        f"DELETE FROM {schema}.{CodeCatalog.__tablename__} "
+        f"WHERE source IN ({source_sql});"
+    )
     await db.status(
         f"""
         INSERT INTO {schema}.{CodeCatalog.__tablename__}
@@ -833,14 +855,16 @@ async def _push(stage_cls, rows: list[dict[str, Any]]) -> int:
 def _selected_sources(raw: str | None) -> set[str]:
     explicit = raw if raw is not None else os.getenv("HLTHPRT_CLINICAL_REFERENCE_SOURCES")
     value = explicit or DEFAULT_CLINICAL_REFERENCE_SOURCES
-    selected = {item.strip().lower() for item in value.split(",") if item.strip()}
-    restricted = selected & RESTRICTED_SOURCE_ALIASES
+    selected_sources = {
+        item.strip().lower() for item in value.split(",") if item.strip()
+    }
+    restricted = selected_sources & RESTRICTED_SOURCE_ALIASES
     if restricted and not _restricted_terminology_enabled():
         joined = ", ".join(sorted(restricted))
         raise RuntimeError(
             f"restricted terminology source(s) require HLTHPRT_ENABLE_RESTRICTED_TERMINOLOGIES=1: {joined}"
         )
-    return selected
+    return selected_sources
 
 
 def _restricted_terminology_enabled() -> bool:
@@ -878,8 +902,8 @@ async def import_clinical_reference(
         ClinicalAreaTreatment,
     ]
     models = shared_models + area_models
-    stages = {model: make_class(model, import_suffix) for model in models}
-    for stage_cls in stages.values():
+    stage_by_model = {model: make_class(model, import_suffix) for model in models}
+    for stage_cls in stage_by_model.values():
         await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_cls.__tablename__};")
         await db.create_table(stage_cls.__table__, checkfirst=True)
 
@@ -887,32 +911,32 @@ async def import_clinical_reference(
     synonym_rows: list[dict[str, Any]] = []
     crosswalk_rows: list[dict[str, Any]] = []
     relationship_rows: list[dict[str, Any]] = []
-    source_counts: dict[str, int] = {}
+    source_count_by_name: dict[str, int] = {}
 
     if "icd10cm" in selected:
         icd_path = _download_url(os.getenv("HLTHPRT_ICD10CM_URL", CDC_ICD10CM_URL), root / "icd10cm" / "icd10cm-CodeDescriptions-2026.zip", force=force_download, run_id=run_id)
-        rows, synonyms, crosswalks = _parse_icd10cm(icd_path, source_test_limit)
-        concept_rows.extend(rows); synonym_rows.extend(synonyms); crosswalk_rows.extend(crosswalks)
-        source_counts["icd10cm"] = len(rows)
+        parsed_concepts, synonyms, crosswalks = _parse_icd10cm(icd_path, source_test_limit)
+        concept_rows.extend(parsed_concepts); synonym_rows.extend(synonyms); crosswalk_rows.extend(crosswalks)
+        source_count_by_name["icd10cm"] = len(parsed_concepts)
 
     if "mesh" in selected:
         desc_path = _download_url(os.getenv("HLTHPRT_MESH_DESC_URL", MESH_DESC_URL), root / "mesh" / "desc2026.gz", force=force_download, run_id=run_id)
         supp_path = _download_url(os.getenv("HLTHPRT_MESH_SUPP_URL", MESH_SUPP_URL), root / "mesh" / "supp2026.gz", force=force_download, run_id=run_id)
-        for path, source in ((desc_path, "nlm_mesh_descriptor"), (supp_path, "nlm_mesh_supplemental")):
+        for path, source_name in ((desc_path, "nlm_mesh_descriptor"), (supp_path, "nlm_mesh_supplemental")):
             _raise_if_cancelled(run_id)
-            rows, synonyms, relationships = _parse_mesh_file(path, source, source_test_limit)
-            concept_rows.extend(rows); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
-            source_counts[source] = len(rows)
+            parsed_concepts, synonyms, relationships = _parse_mesh_file(path, source_name, source_test_limit)
+            concept_rows.extend(parsed_concepts); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
+            source_count_by_name[source_name] = len(parsed_concepts)
 
     if "rxnorm" in selected:
         _raise_if_cancelled(run_id)
         release = _release_current("rxnorm-full-monthly-release")
         rx_path = _download_url(release["downloadUrl"], root / "rxnorm" / release["fileName"], api_key=umls_key, force=force_download, run_id=run_id)
-        rows, synonyms, relationships = _parse_rxnorm(rx_path, source_test_limit)
-        for row in rows:
-            row["source_release"] = release.get("releaseVersion")
-        concept_rows.extend(rows); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
-        source_counts["rxnorm"] = len(rows)
+        parsed_concepts, synonyms, relationships = _parse_rxnorm(rx_path, source_test_limit)
+        for concept_row in parsed_concepts:
+            concept_row["source_release"] = release.get("releaseVersion")
+        concept_rows.extend(parsed_concepts); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
+        source_count_by_name["rxnorm"] = len(parsed_concepts)
 
     if "snomed" in selected:
         _raise_if_cancelled(run_id)
@@ -920,81 +944,81 @@ async def import_clinical_reference(
             raise RuntimeError("SNOMED import requires HLTHPRT_UMLS_API_KEY or UMLS_API_KEY.")
         release = _release_current("snomed-ct-us-edition")
         snomed_path = _download_url(release["downloadUrl"], root / "snomedct_us" / release["fileName"], api_key=umls_key, force=force_download, run_id=run_id)
-        rows, synonyms, relationships = _parse_snomed(snomed_path, source_test_limit)
-        for row in rows:
-            row["source_release"] = release.get("releaseVersion")
-        concept_rows.extend(rows); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
-        source_counts["snomed"] = len(rows)
+        parsed_concepts, synonyms, relationships = _parse_snomed(snomed_path, source_test_limit)
+        for concept_row in parsed_concepts:
+            concept_row["source_release"] = release.get("releaseVersion")
+        concept_rows.extend(parsed_concepts); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
+        source_count_by_name["snomed"] = len(parsed_concepts)
         try:
             map_release = _release_current("snomed-ct-to-icd-10-cm-mapping-resources")
             map_path = _download_url(map_release["downloadUrl"], root / "snomedct_icd10cm" / map_release["fileName"], api_key=umls_key, force=force_download, run_id=run_id)
             map_rows = _parse_snomed_icd_map(map_path, source_test_limit)
             crosswalk_rows.extend(map_rows)
-            source_counts["snomed_icd10cm_map"] = len(map_rows)
+            source_count_by_name["snomed_icd10cm_map"] = len(map_rows)
         except Exception as exc:
             print(f"SNOMED ICD-10-CM map skipped: {exc}")
 
     if "medrt" in selected:
         _raise_if_cancelled(run_id)
-        rows, synonyms, relationships = await _load_medrt_from_rxclass(test_mode)
-        concept_rows.extend(rows); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
-        source_counts["medrt"] = len(rows)
+        parsed_concepts, synonyms, relationships = await _load_medrt_from_rxclass(test_mode)
+        concept_rows.extend(parsed_concepts); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
+        source_count_by_name["medrt"] = len(parsed_concepts)
 
-    deduped_concepts = {(row["code_system"], row["code"]): row for row in concept_rows}
-    deduped_synonyms = {(row["code_system"], row["code"], row["synonym"], row["term_type"]): row for row in synonym_rows}
-    deduped_crosswalks = {(row["from_system"], row["from_code"], row["to_system"], row["to_code"]): row for row in crosswalk_rows}
-    deduped_relationships = {
-        (row["from_system"], row["from_code"], row["relationship"], row["to_system"], row["to_code"]): row
-        for row in relationship_rows
+    concept_by_identity = {(concept_row["code_system"], concept_row["code"]): concept_row for concept_row in concept_rows}
+    synonym_by_identity = {(synonym_row["code_system"], synonym_row["code"], synonym_row["synonym"], synonym_row["term_type"]): synonym_row for synonym_row in synonym_rows}
+    crosswalk_by_identity = {(crosswalk_row["from_system"], crosswalk_row["from_code"], crosswalk_row["to_system"], crosswalk_row["to_code"]): crosswalk_row for crosswalk_row in crosswalk_rows}
+    relationship_by_identity = {
+        (relationship_row["from_system"], relationship_row["from_code"], relationship_row["relationship"], relationship_row["to_system"], relationship_row["to_code"]): relationship_row
+        for relationship_row in relationship_rows
     }
 
-    await _push(stages[CodeCatalog], list(deduped_concepts.values()))
-    await _push(stages[CodeSynonym], list(deduped_synonyms.values()))
-    await _push(stages[CodeCrosswalk], list(deduped_crosswalks.values()))
-    await _push(stages[CodeRelationship], list(deduped_relationships.values()))
+    await _push(stage_by_model[CodeCatalog], list(concept_by_identity.values()))
+    await _push(stage_by_model[CodeSynonym], list(synonym_by_identity.values()))
+    await _push(stage_by_model[CodeCrosswalk], list(crosswalk_by_identity.values()))
+    await _push(stage_by_model[CodeRelationship], list(relationship_by_identity.values()))
 
     area_rows, area_condition_rows, area_treatment_rows = _build_clinical_area_rows(
-        deduped_concepts,
-        deduped_relationships,
+        concept_by_identity,
+        relationship_by_identity,
     )
-    await _push(stages[ClinicalArea], area_rows)
-    await _push(stages[ClinicalAreaCondition], area_condition_rows)
-    await _push(stages[ClinicalAreaTreatment], area_treatment_rows)
+    await _push(stage_by_model[ClinicalArea], area_rows)
+    await _push(stage_by_model[ClinicalAreaCondition], area_condition_rows)
+    await _push(stage_by_model[ClinicalAreaTreatment], area_treatment_rows)
 
-    for stage_cls in stages.values():
+    for stage_cls in stage_by_model.values():
         await _create_stage_indexes(stage_cls, schema)
 
-    concept_count = int(await db.scalar(f"SELECT COUNT(*) FROM {schema}.{stages[CodeCatalog].__tablename__};") or 0)
+    concept_count = int(await db.scalar(f"SELECT COUNT(*) FROM {schema}.{stage_by_model[CodeCatalog].__tablename__};") or 0)
     min_rows = int(os.getenv("HLTHPRT_CLINICAL_REFERENCE_MIN_ROWS", "1" if test_mode else "1000"))
     if concept_count < min_rows:
         raise RuntimeError(f"Clinical reference stage has {concept_count} code rows, below minimum {min_rows}.")
 
     async with db.transaction():
-        await _merge_code_catalog_stage(stages[CodeCatalog], schema)
-        await _merge_code_crosswalk_stage(stages[CodeCrosswalk], schema)
-        await _merge_replace_source_table(CodeSynonym, stages[CodeSynonym], schema)
-        await _merge_replace_source_table(CodeRelationship, stages[CodeRelationship], schema)
+        await _merge_code_catalog_stage(stage_by_model[CodeCatalog], schema)
+        await _merge_code_crosswalk_stage(stage_by_model[CodeCrosswalk], schema)
+        await _merge_replace_source_table(CodeSynonym, stage_by_model[CodeSynonym], schema)
+        await _merge_replace_source_table(CodeRelationship, stage_by_model[CodeRelationship], schema)
         for model in area_models:
-            await _publish_table(model, stages[model], schema)
+            await _publish_table(model, stage_by_model[model], schema)
         for model in shared_models:
-            await db.status(f"DROP TABLE IF EXISTS {schema}.{stages[model].__tablename__};")
+            await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_by_model[model].__tablename__};")
 
-    result = {
+    import_summary_map = {
         "import_id": import_suffix,
         "sources": sorted(selected),
-        "source_counts": source_counts,
+        "source_counts": source_count_by_name,
         "concept_rows": concept_count,
-        "synonym_rows": len(deduped_synonyms),
-        "crosswalk_rows": len(deduped_crosswalks),
-        "relationship_rows": len(deduped_relationships),
+        "synonym_rows": len(synonym_by_identity),
+        "crosswalk_rows": len(crosswalk_by_identity),
+        "relationship_rows": len(relationship_by_identity),
         "clinical_area_rows": len(area_rows),
         "clinical_area_condition_rows": len(area_condition_rows),
         "clinical_area_treatment_rows": len(area_treatment_rows),
         "artifact_root": str(root),
         "test_mode": bool(test_mode),
     }
-    print(f"Clinical reference import done: {result}")
-    return result
+    print(f"Clinical reference import done: {import_summary_map}")
+    return import_summary_map
 
 
 async def main(
