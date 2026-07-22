@@ -411,28 +411,34 @@ async def test_child_context_releases_only_child_on_normal_and_error_exit(
     monkeypatch,
 ) -> None:
     lease = _child_lease()
-    released_leases: list[ProjectionRetainedChildLease] = []
-    async def fake_claim(*_args, **_kwargs):
-        return lease
+    released_leases, verified_leases = [], []
     async def fake_release(released_lease, **_kwargs):
+        if not released_leases:
+            assert verified_leases == [lease]
         released_leases.append(released_lease)
-    monkeypatch.setattr(child_read, "claim_projection_child_read_lease", fake_claim)
+    monkeypatch.setattr(
+        child_read, "claim_projection_child_read_lease", AsyncMock(return_value=lease)
+    )
     monkeypatch.setattr(
         child_read,
-        "release_projection_child_read_lease",
-        fake_release,
+        "assert_verified_projection_child_read_lease",
+        AsyncMock(side_effect=lambda verified_lease, **_kwargs:
+                  verified_leases.append(verified_lease)),
     )
+    monkeypatch.setattr(child_read, "release_projection_child_read_lease", fake_release)
     async with child_read.claimed_projection_child_read_lease(
         lease.shard_claim
     ) as claimed:
         assert claimed == lease
     assert released_leases == [lease]
+    assert verified_leases == [lease]
     with pytest.raises(RuntimeError, match="fixture-body-failed"):
         async with child_read.claimed_projection_child_read_lease(
             lease.shard_claim
         ):
             raise RuntimeError("fixture-body-failed")
     assert released_leases == [lease, lease]
+    assert verified_leases == [lease]
     monkeypatch.setattr(
         child_read,
         "release_projection_child_read_lease",
@@ -475,10 +481,11 @@ async def test_child_dependency_and_action_failures_are_fenced() -> None:
         child_lock._validate_block_mapping(
             {"expected_byte_count": 20, "expected_record_count": 2,
              "expected_payload_sha256": _digest("raw-input")},
-            {"payload_bytes": 21, "record_count": 2,
+            {"payload_bytes": 21, "record_count": 2, "decoded_resource_count": 2,
              "payload_sha256": _digest("raw-input"),
              "content_sha256": _digest("canonical-input")},
-            {"manifest_sha256": _digest("canonical-input")}, {}, True,
+            {"manifest_sha256": _digest("canonical-input"),
+             "artifact_record_count": 2}, {}, True,
         )
     with pytest.raises(ProviderDirectoryProjectionError):
         child_persistence._validated_lease_seconds(29)

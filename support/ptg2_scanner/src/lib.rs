@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod normalize;
 pub mod output;
 pub mod progress;
+pub mod provider_directory_projection;
 pub mod shared_graph;
 pub mod uhc_retained;
 pub mod v3_dense;

@@ -303,7 +303,7 @@ async def assert_verified_projection_child_read_lease(
             database,
             schema,
             lease,
-            allow_completed=False,
+            allow_completed=True,
         )
         exact_verified = bool(
             child_row.get("status") == "verified"

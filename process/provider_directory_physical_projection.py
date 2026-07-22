@@ -1,11 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Public structural contracts and leased worksets for physical projections.
+"""Public contracts, leased worksets, and native physical materialization.
 
-Runtime materialization, publication, and retained-byte streaming are layered
-onto this module by later slices.  Candidate row reducers, semantic summaries,
-and physical-output envelopes deliberately remain in their owning internal
-modules: none of them is native retained-byte attestation or a publish gate.
+Publication remains a later slice. Candidate row reducers, semantic summaries,
+and physical-output envelopes remain in their owning internal modules: none of
+them is native retained-byte attestation or a publish gate.
 """
 
 from process.provider_directory_projection_admission import (
@@ -29,6 +28,10 @@ from process.provider_directory_projection_contract import (
 from process.provider_directory_projection_lease import (
     claim_projection_recipe,
     heartbeat_projection_lease,
+)
+from process.provider_directory_projection_materializer import (
+    ProjectionChildStreamFactory,
+    materialize_projection_shards,
 )
 from process.provider_directory_projection_types import (
     PROJECTION_INPUT_BLOCK_MAX_BYTES,
@@ -66,6 +69,7 @@ __all__ = [
     "PROJECTION_MIXED_RESOURCE_TYPE",
     "PROJECTION_RECIPE_CONTRACT_ID",
     "PhysicalProjectionRecipeIdentity",
+    "ProjectionChildStreamFactory",
     "ProjectionClaim",
     "ProjectionAdmissionIdentity",
     "ProjectionAdmissionInputBlock",
@@ -83,6 +87,7 @@ __all__ = [
     "claim_projection_shard",
     "heartbeat_projection_lease",
     "heartbeat_projection_shard",
+    "materialize_projection_shards",
     "projection_completeness_manifest",
     "projection_admission_input_block",
     "projection_admission_terminal_zero",

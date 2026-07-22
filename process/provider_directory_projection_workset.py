@@ -8,7 +8,15 @@ import secrets
 from typing import Any, Mapping, Sequence
 
 from db.connection import db
+from process.provider_directory_projection_child_read_contract import (
+    validated_child_read_lease,
+    validated_child_shard_claim,
+)
+from process.provider_directory_projection_child_read_store import (
+    assert_verified_projection_child_read_lease,
+)
 from process.provider_directory_projection_contract import (
+    claimed_projection_proof_shard,
     projection_input_block,
     projection_input_set_sha256,
     projection_shard_spec,
@@ -27,6 +35,8 @@ from process.provider_directory_projection_types import (
     PROJECTION_MIXED_RESOURCE_TYPE,
     ProjectionInputBlock,
     ProjectionLease,
+    ProjectionProofShard,
+    ProjectionRetainedChildLease,
     PhysicalProjectionRecipeIdentity,
     ProjectionRecipeIdentity,
     ProjectionShardClaim,
@@ -685,8 +695,145 @@ async def heartbeat_projection_shard(
         )
 
 
+async def projection_shard_input_framing(
+    claim: ProjectionShardClaim,
+    *,
+    database: Any = db,
+    schema: str = "mrf",
+) -> str:
+    """Resolve the source-neutral retained block framing for one live claim."""
+
+    claim = validated_child_shard_claim(claim)
+    async with database.transaction():
+        await shared_active_recipe(
+            claim.recipe_lease,
+            database=database,
+            schema=schema,
+        )
+        block_kind = await database.scalar(
+            f"""
+            SELECT block.block_kind
+              FROM {table_ref(schema, 'provider_directory_projection_input_block')}
+                   AS block
+              JOIN {table_ref(schema, 'provider_directory_projection_proof_shard')}
+                   AS shard
+                ON shard.recipe_id = block.recipe_id
+               AND shard.input_block_id = block.block_id
+             WHERE shard.recipe_id = :recipe_id AND shard.attempt = :attempt
+               AND shard.partition_id = :partition_id
+               AND shard.status = 'building'
+               AND shard.partition_attempt = :partition_attempt
+               AND shard.recipe_lease_token = :recipe_lease_token
+               AND shard.lease_token = :shard_lease_token
+               AND shard.lease_expires_at > now();
+            """,
+            recipe_id=claim.recipe_lease.recipe.recipe_id,
+            attempt=claim.recipe_lease.attempt,
+            partition_id=claim.shard.partition_id,
+            partition_attempt=claim.partition_attempt,
+            recipe_lease_token=claim.recipe_lease.lease_token,
+            shard_lease_token=claim.lease_token,
+        )
+    if block_kind not in {"ndjson", "bundle"}:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_input_framing_invalid"
+        )
+    return str(block_kind)
+
+
+async def _checkpoint_projection_shard(
+    claim: ProjectionShardClaim,
+    validated_proof: ProjectionProofShard,
+    database: Any,
+    schema: str,
+) -> None:
+    await set_local_projection_action(
+        database,
+        "shard_complete",
+        recipe_id=claim.recipe_lease.recipe.recipe_id,
+        recipe_attempt=claim.recipe_lease.attempt,
+        recipe_lease_token=claim.recipe_lease.lease_token,
+        partition_id=claim.shard.partition_id,
+        partition_attempt=claim.partition_attempt,
+        shard_lease_token=claim.lease_token,
+    )
+    updated_count = await database.status(
+        f"""
+        UPDATE {table_ref(schema, 'provider_directory_projection_proof_shard')}
+           SET status = 'complete', recipe_lease_token = NULL,
+               lease_token = NULL, lease_expires_at = NULL,
+               lease_heartbeat_at = NULL,
+               canonical_row_sha256 = :canonical_row_sha256,
+               resource_count = :resource_count,
+               first_identity_json = CAST(:first_identity_json AS jsonb),
+               last_identity_json = CAST(:last_identity_json AS jsonb),
+               proof_json = CAST(:proof_json AS jsonb),
+               completed_at = clock_timestamp()
+         WHERE recipe_id = :recipe_id AND attempt = :attempt
+           AND partition_id = :partition_id AND status = 'building'
+           AND partition_attempt = :partition_attempt
+           AND recipe_lease_token = :recipe_lease_token
+           AND lease_token = :shard_lease_token
+           AND lease_expires_at > now();
+        """,
+        canonical_row_sha256=validated_proof.canonical_row_sha256,
+        resource_count=validated_proof.resource_count,
+        first_identity_json=stable_json(list(validated_proof.first_identity)),
+        last_identity_json=stable_json(list(validated_proof.last_identity)),
+        proof_json=stable_json(validated_proof.proof),
+        recipe_id=claim.recipe_lease.recipe.recipe_id,
+        attempt=claim.recipe_lease.attempt,
+        partition_id=claim.shard.partition_id,
+        partition_attempt=claim.partition_attempt,
+        recipe_lease_token=claim.recipe_lease.lease_token,
+        shard_lease_token=claim.lease_token,
+    )
+    if updated_count != 1:
+        raise ProviderDirectoryProjectionLeaseLost(
+            "provider_directory_projection_shard_lease_lost"
+        )
+
+
+async def complete_projection_shard(
+    claim: ProjectionShardClaim,
+    proof: ProjectionProofShard,
+    *,
+    child_lease: ProjectionRetainedChildLease,
+    database: Any = db,
+    schema: str = "mrf",
+) -> ProjectionProofShard:
+    """Complete only the exact live shard backed by its verified child read."""
+
+    claim = validated_child_shard_claim(claim)
+    child_lease = validated_child_read_lease(child_lease)
+    if child_lease.shard_claim != claim or type(proof) is not ProjectionProofShard:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_shard_completion_mismatch"
+        )
+    validated_proof = claimed_projection_proof_shard(proof.proof, claim=claim)
+    if proof != validated_proof:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_shard_completion_mismatch"
+        )
+    async with database.transaction():
+        await assert_verified_projection_child_read_lease(
+            child_lease,
+            database=database,
+            schema=schema,
+        )
+        await shared_active_recipe(
+            claim.recipe_lease,
+            database=database,
+            schema=schema,
+        )
+        await _checkpoint_projection_shard(claim, validated_proof, database, schema)
+    return validated_proof
+
+
 __all__ = [
     "claim_projection_shard",
+    "complete_projection_shard",
     "heartbeat_projection_shard",
+    "projection_shard_input_framing",
     "register_projection_workset",
 ]

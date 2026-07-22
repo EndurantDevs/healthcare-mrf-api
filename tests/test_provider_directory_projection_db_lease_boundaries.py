@@ -237,7 +237,7 @@ def test_wal_compression_off_and_post_set_verification(monkeypatch):
             if "has_parameter_privilege" in statement:
                 return True
             if "ANY(enumvals)" in statement:
-                return True
+                return "zstd"
             if "current_setting('wal_compression')" in statement:
                 return "off"
             raise AssertionError(statement)

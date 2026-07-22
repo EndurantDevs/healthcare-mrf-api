@@ -42,6 +42,12 @@ CHILD_READ_MIGRATION_PATH = (
     / "versions"
     / "20260722130000_provider_directory_projection_child_read_lease.py"
 )
+DECODED_CENSUS_MIGRATION_PATH = (
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260722170000_projection_child_decoded_census.py"
+)
 POSTGRES_DSN_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_POSTGRES_DSN"
 DISPOSABLE_DATABASE_PATTERN = re.compile(
     r"^ptg2_v3_lifecycle_test_[a-z0-9_]+$"
@@ -144,6 +150,26 @@ class ProjectionFoundationPostgres:
                     sync_connection,
                     "downgrade",
                     CHILD_READ_MIGRATION_PATH,
+                )
+            )
+
+    async def upgrade_decoded_census(self) -> None:
+        async with self.migration_engine.begin() as migration_connection:
+            await migration_connection.run_sync(
+                lambda sync_connection: _run_migration(
+                    sync_connection,
+                    "upgrade",
+                    DECODED_CENSUS_MIGRATION_PATH,
+                )
+            )
+
+    async def downgrade_decoded_census(self) -> None:
+        async with self.migration_engine.begin() as migration_connection:
+            await migration_connection.run_sync(
+                lambda sync_connection: _run_migration(
+                    sync_connection,
+                    "downgrade",
+                    DECODED_CENSUS_MIGRATION_PATH,
                 )
             )
 

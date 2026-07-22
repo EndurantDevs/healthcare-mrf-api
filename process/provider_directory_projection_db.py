@@ -320,16 +320,25 @@ async def set_local_projection_wal_compression(database: Any) -> str | None:
                 "provider_directory_projection_wal_compression_unavailable"
             )
         return None
-    supports_zstd = (
-        await database.scalar(
-            "SELECT COALESCE('zstd' = ANY(enumvals), false) "
-            "FROM pg_settings WHERE name = 'wal_compression';"
-        )
-        is True
+    algorithm = await database.scalar(
+        "SELECT CASE "
+        "WHEN 'zstd' = ANY(enumvals) THEN 'zstd' "
+        "WHEN 'lz4' = ANY(enumvals) THEN 'lz4' "
+        "ELSE 'on' END "
+        "FROM pg_settings WHERE name = 'wal_compression';"
     )
-    algorithm = "zstd" if supports_zstd else "on"
+    if algorithm not in {"zstd", "lz4", "on"}:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_wal_compression_unavailable"
+        )
     await database.status(f"SET LOCAL wal_compression = {algorithm};")
-    if await database.scalar("SELECT current_setting('wal_compression');") == "off":
+    active_algorithm = await database.scalar(
+        "SELECT current_setting('wal_compression');"
+    )
+    accepted_active_algorithms = (
+        {"on", "pglz"} if algorithm == "on" else {algorithm}
+    )
+    if active_algorithm not in accepted_active_algorithms:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_wal_compression_unavailable"
         )

@@ -55,13 +55,16 @@ async def _lock_recipe(
             lease_expires_at=recipe.get("lease_expires_at"),
         )
     )
-    sealed_recipe = bool(
+    completion_coordinate = bool(
         allow_completed
-        and recipe.get("status") == "sealed"
         and recipe_database_identity(recipe)
         == claim.recipe_lease.recipe.identity_payload
+        and (
+            recipe.get("status") in {"proof_ready", "sealed"}
+            or recipe.get("lease_token") == claim.recipe_lease.lease_token
+        )
     )
-    if not active_lease and not sealed_recipe:
+    if not active_lease and not completion_coordinate:
         raise _lease_lost()
 
 
@@ -145,7 +148,11 @@ async def _lock_binding(
         await database.first(
             f"""
             SELECT binding.*, block.record_count, block.content_sha256,
-                   block.payload_sha256, block.payload_bytes
+                   block.payload_sha256, block.payload_bytes,
+                   COALESCE(
+                       (block.summary_json ->> 'resource_count')::bigint,
+                       block.record_count
+                   ) AS decoded_resource_count
               FROM {table_ref(schema, 'provider_directory_projection_admission_input_block')}
                    AS binding
               JOIN {table_ref(schema, 'provider_directory_projection_input_block')}
@@ -355,8 +362,13 @@ def _validate_block_mapping(
     )
     actual_block_fields = (
         binding["payload_bytes"],
-        binding["record_count"],
+        binding["decoded_resource_count"],
         binding["payload_sha256"],
+    )
+    physical_record_count = (
+        layout["artifact_record_count"]
+        if is_full_artifact
+        else layout_range_by_field["record_count"]
     )
     expected_input_sha256 = (
         layout["manifest_sha256"]
@@ -365,6 +377,7 @@ def _validate_block_mapping(
     )
     if (
         expected_block_fields != actual_block_fields
+        or physical_record_count != binding["record_count"]
         or expected_input_sha256 != binding["content_sha256"]
     ):
         raise _lease_lost()
@@ -398,11 +411,9 @@ def _binding_descriptor(
             if is_full_artifact
             else layout_range_by_field["raw_byte_count"]
         ),
-        "expected_record_count": (
-            layout["artifact_record_count"]
-            if is_full_artifact
-            else layout_range_by_field["record_count"]
-        ),
+        # This legacy column is the decoded-resource census.  The immutable
+        # block.record_count remains the separately checked document census.
+        "expected_record_count": binding["decoded_resource_count"],
         "input_sha256": binding["content_sha256"],
         "expected_payload_sha256": (
             binding["retained_artifact_sha256"]
@@ -432,7 +443,9 @@ async def locked_child_read_dependencies(
     claim = validated_child_shard_claim(claim)
     await _lock_recipe(database, schema, claim, allow_completed)
     admission = await _lock_admission(database, schema, claim)
-    await _lock_shard(database, schema, claim, allow_completed)
+    shard = await _lock_shard(database, schema, claim, allow_completed)
+    if allow_completed and shard.get("status") == "complete":
+        return {}
     binding = await _lock_binding(database, schema, claim)
     await _lock_campaign_and_parent(database, schema, admission, binding)
     artifact, layout, layout_range = await _lock_artifact_layout(
