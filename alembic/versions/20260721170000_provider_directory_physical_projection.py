@@ -31,7 +31,6 @@ _CHECKS_BY_TABLE = {
             "AND canonical_row_sha256 ~ '^[0-9a-f]{64}$' "
             "AND input_set_sha256 ~ '^[0-9a-f]{64}$' "
             "AND transform_context_hash ~ '^[0-9a-f]{64}$' "
-            "AND completeness_manifest_hash ~ '^[0-9a-f]{64}$' "
             "AND dataset_hash ~ '^[0-9a-f]{64}$' "
             "AND resource_profile_hash ~ '^[0-9a-f]{64}$' "
             "AND scope_contract_id <> ''"
@@ -41,7 +40,6 @@ _CHECKS_BY_TABLE = {
             "AND jsonb_array_length(selected_resources_json) > 0 "
             "AND jsonb_typeof(required_resources_json) = 'array' "
             "AND jsonb_typeof(transform_context_json) = 'object' "
-            "AND jsonb_typeof(completeness_manifest_json) = 'object' "
             "AND jsonb_typeof(resource_counts_json) = 'object' "
             "AND jsonb_typeof(proof_json) = 'object'"
         ),
@@ -49,22 +47,6 @@ _CHECKS_BY_TABLE = {
             "resource_count > 0 AND storage_schema <> '' "
             "AND storage_relation <> '' AND storage_relation_oid > 0 "
             "AND storage_trigger_oid > 0 "
-            "AND ((membership_storage_schema IS NULL "
-            "AND membership_storage_relation IS NULL "
-            "AND membership_storage_relation_oid IS NULL "
-            "AND membership_storage_trigger_oid IS NULL) OR "
-            "(membership_storage_schema <> '' "
-            "AND membership_storage_relation <> '' "
-            "AND membership_storage_relation_oid > 0 "
-            "AND membership_storage_trigger_oid > 0)) "
-            "AND ((profile_contribution_storage_schema IS NULL "
-            "AND profile_contribution_storage_relation IS NULL "
-            "AND profile_contribution_storage_relation_oid IS NULL "
-            "AND profile_contribution_storage_trigger_oid IS NULL) OR "
-            "(profile_contribution_storage_schema <> '' "
-            "AND profile_contribution_storage_relation <> '' "
-            "AND profile_contribution_storage_relation_oid > 0 "
-            "AND profile_contribution_storage_trigger_oid > 0)) "
             "AND status IN ('sealed', 'retiring') "
             "AND retain_until >= sealed_at "
             "AND ((status = 'sealed' AND retiring_at IS NULL) "
@@ -76,7 +58,6 @@ _CHECKS_BY_TABLE = {
             "recipe_id ~ '^[0-9a-f]{64}$' "
             "AND input_set_sha256 ~ '^[0-9a-f]{64}$' "
             "AND transform_context_hash ~ '^[0-9a-f]{64}$' "
-            "AND completeness_manifest_hash ~ '^[0-9a-f]{64}$' "
             "AND resource_profile_hash ~ '^[0-9a-f]{64}$' "
             "AND scope_contract_id <> '' "
             "AND (lease_token IS NULL OR lease_token ~ '^[0-9a-f]{64}$')"
@@ -86,11 +67,8 @@ _CHECKS_BY_TABLE = {
             "AND jsonb_array_length(selected_resources_json) > 0 "
             "AND jsonb_typeof(required_resources_json) = 'array'"
             " AND jsonb_typeof(transform_context_json) = 'object'"
-            " AND jsonb_typeof(completeness_manifest_json) = 'object'"
             " AND (prepared_proof_json IS NULL OR "
             "jsonb_typeof(prepared_proof_json) = 'object')"
-            " AND (native_campaign_proof_json IS NULL OR "
-            "jsonb_typeof(native_campaign_proof_json) = 'object')"
         ),
         "pd_projection_recipe_state_check": (
             "attempt > 0 AND status IN "
@@ -113,22 +91,6 @@ _CHECKS_BY_TABLE = {
             "(stage_schema <> '' AND stage_relation <> '' "
             "AND stage_relation_oid > 0)"
         ),
-        "pd_projection_recipe_membership_stage_check": (
-            "(membership_stage_schema IS NULL "
-            "AND membership_stage_relation IS NULL "
-            "AND membership_stage_relation_oid IS NULL) OR "
-            "(membership_stage_schema <> '' "
-            "AND membership_stage_relation <> '' "
-            "AND membership_stage_relation_oid > 0)"
-        ),
-        "pd_projection_recipe_profile_stage_check": (
-            "(profile_contribution_stage_schema IS NULL "
-            "AND profile_contribution_stage_relation IS NULL "
-            "AND profile_contribution_stage_relation_oid IS NULL) OR "
-            "(profile_contribution_stage_schema <> '' "
-            "AND profile_contribution_stage_relation <> '' "
-            "AND profile_contribution_stage_relation_oid > 0)"
-        ),
         "pd_projection_recipe_workset_check": (
             "(input_block_set_sha256 IS NULL AND input_block_count IS NULL "
             "AND partition_set_sha256 IS NULL AND partition_count IS NULL "
@@ -146,20 +108,95 @@ _CHECKS_BY_TABLE = {
             "AND source_object_id ~ '^[0-9a-f]{64}$' "
             "AND content_sha256 ~ '^[0-9a-f]{64}$' "
             "AND payload_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
-            "AND retained_campaign_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
             "AND block_proof_sha256 ~ '^[0-9a-f]{64}$'"
         ),
         "pd_projection_input_block_values_check": (
-            "block_ordinal >= 0 AND source_partition_ordinal >= 0 "
+            "block_ordinal >= 0 "
             "AND record_start >= 0 AND record_count > 0 "
             "AND payload_bytes > 0 AND upstream_artifact_id <> '' "
             "AND source_object_id <> '' AND block_kind <> '' "
             "AND input_contract_id <> '' "
-            "AND jsonb_typeof(summary_json) = 'object' "
+            "AND jsonb_typeof(summary_json) = 'object'"
+        ),
+    },
+    "provider_directory_projection_admission": {
+        "pd_projection_admission_digest_check": (
+            "admission_id ~ '^[0-9a-f]{64}$' "
+            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND source_scope_hash ~ '^[0-9a-f]{64}$' "
+            "AND completeness_manifest_hash ~ '^[0-9a-f]{64}$' "
+            "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_campaign_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND input_block_set_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND binding_set_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND stream_set_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND (lease_token IS NULL OR lease_token ~ '^[0-9a-f]{64}$')"
+        ),
+        "pd_projection_admission_json_check": (
+            "jsonb_typeof(source_ids_json) = 'array' "
+            "AND jsonb_array_length(source_ids_json) > 0 "
+            "AND jsonb_typeof(completeness_manifest_json) = 'object' "
+            "AND jsonb_typeof(completeness_manifest_json -> "
+            "'selected_resources') = 'array' "
+            "AND jsonb_typeof(completeness_manifest_json -> "
+            "'required_resources') = 'array' "
+            "AND jsonb_typeof(completeness_manifest_json -> "
+            "'terminal_partitions') = 'array' "
+            "AND completeness_manifest_json -> 'complete' = 'true'::jsonb"
+        ),
+        "pd_projection_admission_state_check": (
+            "acquisition_adapter_id <> '' "
+            "AND retained_consumer_recipe_id <> '' "
+            "AND claim_generation > 0 AND input_block_count >= 0 "
+            "AND binding_count > 0 AND stream_count >= 0 "
+            "AND attempt > 0 AND status IN ('building', 'sealed', 'released') "
+            "AND ((status = 'building' AND lease_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_heartbeat_at IS NOT NULL "
+            "AND sealed_at IS NULL AND released_at IS NULL) OR "
+            "(status = 'sealed' AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND lease_heartbeat_at IS NULL "
+            "AND sealed_at IS NOT NULL AND released_at IS NULL) OR "
+            "(status = 'released' AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND lease_heartbeat_at IS NULL "
+            "AND sealed_at IS NOT NULL AND released_at IS NOT NULL))"
+        ),
+    },
+    "provider_directory_projection_admission_input_block": {
+        "pd_projection_admission_block_digest_check": (
+            "admission_id ~ '^[0-9a-f]{64}$' "
+            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND binding_id ~ '^[0-9a-f]{64}$' "
+            "AND block_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_artifact_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND retained_layout_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND partition_key_hash ~ '^[0-9a-f]{64}$'"
+        ),
+        "pd_projection_admission_block_values_check": (
+            "retained_consumer_recipe_id <> '' "
+            "AND claim_generation > 0 "
+            "AND resource_type <> '' AND source_partition_ordinal >= 0 "
             "AND (retained_range_ordinal IS NULL "
             "OR retained_range_ordinal >= 0)"
+        ),
+    },
+    "provider_directory_projection_admission_stream": {
+        "pd_projection_admission_stream_digest_check": (
+            "admission_id ~ '^[0-9a-f]{64}$' "
+            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND binding_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
+            "AND stream_identity_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND terminal_proof_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND partition_key_hash ~ '^[0-9a-f]{64}$'"
+        ),
+        "pd_projection_admission_stream_values_check": (
+            "claim_generation > 0 AND resource_type <> '' "
+            "AND source_partition_ordinal >= 0 AND stream_ordinal >= 0 "
+            "AND terminal_sequence_ordinal >= 0"
         ),
     },
     "provider_directory_projection_proof_shard": {
@@ -247,34 +284,6 @@ _CHECKS_BY_TABLE = {
             "AND (NOT profile_evidence_json ? 'references' OR "
             "(jsonb_typeof(profile_evidence_json -> 'references') = 'array' "
             "AND jsonb_array_length(profile_evidence_json -> 'references') > 0))))"
-        ),
-    },
-    "provider_directory_physical_projection_resource_membership": {
-        "pd_physical_projection_membership_values_check": (
-            "physical_projection_id ~ '^[0-9a-f]{64}$' "
-            "AND membership_partition_id ~ '^[0-9a-f]{64}$' "
-            "AND resource_type <> '' AND resource_id <> ''"
-        ),
-    },
-    "provider_directory_physical_projection_profile_contribution": {
-        "pd_physical_profile_contribution_values_check": (
-            "physical_projection_id ~ '^[0-9a-f]{64}$' "
-            "AND proof_partition_id ~ '^[0-9a-f]{64}$' "
-            "AND payload_hash ~ '^[0-9a-f]{64}$' "
-            "AND resource_type <> '' AND resource_id <> '' "
-            "AND source_rank <> '' "
-            "AND (direct_npi IS NULL OR "
-            "direct_npi BETWEEN 1000000000 AND 2999999999) "
-            "AND (effective_start IS NULL OR effective_start <> '') "
-            "AND (effective_end IS NULL OR effective_end <> '') "
-            "AND (observed_at IS NULL OR observed_at <> '')"
-        ),
-        "pd_physical_profile_contribution_json_check": (
-            "jsonb_typeof(names_json) = 'array' "
-            "AND jsonb_typeof(specialties_json) = 'array' "
-            "AND jsonb_typeof(contacts_json) = 'array' "
-            "AND jsonb_typeof(addresses_json) = 'array' "
-            "AND jsonb_typeof(references_json) = 'array'"
         ),
     },
     "provider_directory_physical_projection_source_summary": {
@@ -687,213 +696,6 @@ def _create_partitioned_resource_table(schema: str) -> None:
     )
 
 
-def _create_partitioned_membership_table(schema: str) -> None:
-    """Create the optional fact-to-semantic-membership edge parent."""
-
-    connection = op.get_bind()
-    table_name = "provider_directory_physical_projection_resource_membership"
-    relation_kind = None
-    if not _is_offline_mode():
-        relation_kind = connection.execute(
-            sa.text(
-                """
-            SELECT class_record.relkind, partition_record.partstrat,
-                   pg_get_partkeydef(class_record.oid)
-              FROM pg_class AS class_record
-              JOIN pg_namespace AS namespace_record
-                ON namespace_record.oid = class_record.relnamespace
-              LEFT JOIN pg_partitioned_table AS partition_record
-                ON partition_record.partrelid = class_record.oid
-             WHERE namespace_record.nspname = :schema
-               AND class_record.relname = :table_name
-                """
-            ),
-            {"schema": schema, "table_name": table_name},
-        ).first()
-    elements = (
-        sa.Column("physical_projection_id", sa.String(length=64), nullable=False),
-        sa.Column("membership_partition_id", sa.String(length=64), nullable=False),
-        sa.Column("resource_type", sa.String(length=64), nullable=False),
-        sa.Column("resource_id", sa.String(length=256), nullable=False),
-        sa.CheckConstraint(
-            "physical_projection_id ~ '^[0-9a-f]{64}$' "
-            "AND membership_partition_id ~ '^[0-9a-f]{64}$' "
-            "AND resource_type <> '' AND resource_id <> ''",
-            name="pd_physical_projection_membership_values_check",
-        ),
-        sa.ForeignKeyConstraint(
-            ["physical_projection_id"],
-            [f"{schema}.provider_directory_physical_projection.physical_projection_id"],
-            name="pd_physical_projection_membership_projection_fkey",
-        ),
-        sa.ForeignKeyConstraint(
-            ["physical_projection_id", "resource_type", "resource_id"],
-            [
-                f"{schema}.provider_directory_physical_projection_resource.physical_projection_id",
-                f"{schema}.provider_directory_physical_projection_resource.resource_type",
-                f"{schema}.provider_directory_physical_projection_resource.resource_id",
-            ],
-            name="pd_physical_projection_membership_resource_fkey",
-        ),
-        sa.PrimaryKeyConstraint(
-            "physical_projection_id",
-            "membership_partition_id",
-            "resource_type",
-            "resource_id",
-            name="pd_physical_projection_resource_membership_pkey",
-        ),
-    )
-    if relation_kind is None:
-        op.create_table(
-            table_name,
-            *elements,
-            schema=schema,
-            postgresql_partition_by="LIST (physical_projection_id)",
-        )
-    else:
-        relation_kind_value, partition_strategy, partition_key = tuple(relation_kind)
-        if isinstance(relation_kind_value, bytes):
-            relation_kind_value = relation_kind_value.decode("ascii")
-        if isinstance(partition_strategy, bytes):
-            partition_strategy = partition_strategy.decode("ascii")
-        if (str(relation_kind_value), str(partition_strategy)) != (
-            "p",
-            "l",
-        ) or _normalized_expression(partition_key) != _normalized_expression(
-            "LIST (physical_projection_id)"
-        ):
-            raise RuntimeError(
-                "existing_schema_partition_mismatch:" f"{schema}.{table_name}"
-            )
-        create_table_or_validate(op, table_name, *elements, schema=schema)
-    create_index_if_missing(
-        op,
-        "pd_physical_projection_membership_resource_idx",
-        table_name,
-        [
-            "physical_projection_id",
-            "resource_type",
-            "resource_id",
-            "membership_partition_id",
-        ],
-        schema=schema,
-    )
-
-
-def _create_partitioned_profile_contribution_table(schema: str) -> None:
-    """Create the source-neutral Profile-contribution partition parent."""
-
-    connection = op.get_bind()
-    table_name = "provider_directory_physical_projection_profile_contribution"
-    relation_kind = None
-    if not _is_offline_mode():
-        relation_kind = connection.execute(
-            sa.text(
-                """
-            SELECT class_record.relkind, partition_record.partstrat,
-                   pg_get_partkeydef(class_record.oid)
-              FROM pg_class AS class_record
-              JOIN pg_namespace AS namespace_record
-                ON namespace_record.oid = class_record.relnamespace
-              LEFT JOIN pg_partitioned_table AS partition_record
-                ON partition_record.partrelid = class_record.oid
-             WHERE namespace_record.nspname = :schema
-               AND class_record.relname = :table_name
-                """
-            ),
-            {"schema": schema, "table_name": table_name},
-        ).first()
-    elements = (
-        sa.Column("physical_projection_id", sa.String(length=64), nullable=False),
-        sa.Column("resource_type", sa.String(length=64), nullable=False),
-        sa.Column("resource_id", sa.String(length=256), nullable=False),
-        sa.Column("proof_partition_id", sa.String(length=64), nullable=False),
-        sa.Column("payload_hash", sa.String(length=64), nullable=False),
-        sa.Column("source_rank", sa.Text(), nullable=False),
-        sa.Column("direct_npi", sa.BigInteger(), nullable=True),
-        sa.Column("active", sa.Boolean(), nullable=True),
-        sa.Column("effective_start", sa.String(length=64), nullable=True),
-        sa.Column("effective_end", sa.String(length=64), nullable=True),
-        sa.Column("observed_at", sa.String(length=64), nullable=True),
-        sa.Column("names_json", postgresql.JSONB(), nullable=False),
-        sa.Column("specialties_json", postgresql.JSONB(), nullable=False),
-        sa.Column("contacts_json", postgresql.JSONB(), nullable=False),
-        sa.Column("addresses_json", postgresql.JSONB(), nullable=False),
-        sa.Column("references_json", postgresql.JSONB(), nullable=False),
-        sa.CheckConstraint(
-            "physical_projection_id ~ '^[0-9a-f]{64}$' "
-            "AND proof_partition_id ~ '^[0-9a-f]{64}$' "
-            "AND payload_hash ~ '^[0-9a-f]{64}$' "
-            "AND resource_type <> '' AND resource_id <> '' "
-            "AND source_rank <> '' "
-            "AND (direct_npi IS NULL OR "
-            "direct_npi BETWEEN 1000000000 AND 2999999999) "
-            "AND (effective_start IS NULL OR effective_start <> '') "
-            "AND (effective_end IS NULL OR effective_end <> '') "
-            "AND (observed_at IS NULL OR observed_at <> '')",
-            name="pd_physical_profile_contribution_values_check",
-        ),
-        sa.CheckConstraint(
-            "jsonb_typeof(names_json) = 'array' "
-            "AND jsonb_typeof(specialties_json) = 'array' "
-            "AND jsonb_typeof(contacts_json) = 'array' "
-            "AND jsonb_typeof(addresses_json) = 'array' "
-            "AND jsonb_typeof(references_json) = 'array'",
-            name="pd_physical_profile_contribution_json_check",
-        ),
-        sa.ForeignKeyConstraint(
-            ["physical_projection_id"],
-            [f"{schema}.provider_directory_physical_projection.physical_projection_id"],
-            name="pd_physical_profile_contribution_projection_fkey",
-        ),
-        sa.ForeignKeyConstraint(
-            ["physical_projection_id", "resource_type", "resource_id"],
-            [
-                f"{schema}.provider_directory_physical_projection_resource.physical_projection_id",
-                f"{schema}.provider_directory_physical_projection_resource.resource_type",
-                f"{schema}.provider_directory_physical_projection_resource.resource_id",
-            ],
-            name="pd_physical_profile_contribution_resource_fkey",
-        ),
-        sa.PrimaryKeyConstraint(
-            "physical_projection_id",
-            "resource_type",
-            "resource_id",
-            name="pd_physical_profile_contribution_pkey",
-        ),
-    )
-    if relation_kind is None:
-        op.create_table(
-            table_name,
-            *elements,
-            schema=schema,
-            postgresql_partition_by="LIST (physical_projection_id)",
-        )
-    else:
-        relation_kind_value, partition_strategy, partition_key = tuple(relation_kind)
-        if isinstance(relation_kind_value, bytes):
-            relation_kind_value = relation_kind_value.decode("ascii")
-        if isinstance(partition_strategy, bytes):
-            partition_strategy = partition_strategy.decode("ascii")
-        if (str(relation_kind_value), str(partition_strategy)) != (
-            "p",
-            "l",
-        ) or _normalized_expression(partition_key) != _normalized_expression(
-            "LIST (physical_projection_id)"
-        ):
-            raise RuntimeError(
-                "existing_schema_partition_mismatch:" f"{schema}.{table_name}"
-            )
-        create_table_or_validate(op, table_name, *elements, schema=schema)
-    create_index_if_missing(
-        op,
-        "pd_physical_profile_contribution_npi_idx",
-        table_name,
-        ["physical_projection_id", "direct_npi", "resource_type", "resource_id"],
-        schema=schema,
-    )
-
-
 def _create_tables(schema: str) -> None:
     create_table_or_validate(
         op,
@@ -907,8 +709,6 @@ def _create_tables(schema: str) -> None:
         sa.Column("scope_contract_id", sa.String(length=128), nullable=False),
         sa.Column("transform_context_hash", sa.String(length=64), nullable=False),
         sa.Column("transform_context_json", postgresql.JSONB(), nullable=False),
-        sa.Column("completeness_manifest_hash", sa.String(length=64), nullable=False),
-        sa.Column("completeness_manifest_json", postgresql.JSONB(), nullable=False),
         sa.Column("dataset_hash", sa.String(length=64), nullable=False),
         sa.Column("resource_profile_hash", sa.String(length=64), nullable=False),
         sa.Column("selected_resources_json", postgresql.JSONB(), nullable=False),
@@ -920,30 +720,6 @@ def _create_tables(schema: str) -> None:
         sa.Column("storage_relation", sa.String(length=63), nullable=False),
         sa.Column("storage_relation_oid", sa.BigInteger(), nullable=False),
         sa.Column("storage_trigger_oid", sa.BigInteger(), nullable=False),
-        sa.Column("membership_storage_schema", sa.String(length=63), nullable=True),
-        sa.Column("membership_storage_relation", sa.String(length=63), nullable=True),
-        sa.Column("membership_storage_relation_oid", sa.BigInteger(), nullable=True),
-        sa.Column("membership_storage_trigger_oid", sa.BigInteger(), nullable=True),
-        sa.Column(
-            "profile_contribution_storage_schema",
-            sa.String(length=63),
-            nullable=True,
-        ),
-        sa.Column(
-            "profile_contribution_storage_relation",
-            sa.String(length=63),
-            nullable=True,
-        ),
-        sa.Column(
-            "profile_contribution_storage_relation_oid",
-            sa.BigInteger(),
-            nullable=True,
-        ),
-        sa.Column(
-            "profile_contribution_storage_trigger_oid",
-            sa.BigInteger(),
-            nullable=True,
-        ),
         sa.Column("status", sa.String(length=16), nullable=False),
         _timestamp("created_at"),
         _timestamp("sealed_at"),
@@ -954,7 +730,6 @@ def _create_tables(schema: str) -> None:
             "AND canonical_row_sha256 ~ '^[0-9a-f]{64}$' "
             "AND input_set_sha256 ~ '^[0-9a-f]{64}$' "
             "AND transform_context_hash ~ '^[0-9a-f]{64}$' "
-            "AND completeness_manifest_hash ~ '^[0-9a-f]{64}$' "
             "AND dataset_hash ~ '^[0-9a-f]{64}$' "
             "AND resource_profile_hash ~ '^[0-9a-f]{64}$' "
             "AND scope_contract_id <> ''",
@@ -965,7 +740,6 @@ def _create_tables(schema: str) -> None:
             "AND jsonb_array_length(selected_resources_json) > 0 "
             "AND jsonb_typeof(required_resources_json) = 'array' "
             "AND jsonb_typeof(transform_context_json) = 'object' "
-            "AND jsonb_typeof(completeness_manifest_json) = 'object' "
             "AND jsonb_typeof(resource_counts_json) = 'object' "
             "AND jsonb_typeof(proof_json) = 'object'",
             name="pd_physical_projection_json_check",
@@ -974,22 +748,6 @@ def _create_tables(schema: str) -> None:
             "resource_count > 0 AND storage_schema <> '' "
             "AND storage_relation <> '' AND storage_relation_oid > 0 "
             "AND storage_trigger_oid > 0 "
-            "AND ((membership_storage_schema IS NULL "
-            "AND membership_storage_relation IS NULL "
-            "AND membership_storage_relation_oid IS NULL "
-            "AND membership_storage_trigger_oid IS NULL) OR "
-            "(membership_storage_schema <> '' "
-            "AND membership_storage_relation <> '' "
-            "AND membership_storage_relation_oid > 0 "
-            "AND membership_storage_trigger_oid > 0)) "
-            "AND ((profile_contribution_storage_schema IS NULL "
-            "AND profile_contribution_storage_relation IS NULL "
-            "AND profile_contribution_storage_relation_oid IS NULL "
-            "AND profile_contribution_storage_trigger_oid IS NULL) OR "
-            "(profile_contribution_storage_schema <> '' "
-            "AND profile_contribution_storage_relation <> '' "
-            "AND profile_contribution_storage_relation_oid > 0 "
-            "AND profile_contribution_storage_trigger_oid > 0)) "
             "AND status IN ('sealed', 'retiring') "
             "AND retain_until >= sealed_at "
             "AND ((status = 'sealed' AND retiring_at IS NULL) "
@@ -1008,24 +766,6 @@ def _create_tables(schema: str) -> None:
         sa.UniqueConstraint(
             "storage_relation_oid",
             name="pd_physical_projection_storage_oid_key",
-        ),
-        sa.UniqueConstraint(
-            "membership_storage_schema",
-            "membership_storage_relation",
-            name="pd_physical_projection_membership_storage_name_key",
-        ),
-        sa.UniqueConstraint(
-            "membership_storage_relation_oid",
-            name="pd_physical_projection_membership_storage_oid_key",
-        ),
-        sa.UniqueConstraint(
-            "profile_contribution_storage_schema",
-            "profile_contribution_storage_relation",
-            name="pd_physical_projection_profile_storage_name_key",
-        ),
-        sa.UniqueConstraint(
-            "profile_contribution_storage_relation_oid",
-            name="pd_physical_projection_profile_storage_oid_key",
         ),
         schema=schema,
     )
@@ -1119,8 +859,6 @@ def _create_tables(schema: str) -> None:
         sa.Column("scope_contract_id", sa.String(length=128), nullable=False),
         sa.Column("transform_context_hash", sa.String(length=64), nullable=False),
         sa.Column("transform_context_json", postgresql.JSONB(), nullable=False),
-        sa.Column("completeness_manifest_hash", sa.String(length=64), nullable=False),
-        sa.Column("completeness_manifest_json", postgresql.JSONB(), nullable=False),
         sa.Column("resource_profile_hash", sa.String(length=64), nullable=False),
         sa.Column("selected_resources_json", postgresql.JSONB(), nullable=False),
         sa.Column("required_resources_json", postgresql.JSONB(), nullable=False),
@@ -1133,17 +871,10 @@ def _create_tables(schema: str) -> None:
         sa.Column("stage_schema", sa.String(length=63)),
         sa.Column("stage_relation", sa.String(length=63)),
         sa.Column("stage_relation_oid", sa.BigInteger()),
-        sa.Column("membership_stage_schema", sa.String(length=63)),
-        sa.Column("membership_stage_relation", sa.String(length=63)),
-        sa.Column("membership_stage_relation_oid", sa.BigInteger()),
-        sa.Column("profile_contribution_stage_schema", sa.String(length=63)),
-        sa.Column("profile_contribution_stage_relation", sa.String(length=63)),
-        sa.Column("profile_contribution_stage_relation_oid", sa.BigInteger()),
         sa.Column("input_block_set_sha256", sa.String(length=64)),
         sa.Column("input_block_count", sa.Integer()),
         sa.Column("partition_set_sha256", sa.String(length=64)),
         sa.Column("partition_count", sa.Integer()),
-        sa.Column("native_campaign_proof_json", postgresql.JSONB()),
         sa.Column("prepared_proof_json", postgresql.JSONB()),
         _timestamp("created_at"),
         _timestamp("updated_at"),
@@ -1153,7 +884,6 @@ def _create_tables(schema: str) -> None:
             "recipe_id ~ '^[0-9a-f]{64}$' "
             "AND input_set_sha256 ~ '^[0-9a-f]{64}$' "
             "AND transform_context_hash ~ '^[0-9a-f]{64}$' "
-            "AND completeness_manifest_hash ~ '^[0-9a-f]{64}$' "
             "AND resource_profile_hash ~ '^[0-9a-f]{64}$' "
             "AND scope_contract_id <> '' "
             "AND (lease_token IS NULL OR lease_token ~ '^[0-9a-f]{64}$')",
@@ -1164,11 +894,8 @@ def _create_tables(schema: str) -> None:
             "AND jsonb_array_length(selected_resources_json) > 0 "
             "AND jsonb_typeof(required_resources_json) = 'array' "
             "AND jsonb_typeof(transform_context_json) = 'object' "
-            "AND jsonb_typeof(completeness_manifest_json) = 'object' "
             "AND (prepared_proof_json IS NULL OR "
-            "jsonb_typeof(prepared_proof_json) = 'object') "
-            "AND (native_campaign_proof_json IS NULL OR "
-            "jsonb_typeof(native_campaign_proof_json) = 'object')",
+            "jsonb_typeof(prepared_proof_json) = 'object')",
             name="pd_projection_recipe_json_check",
         ),
         sa.CheckConstraint(
@@ -1193,24 +920,6 @@ def _create_tables(schema: str) -> None:
             "(stage_schema <> '' AND stage_relation <> '' "
             "AND stage_relation_oid > 0)",
             name="pd_projection_recipe_stage_check",
-        ),
-        sa.CheckConstraint(
-            "(membership_stage_schema IS NULL "
-            "AND membership_stage_relation IS NULL "
-            "AND membership_stage_relation_oid IS NULL) OR "
-            "(membership_stage_schema <> '' "
-            "AND membership_stage_relation <> '' "
-            "AND membership_stage_relation_oid > 0)",
-            name="pd_projection_recipe_membership_stage_check",
-        ),
-        sa.CheckConstraint(
-            "(profile_contribution_stage_schema IS NULL "
-            "AND profile_contribution_stage_relation IS NULL "
-            "AND profile_contribution_stage_relation_oid IS NULL) OR "
-            "(profile_contribution_stage_schema <> '' "
-            "AND profile_contribution_stage_relation <> '' "
-            "AND profile_contribution_stage_relation_oid > 0)",
-            name="pd_projection_recipe_profile_stage_check",
         ),
         sa.CheckConstraint(
             "(input_block_set_sha256 IS NULL AND input_block_count IS NULL "
@@ -1261,21 +970,12 @@ def _create_tables(schema: str) -> None:
         sa.Column("source_object_id", sa.String(length=64), nullable=False),
         sa.Column("block_kind", sa.String(length=64), nullable=False),
         sa.Column("input_contract_id", sa.String(length=128), nullable=False),
-        sa.Column("source_partition_ordinal", sa.Integer(), nullable=False),
         sa.Column("record_start", sa.BigInteger(), nullable=False),
         sa.Column("record_count", sa.BigInteger(), nullable=False),
         sa.Column("content_sha256", sa.String(length=64), nullable=False),
         sa.Column("payload_sha256", sa.String(length=64), nullable=False),
         sa.Column("payload_bytes", sa.BigInteger(), nullable=False),
         sa.Column("summary_json", postgresql.JSONB(), nullable=False),
-        sa.Column("retained_campaign_id", sa.String(length=64), nullable=False),
-        sa.Column(
-            "retained_campaign_sha256",
-            sa.String(length=64),
-            nullable=False,
-        ),
-        sa.Column("retained_source_item_id", sa.String(length=64), nullable=False),
-        sa.Column("retained_range_ordinal", sa.Integer(), nullable=True),
         sa.Column("block_proof_sha256", sa.String(length=64), nullable=False),
         _timestamp("created_at"),
         sa.CheckConstraint(
@@ -1284,35 +984,22 @@ def _create_tables(schema: str) -> None:
             "AND source_object_id ~ '^[0-9a-f]{64}$' "
             "AND content_sha256 ~ '^[0-9a-f]{64}$' "
             "AND payload_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
-            "AND retained_campaign_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
             "AND block_proof_sha256 ~ '^[0-9a-f]{64}$'",
             name="pd_projection_input_block_digest_check",
         ),
         sa.CheckConstraint(
-            "block_ordinal >= 0 AND source_partition_ordinal >= 0 "
+            "block_ordinal >= 0 "
             "AND record_start >= 0 AND record_count > 0 "
             "AND payload_bytes > 0 AND upstream_artifact_id <> '' "
             "AND source_object_id <> '' AND block_kind <> '' "
             "AND input_contract_id <> '' "
-            "AND jsonb_typeof(summary_json) = 'object' "
-            "AND (retained_range_ordinal IS NULL "
-            "OR retained_range_ordinal >= 0)",
+            "AND jsonb_typeof(summary_json) = 'object'",
             name="pd_projection_input_block_values_check",
         ),
         sa.ForeignKeyConstraint(
             ["recipe_id"],
             [f"{schema}.provider_directory_projection_recipe.recipe_id"],
             name="pd_projection_input_block_recipe_fkey",
-        ),
-        sa.ForeignKeyConstraint(
-            ["retained_campaign_id", "retained_source_item_id"],
-            [
-                f"{schema}.provider_directory_retained_artifact_campaign_item.campaign_id",
-                f"{schema}.provider_directory_retained_artifact_campaign_item.source_item_id",
-            ],
-            name="pd_projection_input_block_retained_item_fkey",
         ),
         sa.PrimaryKeyConstraint(
             "recipe_id",
@@ -1323,6 +1010,316 @@ def _create_tables(schema: str) -> None:
             "recipe_id",
             "block_ordinal",
             name="pd_projection_input_block_ordinal_key",
+        ),
+        schema=schema,
+    )
+
+    create_table_or_validate(
+        op,
+        "provider_directory_projection_admission",
+        sa.Column("admission_id", sa.String(length=64), nullable=False),
+        sa.Column("recipe_id", sa.String(length=64), nullable=False),
+        sa.Column("acquisition_adapter_id", sa.String(length=128), nullable=False),
+        sa.Column("source_scope_hash", sa.String(length=64), nullable=False),
+        sa.Column("source_ids_json", postgresql.JSONB(), nullable=False),
+        sa.Column("completeness_manifest_hash", sa.String(length=64), nullable=False),
+        sa.Column("completeness_manifest_json", postgresql.JSONB(), nullable=False),
+        sa.Column("retained_campaign_id", sa.String(length=64), nullable=False),
+        sa.Column("retained_campaign_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "retained_consumer_recipe_id",
+            sa.String(length=128),
+            nullable=False,
+        ),
+        sa.Column("claim_generation", sa.BigInteger(), nullable=False),
+        sa.Column("input_block_set_sha256", sa.String(length=64), nullable=False),
+        sa.Column("input_block_count", sa.Integer(), nullable=False),
+        sa.Column("binding_count", sa.Integer(), nullable=False),
+        sa.Column("binding_set_sha256", sa.String(length=64), nullable=False),
+        sa.Column("stream_set_sha256", sa.String(length=64), nullable=False),
+        sa.Column("stream_count", sa.Integer(), nullable=False),
+        sa.Column("status", sa.String(length=16), nullable=False),
+        sa.Column("attempt", sa.Integer(), nullable=False, server_default="1"),
+        sa.Column("lease_token", sa.String(length=64), nullable=True),
+        sa.Column("lease_expires_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        sa.Column("lease_heartbeat_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        _timestamp("created_at"),
+        _timestamp("updated_at"),
+        _timestamp("sealed_at", nullable=True),
+        _timestamp("released_at", nullable=True),
+        sa.CheckConstraint(
+            "admission_id ~ '^[0-9a-f]{64}$' "
+            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND source_scope_hash ~ '^[0-9a-f]{64}$' "
+            "AND completeness_manifest_hash ~ '^[0-9a-f]{64}$' "
+            "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_campaign_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND input_block_set_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND binding_set_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND stream_set_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND (lease_token IS NULL OR lease_token ~ '^[0-9a-f]{64}$')",
+            name="pd_projection_admission_digest_check",
+        ),
+        sa.CheckConstraint(
+            "jsonb_typeof(source_ids_json) = 'array' "
+            "AND jsonb_array_length(source_ids_json) > 0 "
+            "AND jsonb_typeof(completeness_manifest_json) = 'object' "
+            "AND jsonb_typeof(completeness_manifest_json -> "
+            "'selected_resources') = 'array' "
+            "AND jsonb_typeof(completeness_manifest_json -> "
+            "'required_resources') = 'array' "
+            "AND jsonb_typeof(completeness_manifest_json -> "
+            "'terminal_partitions') = 'array' "
+            "AND completeness_manifest_json -> 'complete' = 'true'::jsonb",
+            name="pd_projection_admission_json_check",
+        ),
+        sa.CheckConstraint(
+            "acquisition_adapter_id <> '' "
+            "AND retained_consumer_recipe_id <> '' "
+            "AND claim_generation > 0 AND input_block_count >= 0 "
+            "AND binding_count > 0 AND stream_count >= 0 "
+            "AND attempt > 0 AND status IN ('building', 'sealed', 'released') "
+            "AND ((status = 'building' AND lease_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_heartbeat_at IS NOT NULL "
+            "AND sealed_at IS NULL AND released_at IS NULL) OR "
+            "(status = 'sealed' AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND lease_heartbeat_at IS NULL "
+            "AND sealed_at IS NOT NULL AND released_at IS NULL) OR "
+            "(status = 'released' AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND lease_heartbeat_at IS NULL "
+            "AND sealed_at IS NOT NULL AND released_at IS NOT NULL))",
+            name="pd_projection_admission_state_check",
+        ),
+        sa.ForeignKeyConstraint(
+            ["recipe_id"],
+            [f"{schema}.provider_directory_projection_recipe.recipe_id"],
+            name="pd_projection_admission_recipe_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["retained_campaign_id"],
+            [f"{schema}.provider_directory_retained_artifact_campaign.campaign_id"],
+            name="pd_projection_admission_campaign_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["retained_campaign_id", "retained_consumer_recipe_id"],
+            [
+                f"{schema}.provider_directory_retained_artifact_consumer.campaign_id",
+                f"{schema}.provider_directory_retained_artifact_consumer.consumer_recipe_id",
+            ],
+            name="pd_projection_admission_consumer_fkey",
+        ),
+        sa.PrimaryKeyConstraint(
+            "admission_id",
+            name="provider_directory_projection_admission_pkey",
+        ),
+        sa.UniqueConstraint(
+            "admission_id",
+            "recipe_id",
+            name="pd_projection_admission_recipe_key",
+        ),
+        schema=schema,
+    )
+    create_index_if_missing(
+        op,
+        "pd_projection_admission_recipe_idx",
+        "provider_directory_projection_admission",
+        ["recipe_id", "status", "created_at"],
+        schema=schema,
+    )
+    create_index_if_missing(
+        op,
+        "pd_projection_admission_lease_idx",
+        "provider_directory_projection_admission",
+        ["status", "lease_expires_at"],
+        schema=schema,
+    )
+
+    create_table_or_validate(
+        op,
+        "provider_directory_projection_admission_input_block",
+        sa.Column("admission_id", sa.String(length=64), nullable=False),
+        sa.Column("recipe_id", sa.String(length=64), nullable=False),
+        sa.Column("binding_id", sa.String(length=64), nullable=False),
+        sa.Column("block_id", sa.String(length=64), nullable=False),
+        sa.Column("retained_campaign_id", sa.String(length=64), nullable=False),
+        sa.Column(
+            "retained_consumer_recipe_id",
+            sa.String(length=128),
+            nullable=False,
+        ),
+        sa.Column("retained_source_item_id", sa.String(length=64), nullable=False),
+        sa.Column("retained_artifact_sha256", sa.String(length=64), nullable=False),
+        sa.Column("retained_layout_sha256", sa.String(length=64), nullable=False),
+        sa.Column("retained_range_ordinal", sa.Integer(), nullable=True),
+        sa.Column("claim_generation", sa.BigInteger(), nullable=False),
+        sa.Column("resource_type", sa.String(length=64), nullable=False),
+        sa.Column("partition_key_hash", sa.String(length=64), nullable=False),
+        sa.Column("source_partition_ordinal", sa.Integer(), nullable=False),
+        _timestamp("created_at"),
+        sa.CheckConstraint(
+            "admission_id ~ '^[0-9a-f]{64}$' "
+            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND binding_id ~ '^[0-9a-f]{64}$' "
+            "AND block_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_artifact_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND retained_layout_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND partition_key_hash ~ '^[0-9a-f]{64}$'",
+            name="pd_projection_admission_block_digest_check",
+        ),
+        sa.CheckConstraint(
+            "retained_consumer_recipe_id <> '' "
+            "AND claim_generation > 0 "
+            "AND resource_type <> '' AND source_partition_ordinal >= 0 "
+            "AND (retained_range_ordinal IS NULL "
+            "OR retained_range_ordinal >= 0)",
+            name="pd_projection_admission_block_values_check",
+        ),
+        sa.ForeignKeyConstraint(
+            ["admission_id", "recipe_id"],
+            [
+                f"{schema}.provider_directory_projection_admission.admission_id",
+                f"{schema}.provider_directory_projection_admission.recipe_id",
+            ],
+            name="pd_projection_admission_block_admission_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["recipe_id", "block_id"],
+            [
+                f"{schema}.provider_directory_projection_input_block.recipe_id",
+                f"{schema}.provider_directory_projection_input_block.block_id",
+            ],
+            name="pd_projection_admission_block_core_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            [
+                "retained_campaign_id",
+                "retained_consumer_recipe_id",
+                "retained_source_item_id",
+            ],
+            [
+                f"{schema}.provider_directory_retained_artifact_consumer_reference.campaign_id",
+                f"{schema}.provider_directory_retained_artifact_consumer_reference.consumer_recipe_id",
+                f"{schema}.provider_directory_retained_artifact_consumer_reference.source_item_id",
+            ],
+            name="pd_projection_admission_block_reference_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["retained_campaign_id", "retained_source_item_id"],
+            [
+                f"{schema}.provider_directory_retained_artifact_campaign_item.campaign_id",
+                f"{schema}.provider_directory_retained_artifact_campaign_item.source_item_id",
+            ],
+            name="pd_projection_admission_block_item_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["retained_artifact_sha256"],
+            [f"{schema}.provider_directory_retained_artifact.artifact_sha256"],
+            name="pd_projection_admission_block_artifact_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["retained_layout_sha256", "retained_artifact_sha256"],
+            [
+                f"{schema}.provider_directory_retained_artifact_layout.layout_sha256",
+                f"{schema}.provider_directory_retained_artifact_layout.artifact_sha256",
+            ],
+            name="pd_projection_admission_block_layout_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["retained_layout_sha256", "retained_range_ordinal"],
+            [
+                f"{schema}.provider_directory_retained_artifact_range.layout_sha256",
+                f"{schema}.provider_directory_retained_artifact_range.range_ordinal",
+            ],
+            name="pd_projection_admission_block_range_fkey",
+        ),
+        sa.PrimaryKeyConstraint(
+            "admission_id",
+            "binding_id",
+            name="provider_directory_projection_admission_input_block_pkey",
+        ),
+        schema=schema,
+    )
+
+    create_table_or_validate(
+        op,
+        "provider_directory_projection_admission_stream",
+        sa.Column("admission_id", sa.String(length=64), nullable=False),
+        sa.Column("recipe_id", sa.String(length=64), nullable=False),
+        sa.Column("binding_id", sa.String(length=64), nullable=False),
+        sa.Column("retained_campaign_id", sa.String(length=64), nullable=False),
+        sa.Column("retained_source_item_id", sa.String(length=64), nullable=False),
+        sa.Column("claim_generation", sa.BigInteger(), nullable=False),
+        sa.Column("resource_type", sa.String(length=64), nullable=False),
+        sa.Column("partition_key_hash", sa.String(length=64), nullable=False),
+        sa.Column("source_partition_ordinal", sa.Integer(), nullable=False),
+        sa.Column("stream_identity_sha256", sa.String(length=64), nullable=False),
+        sa.Column("stream_ordinal", sa.Integer(), nullable=False),
+        sa.Column("terminal_sequence_ordinal", sa.Integer(), nullable=False),
+        sa.Column("terminal_proof_sha256", sa.String(length=64), nullable=False),
+        _timestamp("created_at"),
+        sa.CheckConstraint(
+            "admission_id ~ '^[0-9a-f]{64}$' "
+            "AND recipe_id ~ '^[0-9a-f]{64}$' "
+            "AND binding_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_campaign_id ~ '^[0-9a-f]{64}$' "
+            "AND retained_source_item_id ~ '^[0-9a-f]{64}$' "
+            "AND stream_identity_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND terminal_proof_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND partition_key_hash ~ '^[0-9a-f]{64}$'",
+            name="pd_projection_admission_stream_digest_check",
+        ),
+        sa.CheckConstraint(
+            "claim_generation > 0 AND resource_type <> '' "
+            "AND source_partition_ordinal >= 0 AND stream_ordinal >= 0 "
+            "AND terminal_sequence_ordinal >= 0",
+            name="pd_projection_admission_stream_values_check",
+        ),
+        sa.ForeignKeyConstraint(
+            ["admission_id", "recipe_id"],
+            [
+                f"{schema}.provider_directory_projection_admission.admission_id",
+                f"{schema}.provider_directory_projection_admission.recipe_id",
+            ],
+            name="pd_projection_admission_stream_admission_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["retained_campaign_id", "retained_source_item_id"],
+            [
+                f"{schema}.provider_directory_retained_artifact_campaign_item.campaign_id",
+                f"{schema}.provider_directory_retained_artifact_campaign_item.source_item_id",
+            ],
+            name="pd_projection_admission_stream_item_fkey",
+        ),
+        sa.ForeignKeyConstraint(
+            ["retained_campaign_id", "stream_identity_sha256"],
+            [
+                f"{schema}.provider_directory_retained_artifact_campaign_stream.campaign_id",
+                f"{schema}.provider_directory_retained_artifact_campaign_stream.stream_identity_sha256",
+            ],
+            name="pd_projection_admission_stream_retained_fkey",
+        ),
+        sa.PrimaryKeyConstraint(
+            "admission_id",
+            "binding_id",
+            name="provider_directory_projection_admission_stream_pkey",
+        ),
+        sa.UniqueConstraint(
+            "admission_id",
+            "stream_identity_sha256",
+            name="pd_projection_admission_stream_identity_key",
+        ),
+        sa.UniqueConstraint(
+            "admission_id",
+            "stream_ordinal",
+            name="pd_projection_admission_stream_ordinal_key",
+        ),
+        sa.UniqueConstraint(
+            "admission_id",
+            "retained_source_item_id",
+            name="pd_projection_admission_stream_item_key",
         ),
         schema=schema,
     )
@@ -1434,8 +1431,6 @@ def _create_tables(schema: str) -> None:
     )
 
     _create_partitioned_resource_table(schema)
-    _create_partitioned_membership_table(schema)
-    _create_partitioned_profile_contribution_table(schema)
 
     create_table_or_validate(
         op,
@@ -1880,114 +1875,6 @@ def _create_fences(schema: str) -> None:
         $$;
 
         CREATE OR REPLACE FUNCTION
-        {quoted_schema}.provider_directory_projection_membership_matches_proof(
-            candidate_schema text,
-            candidate_relation text,
-            candidate_relation_oid bigint,
-            candidate_trigger_oid bigint,
-            physical_projection_id text,
-            prepared_proof jsonb,
-            resource_schema text,
-            resource_relation text
-        ) RETURNS boolean LANGUAGE plpgsql STABLE AS $$
-        DECLARE
-            stage_matches boolean := false;
-            membership_proof jsonb := prepared_proof -> 'semantic_membership';
-        BEGIN
-            IF jsonb_typeof(membership_proof) <> 'object'
-               OR membership_proof ->> 'contract_id' <>
-                  'healthporta.provider-directory.semantic-membership.v1'
-               OR jsonb_typeof(
-                   membership_proof -> 'membership_partition_resource_counts'
-               ) <> 'object'
-               OR NOT {quoted_schema}.
-                  provider_directory_projection_stage_matches_parent(
-                      candidate_schema,
-                      candidate_relation,
-                      candidate_relation_oid,
-                      'provider_directory_physical_projection_resource_membership',
-                      true
-                  )
-               OR NOT {quoted_schema}.
-                  provider_directory_projection_stage_is_immutable(
-                      candidate_schema,
-                      candidate_relation,
-                      candidate_relation_oid,
-                      candidate_trigger_oid
-                  )
-               OR NOT {quoted_schema}.
-                  provider_directory_projection_stage_has_index(
-                      candidate_relation_oid,
-                      ARRAY[
-                          'physical_projection_id',
-                          'membership_partition_id',
-                          'resource_type',
-                          'resource_id'
-                      ],
-                      true
-                  ) THEN
-                RETURN false;
-            END IF;
-            EXECUTE format(
-                $membership_query$
-                WITH actual_partition_counts AS (
-                    SELECT membership_partition_id,
-                           count(*)::bigint AS resource_count
-                      FROM %I.%I
-                     GROUP BY membership_partition_id
-                ),
-                expected_partition_counts AS (
-                    SELECT partition_id,
-                           (count_value #>> '{{}}')::bigint AS resource_count
-                      FROM jsonb_each(
-                          $2 -> 'semantic_membership' ->
-                          'membership_partition_resource_counts'
-                      ) AS expected(partition_id, count_value)
-                )
-                SELECT
-                    (SELECT count(*) FROM %I.%I) =
-                        ($2 -> 'semantic_membership' ->>
-                         'membership_edge_count')::bigint
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM actual_partition_counts AS actual
-                          FULL JOIN expected_partition_counts AS expected
-                            ON expected.partition_id =
-                               actual.membership_partition_id
-                         WHERE actual.resource_count IS DISTINCT FROM
-                               expected.resource_count
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM %I.%I AS membership_record
-                         WHERE membership_record.physical_projection_id <> $1
-                            OR NOT EXISTS (
-                                SELECT 1
-                                  FROM %I.%I AS resource_record
-                                 WHERE resource_record.physical_projection_id = $1
-                                   AND resource_record.resource_type =
-                                       membership_record.resource_type
-                                   AND resource_record.resource_id =
-                                       membership_record.resource_id
-                            )
-                    );
-                $membership_query$,
-                candidate_schema,
-                candidate_relation,
-                candidate_schema,
-                candidate_relation,
-                candidate_schema,
-                candidate_relation,
-                resource_schema,
-                resource_relation
-            ) INTO stage_matches USING physical_projection_id, prepared_proof;
-            RETURN COALESCE(stage_matches, false);
-        EXCEPTION WHEN OTHERS THEN
-            RETURN false;
-        END;
-        $$;
-
-        CREATE OR REPLACE FUNCTION
         {quoted_schema}.provider_directory_projection_stage_is_immutable(
             candidate_schema text,
             candidate_relation text,
@@ -2066,238 +1953,6 @@ def _create_fences(schema: str) -> None:
                                )
                        )
                );
-        $$;
-
-        CREATE OR REPLACE FUNCTION
-        {quoted_schema}.guard_provider_directory_projection_input_block()
-        RETURNS trigger LANGUAGE plpgsql AS $$
-        DECLARE
-            action_setting text := current_setting(
-                'healthporta.provider_directory_projection_action', true
-            );
-            recipe_id_setting text := current_setting(
-                'healthporta.provider_directory_projection_recipe_id', true
-            );
-            recipe_attempt_setting text := current_setting(
-                'healthporta.provider_directory_projection_recipe_attempt', true
-            );
-            recipe_lease_setting text := current_setting(
-                'healthporta.provider_directory_projection_recipe_lease_token',
-                true
-            );
-            physical_id_setting text := current_setting(
-                'healthporta.provider_directory_projection_physical_id', true
-            );
-        BEGIN
-            IF TG_OP = 'DELETE' THEN
-                IF action_setting = 'gc'
-                   AND recipe_id_setting = OLD.recipe_id
-                   AND physical_id_setting = OLD.recipe_id
-                   AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
-                   AND COALESCE(recipe_lease_setting, '') = ''
-                   AND EXISTS (
-                        SELECT 1
-                          FROM {quoted_schema}.
-                               provider_directory_physical_projection AS physical
-                          JOIN {quoted_schema}.
-                               provider_directory_projection_recipe AS recipe
-                            ON recipe.recipe_id = physical.physical_projection_id
-                         WHERE physical.physical_projection_id = OLD.recipe_id
-                           AND physical.status = 'retiring'
-                           AND physical.retain_until <= clock_timestamp()
-                           AND recipe.status = 'retired'
-                           AND recipe.attempt =
-                               recipe_attempt_setting::integer
-                           AND recipe.physical_projection_id IS NULL
-                           AND NOT EXISTS (
-                               SELECT 1
-                                 FROM {quoted_schema}.
-                                      provider_directory_physical_projection_reference
-                                      AS active_reference
-                                WHERE active_reference.physical_projection_id =
-                                      OLD.recipe_id
-                                  AND active_reference.released_at IS NULL
-                           )
-                         FOR SHARE OF physical, recipe
-                   ) THEN
-                    RETURN OLD;
-                END IF;
-                RAISE EXCEPTION
-                    'provider_directory_projection_input_block_immutable'
-                    USING ERRCODE = '55000';
-            END IF;
-            IF TG_OP = 'INSERT' THEN
-                IF action_setting <> 'workset_register'
-                   OR recipe_id_setting <> NEW.recipe_id
-                   OR recipe_attempt_setting !~ '^[1-9][0-9]*$'
-                   OR recipe_lease_setting !~ '^[0-9a-f]{{64}}$'
-                   OR NOT EXISTS (
-                    SELECT 1
-                      FROM {quoted_schema}.provider_directory_projection_recipe
-                     WHERE recipe_id = NEW.recipe_id
-                       AND attempt = recipe_attempt_setting::integer
-                       AND status = 'building'
-                       AND lease_token = recipe_lease_setting
-                       AND lease_expires_at > clock_timestamp()
-                       AND workset_registered_at IS NULL
-                     FOR SHARE
-                ) THEN
-                    RAISE EXCEPTION
-                        'provider_directory_projection_workset_write_unfenced'
-                        USING ERRCODE = '55000';
-                END IF;
-            ELSIF TG_OP = 'UPDATE'
-                  AND action_setting = 'retained_rebind'
-                  AND recipe_id_setting = NEW.recipe_id
-                  AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
-                  AND recipe_lease_setting ~ '^[0-9a-f]{{64}}$'
-                  AND OLD.recipe_id = NEW.recipe_id
-                  AND OLD.block_id = NEW.block_id
-                  AND OLD.block_ordinal = NEW.block_ordinal
-                  AND OLD.upstream_artifact_id = NEW.upstream_artifact_id
-                  AND OLD.source_object_id = NEW.source_object_id
-                  AND OLD.block_kind = NEW.block_kind
-                  AND OLD.input_contract_id = NEW.input_contract_id
-                  AND OLD.source_partition_ordinal = NEW.source_partition_ordinal
-                  AND OLD.record_start = NEW.record_start
-                  AND OLD.record_count = NEW.record_count
-                  AND OLD.content_sha256 = NEW.content_sha256
-                  AND OLD.payload_sha256 = NEW.payload_sha256
-                  AND OLD.payload_bytes = NEW.payload_bytes
-                  AND OLD.summary_json = NEW.summary_json
-                  AND OLD.block_proof_sha256 = NEW.block_proof_sha256
-                  AND OLD.created_at = NEW.created_at THEN
-                IF recipe_lease_setting IS NULL OR NOT EXISTS (
-                    SELECT 1
-                     FROM {quoted_schema}.provider_directory_projection_recipe
-                     WHERE recipe_id = NEW.recipe_id
-                       AND attempt = recipe_attempt_setting::integer
-                       AND status IN ('building', 'proof_ready')
-                       AND lease_token = recipe_lease_setting
-                       AND lease_expires_at > clock_timestamp()
-                       AND workset_registered_at IS NOT NULL
-                     FOR SHARE
-                ) THEN
-                    RAISE EXCEPTION
-                        'provider_directory_projection_binding_write_unfenced'
-                        USING ERRCODE = '55000';
-                END IF;
-            ELSE
-                RAISE EXCEPTION
-                    'provider_directory_projection_input_block_immutable'
-                    USING ERRCODE = '55000';
-            END IF;
-            IF NEW.retained_range_ordinal IS NULL THEN
-                PERFORM 1
-                  FROM {quoted_schema}.provider_directory_retained_artifact_campaign
-                       AS campaign
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_consumer
-                       AS consumer
-                    ON consumer.campaign_id = campaign.campaign_id
-                   AND consumer.consumer_recipe_id = NEW.recipe_id
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_consumer_reference
-                       AS reference
-                    ON reference.campaign_id = consumer.campaign_id
-                   AND reference.consumer_recipe_id = consumer.consumer_recipe_id
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_campaign_item
-                       AS campaign_item
-                    ON campaign_item.campaign_id = reference.campaign_id
-                   AND campaign_item.source_item_id = reference.source_item_id
-                  JOIN {quoted_schema}.provider_directory_retained_artifact
-                       AS artifact
-                    ON artifact.artifact_sha256 = reference.artifact_sha256
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_layout
-                       AS layout
-                    ON layout.layout_sha256 = reference.layout_sha256
-                   AND layout.artifact_sha256 = reference.artifact_sha256
-                 WHERE campaign.campaign_id = NEW.retained_campaign_id
-                   AND campaign.state = 'complete'
-                   AND campaign.complete
-                   AND campaign.campaign_sha256 = NEW.retained_campaign_sha256
-                   AND campaign.released_at IS NULL
-                   AND consumer.claimed_campaign_sha256 = campaign.campaign_sha256
-                   AND consumer.released_at IS NULL
-                   AND reference.claim_generation = consumer.claim_generation
-                   AND reference.released_at IS NULL
-                   AND reference.source_item_id = NEW.retained_source_item_id
-                   AND reference.artifact_sha256 = NEW.upstream_artifact_id
-                   AND reference.layout_sha256 = NEW.source_object_id
-                   AND campaign_item.status = 'admitted'
-                   AND campaign_item.artifact_sha256 = reference.artifact_sha256
-                   AND campaign_item.layout_sha256 = reference.layout_sha256
-                   AND artifact.registry_status = 'verified'
-                   AND artifact.released_at IS NULL
-                   AND layout.registry_status = 'verified'
-                   AND layout.released_at IS NULL
-                   AND NEW.record_start = 0
-                   AND NEW.record_count = layout.artifact_record_count
-                   AND NEW.payload_sha256 = artifact.artifact_sha256
-                   AND NEW.payload_bytes = artifact.artifact_byte_count
-                   AND NEW.content_sha256 = layout.manifest_sha256
-                 FOR SHARE OF campaign, consumer, reference, campaign_item,
-                              artifact, layout;
-            ELSE
-                PERFORM 1
-                  FROM {quoted_schema}.provider_directory_retained_artifact_campaign
-                       AS campaign
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_consumer
-                       AS consumer
-                    ON consumer.campaign_id = campaign.campaign_id
-                   AND consumer.consumer_recipe_id = NEW.recipe_id
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_consumer_reference
-                       AS reference
-                    ON reference.campaign_id = consumer.campaign_id
-                   AND reference.consumer_recipe_id = consumer.consumer_recipe_id
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_campaign_item
-                       AS campaign_item
-                    ON campaign_item.campaign_id = reference.campaign_id
-                   AND campaign_item.source_item_id = reference.source_item_id
-                  JOIN {quoted_schema}.provider_directory_retained_artifact
-                       AS artifact
-                    ON artifact.artifact_sha256 = reference.artifact_sha256
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_layout
-                       AS layout
-                    ON layout.layout_sha256 = reference.layout_sha256
-                   AND layout.artifact_sha256 = reference.artifact_sha256
-                  JOIN {quoted_schema}.provider_directory_retained_artifact_range
-                       AS retained_range
-                    ON retained_range.layout_sha256 = layout.layout_sha256
-                   AND retained_range.range_ordinal = NEW.retained_range_ordinal
-                 WHERE campaign.campaign_id = NEW.retained_campaign_id
-                   AND campaign.state = 'complete'
-                   AND campaign.complete
-                   AND campaign.campaign_sha256 = NEW.retained_campaign_sha256
-                   AND campaign.released_at IS NULL
-                   AND consumer.claimed_campaign_sha256 = campaign.campaign_sha256
-                   AND consumer.released_at IS NULL
-                   AND reference.claim_generation = consumer.claim_generation
-                   AND reference.released_at IS NULL
-                   AND reference.source_item_id = NEW.retained_source_item_id
-                   AND reference.artifact_sha256 = NEW.upstream_artifact_id
-                   AND reference.layout_sha256 = NEW.source_object_id
-                   AND campaign_item.status = 'admitted'
-                   AND campaign_item.artifact_sha256 = reference.artifact_sha256
-                   AND campaign_item.layout_sha256 = reference.layout_sha256
-                   AND artifact.registry_status = 'verified'
-                   AND artifact.released_at IS NULL
-                   AND layout.registry_status = 'verified'
-                   AND layout.released_at IS NULL
-                   AND retained_range.artifact_sha256 = NEW.upstream_artifact_id
-                   AND retained_range.record_start = NEW.record_start
-                   AND retained_range.record_count = NEW.record_count
-                   AND retained_range.raw_sha256 = NEW.payload_sha256
-                   AND retained_range.raw_byte_count = NEW.payload_bytes
-                   AND retained_range.canonical_sha256 = NEW.content_sha256
-                 FOR SHARE OF campaign, consumer, reference, campaign_item,
-                              artifact, layout, retained_range;
-            END IF;
-            IF NOT FOUND THEN
-                RAISE EXCEPTION
-                    'provider_directory_projection_retained_binding_invalid'
-                    USING ERRCODE = '55000';
-            END IF;
-            RETURN NEW;
-        END;
         $$;
 
         CREATE OR REPLACE FUNCTION
@@ -2799,7 +2454,7 @@ def _create_fences(schema: str) -> None:
         $$;
 
         CREATE OR REPLACE FUNCTION
-        {quoted_schema}.guard_provider_directory_projection_recipe()
+        {quoted_schema}.guard_provider_directory_physical_projection()
         RETURNS trigger LANGUAGE plpgsql AS $$
         DECLARE
             action_setting text := current_setting(
@@ -2820,647 +2475,157 @@ def _create_fences(schema: str) -> None:
             );
         BEGIN
             IF TG_OP = 'INSERT' THEN
-                IF action_setting <> 'recipe_insert'
-                   OR recipe_id_setting <> NEW.recipe_id
-                   OR recipe_attempt_setting <> NEW.attempt::text
-                   OR recipe_lease_setting <> NEW.lease_token THEN
-                    RAISE EXCEPTION
-                        'provider_directory_projection_recipe_insert_unfenced'
-                        USING ERRCODE = '55000';
-                END IF;
-                IF NEW.status <> 'building'
-                   OR NEW.attempt <> 1
-                   OR NEW.lease_token !~ '^[0-9a-f]{{64}}$'
-                   OR NEW.lease_expires_at <= clock_timestamp() THEN
-                    RAISE EXCEPTION
-                        'provider_directory_projection_recipe_insert_state_invalid'
-                        USING ERRCODE = '55000';
-                END IF;
-                IF NEW.physical_projection_id IS NOT NULL
-                   OR NEW.stage_schema IS NOT NULL
-                   OR NEW.stage_relation IS NOT NULL
-                   OR NEW.stage_relation_oid IS NOT NULL
-                   OR NEW.membership_stage_schema IS NOT NULL
-                   OR NEW.membership_stage_relation IS NOT NULL
-                   OR NEW.membership_stage_relation_oid IS NOT NULL
-                   OR NEW.profile_contribution_stage_schema IS NOT NULL
-                   OR NEW.profile_contribution_stage_relation IS NOT NULL
-                   OR NEW.profile_contribution_stage_relation_oid IS NOT NULL THEN
-                    RAISE EXCEPTION
-                        'provider_directory_projection_recipe_insert_stage_invalid'
-                        USING ERRCODE = '55000';
-                END IF;
-                IF NEW.workset_registered_at IS NOT NULL
-                   OR NEW.native_campaign_proof_json IS NOT NULL
-                   OR NEW.prepared_proof_json IS NOT NULL
-                   OR NEW.sealed_at IS NOT NULL THEN
-                    RAISE EXCEPTION
-                        'provider_directory_projection_recipe_insert_state_invalid'
-                        USING ERRCODE = '55000';
-                END IF;
-                RETURN NEW;
-            END IF;
-            IF TG_OP = 'DELETE' THEN
-                IF action_setting = 'gc'
-                   AND recipe_id_setting = OLD.recipe_id
-                   AND recipe_attempt_setting = OLD.attempt::text
-                   AND physical_id_setting = OLD.recipe_id
-                   AND COALESCE(recipe_lease_setting, '') = ''
-                   AND OLD.status = 'retired'
-                   AND NOT EXISTS (
-                       SELECT 1
-                         FROM {quoted_schema}.
-                              provider_directory_physical_projection
-                        WHERE physical_projection_id = OLD.recipe_id
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                         FROM {quoted_schema}.
-                              provider_directory_physical_projection_reference
-                        WHERE physical_projection_id = OLD.recipe_id
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                         FROM {quoted_schema}.
-                              provider_directory_projection_proof_shard
-                        WHERE recipe_id = OLD.recipe_id
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                         FROM {quoted_schema}.
-                              provider_directory_projection_input_block
-                        WHERE recipe_id = OLD.recipe_id
-                   ) THEN
-                    RETURN OLD;
-                END IF;
-                RAISE EXCEPTION 'provider_directory_projection_recipe_immutable'
+                RAISE EXCEPTION
+                    'provider_directory_projection_native_attestation_required'
                     USING ERRCODE = '55000';
             END IF;
-            IF OLD.recipe_id IS DISTINCT FROM NEW.recipe_id
-               OR OLD.decoder_contract_id IS DISTINCT FROM NEW.decoder_contract_id
-               OR OLD.input_set_sha256 IS DISTINCT FROM NEW.input_set_sha256
-               OR OLD.transform_contract_id IS DISTINCT FROM NEW.transform_contract_id
-               OR OLD.scope_contract_id IS DISTINCT FROM NEW.scope_contract_id
-               OR OLD.transform_context_hash IS DISTINCT FROM
-                    NEW.transform_context_hash
-               OR OLD.transform_context_json IS DISTINCT FROM
-                    NEW.transform_context_json
-               OR OLD.completeness_manifest_hash IS DISTINCT FROM
-                    NEW.completeness_manifest_hash
-               OR OLD.completeness_manifest_json IS DISTINCT FROM
-                    NEW.completeness_manifest_json
-               OR OLD.resource_profile_hash IS DISTINCT FROM
-                    NEW.resource_profile_hash
-               OR OLD.selected_resources_json IS DISTINCT FROM
-                    NEW.selected_resources_json
-               OR OLD.required_resources_json IS DISTINCT FROM
-                    NEW.required_resources_json
-               OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN
-                RAISE EXCEPTION 'provider_directory_projection_recipe_identity_immutable'
-                    USING ERRCODE = '55000';
-            END IF;
-            IF recipe_id_setting <> OLD.recipe_id
-               OR recipe_attempt_setting <> OLD.attempt::text THEN
-                RAISE EXCEPTION 'provider_directory_projection_recipe_write_unfenced'
-                    USING ERRCODE = '55000';
-            END IF;
-            IF action_setting = 'recipe_reclaim'
-               AND OLD.status IN ('building', 'proof_ready')
-               AND OLD.lease_expires_at <= clock_timestamp()
-               AND NEW.status = 'building'
-               AND NEW.attempt = OLD.attempt
-               AND NEW.lease_token = recipe_lease_setting
+            IF TG_OP = 'INSERT'
+               AND action_setting = 'seal'
+               AND recipe_id_setting = NEW.physical_projection_id
+               AND physical_id_setting = NEW.physical_projection_id
+               AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
                AND recipe_lease_setting ~ '^[0-9a-f]{{64}}$'
-               AND NEW.lease_expires_at > clock_timestamp()
-               AND to_jsonb(NEW) - ARRAY[
-                   'status', 'lease_token', 'lease_expires_at',
-                   'lease_heartbeat_at', 'updated_at'
-               ] = to_jsonb(OLD) - ARRAY[
-                   'status', 'lease_token', 'lease_expires_at',
-                   'lease_heartbeat_at', 'updated_at'
-               ] THEN
-                RETURN NEW;
-            END IF;
-            IF action_setting = 'recipe_heartbeat'
-               AND OLD.status IN ('building', 'proof_ready')
-               AND NEW.status = OLD.status
-               AND OLD.lease_token = recipe_lease_setting
-               AND NEW.lease_token = OLD.lease_token
-               AND OLD.lease_expires_at > clock_timestamp()
-               AND NEW.lease_expires_at > clock_timestamp()
-               AND to_jsonb(NEW) - ARRAY[
-                   'lease_expires_at', 'lease_heartbeat_at', 'updated_at'
-               ] = to_jsonb(OLD) - ARRAY[
-                   'lease_expires_at', 'lease_heartbeat_at', 'updated_at'
-               ] THEN
-                RETURN NEW;
-            END IF;
-            IF action_setting = 'workset_register'
-               AND OLD.status = 'building' AND NEW.status = 'building'
-               AND OLD.lease_token = recipe_lease_setting
-               AND NEW.lease_token = OLD.lease_token
-               AND OLD.lease_expires_at > clock_timestamp()
-               AND NEW.lease_expires_at = OLD.lease_expires_at
-               AND OLD.workset_registered_at IS NULL
-               AND NEW.workset_registered_at IS NOT NULL
-               AND NEW.input_block_set_sha256 IS NOT NULL
-               AND NEW.input_block_count > 0
-               AND NEW.partition_set_sha256 IS NOT NULL
-               AND NEW.partition_count > 0
-               AND to_jsonb(NEW) - ARRAY[
-                   'input_block_set_sha256', 'input_block_count',
-                   'partition_set_sha256', 'partition_count',
-                   'workset_registered_at', 'updated_at'
-               ] = to_jsonb(OLD) - ARRAY[
-                   'input_block_set_sha256', 'input_block_count',
-                   'partition_set_sha256', 'partition_count',
-                   'workset_registered_at', 'updated_at'
-               ] THEN
-                RETURN NEW;
-            END IF;
-            IF action_setting = 'stage_bind'
-               AND OLD.status = 'building' AND NEW.status = 'building'
-               AND OLD.lease_token = recipe_lease_setting
-               AND NEW.lease_token = OLD.lease_token
-               AND OLD.lease_expires_at > clock_timestamp()
-               AND OLD.workset_registered_at IS NOT NULL
-               AND {quoted_schema}.
-                   provider_directory_projection_stage_matches_parent(
-                       NEW.stage_schema,
-                       NEW.stage_relation,
-                       NEW.stage_relation_oid,
-                       'provider_directory_physical_projection_resource',
-                       false
-                   )
-               AND (
-                    OLD.stage_schema IS NULL
-                    OR (
-                        OLD.stage_schema = NEW.stage_schema
-                        AND OLD.stage_relation = NEW.stage_relation
-                        AND OLD.stage_relation_oid = NEW.stage_relation_oid
-                    )
-               )
-               AND (
-                    (
-                        OLD.membership_stage_schema IS NULL
-                        AND NEW.membership_stage_schema IS NULL
-                    )
-                    OR (
-                        {quoted_schema}.
-                        provider_directory_projection_stage_matches_parent(
-                            NEW.membership_stage_schema,
-                            NEW.membership_stage_relation,
-                            NEW.membership_stage_relation_oid,
-                            'provider_directory_physical_projection_resource_membership',
-                            false
-                        )
-                        AND (
-                            OLD.membership_stage_schema IS NULL
-                            OR (
-                                OLD.membership_stage_schema =
-                                    NEW.membership_stage_schema
-                                AND OLD.membership_stage_relation =
-                                    NEW.membership_stage_relation
-                                AND OLD.membership_stage_relation_oid =
-                                    NEW.membership_stage_relation_oid
-                            )
-                        )
-                    )
-               )
-               AND (
-                    (
-                        OLD.profile_contribution_stage_schema IS NULL
-                        AND NEW.profile_contribution_stage_schema IS NULL
-                    )
-                    OR (
-                        {quoted_schema}.
-                        provider_directory_projection_stage_matches_parent(
-                            NEW.profile_contribution_stage_schema,
-                            NEW.profile_contribution_stage_relation,
-                            NEW.profile_contribution_stage_relation_oid,
-                            'provider_directory_physical_projection_profile_contribution',
-                            false
-                        )
-                        AND (
-                            OLD.profile_contribution_stage_schema IS NULL
-                            OR (
-                                OLD.profile_contribution_stage_schema =
-                                    NEW.profile_contribution_stage_schema
-                                AND OLD.profile_contribution_stage_relation =
-                                    NEW.profile_contribution_stage_relation
-                                AND OLD.profile_contribution_stage_relation_oid =
-                                    NEW.profile_contribution_stage_relation_oid
-                            )
-                        )
-                    )
-               )
-               AND to_jsonb(NEW) - ARRAY[
-                   'stage_schema', 'stage_relation', 'stage_relation_oid',
-                   'membership_stage_schema', 'membership_stage_relation',
-                   'membership_stage_relation_oid',
-                   'profile_contribution_stage_schema',
-                   'profile_contribution_stage_relation',
-                   'profile_contribution_stage_relation_oid', 'updated_at'
-               ] = to_jsonb(OLD) - ARRAY[
-                   'stage_schema', 'stage_relation', 'stage_relation_oid',
-                   'membership_stage_schema', 'membership_stage_relation',
-                   'membership_stage_relation_oid',
-                   'profile_contribution_stage_schema',
-                   'profile_contribution_stage_relation',
-                   'profile_contribution_stage_relation_oid', 'updated_at'
-               ] THEN
-                RETURN NEW;
-            END IF;
-            IF action_setting = 'proof_ready'
-               AND OLD.status = 'building' AND NEW.status = 'proof_ready'
-               AND OLD.lease_token = recipe_lease_setting
-               AND NEW.lease_token = OLD.lease_token
-               AND OLD.lease_expires_at > clock_timestamp()
-               AND OLD.workset_registered_at IS NOT NULL
-               AND NEW.prepared_proof_json IS NOT NULL
-               AND NEW.prepared_proof_json ->> 'physical_projection_id' =
-                   NEW.recipe_id
-               AND jsonb_typeof(
-                       NEW.prepared_proof_json -> 'raw_shards'
-                   ) = 'array'
-               AND NOT (NEW.prepared_proof_json ? 'shards')
-               AND jsonb_array_length(
-                       NEW.prepared_proof_json -> 'raw_shards'
-                   ) > 0
-               AND NEW.partition_count = jsonb_array_length(
-                       NEW.prepared_proof_json -> 'raw_shards'
-                   )
-               AND (
-                   SELECT count(DISTINCT expected_shard)
-                     FROM jsonb_array_elements(
-                         NEW.prepared_proof_json -> 'raw_shards'
-                     ) AS expected_shard
-               ) = NEW.partition_count
-               AND (
-                   SELECT count(*)
-                     FROM {quoted_schema}.
-                          provider_directory_projection_proof_shard
-                          AS proof_shard
-                    WHERE proof_shard.recipe_id = NEW.recipe_id
-                      AND proof_shard.attempt = NEW.attempt
-               ) = NEW.partition_count
-               AND NOT EXISTS (
-                   SELECT 1
-                     FROM {quoted_schema}.
-                          provider_directory_projection_proof_shard
-                          AS proof_shard
-                    WHERE proof_shard.recipe_id = NEW.recipe_id
-                      AND proof_shard.attempt = NEW.attempt
-                      AND proof_shard.status <> 'complete'
-               )
-               AND NOT EXISTS (
-                   SELECT 1
-                     FROM jsonb_array_elements(
-                         NEW.prepared_proof_json -> 'raw_shards'
-                     ) AS expected_shard
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                          FROM {quoted_schema}.
-                               provider_directory_projection_proof_shard
-                               AS proof_shard
-                         WHERE proof_shard.recipe_id = NEW.recipe_id
-                           AND proof_shard.attempt = NEW.attempt
-                           AND proof_shard.status = 'complete'
-                           AND proof_shard.partition_id =
-                               expected_shard ->> 'partition_id'
-                           AND to_jsonb(proof_shard.partition_ordinal) =
-                               expected_shard -> 'partition_ordinal'
-                           AND proof_shard.resource_type =
-                               expected_shard ->> 'resource_type'
-                           AND proof_shard.input_sha256 =
-                               expected_shard ->> 'input_sha256'
-                           AND proof_shard.canonical_row_sha256 =
-                               expected_shard ->> 'canonical_row_sha256'
-                           AND to_jsonb(proof_shard.resource_count) =
-                               expected_shard -> 'resource_count'
-                           AND proof_shard.first_identity_json =
-                               expected_shard -> 'first_identity'
-                           AND proof_shard.last_identity_json =
-                               expected_shard -> 'last_identity'
-                    )
-               )
-               AND NOT EXISTS (
-                   SELECT 1
-                     FROM {quoted_schema}.
-                          provider_directory_projection_proof_shard
-                          AS proof_shard
-                    WHERE proof_shard.recipe_id = NEW.recipe_id
-                      AND proof_shard.attempt = NEW.attempt
-                      AND NOT EXISTS (
-                          SELECT 1
-                            FROM jsonb_array_elements(
-                                NEW.prepared_proof_json -> 'raw_shards'
-                            ) AS expected_shard
-                           WHERE proof_shard.partition_id =
-                                 expected_shard ->> 'partition_id'
-                             AND to_jsonb(proof_shard.partition_ordinal) =
-                                 expected_shard -> 'partition_ordinal'
-                             AND proof_shard.resource_type =
-                                 expected_shard ->> 'resource_type'
-                             AND proof_shard.input_sha256 =
-                                 expected_shard ->> 'input_sha256'
-                             AND proof_shard.canonical_row_sha256 =
-                                 expected_shard ->> 'canonical_row_sha256'
-                             AND to_jsonb(proof_shard.resource_count) =
-                                 expected_shard -> 'resource_count'
-                             AND proof_shard.first_identity_json =
-                                 expected_shard -> 'first_identity'
-                             AND proof_shard.last_identity_json =
-                                 expected_shard -> 'last_identity'
-                      )
-               )
-               AND jsonb_typeof(
-                       NEW.prepared_proof_json -> 'source_summary'
-                   ) = 'object'
-               AND {quoted_schema}.
-                   provider_directory_projection_stage_matches_proof(
-                       NEW.stage_schema,
-                       NEW.stage_relation,
-                       NEW.stage_relation_oid,
-                       NULL,
-                       NEW.recipe_id,
-                       NEW.prepared_proof_json
-                   )
-               AND (
-                    NEW.membership_stage_schema IS NULL
-                    OR {quoted_schema}.
-                       provider_directory_projection_membership_matches_proof(
-                           NEW.membership_stage_schema,
-                           NEW.membership_stage_relation,
-                           NEW.membership_stage_relation_oid,
-                           NULL,
-                           NEW.recipe_id,
-                           NEW.prepared_proof_json,
-                           NEW.stage_schema,
-                           NEW.stage_relation
-                       )
-               )
-               AND NEW.profile_contribution_stage_schema IS NULL
-               AND to_jsonb(NEW) - ARRAY[
-                   'status', 'native_campaign_proof_json',
-                   'prepared_proof_json', 'updated_at'
-               ] = to_jsonb(OLD) - ARRAY[
-                   'status', 'native_campaign_proof_json',
-                   'prepared_proof_json', 'updated_at'
-               ] THEN
-                RETURN NEW;
-            END IF;
-            IF action_setting = 'seal'
-               AND OLD.status = 'proof_ready' AND NEW.status = 'sealed'
-               AND OLD.lease_token = recipe_lease_setting
-               AND OLD.lease_expires_at > clock_timestamp()
-               AND NEW.physical_projection_id = physical_id_setting
-               AND physical_id_setting ~ '^[0-9a-f]{{64}}$'
-               AND OLD.prepared_proof_json ->> 'physical_projection_id' =
-                   physical_id_setting
-               AND NEW.lease_token IS NULL
-               AND NEW.lease_expires_at IS NULL
-               AND NEW.lease_heartbeat_at IS NULL
-               AND NEW.sealed_at IS NOT NULL
-               AND {quoted_schema}.
-                   provider_directory_projection_stage_matches_proof(
-                       OLD.stage_schema,
-                       OLD.stage_relation,
-                       OLD.stage_relation_oid,
-                       NULL,
-                       physical_id_setting,
-                       OLD.prepared_proof_json
-                   )
-               AND (
-                    OLD.membership_stage_schema IS NULL
-                    OR {quoted_schema}.
-                       provider_directory_projection_membership_matches_proof(
-                           OLD.membership_stage_schema,
-                           OLD.membership_stage_relation,
-                           OLD.membership_stage_relation_oid,
-                           NULL,
-                           physical_id_setting,
-                           OLD.prepared_proof_json,
-                           OLD.stage_schema,
-                           OLD.stage_relation
-                       )
-               )
-               AND OLD.profile_contribution_stage_schema IS NULL
                AND EXISTS (
                    SELECT 1
-                     FROM {quoted_schema}.provider_directory_physical_projection
-                          AS physical
-                    WHERE physical.physical_projection_id = physical_id_setting
-                      AND physical.proof_json = OLD.prepared_proof_json
-                      AND physical.status = 'sealed'
+                     FROM {quoted_schema}.provider_directory_projection_recipe
+                          AS recipe
+                    WHERE recipe.recipe_id = NEW.physical_projection_id
+                      AND recipe.attempt = recipe_attempt_setting::integer
+                      AND recipe.status = 'proof_ready'
+                      AND recipe.lease_token = recipe_lease_setting
+                      AND recipe.lease_expires_at > clock_timestamp()
+                      AND recipe.prepared_proof_json = NEW.proof_json
+                      AND recipe.prepared_proof_json ->> 'physical_projection_id'
+                          = NEW.physical_projection_id
+                      AND recipe.prepared_proof_json ->> 'canonical_row_sha256'
+                          = NEW.canonical_row_sha256
+                      AND recipe.prepared_proof_json ->> 'dataset_hash' =
+                          NEW.dataset_hash
+                      AND recipe.decoder_contract_id = NEW.decoder_contract_id
+                      AND recipe.input_set_sha256 = NEW.input_set_sha256
+                      AND recipe.transform_contract_id =
+                          NEW.transform_contract_id
+                      AND recipe.scope_contract_id = NEW.scope_contract_id
+                      AND recipe.transform_context_hash =
+                          NEW.transform_context_hash
+                      AND recipe.transform_context_json =
+                          NEW.transform_context_json
+                      AND recipe.resource_profile_hash =
+                          NEW.resource_profile_hash
+                      AND recipe.selected_resources_json =
+                          NEW.selected_resources_json
+                      AND recipe.required_resources_json =
+                          NEW.required_resources_json
+                      AND recipe.prepared_proof_json -> 'resource_counts' =
+                          NEW.resource_counts_json
+                      AND (recipe.prepared_proof_json ->>
+                           'resource_count')::bigint = NEW.resource_count
+                      AND recipe.stage_schema = NEW.storage_schema
+                      AND recipe.stage_relation = NEW.storage_relation
+                      AND recipe.stage_relation_oid = NEW.storage_relation_oid
                       AND {quoted_schema}.
                           provider_directory_projection_stage_matches_proof(
-                              physical.storage_schema,
-                              physical.storage_relation,
-                              physical.storage_relation_oid,
-                              physical.storage_trigger_oid,
-                              physical_id_setting,
-                              OLD.prepared_proof_json
+                              NEW.storage_schema,
+                              NEW.storage_relation,
+                              NEW.storage_relation_oid,
+                              NEW.storage_trigger_oid,
+                              NEW.physical_projection_id,
+                              NEW.proof_json
                           )
-                      AND (
-                          physical.membership_storage_schema IS NULL
-                          OR {quoted_schema}.
-                             provider_directory_projection_membership_matches_proof(
-                                 physical.membership_storage_schema,
-                                 physical.membership_storage_relation,
-                                 physical.membership_storage_relation_oid,
-                                 physical.membership_storage_trigger_oid,
-                                 physical_id_setting,
-                                 OLD.prepared_proof_json,
-                                 physical.storage_schema,
-                                 physical.storage_relation
-                             )
-                      )
-                      AND physical.profile_contribution_storage_schema IS NULL
-                      AND EXISTS (
-                          SELECT 1
-                            FROM {quoted_schema}.
-                                 provider_directory_physical_projection_source_summary
-                                 AS source_summary
-                           WHERE source_summary.physical_projection_id =
-                                 physical_id_setting
-                             AND source_summary.proof_json =
-                                 OLD.prepared_proof_json -> 'source_summary'
-                             AND source_summary.canonical_row_sha256 =
-                                 OLD.prepared_proof_json -> 'source_summary'
-                                     ->> 'canonical_row_sha256'
-                             AND source_summary.dataset_hash =
-                                 OLD.prepared_proof_json -> 'source_summary'
-                                     ->> 'dataset_hash'
-                             AND to_jsonb(source_summary.resource_count) =
-                                 OLD.prepared_proof_json -> 'source_summary'
-                                     -> 'resource_count'
-                             AND source_summary.resource_counts_json =
-                                 OLD.prepared_proof_json -> 'source_summary'
-                                     -> 'resource_counts'
-                      )
-                      AND (
-                          SELECT count(*)
-                            FROM {quoted_schema}.
-                                 provider_directory_physical_projection_partition
-                                 AS partition_record
-                           WHERE partition_record.physical_projection_id =
-                                 physical_id_setting
-                      ) = jsonb_array_length(
-                          OLD.prepared_proof_json -> 'raw_shards'
-                      )
-                      AND (
-                          SELECT count(DISTINCT expected_shard)
-                            FROM jsonb_array_elements(
-                                OLD.prepared_proof_json -> 'raw_shards'
-                            ) AS expected_shard
-                      ) = jsonb_array_length(
-                          OLD.prepared_proof_json -> 'raw_shards'
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                            FROM jsonb_array_elements(
-                                OLD.prepared_proof_json -> 'raw_shards'
-                            ) AS expected_shard
-                           WHERE NOT EXISTS (
-                               SELECT 1
-                                 FROM {quoted_schema}.
-                                      provider_directory_physical_projection_partition
-                                      AS partition_record
-                                WHERE partition_record.physical_projection_id =
-                                      physical_id_setting
-                                  AND partition_record.proof_json = expected_shard
-                                  AND partition_record.proof_partition_id =
-                                      expected_shard ->> 'partition_id'
-                                  AND to_jsonb(
-                                      partition_record.partition_ordinal
-                                  ) = expected_shard -> 'partition_ordinal'
-                                  AND partition_record.resource_type =
-                                      expected_shard ->> 'resource_type'
-                                  AND partition_record.canonical_row_sha256 =
-                                      expected_shard ->> 'canonical_row_sha256'
-                                  AND to_jsonb(partition_record.resource_count) =
-                                      expected_shard -> 'resource_count'
-                           )
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                            FROM {quoted_schema}.
-                                 provider_directory_physical_projection_partition
-                                 AS partition_record
-                           WHERE partition_record.physical_projection_id =
-                                 physical_id_setting
-                             AND NOT EXISTS (
-                                 SELECT 1
-                                   FROM jsonb_array_elements(
-                                       OLD.prepared_proof_json -> 'raw_shards'
-                                   ) AS expected_shard
-                                  WHERE expected_shard =
-                                        partition_record.proof_json
-                                    AND partition_record.proof_partition_id =
-                                        expected_shard ->> 'partition_id'
-                                    AND to_jsonb(
-                                        partition_record.partition_ordinal
-                                    ) = expected_shard -> 'partition_ordinal'
-                                    AND partition_record.resource_type =
-                                        expected_shard ->> 'resource_type'
-                                    AND partition_record.canonical_row_sha256 =
-                                        expected_shard ->>
-                                            'canonical_row_sha256'
-                                    AND to_jsonb(
-                                        partition_record.resource_count
-                                    ) = expected_shard -> 'resource_count'
-                             )
-                      )
-                     FOR SHARE OF physical
-               )
-               AND to_jsonb(NEW) - ARRAY[
-                   'status', 'physical_projection_id', 'lease_token',
-                   'lease_expires_at', 'lease_heartbeat_at', 'sealed_at',
-                   'updated_at'
-               ] = to_jsonb(OLD) - ARRAY[
-                   'status', 'physical_projection_id', 'lease_token',
-                   'lease_expires_at', 'lease_heartbeat_at', 'sealed_at',
-                   'updated_at'
-               ] THEN
+                    FOR SHARE OF recipe
+               ) THEN
                 RETURN NEW;
             END IF;
-            IF action_setting = 'fail'
-               AND OLD.status IN ('building', 'proof_ready')
-               AND NEW.status = 'failed'
-               AND OLD.lease_token = recipe_lease_setting
-               AND OLD.lease_expires_at > clock_timestamp()
-               AND NEW.lease_token IS NULL
-               AND NEW.lease_expires_at IS NULL
-               AND NEW.lease_heartbeat_at IS NULL
-               AND NEW.physical_projection_id IS NULL
-               AND NEW.sealed_at IS NULL
-               AND to_jsonb(NEW) - ARRAY[
-                   'status', 'lease_token', 'lease_expires_at',
-                   'lease_heartbeat_at', 'updated_at'
-               ] = to_jsonb(OLD) - ARRAY[
-                   'status', 'lease_token', 'lease_expires_at',
-                   'lease_heartbeat_at', 'updated_at'
-               ] THEN
-                RETURN NEW;
-            END IF;
-            IF action_setting = 'gc'
-               AND OLD.status = 'sealed' AND NEW.status = 'retired'
-               AND recipe_id_setting = OLD.recipe_id
-               AND recipe_attempt_setting = OLD.attempt::text
+            IF TG_OP = 'UPDATE'
+               AND action_setting = 'gc'
+               AND recipe_id_setting = OLD.physical_projection_id
                AND physical_id_setting = OLD.physical_projection_id
+               AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
                AND COALESCE(recipe_lease_setting, '') = ''
-               AND NEW.physical_projection_id IS NULL
-               AND NEW.stage_schema IS NULL
-               AND NEW.stage_relation IS NULL
-               AND NEW.stage_relation_oid IS NULL
-               AND NEW.membership_stage_schema IS NULL
-               AND NEW.membership_stage_relation IS NULL
-               AND NEW.membership_stage_relation_oid IS NULL
-               AND NEW.profile_contribution_stage_schema IS NULL
-               AND NEW.profile_contribution_stage_relation IS NULL
-               AND NEW.profile_contribution_stage_relation_oid IS NULL
-               AND NEW.lease_token IS NULL
-               AND NEW.lease_expires_at IS NULL
+               AND OLD.status = 'sealed' AND NEW.status = 'retiring'
+               AND NEW.retiring_at IS NOT NULL
+               AND NEW.retiring_at >= OLD.sealed_at
+               AND NEW.retiring_at <= clock_timestamp()
+               AND OLD.retain_until <= clock_timestamp()
                AND EXISTS (
                     SELECT 1
-                      FROM {quoted_schema}.provider_directory_physical_projection
-                           AS physical
-                     WHERE physical.physical_projection_id =
-                           OLD.physical_projection_id
-                       AND physical.status = 'retiring'
-                       AND physical.retain_until <= clock_timestamp()
-                       AND NOT EXISTS (
-                           SELECT 1
-                             FROM {quoted_schema}.
-                                  provider_directory_physical_projection_reference
-                                  AS reference_record
-                            WHERE reference_record.physical_projection_id =
-                                  OLD.physical_projection_id
-                              AND reference_record.released_at IS NULL
-                       )
-                     FOR SHARE OF physical
+                      FROM {quoted_schema}.provider_directory_projection_recipe
+                     WHERE recipe_id = OLD.physical_projection_id
+                       AND attempt = recipe_attempt_setting::integer
+                       AND status = 'sealed'
+                       AND physical_projection_id = OLD.physical_projection_id
                )
-               AND to_jsonb(NEW) - ARRAY[
-                   'status', 'physical_projection_id',
-                   'stage_schema', 'stage_relation', 'stage_relation_oid',
-                   'membership_stage_schema', 'membership_stage_relation',
-                   'membership_stage_relation_oid',
-                   'profile_contribution_stage_schema',
-                   'profile_contribution_stage_relation',
-                   'profile_contribution_stage_relation_oid', 'updated_at'
-               ] = to_jsonb(OLD) - ARRAY[
-                   'status', 'physical_projection_id',
-                   'stage_schema', 'stage_relation', 'stage_relation_oid',
-                   'membership_stage_schema', 'membership_stage_relation',
-                   'membership_stage_relation_oid',
-                   'profile_contribution_stage_schema',
-                   'profile_contribution_stage_relation',
-                   'profile_contribution_stage_relation_oid', 'updated_at'
-               ] THEN
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.
+                           provider_directory_physical_projection_reference
+                     WHERE physical_projection_id = OLD.physical_projection_id
+                       AND released_at IS NULL
+               )
+               AND to_jsonb(NEW) - ARRAY['status', 'retiring_at'] =
+                   to_jsonb(OLD) - ARRAY['status', 'retiring_at'] THEN
                 RETURN NEW;
             END IF;
-            RAISE EXCEPTION 'provider_directory_projection_recipe_transition_invalid'
+            IF TG_OP = 'DELETE'
+               AND action_setting = 'gc'
+               AND recipe_id_setting = OLD.physical_projection_id
+               AND physical_id_setting = OLD.physical_projection_id
+               AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
+               AND COALESCE(recipe_lease_setting, '') = ''
+               AND OLD.status = 'retiring'
+               AND OLD.retain_until <= clock_timestamp()
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.
+                           provider_directory_physical_projection_reference
+                     WHERE physical_projection_id = OLD.physical_projection_id
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.
+                           provider_directory_physical_projection_source_summary
+                     WHERE physical_projection_id = OLD.physical_projection_id
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.
+                           provider_directory_physical_projection_partition
+                     WHERE physical_projection_id = OLD.physical_projection_id
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.
+                           provider_directory_projection_proof_shard
+                     WHERE recipe_id = OLD.physical_projection_id
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.
+                           provider_directory_projection_input_block
+                     WHERE recipe_id = OLD.physical_projection_id
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_admission
+                     WHERE recipe_id = OLD.physical_projection_id
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM pg_class
+                     WHERE oid = OLD.storage_relation_oid::oid
+               )
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_recipe
+                     WHERE recipe_id = OLD.physical_projection_id
+                       AND attempt = recipe_attempt_setting::integer
+                       AND status = 'retired'
+                       AND physical_projection_id IS NULL
+               ) THEN
+                RETURN OLD;
+            END IF;
+            RAISE EXCEPTION
+                'provider_directory_physical_projection_immutable'
                 USING ERRCODE = '55000';
         END;
         $$;
@@ -3486,6 +2651,11 @@ def _create_fences(schema: str) -> None:
                 'healthporta.provider_directory_projection_physical_id', true
             );
         BEGIN
+            IF TG_OP = 'INSERT' THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_native_attestation_required'
+                    USING ERRCODE = '55000';
+            END IF;
             IF TG_OP = 'INSERT'
                AND action_setting = 'seal'
                AND recipe_id_setting = NEW.physical_projection_id
@@ -3584,6 +2754,11 @@ def _create_fences(schema: str) -> None:
                 'healthporta.provider_directory_projection_physical_id', true
             );
         BEGIN
+            IF TG_OP = 'INSERT' THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_native_attestation_required'
+                    USING ERRCODE = '55000';
+            END IF;
             IF TG_OP = 'INSERT'
                AND action_setting = 'seal'
                AND recipe_id_setting = NEW.physical_projection_id
@@ -3707,7 +2882,972 @@ def _create_fences(schema: str) -> None:
         $$;
 
         CREATE OR REPLACE FUNCTION
-        {quoted_schema}.guard_provider_directory_physical_projection()
+        {quoted_schema}.provider_directory_projection_stage_is_attached(
+            candidate_relation_oid bigint,
+            parent_relation text,
+            physical_projection_id text
+        ) RETURNS boolean LANGUAGE sql STABLE AS $$
+            SELECT candidate_relation_oid IS NOT NULL
+               AND parent_relation IS NOT NULL
+               AND physical_projection_id ~ '^[0-9a-f]{{64}}$'
+               AND EXISTS (
+                    SELECT 1
+                      FROM pg_class AS child_record
+                      JOIN pg_namespace AS child_schema
+                        ON child_schema.oid = child_record.relnamespace
+                      JOIN pg_inherits AS inheritance_record
+                        ON inheritance_record.inhrelid = child_record.oid
+                      JOIN pg_class AS parent_record
+                        ON parent_record.oid = inheritance_record.inhparent
+                      JOIN pg_namespace AS parent_schema
+                        ON parent_schema.oid = parent_record.relnamespace
+                     WHERE child_record.oid = candidate_relation_oid::oid
+                       AND child_schema.nspname = {_sql_literal(schema)}
+                       AND child_record.relispartition
+                       AND parent_schema.nspname = {_sql_literal(schema)}
+                       AND parent_record.relname = parent_relation
+                       AND parent_record.relkind = 'p'
+                       AND pg_get_expr(
+                               child_record.relpartbound,
+                               child_record.oid
+                           ) = format(
+                               'FOR VALUES IN (%L)',
+                               physical_projection_id
+                           )
+               );
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.provider_directory_projection_admission_input_binding_id(
+            candidate_block_id text,
+            candidate_campaign_id text,
+            candidate_source_item_id text,
+            candidate_artifact_sha256 text,
+            candidate_layout_sha256 text,
+            candidate_range_ordinal integer,
+            candidate_resource_type text,
+            candidate_partition_key_hash text,
+            candidate_source_partition_ordinal integer
+        ) RETURNS text LANGUAGE sql IMMUTABLE AS $$
+            SELECT encode(
+                sha256(
+                    convert_to(
+                        'provider-directory-projection-admission-input-binding-v1',
+                        'UTF8'
+                    )
+                    || decode('00', 'hex')
+                    || convert_to(
+                        candidate_block_id || '|' ||
+                        candidate_campaign_id || '|' ||
+                        candidate_source_item_id || '|' ||
+                        candidate_artifact_sha256 || '|' ||
+                        candidate_layout_sha256 || '|' ||
+                        COALESCE(candidate_range_ordinal::text, '~') || '|' ||
+                        candidate_resource_type || '|' ||
+                        candidate_partition_key_hash || '|' ||
+                        candidate_source_partition_ordinal::text,
+                        'UTF8'
+                    )
+                ),
+                'hex'
+            );
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.provider_directory_projection_admission_terminal_binding_id(
+            candidate_campaign_id text,
+            candidate_source_item_id text,
+            candidate_resource_type text,
+            candidate_partition_key_hash text,
+            candidate_source_partition_ordinal integer,
+            candidate_stream_identity_sha256 text,
+            candidate_stream_ordinal integer,
+            candidate_terminal_sequence_ordinal integer,
+            candidate_terminal_proof_sha256 text
+        ) RETURNS text LANGUAGE sql IMMUTABLE STRICT AS $$
+            SELECT encode(
+                sha256(
+                    convert_to(
+                        'provider-directory-projection-admission-terminal-binding-v1',
+                        'UTF8'
+                    )
+                    || decode('00', 'hex')
+                    || convert_to(
+                        candidate_campaign_id || '|' ||
+                        candidate_source_item_id || '|' ||
+                        candidate_resource_type || '|' ||
+                        candidate_partition_key_hash || '|' ||
+                        candidate_source_partition_ordinal::text || '|' ||
+                        candidate_stream_identity_sha256 || '|' ||
+                        candidate_stream_ordinal::text || '|' ||
+                        candidate_terminal_sequence_ordinal::text || '|' ||
+                        candidate_terminal_proof_sha256,
+                        'UTF8'
+                    )
+                ),
+                'hex'
+            );
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.provider_directory_projection_admission_binding_set_sha256(
+            candidate_admission_id text
+        ) RETURNS text LANGUAGE sql STABLE AS $$
+            SELECT encode(
+                sha256(
+                    convert_to(
+                        'provider-directory-projection-admission-binding-set-v3',
+                        'UTF8'
+                    )
+                    || decode('00', 'hex')
+                    || convert_to(
+                        COALESCE(
+                            string_agg(
+                                binding.binding_id,
+                                E'\n' ORDER BY binding.binding_id
+                            ),
+                            ''
+                        ),
+                        'UTF8'
+                    )
+                ),
+                'hex'
+            )
+              FROM (
+                    SELECT mapping.binding_id
+                      FROM {quoted_schema}.
+                           provider_directory_projection_admission_input_block
+                           AS mapping
+                     WHERE mapping.admission_id = candidate_admission_id
+                    UNION ALL
+                    SELECT stream.binding_id
+                      FROM {quoted_schema}.
+                           provider_directory_projection_admission_stream
+                           AS stream
+                     WHERE stream.admission_id = candidate_admission_id
+              ) AS binding;
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.provider_directory_projection_admission_stream_set_sha256(
+            candidate_admission_id text
+        ) RETURNS text LANGUAGE sql STABLE AS $$
+            SELECT encode(
+                sha256(
+                    convert_to(
+                        'provider-directory-projection-admission-stream-set-v1',
+                        'UTF8'
+                    )
+                    || decode('00', 'hex')
+                    || convert_to(
+                        COALESCE(
+                            string_agg(
+                                stream.stream_identity_sha256 || '|' ||
+                                stream.stream_ordinal::text || '|' ||
+                                stream.terminal_sequence_ordinal::text || '|' ||
+                                stream.terminal_proof_sha256,
+                                E'\n' ORDER BY stream.stream_ordinal,
+                                stream.stream_identity_sha256
+                            ),
+                            ''
+                        ),
+                        'UTF8'
+                    )
+                ),
+                'hex'
+            )
+              FROM {quoted_schema}.
+                   provider_directory_projection_admission_stream AS stream
+             WHERE stream.admission_id = candidate_admission_id;
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.provider_directory_projection_admission_mapping_is_exact(
+            candidate_admission_id text,
+            candidate_recipe_id text,
+            candidate_binding_id text,
+            candidate_block_id text,
+            candidate_campaign_id text,
+            candidate_consumer_recipe_id text,
+            candidate_source_item_id text,
+            candidate_artifact_sha256 text,
+            candidate_layout_sha256 text,
+            candidate_range_ordinal integer,
+            candidate_claim_generation bigint,
+            candidate_resource_type text,
+            candidate_partition_key_hash text,
+            candidate_source_partition_ordinal integer
+        ) RETURNS boolean LANGUAGE sql STABLE AS $$
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {quoted_schema}.provider_directory_projection_admission
+                       AS admission
+                  JOIN {quoted_schema}.provider_directory_projection_input_block
+                       AS core_block
+                    ON core_block.recipe_id = admission.recipe_id
+                   AND core_block.block_id = candidate_block_id
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_campaign AS campaign
+                    ON campaign.campaign_id = admission.retained_campaign_id
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_consumer AS consumer
+                    ON consumer.campaign_id = campaign.campaign_id
+                   AND consumer.consumer_recipe_id =
+                       admission.retained_consumer_recipe_id
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_consumer_reference
+                       AS retained_reference
+                    ON retained_reference.campaign_id = consumer.campaign_id
+                   AND retained_reference.consumer_recipe_id =
+                       consumer.consumer_recipe_id
+                   AND retained_reference.source_item_id =
+                       candidate_source_item_id
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_campaign_item
+                       AS campaign_item
+                    ON campaign_item.campaign_id =
+                       retained_reference.campaign_id
+                   AND campaign_item.source_item_id =
+                       retained_reference.source_item_id
+                  JOIN {quoted_schema}.provider_directory_retained_artifact
+                       AS artifact
+                    ON artifact.artifact_sha256 =
+                       retained_reference.artifact_sha256
+                  JOIN {quoted_schema}.provider_directory_retained_artifact_layout
+                       AS layout
+                    ON layout.layout_sha256 = retained_reference.layout_sha256
+                   AND layout.artifact_sha256 =
+                       retained_reference.artifact_sha256
+                  LEFT JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_range
+                       AS retained_range
+                    ON retained_range.layout_sha256 = layout.layout_sha256
+                   AND retained_range.range_ordinal = candidate_range_ordinal
+                 WHERE admission.admission_id = candidate_admission_id
+                   AND admission.recipe_id = candidate_recipe_id
+                   AND candidate_binding_id = {quoted_schema}.
+                       provider_directory_projection_admission_input_binding_id(
+                           candidate_block_id,
+                           candidate_campaign_id,
+                           candidate_source_item_id,
+                           candidate_artifact_sha256,
+                           candidate_layout_sha256,
+                           candidate_range_ordinal,
+                           candidate_resource_type,
+                           candidate_partition_key_hash,
+                           candidate_source_partition_ordinal
+                       )
+                   AND admission.retained_campaign_id = candidate_campaign_id
+                   AND admission.retained_consumer_recipe_id =
+                       candidate_consumer_recipe_id
+                   AND admission.claim_generation = candidate_claim_generation
+                   AND EXISTS (
+                        SELECT 1
+                          FROM jsonb_array_elements(
+                              admission.completeness_manifest_json ->
+                                  'terminal_partitions'
+                          ) AS terminal
+                         WHERE terminal ->> 'resource_type' =
+                               candidate_resource_type
+                           AND terminal ->> 'partition_key_hash' =
+                               candidate_partition_key_hash
+                           AND (
+                               terminal ->> 'source_partition_ordinal'
+                           )::integer = candidate_source_partition_ordinal
+                           AND terminal -> 'terminal' = 'true'::jsonb
+                   )
+                   AND campaign.state = 'complete'
+                   AND campaign.complete
+                   AND campaign.campaign_sha256 =
+                       admission.retained_campaign_sha256
+                   AND campaign.released_at IS NULL
+                   AND consumer.claimed_campaign_sha256 =
+                       admission.retained_campaign_sha256
+                   AND consumer.claim_generation = candidate_claim_generation
+                   AND consumer.released_at IS NULL
+                   AND retained_reference.claim_generation =
+                       candidate_claim_generation
+                   AND retained_reference.released_at IS NULL
+                   AND retained_reference.artifact_sha256 =
+                       candidate_artifact_sha256
+                   AND retained_reference.layout_sha256 =
+                       candidate_layout_sha256
+                   AND campaign_item.item_role = 'payload'
+                   AND campaign_item.status = 'admitted'
+                   AND campaign_item.artifact_sha256 =
+                       candidate_artifact_sha256
+                   AND campaign_item.layout_sha256 = candidate_layout_sha256
+                   AND campaign_item.family = candidate_resource_type
+                   AND campaign_item.partition_metadata_sha256 =
+                       candidate_partition_key_hash
+                   AND artifact.registry_status = 'verified'
+                   AND artifact.released_at IS NULL
+                   AND layout.registry_status = 'verified'
+                   AND layout.released_at IS NULL
+                   AND core_block.upstream_artifact_id =
+                       candidate_artifact_sha256
+                   AND core_block.source_object_id = candidate_layout_sha256
+                   AND (
+                        (
+                            candidate_range_ordinal IS NULL
+                            AND core_block.record_start = 0
+                            AND core_block.record_count =
+                                layout.artifact_record_count
+                            AND core_block.payload_sha256 =
+                                artifact.artifact_sha256
+                            AND core_block.payload_bytes =
+                                artifact.artifact_byte_count
+                            AND core_block.content_sha256 =
+                                layout.manifest_sha256
+                        )
+                        OR (
+                            candidate_range_ordinal IS NOT NULL
+                            AND retained_range.range_ordinal =
+                                candidate_range_ordinal
+                            AND retained_range.artifact_sha256 =
+                                candidate_artifact_sha256
+                            AND core_block.record_start =
+                                retained_range.record_start
+                            AND core_block.record_count =
+                                retained_range.record_count
+                            AND core_block.payload_sha256 =
+                                retained_range.raw_sha256
+                            AND core_block.payload_bytes =
+                                retained_range.raw_byte_count
+                            AND core_block.content_sha256 =
+                                retained_range.canonical_sha256
+                        )
+                   )
+            );
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.provider_directory_projection_admission_stream_is_exact(
+            candidate_admission_id text,
+            candidate_recipe_id text,
+            candidate_binding_id text,
+            candidate_campaign_id text,
+            candidate_source_item_id text,
+            candidate_claim_generation bigint,
+            candidate_resource_type text,
+            candidate_partition_key_hash text,
+            candidate_source_partition_ordinal integer,
+            candidate_stream_identity_sha256 text,
+            candidate_stream_ordinal integer,
+            candidate_terminal_sequence_ordinal integer,
+            candidate_terminal_proof_sha256 text
+        ) RETURNS boolean LANGUAGE sql STABLE AS $$
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {quoted_schema}.provider_directory_projection_admission
+                       AS admission
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_campaign AS campaign
+                    ON campaign.campaign_id = admission.retained_campaign_id
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_consumer AS consumer
+                    ON consumer.campaign_id = campaign.campaign_id
+                   AND consumer.consumer_recipe_id =
+                       admission.retained_consumer_recipe_id
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_campaign_stream
+                       AS retained_stream
+                    ON retained_stream.campaign_id = campaign.campaign_id
+                   AND retained_stream.stream_identity_sha256 =
+                       candidate_stream_identity_sha256
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_campaign_item
+                       AS terminal_item
+                    ON terminal_item.campaign_id = campaign.campaign_id
+                   AND terminal_item.source_item_id = candidate_source_item_id
+                 WHERE admission.admission_id = candidate_admission_id
+                   AND admission.recipe_id = candidate_recipe_id
+                   AND candidate_binding_id = {quoted_schema}.
+                       provider_directory_projection_admission_terminal_binding_id(
+                           candidate_campaign_id,
+                           candidate_source_item_id,
+                           candidate_resource_type,
+                           candidate_partition_key_hash,
+                           candidate_source_partition_ordinal,
+                           candidate_stream_identity_sha256,
+                           candidate_stream_ordinal,
+                           candidate_terminal_sequence_ordinal,
+                           candidate_terminal_proof_sha256
+                       )
+                   AND admission.retained_campaign_id = candidate_campaign_id
+                   AND admission.claim_generation = candidate_claim_generation
+                   AND campaign.state = 'complete'
+                   AND campaign.complete
+                   AND campaign.campaign_sha256 =
+                       admission.retained_campaign_sha256
+                   AND campaign.released_at IS NULL
+                   AND consumer.claimed_campaign_sha256 =
+                       admission.retained_campaign_sha256
+                   AND consumer.claim_generation = candidate_claim_generation
+                   AND consumer.released_at IS NULL
+                   AND retained_stream.stream_ordinal = candidate_stream_ordinal
+                   AND retained_stream.terminal_sequence_ordinal =
+                       candidate_terminal_sequence_ordinal
+                   AND retained_stream.terminal_proof_sha256 =
+                       candidate_terminal_proof_sha256
+                   AND retained_stream.complete
+                   AND retained_stream.completed_at IS NOT NULL
+                   AND terminal_item.item_role = 'terminal_zero'
+                   AND terminal_item.status = 'terminal_zero'
+                   AND terminal_item.artifact_sha256 IS NULL
+                   AND terminal_item.layout_sha256 IS NULL
+                   AND terminal_item.family = candidate_resource_type
+                   AND terminal_item.partition_metadata_sha256 =
+                       candidate_partition_key_hash
+                   AND terminal_item.stream_identity_sha256 =
+                       candidate_stream_identity_sha256
+                   AND terminal_item.sequence_ordinal =
+                       candidate_terminal_sequence_ordinal
+                   AND terminal_item.terminal_proof_sha256 =
+                       candidate_terminal_proof_sha256
+                   AND EXISTS (
+                        SELECT 1
+                          FROM jsonb_array_elements(
+                              admission.completeness_manifest_json ->
+                                  'terminal_partitions'
+                          ) AS terminal
+                         WHERE terminal -> 'terminal' = 'true'::jsonb
+                           AND terminal ->> 'resource_type' =
+                               candidate_resource_type
+                           AND terminal ->> 'partition_key_hash' =
+                               candidate_partition_key_hash
+                           AND (
+                               terminal ->> 'source_partition_ordinal'
+                           )::integer = candidate_source_partition_ordinal
+                           AND jsonb_typeof(terminal -> 'retained_stream') =
+                               'object'
+                           AND terminal -> 'retained_stream' ->>
+                               'identity_sha256' =
+                               candidate_stream_identity_sha256
+                           AND (
+                               terminal -> 'retained_stream' ->>
+                                   'stream_ordinal'
+                           )::integer = candidate_stream_ordinal
+                           AND (
+                               terminal -> 'retained_stream' ->>
+                                   'terminal_sequence_ordinal'
+                           )::integer = candidate_terminal_sequence_ordinal
+                           AND terminal -> 'retained_stream' ->>
+                               'terminal_proof_sha256' =
+                               candidate_terminal_proof_sha256
+                           AND (
+                               (terminal ->> 'row_count')::bigint <> 0
+                               OR terminal ->> 'zero_row_proof_sha256' =
+                                  candidate_terminal_proof_sha256
+                           )
+                   )
+            );
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.provider_directory_projection_admission_scope_is_exact(
+            candidate_admission_id text
+        ) RETURNS boolean LANGUAGE sql STABLE AS $$
+            WITH admission_scope AS (
+                SELECT admission.*,
+                       campaign.census_mode,
+                       campaign.expected_item_count,
+                       campaign.expected_stream_count
+                  FROM {quoted_schema}.provider_directory_projection_admission
+                       AS admission
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_campaign AS campaign
+                    ON campaign.campaign_id = admission.retained_campaign_id
+                  JOIN {quoted_schema}.
+                       provider_directory_retained_artifact_consumer AS consumer
+                    ON consumer.campaign_id = campaign.campaign_id
+                   AND consumer.consumer_recipe_id =
+                       admission.retained_consumer_recipe_id
+                 WHERE admission.admission_id = candidate_admission_id
+                   AND campaign.state = 'complete'
+                   AND campaign.complete
+                   AND campaign.campaign_sha256 =
+                       admission.retained_campaign_sha256
+                   AND campaign.released_at IS NULL
+                   AND consumer.claimed_campaign_sha256 =
+                       admission.retained_campaign_sha256
+                   AND consumer.claim_generation = admission.claim_generation
+                   AND consumer.released_at IS NULL
+            ),
+            binding_inventory AS (
+                SELECT mapping.binding_id
+                  FROM {quoted_schema}.
+                       provider_directory_projection_admission_input_block
+                       AS mapping
+                 WHERE mapping.admission_id = candidate_admission_id
+                UNION ALL
+                SELECT stream.binding_id
+                  FROM {quoted_schema}.
+                       provider_directory_projection_admission_stream AS stream
+                 WHERE stream.admission_id = candidate_admission_id
+            ),
+            actual_census_rows AS (
+                SELECT mapping.resource_type,
+                       mapping.partition_key_hash,
+                       mapping.source_partition_ordinal,
+                       1::bigint AS block_count,
+                       core_block.record_count::bigint AS row_count,
+                       core_block.payload_bytes::bigint AS byte_count
+                  FROM {quoted_schema}.
+                       provider_directory_projection_admission_input_block
+                       AS mapping
+                  JOIN {quoted_schema}.
+                       provider_directory_projection_input_block AS core_block
+                    ON core_block.recipe_id = mapping.recipe_id
+                   AND core_block.block_id = mapping.block_id
+                 WHERE mapping.admission_id = candidate_admission_id
+                UNION ALL
+                SELECT stream.resource_type,
+                       stream.partition_key_hash,
+                       stream.source_partition_ordinal,
+                       0::bigint, 0::bigint, 0::bigint
+                  FROM {quoted_schema}.
+                       provider_directory_projection_admission_stream AS stream
+                 WHERE stream.admission_id = candidate_admission_id
+            ),
+            actual_census AS (
+                SELECT resource_type, partition_key_hash,
+                       source_partition_ordinal,
+                       sum(block_count)::bigint AS block_count,
+                       sum(row_count)::bigint AS row_count,
+                       sum(byte_count)::bigint AS byte_count
+                  FROM actual_census_rows
+                 GROUP BY resource_type, partition_key_hash,
+                          source_partition_ordinal
+            ),
+            expected_census AS (
+                SELECT terminal ->> 'resource_type' AS resource_type,
+                       terminal ->> 'partition_key_hash'
+                           AS partition_key_hash,
+                       (terminal ->> 'source_partition_ordinal')::integer
+                           AS source_partition_ordinal,
+                       (terminal ->> 'block_count')::bigint AS block_count,
+                       (terminal ->> 'row_count')::bigint AS row_count,
+                       (terminal ->> 'byte_count')::bigint AS byte_count
+                  FROM admission_scope AS admission,
+                       LATERAL jsonb_array_elements(
+                           admission.completeness_manifest_json ->
+                               'terminal_partitions'
+                       ) AS terminal
+                 WHERE terminal -> 'terminal' = 'true'::jsonb
+                   AND terminal ->> 'resource_type' <> ''
+                   AND terminal ->> 'partition_key_hash' ~
+                       '^[0-9a-f]{{64}}$'
+                   AND terminal ? 'source_partition_ordinal'
+                   AND terminal ? 'block_count'
+                   AND terminal ? 'row_count'
+                   AND terminal ? 'byte_count'
+            )
+            SELECT COALESCE(bool_and(scope_exact), false)
+              FROM (
+                SELECT
+                    admission.input_block_count = (
+                        SELECT count(*)
+                          FROM {quoted_schema}.
+                               provider_directory_projection_input_block
+                         WHERE recipe_id = admission.recipe_id
+                    )
+                    AND admission.binding_count = (
+                        SELECT count(*) FROM binding_inventory
+                    )
+                    AND admission.binding_count = (
+                        SELECT count(DISTINCT binding_id)
+                          FROM binding_inventory
+                    )
+                    AND admission.stream_count = (
+                        SELECT count(*)
+                          FROM {quoted_schema}.
+                               provider_directory_projection_admission_stream
+                         WHERE admission_id = candidate_admission_id
+                    )
+                    AND admission.binding_set_sha256 = {quoted_schema}.
+                        provider_directory_projection_admission_binding_set_sha256(
+                            candidate_admission_id
+                        )
+                    AND admission.stream_set_sha256 = {quoted_schema}.
+                        provider_directory_projection_admission_stream_set_sha256(
+                            candidate_admission_id
+                        )
+                    AND (
+                        (admission.census_mode = 'fixed_catalog'
+                         AND admission.expected_stream_count = 0
+                         AND admission.stream_count = 0)
+                        OR
+                        (admission.census_mode = 'ordered_streams'
+                         AND admission.stream_count =
+                             admission.expected_stream_count)
+                    )
+                    AND admission.expected_item_count = (
+                        SELECT count(*)
+                          FROM {quoted_schema}.
+                               provider_directory_retained_artifact_campaign_item
+                         WHERE campaign_id = admission.retained_campaign_id
+                    )
+                    AND (
+                        admission.completeness_manifest_json ->>
+                            'partition_count'
+                    )::integer = (
+                        SELECT count(*) FROM expected_census
+                    )
+                    AND (
+                        admission.completeness_manifest_json ->>
+                            'partition_count'
+                    )::integer = jsonb_array_length(
+                        admission.completeness_manifest_json ->
+                            'terminal_partitions'
+                    )
+                    AND (
+                        SELECT count(*) FROM expected_census
+                    ) = (
+                        SELECT count(DISTINCT (
+                            resource_type,
+                            partition_key_hash,
+                            source_partition_ordinal
+                        )) FROM expected_census
+                    )
+                    AND admission.stream_count = (
+                        SELECT count(*)
+                          FROM jsonb_array_elements(
+                              admission.completeness_manifest_json ->
+                                  'terminal_partitions'
+                          ) AS terminal
+                         WHERE jsonb_typeof(
+                             terminal -> 'retained_stream'
+                         ) = 'object'
+                    )
+                    AND (
+                        admission.completeness_manifest_json ->> 'block_count'
+                    )::integer = (
+                        SELECT count(*)
+                          FROM {quoted_schema}.
+                               provider_directory_projection_admission_input_block
+                         WHERE admission_id = candidate_admission_id
+                    )
+                    AND (
+                        admission.completeness_manifest_json ->> 'row_count'
+                    )::bigint = COALESCE(
+                        (SELECT sum(row_count) FROM actual_census_rows), 0
+                    )
+                    AND (
+                        admission.completeness_manifest_json ->> 'byte_count'
+                    )::bigint = COALESCE(
+                        (SELECT sum(byte_count) FROM actual_census_rows), 0
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM actual_census AS actual
+                          FULL JOIN expected_census AS expected
+                            USING (
+                                resource_type,
+                                partition_key_hash,
+                                source_partition_ordinal
+                            )
+                         WHERE actual.block_count IS DISTINCT FROM
+                               expected.block_count
+                            OR actual.row_count IS DISTINCT FROM
+                               expected.row_count
+                            OR actual.byte_count IS DISTINCT FROM
+                               expected.byte_count
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_projection_input_block
+                               AS core_block
+                         WHERE core_block.recipe_id = admission.recipe_id
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM {quoted_schema}.
+                                      provider_directory_projection_admission_input_block
+                                      AS mapping
+                                WHERE mapping.admission_id =
+                                      candidate_admission_id
+                                  AND mapping.recipe_id = core_block.recipe_id
+                                  AND mapping.block_id = core_block.block_id
+                           )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_projection_admission_input_block
+                               AS mapping
+                         WHERE mapping.admission_id = candidate_admission_id
+                           AND NOT {quoted_schema}.
+                               provider_directory_projection_admission_mapping_is_exact(
+                                   mapping.admission_id,
+                                   mapping.recipe_id,
+                                   mapping.binding_id,
+                                   mapping.block_id,
+                                   mapping.retained_campaign_id,
+                                   mapping.retained_consumer_recipe_id,
+                                   mapping.retained_source_item_id,
+                                   mapping.retained_artifact_sha256,
+                                   mapping.retained_layout_sha256,
+                                   mapping.retained_range_ordinal,
+                                   mapping.claim_generation,
+                                   mapping.resource_type,
+                                   mapping.partition_key_hash,
+                                   mapping.source_partition_ordinal
+                               )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_projection_admission_stream
+                               AS stream
+                         WHERE stream.admission_id = candidate_admission_id
+                           AND NOT {quoted_schema}.
+                               provider_directory_projection_admission_stream_is_exact(
+                                   stream.admission_id,
+                                   stream.recipe_id,
+                                   stream.binding_id,
+                                   stream.retained_campaign_id,
+                                   stream.retained_source_item_id,
+                                   stream.claim_generation,
+                                   stream.resource_type,
+                                   stream.partition_key_hash,
+                                   stream.source_partition_ordinal,
+                                   stream.stream_identity_sha256,
+                                   stream.stream_ordinal,
+                                   stream.terminal_sequence_ordinal,
+                                   stream.terminal_proof_sha256
+                               )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM jsonb_array_elements(
+                              admission.completeness_manifest_json ->
+                                  'terminal_partitions'
+                          ) AS terminal
+                         WHERE jsonb_typeof(
+                                   terminal -> 'retained_stream'
+                               ) = 'object'
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM {quoted_schema}.
+                                      provider_directory_projection_admission_stream
+                                      AS stream
+                                WHERE stream.admission_id =
+                                      candidate_admission_id
+                                  AND stream.resource_type =
+                                      terminal ->> 'resource_type'
+                                  AND stream.partition_key_hash =
+                                      terminal ->> 'partition_key_hash'
+                                  AND stream.source_partition_ordinal = (
+                                      terminal ->>
+                                          'source_partition_ordinal'
+                                  )::integer
+                                  AND stream.stream_identity_sha256 =
+                                      terminal -> 'retained_stream' ->>
+                                          'identity_sha256'
+                                  AND stream.stream_ordinal = (
+                                      terminal -> 'retained_stream' ->>
+                                          'stream_ordinal'
+                                  )::integer
+                                  AND stream.terminal_sequence_ordinal = (
+                                      terminal -> 'retained_stream' ->>
+                                          'terminal_sequence_ordinal'
+                                  )::integer
+                                  AND stream.terminal_proof_sha256 =
+                                      terminal -> 'retained_stream' ->>
+                                          'terminal_proof_sha256'
+                           )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_retained_artifact_campaign_item
+                               AS item
+                         WHERE item.campaign_id = admission.retained_campaign_id
+                           AND (
+                               (item.item_role = 'payload'
+                                AND item.status = 'admitted'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM {quoted_schema}.
+                                           provider_directory_retained_artifact_consumer_reference
+                                           AS retained_reference
+                                      JOIN {quoted_schema}.
+                                           provider_directory_projection_admission_input_block
+                                           AS mapping
+                                        ON mapping.admission_id =
+                                           candidate_admission_id
+                                       AND mapping.retained_campaign_id =
+                                           retained_reference.campaign_id
+                                       AND mapping.retained_consumer_recipe_id =
+                                           retained_reference.consumer_recipe_id
+                                       AND mapping.retained_source_item_id =
+                                           retained_reference.source_item_id
+                                       AND mapping.retained_artifact_sha256 =
+                                           retained_reference.artifact_sha256
+                                       AND mapping.retained_layout_sha256 =
+                                           retained_reference.layout_sha256
+                                       AND mapping.claim_generation =
+                                           retained_reference.claim_generation
+                                     WHERE retained_reference.campaign_id =
+                                           admission.retained_campaign_id
+                                       AND retained_reference.consumer_recipe_id =
+                                           admission.retained_consumer_recipe_id
+                                       AND retained_reference.source_item_id =
+                                           item.source_item_id
+                                       AND retained_reference.claim_generation =
+                                           admission.claim_generation
+                                       AND retained_reference.released_at IS NULL
+                                ))
+                               OR
+                               (item.item_role = 'terminal_zero'
+                                AND item.status = 'terminal_zero'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM {quoted_schema}.
+                                           provider_directory_projection_admission_stream
+                                           AS stream
+                                     WHERE stream.admission_id =
+                                           candidate_admission_id
+                                       AND stream.retained_campaign_id =
+                                           item.campaign_id
+                                       AND stream.retained_source_item_id =
+                                           item.source_item_id
+                                ))
+                               OR item.item_role NOT IN (
+                                   'payload', 'terminal_zero'
+                               )
+                               OR item.status NOT IN (
+                                   'admitted', 'terminal_zero'
+                               )
+                           )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_retained_artifact_consumer_reference
+                               AS retained_reference
+                         WHERE retained_reference.campaign_id =
+                               admission.retained_campaign_id
+                           AND retained_reference.consumer_recipe_id =
+                               admission.retained_consumer_recipe_id
+                           AND retained_reference.claim_generation =
+                               admission.claim_generation
+                           AND retained_reference.released_at IS NULL
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM {quoted_schema}.
+                                      provider_directory_projection_admission_input_block
+                                      AS mapping
+                                WHERE mapping.admission_id =
+                                      candidate_admission_id
+                                  AND mapping.retained_source_item_id =
+                                      retained_reference.source_item_id
+                                  AND mapping.retained_artifact_sha256 =
+                                      retained_reference.artifact_sha256
+                                  AND mapping.retained_layout_sha256 =
+                                      retained_reference.layout_sha256
+                           )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_retained_artifact_campaign_stream
+                               AS retained_stream
+                         WHERE retained_stream.campaign_id =
+                               admission.retained_campaign_id
+                           AND (
+                               NOT retained_stream.complete
+                               OR NOT EXISTS (
+                                   SELECT 1
+                                     FROM {quoted_schema}.
+                                          provider_directory_projection_admission_stream
+                                          AS stream
+                                    WHERE stream.admission_id =
+                                          candidate_admission_id
+                                      AND stream.retained_campaign_id =
+                                          retained_stream.campaign_id
+                                      AND stream.stream_identity_sha256 =
+                                          retained_stream.stream_identity_sha256
+                                      AND stream.stream_ordinal =
+                                          retained_stream.stream_ordinal
+                                      AND stream.terminal_sequence_ordinal =
+                                          retained_stream.terminal_sequence_ordinal
+                                      AND stream.terminal_proof_sha256 =
+                                          retained_stream.terminal_proof_sha256
+                               )
+                           )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_retained_artifact_campaign_item
+                               AS item
+                          JOIN {quoted_schema}.
+                               provider_directory_retained_artifact_layout
+                               AS layout
+                            ON layout.layout_sha256 = item.layout_sha256
+                           AND layout.artifact_sha256 = item.artifact_sha256
+                         WHERE item.campaign_id = admission.retained_campaign_id
+                           AND item.item_role = 'payload'
+                           AND item.status = 'admitted'
+                           AND NOT (
+                               (
+                                   SELECT count(*) = 1
+                                      FROM {quoted_schema}.
+                                           provider_directory_projection_admission_input_block
+                                           AS mapping
+                                     WHERE mapping.admission_id =
+                                           candidate_admission_id
+                                       AND mapping.retained_source_item_id =
+                                           item.source_item_id
+                                       AND mapping.retained_range_ordinal IS NULL
+                               )
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                     FROM {quoted_schema}.
+                                          provider_directory_projection_admission_input_block
+                                          AS mapping
+                                    WHERE mapping.admission_id =
+                                          candidate_admission_id
+                                      AND mapping.retained_source_item_id =
+                                          item.source_item_id
+                                      AND mapping.retained_range_ordinal IS NOT NULL
+                               )
+                               OR
+                               NOT EXISTS (
+                                   SELECT 1
+                                     FROM {quoted_schema}.
+                                          provider_directory_projection_admission_input_block
+                                          AS mapping
+                                    WHERE mapping.admission_id =
+                                          candidate_admission_id
+                                      AND mapping.retained_source_item_id =
+                                          item.source_item_id
+                                      AND mapping.retained_range_ordinal IS NULL
+                               )
+                               AND (
+                                   SELECT count(*) = layout.layout_range_count
+                                      AND count(DISTINCT
+                                          mapping.retained_range_ordinal
+                                      ) = layout.layout_range_count
+                                     FROM {quoted_schema}.
+                                          provider_directory_projection_admission_input_block
+                                          AS mapping
+                                    WHERE mapping.admission_id =
+                                          candidate_admission_id
+                                      AND mapping.retained_source_item_id =
+                                          item.source_item_id
+                                      AND mapping.retained_range_ordinal IS NOT NULL
+                               )
+                           )
+                    ) AS scope_exact
+                  FROM admission_scope AS admission
+              ) AS exact_scope;
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.guard_provider_directory_projection_input_block()
         RETURNS trigger LANGUAGE plpgsql AS $$
         DECLARE
             action_setting text := current_setting(
@@ -3728,206 +3868,1010 @@ def _create_fences(schema: str) -> None:
             );
         BEGIN
             IF TG_OP = 'INSERT'
-               AND action_setting = 'seal'
-               AND recipe_id_setting = NEW.physical_projection_id
-               AND physical_id_setting = NEW.physical_projection_id
+               AND action_setting = 'workset_register'
+               AND recipe_id_setting = NEW.recipe_id
                AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
                AND recipe_lease_setting ~ '^[0-9a-f]{{64}}$'
                AND EXISTS (
-                   SELECT 1
-                     FROM {quoted_schema}.provider_directory_projection_recipe
-                          AS recipe
-                    WHERE recipe.recipe_id = NEW.physical_projection_id
-                      AND recipe.attempt = recipe_attempt_setting::integer
-                      AND recipe.status = 'proof_ready'
-                      AND recipe.lease_token = recipe_lease_setting
-                      AND recipe.lease_expires_at > clock_timestamp()
-                      AND recipe.prepared_proof_json = NEW.proof_json
-                      AND recipe.prepared_proof_json ->> 'physical_projection_id'
-                          = NEW.physical_projection_id
-                      AND recipe.prepared_proof_json ->> 'canonical_row_sha256'
-                          = NEW.canonical_row_sha256
-                      AND recipe.prepared_proof_json ->> 'dataset_hash' =
-                          NEW.dataset_hash
-                      AND recipe.decoder_contract_id = NEW.decoder_contract_id
-                      AND recipe.input_set_sha256 = NEW.input_set_sha256
-                      AND recipe.transform_contract_id =
-                          NEW.transform_contract_id
-                      AND recipe.scope_contract_id = NEW.scope_contract_id
-                      AND recipe.transform_context_hash =
-                          NEW.transform_context_hash
-                      AND recipe.transform_context_json =
-                          NEW.transform_context_json
-                      AND recipe.completeness_manifest_hash =
-                          NEW.completeness_manifest_hash
-                      AND recipe.completeness_manifest_json =
-                          NEW.completeness_manifest_json
-                      AND recipe.resource_profile_hash =
-                          NEW.resource_profile_hash
-                      AND recipe.selected_resources_json =
-                          NEW.selected_resources_json
-                      AND recipe.required_resources_json =
-                          NEW.required_resources_json
-                      AND recipe.prepared_proof_json -> 'resource_counts' =
-                          NEW.resource_counts_json
-                      AND (recipe.prepared_proof_json ->> 'resource_count')::bigint
-                          = NEW.resource_count
-                      AND recipe.stage_schema = NEW.storage_schema
-                      AND recipe.stage_relation = NEW.storage_relation
-                      AND recipe.stage_relation_oid = NEW.storage_relation_oid
-                      AND recipe.membership_stage_schema IS NOT DISTINCT FROM
-                          NEW.membership_storage_schema
-                      AND recipe.membership_stage_relation IS NOT DISTINCT FROM
-                          NEW.membership_storage_relation
-                      AND recipe.membership_stage_relation_oid IS NOT DISTINCT FROM
-                          NEW.membership_storage_relation_oid
-                      AND recipe.profile_contribution_stage_schema
-                          IS NOT DISTINCT FROM
-                          NEW.profile_contribution_storage_schema
-                      AND recipe.profile_contribution_stage_relation
-                          IS NOT DISTINCT FROM
-                          NEW.profile_contribution_storage_relation
-                      AND recipe.profile_contribution_stage_relation_oid
-                          IS NOT DISTINCT FROM
-                          NEW.profile_contribution_storage_relation_oid
-                      AND {quoted_schema}.
-                          provider_directory_projection_stage_matches_proof(
-                              NEW.storage_schema,
-                              NEW.storage_relation,
-                              NEW.storage_relation_oid,
-                              NEW.storage_trigger_oid,
-                              NEW.physical_projection_id,
-                              NEW.proof_json
-                          )
-                      AND (
-                          NEW.membership_storage_schema IS NULL
-                          OR {quoted_schema}.
-                             provider_directory_projection_membership_matches_proof(
-                                 NEW.membership_storage_schema,
-                                 NEW.membership_storage_relation,
-                                 NEW.membership_storage_relation_oid,
-                                 NEW.membership_storage_trigger_oid,
-                                 NEW.physical_projection_id,
-                                 NEW.proof_json,
-                                 NEW.storage_schema,
-                                 NEW.storage_relation
-                             )
-                      )
-                      AND NEW.profile_contribution_storage_schema IS NULL
-                    FOR SHARE OF recipe
-               ) THEN
-                RETURN NEW;
-            END IF;
-            IF TG_OP = 'UPDATE'
-               AND action_setting = 'gc'
-               AND recipe_id_setting = OLD.physical_projection_id
-               AND physical_id_setting = OLD.physical_projection_id
-               AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
-               AND COALESCE(recipe_lease_setting, '') = ''
-               AND OLD.status = 'sealed' AND NEW.status = 'retiring'
-               AND NEW.retiring_at IS NOT NULL
-               AND NEW.retiring_at >= OLD.sealed_at
-               AND NEW.retiring_at <= clock_timestamp()
-               AND OLD.retain_until <= clock_timestamp()
-               AND EXISTS (
                     SELECT 1
                       FROM {quoted_schema}.provider_directory_projection_recipe
-                           AS recipe
-                     WHERE recipe.recipe_id = OLD.physical_projection_id
-                       AND recipe.attempt = recipe_attempt_setting::integer
-                       AND recipe.status = 'sealed'
-                       AND recipe.physical_projection_id =
-                           OLD.physical_projection_id
-                     FOR SHARE OF recipe
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM {quoted_schema}.
-                           provider_directory_physical_projection_reference
-                           AS reference_record
-                     WHERE reference_record.physical_projection_id =
-                           OLD.physical_projection_id
-                       AND reference_record.released_at IS NULL
-               )
-               AND to_jsonb(NEW) - ARRAY['status', 'retiring_at'] =
-                   to_jsonb(OLD) - ARRAY['status', 'retiring_at'] THEN
+                     WHERE recipe_id = NEW.recipe_id
+                       AND attempt = recipe_attempt_setting::integer
+                       AND status = 'building'
+                       AND lease_token = recipe_lease_setting
+                       AND lease_expires_at > clock_timestamp()
+                       AND workset_registered_at IS NULL
+                     FOR SHARE
+               ) THEN
                 RETURN NEW;
             END IF;
             IF TG_OP = 'DELETE'
                AND action_setting = 'gc'
-               AND recipe_id_setting = OLD.physical_projection_id
-               AND physical_id_setting = OLD.physical_projection_id
+               AND recipe_id_setting = OLD.recipe_id
+               AND physical_id_setting = OLD.recipe_id
                AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
                AND COALESCE(recipe_lease_setting, '') = ''
-               AND OLD.status = 'retiring'
-               AND OLD.retain_until <= clock_timestamp()
                AND NOT EXISTS (
                     SELECT 1
                       FROM {quoted_schema}.
-                           provider_directory_physical_projection_reference
-                           AS reference_record
-                     WHERE reference_record.physical_projection_id =
-                           OLD.physical_projection_id
-                       AND reference_record.released_at IS NULL
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM {quoted_schema}.
-                           provider_directory_physical_projection_reference
-                     WHERE physical_projection_id = OLD.physical_projection_id
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM {quoted_schema}.
-                           provider_directory_physical_projection_source_summary
-                     WHERE physical_projection_id = OLD.physical_projection_id
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM {quoted_schema}.
-                           provider_directory_physical_projection_partition
-                     WHERE physical_projection_id = OLD.physical_projection_id
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM {quoted_schema}.
-                           provider_directory_projection_proof_shard
-                     WHERE recipe_id = OLD.physical_projection_id
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM {quoted_schema}.
-                           provider_directory_projection_input_block
-                     WHERE recipe_id = OLD.physical_projection_id
-               )
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM pg_class AS storage_relation
-                     WHERE storage_relation.oid IN (
-                         OLD.storage_relation_oid::oid,
-                         COALESCE(
-                             OLD.membership_storage_relation_oid,
-                             0
-                         )::oid,
-                         COALESCE(
-                             OLD.profile_contribution_storage_relation_oid,
-                             0
-                         )::oid
-                     )
+                           provider_directory_projection_admission_input_block
+                     WHERE recipe_id = OLD.recipe_id
+                       AND block_id = OLD.block_id
                )
                AND EXISTS (
                     SELECT 1
                       FROM {quoted_schema}.provider_directory_projection_recipe
-                           AS recipe
-                     WHERE recipe.recipe_id = OLD.physical_projection_id
-                       AND recipe.attempt = recipe_attempt_setting::integer
-                       AND recipe.status = 'retired'
-                       AND recipe.physical_projection_id IS NULL
-                     FOR SHARE OF recipe
+                     WHERE recipe_id = OLD.recipe_id
+                       AND attempt = recipe_attempt_setting::integer
+                       AND status = 'retired'
                ) THEN
                 RETURN OLD;
             END IF;
-            RAISE EXCEPTION 'provider_directory_physical_projection_immutable'
+            IF TG_OP = 'INSERT' THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_workset_write_unfenced'
+                    USING ERRCODE = '55000';
+            END IF;
+            RAISE EXCEPTION 'provider_directory_projection_input_block_immutable'
+                USING ERRCODE = '55000';
+        END;
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.guard_provider_directory_projection_shard_admission()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                RETURN OLD;
+            END IF;
+            IF TG_OP = 'INSERT' THEN
+                IF NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_input_block
+                     WHERE recipe_id = NEW.recipe_id
+                       AND block_id = NEW.input_block_id
+                       AND content_sha256 = NEW.input_sha256
+                ) THEN
+                    RAISE EXCEPTION
+                        'provider_directory_projection_shard_core_mismatch'
+                        USING ERRCODE = '55000';
+                END IF;
+                RETURN NEW;
+            END IF;
+            IF OLD.status = 'pending' AND NEW.status = 'building'
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_admission
+                     WHERE recipe_id = NEW.recipe_id
+                       AND status = 'sealed'
+               ) THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_admission_required'
+                    USING ERRCODE = '55000';
+            END IF;
+            RETURN NEW;
+        END;
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.guard_provider_directory_projection_admission_block()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE
+            action_setting text := current_setting(
+                'healthporta.provider_directory_projection_action', true
+            );
+            recipe_id_setting text := current_setting(
+                'healthporta.provider_directory_projection_recipe_id', true
+            );
+            admission_id_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_id', true
+            );
+            admission_attempt_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_attempt',
+                true
+            );
+            admission_lease_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_lease_token',
+                true
+            );
+        BEGIN
+            IF TG_OP = 'INSERT'
+               AND action_setting = 'admission_map'
+               AND admission_id_setting = NEW.admission_id
+               AND admission_attempt_setting ~ '^[1-9][0-9]*$'
+               AND admission_lease_setting ~ '^[0-9a-f]{{64}}$'
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_admission
+                     WHERE admission_id = NEW.admission_id
+                       AND recipe_id = NEW.recipe_id
+                       AND attempt = admission_attempt_setting::integer
+                       AND status = 'building'
+                       AND lease_token = admission_lease_setting
+                       AND lease_expires_at > clock_timestamp()
+                       AND retained_campaign_id = NEW.retained_campaign_id
+                       AND retained_consumer_recipe_id =
+                           NEW.retained_consumer_recipe_id
+                       AND claim_generation = NEW.claim_generation
+                     FOR SHARE
+               )
+               AND {quoted_schema}.
+                   provider_directory_projection_admission_mapping_is_exact(
+                       NEW.admission_id,
+                       NEW.recipe_id,
+                       NEW.binding_id,
+                       NEW.block_id,
+                       NEW.retained_campaign_id,
+                       NEW.retained_consumer_recipe_id,
+                       NEW.retained_source_item_id,
+                       NEW.retained_artifact_sha256,
+                       NEW.retained_layout_sha256,
+                       NEW.retained_range_ordinal,
+                       NEW.claim_generation,
+                       NEW.resource_type,
+                       NEW.partition_key_hash,
+                       NEW.source_partition_ordinal
+                   ) THEN
+                RETURN NEW;
+            END IF;
+            IF TG_OP = 'DELETE'
+               AND action_setting = 'gc'
+               AND recipe_id_setting = OLD.recipe_id
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_admission
+                           AS admission
+                      JOIN {quoted_schema}.provider_directory_projection_recipe
+                           AS recipe ON recipe.recipe_id = admission.recipe_id
+                     WHERE admission.admission_id = OLD.admission_id
+                       AND admission.status = 'released'
+                       AND recipe.status = 'retired'
+               ) THEN
+                RETURN OLD;
+            END IF;
+            IF TG_OP = 'INSERT' THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_admission_map_unfenced'
+                    USING ERRCODE = '55000';
+            END IF;
+            RAISE EXCEPTION
+                'provider_directory_projection_admission_block_immutable'
+                USING ERRCODE = '55000';
+        END;
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.guard_provider_directory_projection_admission_stream()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE
+            action_setting text := current_setting(
+                'healthporta.provider_directory_projection_action', true
+            );
+            recipe_id_setting text := current_setting(
+                'healthporta.provider_directory_projection_recipe_id', true
+            );
+            admission_id_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_id', true
+            );
+            admission_attempt_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_attempt',
+                true
+            );
+            admission_lease_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_lease_token',
+                true
+            );
+        BEGIN
+            IF TG_OP = 'INSERT'
+               AND action_setting = 'admission_map'
+               AND admission_id_setting = NEW.admission_id
+               AND admission_attempt_setting ~ '^[1-9][0-9]*$'
+               AND admission_lease_setting ~ '^[0-9a-f]{{64}}$'
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_admission
+                     WHERE admission_id = NEW.admission_id
+                       AND recipe_id = NEW.recipe_id
+                       AND attempt = admission_attempt_setting::integer
+                       AND status = 'building'
+                       AND lease_token = admission_lease_setting
+                       AND lease_expires_at > clock_timestamp()
+                       AND retained_campaign_id = NEW.retained_campaign_id
+                       AND claim_generation = NEW.claim_generation
+                     FOR SHARE
+               )
+               AND {quoted_schema}.
+                   provider_directory_projection_admission_stream_is_exact(
+                       NEW.admission_id,
+                       NEW.recipe_id,
+                       NEW.binding_id,
+                       NEW.retained_campaign_id,
+                       NEW.retained_source_item_id,
+                       NEW.claim_generation,
+                       NEW.resource_type,
+                       NEW.partition_key_hash,
+                       NEW.source_partition_ordinal,
+                       NEW.stream_identity_sha256,
+                       NEW.stream_ordinal,
+                       NEW.terminal_sequence_ordinal,
+                       NEW.terminal_proof_sha256
+                   ) THEN
+                RETURN NEW;
+            END IF;
+            IF TG_OP = 'DELETE'
+               AND action_setting = 'gc'
+               AND recipe_id_setting = OLD.recipe_id
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_admission
+                           AS admission
+                      JOIN {quoted_schema}.provider_directory_projection_recipe
+                           AS recipe ON recipe.recipe_id = admission.recipe_id
+                     WHERE admission.admission_id = OLD.admission_id
+                       AND admission.status = 'released'
+                       AND recipe.status = 'retired'
+               ) THEN
+                RETURN OLD;
+            END IF;
+            IF TG_OP = 'INSERT' THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_admission_stream_unfenced'
+                    USING ERRCODE = '55000';
+            END IF;
+            RAISE EXCEPTION
+                'provider_directory_projection_admission_stream_immutable'
+                USING ERRCODE = '55000';
+        END;
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.guard_provider_directory_projection_admission()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE
+            action_setting text := current_setting(
+                'healthporta.provider_directory_projection_action', true
+            );
+            recipe_id_setting text := current_setting(
+                'healthporta.provider_directory_projection_recipe_id', true
+            );
+            admission_id_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_id', true
+            );
+            admission_attempt_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_attempt',
+                true
+            );
+            admission_lease_setting text := current_setting(
+                'healthporta.provider_directory_projection_admission_lease_token',
+                true
+            );
+        BEGIN
+            IF TG_OP = 'INSERT' THEN
+                IF action_setting <> 'admission_insert'
+                   OR admission_id_setting <> NEW.admission_id
+                   OR admission_attempt_setting <> NEW.attempt::text
+                   OR admission_lease_setting <> NEW.lease_token
+                   OR NEW.status <> 'building'
+                   OR NEW.attempt <> 1
+                   OR NEW.lease_token !~ '^[0-9a-f]{{64}}$'
+                   OR NEW.lease_expires_at <= clock_timestamp()
+                   OR NEW.lease_heartbeat_at IS NULL
+                   OR NEW.sealed_at IS NOT NULL
+                   OR NEW.released_at IS NOT NULL
+                   OR NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_projection_recipe AS recipe
+                          JOIN {quoted_schema}.
+                               provider_directory_retained_artifact_campaign
+                               AS campaign
+                            ON campaign.campaign_id = NEW.retained_campaign_id
+                          JOIN {quoted_schema}.
+                               provider_directory_retained_artifact_consumer
+                               AS consumer
+                            ON consumer.campaign_id = campaign.campaign_id
+                           AND consumer.consumer_recipe_id =
+                               NEW.retained_consumer_recipe_id
+                         WHERE recipe.recipe_id = NEW.recipe_id
+                           AND recipe.status IN (
+                               'building', 'proof_ready', 'sealed'
+                           )
+                           AND recipe.workset_registered_at IS NOT NULL
+                           AND recipe.input_block_set_sha256 =
+                               NEW.input_block_set_sha256
+                           AND recipe.input_block_count = NEW.input_block_count
+                           AND recipe.selected_resources_json =
+                               NEW.completeness_manifest_json ->
+                                   'selected_resources'
+                           AND recipe.required_resources_json =
+                               NEW.completeness_manifest_json ->
+                                   'required_resources'
+                           AND campaign.state = 'complete'
+                           AND campaign.complete
+                           AND campaign.campaign_sha256 =
+                               NEW.retained_campaign_sha256
+                           AND NEW.completeness_manifest_json ->>
+                               'endpoint_campaign_hash' =
+                               NEW.retained_campaign_sha256
+                           AND campaign.released_at IS NULL
+                           AND consumer.claimed_campaign_sha256 =
+                               NEW.retained_campaign_sha256
+                           AND consumer.claim_generation = NEW.claim_generation
+                           AND consumer.released_at IS NULL
+                         FOR SHARE OF recipe, campaign, consumer
+                   ) THEN
+                    RAISE EXCEPTION
+                        'provider_directory_projection_admission_insert_invalid'
+                        USING ERRCODE = '55000';
+                END IF;
+                RETURN NEW;
+            END IF;
+            IF TG_OP = 'DELETE' THEN
+                IF action_setting = 'gc'
+                   AND recipe_id_setting = OLD.recipe_id
+                   AND OLD.status = 'released'
+                   AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_projection_admission_input_block
+                         WHERE admission_id = OLD.admission_id
+                   )
+                   AND NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_projection_admission_stream
+                         WHERE admission_id = OLD.admission_id
+                   )
+                   AND EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_projection_recipe
+                         WHERE recipe_id = OLD.recipe_id
+                           AND status = 'retired'
+                   ) THEN
+                    RETURN OLD;
+                END IF;
+                RAISE EXCEPTION
+                    'provider_directory_projection_admission_immutable'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF OLD.admission_id IS DISTINCT FROM NEW.admission_id
+               OR OLD.recipe_id IS DISTINCT FROM NEW.recipe_id
+               OR OLD.acquisition_adapter_id IS DISTINCT FROM
+                  NEW.acquisition_adapter_id
+               OR OLD.source_scope_hash IS DISTINCT FROM NEW.source_scope_hash
+               OR OLD.source_ids_json IS DISTINCT FROM NEW.source_ids_json
+               OR OLD.completeness_manifest_hash IS DISTINCT FROM
+                  NEW.completeness_manifest_hash
+               OR OLD.completeness_manifest_json IS DISTINCT FROM
+                  NEW.completeness_manifest_json
+               OR OLD.retained_campaign_id IS DISTINCT FROM
+                  NEW.retained_campaign_id
+               OR OLD.retained_campaign_sha256 IS DISTINCT FROM
+                  NEW.retained_campaign_sha256
+               OR OLD.retained_consumer_recipe_id IS DISTINCT FROM
+                  NEW.retained_consumer_recipe_id
+               OR OLD.claim_generation IS DISTINCT FROM NEW.claim_generation
+               OR OLD.input_block_set_sha256 IS DISTINCT FROM
+                  NEW.input_block_set_sha256
+               OR OLD.input_block_count IS DISTINCT FROM NEW.input_block_count
+               OR OLD.binding_count IS DISTINCT FROM NEW.binding_count
+               OR OLD.binding_set_sha256 IS DISTINCT FROM
+                  NEW.binding_set_sha256
+               OR OLD.stream_set_sha256 IS DISTINCT FROM
+                  NEW.stream_set_sha256
+               OR OLD.stream_count IS DISTINCT FROM NEW.stream_count
+               OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_admission_identity_immutable'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF action_setting <> 'gc' AND (
+                admission_id_setting <> OLD.admission_id
+                OR admission_attempt_setting <> OLD.attempt::text
+            ) THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_admission_write_unfenced'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF action_setting = 'admission_heartbeat'
+               AND OLD.status = 'building' AND NEW.status = 'building'
+               AND OLD.lease_token = admission_lease_setting
+               AND NEW.lease_token = OLD.lease_token
+               AND OLD.lease_expires_at > clock_timestamp()
+               AND NEW.lease_expires_at > clock_timestamp()
+               AND to_jsonb(NEW) - ARRAY[
+                   'lease_expires_at', 'lease_heartbeat_at', 'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'lease_expires_at', 'lease_heartbeat_at', 'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'admission_reclaim'
+               AND OLD.status = 'building' AND NEW.status = 'building'
+               AND OLD.lease_expires_at <= clock_timestamp()
+               AND NEW.lease_token = admission_lease_setting
+               AND admission_lease_setting ~ '^[0-9a-f]{{64}}$'
+               AND NEW.lease_expires_at > clock_timestamp()
+               AND to_jsonb(NEW) - ARRAY[
+                   'lease_token', 'lease_expires_at', 'lease_heartbeat_at',
+                   'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'lease_token', 'lease_expires_at', 'lease_heartbeat_at',
+                   'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'admission_seal'
+               AND OLD.status = 'building' AND NEW.status = 'sealed'
+               AND OLD.lease_token = admission_lease_setting
+               AND OLD.lease_expires_at > clock_timestamp()
+               AND NEW.lease_token IS NULL
+               AND NEW.lease_expires_at IS NULL
+               AND NEW.lease_heartbeat_at IS NULL
+               AND NEW.sealed_at IS NOT NULL
+               AND NEW.released_at IS NULL
+               AND to_jsonb(NEW) - ARRAY[
+                   'status', 'lease_token', 'lease_expires_at',
+                   'lease_heartbeat_at', 'sealed_at', 'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'status', 'lease_token', 'lease_expires_at',
+                   'lease_heartbeat_at', 'sealed_at', 'updated_at'
+               ]
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_recipe
+                           AS recipe
+                      JOIN {quoted_schema}.
+                           provider_directory_retained_artifact_campaign
+                           AS campaign
+                        ON campaign.campaign_id = NEW.retained_campaign_id
+                      JOIN {quoted_schema}.
+                           provider_directory_retained_artifact_consumer
+                           AS consumer
+                        ON consumer.campaign_id = campaign.campaign_id
+                       AND consumer.consumer_recipe_id =
+                           NEW.retained_consumer_recipe_id
+                     WHERE recipe.recipe_id = NEW.recipe_id
+                       AND recipe.workset_registered_at IS NOT NULL
+                       AND recipe.input_block_set_sha256 =
+                           NEW.input_block_set_sha256
+                       AND recipe.input_block_count = NEW.input_block_count
+                       AND recipe.selected_resources_json =
+                           NEW.completeness_manifest_json ->
+                               'selected_resources'
+                       AND recipe.required_resources_json =
+                           NEW.completeness_manifest_json ->
+                               'required_resources'
+                       AND NEW.completeness_manifest_json ->> 'contract_id' =
+                           'healthporta.provider-directory.acquisition-completeness.v1'
+                       AND NEW.completeness_manifest_json ->>
+                           'endpoint_campaign_hash' =
+                           NEW.retained_campaign_sha256
+                       AND campaign.state = 'complete'
+                       AND campaign.complete
+                       AND campaign.campaign_sha256 =
+                           NEW.retained_campaign_sha256
+                       AND campaign.released_at IS NULL
+                       AND consumer.claimed_campaign_sha256 =
+                           NEW.retained_campaign_sha256
+                       AND consumer.claim_generation = NEW.claim_generation
+                       AND consumer.released_at IS NULL
+                     FOR SHARE OF recipe, campaign, consumer
+               )
+               AND {quoted_schema}.
+                   provider_directory_projection_admission_scope_is_exact(
+                       NEW.admission_id
+                   ) THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'gc'
+               AND OLD.status = 'sealed' AND NEW.status = 'released'
+               AND recipe_id_setting = OLD.recipe_id
+               AND NEW.released_at IS NOT NULL
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_recipe
+                     WHERE recipe_id = OLD.recipe_id
+                       AND status = 'retired'
+               )
+               AND to_jsonb(NEW) - ARRAY['status', 'released_at', 'updated_at'] =
+                   to_jsonb(OLD) - ARRAY['status', 'released_at', 'updated_at']
+               THEN
+                RETURN NEW;
+            END IF;
+            RAISE EXCEPTION
+                'provider_directory_projection_admission_transition_invalid'
+                USING ERRCODE = '55000';
+        END;
+        $$;
+
+        CREATE OR REPLACE FUNCTION
+        {quoted_schema}.guard_provider_directory_projection_recipe()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE
+            action_setting text := current_setting(
+                'healthporta.provider_directory_projection_action', true
+            );
+            recipe_id_setting text := current_setting(
+                'healthporta.provider_directory_projection_recipe_id', true
+            );
+            recipe_attempt_setting text := current_setting(
+                'healthporta.provider_directory_projection_recipe_attempt', true
+            );
+            recipe_lease_setting text := current_setting(
+                'healthporta.provider_directory_projection_recipe_lease_token',
+                true
+            );
+            physical_id_setting text := current_setting(
+                'healthporta.provider_directory_projection_physical_id', true
+            );
+        BEGIN
+            IF TG_OP = 'INSERT' THEN
+                IF action_setting <> 'recipe_insert'
+                   OR recipe_id_setting <> NEW.recipe_id
+                   OR recipe_attempt_setting <> NEW.attempt::text
+                   OR recipe_lease_setting <> NEW.lease_token
+                   OR NEW.status <> 'building'
+                   OR NEW.attempt <> 1
+                   OR NEW.lease_token !~ '^[0-9a-f]{{64}}$'
+                   OR NEW.lease_expires_at <= clock_timestamp()
+                   OR NEW.physical_projection_id IS NOT NULL
+                   OR NEW.stage_schema IS NOT NULL
+                   OR NEW.stage_relation IS NOT NULL
+                   OR NEW.stage_relation_oid IS NOT NULL
+                   OR NEW.workset_registered_at IS NOT NULL
+                   OR NEW.prepared_proof_json IS NOT NULL
+                   OR NEW.sealed_at IS NOT NULL THEN
+                    RAISE EXCEPTION
+                        'provider_directory_projection_recipe_insert_state_invalid'
+                        USING ERRCODE = '55000';
+                END IF;
+                RETURN NEW;
+            END IF;
+            IF NEW.status IN ('proof_ready', 'sealed')
+               AND NEW.status IS DISTINCT FROM OLD.status THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_native_attestation_required'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF TG_OP = 'DELETE' THEN
+                IF action_setting = 'gc'
+                   AND recipe_id_setting = OLD.recipe_id
+                   AND recipe_attempt_setting = OLD.attempt::text
+                   AND physical_id_setting = OLD.recipe_id
+                   AND COALESCE(recipe_lease_setting, '') = ''
+                   AND OLD.status = 'retired'
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {quoted_schema}.
+                              provider_directory_physical_projection
+                        WHERE physical_projection_id = OLD.recipe_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {quoted_schema}.
+                              provider_directory_physical_projection_reference
+                        WHERE physical_projection_id = OLD.recipe_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {quoted_schema}.
+                              provider_directory_projection_proof_shard
+                        WHERE recipe_id = OLD.recipe_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {quoted_schema}.
+                              provider_directory_projection_input_block
+                        WHERE recipe_id = OLD.recipe_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {quoted_schema}.
+                              provider_directory_projection_admission
+                        WHERE recipe_id = OLD.recipe_id
+                   ) THEN
+                    RETURN OLD;
+                END IF;
+                RAISE EXCEPTION
+                    'provider_directory_projection_recipe_immutable'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF OLD.recipe_id IS DISTINCT FROM NEW.recipe_id
+               OR OLD.decoder_contract_id IS DISTINCT FROM NEW.decoder_contract_id
+               OR OLD.input_set_sha256 IS DISTINCT FROM NEW.input_set_sha256
+               OR OLD.transform_contract_id IS DISTINCT FROM
+                  NEW.transform_contract_id
+               OR OLD.scope_contract_id IS DISTINCT FROM NEW.scope_contract_id
+               OR OLD.transform_context_hash IS DISTINCT FROM
+                  NEW.transform_context_hash
+               OR OLD.transform_context_json IS DISTINCT FROM
+                  NEW.transform_context_json
+               OR OLD.resource_profile_hash IS DISTINCT FROM
+                  NEW.resource_profile_hash
+               OR OLD.selected_resources_json IS DISTINCT FROM
+                  NEW.selected_resources_json
+               OR OLD.required_resources_json IS DISTINCT FROM
+                  NEW.required_resources_json
+               OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_recipe_identity_immutable'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF recipe_id_setting <> OLD.recipe_id
+               OR recipe_attempt_setting <> OLD.attempt::text THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_recipe_write_unfenced'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF action_setting = 'recipe_reclaim'
+               AND OLD.status IN ('building', 'proof_ready')
+               AND OLD.lease_expires_at <= clock_timestamp()
+               AND NEW.status = 'building'
+               AND NEW.attempt = OLD.attempt
+               AND NEW.lease_token = recipe_lease_setting
+               AND recipe_lease_setting ~ '^[0-9a-f]{{64}}$'
+               AND NEW.lease_expires_at > clock_timestamp()
+               AND to_jsonb(NEW) - ARRAY[
+                   'status', 'lease_token', 'lease_expires_at',
+                   'lease_heartbeat_at', 'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'status', 'lease_token', 'lease_expires_at',
+                   'lease_heartbeat_at', 'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'recipe_heartbeat'
+               AND OLD.status IN ('building', 'proof_ready')
+               AND NEW.status = OLD.status
+               AND OLD.lease_token = recipe_lease_setting
+               AND NEW.lease_token = OLD.lease_token
+               AND OLD.lease_expires_at > clock_timestamp()
+               AND NEW.lease_expires_at > clock_timestamp()
+               AND to_jsonb(NEW) - ARRAY[
+                   'lease_expires_at', 'lease_heartbeat_at', 'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'lease_expires_at', 'lease_heartbeat_at', 'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF OLD.status = 'failed' AND NEW.status = 'building' THEN
+                RAISE EXCEPTION
+                    'provider_directory_projection_failure_classification_required'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF action_setting = 'workset_register'
+               AND OLD.status = 'building' AND NEW.status = 'building'
+               AND OLD.lease_token = recipe_lease_setting
+               AND NEW.lease_token = OLD.lease_token
+               AND OLD.lease_expires_at > clock_timestamp()
+               AND NEW.lease_expires_at = OLD.lease_expires_at
+               AND OLD.workset_registered_at IS NULL
+               AND NEW.workset_registered_at IS NOT NULL
+               AND NEW.input_block_set_sha256 = NEW.input_set_sha256
+               AND NEW.input_block_count > 0
+               AND NEW.partition_set_sha256 IS NOT NULL
+               AND NEW.partition_count = NEW.input_block_count
+               AND (
+                   SELECT count(*)
+                     FROM {quoted_schema}.
+                          provider_directory_projection_input_block
+                    WHERE recipe_id = NEW.recipe_id
+               ) = NEW.input_block_count
+               AND (
+                   SELECT count(*)
+                     FROM {quoted_schema}.
+                          provider_directory_projection_proof_shard
+                    WHERE recipe_id = NEW.recipe_id
+                      AND attempt = NEW.attempt
+               ) = NEW.partition_count
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM {quoted_schema}.
+                          provider_directory_projection_input_block
+                          AS core_block
+                     LEFT JOIN {quoted_schema}.
+                          provider_directory_projection_proof_shard
+                          AS proof_shard
+                       ON proof_shard.recipe_id = core_block.recipe_id
+                      AND proof_shard.attempt = NEW.attempt
+                      AND proof_shard.input_block_id = core_block.block_id
+                    WHERE core_block.recipe_id = NEW.recipe_id
+                    GROUP BY core_block.block_id, core_block.content_sha256
+                   HAVING count(proof_shard.partition_id) <> 1
+                       OR bool_or(
+                           proof_shard.input_sha256 IS DISTINCT FROM
+                           core_block.content_sha256
+                       )
+               )
+               AND to_jsonb(NEW) - ARRAY[
+                   'input_block_set_sha256', 'input_block_count',
+                   'partition_set_sha256', 'partition_count',
+                   'workset_registered_at', 'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'input_block_set_sha256', 'input_block_count',
+                   'partition_set_sha256', 'partition_count',
+                   'workset_registered_at', 'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'stage_bind'
+               AND OLD.status = 'building' AND NEW.status = 'building'
+               AND OLD.lease_token = recipe_lease_setting
+               AND NEW.lease_token = OLD.lease_token
+               AND OLD.lease_expires_at > clock_timestamp()
+               AND OLD.workset_registered_at IS NOT NULL
+               AND {quoted_schema}.
+                   provider_directory_projection_stage_matches_parent(
+                       NEW.stage_schema,
+                       NEW.stage_relation,
+                       NEW.stage_relation_oid,
+                       'provider_directory_physical_projection_resource',
+                       false
+                   )
+               AND (
+                    OLD.stage_schema IS NULL
+                    OR (
+                        OLD.stage_schema = NEW.stage_schema
+                        AND OLD.stage_relation = NEW.stage_relation
+                        AND OLD.stage_relation_oid = NEW.stage_relation_oid
+                    )
+               )
+               AND to_jsonb(NEW) - ARRAY[
+                   'stage_schema', 'stage_relation', 'stage_relation_oid',
+                   'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'stage_schema', 'stage_relation', 'stage_relation_oid',
+                   'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'proof_ready'
+               AND OLD.status = 'building' AND NEW.status = 'proof_ready'
+               AND OLD.lease_token = recipe_lease_setting
+               AND NEW.lease_token = OLD.lease_token
+               AND OLD.lease_expires_at > clock_timestamp()
+               AND OLD.workset_registered_at IS NOT NULL
+               AND NEW.prepared_proof_json IS NOT NULL
+               AND NEW.prepared_proof_json ->> 'physical_projection_id' =
+                   NEW.recipe_id
+               AND jsonb_typeof(
+                       NEW.prepared_proof_json -> 'raw_shards'
+                   ) = 'array'
+               AND NOT (NEW.prepared_proof_json ? 'shards')
+               AND jsonb_array_length(
+                       NEW.prepared_proof_json -> 'raw_shards'
+                   ) = NEW.partition_count
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_projection_admission
+                     WHERE recipe_id = NEW.recipe_id
+                       AND status = 'sealed'
+               )
+               AND (
+                   SELECT count(*)
+                     FROM {quoted_schema}.
+                          provider_directory_projection_proof_shard
+                    WHERE recipe_id = NEW.recipe_id
+                      AND attempt = NEW.attempt
+                      AND status = 'complete'
+               ) = NEW.partition_count
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM jsonb_array_elements(
+                         NEW.prepared_proof_json -> 'raw_shards'
+                     ) AS expected_shard
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM {quoted_schema}.
+                               provider_directory_projection_proof_shard
+                               AS proof_shard
+                         WHERE proof_shard.recipe_id = NEW.recipe_id
+                           AND proof_shard.attempt = NEW.attempt
+                           AND proof_shard.status = 'complete'
+                           AND proof_shard.partition_id =
+                               expected_shard ->> 'partition_id'
+                           AND to_jsonb(proof_shard.partition_ordinal) =
+                               expected_shard -> 'partition_ordinal'
+                           AND proof_shard.resource_type =
+                               expected_shard ->> 'resource_type'
+                           AND proof_shard.input_sha256 =
+                               expected_shard ->> 'input_sha256'
+                           AND proof_shard.canonical_row_sha256 =
+                               expected_shard ->> 'canonical_row_sha256'
+                           AND to_jsonb(proof_shard.resource_count) =
+                               expected_shard -> 'resource_count'
+                           AND proof_shard.first_identity_json =
+                               expected_shard -> 'first_identity'
+                           AND proof_shard.last_identity_json =
+                               expected_shard -> 'last_identity'
+                    )
+               )
+               AND jsonb_typeof(
+                       NEW.prepared_proof_json -> 'source_summary'
+                   ) = 'object'
+               AND {quoted_schema}.
+                   provider_directory_projection_stage_matches_proof(
+                       NEW.stage_schema,
+                       NEW.stage_relation,
+                       NEW.stage_relation_oid,
+                       NULL,
+                       NEW.recipe_id,
+                       NEW.prepared_proof_json
+                   )
+               AND to_jsonb(NEW) - ARRAY[
+                   'status', 'prepared_proof_json', 'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'status', 'prepared_proof_json', 'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'seal'
+               AND OLD.status = 'proof_ready' AND NEW.status = 'sealed'
+               AND OLD.lease_token = recipe_lease_setting
+               AND OLD.lease_expires_at > clock_timestamp()
+               AND NEW.physical_projection_id = physical_id_setting
+               AND physical_id_setting = OLD.recipe_id
+               AND NEW.lease_token IS NULL
+               AND NEW.lease_expires_at IS NULL
+               AND NEW.lease_heartbeat_at IS NULL
+               AND NEW.sealed_at IS NOT NULL
+               AND {quoted_schema}.
+                   provider_directory_projection_stage_is_attached(
+                       OLD.stage_relation_oid,
+                       'provider_directory_physical_projection_resource',
+                       physical_id_setting
+                   )
+               AND EXISTS (
+                   SELECT 1
+                     FROM {quoted_schema}.provider_directory_physical_projection
+                          AS physical
+                    WHERE physical.physical_projection_id = physical_id_setting
+                      AND physical.proof_json = OLD.prepared_proof_json
+                      AND physical.status = 'sealed'
+                      AND physical.decoder_contract_id =
+                          OLD.decoder_contract_id
+                      AND physical.input_set_sha256 = OLD.input_set_sha256
+                      AND physical.transform_contract_id =
+                          OLD.transform_contract_id
+                      AND physical.scope_contract_id = OLD.scope_contract_id
+                      AND physical.transform_context_hash =
+                          OLD.transform_context_hash
+                      AND physical.transform_context_json =
+                          OLD.transform_context_json
+                      AND physical.resource_profile_hash =
+                          OLD.resource_profile_hash
+                      AND physical.selected_resources_json =
+                          OLD.selected_resources_json
+                      AND physical.required_resources_json =
+                          OLD.required_resources_json
+                      AND physical.storage_schema = OLD.stage_schema
+                      AND physical.storage_relation = OLD.stage_relation
+                      AND physical.storage_relation_oid =
+                          OLD.stage_relation_oid
+                      AND {quoted_schema}.
+                          provider_directory_projection_stage_matches_proof(
+                              physical.storage_schema,
+                              physical.storage_relation,
+                              physical.storage_relation_oid,
+                              physical.storage_trigger_oid,
+                              physical_id_setting,
+                              OLD.prepared_proof_json
+                          )
+                      AND {quoted_schema}.
+                          provider_directory_projection_stage_is_attached(
+                              physical.storage_relation_oid,
+                              'provider_directory_physical_projection_resource',
+                              physical_id_setting
+                          )
+                      AND EXISTS (
+                          SELECT 1
+                            FROM {quoted_schema}.
+                                 provider_directory_physical_projection_source_summary
+                                 AS source_summary
+                           WHERE source_summary.physical_projection_id =
+                                 physical_id_setting
+                             AND source_summary.proof_json =
+                                 OLD.prepared_proof_json -> 'source_summary'
+                      )
+                      AND (
+                          SELECT count(*)
+                            FROM {quoted_schema}.
+                                 provider_directory_physical_projection_partition
+                           WHERE physical_projection_id = physical_id_setting
+                      ) = jsonb_array_length(
+                          OLD.prepared_proof_json -> 'raw_shards'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM jsonb_array_elements(
+                                OLD.prepared_proof_json -> 'raw_shards'
+                            ) AS expected_shard
+                           WHERE NOT EXISTS (
+                               SELECT 1
+                                 FROM {quoted_schema}.
+                                      provider_directory_physical_projection_partition
+                                      AS partition_record
+                                WHERE partition_record.physical_projection_id =
+                                      physical_id_setting
+                                  AND partition_record.proof_json = expected_shard
+                                  AND partition_record.proof_partition_id =
+                                      expected_shard ->> 'partition_id'
+                                  AND to_jsonb(
+                                      partition_record.partition_ordinal
+                                  ) = expected_shard -> 'partition_ordinal'
+                                  AND partition_record.resource_type =
+                                      expected_shard ->> 'resource_type'
+                                  AND partition_record.canonical_row_sha256 =
+                                      expected_shard ->> 'canonical_row_sha256'
+                                  AND to_jsonb(
+                                      partition_record.resource_count
+                                  ) = expected_shard -> 'resource_count'
+                           )
+                      )
+                     FOR SHARE OF physical
+               )
+               AND to_jsonb(NEW) - ARRAY[
+                   'status', 'physical_projection_id', 'lease_token',
+                   'lease_expires_at', 'lease_heartbeat_at', 'sealed_at',
+                   'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'status', 'physical_projection_id', 'lease_token',
+                   'lease_expires_at', 'lease_heartbeat_at', 'sealed_at',
+                   'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'fail'
+               AND OLD.status IN ('building', 'proof_ready')
+               AND NEW.status = 'failed'
+               AND OLD.lease_token = recipe_lease_setting
+               AND OLD.lease_expires_at > clock_timestamp()
+               AND NEW.lease_token IS NULL
+               AND NEW.lease_expires_at IS NULL
+               AND NEW.lease_heartbeat_at IS NULL
+               AND NEW.physical_projection_id IS NULL
+               AND NEW.sealed_at IS NULL
+               AND to_jsonb(NEW) - ARRAY[
+                   'status', 'lease_token', 'lease_expires_at',
+                   'lease_heartbeat_at', 'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'status', 'lease_token', 'lease_expires_at',
+                   'lease_heartbeat_at', 'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            IF action_setting = 'gc'
+               AND OLD.status = 'sealed' AND NEW.status = 'retired'
+               AND physical_id_setting = OLD.physical_projection_id
+               AND COALESCE(recipe_lease_setting, '') = ''
+               AND NEW.physical_projection_id IS NULL
+               AND NEW.stage_schema IS NULL
+               AND NEW.stage_relation IS NULL
+               AND NEW.stage_relation_oid IS NULL
+               AND NEW.lease_token IS NULL
+               AND NEW.lease_expires_at IS NULL
+               AND EXISTS (
+                    SELECT 1
+                      FROM {quoted_schema}.provider_directory_physical_projection
+                     WHERE physical_projection_id = OLD.physical_projection_id
+                       AND status = 'retiring'
+                       AND retain_until <= clock_timestamp()
+               )
+               AND to_jsonb(NEW) - ARRAY[
+                   'status', 'physical_projection_id',
+                   'stage_schema', 'stage_relation', 'stage_relation_oid',
+                   'updated_at'
+               ] = to_jsonb(OLD) - ARRAY[
+                   'status', 'physical_projection_id',
+                   'stage_schema', 'stage_relation', 'stage_relation_oid',
+                   'updated_at'
+               ] THEN
+                RETURN NEW;
+            END IF;
+            RAISE EXCEPTION
+                'provider_directory_projection_recipe_transition_invalid'
                 USING ERRCODE = '55000';
         END;
         $$;
@@ -3955,18 +4899,6 @@ def _create_fences(schema: str) -> None:
             "reject_provider_directory_projection_resource_mutation",
         ),
         (
-            "provider_directory_projection_membership_guard",
-            "provider_directory_physical_projection_resource_membership",
-            "BEFORE INSERT OR UPDATE OR DELETE",
-            "reject_provider_directory_projection_stage_mutation",
-        ),
-        (
-            "provider_directory_projection_profile_contribution_guard",
-            "provider_directory_physical_projection_profile_contribution",
-            "BEFORE INSERT OR UPDATE OR DELETE",
-            "reject_provider_directory_projection_stage_mutation",
-        ),
-        (
             "provider_directory_projection_input_block_guard",
             "provider_directory_projection_input_block",
             "BEFORE INSERT OR UPDATE OR DELETE",
@@ -3977,6 +4909,30 @@ def _create_fences(schema: str) -> None:
             "provider_directory_projection_proof_shard",
             "BEFORE INSERT OR UPDATE OR DELETE",
             "guard_provider_directory_projection_proof_shard",
+        ),
+        (
+            "provider_directory_projection_shard_admission_guard",
+            "provider_directory_projection_proof_shard",
+            "BEFORE INSERT OR UPDATE OR DELETE",
+            "guard_provider_directory_projection_shard_admission",
+        ),
+        (
+            "provider_directory_projection_admission_block_guard",
+            "provider_directory_projection_admission_input_block",
+            "BEFORE INSERT OR UPDATE OR DELETE",
+            "guard_provider_directory_projection_admission_block",
+        ),
+        (
+            "provider_directory_projection_admission_stream_guard",
+            "provider_directory_projection_admission_stream",
+            "BEFORE INSERT OR UPDATE OR DELETE",
+            "guard_provider_directory_projection_admission_stream",
+        ),
+        (
+            "provider_directory_projection_admission_guard",
+            "provider_directory_projection_admission",
+            "BEFORE INSERT OR UPDATE OR DELETE",
+            "guard_provider_directory_projection_admission",
         ),
         (
             "provider_directory_projection_reference_guard",
@@ -4062,18 +5018,6 @@ def downgrade() -> None:
                  WHERE inheritance_record.inhparent =
                        '{schema}.provider_directory_physical_projection_resource'
                        ::regclass
-            ) OR EXISTS (
-                SELECT 1
-                  FROM pg_inherits AS inheritance_record
-                 WHERE inheritance_record.inhparent =
-                       '{schema}.provider_directory_physical_projection_resource_membership'
-                       ::regclass
-            ) OR EXISTS (
-                SELECT 1
-                  FROM pg_inherits AS inheritance_record
-                 WHERE inheritance_record.inhparent =
-                       '{schema}.provider_directory_physical_projection_profile_contribution'
-                       ::regclass
             ) THEN
                 RAISE EXCEPTION
                     'provider_directory_projection_downgrade_has_live_state'
@@ -4101,20 +5045,28 @@ def downgrade() -> None:
             "provider_directory_projection_proof_shard",
         ),
         (
+            "provider_directory_projection_shard_admission_guard",
+            "provider_directory_projection_proof_shard",
+        ),
+        (
+            "provider_directory_projection_admission_block_guard",
+            "provider_directory_projection_admission_input_block",
+        ),
+        (
+            "provider_directory_projection_admission_stream_guard",
+            "provider_directory_projection_admission_stream",
+        ),
+        (
+            "provider_directory_projection_admission_guard",
+            "provider_directory_projection_admission",
+        ),
+        (
             "provider_directory_projection_input_block_guard",
             "provider_directory_projection_input_block",
         ),
         (
             "provider_directory_projection_resource_guard",
             "provider_directory_physical_projection_resource",
-        ),
-        (
-            "provider_directory_projection_membership_guard",
-            "provider_directory_physical_projection_resource_membership",
-        ),
-        (
-            "provider_directory_projection_profile_contribution_guard",
-            "provider_directory_physical_projection_profile_contribution",
         ),
         (
             "provider_directory_projection_source_summary_guard",
@@ -4132,10 +5084,11 @@ def downgrade() -> None:
         "provider_directory_physical_projection_reference",
         "provider_directory_physical_projection_source_summary",
         "provider_directory_physical_projection_partition",
-        "provider_directory_physical_projection_profile_contribution",
-        "provider_directory_physical_projection_resource_membership",
         "provider_directory_physical_projection_resource",
         "provider_directory_projection_proof_shard",
+        "provider_directory_projection_admission_stream",
+        "provider_directory_projection_admission_input_block",
+        "provider_directory_projection_admission",
         "provider_directory_projection_input_block",
         "provider_directory_projection_recipe",
         "provider_directory_physical_projection",
@@ -4148,6 +5101,10 @@ def downgrade() -> None:
         "guard_provider_directory_projection_recipe",
         "guard_provider_directory_projection_reference",
         "guard_provider_directory_projection_proof_shard",
+        "guard_provider_directory_projection_shard_admission",
+        "guard_provider_directory_projection_admission_block",
+        "guard_provider_directory_projection_admission_stream",
+        "guard_provider_directory_projection_admission",
         "guard_provider_directory_projection_input_block",
         "reject_provider_directory_projection_stage_mutation",
         "reject_provider_directory_projection_resource_mutation",
@@ -4155,8 +5112,40 @@ def downgrade() -> None:
         op.execute(f"DROP FUNCTION {quoted_schema}.{function_name}()")
     op.execute(
         "DROP FUNCTION "
-        f"{quoted_schema}.provider_directory_projection_membership_matches_proof("
-        "text, text, bigint, bigint, text, jsonb, text, text)"
+        f"{quoted_schema}.provider_directory_projection_admission_scope_is_exact("
+        "text)"
+    )
+    op.execute(
+        "DROP FUNCTION "
+        f"{quoted_schema}.provider_directory_projection_admission_stream_is_exact("
+        "text, text, text, text, text, bigint, text, text, integer, text, "
+        "integer, integer, text)"
+    )
+    op.execute(
+        "DROP FUNCTION "
+        f"{quoted_schema}.provider_directory_projection_admission_mapping_is_exact("
+        "text, text, text, text, text, text, text, text, text, integer, bigint, "
+        "text, text, integer)"
+    )
+    op.execute(
+        "DROP FUNCTION "
+        f"{quoted_schema}.provider_directory_projection_admission_stream_set_sha256("
+        "text)"
+    )
+    op.execute(
+        "DROP FUNCTION "
+        f"{quoted_schema}.provider_directory_projection_admission_binding_set_sha256("
+        "text)"
+    )
+    op.execute(
+        "DROP FUNCTION "
+        f"{quoted_schema}.provider_directory_projection_admission_terminal_binding_id("
+        "text, text, text, text, integer, text, integer, integer, text)"
+    )
+    op.execute(
+        "DROP FUNCTION "
+        f"{quoted_schema}.provider_directory_projection_admission_input_binding_id("
+        "text, text, text, text, text, integer, text, text, integer)"
     )
     op.execute(
         "DROP FUNCTION "
@@ -4172,6 +5161,11 @@ def downgrade() -> None:
         "DROP FUNCTION "
         f"{quoted_schema}.provider_directory_projection_stage_matches_parent("
         "text, text, bigint, text, boolean)"
+    )
+    op.execute(
+        "DROP FUNCTION "
+        f"{quoted_schema}.provider_directory_projection_stage_is_attached("
+        "bigint, text, text)"
     )
     op.execute(
         "DROP FUNCTION "

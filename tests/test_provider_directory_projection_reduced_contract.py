@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+"""Internal candidate-envelope checks, never native publication attestation."""
+
 from __future__ import annotations
 
 import pytest
@@ -8,13 +10,18 @@ from process.provider_directory_projection_contract import (
     PROJECTION_REDUCER_PROOF_CONTRACT_ID,
     projection_completeness_manifest,
     projection_proof_shard,
+    projection_reducer_proof,
     projection_recipe_identity,
     reduced_physical_projection_proof,
 )
 from process.provider_directory_projection_contribution import (
     SEMANTIC_CONTRIBUTION_CONTRACT_ID,
     SEMANTIC_OUTCOME_PROOF_CONTRACT_ID,
+    SEMANTIC_STREAMING_REDUCER_CONTRACT_ID,
     reduce_semantic_outcomes,
+)
+from process.provider_directory_projection_semantic_evidence import (
+    SEMANTIC_TYPED_EVIDENCE_CONTRACT_ID,
 )
 from process.provider_directory_projection_inline_profile import (
     INLINE_PROFILE_EVIDENCE_CONTRACT_ID,
@@ -77,7 +84,7 @@ def _recipe():
     )
 
 
-def _proof_inputs():
+def _candidate_inputs():
     resources, contributions = semantic_rows_and_contributions()
     recipe = _recipe()
     outcome_proof = reduce_semantic_outcomes(resources, contributions)
@@ -92,62 +99,50 @@ def _proof_inputs():
     resource_count_by_type = {
         resource_type: 1 for resource_type in recipe.selected_resources
     }
-    reducer_proof_map = {
-        "contract_id": PROJECTION_REDUCER_PROOF_CONTRACT_ID,
-        "canonical_row_sha256": outcome_proof.canonical_row_sha256,
-        "resource_count": outcome_proof.resource_count,
-        "resource_counts": resource_count_by_type,
-        "semantic_outcome_proof_sha256": outcome_proof.proof_sha256,
-    }
-    membership_proof_map = {
-        "contract_id": "healthporta.provider-directory.semantic-membership.v1",
-        "present": False,
-        "membership_edge_count": 0,
-        "membership_sha256": digest("empty-membership"),
-        "membership_partition_count": 0,
-        "membership_partition_resource_counts": {},
-    }
+    reducer_proof_map = projection_reducer_proof(
+        outcome_proof,
+        resource_count_by_type,
+    )
     return (
         recipe,
         shard,
         outcome_proof,
         resource_count_by_type,
         reducer_proof_map,
-        membership_proof_map,
     )
 
 
-def test_reduced_projection_builds_source_summary_from_bound_outcome_proof():
+def test_candidate_projection_binds_derived_source_summary():
     (
         recipe,
         shard,
         outcome_proof,
         resource_counts,
         reducer_proof,
-        membership_proof,
-    ) = _proof_inputs()
+    ) = _candidate_inputs()
 
-    proof = reduced_physical_projection_proof(
+    candidate_projection = reduced_physical_projection_proof(
         recipe,
         [shard],
         dataset_hash=digest("dataset"),
         canonical_row_sha256=outcome_proof.canonical_row_sha256,
         resource_counts=resource_counts,
         reducer_proof=reducer_proof,
-        membership_proof=membership_proof,
         outcome_proof=outcome_proof,
     )
 
-    source_summary = proof.proof["source_summary"]
+    source_summary = candidate_projection.proof["source_summary"]
     semantic_summary = source_summary["semantic_summary"]
-    assert proof.canonical_row_sha256 == outcome_proof.canonical_row_sha256
+    assert (
+        candidate_projection.canonical_row_sha256
+        == outcome_proof.canonical_row_sha256
+    )
     assert source_summary["resource_counts"] == resource_counts
     assert semantic_summary["outcome_counts"] == outcome_proof.outcome_counts
     assert (
         semantic_summary["semantic_outcome_proof_sha256"]
         == outcome_proof.proof_sha256
     )
-    assert semantic_summary["supplemental_counts"] == {}
 
 
 @pytest.mark.parametrize(
@@ -159,7 +154,7 @@ def test_reduced_projection_builds_source_summary_from_bound_outcome_proof():
         ("reducer_row_hash", "reducer_proof_invalid"),
     ),
 )
-def test_reduced_projection_rejects_cross_wired_reducer_or_semantic_proof(
+def test_candidate_projection_rejects_cross_wired_reducer_or_semantic_input(
     mutation,
     expected_error,
 ):
@@ -169,8 +164,7 @@ def test_reduced_projection_rejects_cross_wired_reducer_or_semantic_proof(
         outcome_proof,
         resource_counts,
         reducer_proof,
-        membership_proof,
-    ) = _proof_inputs()
+    ) = _candidate_inputs()
     canonical_row_sha256 = outcome_proof.canonical_row_sha256
     if mutation == "row_hash":
         canonical_row_sha256 = digest("wrong-row-hash")
@@ -189,7 +183,6 @@ def test_reduced_projection_rejects_cross_wired_reducer_or_semantic_proof(
             canonical_row_sha256=canonical_row_sha256,
             resource_counts=resource_counts,
             reducer_proof=reducer_proof,
-            membership_proof=membership_proof,
             outcome_proof=outcome_proof,
         )
 
@@ -208,6 +201,12 @@ def test_recipe_resource_profile_hash_binds_every_semantic_contract():
             ),
             "semantic_outcome_proof_contract_id": (
                 SEMANTIC_OUTCOME_PROOF_CONTRACT_ID
+            ),
+            "semantic_streaming_reducer_contract_id": (
+                SEMANTIC_STREAMING_REDUCER_CONTRACT_ID
+            ),
+            "semantic_typed_evidence_contract_id": (
+                SEMANTIC_TYPED_EVIDENCE_CONTRACT_ID
             ),
             "semantic_source_summary_contract_id": (
                 SEMANTIC_SOURCE_SUMMARY_CONTRACT_ID

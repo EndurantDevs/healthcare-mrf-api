@@ -12,7 +12,10 @@ from process.provider_directory_projection_types import (
     PROJECTION_CONTENT_HASH_CONTRACT_ID,
     PROJECTION_PROOF_SHARD_CONTRACT_ID,
     PROJECTION_RECIPE_CONTRACT_ID,
+    PhysicalProjectionRecipeIdentity,
     PhysicalProjectionProof,
+    ProjectionAdmissionInputBlock,
+    ProjectionAdmissionTerminalZero,
     ProjectionCompletenessManifest,
     ProjectionInputBlock,
     ProjectionProofShard,
@@ -39,11 +42,15 @@ from process.provider_directory_projection_contribution import (
     SEMANTIC_CONTRIBUTION_COLUMNS,
     SEMANTIC_CONTRIBUTION_CONTRACT_ID,
     SEMANTIC_OUTCOME_PROOF_CONTRACT_ID,
+    SEMANTIC_STREAMING_REDUCER_CONTRACT_ID,
     normalized_semantic_contribution,
     validated_semantic_outcome_proof,
 )
 from process.provider_directory_projection_inline_profile import (
     INLINE_PROFILE_EVIDENCE_CONTRACT_ID,
+)
+from process.provider_directory_projection_semantic_evidence import (
+    SEMANTIC_TYPED_EVIDENCE_CONTRACT_ID,
 )
 
 
@@ -85,6 +92,15 @@ _TERMINAL_PARTITION_FIELDS = frozenset(
         "terminal",
         "terminal_cursor_hmac",
         "zero_row_proof_sha256",
+        "retained_stream",
+    }
+)
+_RETAINED_STREAM_FIELDS = frozenset(
+    {
+        "identity_sha256",
+        "stream_ordinal",
+        "terminal_sequence_ordinal",
+        "terminal_proof_sha256",
     }
 )
 
@@ -196,11 +212,42 @@ def _canonical_terminal_evidence(
     return terminal_cursor_hmac, zero_row_proof_sha256
 
 
+def _canonical_retained_stream(candidate: Any) -> dict[str, Any]:
+    """Validate one exact ordered retained-stream terminal descriptor."""
+
+    if not isinstance(candidate, Mapping) or set(candidate) != set(
+        _RETAINED_STREAM_FIELDS
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_retained_stream_invalid"
+        )
+    return {
+        "identity_sha256": _canonical_hash(
+            candidate["identity_sha256"],
+            "stream_identity_sha256",
+        ),
+        "stream_ordinal": _canonical_nonnegative_integer(
+            candidate["stream_ordinal"],
+            "stream_ordinal",
+        ),
+        "terminal_sequence_ordinal": _canonical_nonnegative_integer(
+            candidate["terminal_sequence_ordinal"],
+            "terminal_sequence_ordinal",
+        ),
+        "terminal_proof_sha256": _canonical_hash(
+            candidate["terminal_proof_sha256"],
+            "terminal_proof_sha256",
+        ),
+    }
+
+
 def _canonical_terminal_partition(candidate: Any) -> dict[str, Any]:
     """Validate one exact terminal-partition census entry."""
 
-    if not isinstance(candidate, Mapping) or set(candidate) != set(
-        _TERMINAL_PARTITION_FIELDS
+    required_fields = _TERMINAL_PARTITION_FIELDS - {"retained_stream"}
+    if not isinstance(candidate, Mapping) or set(candidate) not in (
+        set(required_fields),
+        set(_TERMINAL_PARTITION_FIELDS),
     ):
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_terminal_partition_invalid"
@@ -210,7 +257,7 @@ def _canonical_terminal_partition(candidate: Any) -> dict[str, Any]:
         candidate,
         count_by_field["row_count"],
     )
-    return {
+    canonical_partition_by_field = {
         "resource_type": _canonical_text(
             candidate["resource_type"],
             "resource_type",
@@ -229,6 +276,11 @@ def _canonical_terminal_partition(candidate: Any) -> dict[str, Any]:
         "zero_row_proof_sha256": zero_row_proof_sha256,
         "terminal": True,
     }
+    if "retained_stream" in candidate:
+        canonical_partition_by_field["retained_stream"] = _canonical_retained_stream(
+            candidate["retained_stream"]
+        )
+    return canonical_partition_by_field
 
 
 def _canonical_partition_census(candidate: Any) -> list[dict[str, Any]]:
@@ -259,12 +311,36 @@ def _canonical_partition_census(candidate: Any) -> list[dict[str, Any]]:
         )
         for partition in canonical_partitions
     }
-    if terminal_partitions != canonical_partitions or len(coordinates) != len(
-        canonical_partitions
+    retained_streams = [
+        partition["retained_stream"]
+        for partition in canonical_partitions
+        if "retained_stream" in partition
+    ]
+    stream_identities = {
+        stream["identity_sha256"] for stream in retained_streams
+    }
+    stream_ordinals = {stream["stream_ordinal"] for stream in retained_streams}
+    if (
+        terminal_partitions != canonical_partitions
+        or len(coordinates) != len(canonical_partitions)
+        or (retained_streams and len(retained_streams) != len(canonical_partitions))
+        or len(stream_identities) != len(retained_streams)
+        or stream_ordinals != set(range(len(retained_streams)))
     ):
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_completeness_manifest_invalid"
         )
+    for partition in canonical_partitions:
+        retained_stream = partition.get("retained_stream")
+        if (
+            partition["row_count"] == 0
+            and retained_stream is not None
+            and partition["zero_row_proof_sha256"]
+            != retained_stream["terminal_proof_sha256"]
+        ):
+            raise ProviderDirectoryProjectionError(
+                "provider_directory_projection_terminal_partition_invalid"
+            )
     return canonical_partitions
 
 
@@ -473,6 +549,36 @@ def _recipe_components(
     }
 
 
+def _resource_profile_hash(
+    selected_resources: Sequence[str],
+    required_resources: Sequence[str],
+) -> str:
+    return stable_hash(
+        {
+            "selected": list(selected_resources),
+            "required": list(required_resources),
+            "inline_profile_evidence_contract_id": (
+                INLINE_PROFILE_EVIDENCE_CONTRACT_ID
+            ),
+            "semantic_contribution_contract_id": SEMANTIC_CONTRIBUTION_CONTRACT_ID,
+            "semantic_outcome_proof_contract_id": (
+                SEMANTIC_OUTCOME_PROOF_CONTRACT_ID
+            ),
+            "semantic_streaming_reducer_contract_id": (
+                SEMANTIC_STREAMING_REDUCER_CONTRACT_ID
+            ),
+            "semantic_typed_evidence_contract_id": (
+                SEMANTIC_TYPED_EVIDENCE_CONTRACT_ID
+            ),
+            "semantic_source_summary_contract_id": (
+                SEMANTIC_SOURCE_SUMMARY_CONTRACT_ID
+            ),
+            "reducer_proof_contract_id": PROJECTION_REDUCER_PROOF_CONTRACT_ID,
+        },
+        domain="provider-directory-projection-resource-profile-v1",
+    )
+
+
 def _recipe_payload(components: Mapping[str, Any]) -> dict[str, Any]:
     source_ids = components["source_ids"]
     selected = components["selected_resources"]
@@ -494,26 +600,7 @@ def _recipe_payload(components: Mapping[str, Any]) -> dict[str, Any]:
             domain="provider-directory-projection-transform-context-v1",
         ),
         "transform_context": components["transform_context"],
-        "resource_profile_hash": stable_hash(
-            {
-                "selected": list(selected),
-                "required": list(required),
-                "inline_profile_evidence_contract_id": (
-                    INLINE_PROFILE_EVIDENCE_CONTRACT_ID
-                ),
-                "semantic_contribution_contract_id": (
-                    SEMANTIC_CONTRIBUTION_CONTRACT_ID
-                ),
-                "semantic_outcome_proof_contract_id": (
-                    SEMANTIC_OUTCOME_PROOF_CONTRACT_ID
-                ),
-                "semantic_source_summary_contract_id": (
-                    SEMANTIC_SOURCE_SUMMARY_CONTRACT_ID
-                ),
-                "reducer_proof_contract_id": PROJECTION_REDUCER_PROOF_CONTRACT_ID,
-            },
-            domain="provider-directory-projection-resource-profile-v1",
-        ),
+        "resource_profile_hash": _resource_profile_hash(selected, required),
         "selected_resources": list(selected),
         "required_resources": list(required),
         "completeness_manifest_hash": components["completeness_manifest_hash"],
@@ -533,7 +620,6 @@ def _source_neutral_recipe_payload(identity: Mapping[str, Any]) -> dict[str, Any
         "resource_profile_hash": identity["resource_profile_hash"],
         "selected_resources": identity["selected_resources"],
         "required_resources": identity["required_resources"],
-        "completeness_manifest_hash": identity["completeness_manifest_hash"],
     }
 
 
@@ -587,45 +673,140 @@ def projection_recipe_identity(
     )
 
 
-def _validate_recipe_completeness(recipe: ProjectionRecipeIdentity) -> None:
-    """Revalidate the shallow recipe manifest at each consuming boundary."""
+def validated_projection_recipe_identity(
+    recipe: ProjectionRecipeIdentity,
+) -> ProjectionRecipeIdentity:
+    """Rebuild every recipe field so public dataclasses cannot forge identity."""
 
-    validated_projection_completeness_manifest(
-        ProjectionCompletenessManifest(
+    if type(recipe) is not ProjectionRecipeIdentity:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_recipe_identity_invalid"
+        )
+    rebuilt_recipe = projection_recipe_identity(
+        decoder_contract_id=recipe.decoder_contract_id,
+        acquisition_adapter_id=recipe.acquisition_adapter_id,
+        input_set_sha256=recipe.input_set_sha256,
+        source_ids=recipe.source_ids,
+        transform_contract_id=recipe.transform_contract_id,
+        scope_contract_id=recipe.scope_contract_id,
+        transform_context=recipe.transform_context,
+        selected_resources=recipe.selected_resources,
+        required_resources=recipe.required_resources,
+        completeness_manifest=ProjectionCompletenessManifest(
             recipe.completeness_manifest_hash,
             recipe.completeness_manifest,
+        ),
+    )
+    if recipe != rebuilt_recipe:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_recipe_identity_mismatch"
+        )
+    return rebuilt_recipe
+
+
+def validated_physical_projection_recipe_identity(
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
+) -> PhysicalProjectionRecipeIdentity:
+    """Return an exact campaign-blind recipe view for worker boundaries."""
+
+    if type(recipe) is ProjectionRecipeIdentity:
+        return validated_projection_recipe_identity(recipe).physical
+    if type(recipe) is not PhysicalProjectionRecipeIdentity:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_physical_recipe_invalid"
+        )
+    context_map = {
+        "as_of_date": required_text(
+            recipe.transform_context.get("as_of_date"),
+            "as_of_date",
+            limit=10,
+        ),
+        "time_rule_contract_id": required_text(
+            recipe.transform_context.get("time_rule_contract_id"),
+            "time_rule_contract_id",
+        ),
+    }
+    try:
+        dt.date.fromisoformat(context_map["as_of_date"])
+    except ValueError as error:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_as_of_date_invalid"
+        ) from error
+    selected_resources = sorted_unique_texts(
+        recipe.selected_resources,
+        "selected_resource",
+        limit=64,
+    )
+    required_resources = tuple(
+        sorted(
+            {
+                required_text(resource_type, "required_resource", limit=64)
+                for resource_type in recipe.required_resources
+            }
         )
     )
+    rebuilt_recipe = PhysicalProjectionRecipeIdentity(
+        recipe_id=required_hash(recipe.recipe_id, "recipe_id"),
+        decoder_contract_id=required_text(
+            recipe.decoder_contract_id,
+            "decoder_contract_id",
+        ),
+        input_set_sha256=required_hash(
+            recipe.input_set_sha256,
+            "input_set_sha256",
+        ),
+        transform_contract_id=required_text(
+            recipe.transform_contract_id,
+            "transform_contract_id",
+        ),
+        scope_contract_id=required_text(
+            recipe.scope_contract_id,
+            "scope_contract_id",
+        ),
+        transform_context_hash=stable_hash(
+            context_map,
+            domain="provider-directory-projection-transform-context-v1",
+        ),
+        transform_context=context_map,
+        resource_profile_hash=_resource_profile_hash(
+            selected_resources,
+            required_resources,
+        ),
+        selected_resources=selected_resources,
+        required_resources=required_resources,
+    )
+    expected_recipe_id = stable_hash(
+        rebuilt_recipe.identity_payload,
+        domain="provider-directory-projection-recipe-id-v1",
+    )
+    if (
+        not set(required_resources).issubset(selected_resources)
+        or set(recipe.transform_context) != set(context_map)
+        or rebuilt_recipe.recipe_id != expected_recipe_id
+        or rebuilt_recipe != recipe
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_physical_recipe_mismatch"
+        )
+    return rebuilt_recipe
 
 
 def projection_input_block(
     *,
-    block_ordinal: int,
     upstream_artifact_id: str,
     source_object_id: str,
     block_kind: str,
     input_contract_id: str,
-    source_partition_ordinal: int,
     record_start: int,
     record_count: int,
     content_sha256: str,
     payload_sha256: str,
     payload_bytes: int,
     summary: Mapping[str, int],
-    retained_campaign_id: str,
-    retained_campaign_sha256: str,
-    retained_source_item_id: str,
-    retained_range_ordinal: int | None,
 ) -> ProjectionInputBlock:
-    """Build one source-neutral immutable retained-block descriptor."""
+    """Build one campaign-blind immutable retained-byte descriptor."""
 
-    integer_fields = (
-        block_ordinal,
-        source_partition_ordinal,
-        record_start,
-        record_count,
-        payload_bytes,
-    )
+    integer_fields = (record_start, record_count, payload_bytes)
     if any(
         isinstance(coordinate_value, bool)
         or not isinstance(coordinate_value, int)
@@ -635,9 +816,7 @@ def projection_input_block(
             "provider_directory_projection_input_block_coordinate_invalid"
         )
     if (
-        block_ordinal < 0
-        or source_partition_ordinal < 0
-        or record_start < 0
+        record_start < 0
         or record_count < 1
         or payload_bytes < 1
     ):
@@ -664,29 +843,8 @@ def projection_input_block(
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_input_block_bound_exceeded"
         )
-    if retained_range_ordinal is not None and (
-        isinstance(retained_range_ordinal, bool)
-        or not isinstance(retained_range_ordinal, int)
-        or retained_range_ordinal < 0
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_retained_range_ordinal_invalid"
-        )
-    normalized_retained_campaign_id = required_hash(
-        retained_campaign_id,
-        "retained_campaign_id",
-    )
-    normalized_retained_campaign_sha256 = required_hash(
-        retained_campaign_sha256,
-        "retained_campaign_sha256",
-    )
-    normalized_retained_source_item_id = required_hash(
-        retained_source_item_id,
-        "retained_source_item_id",
-    )
     block_descriptor_map = {
         "contract_id": PROJECTION_INPUT_BLOCK_CONTRACT_ID,
-        "block_ordinal": block_ordinal,
         "upstream_artifact_id": required_hash(
             upstream_artifact_id,
             "upstream_artifact_id",
@@ -697,7 +855,6 @@ def projection_input_block(
             input_contract_id,
             "input_contract_id",
         ),
-        "source_partition_ordinal": source_partition_ordinal,
         "record_start": record_start,
         "record_count": record_count,
         "content_sha256": required_hash(content_sha256, "content_sha256"),
@@ -711,23 +868,177 @@ def projection_input_block(
     )
     return ProjectionInputBlock(
         block_id=block_proof_sha256,
-        block_ordinal=block_ordinal,
         upstream_artifact_id=block_descriptor_map["upstream_artifact_id"],
         source_object_id=block_descriptor_map["source_object_id"],
         block_kind=block_descriptor_map["block_kind"],
         input_contract_id=block_descriptor_map["input_contract_id"],
-        source_partition_ordinal=source_partition_ordinal,
         record_start=record_start,
         record_count=record_count,
         content_sha256=block_descriptor_map["content_sha256"],
         payload_sha256=block_descriptor_map["payload_sha256"],
         payload_bytes=payload_bytes,
         summary=normalized_summary_count_map,
-        retained_campaign_id=normalized_retained_campaign_id,
-        retained_campaign_sha256=normalized_retained_campaign_sha256,
-        retained_source_item_id=normalized_retained_source_item_id,
-        retained_range_ordinal=retained_range_ordinal,
         block_proof_sha256=block_proof_sha256,
+    )
+
+
+def _validated_admission_coordinate(
+    retained_range_ordinal: int | None,
+    resource_type: str,
+    partition_key_hash: str,
+    source_partition_ordinal: int,
+) -> tuple[int | None, str, str, int]:
+    """Validate one logical terminal coordinate shared by admission records."""
+
+    is_invalid_range = retained_range_ordinal is not None and (
+        type(retained_range_ordinal) is not int or retained_range_ordinal < 0
+    )
+    if (
+        type(source_partition_ordinal) is not int
+        or source_partition_ordinal < 0
+        or is_invalid_range
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_admission_coordinate_invalid"
+        )
+    return (
+        retained_range_ordinal,
+        required_text(resource_type, "resource_type", limit=64),
+        required_hash(partition_key_hash, "partition_key_hash"),
+        source_partition_ordinal,
+    )
+
+
+def projection_admission_input_block(
+    block: ProjectionInputBlock,
+    *,
+    retained_campaign_id: str,
+    retained_campaign_sha256: str,
+    retained_source_item_id: str,
+    retained_range_ordinal: int | None,
+    resource_type: str,
+    partition_key_hash: str,
+    source_partition_ordinal: int,
+) -> ProjectionAdmissionInputBlock:
+    """Bind one physical block to a campaign-owned terminal coordinate."""
+
+    block = _validated_projection_input_block(block)
+    retained_range_ordinal, resource_type, partition_key_hash, _ = (
+        _validated_admission_coordinate(
+            retained_range_ordinal,
+            resource_type,
+            partition_key_hash,
+            source_partition_ordinal,
+        )
+    )
+    retained_campaign_id = required_hash(retained_campaign_id, "retained_campaign_id")
+    retained_campaign_sha256 = required_hash(
+        retained_campaign_sha256,
+        "retained_campaign_sha256",
+    )
+    retained_source_item_id = required_hash(
+        retained_source_item_id,
+        "retained_source_item_id",
+    )
+    binding_values = (
+        block.block_id,
+        retained_campaign_id,
+        retained_source_item_id,
+        block.upstream_artifact_id,
+        block.source_object_id,
+        retained_range_ordinal,
+        resource_type,
+        partition_key_hash,
+        source_partition_ordinal,
+    )
+    binding_id = _pipe_identity_hash(
+        "provider-directory-projection-admission-input-binding-v1",
+        binding_values,
+    )
+    return ProjectionAdmissionInputBlock(
+        binding_id=binding_id,
+        block=block,
+        retained_campaign_id=retained_campaign_id,
+        retained_campaign_sha256=retained_campaign_sha256,
+        retained_source_item_id=retained_source_item_id,
+        retained_range_ordinal=retained_range_ordinal,
+        resource_type=resource_type,
+        partition_key_hash=partition_key_hash,
+        source_partition_ordinal=source_partition_ordinal,
+    )
+
+
+def _pipe_identity_hash(domain: str, values: Sequence[Any]) -> str:
+    """Hash one exact ASCII scalar record with explicit null spelling."""
+
+    digest = hashlib.sha256()
+    digest.update(domain.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(
+        "|".join("~" if value is None else str(value) for value in values).encode(
+            "ascii"
+        )
+    )
+    return digest.hexdigest()
+
+
+def projection_admission_terminal_zero(
+    *,
+    retained_campaign_id: str,
+    retained_campaign_sha256: str,
+    retained_source_item_id: str,
+    resource_type: str,
+    partition_key_hash: str,
+    source_partition_ordinal: int,
+    retained_stream: Mapping[str, Any],
+) -> ProjectionAdmissionTerminalZero:
+    """Bind an ordered stream's retained terminal item without a physical block."""
+
+    if type(source_partition_ordinal) is not int or source_partition_ordinal < 0:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_admission_coordinate_invalid"
+        )
+    normalized_stream = _canonical_retained_stream(retained_stream)
+    retained_campaign_id = required_hash(
+        retained_campaign_id,
+        "retained_campaign_id",
+    )
+    retained_campaign_sha256 = required_hash(
+        retained_campaign_sha256,
+        "retained_campaign_sha256",
+    )
+    retained_source_item_id = required_hash(
+        retained_source_item_id,
+        "retained_source_item_id",
+    )
+    resource_type = required_text(resource_type, "resource_type", limit=64)
+    partition_key_hash = required_hash(partition_key_hash, "partition_key_hash")
+    binding_id = _pipe_identity_hash(
+        "provider-directory-projection-admission-terminal-binding-v1",
+        (
+            retained_campaign_id,
+            retained_source_item_id,
+            resource_type,
+            partition_key_hash,
+            source_partition_ordinal,
+            normalized_stream["identity_sha256"],
+            normalized_stream["stream_ordinal"],
+            normalized_stream["terminal_sequence_ordinal"],
+            normalized_stream["terminal_proof_sha256"],
+        ),
+    )
+    return ProjectionAdmissionTerminalZero(
+        binding_id=binding_id,
+        retained_campaign_id=retained_campaign_id,
+        retained_campaign_sha256=retained_campaign_sha256,
+        retained_source_item_id=retained_source_item_id,
+        resource_type=resource_type,
+        partition_key_hash=partition_key_hash,
+        source_partition_ordinal=source_partition_ordinal,
+        stream_identity_sha256=normalized_stream["identity_sha256"],
+        stream_ordinal=normalized_stream["stream_ordinal"],
+        terminal_sequence_ordinal=normalized_stream["terminal_sequence_ordinal"],
+        terminal_proof_sha256=normalized_stream["terminal_proof_sha256"],
     )
 
 
@@ -735,34 +1046,13 @@ def projection_input_set_sha256(
     blocks: Iterable[ProjectionInputBlock],
     *,
     decoder_contract_id: str,
-    completeness_manifest: ProjectionCompletenessManifest,
 ) -> str:
-    """Recompute physical input identity without retained campaign bindings."""
+    """Recompute physical input identity without acquisition-campaign evidence."""
 
-    validated_completeness = validated_projection_completeness_manifest(
-        completeness_manifest
-    )
+    validated_blocks = (_validated_projection_input_block(block) for block in blocks)
     normalized_blocks = sorted(
-        (
-            {
-                "block_id": block.block_id,
-                "block_ordinal": block.block_ordinal,
-                "upstream_artifact_id": block.upstream_artifact_id,
-                "source_object_id": block.source_object_id,
-                "block_kind": block.block_kind,
-                "input_contract_id": block.input_contract_id,
-                "source_partition_ordinal": block.source_partition_ordinal,
-                "record_start": block.record_start,
-                "record_count": block.record_count,
-                "content_sha256": block.content_sha256,
-                "payload_sha256": block.payload_sha256,
-                "payload_bytes": block.payload_bytes,
-                "summary": dict(block.summary),
-                "block_proof_sha256": block.block_proof_sha256,
-            }
-            for block in blocks
-        ),
-        key=lambda block: (block["block_ordinal"], block["block_id"]),
+        (_physical_input_block_descriptor(block) for block in validated_blocks),
+        key=lambda block: block["block_id"],
     )
     if len({block["block_id"] for block in normalized_blocks}) != len(
         normalized_blocks
@@ -777,14 +1067,57 @@ def projection_input_set_sha256(
                 decoder_contract_id,
                 "decoder_contract_id",
             ),
-            "completeness_manifest_hash": required_hash(
-                validated_completeness.manifest_sha256,
-                "completeness_manifest_hash",
-            ),
             "blocks": normalized_blocks,
         },
         domain="provider-directory-projection-input-manifest-v1",
     )
+
+
+def _validated_projection_input_block(
+    block: ProjectionInputBlock,
+) -> ProjectionInputBlock:
+    """Reject forged public input-block dataclasses before hashing them."""
+
+    if type(block) is not ProjectionInputBlock or not isinstance(block.summary, Mapping):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_input_block_invalid"
+        )
+    rebuilt_block = projection_input_block(
+        upstream_artifact_id=block.upstream_artifact_id,
+        source_object_id=block.source_object_id,
+        block_kind=block.block_kind,
+        input_contract_id=block.input_contract_id,
+        record_start=block.record_start,
+        record_count=block.record_count,
+        content_sha256=block.content_sha256,
+        payload_sha256=block.payload_sha256,
+        payload_bytes=block.payload_bytes,
+        summary=block.summary,
+    )
+    if rebuilt_block != block:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_input_block_invalid"
+        )
+    return block
+
+
+def _physical_input_block_descriptor(block: ProjectionInputBlock) -> dict[str, Any]:
+    """Return the campaign-neutral descriptor included in physical identity."""
+
+    return {
+        "block_id": block.block_id,
+        "upstream_artifact_id": block.upstream_artifact_id,
+        "source_object_id": block.source_object_id,
+        "block_kind": block.block_kind,
+        "input_contract_id": block.input_contract_id,
+        "record_start": block.record_start,
+        "record_count": block.record_count,
+        "content_sha256": block.content_sha256,
+        "payload_sha256": block.payload_sha256,
+        "payload_bytes": block.payload_bytes,
+        "summary": dict(block.summary),
+        "block_proof_sha256": block.block_proof_sha256,
+    }
 
 
 def projection_completeness_manifest(
@@ -861,12 +1194,24 @@ def projection_completeness_manifest(
                 "provider_directory_projection_terminal_partition_invalid"
             )
         zero_row_proof = partition.get("zero_row_proof_sha256")
+        retained_stream = None
+        if "retained_stream" in partition:
+            retained_stream = _canonical_retained_stream(
+                partition["retained_stream"]
+            )
         if partition_count_by_field["row_count"] == 0:
             zero_row_proof = _canonical_hash(
                 zero_row_proof,
                 "zero_row_proof_sha256",
             )
             if any(partition_count_by_field.values()):
+                raise ProviderDirectoryProjectionError(
+                    "provider_directory_projection_terminal_partition_invalid"
+                )
+            if (
+                retained_stream is not None
+                and zero_row_proof != retained_stream["terminal_proof_sha256"]
+            ):
                 raise ProviderDirectoryProjectionError(
                     "provider_directory_projection_terminal_partition_invalid"
                 )
@@ -881,17 +1226,18 @@ def projection_completeness_manifest(
             raise ProviderDirectoryProjectionError(
                 "provider_directory_projection_terminal_partition_invalid"
             )
-        normalized_partitions.append(
-            {
-                "resource_type": resource_type,
-                "partition_key_hash": partition_key_hash,
-                "source_partition_ordinal": source_partition_ordinal,
-                "terminal_cursor_hmac": cursor_hmac,
-                **partition_count_by_field,
-                "zero_row_proof_sha256": zero_row_proof,
-                "terminal": True,
-            }
-        )
+        normalized_partition_by_field = {
+            "resource_type": resource_type,
+            "partition_key_hash": partition_key_hash,
+            "source_partition_ordinal": source_partition_ordinal,
+            "terminal_cursor_hmac": cursor_hmac,
+            **partition_count_by_field,
+            "zero_row_proof_sha256": zero_row_proof,
+            "terminal": True,
+        }
+        if retained_stream is not None:
+            normalized_partition_by_field["retained_stream"] = retained_stream
+        normalized_partitions.append(normalized_partition_by_field)
     normalized_partitions.sort(
         key=lambda partition: (
             partition["resource_type"],
@@ -953,40 +1299,26 @@ def projection_completeness_manifest(
 
 def projection_shard_spec(
     *,
-    recipe: ProjectionRecipeIdentity,
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
     partition_ordinal: int,
-    partition_key: str,
     input_block: ProjectionInputBlock,
-    resource_type: str,
-    input_sha256: str | None = None,
 ) -> ProjectionShardSpec:
-    """Build the stable pre-transform identity used for shard leasing."""
+    """Build one block-derived campaign-blind execution shard."""
 
-    _validate_recipe_completeness(recipe)
+    recipe = validated_physical_projection_recipe_identity(recipe)
+    input_block = _validated_projection_input_block(input_block)
     if partition_ordinal < 0:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_partition_coordinate_invalid"
         )
-    normalized_type = required_text(resource_type, "resource_type", limit=64)
-    if (
-        normalized_type != PROJECTION_MIXED_RESOURCE_TYPE
-        and normalized_type not in recipe.selected_resources
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_partition_resource_mismatch"
-        )
-    normalized_input_hash = required_hash(
-        input_sha256 or input_block.content_sha256,
-        "input_sha256",
-    )
     shard_descriptor_map = {
         "contract_id": PROJECTION_SHARD_SPEC_CONTRACT_ID,
         "recipe_id": recipe.recipe_id,
         "partition_ordinal": partition_ordinal,
-        "partition_key": required_hash(partition_key, "partition_key"),
+        "partition_key": input_block.block_id,
         "input_block_id": required_hash(input_block.block_id, "input_block_id"),
-        "resource_type": normalized_type,
-        "input_sha256": normalized_input_hash,
+        "resource_type": PROJECTION_MIXED_RESOURCE_TYPE,
+        "input_sha256": input_block.content_sha256,
     }
     return ProjectionShardSpec(
         partition_id=stable_hash(
@@ -994,10 +1326,10 @@ def projection_shard_spec(
             domain="provider-directory-projection-partition-id-v2",
         ),
         partition_ordinal=partition_ordinal,
-        partition_key=shard_descriptor_map["partition_key"],
+        partition_key=input_block.block_id,
         input_block_id=shard_descriptor_map["input_block_id"],
-        resource_type=normalized_type,
-        input_sha256=normalized_input_hash,
+        resource_type=PROJECTION_MIXED_RESOURCE_TYPE,
+        input_sha256=input_block.content_sha256,
     )
 
 
@@ -1104,7 +1436,7 @@ def _ordered_partition_resources(
 def prepare_projection_proof_shard(
     resources: Iterable[Mapping[str, Any]],
     *,
-    recipe: ProjectionRecipeIdentity,
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
     attempt: int,
     partition_ordinal: int,
     resource_type: str,
@@ -1115,7 +1447,7 @@ def prepare_projection_proof_shard(
 ) -> tuple[ProjectionProofShard, list[dict[str, Any]]]:
     """Build one shard proof and return its single normalized ordered row set."""
 
-    _validate_recipe_completeness(recipe)
+    recipe = validated_physical_projection_recipe_identity(recipe)
     if attempt < 1 or partition_attempt < 1 or partition_ordinal < 0:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_partition_coordinate_invalid"
@@ -1185,7 +1517,7 @@ def prepare_projection_proof_shard(
 def projection_proof_shard(
     resources: Iterable[Mapping[str, Any]],
     *,
-    recipe: ProjectionRecipeIdentity,
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
     attempt: int,
     partition_ordinal: int,
     resource_type: str,
@@ -1211,7 +1543,7 @@ def projection_proof_shard(
 
 
 def _resource_counts(
-    recipe: ProjectionRecipeIdentity,
+    recipe: PhysicalProjectionRecipeIdentity,
     shards: Sequence[ProjectionProofShard],
 ) -> dict[str, int]:
     partition_ids: set[str] = set()
@@ -1270,7 +1602,7 @@ def _resource_counts(
 
 
 def _physical_content_identity(
-    recipe: ProjectionRecipeIdentity,
+    recipe: PhysicalProjectionRecipeIdentity,
     canonical_row_sha256: str,
     dataset_hash: str,
     counts_by_resource: Mapping[str, int],
@@ -1283,7 +1615,6 @@ def _physical_content_identity(
         "scope_contract_id": recipe.scope_contract_id,
         "transform_context_hash": recipe.transform_context_hash,
         "transform_context": dict(recipe.transform_context),
-        "completeness_manifest_hash": recipe.completeness_manifest_hash,
         "canonical_row_sha256": canonical_row_sha256,
         "dataset_hash": dataset_hash,
         "resource_profile_hash": recipe.resource_profile_hash,
@@ -1295,14 +1626,14 @@ def _physical_content_identity(
 
 
 def _basic_physical_projection_proof(
-    recipe: ProjectionRecipeIdentity,
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
     shards: Sequence[ProjectionProofShard],
     *,
     dataset_hash: str,
 ) -> PhysicalProjectionProof:
     """Build a non-publishable raw-shard proof for internal contract tests."""
 
-    _validate_recipe_completeness(recipe)
+    recipe = validated_physical_projection_recipe_identity(recipe)
     if not shards:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_proof_shards_empty"
@@ -1389,8 +1720,49 @@ def _validated_reducer_proof_map(
     return dict(reducer_proof)
 
 
+def projection_reducer_proof(
+    outcome_proof: ProjectionSemanticOutcomeProof,
+    resource_counts: Mapping[str, int],
+) -> dict[str, Any]:
+    """Build the exact bounded proof joining reducer output to row counts."""
+
+    validated_outcome = validated_semantic_outcome_proof(outcome_proof)
+    if not isinstance(resource_counts, Mapping):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_reducer_proof_invalid"
+        )
+    normalized_count_by_resource: dict[str, int] = {}
+    for resource_type, count in resource_counts.items():
+        if type(count) is not int or count < 0:
+            raise ProviderDirectoryProjectionError(
+                "provider_directory_projection_reducer_proof_invalid"
+            )
+        normalized_count_by_resource[
+            required_text(resource_type, "resource_type", limit=64)
+        ] = count
+    positive_count_by_resource = {
+        resource_type: count
+        for resource_type, count in normalized_count_by_resource.items()
+        if count > 0
+    }
+    if (
+        sum(normalized_count_by_resource.values()) != validated_outcome.resource_count
+        or positive_count_by_resource != validated_outcome.resource_counts
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_reducer_proof_invalid"
+        )
+    return {
+        "contract_id": PROJECTION_REDUCER_PROOF_CONTRACT_ID,
+        "canonical_row_sha256": validated_outcome.canonical_row_sha256,
+        "resource_count": validated_outcome.resource_count,
+        "resource_counts": dict(sorted(normalized_count_by_resource.items())),
+        "semantic_outcome_proof_sha256": validated_outcome.proof_sha256,
+    }
+
+
 def _physical_source_summary_map(
-    recipe: ProjectionRecipeIdentity,
+    recipe: PhysicalProjectionRecipeIdentity,
     dataset_hash: str,
     canonical_row_sha256: str,
     resource_count_by_type: Mapping[str, int],
@@ -1419,19 +1791,18 @@ def _physical_source_summary_map(
 
 
 def reduced_physical_projection_proof(
-    recipe: ProjectionRecipeIdentity,
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
     raw_shards: Sequence[ProjectionProofShard],
     *,
     dataset_hash: str,
     canonical_row_sha256: str,
     resource_counts: Mapping[str, int],
     reducer_proof: Mapping[str, Any],
-    membership_proof: Mapping[str, Any],
     outcome_proof: ProjectionSemanticOutcomeProof,
 ) -> PhysicalProjectionProof:
     """Seal deterministic reducer output while retaining raw shard lineage."""
 
-    _validate_recipe_completeness(recipe)
+    recipe = validated_physical_projection_recipe_identity(recipe)
     if not isinstance(resource_counts, Mapping):
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_reduced_resource_mismatch"
@@ -1505,38 +1876,6 @@ def reduced_physical_projection_proof(
         normalized_count_by_resource,
         validated_outcome_proof,
     )
-    partition_count_by_id = {
-        required_hash(partition_id, "membership_partition_id"): int(count)
-        for partition_id, count in dict(
-            membership_proof.get("membership_partition_resource_counts") or {}
-        ).items()
-    }
-    membership_edge_count = int(membership_proof.get("membership_edge_count") or 0)
-    if (
-        membership_proof.get("contract_id")
-        != "healthporta.provider-directory.semantic-membership.v1"
-        or membership_proof.get("present") is not bool(membership_edge_count)
-        or int(membership_proof.get("membership_partition_count") or 0)
-        != len(partition_count_by_id)
-        or any(count < 1 for count in partition_count_by_id.values())
-        or sum(partition_count_by_id.values()) != membership_edge_count
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_membership_proof_invalid"
-        )
-    normalized_membership_proof_map = {
-        "contract_id": membership_proof["contract_id"],
-        "present": bool(membership_edge_count),
-        "membership_edge_count": membership_edge_count,
-        "membership_sha256": required_hash(
-            membership_proof.get("membership_sha256"),
-            "membership_sha256",
-        ),
-        "membership_partition_count": len(partition_count_by_id),
-        "membership_partition_resource_counts": dict(
-            sorted(partition_count_by_id.items())
-        ),
-    }
     projection_id = recipe.recipe_id
     return PhysicalProjectionProof(
         physical_projection_id=projection_id,
@@ -1549,7 +1888,6 @@ def reduced_physical_projection_proof(
             "physical_projection_id": projection_id,
             "raw_shards": [shard.descriptor for shard in ordered_shards],
             "reducer": normalized_reducer_proof_map,
-            "semantic_membership": normalized_membership_proof_map,
             "source_summary": normalized_source_summary_map,
         },
     )

@@ -8,6 +8,9 @@ import json
 import os
 from typing import Any, Mapping
 
+from process.provider_directory_projection_contract import (
+    validated_physical_projection_recipe_identity,
+)
 from process.provider_directory_projection_types import (
     HASH_PATTERN,
     IDENTIFIER_PATTERN,
@@ -21,9 +24,13 @@ from process.provider_directory_projection_types import (
 
 PROJECTION_DATABASE_ACTIONS = frozenset(
     {
+        "admission_heartbeat",
+        "admission_insert",
+        "admission_map",
+        "admission_reclaim",
+        "admission_seal",
         "fail",
         "gc",
-        "proof_ready",
         "reference_heartbeat",
         "reference_insert",
         "reference_reclaim",
@@ -31,8 +38,6 @@ PROJECTION_DATABASE_ACTIONS = frozenset(
         "recipe_heartbeat",
         "recipe_insert",
         "recipe_reclaim",
-        "retained_rebind",
-        "seal",
         "shard_claim",
         "shard_complete",
         "shard_heartbeat",
@@ -138,6 +143,9 @@ async def set_local_projection_action(
     reference_identity_hash: str | None = None,
     reference_lease_token: str | None = None,
     previous_reference_lease_token: str | None = None,
+    admission_id: str | None = None,
+    admission_attempt: int | None = None,
+    admission_lease_token: str | None = None,
 ) -> None:
     """Fence one exact projection database transition in this transaction."""
 
@@ -154,6 +162,8 @@ async def set_local_projection_action(
         reference_identity_hash,
         reference_lease_token,
         previous_reference_lease_token,
+        admission_id,
+        admission_lease_token,
     )
     if (
         any(HASH_PATTERN.fullmatch(value) is None for value in hash_values)
@@ -181,7 +191,35 @@ async def set_local_projection_action(
         reference_lease_token,
         previous_reference_lease_token,
     )
-    if action in reference_actions:
+    admission_actions = {
+        "admission_heartbeat",
+        "admission_insert",
+        "admission_map",
+        "admission_reclaim",
+        "admission_seal",
+    }
+    admission_values = (
+        admission_id,
+        admission_attempt,
+        admission_lease_token,
+    )
+    if action in admission_actions:
+        if (
+            admission_id is None
+            or admission_attempt is None
+            or admission_attempt < 1
+            or admission_lease_token is None
+            or recipe_lease_token is not None
+            or partition_id is not None
+            or partition_attempt is not None
+            or shard_lease_token is not None
+            or physical_projection_id is not None
+            or any(value is not None for value in reference_values)
+        ):
+            raise ProviderDirectoryProjectionError(
+                "provider_directory_projection_action_identity_invalid"
+            )
+    elif action in reference_actions:
         reference_identity_is_valid = all(
             (
                 physical_projection_id is not None,
@@ -206,7 +244,9 @@ async def set_local_projection_action(
             raise ProviderDirectoryProjectionError(
                 "provider_directory_projection_action_identity_invalid"
             )
-    elif any(reference_value is not None for reference_value in reference_values):
+    elif any(reference_value is not None for reference_value in reference_values) or any(
+        admission_value is not None for admission_value in admission_values
+    ):
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_action_identity_invalid"
         )
@@ -228,6 +268,11 @@ async def set_local_projection_action(
         "reference_previous_lease_token": (
             previous_reference_lease_token or ""
         ),
+        "admission_id": admission_id or "",
+        "admission_attempt": (
+            "" if admission_attempt is None else str(admission_attempt)
+        ),
+        "admission_lease_token": admission_lease_token or "",
     }
     for setting_name, setting_value in setting_by_name.items():
         stored_value = await database.scalar(
@@ -302,7 +347,6 @@ def recipe_database_identity(database_fields: Mapping[str, Any]) -> dict[str, An
         "scope_contract_id": database_fields.get("scope_contract_id"),
         "transform_context_hash": database_fields.get("transform_context_hash"),
         "transform_context": json_value(database_fields.get("transform_context_json")),
-        "completeness_manifest_hash": database_fields.get("completeness_manifest_hash"),
         "resource_profile_hash": database_fields.get("resource_profile_hash"),
         "selected_resources": json_value(
             database_fields.get("selected_resources_json")
@@ -335,6 +379,7 @@ async def locked_active_recipe(
 ) -> dict[str, Any]:
     """Lock one recipe and prove the caller still owns its live lease."""
 
+    validated_physical_projection_recipe_identity(lease.recipe)
     recipe_fields = row_mapping(
         await database.first(
             f"SELECT * FROM {table_ref(schema, 'provider_directory_projection_recipe')} "
@@ -369,6 +414,7 @@ async def shared_active_recipe(
 ) -> dict[str, Any]:
     """Hold a shared recipe fence while one independent shard uses COPY."""
 
+    validated_physical_projection_recipe_identity(lease.recipe)
     recipe_fields = row_mapping(
         await database.first(
             f"SELECT * FROM {table_ref(schema, 'provider_directory_projection_recipe')} "
@@ -402,20 +448,6 @@ async def assert_stage_trigger(
     """Verify the exact immutable stage trigger by OID and catalog identity."""
 
     stages = [(prepared.stage, prepared.storage_trigger_oid)]
-    if prepared.membership_stage is not None:
-        stages.append(
-            (
-                prepared.membership_stage,
-                prepared.membership_storage_trigger_oid,
-            )
-        )
-    if prepared.profile_contribution_stage is not None:
-        stages.append(
-            (
-                prepared.profile_contribution_stage,
-                prepared.profile_contribution_storage_trigger_oid,
-            )
-        )
     for stage, expected_trigger_oid in stages:
         trigger_fields = row_mapping(
             await database.first(

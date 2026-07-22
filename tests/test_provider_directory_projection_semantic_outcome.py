@@ -6,15 +6,8 @@ from copy import deepcopy
 
 import pytest
 
+import process.provider_directory_physical_projection as projection_facade
 from process.provider_directory_projection_contract import canonical_row_digest
-from process.provider_directory_physical_projection import (
-    ProjectionSemanticOutcomeProof as FacadeSemanticOutcomeProof,
-    SEMANTIC_OUTCOME_PROOF_CONTRACT_ID as FACADE_OUTCOME_PROOF_CONTRACT_ID,
-    SEMANTIC_STREAMING_REDUCER_CONTRACT_ID as FACADE_STREAMING_CONTRACT_ID,
-    reduce_semantic_outcomes as facade_reduce_semantic_outcomes,
-    reduce_streaming_semantic_outcomes as facade_stream_semantic_outcomes,
-    validated_semantic_outcome_proof as facade_validate_semantic_outcome_proof,
-)
 from process.provider_directory_projection_contribution import (
     MAX_REFERENCE_REDUCER_ROWS,
     SEMANTIC_OUTCOME_PROOF_CONTRACT_ID,
@@ -24,7 +17,6 @@ from process.provider_directory_projection_contribution import (
     validated_semantic_outcome_proof,
 )
 from process.provider_directory_projection_types import (
-    ProjectionSemanticOutcomeProof,
     ProviderDirectoryProjectionError,
 )
 from tests.provider_directory_projection_semantic_support import (
@@ -63,25 +55,37 @@ def _ordered_streams():
     return pairs, iter(sorted(npi_occurrence_by_value.items()))
 
 
-def test_public_projection_facade_exports_semantic_proof_contract():
-    assert FacadeSemanticOutcomeProof is ProjectionSemanticOutcomeProof
-    assert FACADE_OUTCOME_PROOF_CONTRACT_ID == SEMANTIC_OUTCOME_PROOF_CONTRACT_ID
-    assert facade_reduce_semantic_outcomes is reduce_semantic_outcomes
-    assert facade_stream_semantic_outcomes is reduce_streaming_semantic_outcomes
-    assert FACADE_STREAMING_CONTRACT_ID == SEMANTIC_STREAMING_REDUCER_CONTRACT_ID
-    assert facade_validate_semantic_outcome_proof is validated_semantic_outcome_proof
-    facade_pairs, facade_npi_occurrences = _ordered_streams()
-    direct_pairs, direct_npi_occurrences = _ordered_streams()
-    assert facade_stream_semantic_outcomes(
-        facade_pairs,
-        facade_npi_occurrences,
-    ) == reduce_streaming_semantic_outcomes(
-        direct_pairs,
-        direct_npi_occurrences,
+def test_public_projection_facade_excludes_candidate_semantic_outputs():
+    candidate_symbols = {
+        "INLINE_PROFILE_EVIDENCE_COLUMNS",
+        "INLINE_PROFILE_EVIDENCE_CONTRACT_ID",
+        "ProjectionSemanticOutcomeProof",
+        "SEMANTIC_CONTRIBUTION_COLUMNS",
+        "SEMANTIC_CONTRIBUTION_CONTRACT_ID",
+        "SEMANTIC_EVIDENCE_HASH_FIELD",
+        "SEMANTIC_GEOCODE_EVIDENCE_KEY",
+        "SEMANTIC_OUTCOME_FIELDS",
+        "SEMANTIC_OUTCOME_PROOF_CONTRACT_ID",
+        "SEMANTIC_RELATIONSHIP_EVIDENCE_KEY",
+        "SEMANTIC_SOURCE_SUMMARY_CONTRACT_ID",
+        "SEMANTIC_STREAMING_REDUCER_CONTRACT_ID",
+        "SEMANTIC_TYPED_EVIDENCE_CONTRACT_ID",
+        "normalized_semantic_contribution",
+        "normalized_semantic_evidence",
+        "reduce_semantic_outcomes",
+        "reduce_streaming_semantic_outcomes",
+        "semantic_source_summary",
+        "validated_semantic_outcome_proof",
+        "validated_semantic_source_summary",
+    }
+
+    assert candidate_symbols.isdisjoint(projection_facade.__all__)
+    assert all(
+        not hasattr(projection_facade, symbol) for symbol in candidate_symbols
     )
 
 
-def test_semantic_outcome_reducer_is_deterministic_exact_and_row_bound():
+def test_candidate_semantic_reducer_is_deterministic_exact_and_row_bound():
     resources, contributions = semantic_rows_and_contributions()
     proof = reduce_semantic_outcomes(resources, contributions)
     replay = reduce_semantic_outcomes(
@@ -123,11 +127,11 @@ def test_semantic_outcome_reducer_is_deterministic_exact_and_row_bound():
         "organization_affiliation_links": 2,
         "specialty_records": 3,
         "contact_records": 1,
-        "reference_links": 3,
+        "reference_links": 8,
     }
 
 
-def test_streaming_and_bounded_reference_reducers_are_proof_equivalent():
+def test_candidate_streaming_and_reference_reducers_are_equivalent():
     resources, contributions = semantic_rows_and_contributions()
     reference_proof = reduce_semantic_outcomes(resources, contributions)
     semantic_pairs, npi_occurrences = _ordered_streams()
@@ -187,7 +191,7 @@ def test_streaming_reducer_rejects_untrusted_npi_aggregate_stream(
         )
 
 
-def test_profile_arrays_bind_independently_of_physical_row_hash():
+def test_candidate_profile_arrays_bind_independently_of_physical_row_hash():
     resources, contributions = semantic_rows_and_contributions()
     baseline_proof = reduce_semantic_outcomes(resources, contributions)
     extra_specialty_map = {"code": "261Q00000X"}
@@ -216,7 +220,7 @@ def test_profile_arrays_bind_independently_of_physical_row_hash():
         ("orphan_contribution", "semantic_pair_set_mismatch"),
     ),
 )
-def test_semantic_outcome_reducer_requires_exact_one_to_one_pairing(
+def test_candidate_semantic_reducer_requires_exact_one_to_one_pairing(
     mutation,
     expected_error,
 ):
@@ -247,7 +251,7 @@ def test_semantic_outcome_reducer_requires_exact_one_to_one_pairing(
         ("observed_at", "2026-07-21T00:00:00Z"),
     ),
 )
-def test_semantic_outcome_reducer_rejects_cross_wired_profile_identity(
+def test_candidate_semantic_reducer_rejects_cross_wired_profile_identity(
     field_name,
     replacement,
 ):
@@ -261,7 +265,7 @@ def test_semantic_outcome_reducer_rejects_cross_wired_profile_identity(
         reduce_semantic_outcomes(resources, contributions)
 
 
-def test_semantic_outcome_reducer_rejects_array_and_address_count_mismatch():
+def test_candidate_reducer_rejects_array_and_address_summary_mismatch():
     resources, contributions = semantic_rows_and_contributions()
     contributions[0]["specialties_json"].append({"code": "extra"})
     with pytest.raises(
@@ -276,7 +280,7 @@ def test_semantic_outcome_reducer_rejects_array_and_address_count_mismatch():
     contributions[0]["addresses_json"].append(extra_address_map)
     with pytest.raises(
         ProviderDirectoryProjectionError,
-        match="semantic_pair_address_count_mismatch",
+        match="semantic_contribution_inconsistent",
     ):
         reduce_semantic_outcomes(resources, contributions)
 
@@ -293,7 +297,7 @@ def test_semantic_outcome_reducer_rejects_array_and_address_count_mismatch():
         ("unknown_inline_field", "profile_evidence_invalid"),
     ),
 )
-def test_semantic_outcome_reducer_rejects_noncanonical_or_untyped_rows(
+def test_candidate_semantic_reducer_rejects_noncanonical_or_untyped_rows(
     mutation,
     expected_error,
 ):
@@ -330,7 +334,7 @@ def test_semantic_outcome_reducer_rejects_noncanonical_or_untyped_rows(
         reduce_semantic_outcomes(resources, contributions)
 
 
-def test_semantic_outcome_proof_rejects_mutated_count_or_proof_payload():
+def test_candidate_outcome_validator_rejects_mutated_count_or_payload():
     resources, contributions = semantic_rows_and_contributions()
     proof = reduce_semantic_outcomes(resources, contributions)
     proof.outcome_counts["specialty_records"] += 1
@@ -343,7 +347,7 @@ def test_semantic_outcome_proof_rejects_mutated_count_or_proof_payload():
 
 
 @pytest.mark.parametrize("invalid_count", (True, 2**63))
-def test_semantic_outcome_proof_rejects_bool_or_overflow_aggregate(invalid_count):
+def test_candidate_outcome_validator_rejects_bool_or_overflow(invalid_count):
     resources, contributions = semantic_rows_and_contributions()
     proof = reduce_semantic_outcomes(resources, contributions)
     proof.outcome_counts["specialty_records"] = invalid_count

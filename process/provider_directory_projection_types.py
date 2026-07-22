@@ -56,7 +56,42 @@ class ProviderDirectoryProjectionLeaseLost(ProviderDirectoryProjectionError):
 
 
 @dataclass(frozen=True)
+class PhysicalProjectionRecipeIdentity:
+    """Only fields allowed to influence shared physical output."""
+
+    recipe_id: str
+    decoder_contract_id: str
+    input_set_sha256: str
+    transform_contract_id: str
+    scope_contract_id: str
+    transform_context_hash: str
+    transform_context: Mapping[str, Any]
+    resource_profile_hash: str
+    selected_resources: tuple[str, ...]
+    required_resources: tuple[str, ...]
+
+    @property
+    def identity_payload(self) -> dict[str, Any]:
+        """Return source-neutral fields covered by ``recipe_id``."""
+
+        return {
+            "contract_id": PROJECTION_RECIPE_CONTRACT_ID,
+            "decoder_contract_id": self.decoder_contract_id,
+            "input_set_sha256": self.input_set_sha256,
+            "transform_contract_id": self.transform_contract_id,
+            "scope_contract_id": self.scope_contract_id,
+            "transform_context_hash": self.transform_context_hash,
+            "transform_context": dict(self.transform_context),
+            "resource_profile_hash": self.resource_profile_hash,
+            "selected_resources": list(self.selected_resources),
+            "required_resources": list(self.required_resources),
+        }
+
+
+@dataclass(frozen=True)
 class ProjectionRecipeIdentity:
+    """Planning identity containing separate physical and admission context."""
+
     recipe_id: str
     decoder_contract_id: str
     acquisition_adapter_id: str
@@ -74,32 +109,60 @@ class ProjectionRecipeIdentity:
     completeness_manifest: Mapping[str, Any]
 
     @property
-    def identity_payload(self) -> dict[str, Any]:
-        """Return source-neutral physical recipe fields covered by ``recipe_id``."""
+    def physical(self) -> PhysicalProjectionRecipeIdentity:
+        """Return the campaign-blind view passed to workers and reducers."""
 
-        return {
-            "contract_id": PROJECTION_RECIPE_CONTRACT_ID,
-            "decoder_contract_id": self.decoder_contract_id,
-            "input_set_sha256": self.input_set_sha256,
-            "transform_contract_id": self.transform_contract_id,
-            "scope_contract_id": self.scope_contract_id,
-            "transform_context_hash": self.transform_context_hash,
-            "transform_context": dict(self.transform_context),
-            "resource_profile_hash": self.resource_profile_hash,
-            "selected_resources": list(self.selected_resources),
-            "required_resources": list(self.required_resources),
-            "completeness_manifest_hash": self.completeness_manifest_hash,
-        }
+        return PhysicalProjectionRecipeIdentity(
+            recipe_id=self.recipe_id,
+            decoder_contract_id=self.decoder_contract_id,
+            input_set_sha256=self.input_set_sha256,
+            transform_contract_id=self.transform_contract_id,
+            scope_contract_id=self.scope_contract_id,
+            transform_context_hash=self.transform_context_hash,
+            transform_context=dict(self.transform_context),
+            resource_profile_hash=self.resource_profile_hash,
+            selected_resources=self.selected_resources,
+            required_resources=self.required_resources,
+        )
+
+    @property
+    def identity_payload(self) -> dict[str, Any]:
+        """Preserve the physical identity payload for planning validation."""
+
+        return self.physical.identity_payload
 
 
 @dataclass(frozen=True)
 class ProjectionLease:
-    recipe: ProjectionRecipeIdentity
+    recipe: PhysicalProjectionRecipeIdentity
     attempt: int
     lease_token: str
     stage_schema: str | None = None
     stage_relation: str | None = None
     stage_relation_oid: int | None = None
+
+
+@dataclass(frozen=True)
+class ProjectionAdmissionIdentity:
+    """One immutable acquisition proof bound many-to-one to a recipe."""
+
+    admission_id: str
+    recipe_id: str
+    acquisition_adapter_id: str
+    source_scope_hash: str
+    source_ids: tuple[str, ...]
+    completeness_manifest_hash: str
+    completeness_manifest: Mapping[str, Any]
+    retained_campaign_id: str
+    retained_campaign_sha256: str
+    retained_consumer_recipe_id: str
+    claim_generation: int
+    input_block_set_sha256: str
+    input_block_count: int
+    binding_count: int
+    binding_set_sha256: str
+    stream_set_sha256: str
+    stream_count: int
 
 
 @dataclass(frozen=True)
@@ -115,26 +178,52 @@ class PhysicalProjectionReferenceLease:
 
 @dataclass(frozen=True)
 class ProjectionInputBlock:
-    """One immutable retained-input block covered by a physical recipe."""
+    """One campaign-blind immutable byte block covered by a recipe."""
 
     block_id: str
-    block_ordinal: int
     upstream_artifact_id: str
     source_object_id: str
     block_kind: str
     input_contract_id: str
-    source_partition_ordinal: int
     record_start: int
     record_count: int
     content_sha256: str
     payload_sha256: str
     payload_bytes: int
     summary: Mapping[str, int]
+    block_proof_sha256: str
+
+
+@dataclass(frozen=True)
+class ProjectionAdmissionInputBlock:
+    """Campaign coordinate binding for one neutral physical block."""
+
+    binding_id: str
+    block: ProjectionInputBlock
     retained_campaign_id: str
     retained_campaign_sha256: str
     retained_source_item_id: str
     retained_range_ordinal: int | None
-    block_proof_sha256: str
+    resource_type: str
+    partition_key_hash: str
+    source_partition_ordinal: int
+
+
+@dataclass(frozen=True)
+class ProjectionAdmissionTerminalZero:
+    """Terminal ordered-stream evidence with no physical projection input."""
+
+    binding_id: str
+    retained_campaign_id: str
+    retained_campaign_sha256: str
+    retained_source_item_id: str
+    resource_type: str
+    partition_key_hash: str
+    source_partition_ordinal: int
+    stream_identity_sha256: str
+    stream_ordinal: int
+    terminal_sequence_ordinal: int
+    terminal_proof_sha256: str
 
 
 @dataclass(frozen=True)
@@ -162,6 +251,7 @@ class ProjectionShardClaim:
     """One lease-fenced shard generation claimed by a projection worker."""
 
     recipe_lease: ProjectionLease
+    admission_id: str
     shard: ProjectionShardSpec
     partition_attempt: int
     lease_token: str
@@ -169,14 +259,9 @@ class ProjectionShardClaim:
 
 @dataclass(frozen=True)
 class ProjectionClaim:
-    lease: ProjectionLease | None
-    physical_projection_id: str | None
+    """One live build lease; sealed reuse requires admission resolution."""
 
-    @property
-    def is_reused(self) -> bool:
-        """Return whether claim resolution avoided a new physical build."""
-
-        return self.physical_projection_id is not None
+    lease: ProjectionLease
 
 
 @dataclass(frozen=True)
@@ -239,7 +324,6 @@ class ProjectionStage:
     schema: str
     relation: str
     relation_oid: int
-    profile_contribution_stage: ProjectionStage | None = None
 
 
 @dataclass(frozen=True)
@@ -247,10 +331,6 @@ class PreparedProjectionStage:
     stage: ProjectionStage
     storage_trigger_oid: int
     proof: PhysicalProjectionProof
-    membership_stage: ProjectionStage | None = None
-    membership_storage_trigger_oid: int | None = None
-    profile_contribution_stage: ProjectionStage | None = None
-    profile_contribution_storage_trigger_oid: int | None = None
 
 
 def stable_json(document: Any) -> str:

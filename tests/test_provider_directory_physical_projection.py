@@ -11,6 +11,7 @@ import pytest
 import process.provider_directory_physical_projection as projection_facade
 from process.provider_directory_projection_contract import (
     _basic_physical_projection_proof,
+    projection_proof_shard,
 )
 from process.provider_directory_projection_db import (
     assert_stage_trigger,
@@ -26,7 +27,6 @@ from process.provider_directory_physical_projection import (
     PROJECTION_MIXED_RESOURCE_TYPE,
     ProviderDirectoryProjectionError,
     projection_completeness_manifest,
-    projection_proof_shard,
     projection_recipe_identity,
 )
 
@@ -296,13 +296,67 @@ def test_recipe_reuse_requires_exact_artifact_and_transform_contract_hashes():
     assert baseline.recipe_id != different_transform.recipe_id
 
 
-def test_public_facade_exposes_only_publishable_physical_proof_builder():
-    assert not hasattr(projection_facade, "physical_projection_proof")
-    assert "physical_projection_proof" not in projection_facade.__all__
-    assert callable(projection_facade.reduced_physical_projection_proof)
+def test_public_facade_exposes_only_structural_projection_foundation():
+    structural_symbols = {
+        "PROJECTION_ADMISSION_CONTRACT_ID",
+        "PROJECTION_INPUT_BLOCK_MAX_BYTES",
+        "PROJECTION_INPUT_BLOCK_MAX_DOCUMENTS",
+        "PROJECTION_INPUT_BLOCK_MAX_RESOURCES",
+        "PROJECTION_MIXED_RESOURCE_TYPE",
+        "PROJECTION_RECIPE_CONTRACT_ID",
+        "PhysicalProjectionRecipeIdentity",
+        "ProjectionAdmissionIdentity",
+        "ProjectionAdmissionInputBlock",
+        "ProjectionAdmissionTerminalZero",
+        "ProjectionClaim",
+        "ProjectionCompletenessManifest",
+        "ProjectionInputBlock",
+        "ProjectionLease",
+        "ProjectionRecipeIdentity",
+        "ProjectionShardClaim",
+        "ProjectionShardSpec",
+        "ProviderDirectoryProjectionBusy",
+        "ProviderDirectoryProjectionError",
+        "ProviderDirectoryProjectionLeaseLost",
+        "claim_projection_recipe",
+        "claim_projection_shard",
+        "heartbeat_projection_lease",
+        "heartbeat_projection_shard",
+        "projection_admission_consumer_id",
+        "projection_admission_identity",
+        "projection_admission_input_block",
+        "projection_admission_terminal_zero",
+        "projection_completeness_manifest",
+        "projection_input_block",
+        "projection_input_set_sha256",
+        "projection_recipe_identity",
+        "projection_shard_spec",
+        "register_projection_admission",
+        "register_projection_workset",
+        "validated_physical_projection_recipe_identity",
+        "validated_projection_recipe_identity",
+    }
+    candidate_symbols = {
+        "PROJECTION_CONTENT_HASH_CONTRACT_ID",
+        "PROJECTION_PROOF_SHARD_CONTRACT_ID",
+        "PhysicalProjectionProof",
+        "ProjectionProofShard",
+        "canonical_row_digest",
+        "canonical_row_line",
+        "physical_projection_proof",
+        "prepare_projection_proof_shard",
+        "projection_proof_shard",
+        "projection_reducer_proof",
+        "reduced_physical_projection_proof",
+    }
+
+    assert set(projection_facade.__all__) == structural_symbols
+    assert all(
+        not hasattr(projection_facade, symbol) for symbol in candidate_symbols
+    )
 
 
-def test_physical_projection_identity_covers_content_counts_and_scope():
+def test_candidate_projection_identity_covers_content_counts_and_scope():
     recipe = _recipe()
     organization = projection_proof_shard(
         _rows("Organization", "o-1", "o-2"),
@@ -342,7 +396,7 @@ def test_physical_projection_identity_covers_content_counts_and_scope():
     assert proof.proof["resource_profile_hash"] == recipe.resource_profile_hash
 
 
-def test_mixed_resource_shard_is_generic_and_reports_exact_type_counts():
+def test_candidate_mixed_resource_shard_reports_exact_type_counts():
     recipe = _recipe()
     mixed = projection_proof_shard(
         [
@@ -374,7 +428,7 @@ def test_mixed_resource_shard_is_generic_and_reports_exact_type_counts():
     }
 
 
-def test_physical_projection_rejects_cross_recipe_or_incomplete_profile():
+def test_candidate_projection_rejects_cross_recipe_or_incomplete_profile():
     recipe = _recipe()
     other_recipe = _recipe(input_label="other-input-set")
     organization = projection_proof_shard(

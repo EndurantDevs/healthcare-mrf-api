@@ -1,6 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Validation for semantic winner rows and their exact Profile evidence."""
+"""Validate candidate semantic rows and their paired Profile-shaped evidence.
+
+This module validates caller-provided shapes and pair consistency.  It does not
+establish that values were natively decoded from retained FHIR source bytes and
+must not be used as a publication attestation boundary.
+"""
 
 from __future__ import annotations
 
@@ -14,18 +19,30 @@ from process.provider_directory_projection_types import (
     required_hash,
     stable_json,
 )
-
-
-SEMANTIC_CONTRIBUTION_CONTRACT_ID = (
-    "healthporta.provider-directory.semantic-contribution.v1"
+from process.provider_directory_projection_typed_evidence import (
+    SEMANTIC_EVIDENCE_HASH_FIELD,
+    SEMANTIC_TYPED_EVIDENCE_CONTRACT_ID as SEMANTIC_TYPED_EVIDENCE_CONTRACT_ID,
+    evidence_derived_semantic_summary,
+    normalized_semantic_evidence,
 )
-SEMANTIC_CONTRIBUTION_COLUMNS = (
+
+
+# Historical wire identifier for a candidate contribution shape, not a native
+# retained-byte attestation contract.
+SEMANTIC_CONTRIBUTION_CONTRACT_ID = (
+    "healthporta.provider-directory.semantic-contribution.v2"
+)
+_STORED_SEMANTIC_CONTRIBUTION_COLUMNS = (
     "summary_npi",
     "summary_address_count",
     "summary_addressed_location",
     "summary_geocoded_location",
     "summary_network_link_count",
     "summary_affiliation_link_count",
+)
+SEMANTIC_CONTRIBUTION_COLUMNS = (
+    *_STORED_SEMANTIC_CONTRIBUTION_COLUMNS,
+    SEMANTIC_EVIDENCE_HASH_FIELD,
 )
 PROFILE_CONTRIBUTION_ARRAY_FIELDS = (
     ("names", "names_json"),
@@ -42,7 +59,6 @@ _NPI_RESOURCE_TYPES = frozenset(
         "PractitionerRole",
     }
 )
-_MAX_INT32 = 2**31 - 1
 _MAX_INT64 = 2**63 - 1
 NPI_ACCUMULATOR_MODULUS = 2**256 - 2**32 - 977
 _MAX_PROFILE_ARRAY_ITEMS = 10_000
@@ -118,14 +134,6 @@ def canonical_semantic_resource_row(resource: Mapping[str, Any]) -> bytes:
     return stable_json(framed_fields).encode("utf-8")
 
 
-def _bounded_count(raw_count: Any, field_name: str) -> int:
-    if type(raw_count) is not int or raw_count < 0 or raw_count > _MAX_INT32:
-        raise ProviderDirectoryProjectionError(
-            f"provider_directory_projection_{field_name}_invalid"
-        )
-    return raw_count
-
-
 def _strict_text(raw_text: Any, field_name: str, *, limit: int) -> str:
     if (
         not isinstance(raw_text, str)
@@ -181,65 +189,6 @@ def _normalized_json_array(raw_array: Any, field_name: str) -> list[Any]:
     return normalized_array
 
 
-def normalized_semantic_contribution(
-    resource: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Validate the exact typed contribution carried by one physical fact."""
-
-    if set(SEMANTIC_CONTRIBUTION_COLUMNS) - set(resource):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_semantic_contribution_missing"
-        )
-    resource_type = resource.get("resource_type")
-    raw_npi = resource.get("summary_npi")
-    if raw_npi is not None and (
-        type(raw_npi) is not int
-        or not 1_000_000_000 <= raw_npi <= 2_999_999_999
-        or resource_type not in _NPI_RESOURCE_TYPES
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_summary_npi_invalid"
-        )
-    address_count = _bounded_count(
-        resource.get("summary_address_count"),
-        "summary_address_count",
-    )
-    network_link_count = _bounded_count(
-        resource.get("summary_network_link_count"),
-        "summary_network_link_count",
-    )
-    affiliation_link_count = _bounded_count(
-        resource.get("summary_affiliation_link_count"),
-        "summary_affiliation_link_count",
-    )
-    is_addressed_location = resource.get("summary_addressed_location")
-    is_geocoded_location = resource.get("summary_geocoded_location")
-    if (
-        type(is_addressed_location) is not bool
-        or type(is_geocoded_location) is not bool
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_summary_location_flag_invalid"
-        )
-    if (
-        is_addressed_location != (resource_type == "Location" and address_count > 0)
-        or (is_geocoded_location and not is_addressed_location)
-        or (network_link_count > 0 and resource_type != "InsurancePlan")
-        or (affiliation_link_count > 0 and resource_type != "OrganizationAffiliation")
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_semantic_contribution_inconsistent"
-        )
-    return {
-        "summary_npi": raw_npi,
-        "summary_address_count": address_count,
-        "summary_addressed_location": is_addressed_location,
-        "summary_geocoded_location": is_geocoded_location,
-        "summary_network_link_count": network_link_count,
-        "summary_affiliation_link_count": affiliation_link_count,
-    }
-
-
 def _normalized_inline_profile(resource: Mapping[str, Any]) -> dict[str, list[Any]]:
     raw_evidence_by_name = resource.get("profile_evidence_json")
     if raw_evidence_by_name is None:
@@ -271,6 +220,47 @@ def _normalized_inline_profile(resource: Mapping[str, Any]) -> dict[str, list[An
             )
         normalized_evidence_by_name[evidence_name] = normalized_array
     return normalized_evidence_by_name
+
+
+def _semantic_contribution_from_evidence(
+    resource: Mapping[str, Any],
+    profile_evidence: Mapping[str, list[Any]],
+) -> dict[str, Any]:
+    resource_type = _strict_text(
+        resource.get("resource_type"),
+        "resource_type",
+        limit=64,
+    )
+    raw_npi = resource.get("summary_npi")
+    if raw_npi is not None and (
+        type(raw_npi) is not int
+        or not 1_000_000_000 <= raw_npi <= 2_999_999_999
+        or resource_type not in _NPI_RESOURCE_TYPES
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_summary_npi_invalid"
+        )
+    return {
+        "summary_npi": raw_npi,
+        **evidence_derived_semantic_summary(
+            resource_type,
+            resource,
+            profile_evidence,
+        ),
+    }
+
+
+def normalized_semantic_contribution(
+    resource: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate evidence-derived semantic contribution for one physical fact."""
+
+    if set(_STORED_SEMANTIC_CONTRIBUTION_COLUMNS) - set(resource):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_semantic_contribution_missing"
+        )
+    profile_evidence = _normalized_inline_profile(resource)
+    return _semantic_contribution_from_evidence(resource, profile_evidence)
 
 
 def _normalized_shared_identity(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -317,10 +307,11 @@ def normalized_semantic_winner(resource: Mapping[str, Any]) -> dict[str, Any]:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_semantic_resource_fields_missing"
         )
+    profile_evidence = _normalized_inline_profile(resource)
     return {
         **_normalized_shared_identity(resource),
-        **normalized_semantic_contribution(resource),
-        "profile_evidence": _normalized_inline_profile(resource),
+        **_semantic_contribution_from_evidence(resource, profile_evidence),
+        "profile_evidence": profile_evidence,
     }
 
 
@@ -352,6 +343,13 @@ def normalized_profile_contribution(
             contribution.get(column_name),
             column_name,
         )
+    normalized_semantic_evidence(
+        normalized_contribution_map["resource_type"],
+        {
+            evidence_name: normalized_contribution_map[evidence_name]
+            for evidence_name, _column_name in PROFILE_CONTRIBUTION_ARRAY_FIELDS
+        },
+    )
     return normalized_contribution_map
 
 

@@ -8,6 +8,9 @@ import secrets
 from typing import Any
 
 from db.connection import db
+from process.provider_directory_projection_contract import (
+    validated_physical_projection_recipe_identity,
+)
 from process.provider_directory_projection_db import (
     recipe_database_identity,
     row_mapping,
@@ -17,11 +20,11 @@ from process.provider_directory_projection_db import (
 from process.provider_directory_projection_types import (
     ProjectionClaim,
     ProjectionLease,
+    PhysicalProjectionRecipeIdentity,
     ProjectionRecipeIdentity,
     ProviderDirectoryProjectionBusy,
     ProviderDirectoryProjectionError,
     ProviderDirectoryProjectionLeaseLost,
-    required_hash,
     stable_json,
 )
 
@@ -29,7 +32,7 @@ from process.provider_directory_projection_types import (
 async def _insert_recipe_if_missing(
     database: Any,
     recipe_table: str,
-    recipe: ProjectionRecipeIdentity,
+    recipe: PhysicalProjectionRecipeIdentity,
     lease_token: str,
     lease_seconds: int,
 ) -> None:
@@ -38,8 +41,7 @@ async def _insert_recipe_if_missing(
         INSERT INTO {recipe_table} (
             recipe_id, decoder_contract_id, input_set_sha256,
             transform_contract_id, scope_contract_id, transform_context_hash,
-            transform_context_json, completeness_manifest_hash,
-            completeness_manifest_json, resource_profile_hash,
+            transform_context_json, resource_profile_hash,
             selected_resources_json, required_resources_json, status,
             attempt, lease_token, lease_expires_at, lease_heartbeat_at,
             created_at, updated_at
@@ -47,8 +49,6 @@ async def _insert_recipe_if_missing(
             :recipe_id, :decoder_contract_id, :input_set_sha256,
             :transform_contract_id, :scope_contract_id, :transform_context_hash,
             CAST(:transform_context_json AS jsonb),
-            :completeness_manifest_hash,
-            CAST(:completeness_manifest_json AS jsonb),
             :resource_profile_hash, CAST(:selected_resources_json AS jsonb),
             CAST(:required_resources_json AS jsonb), 'building', 1,
             :lease_token, now() + make_interval(secs => :lease_seconds),
@@ -62,8 +62,6 @@ async def _insert_recipe_if_missing(
         scope_contract_id=recipe.scope_contract_id,
         transform_context_hash=recipe.transform_context_hash,
         transform_context_json=stable_json(recipe.transform_context),
-        completeness_manifest_hash=recipe.completeness_manifest_hash,
-        completeness_manifest_json=stable_json(recipe.completeness_manifest),
         resource_profile_hash=recipe.resource_profile_hash,
         selected_resources_json=stable_json(recipe.selected_resources),
         required_resources_json=stable_json(recipe.required_resources),
@@ -75,7 +73,7 @@ async def _insert_recipe_if_missing(
 async def _locked_recipe(
     database: Any,
     recipe_table: str,
-    recipe: ProjectionRecipeIdentity,
+    recipe: PhysicalProjectionRecipeIdentity,
 ) -> dict[str, Any]:
     recipe_fields = row_mapping(
         await database.first(
@@ -91,7 +89,7 @@ async def _locked_recipe(
 
 
 def _projection_lease(
-    recipe: ProjectionRecipeIdentity,
+    recipe: PhysicalProjectionRecipeIdentity,
     recipe_fields: dict[str, Any],
     lease_token: str,
 ) -> ProjectionLease:
@@ -109,31 +107,25 @@ def _projection_lease(
 async def _claim_locked_recipe(
     database: Any,
     recipe_table: str,
-    recipe: ProjectionRecipeIdentity,
+    recipe: PhysicalProjectionRecipeIdentity,
     recipe_fields: dict[str, Any],
     lease_token: str,
     lease_seconds: int,
 ) -> ProjectionClaim:
-    """Return a reusable projection or fence one live recipe generation."""
+    """Fence one live build; reuse and failed-state recovery are separate."""
 
     if recipe_fields.get("status") == "sealed":
-        if (
-            recipe_fields.get("workset_registered_at") is None
-            or recipe_fields.get("input_block_set_sha256") != recipe.input_set_sha256
-        ):
-            raise ProviderDirectoryProjectionError(
-                "provider_directory_projection_sealed_workset_missing"
-            )
-        return ProjectionClaim(
-            lease=None,
-            physical_projection_id=required_hash(
-                recipe_fields.get("physical_projection_id"),
-                "physical_projection_id",
-            ),
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_admission_resolution_required"
         )
-    if recipe_fields.get("status") not in {"building", "proof_ready"}:
+    recipe_status = recipe_fields.get("status")
+    if recipe_status not in {"building", "proof_ready", "failed"}:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_recipe_not_reclaimable"
+        )
+    if recipe_status == "failed":
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_failure_classification_required"
         )
     is_inserted_token = recipe_fields.get("lease_token") == lease_token
     is_lease_expired = bool(
@@ -166,21 +158,19 @@ async def _claim_locked_recipe(
             lease_token=lease_token,
             lease_seconds=lease_seconds,
         )
-    return ProjectionClaim(
-        lease=_projection_lease(recipe, recipe_fields, lease_token),
-        physical_projection_id=None,
-    )
+    return ProjectionClaim(_projection_lease(recipe, recipe_fields, lease_token))
 
 
 async def claim_projection_recipe(
-    recipe: ProjectionRecipeIdentity,
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
     *,
     lease_seconds: int = 900,
     database: Any = db,
     schema: str = "mrf",
 ) -> ProjectionClaim:
-    """Claim or reclaim one recipe without discarding completed proof shards."""
+    """Claim a live build; failed and sealed recipes require scoped resolution."""
 
+    recipe = validated_physical_projection_recipe_identity(recipe)
     if lease_seconds < 30 or lease_seconds > 86_400:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_lease_seconds_invalid"
@@ -222,6 +212,7 @@ async def heartbeat_projection_lease(
 ) -> None:
     """Extend a live recipe lease without opening a long transaction."""
 
+    validated_physical_projection_recipe_identity(lease.recipe)
     if lease_seconds < 30 or lease_seconds > 86_400:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_lease_seconds_invalid"

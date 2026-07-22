@@ -1,11 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""One immutable outcome summary per visible Provider Directory source."""
+"""Build non-authoritative source-summary candidates from semantic aggregates.
+
+The summary is deterministically bound to its candidate aggregate, but neither
+object attests native decoding from retained bytes or authorizes publication.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-import re
 from typing import Any
 
 from process.provider_directory_projection_contribution import (
@@ -21,59 +24,19 @@ from process.provider_directory_projection_types import (
 )
 
 
+# Historical wire identifier retained for compatibility.  It describes a
+# candidate summary envelope rather than a native-attested source summary.
 SEMANTIC_SOURCE_SUMMARY_CONTRACT_ID = (
     "healthporta.provider-directory.physical-source-semantic-summary.v1"
 )
-MAX_SUPPLEMENTAL_COUNT_FIELDS = 32
-_SUPPLEMENTAL_COUNT_FIELD = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-
-
-def _nonnegative_count(raw_value: Any, field_name: str) -> int:
-    if isinstance(raw_value, bool) or not isinstance(raw_value, int) or raw_value < 0:
-        raise ProviderDirectoryProjectionError(
-            f"provider_directory_projection_semantic_{field_name}_invalid"
-        )
-    return raw_value
-
-
-def normalized_supplemental_counts(raw_counts: Any) -> dict[str, int]:
-    """Validate a bounded, source-adapter-neutral map of additive counters."""
-
-    if raw_counts is None:
-        return {}
-    if (
-        not isinstance(raw_counts, Mapping)
-        or len(raw_counts) > MAX_SUPPLEMENTAL_COUNT_FIELDS
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_supplemental_counts_invalid"
-        )
-    normalized_count_by_name: dict[str, int] = {}
-    for raw_name, raw_value in raw_counts.items():
-        if not isinstance(raw_name, str) or not _SUPPLEMENTAL_COUNT_FIELD.fullmatch(
-            raw_name
-        ) or raw_name in SEMANTIC_OUTCOME_FIELDS:
-            raise ProviderDirectoryProjectionError(
-                "provider_directory_projection_supplemental_count_name_invalid"
-            )
-        value = _nonnegative_count(raw_value, "supplemental_count")
-        if value > 9_223_372_036_854_775_807:
-            raise ProviderDirectoryProjectionError(
-                "provider_directory_projection_supplemental_count_invalid"
-            )
-        normalized_count_by_name[raw_name] = value
-    return dict(sorted(normalized_count_by_name.items()))
-
-
 def semantic_source_summary(
     *,
     semantic_adapter_contract_id: str,
     transform_contract_id: str,
     dataset_hash: str,
     outcome_proof: ProjectionSemanticOutcomeProof,
-    supplemental_counts: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Build counts only from the reducer-derived semantic outcome proof."""
+    """Build counts only from one structurally validated candidate outcome."""
 
     validated_proof = validated_semantic_outcome_proof(outcome_proof)
     summary_map = {
@@ -101,7 +64,6 @@ def semantic_source_summary(
             field_name: validated_proof.outcome_counts[field_name]
             for field_name in SEMANTIC_OUTCOME_FIELDS
         },
-        "supplemental_counts": normalized_supplemental_counts(supplemental_counts),
         "complete": True,
     }
     summary_map["summary_sha256"] = stable_hash(
@@ -118,9 +80,8 @@ def validated_semantic_source_summary(
     expected_transform_contract_id: str,
     expected_dataset_hash: str,
     expected_outcome_proof: ProjectionSemanticOutcomeProof,
-    expected_supplemental_counts: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Validate a stored summary against independently derived expectations."""
+    """Validate candidate-summary shape and exact expected bindings only."""
 
     if not isinstance(raw_summary, Mapping):
         raise ProviderDirectoryProjectionError(
@@ -140,7 +101,6 @@ def validated_semantic_source_summary(
         "resource_count",
         "resource_counts",
         "outcome_counts",
-        "supplemental_counts",
         "complete",
         "summary_sha256",
     }
@@ -153,7 +113,6 @@ def validated_semantic_source_summary(
         transform_contract_id=expected_transform_contract_id,
         dataset_hash=expected_dataset_hash,
         outcome_proof=expected_outcome_proof,
-        supplemental_counts=expected_supplemental_counts,
     )
     if dict(raw_summary) != canonical:
         raise ProviderDirectoryProjectionError(
@@ -163,10 +122,8 @@ def validated_semantic_source_summary(
 
 
 __all__ = [
-    "MAX_SUPPLEMENTAL_COUNT_FIELDS",
     "SEMANTIC_OUTCOME_FIELDS",
     "SEMANTIC_SOURCE_SUMMARY_CONTRACT_ID",
-    "normalized_supplemental_counts",
     "semantic_source_summary",
     "validated_semantic_source_summary",
 ]

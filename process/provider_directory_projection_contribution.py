@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Source-neutral reducer and immutable semantic outcome proof."""
+"""Non-authoritative candidate reducers, not byte attestations or publish gates."""
 
 from __future__ import annotations
 
@@ -346,11 +346,11 @@ def reduce_streaming_semantic_outcomes(
     semantic_pairs: Iterable[tuple[Mapping[str, Any], Mapping[str, Any]]],
     npi_occurrences: Iterable[tuple[int, int]],
 ) -> ProjectionSemanticOutcomeProof:
-    """Reduce two ordered set-based streams without retaining winner sets.
+    """Build a candidate aggregate without retaining winner sets.
 
-    Production callers must supply a strict winner/Profile join ordered by
+    Callers must supply a strict winner/Profile join ordered by
     ``(resource_type, resource_id)`` and a strict ``GROUP BY summary_npi``
-    occurrence stream from the same frozen database snapshot.
+    occurrence stream from one snapshot.  This checks shape, not byte origin.
     """
 
     return _reduce_normalized_semantic_outcomes(
@@ -363,7 +363,7 @@ def reduce_semantic_outcomes(
     resources: Iterable[Mapping[str, Any]],
     profile_contributions: Iterable[Mapping[str, Any]],
 ) -> ProjectionSemanticOutcomeProof:
-    """Run the bounded in-memory reference reducer (tests/small fixtures only)."""
+    """Build a bounded in-memory candidate for tests and small fixtures only."""
 
     ordered_resources, ordered_contributions = _ordered_semantic_pairs(
         resources,
@@ -450,7 +450,7 @@ def _validated_proof_hashes(
 def validated_semantic_outcome_proof(
     raw_proof: Any,
 ) -> ProjectionSemanticOutcomeProof:
-    """Validate the immutable reducer proof before using its derived counts."""
+    """Validate candidate self-consistency, not retained-byte provenance."""
 
     if not isinstance(raw_proof, ProjectionSemanticOutcomeProof) or not isinstance(
         raw_proof.proof,
