@@ -2747,7 +2747,7 @@ class SourceIndex:
         return prefix == f"{base}.npi" or prefix == f"{base}.npi.item"
 
     @staticmethod
-    def _consume_zero_npi_marker_event(
+    def _is_zero_npi_marker_event_consumed(
         state: ProviderReferenceState | InNetworkState,
         *,
         prefix: str,
@@ -3035,7 +3035,7 @@ class SourceIndex:
             self._capture_provider_reference_id(state, event, raw_value)
             return
         provider_group_prefix = f"{base_prefix}.provider_groups.item"
-        if self._consume_zero_npi_marker_event(
+        if self._is_zero_npi_marker_event_consumed(
             state,
             prefix=prefix,
             provider_group_prefix=provider_group_prefix,
@@ -3614,7 +3614,7 @@ class SourceIndex:
                     self.metrics["invalid_field_types"] += 1
                 return True
         inline_prefix = f"{NEGOTIATED_RATE_PREFIX}.provider_groups.item"
-        if self._consume_zero_npi_marker_event(
+        if self._is_zero_npi_marker_event_consumed(
             state,
             prefix=prefix,
             provider_group_prefix=inline_prefix,
@@ -3996,7 +3996,7 @@ class ApiOccurrenceSample:
 
 
 class ApiOccurrenceSource(Protocol):
-    def validate_source_set(self) -> bool:
+    def is_source_set_valid(self) -> bool:
         """Bind supplied raw sources before either side selects occurrences."""
 
     def sample_occurrences(self, *, sample_target: int, seed: str) -> ApiOccurrenceSample:
@@ -5797,7 +5797,7 @@ class HttpApiOccurrenceSource:
         self._source_set_validated = True
         return observed
 
-    def validate_source_set(self) -> bool:
+    def is_source_set_valid(self) -> bool:
         """Validate exact source coverage before local or API occurrence sampling."""
 
         if self._source_set_validated:
@@ -6904,7 +6904,7 @@ class AuditRunner:
     def _prepare_samples(self) -> _AuditSamples:
         """Validate source seals and prepare bounded audit samples and request plans."""
 
-        if self.api_occurrence_source.validate_source_set() is not True:
+        if self.api_occurrence_source.is_source_set_valid() is not True:
             raise ApiSchemaError("snapshot_source_set_was_not_validated")
         self.source_index.prepare_occurrence_sample()
         source_occurrences = self.source_index.source_occurrences(

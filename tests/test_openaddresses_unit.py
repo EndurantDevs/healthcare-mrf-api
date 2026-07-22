@@ -370,8 +370,7 @@ async def test_openaddresses_backfill_plan_skips_invalid_archive_state_shards(mo
 
 @pytest.mark.asyncio
 async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggregates(monkeypatch):
-    active = 0
-    max_active = 0
+    concurrency_by_metric = {"active": 0, "max_active": 0}
     progress = []
     shards = [
         openaddresses.OpenAddressesBackfillShard(state_code="TX", zip_prefix="75", candidate_count=10),
@@ -389,11 +388,13 @@ async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggre
         return shards
 
     async def fake_refresh(**kwargs):
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
+        concurrency_by_metric["active"] += 1
+        concurrency_by_metric["max_active"] = max(
+            concurrency_by_metric["max_active"],
+            concurrency_by_metric["active"],
+        )
         await asyncio.sleep(0.01)
-        active -= 1
+        concurrency_by_metric["active"] -= 1
         return openaddresses.OpenAddressesBackfillStats(
             exact_updates=int(kwargs["zip_prefix"]),
             fuzzy_updates=1,
@@ -412,7 +413,7 @@ async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggre
         run_id="run_openaddresses",
     )
 
-    assert max_active == 2
+    assert concurrency_by_metric["max_active"] == 2
     assert stats == openaddresses.OpenAddressesBackfillStats(
         exact_updates=175,
         fuzzy_updates=3,
@@ -613,15 +614,16 @@ async def test_openaddresses_local_files_load_in_parallel(monkeypatch, tmp_path)
         path.write_text("{}", encoding="utf-8")
         paths.append(path)
 
-    active = 0
-    max_active = 0
+    concurrency_by_metric = {"active": 0, "max_active": 0}
 
     async def fake_load_file(path, **_kwargs):
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
+        concurrency_by_metric["active"] += 1
+        concurrency_by_metric["max_active"] = max(
+            concurrency_by_metric["max_active"],
+            concurrency_by_metric["active"],
+        )
         await asyncio.sleep(0.01)
-        active -= 1
+        concurrency_by_metric["active"] -= 1
         return 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
 
     monkeypatch.setattr(openaddresses, "_load_file", fake_load_file)
@@ -644,7 +646,7 @@ async def test_openaddresses_local_files_load_in_parallel(monkeypatch, tmp_path)
         "zip_restore_shards": 64,
         "zip_restore_concurrency": openaddresses.DEFAULT_ZIP_RESTORE_CONCURRENCY,
     }
-    assert max_active > 1
+    assert concurrency_by_metric["max_active"] > 1
 
 
 @pytest.mark.asyncio
@@ -653,18 +655,19 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
         {"source": f"us/tx/source-{index}", "layer": "addresses", "output": {"output": True}, "id": index, "job": index}
         for index in range(1, 4)
     ]
-    active = 0
-    max_active = 0
+    concurrency_by_metric = {"active": 0, "max_active": 0}
 
     async def fake_fetch_json(_client, _url, _token):
         return source_entries
 
     async def fake_load_source_item(**kwargs):
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
+        concurrency_by_metric["active"] += 1
+        concurrency_by_metric["max_active"] = max(
+            concurrency_by_metric["max_active"],
+            concurrency_by_metric["active"],
+        )
         await asyncio.sleep(0.01)
-        active -= 1
+        concurrency_by_metric["active"] -= 1
         return kwargs["source_item"]["source"], 10, 5, 1, {
             "missing_zip5": 1,
             "not_point": 4,
@@ -692,7 +695,7 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
         "zip_restore_shards": 64,
         "zip_restore_concurrency": openaddresses.DEFAULT_ZIP_RESTORE_CONCURRENCY,
     }
-    assert max_active > 1
+    assert concurrency_by_metric["max_active"] > 1
 
 
 @pytest.mark.asyncio
@@ -759,20 +762,21 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
         {"source": f"us/ca/test-{index}", "layer": "addresses", "output": {"output": True}, "id": index, "job": index}
         for index in range(1, 4)
     ]
-    active = 0
-    max_active = 0
+    concurrency_by_metric = {"active": 0, "max_active": 0}
 
     async def fake_fetch_json(_client, _url, _token):
         return source_entries
 
     async def fake_load_source_item(**kwargs):
-        nonlocal active, max_active
         assert kwargs["test_mode"] is True
         assert kwargs["test_row_limit"] == 10
-        active += 1
-        max_active = max(max_active, active)
+        concurrency_by_metric["active"] += 1
+        concurrency_by_metric["max_active"] = max(
+            concurrency_by_metric["max_active"],
+            concurrency_by_metric["active"],
+        )
         await asyncio.sleep(0.01)
-        active -= 1
+        concurrency_by_metric["active"] -= 1
         return kwargs["source_item"]["source"], 10, 5, 1, {
             "missing_zip5": 1,
             "not_point": 4,
@@ -800,7 +804,7 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
         "zip_restore_shards": 64,
         "zip_restore_concurrency": openaddresses.DEFAULT_ZIP_RESTORE_CONCURRENCY,
     }
-    assert max_active > 1
+    assert concurrency_by_metric["max_active"] > 1
 
 
 @pytest.mark.asyncio

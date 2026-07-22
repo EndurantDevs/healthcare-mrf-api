@@ -143,7 +143,7 @@ def has_private_text_fingerprint(text: str) -> bool:
     tokens = list(TEXT_TOKEN_RE.finditer(text))
     for start in range(len(tokens)):
         normalized_window = ""
-        integration_identifier = True
+        is_integration_identifier = True
         for width in range(PRIVATE_TEXT_WINDOW_MAX):
             token_index = start + width
             if token_index >= len(tokens):
@@ -152,8 +152,8 @@ def has_private_text_fingerprint(text: str) -> bool:
                 separator = text[
                     tokens[token_index - 1].end() : tokens[token_index].start()
                 ]
-                integration_identifier = bool(
-                    integration_identifier
+                is_integration_identifier = bool(
+                    is_integration_identifier
                     and INTEGRATION_IDENTIFIER_SEPARATOR_RE.fullmatch(separator)
                 )
             normalized_window += tokens[token_index].group(0).lower()
@@ -161,7 +161,7 @@ def has_private_text_fingerprint(text: str) -> bool:
             if fingerprint in PRIVATE_EXAMPLE_FINGERPRINTS:
                 return True
             if (
-                integration_identifier
+                is_integration_identifier
                 and fingerprint in PRIVATE_INTEGRATION_FINGERPRINTS
             ):
                 return True

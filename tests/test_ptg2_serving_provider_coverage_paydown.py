@@ -369,3 +369,84 @@ def test_provider_directory_network_matches_aliases_and_pre_shaped_rows():
     assert matches[1]["provider_directory_network_resource_id"] == "network-2"
     assert matches[1]["provider_directory_issuer_key"] == "coveragehealth"
     assert serving._provider_directory_network_name_matches({}, address_data_map) == []
+
+
+def test_payload_helpers_cover_invalid_and_nested_guard_paths():
+    assert serving._safe_table_name(None) is None
+    with pytest.raises(ValueError, match="mode must be"):
+        serving.normalize_ptg2_mode("unsupported")
+
+    assert serving._is_truthy_payload(1) is True
+    assert serving._optional_bool_payload(0) is False
+    assert serving._optional_bool_payload("unknown") is None
+    assert serving._coerce_str_list_payload({"not": "a list"}) == []
+    assert serving._coerce_str_list_payload(["", "Coverage PPO"]) == [
+        "Coverage PPO"
+    ]
+    assert serving._has_displayed_address_payload(
+        {}, {"address": {"city": "Chicago", "state": "IL"}}
+    )
+
+
+def test_provider_directory_helpers_reject_malformed_evidence():
+    malformed_evidence_by_field = {
+        "address_verification_evidence": '["unexpected"]'
+    }
+
+    assert serving._has_plan_context_match(malformed_evidence_by_field) is False
+    assert serving._provider_directory_network_match_context_payload(
+        malformed_evidence_by_field
+    ) == {}
+    assert (
+        serving._has_direct_payer_location_record_evidence(malformed_evidence_by_field)
+        is False
+    )
+    assert (
+        serving._provider_directory_address_verification_evidence(
+            malformed_evidence_by_field, []
+        )
+        is None
+    )
+    assert serving._has_source_file_version_trace({"source_trace": "invalid"}) is False
+
+
+def test_provider_directory_helpers_cover_network_evidence_edges():
+    matches = serving._provider_directory_network_name_matches(
+        {"network_names": ["Coverage PPO"]},
+        {
+            "provider_directory_network_matches": [
+                {"name": "Coverage PPO", "aliases": {"invalid": "shape"}}
+            ]
+        },
+    )
+
+    assert [match["ptg_network_name"] for match in matches] == ["Coverage PPO"]
+    assert serving._provider_directory_address_verification_evidence(
+        {
+            "address_verification_evidence": {
+                "matched_on": "npi_address_key_role_location_network_name"
+            }
+        },
+        matches,
+    )["matched_on"] == "npi_address_key_role_location_network_name"
+    assert serving._provider_directory_address_verification_evidence(
+        {
+            "address_verification_evidence": {
+                "matched_on": "npi_address_key_role_location_network_name"
+            }
+        },
+        [],
+    )["matched_on"] == "npi_address_key_role_location"
+
+
+def test_strict_v3_metadata_helpers_reject_missing_values():
+    with pytest.raises(serving.PTG2ManifestArtifactError, match="shared-block"):
+        serving._required_shared_snapshot_key(
+            strict_v3_tables(shared_snapshot_key=None)
+        )
+    with pytest.raises(serving.PTG2ManifestArtifactError, match="source_count"):
+        serving._required_source_count(
+            SimpleNamespace(uses_shared_blocks=True, source_count=None)
+        )
+    with pytest.raises(serving.PTG2ManifestArtifactError, match="logical snapshot"):
+        serving._required_logical_snapshot_id(strict_v3_tables(snapshot_id="  "))

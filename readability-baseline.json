@@ -1,8 +1,8 @@
 {
   "issue_counts": {
-    "ambiguous_function_names": 40,
-    "ambiguous_variable_names": 212,
-    "boolean_name_mismatch": 142,
+    "ambiguous_function_names": 38,
+    "ambiguous_variable_names": 203,
+    "boolean_name_mismatch": 135,
     "builtin_shadowing": 1,
     "class_name_shape": 2,
     "collection_name_mismatch": 312,
@@ -10,11 +10,11 @@
     "confusable_function_names": 0,
     "deep_nesting": 69,
     "function_name_shape": 50,
-    "global_state_usage": 19,
+    "global_state_usage": 13,
     "inline_suppressions": 4,
     "long_files": 158,
     "long_functions": 819,
-    "missing_contract_docstrings": 0,
+    "missing_contract_docstrings": 1,
     "pass_placeholders": 8,
     "single_letter_names": 33,
     "syntax_errors": 0,
@@ -60,9 +60,7 @@
       "ambiguous_function_name:process/provider_enrichment.py:process_data",
       "ambiguous_function_name:process/provider_enrichment.py:shutdown",
       "ambiguous_function_name:process/ptg.py:main",
-      "ambiguous_function_name:process/ptg_candidate_audit.py:main",
-      "ambiguous_function_name:scripts/research/price_address_assurance_report.py:main",
-      "ambiguous_function_name:scripts/research/provider_directory_coverage_audit.py:main"
+      "ambiguous_function_name:process/ptg_candidate_audit.py:main"
     ],
     "ambiguous_variable_names": [
       "ambiguous_variable_name:api/control.py:_ptg_source_snapshot_refresh_payload:payload",
@@ -267,16 +265,7 @@
       "ambiguous_variable_name:process/terminology_synonyms.py:_provider_rows:rows",
       "ambiguous_variable_name:process/terminology_synonyms.py:_record:source",
       "ambiguous_variable_name:process/terminology_synonyms.py:import_terminology_synonyms:result",
-      "ambiguous_variable_name:process/terminology_synonyms.py:import_terminology_synonyms:rows",
-      "ambiguous_variable_name:scripts/research/discover_asr_health_benefits_groups.py:_discover:results",
-      "ambiguous_variable_name:scripts/research/price_address_assurance_report.py:_resolve_raw_artifacts_from_db:row",
-      "ambiguous_variable_name:scripts/research/price_address_assurance_report.py:_resolve_raw_artifacts_from_db:rows",
-      "ambiguous_variable_name:scripts/research/ptg_client_carrier_coverage_audit.py:async_main:item",
-      "ambiguous_variable_name:scripts/research/ptg_client_carrier_coverage_audit.py:async_main:payload",
-      "ambiguous_variable_name:scripts/research/ptg_client_carrier_coverage_audit.py:async_main:rows",
-      "ambiguous_variable_name:scripts/smoke/provider_directory_address_corroboration_smoke.py:run_smoke:payload",
-      "ambiguous_variable_name:scripts/smoke/provider_directory_address_corroboration_smoke.py:run_smoke:row",
-      "ambiguous_variable_name:scripts/smoke/provider_directory_address_corroboration_smoke.py:run_smoke:rows"
+      "ambiguous_variable_name:process/terminology_synonyms.py:import_terminology_synonyms:rows"
     ],
     "boolean_name_mismatch": [
       "boolean_name_mismatch:api/code_systems.py:restricted_terminology_public_enabled:function",
@@ -413,14 +402,7 @@
       "boolean_name_mismatch:process/ptg_parts/json_streams.py:_iter_top_level_objects_jsondecoder:eof:assignment",
       "boolean_name_mismatch:process/ptg_parts/screen.py:_ensure_screen_writer:_SCREEN_WRITER_STARTED:assignment",
       "boolean_name_mismatch:process/redis_config.py:_env_bool:function",
-      "boolean_name_mismatch:process/url_security.py:_allow_local:function",
-      "boolean_name_mismatch:scripts/ci/public_hygiene.py:has_private_text_fingerprint:integration_identifier:assignment",
-      "boolean_name_mismatch:scripts/research/ptg_client_carrier_coverage_audit.py:candidate_supports_benefit_line:function",
-      "boolean_name_mismatch:scripts/research/ptg_client_carrier_coverage_audit.py:discovery_candidate_matches:function",
-      "boolean_name_mismatch:scripts/validation/ptg2_v3_capacity_gate.py:_boolean:function",
-      "boolean_name_mismatch:scripts/validation/ptg2_v3_source_api_audit.py:ApiOccurrenceSource.validate_source_set:function",
-      "boolean_name_mismatch:scripts/validation/ptg2_v3_source_api_audit.py:HttpApiOccurrenceSource.validate_source_set:function",
-      "boolean_name_mismatch:scripts/validation/ptg2_v3_source_api_audit.py:SourceIndex._consume_zero_npi_marker_event:function"
+      "boolean_name_mismatch:process/url_security.py:_allow_local:function"
     ],
     "builtin_shadowing": [
       "builtin_shadowing:process/ext/utils.py:log_error:type"
@@ -811,7 +793,7 @@
       "deep_nesting:process/ptg_parts/source_download.py:_download_raw_artifact_ranges.fetch_range",
       "deep_nesting:process/ptg_parts/source_jobs.py:_load_toc_urls_from_file",
       "deep_nesting:scripts/research/provider_directory_coverage_audit.py:_credential_onboarding_backlog",
-      "deep_nesting:scripts/research/provider_directory_coverage_audit.py:main",
+      "deep_nesting:scripts/research/provider_directory_coverage_audit.py:run_provider_directory_coverage_audit",
       "deep_nesting:scripts/research/ptg2_experiment.py:write_serving_by_provider_set_candidate",
       "deep_nesting:scripts/validation/ptg2_v3_source_api_audit.py:SourceIndex._is_rate_event_consumed",
       "deep_nesting:tests/test_process_claims_pricing_unit.py:test_split_provider_service_chunks_partition_by_npi"
@@ -881,13 +863,7 @@
       "global_state_usage:process/provider_quality.py:_split_source_into_chunks.flush_chunk:nonlocal:517:chunk_rows,chunk_bytes,chunk_index",
       "global_state_usage:process/ptg_parts/json_streams.py:_iter_top_level_objects_jsondecoder.compact_buffer:nonlocal:239:buffer,pos",
       "global_state_usage:process/ptg_parts/json_streams.py:_iter_top_level_objects_jsondecoder.read_more:nonlocal:219:buffer,eof,bytes_since_progress",
-      "global_state_usage:process/ptg_parts/screen.py:_ensure_screen_writer:global:36:_SCREEN_WRITER_STARTED",
-      "global_state_usage:scripts/research/discover_asr_health_benefits_groups.py:_discover.worker:nonlocal:163:checked",
-      "global_state_usage:tests/test_openaddresses_unit.py:test_openaddresses_local_files_load_in_parallel.fake_load_file:nonlocal:620:active,max_active",
-      "global_state_usage:tests/test_openaddresses_unit.py:test_openaddresses_remote_sources_load_in_parallel.fake_load_source_item:nonlocal:663:active,max_active",
-      "global_state_usage:tests/test_openaddresses_unit.py:test_openaddresses_remote_test_mode_honors_source_concurrency.fake_load_source_item:nonlocal:769:active,max_active",
-      "global_state_usage:tests/test_openaddresses_unit.py:test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggregates.fake_refresh:nonlocal:392:active,max_active",
-      "global_state_usage:tests/test_process_provider_quality_unit.py:test_ensure_provider_quality_rx_agg_table_builds_once._capture_scalar:nonlocal:802:scalar_calls"
+      "global_state_usage:process/ptg_parts/screen.py:_ensure_screen_writer:global:36:_SCREEN_WRITER_STARTED"
     ],
     "inline_suppressions": [
       "inline_suppression:process/entity_address_unified.py:python_pylint_disable:39bc23714fd6",
@@ -1172,7 +1148,6 @@
       "long_function:api/ptg2_serving.py:_search_multi_ptg2_snapshots",
       "long_function:api/ptg2_serving.py:_search_ptg2_manifest_provider_procedures",
       "long_function:api/ptg2_serving.py:_shared_graph_members_many",
-      "long_function:api/ptg2_serving.py:_shared_rate_provider_groups",
       "long_function:api/ptg2_serving.py:_shared_rows_for_code",
       "long_function:api/ptg2_serving.py:_sort_ptg2_manifest_provider_items",
       "long_function:api/ptg2_serving.py:_strict_cost_provider_expansion_selection",
@@ -1554,9 +1529,10 @@
       "long_function:process/ptg_parts/source_versions.py:_record_source_version",
       "long_function:process/ptg_parts/table_setup.py:_ensure_ptg2_serving_rate_stage_table",
       "long_function:scripts/devops/ptg2_strict_v3_cutover_ready.py:collect_cutover_readiness",
+      "long_function:scripts/research/discover_asr_health_benefits_groups.py:_discover",
       "long_function:scripts/research/price_address_assurance_report.py:_resolve_raw_artifacts_from_db",
-      "long_function:scripts/research/price_address_assurance_report.py:main",
       "long_function:scripts/research/price_address_assurance_report.py:parse_args",
+      "long_function:scripts/research/price_address_assurance_report.py:run_price_address_assurance_report",
       "long_function:scripts/research/provider_directory_coverage_audit.py:_advertised_resource_gap_summary",
       "long_function:scripts/research/provider_directory_coverage_audit.py:_canonical_resource_summary",
       "long_function:scripts/research/provider_directory_coverage_audit.py:_credential_api_base_targets_export",
@@ -1876,7 +1852,9 @@
       "long_function:tests/test_site_intelligence_api.py:test_site_intelligence_returns_trade_area_metrics",
       "long_function:tests/test_site_intelligence_api.py:test_site_intelligence_target_scripts_gates_recommendation"
     ],
-    "missing_contract_docstrings": [],
+    "missing_contract_docstrings": [
+      "missing_contract_docstring:scripts/research/discover_asr_health_benefits_groups.py:_discover"
+    ],
     "pass_placeholders": [
       "pass_placeholder:api/endpoint/issuer.py:_row_to_dict:pass:30",
       "pass_placeholder:api/endpoint/issuer.py:_row_to_dict:pass:35",
