@@ -22,6 +22,11 @@ from api.ptg2_candidate_audit_integrity import (
     PersistedAuditOccurrence,
     validate_candidate_source_scope,
 )
+from api.ptg2_candidate_audit_price_load import (
+    CandidatePriceLoad as _CandidatePriceLoad,
+    build_candidate_price_load,
+)
+from api.ptg2_candidate_audit_reverse import load_candidate_provider_scope
 from api.ptg2_db_sidecars import (
     lookup_forward_price_index_from_db,
     lookup_shared_graph_members_from_db,
@@ -69,14 +74,6 @@ class _CandidateAuditData:
 
 
 @dataclass(frozen=True)
-class _CandidatePriceLoad:
-    """Candidate prices plus proof that only exact forward rows were retained."""
-
-    data: CandidatePriceData
-    selection_io: Mapping[str, int]
-
-
-@dataclass(frozen=True)
 class CandidateAuditBatchResult:
     """Report aggregate matching counts without returning witness evidence."""
 
@@ -96,6 +93,9 @@ class _CandidateScopeIndexes:
     provider_sets_by_npi_code: Mapping[tuple[int, int], tuple[int, ...]]
     provider_filters_by_code_key: Mapping[int, tuple[int, ...]]
     network_digests_by_key: Mapping[int, frozenset[str]]
+    preloaded_price_keys_by_occurrence: Mapping[
+        tuple[int, int, int], tuple[int, ...]
+    ] | None = None
 
 
 def _record_fields(database_record: Any) -> dict[str, Any]:
@@ -236,6 +236,9 @@ async def _candidate_data_for_conditions(
         scope_indexes.provider_sets_by_npi_code,
         scope_indexes.provider_filters_by_code_key,
         persisted_audit_occurrences,
+        preloaded_price_keys_by_occurrence=(
+            scope_indexes.preloaded_price_keys_by_occurrence
+        ),
     )
     validate_persisted_audit_price_scope(
         persisted_audit_occurrences,
@@ -276,12 +279,15 @@ async def _candidate_scope_indexes(
             for occurrence in persisted_audit_occurrences
         ),
     )
-    provider_set_keys_by_npi = await _provider_set_keys_by_npi(
+    provider_scope = await load_candidate_provider_scope(
+        _provider_set_keys_by_npi,
         session,
         serving_tables,
         challenges,
         persisted_audit_occurrences,
+        code_index,
     )
+    provider_set_keys_by_npi = provider_scope.provider_set_keys_by_npi
     validate_persisted_audit_graph_scope(
         persisted_audit_occurrences,
         code_index,
@@ -308,7 +314,12 @@ async def _candidate_scope_indexes(
         provider_sets_by_npi_code=provider_sets_by_npi_code,
         provider_filters_by_code_key=provider_filters,
         network_digests_by_key=network_digests_by_key,
+        preloaded_price_keys_by_occurrence=(
+            provider_scope.price_keys_by_occurrence
+        ),
     )
+
+
 async def _provider_network_digests_by_key(
     session: Any,
     serving_tables: PTG2ServingTables,
@@ -338,6 +349,10 @@ async def _load_candidate_price_data(
     provider_sets_by_npi_code: Mapping[tuple[int, int], tuple[int, ...]],
     provider_filters_by_code_key: Mapping[int, tuple[int, ...]],
     persisted_audit_occurrences: Sequence[PersistedAuditOccurrence] = (),
+    *,
+    preloaded_price_keys_by_occurrence: Mapping[
+        tuple[int, int, int], tuple[int, ...]
+    ] | None = None,
 ) -> _CandidatePriceLoad:
     """Retain exact forward rows, then hydrate each retained price once."""
 
@@ -347,11 +362,12 @@ async def _load_candidate_price_data(
         provider_sets_by_npi_code,
         persisted_audit_occurrences,
     )
-    price_keys_by_occurrence = await _candidate_forward_price_keys(
+    price_keys_by_occurrence = await _price_keys_for_candidate_scope(
         session,
         serving_tables,
         provider_filters_by_code_key,
         required_occurrence_keys,
+        preloaded_price_keys_by_occurrence,
     )
     if set(price_keys_by_occurrence).difference(required_occurrence_keys):
         raise PTG2ManifestArtifactError(
@@ -368,25 +384,36 @@ async def _load_candidate_price_data(
         retained_price_keys,
         copy_payloads=False,
     )
-    return _CandidatePriceLoad(
-        data=CandidatePriceData(
-            price_keys_by_occurrence,
-            hydration.atom_keys_by_price_key,
-            hydration.prices_by_key,
-        ),
-        selection_io={
-            "exact_candidate_occurrence_coordinates": len(
-                required_occurrence_keys
-            ),
-            "exact_forward_occurrence_coordinates_returned": len(
-                price_keys_by_occurrence
-            ),
-            "exact_forward_price_key_deliveries_returned": sum(
-                len(price_keys)
-                for price_keys in price_keys_by_occurrence.values()
-            ),
-        },
+    return build_candidate_price_load(
+        price_keys_by_occurrence,
+        required_occurrence_keys,
+        hydration,
     )
+
+
+async def _price_keys_for_candidate_scope(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    provider_filters_by_code_key: Mapping[int, tuple[int, ...]],
+    required_occurrence_keys: frozenset[tuple[int, int, int]],
+    preloaded_price_keys_by_occurrence: Mapping[
+        tuple[int, int, int], tuple[int, ...]
+    ] | None,
+) -> dict[tuple[int, int, int], tuple[int, ...]]:
+    """Read exact rows once or retain them from the reverse proof read."""
+
+    if preloaded_price_keys_by_occurrence is None:
+        return await _candidate_forward_price_keys(
+            session,
+            serving_tables,
+            provider_filters_by_code_key,
+            required_occurrence_keys,
+        )
+    return {
+        occurrence_key: tuple(price_keys)
+        for occurrence_key, price_keys in preloaded_price_keys_by_occurrence.items()
+        if occurrence_key in required_occurrence_keys
+    }
 
 
 def _is_challenge_match(

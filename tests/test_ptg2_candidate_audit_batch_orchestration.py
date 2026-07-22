@@ -300,6 +300,56 @@ async def test_candidate_scope_indexes_resolve_each_coordinate_family_once(
 
 
 @pytest.mark.asyncio
+async def test_candidate_scope_indexes_uses_preloaded_reverse_scope(
+    monkeypatch,
+):
+    challenge = _challenge()
+    code_index = codes.CandidateCodeIndex(
+        by_pair={("CPT", "99213"): ({"code_key": 7},)},
+        by_key={7: {"code_key": 7}},
+    )
+    preloaded_price_index = {(7, 5, 0): (8,)}
+    monkeypatch.setattr(
+        batch,
+        "candidate_code_records_by_pair",
+        AsyncMock(return_value=code_index),
+    )
+    provider_scope_loader = AsyncMock(
+        return_value=SimpleNamespace(
+            provider_set_keys_by_npi={challenge.npi: (5,)},
+            price_keys_by_occurrence=preloaded_price_index,
+        )
+    )
+    monkeypatch.setattr(
+        batch,
+        "load_candidate_provider_scope",
+        provider_scope_loader,
+    )
+    monkeypatch.setattr(
+        selection,
+        "_load_candidate_provider_code_sets_prepared",
+        AsyncMock(return_value={5: frozenset((7,))}),
+    )
+    monkeypatch.setattr(
+        batch,
+        "_provider_network_digests_by_key",
+        AsyncMock(return_value={5: frozenset()}),
+    )
+
+    indexes = await batch._candidate_scope_indexes(
+        object(),
+        _serving_tables(),
+        _access(),
+        (challenge,),
+        (),
+    )
+
+    assert indexes.provider_sets_by_npi_code == {(challenge.npi, 7): (5,)}
+    assert indexes.preloaded_price_keys_by_occurrence is preloaded_price_index
+    assert provider_scope_loader.await_args.args[0] is batch._provider_set_keys_by_npi
+
+
+@pytest.mark.asyncio
 async def test_provider_network_digest_projection_uses_one_metadata_read(monkeypatch):
     network_lookup = AsyncMock(return_value={5: ("Alpha",), 7: ("Beta",)})
     monkeypatch.setattr(batch, "_provider_network_names_by_key", network_lookup)
