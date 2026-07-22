@@ -72,6 +72,14 @@ from api.ptg2_address_policy import (
     PTG2_UNIFIED_ADDRESS_COLUMNS,
 )
 from api.ptg2_serving_utils import ein_plan_id_variants
+from api.plan_release_serving import (
+    PlanReleaseServingSelection,
+    annotate_plan_release_response,
+    binding_query_args,
+    has_conflicting_release_selectors,
+    normalize_plan_release_id,
+    resolve_plan_release_serving,
+)
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_demographic_filters import (
@@ -1099,6 +1107,26 @@ def _is_broad_office_visit_cpt(code_system: Any, code: Any) -> bool:
     return 99202 <= value <= 99215
 
 
+def _validated_plan_release_id(args: Mapping[str, Any]) -> str:
+    """Validate the canonical selector and forbid weaker routing overrides."""
+
+    raw_release_id = str(args.get("plan_release_id") or "").strip()
+    if not raw_release_id:
+        return ""
+    normalized_release_id = normalize_plan_release_id(raw_release_id)
+    if normalized_release_id is None:
+        raise InvalidUsage(
+            "Parameter 'plan_release_id' must be hprelease_ followed by "
+            "26 uppercase Crockford base32 characters"
+        )
+    if has_conflicting_release_selectors(args):
+        raise InvalidUsage(
+            "Parameter 'plan_release_id' cannot be combined with plan_id, "
+            "plan_external_id, plan_id_type, source_key, or snapshot_id"
+        )
+    return normalized_release_id
+
+
 def _reject_broad_group_plan_provider_expansion(
     args: Mapping[str, Any],
     context: Mapping[str, Any],
@@ -1155,6 +1183,23 @@ def _reject_broad_group_plan_provider_expansion(
         "use /api/v1/pricing/group-plan-providers with specialty/classification/location filters, or add "
         "specialty/taxonomy/npi and use procedure pricing only when the user asks for office-visit cost."
     )
+
+
+def _release_market_type_for_guard(
+    selection: PlanReleaseServingSelection | None,
+) -> str:
+    """Derive the guard market only from exact frozen network bindings."""
+
+    market_types = {
+        binding.plan_market_type.strip().lower()
+        for binding in (
+            selection.in_network_bindings if selection is not None else ()
+        )
+        if binding.plan_market_type.strip()
+    }
+    if "group" in market_types:
+        return "group"
+    return next(iter(market_types)) if len(market_types) == 1 else ""
 
 
 def _raise_unresolved_specialty(specialty_filter) -> None:
@@ -1842,8 +1887,10 @@ def _group_plan_provider_coverage_match_sql(
     clauses: list[str] = []
     if array_coverage_supported:
         clauses.extend((
-            f"{address_alias}.group_plan_array @> ARRAY[:plan_id]::varchar[]",
-            f"{address_alias}.ptg_plan_array @> ARRAY[:plan_id]::varchar[]",
+            f"{address_alias}.group_plan_array "
+            "&& CAST(:plan_ids AS varchar[])",
+            f"{address_alias}.ptg_plan_array "
+            "&& CAST(:plan_ids AS varchar[])",
         ))
     if plan_bridge_supported:
         clauses.append(
@@ -1851,7 +1898,7 @@ def _group_plan_provider_coverage_match_sql(
                 SELECT 1
                   FROM {PRICING_SCHEMA}.entity_address_plan_bridge eapb
                  WHERE eapb.location_key = {address_alias}.location_key
-                   AND eapb.plan_id = :plan_id
+                   AND eapb.plan_id = ANY(CAST(:plan_ids AS text[]))
             )"""
         )
     return "(" + " OR ".join(clauses) + ")" if clauses else "FALSE"
@@ -5511,19 +5558,34 @@ def _allowed_amount_provider_filter_sql(
 _ALLOWED_AMOUNT_SCOPE_CTES_SQL = f"""
         current_snapshots AS MATERIALIZED (
             SELECT current_snapshot.snapshot_id,
-                   current_snapshot.source_key
+                   current_snapshot.source_key,
+                   current_snapshot.plan_id,
+                   current_snapshot.plan_market_type
               FROM unnest(
                        CAST(:snapshot_ids AS text[]),
-                       CAST(:source_keys AS text[])
-                   ) AS current_snapshot(snapshot_id, source_key)
+                       CAST(:source_keys AS text[]),
+                       CAST(:plan_ids AS text[]),
+                       CAST(:plan_market_types AS text[])
+                   ) AS current_snapshot(
+                       snapshot_id,
+                       source_key,
+                       plan_id,
+                       plan_market_type
+                   )
               JOIN {PTG2_SCHEMA}.ptg2_snapshot snapshot
                 ON snapshot.snapshot_id = current_snapshot.snapshot_id
-              JOIN {PTG2_SCHEMA}.ptg2_current_source_snapshot allowed_pointer
-                ON allowed_pointer.snapshot_id = snapshot.snapshot_id
-               AND allowed_pointer.source_key
-                   = snapshot.manifest
-                       ->'allowed_amount_index'->>'current_source_key'
              WHERE snapshot.status = 'published'
+               AND (
+                    :allow_release_snapshot
+                    OR EXISTS (
+                        SELECT 1
+                          FROM {PTG2_SCHEMA}.ptg2_current_source_snapshot allowed_pointer
+                         WHERE allowed_pointer.snapshot_id = snapshot.snapshot_id
+                           AND allowed_pointer.source_key
+                               = snapshot.manifest
+                                   ->'allowed_amount_index'->>'current_source_key'
+                    )
+               )
                AND snapshot.manifest->'allowed_amount_index'->>'contract'
                    = :allowed_contract
                AND snapshot.manifest->'allowed_amount_index'->>'arch_version'
@@ -5555,11 +5617,12 @@ _ALLOWED_AMOUNT_SCOPE_CTES_SQL = f"""
                 ON snapshot.snapshot_id = current_snapshot.snapshot_id
               JOIN {PTG2_SCHEMA}.ptg2_allowed_amount_plan plan_coverage
                 ON plan_coverage.snapshot_id = snapshot.snapshot_id
-               AND plan_coverage.plan_id = ANY(CAST(:plan_ids AS text[]))
+               AND plan_coverage.plan_id = current_snapshot.plan_id
                AND (
-                    :market_type = ''
+                    current_snapshot.plan_market_type = ''
                     OR COALESCE(plan_coverage.plan_market_type, '') = ''
-                    OR COALESCE(plan_coverage.plan_market_type, '') = :market_type
+                    OR COALESCE(plan_coverage.plan_market_type, '')
+                       = current_snapshot.plan_market_type
                )
               JOIN {PTG2_SCHEMA}.ptg2_allowed_amount_item allowed_item
                 ON allowed_item.snapshot_id = plan_coverage.snapshot_id
@@ -5720,6 +5783,8 @@ _ALLOWED_AMOUNT_PAGE_SQL_TEMPLATE = f"""
                     DISTINCT jsonb_build_object(
                         'source_key', evidence.source_key,
                         'snapshot_id', evidence.snapshot_id,
+                        'plan_id', evidence.plan_id,
+                        'plan_market_type', evidence.plan_market_type,
                         'source_file_import_id',
                             regexp_replace(
                                 COALESCE(evidence.import_run_id, ''),
@@ -5845,20 +5910,44 @@ def _allowed_amount_query_params(
     npi: int | None,
     current_snapshots: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    requested_market_type = str(
+        args.get("plan_market_type") or args.get("market_type") or ""
+    ).strip().lower()
+    physical_binding_tuples: list[tuple[str, str, str, str]] = []
+    seen_binding_tuples: set[tuple[str, str, str, str]] = set()
+    for snapshot_by_field in current_snapshots:
+        binding_plan_id = str(
+            snapshot_by_field.get("plan_id") or plan_id
+        ).strip()
+        binding_market_type = str(
+            snapshot_by_field.get(
+                "plan_market_type",
+                requested_market_type,
+            )
+            or ""
+        ).strip().lower()
+        for plan_id_variant in ein_plan_id_variants(binding_plan_id):
+            binding_tuple = (
+                str(snapshot_by_field["snapshot_id"]),
+                str(snapshot_by_field["source_key"]),
+                plan_id_variant,
+                binding_market_type,
+            )
+            if binding_tuple in seen_binding_tuples:
+                continue
+            seen_binding_tuples.add(binding_tuple)
+            physical_binding_tuples.append(binding_tuple)
     parameter_map = {
         "allowed_contract": PTG2_ALLOWED_AMOUNT_CONTRACT,
-        "snapshot_ids": [
-            snapshot_by_field["snapshot_id"]
-            for snapshot_by_field in current_snapshots
+        "snapshot_ids": [binding_tuple[0] for binding_tuple in physical_binding_tuples],
+        "source_keys": [binding_tuple[1] for binding_tuple in physical_binding_tuples],
+        "plan_ids": [binding_tuple[2] for binding_tuple in physical_binding_tuples],
+        "plan_market_types": [
+            binding_tuple[3] for binding_tuple in physical_binding_tuples
         ],
-        "source_keys": [
-            snapshot_by_field["source_key"]
-            for snapshot_by_field in current_snapshots
-        ],
-        "plan_ids": list(ein_plan_id_variants(plan_id)),
-        "market_type": str(
-            args.get("plan_market_type") or args.get("market_type") or ""
-        ).strip().lower(),
+        "allow_release_snapshot": bool(
+            str(args.get("plan_release_id") or "").strip()
+        ),
         "code": code,
         "code_system": code_system,
         "npi": npi,
@@ -6001,6 +6090,69 @@ def _allowed_amount_search_response(
     }
 
 
+def _allowed_amount_no_match_response(
+    args: Mapping[str, Any],
+    pagination,
+    selection: PlanReleaseServingSelection,
+    *,
+    search_scope: tuple[str, str, str, int | None],
+) -> dict[str, Any]:
+    """Return a resolved empty result for an exact canonical release."""
+
+    plan_id, code, code_system, _npi_filter = search_scope
+    binding_sources = [
+        {
+            "source_key": binding.source_key,
+            "snapshot_id": binding.snapshot_id,
+            "plan_id": binding.plan_id,
+            "plan_market_type": binding.plan_market_type,
+            "role": binding.role,
+        }
+        for binding in selection.allowed_amount_bindings
+    ]
+    network_context = _allowed_amount_network_context(())
+    query_by_field = _allowed_amount_response_query(
+        args,
+        evidence_sources=binding_sources,
+        network_context=network_context,
+        plan_id=plan_id,
+        code=code,
+        code_system=code_system,
+    )
+    query_by_field["status"] = "no_match"
+    response_by_field = {
+        "result_state": _ptg2_empty_result_state(
+            "no_match",
+            has_location_filter=_has_ptg2_location_filter(args),
+        ),
+        "pricing_scope": "plan_scoped_allowed_amounts",
+        "resolved": True,
+        "items": [],
+        "pagination": _empty_allowed_amount_pagination(pagination),
+        "query": query_by_field,
+        "sources": _allowed_amount_response_sources(
+            binding_sources,
+            network_context,
+        ),
+        "warnings": [],
+    }
+    return (
+        annotate_plan_release_response(response_by_field, selection)
+        or response_by_field
+    )
+
+
+def _empty_allowed_amount_pagination(pagination) -> dict[str, Any]:
+    return {
+        "total": 0,
+        "limit": max(int(getattr(pagination, "limit", 25) or 25), 1),
+        "offset": max(int(getattr(pagination, "offset", 0) or 0), 0),
+        "page": max(int(getattr(pagination, "page", 1) or 1), 1),
+        "has_more": False,
+        "total_is_exact": True,
+    }
+
+
 async def _allowed_amount_page_rows(
     session,
     args: Mapping[str, Any],
@@ -6084,30 +6236,89 @@ async def _allowed_amount_response_from_page(
     )
 
 
+async def _resolve_allowed_amount_route(
+    session,
+    args: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], PlanReleaseServingSelection | None] | None:
+    requested_release_id = str(args.get("plan_release_id") or "").strip()
+    if not requested_release_id:
+        return args, None
+    if has_conflicting_release_selectors(args):
+        return None
+    release_selection = await resolve_plan_release_serving(
+        session,
+        requested_release_id,
+    )
+    if release_selection is None:
+        return None
+    allowed_bindings = release_selection.allowed_amount_bindings
+    if not allowed_bindings:
+        return None
+    resolved_args_by_name = binding_query_args(args, allowed_bindings[0])
+    resolved_args_by_name["_plan_release_allowed_bindings"] = [
+        {
+            "source_key": binding.source_key,
+            "snapshot_id": binding.snapshot_id,
+            "plan_id": binding.plan_id,
+            "plan_market_type": binding.plan_market_type,
+        }
+        for binding in allowed_bindings
+    ]
+    return resolved_args_by_name, release_selection
+
+
+async def _allowed_amount_snapshot_rows(
+    session,
+    resolved_args: Mapping[str, Any],
+    plan_id: str,
+    release_selection: PlanReleaseServingSelection | None,
+) -> list[dict[str, Any]]:
+    if release_selection is not None:
+        return [
+            {
+                "source_key": binding.source_key,
+                "snapshot_id": binding.snapshot_id,
+                "plan_id": binding.plan_id,
+                "plan_market_type": binding.plan_market_type,
+            }
+            for binding in release_selection.allowed_amount_bindings
+        ]
+    return await _current_allowed_amount_snapshots_for_plan(
+        session,
+        resolved_args,
+        plan_id=plan_id,
+    )
+
+
 async def _search_ptg_allowed_amount_evidence(
     session,
     args: Mapping[str, Any],
     pagination,
 ) -> dict[str, Any] | None:
-    """Search current strict-V3 allowed evidence with exact SQL pagination."""
+    """Search current or canonically pinned strict-V3 allowed evidence."""
 
-    search_scope = _allowed_amount_scope_from_args(args)
+    resolved_route = await _resolve_allowed_amount_route(session, args)
+    if resolved_route is None:
+        return None
+    resolved_args, release_selection = resolved_route
+    search_scope = _allowed_amount_scope_from_args(resolved_args)
     if (
         search_scope is None
-        or not _supports_allowed_amount_fallback(args)
+        or not _supports_allowed_amount_fallback(resolved_args)
     ):
         return None
     plan_id = search_scope[0]
-    current_snapshots = await _current_allowed_amount_snapshots_for_plan(
+    current_snapshots = await _allowed_amount_snapshot_rows(
         session,
-        args,
-        plan_id=plan_id,
+        resolved_args,
+        plan_id,
+        release_selection,
     )
     if not current_snapshots:
         return None
     page_search = await _allowed_amount_page_rows(
         session,
-        args,
+        resolved_args,
         pagination,
         search_scope=search_scope,
         current_snapshots=current_snapshots,
@@ -6115,14 +6326,27 @@ async def _search_ptg_allowed_amount_evidence(
     if page_search is None:
         return None
     page_rows, query_parameter_map = page_search
-    return await _allowed_amount_response_from_page(
+    response_payload = await _allowed_amount_response_from_page(
         session,
-        args,
+        resolved_args,
         pagination,
         search_scope=search_scope,
         page_rows=page_rows,
         query_parameter_map=query_parameter_map,
     )
+    if release_selection is not None:
+        if response_payload is None:
+            return _allowed_amount_no_match_response(
+                resolved_args,
+                pagination,
+                release_selection,
+                search_scope=search_scope,
+            )
+        return annotate_plan_release_response(
+            response_payload,
+            release_selection,
+        )
+    return response_payload
 
 
 def _allowed_amount_rows_by_npi(
@@ -6207,21 +6431,32 @@ def _allowed_amount_response_query(
 ) -> dict[str, Any]:
     """Build the response query contract for an allowed-evidence result."""
 
-    source_keys = [
-        source_by_field.get("source_key")
-        for source_by_field in evidence_sources
-        if source_by_field.get("source_key")
-    ]
-    snapshot_ids = [
-        source_by_field.get("snapshot_id")
-        for source_by_field in evidence_sources
-        if source_by_field.get("snapshot_id")
-    ]
+    release_bindings, release_plan_ids, release_market_types = (
+        _allowed_release_query_scope(args)
+    )
+    source_keys, snapshot_ids = _allowed_evidence_coordinates(
+        evidence_sources
+    )
     query_by_field = {
-        "plan_id": plan_id,
-        "plan_market_type": (
-            args.get("plan_market_type") or args.get("market_type") or None
+        "plan_id": (
+            release_plan_ids[0]
+            if len(release_plan_ids) == 1
+            else (None if release_bindings else plan_id)
         ),
+        "plan_ids": release_plan_ids or None,
+        "plan_market_type": (
+            release_market_types[0]
+            if len(release_market_types) == 1
+            else (
+                None
+                if release_bindings
+                else args.get("plan_market_type")
+                or args.get("market_type")
+                or None
+            )
+        ),
+        "plan_market_types": release_market_types or None,
+        "bindings": release_bindings or None,
         "code": code,
         "code_system": code_system or None,
         "source": "ptg2_allowed_amounts",
@@ -6234,6 +6469,53 @@ def _allowed_amount_response_query(
     }
     query_by_field.update(_allowed_amount_response_filters(args))
     return query_by_field
+
+
+def _allowed_release_query_scope(
+    args: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    release_bindings = [
+        dict(binding_by_field)
+        for binding_by_field in (
+            args.get("_plan_release_allowed_bindings") or []
+        )
+        if isinstance(binding_by_field, Mapping)
+    ]
+    release_plan_ids = sorted(
+        {
+            str(binding_by_field.get("plan_id") or "").strip()
+            for binding_by_field in release_bindings
+            if str(binding_by_field.get("plan_id") or "").strip()
+        }
+    )
+    release_market_types = sorted(
+        {
+            str(
+                binding_by_field.get("plan_market_type") or ""
+            ).strip().lower()
+            for binding_by_field in release_bindings
+            if str(
+                binding_by_field.get("plan_market_type") or ""
+            ).strip()
+        }
+    )
+    return release_bindings, release_plan_ids, release_market_types
+
+
+def _allowed_evidence_coordinates(
+    evidence_sources: Iterable[Mapping[str, Any]],
+) -> tuple[list[Any], list[Any]]:
+    source_keys = [
+        source_by_field.get("source_key")
+        for source_by_field in evidence_sources
+        if source_by_field.get("source_key")
+    ]
+    snapshot_ids = [
+        source_by_field.get("snapshot_id")
+        for source_by_field in evidence_sources
+        if source_by_field.get("snapshot_id")
+    ]
+    return source_keys, snapshot_ids
 
 
 def _allowed_amount_response_sources(
@@ -6695,9 +6977,13 @@ async def group_plan_providers(request):
     path that can answer "all providers for this group plan" for any API client.
     """
     session = _get_session(request)
+    # Keep the parameter visible to the route/OpenAPI parity scanner; the
+    # shared validator below also checks incompatible raw selectors.
+    request.args.get("plan_release_id")
+    plan_release_id = _validated_plan_release_id(request.args)
     plan_id = (request.args.get("plan_id") or "").strip()
-    if not plan_id:
-        raise InvalidUsage("plan_id (EIN) is required")
+    if not plan_id and not plan_release_id:
+        raise InvalidUsage("plan_id (EIN) or plan_release_id is required")
     market_type = (request.args.get("market_type") or "group").strip().lower()
     try:
         limit = int(request.args.get("limit") or 200)
@@ -6738,20 +7024,92 @@ async def group_plan_providers(request):
     specialty_warning = None
 
     requested_source_key = (request.args.get("source_key") or "").strip().lower()
-    snapshot_pairs = await _current_source_snapshot_pairs_for_plan(
-        session, {"plan_id": plan_id, "plan_market_type": market_type, "source_key": requested_source_key or None}
+    release_selection = None
+    resolved_plan_ids = [plan_id] if plan_id else []
+    resolved_market_types = (
+        [market_type] if market_type and not plan_release_id else []
     )
+    if plan_release_id:
+        market_type = None
+        release_selection = await resolve_plan_release_serving(
+            session,
+            plan_release_id,
+        )
+        release_bindings = (
+            release_selection.in_network_bindings
+            if release_selection is not None
+            else ()
+        )
+        snapshot_pairs = [
+            (binding.source_key, binding.snapshot_id)
+            for binding in release_bindings
+        ]
+        if release_bindings:
+            resolved_plan_ids = sorted(
+                {binding.plan_id for binding in release_bindings}
+            )
+            resolved_market_types = sorted(
+                {
+                    binding.plan_market_type
+                    for binding in release_bindings
+                    if binding.plan_market_type
+                }
+            )
+            plan_id = (
+                resolved_plan_ids[0]
+                if len(resolved_plan_ids) == 1
+                else None
+            )
+            market_type = (
+                resolved_market_types[0]
+                if len(resolved_market_types) == 1
+                else None
+            )
+    else:
+        snapshot_pairs = await _current_source_snapshot_pairs_for_plan(
+            session,
+            {
+                "plan_id": plan_id,
+                "plan_market_type": market_type,
+                "source_key": requested_source_key or None,
+            },
+        )
     if not snapshot_pairs:
-        return response.json({
+        is_canonical_release_resolved = release_selection is not None
+        no_route_by_field = {
             "ok": True, "plan_id": plan_id, "market_type": market_type,
-            "snapshot_id": None, "resolved": False,
-            "reason": "no published serving snapshot for this plan_id + market_type",
+            "plan_ids": resolved_plan_ids,
+            "plan_market_types": resolved_market_types,
+            "plan_release_id": plan_release_id or None,
+            "snapshot_id": None,
+            "snapshots": [],
+            "resolved": is_canonical_release_resolved,
+            "result_state": (
+                "no_matching_providers"
+                if is_canonical_release_resolved
+                else "no_snapshot_for_plan"
+            ),
+            "reason": (
+                "published plan release has no in-network provider binding"
+                if is_canonical_release_resolved
+                else "no complete published serving revision for this plan_release_id"
+                if plan_release_id
+                else "no published serving snapshot for this plan_id + market_type"
+            ),
             "providers": {"count": 0, "items": [], "next_cursor": None},
             "provider_sex_code": provider_sex_code,
             "taxonomy_filter": specialty_filter.response_payload(),
             "specialty_warning": specialty_warning,
             "exhausted": True,
-        })
+            "query": {
+                "status": (
+                    "no_match" if is_canonical_release_resolved else "no_route"
+                )
+            },
+        }
+        if release_selection is not None:
+            annotate_plan_release_response(no_route_by_field, release_selection)
+        return response.json(no_route_by_field)
     selected_source_key, snapshot_id = snapshot_pairs[0]
 
     # A plan served by multiple networks (e.g. a medical network plus a
@@ -6761,8 +7119,51 @@ async def group_plan_providers(request):
     # snapshot instead.
     snapshots = []
     shared_snapshot_keys: list[int] = []
+    release_binding_by_snapshot = {
+        (binding.source_key, binding.snapshot_id): binding
+        for binding in (
+            release_selection.in_network_bindings
+            if release_selection is not None
+            else ()
+        )
+    }
     for pair_source_key, pair_snapshot_id in snapshot_pairs:
         pair_tables = await snapshot_serving_tables(session, pair_snapshot_id)
+        pair_plan_id = plan_id
+        pair_market_type = market_type
+        if release_selection is not None:
+            release_binding = release_binding_by_snapshot.get(
+                (pair_source_key, pair_snapshot_id)
+            )
+            if release_binding is None:
+                raise PTG2ManifestArtifactError(
+                    "canonical plan release is missing a frozen network binding"
+                )
+            pair_plan_id = release_binding.plan_id
+            pair_market_type = release_binding.plan_market_type
+            serving_plan_id = str(
+                getattr(pair_tables, "plan_id", None) or ""
+            ).strip()
+            serving_market_type = str(
+                getattr(pair_tables, "plan_market_type", None) or ""
+            ).strip().lower()
+            serving_source_key = str(
+                getattr(pair_tables, "source_key", None) or ""
+            ).strip().lower()
+            if (
+                serving_plan_id
+                not in set(ein_plan_id_variants(release_binding.plan_id))
+                or not serving_market_type
+                or serving_market_type
+                != release_binding.plan_market_type.strip().lower()
+                or not serving_source_key
+                or serving_source_key
+                != release_binding.source_key.strip().lower()
+            ):
+                raise PTG2ManifestArtifactError(
+                    "canonical plan release binding does not match the "
+                    "snapshot's attested plan, market, and source scope"
+                )
         pair_snapshot_key = (
             int(pair_tables.shared_snapshot_key)
             if pair_tables.uses_shared_blocks
@@ -6772,6 +7173,8 @@ async def group_plan_providers(request):
         snapshots.append({
             "source_key": pair_source_key,
             "snapshot_id": pair_snapshot_id,
+            "plan_id": pair_plan_id,
+            "plan_market_type": pair_market_type,
             "enumerated": pair_snapshot_key is not None,
         })
         if pair_snapshot_key is not None:
@@ -6797,7 +7200,15 @@ async def group_plan_providers(request):
         "limit": limit,
         "npi_min": NPI_MIN,
         "npi_max": NPI_MAX,
-        "plan_id": plan_id,
+        "plan_ids": sorted(
+            {
+                plan_id_variant
+                for resolved_plan_id in resolved_plan_ids
+                for plan_id_variant in ein_plan_id_variants(
+                    resolved_plan_id
+                )
+            }
+        ),
         "snapshot_keys": sorted(set(shared_snapshot_keys)),
     }
     taxonomy_predicate = provider_specialty_taxonomy_exists_sql(
@@ -7020,7 +7431,7 @@ async def group_plan_providers(request):
     if has_location_filter and provider_npis:
         address_parameters_by_name: dict[str, Any] = {
             "npis": provider_npis,
-            "plan_id": plan_id,
+            "plan_ids": params["plan_ids"],
         }
         address_clauses = ["addr.npi = ANY(:npis)"]
         if not include_mail_addresses:
@@ -7146,14 +7557,23 @@ async def group_plan_providers(request):
             provider_item["address"] = item_addresses[0]
 
     next_cursor = str(provider_npis[-1]) if len(provider_npis) == limit else None
-    return response.json({
+    response_by_field = {
         "ok": True,
+        "result_state": (
+            "matched" if provider_items else "no_matching_providers"
+        ),
         "plan_id": plan_id,
+        "plan_ids": resolved_plan_ids,
+        "plan_release_id": plan_release_id or None,
         "market_type": market_type,
+        "plan_market_types": resolved_market_types,
         "snapshot_id": snapshot_id,
         "source_key": selected_source_key,
         "snapshots": snapshots,
         "resolved": True,
+        "query": {
+            "status": "matched" if provider_items else "no_match",
+        },
         "provider_sex_code": provider_sex_code,
         "taxonomy_filter": specialty_filter.response_payload(),
         "specialty_warning": specialty_warning,
@@ -7171,6 +7591,8 @@ async def group_plan_providers(request):
             "address_types": list(address_types) if has_location_filter and not include_mail_addresses else None,
             "count_requested": is_count_requested,
             "count_exact": is_count_requested and not should_skip_exact_count,
+            "plan_ids_considered": resolved_plan_ids,
+            "plan_market_types_considered": resolved_market_types,
         },
         "providers": {
             "count": len(provider_items),
@@ -7180,7 +7602,10 @@ async def group_plan_providers(request):
             "next_cursor": next_cursor,
         },
         "exhausted": next_cursor is None,
-    })
+    }
+    if release_selection is not None:
+        annotate_plan_release_response(response_by_field, release_selection)
+    return response.json(response_by_field)
 
 
 @blueprint.get("/statistics", name="pricing.statistics")
@@ -7838,6 +8263,8 @@ async def list_provider_procedures(request, npi: str):
     plan_market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
     source_key = str(args.get("source_key", "")).strip().lower()
     snapshot_id = str(args.get("snapshot_id", "")).strip()
+    args.get("plan_release_id")
+    plan_release_id = _validated_plan_release_id(args)
     mode = str(args.get("mode", "")).strip()
 
     if mode:
@@ -7845,10 +8272,11 @@ async def list_provider_procedures(request, npi: str):
             normalize_ptg2_mode(mode)
         except ValueError as exc:
             raise InvalidUsage(str(exc)) from exc
-    if plan_id or plan_external_id or source_key or snapshot_id:
+    if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         ptg_args_by_name = {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
+                "plan_release_id": plan_release_id or None,
                 "plan_id_type": plan_id_type or None,
                 "plan_market_type": plan_market_type or None,
                 "source_key": source_key or None,
@@ -7882,6 +8310,7 @@ async def list_provider_procedures(request, npi: str):
                 "npi": provider_npi,
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
+                "plan_release_id": plan_release_id or None,
                 "plan_id_type": plan_id_type or None,
                 "plan_market_type": plan_market_type or None,
                 "source_key": source_key or None,
@@ -7904,7 +8333,13 @@ async def list_provider_procedures(request, npi: str):
                     "pricing_scope": "plan_scoped_ptg",
                     "resolved": ptg_empty_status == "no_match",
                     **(
-                        {"reason": "no published serving snapshot for this plan_id + market_type"}
+                        {
+                            "reason": (
+                                "no complete published serving revision for this plan_release_id"
+                                if plan_release_id
+                                else "no published serving snapshot for this plan_id + market_type"
+                            )
+                        }
                         if ptg_empty_status == "no_route"
                         else {}
                     ),
@@ -7922,11 +8357,15 @@ async def list_provider_procedures(request, npi: str):
             ptg2_payload,
             plan_id_type=plan_id_type,
             year=year,
-            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+            has_plan_scope=bool(
+                plan_id or plan_external_id or snapshot_id or plan_release_id
+            ),
         )
         _annotate_ptg2_result_state(
             ptg2_payload,
-            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+            has_plan_scope=bool(
+                plan_id or plan_external_id or snapshot_id or plan_release_id
+            ),
             has_location_filter=_has_ptg2_location_filter(args),
         )
         return _json_response(ptg2_payload)
@@ -10299,6 +10738,8 @@ async def list_providers_by_procedure(request):
     plan_market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
     source_key = str(args.get("source_key", "")).strip().lower()
     snapshot_id = str(args.get("snapshot_id", "")).strip()
+    args.get("plan_release_id")
+    plan_release_id = _validated_plan_release_id(args)
     mode = str(args.get("mode", "")).strip()
     npi = _parse_int(args.get("npi") or None, "npi", minimum=1)
     provider_sex_code = normalize_provider_sex_code(
@@ -10311,7 +10752,7 @@ async def list_providers_by_procedure(request):
     if not query_text and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
     ptg_specialty_filter = None
-    if plan_id or plan_external_id or source_key or snapshot_id:
+    if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         # Plan-scoped searches filter via taxonomy codes; an unresolvable
         # specialty would otherwise silently return every specialty as if
         # filtered. Claims mode keeps its own LIKE/terminology fallback.
@@ -10321,14 +10762,24 @@ async def list_providers_by_procedure(request):
             args.get("taxonomy_code") or args.get("taxonomy_classification")
         ):
             _raise_unresolved_specialty(specialty_probe)
+    broad_expansion_market_type = plan_market_type
+    if plan_release_id:
+        broad_expansion_market_type = (
+            _release_market_type_for_guard(
+                await resolve_plan_release_serving(
+                    session,
+                    plan_release_id,
+                )
+            )
+        )
     _reject_broad_group_plan_provider_expansion(
         args,
         {
             "code": code,
             "code_system": ptg_code_system,
             "plan_id": plan_id,
-            "plan_external_id": plan_external_id,
-            "plan_market_type": plan_market_type,
+            "plan_external_id": plan_external_id or plan_release_id,
+            "plan_market_type": broad_expansion_market_type,
             "state": state,
             "city": city,
             "zip5": zip5,
@@ -10344,7 +10795,7 @@ async def list_providers_by_procedure(request):
             normalize_ptg2_mode(mode)
         except ValueError as exc:
             raise InvalidUsage(str(exc)) from exc
-    if plan_id or plan_external_id or source_key or snapshot_id:
+    if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         ptg_latitude = latitude
         ptg_longitude = longitude
         ptg_radius_miles = coordinate_radius_miles if latitude is not None else None
@@ -10363,6 +10814,7 @@ async def list_providers_by_procedure(request):
         ptg_args_by_name = {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
+                "plan_release_id": plan_release_id or None,
                 "plan_id_type": plan_id_type or None,
                 "plan_market_type": plan_market_type or None,
                 "source_key": source_key or None,
@@ -10434,7 +10886,10 @@ async def list_providers_by_procedure(request):
                         plan_id_type=plan_id_type,
                         year=year,
                         has_plan_scope=bool(
-                            plan_id or plan_external_id or snapshot_id
+                            plan_id
+                            or plan_external_id
+                            or snapshot_id
+                            or plan_release_id
                         ),
                     )
                     return _ptg_json_response(
@@ -10446,6 +10901,7 @@ async def list_providers_by_procedure(request):
             query_by_field = {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
+                "plan_release_id": plan_release_id or None,
                 "plan_id_type": plan_id_type or None,
                 "plan_market_type": plan_market_type or None,
                 "source_key": source_key or None,
@@ -10480,7 +10936,13 @@ async def list_providers_by_procedure(request):
                     "pricing_scope": "plan_scoped_ptg",
                     "resolved": ptg_empty_status == "no_match",
                     **(
-                        {"reason": "no published serving snapshot for this plan_id + market_type"}
+                        {
+                            "reason": (
+                                "no complete published serving revision for this plan_release_id"
+                                if plan_release_id
+                                else "no published serving snapshot for this plan_id + market_type"
+                            )
+                        }
                         if ptg_empty_status == "no_route"
                         else {}
                     ),
@@ -10509,7 +10971,10 @@ async def list_providers_by_procedure(request):
                     plan_id_type=plan_id_type,
                     year=year,
                     has_plan_scope=bool(
-                        plan_id or plan_external_id or snapshot_id
+                        plan_id
+                        or plan_external_id
+                        or snapshot_id
+                        or plan_release_id
                     ),
                 )
                 return _ptg_json_response(
@@ -10520,11 +10985,15 @@ async def list_providers_by_procedure(request):
             ptg2_payload,
             plan_id_type=plan_id_type,
             year=year,
-            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+            has_plan_scope=bool(
+                plan_id or plan_external_id or snapshot_id or plan_release_id
+            ),
         )
         _annotate_ptg2_result_state(
             ptg2_payload,
-            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+            has_plan_scope=bool(
+                plan_id or plan_external_id or snapshot_id or plan_release_id
+            ),
             has_location_filter=_has_ptg2_location_filter(args),
         )
         return _ptg_json_response(request, ptg2_payload)

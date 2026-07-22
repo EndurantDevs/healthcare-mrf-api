@@ -57,6 +57,13 @@ from api.ptg2_snapshot import (
     current_network_snapshots_for_plan,
     resolve_current_ptg2_snapshot_id,
 )
+from api.plan_release_serving import (
+    PlanReleaseServingSelection,
+    annotate_plan_release_response,
+    binding_query_args,
+    has_conflicting_release_selectors,
+    resolve_plan_release_serving,
+)
 from api.ptg2_response import (
     _canonical_catalog_code,
     _catalog_key,
@@ -9201,18 +9208,35 @@ async def _search_multi_ptg2_provider_procedures(
     network_snapshots: list[tuple[str, str]],
     args: dict[str, Any],
     pagination,
+    *,
+    release_selection: PlanReleaseServingSelection | None = None,
 ) -> dict[str, Any] | None:
     """Combine one provider's priced procedures across every plan network."""
     fetch_count = max(1, int(pagination.offset) + int(pagination.limit) + 1)
     sub_pagination = PaginationParams(page=1, limit=fetch_count, offset=0, source="page")
 
+    binding_by_network = {
+        (binding.source_key, binding.snapshot_id): binding
+        for binding in (
+            release_selection.in_network_bindings
+            if release_selection is not None
+            else ()
+        )
+    }
+
     async def read_network(source_key: str, snapshot_id: str):
         """Read one network through an independent database session."""
+        network_args = args
+        if release_selection is not None:
+            binding = binding_by_network.get((source_key, snapshot_id))
+            if binding is None:
+                return source_key, snapshot_id, None
+            network_args = binding_query_args(args, binding)
         return await _search_provider_procedures_network(
             source_key,
             snapshot_id,
             npi,
-            args,
+            network_args,
             sub_pagination,
         )
 
@@ -9220,11 +9244,187 @@ async def _search_multi_ptg2_provider_procedures(
         network_snapshots,
         read_network,
     )
-    return _shape_multi_provider_procedure_response(
+    response = _shape_multi_provider_procedure_response(
         network_responses,
         network_snapshots,
         args,
         pagination,
+    )
+    if release_selection is not None:
+        return annotate_plan_release_response(response, release_selection)
+    return response
+
+
+def _plan_release_no_match_query(
+    selection: PlanReleaseServingSelection,
+    args: Mapping[str, Any],
+    *,
+    npi: int | None = None,
+) -> dict[str, Any]:
+    release_bindings = selection.in_network_bindings
+    plan_ids = sorted({binding.plan_id for binding in release_bindings})
+    market_types = sorted(
+        {
+            binding.plan_market_type
+            for binding in release_bindings
+            if binding.plan_market_type
+        }
+    )
+    snapshots = [
+        {
+            "source_key": binding.source_key,
+            "snapshot_id": binding.snapshot_id,
+            "plan_id": binding.plan_id,
+            "plan_market_type": binding.plan_market_type,
+        }
+        for binding in release_bindings
+    ]
+    return {
+        "plan_id": plan_ids[0] if len(plan_ids) == 1 else None,
+        "plan_ids": plan_ids,
+        "plan_market_type": (
+            market_types[0] if len(market_types) == 1 else None
+        ),
+        "plan_market_types": market_types,
+        "source": "ptg2",
+        "status": "no_match",
+        "source_key": (
+            snapshots[0]["source_key"] if len(snapshots) == 1 else None
+        ),
+        "snapshot_id": (
+            snapshots[0]["snapshot_id"] if len(snapshots) == 1 else None
+        ),
+        "snapshots": snapshots,
+        "code": args.get("code") or None,
+        "code_system": args.get("code_system") or None,
+        "q": args.get("q") or None,
+        "npi": npi,
+    }
+
+
+def _empty_plan_release_pagination(pagination) -> dict[str, Any]:
+    return {
+        "total": 0,
+        "limit": max(int(getattr(pagination, "limit", 25) or 25), 1),
+        "offset": max(int(getattr(pagination, "offset", 0) or 0), 0),
+        "page": max(int(getattr(pagination, "page", 1) or 1), 1),
+        "has_more": False,
+    }
+
+
+def _plan_release_no_match_response(
+    selection: PlanReleaseServingSelection,
+    args: Mapping[str, Any],
+    pagination,
+    *,
+    npi: int | None = None,
+) -> dict[str, Any]:
+    """Represent a valid exact release with zero matching priced rows."""
+
+    response_by_field = {
+        "result_state": (
+            "no_match_in_radius"
+            if _has_location_filter(dict(args))
+            else "no_matching_rates"
+        ),
+        "pricing_scope": "plan_scoped_ptg",
+        "resolved": True,
+        "items": [],
+        "pagination": _empty_plan_release_pagination(pagination),
+        "query": _plan_release_no_match_query(selection, args, npi=npi),
+    }
+    return (
+        annotate_plan_release_response(response_by_field, selection)
+        or response_by_field
+    )
+
+
+def _plan_release_response_or_no_match(
+    response_by_field: dict[str, Any] | None,
+    selection: PlanReleaseServingSelection,
+    args: Mapping[str, Any],
+    pagination,
+    *,
+    npi: int | None = None,
+) -> dict[str, Any]:
+    """Keep matched data; normalize every valid empty release to no-match."""
+
+    procedure_items = (
+        response_by_field.get("items")
+        if isinstance(response_by_field, dict)
+        else None
+    )
+    pagination_by_field = (
+        response_by_field.get("pagination")
+        if isinstance(response_by_field, dict)
+        else None
+    )
+    try:
+        total = int(
+            pagination_by_field.get("total")
+            if isinstance(pagination_by_field, dict)
+            and pagination_by_field.get("total") is not None
+            else 0
+        )
+    except (TypeError, ValueError):
+        total = 0
+    if response_by_field is None or (
+        isinstance(procedure_items, list)
+        and not procedure_items
+        and total <= 0
+    ):
+        return _plan_release_no_match_response(
+            selection,
+            args,
+            pagination,
+            npi=npi,
+        )
+    return (
+        annotate_plan_release_response(response_by_field, selection)
+        or response_by_field
+    )
+
+
+async def _search_plan_release_provider_procedures(
+    session,
+    npi: int,
+    args: dict[str, Any],
+    pagination,
+    release_selection: PlanReleaseServingSelection,
+) -> dict[str, Any]:
+    release_bindings = release_selection.in_network_bindings
+    if not release_bindings:
+        return _plan_release_no_match_response(
+            release_selection, args, pagination, npi=npi
+        )
+    network_snapshots = [
+        (binding.source_key, binding.snapshot_id)
+        for binding in release_bindings
+    ]
+    if len(release_bindings) > 1:
+        response_by_field = await _search_multi_ptg2_provider_procedures(
+            session,
+            npi,
+            network_snapshots,
+            args,
+            pagination,
+            release_selection=release_selection,
+        )
+    else:
+        binding = release_bindings[0]
+        response_by_field = await _search_ptg2_provider_procedures_snapshot(
+            session,
+            npi,
+            binding_query_args(args, binding),
+            pagination,
+            snapshot_id=binding.snapshot_id,
+        )
+    return _plan_release_response_or_no_match(
+        response_by_field,
+        release_selection,
+        args,
+        pagination,
+        npi=npi,
     )
 
 
@@ -9235,6 +9435,23 @@ async def search_ptg2_provider_procedures(
     pagination,
 ) -> dict[str, Any] | None:
     """Search one or every plan-network snapshot for a provider's procedures."""
+    requested_release_id = str(args.get("plan_release_id") or "").strip()
+    if requested_release_id:
+        if has_conflicting_release_selectors(args):
+            return None
+        release_selection = await resolve_plan_release_serving(
+            session,
+            requested_release_id,
+        )
+        if release_selection is None:
+            return None
+        return await _search_plan_release_provider_procedures(
+            session,
+            npi,
+            args,
+            pagination,
+            release_selection,
+        )
     explicit_snapshot = str(args.get("snapshot_id") or "").strip()
     explicit_source = str(args.get("source_key") or "").strip()
     plan_scoped = bool(str(args.get("plan_id") or args.get("plan_external_id") or "").strip())
@@ -9556,6 +9773,8 @@ async def _search_multi_ptg2_snapshots(
     network_snapshots: list[tuple[str, str]],
     args: dict[str, Any],
     pagination,
+    *,
+    release_selection: PlanReleaseServingSelection | None = None,
 ) -> dict[str, Any] | None:
     """Search every network's snapshot for a plan and combine the results.
 
@@ -9579,46 +9798,21 @@ async def _search_multi_ptg2_snapshots(
         source=getattr(pagination, "source", "page"),
     )
 
-    combined_provider_items: list[dict[str, Any]] = []
-    total = 0
-    base_query_by_field: dict[str, Any] | None = None
-    matched_networks: list[dict[str, str]] = []
-    serving_tables_by_snapshot_id = (
-        await _network_tables_by_snapshot_id(
+    network_responses = await _read_multi_ptg2_snapshots(
         session,
         network_snapshots,
-        )
+        args,
+        sub_pagination,
+        release_selection,
     )
-
-    network_responses = []
-    for source_key, snapshot_id in network_snapshots:
-        network_response = await _search_one_ptg2_snapshot(
-            session,
-            snapshot_id,
-            args,
-            sub_pagination,
-            serving_tables=serving_tables_by_snapshot_id[snapshot_id],
-        )
-        network_responses.append((source_key, snapshot_id, network_response))
-    for source_key, snapshot_id, network_response in network_responses:
-        if not network_response:
-            continue
-        if base_query_by_field is None:
-            base_query_by_field = dict(network_response.get("query") or {})
-        page_info = network_response.get("pagination") or {}
-        try:
-            page_total = int(page_info.get("total") or 0)
-        except (TypeError, ValueError):
-            page_total = 0
-        total += page_total
-        network_items = network_response.get("items") or []
-        if network_items:
-            matched_networks.append({"source_key": source_key, "snapshot_id": snapshot_id})
-        for network_item in network_items:
-            tagged_provider_item_by_field = dict(network_item)
-            if source_key:
-                tagged_provider_item_by_field.setdefault("network", source_key)
-            combined_provider_items.append(tagged_provider_item_by_field)
+    if network_responses is None:
+        return None
+    (
+        combined_provider_items,
+        total,
+        base_query_by_field,
+        matched_networks,
+    ) = _combine_ptg2_network_results(network_responses)
 
     if base_query_by_field is None:
         # No network produced a payload, so behave like
@@ -9643,7 +9837,7 @@ async def _search_multi_ptg2_snapshots(
     query_by_field["networks"] = matched_networks
     query_by_field["combined"] = True
 
-    return {
+    response_by_field = {
         "items": page_items,
         "pagination": {
             "total": total,
@@ -9654,11 +9848,157 @@ async def _search_multi_ptg2_snapshots(
         },
         "query": query_by_field,
     }
+    if release_selection is not None:
+        return annotate_plan_release_response(
+            response_by_field, release_selection
+        )
+    return response_by_field
+
+
+def _combine_ptg2_network_results(
+    network_responses: Iterable[
+        tuple[str, str, dict[str, Any] | None]
+    ],
+) -> tuple[
+    list[dict[str, Any]],
+    int,
+    dict[str, Any] | None,
+    list[dict[str, str]],
+]:
+    combined_provider_items: list[dict[str, Any]] = []
+    total = 0
+    base_query_by_field: dict[str, Any] | None = None
+    matched_networks: list[dict[str, str]] = []
+    for source_key, snapshot_id, network_response in network_responses:
+        if not network_response:
+            continue
+        if base_query_by_field is None:
+            base_query_by_field = dict(network_response.get("query") or {})
+        page_info = network_response.get("pagination") or {}
+        page_total = 0
+        try:
+            page_total = int(page_info.get("total") or 0)
+        except (TypeError, ValueError):
+            page_total = 0
+        total += page_total
+        network_items = network_response.get("items") or []
+        if network_items:
+            matched_networks.append(
+                {"source_key": source_key, "snapshot_id": snapshot_id}
+            )
+        for network_item in network_items:
+            tagged_provider_item_by_field = dict(network_item)
+            if source_key:
+                tagged_provider_item_by_field.setdefault(
+                    "network", source_key
+                )
+            combined_provider_items.append(tagged_provider_item_by_field)
+    return (
+        combined_provider_items,
+        total,
+        base_query_by_field,
+        matched_networks,
+    )
+
+
+async def _read_multi_ptg2_snapshots(
+    session,
+    network_snapshots: Sequence[tuple[str, str]],
+    args: dict[str, Any],
+    sub_pagination: PaginationParams,
+    release_selection: PlanReleaseServingSelection | None,
+) -> list[tuple[str, str, dict[str, Any] | None]] | None:
+    serving_tables_by_snapshot_id = await _network_tables_by_snapshot_id(
+        session,
+        network_snapshots,
+    )
+    binding_by_network = {
+        (binding.source_key, binding.snapshot_id): binding
+        for binding in (
+            release_selection.in_network_bindings
+            if release_selection is not None
+            else ()
+        )
+    }
+    network_responses = []
+    for source_key, snapshot_id in network_snapshots:
+        network_args = args
+        if release_selection is not None:
+            binding = binding_by_network.get((source_key, snapshot_id))
+            if binding is None:
+                return None
+            network_args = binding_query_args(args, binding)
+        network_response = await _search_one_ptg2_snapshot(
+            session,
+            snapshot_id,
+            network_args,
+            sub_pagination,
+            serving_tables=serving_tables_by_snapshot_id[snapshot_id],
+        )
+        network_responses.append(
+            (source_key, snapshot_id, network_response)
+        )
+    return network_responses
+
+
+async def _search_plan_release_index(
+    session,
+    args: dict[str, Any],
+    pagination,
+    release_selection: PlanReleaseServingSelection,
+) -> dict[str, Any]:
+    release_bindings = release_selection.in_network_bindings
+    if not release_bindings:
+        return _plan_release_no_match_response(
+            release_selection, args, pagination
+        )
+    network_snapshots = [
+        (binding.source_key, binding.snapshot_id)
+        for binding in release_bindings
+    ]
+    if len(release_bindings) > 1:
+        response_by_field = await _search_multi_ptg2_snapshots(
+            session,
+            network_snapshots,
+            args,
+            pagination,
+            release_selection=release_selection,
+        )
+    else:
+        binding = release_bindings[0]
+        response_by_field = await _search_one_ptg2_snapshot(
+            session,
+            binding.snapshot_id,
+            binding_query_args(args, binding),
+            pagination,
+        )
+    return _plan_release_response_or_no_match(
+        response_by_field,
+        release_selection,
+        args,
+        pagination,
+    )
 
 
 async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -> dict[str, Any] | None:
     """Resolve current plan snapshots and execute a single or multi-network query."""
 
+    requested_release_id = str(args.get("plan_release_id") or "").strip()
+    if requested_release_id:
+        if has_conflicting_release_selectors(args):
+            return None
+        release_selection = await resolve_plan_release_serving(
+            session,
+            requested_release_id,
+        )
+        if release_selection is None:
+            return None
+        return await _search_plan_release_index(
+            session,
+            args,
+            pagination,
+            release_selection,
+        )
     explicit_snapshot = str(args.get("snapshot_id") or "").strip()
     explicit_source = str(args.get("source_key") or "").strip()
     plan_scoped = bool(str(args.get("plan_id") or args.get("plan_external_id") or "").strip())

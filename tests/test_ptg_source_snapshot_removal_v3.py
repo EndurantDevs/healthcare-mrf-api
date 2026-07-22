@@ -118,6 +118,20 @@ async def _create_production_shaped_schema(database, schema_name):
         )
         await connection.status(
             f"""
+            CREATE TABLE {schema}.ptg2_snapshot_pin (
+                owner_type varchar(48) NOT NULL,
+                owner_id varchar(96) NOT NULL,
+                snapshot_id varchar(128) NOT NULL REFERENCES
+                    {schema}.ptg2_snapshot(snapshot_id) ON DELETE RESTRICT,
+                reason varchar(256),
+                created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+                PRIMARY KEY (owner_type, owner_id, snapshot_id),
+                CHECK (btrim(owner_type) <> '' AND btrim(owner_id) <> '')
+            )
+            """
+        )
+        await connection.status(
+            f"""
             CREATE TABLE {schema}.ptg2_current_snapshot (
                 slot varchar(32) PRIMARY KEY,
                 snapshot_id varchar(96),

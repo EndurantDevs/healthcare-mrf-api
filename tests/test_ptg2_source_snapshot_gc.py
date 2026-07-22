@@ -140,6 +140,39 @@ def test_gc_plan_selects_only_unreferenced_strict_v3_snapshots():
     assert plan.tables == ()
 
 
+def test_gc_protected_set_unions_owner_qualified_snapshot_pins():
+    executor = _Executor(
+        [
+            {
+                "snapshot_id": "release-pinned",
+                "status": "published",
+                "source_key": "source_a",
+                "serving_index": _strict_index(),
+            },
+            {
+                "snapshot_id": "unreferenced",
+                "status": "published",
+                "source_key": "source_a",
+                "serving_index": _strict_index(),
+            },
+        ],
+        current_snapshot_ids=("release-pinned",),
+    )
+
+    plan = asyncio.run(
+        snapshot_gc.build_ptg2_source_snapshot_gc_plan(executor=executor)
+    )
+
+    pointer_sql = next(
+        statement
+        for statement, _params in executor.all_calls
+        if "SELECT DISTINCT snapshot_id" in statement
+    )
+    assert "ptg2_snapshot_pin" in pointer_sql
+    assert plan.current_snapshot_ids == ("release-pinned",)
+    assert plan.candidate_snapshot_ids == ("unreferenced",)
+
+
 def test_gc_plan_tracks_allowed_current_replacement_and_collects_older_snapshot():
     executor = _Executor(
         [

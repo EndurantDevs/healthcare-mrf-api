@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from api import ptg2_capacity_evidence as capacity_evidence
+from api import plan_release_serving
 from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_ACCESS_ARG,
     PTG2_CANDIDATE_AUDIT_HEADER,
@@ -489,8 +490,10 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
         "include_mail_addresses": False,
         "address_source": "npi",
         "address_types": ["primary", "secondary"],
-        "count_requested": True,
-        "count_exact": True,
+            "count_requested": True,
+            "count_exact": True,
+            "plan_ids_considered": ["TESTPLAN001"],
+            "plan_market_types_considered": ["group"],
     }
     assert pricing_response["providers"]["total_distinct"] == 1
     assert pricing_response["providers"]["items"][0]["address"] == {
@@ -632,13 +635,241 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
 
     assert response_payload["snapshot_id"] == "ptg2:test:ndc"
     assert response_payload["snapshots"] == [
-        {"source_key": "ptg_ndc", "snapshot_id": "ptg2:test:ndc", "enumerated": True},
-        {"source_key": "ptg_c2", "snapshot_id": "ptg2:test:c2", "enumerated": True},
+        {
+            "source_key": "ptg_ndc",
+            "snapshot_id": "ptg2:test:ndc",
+            "plan_id": "TESTPLAN001",
+            "plan_market_type": "group",
+            "enumerated": True,
+        },
+        {
+            "source_key": "ptg_c2",
+            "snapshot_id": "ptg2:test:c2",
+            "plan_id": "TESTPLAN001",
+            "plan_market_type": "group",
+            "enumerated": True,
+        },
     ]
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     assert "SELECT npi FROM mrf.ptg2_v3_npi_scope" in provider_sql
     assert "snapshot_key = ANY(:snapshot_keys)" in provider_sql
     assert "(SELECT npi FROM" in provider_sql
+
+
+def _canonical_directory_selection():
+    return _canonical_release_selection(
+        [
+            plan_release_serving.PlanReleaseSnapshotBinding(
+                binding_ordinal=0,
+                snapshot_id="ptg2:release:a",
+                source_key="aetna-a",
+                plan_id="38-2418014",
+                plan_market_type="group",
+                role="in_network",
+                required=True,
+            ),
+            plan_release_serving.PlanReleaseSnapshotBinding(
+                binding_ordinal=1,
+                snapshot_id="ptg2:release:b",
+                source_key="aetna-b",
+                plan_id="PLAN-B",
+                plan_market_type="group",
+                role="in_network",
+                required=True,
+            ),
+        ]
+    )
+
+
+def _canonical_directory_tables():
+    return {
+        "ptg2:release:a": types.SimpleNamespace(
+            uses_shared_blocks=True,
+            shared_snapshot_key=71,
+            plan_id="382418014",
+            plan_market_type="group",
+            source_key="aetna-a",
+        ),
+        "ptg2:release:b": types.SimpleNamespace(
+            uses_shared_blocks=True,
+            shared_snapshot_key=72,
+            plan_id="PLAN-B",
+            plan_market_type="group",
+            source_key="aetna-b",
+        ),
+    }
+
+
+def _configure_canonical_directory(monkeypatch, selection, tables_by_snapshot_id):
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "snapshot_serving_tables",
+        AsyncMock(
+            side_effect=lambda _session, snapshot_id: (
+                tables_by_snapshot_id[snapshot_id]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_group_plan_provider_address_source",
+        AsyncMock(
+            return_value=("mrf.entity_address_unified", True, True, True)
+        ),
+    )
+
+
+def _canonical_directory_request(selection):
+    address_by_field = {
+        "npi": 1073913877,
+        "type": "practice",
+        "first_line": "1 TEST WAY",
+        "second_line": None,
+        "city_name": "CHICAGO",
+        "state_name": "IL",
+        "postal_code": "606010000",
+        "zip5": "60601",
+        "phone_number": None,
+        "address_precision": "street",
+        "plan_coverage_match": True,
+    }
+    return make_request(
+        [
+            FakeResult(rows=[types.SimpleNamespace(npi=1073913877)]),
+            FakeResult(rows=[types.SimpleNamespace(npi=1073913877)]),
+            FakeResult(rows=[address_by_field]),
+        ],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "city": "Chicago",
+            "enrich": "0",
+            "limit": "10",
+        },
+    )
+
+
+def _assert_canonical_directory_response(response_by_field, selection, request):
+    assert response_by_field["resolved"] is True
+    assert response_by_field["plan_id"] is None
+    assert response_by_field["plan_ids"] == ["38-2418014", "PLAN-B"]
+    assert response_by_field["market_type"] == "group"
+    assert response_by_field["snapshots"] == [
+        {
+            "source_key": "aetna-a",
+            "snapshot_id": "ptg2:release:a",
+            "plan_id": "38-2418014",
+            "plan_market_type": "group",
+            "enumerated": True,
+        },
+        {
+            "source_key": "aetna-b",
+            "snapshot_id": "ptg2:release:b",
+            "plan_id": "PLAN-B",
+            "plan_market_type": "group",
+            "enumerated": True,
+        },
+    ]
+    assert response_by_field["healthporta_plan_id"] == selection.healthporta_plan_id
+    assert response_by_field["query"]["plan_release_id"] == selection.plan_release_id
+    address_sql = str(request.ctx.sa_session.executions[2][0][0])
+    address_parameters = request.ctx.sa_session.executions[2][0][1]
+    assert "eapb.plan_id = ANY(CAST(:plan_ids AS text[]))" in address_sql
+    assert address_parameters["plan_ids"] == ["38-2418014", "382418014", "PLAN-B"]
+    assert response_by_field["location_filter"]["plan_ids_considered"] == [
+        "38-2418014",
+        "PLAN-B",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_group_directory_preserves_every_binding_scope(
+    monkeypatch,
+):
+    """Canonical directory reads must preserve each frozen source scope."""
+
+    selection = _canonical_directory_selection()
+    _configure_canonical_directory(
+        monkeypatch,
+        selection,
+        _canonical_directory_tables(),
+    )
+    request = _canonical_directory_request(selection)
+
+    response = await group_plan_providers(request)
+    response_by_field = json.loads(response.body)
+    _assert_canonical_directory_response(response_by_field, selection, request)
+
+
+@pytest.mark.asyncio
+async def test_canonical_group_directory_fails_closed_on_scope_mismatch(
+    monkeypatch,
+):
+    selection = _canonical_release_selection(
+        [
+            plan_release_serving.PlanReleaseSnapshotBinding(
+                binding_ordinal=0,
+                snapshot_id="ptg2:release:a",
+                source_key="aetna-a",
+                plan_id="38-2418014",
+                plan_market_type="group",
+                role="in_network",
+                required=True,
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "snapshot_serving_tables",
+        AsyncMock(return_value=types.SimpleNamespace(
+            uses_shared_blocks=True,
+            shared_snapshot_key=71,
+            plan_id="ANOTHER-PLAN",
+            plan_market_type="group",
+            source_key="aetna-a",
+        )),
+    )
+    request = make_request(
+        [],
+        args={"plan_release_id": selection.plan_release_id},
+    )
+
+    with pytest.raises(
+        pricing_module.PTG2ManifestArtifactError,
+        match="attested plan, market, and source scope",
+    ):
+        await group_plan_providers(request)
+
+
+@pytest.mark.asyncio
+async def test_unknown_canonical_group_release_stays_unresolved(monkeypatch):
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=None),
+    )
+    release_id = "hprelease_" + "0" * 26
+    response = await group_plan_providers(
+        make_request([], args={"plan_release_id": release_id})
+    )
+    response_by_field = json.loads(response.body)
+
+    assert response_by_field["resolved"] is False
+    assert response_by_field["plan_release_id"] == release_id
+    assert "healthporta_plan_id" not in response_by_field
+    assert response_by_field["providers"]["items"] == []
+    assert response_by_field["reason"] == (
+        "no complete published serving revision for this plan_release_id"
+    )
 
 
 @pytest.mark.asyncio
@@ -782,8 +1013,10 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
     assert "addr.type IN ('practice', 'site', 'primary', 'secondary')" in provider_sql
     assert "UPPER(COALESCE(addr.state_code, addr.state_name, '')) = :location_state" in provider_sql
     assert "mrf.entity_address_unified addr" in address_sql
-    assert "addr.group_plan_array @> ARRAY[:plan_id]::varchar[]" in address_sql
+    assert "addr.group_plan_array" in address_sql
+    assert "&& CAST(:plan_ids AS varchar[])" in address_sql
     assert "mrf.entity_address_plan_bridge eapb" in address_sql
+    assert "eapb.plan_id = ANY(CAST(:plan_ids AS text[]))" in address_sql
     assert "CASE addr.type WHEN 'practice' THEN 0" in address_sql
 
 
@@ -2708,6 +2941,19 @@ def _build_current_allowed_snapshots() -> list[dict]:
     ]
 
 
+def _canonical_release_selection(bindings):
+    return plan_release_serving.PlanReleaseServingSelection(
+        serving_revision_id="hpserve_" + "3" * 26,
+        plan_release_id="hprelease_" + "0" * 26,
+        healthporta_plan_id="hpplan_" + "1" * 26,
+        plan_version_id="hpversion_" + "2" * 26,
+        release_month="2026-07",
+        release_status="published",
+        binding_set_digest="a" * 64,
+        bindings=tuple(bindings),
+    )
+
+
 def _build_allowed_amount_page_row(*, total: int = 12501) -> dict:
     return {
         "total": total,
@@ -3171,11 +3417,89 @@ def test_allowed_amount_sql_uses_shared_file_plan_coverage_for_each_plan():
         plan_parameter_sets.append(parameter_map["plan_ids"])
 
     assert sql_texts[0] == sql_texts[1]
-    assert plan_parameter_sets == [["PLAN-A"], ["PLAN-B"]]
+    assert plan_parameter_sets == [
+        ["PLAN-A", "PLAN-A"],
+        ["PLAN-B", "PLAN-B"],
+    ]
     assert "allowed_item.file_id = plan_coverage.file_id" in sql_texts[0]
     assert "plan_coverage.plan_id" in sql_texts[0]
     assert "allowed_item.plan_id" not in sql_texts[0]
     assert "allowed_item.plan_market_type" not in sql_texts[0]
+
+
+def _canonical_allowed_binding_snapshots():
+    return [
+        {
+            "snapshot_id": "ptg2:allowed:group",
+            "source_key": "allowed-group",
+            "plan_id": "38-2418014",
+            "plan_market_type": "group",
+        },
+        {
+            "snapshot_id": "ptg2:allowed:individual",
+            "source_key": "allowed-individual",
+            "plan_id": "PLAN-B",
+            "plan_market_type": "individual",
+        },
+    ]
+
+
+def test_canonical_allowed_amount_parameters_preserve_binding_local_tuples():
+    """Frozen physical coordinates must remain aligned by tuple position."""
+
+    parameter_map = pricing_module._allowed_amount_query_params(
+        {
+            "plan_release_id": "hprelease_" + "0" * 26,
+            "code": "99214",
+            "code_system": "CPT",
+        },
+        types.SimpleNamespace(limit=25, offset=0, page=1),
+        plan_id="38-2418014",
+        code="99214",
+        code_system="CPT",
+        npi=None,
+        current_snapshots=_canonical_allowed_binding_snapshots(),
+    )
+
+    assert list(
+        zip(
+            parameter_map["snapshot_ids"],
+            parameter_map["source_keys"],
+            parameter_map["plan_ids"],
+            parameter_map["plan_market_types"],
+        )
+    ) == [
+        (
+            "ptg2:allowed:group",
+            "allowed-group",
+            "38-2418014",
+            "group",
+        ),
+        (
+            "ptg2:allowed:group",
+            "allowed-group",
+            "382418014",
+            "group",
+        ),
+        (
+            "ptg2:allowed:individual",
+            "allowed-individual",
+            "PLAN-B",
+            "individual",
+        ),
+    ]
+    query_sql = str(
+        pricing_module._allowed_amount_page_sql(
+            {},
+            address_table=None,
+            parameter_map=parameter_map,
+        )
+    )
+    assert "plan_coverage.plan_id = current_snapshot.plan_id" in query_sql
+    assert (
+        "plan_coverage.plan_market_type, '') "
+        "= current_snapshot.plan_market_type"
+    ) in " ".join(query_sql.split())
 
 
 def _assert_allowed_amount_multi_source_response(response_by_field):
@@ -3351,6 +3675,97 @@ async def test_allowed_amount_search_filters_with_location_but_omits_unverified_
 
 
 @pytest.mark.asyncio
+async def test_canonical_allowed_amount_zero_rows_is_resolved_no_match(
+    monkeypatch,
+):
+    """An exact allowed-only release resolves even when it has zero rows."""
+
+    selection = _allowed_only_release_selection()
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_allowed_amount_address_table",
+        AsyncMock(return_value="mrf.npi_address"),
+    )
+    session = FakeSession(
+        [FakeResult(rows=[_build_allowed_amount_page_row(total=0)])]
+    )
+
+    response_by_field = (
+        await pricing_module._search_ptg_allowed_amount_evidence(
+            session,
+            {
+                "plan_release_id": selection.plan_release_id,
+                "code": "99214",
+                "code_system": "CPT",
+            },
+            types.SimpleNamespace(limit=25, offset=0, page=1),
+        )
+    )
+
+    _assert_allowed_release_no_match(response_by_field, selection, session)
+
+
+def _allowed_only_release_selection():
+    return _canonical_release_selection(
+        [
+            plan_release_serving.PlanReleaseSnapshotBinding(
+                binding_ordinal=0,
+                snapshot_id="ptg2:allowed:release",
+                source_key="allowed-release",
+                plan_id="38-2418014",
+                plan_market_type="group",
+                role="allowed_amounts",
+                required=True,
+            )
+        ]
+    )
+
+
+def _assert_allowed_release_no_match(response_by_field, selection, session):
+    assert response_by_field["resolved"] is True
+    assert response_by_field["result_state"] == "no_matching_rates"
+    assert response_by_field["items"] == []
+    assert response_by_field["query"]["status"] == "no_match"
+    assert response_by_field["plan_release_id"] == selection.plan_release_id
+    assert response_by_field["query"]["healthporta_plan_id"] == selection.healthporta_plan_id
+    assert response_by_field["query"]["bindings"] == [
+        {
+            "source_key": "allowed-release",
+            "snapshot_id": "ptg2:allowed:release",
+            "plan_id": "38-2418014",
+            "plan_market_type": "group",
+        }
+    ]
+    parameters_by_name = session.executions[0][0][1]
+    assert list(
+        zip(
+            parameters_by_name["snapshot_ids"],
+            parameters_by_name["source_keys"],
+            parameters_by_name["plan_ids"],
+            parameters_by_name["plan_market_types"],
+        )
+    ) == [
+        (
+            "ptg2:allowed:release",
+            "allowed-release",
+            "38-2418014",
+            "group",
+        ),
+        (
+            "ptg2:allowed:release",
+            "allowed-release",
+            "382418014",
+            "group",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_allowed_amount_search_preserves_no_match_for_negotiated_rate_filter(
     monkeypatch,
 ):
@@ -3398,6 +3813,57 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
     )
 
     with pytest.raises(pricing_module.InvalidUsage, match="provider-directory request"):
+        await list_providers_by_procedure(request)
+
+
+@pytest.mark.asyncio
+async def test_canonical_plan_uses_binding_market_for_broad_expansion_guard(
+    monkeypatch,
+):
+    selection = _canonical_release_selection(
+        [
+            plan_release_serving.PlanReleaseSnapshotBinding(
+                binding_ordinal=0,
+                snapshot_id="ptg2:release:group",
+                source_key="aetna-group",
+                plan_id="38-2418014",
+                plan_market_type="group",
+                role="in_network",
+                required=True,
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+
+    async def fail_search(*_args, **_kwargs):
+        raise AssertionError("resolved group guard must run before PTG search")
+
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        fail_search,
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "market_type": "individual",
+            "code": "99213",
+            "code_system": "CPT",
+            "state": "IL",
+            "city": "Chicago",
+            "include_providers": "true",
+        },
+    )
+
+    with pytest.raises(
+        pricing_module.InvalidUsage,
+        match="provider-directory request",
+    ):
         await list_providers_by_procedure(request)
 
 
