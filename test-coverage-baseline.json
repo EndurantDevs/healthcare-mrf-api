@@ -146,6 +146,11 @@
         "process/provider_directory_profile_selection_snapshot.py",
         "process/provider_directory_projection_admission.py",
         "process/provider_directory_projection_admission_contract.py",
+        "process/provider_directory_projection_child_read.py",
+        "process/provider_directory_projection_child_read_contract.py",
+        "process/provider_directory_projection_child_read_lock.py",
+        "process/provider_directory_projection_child_read_persistence.py",
+        "process/provider_directory_projection_child_read_store.py",
         "process/provider_directory_projection_contract.py",
         "process/provider_directory_projection_contribution.py",
         "process/provider_directory_projection_db.py",
@@ -327,12 +332,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 25395,
-          "total": 33948
+          "covered": 25592,
+          "total": 34026
         },
         "lines": {
-          "covered": 84382,
-          "total": 99838
+          "covered": 85006,
+          "total": 100180
         }
       },
       "path": "test-coverage-python.json",

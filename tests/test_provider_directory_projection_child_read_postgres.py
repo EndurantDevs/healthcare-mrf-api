@@ -1,15 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-
 """Disposable PostgreSQL proofs for projection child retained-read leases."""
-
 from __future__ import annotations
-
 import asyncio
-
+from unittest.mock import AsyncMock
 import asyncpg
 import pytest
 from sqlalchemy.exc import DBAPIError
-
+import process.provider_directory_projection_child_read_store as child_store
 from process.provider_directory_physical_projection import (
     claim_projection_shard,
     projection_admission_consumer_id,
@@ -46,19 +43,16 @@ from tests.test_provider_directory_projection_foundation_postgres import (
 )
 from tests.provider_directory_retained_core_postgres_support import campaign_item
 from tests.test_provider_directory_projection_child_read import (
+    _child_lease,
     _claim_projection_children,
     _claimed_child_context,
     _complete_claimed_shard,
     _full_artifact_fixture,
+    _unit_database,
 )
-
-
 def _database_arguments(postgres):
     """Return the explicit disposable projection database coordinates."""
-
     return {"database": postgres.database, "schema": postgres.schema}
-
-
 @pytest.mark.asyncio
 async def test_child_read_migration_upgrades_and_downgrades_empty(monkeypatch) -> None:
     async with projection_foundation_postgres(monkeypatch) as postgres:
@@ -87,24 +81,19 @@ async def test_child_read_migration_upgrades_and_downgrades_empty(monkeypatch) -
                 "provider_directory_projection_child_read_lease"
             ),
         ) is None
-
-
 @pytest.mark.asyncio
 async def test_child_read_claims_exact_full_artifact(monkeypatch) -> None:
     """Bind a child to full artifact coordinates without a range ordinal."""
-
     async with projection_foundation_postgres(monkeypatch) as postgres:
         await postgres.upgrade()
         await postgres.upgrade_child_read()
         artifact_label = "child-full-artifact"
-
         def consumer_id(retained_binding):
             _artifact, recipe, admission_block, _shard = _full_artifact_fixture(
                 retained_binding,
                 artifact_label,
             )
             return projection_admission_consumer_id(recipe, (admission_block,))
-
         retained_binding = await _sealed_retained_binding(
             postgres,
             campaign_label="child-full-artifact",
@@ -139,8 +128,6 @@ async def test_child_read_claims_exact_full_artifact(monkeypatch) -> None:
             child_lease,
             **_database_arguments(postgres),
         )
-
-
 async def _assert_busy_and_unfenced_mutation(postgres, shard_claim, child) -> None:
     with pytest.raises(
         ProviderDirectoryProjectionBusy,
@@ -170,8 +157,6 @@ async def _assert_busy_and_unfenced_mutation(postgres, shard_claim, child) -> No
                 """,
                 child_lease_token=child.child_lease_token,
             )
-
-
 async def _assert_parent_release_fences(postgres, retained, child) -> None:
     with pytest.raises(
         asyncpg.PostgresError,
@@ -205,8 +190,6 @@ async def _assert_parent_release_fences(postgres, retained, child) -> None:
     assert heartbeat_result is None
     assert isinstance(parent_result, RetainedArtifactError)
     assert str(parent_result) == "provider_directory_projection_retained_parent_live"
-
-
 async def _assert_verification_mismatches(postgres, child) -> None:
     verification_arguments_by_name = {
         "byte_count": child.expected_byte_count,
@@ -242,8 +225,6 @@ async def _assert_verification_mismatches(postgres, child) -> None:
                 **_database_arguments(postgres),
                 **mismatch,
             )
-
-
 async def _reclaim_and_reject_stale_child(postgres, shard_claim, child):
     await release_projection_child_read_lease(child, **_database_arguments(postgres))
     reclaimed = await claim_projection_child_read_lease(
@@ -271,8 +252,6 @@ async def _reclaim_and_reject_stale_child(postgres, shard_claim, child):
         ):
             await stale_operation
     return reclaimed
-
-
 async def _verify_child_and_fence_owner(postgres, shard_claim, child) -> None:
     with pytest.raises(
         DBAPIError,
@@ -314,8 +293,6 @@ async def _verify_child_and_fence_owner(postgres, shard_claim, child) -> None:
                 """,
                 recipe_id=shard_claim.recipe_lease.recipe.recipe_id,
             )
-
-
 async def _release_and_assert_child_state(
     postgres,
     retained,
@@ -346,14 +323,11 @@ async def _release_and_assert_child_state(
         """,
         campaign_id=retained.campaign_id,
     ) == 0
-
-
 @pytest.mark.asyncio
 async def test_child_read_lifecycle_fences_stale_and_parent_operations(
     monkeypatch,
 ) -> None:
     """Fence stale tokens, incomplete proof, owner failure, and parent release."""
-
     async with projection_foundation_postgres(monkeypatch) as postgres:
         await postgres.upgrade()
         await postgres.upgrade_child_read()
@@ -379,20 +353,16 @@ async def test_child_read_lifecycle_fences_stale_and_parent_operations(
             shard_claim,
             second_child,
         )
-
-
 async def _claimed_range_sibling_children(postgres):
     produced_artifact = _two_range_artifact(
         "child-sibling-ranges",
         campaign_item("child-sibling-ranges").artifact_kind,
     )
-
     def consumer_recipe_id(bindings, shared_artifact):
         recipe, admission_blocks, _shards = _range_subset_fixture(
             bindings[0], shared_artifact, (0, 1)
         )
         return projection_admission_consumer_id(recipe, admission_blocks)
-
     bindings, produced_artifact = await _sealed_shared_artifact_bindings(
         postgres,
         campaign_label="child-sibling-ranges",
@@ -410,8 +380,6 @@ async def _claimed_range_sibling_children(postgres):
         shards,
         bindings[0].consumer_claim_generation,
     )
-
-
 def _assert_range_sibling_identity(first_child, second_child) -> None:
     assert first_child.retained_artifact_sha256 == (
         second_child.retained_artifact_sha256
@@ -423,8 +391,6 @@ def _assert_range_sibling_identity(first_child, second_child) -> None:
     } == {0, 1}
     assert first_child.raw_byte_start != second_child.raw_byte_start
     assert first_child.expected_payload_sha256 != second_child.expected_payload_sha256
-
-
 async def _retry_first_sibling(postgres, shard_claim, first_child, second_child):
     await release_projection_child_read_lease(
         first_child,
@@ -450,8 +416,6 @@ async def _retry_first_sibling(postgres, shard_claim, first_child, second_child)
         second_child.child_lease_token,
     )
     return retried_first
-
-
 async def _assert_separate_artifact_isolation(postgres, retried_first, sibling) -> None:
     separate_context = await _claimed_child_context(
         postgres,
@@ -467,12 +431,9 @@ async def _assert_separate_artifact_isolation(postgres, retried_first, sibling) 
             child_lease,
             **_database_arguments(postgres),
         )
-
-
 @pytest.mark.asyncio
 async def test_child_read_siblings_isolate_ranges_and_artifacts(monkeypatch) -> None:
     """Keep range siblings and unrelated artifacts independently retryable."""
-
     async with projection_foundation_postgres(monkeypatch) as postgres:
         await postgres.upgrade()
         await postgres.upgrade_child_read()
@@ -490,3 +451,44 @@ async def test_child_read_siblings_isolate_ranges_and_artifacts(monkeypatch) -> 
             retried_first,
             second_child,
         )
+@pytest.mark.asyncio
+async def test_child_store_failures_are_fenced(monkeypatch) -> None:
+    lease = _child_lease()
+    database = _unit_database(status_result=0)
+    monkeypatch.setattr(child_store, "locked_child_read_dependencies", AsyncMock(return_value={}))
+    monkeypatch.setattr(child_store, "_locked_child_row", AsyncMock(return_value={}))
+    monkeypatch.setattr(child_store, "_set_child_action", AsyncMock())
+    monkeypatch.setattr(child_store, "_insert_child", AsyncMock(return_value={}))
+    with pytest.raises(ProviderDirectoryProjectionLeaseLost):
+        await child_store.claim_projection_child_read_lease(lease.shard_claim, database=database)
+    locked_row = AsyncMock(side_effect=({"status": status} for status in (
+        "verified", "active", "verified", "active",
+        "released", "failed", "active", "active",
+    )))
+    monkeypatch.setattr(child_store, "_locked_exact_lease_row", locked_row)
+    monkeypatch.setattr(child_store, "_verify_child_row", AsyncMock(return_value=0))
+    verification_by_field = {
+        "byte_count": lease.expected_byte_count,
+        "record_count": lease.expected_record_count,
+        "input_sha256": lease.input_sha256,
+        "payload_sha256": lease.expected_payload_sha256,
+        "database": database,
+    }
+    failing_operations = (
+        child_store.heartbeat_projection_child_read_lease(lease, database=database),
+        child_store.heartbeat_projection_child_read_lease(lease, database=database),
+        child_store.verify_projection_child_read_lease(lease, **verification_by_field),
+        child_store.verify_projection_child_read_lease(lease, **verification_by_field),
+    )
+    for failing_operation in failing_operations:
+        with pytest.raises(ProviderDirectoryProjectionLeaseLost):
+            await failing_operation
+    await child_store.release_projection_child_read_lease(lease, database=database)
+    terminal_operations = (
+        child_store.release_projection_child_read_lease(lease, database=database),
+        child_store.release_projection_child_read_lease(lease, database=database),
+        child_store.assert_verified_projection_child_read_lease(lease, database=database),
+    )
+    for terminal_operation in terminal_operations:
+        with pytest.raises(ProviderDirectoryProjectionLeaseLost):
+            await terminal_operation
