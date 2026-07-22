@@ -426,16 +426,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 2376,
-          "total": 3011
+          "covered": 2356,
+          "total": 2991
         },
         "lines": {
-          "covered": 34752,
-          "total": 43119
+          "covered": 34196,
+          "total": 42566
         },
         "regions": {
-          "covered": 52888,
-          "total": 64796
+          "covered": 51845,
+          "total": 63759
         }
       },
       "path": "test-coverage-rust.json",
