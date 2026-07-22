@@ -251,3 +251,24 @@ async def test_prepared_provider_requests_reject_empty_code_scope(monkeypatch):
         )
 
     lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prepared_provider_requests_reject_incomplete_artifact(monkeypatch):
+    monkeypatch.setattr(
+        selection,
+        "_lookup_prepared_code_map_from_db",
+        AsyncMock(return_value={}),
+    )
+    requests = selection._freeze_provider_code_requests(
+        {5: {7}},
+        membership_count=1,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="missing a referenced"):
+        await selection._load_candidate_provider_code_sets_prepared(
+            object(),
+            41,
+            requests,
+            schema_name="mrf",
+        )

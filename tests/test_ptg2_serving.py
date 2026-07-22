@@ -9,8 +9,10 @@ import pytest
 
 from api import ptg2_serving
 from api.code_systems import (
+    canonical_catalog_code,
     catalog_code_lookup_values,
     catalog_code_system_lookup_values,
+    equivalent_external_procedure_pairs,
 )
 from process.ptg_parts.address_assurance import summarize_ptg_price_address_payload
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -927,6 +929,26 @@ def test_code_system_lookup_values_include_legacy_persisted_aliases():
         "DRG",
     )
     assert catalog_code_system_lookup_values("CPT") == ("CPT",)
+
+
+def test_code_lookup_boundaries_cover_empty_width_and_equivalent_forms():
+    assert catalog_code_system_lookup_values(None) == ()
+    assert canonical_catalog_code("ICD10CM", " a.12 ") == "A12"
+    assert catalog_code_lookup_values(None, None) == ()
+    assert equivalent_external_procedure_pairs("UNKNOWN", "12345") == set()
+    assert equivalent_external_procedure_pairs("CPT", "1234") == set()
+    assert equivalent_external_procedure_pairs("CPT", "12-45") == set()
+    assert equivalent_external_procedure_pairs("CPT", "12345") == {
+        ("CPT", "12345"),
+        ("HCPCS", "12345"),
+    }
+    assert equivalent_external_procedure_pairs("CDT", "D1234") == {
+        ("CDT", "D1234"),
+        ("HCPCS", "D1234"),
+    }
+    assert equivalent_external_procedure_pairs("CPT", "A1234") == {
+        ("CPT", "A1234"),
+    }
 
 
 def test_code_metadata_rows_expose_canonical_code_systems():

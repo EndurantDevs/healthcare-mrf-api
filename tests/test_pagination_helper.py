@@ -39,6 +39,18 @@ def test_parse_pagination_accepts_offset_mode():
     assert params.source == "offset"
 
 
+def test_parse_pagination_accepts_matching_page_and_offset_window():
+    params = parse_pagination(
+        {"page": "3", "limit": "25", "offset": "50"},
+        default_limit=50,
+        max_limit=200,
+        default_page=1,
+    )
+
+    assert params.page == 3
+    assert params.offset == 50
+
+
 def test_parse_pagination_rejects_limit_page_size_conflict():
     with pytest.raises(InvalidUsage):
         parse_pagination(
