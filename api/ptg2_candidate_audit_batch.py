@@ -384,7 +384,7 @@ async def audit_candidate_source_witness_batch(
 ) -> CandidateAuditBatchResult:
     """Match every grouped source condition through one read-only snapshot."""
 
-    if not access.matches(
+    if not access.is_match(
         snapshot_id=audit_request.snapshot_id,
         source_key=audit_request.source_key,
         plan_id=audit_request.plan_id,

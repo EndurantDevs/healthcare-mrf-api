@@ -147,7 +147,7 @@ async def audit_candidate_partition(
     """Evaluate only the exact coordinates assigned to one bounded request."""
 
     binding = audit_request.binding
-    if not access.matches(
+    if not access.is_match(
         snapshot_id=binding.snapshot_id,
         source_key=binding.source_key,
         plan_id=binding.plan_id,

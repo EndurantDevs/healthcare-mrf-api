@@ -26,7 +26,9 @@ assert MODULE_SPEC and MODULE_SPEC.loader
 MODULE_SPEC.loader.exec_module(pricing_module)
 
 get_provider_procedure = pricing_module.get_provider_procedure
-get_provider_procedure_estimated_cost_level_internal = pricing_module.get_provider_procedure_estimated_cost_level_internal
+get_provider_procedure_estimated_cost_level_internal = (
+    pricing_module.get_provider_procedure_cost_level
+)
 get_procedure_geo_benchmarks = pricing_module.get_procedure_geo_benchmarks
 get_provider_prescription = pricing_module.get_provider_prescription
 get_prescription_benchmarks = pricing_module.get_prescription_benchmarks
@@ -2954,6 +2956,31 @@ def _canonical_release_selection(bindings):
     )
 
 
+def _mixed_canonical_release_selection():
+    return _canonical_release_selection(
+        [
+            plan_release_serving.PlanReleaseSnapshotBinding(
+                binding_ordinal=0,
+                snapshot_id="ptg2:release:network",
+                source_key="aetna-network",
+                plan_id="99-0000001",
+                plan_market_type="group",
+                role="in_network",
+                required=True,
+            ),
+            plan_release_serving.PlanReleaseSnapshotBinding(
+                binding_ordinal=1,
+                snapshot_id="ptg2:release:allowed",
+                source_key="aetna-allowed",
+                plan_id="99-0000001",
+                plan_market_type="group",
+                role="allowed_amounts",
+                required=True,
+            ),
+        ]
+    )
+
+
 def _build_allowed_amount_page_row(*, total: int = 12501) -> dict:
     return {
         "total": total,
@@ -3071,6 +3098,62 @@ async def test_list_providers_by_procedure_falls_back_to_allowed_amounts(
     allowed_search.assert_awaited_once()
     assert strict_search.await_args.args[1]["provider_sex_code"] == "U"
     assert allowed_search.await_args.args[1]["provider_sex_code"] == "U"
+
+
+@pytest.mark.asyncio
+async def test_canonical_empty_negotiated_result_reuses_release_for_allowed_fallback(
+    monkeypatch,
+):
+    """Reuse one canonical selection across empty negotiated and allowed reads."""
+
+    selection = _mixed_canonical_release_selection()
+    release_resolver = AsyncMock(return_value=selection)
+    strict_search = AsyncMock(
+        return_value={
+            "resolved": True,
+            "items": [],
+            "pagination": {"total": 0, "limit": 25, "offset": 0, "page": 1},
+            "query": {"source": "ptg2", "status": "no_match"},
+        }
+    )
+    allowed_search = AsyncMock(
+        return_value=_build_allowed_amount_fallback_response()
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        release_resolver,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        strict_search,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_search_ptg_allowed_amount_evidence",
+        allowed_search,
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "code": "70551",
+            "code_system": "CPT",
+            "include_allowed_amounts": "true",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    response_by_field = json.loads(response.body)
+
+    assert response_by_field["result_state"] == "allowed_amounts_found"
+    release_resolver.assert_awaited_once_with(
+        request.ctx.sa_session,
+        selection.plan_release_id,
+    )
+    assert strict_search.await_args.kwargs["release_selection"] is selection
+    assert allowed_search.await_args.kwargs["release_selection"] is selection
 
 
 def test_allowed_amount_provider_predicate_preserves_provider_sex():
@@ -3684,7 +3767,7 @@ async def test_canonical_allowed_amount_zero_rows_is_resolved_no_match(
     monkeypatch.setattr(
         pricing_module,
         "resolve_plan_release_serving",
-        AsyncMock(return_value=selection),
+        AsyncMock(side_effect=AssertionError("supplied selection must be reused")),
     )
     monkeypatch.setattr(
         pricing_module,
@@ -3704,10 +3787,49 @@ async def test_canonical_allowed_amount_zero_rows_is_resolved_no_match(
                 "code_system": "CPT",
             },
             types.SimpleNamespace(limit=25, offset=0, page=1),
+            release_selection=selection,
         )
     )
 
     _assert_allowed_release_no_match(response_by_field, selection, session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "supplied_selection",
+    [
+        pytest.param(None, id="explicit-resolution-miss"),
+        pytest.param(
+            types.SimpleNamespace(plan_release_id="hprelease_" + "9" * 26),
+            id="mismatched-release",
+        ),
+    ],
+)
+async def test_allowed_amount_route_rejects_invalid_supplied_release(
+    monkeypatch,
+    supplied_selection,
+):
+    selection = _allowed_only_release_selection()
+    resolver = AsyncMock(
+        side_effect=AssertionError("mismatched selection must fail closed")
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        resolver,
+    )
+
+    resolved_route = await pricing_module._resolve_allowed_amount_route(
+        FakeSession(),
+        {
+            "plan_release_id": selection.plan_release_id,
+            "code": "99214",
+        },
+        release_selection=supplied_selection,
+    )
+
+    assert resolved_route is None
+    resolver.assert_not_awaited()
 
 
 def _allowed_only_release_selection():

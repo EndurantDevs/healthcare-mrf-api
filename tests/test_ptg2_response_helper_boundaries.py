@@ -6,9 +6,9 @@ from api import ptg2_response as response
 
 
 def test_request_boolean_sequences_and_defaults_are_deterministic():
-    assert response._request_bool(["yes"]) is True
-    assert response._request_bool([], default=True) is True
-    assert response._request_bool([""], default=True) is True
+    assert response._is_request_flag_enabled(["yes"]) is True
+    assert response._is_request_flag_enabled([], default=True) is True
+    assert response._is_request_flag_enabled([""], default=True) is True
 
 
 def test_optional_number_parsers_reject_non_numeric_values():

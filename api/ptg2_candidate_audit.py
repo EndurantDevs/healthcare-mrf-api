@@ -30,7 +30,7 @@ class PTG2CandidateAuditAccess:
     plan_id: str
     plan_market_type: str
 
-    def matches(
+    def is_match(
         self,
         *,
         snapshot_id: Any,

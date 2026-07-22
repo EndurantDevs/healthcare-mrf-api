@@ -71,6 +71,7 @@ from process.ptg_parts.ptg2_shared_reuse import (
     SharedSnapshotSourceAssignment,
     deterministic_source_key_assignments,
     normalized_full_rebuild_scope_digest,
+    shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_source_witness_store import publish_shared_source_witness
 
@@ -460,6 +461,80 @@ def _snapshot_source_rows(
     return source_records
 
 
+def _logical_snapshot_source_set_update_sql(schema: str) -> str:
+    """Build the guarded logical source-set update without touching layouts."""
+
+    return f"""
+        WITH expected_source_set AS (
+            SELECT jsonb_build_object(
+                'contract', CAST(:source_set_contract AS text),
+                'source_count', CAST(:source_set_count AS integer),
+                'raw_container_sha256_digest', CAST(:source_set_digest AS text)
+            ) AS value
+        )
+        UPDATE {schema}.ptg2_snapshot AS snapshot
+           SET manifest = CAST(
+               jsonb_set(
+                   COALESCE(snapshot.manifest::jsonb, '{{}}'::jsonb),
+                   '{{serving_index}}',
+                   COALESCE(
+                       snapshot.manifest::jsonb->'serving_index',
+                       '{{}}'::jsonb
+                   ) || jsonb_build_object(
+                       'source_set', expected_source_set.value
+                   ),
+                   true
+               ) AS json
+           )
+          FROM expected_source_set
+         WHERE snapshot.snapshot_id = :snapshot_id
+           AND snapshot.status = 'building'
+           AND jsonb_typeof(COALESCE(
+               snapshot.manifest::jsonb->'serving_index',
+               '{{}}'::jsonb
+           )) = 'object'
+           AND (
+               snapshot.manifest::jsonb #> '{{serving_index,source_set}}' IS NULL
+               OR snapshot.manifest::jsonb #> '{{serving_index,source_set}}'
+                   = expected_source_set.value
+           )
+        RETURNING snapshot.manifest::jsonb
+            #> '{{serving_index,source_set}}' AS snapshot_source_set
+    """
+
+
+async def _persist_logical_snapshot_source_set(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_id: str,
+    source_set_by_field: Mapping[str, Any],
+) -> None:
+    """Seal one logical source set without changing reusable physical metadata."""
+
+    update_result = await session.execute(
+        db.text(_logical_snapshot_source_set_update_sql(schema)),
+        {
+            "snapshot_id": str(snapshot_id),
+            "source_set_contract": source_set_by_field["contract"],
+            "source_set_count": source_set_by_field["source_count"],
+            "source_set_digest": source_set_by_field[
+                "raw_container_sha256_digest"
+            ],
+        },
+    )
+    updated_row = update_result.first()
+    persisted_source_set = (
+        _row_mapping(updated_row).get("snapshot_source_set")
+        if updated_row is not None
+        else None
+    )
+    if persisted_source_set != dict(source_set_by_field):
+        raise RuntimeError(
+            f"PTG snapshot {snapshot_id} has a conflicting logical source-set seal"
+        )
+
+
 async def publish_shared_v3_snapshot_sources(
     *,
     schema_name: str,
@@ -473,6 +548,9 @@ async def publish_shared_v3_snapshot_sources(
     source_records = _snapshot_source_rows(
         snapshot_id=snapshot_id,
         assignments=assignments,
+    )
+    source_set_by_field = shared_source_set_metadata(
+        source_record["raw_container_sha256"] for source_record in source_records
     )
     scope_id = _validated_coverage_scope_id(coverage_scope_id)
     normalized_plan_scopes = tuple(
@@ -615,6 +693,12 @@ async def publish_shared_v3_snapshot_sources(
             raise RuntimeError(
                 f"PTG snapshot {snapshot_id} already has a conflicting source-key mapping"
             )
+        await _persist_logical_snapshot_source_set(
+            session,
+            schema=schema,
+            snapshot_id=str(snapshot_id),
+            source_set_by_field=source_set_by_field,
+        )
     return tuple(source_records)
 
 
@@ -645,11 +729,7 @@ async def delete_unpublished_snapshot_sources(
             {"snapshot_id": str(snapshot_id)},
         )
         snapshot_row = snapshot_result.first()
-        snapshot_state = _row_mapping(snapshot_row) if snapshot_row is not None else {}
-        if snapshot_state.get("is_bound") or str(snapshot_state.get("status") or "") not in {
-            "building",
-            "failed",
-        }:
+        if not _can_delete_unpublished_sources(snapshot_row):
             return
         await session.execute(
             db.text(
@@ -679,6 +759,15 @@ async def delete_unpublished_snapshot_sources(
             ),
             {"snapshot_id": str(snapshot_id)},
         )
+
+
+def _can_delete_unpublished_sources(snapshot_row: Any) -> bool:
+    """Allow cleanup only for unbound logical snapshots that never published."""
+
+    snapshot_state = _row_mapping(snapshot_row) if snapshot_row is not None else {}
+    return not snapshot_state.get("is_bound") and str(
+        snapshot_state.get("status") or ""
+    ) in {"building", "failed"}
 
 
 async def validate_reused_snapshot_sources(

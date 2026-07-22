@@ -1356,7 +1356,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             source_trace_set_hash=source_assignment.source_trace_set_hash,
             source_trace_hashes=list(source_assignment.source_trace_hashes),
         )
-        await publish_shared_v3_snapshot_sources(
+        published_source_rows = await publish_shared_v3_snapshot_sources(
             schema_name=schema_name,
             snapshot_id=snapshot_id,
             plan_scopes=[
@@ -1365,6 +1365,16 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             coverage_scope_id=coverage_scope_id,
             assignments=[source_assignment],
         )
+        replayed_source_rows = await publish_shared_v3_snapshot_sources(
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            plan_scopes=[
+                SharedLogicalPlanScope("plan-v3-runs", "ein", "group")
+            ],
+            coverage_scope_id=coverage_scope_id,
+            assignments=[source_assignment],
+        )
+        assert replayed_source_rows == published_source_rows
         async with db.transaction() as session:
             reservation = await reserve_shared_layout(
                 session,
@@ -1533,6 +1543,66 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             path.name.startswith("ptg2-v3-shared-publish-")
             for path in tmp_path.iterdir()
         )
+        source_set_by_field = shared_source_set_metadata(
+            [source_assignment.raw_container_sha256]
+        )
+        logical_source_set = await db.scalar(
+            f"""
+            SELECT manifest::jsonb #> '{{serving_index,source_set}}'
+              FROM {quoted_schema}.ptg2_snapshot
+             WHERE snapshot_id = :snapshot_id
+            """,
+            snapshot_id=snapshot_id,
+        )
+        assert logical_source_set == source_set_by_field
+        assert "source_set" not in publication.serving_index
+        assert (
+            await db.scalar(
+                f"""
+                SELECT layout_manifest #> '{{serving_index,source_set}}'
+                  FROM {quoted_schema}.ptg2_v3_snapshot_layout
+                 WHERE snapshot_key = :snapshot_key
+                """,
+                snapshot_key=publication.snapshot_key,
+            )
+            is None
+        )
+        conflicting_snapshot_id = f"shared-conflict-{uuid.uuid4().hex}"
+        conflicting_source_set = shared_source_set_metadata(["f" * 64])
+        await db.status(
+            f"""
+            INSERT INTO {quoted_schema}.ptg2_snapshot
+                (snapshot_id, status, manifest)
+            VALUES (:snapshot_id, 'building', CAST(:manifest AS json))
+            """,
+            snapshot_id=conflicting_snapshot_id,
+            manifest=json.dumps(
+                {"serving_index": {"source_set": conflicting_source_set}},
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="conflicting logical source-set seal",
+        ):
+            await publish_shared_v3_snapshot_sources(
+                schema_name=schema_name,
+                snapshot_id=conflicting_snapshot_id,
+                plan_scopes=[
+                    SharedLogicalPlanScope("plan-v3-conflict", "ein", "group")
+                ],
+                coverage_scope_id=coverage_scope_id,
+                assignments=[source_assignment],
+            )
+        assert await db.scalar(
+            f"""
+            SELECT manifest::jsonb #> '{{serving_index,source_set}}'
+              FROM {quoted_schema}.ptg2_snapshot
+             WHERE snapshot_id = :snapshot_id
+            """,
+            snapshot_id=conflicting_snapshot_id,
+        ) == conflicting_source_set
 
         await db.status(
             f"""
@@ -1547,6 +1617,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                     "serving_index": {
                         **publication.serving_index,
                         "source_key": "synthetic-source",
+                        "source_set": logical_source_set,
                     }
                 },
                 ensure_ascii=True,
@@ -1560,9 +1631,6 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
                 snapshot_id=snapshot_id,
                 snapshot_key=publication.snapshot_key,
             )
-        source_set_by_field = shared_source_set_metadata(
-            [source_assignment.raw_container_sha256]
-        )
         await db.status(
             f"""
             INSERT INTO {quoted_schema}.ptg2_v3_candidate_audit_attestation
@@ -1931,6 +1999,18 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             coverage_scope_id=coverage_scope_id,
             assignments=[reused_assignment],
         )
+        reused_source_set = await db.scalar(
+            f"""
+            SELECT manifest::jsonb #> '{{serving_index,source_set}}'
+              FROM {quoted_schema}.ptg2_snapshot
+             WHERE snapshot_id = :snapshot_id
+            """,
+            snapshot_id=reused_snapshot_id,
+        )
+        assert reused_source_set == shared_source_set_metadata(
+            [reused_assignment.raw_container_sha256]
+        )
+        assert reused_source_set != logical_source_set
         reused_publication = await publish_strict_shared_v3_layout(
             schema_name=schema_name,
             manifest_stage_table=reused_stage,
