@@ -237,6 +237,13 @@ def test_manual_retire_rejects_legacy_manifest_before_pointer_mutation(monkeypat
 def test_current_references_include_previous_pointer_columns(monkeypatch):
     async def pointer_rows(statement, **params):
         assert params == {"snapshot_id": "snap_a"}
+        if "ptg2_snapshot_pin" in statement:
+            return [
+                {
+                    "owner_type": "plan_release_serving_revision",
+                    "owner_id": "hpserve_example",
+                }
+            ]
         is_previous_reference = "previous_snapshot_id" in statement
         if not is_previous_reference:
             return []
@@ -257,3 +264,6 @@ def test_current_references_include_previous_pointer_columns(monkeypatch):
     assert references["previous_global_slots"] == ["current"]
     assert references["previous_source_keys"] == ["source_a"]
     assert references["previous_plan_source_keys"] == ["plan_source_a"]
+    assert references["plan_release_pins"] == [
+        "plan_release_serving_revision:hpserve_example"
+    ]

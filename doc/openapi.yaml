@@ -2707,16 +2707,23 @@ paths:
       operationId: getPricingGroupPlanProviders
       summary: List distinct in-network provider NPIs for an imported group plan
       description: |
-        Resolves the published PTG2 serving snapshot for a group plan by EIN
-        `plan_id` and `market_type`, then enumerates the snapshot provider
-        scope in strict shared V3 storage as keyset-paginated 10-digit NPI values.
+        Resolves either the exact immutable binding set selected by
+        `plan_release_id`, or the current PTG2 serving snapshots for legacy EIN
+        `plan_id` plus `market_type`, then enumerates the snapshot provider scope
+        in strict shared V3 storage as keyset-paginated 10-digit NPI values.
+        `plan_release_id` cannot be combined with raw plan/source/snapshot selectors.
       parameters:
         - name: plan_id
           in: query
-          required: true
           schema:
             type: string
-          description: Group plan EIN.
+          description: Legacy group plan EIN. Required when plan_release_id is absent.
+        - name: plan_release_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Canonical immutable release selector. Required when plan_id is absent.
         - name: market_type
           in: query
           schema:
@@ -3489,6 +3496,12 @@ paths:
           in: query
           schema:
             type: string
+        - name: plan_release_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Canonical immutable release selector; cannot be combined with raw plan/source/snapshot selectors.
         - name: plan_id_type
           in: query
           schema:
@@ -4083,6 +4096,12 @@ paths:
         - name: plan_external_id
           in: query
           schema: { type: string }
+        - name: plan_release_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Canonical immutable release selector; cannot be combined with raw plan/source/snapshot selectors.
         - name: plan_id_type
           in: query
           schema: { type: string, enum: [ein, hios] }
@@ -4332,6 +4351,12 @@ paths:
           schema:
             type: string
           description: Alias for plan_id when resolving a PTG2 source snapshot.
+        - name: plan_release_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Canonical immutable release selector; cannot be combined with raw plan/source/snapshot selectors.
         - name: plan_id_type
           in: query
           schema:

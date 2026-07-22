@@ -1824,6 +1824,134 @@ class PTG2Snapshot(Base, JSONOutputMixin):
     manifest = Column(JSON)
 
 
+class PlanReleaseServingRevision(Base, JSONOutputMixin):
+    """Engine-local projection of one immutable physical plan release."""
+
+    __tablename__ = "plan_release_serving_revision"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("serving_revision_id"),
+        CheckConstraint(
+            "expected_binding_count > 0",
+            name="plan_release_serving_binding_count_check",
+        ),
+        CheckConstraint(
+            "NOT is_current OR (serving_status = 'published' AND "
+            "release_status = 'published')",
+            name="plan_release_serving_current_state_check",
+        ),
+        Index(
+            "plan_release_serving_current_release_uidx",
+            "plan_release_id",
+            unique=True,
+            postgresql_where=text("is_current"),
+        ),
+        Index(
+            "plan_release_serving_current_plan_uidx",
+            "healthporta_plan_id",
+            unique=True,
+            postgresql_where=text("is_current"),
+        ),
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
+    )
+    __my_index_elements__ = ["serving_revision_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("healthporta_plan_id", "release_month"),
+            "name": "plan_release_serving_plan_idx",
+        },
+    ]
+
+    serving_revision_id = Column(String(64), nullable=False)
+    plan_release_id = Column(String(64), nullable=False)
+    healthporta_plan_id = Column(String(64), nullable=False)
+    plan_version_id = Column(String(64))
+    release_month = Column(String(7), nullable=False)
+    release_status = Column(String(16), nullable=False)
+    serving_status = Column(String(16), nullable=False)
+    is_current = Column(Boolean, nullable=False, default=False)
+    expected_binding_count = Column(Integer, nullable=False)
+    binding_set_digest = Column(String(64), nullable=False)
+    source_manifest = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True))
+    published_at = Column(DateTime(timezone=True))
+    retired_at = Column(DateTime(timezone=True))
+
+
+class PlanReleaseSnapshotBinding(Base, JSONOutputMixin):
+    """One ordinal member of a frozen physical plan-release binding set."""
+
+    __tablename__ = "plan_release_snapshot_binding"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "serving_revision_id",
+            "role",
+            "binding_ordinal",
+        ),
+        ForeignKeyConstraint(
+            ["serving_revision_id"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}.plan_release_serving_revision."
+                "serving_revision_id"
+            ],
+            ondelete="CASCADE",
+        ),
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
+    )
+    __my_index_elements__ = [
+        "serving_revision_id",
+        "role",
+        "binding_ordinal",
+    ]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("snapshot_id",),
+            "name": "plan_release_snapshot_binding_snapshot_idx",
+        },
+    ]
+
+    serving_revision_id = Column(String(64), nullable=False)
+    binding_ordinal = Column(Integer, nullable=False)
+    snapshot_id = Column(String(128), nullable=False)
+    source_key = Column(String(128), nullable=False)
+    plan_id = Column(String(128), nullable=False)
+    plan_market_type = Column(String(64))
+    role = Column(String(32), nullable=False)
+    required = Column(Boolean, nullable=False, default=True)
+    metadata_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True))
+
+
+class PTG2SnapshotPin(Base, JSONOutputMixin):
+    """Owner-qualified retention pin for a published PTG2 snapshot."""
+
+    __tablename__ = "ptg2_snapshot_pin"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("owner_type", "owner_id", "snapshot_id"),
+        ForeignKeyConstraint(
+            ["snapshot_id"],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_snapshot.snapshot_id"],
+            ondelete="RESTRICT",
+        ),
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
+    )
+    __my_index_elements__ = ["owner_type", "owner_id", "snapshot_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("snapshot_id",),
+            "name": "ptg2_snapshot_pin_snapshot_idx",
+        },
+    ]
+
+    owner_type = Column(String(48), nullable=False)
+    owner_id = Column(String(96), nullable=False)
+    snapshot_id = Column(String(128), nullable=False)
+    reason = Column(String(256))
+    created_at = Column(DateTime(timezone=True))
+
+
 class PTG2AllowedAmountPlan(Base, JSONOutputMixin):
     __tablename__ = "ptg2_allowed_amount_plan"
     __main_table__ = __tablename__

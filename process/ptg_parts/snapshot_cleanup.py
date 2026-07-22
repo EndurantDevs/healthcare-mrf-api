@@ -104,6 +104,12 @@ SELECT DISTINCT snapshot_id
          WHERE current_pointer.slot = 'current'
            AND current_pointer.previous_snapshot_id IS NOT NULL
            AND snapshot.manifest->'serving_index'->>'source_key' = :source_key
+        UNION ALL
+        SELECT pin.snapshot_id
+          FROM __SCHEMA__.ptg2_snapshot_pin AS pin
+          JOIN __SCHEMA__.ptg2_snapshot AS snapshot
+            ON snapshot.snapshot_id = pin.snapshot_id
+         WHERE snapshot.manifest->'serving_index'->>'source_key' = :source_key
   ) current_refs
 """
 

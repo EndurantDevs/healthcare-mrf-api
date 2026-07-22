@@ -105,6 +105,7 @@ def _snapshot_remove_reasons(
         "previous_global_slots": "previous global",
         "previous_source_keys": "previous source",
         "previous_plan_source_keys": "previous plan",
+        "plan_release_pins": "plan release pin",
     }
     reasons.extend(
         f"snapshot is referenced by {label} pointer"
@@ -385,30 +386,49 @@ async def _current_source_snapshot_state(schema: str, source_key: str) -> tuple[
     return (str(row[0]) if row[0] else None, str(row[1]) if row[1] else None)
 
 
+async def _snapshot_reference_rows(
+    schema: str,
+    snapshot_id: str,
+    *,
+    table: str,
+    selected_fields: str,
+    reference_field: str = "snapshot_id",
+    order_fields: str | None = None,
+) -> list[Any]:
+    return await db.all(
+        f"SELECT {selected_fields} FROM {_quote_ident(schema)}.{table} "
+        f"WHERE {reference_field} = :snapshot_id "
+        f"ORDER BY {order_fields or selected_fields}",
+        snapshot_id=snapshot_id,
+    )
+
+
 async def _current_references(schema: str, snapshot_id: str) -> dict[str, list[str]]:
-    global_rows = await db.all(
-        f"SELECT slot FROM {_quote_ident(schema)}.ptg2_current_snapshot WHERE snapshot_id = :snapshot_id ORDER BY slot",
-        snapshot_id=snapshot_id,
+    """Return every current pointer or release pin retaining a snapshot."""
+
+    global_rows = await _snapshot_reference_rows(
+        schema, snapshot_id, table="ptg2_current_snapshot", selected_fields="slot"
     )
-    source_rows = await db.all(
-        f"SELECT source_key FROM {_quote_ident(schema)}.ptg2_current_source_snapshot WHERE snapshot_id = :snapshot_id ORDER BY source_key",
-        snapshot_id=snapshot_id,
+    source_rows = await _snapshot_reference_rows(
+        schema, snapshot_id, table="ptg2_current_source_snapshot", selected_fields="source_key"
     )
-    plan_rows = await db.all(
-        f"SELECT plan_source_key FROM {_quote_ident(schema)}.ptg2_current_plan_source WHERE snapshot_id = :snapshot_id ORDER BY plan_source_key",
-        snapshot_id=snapshot_id,
+    plan_rows = await _snapshot_reference_rows(
+        schema, snapshot_id, table="ptg2_current_plan_source", selected_fields="plan_source_key"
     )
-    previous_global_rows = await db.all(
-        f"SELECT slot FROM {_quote_ident(schema)}.ptg2_current_snapshot WHERE previous_snapshot_id = :snapshot_id ORDER BY slot",
-        snapshot_id=snapshot_id,
+    previous_global_rows = await _snapshot_reference_rows(
+        schema, snapshot_id, table="ptg2_current_snapshot", selected_fields="slot",
+        reference_field="previous_snapshot_id",
     )
-    previous_source_rows = await db.all(
-        f"SELECT source_key FROM {_quote_ident(schema)}.ptg2_current_source_snapshot WHERE previous_snapshot_id = :snapshot_id ORDER BY source_key",
-        snapshot_id=snapshot_id,
+    previous_source_rows = await _snapshot_reference_rows(
+        schema, snapshot_id, table="ptg2_current_source_snapshot", selected_fields="source_key",
+        reference_field="previous_snapshot_id",
     )
-    previous_plan_rows = await db.all(
-        f"SELECT plan_source_key FROM {_quote_ident(schema)}.ptg2_current_plan_source WHERE previous_snapshot_id = :snapshot_id ORDER BY plan_source_key",
-        snapshot_id=snapshot_id,
+    previous_plan_rows = await _snapshot_reference_rows(
+        schema, snapshot_id, table="ptg2_current_plan_source", selected_fields="plan_source_key",
+        reference_field="previous_snapshot_id",
+    )
+    pin_rows = await _snapshot_reference_rows(
+        schema, snapshot_id, table="ptg2_snapshot_pin", selected_fields="owner_type, owner_id"
     )
     return {
         "global_slots": [
@@ -434,6 +454,11 @@ async def _current_references(schema: str, snapshot_id: str) -> dict[str, list[s
         "previous_plan_source_keys": [
             str(_row_mapping(reference_row).get("plan_source_key"))
             for reference_row in previous_plan_rows
+        ],
+        "plan_release_pins": [
+            f"{_row_mapping(reference_row).get('owner_type')}:"
+            f"{_row_mapping(reference_row).get('owner_id')}"
+            for reference_row in pin_rows
         ],
     }
 
