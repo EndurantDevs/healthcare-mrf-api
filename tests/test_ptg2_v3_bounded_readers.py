@@ -5,6 +5,9 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from api import ptg2_db_serving_v3, ptg2_db_sidecars, ptg2_serving
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditDecodedRetentionBudget,
+)
 from api.ptg2_db_sidecars import (
     PTG2ManifestArtifactError,
     lookup_code_prefix_rows_from_db,
@@ -720,6 +723,9 @@ async def test_audit_forward_exact_filter_spans_provider_shards(monkeypatch):
         fetch,
     )
     required_occurrences = {(7, 5, 0), (7, 1025, 1)}
+    retention_budget = CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=1024 * 1024
+    )
 
     observed = await ptg2_db_sidecars.lookup_forward_price_index_from_db(
         object(),
@@ -730,10 +736,12 @@ async def test_audit_forward_exact_filter_spans_provider_shards(monkeypatch):
         source_count=2,
         price_dictionary_item_count=2048,
         price_dictionary_block_bytes=2048,
+        retention_budget=retention_budget,
     )
 
     assert observed == {(7, 5, 0): (5,), (7, 1025, 1): (1025,)}
     assert fetch.await_args.kwargs["block_keys"] == block_keys
+    assert retention_budget.retained_bytes == 2 * (256 + 48)
 
 
 @pytest.mark.asyncio

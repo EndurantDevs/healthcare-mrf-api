@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import types
 from dataclasses import replace
@@ -16,6 +17,7 @@ from api.ptg2_candidate_audit import (
     PTG2CandidateAuditAccess,
 )
 from api.ptg2_shared_blocks import PTG2SharedBlockError
+from api.ptg2_candidate_audit_capacity import CandidateAuditProcessAdmission
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts import ptg2_partitioned_candidate_audit_contract as contract
 from process.ptg_parts.ptg2_candidate_audit_evidence import (
@@ -242,6 +244,77 @@ async def test_route_returns_strict_partition_result(monkeypatch):
     assert parsed_result.matched_source_occurrence_count == 1
     assert parsed_result.validated_persisted_occurrence_count == 1
     resolver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partition_route_reports_process_admission_rejection(
+    monkeypatch,
+):
+    audit_request = _request()
+    web_request = types.SimpleNamespace(
+        ctx=types.SimpleNamespace(sa_session=object()),
+    )
+    resolver = AsyncMock()
+    monkeypatch.setattr(pricing, "audit_candidate_partition", resolver)
+    monkeypatch.setattr(pricing, "_candidate_audit_batch_raw_limit", lambda: 100)
+    monkeypatch.setattr(
+        pricing,
+        "_candidate_audit_process_admission",
+        lambda: CandidateAuditProcessAdmission(100),
+    )
+
+    with pytest.raises(
+        Exception,
+        match="partition requires .* process limit",
+    ) as exc_info:
+        await pricing._partitioned_candidate_audit_response(
+            web_request,
+            audit_request.payload,
+            _access(),
+        )
+
+    assert type(exc_info.value).__name__ == "ServiceUnavailable"
+    resolver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partition_route_cancellation_releases_process_weight_once(
+    monkeypatch,
+):
+    audit_request = _request()
+    web_request = types.SimpleNamespace(
+        ctx=types.SimpleNamespace(sa_session=object()),
+    )
+    raw_limit = 100
+    admission = CandidateAuditProcessAdmission(
+        pricing._candidate_audit_partition_weight(raw_limit)
+    )
+    monkeypatch.setattr(
+        pricing,
+        "_candidate_audit_batch_raw_limit",
+        lambda: raw_limit,
+    )
+    monkeypatch.setattr(
+        pricing,
+        "_candidate_audit_process_admission",
+        lambda: admission,
+    )
+    monkeypatch.setattr(
+        pricing,
+        "audit_candidate_partition",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await pricing._partitioned_candidate_audit_response(
+            web_request,
+            audit_request.payload,
+            _access(),
+        )
+
+    assert admission.snapshot.retained_bytes == 0
+    assert admission.snapshot.admitted_count == 1
+    assert admission.snapshot.released_count == 1
 
 
 def _serving_tables(audit_request):

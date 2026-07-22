@@ -356,9 +356,11 @@ class _NetworkSession:
     def __init__(self, rows):
         self.rows = rows
         self.calls = 0
+        self.statements = []
 
-    async def execute(self, _statement, _params=None):
+    async def execute(self, statement, _params=None):
         self.calls += 1
+        self.statements.append(str(statement))
         return self.rows
 
 
@@ -389,6 +391,21 @@ async def test_provider_network_names_handle_empty_complete_and_incomplete_sets(
             _serving_tables(),
             (5,),
         )
+
+
+@pytest.mark.asyncio
+async def test_provider_network_names_follow_batch_schema_override(monkeypatch):
+    monkeypatch.setattr(batch, "PTG2_SCHEMA", "candidate_schema")
+    session = _NetworkSession(
+        ({"provider_set_key": 5, "network_names": ["Alpha"]},)
+    )
+
+    assert await batch._provider_network_names_by_key(
+        session,
+        _serving_tables(),
+        (5,),
+    ) == {5: ("Alpha",)}
+    assert "FROM candidate_schema.ptg2_v3_provider_set" in session.statements[0]
 
 
 @pytest.mark.asyncio
@@ -467,25 +484,6 @@ def test_candidate_projection_rejects_non_singular_wire_price(monkeypatch):
     )
 
     with pytest.raises(PTG2ManifestArtifactError, match="not singular"):
-        projection._build_canonical_candidate_tuple(
-            source_audit.QueryKey("CPT", "99213", 1234567890),
-            {},
-            (),
-            _price_payload(),
-        )
-
-
-def test_candidate_projection_wraps_public_schema_errors(monkeypatch):
-    def invalid_public_tuple(*_args):
-        raise source_audit.ApiSchemaError("invalid")
-
-    monkeypatch.setattr(
-        projection.source_audit,
-        "canonical_api_price_tuple",
-        invalid_public_tuple,
-    )
-
-    with pytest.raises(PTG2ManifestArtifactError, match="public API contract"):
         projection._build_canonical_candidate_tuple(
             source_audit.QueryKey("CPT", "99213", 1234567890),
             {},

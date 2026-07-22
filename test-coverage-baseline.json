@@ -44,13 +44,20 @@
         "api/ptg2_audit_occurrences.py",
         "api/ptg2_candidate_audit.py",
         "api/ptg2_candidate_audit_batch.py",
+        "api/ptg2_candidate_audit_capacity.py",
         "api/ptg2_candidate_audit_codes.py",
         "api/ptg2_candidate_audit_coordinates.py",
+        "api/ptg2_candidate_audit_forward.py",
         "api/ptg2_candidate_audit_graph.py",
         "api/ptg2_candidate_audit_integrity.py",
+        "api/ptg2_candidate_audit_maps.py",
+        "api/ptg2_candidate_audit_networks.py",
+        "api/ptg2_candidate_audit_npis.py",
+        "api/ptg2_candidate_audit_occurrences.py",
         "api/ptg2_candidate_audit_partition.py",
         "api/ptg2_candidate_audit_price_load.py",
         "api/ptg2_candidate_audit_projection.py",
+        "api/ptg2_candidate_audit_provider_requests.py",
         "api/ptg2_candidate_audit_reverse.py",
         "api/ptg2_candidate_audit_selection.py",
         "api/ptg2_capacity_evidence.py",
@@ -305,14 +312,14 @@
         }
       },
       "metrics": {
-      "branches": {
-        "covered": 23905,
-        "total": 32864
-      },
-      "lines": {
-        "covered": 80319,
-        "total": 96623
-      }
+        "branches": {
+          "covered": 24568,
+          "total": 33352
+        },
+        "lines": {
+          "covered": 82097,
+          "total": 98079
+        }
       },
       "path": "test-coverage-python.json",
       "scope": {

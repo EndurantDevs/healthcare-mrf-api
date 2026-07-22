@@ -9,9 +9,11 @@ from sqlalchemy import text
 
 from api import ptg2_candidate_audit_batch as candidate_batch
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
+from api.ptg2_candidate_audit_capacity import CandidateAuditDecodedRetentionBudget
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
+    bind_shared_block_decoded_retention_budget,
     fetch_snapshot_source_set_identity,
 )
 from api.ptg2_types import PTG2ServingTables
@@ -28,6 +30,7 @@ async def _validate_partition_binding(
     session: Any,
     serving_tables: PTG2ServingTables,
     audit_request: PartitionedCandidateAuditRequest,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> None:
     """Bind one explicit partition to immutable candidate metadata."""
 
@@ -58,14 +61,14 @@ async def _validate_partition_binding(
             "PTG2 candidate partition disagrees with sealed audit metadata"
         )
     try:
-        observed_source_set, observed_ordinal_digest, _raw_source_sha256 = (
-            await fetch_snapshot_source_set_identity(
-                session,
-                schema_name=candidate_batch.PTG2_SCHEMA,
-                logical_snapshot_id=binding.snapshot_id,
-                expected_source_count=source_count,
-            )
+        observed_identity = await fetch_snapshot_source_set_identity(
+            session,
+            schema_name=candidate_batch.PTG2_SCHEMA,
+            logical_snapshot_id=binding.snapshot_id,
+            expected_source_count=source_count,
+            retention_budget=retention_budget,
         )
+        observed_source_set, observed_ordinal_digest, _ = observed_identity
     except PTG2SharedBlockError as exc:
         raise PTG2ManifestArtifactError(str(exc)) from exc
     has_invalid_source_key = any(
@@ -120,6 +123,22 @@ def _partition_persisted_occurrences(
     )
 
 
+def _candidate_partition_result(
+    audit_data: candidate_batch._CandidateAuditData,
+) -> candidate_batch.CandidateAuditBatchResult:
+    persisted_count = audit_data.persisted_audit_occurrence_count
+    return candidate_batch.CandidateAuditBatchResult(
+        matched_challenge_count=sum(
+            challenge.multiplicity for challenge in audit_data.challenges
+        ),
+        unique_challenge_count=len(audit_data.challenges),
+        witness_io={},
+        candidate_processing_io=audit_data.candidate_processing_io,
+        persisted_audit_occurrence_count=persisted_count,
+        validated_persisted_audit_occurrence_count=persisted_count,
+    )
+
+
 async def audit_candidate_partition(
     session: Any,
     audit_request: PartitionedCandidateAuditRequest,
@@ -135,6 +154,8 @@ async def audit_candidate_partition(
         plan_market_type=binding.plan_market_type,
     ):
         raise PTG2ManifestArtifactError("PTG2 candidate audit access mismatch")
+    retention_budget = CandidateAuditDecodedRetentionBudget()
+    bind_shared_block_decoded_retention_budget(retention_budget)
     await session.execute(
         text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
     )
@@ -143,7 +164,12 @@ async def audit_candidate_partition(
         binding.snapshot_id,
         candidate_audit_access=access,
     )
-    await _validate_partition_binding(session, serving_tables, audit_request)
+    await _validate_partition_binding(
+        session,
+        serving_tables,
+        audit_request,
+        retention_budget,
+    )
     audit_data = await candidate_batch._candidate_data_for_conditions(
         session,
         serving_tables,
@@ -153,6 +179,7 @@ async def audit_candidate_partition(
             audit_request
         ),
         witness_io={},
+        retention_budget=retention_budget,
     )
     if any(
         not candidate_batch._is_challenge_match(challenge, audit_data)
@@ -161,20 +188,7 @@ async def audit_candidate_partition(
         raise PTG2ManifestArtifactError(
             "PTG2 candidate source witness is missing from the sealed serving layout"
         )
-    return candidate_batch.CandidateAuditBatchResult(
-        matched_challenge_count=sum(
-            challenge.multiplicity for challenge in audit_data.challenges
-        ),
-        unique_challenge_count=len(audit_data.challenges),
-        witness_io={},
-        candidate_processing_io=audit_data.candidate_processing_io,
-        persisted_audit_occurrence_count=(
-            audit_data.persisted_audit_occurrence_count
-        ),
-        validated_persisted_audit_occurrence_count=(
-            audit_data.persisted_audit_occurrence_count
-        ),
-    )
+    return _candidate_partition_result(audit_data)
 
 
 __all__ = ["audit_candidate_partition"]

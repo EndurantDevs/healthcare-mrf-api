@@ -13,6 +13,10 @@ from sqlalchemy import text
 
 from api import ptg2_db_serving_v3, ptg2_db_sidecars
 from api import ptg2_shared_blocks as shared_readers
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditDecodedRetentionBudget,
+    CandidateAuditDecodedRetentionError,
+)
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
     PTG2_V3_GRAPH_CHUNK_BYTES,
@@ -125,6 +129,53 @@ class _ReadOnceSession:
                 if bytes(row["block_hash"]) in requested_hashes
             )
         raise AssertionError(f"unexpected SQL: {sql}")
+
+
+class _LazyAsyncRows:
+    def __init__(self, rows):
+        self._rows = iter(rows)
+        self.consumed_count = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            row = next(self._rows)
+        except StopIteration:
+            raise StopAsyncIteration
+        self.consumed_count += 1
+        return row
+
+
+class _LazyMappingSession:
+    def __init__(self, mapping_rows):
+        self.mapping_result = _LazyAsyncRows(mapping_rows)
+        self.stream_calls = []
+        self.execute_calls = []
+
+    async def stream(self, statement, params=None):
+        self.stream_calls.append((str(statement), dict(params or {})))
+        return self.mapping_result
+
+    async def execute(self, statement, params=None):
+        self.execute_calls.append((str(statement), dict(params or {})))
+        raise AssertionError("physical rows must not be fetched after mapping overflow")
+
+
+class _LazySourceIdentitySession:
+    def __init__(self, source_rows):
+        self.source_result = _LazyAsyncRows(source_rows)
+        self.stream_calls = []
+        self.execute_calls = []
+
+    async def stream(self, statement, params=None):
+        self.stream_calls.append((str(statement), dict(params or {})))
+        return self.source_result
+
+    async def execute(self, statement, params=None):
+        self.execute_calls.append((str(statement), dict(params or {})))
+        raise AssertionError("source identity rows must use the streaming query")
 
 
 class _MappingCopyDriver:
@@ -780,6 +831,35 @@ async def test_snapshot_source_identity_preserves_dense_ordinal_order():
     assert first_ordered != reversed_ordered
     assert first_raw_hashes == ("1" * 64, "2" * 64)
     assert reversed_raw_hashes == ("2" * 64, "1" * 64)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_source_identity_streams_and_fails_before_buffering():
+    session = _LazySourceIdentitySession(
+        {"source_key": source_key, "raw_container_sha256": "1" * 64}
+        for source_key in range(100)
+    )
+    budget = CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=shared_readers._SOURCE_IDENTITY_RECORD_RETAINED_BYTES
+    )
+
+    with pytest.raises(
+        CandidateAuditDecodedRetentionError,
+        match="source identity record",
+    ):
+        await fetch_snapshot_source_set_identity(
+            session,
+            schema_name="mrf",
+            logical_snapshot_id="snapshot-1",
+            expected_source_count=3,
+            retention_budget=budget,
+        )
+
+    assert session.execute_calls == []
+    assert len(session.stream_calls) == 1
+    assert session.stream_calls[0][1]["row_limit"] == 4
+    assert session.source_result.consumed_count == 2
+    assert budget.retained_bytes == 0
 
 
 @pytest.mark.asyncio
@@ -1522,6 +1602,69 @@ async def test_read_once_scope_fetches_and_decodes_one_shared_physical_block_onc
 
 
 @pytest.mark.asyncio
+async def test_read_once_mapping_stream_stops_at_first_fragment_count_excess():
+    mapping_rows, _physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"same payload",
+        coordinates=((7, 0), (7, 1), (7, 2), (7, 3)),
+    )
+    session = _LazyMappingSession(mapping_rows)
+    retained_row_bytes = shared_readers._SHARED_MAPPING_RECORD_RETAINED_BYTES
+
+    with shared_block_read_once_scope(
+        max_retained_raw_bytes=1024,
+        max_retained_mapping_bytes=2 * retained_row_bytes,
+    ):
+        with pytest.raises(
+            shared_readers.SharedMappingReadLimitError,
+            match="fragment metadata",
+        ):
+            await fetch_shared_blocks(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                object_kind="page_v4",
+                block_keys=(7,),
+            )
+
+    assert session.mapping_result.consumed_count == 3
+    assert session.stream_calls[0][1]["mapping_row_limit"] == 3
+    assert session.execute_calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_once_mapping_stream_stops_and_unwinds_on_budget_excess():
+    mapping_rows, _physical_rows = _read_once_rows(
+        object_kind="page_v4",
+        raw_payload=b"same payload",
+        coordinates=((7, 0), (7, 1), (7, 2)),
+    )
+    session = _LazyMappingSession(mapping_rows)
+    retained_row_bytes = shared_readers._SHARED_MAPPING_RECORD_RETAINED_BYTES
+    budget = CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=2 * retained_row_bytes - 1
+    )
+
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024):
+        shared_readers.bind_shared_block_decoded_retention_budget(budget)
+        with pytest.raises(
+            CandidateAuditDecodedRetentionError,
+            match="fragment metadata row",
+        ):
+            await fetch_shared_blocks(
+                session,
+                schema_name="mrf",
+                snapshot_key=12,
+                object_kind="page_v4",
+                block_keys=(7,),
+            )
+
+    assert session.mapping_result.consumed_count == 2
+    assert session.execute_calls == []
+    assert budget.retained_bytes == 0
+
+
+@pytest.mark.asyncio
 async def test_forward_alias_is_read_decoded_and_parsed_once_then_fanned_out():
     block_7 = 7 << 31
     block_8 = 8 << 31
@@ -1823,6 +1966,8 @@ async def test_provider_specific_requests_normalize_and_bound_before_io():
         )
         scope.assert_processed_once()
     assert code_keys_by_provider == {0: (1,), 1: (1,)}
+
+
 @pytest.mark.asyncio
 async def test_provider_specific_requests_validate_before_io():
     provider_payload = _provider_code_block_payload(((0, (1, 2)),))
@@ -2035,6 +2180,7 @@ async def test_provider_specific_intersections_filter_physical_aliases_once(
     assert ledger["repeated_physical_reads"] == 0
     assert ledger["repeated_physical_decodes"] == 0
     assert ledger["repeated_logical_payload_processes"] == 0
+
 
 @pytest.mark.asyncio
 async def test_provider_specific_partial_aliases_read_and_filter_once(

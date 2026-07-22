@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+from api import ptg2_candidate_audit_capacity as capacity
+from api.ptg2_candidate_audit_capacity import (
+    PTG2_CANDIDATE_AUDIT_MAX_PROCESS_BYTES,
+    CandidateAuditDecodedRetentionBudget,
+    CandidateAuditProcessAdmission,
+    CandidateAuditProcessAdmissionError,
+    retain_unique_integer_key_set,
+    retain_unique_integer_keys,
+)
+
+
+class _AuditAbort(BaseException):
+    pass
+
+
+class _LeaseConstructionAbort(BaseException):
+    pass
+
+
+def _aborting_keys():
+    yield 7
+    raise _AuditAbort("stop")
+
+
+def test_unique_integer_tuple_releases_claims_on_base_exception():
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=4096)
+
+    with pytest.raises(_AuditAbort, match="stop"):
+        retain_unique_integer_keys(
+            _aborting_keys(),
+            budget,
+            category="test",
+        )
+
+    assert budget.retained_bytes == 0
+
+
+def test_unique_integer_set_releases_claims_on_base_exception():
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=4096)
+
+    with pytest.raises(_AuditAbort, match="stop"):
+        retain_unique_integer_key_set(
+            _aborting_keys(),
+            budget,
+            category="test",
+        )
+
+    assert budget.retained_bytes == 0
+
+
+def test_unique_integer_set_propagates_base_exception_without_budget():
+    with pytest.raises(_AuditAbort, match="stop"):
+        retain_unique_integer_key_set(
+            _aborting_keys(),
+            None,
+            category="test",
+        )
+
+
+@pytest.mark.parametrize(
+    "maximum_bytes",
+    (0, -1, True, PTG2_CANDIDATE_AUDIT_MAX_PROCESS_BYTES + 1),
+)
+def test_process_admission_rejects_invalid_limits(maximum_bytes):
+    with pytest.raises(ValueError, match="process-byte limit is invalid"):
+        CandidateAuditProcessAdmission(maximum_bytes)
+
+
+@pytest.mark.asyncio
+async def test_process_admission_rejects_one_partition_above_limit():
+    admission = CandidateAuditProcessAdmission(99)
+
+    with pytest.raises(CandidateAuditProcessAdmissionError) as exc_info:
+        await admission.acquire(100)
+
+    assert exc_info.value.requested_bytes == 100
+    assert exc_info.value.maximum_bytes == 99
+    assert admission.snapshot.rejected_count == 1
+    assert admission.snapshot.retained_bytes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("weight_bytes", (0, -1, True))
+async def test_process_admission_rejects_invalid_weights(weight_bytes):
+    admission = CandidateAuditProcessAdmission(99)
+
+    with pytest.raises(ValueError, match="admission weight is invalid"):
+        await admission.acquire(weight_bytes)
+
+
+@pytest.mark.asyncio
+async def test_process_admission_lease_context_releases_base_exception_once():
+    admission = CandidateAuditProcessAdmission(10)
+    lease = await admission.acquire(10)
+
+    assert lease.is_released is False
+    with pytest.raises(_AuditAbort, match="stop"):
+        async with lease as entered_lease:
+            assert entered_lease is lease
+            raise _AuditAbort("stop")
+
+    assert lease.is_released is True
+    assert admission.snapshot.retained_bytes == 0
+    assert admission.snapshot.released_count == 1
+    with pytest.raises(RuntimeError, match="released twice"):
+        lease.release()
+
+
+@pytest.mark.asyncio
+async def test_immediate_lease_construction_abort_returns_granted_weight(
+    monkeypatch,
+):
+    admission = CandidateAuditProcessAdmission(10)
+    original_lease = capacity.CandidateAuditProcessAdmissionLease
+
+    def abort_lease(*_args, **_kwargs):
+        raise _LeaseConstructionAbort("stop")
+
+    monkeypatch.setattr(
+        capacity,
+        "CandidateAuditProcessAdmissionLease",
+        abort_lease,
+    )
+    with pytest.raises(_LeaseConstructionAbort, match="stop"):
+        await admission.acquire(10)
+
+    assert admission.snapshot.retained_bytes == 0
+    assert admission.snapshot.admitted_count == 1
+    assert admission.snapshot.released_count == 1
+    monkeypatch.setattr(
+        capacity,
+        "CandidateAuditProcessAdmissionLease",
+        original_lease,
+    )
+    retry_lease = await admission.acquire(10)
+    retry_lease.release()
+    assert admission.snapshot.retained_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_waited_lease_construction_abort_returns_granted_weight(
+    monkeypatch,
+):
+    admission = CandidateAuditProcessAdmission(10)
+    active_lease = await admission.acquire(10)
+    waiting_acquire = asyncio.create_task(admission.acquire(10))
+    await asyncio.sleep(0)
+    original_lease = capacity.CandidateAuditProcessAdmissionLease
+
+    def abort_lease(*_args, **_kwargs):
+        raise _LeaseConstructionAbort("stop")
+
+    monkeypatch.setattr(
+        capacity,
+        "CandidateAuditProcessAdmissionLease",
+        abort_lease,
+    )
+    active_lease.release()
+    with pytest.raises(_LeaseConstructionAbort, match="stop"):
+        await waiting_acquire
+
+    assert admission.snapshot.retained_bytes == 0
+    assert admission.snapshot.queued_count == 0
+    assert admission.snapshot.admitted_count == 2
+    assert admission.snapshot.released_count == 2
+    monkeypatch.setattr(
+        capacity,
+        "CandidateAuditProcessAdmissionLease",
+        original_lease,
+    )
+    retry_lease = await admission.acquire(10)
+    retry_lease.release()
+    assert admission.snapshot.retained_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_process_admission_serializes_concurrent_weight_and_retries():
+    admission = CandidateAuditProcessAdmission(10)
+    first_lease = await admission.acquire(6)
+    waiting_acquire = asyncio.create_task(admission.acquire(6))
+    await asyncio.sleep(0)
+
+    assert not waiting_acquire.done()
+    assert admission.snapshot.retained_bytes == 6
+    assert admission.snapshot.queued_count == 1
+
+    first_lease.release()
+    second_lease = await waiting_acquire
+    assert second_lease.waited is True
+    assert admission.snapshot.retained_bytes == 6
+    second_lease.release()
+
+    retry_lease = await admission.acquire(10)
+    retry_lease.release()
+    assert admission.snapshot.retained_bytes == 0
+    assert admission.snapshot.peak_retained_bytes == 10
+    assert admission.snapshot.admitted_count == 3
+    assert admission.snapshot.released_count == 3
+
+
+@pytest.mark.asyncio
+async def test_process_admission_fifo_blocks_lighter_follower():
+    admission = CandidateAuditProcessAdmission(10)
+    active_lease = await admission.acquire(6)
+    heavy_acquire = asyncio.create_task(admission.acquire(6))
+    light_acquire = asyncio.create_task(admission.acquire(4))
+    await asyncio.sleep(0)
+
+    assert not heavy_acquire.done()
+    assert not light_acquire.done()
+    assert admission.snapshot.queued_count == 2
+
+    active_lease.release()
+    heavy_lease, light_lease = await asyncio.gather(heavy_acquire, light_acquire)
+    assert heavy_lease.waited is True
+    assert light_lease.waited is True
+    assert admission.snapshot.retained_bytes == 10
+    heavy_lease.release()
+    light_lease.release()
+    assert admission.snapshot.retained_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_process_admission_pending_cancellation_removes_waiter_once():
+    admission = CandidateAuditProcessAdmission(10)
+    active_lease = await admission.acquire(6)
+    waiting_acquire = asyncio.create_task(admission.acquire(6))
+    await asyncio.sleep(0)
+
+    waiting_acquire.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting_acquire
+
+    assert admission.snapshot.retained_bytes == 6
+    assert admission.snapshot.queued_count == 0
+    assert admission.snapshot.cancelled_count == 1
+    active_lease.release()
+    retry_lease = await admission.acquire(10)
+    retry_lease.release()
+    assert admission.snapshot.retained_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_process_admission_discards_cancelled_head_before_task_cleanup():
+    admission = CandidateAuditProcessAdmission(10)
+    active_lease = await admission.acquire(10)
+    waiting_acquire = asyncio.create_task(admission.acquire(1))
+    await asyncio.sleep(0)
+    waiter = admission._waiters[0]
+
+    waiter.future.cancel()
+    admission._grant_waiters()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting_acquire
+
+    assert admission.snapshot.cancelled_count == 1
+    assert admission.snapshot.queued_count == 0
+    assert admission.snapshot.retained_bytes == 10
+    active_lease.release()
+    assert admission.snapshot.retained_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_process_admission_cancel_after_grant_releases_exactly_once():
+    admission = CandidateAuditProcessAdmission(10)
+    active_lease = await admission.acquire(6)
+    waiting_acquire = asyncio.create_task(admission.acquire(6))
+    await asyncio.sleep(0)
+
+    active_lease.release()
+    waiting_acquire.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting_acquire
+
+    assert admission.snapshot.retained_bytes == 0
+    assert admission.snapshot.queued_count == 0
+    assert admission.snapshot.released_count == 2
+    retry_lease = await admission.acquire(10)
+    retry_lease.release()
+    assert admission.snapshot.retained_bytes == 0
+
+
+def test_process_admission_rejects_invalid_internal_release():
+    admission = CandidateAuditProcessAdmission(10)
+
+    with pytest.raises(RuntimeError, match="release is invalid"):
+        admission._release(0)
+
+
+@pytest.mark.asyncio
+async def test_process_admission_caps_eight_nominal_partition_weights():
+    partition_weight = 576
+    admission = CandidateAuditProcessAdmission(4 * partition_weight)
+    release_wave = asyncio.Event()
+    counts = SimpleNamespace(active=0, peak=0)
+
+    async def run_partition() -> None:
+        lease = await admission.acquire(partition_weight)
+        counts.active += 1
+        counts.peak = max(counts.peak, counts.active)
+        await release_wave.wait()
+        counts.active -= 1
+        lease.release()
+
+    tasks = [asyncio.create_task(run_partition()) for _ in range(8)]
+    await asyncio.sleep(0)
+
+    assert counts.peak == 4
+    assert admission.snapshot.retained_bytes == 4 * partition_weight
+    assert admission.snapshot.queued_count == 4
+
+    release_wave.set()
+    await asyncio.gather(*tasks)
+    assert counts.peak == 4
+    assert admission.snapshot.retained_bytes == 0
+    assert admission.snapshot.admitted_count == 8
+    assert admission.snapshot.released_count == 8
