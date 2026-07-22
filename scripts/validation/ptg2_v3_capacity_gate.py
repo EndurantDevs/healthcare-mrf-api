@@ -418,7 +418,7 @@ def _decimal(
     return value
 
 
-def _boolean(obj: Mapping[str, Any], name: str, path: str) -> bool:
+def _is_boolean_value(obj: Mapping[str, Any], name: str, path: str) -> bool:
     value = obj[name]
     if not isinstance(value, bool):
         raise EvidenceError("invalid_type", _field(path, name))
@@ -1298,7 +1298,7 @@ def verify_receipt(
 
     measurement_fields = tuple(name for name in _ROOT_FIELDS if name != "receipt")
     root = _object(measurement_record, "", measurement_fields, ("receipt",))
-    if not _boolean(root, "release_evidence", ""):
+    if not _is_boolean_value(root, "release_evidence", ""):
         raise EvidenceError("non_release_example", "release_evidence")
     if "receipt" not in root:
         raise EvidenceError("missing_field", "receipt")
@@ -2623,7 +2623,7 @@ def _validate_api(root: Mapping[str, Any]) -> ApiEvidence:
         contention_seconds=contention_seconds,
         contention_started_at=contention_started_at,
         contention_ended_at=contention_ended_at,
-        fresh_processes=_boolean(api_dict, "fresh_processes", path),
+        fresh_processes=_is_boolean_value(api_dict, "fresh_processes", path),
         planned_requests=counts["planned_requests"],
         attempted_requests=counts["attempted_requests"],
         succeeded_requests=counts["succeeded_requests"],
@@ -2667,7 +2667,7 @@ def _import_boolean_fields(
     sample_object: Mapping[str, Any], path: str
 ) -> dict[str, bool]:
     names = _IMPORT_SAMPLE_FIELDS[11:21]
-    return {name: _boolean(sample_object, name, path) for name in names}
+    return {name: _is_boolean_value(sample_object, name, path) for name in names}
 
 
 def _validate_import_sample(value: Any, path: str) -> ImportLifecycleSample:
@@ -3080,8 +3080,8 @@ def _validate_http_sample(
             tuple(_HTTP_SELECTION_METHODS.values()),
         ),
         selection_ordinal=_integer(sample_object, "selection_ordinal", path, minimum=0),
-        cold=_boolean(sample_object, "cold", path),
-        first_observation=_boolean(sample_object, "first_observation", path),
+        cold=_is_boolean_value(sample_object, "cold", path),
+        first_observation=_is_boolean_value(sample_object, "first_observation", path),
         response_status=response_status,
         response_body_sha256=_digest(sample_object, "response_body_sha256", path),
         result_count=_integer(sample_object, "result_count", path, minimum=0),
@@ -4234,7 +4234,7 @@ def validate_measurement(
     if _integer(root, "schema_version", "", minimum=1) != SCHEMA_VERSION:
         raise EvidenceError("unsupported_schema_version", "schema_version")
     _fixed_string(root, "evidence_profile", "", EVIDENCE_PROFILE)
-    if not _boolean(root, "release_evidence", ""):
+    if not _is_boolean_value(root, "release_evidence", ""):
         raise EvidenceError("non_release_example", "release_evidence")
 
     api_evidence = _validate_api(root)

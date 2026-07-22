@@ -29,7 +29,7 @@ def _binding_row(**updates):
         "binding_ordinal": 0,
         "snapshot_id": "ptg2:release-network",
         "source_key": "aetna-network",
-        "plan_id": "38-2418014",
+        "plan_id": "99-0000001",
         "plan_market_type": "group",
         "role": "in_network",
         "required": True,
@@ -46,7 +46,7 @@ def _binding(
     role="in_network",
     snapshot_id="ptg2:release-network",
     source_key="aetna-network",
-    plan_id="38-2418014",
+    plan_id="99-0000001",
     market_type="group",
 ):
     return plan_release_serving.PlanReleaseSnapshotBinding(
@@ -186,13 +186,13 @@ def test_allowed_amount_query_params_deduplicate_physical_bindings():
     duplicate_snapshot_by_field = {
         "snapshot_id": "ptg2:release-allowed",
         "source_key": "aetna-allowed",
-        "plan_id": "38-2418014",
+        "plan_id": "99-0000001",
         "plan_market_type": "GROUP",
     }
     parameter_map = pricing._allowed_amount_query_params(
         {"plan_release_id": PLAN_RELEASE_ID},
         pagination,
-        plan_id="38-2418014",
+        plan_id="99-0000001",
         code="99213",
         code_system="CPT",
         npi=None,
@@ -329,7 +329,7 @@ def test_allowed_amount_release_result_is_annotated_after_a_successful_page(
     )
     resolved_args_by_name = {
         "plan_release_id": PLAN_RELEASE_ID,
-        "plan_id": "38-2418014",
+        "plan_id": "99-0000001",
     }
 
     async def resolved_route(_session, _args):
@@ -348,7 +348,7 @@ def test_allowed_amount_release_result_is_annotated_after_a_successful_page(
     monkeypatch.setattr(
         pricing,
         "_allowed_amount_scope_from_args",
-        lambda _args: ("38-2418014", "99213", "CPT", None),
+        lambda _args: ("99-0000001", "99213", "CPT", None),
     )
     monkeypatch.setattr(
         pricing,

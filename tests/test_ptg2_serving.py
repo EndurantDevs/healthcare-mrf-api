@@ -1378,7 +1378,7 @@ async def test_knn_duplicate_addresses_do_not_signal_location_exhaustion(monkeyp
         _rate_scope,
         candidate_rows,
         matched_rows,
-        groups_by_npi,
+        provider_set_keys_by_npi,
         seen_npis,
     ):
         before = len(matched_rows)
@@ -1388,7 +1388,7 @@ async def test_knn_duplicate_addresses_do_not_signal_location_exhaustion(monkeyp
                 continue
             seen_npis.add(npi)
             matched_rows.append(candidate_row)
-            groups_by_npi[npi].add("01" * 16)
+            provider_set_keys_by_npi[npi].add(1)
         return len(matched_rows) - before
 
     monkeypatch.setattr(ptg2_serving, "_membership_location_rows", fake_location_rows)
@@ -1398,7 +1398,7 @@ async def test_knn_duplicate_addresses_do_not_signal_location_exhaustion(monkeyp
         object(),
         _strict_v3_tables(),
         {"lat": 41.9, "long": -87.65},
-        ptg2_serving._ptg2_build_rate_scope(("01" * 16,)),
+        frozenset({1}),
         2,
     )
 

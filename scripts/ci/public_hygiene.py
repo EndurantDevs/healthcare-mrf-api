@@ -58,6 +58,7 @@ PRIVATE_EXAMPLE_FINGERPRINTS = {
     "7ea30da2361ecea73d26f07495a0e642d739387377972872467d57a458451c4c",
     "8da581325f2ef67ad5d670316501495be60f04e39c24ad441cac51b552594b96",
     "a3f6cfd195ad02801803784eb724e2ae3580de1ff68bd4625d2eef3adf49eb50",
+    "aabafece548ae3faf95aae9c3ae1465c75bcfc1de20c8e96c634ced44fe41af3",
     "b996c1e92f49a8b0cf629680fb4a8fafc627639a344678772f98e025b17da30a",
     "c72086ecc3255c4530054a242028242aa1139a0c8ba397ab169c33abedd661b0",
     "d4590607d00cb32b1a7a776c7eb6c77636d2fe8879349c8faa713ef4b624cade",
@@ -143,7 +144,7 @@ def has_private_text_fingerprint(text: str) -> bool:
     tokens = list(TEXT_TOKEN_RE.finditer(text))
     for start in range(len(tokens)):
         normalized_window = ""
-        integration_identifier = True
+        is_integration_identifier = True
         for width in range(PRIVATE_TEXT_WINDOW_MAX):
             token_index = start + width
             if token_index >= len(tokens):
@@ -152,8 +153,8 @@ def has_private_text_fingerprint(text: str) -> bool:
                 separator = text[
                     tokens[token_index - 1].end() : tokens[token_index].start()
                 ]
-                integration_identifier = bool(
-                    integration_identifier
+                is_integration_identifier = bool(
+                    is_integration_identifier
                     and INTEGRATION_IDENTIFIER_SEPARATOR_RE.fullmatch(separator)
                 )
             normalized_window += tokens[token_index].group(0).lower()
@@ -161,7 +162,7 @@ def has_private_text_fingerprint(text: str) -> bool:
             if fingerprint in PRIVATE_EXAMPLE_FINGERPRINTS:
                 return True
             if (
-                integration_identifier
+                is_integration_identifier
                 and fingerprint in PRIVATE_INTEGRATION_FINGERPRINTS
             ):
                 return True

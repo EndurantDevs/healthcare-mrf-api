@@ -207,7 +207,7 @@ async def _resolve_raw_artifacts_from_db(
         password=password or None,
     )
     try:
-        rows = await conn.fetch(
+        source_file_version_rows = await conn.fetch(
             f"""
             SELECT source_file_version_id, raw_storage_uri, raw_sha256, content_length
               FROM {table}
@@ -219,11 +219,14 @@ async def _resolve_raw_artifacts_from_db(
     finally:
         await conn.close()
 
-    rows_by_id = {str(row["source_file_version_id"]): row for row in rows}
+    rows_by_id = {
+        str(source_file_version_row["source_file_version_id"]): source_file_version_row
+        for source_file_version_row in source_file_version_rows
+    }
     resolutions: list[dict[str, Any]] = []
     for source_file_version_id in source_file_version_ids:
-        row = rows_by_id.get(source_file_version_id)
-        if row is None:
+        source_file_version_row = rows_by_id.get(source_file_version_id)
+        if source_file_version_row is None:
             resolutions.append(
                 {
                     "source_file_version_id": source_file_version_id,
@@ -231,7 +234,7 @@ async def _resolve_raw_artifacts_from_db(
                 }
             )
             continue
-        raw_storage_uri = str(row["raw_storage_uri"] or "")
+        raw_storage_uri = str(source_file_version_row["raw_storage_uri"] or "")
         path = _file_uri_to_path(raw_storage_uri)
         status = "resolved"
         if path is None:
@@ -243,8 +246,8 @@ async def _resolve_raw_artifacts_from_db(
                 "source_file_version_id": source_file_version_id,
                 "raw_storage_uri": raw_storage_uri,
                 "raw_artifact_path": path,
-                "raw_sha256": row["raw_sha256"],
-                "content_length": row["content_length"],
+                "raw_sha256": source_file_version_row["raw_sha256"],
+                "content_length": source_file_version_row["content_length"],
                 "status": status,
             }
         )
@@ -310,7 +313,7 @@ def _raw_artifact_resolution_issues(
     return issues
 
 
-def main() -> int:
+def run_price_address_assurance_report() -> int:
     """Build and print the requested price-address assurance report."""
     args = parse_args()
     api_payload = _load_api_payload(args.api_payload, args.api_url, args.api_key, args.timeout)
@@ -375,6 +378,11 @@ def main() -> int:
     if args.strict and not report["ok"]:
         return 1
     return 0
+
+
+def main() -> int:
+    """Run the price-address assurance report CLI."""
+    return run_price_address_assurance_report()
 
 
 if __name__ == "__main__":

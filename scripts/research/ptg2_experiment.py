@@ -93,6 +93,12 @@ async def main():
             "code_system": probe_config["code_system"],
             "include_details": "true",
         }
+        location_code_args = {
+            **code_args,
+            "zip5": probe_config["zip5"],
+            "radius_miles": probe_config["radius_miles"],
+            "include_providers": "true",
+        }
         npi_args = {
             "plan_id": probe_config["plan_id"],
             "snapshot_id": snapshot_id,
@@ -105,6 +111,18 @@ async def main():
                     session,
                     snapshot_id,
                     code_args,
+                    pagination,
+                    serving_tables=serving_tables,
+                ),
+                iterations=probe_config["iterations"],
+                warmup=probe_config["warmup"],
+            ),
+            "location_code": await timed_probe(
+                "location_code",
+                lambda: search_ptg2_serving_table(
+                    session,
+                    snapshot_id,
+                    location_code_args,
                     pagination,
                     serving_tables=serving_tables,
                 ),
@@ -1222,6 +1240,10 @@ def _api_latency_probe_config(
         "code": str(case.get("api_probe_code") or "99213"),
         "code_system": str(case.get("api_probe_code_system") or "CPT"),
         "npi": int(case.get("api_probe_npi") or 1234567890),
+        "zip5": str(case.get("api_probe_zip5") or "60652"),
+        "radius_miles": float(
+            case.get("api_probe_radius_miles") or 25.0
+        ),
         "limit": int(case.get("api_probe_limit") or 25),
         "iterations": int(_api_probe_setting(case, variant, "api_probe_iterations", 8)),
         "warmup": int(_api_probe_setting(case, variant, "api_probe_warmup", 2)),

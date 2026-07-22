@@ -147,8 +147,8 @@ async def _discover(args: argparse.Namespace) -> list[dict[str, Any]]:
     queue: asyncio.Queue[str] = asyncio.Queue()
     for group_number in groups:
         queue.put_nowait(group_number)
-    results: list[dict[str, Any]] = []
-    checked = 0
+    discovery_probe_results: list[dict[str, Any]] = []
+    discovery_progress_by_metric = {"checked": 0}
 
     async with aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
@@ -160,7 +160,6 @@ async def _discover(args: argparse.Namespace) -> list[dict[str, Any]]:
         async def worker() -> None:
             """Probe queued ASR group identifiers until the queue drains."""
 
-            nonlocal checked
             while True:
                 try:
                     group_number = queue.get_nowait()
@@ -184,20 +183,28 @@ async def _discover(args: argparse.Namespace) -> list[dict[str, Any]]:
                         probe_result["ok"] = json_ok
                         probe_result["json_validated"] = json_ok
                         probe_result["json_error"] = error
-                    results.append(probe_result)
-                    checked += 1
-                    if args.progress_every and checked % args.progress_every == 0:
+                    discovery_probe_results.append(probe_result)
+                    discovery_progress_by_metric["checked"] += 1
+                    checked_count = discovery_progress_by_metric["checked"]
+                    if args.progress_every and checked_count % args.progress_every == 0:
                         found = len(
-                            [probe_result for probe_result in results if probe_result["ok"]]
+                            [
+                                probe_result
+                                for probe_result in discovery_probe_results
+                                if probe_result["ok"]
+                            ]
                         )
-                        print(f"checked={checked} found={found}", file=sys.stderr)
+                        print(
+                            f"checked={checked_count} found={found}",
+                            file=sys.stderr,
+                        )
                 finally:
                     queue.task_done()
 
         workers = [asyncio.create_task(worker()) for _ in range(args.concurrency)]
         await queue.join()
         await asyncio.gather(*workers)
-    return results
+    return discovery_probe_results
 
 
 def _parse_args() -> argparse.Namespace:

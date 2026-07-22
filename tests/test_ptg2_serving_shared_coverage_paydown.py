@@ -11,22 +11,80 @@ from tests.ptg2_serving_coverage_paydown_support import strict_v3_tables
 
 
 @pytest.mark.asyncio
-async def test_append_rate_matched_locations_skips_seen_and_unpriced_groups(
+async def test_dense_npi_graph_intersects_rate_sets_without_id_hydration(
     monkeypatch,
 ):
-    group_a = "01" * 16
-    group_b = "02" * 16
-    rate_scope = serving._ptg2_build_rate_scope((group_a,))
+    graph_lookup = AsyncMock(
+        side_effect=(
+            {11: (7, 8), 12: (8, 9)},
+            {7: (101, 101), 8: (102, 103), 9: (104,)},
+        )
+    )
+    monkeypatch.setattr(
+        serving, "lookup_shared_graph_members_from_db", graph_lookup
+    )
+    hydrate_group_ids = AsyncMock(
+        side_effect=AssertionError("dense location traversal hydrated group IDs")
+    )
+    monkeypatch.setattr(
+        serving, "_shared_provider_group_ids_for_keys", hydrate_group_ids
+    )
+
+    matches = await serving._shared_provider_set_keys_by_npi(
+        object(),
+        strict_v3_tables(),
+        (12, 11, 11),
+        (101, 103, 999),
+    )
+
+    assert matches == {11: {101, 103}, 12: {103}}
+    assert [call.args[2] for call in graph_lookup.await_args_list] == [
+        serving.PTG2_V3_GRAPH_NPI_TO_GROUP,
+        serving.PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+    ]
+    assert graph_lookup.await_args_list[0].args[3] == (11, 12)
+    assert graph_lookup.await_args_list[1].args[3] == (7, 8, 9)
+    hydrate_group_ids.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dense_npi_graph_fails_closed_on_missing_reverse_owner(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        serving,
+        "lookup_shared_graph_members_from_db",
+        AsyncMock(side_effect=({11: (7, 8)}, {7: (101,)})),
+    )
+
+    with pytest.raises(
+        serving.PTG2ManifestArtifactError,
+        match="missing a group-to-provider-set owner",
+    ):
+        await serving._shared_provider_set_keys_by_npi(
+            object(),
+            strict_v3_tables(),
+            (11,),
+            (101,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_append_rate_matched_locations_skips_seen_and_unpriced_sets(
+    monkeypatch,
+):
+    rate_scope = frozenset({101})
     matched_rows = []
-    groups_by_npi = defaultdict(set)
+    provider_set_keys_by_npi = defaultdict(set)
     seen_npis = {10}
     graph_lookup = AsyncMock(
         return_value={
-            serving._ptg2_npi_member_id(11): (group_a, group_b),
-            serving._ptg2_npi_member_id(12): (group_b,),
+            11: {101},
         }
     )
-    monkeypatch.setattr(serving, "_shared_graph_members_by_id", graph_lookup)
+    monkeypatch.setattr(
+        serving, "_shared_provider_set_keys_by_npi", graph_lookup
+    )
 
     added = await serving._append_rate_matched_locations(
         object(),
@@ -34,13 +92,13 @@ async def test_append_rate_matched_locations_skips_seen_and_unpriced_groups(
         rate_scope,
         [{"npi": 10}, {"npi": 11}, {"npi": 12}],
         matched_rows,
-        groups_by_npi,
+        provider_set_keys_by_npi,
         seen_npis,
     )
 
     assert added == 1
     assert matched_rows == [{"npi": 11}]
-    assert groups_by_npi == {11: {group_a}}
+    assert provider_set_keys_by_npi == {11: {101}}
     assert seen_npis == {10, 11, 12}
 
     assert (
@@ -50,7 +108,7 @@ async def test_append_rate_matched_locations_skips_seen_and_unpriced_groups(
             rate_scope,
             [{"npi": 10}],
             matched_rows,
-            groups_by_npi,
+            provider_set_keys_by_npi,
             seen_npis,
         )
         == 0
@@ -76,14 +134,14 @@ async def test_taxonomy_filtered_candidates_handles_pre_filtered_empty_and_limit
     monkeypatch.setattr(serving, "_filter_npis_by_taxonomy", taxonomy_filter)
     candidates = serving._GraphLocationCandidates(
         [{"npi": 11}, {"npi": 12}, {"npi": 13}],
-        {11: {"a"}, 12: {"b"}, 13: {"c"}},
+        {11: {1}, 12: {2}, 13: {3}},
     )
     filtered = await serving._taxonomy_filtered_candidates(
         object(), {"provider_sex_code": "F"}, candidates, 1
     )
 
     assert filtered == serving._GraphLocationCandidates(
-        [{"npi": 12}], {12: {"b"}}, taxonomy_filtered=True
+        [{"npi": 12}], {12: {2}}, taxonomy_filtered=True
     )
 
 
