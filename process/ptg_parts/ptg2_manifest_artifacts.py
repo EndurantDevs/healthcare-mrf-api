@@ -75,6 +75,10 @@ class PTG2ManifestArtifactError(ValueError):
     """Raised when a PTG2 artifact is malformed or fails validation."""
 
 
+class ManifestReadLimitError(PTG2ManifestArtifactError):
+    """Raised when a valid artifact cannot fit one bounded read."""
+
+
 @dataclass(frozen=True)
 class PTG2ManifestSidecarEntry:
     """One owner entry from a Rust PTG2 global sidecar."""

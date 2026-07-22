@@ -209,9 +209,12 @@ def test_graph_owner_selection_skips_empty_owner_and_limits_one_owner():
         ),
         maximum_raw_bytes=PTG2_V3_GRAPH_CHUNK_BYTES,
     )
-    assert selection.required_chunk_keys == frozenset({1})
+    assert selection.required_chunk_keys == {1}
 
-    with pytest.raises(PTG2SharedBlockError, match="owner exceeds"):
+    with pytest.raises(
+        shared_readers.SharedGraphReadLimitError,
+        match="owner exceeds",
+    ):
         shared_readers._validated_graph_owner_selection(
             request,
             (
@@ -229,7 +232,10 @@ def test_graph_owner_selection_skips_empty_owner_and_limits_one_owner():
 
 def test_graph_owner_selection_limits_chunks_and_validates_owner():
     request = _graph_request()
-    with pytest.raises(PTG2SharedBlockError, match="chunks exceed"):
+    with pytest.raises(
+        shared_readers.SharedGraphReadLimitError,
+        match="chunks exceed",
+    ):
         shared_readers._validated_graph_owner_selection(
             request,
             (
@@ -266,15 +272,46 @@ def test_graph_owner_selection_limits_chunks_and_validates_owner():
         )
 
 
-def test_scoped_graph_chunk_and_decode_guards(monkeypatch):
-    request = _graph_request()
-    assert shared_readers._selected_graph_bytes(
-        {}, first_chunk=0, member_offset=0, byte_count=0
-    ) == b""
-    with pytest.raises(PTG2SharedBlockError, match="stream is truncated"):
-        shared_readers._selected_graph_bytes(
-            {}, first_chunk=0, member_offset=0, byte_count=4
+def test_selected_graph_member_iterator_guards():
+    assert (
+        tuple(
+            shared_readers._iter_selected_graph_members(
+                {},
+                first_chunk=0,
+                member_offset=0,
+                member_count=0,
+                member_width=4,
+            )
         )
+        == ()
+    )
+    assert tuple(
+        shared_readers._iter_selected_graph_members(
+            {
+                0: b"\x04\x03",
+                1: b"\x02\x01\x08",
+                2: b"\x07\x06\x05",
+            },
+            first_chunk=0,
+            member_offset=0,
+            member_count=2,
+            member_width=4,
+        )
+    ) == (0x01020304, 0x05060708)
+    with pytest.raises(PTG2SharedBlockError, match="stream is truncated"):
+        tuple(
+            shared_readers._iter_selected_graph_members(
+                {0: b"\x01\x02"},
+                first_chunk=0,
+                member_offset=0,
+                member_count=1,
+                member_width=4,
+            )
+        )
+
+
+def test_validated_graph_chunk_guards(monkeypatch):
+    request = _graph_request()
     assert shared_readers._validated_graph_chunks(request, {}) == {}
 
     invalid_fragment = shared_readers.SharedBlockPayload(

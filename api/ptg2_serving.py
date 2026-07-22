@@ -46,6 +46,10 @@ from api.ptg2_candidate_audit import (
     PTG2CandidateAuditAccess,
     candidate_audit_access_from_args,
 )
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditDecodedRetentionBudget,
+    retain_unique_integer_keys,
+)
 from api.ptg2_code_context import (
     _resolve_ptg2_code_search_context,
 )
@@ -106,6 +110,9 @@ from process.ptg_parts.ptg2_candidate_attestation import (
     PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
 )
 from process.ext.contact_canon import canonicalize_one
+from process.ptg_parts.address_assurance import (
+    DIRECT_PAYER_LOCATION_RECORD_KEYS as PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS,
+)
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from api.ptg2_serving_utils import (
     _normalize_zip5,
@@ -4249,6 +4256,31 @@ def _ptg2_price_atom_attr_specs() -> tuple[tuple[str, str, str, str], ...]:
     )
 
 
+_HYDRATION_KEY_SET_BYTES = 256
+_HYDRATION_DICTIONARY_MAP_BYTES = 224
+_HYDRATION_DICTIONARY_ENTRY_BYTES = 2048
+_HYDRATION_PAYLOAD_MAP_BYTES = 224
+_HYDRATION_PAYLOAD_ENTRY_BYTES = 4096
+_HYDRATION_PRICE_MAP_BYTES = 224
+_HYDRATION_PRICE_BUCKET_BYTES = 160
+_HYDRATION_PRICE_MEMBERSHIP_BYTES = 16
+
+
+def _budgeted_hydration_integer_keys(
+    integer_keys: Iterable[int],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    *,
+    category: str,
+) -> tuple[tuple[int, ...], int]:
+    """Delegate dense-key accounting to the shared candidate helper."""
+
+    return retain_unique_integer_keys(
+        integer_keys,
+        retention_budget,
+        category=category,
+    )
+
+
 def _version_three_atom_key_bits(serving_tables: PTG2ServingTables) -> int:
     """Return the manifest-declared dense atom width for a v3 snapshot."""
 
@@ -4284,30 +4316,61 @@ def _version_three_dictionary_entry(
     return (str(attr_kind), int(attr_key)), dictionary_value
 
 
-async def _version_three_dictionary_values(
+def _required_version_three_dictionary_keys(
+    price_atoms_by_key: Mapping[int, Any],
+    attribute_specs: Sequence[tuple[str, str, str, str]],
+    constant_values: Mapping[str, Any],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+) -> tuple[set[tuple[str, int]], int]:
+    retained_required_bytes = 0
+    if retention_budget is not None:
+        retention_budget.claim(
+            _HYDRATION_KEY_SET_BYTES,
+            category="the required price dictionary key set",
+        )
+        retained_required_bytes = _HYDRATION_KEY_SET_BYTES
+    required_keys: set[tuple[str, int]] = set()
+    try:
+        for price_atom in price_atoms_by_key.values():
+            if len(price_atom.attribute_keys) != len(attribute_specs):
+                raise PTG2ManifestArtifactError(
+                    "PTG2 v3 price atom has an invalid attribute-key count"
+                )
+            for (
+                attr_kind,
+                _key_column,
+                _value_kind,
+                _select_sql,
+            ), attr_key in zip(attribute_specs, price_atom.attribute_keys):
+                if attr_kind in constant_values or attr_key is None:
+                    continue
+                dictionary_key = (attr_kind, int(attr_key))
+                if dictionary_key in required_keys:
+                    continue
+                if retention_budget is not None:
+                    retention_budget.claim(
+                        _HYDRATION_DICTIONARY_ENTRY_BYTES,
+                        category="a required price dictionary key",
+                    )
+                    retained_required_bytes += (
+                        _HYDRATION_DICTIONARY_ENTRY_BYTES
+                    )
+                required_keys.add(dictionary_key)
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_required_bytes)
+        raise
+    return required_keys, retained_required_bytes
+
+
+async def _version_three_dictionary_query(
     session,
     serving_tables: PTG2ServingTables,
-    price_atoms_by_key: Mapping[int, Any],
-) -> dict[tuple[str, int], Any]:
-    """Read only dictionary values referenced by the requested dense atoms."""
-
-    attribute_specs = _ptg2_price_atom_attr_specs()
-    constant_values = _version_three_price_atom_constants(serving_tables)
-    required_keys: set[tuple[str, int]] = set()
-    for price_atom in price_atoms_by_key.values():
-        if len(price_atom.attribute_keys) != len(attribute_specs):
-            raise PTG2ManifestArtifactError("PTG2 v3 price atom has an invalid attribute-key count")
-        for (attr_kind, _key_column, _value_kind, _select_sql), attr_key in zip(
-            attribute_specs,
-            price_atom.attribute_keys,
-        ):
-            if attr_kind not in constant_values and attr_key is not None:
-                required_keys.add((attr_kind, int(attr_key)))
-    if not required_keys:
-        return {}
+    required_keys: set[tuple[str, int]],
+):
     _require_strict_shared_v3(serving_tables)
     dictionary_table = _shared_v3_price_attr_table()
-    dictionary_result = await session.execute(
+    return await session.execute(
         text(
             f"""
             SELECT attribute_kind, attribute_key, value
@@ -4323,15 +4386,90 @@ async def _version_three_dictionary_values(
             "attr_keys": sorted({attr_key for _attr_kind, attr_key in required_keys}),
         },
     )
+
+
+def _decoded_version_three_dictionary_values(
+    dictionary_result: Iterable[Any],
+    required_keys: set[tuple[str, int]],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[tuple[str, int], Any]:
+    retained_result_bytes = 0
+    if retention_budget is not None:
+        retention_budget.claim(
+            _HYDRATION_DICTIONARY_MAP_BYTES,
+            category="the decoded price dictionary map",
+        )
+        retained_result_bytes = _HYDRATION_DICTIONARY_MAP_BYTES
     values_by_key: dict[tuple[str, int], Any] = {}
-    for dictionary_record in dictionary_result:
-        dictionary_entry = _version_three_dictionary_entry(dictionary_record)
-        if dictionary_entry is not None:
+    try:
+        for dictionary_record in dictionary_result:
+            dictionary_entry = _version_three_dictionary_entry(
+                dictionary_record
+            )
+            if dictionary_entry is None:
+                continue
             dictionary_key, dictionary_value = dictionary_entry
+            if dictionary_key not in values_by_key:
+                if retention_budget is not None:
+                    retention_budget.claim(
+                        _HYDRATION_DICTIONARY_ENTRY_BYTES,
+                        category="a decoded price dictionary entry",
+                    )
+                    retained_result_bytes += (
+                        _HYDRATION_DICTIONARY_ENTRY_BYTES
+                    )
             values_by_key[dictionary_key] = dictionary_value
-    missing_keys = required_keys.difference(values_by_key)
-    if missing_keys:
-        raise PTG2ManifestArtifactError("PTG2 v3 price atom dictionary key is missing")
+        if any(
+            dictionary_key not in values_by_key
+            for dictionary_key in required_keys
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 price atom dictionary key is missing"
+            )
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_result_bytes)
+        raise
+    return values_by_key
+
+
+async def _version_three_dictionary_values(
+    session,
+    serving_tables: PTG2ServingTables,
+    price_atoms_by_key: Mapping[int, Any],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+) -> dict[tuple[str, int], Any]:
+    """Read only dictionary values referenced by the requested dense atoms."""
+
+    required_keys, retained_required_bytes = (
+        _required_version_three_dictionary_keys(
+            price_atoms_by_key,
+            _ptg2_price_atom_attr_specs(),
+            _version_three_price_atom_constants(serving_tables),
+            retention_budget,
+        )
+    )
+    if not required_keys:
+        if retention_budget is not None:
+            retention_budget.release(retained_required_bytes)
+        return {}
+    try:
+        dictionary_result = await _version_three_dictionary_query(
+            session,
+            serving_tables,
+            required_keys,
+        )
+        values_by_key = _decoded_version_three_dictionary_values(
+            dictionary_result,
+            required_keys,
+            retention_budget,
+        )
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_required_bytes)
+        raise
+    if retention_budget is not None:
+        retention_budget.release(retained_required_bytes)
     return values_by_key
 
 
@@ -4366,66 +4504,153 @@ class _VersionThreePriceHydration:
     prices_by_key: dict[int, list[dict[str, Any]]]
 
 
+async def _version_three_price_memberships(
+    session,
+    serving_tables: PTG2ServingTables,
+    normalized_price_keys: tuple[int, ...],
+    atom_key_bits: int,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[int, tuple[int, ...]]:
+    membership_argument_map: dict[str, Any] = {
+        "atom_key_bits": atom_key_bits,
+        "block_span": serving_tables.price_key_block_span,
+        "schema_name": PTG2_SCHEMA,
+    }
+    if retention_budget is not None:
+        membership_argument_map["retention_budget"] = retention_budget
+    memberships_by_price_key = (
+        await lookup_shared_price_atom_memberships_from_db(
+            session,
+            _required_shared_snapshot_key(serving_tables),
+            normalized_price_keys,
+            **membership_argument_map,
+        )
+    )
+    _validate_version_three_price_memberships(
+        normalized_price_keys,
+        memberships_by_price_key,
+    )
+    return memberships_by_price_key
+
+
+async def _version_three_price_atoms(
+    session,
+    serving_tables: PTG2ServingTables,
+    requested_atom_keys: tuple[int, ...],
+    atom_key_bits: int,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[int, Any]:
+    atom_argument_map: dict[str, Any] = {
+        "atom_key_bits": atom_key_bits,
+        "block_span": serving_tables.atom_key_block_span,
+        "schema_name": PTG2_SCHEMA,
+    }
+    if retention_budget is not None:
+        atom_argument_map["retention_budget"] = retention_budget
+    price_atoms_by_key = await lookup_shared_price_atoms_from_db(
+        session,
+        _required_shared_snapshot_key(serving_tables),
+        requested_atom_keys,
+        **atom_argument_map,
+    )
+    if any(atom_key not in price_atoms_by_key for atom_key in requested_atom_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price-atom artifact is missing a referenced atom key"
+        )
+    return price_atoms_by_key
+
+
+async def _version_three_price_hydration_for_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    normalized_price_keys: tuple[int, ...],
+    copy_payloads: bool,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> _VersionThreePriceHydration:
+    atom_key_bits = _version_three_atom_key_bits(serving_tables)
+    atom_keys_by_price_key = await _version_three_price_memberships(
+        session,
+        serving_tables,
+        normalized_price_keys,
+        atom_key_bits,
+        retention_budget,
+    )
+    requested_atom_keys, retained_atom_key_bytes = (
+        _budgeted_hydration_integer_keys(
+            (
+                atom_key
+                for price_key in normalized_price_keys
+                for atom_key in atom_keys_by_price_key.get(price_key, ())
+            ),
+            retention_budget,
+            category="candidate hydration atom",
+        )
+    )
+    try:
+        price_atoms_by_key = await _version_three_price_atoms(
+            session,
+            serving_tables,
+            requested_atom_keys,
+            atom_key_bits,
+            retention_budget,
+        )
+        dictionary_values = await _version_three_dictionary_values(
+            session,
+            serving_tables,
+            price_atoms_by_key,
+            retention_budget,
+        )
+        prices_by_key = _version_three_price_rows(
+            normalized_price_keys,
+            atom_keys_by_price_key,
+            price_atoms_by_key,
+            dictionary_values,
+            _version_three_price_atom_constants(serving_tables),
+            copy_payloads=copy_payloads,
+            retention_budget=retention_budget,
+        )
+        return _VersionThreePriceHydration(
+            atom_keys_by_price_key,
+            prices_by_key,
+        )
+    finally:
+        if retention_budget is not None:
+            retention_budget.release(retained_atom_key_bytes)
+
+
 async def _version_three_price_hydration(
     session,
     serving_tables: PTG2ServingTables,
     price_keys: Iterable[int],
     *,
     copy_payloads: bool = True,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> _VersionThreePriceHydration:
     """Hydrate memberships and prices through one union of shared blocks."""
 
     _require_strict_shared_v3(serving_tables)
-    normalized_price_keys = tuple(sorted({int(price_key) for price_key in price_keys}))
+    normalized_price_keys, retained_price_key_bytes = (
+        _budgeted_hydration_integer_keys(
+            price_keys,
+            retention_budget,
+            category="candidate hydration price",
+        )
+    )
     if not normalized_price_keys:
+        if retention_budget is not None:
+            retention_budget.release(retained_price_key_bytes)
         return _VersionThreePriceHydration({}, {})
-    atom_key_bits = _version_three_atom_key_bits(serving_tables)
-    atom_keys_by_price_key = await lookup_shared_price_atom_memberships_from_db(
-        session,
-        _required_shared_snapshot_key(serving_tables),
-        normalized_price_keys,
-        atom_key_bits=atom_key_bits,
-        block_span=serving_tables.price_key_block_span,
-        schema_name=PTG2_SCHEMA,
-    )
-    _validate_version_three_price_memberships(normalized_price_keys, atom_keys_by_price_key)
-    requested_atom_keys = tuple(
-        dict.fromkeys(
-            atom_key
-            for price_key in normalized_price_keys
-            for atom_key in atom_keys_by_price_key.get(price_key, ())
-        )
-    )
-    price_atoms_by_key = await lookup_shared_price_atoms_from_db(
-        session,
-        _required_shared_snapshot_key(serving_tables),
-        requested_atom_keys,
-        atom_key_bits=atom_key_bits,
-        block_span=serving_tables.atom_key_block_span,
-        schema_name=PTG2_SCHEMA,
-    )
-    missing_atom_keys = set(requested_atom_keys).difference(price_atoms_by_key)
-    if missing_atom_keys:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 price-atom artifact is missing a referenced atom key"
-        )
-    dictionary_values = await _version_three_dictionary_values(
-        session,
-        serving_tables,
-        price_atoms_by_key,
-    )
-    constant_values = _version_three_price_atom_constants(serving_tables)
-    return _VersionThreePriceHydration(
-        atom_keys_by_price_key=atom_keys_by_price_key,
-        prices_by_key=_version_three_price_rows(
+    try:
+        return await _version_three_price_hydration_for_keys(
+            session,
+            serving_tables,
             normalized_price_keys,
-            atom_keys_by_price_key,
-            price_atoms_by_key,
-            dictionary_values,
-            constant_values,
-            copy_payloads=copy_payloads,
-        ),
-    )
+            copy_payloads,
+            retention_budget,
+        )
+    finally:
+        if retention_budget is not None:
+            retention_budget.release(retained_price_key_bytes)
 
 
 async def _version_three_prices_by_key(
@@ -4459,14 +4684,46 @@ def _validate_version_three_price_memberships(
 ) -> None:
     """Reject missing or empty v3 price memberships."""
 
-    missing_price_keys = set(price_keys).difference(atom_keys_by_price_key)
-    empty_price_keys = {
-        price_key for price_key, atom_keys in atom_keys_by_price_key.items() if not atom_keys
-    }
-    if missing_price_keys or empty_price_keys:
+    if any(
+        price_key not in atom_keys_by_price_key
+        for price_key in price_keys
+    ) or any(not atom_keys for atom_keys in atom_keys_by_price_key.values()):
         raise PTG2ManifestArtifactError(
             "PTG2 v3 price-membership artifact is missing a referenced price key"
         )
+
+
+def _version_three_payloads_by_atom_key(
+    price_atoms_by_key: Mapping[int, Any],
+    dictionary_values: Mapping[tuple[str, int], str],
+    constant_values: Mapping[str, Any],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[int, dict[str, Any]]:
+    retained_payload_bytes = _HYDRATION_PAYLOAD_MAP_BYTES
+    if retention_budget is not None:
+        retention_budget.claim(
+            retained_payload_bytes,
+            category="the hydrated atom payload map",
+        )
+    payload_by_atom_key: dict[int, dict[str, Any]] = {}
+    try:
+        for atom_key, price_atom in price_atoms_by_key.items():
+            if retention_budget is not None:
+                retention_budget.claim(
+                    _HYDRATION_PAYLOAD_ENTRY_BYTES,
+                    category="a hydrated atom payload",
+                )
+                retained_payload_bytes += _HYDRATION_PAYLOAD_ENTRY_BYTES
+            payload_by_atom_key[atom_key] = _version_three_price_payload(
+                price_atom,
+                dictionary_values,
+                constant_values,
+            )
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_payload_bytes)
+        raise
+    return payload_by_atom_key
 
 
 def _version_three_price_rows(
@@ -4477,29 +4734,51 @@ def _version_three_price_rows(
     constant_values: Mapping[str, Any],
     *,
     copy_payloads: bool = True,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     """Project each unique atom once, then assemble requested price rows."""
 
-    payload_by_atom_key = {
-        atom_key: _version_three_price_payload(
-            price_atom,
-            dictionary_values,
-            constant_values,
+    payload_by_atom_key = _version_three_payloads_by_atom_key(
+        price_atoms_by_key,
+        dictionary_values,
+        constant_values,
+        retention_budget,
+    )
+    if retention_budget is not None:
+        retention_budget.claim(
+            _HYDRATION_PRICE_MAP_BYTES,
+            category="the hydrated price result map",
         )
-        for atom_key, price_atom in price_atoms_by_key.items()
-    }
-    return {
-        price_key: [
-            (
-                dict(payload_by_atom_key[atom_key])
-                if copy_payloads
-                else payload_by_atom_key[atom_key]
+    prices_by_key: dict[int, list[dict[str, Any]]] = {}
+    for price_key in price_keys:
+        if retention_budget is not None:
+            retention_budget.claim(
+                _HYDRATION_PRICE_BUCKET_BYTES,
+                category="a hydrated price bucket",
             )
-            for atom_key in atom_keys_by_price_key.get(price_key, ())
-            if atom_key in payload_by_atom_key
-        ]
-        for price_key in price_keys
-    }
+        price_payloads: list[dict[str, Any]] = []
+        prices_by_key[price_key] = price_payloads
+        for atom_key in atom_keys_by_price_key.get(price_key, ()):
+            if atom_key not in payload_by_atom_key:
+                continue
+            if retention_budget is not None:
+                retention_budget.claim(
+                    _HYDRATION_PRICE_MEMBERSHIP_BYTES
+                    + (
+                        _HYDRATION_PAYLOAD_ENTRY_BYTES
+                        if copy_payloads
+                        else 0
+                    ),
+                    category="a hydrated price payload membership",
+                )
+            price_payloads.append(
+                (
+                    dict(payload_by_atom_key[atom_key])
+                    if copy_payloads
+                    else payload_by_atom_key[atom_key]
+                )
+            )
+    return prices_by_key
 
 
 async def _prices_for_price_sets(

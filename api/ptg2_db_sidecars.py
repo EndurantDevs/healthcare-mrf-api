@@ -7,14 +7,20 @@ import heapq
 import re
 import zlib
 from array import array
+from collections.abc import Sized
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import AbstractSet, Any, Callable, Iterable, Mapping
 
 from sqlalchemy import text
 
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditDecodedRetentionBudget,
+    retain_unique_integer_keys,
+)
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
+    SharedGraphReadLimitError,
     claim_shared_block_processing,
     claim_shared_logical_payload_processing,
     decode_dense_source_header,
@@ -29,11 +35,43 @@ from api.ptg2_shared_blocks import (
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
+    ManifestReadLimitError,
 )
 from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
 
 
 _ProviderCodeRequests = Mapping[int, tuple[int, ...]]
+_FORWARD_OCCURRENCE_RETAINED_BYTES = 256
+_FORWARD_PRICE_KEY_RETAINED_BYTES = 48
+_FORWARD_RESULT_MAP_RETAINED_BYTES = 224
+_FORWARD_RESULT_OCCURRENCE_RETAINED_BYTES = 144
+_FORWARD_RESULT_PRICE_KEY_RETAINED_BYTES = 8
+# CPython 3.14 retains three non-cached integers (3 * 32 allocator bytes), a
+# three-slot tuple (72, rounded to 80), worst-case list growth attributed per
+# row (32), and a transient three-slot coordinate tuple (also rounded to 80).
+_FORWARD_FANOUT_ROW_RETAINED_BYTES = 288
+# The coordinate index retains a resize-safe dict base, then one dict slot,
+# three-slot key tuple, and empty list for every logical fragment coordinate.
+_FORWARD_COORDINATE_MAP_RETAINED_BYTES = 224
+_FORWARD_COORDINATE_RETAINED_BYTES = 64 + 64 + 64
+# A budgeted forward request keeps several normalized maps and indexes alive
+# together. These allowances deliberately cover each newly-created copy rather
+# than caller-owned candidate maps, which have already been claimed upstream.
+_FORWARD_REQUEST_BASE_RETAINED_BYTES = 4096
+_FORWARD_REQUEST_CODE_RETAINED_BYTES = 4096
+# Covers a normalized dict entry, copied integer key, and insertion peak.
+_FORWARD_FILTER_MAP_ENTRY_RETAINED_BYTES = 256
+_FORWARD_PROVIDER_FILTER_COPY_RETAINED_BYTES = 512
+_FORWARD_SOURCE_FILTER_COPY_RETAINED_BYTES = 512
+_FORWARD_OCCURRENCE_WORKSPACE_RETAINED_BYTES = 2048
+_FORWARD_DISCOVERED_SHARD_RETAINED_BYTES = 1024
+_FORWARD_FRAGMENT_WORKSPACE_RETAINED_BYTES = 4096
+_PRICE_MEMBERSHIP_OWNER_RETAINED_BYTES = 272
+_PRICE_MEMBERSHIP_RETAINED_BYTES = 40
+_PRICE_ATOM_RETAINED_BYTES = 2048
+_PROVIDER_CODE_DECODED_MAP_BYTES = 224
+_PROVIDER_CODE_DECODED_BUCKET_BYTES = 160
+_PROVIDER_CODE_DECODED_MEMBERSHIP_BYTES = 16
 
 
 @dataclass(frozen=True)
@@ -86,6 +124,30 @@ class _ForwardBatchOptions:
     occurrence_keys: Iterable[tuple[int, int, int]] | None = None
     provider_counts_by_key: Mapping[int, int] | None = None
     schema_name: str = "mrf"
+
+
+@dataclass
+class _ForwardTemporaryRetention:
+    """Own every temporary decoded claim made by one forward visit."""
+
+    budget: CandidateAuditDecodedRetentionBudget | None
+    retained_bytes: int = 0
+
+    def claim(self, byte_count: int, *, category: str) -> None:
+        """Claim before allocation and remember the exact cleanup amount."""
+
+        if self.budget is None or not byte_count:
+            return
+        self.budget.claim(byte_count, category=category)
+        self.retained_bytes += byte_count
+
+    def release(self) -> None:
+        """Release the complete workspace once, including on cancellation."""
+
+        if self.budget is not None and self.retained_bytes:
+            retained_bytes = self.retained_bytes
+            self.retained_bytes = 0
+            self.budget.release(retained_bytes)
 
 
 @dataclass(frozen=True)
@@ -157,6 +219,7 @@ class _ForwardFanoutCapture:
         tuple[int, int, int],
         list[tuple[int, int, int]],
     ]
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None
     first_provider_set_key: int | None = None
     first_occurrence: tuple[int, int] | None = None
 
@@ -176,8 +239,7 @@ class _ForwardFanoutCapture:
             self._retain(view, provider_set_key, price_key, source_key)
         for view in self.fallback_views:
             is_provider_match = (
-                view.provider_filter is None
-                or provider_set_key in view.provider_filter
+                view.provider_filter is None or provider_set_key in view.provider_filter
             )
             is_source_match = (
                 view.source_filter is None or source_key in view.source_filter
@@ -204,10 +266,20 @@ class _ForwardFanoutCapture:
         price_key: int,
         source_key: int,
     ) -> None:
-        coordinate = (view.code_key, view.block_key, view.fragment_no)
-        self.retained_by_coordinate[coordinate].append(
-            (provider_set_key, price_key, source_key)
-        )
+        if self.retention_budget is not None:
+            self.retention_budget.claim(
+                _FORWARD_FANOUT_ROW_RETAINED_BYTES,
+                category="a decoded forward fanout row",
+            )
+        try:
+            coordinate = (view.code_key, view.block_key, view.fragment_no)
+            self.retained_by_coordinate[coordinate].append(
+                (provider_set_key, price_key, source_key)
+            )
+        except BaseException:
+            if self.retention_budget is not None:
+                self.retention_budget.release(_FORWARD_FANOUT_ROW_RETAINED_BYTES)
+            raise
 
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
@@ -388,6 +460,7 @@ async def _discover_forward_shard_keys(
     schema_name: str,
     code_keys: Iterable[int],
     provider_shard_span: int | None = None,
+    temporary_retention: _ForwardTemporaryRetention | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Discover every immutable provider shard in exact code-key ranges."""
 
@@ -397,9 +470,8 @@ async def _discover_forward_shard_keys(
     if not normalized_code_keys:
         return {}
     schema = _quote_ident(schema_name)
-    shard_query_result = await session.execute(
-        text(
-            f"""
+    statement = text(
+        f"""
             WITH requested_code(code_key) AS (
                 SELECT unnest(CAST(:code_keys AS bigint[]))
             )
@@ -417,24 +489,32 @@ async def _discover_forward_shard_keys(
                AND mapping.block_key <
                    (requested_code.code_key + 1) * :code_block_span
              ORDER BY requested_code.code_key, mapping.block_key
-            """
-        ),
-        {
-            "snapshot_key": _required_shared_snapshot_key(
-                shared_snapshot_key
-            ),
-            "generation": PTG2_V3_SHARED_GENERATION,
-            "object_kind": _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
-            "code_keys": normalized_code_keys,
-            "code_block_span": _SERVING_BINARY_BY_CODE_BLOCK_SPAN,
-        },
+        """
+    )
+    params_by_name = {
+        "snapshot_key": _required_shared_snapshot_key(shared_snapshot_key),
+        "generation": PTG2_V3_SHARED_GENERATION,
+        "object_kind": _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
+        "code_keys": normalized_code_keys,
+        "code_block_span": _SERVING_BINARY_BY_CODE_BLOCK_SPAN,
+    }
+    stream = getattr(session, "stream", None)
+    shard_query_result = (
+        await stream(statement, params_by_name)
+        if callable(stream)
+        else await session.execute(statement, params_by_name)
     )
     requested_code_set = set(normalized_code_keys)
     shard_keys_by_code: dict[int, list[int]] = {
         code_key: [] for code_key in normalized_code_keys
     }
     observed_pairs: set[tuple[int, int]] = set()
-    for raw_row in shard_query_result:
+    async for raw_row in _iterate_forward_query_rows(shard_query_result):
+        if temporary_retention is not None and temporary_retention.budget is not None:
+            temporary_retention.claim(
+                _FORWARD_DISCOVERED_SHARD_RETAINED_BYTES,
+                category="a decoded discovered forward shard",
+            )
         shard_row = _row_mapping(raw_row)
         code_key = int(shard_row.get("code_key"))
         block_key = int(shard_row.get("block_key"))
@@ -458,6 +538,17 @@ async def _discover_forward_shard_keys(
         code_key: tuple(block_keys)
         for code_key, block_keys in shard_keys_by_code.items()
     }
+
+
+async def _iterate_forward_query_rows(query_result: Any):
+    """Iterate SQLAlchemy streaming results and execute-only test doubles."""
+
+    if hasattr(query_result, "__aiter__"):
+        async for row in query_result:
+            yield row
+        return
+    for row in query_result:
+        yield row
 
 
 async def _forward_shard_keys_for_read(
@@ -1971,6 +2062,119 @@ async def has_serving_binary_code_block(
 serving_binary_code_block_exists = has_serving_binary_code_block
 
 
+def _budgeted_forward_input_length(value: Any, *, category: str) -> int:
+    """Return a non-consuming size for one budgeted internal filter."""
+
+    if not isinstance(value, Sized):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 budgeted {category} must expose a bounded size"
+        )
+    return len(value)
+
+
+def _forward_filter_map_entry_count(options: _ForwardBatchOptions) -> int:
+    """Count every supplied mapping entry retained during normalization."""
+
+    return sum(
+        len(filters_by_code)
+        for filters_by_code in (
+            options.provider_set_keys_by_code,
+            options.source_keys_by_code,
+        )
+        if filters_by_code is not None
+    )
+
+
+def _forward_provider_filter_copy_count(
+    options: _ForwardBatchOptions,
+    code_count: int,
+) -> int:
+    """Count provider memberships copied into temporary forward indexes."""
+
+    filters_by_code = options.provider_set_keys_by_code
+    if filters_by_code is not None:
+        provider_count = sum(
+            _budgeted_forward_input_length(
+                provider_keys,
+                category="provider filter",
+            )
+            for provider_keys in filters_by_code.values()
+        )
+        return 2 * provider_count
+    provider_keys = options.provider_set_keys
+    if provider_keys is None:
+        return 0
+    provider_count = _budgeted_forward_input_length(
+        provider_keys,
+        category="provider filter",
+    )
+    return provider_count * (code_count + 1)
+
+
+def _forward_source_filter_copy_count(options: _ForwardBatchOptions) -> int:
+    """Count source memberships copied into normalized forward filters."""
+
+    source_filters_by_code = options.source_keys_by_code
+    if source_filters_by_code is None:
+        return 0
+    return sum(
+        _budgeted_forward_input_length(
+            source_keys,
+            category="source filter",
+        )
+        for source_keys in source_filters_by_code.values()
+    )
+
+
+def _forward_occurrence_filter_count(options: _ForwardBatchOptions) -> int:
+    """Count exact occurrence coordinates copied into forward workspaces."""
+
+    occurrence_keys = options.occurrence_keys
+    if occurrence_keys is None:
+        return 0
+    return _budgeted_forward_input_length(
+        occurrence_keys,
+        category="occurrence filter",
+    )
+
+
+def _claim_forward_request_workspace(
+    temporary_retention: _ForwardTemporaryRetention,
+    code_keys: tuple[int, ...],
+    options: _ForwardBatchOptions,
+) -> None:
+    """Preclaim normalized filter, shard, and fanout-index allocations."""
+
+    if temporary_retention.budget is None:
+        return
+    code_count = len(code_keys)
+    temporary_retention.claim(
+        _FORWARD_REQUEST_BASE_RETAINED_BYTES
+        + code_count * _FORWARD_REQUEST_CODE_RETAINED_BYTES,
+        category="the decoded forward request workspace",
+    )
+    temporary_retention.claim(
+        _forward_filter_map_entry_count(options)
+        * _FORWARD_FILTER_MAP_ENTRY_RETAINED_BYTES,
+        category="decoded forward filter-map entries",
+    )
+    temporary_retention.claim(
+        _forward_provider_filter_copy_count(options, code_count)
+        * _FORWARD_PROVIDER_FILTER_COPY_RETAINED_BYTES,
+        category="decoded forward provider-filter copies",
+    )
+    temporary_retention.claim(
+        _forward_source_filter_copy_count(options)
+        * _FORWARD_SOURCE_FILTER_COPY_RETAINED_BYTES,
+        category="decoded forward source-filter copies",
+    )
+    temporary_retention.claim(
+        _forward_occurrence_filter_count(options)
+        * _FORWARD_OCCURRENCE_WORKSPACE_RETAINED_BYTES,
+        category="decoded forward occurrence-filter workspace",
+    )
+
+
 def _normalized_batch_provider_filters(
     options: _ForwardBatchOptions,
     code_keys: tuple[int, ...],
@@ -2098,12 +2302,16 @@ async def _forward_batch_shards_and_filters(
     options: _ForwardBatchOptions,
     code_keys: tuple[int, ...],
     filters_by_code: dict[int, tuple[int, ...]] | None,
+    temporary_retention: _ForwardTemporaryRetention | None = None,
 ) -> tuple[
     dict[int, tuple[int, ...]],
     dict[int, tuple[int, ...] | None],
     bool,
 ]:
     if filters_by_code is None:
+        discovery_options_by_name: dict[str, Any] = {}
+        if temporary_retention is not None and temporary_retention.budget is not None:
+            discovery_options_by_name["temporary_retention"] = temporary_retention
         shard_keys_by_code = await _discover_forward_shard_keys(
             session,
             shared_snapshot_key=options.shared_snapshot_key,
@@ -2112,11 +2320,10 @@ async def _forward_batch_shards_and_filters(
             provider_shard_span=_normalized_provider_shard_span(
                 options.provider_shard_span
             ),
+            **discovery_options_by_name,
         )
         return shard_keys_by_code, {code_key: None for code_key in code_keys}, True
-    provider_shard_span = _normalized_provider_shard_span(
-        options.provider_shard_span
-    )
+    provider_shard_span = _normalized_provider_shard_span(options.provider_shard_span)
     shard_keys_by_code = {
         code_key: _computed_forward_shard_keys(
             (code_key,),
@@ -2360,11 +2567,50 @@ def _forward_fragment_physical_identity(
     )
 
 
+def _retained_forward_rows_by_coordinate(
+    views: Iterable[_ForwardBatchFragmentView],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> tuple[
+    dict[tuple[int, int, int], list[tuple[int, int, int]]],
+    int,
+]:
+    """Allocate the coordinate map only after its deep size is claimed."""
+
+    retained_bytes = 0
+    if retention_budget is not None:
+        retention_budget.claim(
+            _FORWARD_COORDINATE_MAP_RETAINED_BYTES,
+            category="the decoded forward coordinate map",
+        )
+        retained_bytes = _FORWARD_COORDINATE_MAP_RETAINED_BYTES
+    retained_by_coordinate: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
+    try:
+        for view in views:
+            if retention_budget is not None:
+                retention_budget.claim(
+                    _FORWARD_COORDINATE_RETAINED_BYTES,
+                    category="a decoded forward coordinate bucket",
+                )
+            coordinate = (view.code_key, view.block_key, view.fragment_no)
+            if coordinate in retained_by_coordinate:
+                if retention_budget is not None:
+                    retention_budget.release(_FORWARD_COORDINATE_RETAINED_BYTES)
+                continue
+            retained_by_coordinate[coordinate] = []
+            retained_bytes += _FORWARD_COORDINATE_RETAINED_BYTES
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_bytes)
+        raise
+    return retained_by_coordinate, retained_bytes
+
+
 def _parse_forward_batch_physical_fragments_once(
     views: tuple[_ForwardBatchFragmentView, ...],
     *,
     options: _ForwardBatchOptions,
     price_item_count: int,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> tuple[
     dict[tuple[Any, ...], _ParsedForwardFragment],
     dict[tuple[int, int, int], list[tuple[int, int, int]]],
@@ -2373,18 +2619,28 @@ def _parse_forward_batch_physical_fragments_once(
 
     views_by_identity = _forward_views_by_physical_identity(views)
     parsed_by_identity: dict[tuple[Any, ...], _ParsedForwardFragment] = {}
-    retained_by_coordinate: dict[
-        tuple[int, int, int], list[tuple[int, int, int]]
-    ] = {
-        (view.code_key, view.block_key, view.fragment_no): [] for view in views
-    }
-    for identity, physical_views in views_by_identity.items():
-        parsed_by_identity[identity] = _parse_physical_forward_fragment_once(
-            tuple(physical_views),
-            options,
-            price_item_count,
-            retained_by_coordinate,
-        )
+    retained_by_coordinate, retained_coordinate_bytes = (
+        _retained_forward_rows_by_coordinate(views, retention_budget)
+    )
+    try:
+        for identity, physical_views in views_by_identity.items():
+            parsed_by_identity[identity] = _parse_physical_forward_fragment_once(
+                tuple(physical_views),
+                options,
+                price_item_count,
+                retained_by_coordinate,
+                retention_budget,
+            )
+    except BaseException:
+        if retention_budget is not None:
+            retained_row_count = sum(
+                len(retained_rows) for retained_rows in retained_by_coordinate.values()
+            )
+            retention_budget.release(
+                retained_coordinate_bytes
+                + retained_row_count * _FORWARD_FANOUT_ROW_RETAINED_BYTES
+            )
+        raise
     return parsed_by_identity, retained_by_coordinate
 
 
@@ -2394,6 +2650,7 @@ def _forward_fanout_capture(
         tuple[int, int, int],
         list[tuple[int, int, int]],
     ],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> _ForwardFanoutCapture:
     """Index exact logical views once before visiting physical occurrences."""
 
@@ -2427,6 +2684,7 @@ def _forward_fanout_capture(
             else frozenset(provider_filter_set)
         ),
         retained_by_coordinate=retained_by_coordinate,
+        retention_budget=retention_budget,
     )
 
 
@@ -2448,6 +2706,7 @@ def _parse_physical_forward_fragment_once(
         tuple[int, int, int],
         list[tuple[int, int, int]],
     ],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> _ParsedForwardFragment:
     representative = physical_views[0]
     raw_block_hash = representative.fragment_row.get("_block_hash")
@@ -2462,6 +2721,7 @@ def _parse_physical_forward_fragment_once(
     fanout_capture = _forward_fanout_capture(
         physical_views,
         retained_by_coordinate,
+        retention_budget,
     )
     last_cursor, source_count = _visit_serving_binary_by_code_record(
         representative.fragment_row,
@@ -2548,12 +2808,41 @@ async def _visit_forward_batch_keys(
     code_keys: tuple[int, ...],
     options: _ForwardBatchOptions,
     occurrence_consumer: Callable[[int, int, int, int], None],
+    *,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> None:
     """Fetch the union of all code shards once and visit their occurrences."""
 
-    price_item_count = _normalized_price_item_count(
-        options.price_dictionary_item_count
-    )
+    temporary_retention = _ForwardTemporaryRetention(retention_budget)
+    try:
+        _claim_forward_request_workspace(
+            temporary_retention,
+            code_keys,
+            options,
+        )
+        await _visit_forward_batch_keys_with_retention(
+            session,
+            code_keys,
+            options,
+            occurrence_consumer,
+            retention_budget,
+            temporary_retention,
+        )
+    finally:
+        temporary_retention.release()
+
+
+async def _visit_forward_batch_keys_with_retention(
+    session: Any,
+    code_keys: tuple[int, ...],
+    options: _ForwardBatchOptions,
+    occurrence_consumer: Callable[[int, int, int, int], None],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    temporary_retention: _ForwardTemporaryRetention,
+) -> None:
+    """Visit forward rows while one exact temporary claim remains active."""
+
+    price_item_count = _normalized_price_item_count(options.price_dictionary_item_count)
     source_filters_by_code = _normalized_batch_source_filters(
         options,
         code_keys,
@@ -2568,20 +2857,38 @@ async def _visit_forward_batch_keys(
         options,
         source_filters_by_code,
         occurrence_filters_by_code,
+        temporary_retention,
     )
     parsed_by_identity, retained_by_coordinate = (
         _parse_forward_batch_physical_fragments_once(
             views,
             options=options,
             price_item_count=price_item_count,
+            retention_budget=retention_budget,
         )
     )
-    _emit_forward_batch_logical_views(
-        views,
-        parsed_by_identity,
-        retained_by_coordinate,
-        occurrence_consumer,
-    )
+    retained_coordinate_bytes = 0
+    if retention_budget is not None:
+        retained_coordinate_bytes = (
+            _FORWARD_COORDINATE_MAP_RETAINED_BYTES
+            + len(retained_by_coordinate) * _FORWARD_COORDINATE_RETAINED_BYTES
+        )
+    try:
+        _emit_forward_batch_logical_views(
+            views,
+            parsed_by_identity,
+            retained_by_coordinate,
+            occurrence_consumer,
+        )
+    finally:
+        if retention_budget is not None:
+            retained_row_count = sum(
+                len(retained_rows) for retained_rows in retained_by_coordinate.values()
+            )
+            retention_budget.release(
+                retained_coordinate_bytes
+                + retained_row_count * _FORWARD_FANOUT_ROW_RETAINED_BYTES
+            )
 
 
 async def _fetch_forward_batch_fragment_views(
@@ -2589,11 +2896,8 @@ async def _fetch_forward_batch_fragment_views(
     code_keys: tuple[int, ...],
     options: _ForwardBatchOptions,
     source_filters_by_code: Mapping[int, frozenset[int]] | None,
-    occurrence_filters_by_code: Mapping[
-        int,
-        frozenset[tuple[int, int]],
-    ]
-    | None,
+    occurrence_filters_by_code: Mapping[int, frozenset[tuple[int, int]]] | None,
+    temporary_retention: _ForwardTemporaryRetention | None = None,
 ) -> tuple[_ForwardBatchFragmentView, ...]:
     """Fetch selected shards and bind them to validated logical views."""
 
@@ -2610,6 +2914,7 @@ async def _fetch_forward_batch_fragment_views(
             options,
             code_keys,
             filters_by_code,
+            temporary_retention,
         )
     )
     if requires_all and any(not shard_keys_by_code[code_key] for code_key in code_keys):
@@ -2627,6 +2932,11 @@ async def _fetch_forward_batch_fragment_views(
         block_keys=block_keys,
         require_all=requires_all,
     )
+    if temporary_retention is not None:
+        temporary_retention.claim(
+            len(fragment_rows) * _FORWARD_FRAGMENT_WORKSPACE_RETAINED_BYTES,
+            category="decoded forward fragment-view workspace",
+        )
     fragments_by_code = _group_forward_fragments_by_code(
         fragment_rows,
         shard_keys_by_code,
@@ -2705,39 +3015,204 @@ async def lookup_forward_occurrences_batch_from_db(
 async def lookup_forward_price_index_from_db(
     session: Any,
     code_keys: Iterable[int],
+    *,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
     **read_options: Any,
 ) -> dict[tuple[int, int, int], tuple[int, ...]]:
     """Index selected forward prices without retaining intermediate rows."""
 
     options = _ForwardBatchOptions(**read_options)
-    normalized_code_keys = tuple(
-        sorted({_normalized_code_key(code_key) for code_key in code_keys})
+    normalized_code_keys, retained_code_key_bytes = retain_unique_integer_keys(
+        (_normalized_code_key(code_key) for code_key in code_keys),
+        retention_budget,
+        category="forward code",
     )
     if not normalized_code_keys:
+        if retention_budget is not None:
+            retention_budget.release(retained_code_key_bytes)
         return {}
+    try:
+        price_keys_by_occurrence = await _mutable_forward_price_index(
+            session,
+            normalized_code_keys,
+            options,
+            retention_budget,
+        )
+    finally:
+        del normalized_code_keys
+        if retention_budget is not None:
+            retention_budget.release(retained_code_key_bytes)
+    try:
+        frozen_price_keys_by_occurrence, retained_freeze_peak_bytes = (
+            _build_frozen_forward_price_index(
+                price_keys_by_occurrence,
+                retention_budget,
+            )
+        )
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(
+                _mutable_forward_index_retained_bytes(price_keys_by_occurrence)
+            )
+        raise
+    price_keys_by_occurrence.clear()
+    if retention_budget is not None:
+        retention_budget.release(retained_freeze_peak_bytes)
+    return frozen_price_keys_by_occurrence
+
+
+def _append_forward_price_membership(
+    price_keys_by_occurrence: dict[tuple[int, int, int], list[int]],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    code_key: int,
+    provider_set_key: int,
+    price_key: int,
+    source_key: int,
+) -> None:
+    """Claim and append one unique price membership to a mutable index."""
+
+    is_occurrence_claimed = retention_budget is not None
+    if retention_budget is not None:
+        retention_budget.claim(
+            _FORWARD_OCCURRENCE_RETAINED_BYTES,
+            category="a forward occurrence lookup",
+        )
+    try:
+        occurrence_key = (code_key, provider_set_key, source_key)
+        retained_price_keys = price_keys_by_occurrence.get(occurrence_key)
+        if retained_price_keys is None:
+            retained_price_keys = []
+            price_keys_by_occurrence[occurrence_key] = retained_price_keys
+        elif retention_budget is not None:
+            retention_budget.release(_FORWARD_OCCURRENCE_RETAINED_BYTES)
+            is_occurrence_claimed = False
+    except BaseException:
+        if retention_budget is not None and is_occurrence_claimed:
+            retention_budget.release(_FORWARD_OCCURRENCE_RETAINED_BYTES)
+        raise
+    if retained_price_keys and retained_price_keys[-1] == price_key:
+        return
+    if retention_budget is not None:
+        retention_budget.claim(
+            _FORWARD_PRICE_KEY_RETAINED_BYTES,
+            category="a forward price membership",
+        )
+    try:
+        retained_price_keys.append(price_key)
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(_FORWARD_PRICE_KEY_RETAINED_BYTES)
+        raise
+
+
+async def _mutable_forward_price_index(
+    session: Any,
+    code_keys: tuple[int, ...],
+    options: _ForwardBatchOptions,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[tuple[int, int, int], list[int]]:
+    """Visit forward rows and own all claims in the mutable result index."""
+
     price_keys_by_occurrence: dict[tuple[int, int, int], list[int]] = {}
 
-    def _retain(
+    def retain_price_key(
         code_key: int,
         provider_set_key: int,
         price_key: int,
         source_key: int,
     ) -> None:
-        occurrence_key = (code_key, provider_set_key, source_key)
-        retained_price_keys = price_keys_by_occurrence.setdefault(occurrence_key, [])
-        if not retained_price_keys or retained_price_keys[-1] != price_key:
-            retained_price_keys.append(price_key)
+        """Append one visited price key to the claimed mutable index."""
 
-    await _visit_forward_batch_keys(
-        session,
-        normalized_code_keys,
-        options,
-        _retain,
+        _append_forward_price_membership(
+            price_keys_by_occurrence,
+            retention_budget,
+            code_key,
+            provider_set_key,
+            price_key,
+            source_key,
+        )
+
+    try:
+        await _visit_forward_batch_keys(
+            session,
+            code_keys,
+            options,
+            retain_price_key,
+            retention_budget=retention_budget,
+        )
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(
+                _mutable_forward_index_retained_bytes(price_keys_by_occurrence)
+            )
+        raise
+    return price_keys_by_occurrence
+
+
+def _mutable_forward_index_retained_bytes(
+    price_keys_by_occurrence: Mapping[tuple[int, int, int], list[int]],
+) -> int:
+    """Return the claims owned by one partially built mutable index."""
+
+    return len(price_keys_by_occurrence) * _FORWARD_OCCURRENCE_RETAINED_BYTES + sum(
+        len(price_keys) * _FORWARD_PRICE_KEY_RETAINED_BYTES
+        for price_keys in price_keys_by_occurrence.values()
     )
-    return {
-        occurrence_key: tuple(price_keys)
-        for occurrence_key, price_keys in price_keys_by_occurrence.items()
-    }
+
+
+def _freeze_forward_price_index(
+    price_keys_by_occurrence: Mapping[tuple[int, int, int], list[int]],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[tuple[int, int, int], tuple[int, ...]]:
+    """Compatibility wrapper that releases its frozen-map peak claim."""
+
+    frozen_price_keys_by_occurrence, retained_result_bytes = (
+        _build_frozen_forward_price_index(
+            price_keys_by_occurrence,
+            retention_budget,
+        )
+    )
+    if retention_budget is not None:
+        retention_budget.release(retained_result_bytes)
+    return frozen_price_keys_by_occurrence
+
+
+def _build_frozen_forward_price_index(
+    price_keys_by_occurrence: Mapping[tuple[int, int, int], list[int]],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> tuple[dict[tuple[int, int, int], tuple[int, ...]], int]:
+    """Build a frozen index while leaving its old-plus-new peak claimed."""
+
+    if retention_budget is None:
+        return (
+            {
+                occurrence_key: tuple(price_keys)
+                for occurrence_key, price_keys in price_keys_by_occurrence.items()
+            },
+            0,
+        )
+    retained_result_bytes = _FORWARD_RESULT_MAP_RETAINED_BYTES
+    retention_budget.claim(
+        retained_result_bytes,
+        category="the frozen forward occurrence map",
+    )
+    frozen_price_keys_by_occurrence: dict[tuple[int, int, int], tuple[int, ...]] = {}
+    try:
+        for occurrence_key, price_keys in price_keys_by_occurrence.items():
+            occurrence_bytes = (
+                _FORWARD_RESULT_OCCURRENCE_RETAINED_BYTES
+                + len(price_keys) * _FORWARD_RESULT_PRICE_KEY_RETAINED_BYTES
+            )
+            retention_budget.claim(
+                occurrence_bytes,
+                category="a frozen forward occurrence",
+            )
+            retained_result_bytes += occurrence_bytes
+            frozen_price_keys_by_occurrence[occurrence_key] = tuple(price_keys)
+    except BaseException:
+        retention_budget.release(retained_result_bytes)
+        raise
+    return frozen_price_keys_by_occurrence, retained_result_bytes
 
 
 @dataclass(frozen=True)
@@ -3148,13 +3623,12 @@ async def _lookup_prepared_code_map_from_db(
     *,
     max_retained_memberships: int | None,
     schema_name: str,
+    decoded_retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Read one validated exact request map without normalizing it again."""
 
     if max_retained_memberships is not None:
-        request_budget = _ProviderCodeRetentionBudget(
-            max_retained_memberships
-        )
+        request_budget = _ProviderCodeRetentionBudget(max_retained_memberships)
         request_budget.claim(requests.membership_count)
     return await _lookup_provider_code_keys_from_db(
         session,
@@ -3163,6 +3637,7 @@ async def _lookup_prepared_code_map_from_db(
         requested_code_keys_by_provider_set=requests.code_keys_by_provider_set,
         max_retained_memberships=None,
         schema_name=schema_name,
+        decoded_retention_budget=decoded_retention_budget,
     )
 
 
@@ -3175,6 +3650,7 @@ async def _lookup_provider_code_keys_from_db(
     requested_code_keys_by_provider_set: _ProviderCodeRequests | None = None,
     max_retained_memberships: int | None = None,
     schema_name: str,
+    decoded_retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Read each requested provider-code block with one retention policy."""
 
@@ -3217,10 +3693,9 @@ async def _lookup_provider_code_keys_from_db(
         logical_blocks,
         requested_key_set=set(requested_keys),
         requested_code_selection=requested_code_selection,
-        requested_code_keys_by_provider_set=(
-            requested_code_keys_by_provider_set
-        ),
+        requested_code_keys_by_provider_set=requested_code_keys_by_provider_set,
         retention_budget=retention_budget,
+        decoded_retention_budget=decoded_retention_budget,
         schema_name=schema_name,
     )
 
@@ -3332,6 +3807,17 @@ class _ProviderCodeDecodePlan:
     retention_callback: Callable[[int, tuple[int, ...]], None] | None
 
 
+@dataclass(frozen=True)
+class _ProviderCodeAliasContext:
+    requested_offsets_by_block: Mapping[int, AbstractSet[int]]
+    requested_code_selection: Any | None
+    requested_code_keys_by_provider_set: _ProviderCodeRequests | None
+    retention_budget: _ProviderCodeRetentionBudget | None
+    decoded_retention_budget: CandidateAuditDecodedRetentionBudget | None
+    schema_name: str
+    block_span: int
+
+
 def _provider_code_decode_plan(
     physical_aliases: Iterable[tuple[int, _SharedLogicalBlock]],
     requested_offsets_by_block: Mapping[int, AbstractSet[int]],
@@ -3413,6 +3899,7 @@ def _retain_provider_aliases(
     block_span: int,
     requested_code_keys_by_provider_set: _ProviderCodeRequests | None = None,
     retention_budget: _ProviderCodeRetentionBudget | None = None,
+    decoded_retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> None:
     """Fan out decoded aliases, filtering and budgeting exact requests once."""
 
@@ -3424,6 +3911,12 @@ def _retain_provider_aliases(
                 continue
             provider_set_key = block_start + requested_offset
             if requested_code_keys_by_provider_set is None:
+                _claim_decoded_provider_code_bucket(
+                    code_keys_by_provider,
+                    provider_set_key,
+                    code_keys,
+                    decoded_retention_budget,
+                )
                 code_keys_by_provider[provider_set_key] = code_keys
                 continue
             filtered_code_keys = _ordered_code_intersection(
@@ -3432,7 +3925,33 @@ def _retain_provider_aliases(
             )
             if retention_budget is not None:
                 retention_budget.claim(len(filtered_code_keys))
+            _claim_decoded_provider_code_bucket(
+                code_keys_by_provider,
+                provider_set_key,
+                filtered_code_keys,
+                decoded_retention_budget,
+            )
             code_keys_by_provider[provider_set_key] = filtered_code_keys
+
+
+def _claim_decoded_provider_code_bucket(
+    code_keys_by_provider: Mapping[int, tuple[int, ...]],
+    provider_set_key: int,
+    code_keys: tuple[int, ...],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> None:
+    """Claim one provider/code bucket before inserting it in the result."""
+
+    if provider_set_key in code_keys_by_provider:
+        raise PTG2ManifestArtifactError(
+            "PTG2 provider-code artifact contains a duplicate provider key"
+        )
+    if retention_budget is not None:
+        retention_budget.claim(
+            _PROVIDER_CODE_DECODED_BUCKET_BYTES
+            + len(code_keys) * _PROVIDER_CODE_DECODED_MEMBERSHIP_BYTES,
+            category="a decoded provider/code bucket",
+        )
 
 
 def _decoded_provider_code_offsets(
@@ -3468,6 +3987,49 @@ def _decoded_provider_code_offsets(
     }
 
 
+def _retain_provider_code_alias_group(
+    code_keys_by_provider: dict[int, tuple[int, ...]],
+    physical_aliases: list[tuple[int, _SharedLogicalBlock]],
+    context: _ProviderCodeAliasContext,
+) -> None:
+    representative_key, logical_block = physical_aliases[0]
+    representative_start = representative_key * context.block_span
+    alias_count_by_offset = _requested_alias_counts(
+        physical_aliases,
+        context.requested_offsets_by_block,
+    )
+    decode_plan = _provider_code_decode_plan(
+        physical_aliases,
+        context.requested_offsets_by_block,
+        context.requested_code_keys_by_provider_set,
+        context.retention_budget,
+        representative_start,
+        alias_count_by_offset,
+        block_span=context.block_span,
+    )
+    code_keys_by_offset = _decoded_provider_code_offsets(
+        logical_block,
+        representative_key,
+        representative_start,
+        alias_count_by_offset,
+        context.requested_code_selection,
+        decode_plan,
+        context.schema_name,
+    )
+    _retain_provider_aliases(
+        code_keys_by_provider,
+        physical_aliases,
+        code_keys_by_offset,
+        context.requested_offsets_by_block,
+        block_span=context.block_span,
+        requested_code_keys_by_provider_set=(
+            context.requested_code_keys_by_provider_set
+        ),
+        retention_budget=context.retention_budget,
+        decoded_retention_budget=context.decoded_retention_budget,
+    )
+
+
 def _provider_code_keys_from_aliases(
     logical_blocks: Mapping[int, _SharedLogicalBlock],
     *,
@@ -3475,54 +4037,55 @@ def _provider_code_keys_from_aliases(
     requested_code_selection: Any | None = None,
     requested_code_keys_by_provider_set: _ProviderCodeRequests | None = None,
     retention_budget: _ProviderCodeRetentionBudget | None = None,
+    decoded_retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
     schema_name: str,
 ) -> dict[int, tuple[int, ...]]:
     """Parse each distinct logical provider-code payload once and rebase it."""
     from api.ptg2_db_serving_v3 import (
         PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN,
     )
+
     block_span = PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
     requested_offsets_by_block = _requested_offsets_by_block(
         requested_key_set,
         block_span=block_span,
     )
+    if decoded_retention_budget is not None:
+        decoded_retention_budget.claim(
+            _PROVIDER_CODE_DECODED_MAP_BYTES,
+            category="the decoded provider/code map",
+        )
     code_keys_by_provider: dict[int, tuple[int, ...]] = {}
     physical_alias_groups = _logical_blocks_by_physical_identity(
         logical_blocks
     ).values()
-    for physical_aliases in physical_alias_groups:
-        representative_key, logical_block = physical_aliases[0]
-        representative_start = representative_key * block_span
-        alias_count_by_offset = _requested_alias_counts(
-            physical_aliases, requested_offsets_by_block
-        )
-        decode_plan = _provider_code_decode_plan(
-            physical_aliases,
-            requested_offsets_by_block,
-            requested_code_keys_by_provider_set,
-            retention_budget,
-            representative_start,
-            alias_count_by_offset,
-            block_span=block_span,
-        )
-        code_keys_by_offset = _decoded_provider_code_offsets(
-            logical_block,
-            representative_key,
-            representative_start,
-            alias_count_by_offset,
-            requested_code_selection,
-            decode_plan,
-            schema_name,
-        )
-        _retain_provider_aliases(
-            code_keys_by_provider,
-            physical_aliases,
-            code_keys_by_offset,
-            requested_offsets_by_block,
-            block_span=block_span,
-            requested_code_keys_by_provider_set=requested_code_keys_by_provider_set,
-            retention_budget=retention_budget,
-        )
+    alias_context = _ProviderCodeAliasContext(
+        requested_offsets_by_block=requested_offsets_by_block,
+        requested_code_selection=requested_code_selection,
+        requested_code_keys_by_provider_set=requested_code_keys_by_provider_set,
+        retention_budget=retention_budget,
+        decoded_retention_budget=decoded_retention_budget,
+        schema_name=schema_name,
+        block_span=block_span,
+    )
+    try:
+        for physical_aliases in physical_alias_groups:
+            _retain_provider_code_alias_group(
+                code_keys_by_provider,
+                physical_aliases,
+                alias_context,
+            )
+    except BaseException:
+        if decoded_retention_budget is not None:
+            decoded_retention_budget.release(
+                _PROVIDER_CODE_DECODED_MAP_BYTES
+                + sum(
+                    _PROVIDER_CODE_DECODED_BUCKET_BYTES
+                    + len(code_keys) * _PROVIDER_CODE_DECODED_MEMBERSHIP_BYTES
+                    for code_keys in code_keys_by_provider.values()
+                )
+            )
+        raise
     return code_keys_by_provider
 
 
@@ -3541,6 +4104,7 @@ async def lookup_price_atom_memberships_from_db(
     atom_key_bits: int | None = None,
     block_span: int | None = None,
     schema_name: str = "mrf",
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Read requested price-to-atom memberships from fresh shared blocks."""
 
@@ -3568,33 +4132,57 @@ async def lookup_price_atom_memberships_from_db(
     )
     requested_key_set = set(requested_keys)
     memberships_by_price_key: dict[int, tuple[int, ...]] = {}
-    for physical_aliases in _logical_blocks_by_physical_identity(
-        logical_blocks
-    ).values():
-        representative_key, logical_block = physical_aliases[0]
-        group_requested_keys = {
-            price_key
-            for block_key, _alias_block in physical_aliases
-            for price_key in requested_key_set
-            if block_key * effective_span <= price_key < (block_key + 1) * effective_span
-        }
-        _claim_logical_block_processing(
-            logical_block,
-            schema_name=schema_name,
-        )
-        decoded_memberships = _decode_price_membership_block(
-            logical_block.payload,
-            block_key=representative_key,
-            entry_count=logical_block.entry_count,
-            atom_key_bits=expected_bits,
-            block_span=effective_span,
-            requested_price_keys=group_requested_keys,
-        )
-        if len(physical_aliases) > 1 and logical_block.entry_count:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 price-membership block has an incompatible physical alias"
+    retained_membership_bytes = 0
+    try:
+        for physical_aliases in _logical_blocks_by_physical_identity(
+            logical_blocks
+        ).values():
+            representative_key, logical_block = physical_aliases[0]
+            group_requested_keys = {
+                price_key
+                for block_key, _alias_block in physical_aliases
+                for price_key in requested_key_set
+                if block_key * effective_span
+                <= price_key
+                < (block_key + 1) * effective_span
+            }
+            _claim_logical_block_processing(
+                logical_block,
+                schema_name=schema_name,
             )
-        memberships_by_price_key.update(decoded_memberships)
+            decoded_memberships = _decode_price_membership_block(
+                logical_block.payload,
+                block_key=representative_key,
+                entry_count=logical_block.entry_count,
+                atom_key_bits=expected_bits,
+                block_span=effective_span,
+                requested_price_keys=group_requested_keys,
+            )
+            if len(physical_aliases) > 1 and logical_block.entry_count:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 v3 price-membership block has an incompatible "
+                    "physical alias"
+                )
+            for price_key, atom_keys in decoded_memberships.items():
+                if price_key in memberships_by_price_key:
+                    raise PTG2ManifestArtifactError(
+                        "PTG2 v3 price-membership artifact contains a " "duplicate key"
+                    )
+                membership_bytes = (
+                    _PRICE_MEMBERSHIP_OWNER_RETAINED_BYTES
+                    + len(atom_keys) * _PRICE_MEMBERSHIP_RETAINED_BYTES
+                )
+                if retention_budget is not None:
+                    retention_budget.claim(
+                        membership_bytes,
+                        category="a decoded price-to-atom membership",
+                    )
+                    retained_membership_bytes += membership_bytes
+                memberships_by_price_key[price_key] = atom_keys
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_membership_bytes)
+        raise
     return memberships_by_price_key
 
 
@@ -3647,6 +4235,7 @@ async def lookup_shared_price_atoms_from_db(
     atom_key_bits: int | None = None,
     block_span: int | None = None,
     schema_name: str = "mrf",
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, Any]:
     """Decode requested price atoms from fresh shared payload blocks."""
 
@@ -3684,7 +4273,75 @@ async def lookup_shared_price_atoms_from_db(
         requested_key_set=set(requested_keys),
         block_span=effective_span,
         schema_name=schema_name,
+        retention_budget=retention_budget,
     )
+
+
+@dataclass
+class _RetainedPriceAtoms:
+    retention_budget: CandidateAuditDecodedRetentionBudget | None
+    atoms_by_key: dict[int, Any]
+    retained_bytes: int = 0
+
+    def add(self, atom_key: int, price_atom: Any) -> None:
+        """Claim and retain one unique rebased atom."""
+
+        if atom_key in self.atoms_by_key:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 price-atom artifact contains a duplicate key"
+            )
+        if self.retention_budget is not None:
+            self.retention_budget.claim(
+                _PRICE_ATOM_RETAINED_BYTES,
+                category="a decoded price atom",
+            )
+            self.retained_bytes += _PRICE_ATOM_RETAINED_BYTES
+        self.atoms_by_key[atom_key] = price_atom
+
+    def release(self) -> None:
+        """Release all atom claims after a failed alias decode."""
+
+        if self.retention_budget is not None:
+            self.retention_budget.release(self.retained_bytes)
+        self.retained_bytes = 0
+
+
+def _retain_price_atom_alias_group(
+    retained_atoms: _RetainedPriceAtoms,
+    physical_aliases: list[tuple[int, _SharedLogicalBlock]],
+    requested_key_set: set[int],
+    block_span: int,
+    schema_name: str,
+) -> None:
+    representative_key, logical_block = physical_aliases[0]
+    requested_offsets = {
+        atom_key - block_key * block_span
+        for block_key, _alias_block in physical_aliases
+        for atom_key in requested_key_set
+        if block_key * block_span <= atom_key < (block_key + 1) * block_span
+    }
+    representative_start = representative_key * block_span
+    _claim_logical_block_processing(logical_block, schema_name=schema_name)
+    decoded_by_representative_key = _decode_price_atom_block(
+        logical_block.payload,
+        block_key=representative_key,
+        entry_count=logical_block.entry_count,
+        block_span=block_span,
+        requested_keys={
+            representative_start + requested_offset
+            for requested_offset in requested_offsets
+        },
+    )
+    atoms_by_offset = {
+        atom_key - representative_start: price_atom
+        for atom_key, price_atom in decoded_by_representative_key.items()
+    }
+    for block_key, _alias_block in physical_aliases:
+        block_start = block_key * block_span
+        for atom_offset, price_atom in atoms_by_offset.items():
+            atom_key = block_start + atom_offset
+            if atom_key in requested_key_set:
+                retained_atoms.add(atom_key, price_atom)
 
 
 def _price_atoms_from_aliases(
@@ -3693,51 +4350,26 @@ def _price_atoms_from_aliases(
     requested_key_set: set[int],
     block_span: int,
     schema_name: str,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, Any]:
     """Parse each distinct logical atom payload once and rebase its offsets."""
 
-    atoms_by_key: dict[int, Any] = {}
-    for physical_aliases in _logical_blocks_by_physical_identity(
-        logical_blocks
-    ).values():
-        representative_key, logical_block = physical_aliases[0]
-        requested_offsets = {
-            atom_key - block_key * block_span
-            for block_key, _alias_block in physical_aliases
-            for atom_key in requested_key_set
-            if block_key * block_span <= atom_key < (block_key + 1) * block_span
-        }
-        representative_start = representative_key * block_span
-        _claim_logical_block_processing(
-            logical_block,
-            schema_name=schema_name,
-        )
-        decoded_by_representative_key = _decode_price_atom_block(
-            logical_block.payload,
-            block_key=representative_key,
-            entry_count=logical_block.entry_count,
-            block_span=block_span,
-            requested_keys={
-                representative_start + requested_offset
-                for requested_offset in requested_offsets
-            },
-        )
-        atoms_by_offset = {
-            atom_key - representative_start: price_atom
-            for atom_key, price_atom in decoded_by_representative_key.items()
-        }
-        for block_key, _alias_block in physical_aliases:
-            block_start = block_key * block_span
-            for atom_offset, price_atom in atoms_by_offset.items():
-                atom_key = block_start + atom_offset
-                if atom_key not in requested_key_set:
-                    continue
-                if atom_key in atoms_by_key:
-                    raise PTG2ManifestArtifactError(
-                        "PTG2 v3 price-atom artifact contains a duplicate key"
-                    )
-                atoms_by_key[atom_key] = price_atom
-    return atoms_by_key
+    retained_atoms = _RetainedPriceAtoms(retention_budget, {})
+    try:
+        for physical_aliases in _logical_blocks_by_physical_identity(
+            logical_blocks
+        ).values():
+            _retain_price_atom_alias_group(
+                retained_atoms,
+                physical_aliases,
+                requested_key_set,
+                block_span,
+                schema_name,
+            )
+    except BaseException:
+        retained_atoms.release()
+        raise
+    return retained_atoms.atoms_by_key
 
 
 async def lookup_shared_code_page_from_db(
@@ -3888,12 +4520,15 @@ async def lookup_shared_graph_members_from_db(
     *,
     schema_name: str = "mrf",
     max_members: int | None = None,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Read graph members directly and optionally bound each owner result."""
 
     fetch_options_by_name: dict[str, Any] = {}
     if max_members is not None:
         fetch_options_by_name["max_members"] = max_members
+    if retention_budget is not None:
+        fetch_options_by_name["retention_budget"] = retention_budget
     try:
         return await fetch_shared_graph_members(
             session,
@@ -3903,6 +4538,8 @@ async def lookup_shared_graph_members_from_db(
             owner_keys=owner_keys,
             **fetch_options_by_name,
         )
+    except SharedGraphReadLimitError as exc:
+        raise ManifestReadLimitError(str(exc)) from exc
     except PTG2SharedBlockError as exc:
         raise PTG2ManifestArtifactError(str(exc)) from exc
 

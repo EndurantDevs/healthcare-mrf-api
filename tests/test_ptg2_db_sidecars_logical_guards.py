@@ -9,6 +9,10 @@ import pytest
 
 from api import ptg2_db_serving_v3
 from api import ptg2_db_sidecars as sidecars
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditDecodedRetentionBudget,
+    CandidateAuditDecodedRetentionError,
+)
 from api.ptg2_shared_blocks import PTG2SharedBlockError, SharedBlockPayload
 
 
@@ -393,6 +397,58 @@ async def test_graph_reader_translates_shared_block_errors(monkeypatch):
             0,
             (5,),
         )
+
+
+@pytest.mark.asyncio
+async def test_graph_reader_preserves_typed_read_limit(monkeypatch):
+    monkeypatch.setattr(
+        sidecars,
+        "fetch_shared_graph_members",
+        AsyncMock(
+            side_effect=sidecars.SharedGraphReadLimitError(
+                "shared PTG graph owner exceeds the read-once byte limit"
+            )
+        ),
+    )
+    with pytest.raises(
+        sidecars.ManifestReadLimitError,
+        match="graph owner exceeds",
+    ):
+        await sidecars.lookup_shared_graph_members_from_db(
+            object(),
+            1,
+            0,
+            (5,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_graph_reader_forwards_and_preserves_decoded_retention_error(
+    monkeypatch,
+):
+    retention_budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=1)
+    retention_error = CandidateAuditDecodedRetentionError("decoded limit")
+    graph_reader = AsyncMock(side_effect=retention_error)
+    monkeypatch.setattr(
+        sidecars,
+        "fetch_shared_graph_members",
+        graph_reader,
+    )
+
+    with pytest.raises(CandidateAuditDecodedRetentionError) as exc_info:
+        await sidecars.lookup_shared_graph_members_from_db(
+            object(),
+            1,
+            0,
+            (5,),
+            retention_budget=retention_budget,
+        )
+
+    assert exc_info.value is retention_error
+    assert (
+        graph_reader.await_args.kwargs["retention_budget"]
+        is retention_budget
+    )
 
 
 @pytest.mark.asyncio

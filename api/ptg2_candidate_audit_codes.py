@@ -13,6 +13,7 @@ from api.code_systems import (
     catalog_code_system_lookup_values,
 )
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
+from api.ptg2_candidate_audit_capacity import CandidateAuditDecodedRetentionBudget
 from api.ptg2_serving import (
     _canonical_code_metadata_row,
     _required_shared_snapshot_key,
@@ -22,6 +23,11 @@ from api.ptg2_serving import (
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import AuditBatchChallenge
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+
+
+_CODE_INDEX_BYTES = 512
+_CODE_INDEX_RECORD_BYTES = 2048
+_CODE_INDEX_PAIR_MEMBERSHIP_BYTES = 256
 
 
 @dataclass(frozen=True)
@@ -101,30 +107,72 @@ def _code_query_sql(scope_join_sql: str, code_filters: Sequence[str]) -> str:
     """
 
 
+def _index_candidate_code_record(
+    raw_code_record: Any,
+    records_by_pair_and_key: dict[
+        tuple[str, str], dict[int, dict[str, Any]]
+    ],
+    records_by_key: dict[int, dict[str, Any]],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+) -> None:
+    code_record = _canonical_code_metadata_row(raw_code_record)
+    canonical_system = code_record.pop("canonical_system", None)
+    canonical_code = code_record.pop("canonical_code", None)
+    code_key = int(code_record.get("code_key"))
+    existing_by_key = records_by_key.get(code_key)
+    if existing_by_key is None:
+        if retention_budget is not None:
+            retention_budget.claim(
+                _CODE_INDEX_RECORD_BYTES,
+                category="a candidate code metadata record",
+            )
+        records_by_key[code_key] = code_record
+        existing_by_key = code_record
+    if existing_by_key != code_record:
+        raise PTG2ManifestArtifactError(
+            "PTG2 candidate code aliases resolve inconsistently"
+        )
+    if canonical_system is None or canonical_code is None:
+        return
+    code_pair = (str(canonical_system), str(canonical_code))
+    pair_records_by_key = records_by_pair_and_key.get(code_pair)
+    if pair_records_by_key is None or code_key not in pair_records_by_key:
+        if retention_budget is not None:
+            retention_budget.claim(
+                _CODE_INDEX_PAIR_MEMBERSHIP_BYTES,
+                category="a candidate code alias membership",
+            )
+        if pair_records_by_key is None:
+            pair_records_by_key = {}
+            records_by_pair_and_key[code_pair] = pair_records_by_key
+        pair_records_by_key[code_key] = code_record
+
+
 def _indexed_candidate_code_records(
     challenges: Sequence[AuditBatchChallenge],
     persisted_code_keys: Iterable[int],
     code_query: Iterable[Any],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> CandidateCodeIndex:
+    """Index candidate metadata only after each retained record is claimed."""
+
     records_by_pair_and_key: dict[
         tuple[str, str],
         dict[int, dict[str, Any]],
     ] = {}
     records_by_key: dict[int, dict[str, Any]] = {}
+    if retention_budget is not None:
+        retention_budget.claim(
+            _CODE_INDEX_BYTES,
+            category="the candidate code index",
+        )
     for raw_code_record in code_query:
-        code_record = _canonical_code_metadata_row(raw_code_record)
-        canonical_system = code_record.pop("canonical_system", None)
-        canonical_code = code_record.pop("canonical_code", None)
-        code_key = int(code_record.get("code_key"))
-        existing_by_key = records_by_key.setdefault(code_key, code_record)
-        if existing_by_key != code_record:
-            raise PTG2ManifestArtifactError(
-                "PTG2 candidate code aliases resolve inconsistently"
-            )
-        if canonical_system is None or canonical_code is None:
-            continue
-        code_pair = (str(canonical_system), str(canonical_code))
-        records_by_pair_and_key.setdefault(code_pair, {})[code_key] = code_record
+        _index_candidate_code_record(
+            raw_code_record,
+            records_by_pair_and_key,
+            records_by_key,
+            retention_budget,
+        )
     requested_pairs = {
         (challenge.code_system, challenge.code) for challenge in challenges
     }
@@ -156,6 +204,7 @@ async def candidate_code_records_by_pair(
     challenges: Sequence[AuditBatchChallenge],
     *,
     persisted_code_keys: Iterable[int] = (),
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> CandidateCodeIndex:
     """Return every exact plan-scoped code record in one database query."""
 
@@ -189,6 +238,7 @@ async def candidate_code_records_by_pair(
         challenges,
         normalized_persisted_code_keys,
         code_query,
+        retention_budget,
     )
 
 

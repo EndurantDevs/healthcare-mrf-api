@@ -8,13 +8,19 @@ import pytest
 from api import ptg2_candidate_audit_batch as batch
 from api import ptg2_candidate_audit_graph as candidate_graph
 from api import ptg2_candidate_audit_reverse as reverse_scope
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditDecodedRetentionBudget,
+    CandidateAuditDecodedRetentionError,
+)
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     AuditBatchChallenge,
 )
-from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2ManifestArtifactError,
+)
 
 
 def _challenge() -> AuditBatchChallenge:
@@ -62,29 +68,74 @@ def _code_index() -> CandidateCodeIndex:
     )
 
 
+def _overflowing_graph_lookup(loaded_group_keys_by_npi):
+    async def graph_lookup(
+        _session,
+        _shared_snapshot_key,
+        graph_kind,
+        _requested_keys,
+        *,
+        retention_budget,
+        **_kwargs,
+    ):
+        if graph_kind == candidate_graph.PTG2_V3_GRAPH_NPI_TO_GROUP:
+            retention_budget.claim(
+                512,
+                category="the decoded NPI graph result",
+            )
+            return loaded_group_keys_by_npi
+        retention_budget.claim(
+            retention_budget.maximum_bytes,
+            category="a decoded shared graph result owner",
+        )
+        raise AssertionError("decoded retention claim must fail")
+
+    return graph_lookup
+
+
+def _broad_scope_lookup_using(graph_lookup):
+    async def broad_scope_lookup(
+        session,
+        serving_tables,
+        challenges,
+        persisted_occurrences,
+        *,
+        retention_budget,
+    ):
+        return await candidate_graph.provider_set_keys_by_npi(
+            graph_lookup,
+            session,
+            serving_tables.shared_snapshot_key,
+            "mrf",
+            challenges,
+            persisted_occurrences,
+            retention_budget=retention_budget,
+        )
+
+    return broad_scope_lookup
+
+
 @pytest.mark.asyncio
 async def test_oversized_challenge_graph_preserves_loaded_npi_groups():
     challenge = _challenge()
-    graph_lookup = AsyncMock(
-        side_effect=[
-            {challenge.npi: (4, 5)},
-            PTG2ManifestArtifactError(
-                "shared PTG graph chunks exceed the read-once byte limit"
-            ),
-        ]
-    )
+    loaded_group_keys_by_npi = {challenge.npi: (4, 5)}
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=16 * 1024)
 
     with pytest.raises(candidate_graph.ChallengeGraphScopeTooLarge) as exc_info:
         await candidate_graph.provider_set_keys_by_npi(
-            graph_lookup,
+            _overflowing_graph_lookup(loaded_group_keys_by_npi),
             object(),
             41,
             "mrf",
             (challenge,),
             (),
+            retention_budget=budget,
         )
 
+    assert isinstance(exc_info.value.__cause__, CandidateAuditDecodedRetentionError)
     assert exc_info.value.group_keys_by_npi == {challenge.npi: (4, 5)}
+    assert exc_info.value.group_keys_by_npi is loaded_group_keys_by_npi
+    assert "decoded retention exceeds" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -111,6 +162,7 @@ async def test_challenge_graph_does_not_reclassify_other_artifact_errors():
 @pytest.mark.asyncio
 async def test_reverse_candidate_graph_retains_intersecting_memberships():
     graph_lookup = AsyncMock(return_value={5: (2, 7), 6: (9,)})
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=1024 * 1024)
 
     observed = await candidate_graph.prove_provider_candidates_by_npi(
         graph_lookup,
@@ -119,6 +171,7 @@ async def test_reverse_candidate_graph_retains_intersecting_memberships():
         "mrf",
         {1234567890: (5, 6), 1111111111: ()},
         {1234567890: (2, 3), 1111111111: (8,)},
+        retention_budget=budget,
     )
 
     assert observed == {1234567890: (5,), 1111111111: ()}
@@ -126,6 +179,7 @@ async def test_reverse_candidate_graph_retains_intersecting_memberships():
         candidate_graph.PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP
     )
     assert tuple(graph_lookup.await_args.args[3]) == (5, 6)
+    assert budget.retained_bytes > 0
 
 
 @pytest.mark.asyncio
@@ -153,9 +207,7 @@ async def test_reverse_source_scope_filters_forward_then_proves_graph(
     persisted = _persisted_occurrence()
     expected_price_index = {(7, 5, 0): (10,), (8, 7, 1): (9,)}
     forward_lookup = AsyncMock(return_value=expected_price_index)
-    graph_proof = AsyncMock(
-        return_value={challenge.npi: (5,), persisted.npi: (7,)}
-    )
+    graph_proof = AsyncMock(return_value={challenge.npi: (5,), persisted.npi: (7,)})
     monkeypatch.setattr(
         reverse_scope,
         "lookup_forward_price_index_from_db",
@@ -175,6 +227,7 @@ async def test_reverse_source_scope_filters_forward_then_proves_graph(
         (persisted,),
         _code_index(),
         group_keys_by_npi,
+        schema_name="candidate_schema",
     )
 
     assert observed_scope.provider_set_keys_by_npi == {
@@ -188,24 +241,84 @@ async def test_reverse_source_scope_filters_forward_then_proves_graph(
         8: (1,),
     }
     assert "provider_set_keys_by_code" not in forward_lookup.await_args.kwargs
+    assert forward_lookup.await_args.kwargs["schema_name"] == "candidate_schema"
     assert graph_proof.await_args.args[4] == {
         challenge.npi: {5},
         persisted.npi: {7},
     }
     assert graph_proof.await_args.args[5] is group_keys_by_npi
+    assert graph_proof.await_args.args[3] == "candidate_schema"
+    assert (
+        graph_proof.await_args.kwargs["retention_budget"]
+        is forward_lookup.await_args.kwargs["retention_budget"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_reverse_source_scope_fails_closed_before_graph_proof(
+    monkeypatch,
+):
+    challenge = _challenge()
+    forward_lookup = AsyncMock(return_value={(7, 5, 0): (10,)})
+    graph_proof = AsyncMock()
+    maximum_bytes = (
+        reverse_scope._PRELOADED_NPI_GROUP_MAP_BYTES
+        + reverse_scope._PRELOADED_NPI_GROUP_BUCKET_BYTES
+        + reverse_scope._PRELOADED_NPI_GROUP_MEMBERSHIP_BYTES
+        + reverse_scope._CODE_SOURCE_NPI_MAP_BYTES
+        + reverse_scope._CODE_SOURCE_NPI_KEY_BYTES
+        + reverse_scope._CODE_SOURCE_NPI_BUCKET_BYTES
+        + reverse_scope._CODE_SOURCE_NPI_MEMBERSHIP_BYTES
+        + reverse_scope._NPI_PROVIDER_MAP_BYTES
+        + reverse_scope._NPI_PROVIDER_MAP_ENTRY_BYTES
+        + reverse_scope._NPI_PROVIDER_BUCKET_BYTES
+    )
+    monkeypatch.setattr(
+        reverse_scope,
+        "CandidateAuditDecodedRetentionBudget",
+        lambda: CandidateAuditDecodedRetentionBudget(
+            maximum_bytes=maximum_bytes
+        ),
+    )
+    monkeypatch.setattr(
+        reverse_scope,
+        "lookup_forward_price_index_from_db",
+        forward_lookup,
+    )
+    monkeypatch.setattr(
+        reverse_scope,
+        "prove_provider_candidates_by_npi",
+        graph_proof,
+    )
+
+    with pytest.raises(
+        CandidateAuditDecodedRetentionError,
+        match="NPI provider membership",
+    ):
+        await reverse_scope.load_reverse_source_candidate_scope(
+            object(),
+            _serving_tables(),
+            (challenge,),
+            (),
+            _code_index(),
+            {challenge.npi: (4,)},
+        )
+
+    forward_lookup.assert_awaited_once()
+    graph_proof.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_candidate_provider_scope_falls_back_only_for_oversized_graph(
     monkeypatch,
 ):
+    """A decoded graph overflow reuses the loaded NPI group map."""
+
     challenge = _challenge()
     expected_price_index = {(7, 5, 0): (10,)}
-    broad_scope_lookup = AsyncMock(
-        side_effect=candidate_graph.ChallengeGraphScopeTooLarge(
-            {challenge.npi: (4,)}
-        )
-    )
+    loaded_group_keys_by_npi = {challenge.npi: (4,)}
+    graph_lookup = _overflowing_graph_lookup(loaded_group_keys_by_npi)
+
     reverse_scope_loader = AsyncMock(
         return_value=reverse_scope.ReverseCandidateScope(
             provider_set_keys_by_npi={challenge.npi: (5,)},
@@ -219,17 +332,24 @@ async def test_candidate_provider_scope_falls_back_only_for_oversized_graph(
     )
 
     observed_scope = await reverse_scope.load_candidate_provider_scope(
-        broad_scope_lookup,
+        _broad_scope_lookup_using(graph_lookup),
         object(),
         _serving_tables(),
         (challenge,),
         (),
         _code_index(),
+        schema_name="candidate_schema",
     )
 
     assert observed_scope.provider_set_keys_by_npi == {challenge.npi: (5,)}
     assert observed_scope.price_keys_by_occurrence is expected_price_index
-    assert reverse_scope_loader.await_args.args[5] == {challenge.npi: (4,)}
+    assert reverse_scope_loader.await_args.args[5] is loaded_group_keys_by_npi
+    assert reverse_scope_loader.await_args.kwargs["schema_name"] == "candidate_schema"
+    assert reverse_scope_loader.await_args.kwargs["retention_budget"] is not None
+    assert (
+        reverse_scope_loader.await_args.kwargs["retention_budget"].maximum_bytes
+        == 64 * 1024 * 1024
+    )
 
 
 @pytest.mark.asyncio

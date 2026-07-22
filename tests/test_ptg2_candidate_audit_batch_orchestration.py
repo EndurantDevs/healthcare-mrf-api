@@ -10,6 +10,7 @@ from api import ptg2_candidate_audit_codes as codes
 from api import ptg2_candidate_audit_graph as candidate_graph
 from api import ptg2_candidate_audit_selection as selection
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
+from api.ptg2_candidate_audit_capacity import CandidateAuditDecodedRetentionBudget
 from api.ptg2_candidate_audit_integrity import (
     CandidateWitnessScope,
     PersistedAuditOccurrence,
@@ -93,12 +94,14 @@ async def test_provider_graph_lookup_unions_witness_and_persisted_npis(monkeypat
         ]
     )
     monkeypatch.setattr(batch, "lookup_shared_graph_members_from_db", graph_lookup)
+    retention_budget = CandidateAuditDecodedRetentionBudget()
 
     provider_keys_by_npi = await batch._provider_set_keys_by_npi(
         object(),
         _serving_tables(),
         (_challenge(),),
         (_persisted_occurrence(),),
+        retention_budget=retention_budget,
     )
 
     assert provider_keys_by_npi == {
@@ -113,6 +116,10 @@ async def test_provider_graph_lookup_unions_witness_and_persisted_npis(monkeypat
     ]
     assert tuple(graph_lookup.await_args_list[1].args[3]) == (2, 3)
     assert tuple(graph_lookup.await_args_list[2].args[3]) == (7,)
+    assert all(
+        graph_call.kwargs["retention_budget"] is retention_budget
+        for graph_call in graph_lookup.await_args_list
+    )
 
 
 @pytest.mark.asyncio

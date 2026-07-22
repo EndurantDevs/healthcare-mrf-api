@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from api.ptg2_candidate_audit_capacity import CandidateAuditDecodedRetentionBudget
 from api.ptg2_response import _price_response_fields, _response_wire_value
 from api.ptg2_serving import _exact_source_rate_fields
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
@@ -21,6 +22,18 @@ from scripts.validation import ptg2_v3_source_api_audit as source_audit
 _CandidateConditionKey = tuple[str, str, int, int, str]
 _CandidateCoordinate = tuple[str, str, int, int]
 _CandidateProjectionKey = tuple[str, str, int, int, int]
+_PROJECTION_MAP_BYTES = 224
+_PROJECTION_ENTRY_BYTES = 1024
+_AVAILABILITY_MAP_BYTES = 224
+_AVAILABILITY_BUCKET_BYTES = 512
+_AVAILABILITY_MEMBERSHIP_BYTES = 256
+_AVAILABILITY_RESULT_MAP_BYTES = 224
+_AVAILABILITY_RESULT_ENTRY_BYTES = 256
+_AVAILABILITY_RESULT_MEMBERSHIP_BYTES = 24
+_COORDINATE_SET_BYTES = 256
+_COORDINATE_SET_MEMBERSHIP_BYTES = 512
+_COORDINATE_TUPLE_BYTES = 56
+_COORDINATE_TUPLE_MEMBERSHIP_BYTES = 8
 
 
 @dataclass(frozen=True)
@@ -34,6 +47,7 @@ class CandidatePriceData:
 
 @dataclass
 class _CandidateAvailabilityState:
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None
     tuple_digest_by_projection: dict[_CandidateProjectionKey, str] = field(
         default_factory=dict
     )
@@ -43,6 +57,13 @@ class _CandidateAvailabilityState:
     ] = field(default_factory=dict)
     projection_deliveries: int = 0
     duplicate_availability_deliveries: int = 0
+
+    def __post_init__(self) -> None:
+        if self.retention_budget is not None:
+            self.retention_budget.claim(
+                _PROJECTION_MAP_BYTES + _AVAILABILITY_MAP_BYTES,
+                category="the candidate availability indexes",
+            )
 
     def add_projection(
         self,
@@ -57,6 +78,47 @@ class _CandidateAvailabilityState:
         """Record one retained price delivery and reuse its tuple projection."""
 
         self.projection_deliveries += 1
+        tuple_digest = self._tuple_digest(
+            query,
+            code_key,
+            code_record,
+            price_payload,
+        )
+        condition_key = (
+            query.code_system,
+            query.code,
+            query.npi,
+            source_artifact_key,
+            tuple_digest,
+        )
+        available_network_sets = self.network_sets_by_condition.get(
+            condition_key
+        )
+        if available_network_sets is None:
+            if self.retention_budget is not None:
+                self.retention_budget.claim(
+                    _AVAILABILITY_BUCKET_BYTES,
+                    category="a candidate availability condition",
+                )
+            available_network_sets = set()
+            self.network_sets_by_condition[condition_key] = available_network_sets
+        if provider_network_digests in available_network_sets:
+            self.duplicate_availability_deliveries += 1
+            return
+        if self.retention_budget is not None:
+            self.retention_budget.claim(
+                _AVAILABILITY_MEMBERSHIP_BYTES,
+                category="a candidate availability network set",
+            )
+        available_network_sets.add(provider_network_digests)
+
+    def _tuple_digest(
+        self,
+        query: source_audit.QueryKey,
+        code_key: int,
+        code_record: Mapping[str, Any],
+        price_payload: Mapping[str, Any],
+    ) -> str:
         projection_key = (
             query.code_system,
             query.code,
@@ -66,6 +128,11 @@ class _CandidateAvailabilityState:
         )
         tuple_digest = self.tuple_digest_by_projection.get(projection_key)
         if tuple_digest is None:
+            if self.retention_budget is not None:
+                self.retention_budget.claim(
+                    _PROJECTION_ENTRY_BYTES,
+                    category="a candidate tuple projection",
+                )
             candidate_tuple = _build_canonical_candidate_tuple(
                 query,
                 code_record,
@@ -74,37 +141,14 @@ class _CandidateAvailabilityState:
             )
             tuple_digest = canonical_tuple_digest_without_networks(candidate_tuple)
             self.tuple_digest_by_projection[projection_key] = tuple_digest
-        condition_key = (
-            query.code_system,
-            query.code,
-            query.npi,
-            source_artifact_key,
-            tuple_digest,
-        )
-        available_network_sets = self.network_sets_by_condition.setdefault(
-            condition_key,
-            set(),
-        )
-        if provider_network_digests in available_network_sets:
-            self.duplicate_availability_deliveries += 1
-        available_network_sets.add(provider_network_digests)
+        return tuple_digest
 
-    def finalized(
+    def _processing_ledger(
         self,
-    ) -> tuple[dict[_CandidateConditionKey, tuple[frozenset[str], ...]], dict[str, int]]:
-        """Freeze the match index and expose truthful projection counters."""
-
-        availability_by_condition = {
-            condition_key: tuple(
-                sorted(
-                    network_digest_sets,
-                    key=lambda digest_set: tuple(sorted(digest_set)),
-                )
-            )
-            for condition_key, network_digest_sets in self.network_sets_by_condition.items()
-        }
-        projection_count = len(self.tuple_digest_by_projection)
-        return availability_by_condition, {
+        projection_count: int,
+        condition_count: int,
+    ) -> dict[str, int]:
+        return {
             "candidate_occurrence_deliveries": self.projection_deliveries,
             "unique_candidate_projections": projection_count,
             "candidate_projection_builds": projection_count,
@@ -112,29 +156,116 @@ class _CandidateAvailabilityState:
                 self.projection_deliveries - projection_count
             ),
             "repeated_candidate_projection_builds": 0,
-            "availability_condition_count": len(availability_by_condition),
+            "availability_condition_count": condition_count,
             "duplicate_availability_deliveries": (
                 self.duplicate_availability_deliveries
             ),
         }
 
+    def finalized(
+        self,
+    ) -> tuple[dict[_CandidateConditionKey, tuple[frozenset[str], ...]], dict[str, int]]:
+        """Freeze the match index and expose truthful projection counters."""
+
+        retained_result_bytes = _AVAILABILITY_RESULT_MAP_BYTES
+        if self.retention_budget is not None:
+            self.retention_budget.claim(
+                retained_result_bytes,
+                category="the frozen candidate availability map",
+            )
+        availability_by_condition: dict[
+            _CandidateConditionKey, tuple[frozenset[str], ...]
+        ] = {}
+        try:
+            for (
+                condition_key,
+                network_digest_sets,
+            ) in self.network_sets_by_condition.items():
+                result_entry_bytes = (
+                    _AVAILABILITY_RESULT_ENTRY_BYTES
+                    + len(network_digest_sets)
+                    * _AVAILABILITY_RESULT_MEMBERSHIP_BYTES
+                )
+                if self.retention_budget is not None:
+                    self.retention_budget.claim(
+                        result_entry_bytes,
+                        category="a frozen candidate availability condition",
+                    )
+                    retained_result_bytes += result_entry_bytes
+                availability_by_condition[condition_key] = tuple(
+                    sorted(
+                        network_digest_sets,
+                        key=lambda digest_set: tuple(sorted(digest_set)),
+                    )
+                )
+        except BaseException:
+            if self.retention_budget is not None:
+                self.retention_budget.release(retained_result_bytes)
+            raise
+        projection_count = len(self.tuple_digest_by_projection)
+        if self.retention_budget is not None:
+            source_bytes = (
+                _PROJECTION_MAP_BYTES
+                + _AVAILABILITY_MAP_BYTES
+                + projection_count * _PROJECTION_ENTRY_BYTES
+                + sum(
+                    _AVAILABILITY_BUCKET_BYTES
+                    + len(network_sets) * _AVAILABILITY_MEMBERSHIP_BYTES
+                    for network_sets in self.network_sets_by_condition.values()
+                )
+            )
+            self.retention_budget.release(source_bytes)
+        return availability_by_condition, self._processing_ledger(
+            projection_count,
+            len(availability_by_condition),
+        )
+
 
 def _requested_candidate_coordinates(
     challenges: Sequence[AuditBatchChallenge],
-) -> tuple[_CandidateCoordinate, ...]:
-    return tuple(
-        sorted(
-            {
-                (
-                    challenge.code_system,
-                    challenge.code,
-                    challenge.npi,
-                    challenge.source_artifact_key,
-                )
-                for challenge in challenges
-            }
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+) -> tuple[tuple[_CandidateCoordinate, ...], int]:
+    retained_set_bytes = _COORDINATE_SET_BYTES
+    if retention_budget is not None:
+        retention_budget.claim(
+            retained_set_bytes,
+            category="the requested candidate coordinate set",
         )
-    )
+    coordinates: set[_CandidateCoordinate] = set()
+    try:
+        for challenge in challenges:
+            coordinate = (
+                challenge.code_system,
+                challenge.code,
+                challenge.npi,
+                challenge.source_artifact_key,
+            )
+            if coordinate in coordinates:
+                continue
+            if retention_budget is not None:
+                retention_budget.claim(
+                    _COORDINATE_SET_MEMBERSHIP_BYTES,
+                    category="a requested candidate coordinate",
+                )
+                retained_set_bytes += _COORDINATE_SET_MEMBERSHIP_BYTES
+            coordinates.add(coordinate)
+        retained_tuple_bytes = (
+            _COORDINATE_TUPLE_BYTES
+            + len(coordinates) * _COORDINATE_TUPLE_MEMBERSHIP_BYTES
+        )
+        if retention_budget is not None:
+            retention_budget.claim(
+                retained_tuple_bytes,
+                category="the ordered candidate coordinates",
+            )
+        ordered_coordinates = tuple(sorted(coordinates))
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_set_bytes)
+        raise
+    if retention_budget is not None:
+        retention_budget.release(retained_set_bytes)
+    return ordered_coordinates, retained_tuple_bytes
 
 
 def _record_coordinate_availability(
@@ -178,20 +309,30 @@ def candidate_availability_index(
     provider_sets_by_npi_code: Mapping[tuple[int, int], tuple[int, ...]],
     network_digests_by_provider_set_key: Mapping[int, frozenset[str]],
     price_data: CandidatePriceData,
+    *,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> tuple[dict[_CandidateConditionKey, tuple[frozenset[str], ...]], dict[str, int]]:
     """Project each unique candidate price once into a direct match index."""
 
-    state = _CandidateAvailabilityState()
-    for coordinate in _requested_candidate_coordinates(challenges):
-        _record_coordinate_availability(
-            state,
-            coordinate,
-            code_records_by_pair,
-            provider_sets_by_npi_code,
-            network_digests_by_provider_set_key,
-            price_data,
-        )
-    return state.finalized()
+    state = _CandidateAvailabilityState(retention_budget=retention_budget)
+    coordinates, retained_coordinate_bytes = _requested_candidate_coordinates(
+        challenges,
+        retention_budget,
+    )
+    try:
+        for coordinate in coordinates:
+            _record_coordinate_availability(
+                state,
+                coordinate,
+                code_records_by_pair,
+                provider_sets_by_npi_code,
+                network_digests_by_provider_set_key,
+                price_data,
+            )
+        return state.finalized()
+    finally:
+        if retention_budget is not None:
+            retention_budget.release(retained_coordinate_bytes)
 
 
 def _build_canonical_candidate_tuple(

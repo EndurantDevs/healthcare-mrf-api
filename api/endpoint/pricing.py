@@ -13,6 +13,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
 import orjson
@@ -35,6 +36,13 @@ from api.ptg2_candidate_audit_batch import (
     audit_candidate_source_witness_batch,
 )
 from api.ptg2_candidate_audit_partition import audit_candidate_partition
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditProcessAdmission,
+    CandidateAuditProcessAdmissionError,
+    CandidateAuditProcessConfigurationError,
+    PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES,
+    PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES,
+)
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
     shared_block_read_once_scope,
@@ -9992,6 +10000,44 @@ def _candidate_audit_batch_raw_limit() -> int:
     return min(configured_limit, 2 * 1024 * 1024 * 1024)
 
 
+def _candidate_audit_process_limit() -> int:
+    """Return the configured process-wide concurrent audit allowance."""
+
+    raw_limit = os.getenv(
+        "HLTHPRT_PTG2_AUDIT_PROCESS_MAX_BYTES",
+        str(PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES),
+    )
+    try:
+        configured_limit = int(raw_limit)
+        CandidateAuditProcessAdmission(configured_limit)
+    except (TypeError, ValueError) as exc:
+        raise CandidateAuditProcessConfigurationError(
+            "candidate audit process-byte limit is invalid"
+        ) from exc
+    return configured_limit
+
+
+@lru_cache(maxsize=None)
+def _candidate_audit_process_admission_for_limit(
+    maximum_bytes: int,
+) -> CandidateAuditProcessAdmission:
+    """Share one weighted gate for each process configuration."""
+
+    return CandidateAuditProcessAdmission(maximum_bytes)
+
+
+def _candidate_audit_process_admission() -> CandidateAuditProcessAdmission:
+    return _candidate_audit_process_admission_for_limit(
+        _candidate_audit_process_limit()
+    )
+
+
+def _candidate_audit_partition_weight(raw_limit: int) -> int:
+    """Reserve both independent raw and decoded request allowances."""
+
+    return raw_limit + PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES
+
+
 def _read_once_block_io_map(read_once_scope) -> dict[str, int]:
     read_once_scope.assert_processed_once()
     return read_once_scope.ledger
@@ -10081,9 +10127,14 @@ async def _partitioned_candidate_audit_response(
     except ValueError as exc:
         raise InvalidUsage(str(exc)) from exc
     started_at = time.perf_counter()
+    admission_lease = None
     try:
+        raw_limit = _candidate_audit_batch_raw_limit()
+        admission_lease = await _candidate_audit_process_admission().acquire(
+            _candidate_audit_partition_weight(raw_limit)
+        )
         with shared_block_read_once_scope(
-            max_retained_raw_bytes=_candidate_audit_batch_raw_limit(),
+            max_retained_raw_bytes=raw_limit,
         ) as read_once_scope:
             batch_result = await audit_candidate_partition(
                 _get_session(request),
@@ -10091,13 +10142,19 @@ async def _partitioned_candidate_audit_response(
                 candidate_access,
             )
             block_io_map = _read_once_block_io_map(read_once_scope)
+    except (
+        CandidateAuditProcessAdmissionError,
+        CandidateAuditProcessConfigurationError,
+    ) as exc:
+        raise sanic.exceptions.ServiceUnavailable(str(exc)) from exc
     except (PTG2ManifestArtifactError, PTG2SharedBlockError) as exc:
         raise InvalidUsage(str(exc)) from exc
+    finally:
+        if admission_lease is not None:
+            admission_lease.release()
     partition_result = build_partitioned_candidate_audit_result(
         request=audit_request,
-        matched_source_occurrence_count=(
-            batch_result.matched_challenge_count
-        ),
+        matched_source_occurrence_count=(batch_result.matched_challenge_count),
         validated_persisted_occurrence_count=(
             batch_result.validated_persisted_audit_occurrence_count
         ),

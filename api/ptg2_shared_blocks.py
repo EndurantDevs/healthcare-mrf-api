@@ -9,8 +9,8 @@ import re
 import zlib
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, Protocol
 
 from sqlalchemy import text
 
@@ -44,6 +44,52 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 class PTG2SharedBlockError(RuntimeError):
     pass
+
+
+class SharedGraphReadLimitError(PTG2SharedBlockError):
+    """Raised when a selected graph scope exceeds its read-once limit."""
+
+
+class SharedMappingReadLimitError(PTG2SharedBlockError):
+    """Raised before snapshot fragment metadata can grow without a bound."""
+
+
+class GraphDecodedRetentionBudget(Protocol):
+    """Structural budget used by graph readers without importing audit code."""
+
+    def claim(self, byte_count: int, *, category: str) -> None:
+        """Reserve bytes before an allocation is retained."""
+
+    def release(self, byte_count: int) -> None:
+        """Release request-local graph metadata after decoding."""
+
+
+_GRAPH_OWNER_SET_BYTES = 256
+_GRAPH_OWNER_SET_MEMBERSHIP_BYTES = 112
+_GRAPH_OWNER_ORDERING_BYTES = 112
+_GRAPH_OWNER_ORDERING_MEMBERSHIP_BYTES = 16
+_GRAPH_OWNER_TUPLE_BYTES = 56
+_GRAPH_OWNER_TUPLE_MEMBERSHIP_BYTES = 8
+_GRAPH_REQUEST_METADATA_BYTES = 512
+# Covers the owner-record tuple, locator map, selected-range list, chunk set,
+# and selection object before the validated member counts can be consumed.
+_GRAPH_PREFLIGHT_BYTES = 512
+_GRAPH_PREFLIGHT_OWNER_BYTES = 640
+# Chunk keys are generated integers, so this covers the resize-safe set-table
+# share (112 bytes) plus the retained integer object (rounded to 32 bytes).
+_GRAPH_PREFLIGHT_CHUNK_MEMBERSHIP_BYTES = 144
+# One owner charge covers the result-map resize, owner key reference, and tuple
+# base. Each member charge covers a worst-case CPython 3.14 uint64 integer, its
+# tuple reference, and the iterator-to-tuple construction vector retained at
+# the same peak. Keep this aligned above the measured 53-byte membership peak.
+_GRAPH_RESULT_OWNER_BYTES = 272
+_GRAPH_RESULT_MEMBERSHIP_BYTES = 56
+# A mapping row retains a dict, five keys and values, a copied 32-byte hash,
+# tuple/list slots, and allocator growth. Keep this deliberately above a
+# CPython 3.14 deep-size observation so the claim is conservative.
+_SHARED_MAPPING_RECORD_RETAINED_BYTES = 1024
+_SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES = 64 * 1024 * 1024
+_SOURCE_IDENTITY_RECORD_RETAINED_BYTES = 1024
 
 
 def read_strict_uvarint(
@@ -327,6 +373,7 @@ class _SharedMappingSelection:
     observed_block_keys: frozenset[int]
     fragment_nos_by_block_key: dict[int, frozenset[int]]
     physical_hashes: frozenset[bytes]
+    retained_metadata_bytes: int
 
 
 def _shared_block_read_request(
@@ -359,19 +406,20 @@ def _shared_block_read_request(
     )
 
 
-async def _shared_mapping_records(
+async def _stream_shared_mapping_records(
     session: Any,
     request: _SharedBlockReadRequest,
-) -> tuple[dict[str, Any], ...]:
+    *,
+    row_limit: int,
+) -> AsyncIterator[Any]:
     schema = _quote_ident(request.schema_name)
     fragment_filter = (
         "AND mapping.fragment_no = ANY(CAST(:fragment_nos AS integer[]))"
         if request.has_fragment_filter
         else ""
     )
-    mapping_query = await session.execute(
-        text(
-            f"""
+    statement = text(
+        f"""
             SELECT mapping.object_kind, mapping.block_key, mapping.fragment_no,
                    mapping.entry_count AS mapping_entry_count, mapping.block_hash
               FROM {schema}.ptg2_v3_snapshot_layout layout
@@ -384,17 +432,25 @@ async def _shared_mapping_records(
                AND mapping.block_key = ANY(CAST(:block_keys AS bigint[]))
                {fragment_filter}
              ORDER BY mapping.block_key, mapping.fragment_no
+             LIMIT :mapping_row_limit
             """
-        ),
-        {
-            "snapshot_key": request.snapshot_key,
-            "generation": PTG2_V3_SHARED_GENERATION,
-            "object_kind": request.object_kind,
-            "block_keys": request.block_keys,
-            "fragment_nos": request.fragment_nos,
-        },
     )
-    return tuple(_row_mapping(mapping_record) for mapping_record in mapping_query)
+    params_by_name = {
+        "snapshot_key": request.snapshot_key,
+        "generation": PTG2_V3_SHARED_GENERATION,
+        "object_kind": request.object_kind,
+        "block_keys": request.block_keys,
+        "fragment_nos": request.fragment_nos,
+        "mapping_row_limit": int(row_limit),
+    }
+    stream = getattr(session, "stream", None)
+    mapping_query = (
+        await stream(statement, params_by_name)
+        if callable(stream)
+        else await session.execute(statement, params_by_name)
+    )
+    async for mapping_record in _iterate_shared_query_rows(mapping_query):
+        yield mapping_record
 
 
 def _validated_mapping_coordinate(
@@ -437,6 +493,73 @@ def _shared_delivery_key(
         coordinate[0],
         coordinate[1],
     )
+
+
+@dataclass
+class _SharedMappingAccumulator:
+    request: _SharedBlockReadRequest
+    delivered_coordinates: set[tuple[str, int, str, int, int]]
+    retention_budget: GraphDecodedRetentionBudget | None
+    mapping_records: list[dict[str, Any]] = field(default_factory=list)
+    observed_block_keys: set[int] = field(default_factory=set)
+    fragment_nos_by_block_key: dict[int, set[int]] = field(default_factory=dict)
+    physical_hashes: set[bytes] = field(default_factory=set)
+    previous_coordinate: tuple[int, int] | None = None
+    retained_metadata_bytes: int = 0
+
+    def append(self, raw_mapping_record: Any, maximum_records: int) -> None:
+        """Validate and retain one metadata row only after its byte claim."""
+
+        if len(self.mapping_records) >= maximum_records:
+            raise SharedMappingReadLimitError(
+                "shared PTG snapshot fragment metadata exceeds its "
+                "bounded count or byte limit"
+            )
+        if self.retention_budget is not None:
+            self.retention_budget.claim(
+                _SHARED_MAPPING_RECORD_RETAINED_BYTES,
+                category="a shared snapshot fragment metadata row",
+            )
+            self.retained_metadata_bytes += _SHARED_MAPPING_RECORD_RETAINED_BYTES
+        mapping_record = _row_mapping(raw_mapping_record)
+        coordinate, physical_hash = _validated_mapping_coordinate(
+            self.request,
+            mapping_record,
+            previous_coordinate=self.previous_coordinate,
+        )
+        delivery_key = _shared_delivery_key(self.request, coordinate)
+        if delivery_key in self.delivered_coordinates:
+            raise PTG2SharedBlockError(
+                "shared PTG logical block was requested more than once"
+            )
+        self.previous_coordinate = coordinate
+        self.observed_block_keys.add(coordinate[0])
+        self.fragment_nos_by_block_key.setdefault(coordinate[0], set()).add(
+            coordinate[1]
+        )
+        self.physical_hashes.add(physical_hash)
+        self.mapping_records.append(mapping_record)
+
+    def release(self) -> None:
+        """Release every metadata claim after a failed selection."""
+
+        if self.retention_budget is not None:
+            self.retention_budget.release(self.retained_metadata_bytes)
+        self.retained_metadata_bytes = 0
+
+    def selection(self) -> _SharedMappingSelection:
+        """Freeze the validated metadata selection for physical delivery."""
+
+        return _SharedMappingSelection(
+            mapping_records=tuple(self.mapping_records),
+            observed_block_keys=frozenset(self.observed_block_keys),
+            fragment_nos_by_block_key={
+                block_key: frozenset(fragment_nos)
+                for block_key, fragment_nos in self.fragment_nos_by_block_key.items()
+            },
+            physical_hashes=frozenset(self.physical_hashes),
+            retained_metadata_bytes=self.retained_metadata_bytes,
+        )
 
 
 def _require_complete_shared_mapping(
@@ -499,22 +622,30 @@ async def _stream_shared_physical_records(
 class SharedBlockReadOnceScope:
     """Read each immutable payload at most once within one bounded request."""
 
-    def __init__(self, *, max_retained_raw_bytes: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_retained_raw_bytes: int,
+        max_retained_mapping_bytes: int = (_SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES),
+    ) -> None:
         retained_limit = int(max_retained_raw_bytes)
         if retained_limit < 1:
             raise ValueError("shared PTG retained byte limit must be positive")
+        retained_mapping_limit = int(max_retained_mapping_bytes)
+        if retained_mapping_limit < _SHARED_MAPPING_RECORD_RETAINED_BYTES:
+            raise ValueError("shared PTG mapping-metadata byte limit is too small")
         self._max_retained_raw_bytes = retained_limit
+        self._max_mapping_records = (
+            retained_mapping_limit // _SHARED_MAPPING_RECORD_RETAINED_BYTES
+        )
+        self._decoded_retention_budget: GraphDecodedRetentionBudget | None = None
         self._seen_physical_identities: set[tuple[str, bytes]] = set()
         self._delivered_coordinates: set[tuple[str, int, str, int, int]] = set()
         self._physical_rows_read = 0
         self._payload_decode_count = 0
         self._prepared_physical_identities: set[tuple[str, bytes]] = set()
-        self._registered_logical_identities: set[
-            tuple[str, tuple[bytes, ...]]
-        ] = set()
-        self._processed_logical_identities: set[
-            tuple[str, tuple[bytes, ...]]
-        ] = set()
+        self._registered_logical_identities: set[tuple[str, tuple[bytes, ...]]] = set()
+        self._processed_logical_identities: set[tuple[str, tuple[bytes, ...]]] = set()
         self._peak_raw_bytes = 0
         self._poisoned_reason: str | None = None
         self._lock = asyncio.Lock()
@@ -537,25 +668,18 @@ class SharedBlockReadOnceScope:
         return {
             "logical_block_deliveries": logical_deliveries,
             "physical_mapping_references": logical_deliveries,
-            "physical_mapping_aliases": (
-                logical_deliveries - unique_physical_blocks
-            ),
+            "physical_mapping_aliases": (logical_deliveries - unique_physical_blocks),
             "unique_physical_blocks": unique_physical_blocks,
             "physical_block_reads": self._physical_rows_read,
             "physical_block_decodes": self._payload_decode_count,
-            "physical_payload_preparations": len(
-                self._prepared_physical_identities
-            ),
+            "physical_payload_preparations": len(self._prepared_physical_identities),
             "expected_logical_payload_processes": len(
                 self._registered_logical_identities
             ),
-            "logical_payload_processes": len(
-                self._processed_logical_identities
-            ),
+            "logical_payload_processes": len(self._processed_logical_identities),
             "logical_payload_fragment_references": logical_fragment_references,
             "logical_payload_fragment_aliases": (
-                logical_fragment_references
-                - len(logically_referenced_physical_blocks)
+                logical_fragment_references - len(logically_referenced_physical_blocks)
             ),
             "repeated_physical_reads": (
                 self._physical_rows_read - unique_physical_blocks
@@ -574,6 +698,21 @@ class SharedBlockReadOnceScope:
 
         return self._max_retained_raw_bytes
 
+    def bind_decoded_retention_budget(
+        self,
+        retention_budget: GraphDecodedRetentionBudget,
+    ) -> None:
+        """Bind mapping metadata to the candidate's single decoded budget."""
+
+        if (
+            self._decoded_retention_budget is not None
+            and self._decoded_retention_budget is not retention_budget
+        ):
+            raise PTG2SharedBlockError(
+                "shared PTG read-once scope has conflicting decoded budgets"
+            )
+        self._decoded_retention_budget = retention_budget
+
     def assert_read_once(self) -> None:
         """Fail unless every unique physical hash had one row and one decode."""
 
@@ -582,7 +721,10 @@ class SharedBlockReadOnceScope:
                 f"shared PTG read-once scope is poisoned: {self._poisoned_reason}"
             )
         unique_count = len(self._seen_physical_identities)
-        if unique_count != self._physical_rows_read or unique_count != self._payload_decode_count:
+        if (
+            unique_count != self._physical_rows_read
+            or unique_count != self._payload_decode_count
+        ):
             raise PTG2SharedBlockError(
                 "shared PTG read-once ledger does not prove one read and decode per block"
             )
@@ -618,9 +760,7 @@ class SharedBlockReadOnceScope:
             raise PTG2SharedBlockError(
                 "shared PTG logical payload registration has an unread fragment"
             )
-        self._registered_logical_identities.add(
-            (str(schema_name), normalized_hashes)
-        )
+        self._registered_logical_identities.add((str(schema_name), normalized_hashes))
 
     def claim_logical_payload_processing(
         self,
@@ -668,14 +808,10 @@ class SharedBlockReadOnceScope:
         }
         if (
             self._prepared_physical_identities != self._seen_physical_identities
-            or self._processed_logical_identities
-            != self._registered_logical_identities
-            or logically_processed_physical_identities
-            != self._seen_physical_identities
+            or self._processed_logical_identities != self._registered_logical_identities
+            or logically_processed_physical_identities != self._seen_physical_identities
         ):
-            raise PTG2SharedBlockError(
-                "shared PTG processing ledger is incomplete"
-            )
+            raise PTG2SharedBlockError("shared PTG processing ledger is incomplete")
 
     def _raise_if_poisoned(self) -> None:
         if self._poisoned_reason is not None:
@@ -729,55 +865,64 @@ class SharedBlockReadOnceScope:
     ) -> tuple[SharedBlockPayload, ...]:
         """Execute one serialized mapping, physical fetch, and delivery cycle."""
 
-        mapping_records = await _shared_mapping_records(session, request)
-        selection = self._validated_mapping_selection(request, mapping_records)
-        _require_complete_shared_mapping(request, selection)
-        physical_blocks_by_hash = await self._physical_blocks_by_hash(
+        selection = await self._validated_mapping_selection(
             session,
             request,
-            selection.physical_hashes,
         )
-        deliveries = self._mapping_deliveries(
-            request,
-            selection.mapping_records,
-            physical_blocks_by_hash,
-        )
-        self.assert_read_once()
-        return deliveries
-
-    def _validated_mapping_selection(
-        self,
-        request: _SharedBlockReadRequest,
-        mapping_records: tuple[dict[str, Any], ...],
-    ) -> _SharedMappingSelection:
-        observed_block_keys: set[int] = set()
-        fragment_nos_by_block_key: dict[int, set[int]] = {}
-        physical_hashes: set[bytes] = set()
-        previous_coordinate: tuple[int, int] | None = None
-        for mapping_record in mapping_records:
-            coordinate, physical_hash = _validated_mapping_coordinate(
+        try:
+            _require_complete_shared_mapping(request, selection)
+            physical_blocks_by_hash = await self._physical_blocks_by_hash(
+                session,
                 request,
-                mapping_record,
-                previous_coordinate=previous_coordinate,
+                selection.physical_hashes,
             )
-            delivery_key = _shared_delivery_key(request, coordinate)
-            if delivery_key in self._delivered_coordinates:
-                raise PTG2SharedBlockError(
-                    "shared PTG logical block was requested more than once"
+            deliveries = self._mapping_deliveries(
+                request,
+                selection.mapping_records,
+                physical_blocks_by_hash,
+            )
+            self.assert_read_once()
+            return deliveries
+        except BaseException:
+            if (
+                self._decoded_retention_budget is not None
+                and selection.retained_metadata_bytes
+            ):
+                self._decoded_retention_budget.release(
+                    selection.retained_metadata_bytes
                 )
-            previous_coordinate = coordinate
-            observed_block_keys.add(coordinate[0])
-            fragment_nos_by_block_key.setdefault(coordinate[0], set()).add(coordinate[1])
-            physical_hashes.add(physical_hash)
-        return _SharedMappingSelection(
-            mapping_records=mapping_records,
-            observed_block_keys=frozenset(observed_block_keys),
-            fragment_nos_by_block_key={
-                block_key: frozenset(fragment_nos)
-                for block_key, fragment_nos in fragment_nos_by_block_key.items()
-            },
-            physical_hashes=frozenset(physical_hashes),
+            raise
+
+    async def _validated_mapping_selection(
+        self,
+        session: Any,
+        request: _SharedBlockReadRequest,
+    ) -> _SharedMappingSelection:
+        """Stream and validate metadata within count and byte limits."""
+
+        maximum_records = self._max_mapping_records
+        if request.has_fragment_filter:
+            maximum_records = min(
+                maximum_records,
+                len(request.block_keys) * len(request.fragment_nos),
+            )
+        query_row_limit = maximum_records + 1
+        accumulator = _SharedMappingAccumulator(
+            request,
+            self._delivered_coordinates,
+            self._decoded_retention_budget,
         )
+        try:
+            async for raw_mapping_record in _stream_shared_mapping_records(
+                session,
+                request,
+                row_limit=max(query_row_limit, 1),
+            ):
+                accumulator.append(raw_mapping_record, maximum_records)
+        except BaseException:
+            accumulator.release()
+            raise
+        return accumulator.selection()
 
     async def _physical_blocks_by_hash(
         self,
@@ -802,7 +947,10 @@ class SharedBlockReadOnceScope:
             physical_hashes,
         ):
             returned_hash = bytes(physical_record.get("block_hash") or b"")
-            if returned_hash not in physical_hashes or returned_hash in physical_blocks_by_hash:
+            if (
+                returned_hash not in physical_hashes
+                or returned_hash in physical_blocks_by_hash
+            ):
                 raise PTG2SharedBlockError(
                     "shared PTG physical block query returned an unexpected row"
                 )
@@ -870,6 +1018,7 @@ _ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE: ContextVar[
 def shared_block_read_once_scope(
     *,
     max_retained_raw_bytes: int,
+    max_retained_mapping_bytes: int = (_SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES),
 ) -> Iterator[SharedBlockReadOnceScope]:
     """Create one non-nested request-local read-once scope."""
 
@@ -877,12 +1026,23 @@ def shared_block_read_once_scope(
         raise PTG2SharedBlockError("shared PTG read-once scopes cannot be nested")
     reader = SharedBlockReadOnceScope(
         max_retained_raw_bytes=max_retained_raw_bytes,
+        max_retained_mapping_bytes=max_retained_mapping_bytes,
     )
     token = _ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE.set(reader)
     try:
         yield reader
     finally:
         _ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE.reset(token)
+
+
+def bind_shared_block_decoded_retention_budget(
+    retention_budget: GraphDecodedRetentionBudget,
+) -> None:
+    """Attach the active read-once scope to one candidate decoded budget."""
+
+    read_once_scope = _ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE.get()
+    if read_once_scope is not None:
+        read_once_scope.bind_decoded_retention_budget(retention_budget)
 
 
 def claim_shared_block_processing(*, schema_name: str, block_hash: bytes) -> None:
@@ -1138,48 +1298,35 @@ async def fetch_snapshot_source_set_metadata(
     return source_set
 
 
-async def fetch_snapshot_source_set_identity(
-    session: Any,
-    *,
-    schema_name: str,
-    logical_snapshot_id: str,
-    expected_source_count: int,
-) -> tuple[dict[str, Any], str, tuple[str, ...]]:
-    """Return set, ordered identity, and raw hashes from one source-row read."""
+async def _snapshot_source_identity_rows(
+    query_result: Any,
+    retention_budget: GraphDecodedRetentionBudget | None,
+) -> tuple[list[dict[str, Any]], int]:
+    retained_metadata_bytes = 0
+    metadata_rows: list[dict[str, Any]] = []
+    try:
+        async for metadata_row in _iterate_shared_query_rows(query_result):
+            if retention_budget is not None:
+                retention_budget.claim(
+                    _SOURCE_IDENTITY_RECORD_RETAINED_BYTES,
+                    category="a snapshot source identity record",
+                )
+                retained_metadata_bytes += _SOURCE_IDENTITY_RECORD_RETAINED_BYTES
+            metadata_rows.append(_row_mapping(metadata_row))
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_metadata_bytes)
+        raise
+    return metadata_rows, retained_metadata_bytes
 
-    source_count = int(expected_source_count)
-    dense_source_key_bits(source_count)
-    if source_count > PTG2_V3_MAX_AUDIT_SOURCE_FILES:
-        raise PTG2SharedBlockError(
-            "shared PTG audit source set exceeds the bounded verification limit"
-        )
-    snapshot_id = str(logical_snapshot_id or "").strip()
-    if not snapshot_id:
-        raise PTG2SharedBlockError("shared PTG logical snapshot id is missing")
-    schema = _quote_ident(schema_name)
-    query_result = await session.execute(
-        text(
-            f"""
-            SELECT source_key, raw_container_sha256
-              FROM {schema}.ptg2_v3_snapshot_source
-             WHERE snapshot_id = :snapshot_id
-             ORDER BY source_key
-             LIMIT :row_limit
-            """
-        ),
-        {
-            "snapshot_id": snapshot_id,
-            "row_limit": source_count + 1,
-        },
-    )
-    metadata_rows = [
-        _row_mapping(metadata_row) for metadata_row in query_result
-    ]
-    if (
-        len(metadata_rows) != source_count
-        or [metadata_row.get("source_key") for metadata_row in metadata_rows]
-        != list(range(source_count))
-    ):
+
+def _snapshot_source_identity(
+    metadata_rows: list[dict[str, Any]],
+    source_count: int,
+) -> tuple[dict[str, Any], str, tuple[str, ...]]:
+    if len(metadata_rows) != source_count or [
+        metadata_row.get("source_key") for metadata_row in metadata_rows
+    ] != list(range(source_count)):
         raise PTG2SharedBlockError(
             "shared PTG source metadata is not complete and dense"
         )
@@ -1197,6 +1344,57 @@ async def fetch_snapshot_source_set_identity(
         raise PTG2SharedBlockError(
             "shared PTG source-set identity metadata is invalid"
         ) from exc
+
+
+async def fetch_snapshot_source_set_identity(
+    session: Any,
+    *,
+    schema_name: str,
+    logical_snapshot_id: str,
+    expected_source_count: int,
+    retention_budget: GraphDecodedRetentionBudget | None = None,
+) -> tuple[dict[str, Any], str, tuple[str, ...]]:
+    """Return set, ordered identity, and raw hashes from one source-row read."""
+
+    source_count = int(expected_source_count)
+    dense_source_key_bits(source_count)
+    if source_count > PTG2_V3_MAX_AUDIT_SOURCE_FILES:
+        raise PTG2SharedBlockError(
+            "shared PTG audit source set exceeds the bounded verification limit"
+        )
+    snapshot_id = str(logical_snapshot_id or "").strip()
+    if not snapshot_id:
+        raise PTG2SharedBlockError("shared PTG logical snapshot id is missing")
+    schema = _quote_ident(schema_name)
+    statement = text(
+        f"""
+            SELECT source_key, raw_container_sha256
+              FROM {schema}.ptg2_v3_snapshot_source
+             WHERE snapshot_id = :snapshot_id
+             ORDER BY source_key
+             LIMIT :row_limit
+            """
+    )
+    params_by_name = {
+        "snapshot_id": snapshot_id,
+        "row_limit": source_count + 1,
+    }
+    stream = getattr(session, "stream", None)
+    query_result = (
+        await stream(statement, params_by_name)
+        if callable(stream)
+        else await session.execute(statement, params_by_name)
+    )
+    metadata_rows, retained_metadata_bytes = await _snapshot_source_identity_rows(
+        query_result,
+        retention_budget,
+    )
+    try:
+        return _snapshot_source_identity(metadata_rows, source_count)
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(retained_metadata_bytes)
+        raise
 
 
 async def fetch_snapshot_source_provenance(
@@ -1359,59 +1557,80 @@ async def fetch_snapshot_source_provenance(
     return provenance_by_key
 
 
-def _selected_graph_bytes(
+def _iter_selected_graph_members(
     raw_chunks_by_key: Mapping[int, bytes],
     *,
     first_chunk: int,
     member_offset: int,
-    byte_count: int,
-) -> bytes:
-    remaining = int(byte_count)
-    if remaining == 0:
-        return b""
+    member_count: int,
+    member_width: int,
+) -> Iterator[int]:
+    """Decode selected members without retaining a contiguous byte copy."""
+
+    remaining_members = int(member_count)
+    if remaining_members == 0:
+        return
+    width = int(member_width)
     chunk_key = int(first_chunk)
     chunk_offset = int(member_offset)
-    selected_parts: list[memoryview] = []
-    while remaining:
+    while remaining_members:
         chunk = raw_chunks_by_key.get(chunk_key)
         if chunk is None or chunk_offset < 0 or chunk_offset >= len(chunk):
             raise PTG2SharedBlockError("shared PTG graph member stream is truncated")
-        selected_count = min(remaining, len(chunk) - chunk_offset)
-        selected_parts.append(memoryview(chunk)[chunk_offset : chunk_offset + selected_count])
-        remaining -= selected_count
-        chunk_key += 1
-        chunk_offset = 0
-    return b"".join(selected_parts)
+        member_end = chunk_offset + width
+        if member_end <= len(chunk):
+            yield int.from_bytes(
+                chunk[chunk_offset:member_end],
+                "little",
+                signed=False,
+            )
+            remaining_members -= 1
+            chunk_offset = member_end
+            if chunk_offset == len(chunk):
+                chunk_key += 1
+                chunk_offset = 0
+            continue
+
+        member_value = 0
+        member_shift = 0
+        remaining_member_bytes = width
+        while remaining_member_bytes:
+            chunk = raw_chunks_by_key.get(chunk_key)
+            if chunk is None or chunk_offset < 0 or chunk_offset >= len(chunk):
+                raise PTG2SharedBlockError(
+                    "shared PTG graph member stream is truncated"
+                )
+            selected_count = min(
+                remaining_member_bytes,
+                len(chunk) - chunk_offset,
+            )
+            for selected_byte in chunk[chunk_offset : chunk_offset + selected_count]:
+                member_value |= int(selected_byte) << member_shift
+                member_shift += 8
+            chunk_offset += selected_count
+            remaining_member_bytes -= selected_count
+            if chunk_offset == len(chunk):
+                chunk_key += 1
+                chunk_offset = 0
+        yield member_value
+        remaining_members -= 1
 
 
 async def _fetch_shared_graph_members_read_once(
     session: Any,
     request: _SharedGraphReadRequest,
+    retention_budget: GraphDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Resolve all owners through unique request-local graph chunks."""
 
     read_once_scope = _ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE.get()
     if read_once_scope is None:
         raise PTG2SharedBlockError("shared PTG graph read-once scope is missing")
-    owner_records = await _shared_graph_owner_records(session, request)
-    owner_selection = _validated_graph_owner_selection(
-        request,
-        owner_records,
-        maximum_raw_bytes=read_once_scope.maximum_raw_bytes,
-    )
-    chunks_by_key = await fetch_shared_blocks(
+    return await _fetch_shared_graph_members_preflight(
         session,
-        schema_name=request.schema_name,
-        snapshot_key=request.snapshot_key,
-        object_kind=request.object_kind,
-        block_keys=owner_selection.required_chunk_keys,
-        require_all=True,
-    )
-    raw_chunks_by_key = _validated_graph_chunks(request, chunks_by_key)
-    return _decoded_scoped_graph_members(
         request,
-        owner_selection.locator_by_owner,
-        raw_chunks_by_key,
+        maximum_raw_bytes=read_once_scope.maximum_raw_bytes,
+        retention_budget=retention_budget,
     )
 
 
@@ -1421,7 +1640,7 @@ class _SharedGraphReadRequest:
     snapshot_key: int
     direction: int
     owner_keys: tuple[int, ...]
-    owner_key_set: frozenset[int]
+    owner_key_set: set[int]
     object_kind: str
     member_width: int
     member_count_sql: str
@@ -1431,7 +1650,110 @@ class _SharedGraphReadRequest:
 @dataclass(frozen=True)
 class _GraphOwnerSelection:
     locator_by_owner: dict[int, tuple[int, int, int, int]]
-    required_chunk_keys: frozenset[int]
+    required_chunk_keys: set[int]
+
+
+@dataclass
+class _GraphPreflightClaim:
+    retained_bytes: int = 0
+
+    def reserve(
+        self,
+        retention_budget: GraphDecodedRetentionBudget | None,
+        byte_count: int,
+        *,
+        category: str,
+    ) -> None:
+        """Reserve preflight bytes and remember them for guaranteed cleanup."""
+
+        if retention_budget is None:
+            return
+        retention_budget.claim(byte_count, category=category)
+        self.retained_bytes += byte_count
+
+
+async def _fetch_shared_graph_members_preflight(
+    session: Any,
+    request: _SharedGraphReadRequest,
+    *,
+    maximum_raw_bytes: int | None,
+    retention_budget: GraphDecodedRetentionBudget | None,
+) -> dict[int, tuple[int, ...]]:
+    """Preflight graph metadata and decoded size before payload retrieval."""
+
+    preflight_claim = _GraphPreflightClaim()
+    preflight_claim.reserve(
+        retention_budget,
+        _GRAPH_PREFLIGHT_BYTES + len(request.owner_keys) * _GRAPH_PREFLIGHT_OWNER_BYTES,
+        category="shared graph owner preflight metadata",
+    )
+    retained_result_bytes = 0
+    try:
+        owner_records = await _shared_graph_owner_records(session, request)
+        owner_selection = _validated_graph_owner_selection(
+            request,
+            owner_records,
+            maximum_raw_bytes=maximum_raw_bytes,
+            retention_budget=retention_budget,
+            preflight_claim=preflight_claim,
+        )
+        retained_result_bytes = _claim_graph_result_retention(
+            request,
+            owner_selection.locator_by_owner,
+            retention_budget,
+        )
+        chunks_by_key = await fetch_shared_blocks(
+            session,
+            schema_name=request.schema_name,
+            snapshot_key=request.snapshot_key,
+            object_kind=request.object_kind,
+            block_keys=owner_selection.required_chunk_keys,
+            require_all=True,
+        )
+        raw_chunks_by_key = _validated_graph_chunks(request, chunks_by_key)
+        members_by_owner = _decoded_scoped_graph_members(
+            request,
+            owner_selection.locator_by_owner,
+            raw_chunks_by_key,
+        )
+    except BaseException:
+        if retention_budget is not None and retained_result_bytes:
+            retention_budget.release(retained_result_bytes)
+        raise
+    finally:
+        if retention_budget is not None and preflight_claim.retained_bytes:
+            retention_budget.release(preflight_claim.retained_bytes)
+    return members_by_owner
+
+
+def _claim_graph_result_retention(
+    request: _SharedGraphReadRequest,
+    locator_by_owner: Mapping[int, tuple[int, int, int, int]],
+    retention_budget: GraphDecodedRetentionBudget | None,
+) -> int:
+    """Claim every graph result owner before payload retrieval and decoding."""
+
+    if retention_budget is None:
+        return 0
+    retained_result_bytes = 0
+    try:
+        for owner_key in request.owner_keys:
+            locator = locator_by_owner.get(owner_key)
+            selected_member_count = 0 if locator is None else locator[3]
+            owner_bytes = (
+                _GRAPH_RESULT_OWNER_BYTES
+                + selected_member_count * _GRAPH_RESULT_MEMBERSHIP_BYTES
+            )
+            retention_budget.claim(
+                owner_bytes,
+                category="a decoded shared graph result owner",
+            )
+            retained_result_bytes += owner_bytes
+    except BaseException:
+        if retained_result_bytes:
+            retention_budget.release(retained_result_bytes)
+        raise
+    return retained_result_bytes
 
 
 def _shared_graph_read_request(
@@ -1440,6 +1762,7 @@ def _shared_graph_read_request(
     snapshot_key: int,
     direction: int,
     owner_keys: tuple[int, ...],
+    owner_key_set: set[int] | None = None,
     max_members: int | None,
 ) -> _SharedGraphReadRequest:
     try:
@@ -1469,7 +1792,7 @@ def _shared_graph_read_request(
         snapshot_key=int(snapshot_key),
         direction=int(direction),
         owner_keys=owner_keys,
-        owner_key_set=frozenset(owner_keys),
+        owner_key_set=set(owner_keys) if owner_key_set is None else owner_key_set,
         object_kind=object_kind,
         member_width=member_width,
         member_count_sql=member_count_sql,
@@ -1508,26 +1831,25 @@ def _validated_graph_owner_selection(
     request: _SharedGraphReadRequest,
     owner_records: tuple[dict[str, Any], ...],
     *,
-    maximum_raw_bytes: int,
+    maximum_raw_bytes: int | None,
+    retention_budget: GraphDecodedRetentionBudget | None = None,
+    preflight_claim: _GraphPreflightClaim | None = None,
 ) -> _GraphOwnerSelection:
     """Validate owner locators and collect each required physical chunk once."""
 
     locator_by_owner: dict[int, tuple[int, int, int, int]] = {}
     required_chunk_keys: set[int] = set()
     selected_byte_ranges: list[tuple[int, int]] = []
+    active_preflight_claim = preflight_claim or _GraphPreflightClaim()
     previous_owner_key: int | None = None
-    maximum_chunk_count = max(
-        1,
-        (int(maximum_raw_bytes) + PTG2_V3_GRAPH_CHUNK_BYTES - 1)
-        // PTG2_V3_GRAPH_CHUNK_BYTES,
-    )
+    maximum_chunk_count = _maximum_graph_chunk_count(maximum_raw_bytes)
     for owner_record in owner_records:
         owner_key, locator = _validated_graph_owner_locator(
             request,
             owner_record,
             previous_owner_key,
         )
-        first_chunk, member_offset, member_count, selected_member_count = locator
+        first_chunk, member_offset, _member_count, selected_member_count = locator
         previous_owner_key = owner_key
         locator_by_owner[owner_key] = locator
         selected_byte_count = selected_member_count * request.member_width
@@ -1540,21 +1862,20 @@ def _validated_graph_owner_selection(
                 (member_offset + selected_byte_count - 1)
                 // PTG2_V3_GRAPH_CHUNK_BYTES
             )
-            if last_chunk - first_chunk + 1 > maximum_chunk_count:
-                raise PTG2SharedBlockError(
-                    "shared PTG graph owner exceeds the read-once byte limit"
-                )
-            required_chunk_keys.update(range(first_chunk, last_chunk + 1))
-            if len(required_chunk_keys) > maximum_chunk_count:
-                raise PTG2SharedBlockError(
-                    "shared PTG graph chunks exceed the read-once byte limit"
-                )
-    ordered_ranges = sorted(selected_byte_ranges)
+            _retain_graph_chunk_range(
+                required_chunk_keys,
+                first_chunk,
+                last_chunk,
+                maximum_chunk_count,
+                retention_budget,
+                active_preflight_claim,
+            )
+    selected_byte_ranges.sort()
     if any(
         right_start < left_end
         for (_left_start, left_end), (right_start, _right_end) in zip(
-            ordered_ranges,
-            ordered_ranges[1:],
+            selected_byte_ranges,
+            selected_byte_ranges[1:],
         )
     ):
         raise PTG2SharedBlockError(
@@ -1562,8 +1883,55 @@ def _validated_graph_owner_selection(
         )
     return _GraphOwnerSelection(
         locator_by_owner=locator_by_owner,
-        required_chunk_keys=frozenset(required_chunk_keys),
+        required_chunk_keys=required_chunk_keys,
     )
+
+
+def _maximum_graph_chunk_count(maximum_raw_bytes: int | None) -> int | None:
+    """Convert an optional raw-byte bound into its physical chunk bound."""
+
+    if maximum_raw_bytes is None:
+        return None
+    return max(
+        1,
+        (int(maximum_raw_bytes) + PTG2_V3_GRAPH_CHUNK_BYTES - 1)
+        // PTG2_V3_GRAPH_CHUNK_BYTES,
+    )
+
+
+def _retain_graph_chunk_range(
+    required_chunk_keys: set[int],
+    first_chunk: int,
+    last_chunk: int,
+    maximum_chunk_count: int | None,
+    retention_budget: GraphDecodedRetentionBudget | None,
+    preflight_claim: _GraphPreflightClaim,
+) -> None:
+    """Retain unique chunk keys after both raw and decoded limit checks."""
+
+    if (
+        maximum_chunk_count is not None
+        and last_chunk - first_chunk + 1 > maximum_chunk_count
+    ):
+        raise SharedGraphReadLimitError(
+            "shared PTG graph owner exceeds the read-once byte limit"
+        )
+    for chunk_key in range(first_chunk, last_chunk + 1):
+        if chunk_key in required_chunk_keys:
+            continue
+        if (
+            maximum_chunk_count is not None
+            and len(required_chunk_keys) >= maximum_chunk_count
+        ):
+            raise SharedGraphReadLimitError(
+                "shared PTG graph chunks exceed the read-once byte limit"
+            )
+        preflight_claim.reserve(
+            retention_budget,
+            _GRAPH_PREFLIGHT_CHUNK_MEMBERSHIP_BYTES,
+            category="a shared graph preflight chunk key",
+        )
+        required_chunk_keys.add(chunk_key)
 
 
 def _validated_graph_owner_locator(
@@ -1653,21 +2021,65 @@ def _decoded_scoped_graph_members(
             members_by_owner[owner_key] = ()
             continue
         first_chunk, member_offset, _member_count, selected_member_count = locator
-        selected = _selected_graph_bytes(
-            raw_chunks_by_key,
-            first_chunk=first_chunk,
-            member_offset=member_offset,
-            byte_count=selected_member_count * request.member_width,
-        )
         members_by_owner[owner_key] = tuple(
-            int.from_bytes(
-                selected[offset : offset + request.member_width],
-                "little",
-                signed=False,
+            _iter_selected_graph_members(
+                raw_chunks_by_key,
+                first_chunk=first_chunk,
+                member_offset=member_offset,
+                member_count=selected_member_count,
+                member_width=request.member_width,
             )
-            for offset in range(0, len(selected), request.member_width)
         )
     return members_by_owner
+
+
+def _budgeted_graph_owner_keys(
+    owner_keys: Iterable[int],
+    retention_budget: GraphDecodedRetentionBudget,
+) -> tuple[tuple[int, ...], set[int], int]:
+    """Normalize graph owners while claiming every transient container peak."""
+
+    retained_set_bytes = _GRAPH_OWNER_SET_BYTES
+    retention_budget.claim(
+        retained_set_bytes,
+        category="the shared graph owner normalization set",
+    )
+    ordering_bytes = 0
+    owner_key_set: set[int] = set()
+    try:
+        for raw_owner_key in owner_keys:
+            owner_key = int(raw_owner_key)
+            if owner_key in owner_key_set:
+                continue
+            retention_budget.claim(
+                _GRAPH_OWNER_SET_MEMBERSHIP_BYTES,
+                category="a shared graph normalized owner key",
+            )
+            retained_set_bytes += _GRAPH_OWNER_SET_MEMBERSHIP_BYTES
+            owner_key_set.add(owner_key)
+        owner_count = len(owner_key_set)
+        ordering_bytes = (
+            _GRAPH_OWNER_ORDERING_BYTES
+            + owner_count * _GRAPH_OWNER_ORDERING_MEMBERSHIP_BYTES
+        )
+        retention_budget.claim(
+            ordering_bytes,
+            category="the ordered shared graph owner keys",
+        )
+        requested_owner_keys = tuple(sorted(owner_key_set))
+        retained_tuple_bytes = (
+            _GRAPH_OWNER_TUPLE_BYTES + owner_count * _GRAPH_OWNER_TUPLE_MEMBERSHIP_BYTES
+        )
+        retention_budget.release(ordering_bytes - retained_tuple_bytes)
+        ordering_bytes = retained_tuple_bytes
+    except BaseException:
+        retention_budget.release(retained_set_bytes + ordering_bytes)
+        raise
+    return (
+        requested_owner_keys,
+        owner_key_set,
+        retained_set_bytes + retained_tuple_bytes,
+    )
 
 
 async def fetch_shared_graph_members(
@@ -1678,28 +2090,71 @@ async def fetch_shared_graph_members(
     direction: int,
     owner_keys: Iterable[int],
     max_members: int | None = None,
+    retention_budget: GraphDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    """Resolve one dense graph direction in one PostgreSQL round trip."""
+    """Resolve one dense graph direction after an optional bounded preflight."""
 
-    requested_owner_keys = tuple(sorted({int(owner_key) for owner_key in owner_keys}))
+    if retention_budget is None:
+        requested_owner_key_set = {
+            int(owner_key) for owner_key in owner_keys
+        }
+        requested_owner_keys = tuple(sorted(requested_owner_key_set))
+        retained_owner_key_bytes = 0
+    else:
+        (
+            requested_owner_keys,
+            requested_owner_key_set,
+            retained_owner_key_bytes,
+        ) = (
+            _budgeted_graph_owner_keys(owner_keys, retention_budget)
+        )
     if not requested_owner_keys:
+        if retention_budget is not None:
+            retention_budget.release(retained_owner_key_bytes)
         return {}
-    request = _shared_graph_read_request(
-        schema_name=schema_name,
-        snapshot_key=snapshot_key,
-        direction=direction,
-        owner_keys=requested_owner_keys,
-        max_members=max_members,
-    )
-    if _ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE.get() is not None:
-        return await _fetch_shared_graph_members_read_once(session, request)
-    return await _fetch_shared_graph_members_direct(session, request)
+    try:
+        if retention_budget is not None:
+            retention_budget.claim(
+                _GRAPH_REQUEST_METADATA_BYTES,
+                category="shared graph request metadata",
+            )
+            retained_owner_key_bytes += _GRAPH_REQUEST_METADATA_BYTES
+        request = _shared_graph_read_request(
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            direction=direction,
+            owner_keys=requested_owner_keys,
+            owner_key_set=requested_owner_key_set,
+            max_members=max_members,
+        )
+        if _ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE.get() is not None:
+            return await _fetch_shared_graph_members_read_once(
+                session,
+                request,
+                retention_budget,
+            )
+        return await _fetch_shared_graph_members_direct(
+            session,
+            request,
+            retention_budget,
+        )
+    finally:
+        if retention_budget is not None and retained_owner_key_bytes:
+            retention_budget.release(retained_owner_key_bytes)
 
 
 async def _fetch_shared_graph_members_direct(
     session: Any,
     request: _SharedGraphReadRequest,
+    retention_budget: GraphDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
+    if retention_budget is not None:
+        return await _fetch_shared_graph_members_preflight(
+            session,
+            request,
+            maximum_raw_bytes=None,
+            retention_budget=retention_budget,
+        )
     schema = _quote_ident(request.schema_name)
     query_result = await session.execute(
         text(
@@ -1771,7 +2226,10 @@ def _indexed_direct_graph_records(
             raise PTG2SharedBlockError(
                 "shared PTG graph owner member count is invalid"
             )
-        previous_locator = locator_by_owner.setdefault(owner_key, locator)
+        previous_locator = locator_by_owner.get(owner_key)
+        if previous_locator is None:
+            locator_by_owner[owner_key] = locator
+            previous_locator = locator
         if previous_locator != locator:
             raise PTG2SharedBlockError("shared PTG graph owner locator changed within one query")
         chunks_by_owner.setdefault(owner_key, []).append(
