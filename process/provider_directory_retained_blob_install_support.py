@@ -182,8 +182,6 @@ def _require_install_platform() -> None:
     _require_descriptor_install_platform()
     if not sys.platform.startswith("linux") or _TMPFILE_FLAG is None:
         raise RetainedArtifactError("retained_blob_install_unavailable")
-    if os.link not in os.supports_follow_symlinks:
-        raise RetainedArtifactError("retained_blob_install_unavailable")
     try:
         proc_fd_state = os.stat(_PROC_SELF_FD_DIRECTORY)
     except OSError as error:
@@ -210,7 +208,6 @@ def _link_open_descriptor(
             source_descriptor_path,
             target_leaf_name,
             dst_dir_fd=target_directory_descriptor,
-            follow_symlinks=True,
         )
     except FileExistsError:
         raise

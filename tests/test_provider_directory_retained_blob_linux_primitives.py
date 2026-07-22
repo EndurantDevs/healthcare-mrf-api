@@ -28,11 +28,6 @@ def _mock_supported_linux(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         install_io.os,
-        "supports_follow_symlinks",
-        {install_io.os.link},
-    )
-    monkeypatch.setattr(
-        install_io.os,
         "stat",
         lambda *args, **kwargs: SimpleNamespace(st_mode=stat.S_IFDIR),
     )
@@ -42,12 +37,13 @@ def test_linux_publication_capability_probe_accepts_complete_platform(
     monkeypatch,
 ) -> None:
     _mock_supported_linux(monkeypatch)
+    monkeypatch.setattr(install_io.os, "supports_follow_symlinks", set())
     install_io._require_install_platform()
 
 
 @pytest.mark.parametrize(
     "missing_capability",
-    ("platform", "tmpfile", "follow", "proc_missing", "proc_not_directory"),
+    ("platform", "tmpfile", "proc_missing", "proc_not_directory"),
 )
 def test_linux_publication_capability_probe_fails_closed(
     monkeypatch,
@@ -58,8 +54,6 @@ def test_linux_publication_capability_probe_fails_closed(
         monkeypatch.setattr(install_io.sys, "platform", "darwin")
     elif missing_capability == "tmpfile":
         monkeypatch.setattr(install_io, "_TMPFILE_FLAG", None)
-    elif missing_capability == "follow":
-        monkeypatch.setattr(install_io.os, "supports_follow_symlinks", set())
     elif missing_capability == "proc_missing":
         monkeypatch.setattr(
             install_io.os,
@@ -100,7 +94,7 @@ def test_procfd_link_uses_open_descriptor_and_no_source_path(
     assert link_call_by_field == {
         "source_pathname": f"/proc/self/fd/{source_descriptor}",
         "target_name": "canonical",
-        "kwargs": {"dst_dir_fd": 123, "follow_symlinks": True},
+        "kwargs": {"dst_dir_fd": 123},
     }
 
 
