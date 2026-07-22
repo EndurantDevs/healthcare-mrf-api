@@ -6,6 +6,11 @@ use std::collections::BTreeMap;
 use std::io;
 
 pub const PROVIDER_DIRECTORY_PROJECTION_COPY_MAGIC: &[u8] = b"HPPDCOPY\0\0\0\x02";
+pub const PROVIDER_DIRECTORY_PROJECTION_DECODER_CONTRACT_ID: &str =
+    "healthporta.provider-directory.fhir-json-decoder.v1";
+pub const PROVIDER_DIRECTORY_PROJECTION_MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
+pub const PROVIDER_DIRECTORY_PROJECTION_MAX_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
+pub const PROVIDER_DIRECTORY_PROJECTION_MAX_RESOURCE_COUNT: usize = 100_000;
 pub const COPY_SPOOL_CONTRACT_ID: &str =
     "healthporta.provider-directory.native-projection-copy-spool.v2";
 pub const TRANSFORM_CONTRACT_ID: &str = "healthporta.provider-directory.fhir-profile-projection.v2";
@@ -24,6 +29,31 @@ pub const MAX_COPY_STREAM_BYTES: usize = 128 * 1024 * 1024;
 pub const PROVIDER_DIRECTORY_PROJECTION_COPY_MAX_OWNED_IO_BYTES: usize =
     32 * 1024 * 1024 + MAX_COPY_STREAM_BYTES + MAX_COPY_SUMMARY_BYTES + 32;
 pub const COPY_FIELD_COUNT: i16 = 18;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderDirectoryInputFraming {
+    Ndjson,
+    Bundle,
+}
+
+impl ProviderDirectoryInputFraming {
+    pub fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "ndjson" => Ok(Self::Ndjson),
+            "bundle" => Ok(Self::Bundle),
+            _ => Err(invalid_input(
+                "provider-directory projection framing must be ndjson or bundle",
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ndjson => "ndjson",
+            Self::Bundle => "bundle",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionCopyContext {

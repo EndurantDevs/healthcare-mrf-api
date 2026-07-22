@@ -89,11 +89,7 @@ fn write_optional_text(text: Option<&str>, output: &mut Vec<u8>) -> io::Result<(
 }
 
 fn write_jsonb(value: &serde_json::Value, output: &mut Vec<u8>) -> io::Result<()> {
-    let encoded = serde_json::to_vec(value).map_err(|error| {
-        invalid_data(format!(
-            "provider-directory COPY JSONB cannot be encoded: {error}"
-        ))
-    })?;
+    let encoded = serde_json::to_vec(value).expect("serde_json::Value serialization is infallible");
     write_length(encoded.len().saturating_add(1), output)?;
     output.push(1);
     output.extend_from_slice(&encoded);
@@ -149,4 +145,74 @@ fn assert_copy_bound(byte_count: usize) -> io::Result<()> {
 #[cfg(test)]
 pub(super) fn test_copy_columns() -> &'static [&'static str] {
     &COPY_COLUMNS
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row() -> ProjectedResourceRow {
+        ProjectedResourceRow {
+            physical_projection_id: "projection".to_owned(),
+            resource_type: "Organization".to_owned(),
+            resource_id: "org-1".to_owned(),
+            proof_partition_id: "partition".to_owned(),
+            payload_hash: "a".repeat(64),
+            payload_json: json!({"id": "org-1", "resourceType": "Organization"}),
+            source_rank: "000000000000:Organization:org-1".to_owned(),
+            summary_npi: Some(1_234_567_890),
+            summary_address_count: 2,
+            summary_addressed_location: true,
+            summary_geocoded_location: false,
+            summary_network_link_count: 3,
+            summary_affiliation_link_count: 4,
+            active: Some(false),
+            effective_start: Some("2026-01-01".to_owned()),
+            effective_end: Some("2026-12-31".to_owned()),
+            observed_at: Some("2026-07-22T00:00:00Z".to_owned()),
+            profile_evidence_json: Some(json!({"proof": true})),
+            semantic_evidence_sha256: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn binary_copy_covers_empty_rows_and_all_optional_encodings() {
+        let empty = encode_binary_copy(&[]).expect("empty COPY stream");
+        assert!(empty.starts_with(POSTGRES_COPY_MAGIC));
+        assert!(empty.ends_with(&(-1i16).to_be_bytes()));
+
+        let populated = encode_binary_copy(&[row()]).expect("populated COPY stream");
+        assert!(populated.starts_with(POSTGRES_COPY_MAGIC));
+        assert!(populated.ends_with(&(-1i16).to_be_bytes()));
+
+        let mut absent = row();
+        absent.summary_npi = None;
+        absent.active = None;
+        absent.effective_start = None;
+        absent.effective_end = None;
+        absent.observed_at = None;
+        absent.profile_evidence_json = None;
+        let absent = encode_binary_copy(&[absent]).expect("COPY stream with nulls");
+        assert!(absent
+            .windows(4)
+            .any(|value| value == (-1i32).to_be_bytes()));
+    }
+
+    #[test]
+    fn primitive_writers_and_copy_boundaries_fail_closed() {
+        assert_copy_bound(MAX_COPY_STREAM_BYTES).expect("exact limit");
+        assert!(assert_copy_bound(MAX_COPY_STREAM_BYTES + 1).is_err());
+
+        let mut output = Vec::new();
+        assert!(write_length(usize::MAX, &mut output).is_err());
+        write_optional_text(None, &mut output).expect("null text");
+        write_optional_jsonb(None, &mut output).expect("null jsonb");
+        write_optional_i64(None, &mut output);
+        write_optional_bool(None, &mut output);
+        write_optional_bool(Some(true), &mut output);
+        write_bool(false, &mut output);
+        write_i32(-7, &mut output);
+        assert!(!output.is_empty());
+    }
 }

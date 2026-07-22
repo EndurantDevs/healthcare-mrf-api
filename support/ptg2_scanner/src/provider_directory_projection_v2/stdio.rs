@@ -1,9 +1,10 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-use super::contracts::{invalid_input, is_sha256, ProjectionCopyContext};
+use super::contracts::{
+    invalid_input, is_sha256, ProjectionCopyContext, ProviderDirectoryInputFraming,
+};
 use super::encode::project_provider_directory_copy;
-use crate::provider_directory_projection::contracts::ProviderDirectoryInputFraming;
-use crate::provider_directory_projection::wire::read_bounded_input;
+use super::input::read_bounded_input;
 use std::io::{self, BufWriter, Write};
 use std::time::Instant;
 

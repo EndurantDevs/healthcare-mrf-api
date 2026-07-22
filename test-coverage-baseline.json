@@ -392,6 +392,15 @@
         "support/ptg2_scanner/src/normalize.rs",
         "support/ptg2_scanner/src/output.rs",
         "support/ptg2_scanner/src/progress.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/canonical.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/contracts.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/encode.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/fhir_values.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/input.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/pg_copy.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/references.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/semantics.rs",
+        "support/ptg2_scanner/src/provider_directory_projection_v2/stdio.rs",
         "support/ptg2_scanner/src/shared_graph.rs",
         "support/ptg2_scanner/src/source_witness.rs",
         "support/ptg2_scanner/src/source_witness_spool.rs",
@@ -417,16 +426,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 2104,
-          "total": 2761
+          "covered": 2376,
+          "total": 3011
         },
         "lines": {
-          "covered": 32044,
-          "total": 40516
+          "covered": 34752,
+          "total": 43119
         },
         "regions": {
-          "covered": 48233,
-          "total": 60296
+          "covered": 52888,
+          "total": 64796
         }
       },
       "path": "test-coverage-rust.json",

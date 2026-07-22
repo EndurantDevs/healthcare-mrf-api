@@ -124,3 +124,24 @@ fn write_unicode_escape(value: u16, output: &mut Vec<u8>) {
 pub(super) fn test_python_stable_json(value: &Value) -> Vec<u8> {
     python_stable_json(value)
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn python_json_covers_every_escape_and_value_family() {
+        let value = json!({
+            "array": [null, true, false, 1.5],
+            "text": "\"\\\u{0008}\u{000c}\n\r\t\u{0001} ascii é 😀"
+        });
+        let encoded = String::from_utf8(python_stable_json(&value)).expect("ASCII JSON");
+        assert_eq!(
+            encoded,
+            r#"{"array":[null,true,false,1.5],"text":"\"\\\b\f\n\r\t\u0001 ascii \u00e9 \ud83d\ude00"}"#
+        );
+        assert_eq!(stable_hash(&value, "domain").len(), 64);
+        assert_eq!(sha256_bytes(b"payload").len(), 64);
+    }
+}

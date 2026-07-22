@@ -283,8 +283,8 @@ fn deduplicate_values(values: Vec<Value>) -> io::Result<Vec<Value>> {
     let mut seen = HashSet::new();
     let mut unique = Vec::new();
     for value in values {
-        let key = serde_json::to_vec(&value)
-            .map_err(|error| invalid_data(format!("reference cannot be encoded: {error}")))?;
+        let key =
+            serde_json::to_vec(&value).expect("serde_json::Value serialization is infallible");
         if seen.insert(key) {
             unique.push(value);
         }

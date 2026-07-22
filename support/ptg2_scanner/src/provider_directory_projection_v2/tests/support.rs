@@ -1,8 +1,9 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-use super::super::contracts::{ProjectionCopyContext, ProviderDirectoryProjectionCopySpool};
+use super::super::contracts::{
+    ProjectionCopyContext, ProviderDirectoryInputFraming, ProviderDirectoryProjectionCopySpool,
+};
 use super::super::encode::project_provider_directory_copy;
-use crate::provider_directory_projection::contracts::ProviderDirectoryInputFraming;
 use serde_json::Value;
 
 pub const RECIPE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

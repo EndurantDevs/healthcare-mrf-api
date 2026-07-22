@@ -6,6 +6,7 @@ mod canonical;
 mod contracts;
 mod encode;
 mod fhir_values;
+mod input;
 mod pg_copy;
 mod references;
 mod semantics;
