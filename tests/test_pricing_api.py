@@ -663,7 +663,7 @@ def _canonical_directory_selection():
                 binding_ordinal=0,
                 snapshot_id="ptg2:release:a",
                 source_key="aetna-a",
-                plan_id="38-2418014",
+                plan_id="99-0000001",
                 plan_market_type="group",
                 role="in_network",
                 required=True,
@@ -686,7 +686,7 @@ def _canonical_directory_tables():
         "ptg2:release:a": types.SimpleNamespace(
             uses_shared_blocks=True,
             shared_snapshot_key=71,
-            plan_id="382418014",
+            plan_id="990000001",
             plan_market_type="group",
             source_key="aetna-a",
         ),
@@ -756,13 +756,13 @@ def _canonical_directory_request(selection):
 def _assert_canonical_directory_response(response_by_field, selection, request):
     assert response_by_field["resolved"] is True
     assert response_by_field["plan_id"] is None
-    assert response_by_field["plan_ids"] == ["38-2418014", "PLAN-B"]
+    assert response_by_field["plan_ids"] == ["99-0000001", "PLAN-B"]
     assert response_by_field["market_type"] == "group"
     assert response_by_field["snapshots"] == [
         {
             "source_key": "aetna-a",
             "snapshot_id": "ptg2:release:a",
-            "plan_id": "38-2418014",
+            "plan_id": "99-0000001",
             "plan_market_type": "group",
             "enumerated": True,
         },
@@ -779,9 +779,9 @@ def _assert_canonical_directory_response(response_by_field, selection, request):
     address_sql = str(request.ctx.sa_session.executions[2][0][0])
     address_parameters = request.ctx.sa_session.executions[2][0][1]
     assert "eapb.plan_id = ANY(CAST(:plan_ids AS text[]))" in address_sql
-    assert address_parameters["plan_ids"] == ["38-2418014", "382418014", "PLAN-B"]
+    assert address_parameters["plan_ids"] == ["99-0000001", "990000001", "PLAN-B"]
     assert response_by_field["location_filter"]["plan_ids_considered"] == [
-        "38-2418014",
+        "99-0000001",
         "PLAN-B",
     ]
 
@@ -815,7 +815,7 @@ async def test_canonical_group_directory_fails_closed_on_scope_mismatch(
                 binding_ordinal=0,
                 snapshot_id="ptg2:release:a",
                 source_key="aetna-a",
-                plan_id="38-2418014",
+                plan_id="99-0000001",
                 plan_market_type="group",
                 role="in_network",
                 required=True,
@@ -3432,7 +3432,7 @@ def _canonical_allowed_binding_snapshots():
         {
             "snapshot_id": "ptg2:allowed:group",
             "source_key": "allowed-group",
-            "plan_id": "38-2418014",
+            "plan_id": "99-0000001",
             "plan_market_type": "group",
         },
         {
@@ -3454,7 +3454,7 @@ def test_canonical_allowed_amount_parameters_preserve_binding_local_tuples():
             "code_system": "CPT",
         },
         types.SimpleNamespace(limit=25, offset=0, page=1),
-        plan_id="38-2418014",
+        plan_id="99-0000001",
         code="99214",
         code_system="CPT",
         npi=None,
@@ -3472,13 +3472,13 @@ def test_canonical_allowed_amount_parameters_preserve_binding_local_tuples():
         (
             "ptg2:allowed:group",
             "allowed-group",
-            "38-2418014",
+            "99-0000001",
             "group",
         ),
         (
             "ptg2:allowed:group",
             "allowed-group",
-            "382418014",
+            "990000001",
             "group",
         ),
         (
@@ -3717,7 +3717,7 @@ def _allowed_only_release_selection():
                 binding_ordinal=0,
                 snapshot_id="ptg2:allowed:release",
                 source_key="allowed-release",
-                plan_id="38-2418014",
+                plan_id="99-0000001",
                 plan_market_type="group",
                 role="allowed_amounts",
                 required=True,
@@ -3737,7 +3737,7 @@ def _assert_allowed_release_no_match(response_by_field, selection, session):
         {
             "source_key": "allowed-release",
             "snapshot_id": "ptg2:allowed:release",
-            "plan_id": "38-2418014",
+            "plan_id": "99-0000001",
             "plan_market_type": "group",
         }
     ]
@@ -3753,13 +3753,13 @@ def _assert_allowed_release_no_match(response_by_field, selection, session):
         (
             "ptg2:allowed:release",
             "allowed-release",
-            "38-2418014",
+            "99-0000001",
             "group",
         ),
         (
             "ptg2:allowed:release",
             "allowed-release",
-            "382418014",
+            "990000001",
             "group",
         ),
     ]
@@ -3826,7 +3826,7 @@ async def test_canonical_plan_uses_binding_market_for_broad_expansion_guard(
                 binding_ordinal=0,
                 snapshot_id="ptg2:release:group",
                 source_key="aetna-group",
-                plan_id="38-2418014",
+                plan_id="99-0000001",
                 plan_market_type="group",
                 role="in_network",
                 required=True,

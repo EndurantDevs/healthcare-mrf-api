@@ -26,7 +26,7 @@ def _binding_row(**updates):
         "binding_ordinal": 0,
         "snapshot_id": "ptg2:release-old",
         "source_key": "aetna-network-a",
-        "plan_id": "38-2418014",
+        "plan_id": "99-0000001",
         "plan_market_type": "group",
         "role": "in_network",
         "required": True,
@@ -42,7 +42,7 @@ def _network_binding(ordinal, snapshot_id, source_key):
         binding_ordinal=ordinal,
         snapshot_id=snapshot_id,
         source_key=source_key,
-        plan_id="38-2418014",
+        plan_id="99-0000001",
         plan_market_type="group",
         role="in_network",
         required=True,
@@ -231,7 +231,7 @@ def test_release_query_uses_bound_snapshot_when_current_pointer_differs(monkeypa
             {
                 "plan_release_id": PLAN_RELEASE_ID,
                 "code": "99213",
-                "plan_id": "38-2418014",
+                "plan_id": "99-0000001",
                 "plan_external_id": None,
                 "plan_market_type": "group",
                 "source_key": "aetna-network-a",
@@ -330,18 +330,18 @@ def test_release_query_fans_out_only_across_frozen_release_bindings(monkeypatch)
     assert response["resolved"] is True
     assert response["result_state"] == "no_matching_rates"
     assert response["query"]["status"] == "no_match"
-    assert response["query"]["plan_id"] == "38-2418014"
+    assert response["query"]["plan_id"] == "99-0000001"
     assert response["query"]["snapshots"] == [
         {
             "source_key": "aetna-network-a",
             "snapshot_id": "ptg2:release-network-a",
-            "plan_id": "38-2418014",
+            "plan_id": "99-0000001",
             "plan_market_type": "group",
         },
         {
             "source_key": "aetna-network-b",
             "snapshot_id": "ptg2:release-network-b",
-            "plan_id": "38-2418014",
+            "plan_id": "99-0000001",
             "plan_market_type": "group",
         },
     ]
@@ -384,7 +384,7 @@ def test_valid_allowed_only_release_is_resolved_no_match_for_network_search(
                 binding_ordinal=0,
                 snapshot_id="ptg2:release-allowed",
                 source_key="aetna-allowed",
-                plan_id="38-2418014",
+                plan_id="99-0000001",
                 plan_market_type="group",
                 role="allowed_amounts",
                 required=True,
