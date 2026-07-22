@@ -558,6 +558,19 @@ def profile_evidence_insert_sql(
     )
 
 
+def _profile_evidence_npi_scope_sql(npi_start: int | None) -> str:
+    """Constrain every bounded evidence read to the active NPI partition."""
+
+    if npi_start is None:
+        return ""
+    return (
+        "\n             WHERE evidence.npi >= "
+        "CAST(:profile_npi_start AS bigint)"
+        "\n               AND evidence.npi < "
+        "CAST(:profile_npi_end AS bigint)"
+    )
+
+
 def profile_insert_sql(
     *,
     evidence_ref: str,
@@ -610,6 +623,7 @@ def profile_insert_sql(
         "provider_directory_profile_aggregate.sql",
         {
             "AFFECTED_NPIS_SQL": affected_npis_sql,
+            "EVIDENCE_NPI_SCOPE_SQL": _profile_evidence_npi_scope_sql(npi_start),
             "EVIDENCE_REF": evidence_ref,
             "TARGET_REF": target_ref,
             "PROFILE_FACT_EVIDENCE_LIMIT": PROFILE_FACT_EVIDENCE_LIMIT,
