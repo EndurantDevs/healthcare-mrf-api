@@ -38462,7 +38462,7 @@ async def _mark_failed_endpoint_dataset_without_masking(
 
 
 async def _import_resources(
-    sources: list[dict[str, Any]],
+    source_records: list[dict[str, Any]],
     *,
     resources: list[str],
     per_resource_limit: int,
@@ -38498,19 +38498,19 @@ async def _import_resources(
     require_complete_resources: bool = False,
 ) -> dict[str, int]:
     """Import resources into the provider-directory snapshot."""
-    counts: dict[str, int] = {resource: 0 for resource in resources}
+    count_by_resource: dict[str, int] = {resource: 0 for resource in resources}
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
     _validate_provider_directory_endpoint_scope(
-        sources,
+        source_records,
         provider_directory_endpoint_scope,
     )
-    source_groups = _group_resource_import_sources(sources, linked_resource_limit=linked_resource_limit)
+    source_groups = _group_resource_import_sources(source_records, linked_resource_limit=linked_resource_limit)
     total_groups = len(source_groups)
     completed_groups = 0
     report_every = max(1, total_groups // 20)
     progress_lock = asyncio.Lock()
-    active_partial_counts: dict[int, dict[str, int]] = {}
-    active_group_details: dict[int, dict[str, Any]] = {}
+    active_partial_count_by_group: dict[int, dict[str, int]] = {}
+    active_group_by_key: dict[int, dict[str, Any]] = {}
     progress_timer_by_name = {"next_partial_progress_at": 0.0}
 
     def merge_counts(target: dict[str, int], source_counts: dict[str, int]) -> None:
@@ -38540,31 +38540,31 @@ async def _import_resources(
 
     def progress_counts_snapshot() -> dict[str, int]:
         """Return an immutable snapshot of current import counters."""
-        snapshot = dict(counts)
-        for partial_counts in active_partial_counts.values():
-            merge_counts(snapshot, partial_counts)
-        return snapshot
+        progress_count_by_resource = dict(count_by_resource)
+        for partial_counts in active_partial_count_by_group.values():
+            merge_counts(progress_count_by_resource, partial_counts)
+        return progress_count_by_resource
 
     def active_group_snapshot() -> list[dict[str, Any]]:
         """Return a stable snapshot of active provider-directory groups."""
         now = time.monotonic()
         groups: list[dict[str, Any]] = []
-        for detail in active_group_details.values():
-            group = {
+        for detail in active_group_by_key.values():
+            group_detail_by_field = {
                 key: value
                 for key, value in detail.items()
                 if key not in {"started_monotonic", "resource_started_monotonic"}
             }
-            group["elapsed_seconds"] = int(now - detail["started_monotonic"])
+            group_detail_by_field["elapsed_seconds"] = int(now - detail["started_monotonic"])
             if detail.get("resource_started_monotonic") is not None:
-                group["resource_elapsed_seconds"] = int(now - detail["resource_started_monotonic"])
-            groups.append(group)
+                group_detail_by_field["resource_elapsed_seconds"] = int(now - detail["resource_started_monotonic"])
+            groups.append(group_detail_by_field)
         return sorted(
             groups,
-            key=lambda item: (
-                str(item.get("sample_org_name") or ""),
-                str(item.get("sample_plan_name") or ""),
-                str(item.get("sample_source_id") or ""),
+            key=lambda group_detail: (
+                str(group_detail.get("sample_org_name") or ""),
+                str(group_detail.get("sample_plan_name") or ""),
+                str(group_detail.get("sample_source_id") or ""),
             ),
         )
 
@@ -38572,22 +38572,22 @@ async def _import_resources(
         """Publish current provider-directory import progress."""
         if not progress_callback:
             return
-        snapshot: dict[str, int] | None = None
-        details: dict[str, Any] | None = None
+        progress_count_by_resource: dict[str, int] | None = None
+        progress_detail_by_field: dict[str, Any] | None = None
         async with progress_lock:
             now = time.monotonic()
             if force or now >= progress_timer_by_name["next_partial_progress_at"]:
                 if not force:
                     progress_timer_by_name["next_partial_progress_at"] = now + 15.0
-                snapshot = progress_counts_snapshot()
-                details = {"active_source_groups": active_group_snapshot()}
-        if snapshot is not None:
+                progress_count_by_resource = progress_counts_snapshot()
+                progress_detail_by_field = {"active_source_groups": active_group_snapshot()}
+        if progress_count_by_resource is not None:
             try:
                 await progress_callback(
                     completed_groups,
                     total_groups,
-                    snapshot,
-                    details,
+                    progress_count_by_resource,
+                    progress_detail_by_field,
                 )
             except (asyncio.CancelledError, ImportCancelledError):
                 raise
@@ -38605,15 +38605,15 @@ async def _import_resources(
         if not progress_callback or written <= 0:
             return
         async with progress_lock:
-            group_counts = active_partial_counts.setdefault(group_key, {})
+            group_counts = active_partial_count_by_group.setdefault(group_key, {})
             group_counts[resource_type] = group_counts.get(resource_type, 0) + written
         await report_progress()
 
     async def clear_partial_progress(group_key: int) -> None:
         """Clear persisted partial progress for the active source group."""
         async with progress_lock:
-            active_partial_counts.pop(group_key, None)
-            active_group_details.pop(group_key, None)
+            active_partial_count_by_group.pop(group_key, None)
+            active_group_by_key.pop(group_key, None)
 
     async def import_one_group(
         source_group: list[dict[str, Any]],
@@ -38621,20 +38621,20 @@ async def _import_resources(
         """Import, validate, and finalize one provider-directory source group."""
         await _raise_if_resource_import_cancelled(cancel_ctx, cancel_task)
         group_key = id(source_group)
-        source_ids = sorted(item["source_id"] for item in source_group)
+        source_ids = sorted(source_record["source_id"] for source_record in source_group)
         _validate_provider_directory_endpoint_scope(
             source_group,
             provider_directory_endpoint_scope,
         )
-        source = _scoped_partition_source_record(source_group, source_ids)
+        partition_source = _scoped_partition_source_record(source_group, source_ids)
         async with progress_lock:
-            active_group_details[group_key] = {
+            active_group_by_key[group_key] = {
                 "source_ids": source_ids[:10],
                 "source_count": len(source_ids),
-                "sample_source_id": source.get("source_id"),
-                "sample_org_name": source.get("org_name"),
-                "sample_plan_name": source.get("plan_name"),
-                "api_base": source.get("canonical_api_base") or source.get("api_base"),
+                "sample_source_id": partition_source.get("source_id"),
+                "sample_org_name": partition_source.get("org_name"),
+                "sample_plan_name": partition_source.get("plan_name"),
+                "api_base": partition_source.get("canonical_api_base") or partition_source.get("api_base"),
                 "current_resource": None,
                 "started_at": _now().isoformat(timespec="seconds") + "Z",
                 "started_monotonic": time.monotonic(),
@@ -38642,16 +38642,16 @@ async def _import_resources(
                 "resource_started_monotonic": None,
             }
         await report_progress(force=True)
-        source_counts: dict[str, int] = {resource: 0 for resource in resources}
-        source_linked_counts: dict[str, int] = {}
-        source_resource_stats: dict[str, dict[str, Any]] = {}
-        source_resource_diagnostics: dict[str, dict[str, Any]] = {}
-        source_stale_counts: dict[str, int] = {}
-        source_stale_ready_source_ids: dict[str, list[str]] = {}
+        source_count_by_resource: dict[str, int] = {resource: 0 for resource in resources}
+        linked_count_by_resource: dict[str, int] = {}
+        resource_stats_by_type: dict[str, dict[str, Any]] = {}
+        resource_diagnostic_by_type: dict[str, dict[str, Any]] = {}
+        stale_count_by_resource: dict[str, int] = {}
+        stale_ready_source_ids_by_resource: dict[str, list[str]] = {}
         rows_by_resource: dict[str, list[dict[str, Any]]] = {}
         deferred_zero_role_cleanup: ResourceFetchResult | None = None
         is_scan_role_reverse_lookup_planned = (
-            _is_practitioner_role_reverse_lookup_planned(source, resources)
+            _is_practitioner_role_reverse_lookup_planned(partition_source, resources)
         )
 
         async def mark_resource_stale_cleanup_ready(resource_type: str, result: ResourceFetchResult) -> None:
@@ -38659,17 +38659,17 @@ async def _import_resources(
             if not stale_cleanup or not _is_resource_fetch_complete_for_publish(result):
                 return
             if seen_stage_table:
-                source_stale_ready_source_ids[resource_type] = [source["source_id"]]
+                stale_ready_source_ids_by_resource[resource_type] = [partition_source["source_id"]]
                 return
             stale_deleted = await _delete_stale_resource_rows(
                 result.model,
-                source["source_id"],
+                partition_source["source_id"],
                 run_id,
                 use_seen_table=True,
             )
             if stale_deleted:
-                source_stale_counts[resource_type] = (
-                    source_stale_counts.get(resource_type, 0) + stale_deleted
+                stale_count_by_resource[resource_type] = (
+                    stale_count_by_resource.get(resource_type, 0) + stale_deleted
                 )
 
         def should_retry_zero_practitioner_role(result: ResourceFetchResult | None) -> bool:
@@ -38677,20 +38677,20 @@ async def _import_resources(
             return (
                 result is not None
                 and not is_scan_role_reverse_lookup_planned
-                and bool(_resource_start_url(source, "PractitionerRole", page_count=page_count))
+                and bool(_resource_start_url(partition_source, "PractitionerRole", page_count=page_count))
                 and result.complete
                 and not result.error
                 and not result.is_bounded
                 and result.rows_fetched == 0
                 and result.rows_written == 0
-                and source_counts.get("Practitioner", 0) > 0
-                and source_counts.get("Location", 0) > 0
+                and source_count_by_resource.get("Practitioner", 0) > 0
+                and source_count_by_resource.get("Location", 0) > 0
             )
-        if _uses_alohr_graphql_connector(source):
+        if _uses_alohr_graphql_connector(partition_source):
             async with progress_lock:
-                active_group_details[group_key]["current_resource"] = "ALOHR GraphQL"
-                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
-                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+                active_group_by_key[group_key]["current_resource"] = "ALOHR GraphQL"
+                active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_by_key[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
             return await _import_alohr_graphql_source_group(
                 source_group,
@@ -38702,26 +38702,26 @@ async def _import_resources(
                     run_id=run_id,
                     stale_cleanup=stale_cleanup,
                     seen_table=seen_stage_table,
-                    checkpoint_context=source.get("_pagination_checkpoint_context"),
+                    checkpoint_context=partition_source.get("_pagination_checkpoint_context"),
                     resume_required_entries=pagination_resume_required,
-                    dataset_id=source.get("_endpoint_dataset_id"),
+                    dataset_id=partition_source.get("_endpoint_dataset_id"),
                 ),
             )
         if _should_use_uhc_plan_graph(
-            source,
+            partition_source,
             resources,
             per_resource_limit=per_resource_limit,
             page_limit=page_limit,
         ):
             async with progress_lock:
-                active_group_details[group_key]["current_resource"] = "InsurancePlan graph"
-                active_group_details[group_key]["resource_started_at"] = (
+                active_group_by_key[group_key]["current_resource"] = "InsurancePlan graph"
+                active_group_by_key[group_key]["resource_started_at"] = (
                     _now().isoformat(timespec="seconds") + "Z"
                 )
-                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+                active_group_by_key[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
             import_summary = await _import_uhc_plan_graph_source_group(
-                source,
+                partition_source,
                 resources,
                 page_count=page_count,
                 timeout=timeout,
@@ -38731,12 +38731,12 @@ async def _import_resources(
                 seen_table=seen_stage_table,
             )
             await _finalize_source_pagination_checkpoints(
-                source,
+                partition_source,
                 import_summary[1],
                 pagination_resume_required,
                 require_complete_resources=require_complete_resources,
                 retain_complete_checkpoint=bool(
-                    source.get("_endpoint_dataset_id")
+                    partition_source.get("_endpoint_dataset_id")
                 ),
             )
             _record_uhc_plan_graph_completion(
@@ -38745,17 +38745,17 @@ async def _import_resources(
                 import_summary[1],
             )
             return import_summary
-        for resource_type in _source_resource_fetch_order(source, resources):
+        for resource_type in _source_resource_fetch_order(partition_source, resources):
             await _raise_if_resource_import_cancelled(cancel_ctx, cancel_task)
             if (
                 resource_type == "PractitionerRole"
-                and _needs_practitioner_role_reverse_lookup(source, "PractitionerRole")
+                and _needs_practitioner_role_reverse_lookup(partition_source, "PractitionerRole")
             ):
                 continue
             async with progress_lock:
-                active_group_details[group_key]["current_resource"] = resource_type
-                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
-                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+                active_group_by_key[group_key]["current_resource"] = resource_type
+                active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_by_key[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
             use_streaming = stream_batch_size > 0
 
@@ -38763,7 +38763,7 @@ async def _import_resources(
                 """Persist a normalized row batch for the active source group."""
                 if linked_resource_limit > 0 or (
                     is_scan_role_reverse_lookup_planned
-                    and resource_type in _practitioner_role_reverse_lookup_resources(source)
+                    and resource_type in _practitioner_role_reverse_lookup_resources(partition_source)
                 ):
                     rows_by_resource.setdefault(resource_type, []).extend(
                         _compact_linked_reference_rows(resource_type, rows)
@@ -38772,14 +38772,14 @@ async def _import_resources(
                     model,
                     _rows_for_compatibility_source(
                         rows,
-                        source["source_id"],
+                        partition_source["source_id"],
                     ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
-                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=[source["source_id"]],
-                    dataset_id=source.get("_endpoint_dataset_id"),
+                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
+                    source_ids=[partition_source["source_id"]],
+                    dataset_id=partition_source.get("_endpoint_dataset_id"),
                 )
                 await maybe_report_partial_progress(group_key, resource_type, written)
                 return written
@@ -38787,16 +38787,16 @@ async def _import_resources(
             if (
                 stale_cleanup
                 and resource_type == "PractitionerRole"
-                and _is_uhc_role_postal_partition_enabled(source)
+                and _is_uhc_role_postal_partition_enabled(partition_source)
             ):
                 await _mark_postal_checkpointed_roles_seen(
-                    source,
-                    [source["source_id"]],
+                    partition_source,
+                    [partition_source["source_id"]],
                     run_id,
                     seen_stage_table,
                 )
-            result = await _fetch_resource_rows(
-                source,
+            fetch_result = await _fetch_resource_rows(
+                partition_source,
                 resource_type,
                 per_resource_limit=per_resource_limit,
                 page_limit=page_limit,
@@ -38813,31 +38813,31 @@ async def _import_resources(
                     bulk_export_max_pending_seconds
                 ),
                 deadline_seconds=resource_deadline_seconds,
-                pagination_checkpoint=source.get("_pagination_checkpoint_context"),
+                pagination_checkpoint=partition_source.get("_pagination_checkpoint_context"),
             )
-            if not result:
+            if not fetch_result:
                 continue
-            result = _fail_closed_on_unexpected_empty_resource(
-                source,
+            fetch_result = _fail_closed_on_unexpected_empty_resource(
+                partition_source,
                 resource_type,
-                result,
+                fetch_result,
             )
             await _reset_unexpected_empty_pagination_checkpoint(
-                source,
+                partition_source,
                 resource_type,
                 page_count,
-                result,
+                fetch_result,
             )
             _record_resource_fetch_stats(
-                source_resource_stats,
+                resource_stats_by_type,
                 resource_type,
-                result,
+                fetch_result,
                 bulk_export_selection=_source_bulk_export_selection(
-                    source,
+                    partition_source,
                     bulk_export,
                     per_resource_limit=per_resource_limit,
                     checkpoint_context=(
-                        source.get("_pagination_checkpoint_context")
+                        partition_source.get("_pagination_checkpoint_context")
                         if use_streaming
                         and per_resource_limit <= 0
                         and page_limit <= 0
@@ -38845,47 +38845,47 @@ async def _import_resources(
                     ),
                 ),
             )
-            _record_resource_completion(resource_completion, resource_type, source_ids, result)
-            if result.rows or resource_type not in rows_by_resource:
-                rows_by_resource[resource_type] = result.rows
+            _record_resource_completion(resource_completion, resource_type, source_ids, fetch_result)
+            if fetch_result.rows or resource_type not in rows_by_resource:
+                rows_by_resource[resource_type] = fetch_result.rows
             written_total = (
-                result.rows_written
+                fetch_result.rows_written
                 if use_streaming
                 else await _upsert_resource_rows(
-                    result.model,
+                    fetch_result.model,
                     _rows_for_compatibility_source(
-                        result.rows,
-                        source["source_id"],
+                        fetch_result.rows,
+                        partition_source["source_id"],
                     ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
-                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=[source["source_id"]],
-                    dataset_id=source.get("_endpoint_dataset_id"),
+                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
+                    source_ids=[partition_source["source_id"]],
+                    dataset_id=partition_source.get("_endpoint_dataset_id"),
                 )
             )
-            source_counts[resource_type] += written_total
-            source_resource_diagnostics[resource_type] = _resource_fetch_diagnostic(
-                result,
+            source_count_by_resource[resource_type] += written_total
+            resource_diagnostic_by_type[resource_type] = _resource_fetch_diagnostic(
+                fetch_result,
                 rows_written=written_total,
             )
             if (
                 resource_type == "PractitionerRole"
-                and result.complete
-                and not result.error
-                and not result.is_bounded
-                and result.rows_fetched == 0
+                and fetch_result.complete
+                and not fetch_result.error
+                and not fetch_result.is_bounded
+                and fetch_result.rows_fetched == 0
                 and written_total == 0
             ):
-                deferred_zero_role_cleanup = result
+                deferred_zero_role_cleanup = fetch_result
             else:
-                await mark_resource_stale_cleanup_ready(resource_type, result)
+                await mark_resource_stale_cleanup_ready(resource_type, fetch_result)
         if should_retry_zero_practitioner_role(deferred_zero_role_cleanup):
             async with progress_lock:
-                active_group_details[group_key]["current_resource"] = "PractitionerRole retry"
-                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
-                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+                active_group_by_key[group_key]["current_resource"] = "PractitionerRole retry"
+                active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_by_key[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
 
             use_streaming = stream_batch_size > 0
@@ -38896,20 +38896,20 @@ async def _import_resources(
                     model,
                     _rows_for_compatibility_source(
                         rows,
-                        source["source_id"],
+                        partition_source["source_id"],
                     ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
-                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=[source["source_id"]],
-                    dataset_id=source.get("_endpoint_dataset_id"),
+                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
+                    source_ids=[partition_source["source_id"]],
+                    dataset_id=partition_source.get("_endpoint_dataset_id"),
                 )
                 await maybe_report_partial_progress(group_key, "PractitionerRole", written)
                 return written
 
             retry_result = await _fetch_resource_rows(
-                source,
+                partition_source,
                 "PractitionerRole",
                 per_resource_limit=per_resource_limit,
                 page_limit=page_limit,
@@ -38935,7 +38935,7 @@ async def _import_resources(
             else:
                 retry_result = replace(retry_result, fetch_mode=f"{retry_result.fetch_mode}_retry")
                 _record_resource_fetch_stats(
-                    source_resource_stats,
+                    resource_stats_by_type,
                     "PractitionerRole",
                     retry_result,
                 )
@@ -38954,17 +38954,17 @@ async def _import_resources(
                         retry_result.model,
                         _rows_for_compatibility_source(
                             retry_result.rows,
-                            source["source_id"],
+                            partition_source["source_id"],
                         ),
                         run_id=run_id,
                         track_seen=stale_cleanup,
                         seen_table=seen_stage_table,
-                        canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                        source_ids=[source["source_id"]],
-                        dataset_id=source.get("_endpoint_dataset_id"),
+                        canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
+                        source_ids=[partition_source["source_id"]],
+                        dataset_id=partition_source.get("_endpoint_dataset_id"),
                     )
                 )
-                source_counts["PractitionerRole"] = source_counts.get("PractitionerRole", 0) + retry_written_total
+                source_count_by_resource["PractitionerRole"] = source_count_by_resource.get("PractitionerRole", 0) + retry_written_total
                 if (
                     retry_result.complete
                     and not retry_result.error
@@ -38983,20 +38983,20 @@ async def _import_resources(
             )
             retry_diagnostic["retry_of_zero_rows"] = True
             retry_diagnostic["retry_reason"] = PRACTITIONER_ROLE_ZERO_RETRY_REASON
-            source_resource_diagnostics["PractitionerRole"] = retry_diagnostic
+            resource_diagnostic_by_type["PractitionerRole"] = retry_diagnostic
             if retry_result.error != PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR:
                 await mark_resource_stale_cleanup_ready("PractitionerRole", retry_result)
         elif deferred_zero_role_cleanup is not None:
             await mark_resource_stale_cleanup_ready("PractitionerRole", deferred_zero_role_cleanup)
         if (
             "PractitionerRole" in resources
-            and _needs_practitioner_role_reverse_lookup(source, "PractitionerRole")
-            and "PractitionerRole" not in source_resource_diagnostics
+            and _needs_practitioner_role_reverse_lookup(partition_source, "PractitionerRole")
+            and "PractitionerRole" not in resource_diagnostic_by_type
         ):
             async with progress_lock:
-                active_group_details[group_key]["current_resource"] = "PractitionerRole reverse lookup"
-                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
-                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+                active_group_by_key[group_key]["current_resource"] = "PractitionerRole reverse lookup"
+                active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_by_key[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
             use_streaming = stream_batch_size > 0
             scan_seed_stage_table = (
@@ -39008,7 +39008,7 @@ async def _import_resources(
             )
             if scan_seed_stage_table:
                 await _prepare_import_seen_stage_lookup(scan_seed_stage_table)
-                for seed_resource_type in _practitioner_role_reverse_lookup_resources(source):
+                for seed_resource_type in _practitioner_role_reverse_lookup_resources(partition_source):
                     rows_by_resource.pop(seed_resource_type, None)
 
             async def scan_role_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
@@ -39017,20 +39017,20 @@ async def _import_resources(
                     model,
                     _rows_for_compatibility_source(
                         rows,
-                        source["source_id"],
+                        partition_source["source_id"],
                     ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
-                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=[source["source_id"]],
-                    dataset_id=source.get("_endpoint_dataset_id"),
+                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
+                    source_ids=[partition_source["source_id"]],
+                    dataset_id=partition_source.get("_endpoint_dataset_id"),
                 )
                 await maybe_report_partial_progress(group_key, "PractitionerRole", written)
                 return written
 
-            result = await _fetch_scan_practitioner_role_rows(
-                source,
+            fetch_result = await _fetch_scan_practitioner_role_rows(
+                partition_source,
                 rows_by_resource,
                 ScanPractitionerRoleFetchOptions(
                     per_resource_limit=per_resource_limit,
@@ -39044,15 +39044,15 @@ async def _import_resources(
                     cancel_ctx=cancel_ctx,
                     cancel_task=cancel_task,
                     deadline_seconds=linked_resource_deadline_seconds,
-                    source=source,
+                    source=partition_source,
                     seed_stage_table=scan_seed_stage_table,
                     seed_source_ids=(
-                        (source["source_id"],)
+                        (partition_source["source_id"],)
                         if scan_seed_stage_table
                         else ()
                     ),
                     existing_seed_source_ids=(
-                        (source["source_id"],)
+                        (partition_source["source_id"],)
                         if not scan_seed_stage_table
                         else ()
                     ),
@@ -39061,77 +39061,77 @@ async def _import_resources(
                 ),
             )
             _record_resource_fetch_stats(
-                source_resource_stats,
+                resource_stats_by_type,
                 "PractitionerRole",
-                result,
+                fetch_result,
             )
-            _record_resource_completion(resource_completion, "PractitionerRole", source_ids, result)
+            _record_resource_completion(resource_completion, "PractitionerRole", source_ids, fetch_result)
             written_total = (
-                result.rows_written
+                fetch_result.rows_written
                 if use_streaming
                 else await _upsert_resource_rows(
-                    result.model,
+                    fetch_result.model,
                     _rows_for_compatibility_source(
-                        result.rows,
-                        source["source_id"],
+                        fetch_result.rows,
+                        partition_source["source_id"],
                     ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
-                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=[source["source_id"]],
-                    dataset_id=source.get("_endpoint_dataset_id"),
+                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
+                    source_ids=[partition_source["source_id"]],
+                    dataset_id=partition_source.get("_endpoint_dataset_id"),
                 )
             )
-            source_counts["PractitionerRole"] = source_counts.get("PractitionerRole", 0) + written_total
-            rows_by_resource["PractitionerRole"] = result.rows
-            source_resource_diagnostics["PractitionerRole"] = _resource_fetch_diagnostic(
-                result,
+            source_count_by_resource["PractitionerRole"] = source_count_by_resource.get("PractitionerRole", 0) + written_total
+            rows_by_resource["PractitionerRole"] = fetch_result.rows
+            resource_diagnostic_by_type["PractitionerRole"] = _resource_fetch_diagnostic(
+                fetch_result,
                 rows_written=written_total,
             )
-            await mark_resource_stale_cleanup_ready("PractitionerRole", result)
+            await mark_resource_stale_cleanup_ready("PractitionerRole", fetch_result)
         if linked_resource_limit > 0 and rows_by_resource:
             async with progress_lock:
-                active_group_details[group_key]["current_resource"] = "Linked resources"
-                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
-                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+                active_group_by_key[group_key]["current_resource"] = "Linked resources"
+                active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_by_key[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
 
             async def linked_progress(resource_type: str, written: int) -> None:
                 """Report linked-resource progress for the active source group."""
                 await maybe_report_partial_progress(group_key, resource_type, written)
 
-            source_linked_counts = await _import_linked_resource_rows(
-                source,
+            linked_count_by_resource = await _import_linked_resource_rows(
+                partition_source,
                 rows_by_resource,
                 per_source_limit=linked_resource_limit,
                 concurrency=linked_resource_concurrency,
                 timeout=timeout,
                 run_id=run_id,
-                source_ids=[source["source_id"]],
+                source_ids=[partition_source["source_id"]],
                 track_seen=stale_cleanup,
                 seen_table=seen_stage_table,
                 progress_callback=linked_progress,
                 deadline_seconds=linked_resource_deadline_seconds,
-                dataset_id=source.get("_endpoint_dataset_id"),
+                dataset_id=partition_source.get("_endpoint_dataset_id"),
             )
         await _finalize_source_pagination_checkpoints(
-            source,
-            source_resource_diagnostics,
+            partition_source,
+            resource_diagnostic_by_type,
             pagination_resume_required,
             require_complete_resources=require_complete_resources,
             retain_complete_checkpoint=bool(
-                source.get("_endpoint_dataset_id")
+                partition_source.get("_endpoint_dataset_id")
             ),
         )
         return (
             source_ids,
-            source_resource_diagnostics,
-            source_counts,
-            source_linked_counts,
-            source_resource_stats,
-            source_stale_counts,
-            source_stale_ready_source_ids,
+            resource_diagnostic_by_type,
+            source_count_by_resource,
+            linked_count_by_resource,
+            resource_stats_by_type,
+            stale_count_by_resource,
+            stale_ready_source_ids_by_resource,
         )
 
     seen_stage_table = (
@@ -39257,7 +39257,7 @@ async def _import_resources(
                 run_id=run_id,
                 diagnostics=source_resource_diagnostics,
             )
-            merge_counts(counts, source_counts)
+            merge_counts(count_by_resource, source_counts)
             if linked_counts is not None:
                 merge_counts(linked_counts, source_linked_counts)
             if resource_fetch_stats is not None:
@@ -39297,7 +39297,7 @@ async def _import_resources(
                 "provider_directory_source_groups_failed:"
                 + ",".join(sorted(failed_source_ids))
             )
-        return counts
+        return count_by_resource
     except BaseException:
         for task in tasks:
             task.cancel()
@@ -39564,29 +39564,29 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         return metrics
     if publish_artifacts_only:
-        metrics = {
+        publish_metric_by_name = {
             "publish_artifacts": True,
             "publish_artifacts_only": True,
             "source_ids": requested_source_ids,
         }
         if profile_execution is None:
-            metrics = await _publish_provider_directory_dataset_artifacts(
+            publish_metric_by_name = await _publish_provider_directory_dataset_artifacts(
                 run_id=run_id,
-                metrics=metrics,
+                metrics=publish_metric_by_name,
                 source_ids=requested_source_ids,
                 publish_corroboration=should_publish_corroboration,
                 publish_artifacts_targets=publish_artifacts_targets,
             )
         else:
-            metrics = await _publish_attested_provider_directory_profile(
+            publish_metric_by_name = await _publish_attested_provider_directory_profile(
                 run_id=run_id,
-                metrics=metrics,
+                metrics=publish_metric_by_name,
                 execution=profile_execution,
             )
-        ctx["context"]["audit"] = metrics
+        ctx["context"]["audit"] = publish_metric_by_name
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
-        print("PROVIDER_DIRECTORY_ARTIFACT_PUBLISH_DONE\t" + json.dumps(metrics, sort_keys=True, default=str))
-        return metrics
+        print("PROVIDER_DIRECTORY_ARTIFACT_PUBLISH_DONE\t" + json.dumps(publish_metric_by_name, sort_keys=True, default=str))
+        return publish_metric_by_name
     await _clear_resource_rows_seen(run_id)
 
     seed_rows: list[dict[str, Any]]
@@ -39594,7 +39594,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     retest_tmpdir = None
     supplemental_retest_seed_rows: list[dict[str, Any]] = []
     supplemental_catalog_seed_rows: list[dict[str, Any]] = []
-    supplemental_catalog_metrics: dict[str, Any] = {
+    supplemental_catalog_metric_by_name: dict[str, Any] = {
         "enabled": include_supplemental_catalogs,
         "rows": 0,
         "catalogs": {},
@@ -39636,7 +39636,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         supplemental_retest_seed_rows = _seed_rows_from_retest_results(retest_path, source_query=source_query)
         seed_rows.extend(supplemental_retest_seed_rows)
     if include_supplemental_catalogs:
-        supplemental_catalog_seed_rows, supplemental_catalog_metrics = _seed_rows_from_supplemental_catalogs(
+        supplemental_catalog_seed_rows, supplemental_catalog_metric_by_name = _seed_rows_from_supplemental_catalogs(
             source_query=source_query,
             timeout=timeout,
             amerihealth_caritas_catalog_path=_clean_text(task.get("amerihealth_caritas_catalog_path")),
@@ -39646,16 +39646,16 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             cms_sma_endpoint_directory_path=_clean_text(task.get("cms_sma_endpoint_directory_path")),
             cms_sma_endpoint_directory_url=_clean_text(task.get("cms_sma_endpoint_directory_url")),
         )
-        supplemental_catalog_metrics["enabled"] = True
+        supplemental_catalog_metric_by_name["enabled"] = True
         seed_rows.extend(supplemental_catalog_seed_rows)
 
     try:
-        source_rows = _dedupe_source_rows([_source_row_from_seed(row) for row in seed_rows])
+        source_rows = _dedupe_source_rows([_source_row_from_seed(seed_record) for seed_record in seed_rows])
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
         endpoint_rows_seeded = await _upsert_provider_directory_source_rows(source_rows)
-        stale_source_rows_deleted = {}
+        stale_source_deletion_by_type = {}
         protected_source_ids: list[str] = []
         missing_protected_source_ids: list[str] = []
         if _is_source_catalog_stale_cleanup_enabled(
@@ -39668,10 +39668,10 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         ):
             protected_source_ids = _configured_catalog_protected_source_ids(task)
             catalog_cleanup_result = await _delete_stale_provider_directory_source_catalog(
-                [row["source_id"] for row in source_rows],
+                [source_record["source_id"] for source_record in source_rows],
                 protected_source_ids=protected_source_ids,
             )
-            stale_source_rows_deleted = catalog_cleanup_result["deleted"]
+            stale_source_deletion_by_type = catalog_cleanup_result["deleted"]
             missing_protected_source_ids = catalog_cleanup_result["protected_source_ids_missing"]
         metrics: dict[str, Any] = {
             "sources_seeded": len(source_rows),
@@ -39679,8 +39679,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "source_ids": requested_source_ids,
             "supplemental_retest_sources_considered": len(supplemental_retest_seed_rows),
             "supplemental_catalog_sources_considered": len(supplemental_catalog_seed_rows),
-            "supplemental_catalogs": supplemental_catalog_metrics,
-            "stale_source_rows_deleted": stale_source_rows_deleted,
+            "supplemental_catalogs": supplemental_catalog_metric_by_name,
+            "stale_source_rows_deleted": stale_source_deletion_by_type,
             "protected_source_ids": protected_source_ids,
             "protected_source_ids_missing": missing_protected_source_ids,
             "sources_probed": 0,
@@ -40072,9 +40072,9 @@ async def main(
     timeout: int | None = None,
 ) -> dict[str, Any]:
     """Run the provider-directory import command."""
-    ctx: dict[str, Any] = {"context": {"test_mode": test_mode}}
-    await startup(ctx)
-    task = {
+    runtime_context_by_key: dict[str, Any] = {"context": {"test_mode": test_mode}}
+    await startup(runtime_context_by_key)
+    task_by_field = {
         "test_mode": test_mode,
         "seed_db_path": seed_db_path,
         "seed_db_url": seed_db_url,
@@ -40125,9 +40125,9 @@ async def main(
         "concurrency": concurrency,
         "timeout": timeout,
     }
-    result = await process_data(ctx, task)
-    await shutdown(ctx)
-    return result
+    import_result = await process_data(runtime_context_by_key, task_by_field)
+    await shutdown(runtime_context_by_key)
+    return import_result
 
 
 def _clean_source_id_list(raw_source_ids: Any) -> list[str]:

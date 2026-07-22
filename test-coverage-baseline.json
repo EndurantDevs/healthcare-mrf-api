@@ -138,6 +138,7 @@
         "process/provider_directory_retained_artifact_base.py",
         "process/provider_directory_retained_artifact_contract.py",
         "process/provider_directory_retained_artifact_keys.py",
+        "process/provider_directory_retained_blob_store.py",
         "process/provider_directory_retained_campaign_contract.py",
         "process/provider_directory_retained_catalog_store.py",
         "process/provider_directory_retained_consumer_claim_store.py",
@@ -146,6 +147,8 @@
         "process/provider_directory_retained_layout_contract.py",
         "process/provider_directory_retained_lease_store.py",
         "process/provider_directory_retained_private_store.py",
+        "process/provider_directory_retained_reader.py",
+        "process/provider_directory_retained_reader_store.py",
         "process/provider_directory_retained_request_fence_store.py",
         "process/provider_directory_retained_seal_contract.py",
         "process/provider_directory_retained_seal_store.py",
@@ -297,12 +300,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 23284,
-          "total": 32568
+          "covered": 23508,
+          "total": 32676
         },
         "lines": {
-          "covered": 78490,
-          "total": 95307
+          "covered": 79173,
+          "total": 95764
         }
       },
       "path": "test-coverage-python.json",

@@ -557,6 +557,10 @@ jobs:
           tests/test_provider_directory_retained_private_key_binding.py
           tests/test_provider_directory_retained_sealed_contract.py
           tests/test_provider_directory_retained_source_neutrality.py
+          tests/test_provider_directory_retained_blob_store.py
+          tests/test_provider_directory_retained_reader_postgres.py
+          tests/test_provider_directory_retained_reader_parallel_postgres.py
+          tests/test_provider_directory_retained_reader_close_races_postgres.py
           tests/test_provider_directory_retained_core_postgres.py
           tests/test_provider_directory_retained_core_state_guards.py
           tests/test_provider_directory_retained_seal_claim_guards.py
