@@ -571,6 +571,7 @@ jobs:
           tests/test_provider_directory_retained_retry_gc_guards.py
           tests/test_provider_directory_retained_key_fence_status.py
           tests/test_provider_directory_projection_foundation_postgres.py
+          tests/test_provider_directory_projection_child_read_postgres.py
       - name: Upload PostgreSQL coverage data
         uses: actions/upload-artifact@v7
         with:

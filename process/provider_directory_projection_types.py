@@ -262,6 +262,31 @@ class ProjectionShardClaim:
 
 
 @dataclass(frozen=True)
+class ProjectionRetainedChildLease:
+    """One exact retained byte binding owned by one shard generation."""
+
+    shard_claim: ProjectionShardClaim
+    binding_id: str
+    block_id: str
+    retained_campaign_id: str
+    retained_campaign_sha256: str
+    retained_consumer_recipe_id: str
+    retained_claim_generation: int
+    retained_source_item_id: str
+    retained_artifact_sha256: str
+    retained_layout_sha256: str
+    retained_range_ordinal: int | None
+    artifact_byte_count: int
+    raw_byte_start: int
+    expected_byte_count: int
+    expected_record_count: int
+    input_sha256: str
+    expected_payload_sha256: str
+    child_generation: int
+    child_lease_token: str
+
+
+@dataclass(frozen=True)
 class ProjectionClaim:
     """One live build lease; sealed reuse requires admission resolution."""
 

@@ -645,6 +645,11 @@ async def heartbeat_projection_shard(
             "provider_directory_projection_shard_lease_seconds_invalid"
         )
     async with database.transaction():
+        await shared_active_recipe(
+            claim.recipe_lease,
+            database=database,
+            schema=schema,
+        )
         await set_local_projection_action(
             database,
             "shard_heartbeat",

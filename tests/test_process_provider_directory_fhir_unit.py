@@ -1214,8 +1214,7 @@ def test_provider_directory_blocker_runtime_rejects_non_v2_registry(
         importer._provider_directory_blocker_seed_rows()
 
 
-def _cms_sma_fixture_csv() -> str:
-    """Verify this provider-directory regression contract."""
+def _cms_sma_fixture_header_rows() -> tuple[list[str], list[str]]:
     section = [""] * 34
     section[0] = "State Medicaid Agency Interoperability and Patient Access Endpoint Directory"
     section[22] = "Provider Directory Endpoint Information "
@@ -1228,33 +1227,33 @@ def _cms_sma_fixture_csv() -> str:
     header[26] = "Data Refresh Frequency (e.g. Real-Time, Hourly, Daily, Weekly, Monthly) "
     header[27] = "Is the API Public?\n(Y/N drop-down list) "
     header[28] = "FHIR Version\n(drop-down list)\n"
+    return section, header
 
-    def row(
-        state: str,
-        *,
-        status: str,
-        public: str,
-        production_urls: str,
-        capability_url: str,
-        refresh: str = "Weekly",
-    ) -> list[str]:
-        item = [""] * 34
-        item[0] = state
-        item[1] = "4/28/2023"
-        item[22] = production_urls
-        item[23] = status
-        item[25] = capability_url
-        item[26] = refresh
-        item[27] = public
-        item[28] = "4.0.1"
-        return item
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(section)
-    writer.writerow(header)
-    writer.writerow(
-        row(
+def _cms_sma_fixture_row(
+    state: str,
+    *,
+    status: str,
+    public: str,
+    production_urls: str,
+    capability_url: str,
+    refresh: str = "Weekly",
+) -> list[str]:
+    item = [""] * 34
+    item[0] = state
+    item[1] = "4/28/2023"
+    item[22] = production_urls
+    item[23] = status
+    item[25] = capability_url
+    item[26] = refresh
+    item[27] = public
+    item[28] = "4.0.1"
+    return item
+
+
+def _cms_sma_fixture_data_rows() -> list[list[str]]:
+    return [
+        _cms_sma_fixture_row(
             "Alaska",
             status="Active",
             public="Yes",
@@ -1265,28 +1264,22 @@ def _cms_sma_fixture_csv() -> str:
             ),
             capability_url="https://api.alaskafhir.com/r4/metadata",
             refresh="Within 24 hours after claims adjudication. Normal cycle is weekly.",
-        )
-    )
-    writer.writerow(
-        row(
+        ),
+        _cms_sma_fixture_row(
             "Alabama",
             status="Active",
             public="No",
             production_urls="https://api.esante.us/provider/fhir/Practitioner",
             capability_url="https://api.esante.us/provider/fhir/Practitioner/metadata",
-        )
-    )
-    writer.writerow(
-        row(
+        ),
+        _cms_sma_fixture_row(
             "Oregon",
             status="In Development",
             public="Yes",
             production_urls="https://api.oregonfhir.com",
             capability_url="https://api.oregonfhir.com/r4/metadata",
-        )
-    )
-    writer.writerow(
-        row(
+        ),
+        _cms_sma_fixture_row(
             "Pennsylvania",
             status="Active",
             public="Yes",
@@ -1299,8 +1292,19 @@ def _cms_sma_fixture_csv() -> str:
                 "https://fite.pa-prd.gw03.abacusinsights.ai/provider-directory/metadata\n"
                 "https://fite.pa-prd.gw03.abacusinsights.ai/open-formulary/metadata"
             ),
-        )
-    )
+        ),
+    ]
+
+
+def _cms_sma_fixture_csv() -> str:
+    """Verify this provider-directory regression contract."""
+    section, header = _cms_sma_fixture_header_rows()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(section)
+    writer.writerow(header)
+    writer.writerows(_cms_sma_fixture_data_rows())
     return output.getvalue()
 
 
@@ -2383,6 +2387,36 @@ def test_source_row_from_seed_overrides_hap_name_only_seed_row():
     assert row["metadata_json"]["provider_directory_override"] == "hap_provider_directory_r4"
 
 
+def _assert_scan_partition_contract(source_record: dict[str, Any]) -> None:
+    partition_resources = source_record["metadata_json"][
+        importer.LAST_UPDATED_PARTITION_METADATA_KEY
+    ]["resources"]
+    assert set(partition_resources) == set(importer.DEFAULT_RESOURCES)
+    assert all(
+        resource_config == {
+            "start": "1900-01-01T00:00:00Z",
+            "end": "resolved_now",
+            "ceiling": 1000,
+            "minimum_width_seconds": 1,
+            "boundary_precision_seconds": 1,
+            "page_count": 100,
+            "volatile_metadata_paths": [],
+        }
+        for resource_config in partition_resources.values()
+    )
+    for resource_type in importer.DEFAULT_RESOURCES:
+        partition_config, partition_error = importer._last_updated_partition_config(
+            source_record,
+            resource_type,
+        )
+        assert partition_error is None
+        assert partition_config is not None
+        assert partition_config.ceiling == 1000
+        assert partition_config.page_count == 100
+        assert partition_config.end_mode == "resolved_now"
+        assert partition_config.boundary_precision == datetime.timedelta(seconds=1)
+
+
 def test_source_row_from_seed_overrides_scan_developer_portal_base():
     """The SCAN portal seed resolves to its strict partitioned FHIR source."""
     source_record = importer._source_row_from_seed(
@@ -2407,37 +2441,11 @@ def test_source_row_from_seed_overrides_scan_developer_portal_base():
     assert source_record["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
     assert source_record["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
     assert source_record["metadata_json"]["provider_directory_acquisition_enabled"] is True
-    partition_resources = source_record["metadata_json"][
-        importer.LAST_UPDATED_PARTITION_METADATA_KEY
-    ]["resources"]
-    assert set(partition_resources) == set(importer.DEFAULT_RESOURCES)
-    assert all(
-        resource_config == {
-            "start": "1900-01-01T00:00:00Z",
-            "end": "resolved_now",
-            "ceiling": 1000,
-            "minimum_width_seconds": 1,
-            "boundary_precision_seconds": 1,
-            "page_count": 100,
-            "volatile_metadata_paths": [],
-        }
-        for resource_config in partition_resources.values()
-    )
+    _assert_scan_partition_contract(source_record)
     assert importer._resource_acquisition_blocked_reason(
         source_record,
         list(importer.DEFAULT_RESOURCES),
     ) is None
-    for resource_type in importer.DEFAULT_RESOURCES:
-        partition_config, partition_error = importer._last_updated_partition_config(
-            source_record,
-            resource_type,
-        )
-        assert partition_error is None
-        assert partition_config is not None
-        assert partition_config.ceiling == 1000
-        assert partition_config.page_count == 100
-        assert partition_config.end_mode == "resolved_now"
-        assert partition_config.boundary_precision == datetime.timedelta(seconds=1)
     checkpoint_context = importer._pagination_checkpoint_context(
         source_record,
         [source_record["source_id"]],
@@ -2717,78 +2725,87 @@ def test_alohr_graphql_endpoint_change_forces_a_fresh_four_resource_dataset(
     assert changed_dataset_id != original_dataset_id
 
 
-def test_source_row_from_seed_preserves_known_confirmed_importable_bases():
-    """Verify this provider-directory regression contract."""
-    cases = [
+def _confirmed_importable_seed(
+    seed_id: str,
+    org_name: str,
+    api_base: str,
+    *,
+    auth_type: str = "none",
+) -> dict[str, Any]:
+    return {
+        "id": seed_id,
+        "org_name": org_name,
+        "api_base": api_base,
+        "auth_type": auth_type,
+        "source": "provider-directory-db",
+    }
+
+
+def _confirmed_importable_base_cases():
+    """Return confirmed seed, API-base, and compatibility-owner cases."""
+    return [
         (
-            {
-                "id": "aetna-r4",
-                "org_name": "Aetna R4",
-                "api_base": "https://fhir-ehr.cerner.com/r4/aetna",
-                "auth_type": "OAuth2/SMART",
-                "source": "provider-directory-db",
-            },
-            importer.AETNA_PROVIDER_DIRECTORY_BASE,
-            "aetna_apif1_providerdirectory",
+            _confirmed_importable_seed(
+                "aetna-r4",
+                "Aetna R4",
+                "https://fhir-ehr.cerner.com/r4/aetna",
+                auth_type="OAuth2/SMART",
+            ),
+            importer.AETNA_PROVIDER_DIRECTORY_BASE, "aetna_apif1_providerdirectory",
         ),
         (
-            {
-                "id": "alohr-public",
-                "org_name": "Blue Cross and Blue Shield of Alabama",
-                "api_base": "https://alohr.esante.us/public/providers",
-                "auth_type": "none",
-                "source": "provider-directory-db",
-            },
+            _confirmed_importable_seed(
+                "alohr-public",
+                "Blue Cross and Blue Shield of Alabama",
+                "https://alohr.esante.us/public/providers",
+            ),
             importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
             "alohr_healthshare_providerdirectory",
         ),
         (
-            {
-                "id": "cigna-availity",
-                "org_name": "Cigna",
-                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4",
-                "auth_type": "none",
-                "source": "provider-directory-db",
-            },
-            importer.CIGNA_PROVIDER_DIRECTORY_BASE,
-            "cigna_public_providerdirectory",
+            _confirmed_importable_seed(
+                "cigna-availity",
+                "Cigna",
+                "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4",
+            ),
+            importer.CIGNA_PROVIDER_DIRECTORY_BASE, "cigna_public_providerdirectory",
         ),
         (
-            {
-                "id": "centene-portal",
-                "org_name": "Centene Corporation",
-                "api_base": "https://partners.centene.com/apis",
-                "auth_type": "OAuth2 Client Credentials",
-                "source": "provider-directory-db",
-            },
+            _confirmed_importable_seed(
+                "centene-portal",
+                "Centene Corporation",
+                "https://partners.centene.com/apis",
+                auth_type="OAuth2 Client Credentials",
+            ),
             importer.CENTENE_PROVIDER_DIRECTORY_BASE,
             "centene_iopc_pd_providerdirectory",
         ),
         (
-            {
-                "id": "uhc-portal",
-                "org_name": "UnitedHealthcare",
-                "api_base": "https://www.uhc.com/legal/interoperability-apis/patient-access-api",
-                "auth_type": "OAuth2 Client Credentials",
-                "source": "provider-directory-db",
-            },
+            _confirmed_importable_seed(
+                "uhc-portal",
+                "UnitedHealthcare",
+                "https://www.uhc.com/legal/interoperability-apis/patient-access-api",
+                auth_type="OAuth2 Client Credentials",
+            ),
             importer.UHC_PROVIDER_DIRECTORY_BASE,
             "uhc_flex_optum_fhirpublic_r4",
         ),
         (
-            {
-                "id": "scan-portal",
-                "org_name": "SCAN Health Plan",
-                "api_base": "https://developer.scanhealthplan.com",
-                "auth_type": "API Key",
-                "source": "provider-directory-db",
-            },
+            _confirmed_importable_seed(
+                "scan-portal",
+                "SCAN Health Plan",
+                "https://developer.scanhealthplan.com",
+                auth_type="API Key",
+            ),
             importer.SCAN_PROVIDER_DIRECTORY_BASE,
             "scan_providerdirectory_intersystems",
         ),
     ]
 
-    for seed_row, expected_base, expected_override in cases:
+
+def test_source_row_from_seed_preserves_known_confirmed_importable_bases():
+    """Verify this provider-directory regression contract."""
+    for seed_row, expected_base, expected_override in _confirmed_importable_base_cases():
         observed_row_map = importer._source_row_from_seed(seed_row)
 
         assert observed_row_map["api_base"] == expected_base
@@ -2988,78 +3005,65 @@ async def test_process_data_acquires_only_neutral_0900_without_alias_fanout(
     assert audit_metrics["source_import_groups_attempted"] == 1
     assert audit_metrics["source_import_duplicate_sources_collapsed"] == 0
     assert "amerihealth_shared_backend_preflight" not in audit_metrics
-def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):
-    """Verify seed rows from retest results filters to provider like rows."""
-    retest_path = tmp_path / "retest_results.json"
-    retest_path.write_text(
-        json.dumps(
-            {
-                "tested_at": "2026-06-03T17:43:09Z",
-                "results": [
-                    {
-                        "payer_id": 10,
-                        "classification": "valid",
-                        "org_name": "Public FHIR Payer",
-                        "api_base": "https://public.example/fhir",
-                        "status_code": 200,
-                    },
-                    {
-                        "payer_id": 11,
-                        "classification": "valid_non_fhir",
-                        "org_name": "Public App Payer",
-                        "api_base": "https://public-app.example/providers",
-                        "status_code": 200,
-                    },
-                    {
-                        "payer_id": 12,
-                        "classification": "auth_required",
-                        "org_name": "Auth Payer",
-                        "api_base": "https://auth.example/fhir",
-                        "status_code": 403,
-                    },
-                    {
-                        "payer_id": 13,
-                        "classification": "not_found",
-                        "org_name": "Dead Payer",
-                        "api_base": "https://dead.example/fhir",
-                        "status_code": 404,
-                    },
-                    {
-                        "payer_id": 14,
-                        "classification": "not_found",
-                        "org_name": "Aetna",
-                        "api_base": "https://vteapif1.aetna.com/fhirdirectory/v1/patientaccess/",
-                        "status_code": 404,
-                    },
-                    {
-                        "payer_id": 15,
-                        "classification": "client_error",
-                        "org_name": "Humana Inc.",
-                        "api_base": "https://fhir.humana.com/api/provider-directory/",
-                        "status_code": 400,
-                    },
-                    {
-                        "payer_id": 16,
-                        "classification": "not_found",
-                        "org_name": "State of Maine",
-                        "api_base": "https://maineproviderdirectory.verityanalytics.org/fhir/Practitioner",
-                        "status_code": 404,
-                    },
-                    {
-                        "payer_id": 17,
-                        "classification": "not_found",
-                        "org_name": "Maryland Physicians Care",
-                        "api_base": "https://md-medicaid.convergent-pd.com/fhir/{resource}",
-                        "status_code": 404,
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+def _retest_result(
+    payer_id: int,
+    classification: str,
+    org_name: str,
+    api_base: str,
+    status_code: int,
+) -> dict[str, Any]:
+    return {
+        "payer_id": payer_id,
+        "classification": classification,
+        "org_name": org_name,
+        "api_base": api_base,
+        "status_code": status_code,
+    }
 
-    observed_rows = importer._seed_rows_from_retest_results(retest_path)
 
+def _provider_like_retest_payload() -> dict[str, Any]:
+    return {
+        "tested_at": "2026-06-03T17:43:09Z",
+        "results": [
+            _retest_result(10, "valid", "Public FHIR Payer", "https://public.example/fhir", 200),
+            _retest_result(
+                11, "valid_non_fhir", "Public App Payer", "https://public-app.example/providers", 200
+            ),
+            _retest_result(12, "auth_required", "Auth Payer", "https://auth.example/fhir", 403),
+            _retest_result(13, "not_found", "Dead Payer", "https://dead.example/fhir", 404),
+            _retest_result(
+                14,
+                "not_found",
+                "Aetna",
+                "https://vteapif1.aetna.com/fhirdirectory/v1/patientaccess/",
+                404,
+            ),
+            _retest_result(
+                15,
+                "client_error",
+                "Humana Inc.",
+                "https://fhir.humana.com/api/provider-directory/",
+                400,
+            ),
+            _retest_result(
+                16,
+                "not_found",
+                "State of Maine",
+                "https://maineproviderdirectory.verityanalytics.org/fhir/Practitioner",
+                404,
+            ),
+            _retest_result(
+                17,
+                "not_found",
+                "Maryland Physicians Care",
+                "https://md-medicaid.convergent-pd.com/fhir/{resource}",
+                404,
+            ),
+        ],
+    }
+
+
+def _assert_provider_like_retest_rows(observed_rows: list[dict[str, Any]]) -> None:
     assert [observed_row_map["org_name"] for observed_row_map in observed_rows] == [
         "Public FHIR Payer",
         "Public App Payer",
@@ -3101,6 +3105,16 @@ def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):
         normalized_maryland["metadata_json"]["provider_directory_base_normalization"]
         == "resource_or_metadata_parent_base"
     )
+
+
+def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):
+    """Verify seed rows from retest results filters to provider like rows."""
+    retest_path = tmp_path / "retest_results.json"
+    retest_path.write_text(json.dumps(_provider_like_retest_payload()), encoding="utf-8")
+
+    observed_rows = importer._seed_rows_from_retest_results(retest_path)
+
+    _assert_provider_like_retest_rows(observed_rows)
 
 
 def test_dedupe_source_rows_skips_low_information_retest_duplicate():
@@ -4453,6 +4467,24 @@ async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch)
     assert upsert_calls == [(ProviderDirectoryLocation, rows, {"skip_unchanged": True})]
 
 
+def _location_contact_derivation_rows() -> list[dict[str, Any]]:
+    return [
+        {
+            "source_id": "source_a",
+            "resource_id": "loc-1",
+            "telephone_number": "+1 (312) 555-0100 ext. 45",
+            "fax_number": "312.555.0199",
+            "country_code": "US",
+        },
+        {
+            "source_id": "source_a",
+            "resource_id": "loc-2",
+            "telephone_number": "312-555-0101",
+            "country_code": "US",
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_upsert_resource_rows_batches_location_contact_derivation(monkeypatch):
     """Verify this provider-directory regression contract."""
@@ -4484,21 +4516,7 @@ async def test_upsert_resource_rows_batches_location_contact_derivation(monkeypa
     monkeypatch.setattr(importer, "canonicalize_contact_batch", fake_canonicalize_contact_batch)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    observed_rows = [
-        {
-            "source_id": "source_a",
-            "resource_id": "loc-1",
-            "telephone_number": "+1 (312) 555-0100 ext. 45",
-            "fax_number": "312.555.0199",
-            "country_code": "US",
-        },
-        {
-            "source_id": "source_a",
-            "resource_id": "loc-2",
-            "telephone_number": "312-555-0101",
-            "country_code": "US",
-        },
-    ]
+    observed_rows = _location_contact_derivation_rows()
     written = await importer._upsert_resource_rows(
         ProviderDirectoryLocation,
         observed_rows,
@@ -4625,6 +4643,71 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
     assert upsert_calls[-1][0] is ProviderDirectoryPractitionerRole
 
 
+def _alohr_graphql_fixture_page(root_key: str):
+    if root_key == "providers":
+        return (
+            [
+                {
+                    "providerId": "prac-1234567893",
+                    "firstName": "Ada",
+                    "lastName": "Lovelace",
+                    "npi": "1234567893",
+                    "phone": "+12055550123",
+                    "address": {
+                        "street1": "100 Main St",
+                        "city": "Birmingham",
+                        "state": "AL",
+                        "zip": "35203",
+                    },
+                }
+            ],
+            None,
+            None,
+        )
+    return (
+        [
+            {
+                "orgId": "org-1992793046",
+                "name": "New Day Senior Care",
+                "npi": "1992793046",
+                "addresses": [
+                    {
+                        "street1": "241 Robert K Wilson Dr",
+                        "city": "Carrollton",
+                        "state": "AL",
+                        "zip": "35447",
+                    }
+                ],
+                "contacts": [{"contacts": [{"system": "phone", "value": "+12055550999"}]}],
+            }
+        ],
+        None,
+        None,
+    )
+
+
+def _assert_alohr_graphql_import_result(result, calls, rows_by_model) -> None:
+    source_ids, diagnostics, counts, linked_counts, stats, stale, stale_ready = result
+    assert source_ids == ["source_alohr"]
+    assert linked_counts == {}
+    assert stale == {}
+    assert stale_ready == {}
+    assert calls == [("providers", None), ("providerOrgs", None)]
+    assert counts == {
+        "Practitioner": 1,
+        "Location": 2,
+        "PractitionerRole": 1,
+        "Organization": 1,
+        "OrganizationAffiliation": 0,
+    }
+    assert ProviderDirectoryOrganizationAffiliation not in rows_by_model
+    assert "OrganizationAffiliation" not in diagnostics
+    assert rows_by_model[ProviderDirectoryOrganization][0]["npi"] == 1992793046
+    assert diagnostics["Practitioner"]["complete"] is True
+    assert diagnostics["Organization"]["rows_written"] == 1
+    assert stats["Location"]["sources_completed"] == 1
+
+
 @pytest.mark.asyncio
 async def test_import_alohr_graphql_source_group_writes_existing_resource_tables(monkeypatch):
     """Verify this provider-directory regression contract."""
@@ -4632,34 +4715,7 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
 
     async def fake_fetch_page(query, root_key, item_key, *, next_token, timeout):
         calls.append((root_key, next_token))
-        if root_key == "providers":
-            return (
-                [
-                    {
-                        "providerId": "prac-1234567893",
-                        "firstName": "Ada",
-                        "lastName": "Lovelace",
-                        "npi": "1234567893",
-                        "phone": "+12055550123",
-                        "address": {"street1": "100 Main St", "city": "Birmingham", "state": "AL", "zip": "35203"},
-                    }
-                ],
-                None,
-                None,
-            )
-        return (
-            [
-                {
-                    "orgId": "org-1992793046",
-                    "name": "New Day Senior Care",
-                    "npi": "1992793046",
-                    "addresses": [{"street1": "241 Robert K Wilson Dr", "city": "Carrollton", "state": "AL", "zip": "35447"}],
-                    "contacts": [{"contacts": [{"system": "phone", "value": "+12055550999"}]}],
-                }
-            ],
-            None,
-            None,
-        )
+        return _alohr_graphql_fixture_page(root_key)
 
     upsert_rows_by_model: dict[type, list[dict[str, Any]]] = {}
 
@@ -4680,28 +4736,13 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
         checkpoint_context=None,
         resume_required_entries=None,
     )
-    source_ids, diagnostics, counts, linked_counts, stats, stale, stale_ready = await importer._import_alohr_graphql_source_group(
+    import_result = await importer._import_alohr_graphql_source_group(
         [{"source_id": "source_alohr", "api_base": importer.ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE}],
         ["Practitioner", "Location", "PractitionerRole", "Organization", "OrganizationAffiliation"],
         options,
     )
 
-    assert source_ids == ["source_alohr"]
-    assert linked_counts == {}
-    assert stale == {}
-    assert stale_ready == {}
-    assert calls == [("providers", None), ("providerOrgs", None)]
-    assert counts["Practitioner"] == 1
-    assert counts["Location"] == 2
-    assert counts["PractitionerRole"] == 1
-    assert counts["Organization"] == 1
-    assert counts["OrganizationAffiliation"] == 0
-    assert ProviderDirectoryOrganizationAffiliation not in upsert_rows_by_model
-    assert "OrganizationAffiliation" not in diagnostics
-    assert upsert_rows_by_model[ProviderDirectoryOrganization][0]["npi"] == 1992793046
-    assert diagnostics["Practitioner"]["complete"] is True
-    assert diagnostics["Organization"]["rows_written"] == 1
-    assert stats["Location"]["sources_completed"] == 1
+    _assert_alohr_graphql_import_result(import_result, calls, upsert_rows_by_model)
 
 
 @pytest.mark.asyncio
@@ -6265,6 +6306,23 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
     assert "secret-token" not in json.dumps(metadata)
 
 
+def _caresource_public_override_source() -> dict[str, Any]:
+    return importer._source_row_from_seed(
+        {
+            "id": "57",
+            "org_tin": "31-1703368",
+            "org_name": "CareSource",
+            "plan_name": "Medicare Advantage, Medicaid MCO",
+            "api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
+            "requires_registration": "false",
+            "requires_api_key": "false",
+            "auth_type": "OAuth2/SMART",
+            "last_validated_status": "auth_required",
+            "source": "defacto_2024",
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_caresource_public_override_probes_and_selects_without_credentials(
     monkeypatch,
@@ -6289,20 +6347,7 @@ async def test_caresource_public_override_probes_and_selects_without_credentials
         return 200, {"resourceType": "Bundle", "entry": []}, None, 5
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
-    tested_source_map = importer._source_row_from_seed(
-        {
-            "id": "57",
-            "org_tin": "31-1703368",
-            "org_name": "CareSource",
-            "plan_name": "Medicare Advantage, Medicaid MCO",
-            "api_base": importer.CARESOURCE_PROVIDER_DIRECTORY_BASE,
-            "requires_registration": "false",
-            "requires_api_key": "false",
-            "auth_type": "OAuth2/SMART",
-            "last_validated_status": "auth_required",
-            "source": "defacto_2024",
-        }
-    )
+    tested_source_map = _caresource_public_override_source()
 
     probe, returned_capability = await importer._probe_source(
         tested_source_map,
@@ -6790,197 +6835,183 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
     )
 
 
-def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint():
-    """Verify parse fhir resource maps plan practitioner location role and endpoint."""
-    plan_model, plan_row = importer.parse_fhir_resource(
-        "source_a",
-        {
-            "resourceType": "InsurancePlan",
-            "id": "plan-1",
-            "identifier": [{"system": "https://example.test/plan-id", "value": "H1234-001"}],
-            "name": "Example HMO",
-            "network": [{"reference": "Organization/network-1"}],
-            "extension": [
+def _plan_parse_fixture() -> dict[str, Any]:
+    return {
+        "resourceType": "InsurancePlan",
+        "id": "plan-1",
+        "identifier": [{"system": "https://example.test/plan-id", "value": "H1234-001"}],
+        "name": "Example HMO",
+        "network": [{"reference": "Organization/network-1"}],
+        "extension": [
+            {
+                "url": (
+                    "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                    "StructureDefinition/network-reference"
+                ),
+                "valueReference": {"reference": "Organization/ignored-plan-extension"},
+            }
+        ],
+    }
+
+
+def _practitioner_qualification_fixture() -> dict[str, Any]:
+    return {
+        "identifier": [{"system": "https://example.test/license", "value": "IL-1234"}],
+        "code": {
+            "coding": [
                 {
-                    "url": (
-                        "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
-                        "StructureDefinition/network-reference"
-                    ),
-                    "valueReference": {"reference": "Organization/ignored-plan-extension"},
+                    "system": "http://terminology.hl7.org/CodeSystem/v2-0360",
+                    "code": "MD",
+                    "display": "Doctor of Medicine",
                 }
-            ],
+            ]
         },
-        run_id="run_1",
-    )
-    practitioner_model, practitioner_row = importer.parse_fhir_resource(
-        "source_a",
-        {
-            "resourceType": "Practitioner",
-            "id": "prac-1",
-            "identifier": [
-                {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567893"},
-                {
-                    "system": "https://example.test/license",
-                    "value": "IL-1234",
-                },
-            ],
-            "name": [
-                {
-                    "use": "official",
-                    "family": "Rivera",
-                    "given": ["Alex", "Morgan"],
-                    "prefix": ["Dr."],
-                    "suffix": ["MD"],
-                }
-            ],
-            "gender": "female",
-            "birthDate": "1970-01-01",
-            "address": [
-                {
-                    "use": "work",
-                    "line": ["100 Main St", "Suite 2"],
-                    "city": "Chicago",
-                    "state": "IL",
-                    "postalCode": "60601",
-                }
-            ],
-            "qualification": [
-                {
-                    "identifier": [
-                        {
-                            "system": "https://example.test/license",
-                            "value": "IL-1234",
-                        }
-                    ],
-                    "code": {
-                        "coding": [
-                            {
-                                "system": "http://terminology.hl7.org/CodeSystem/v2-0360",
-                                "code": "MD",
-                                "display": "Doctor of Medicine",
-                            }
-                        ]
-                    },
-                    "period": {"start": "2001-01-01"},
-                    "issuer": {
-                        "reference": "Organization/medical-school-1",
-                        "display": "Example Medical School",
-                    },
-                }
-            ],
-            "communication": [
-                {
-                    "coding": [
-                        {
-                            "system": "urn:ietf:bcp:47",
-                            "code": "es",
-                            "display": "Spanish",
-                        }
-                    ],
-                    "text": "Spanish",
-                }
-            ],
-            "photo": [
-                {
-                    "contentType": "image/jpeg",
-                    "url": "https://images.example.test/practitioner/prac-1.jpg",
-                    "data": "must-not-be-retained",
-                    "title": "Portrait",
-                },
-                {
-                    "contentType": "image/jpeg",
-                    "url": "https://images.example.test/private.jpg?token=secret",
-                },
-            ],
+        "period": {"start": "2001-01-01"},
+        "issuer": {
+            "reference": "Organization/medical-school-1",
+            "display": "Example Medical School",
         },
-    )
-    location_model, location_row = importer.parse_fhir_resource(
-        "source_a",
-        {
-            "resourceType": "Location",
-            "id": "loc-1",
-            "name": "Example Clinic",
-            "telecom": [{"system": "phone", "value": "312-555-0100"}],
-            "address": {
+    }
+
+
+def _practitioner_parse_fixture() -> dict[str, Any]:
+    return {
+        "resourceType": "Practitioner",
+        "id": "prac-1",
+        "identifier": [
+            {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567893"},
+            {"system": "https://example.test/license", "value": "IL-1234"},
+        ],
+        "name": [
+            {
+                "use": "official",
+                "family": "Rivera",
+                "given": ["Alex", "Morgan"],
+                "prefix": ["Dr."],
+                "suffix": ["MD"],
+            }
+        ],
+        "gender": "female",
+        "birthDate": "1970-01-01",
+        "address": [
+            {
+                "use": "work",
                 "line": ["100 Main St", "Suite 2"],
                 "city": "Chicago",
                 "state": "IL",
-                "postalCode": "60601-1234",
-                "country": "US",
+                "postalCode": "60601",
+            }
+        ],
+        "qualification": [_practitioner_qualification_fixture()],
+        "communication": [
+            {
+                "coding": [{"system": "urn:ietf:bcp:47", "code": "es", "display": "Spanish"}],
+                "text": "Spanish",
+            }
+        ],
+        "photo": [
+            {
+                "contentType": "image/jpeg",
+                "url": "https://images.example.test/practitioner/prac-1.jpg",
+                "data": "must-not-be-retained",
+                "title": "Portrait",
             },
+            {
+                "contentType": "image/jpeg",
+                "url": "https://images.example.test/private.jpg?token=secret",
+            },
+        ],
+    }
+
+
+def _location_parse_fixture() -> dict[str, Any]:
+    return {
+        "resourceType": "Location",
+        "id": "loc-1",
+        "name": "Example Clinic",
+        "telecom": [{"system": "phone", "value": "312-555-0100"}],
+        "address": {
+            "line": ["100 Main St", "Suite 2"],
+            "city": "Chicago",
+            "state": "IL",
+            "postalCode": "60601-1234",
+            "country": "US",
         },
+    }
+
+
+def _role_network_extension_fixtures() -> list[dict[str, Any]]:
+    plan_net_url = (
+        "http://hl7.org/fhir/us/davinci-pdex-plan-net/StructureDefinition/network-reference"
     )
-    role_model, role_row = importer.parse_fhir_resource(
-        "source_a",
+    return [
         {
-            "resourceType": "PractitionerRole",
-            "id": "role-1",
-            "identifier": [{"system": "https://example.test/fhir/npi", "value": "1234567893"}],
-            "practitioner": {"reference": "Practitioner/prac-1"},
-            "organization": {"reference": "Organization/org-1"},
-            "location": [{"reference": "Location/loc-1"}],
-            "network": [{"reference": "Organization/network-1"}],
-            "insurancePlan": [{"reference": "InsurancePlan/plan-1"}],
-            "endpoint": [{"reference": "Endpoint/endpoint-1"}],
+            "url": plan_net_url,
+            "valueReference": {"reference": "https://example.test/fhir/Organization/network-1"},
+        },
+        {
+            "url": "https://example.test/wrapper",
             "extension": [
                 {
                     "url": (
-                        "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
-                        "StructureDefinition/network-reference"
+                        "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                        "StructureDefinition/network-reference|1.2.0"
                     ),
-                    "valueReference": {
-                        "reference": "https://example.test/fhir/Organization/network-1"
-                    },
-                },
-                {
-                    "url": "https://example.test/wrapper",
-                    "extension": [
-                        {
-                            "url": (
-                                "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
-                                "StructureDefinition/network-reference|1.2.0"
-                            ),
-                            "valueReference": {"reference": "Organization/network-2"},
-                        }
-                    ],
-                },
-                {
-                    "url": "https://example.test/StructureDefinition/network-reference",
-                    "valueReference": {"reference": "Organization/wrong-namespace"},
-                },
-                {
-                    "url": (
-                        "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
-                        "StructureDefinition/network-reference"
-                    ),
-                    "valueReference": {"reference": "Practitioner/not-a-network"},
-                },
+                    "valueReference": {"reference": "Organization/network-2"},
+                }
             ],
         },
-    )
-    endpoint_model, endpoint_row = importer.parse_fhir_resource(
-        "source_a",
         {
-            "resourceType": "Endpoint",
-            "id": "endpoint-1",
-            "status": "active",
-            "connectionType": {
-                "system": "http://terminology.hl7.org/CodeSystem/endpoint-connection-type",
-                "code": "hl7-fhir-rest",
-                "display": "HL7 FHIR",
-            },
-            "name": "Provider Directory FHIR",
-            "managingOrganization": {"reference": "Organization/org-1"},
-            "contact": [{"system": "phone", "value": "312-555-1111"}],
-            "payloadType": [{"coding": [{"system": "http://hl7.org/fhir/resource-types", "code": "Organization"}]}],
-            "payloadMimeType": ["application/fhir+json"],
-            "address": "https://example.test/fhir",
-            "header": ["X-Test: true"],
-            "period": {"start": "2026-01-01"},
+            "url": "https://example.test/StructureDefinition/network-reference",
+            "valueReference": {"reference": "Organization/wrong-namespace"},
         },
-        run_id="run_2",
-    )
+        {
+            "url": plan_net_url,
+            "valueReference": {"reference": "Practitioner/not-a-network"},
+        },
+    ]
 
+
+def _role_parse_fixture() -> dict[str, Any]:
+    return {
+        "resourceType": "PractitionerRole",
+        "id": "role-1",
+        "identifier": [{"system": "https://example.test/fhir/npi", "value": "1234567893"}],
+        "practitioner": {"reference": "Practitioner/prac-1"},
+        "organization": {"reference": "Organization/org-1"},
+        "location": [{"reference": "Location/loc-1"}],
+        "network": [{"reference": "Organization/network-1"}],
+        "insurancePlan": [{"reference": "InsurancePlan/plan-1"}],
+        "endpoint": [{"reference": "Endpoint/endpoint-1"}],
+        "extension": _role_network_extension_fixtures(),
+    }
+
+
+def _endpoint_parse_fixture() -> dict[str, Any]:
+    return {
+        "resourceType": "Endpoint",
+        "id": "endpoint-1",
+        "status": "active",
+        "connectionType": {
+            "system": "http://terminology.hl7.org/CodeSystem/endpoint-connection-type",
+            "code": "hl7-fhir-rest",
+            "display": "HL7 FHIR",
+        },
+        "name": "Provider Directory FHIR",
+        "managingOrganization": {"reference": "Organization/org-1"},
+        "contact": [{"system": "phone", "value": "312-555-1111"}],
+        "payloadType": [
+            {"coding": [{"system": "http://hl7.org/fhir/resource-types", "code": "Organization"}]}
+        ],
+        "payloadMimeType": ["application/fhir+json"],
+        "address": "https://example.test/fhir",
+        "header": ["X-Test: true"],
+        "period": {"start": "2026-01-01"},
+    }
+
+
+def _assert_plan_and_practitioner_parse(result_by_type) -> None:
+    (plan_model, plan_row), (practitioner_model, practitioner_row) = result_by_type
     assert plan_model is ProviderDirectoryInsurancePlan
     assert plan_row["plan_identifier"] == "H1234-001"
     assert plan_row["network_refs"] == ["Organization/network-1"]
@@ -7016,6 +7047,12 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert "birthDate" not in practitioner_row
     assert "birth_date" not in practitioner_row
     assert "data" not in json.dumps(practitioner_row["photos"])
+
+
+def _assert_location_role_and_endpoint_parse(result_by_type) -> None:
+    (location_model, location_row), (role_model, role_row), (endpoint_model, endpoint_row) = (
+        result_by_type
+    )
     assert location_model is ProviderDirectoryLocation
     assert location_row["zip5"] == "60601"
     assert location_row["state_code"] == "IL"
@@ -7035,6 +7072,25 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["address"] == "https://example.test/fhir"
     assert endpoint_row["period_start"] == "2026-01-01"
     assert endpoint_row["last_seen_run_id"] == "run_2"
+
+
+def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint():
+    """Verify parse fhir resource maps plan practitioner location role and endpoint."""
+    plan_result = importer.parse_fhir_resource("source_a", _plan_parse_fixture(), run_id="run_1")
+    practitioner_result = importer.parse_fhir_resource(
+        "source_a",
+        _practitioner_parse_fixture(),
+    )
+    location_result = importer.parse_fhir_resource("source_a", _location_parse_fixture())
+    role_result = importer.parse_fhir_resource("source_a", _role_parse_fixture())
+    endpoint_result = importer.parse_fhir_resource(
+        "source_a",
+        _endpoint_parse_fixture(),
+        run_id="run_2",
+    )
+
+    _assert_plan_and_practitioner_parse((plan_result, practitioner_result))
+    _assert_location_role_and_endpoint_parse((location_result, role_result, endpoint_result))
 
 
 @pytest.mark.parametrize(
@@ -10927,62 +10983,60 @@ async def test_endpoint_dataset_does_not_publish_an_empty_resource_selection():
     assert candidate is None
 
 
-@pytest.mark.asyncio
-async def test_import_linked_resource_rows_fetches_role_references_and_upserts(monkeypatch):
-    """Verify this provider-directory regression contract."""
-    async def fake_fetch_json(url, *, timeout):
-        if "/Practitioner/prac-1" in url:
-            return 200, {"resourceType": "Practitioner", "id": "prac-1"}, None, 5
-        if "/Location/loc-1" in url:
-            return (
-                200,
-                {
-                    "resourceType": "Location",
-                    "id": "loc-1",
-                    "address": {"line": ["100 Main"], "city": "Chicago", "state": "IL", "postalCode": "60601"},
+def _linked_reference_fetch_result(url: str):
+    if "/Practitioner/prac-1" in url:
+        return 200, {"resourceType": "Practitioner", "id": "prac-1"}, None, 5
+    if "/Location/loc-1" in url:
+        return (
+            200,
+            {
+                "resourceType": "Location",
+                "id": "loc-1",
+                "address": {
+                    "line": ["100 Main"],
+                    "city": "Chicago",
+                    "state": "IL",
+                    "postalCode": "60601",
                 },
-                None,
-                5,
-            )
-        if "/InsurancePlan/plan-1" in url:
-            return 200, {"resourceType": "InsurancePlan", "id": "plan-1", "name": "Plan"}, None, 5
-        if "/Endpoint/endpoint-1" in url:
-            return 200, {"resourceType": "Endpoint", "id": "endpoint-1", "status": "active"}, None, 5
-        return 404, None, None, 5
-
-    upserts = []
-
-    async def fake_upsert(model, rows, **_kwargs):
-        upserts.append((model, rows, _kwargs))
-        return len(rows)
-
-    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
-    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
-
-    linked_resource_counts = await importer._import_linked_resource_rows(
-        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
-        {
-            "PractitionerRole": [
-                {
-                    "resource_id": "role-1",
-                    "practitioner_ref": "Practitioner/prac-1",
-                    "location_refs": ["Location/loc-1"],
-                    "insurance_plan_refs": ["InsurancePlan/plan-1"],
-                    "endpoint_refs": ["Endpoint/endpoint-1"],
-                }
-            ]
+            },
+            None,
+            5,
+        )
+    resource_by_path = {
+        "/InsurancePlan/plan-1": {
+            "resourceType": "InsurancePlan",
+            "id": "plan-1",
+            "name": "Plan",
         },
-        per_source_limit=5,
-        timeout=3,
-        run_id="run_1",
-    )
-
-    assert linked_resource_counts == {
-        "Practitioner": 1,
-        "Location": 1,
-        "InsurancePlan": 1,
-        "Endpoint": 1,
+        "/Endpoint/endpoint-1": {
+            "resourceType": "Endpoint",
+            "id": "endpoint-1",
+            "status": "active",
+        },
     }
+    for path, resource in resource_by_path.items():
+        if path in url:
+            return 200, resource, None, 5
+    return 404, None, None, 5
+
+
+def _linked_role_reference_rows() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "PractitionerRole": [
+            {
+                "resource_id": "role-1",
+                "practitioner_ref": "Practitioner/prac-1",
+                "location_refs": ["Location/loc-1"],
+                "insurance_plan_refs": ["InsurancePlan/plan-1"],
+                "endpoint_refs": ["Endpoint/endpoint-1"],
+            }
+        ]
+    }
+
+
+def _assert_linked_reference_upserts(linked_resource_counts, upserts) -> None:
+    expected_resource_types = {"Practitioner", "Location", "InsurancePlan", "Endpoint"}
+    assert linked_resource_counts == {resource_type: 1 for resource_type in expected_resource_types}
     concrete_models = [
         model
         for model, _rows, _kwargs in upserts
@@ -10995,32 +11049,50 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
         ProviderDirectoryEndpoint,
     ]
     canonical_rows = [
-        observed_row_map
-        for model, observed_rows, _kwargs in upserts
+        upsert_row
+        for model, upsert_rows, _kwargs in upserts
         if model is ProviderDirectoryCanonicalResource
-        for observed_row_map in observed_rows
+        for upsert_row in upsert_rows
     ]
-    source_edge_rows = [
-        observed_row_map
-        for model, observed_rows, _kwargs in upserts
+    edge_rows = [
+        upsert_row
+        for model, upsert_rows, _kwargs in upserts
         if model is ProviderDirectorySourceResource
-        for observed_row_map in observed_rows
+        for upsert_row in upsert_rows
     ]
-    assert {observed_row_map["resource_type"] for observed_row_map in canonical_rows} == {
-        "Practitioner",
-        "Location",
-        "InsurancePlan",
-        "Endpoint",
+    assert {canonical_row["resource_type"] for canonical_row in canonical_rows} == expected_resource_types
+    assert {canonical_row["canonical_api_base"] for canonical_row in canonical_rows} == {
+        "https://example.test/fhir"
     }
-    assert {observed_row_map["canonical_api_base"] for observed_row_map in canonical_rows} == {"https://example.test/fhir"}
-    assert {observed_row_map["source_id"] for observed_row_map in source_edge_rows} == {"source_a"}
-    assert {observed_row_map["resource_type"] for observed_row_map in source_edge_rows} == {
-        "Practitioner",
-        "Location",
-        "InsurancePlan",
-        "Endpoint",
-    }
-    assert {observed_row_map["last_seen_run_id"] for observed_row_map in source_edge_rows} == {"run_1"}
+    assert {edge_row["source_id"] for edge_row in edge_rows} == {"source_a"}
+    assert {edge_row["resource_type"] for edge_row in edge_rows} == expected_resource_types
+    assert {edge_row["last_seen_run_id"] for edge_row in edge_rows} == {"run_1"}
+
+
+@pytest.mark.asyncio
+async def test_import_linked_resource_rows_fetches_role_references_and_upserts(monkeypatch):
+    """Verify this provider-directory regression contract."""
+    async def fake_fetch_json(url, *, timeout):
+        return _linked_reference_fetch_result(url)
+
+    upserts = []
+
+    async def fake_upsert(model, rows, **_kwargs):
+        upserts.append((model, rows, _kwargs))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    linked_resource_counts = await importer._import_linked_resource_rows(
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        _linked_role_reference_rows(),
+        per_source_limit=5,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    _assert_linked_reference_upserts(linked_resource_counts, upserts)
 
 
 @pytest.mark.asyncio
@@ -11179,6 +11251,28 @@ async def test_import_linked_resource_rows_reports_progress_when_flushing(monkey
     assert sorted(progress) == [("Location", 1), ("Practitioner", 1)]
 
 
+def _complete_practitioner_role_fetch(source_id: str):
+    return importer.ResourceFetchResult(
+        model=ProviderDirectoryPractitionerRole,
+        rows=[
+            {
+                "source_id": source_id,
+                "resource_id": "role-1",
+                "practitioner_ref": "Practitioner/prac-1",
+                "location_refs": ["Location/loc-1"],
+            }
+        ],
+        rows_fetched=1,
+        rows_written=0,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     """Verify this provider-directory regression contract."""
@@ -11187,25 +11281,7 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
         if resource_type != "PractitionerRole":
             return None
-        return importer.ResourceFetchResult(
-            model=ProviderDirectoryPractitionerRole,
-            rows=[
-                {
-                    "source_id": source["source_id"],
-                    "resource_id": "role-1",
-                    "practitioner_ref": "Practitioner/prac-1",
-                    "location_refs": ["Location/loc-1"],
-                }
-            ],
-            rows_fetched=1,
-            rows_written=0,
-            pages_fetched=1,
-            complete=True,
-            row_limit_reached=False,
-            page_limit_reached=False,
-            hard_page_limit_reached=False,
-            next_url_remaining=False,
-        )
+        return _complete_practitioner_role_fetch(source["source_id"])
 
     async def fake_upsert(_model, rows, **_kwargs):
         return len(rows)
@@ -11247,6 +11323,39 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     assert callable(linked_kwargs[0]["progress_callback"])
 
 
+def _complete_resource_fetch(model, rows):
+    return importer.ResourceFetchResult(
+        model=model,
+        rows=rows,
+        rows_fetched=len(rows),
+        rows_written=0,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+
+def _suspicious_zero_fetch_result(source_id, resource_type, resource_attempt):
+    if resource_type == "PractitionerRole" and resource_attempt == 1:
+        return _complete_resource_fetch(ProviderDirectoryPractitionerRole, [])
+    if resource_type == "PractitionerRole":
+        return _complete_practitioner_role_fetch(source_id)
+    model_and_id_by_resource = {
+        "Practitioner": (ProviderDirectoryPractitioner, "prac-1"),
+        "Location": (ProviderDirectoryLocation, "loc-1"),
+    }
+    if resource_type not in model_and_id_by_resource:
+        return None
+    model, resource_id = model_and_id_by_resource[resource_type]
+    return _complete_resource_fetch(
+        model,
+        [{"source_id": source_id, "resource_id": resource_id}],
+    )
+
+
 @pytest.mark.asyncio
 async def test_import_resources_retries_suspicious_zero_practitioner_role(monkeypatch):
     """Verify import resources retries suspicious zero practitioner role."""
@@ -11260,66 +11369,11 @@ async def test_import_resources_retries_suspicious_zero_practitioner_role(monkey
     async def fake_fetch_resource_rows(source_row, resource_type, **_kwargs):
         """Support the fake fetch resource rows test fixture."""
         fetch_calls.append(resource_type)
-        if resource_type == "PractitionerRole" and fetch_calls.count("PractitionerRole") == 1:
-            return importer.ResourceFetchResult(
-                model=ProviderDirectoryPractitionerRole,
-                rows=[],
-                rows_fetched=0,
-                rows_written=0,
-                pages_fetched=1,
-                complete=True,
-                row_limit_reached=False,
-                page_limit_reached=False,
-                hard_page_limit_reached=False,
-                next_url_remaining=False,
-            )
-        if resource_type == "PractitionerRole":
-            return importer.ResourceFetchResult(
-                model=ProviderDirectoryPractitionerRole,
-                rows=[
-                    {
-                        "source_id": source_row["source_id"],
-                        "resource_id": "role-1",
-                        "practitioner_ref": "Practitioner/prac-1",
-                        "location_refs": ["Location/loc-1"],
-                    }
-                ],
-                rows_fetched=1,
-                rows_written=0,
-                pages_fetched=1,
-                complete=True,
-                row_limit_reached=False,
-                page_limit_reached=False,
-                hard_page_limit_reached=False,
-                next_url_remaining=False,
-            )
-        if resource_type == "Practitioner":
-            return importer.ResourceFetchResult(
-                model=ProviderDirectoryPractitioner,
-                rows=[{"source_id": source_row["source_id"], "resource_id": "prac-1"}],
-                rows_fetched=1,
-                rows_written=0,
-                pages_fetched=1,
-                complete=True,
-                row_limit_reached=False,
-                page_limit_reached=False,
-                hard_page_limit_reached=False,
-                next_url_remaining=False,
-            )
-        if resource_type == "Location":
-            return importer.ResourceFetchResult(
-                model=ProviderDirectoryLocation,
-                rows=[{"source_id": source_row["source_id"], "resource_id": "loc-1"}],
-                rows_fetched=1,
-                rows_written=0,
-                pages_fetched=1,
-                complete=True,
-                row_limit_reached=False,
-                page_limit_reached=False,
-                hard_page_limit_reached=False,
-                next_url_remaining=False,
-            )
-        return None
+        return _suspicious_zero_fetch_result(
+            source_row["source_id"],
+            resource_type,
+            fetch_calls.count(resource_type),
+        )
 
     async def fake_upsert(_model, rows, **_kwargs):
         return len(rows)
@@ -11350,6 +11404,21 @@ async def test_import_resources_retries_suspicious_zero_practitioner_role(monkey
     assert role_diagnostic["error"] is None
 
 
+def _zero_role_fetch_result(source_id: str, resource_type: str):
+    model_by_resource = {
+        "PractitionerRole": ProviderDirectoryPractitionerRole,
+        "Practitioner": ProviderDirectoryPractitioner,
+        "Location": ProviderDirectoryLocation,
+    }
+    resource_id_by_type = {
+        "Practitioner": "prac-1",
+        "Location": "loc-1",
+    }
+    resource_id = resource_id_by_type.get(resource_type)
+    rows = [] if resource_id is None else [{"source_id": source_id, "resource_id": resource_id}]
+    return _complete_resource_fetch(model_by_resource[resource_type], rows)
+
+
 @pytest.mark.asyncio
 async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_after_retry(monkeypatch):
     """Verify this provider-directory regression contract."""
@@ -11359,29 +11428,7 @@ async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_afte
         metadata_calls.append(kwargs["diagnostics"])
 
     async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
-        model_by_resource = {
-            "PractitionerRole": ProviderDirectoryPractitionerRole,
-            "Practitioner": ProviderDirectoryPractitioner,
-            "Location": ProviderDirectoryLocation,
-        }
-        rows_by_resource = {
-            "PractitionerRole": [],
-            "Practitioner": [{"source_id": source["source_id"], "resource_id": "prac-1"}],
-            "Location": [{"source_id": source["source_id"], "resource_id": "loc-1"}],
-        }
-        rows = rows_by_resource[resource_type]
-        return importer.ResourceFetchResult(
-            model=model_by_resource[resource_type],
-            rows=rows,
-            rows_fetched=len(rows),
-            rows_written=0,
-            pages_fetched=1,
-            complete=True,
-            row_limit_reached=False,
-            page_limit_reached=False,
-            hard_page_limit_reached=False,
-            next_url_remaining=False,
-        )
+        return _zero_role_fetch_result(source["source_id"], resource_type)
 
     async def fake_upsert(_model, rows, **_kwargs):
         return len(rows)
@@ -11741,9 +11788,7 @@ async def test_process_data_merges_supplemental_retest_sources(monkeypatch, tmp_
     assert supplemental["seed_source"] == "provider-directory-db-retest"
 
 
-@pytest.mark.asyncio
-async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp_path):
-    """Verify process data merges supplemental catalog sources."""
+def _write_supplemental_catalog_fixtures(tmp_path):
     amerihealth_catalog_path = tmp_path / "amerihealth.html"
     amerihealth_catalog_path.write_text(
         """
@@ -11771,6 +11816,62 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
     )
     cms_sma_catalog_path = tmp_path / "cms-sma.csv"
     cms_sma_catalog_path.write_text("State Medicaid Agency Interoperability and Patient Access Endpoint Directory\n", encoding="utf-8")
+    return amerihealth_catalog_path, contra_costa_catalog_path, cms_sma_catalog_path
+
+
+def _assert_supplemental_catalog_metrics(metrics) -> None:
+    assert metrics["sources_seeded"] == 16
+    assert metrics["supplemental_catalog_sources_considered"] == 15
+    catalog_metrics = metrics["supplemental_catalogs"]["catalogs"]
+    assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 8
+    assert catalog_metrics["amerihealth_caritas"]["rows"] == 1
+    assert catalog_metrics["contra_costa"]["rows"] == 1
+    assert catalog_metrics["cms_sma_endpoint_directory"]["rows"] == 0
+    assert catalog_metrics["health_partners_plans"]["rows"] == 1
+    assert catalog_metrics["aetna_provider_directorydata"]["rows"] == 1
+    assert catalog_metrics["provider_directory_blockers"]["rows"] == 3
+
+
+def _source_seeded_from(rows, seed_source):
+    return next(row for row in rows if row["seed_source"] == seed_source)
+
+
+def _assert_supplemental_source_rows(upserted_source_rows) -> None:
+    amerihealth = _source_seeded_from(
+        upserted_source_rows,
+        "amerihealth-caritas-developer-portal",
+    )
+    assert amerihealth["org_name"] == "AmeriHealth Caritas"
+    assert amerihealth["plan_name"] == "AmeriHealth Caritas District of Columbia"
+    assert amerihealth["api_base"] == "https://api-ext.amerihealthcaritas.com/5400/provider-api"
+    contra_costa = _source_seeded_from(upserted_source_rows, "contra-costa-health-developer-page")
+    assert contra_costa["org_name"] == "Contra Costa Health Plan"
+    assert contra_costa["api_base"] == "https://ihyml0v6d9.execute-api.us-east-1.amazonaws.com/hxprod"
+    health_partners = _source_seeded_from(upserted_source_rows, "health-partners-plans-fhir-root")
+    assert health_partners["org_name"] == "Health Partners Plans"
+    assert health_partners["api_base"] == importer.HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE
+    aetna = _source_seeded_from(upserted_source_rows, "aetna-developer-portal")
+    assert aetna["org_name"] == "Aetna"
+    assert aetna["api_base"] == importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE
+    blockers = [
+        row
+        for row in upserted_source_rows
+        if row["seed_source"] == importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE
+    ]
+    assert {row["org_name"] for row in blockers} == {
+        "Chorus Community Health Plans (fka Children's Community Health Plan)",
+        "First Medical Health Plan, Inc.",
+        "Territory of Puerto Rico",
+    }
+    assert all(row["api_base"] is None for row in blockers)
+    assert all(row["metadata_json"]["provider_directory_blocked"] is True for row in blockers)
+
+
+@pytest.mark.asyncio
+async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp_path):
+    """Verify process data merges supplemental catalog sources."""
+    catalog_paths = _write_supplemental_catalog_fixtures(tmp_path)
+    amerihealth_catalog_path, contra_costa_catalog_path, cms_sma_catalog_path = catalog_paths
     upserted_source_rows: list[dict[str, Any]] = []
 
     async def fake_upsert(model, rows, **_kwargs):
@@ -11796,48 +11897,8 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
         },
     )
 
-    assert metrics["sources_seeded"] == 16
-    assert metrics["supplemental_catalog_sources_considered"] == 15
-    assert metrics["supplemental_catalogs"]["catalogs"][
-        "reviewed_provider_directory_candidates"
-    ]["rows"] == 8
-    assert metrics["supplemental_catalogs"]["catalogs"]["amerihealth_caritas"]["rows"] == 1
-    assert metrics["supplemental_catalogs"]["catalogs"]["contra_costa"]["rows"] == 1
-    assert metrics["supplemental_catalogs"]["catalogs"]["cms_sma_endpoint_directory"]["rows"] == 0
-    assert metrics["supplemental_catalogs"]["catalogs"]["health_partners_plans"]["rows"] == 1
-    assert metrics["supplemental_catalogs"]["catalogs"]["aetna_provider_directorydata"]["rows"] == 1
-    assert metrics["supplemental_catalogs"]["catalogs"]["provider_directory_blockers"]["rows"] == 3
-    amerihealth = next(
-        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == "amerihealth-caritas-developer-portal"
-    )
-    assert amerihealth["org_name"] == "AmeriHealth Caritas"
-    assert amerihealth["plan_name"] == "AmeriHealth Caritas District of Columbia"
-    assert amerihealth["api_base"] == "https://api-ext.amerihealthcaritas.com/5400/provider-api"
-    contra_costa = next(
-        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == "contra-costa-health-developer-page"
-    )
-    assert contra_costa["org_name"] == "Contra Costa Health Plan"
-    assert contra_costa["api_base"] == "https://ihyml0v6d9.execute-api.us-east-1.amazonaws.com/hxprod"
-    health_partners_plans = next(
-        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == "health-partners-plans-fhir-root"
-    )
-    assert health_partners_plans["org_name"] == "Health Partners Plans"
-    assert health_partners_plans["api_base"] == importer.HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE
-    aetna = next(
-        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == "aetna-developer-portal"
-    )
-    assert aetna["org_name"] == "Aetna"
-    assert aetna["api_base"] == importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE
-    blockers = [
-        observed_row_map for observed_row_map in upserted_source_rows if observed_row_map["seed_source"] == importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE
-    ]
-    assert {observed_row_map["org_name"] for observed_row_map in blockers} == {
-        "Chorus Community Health Plans (fka Children's Community Health Plan)",
-        "First Medical Health Plan, Inc.",
-        "Territory of Puerto Rico",
-    }
-    assert all(observed_row_map["api_base"] is None for observed_row_map in blockers)
-    assert all(observed_row_map["metadata_json"]["provider_directory_blocked"] is True for observed_row_map in blockers)
+    _assert_supplemental_catalog_metrics(metrics)
+    _assert_supplemental_source_rows(upserted_source_rows)
 
 
 @pytest.mark.asyncio
@@ -11988,9 +12049,7 @@ async def test_non_fhir_retest_requires_valid_probe(monkeypatch, tmp_path):
     assert metrics["source_import_skipped_validation_status"] == 1
 
 
-@pytest.mark.asyncio
-async def test_process_data_stamps_locations_and_publishes_corroboration_view_when_requested(monkeypatch):
-    """Verify this provider-directory regression contract."""
+def _stub_corroboration_publish_pipeline(monkeypatch):
     import_resources = AsyncMock(return_value={"Location": 2})
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
@@ -12017,6 +12076,46 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
         "_is_address_corroboration_published",
         AsyncMock(return_value=True),
     )
+    return import_resources
+
+
+def _assert_corroboration_publish_result(metrics, import_resources) -> None:
+    assert metrics["resource_rows"] == {"Location": 2}
+    assert metrics["bulk_export_max_pending_seconds"] == 23456
+    assert import_resources.await_args.kwargs["bulk_export_max_pending_seconds"] == 23456
+    assert metrics["sources_import_attempted"] == 1
+    assert metrics["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
+    assert metrics["location_coordinates_backfilled"] == 6
+    assert metrics["resource_id_npis_backfilled"] == {"Practitioner": 2, "Organization": 1}
+    assert metrics["location_address_keys_stamped"] == 3
+    assert metrics["location_archive"] == {"inserted": 4, "provenance_updates": 1}
+    assert metrics["network_catalog"] == {"rows": 8}
+    assert metrics["publish_corroboration"] is True
+    assert metrics["ptg_corroboration_view_published"] is True
+    importer.backfill_provider_directory_location_contacts.assert_awaited_once()
+    run_scoped_calls = (
+        "backfill_provider_directory_location_coordinates",
+        "backfill_provider_directory_resource_id_npis",
+        "publish_provider_directory_location_address_keys",
+        "publish_provider_directory_location_archive",
+        "publish_provider_directory_address_overlay",
+        "publish_provider_directory_network_catalog",
+    )
+    for call_name in run_scoped_calls:
+        observed_call = getattr(importer, call_name)
+        observed_call.assert_awaited_once()
+        assert observed_call.await_args.kwargs["run_id"] == "run_full"
+    importer._is_address_corroboration_published.assert_awaited_once()
+    assert (
+        importer._is_address_corroboration_published.await_args.kwargs["refresh_network_catalog"]
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_data_stamps_locations_and_publishes_corroboration_view_when_requested(monkeypatch):
+    """Verify this provider-directory regression contract."""
+    import_resources = _stub_corroboration_publish_pipeline(monkeypatch)
 
     metrics = await importer.process_data(
         {"context": {}},
@@ -12031,41 +12130,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
             "bulk_export_max_pending_seconds": 23456,
         },
     )
-    assert metrics["resource_rows"] == {"Location": 2}
-    assert metrics["bulk_export_max_pending_seconds"] == 23456
-    assert (
-        import_resources.await_args.kwargs["bulk_export_max_pending_seconds"]
-        == 23456
-    )
-    assert metrics["sources_import_attempted"] == 1
-    assert metrics["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
-    assert metrics["location_coordinates_backfilled"] == 6
-    assert metrics["resource_id_npis_backfilled"] == {"Practitioner": 2, "Organization": 1}
-    assert metrics["location_address_keys_stamped"] == 3
-    assert metrics["location_archive"] == {"inserted": 4, "provenance_updates": 1}
-    assert metrics["network_catalog"] == {"rows": 8}
-    assert metrics["publish_corroboration"] is True
-    assert metrics["ptg_corroboration_view_published"] is True
-    importer.backfill_provider_directory_location_contacts.assert_awaited_once()
-    importer.backfill_provider_directory_location_coordinates.assert_awaited_once()
-    assert importer.backfill_provider_directory_location_coordinates.await_args.kwargs["run_id"] == "run_full"
-    importer.backfill_provider_directory_resource_id_npis.assert_awaited_once()
-    assert importer.backfill_provider_directory_resource_id_npis.await_args.kwargs["run_id"] == "run_full"
-    importer.publish_provider_directory_location_address_keys.assert_awaited_once()
-    assert importer.publish_provider_directory_location_address_keys.await_args.kwargs["run_id"] == "run_full"
-    importer.publish_provider_directory_location_archive.assert_awaited_once()
-    assert importer.publish_provider_directory_location_archive.await_args.kwargs["run_id"] == "run_full"
-    importer.publish_provider_directory_address_overlay.assert_awaited_once()
-    assert importer.publish_provider_directory_address_overlay.await_args.kwargs["run_id"] == "run_full"
-    importer.publish_provider_directory_network_catalog.assert_awaited_once()
-    assert importer.publish_provider_directory_network_catalog.await_args.kwargs["run_id"] == "run_full"
-    importer._is_address_corroboration_published.assert_awaited_once()
-    assert (
-        importer._is_address_corroboration_published.await_args.kwargs[
-            "refresh_network_catalog"
-        ]
-        is False
-    )
+    _assert_corroboration_publish_result(metrics, import_resources)
 
 
 @pytest.mark.asyncio
@@ -12105,6 +12170,68 @@ def _stub_artifact_dataset_scope(monkeypatch) -> None:
         "_resolve_provider_directory_artifact_datasets",
         AsyncMock(return_value=importer.ProviderDirectoryArtifactDatasetFence(())),
     )
+
+
+def _stub_artifact_only_publishers(monkeypatch) -> None:
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
+    _stub_artifact_dataset_scope(monkeypatch)
+    return_value_by_name = {
+        "backfill_provider_directory_location_contacts": {"location_contact_rows_updated": 5},
+        "backfill_provider_directory_location_coordinates": 6,
+        "backfill_provider_directory_resource_id_npis": {"Practitioner": 2, "Organization": 1},
+        "publish_provider_directory_location_address_keys": 3,
+        "publish_provider_directory_location_archive": {"inserted": 4, "provenance_updates": 1},
+        "publish_provider_directory_address_overlay": {},
+        "publish_provider_directory_network_catalog": {"rows": 8},
+        "_is_address_corroboration_published": True,
+    }
+    for call_name, return_value in return_value_by_name.items():
+        monkeypatch.setattr(importer, call_name, AsyncMock(return_value=return_value))
+    monkeypatch.setattr(
+        importer,
+        "_resolve_seed_db",
+        lambda *_args, **_kwargs: pytest.fail(
+            "seed DB should not be resolved for artifact publish"
+        ),
+    )
+
+
+def _assert_artifact_only_publish_result(operation_result) -> None:
+    assert operation_result["publish_artifacts_only"] is True
+    assert operation_result["location_contacts_backfilled"] == {
+        "location_contact_rows_updated": 5
+    }
+    assert operation_result["location_coordinates_backfilled"] == 6
+    assert operation_result["resource_id_npis_backfilled"] == {
+        "Practitioner": 2,
+        "Organization": 1,
+    }
+    assert operation_result["location_address_keys_stamped"] == 3
+    assert operation_result["location_archive"] == {"inserted": 4, "provenance_updates": 1}
+    assert operation_result["network_catalog"] == {"rows": 8}
+    assert operation_result["publish_corroboration"] is False
+    assert operation_result["ptg_corroboration_view_published"] is False
+    assert operation_result["ptg_corroboration_view_skipped"] == {
+        "reason": "publish_corroboration_disabled",
+    }
+    importer.backfill_provider_directory_location_contacts.assert_awaited_once()
+    standard_kwargs_by_name = {"run_id": None, "source_ids": [], "seen_table": None}
+    for call_name in (
+        "backfill_provider_directory_location_coordinates",
+        "backfill_provider_directory_resource_id_npis",
+        "publish_provider_directory_location_address_keys",
+        "publish_provider_directory_location_archive",
+    ):
+        getattr(importer, call_name).assert_awaited_once_with(**standard_kwargs_by_name)
+    deferred_kwargs_by_name = {"run_id": None, "source_ids": [], "defer_cutover": True}
+    for call_name in (
+        "publish_provider_directory_address_overlay",
+        "publish_provider_directory_network_catalog",
+    ):
+        getattr(importer, call_name).assert_awaited_once_with(**deferred_kwargs_by_name)
+    importer._is_address_corroboration_published.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -12586,6 +12713,51 @@ def _checkpoint_retry_task(requested_source_id):
     }
 
 
+def _completed_resource_progress_fakes(requested_source_id, completion_snapshots):
+    async def fake_mark_progress(
+        _run_id,
+        *,
+        phase,
+        details=None,
+        metrics=None,
+        **_kwargs,
+    ):
+        active_groups = details.get("active_source_groups", []) if isinstance(details, dict) else []
+        if (
+            phase == "provider-directory importing resources"
+            and active_groups
+            and active_groups[0].get("current_resource") == "Organization"
+        ):
+            completion_snapshots.append(
+                dict(metrics.get("resource_fetch_completed_source_ids", {}))
+            )
+
+    async def fake_import_resources(
+        _sources,
+        *,
+        resource_completion,
+        progress_callback,
+        **_kwargs,
+    ):
+        resource_counts_by_type = {"InsurancePlan": 1413, "Organization": 0}
+        def progress_details(resource_type):
+            return {
+                "active_source_groups": [
+                    {
+                        "sample_source_id": requested_source_id,
+                        "current_resource": resource_type,
+                    }
+                ]
+            }
+
+        await progress_callback(0, 1, resource_counts_by_type, progress_details("InsurancePlan"))
+        resource_completion["InsurancePlan"] = {requested_source_id}
+        await progress_callback(0, 1, resource_counts_by_type, progress_details("Organization"))
+        return resource_counts_by_type
+
+    return fake_mark_progress, fake_import_resources
+
+
 @pytest.mark.asyncio
 async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejection(
     monkeypatch,
@@ -12687,64 +12859,10 @@ async def test_process_data_reports_completed_resource_when_next_resource_starts
     requested_source_id = "pdfhir_checkpointed"
     _stub_checkpoint_retry_process(monkeypatch, requested_source_id)
     completion_snapshots: list[dict[str, list[str]]] = []
-
-    async def fake_mark_progress(
-        _run_id,
-        *,
-        phase,
-        details=None,
-        metrics=None,
-        **_kwargs,
-    ):
-        active_groups = (
-            details.get("active_source_groups", [])
-            if isinstance(details, dict)
-            else []
-        )
-        if (
-            phase == "provider-directory importing resources"
-            and active_groups
-            and active_groups[0].get("current_resource") == "Organization"
-        ):
-            completion_snapshots.append(
-                dict(metrics.get("resource_fetch_completed_source_ids", {}))
-            )
-
-    async def fake_import_resources(
-        _sources,
-        *,
-        resource_completion,
-        progress_callback,
-        **_kwargs,
-    ):
-        await progress_callback(
-            0,
-            1,
-            {"InsurancePlan": 1413, "Organization": 0},
-            {
-                "active_source_groups": [
-                    {
-                        "sample_source_id": requested_source_id,
-                        "current_resource": "InsurancePlan",
-                    }
-                ]
-            },
-        )
-        resource_completion["InsurancePlan"] = {requested_source_id}
-        await progress_callback(
-            0,
-            1,
-            {"InsurancePlan": 1413, "Organization": 0},
-            {
-                "active_source_groups": [
-                    {
-                        "sample_source_id": requested_source_id,
-                        "current_resource": "Organization",
-                    }
-                ]
-            },
-        )
-        return {"InsurancePlan": 1413, "Organization": 0}
+    fake_mark_progress, fake_import_resources = _completed_resource_progress_fakes(
+        requested_source_id,
+        completion_snapshots,
+    )
 
     monkeypatch.setattr(importer, "_mark_provider_directory_progress", fake_mark_progress)
     monkeypatch.setattr(importer, "_import_resources", fake_import_resources)
@@ -15498,6 +15616,18 @@ async def test_non_role_uhc_residual_partition_retains_checkpoints(monkeypatch):
     assert checkpoint_rows[0]["seed_resource_id"] == "family=AB"
 
 
+def _assert_scan_partition_error_result(calls, location_fetch_result) -> None:
+    assert calls == [
+        "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=A",
+        "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=B",
+    ]
+    assert location_fetch_result is not None
+    assert location_fetch_result.model is ProviderDirectoryLocation
+    assert location_fetch_result.rows_fetched == 1
+    assert location_fetch_result.rows[0]["resource_id"] == "location-1"
+    assert location_fetch_result.error == "partition_errors_1_last_http_413"
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypatch):
     """Verify fetch resource rows continues after scan partition error."""
@@ -15551,15 +15681,7 @@ async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypa
         run_id="run_1",
     )
 
-    assert calls == [
-        "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=A",
-        "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=B",
-    ]
-    assert location_fetch_result is not None
-    assert location_fetch_result.model is ProviderDirectoryLocation
-    assert location_fetch_result.rows_fetched == 1
-    assert location_fetch_result.rows[0]["resource_id"] == "location-1"
-    assert location_fetch_result.error == "partition_errors_1_last_http_413"
+    _assert_scan_partition_error_result(calls, location_fetch_result)
 
 
 @pytest.mark.asyncio
@@ -16055,6 +16177,44 @@ async def test_postal_partition_resume_marks_existing_roles_seen(monkeypatch):
     assert statements[0][1]["source_ids"] == ["uhc"]
 
 
+def _scan_role_lookup_response():
+    return (
+        200,
+        {
+            "resourceType": "Bundle",
+            "entry": [
+                {
+                    "fullUrl": (
+                        "https://providerdirectory.scanhealthplan.com/"
+                        "PractitionerRole/role-1"
+                    ),
+                    "resource": {
+                        "resourceType": "PractitionerRole",
+                        "id": "role-1",
+                        "practitioner": {"reference": "Practitioner/prac-1"},
+                    },
+                }
+            ],
+        },
+        None,
+        5,
+    )
+
+
+def _assert_scan_roles_after_practitioners(counts, upserts, role_calls, stats) -> None:
+    assert counts == {"PractitionerRole": 1, "Practitioner": 1}
+    assert [model for model, _rows in upserts] == [
+        ProviderDirectoryPractitioner,
+        ProviderDirectoryPractitionerRole,
+    ]
+    assert role_calls == [
+        "https://providerdirectory.scanhealthplan.com/"
+        "PractitionerRole?practitioner=Practitioner%2Fprac-1&_count=25"
+    ]
+    assert stats["PractitionerRole"]["sources_attempted"] == 1
+    assert stats["PractitionerRole"]["rows_fetched"] == 1
+
+
 @pytest.mark.asyncio
 async def test_import_resources_fetches_scan_practitioner_roles_after_practitioners(monkeypatch):
     """Verify import resources fetches scan practitioner roles after practitioners."""
@@ -16065,47 +16225,16 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
             raise AssertionError("SCAN PractitionerRole should be reverse-looked-up after practitioners")
         if resource_type != "Practitioner":
             return None
-        return importer.ResourceFetchResult(
-            model=ProviderDirectoryPractitioner,
-            rows=[
-                {
-                    "source_id": source["source_id"],
-                    "resource_id": "prac-1",
-                    "npi": "1234567890",
-                }
-            ],
-            rows_fetched=1,
-            rows_written=0,
-            pages_fetched=1,
-            complete=True,
-            row_limit_reached=False,
-            page_limit_reached=False,
-            hard_page_limit_reached=False,
-            next_url_remaining=False,
+        return _complete_resource_fetch(
+            ProviderDirectoryPractitioner,
+            [{"source_id": source["source_id"], "resource_id": "prac-1", "npi": "1234567890"}],
         )
 
     role_calls: list[str] = []
 
     async def fake_fetch_source_json(_source, url, *, timeout):
         role_calls.append(url)
-        return (
-            200,
-            {
-                "resourceType": "Bundle",
-                "entry": [
-                    {
-                        "fullUrl": "https://providerdirectory.scanhealthplan.com/PractitionerRole/role-1",
-                        "resource": {
-                            "resourceType": "PractitionerRole",
-                            "id": "role-1",
-                            "practitioner": {"reference": "Practitioner/prac-1"},
-                        },
-                    }
-                ],
-            },
-            None,
-            5,
-        )
+        return _scan_role_lookup_response()
 
     upserts: list[tuple[type, list[dict[str, Any]]]] = []
 
@@ -16135,16 +16264,12 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
         resource_fetch_stats=resource_fetch_stats_by_type,
     )
 
-    assert counts == {"PractitionerRole": 1, "Practitioner": 1}
-    assert [model for model, _rows in upserts] == [
-        ProviderDirectoryPractitioner,
-        ProviderDirectoryPractitionerRole,
-    ]
-    assert role_calls == [
-        "https://providerdirectory.scanhealthplan.com/PractitionerRole?practitioner=Practitioner%2Fprac-1&_count=25"
-    ]
-    assert resource_fetch_stats_by_type["PractitionerRole"]["sources_attempted"] == 1
-    assert resource_fetch_stats_by_type["PractitionerRole"]["rows_fetched"] == 1
+    _assert_scan_roles_after_practitioners(
+        counts,
+        upserts,
+        role_calls,
+        resource_fetch_stats_by_type,
+    )
 
 
 def _uhc_reverse_lookup_source() -> dict[str, str]:
@@ -18058,6 +18183,17 @@ async def test_fetch_resource_rows_rewrites_live_hap_page_two(monkeypatch):
     assert fetched_urls == [first_url, second_url]
 
 
+def _assert_relative_next_link_result(operation_result, calls) -> None:
+    assert operation_result is not None
+    assert operation_result.model is ProviderDirectoryPractitioner
+    assert operation_result.complete is True
+    assert [row["resource_id"] for row in operation_result.rows] == ["prac-1", "prac-2"]
+    assert calls == [
+        "https://example.test/fhir/Practitioner?_count=10",
+        "https://example.test/page/2",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
     """Verify this provider-directory regression contract."""
@@ -18116,14 +18252,7 @@ async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
         run_id="run_1",
     )
 
-    assert operation_result is not None
-    assert operation_result.model is ProviderDirectoryPractitioner
-    assert operation_result.complete is True
-    assert [observed_row_map["resource_id"] for observed_row_map in operation_result.rows] == ["prac-1", "prac-2"]
-    assert calls == [
-        "https://example.test/fhir/Practitioner?_count=10",
-        "https://example.test/page/2",
-    ]
+    _assert_relative_next_link_result(operation_result, calls)
 
 
 @pytest.mark.asyncio
@@ -20259,23 +20388,11 @@ async def test_generic_403_continuation_remains_fetch_error(monkeypatch):
     clear_checkpoint.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monkeypatch):
-    """Verify this provider-directory regression contract."""
-    _stub_resource_import_metadata(monkeypatch)
-
-    fetch_results = [
-        importer.ResourceFetchResult(
-            model=ProviderDirectoryLocation,
-            rows=[{"source_id": "source_a", "resource_id": "loc-1"}],
-            rows_fetched=1,
-            rows_written=0,
-            pages_fetched=1,
-            complete=True,
-            row_limit_reached=False,
-            page_limit_reached=False,
-            hard_page_limit_reached=False,
-            next_url_remaining=False,
+def _stale_cleanup_fetch_results():
+    return [
+        _complete_resource_fetch(
+            ProviderDirectoryLocation,
+            [{"source_id": "source_a", "resource_id": "loc-1"}],
         ),
         importer.ResourceFetchResult(
             model=ProviderDirectoryPractitioner,
@@ -20290,6 +20407,31 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
             next_url_remaining=True,
         ),
     ]
+
+
+def _assert_complete_scan_stale_cleanup(counts, stale_counts, deletes, stats) -> None:
+    assert counts == {"Location": 1, "Practitioner": 1}
+    assert stale_counts == {"Location": 4}
+    assert len(deletes) == 2
+    assert '"provider_directory_source_resource"' in deletes[0][0]
+    assert '"provider_directory_location"' in deletes[1][0]
+    assert all("provider_directory_import_seen" in sql for sql, _params in deletes)
+    expected_params_by_name = {
+        "source_id": "source_a",
+        "run_id": "run_1",
+        "resource_type": "Location",
+    }
+    assert deletes[0][1] == expected_params_by_name
+    assert deletes[1][1] == expected_params_by_name
+    assert stats["Location"]["sources_completed"] == 1
+    assert stats["Practitioner"]["sources_bounded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monkeypatch):
+    """Verify this provider-directory regression contract."""
+    _stub_resource_import_metadata(monkeypatch)
+    fetch_results = _stale_cleanup_fetch_results()
 
     async def fake_fetch_resource_rows(_source, _resource_type, **_kwargs):
         return fetch_results.pop(0)
@@ -20324,17 +20466,12 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
         stale_cleanup=True,
     )
 
-    assert counts == {"Location": 1, "Practitioner": 1}
-    assert stale_counts_by_resource == {"Location": 4}
-    assert len(deletes) == 2
-    assert '"provider_directory_source_resource"' in deletes[0][0]
-    assert '"provider_directory_location"' in deletes[1][0]
-    assert "provider_directory_import_seen" in deletes[0][0]
-    assert "provider_directory_import_seen" in deletes[1][0]
-    assert deletes[0][1] == {"source_id": "source_a", "run_id": "run_1", "resource_type": "Location"}
-    assert deletes[1][1] == {"source_id": "source_a", "run_id": "run_1", "resource_type": "Location"}
-    assert resource_fetch_stats_by_type["Location"]["sources_completed"] == 1
-    assert resource_fetch_stats_by_type["Practitioner"]["sources_bounded"] == 1
+    _assert_complete_scan_stale_cleanup(
+        counts,
+        stale_counts_by_resource,
+        deletes,
+        resource_fetch_stats_by_type,
+    )
 
 
 @pytest.mark.asyncio
@@ -21248,87 +21385,14 @@ async def test_process_data_contact_backfill_only_skips_seed_resolution(monkeypa
 @pytest.mark.asyncio
 async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeypatch):
     """Verify process data publish artifacts only skips seed resolution."""
-    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
-    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
-    monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
-    _stub_artifact_dataset_scope(monkeypatch)
-    monkeypatch.setattr(
-        importer,
-        "backfill_provider_directory_location_contacts",
-        AsyncMock(return_value={"location_contact_rows_updated": 5}),
-    )
-    monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", AsyncMock(return_value=6))
-    monkeypatch.setattr(
-        importer,
-        "backfill_provider_directory_resource_id_npis",
-        AsyncMock(return_value={"Practitioner": 2, "Organization": 1}),
-    )
-    monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_location_archive",
-        AsyncMock(return_value={"inserted": 4, "provenance_updates": 1}),
-    )
-    monkeypatch.setattr(importer, "publish_provider_directory_address_overlay", AsyncMock(return_value={}))
-    monkeypatch.setattr(importer, "publish_provider_directory_network_catalog", AsyncMock(return_value={"rows": 8}))
-    monkeypatch.setattr(
-        importer,
-        "_is_address_corroboration_published",
-        AsyncMock(return_value=True),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_resolve_seed_db",
-        lambda *_args, **_kwargs: pytest.fail("seed DB should not be resolved for artifact publish"),
-    )
+    _stub_artifact_only_publishers(monkeypatch)
 
     operation_result = await importer.process_data(
         {"context": {}},
         {"publish_artifacts_only": True, "run_id": "run_publish"},
     )
 
-    assert operation_result["publish_artifacts_only"] is True
-    assert operation_result["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
-    assert operation_result["location_coordinates_backfilled"] == 6
-    assert operation_result["resource_id_npis_backfilled"] == {"Practitioner": 2, "Organization": 1}
-    assert operation_result["location_address_keys_stamped"] == 3
-    assert operation_result["location_archive"] == {"inserted": 4, "provenance_updates": 1}
-    assert operation_result["network_catalog"] == {"rows": 8}
-    assert operation_result["publish_corroboration"] is False
-    assert operation_result["ptg_corroboration_view_published"] is False
-    assert operation_result["ptg_corroboration_view_skipped"] == {
-        "reason": "publish_corroboration_disabled",
-    }
-    importer.backfill_provider_directory_location_contacts.assert_awaited_once()
-    importer.backfill_provider_directory_location_coordinates.assert_awaited_once_with(
-        run_id=None,
-        source_ids=[],
-        seen_table=None,
-    )
-    importer.backfill_provider_directory_resource_id_npis.assert_awaited_once_with(
-        run_id=None,
-        source_ids=[],
-        seen_table=None,
-    )
-    importer.publish_provider_directory_location_address_keys.assert_awaited_once_with(
-        run_id=None, source_ids=[],
-        seen_table=None,
-    )
-    importer.publish_provider_directory_location_archive.assert_awaited_once_with(
-        run_id=None, source_ids=[],
-        seen_table=None,
-    )
-    importer.publish_provider_directory_address_overlay.assert_awaited_once_with(
-        run_id=None,
-        source_ids=[],
-        defer_cutover=True,
-    )
-    importer.publish_provider_directory_network_catalog.assert_awaited_once_with(
-        run_id=None,
-        source_ids=[],
-        defer_cutover=True,
-    )
-    importer._is_address_corroboration_published.assert_not_awaited()
+    _assert_artifact_only_publish_result(operation_result)
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):
     fixture_case_result = harness._run_fixture_case()

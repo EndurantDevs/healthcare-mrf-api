@@ -36,6 +36,12 @@ MIGRATION_PATH = (
     / "versions"
     / "20260721170000_provider_directory_physical_projection.py"
 )
+CHILD_READ_MIGRATION_PATH = (
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260722130000_provider_directory_projection_child_read_lease.py"
+)
 POSTGRES_DSN_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_POSTGRES_DSN"
 DISPOSABLE_DATABASE_PATTERN = re.compile(
     r"^ptg2_v3_lifecycle_test_[a-z0-9_]+$"
@@ -119,6 +125,26 @@ class ProjectionFoundationPostgres:
         async with self.migration_engine.begin() as migration_connection:
             await migration_connection.run_sync(
                 lambda sync_connection: _run_migration(sync_connection, "downgrade")
+            )
+
+    async def upgrade_child_read(self) -> None:
+        async with self.migration_engine.begin() as migration_connection:
+            await migration_connection.run_sync(
+                lambda sync_connection: _run_migration(
+                    sync_connection,
+                    "upgrade",
+                    CHILD_READ_MIGRATION_PATH,
+                )
+            )
+
+    async def downgrade_child_read(self) -> None:
+        async with self.migration_engine.begin() as migration_connection:
+            await migration_connection.run_sync(
+                lambda sync_connection: _run_migration(
+                    sync_connection,
+                    "downgrade",
+                    CHILD_READ_MIGRATION_PATH,
+                )
             )
 
     async def relation_oids(
@@ -286,6 +312,7 @@ async def projection_foundation_postgres(
 
 
 __all__ = [
+    "CHILD_READ_MIGRATION_PATH",
     "MIGRATION_PATH",
     "PREDECESSOR_MIGRATION_PATH",
     "PROJECTION_RELATIONS",
