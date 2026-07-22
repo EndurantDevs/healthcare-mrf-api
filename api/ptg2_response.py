@@ -68,7 +68,7 @@ PTG2_QUERY_DIAGNOSTIC_FIELDS = {
     "route_item_table",
     "snapshot_id",
 }
-def _request_bool(value: Any, default: bool = False) -> bool:
+def _is_request_flag_enabled(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
     if isinstance(value, bool):
@@ -104,11 +104,15 @@ def _optional_decimal(value: Any) -> Decimal | None:
 
 
 def _include_ptg2_details(args: dict[str, Any]) -> bool:
-    return _request_bool(args.get("include_details")) or _request_bool(args.get("include_debug"))
+    return _is_request_flag_enabled(
+        args.get("include_details")
+    ) or _is_request_flag_enabled(args.get("include_debug"))
 
 
 def _include_ptg2_sources(args: dict[str, Any]) -> bool:
-    return _include_ptg2_details(args) or _request_bool(args.get("include_sources"))
+    return _include_ptg2_details(args) or _is_request_flag_enabled(
+        args.get("include_sources")
+    )
 
 
 def _shape_ptg2_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:

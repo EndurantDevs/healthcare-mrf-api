@@ -645,11 +645,7 @@ async def delete_unpublished_snapshot_sources(
             {"snapshot_id": str(snapshot_id)},
         )
         snapshot_row = snapshot_result.first()
-        snapshot_state = _row_mapping(snapshot_row) if snapshot_row is not None else {}
-        if snapshot_state.get("is_bound") or str(snapshot_state.get("status") or "") not in {
-            "building",
-            "failed",
-        }:
+        if not _can_delete_unpublished_sources(snapshot_row):
             return
         await session.execute(
             db.text(
@@ -679,6 +675,15 @@ async def delete_unpublished_snapshot_sources(
             ),
             {"snapshot_id": str(snapshot_id)},
         )
+
+
+def _can_delete_unpublished_sources(snapshot_row: Any) -> bool:
+    """Allow cleanup only for unbound logical snapshots that never published."""
+
+    snapshot_state = _row_mapping(snapshot_row) if snapshot_row is not None else {}
+    return not snapshot_state.get("is_bound") and str(
+        snapshot_state.get("status") or ""
+    ) in {"building", "failed"}
 
 
 async def validate_reused_snapshot_sources(

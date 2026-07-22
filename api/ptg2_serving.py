@@ -77,7 +77,7 @@ from api.ptg2_response import (
     _optional_float,
     _price_response_fields,
     _price_row_key,
-    _request_bool,
+    _is_request_flag_enabled,
     _shape_ptg2_response,
 )
 from api.ptg2_tables import (
@@ -1029,7 +1029,10 @@ def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
 
 
 def _include_unverified_addresses(args: Mapping[str, Any] | dict[str, Any]) -> bool:
-    return _request_bool(args.get("include_unverified_addresses"), default=True)
+    return _is_request_flag_enabled(
+        args.get("include_unverified_addresses"),
+        default=True,
+    )
 
 
 def _is_plan_scoped_ptg_request(args: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -1397,7 +1400,14 @@ def _inferred_provider_taxonomy_rule(args: dict[str, Any]) -> InferredProviderTa
     if requested_system not in EQUIVALENT_PROCEDURE_CODE_SYSTEMS or not requested_code or not requested_code.isdigit():
         return None
     code_value = int(requested_code)
-    return next((rule for rule in INFERRED_PROVIDER_TAXONOMY_RULES if rule.matches(code_value)), None)
+    return next(
+        (
+            rule
+            for rule in INFERRED_PROVIDER_TAXONOMY_RULES
+            if rule.is_match(code_value)
+        ),
+        None,
+    )
 
 
 def _inferred_provider_taxonomy_code_sql(
@@ -7833,8 +7843,8 @@ async def _search_manifest_serving_table(
     if args.get("q") or not requested_code or (not requested_plan and not explicit_source_scope):
         return None
 
-    expand_providers = (
-        _request_bool(args.get("include_providers"))
+    include_providers = (
+        _is_request_flag_enabled(args.get("include_providers"))
         or _is_ptg2_provider_filter_requested(args)
     )
     candidate_audit_npi = (
@@ -7875,7 +7885,7 @@ async def _search_manifest_serving_table(
     location_requires_exhaustive = bool(
         location_filter_requested
         and (
-            not expand_providers
+            not include_providers
             or requested_order not in distance_order_fields
             or requested_direction == "desc"
         )
@@ -7893,7 +7903,7 @@ async def _search_manifest_serving_table(
         rate_candidate_limit = _ptg2_manifest_rate_candidate_limit(
             args,
             pagination,
-            expand_providers=expand_providers,
+            expand_providers=include_providers,
             location_filter_requested=location_filter_requested,
         )
     # One NPI can participate in more serving rows than the provider-page size.
@@ -7902,7 +7912,7 @@ async def _search_manifest_serving_table(
     serving_row_limit = _ptg2_manifest_serving_row_limit(
         args,
         rate_candidate_limit,
-        expand_providers=expand_providers and not direct_npi_filter_requested,
+        expand_providers=include_providers and not direct_npi_filter_requested,
     )
 
     def no_match_response() -> dict[str, Any]:
@@ -7942,7 +7952,7 @@ async def _search_manifest_serving_table(
                     "provider_sex_code": args.get("provider_sex_code") or None,
                     "source": "ptg2_db",
                     "serving_table": None,
-                    "include_providers": expand_providers,
+                    "include_providers": include_providers,
                     "procedure_consolidation": "REPORTED_CODE",
                     "status": "no_match",
                 },
@@ -8076,7 +8086,7 @@ async def _search_manifest_serving_table(
     network_names = serving_tables.network_names or []
     exact_provider_selection: _ProviderExpansionSelection | None = None
     strict_cost_provider_expansion = (
-        expand_providers
+        include_providers
         and not location_filter_requested
         and not direct_npi_filter_requested
         and not price_filter_requested
@@ -8113,7 +8123,7 @@ async def _search_manifest_serving_table(
             offset=(
                 0
                 if (
-                    expand_providers
+                    include_providers
                     or price_filter_requested
                     or location_filter_requested
                     or direct_npi_filter_requested
@@ -8238,7 +8248,7 @@ async def _search_manifest_serving_table(
         for price_set_id in retained_price_set_ids
     }
     providers_by_set: dict[str, list[dict[str, Any]]] = {}
-    if expand_providers:
+    if include_providers:
         if exact_provider_selection is not None:
             providers_by_set = exact_provider_selection.providers_by_set
         elif location_filter_requested:
@@ -8283,7 +8293,7 @@ async def _search_manifest_serving_table(
     )
     for serving_row in serving_rows:
         if (
-            not expand_providers
+            not include_providers
             and not price_filter_requested
             and not location_filter_requested
             and not direct_npi_filter_requested
@@ -8378,7 +8388,7 @@ async def _search_manifest_serving_table(
             _address_verification_payload(base_response_by_field, {}, {})
         )
         _apply_address_display_policy(base_response_by_field, args)
-        if not expand_providers:
+        if not include_providers:
             response_items.append(base_response_by_field)
             continue
         provider_rows = providers_by_set.get(
@@ -8451,7 +8461,7 @@ async def _search_manifest_serving_table(
             response_items.append(response_item_by_field)
     if not response_items:
         return None
-    if expand_providers:
+    if include_providers:
         response_items = _merge_ptg2_provider_rate_items(response_items)
     if exact_provider_selection is not None:
         selected_items: list[dict[str, Any]] = []
@@ -8479,7 +8489,7 @@ async def _search_manifest_serving_table(
     response_items = _sort_ptg2_manifest_provider_items(
         response_items,
         args,
-        location_filter_requested=location_filter_requested and expand_providers,
+        location_filter_requested=location_filter_requested and include_providers,
     )
     total_items = len(response_items)
     requested_page_end = max(int(pagination.offset), 0) + max(
@@ -8504,7 +8514,7 @@ async def _search_manifest_serving_table(
             "PTG2 provider traversal could not prove the requested page boundary"
         )
     has_more_page_rows = False
-    if expand_providers or price_filter_requested or membership_filter_requested:
+    if include_providers or price_filter_requested or membership_filter_requested:
         start = max(int(pagination.offset), 0)
         end = start + max(int(pagination.limit), 0)
         response_items = response_items[start:end]
@@ -8523,7 +8533,7 @@ async def _search_manifest_serving_table(
             "pagination": {
                 "total": (
                     total_items
-                    if expand_providers
+                    if include_providers
                     or price_filter_requested
                     or membership_filter_requested
                     else total
@@ -8550,7 +8560,7 @@ async def _search_manifest_serving_table(
                                 "total_is_exact": True,
                                 "total_lower_bound": total_items,
                             }
-                            if expand_providers or price_filter_requested
+                            if include_providers or price_filter_requested
                             else {}
                         )
                     )
@@ -8579,7 +8589,7 @@ async def _search_manifest_serving_table(
                 "provider_sex_code": args.get("provider_sex_code") or None,
                 "source": "ptg2_db",
                 "serving_table": None,
-                "include_providers": expand_providers,
+                "include_providers": include_providers,
                 "procedure_consolidation": "REPORTED_CODE",
             },
         },
@@ -9766,7 +9776,7 @@ async def _search_candidate_ptg2_snapshot(
     requested_market_type = str(
         args.get("plan_market_type") or args.get("market_type") or ""
     ).strip()
-    if not candidate_audit_access.matches(
+    if not candidate_audit_access.is_match(
         snapshot_id=explicit_snapshot,
         source_key=explicit_source,
         plan_id=requested_plan_id,

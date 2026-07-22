@@ -26,7 +26,9 @@ assert MODULE_SPEC and MODULE_SPEC.loader
 MODULE_SPEC.loader.exec_module(pricing_module)
 
 get_provider_procedure = pricing_module.get_provider_procedure
-get_provider_procedure_estimated_cost_level_internal = pricing_module.get_provider_procedure_estimated_cost_level_internal
+get_provider_procedure_estimated_cost_level_internal = (
+    pricing_module.get_provider_procedure_cost_level
+)
 get_procedure_geo_benchmarks = pricing_module.get_procedure_geo_benchmarks
 get_provider_prescription = pricing_module.get_provider_prescription
 get_prescription_benchmarks = pricing_module.get_prescription_benchmarks

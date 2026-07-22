@@ -333,15 +333,19 @@ async def test_shared_snapshot_metadata_is_never_process_cached():
 
         def one_or_none(self):
             serving_index = self.value["serving_index"]
+            snapshot_source_set = serving_index["source_set"]
+            layout_serving_index = dict(serving_index)
+            layout_serving_index.pop("source_set")
             return {
-                "layout_serving_index": serving_index,
+                "layout_serving_index": layout_serving_index,
+                "snapshot_source_set": snapshot_source_set,
                 "bound_snapshot_key": serving_index["shared_snapshot_key"],
                 "snapshot_plan_id": "TEST-PLAN-001",
                 "snapshot_plan_market_type": "group",
                 "snapshot_coverage_scope_id": "c" * 64,
                 "attested_source_key": "source-a",
                 "attested_coverage_scope_id": "c" * 64,
-                "attested_source_set_digest": serving_index["source_set"][
+                "attested_source_set_digest": snapshot_source_set[
                     "raw_container_sha256_digest"
                 ],
                 "attested_audit_sample_digest": "a" * 64,

@@ -117,18 +117,18 @@ def strict_serving_index(snapshot_key=41):
 
 def strict_snapshot_row(serving_index=None, **overrides):
     serving_index = dict(serving_index or strict_serving_index())
+    snapshot_source_set = serving_index.pop("source_set", None)
     coverage_scope_id = serving_index.get("coverage_scope_id")
     snapshot_row_map = {
         "layout_serving_index": serving_index,
+        "snapshot_source_set": snapshot_source_set,
         "bound_snapshot_key": serving_index.get("shared_snapshot_key"),
         "snapshot_plan_id": "TEST-PLAN-001",
         "snapshot_plan_market_type": "group",
         "snapshot_coverage_scope_id": coverage_scope_id,
         "attested_source_key": "source-a",
         "attested_coverage_scope_id": coverage_scope_id,
-        "attested_source_set_digest": serving_index.get("source_set", {}).get(
-            "raw_container_sha256_digest"
-        ),
+        "attested_source_set_digest": snapshot_source_set["raw_container_sha256_digest"],
         "attested_audit_sample_digest": "a" * 64,
         "source_row_count": serving_index.get("source_count"),
         "distinct_source_key_count": serving_index.get("source_count"),
@@ -201,7 +201,9 @@ async def test_snapshot_serving_tables_requires_published_and_never_caches_v3_me
     assert "logical_hash_deferred" in sql
     assert "source_trace_set_hash" in sql
     assert "pgcrypto" not in sql
-    assert "snapshot.manifest" not in sql
+    source_set_sql = "snapshot.manifest->'serving_index'->'source_set'"
+    assert f"{source_set_sql} AS snapshot_source_set" in " ".join(sql.split())
+    assert "SELECT snapshot.manifest," not in sql
     assert "current_setting('server_version_num')" in sql
     assert "txid_current_snapshot()" in sql
     assert "attestation.contract = ANY(" in sql

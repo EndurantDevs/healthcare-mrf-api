@@ -98,12 +98,9 @@ async def test_published_source_set_requires_matching_manifest_rows_and_attestat
     attested_digest,
 ):
     serving_index = strict_serving_index()
-    if manifest_source_set is None:
-        serving_index.pop("source_set")
-    else:
-        serving_index["source_set"] = manifest_source_set
     row = strict_snapshot_row(
         serving_index,
+        snapshot_source_set=manifest_source_set,
         attested_source_set_digest=attested_digest,
     )
 
@@ -112,3 +109,18 @@ async def test_published_source_set_requires_matching_manifest_rows_and_attestat
             FakeSession([row]),
             "published-source-set-mismatch",
         )
+
+
+@pytest.mark.asyncio
+async def test_published_source_set_comes_from_logical_snapshot_manifest():
+    serving_index = strict_serving_index()
+    expected_source_set = serving_index["source_set"]
+    row = strict_snapshot_row(serving_index)
+
+    assert "source_set" not in row["layout_serving_index"]
+    tables = await ptg2_tables.snapshot_serving_tables(
+        FakeSession([row]),
+        "published-logical-source-set",
+    )
+
+    assert tables.source_set == expected_source_set

@@ -96,7 +96,7 @@ async def current_snapshot_id(
         }
         status_sql = "status = 'published'"
         if candidate_audit_access is not None:
-            if not candidate_audit_access.matches(
+            if not candidate_audit_access.is_match(
                 snapshot_id=requested_snapshot_id,
                 source_key=requested_source_key,
                 plan_id=requested_plan_id,

@@ -27,7 +27,7 @@ class InferredProviderTaxonomyRule:
     taxonomy_codes: tuple[str, ...]
     display_terms: tuple[str, ...]
 
-    def matches(self, code_value: int) -> bool:
+    def is_match(self, code_value: int) -> bool:
         """Return whether a numeric procedure code falls in this rule."""
 
         return any(start <= code_value <= end for start, end in self.ranges)
@@ -450,7 +450,14 @@ def _inferred_provider_taxonomy_sql(args: dict[str, Any], *, nt_alias: str, nucc
     if requested_system != "CPT" or not requested_code or not requested_code.isdigit():
         return ""
     code_value = int(requested_code)
-    matching_rule = next((rule for rule in INFERRED_PROVIDER_TAXONOMY_RULES if rule.matches(code_value)), None)
+    matching_rule = next(
+        (
+            rule
+            for rule in INFERRED_PROVIDER_TAXONOMY_RULES
+            if rule.is_match(code_value)
+        ),
+        None,
+    )
     if matching_rule:
         code_sql = ",\n                    ".join(f"'{code}'" for code in matching_rule.taxonomy_codes)
         display_sql = "\n".join(

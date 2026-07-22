@@ -639,6 +639,8 @@ async def snapshot_serving_tables(
         query_sql = f"""
             SELECT layout.layout_manifest->'serving_index'
                        AS layout_serving_index,
+                   snapshot.manifest->'serving_index'->'source_set'
+                       AS snapshot_source_set,
                    binding.snapshot_key AS bound_snapshot_key,
                    snapshot_scope.plan_id AS snapshot_plan_id,
                    snapshot_scope.plan_market_type AS snapshot_plan_market_type,
@@ -873,13 +875,21 @@ async def snapshot_serving_tables(
             raise PTG2ManifestArtifactError(
                 "PTG2 published source dictionary is not complete and dense"
             )
+        snapshot_source_set = row_fields.get("snapshot_source_set")
+        if isinstance(snapshot_source_set, str):
+            try:
+                snapshot_source_set = json.loads(snapshot_source_set)
+            except json.JSONDecodeError as exc:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 published snapshot source set is malformed"
+                ) from exc
         manifest_source_set = _strict_v3_source_set(
-            serving_index,
+            {"source_set": snapshot_source_set},
             source_count=source_count,
         )
         if manifest_source_set is None:
             raise PTG2ManifestArtifactError(
-                "PTG2 published source set is missing from its sealed layout"
+                "PTG2 published source set is missing from its snapshot manifest"
             )
         source_set_by_field = _validated_published_source_set(
             row_fields.get("source_identity_rows"),
