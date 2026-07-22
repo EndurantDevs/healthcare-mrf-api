@@ -288,6 +288,7 @@ async def projection_foundation_postgres(
     monkeypatch.setenv("HLTHPRT_DB_PASSWORD", str(database_url.password or ""))
     monkeypatch.setenv("HLTHPRT_DB_DATABASE", str(database_url.database))
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    monkeypatch.setenv("DB_SCHEMA", schema_name)
     monkeypatch.setenv(
         "HLTHPRT_PROVIDER_DIRECTORY_RETAINED_ARTIFACT_KEY_ID",
         "projection-foundation-test-v1",

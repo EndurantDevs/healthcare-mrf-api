@@ -58,6 +58,23 @@ def test_decoded_census_migration_quotes_apostrophe_schema() -> None:
     )
 
 
+def test_decoded_census_schema_contract_rejects_legacy_runtime_drift(
+    monkeypatch,
+) -> None:
+    """Keep the production schema-alias fence explicit in isolated tests."""
+
+    migration = _load_migration()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "isolated_schema")
+    monkeypatch.setenv("DB_SCHEMA", "isolated_schema")
+    assert migration._schema() == "isolated_schema"
+    monkeypatch.setenv("DB_SCHEMA", "drifted_schema")
+    with pytest.raises(
+        RuntimeError,
+        match="DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema",
+    ):
+        migration._schema()
+
+
 async def _set_decoded_resource_count(
     postgres,
     recipe_id: str,
