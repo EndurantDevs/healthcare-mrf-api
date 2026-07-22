@@ -406,7 +406,14 @@ def test_shard_heartbeat_enforces_bounds_and_exact_generation(monkeypatch):
     async def accept_action(*_args, **_kwargs):
         return None
 
+    locked_recipe_leases = []
+
+    async def lock_recipe(candidate_lease, **_kwargs):
+        locked_recipe_leases.append(candidate_lease)
+        return {}
+
     monkeypatch.setattr(workset_module, "set_local_projection_action", accept_action)
+    monkeypatch.setattr(workset_module, "shared_active_recipe", lock_recipe)
     asyncio.run(
         heartbeat_projection_shard(
             claim,
@@ -422,3 +429,4 @@ def test_shard_heartbeat_enforces_bounds_and_exact_generation(monkeypatch):
                 database=_RuntimeDatabase(status_values=(0,)),
             )
         )
+    assert locked_recipe_leases == [claim.recipe_lease, claim.recipe_lease]

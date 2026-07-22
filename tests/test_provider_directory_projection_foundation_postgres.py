@@ -121,6 +121,17 @@ class _AllZeroAdmissionContext:
     claim_generation: int
 
 
+@dataclass(frozen=True)
+class _FixtureRetainedIdentity:
+    campaign_id: str
+    campaign_sha256: str
+    source_item_id: str
+    stream_identity_sha256: str
+    sequence_ordinal: int
+    resource_type: str
+    partition_key_hash: str
+
+
 def _fixture_input_block(
     produced_artifact: ProducedArtifact,
     retained_range: ArtifactLayoutRange,
@@ -176,6 +187,55 @@ def _fixture_shards(recipe, input_blocks):
     )
 
 
+def _fixture_retained_identity(
+    retained_binding: _RetainedBinding | None,
+) -> _FixtureRetainedIdentity:
+    if retained_binding is not None:
+        return _FixtureRetainedIdentity(
+            campaign_id=retained_binding.campaign_id,
+            campaign_sha256=retained_binding.campaign_sha256,
+            source_item_id=retained_binding.source_item_id,
+            stream_identity_sha256=retained_binding.stream_identity_sha256,
+            sequence_ordinal=retained_binding.sequence_ordinal,
+            resource_type=retained_binding.family,
+            partition_key_hash=retained_binding.partition_metadata_sha256,
+        )
+    return _FixtureRetainedIdentity(
+        campaign_id=_digest("provisional-retained-campaign"),
+        campaign_sha256=_digest("provisional-retained-campaign-proof"),
+        source_item_id=_digest("provisional-retained-source-item"),
+        stream_identity_sha256=_digest("provisional-retained-stream"),
+        sequence_ordinal=0,
+        resource_type="PractitionerRole",
+        partition_key_hash=(
+            campaign_item("provisional-retained-item").partition_metadata_sha256
+        ),
+    )
+
+
+def _fixture_completeness(identity, retained_range, row_delta):
+    return projection_completeness_manifest(
+        endpoint_campaign_hash=identity.campaign_sha256,
+        partition_strategy_contract_id="fixture-partitions.v1",
+        selected_resources=(identity.resource_type,),
+        required_resources=(identity.resource_type,),
+        terminal_partitions=(
+            {
+                "resource_type": identity.resource_type,
+                "partition_key_hash": identity.partition_key_hash,
+                "source_partition_ordinal": 0,
+                "terminal_cursor_hmac": _digest("terminal-cursor"),
+                "terminal": True,
+                "block_count": 1,
+                "row_count": retained_range.record_count + row_delta,
+                "byte_count": retained_range.raw_byte_count,
+                "zero_row_proof_sha256": None,
+            },
+        ),
+        complete=True,
+    )
+
+
 def _projection_fixture(
     *,
     retained_binding: _RetainedBinding | None = None,
@@ -185,100 +245,28 @@ def _projection_fixture(
     """Build one locator-free recipe, input block, and shard fixture."""
 
     produced_artifact = registry_artifact(artifact_label, "bulk_ndjson")
-    layout_sha256 = produced_layout_digest(produced_artifact)
     retained_range = produced_artifact.ranges[0]
-    retained_campaign_id = (
-        retained_binding.campaign_id
-        if retained_binding
-        else _digest("provisional-retained-campaign")
+    identity = _fixture_retained_identity(retained_binding)
+    completeness = _fixture_completeness(
+        identity,
+        retained_range,
+        completeness_row_delta,
     )
-    retained_campaign_sha256 = (
-        retained_binding.campaign_sha256
-        if retained_binding
-        else _digest("provisional-retained-campaign-proof")
-    )
-    retained_source_item_id = (
-        retained_binding.source_item_id
-        if retained_binding
-        else _digest("provisional-retained-source-item")
-    )
-    stream_identity_sha256 = (
-        retained_binding.stream_identity_sha256
-        if retained_binding
-        else _digest("provisional-retained-stream")
-    )
-    sequence_ordinal = retained_binding.sequence_ordinal if retained_binding else 0
-    resource_type = (
-        retained_binding.family if retained_binding else "PractitionerRole"
-    )
-    partition_key_hash = (
-        retained_binding.partition_metadata_sha256
-        if retained_binding
-        else campaign_item("provisional-retained-item").partition_metadata_sha256
-    )
-    completeness = projection_completeness_manifest(
-        endpoint_campaign_hash=retained_campaign_sha256,
-        partition_strategy_contract_id="fixture-partitions.v1",
-        selected_resources=(resource_type,),
-        required_resources=(resource_type,),
-        terminal_partitions=(
-            {
-                "resource_type": resource_type,
-                "partition_key_hash": partition_key_hash,
-                "source_partition_ordinal": 0,
-                "terminal_cursor_hmac": _digest("terminal-cursor"),
-                "terminal": True,
-                "block_count": 1,
-                "row_count": retained_range.record_count
-                + completeness_row_delta,
-                "byte_count": retained_range.raw_byte_count,
-                "zero_row_proof_sha256": None,
-            },
-        ),
-        complete=True,
-    )
-    input_block = projection_input_block(
-        upstream_artifact_id=produced_artifact.artifact_sha256,
-        source_object_id=layout_sha256,
-        block_kind="ndjson",
-        input_contract_id="fixture-input.v1",
-        record_start=retained_range.record_start,
-        record_count=retained_range.record_count,
-        content_sha256=retained_range.canonical_sha256,
-        payload_sha256=retained_range.raw_sha256,
-        payload_bytes=retained_range.raw_byte_count,
-        summary={"resource_count": retained_range.record_count},
-    )
+    input_block = _fixture_input_block(produced_artifact, retained_range)
     admission_block = projection_admission_input_block(
         input_block,
-        retained_campaign_id=retained_campaign_id,
-        retained_campaign_sha256=retained_campaign_sha256,
-        retained_source_item_id=retained_source_item_id,
+        retained_campaign_id=identity.campaign_id,
+        retained_campaign_sha256=identity.campaign_sha256,
+        retained_source_item_id=identity.source_item_id,
         retained_range_ordinal=retained_range.range_ordinal,
-        stream_identity_sha256=stream_identity_sha256,
-        sequence_ordinal=sequence_ordinal,
-        resource_type=resource_type,
-        partition_key_hash=partition_key_hash,
+        stream_identity_sha256=identity.stream_identity_sha256,
+        sequence_ordinal=identity.sequence_ordinal,
+        resource_type=identity.resource_type,
+        partition_key_hash=identity.partition_key_hash,
         source_partition_ordinal=0,
     )
-    input_set_sha256 = projection_input_set_sha256(
-        (input_block,),
-        decoder_contract_id="fixture-fhir-r4-decoder.v1",
-    )
-    recipe = projection_recipe_identity(
-        decoder_contract_id="fixture-fhir-r4-decoder.v1",
-        acquisition_adapter_id="fixture-fhir-rest.v1",
-        input_set_sha256=input_set_sha256,
-        source_ids=("fixture-source",),
-        transform_contract_id="fixture-normalization.v1",
-        scope_contract_id="healthporta.provider-directory.global-scope.v1",
-        transform_context={
-            "as_of_date": "2026-07-22",
-            "time_rule_contract_id": "fixture-time-rules.v1",
-        },
-        selected_resources=(resource_type,),
-        required_resources=(resource_type,),
-        completeness_manifest=completeness,
+    recipe = _fixture_projection_recipe(
+        (input_block,), identity.resource_type, completeness
     )
     shard = projection_shard_spec(
         recipe=recipe, partition_ordinal=0, input_block=input_block
@@ -314,22 +302,7 @@ async def _admit_existing_artifact(
     )
 
 
-async def _admit_produced_artifact(
-    connection,
-    campaign_id: str,
-    retained_item: RetainedCampaignItem,
-    produced_artifact: ProducedArtifact,
-) -> str:
-    """Register all fixture layout ranges, not only the legacy first range."""
-
-    if len(produced_artifact.ranges) == 1:
-        return await admit_campaign_item(
-            connection,
-            campaign_id,
-            retained_item,
-            produced_artifact,
-        )
-    layout_sha256 = produced_layout_digest(produced_artifact)
+async def _register_fixture_artifact(connection, produced_artifact) -> None:
     await connection.execute(
         f"""
         INSERT INTO {database_table('provider_directory_retained_artifact')} (
@@ -341,6 +314,13 @@ async def _admit_produced_artifact(
         produced_artifact.artifact_byte_count,
         f"fixture://artifact/{produced_artifact.artifact_sha256}",
     )
+
+
+async def _register_fixture_layout(
+    connection,
+    produced_artifact,
+    layout_sha256,
+) -> None:
     await connection.execute(
         f"""
         INSERT INTO {database_table('provider_directory_retained_artifact_layout')} (
@@ -365,6 +345,9 @@ async def _admit_produced_artifact(
         f"fixture://manifest/{produced_artifact.manifest_sha256}",
         produced_artifact.producer_build_id,
     )
+
+
+async def _register_fixture_ranges(connection, produced_artifact, layout_sha256):
     range_table = database_table("provider_directory_retained_artifact_range")
     for retained_range in produced_artifact.ranges:
         await connection.execute(
@@ -392,21 +375,32 @@ async def _admit_produced_artifact(
             retained_range.canonical_sha256,
             retained_range.canonical_byte_count,
         )
-    await connection.execute(
-        f"""
-        UPDATE {database_table('provider_directory_retained_artifact_campaign_item')}
-           SET status='admitted', observed_byte_count=$3,
-               acquisition_mode='producer_verified',
-               validator_kind='producer_proof', validator_sha256=NULL,
-               immutable_identity_sha256=$4, committed_byte_count=$3,
-               downloaded_artifact_sha256=$4, artifact_sha256=$4,
-               layout_sha256=$5, admitted_at=now(), updated_at=now()
-         WHERE campaign_id=$1 AND source_item_id=$2;
-        """,
+
+
+async def _admit_produced_artifact(
+    connection,
+    campaign_id: str,
+    retained_item: RetainedCampaignItem,
+    produced_artifact: ProducedArtifact,
+) -> str:
+    """Register all fixture layout ranges, not only the legacy first range."""
+
+    if len(produced_artifact.ranges) == 1:
+        return await admit_campaign_item(
+            connection,
+            campaign_id,
+            retained_item,
+            produced_artifact,
+        )
+    layout_sha256 = produced_layout_digest(produced_artifact)
+    await _register_fixture_artifact(connection, produced_artifact)
+    await _register_fixture_layout(connection, produced_artifact, layout_sha256)
+    await _register_fixture_ranges(connection, produced_artifact, layout_sha256)
+    await _admit_existing_artifact(
+        connection,
         campaign_id,
-        retained_item.source_item_id,
-        produced_artifact.artifact_byte_count,
-        produced_artifact.artifact_sha256,
+        retained_item,
+        produced_artifact,
         layout_sha256,
     )
     return layout_sha256
@@ -493,34 +487,35 @@ def _shared_block_fixture(
     return recipe, admission_blocks, shard
 
 
-async def _sealed_shared_artifact_bindings(
-    postgres,
-    *,
-    campaign_label: str,
-    item_count: int,
-    consumer_recipe_id,
-    produced_artifact: ProducedArtifact | None = None,
-) -> tuple[tuple[_RetainedBinding, ...], ProducedArtifact]:
-    """Seal and claim multiple logical items backed by one physical artifact."""
-
-    connection = postgres.retained_connection
-    retained_items = tuple(
+def _shared_retained_items(campaign_label: str, item_count: int):
+    return tuple(
         _shared_item(f"{campaign_label}-item-{ordinal}", campaign_label)
         for ordinal in range(item_count)
     )
-    campaign_id = await initialize_retained_artifact_campaign(
-        connection,
-        plan=fixed_campaign_plan(campaign_label, retained_items),
+
+
+def _provisional_shared_bindings(campaign_id, campaign_sha256, retained_items):
+    return tuple(
+        _RetainedBinding(
+            campaign_id=campaign_id,
+            campaign_sha256=campaign_sha256,
+            source_item_id=retained_item.source_item_id,
+            consumer_claim_generation=1,
+            family=retained_item.family,
+            partition_metadata_sha256=retained_item.partition_metadata_sha256,
+            stream_identity_sha256=retained_item.stream_identity_sha256,
+            sequence_ordinal=retained_item.sequence_ordinal,
+        )
+        for retained_item in retained_items
     )
-    campaign_lease = await acquire_campaign_lease(
-        connection,
-        campaign_id=campaign_id,
-        owner=f"projection-{campaign_label}",
-    )
-    produced_artifact = produced_artifact or registry_artifact(
-        f"{campaign_label}-shared-artifact",
-        retained_items[0].artifact_kind,
-    )
+
+
+async def _admit_shared_artifact_items(
+    connection,
+    campaign_id,
+    retained_items,
+    produced_artifact,
+) -> None:
     layout_sha256 = await _admit_produced_artifact(
         connection,
         campaign_id,
@@ -535,23 +530,48 @@ async def _sealed_shared_artifact_bindings(
             produced_artifact,
             layout_sha256,
         )
+
+
+async def _sealed_shared_artifact_bindings(
+    postgres,
+    *,
+    campaign_label: str,
+    item_count: int,
+    consumer_recipe_id,
+    produced_artifact: ProducedArtifact | None = None,
+) -> tuple[tuple[_RetainedBinding, ...], ProducedArtifact]:
+    """Seal and claim multiple logical items backed by one physical artifact."""
+
+    connection = postgres.retained_connection
+    retained_items = _shared_retained_items(campaign_label, item_count)
+    campaign_id = await initialize_retained_artifact_campaign(
+        connection,
+        plan=fixed_campaign_plan(campaign_label, retained_items),
+    )
+    campaign_lease = await acquire_campaign_lease(
+        connection,
+        campaign_id=campaign_id,
+        owner=f"projection-{campaign_label}",
+    )
+    produced_artifact = produced_artifact or registry_artifact(
+        f"{campaign_label}-shared-artifact",
+        retained_items[0].artifact_kind,
+    )
+    await _admit_shared_artifact_items(
+        connection,
+        campaign_id,
+        retained_items,
+        produced_artifact,
+    )
     sealed_summary = await seal_retained_artifact_campaign(
         connection,
         campaign_id=campaign_id,
         campaign_lease=campaign_lease,
     )
-    provisional_bindings = tuple(
-        _RetainedBinding(
-            campaign_id=campaign_id,
-            campaign_sha256=sealed_summary["campaign_sha256"],
-            source_item_id=retained_item.source_item_id,
-            consumer_claim_generation=1,
-            family=retained_item.family,
-            partition_metadata_sha256=retained_item.partition_metadata_sha256,
-            stream_identity_sha256=retained_item.stream_identity_sha256,
-            sequence_ordinal=retained_item.sequence_ordinal,
-        )
-        for retained_item in retained_items
+    provisional_bindings = _provisional_shared_bindings(
+        campaign_id,
+        sealed_summary["campaign_sha256"],
+        retained_items,
     )
     if callable(consumer_recipe_id):
         consumer_recipe_id = consumer_recipe_id(provisional_bindings, produced_artifact)
@@ -1467,6 +1487,50 @@ def _forged_all_zero_recipe(
     )
 
 
+def _retained_binding_from_item(
+    campaign_id,
+    campaign_sha256,
+    claim_generation,
+    retained_item,
+) -> _RetainedBinding:
+    return _RetainedBinding(
+        campaign_id=campaign_id,
+        campaign_sha256=campaign_sha256,
+        source_item_id=retained_item.source_item_id,
+        consumer_claim_generation=claim_generation,
+        family=retained_item.family,
+        partition_metadata_sha256=retained_item.partition_metadata_sha256,
+        stream_identity_sha256=retained_item.stream_identity_sha256,
+        sequence_ordinal=retained_item.sequence_ordinal,
+    )
+
+
+async def _admit_single_fixture_artifact(
+    connection,
+    campaign_id,
+    retained_item,
+    produced_artifact,
+    reuse_verified_artifact,
+) -> None:
+    layout_sha256 = produced_layout_digest(produced_artifact)
+    if reuse_verified_artifact:
+        await _admit_existing_artifact(
+            connection,
+            campaign_id,
+            retained_item,
+            produced_artifact,
+            layout_sha256,
+        )
+        return
+    admitted_layout = await admit_campaign_item(
+        connection,
+        campaign_id,
+        retained_item,
+        produced_artifact,
+    )
+    assert admitted_layout == layout_sha256
+
+
 async def _sealed_retained_binding(
     postgres,
     *,
@@ -1492,23 +1556,13 @@ async def _sealed_retained_binding(
         artifact_label,
         retained_item.artifact_kind,
     )
-    layout_sha256 = produced_layout_digest(produced_artifact)
-    if reuse_verified_artifact:
-        await _admit_existing_artifact(
-            connection,
-            campaign_id,
-            retained_item,
-            produced_artifact,
-            layout_sha256,
-        )
-    else:
-        admitted_layout = await admit_campaign_item(
-            connection,
-            campaign_id,
-            retained_item,
-            produced_artifact,
-        )
-        assert admitted_layout == layout_sha256
+    await _admit_single_fixture_artifact(
+        connection,
+        campaign_id,
+        retained_item,
+        produced_artifact,
+        reuse_verified_artifact,
+    )
     sealed_summary = await seal_retained_artifact_campaign(
         connection,
         campaign_id=campaign_id,
@@ -1517,15 +1571,11 @@ async def _sealed_retained_binding(
     assert sealed_summary["complete"] is True
     if callable(consumer_recipe_id):
         consumer_recipe_id = consumer_recipe_id(
-            _RetainedBinding(
-                campaign_id=campaign_id,
-                campaign_sha256=sealed_summary["campaign_sha256"],
-                source_item_id=retained_item.source_item_id,
-                consumer_claim_generation=1,
-                family=retained_item.family,
-                partition_metadata_sha256=retained_item.partition_metadata_sha256,
-                stream_identity_sha256=retained_item.stream_identity_sha256,
-                sequence_ordinal=retained_item.sequence_ordinal,
+            _retained_binding_from_item(
+                campaign_id,
+                sealed_summary["campaign_sha256"],
+                1,
+                retained_item,
             )
         )
     claimed_campaign = await claim_sealed_retained_campaign(
@@ -1533,15 +1583,11 @@ async def _sealed_retained_binding(
         campaign_id=campaign_id,
         consumer_recipe_id=consumer_recipe_id,
     )
-    return _RetainedBinding(
-        campaign_id=campaign_id,
-        campaign_sha256=claimed_campaign.campaign_sha256,
-        source_item_id=retained_item.source_item_id,
-        consumer_claim_generation=claimed_campaign.consumer_claim_generation,
-        family=retained_item.family,
-        partition_metadata_sha256=retained_item.partition_metadata_sha256,
-        stream_identity_sha256=retained_item.stream_identity_sha256,
-        sequence_ordinal=retained_item.sequence_ordinal,
+    return _retained_binding_from_item(
+        campaign_id,
+        claimed_campaign.campaign_sha256,
+        claimed_campaign.consumer_claim_generation,
+        retained_item,
     )
 
 
@@ -1721,13 +1767,32 @@ def _physical_projection_proof(
     return proof_map
 
 
-async def _complete_registered_projection_shard(
-    database,
-    schema: str,
-    lease,
-) -> dict[str, object]:
-    """Complete the registered fixture shard and return its reduced descriptor."""
+_SHARD_DESCRIPTOR_FIELDS = (
+    "partition_id",
+    "partition_ordinal",
+    "resource_type",
+    "input_sha256",
+    "canonical_row_sha256",
+    "resource_count",
+    "first_identity",
+    "last_identity",
+)
 
+
+def _completed_shard_descriptor(completed_row) -> dict[str, object]:
+    return {
+        "partition_id": completed_row.partition_id,
+        "partition_ordinal": completed_row.partition_ordinal,
+        "resource_type": completed_row.resource_type,
+        "input_sha256": completed_row.input_sha256,
+        "canonical_row_sha256": completed_row.canonical_row_sha256,
+        "resource_count": completed_row.resource_count,
+        "first_identity": list(completed_row.first_identity_json),
+        "last_identity": list(completed_row.last_identity_json),
+    }
+
+
+async def _existing_completed_shard(database, schema, lease):
     completed_row = await database.first(
         f"""
         SELECT partition_id, partition_ordinal, resource_type, input_sha256,
@@ -1740,17 +1805,10 @@ async def _complete_registered_projection_shard(
         recipe_id=lease.recipe.recipe_id,
         attempt=lease.attempt,
     )
-    if completed_row is not None:
-        return {
-            "partition_id": completed_row.partition_id,
-            "partition_ordinal": completed_row.partition_ordinal,
-            "resource_type": completed_row.resource_type,
-            "input_sha256": completed_row.input_sha256,
-            "canonical_row_sha256": completed_row.canonical_row_sha256,
-            "resource_count": completed_row.resource_count,
-            "first_identity": list(completed_row.first_identity_json),
-            "last_identity": list(completed_row.last_identity_json),
-        }
+    return completed_row
+
+
+async def _claim_registered_shard(database, schema, lease):
     admission_id = await database.scalar(
         f"""
         SELECT admission_id
@@ -1769,6 +1827,10 @@ async def _complete_registered_projection_shard(
         schema=schema,
     )
     assert shard_claim is not None
+    return shard_claim
+
+
+def _claimed_shard_proof(lease, shard_claim) -> dict[str, object]:
     canonical_row_sha256 = _digest(
         f"completed-partition:{shard_claim.shard.partition_id}"
     )
@@ -1779,7 +1841,7 @@ async def _complete_registered_projection_shard(
         resource_name: int(resource_name == selected_resource)
         for resource_name in lease.recipe.selected_resources
     }
-    expanded_proof_map = {
+    return {
         "contract_id": (
             "healthporta.provider-directory.projection-proof-shard.v1"
         ),
@@ -1796,6 +1858,10 @@ async def _complete_registered_projection_shard(
         "first_identity": resource_identity_parts,
         "last_identity": resource_identity_parts,
     }
+
+
+async def _persist_completed_shard(database, schema, lease, shard_claim, proof):
+    identity_json = stable_json(proof["first_identity"])
     async with database.transaction():
         await set_local_projection_action(
             database,
@@ -1822,26 +1888,32 @@ async def _complete_registered_projection_shard(
              WHERE recipe_id = :recipe_id AND attempt = :attempt
                AND partition_id = :partition_id;
             """,
-            canonical_row_sha256=canonical_row_sha256,
-            first_identity=stable_json(resource_identity_parts),
-            last_identity=stable_json(resource_identity_parts),
-            proof_json=stable_json(expanded_proof_map),
+            canonical_row_sha256=proof["canonical_row_sha256"],
+            first_identity=identity_json,
+            last_identity=identity_json,
+            proof_json=stable_json(proof),
             recipe_id=lease.recipe.recipe_id,
             attempt=lease.attempt,
             partition_id=shard_claim.shard.partition_id,
         )
+
+
+async def _complete_registered_projection_shard(
+    database,
+    schema: str,
+    lease,
+) -> dict[str, object]:
+    """Complete the registered fixture shard and return its reduced descriptor."""
+
+    completed_row = await _existing_completed_shard(database, schema, lease)
+    if completed_row is not None:
+        return _completed_shard_descriptor(completed_row)
+    shard_claim = await _claim_registered_shard(database, schema, lease)
+    proof = _claimed_shard_proof(lease, shard_claim)
+    await _persist_completed_shard(database, schema, lease, shard_claim, proof)
     return {
-        descriptor_field: expanded_proof_map[descriptor_field]
-        for descriptor_field in (
-            "partition_id",
-            "partition_ordinal",
-            "resource_type",
-            "input_sha256",
-            "canonical_row_sha256",
-            "resource_count",
-            "first_identity",
-            "last_identity",
-        )
+        descriptor_field: proof[descriptor_field]
+        for descriptor_field in _SHARD_DESCRIPTOR_FIELDS
     }
 
 
@@ -1853,18 +1925,7 @@ class _StageBinding:
     trigger_oid: int | None
 
 
-async def _create_projection_stage(
-    database,
-    schema: str,
-    *,
-    label: str,
-    physical_projection_id: str,
-    raw_shard: Mapping[str, object],
-    install_trigger: bool,
-) -> _StageBinding:
-    """Create a logged fixture stage with exact serving shape and indexes."""
-
-    relation = f"projection_stage_{_digest(label)[:16]}"
+async def _create_stage_relation(database, schema, relation, projection_id):
     await database.status(
         f"""
         CREATE TABLE "{schema}"."{relation}" (
@@ -1876,19 +1937,26 @@ async def _create_projection_stage(
     await database.status(
         f"""
         ALTER TABLE "{schema}"."{relation}"
-            ALTER COLUMN physical_projection_id
-            SET DEFAULT '{physical_projection_id}';
+            ALTER COLUMN physical_projection_id SET DEFAULT '{projection_id}';
         """
     )
     await database.status(
         f"""
         ALTER TABLE "{schema}"."{relation}"
             ADD CONSTRAINT provider_directory_projection_partition_bound
-            CHECK (physical_projection_id = '{physical_projection_id}');
+            CHECK (physical_projection_id = '{projection_id}');
         """
     )
-    resource_type = str(raw_shard["first_identity"][0])
-    resource_id = str(raw_shard["first_identity"][1])
+
+
+async def _insert_stage_fixture_row(
+    database,
+    schema,
+    relation,
+    physical_projection_id,
+    raw_shard,
+):
+    resource_type, resource_id = map(str, raw_shard["first_identity"])
     await database.status(
         f"""
         INSERT INTO "{schema}"."{relation}" (
@@ -1914,6 +1982,9 @@ async def _create_projection_stage(
         proof_partition_id=raw_shard["partition_id"],
         payload_hash=_digest("fixture-stage-payload"),
     )
+
+
+async def _index_stage_relation(database, schema, relation):
     await database.status(
         f"""
         CREATE UNIQUE INDEX "{relation}_key"
@@ -1930,6 +2001,29 @@ async def _create_projection_stage(
             );
         """
     )
+
+
+async def _create_projection_stage(
+    database,
+    schema: str,
+    *,
+    label: str,
+    physical_projection_id: str,
+    raw_shard: Mapping[str, object],
+    install_trigger: bool,
+) -> _StageBinding:
+    """Create a logged fixture stage with exact serving shape and indexes."""
+
+    relation = f"projection_stage_{_digest(label)[:16]}"
+    await _create_stage_relation(database, schema, relation, physical_projection_id)
+    await _insert_stage_fixture_row(
+        database,
+        schema,
+        relation,
+        physical_projection_id,
+        raw_shard,
+    )
+    await _index_stage_relation(database, schema, relation)
     relation_oid = int(
         await database.scalar(
             "SELECT to_regclass(:qualified_relation)::oid::bigint;",
@@ -2037,6 +2131,150 @@ def _partition_records(projection_proof: Mapping[str, object]) -> list[dict]:
     ]
 
 
+@dataclass(frozen=True)
+class _SealOptions:
+    attach_stage: bool = True
+    set_action: bool = True
+
+
+def _physical_projection_insert_values(lease, stage, projection_proof, seconds):
+    return {
+        "physical_projection_id": lease.recipe.recipe_id,
+        "canonical_row_sha256": projection_proof["canonical_row_sha256"],
+        "decoder_contract_id": lease.recipe.decoder_contract_id,
+        "input_set_sha256": lease.recipe.input_set_sha256,
+        "transform_contract_id": lease.recipe.transform_contract_id,
+        "scope_contract_id": lease.recipe.scope_contract_id,
+        "transform_context_hash": lease.recipe.transform_context_hash,
+        "transform_context_json": stable_json(lease.recipe.transform_context),
+        "dataset_hash": projection_proof["dataset_hash"],
+        "resource_profile_hash": lease.recipe.resource_profile_hash,
+        "selected_resources_json": stable_json(lease.recipe.selected_resources),
+        "required_resources_json": stable_json(lease.recipe.required_resources),
+        "resource_count": projection_proof["resource_count"],
+        "resource_counts_json": stable_json(projection_proof["resource_counts"]),
+        "proof_json": stable_json(projection_proof),
+        "storage_schema": stage.schema,
+        "storage_relation": stage.relation,
+        "storage_relation_oid": stage.relation_oid,
+        "storage_trigger_oid": stage.trigger_oid,
+        "retain_seconds": seconds,
+    }
+
+
+async def _insert_physical_projection(database, schema, values):
+    await database.status(
+        f"""
+        INSERT INTO "{schema}".provider_directory_physical_projection (
+            physical_projection_id, canonical_row_sha256,
+            content_hash_contract_id, decoder_contract_id, input_set_sha256,
+            transform_contract_id, scope_contract_id, transform_context_hash,
+            transform_context_json, dataset_hash, resource_profile_hash,
+            selected_resources_json, required_resources_json, resource_count,
+            resource_counts_json, proof_json, storage_schema, storage_relation,
+            storage_relation_oid, storage_trigger_oid, status, created_at,
+            sealed_at, retain_until
+        ) VALUES (
+            :physical_projection_id, :canonical_row_sha256,
+            'fixture-content-hash.v1', :decoder_contract_id,
+            :input_set_sha256, :transform_contract_id, :scope_contract_id,
+            :transform_context_hash, CAST(:transform_context_json AS jsonb),
+            :dataset_hash, :resource_profile_hash,
+            CAST(:selected_resources_json AS jsonb),
+            CAST(:required_resources_json AS jsonb), :resource_count,
+            CAST(:resource_counts_json AS jsonb), CAST(:proof_json AS jsonb),
+            :storage_schema, :storage_relation, :storage_relation_oid,
+            :storage_trigger_oid, 'sealed', now(), now(),
+            now() + CAST(:retain_seconds AS integer) * interval '1 second'
+        );
+        """,
+        **values,
+    )
+
+
+async def _insert_physical_source_summary(
+    database,
+    schema,
+    physical_projection_id,
+    source_summary,
+):
+    await database.status(
+        f"""
+        INSERT INTO
+            "{schema}".provider_directory_physical_projection_source_summary (
+            physical_projection_id, canonical_row_sha256, dataset_hash,
+            resource_count, resource_counts_json, proof_json, created_at
+        ) VALUES (
+            :physical_projection_id, :canonical_row_sha256, :dataset_hash,
+            :resource_count, CAST(:resource_counts_json AS jsonb),
+            CAST(:proof_json AS jsonb), now()
+        );
+        """,
+        physical_projection_id=physical_projection_id,
+        canonical_row_sha256=source_summary["canonical_row_sha256"],
+        dataset_hash=source_summary["dataset_hash"],
+        resource_count=source_summary["resource_count"],
+        resource_counts_json=stable_json(source_summary["resource_counts"]),
+        proof_json=stable_json(source_summary),
+    )
+
+
+async def _insert_physical_partitions(
+    database,
+    schema,
+    physical_projection_id,
+    partition_records,
+):
+    for partition_record in partition_records:
+        await database.status(
+            f"""
+            INSERT INTO
+                "{schema}".provider_directory_physical_projection_partition (
+                physical_projection_id, proof_partition_id, partition_ordinal,
+                resource_type, canonical_row_sha256, resource_count,
+                proof_json, created_at
+            ) VALUES (
+                :physical_projection_id, :proof_partition_id,
+                :partition_ordinal, :resource_type,
+                :canonical_row_sha256, :resource_count,
+                CAST(:proof_json AS jsonb), now()
+            );
+            """,
+            physical_projection_id=physical_projection_id,
+            proof_partition_id=partition_record["proof_partition_id"],
+            partition_ordinal=partition_record["partition_ordinal"],
+            resource_type=partition_record["resource_type"],
+            canonical_row_sha256=partition_record["canonical_row_sha256"],
+            resource_count=partition_record["resource_count"],
+            proof_json=stable_json(partition_record["proof_json"]),
+        )
+
+
+async def _attach_physical_stage(database, schema, stage, projection_id):
+    await database.status(
+        f"""
+        ALTER TABLE "{schema}".provider_directory_physical_projection_resource
+        ATTACH PARTITION "{stage.schema}"."{stage.relation}"
+        FOR VALUES IN ('{projection_id}');
+        """
+    )
+
+
+async def _mark_projection_recipe_sealed(database, schema, lease, projection_id):
+    await database.status(
+        f"""
+        UPDATE "{schema}".provider_directory_projection_recipe
+           SET status = 'sealed', physical_projection_id = :projection_id,
+               lease_token = NULL, lease_expires_at = NULL,
+               lease_heartbeat_at = NULL, sealed_at = now(),
+               updated_at = clock_timestamp()
+         WHERE recipe_id = :recipe_id;
+        """,
+        projection_id=projection_id,
+        recipe_id=lease.recipe.recipe_id,
+    )
+
+
 async def _seal_physical_projection(
     database,
     schema: str,
@@ -2046,16 +2284,14 @@ async def _seal_physical_projection(
     partition_records: Sequence[Mapping[str, object]],
     *,
     retain_seconds: int,
-    attach_stage: bool = True,
-    set_action: bool = True,
+    options: _SealOptions = _SealOptions(),
 ) -> str:
     """Seal one fixture projection through the exact guarded write order."""
 
     physical_projection_id = lease.recipe.recipe_id
     assert stage.trigger_oid is not None
-    source_summary = projection_proof["source_summary"]
     async with database.transaction():
-        if set_action:
+        if options.set_action:
             await set_local_projection_action(
                 database,
                 "seal",
@@ -2064,119 +2300,139 @@ async def _seal_physical_projection(
                 recipe_lease_token=lease.lease_token,
                 physical_projection_id=physical_projection_id,
             )
-        await database.status(
-            f"""
-            INSERT INTO "{schema}".provider_directory_physical_projection (
-                physical_projection_id, canonical_row_sha256,
-                content_hash_contract_id, decoder_contract_id, input_set_sha256,
-                transform_contract_id, scope_contract_id, transform_context_hash,
-                transform_context_json, dataset_hash, resource_profile_hash,
-                selected_resources_json, required_resources_json, resource_count,
-                resource_counts_json, proof_json, storage_schema, storage_relation,
-                storage_relation_oid, storage_trigger_oid, status, created_at,
-                sealed_at, retain_until
-            ) VALUES (
-                :physical_projection_id, :canonical_row_sha256,
-                'fixture-content-hash.v1', :decoder_contract_id,
-                :input_set_sha256, :transform_contract_id, :scope_contract_id,
-                :transform_context_hash, CAST(:transform_context_json AS jsonb),
-                :dataset_hash, :resource_profile_hash,
-                CAST(:selected_resources_json AS jsonb),
-                CAST(:required_resources_json AS jsonb), :resource_count,
-                CAST(:resource_counts_json AS jsonb), CAST(:proof_json AS jsonb),
-                :storage_schema, :storage_relation, :storage_relation_oid,
-                :storage_trigger_oid, 'sealed', now(), now(),
-                now() + CAST(:retain_seconds AS integer) * interval '1 second'
-            );
-            """,
-            physical_projection_id=physical_projection_id,
-            canonical_row_sha256=projection_proof["canonical_row_sha256"],
-            decoder_contract_id=lease.recipe.decoder_contract_id,
-            input_set_sha256=lease.recipe.input_set_sha256,
-            transform_contract_id=lease.recipe.transform_contract_id,
-            scope_contract_id=lease.recipe.scope_contract_id,
-            transform_context_hash=lease.recipe.transform_context_hash,
-            transform_context_json=stable_json(lease.recipe.transform_context),
-            dataset_hash=projection_proof["dataset_hash"],
-            resource_profile_hash=lease.recipe.resource_profile_hash,
-            selected_resources_json=stable_json(lease.recipe.selected_resources),
-            required_resources_json=stable_json(lease.recipe.required_resources),
-            resource_count=projection_proof["resource_count"],
-            resource_counts_json=stable_json(projection_proof["resource_counts"]),
-            proof_json=stable_json(projection_proof),
-            storage_schema=stage.schema,
-            storage_relation=stage.relation,
-            storage_relation_oid=stage.relation_oid,
-            storage_trigger_oid=stage.trigger_oid,
-            retain_seconds=retain_seconds,
+        projection_insert_values = _physical_projection_insert_values(
+            lease, stage, projection_proof, retain_seconds
         )
-        await database.status(
-            f"""
-            INSERT INTO
-                "{schema}".provider_directory_physical_projection_source_summary (
-                physical_projection_id, canonical_row_sha256, dataset_hash,
-                resource_count, resource_counts_json, proof_json, created_at
-            ) VALUES (
-                :physical_projection_id, :canonical_row_sha256, :dataset_hash,
-                :resource_count, CAST(:resource_counts_json AS jsonb),
-                CAST(:proof_json AS jsonb), now()
-            );
-            """,
-            physical_projection_id=physical_projection_id,
-            canonical_row_sha256=source_summary["canonical_row_sha256"],
-            dataset_hash=source_summary["dataset_hash"],
-            resource_count=source_summary["resource_count"],
-            resource_counts_json=stable_json(source_summary["resource_counts"]),
-            proof_json=stable_json(source_summary),
+        await _insert_physical_projection(
+            database, schema, projection_insert_values
         )
-        for partition_record in partition_records:
-            await database.status(
-                f"""
-                INSERT INTO
-                    "{schema}".provider_directory_physical_projection_partition (
-                    physical_projection_id, proof_partition_id, partition_ordinal,
-                    resource_type, canonical_row_sha256, resource_count,
-                    proof_json, created_at
-                ) VALUES (
-                    :physical_projection_id, :proof_partition_id,
-                    :partition_ordinal, :resource_type,
-                    :canonical_row_sha256, :resource_count,
-                    CAST(:proof_json AS jsonb), now()
-                );
-                """,
-                physical_projection_id=physical_projection_id,
-                proof_partition_id=partition_record["proof_partition_id"],
-                partition_ordinal=partition_record["partition_ordinal"],
-                resource_type=partition_record["resource_type"],
-                canonical_row_sha256=partition_record["canonical_row_sha256"],
-                resource_count=partition_record["resource_count"],
-                proof_json=stable_json(partition_record["proof_json"]),
+        await _insert_physical_source_summary(
+            database,
+            schema,
+            physical_projection_id,
+            projection_proof["source_summary"],
+        )
+        await _insert_physical_partitions(
+            database, schema, physical_projection_id, partition_records
+        )
+        if options.attach_stage:
+            await _attach_physical_stage(
+                database, schema, stage, physical_projection_id
             )
-        if attach_stage:
-            await database.status(
-                f"""
-                ALTER TABLE
-                    "{schema}".provider_directory_physical_projection_resource
-                ATTACH PARTITION "{stage.schema}"."{stage.relation}"
-                FOR VALUES IN ('{physical_projection_id}');
-                """
-            )
-        await database.status(
-            f"""
-            UPDATE "{schema}".provider_directory_projection_recipe
-               SET status = 'sealed',
-                   physical_projection_id = :physical_projection_id,
-                   lease_token = NULL,
-                   lease_expires_at = NULL,
-                   lease_heartbeat_at = NULL,
-                   sealed_at = now(),
-                   updated_at = clock_timestamp()
-             WHERE recipe_id = :recipe_id;
-            """,
-            physical_projection_id=physical_projection_id,
-            recipe_id=lease.recipe.recipe_id,
+        await _mark_projection_recipe_sealed(
+            database, schema, lease, physical_projection_id
         )
     return physical_projection_id
+
+
+async def _assert_source_neutral_core_columns(database, schema) -> None:
+    column_names = {
+        column_record.column_name
+        for column_record in await database.all(
+            """
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_schema = :schema
+               AND table_name = 'provider_directory_projection_input_block';
+            """,
+            schema=schema,
+        )
+    }
+    campaign_column_names = {
+        "retained_campaign_id",
+        "retained_campaign_sha256",
+        "retained_source_item_id",
+        "retained_range_ordinal",
+    }
+    assert not campaign_column_names & column_names
+
+
+async def _assert_admission_rows_are_immutable(database, schema, admission_id):
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_admission_identity_immutable",
+    ):
+        await database.status(
+            f"""
+            UPDATE "{schema}".provider_directory_projection_admission
+               SET retained_campaign_sha256 = :forged_hash
+             WHERE admission_id = :admission_id;
+            """,
+            forged_hash=_digest("forged-campaign-hash"),
+            admission_id=admission_id,
+        )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_admission_block_immutable",
+    ):
+        await database.status(
+            f"""
+            UPDATE "{schema}".
+                   provider_directory_projection_admission_input_block
+               SET retained_source_item_id = :forged_item
+             WHERE admission_id = :admission_id;
+            """,
+            forged_item=_digest("forged-source-item"),
+            admission_id=admission_id,
+        )
+
+
+async def _assert_rebound_campaign_admission(
+    postgres,
+    lease,
+    original_binding,
+    input_block,
+    original_admission_id,
+) -> None:
+    rebound = await _register_additional_projection_admission(
+        postgres,
+        lease.recipe,
+        "source-neutral-rebound-campaign",
+    )
+    rebound_binding, rebound_block, _rebound_shard, rebound_admission_id = rebound
+    assert rebound_admission_id != original_admission_id
+    assert rebound_block.block.block_id == input_block.block.block_id
+    assert rebound_binding.campaign_id != original_binding.campaign_id
+    database, schema = postgres.database, postgres.schema
+    assert await database.scalar(
+        f'SELECT count(*) FROM "{schema}".'
+        'provider_directory_projection_recipe;'
+    ) == 1
+    assert await database.scalar(
+        f"""
+        SELECT count(*)
+          FROM "{schema}".provider_directory_projection_admission
+         WHERE recipe_id = :recipe_id AND status = 'sealed';
+        """,
+        recipe_id=lease.recipe.recipe_id,
+    ) == 2
+    with pytest.raises(
+        ProviderDirectoryProjectionError,
+        match="provider_directory_projection_admission_census_mismatch",
+    ):
+        await _prepare_additional_projection_admission(
+            postgres,
+            lease.recipe,
+            "source-neutral-bad-census-campaign",
+            completeness_row_delta=1,
+        )
+
+
+def _shared_content_consumer_id(bindings, produced_artifact):
+    recipe, admission_blocks, _shard = _shared_block_fixture(
+        bindings,
+        produced_artifact,
+    )
+    return projection_admission_consumer_id(recipe, admission_blocks)
+
+
+def _partial_range_consumer_id(bindings, produced_artifact):
+    recipe, admission_blocks, _shards = _range_subset_fixture(
+        bindings[0],
+        produced_artifact,
+        (0,),
+    )
+    return projection_admission_consumer_id(recipe, admission_blocks)
 
 
 @pytest.mark.asyncio
@@ -2237,89 +2493,17 @@ async def test_source_neutral_recipe_reuses_immutable_campaign_admissions(
             "source-neutral-original-campaign",
         )
         assert lease is not None
-        core_columns = {
-                column_record.column_name
-                for column_record in await database.all(
-                """
-                SELECT column_name
-                  FROM information_schema.columns
-                 WHERE table_schema = :schema
-                   AND table_name =
-                       'provider_directory_projection_input_block';
-                """,
-                schema=schema,
-            )
-        }
-        assert not {
-            "retained_campaign_id",
-            "retained_campaign_sha256",
-            "retained_source_item_id",
-            "retained_range_ordinal",
-        } & core_columns
-
-        with pytest.raises(
-            DBAPIError,
-            match="provider_directory_projection_admission_identity_immutable",
-        ):
-            await database.status(
-                f"""
-                UPDATE "{schema}".provider_directory_projection_admission
-                   SET retained_campaign_sha256 = :forged_hash
-                 WHERE admission_id = :admission_id;
-                """,
-                forged_hash=_digest("forged-campaign-hash"),
-                admission_id=original_admission_id,
-            )
-        with pytest.raises(
-            DBAPIError,
-            match="provider_directory_projection_admission_block_immutable",
-        ):
-            await database.status(
-                f"""
-                UPDATE "{schema}".
-                       provider_directory_projection_admission_input_block
-                   SET retained_source_item_id = :forged_item
-                 WHERE admission_id = :admission_id;
-                """,
-                forged_item=_digest("forged-source-item"),
-                admission_id=original_admission_id,
-            )
-
-        (
-            rebound_binding,
-            rebound_block,
-            _rebound_shard,
-            rebound_admission_id,
-        ) = await _register_additional_projection_admission(
-            postgres,
-            lease.recipe,
-            "source-neutral-rebound-campaign",
+        await _assert_source_neutral_core_columns(database, schema)
+        await _assert_admission_rows_are_immutable(
+            database, schema, original_admission_id
         )
-        assert rebound_admission_id != original_admission_id
-        assert rebound_block.block.block_id == input_block.block.block_id
-        assert rebound_binding.campaign_id != original_binding.campaign_id
-        assert await database.scalar(
-            f'SELECT count(*) FROM "{schema}".'
-            'provider_directory_projection_recipe;'
-        ) == 1
-        assert await database.scalar(
-            f"""
-            SELECT count(*)
-              FROM "{schema}".provider_directory_projection_admission
-             WHERE recipe_id = :recipe_id AND status = 'sealed';
-            """,
-            recipe_id=lease.recipe.recipe_id,
-        ) == 2
-        with pytest.raises(
-            ProviderDirectoryProjectionError,
-            match="provider_directory_projection_admission_census_mismatch",
-        ):
-            await _prepare_additional_projection_admission(
-                postgres,
-                lease.recipe,
-                "source-neutral-bad-census-campaign",
-                completeness_row_delta=1,
-            )
+        await _assert_rebound_campaign_admission(
+            postgres,
+            lease,
+            original_binding,
+            input_block,
+            original_admission_id,
+        )
 
 
 @pytest.mark.asyncio
@@ -2381,19 +2565,11 @@ async def test_admission_maps_two_items_to_one_content_block(monkeypatch) -> Non
 
     async with projection_foundation_postgres(monkeypatch) as postgres:
         await postgres.upgrade()
-
-        def shared_consumer_id(bindings, produced_artifact):
-            recipe, admission_blocks, _shard = _shared_block_fixture(
-                bindings,
-                produced_artifact,
-            )
-            return projection_admission_consumer_id(recipe, admission_blocks)
-
         bindings, produced_artifact = await _sealed_shared_artifact_bindings(
             postgres,
             campaign_label="shared-content-success",
             item_count=2,
-            consumer_recipe_id=shared_consumer_id,
+            consumer_recipe_id=_shared_content_consumer_id,
         )
         recipe, admission_blocks, shard = _shared_block_fixture(
             bindings,
@@ -2452,20 +2628,11 @@ async def test_admission_rejects_a_missing_layout_range(monkeypatch) -> None:
             campaign_item("missing-layout-range").artifact_kind,
         )
         assert len(produced_artifact.ranges) == 2
-
-        def partial_range_consumer_id(bindings, shared_artifact):
-            recipe, admission_blocks, _shards = _range_subset_fixture(
-                bindings[0],
-                shared_artifact,
-                (0,),
-            )
-            return projection_admission_consumer_id(recipe, admission_blocks)
-
         bindings, produced_artifact = await _sealed_shared_artifact_bindings(
             postgres,
             campaign_label="missing-layout-range",
             item_count=1,
-            consumer_recipe_id=partial_range_consumer_id,
+            consumer_recipe_id=_partial_range_consumer_id,
             produced_artifact=produced_artifact,
         )
         assert len(produced_artifact.ranges) == 2
@@ -2679,6 +2846,167 @@ async def test_no_input_admission_rejects_retained_positive_payload(
         ) == 0
 
 
+@dataclass(frozen=True)
+class _FailedRecipeContext:
+    primary_lease: object
+    sibling_lease: object
+    proof: Mapping[str, object]
+    primary_before: object
+    sibling_before: object
+
+
+async def _primary_recipe_snapshot(database, schema, recipe_id):
+    return await database.first(
+        f"""
+        SELECT recipe.attempt, recipe.stage_relation_oid,
+               recipe.input_block_count, recipe.partition_count,
+               proof_shard.partition_id, proof_shard.status,
+               proof_shard.canonical_row_sha256
+          FROM "{schema}".provider_directory_projection_recipe AS recipe
+          JOIN "{schema}".provider_directory_projection_proof_shard
+               AS proof_shard
+            ON proof_shard.recipe_id = recipe.recipe_id
+           AND proof_shard.attempt = recipe.attempt
+         WHERE recipe.recipe_id = :recipe_id;
+        """,
+        recipe_id=recipe_id,
+    )
+
+
+async def _sibling_recipe_snapshot(database, schema, recipe_id):
+    return await database.first(
+        f"""
+        SELECT attempt, status, stage_relation_oid,
+               input_block_count, partition_count, lease_token
+          FROM "{schema}".provider_directory_projection_recipe
+         WHERE recipe_id = :recipe_id;
+        """,
+        recipe_id=recipe_id,
+    )
+
+
+async def _failed_recipe_context(postgres) -> _FailedRecipeContext:
+    primary_context = await _registered_projection_context(
+        postgres,
+        "retry-primary-campaign",
+    )
+    sibling_context = await _registered_projection_context(
+        postgres,
+        "retry-sibling-campaign",
+        artifact_label="projection-sibling-artifact",
+    )
+    primary_lease, sibling_lease = primary_context[0], sibling_context[0]
+    assert primary_lease is not None and sibling_lease is not None
+    assert primary_lease.recipe.recipe_id != sibling_lease.recipe.recipe_id
+    database, schema = postgres.database, postgres.schema
+    completed_shard = await _complete_registered_projection_shard(
+        database, schema, primary_lease
+    )
+    proof = _physical_projection_proof(
+        primary_lease.recipe.recipe_id, completed_shard
+    )
+    stage = await _create_projection_stage(
+        database,
+        schema,
+        label="retry-primary-stage",
+        physical_projection_id=primary_lease.recipe.recipe_id,
+        raw_shard=completed_shard,
+        install_trigger=True,
+    )
+    await _bind_projection_stage(database, schema, primary_lease, stage)
+    return _FailedRecipeContext(
+        primary_lease=primary_lease,
+        sibling_lease=sibling_lease,
+        proof=proof,
+        primary_before=await _primary_recipe_snapshot(
+            database, schema, primary_lease.recipe.recipe_id
+        ),
+        sibling_before=await _sibling_recipe_snapshot(
+            database, schema, sibling_lease.recipe.recipe_id
+        ),
+    )
+
+
+async def _mark_fixture_recipe_failed(database, schema, lease) -> None:
+    async with database.transaction():
+        await set_local_projection_action(
+            database,
+            "fail",
+            recipe_id=lease.recipe.recipe_id,
+            recipe_attempt=lease.attempt,
+            recipe_lease_token=lease.lease_token,
+        )
+        await database.status(
+            f"""
+            UPDATE "{schema}".provider_directory_projection_recipe
+               SET status = 'failed', lease_token = NULL,
+                   lease_expires_at = NULL, lease_heartbeat_at = NULL,
+                   updated_at = now()
+             WHERE recipe_id = :recipe_id;
+            """,
+            recipe_id=lease.recipe.recipe_id,
+        )
+
+
+async def _assert_unclassified_raw_retry_rejected(database, schema, lease):
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_failure_classification_required",
+    ):
+        async with database.transaction():
+            replacement_token = _digest("unclassified-retry-token")
+            settings = (
+                ("action", "recipe_retry"),
+                ("recipe_id", lease.recipe.recipe_id),
+                ("recipe_attempt", str(lease.attempt)),
+                ("recipe_lease_token", replacement_token),
+            )
+            for setting_name, setting_value in settings:
+                assert await database.scalar(
+                    "SELECT set_config("
+                    "'healthporta.provider_directory_projection_"
+                    f"{setting_name}', :setting_value, true);",
+                    setting_value=setting_value,
+                ) == setting_value
+            await database.status(
+                f"""
+                UPDATE "{schema}".provider_directory_projection_recipe
+                   SET status = 'building', lease_token = :lease_token,
+                       lease_expires_at = now() + interval '15 minutes',
+                       lease_heartbeat_at = now(), updated_at = now()
+                 WHERE recipe_id = :recipe_id;
+                """,
+                lease_token=replacement_token,
+                recipe_id=lease.recipe.recipe_id,
+            )
+
+
+async def _assert_failed_recipe_quarantine(postgres, context) -> None:
+    database, schema = postgres.database, postgres.schema
+    primary_recipe_id = context.primary_lease.recipe.recipe_id
+    primary_after = await _primary_recipe_snapshot(
+        database, schema, primary_recipe_id
+    )
+    assert tuple(primary_after) == tuple(context.primary_before)
+    assert context.proof["raw_shards"][0]["partition_id"] == (
+        primary_after.partition_id
+    )
+    assert await database.scalar(
+        f"""
+        SELECT status
+          FROM "{schema}".provider_directory_projection_recipe
+         WHERE recipe_id = :recipe_id;
+        """,
+        recipe_id=primary_recipe_id,
+    ) == "failed"
+    sibling_after = await _sibling_recipe_snapshot(
+        database,
+        schema,
+        context.sibling_lease.recipe.recipe_id,
+    )
+    assert tuple(sibling_after) == tuple(context.sibling_before)
+
+
 @pytest.mark.asyncio
 async def test_failed_recipe_requires_classification_and_quarantines_work(
     monkeypatch,
@@ -2689,158 +3017,23 @@ async def test_failed_recipe_requires_classification_and_quarantines_work(
         await postgres.upgrade()
         database = postgres.database
         schema = postgres.schema
-        primary_context = await _registered_projection_context(
-            postgres,
-            "retry-primary-campaign",
-        )
-        sibling_context = await _registered_projection_context(
-            postgres,
-            "retry-sibling-campaign",
-            artifact_label="projection-sibling-artifact",
-        )
-        primary_lease = primary_context[0]
-        sibling_lease = sibling_context[0]
-        assert primary_lease is not None and sibling_lease is not None
-        assert primary_lease.recipe.recipe_id != sibling_lease.recipe.recipe_id
-
-        completed_shard = await _complete_registered_projection_shard(
-            database,
-            schema,
-            primary_lease,
-        )
-        proof = _physical_projection_proof(
-            primary_lease.recipe.recipe_id,
-            completed_shard,
-        )
-        stage = await _create_projection_stage(
-            database,
-            schema,
-            label="retry-primary-stage",
-            physical_projection_id=primary_lease.recipe.recipe_id,
-            raw_shard=completed_shard,
-            install_trigger=True,
-        )
-        await _bind_projection_stage(
-            database,
-            schema,
-            primary_lease,
-            stage,
-        )
-        before_retry = await database.first(
-            f"""
-            SELECT recipe.attempt, recipe.stage_relation_oid,
-                   recipe.input_block_count, recipe.partition_count,
-                   proof_shard.partition_id, proof_shard.status,
-                   proof_shard.canonical_row_sha256
-              FROM "{schema}".provider_directory_projection_recipe AS recipe
-              JOIN "{schema}".provider_directory_projection_proof_shard
-                   AS proof_shard
-                ON proof_shard.recipe_id = recipe.recipe_id
-               AND proof_shard.attempt = recipe.attempt
-             WHERE recipe.recipe_id = :recipe_id;
-            """,
-            recipe_id=primary_lease.recipe.recipe_id,
-        )
-        sibling_before = await database.first(
-            f"""
-            SELECT attempt, status, stage_relation_oid,
-                   input_block_count, partition_count, lease_token
-              FROM "{schema}".provider_directory_projection_recipe
-             WHERE recipe_id = :recipe_id;
-            """,
-            recipe_id=sibling_lease.recipe.recipe_id,
-        )
-        async with database.transaction():
-            await set_local_projection_action(
-                database,
-                "fail",
-                recipe_id=primary_lease.recipe.recipe_id,
-                recipe_attempt=primary_lease.attempt,
-                recipe_lease_token=primary_lease.lease_token,
-            )
-            await database.status(
-                f"""
-                UPDATE "{schema}".provider_directory_projection_recipe
-                   SET status = 'failed', lease_token = NULL,
-                       lease_expires_at = NULL, lease_heartbeat_at = NULL,
-                       updated_at = now()
-                 WHERE recipe_id = :recipe_id;
-                """,
-                recipe_id=primary_lease.recipe.recipe_id,
-            )
+        context = await _failed_recipe_context(postgres)
+        await _mark_fixture_recipe_failed(database, schema, context.primary_lease)
         with pytest.raises(
             ProviderDirectoryProjectionError,
             match="provider_directory_projection_failure_classification_required",
         ):
             await claim_projection_recipe(
-                primary_lease.recipe,
+                context.primary_lease.recipe,
                 database=database,
                 schema=schema,
             )
-        with pytest.raises(
-            DBAPIError,
-            match="provider_directory_projection_failure_classification_required",
-        ):
-            async with database.transaction():
-                replacement_token = _digest("unclassified-retry-token")
-                for setting_name, setting_value in (
-                    ("action", "recipe_retry"),
-                    ("recipe_id", primary_lease.recipe.recipe_id),
-                    ("recipe_attempt", str(primary_lease.attempt)),
-                    ("recipe_lease_token", replacement_token),
-                ):
-                    assert await database.scalar(
-                        "SELECT set_config("
-                        "'healthporta.provider_directory_projection_"
-                        f"{setting_name}', :setting_value, true);",
-                        setting_value=setting_value,
-                    ) == setting_value
-                await database.status(
-                    f"""
-                    UPDATE "{schema}".provider_directory_projection_recipe
-                       SET status = 'building', lease_token = :lease_token,
-                           lease_expires_at = now() + interval '15 minutes',
-                           lease_heartbeat_at = now(), updated_at = now()
-                     WHERE recipe_id = :recipe_id;
-                    """,
-                    lease_token=replacement_token,
-                    recipe_id=primary_lease.recipe.recipe_id,
-                )
-        after_failure = await database.first(
-            f"""
-            SELECT recipe.attempt, recipe.stage_relation_oid,
-                   recipe.input_block_count, recipe.partition_count,
-                   proof_shard.partition_id, proof_shard.status,
-                   proof_shard.canonical_row_sha256
-              FROM "{schema}".provider_directory_projection_recipe AS recipe
-              JOIN "{schema}".provider_directory_projection_proof_shard
-                   AS proof_shard
-                ON proof_shard.recipe_id = recipe.recipe_id
-               AND proof_shard.attempt = recipe.attempt
-             WHERE recipe.recipe_id = :recipe_id;
-            """,
-            recipe_id=primary_lease.recipe.recipe_id,
+        await _assert_unclassified_raw_retry_rejected(
+            database,
+            schema,
+            context.primary_lease,
         )
-        assert tuple(after_failure) == tuple(before_retry)
-        assert proof["raw_shards"][0]["partition_id"] == after_failure.partition_id
-        assert await database.scalar(
-            f"""
-            SELECT status
-              FROM "{schema}".provider_directory_projection_recipe
-             WHERE recipe_id = :recipe_id;
-            """,
-            recipe_id=primary_lease.recipe.recipe_id,
-        ) == "failed"
-        sibling_after = await database.first(
-            f"""
-            SELECT attempt, status, stage_relation_oid,
-                   input_block_count, partition_count, lease_token
-              FROM "{schema}".provider_directory_projection_recipe
-             WHERE recipe_id = :recipe_id;
-            """,
-            recipe_id=sibling_lease.recipe.recipe_id,
-        )
-        assert tuple(sibling_after) == tuple(sibling_before)
+        await _assert_failed_recipe_quarantine(postgres, context)
 
 
 @pytest.mark.asyncio
@@ -2918,6 +3111,152 @@ async def test_projection_downgrade_refuses_live_foundation_state(monkeypatch) -
             await postgres.downgrade()
 
 
+async def _stage_bind_fixture(postgres):
+    database, schema = postgres.database, postgres.schema
+    lease = await _registered_projection_lease(postgres, "stage-bind-campaign")
+    completed_shard = await _complete_registered_projection_shard(
+        database, schema, lease
+    )
+    projection_proof = _physical_projection_proof(
+        lease.recipe.recipe_id,
+        completed_shard,
+    )
+    return lease, completed_shard, projection_proof
+
+
+async def _assert_invalid_stage_identities_rejected(
+    database,
+    schema,
+    lease,
+) -> None:
+    nonexistent_stage = _StageBinding(
+        schema,
+        "missing_projection_stage",
+        2_147_483_647,
+        None,
+    )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_recipe_transition_invalid",
+    ):
+        await _bind_projection_stage(database, schema, lease, nonexistent_stage)
+    arbitrary_relation = f"arbitrary_stage_{_digest('one-column')[:12]}"
+    await database.status(
+        f'CREATE TABLE "{schema}"."{arbitrary_relation}" '
+        "(stage_row_id bigint);"
+    )
+    arbitrary_oid = int(
+        await database.scalar(
+            "SELECT to_regclass(:qualified_relation)::oid::bigint;",
+            qualified_relation=f"{schema}.{arbitrary_relation}",
+        )
+    )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_recipe_transition_invalid",
+    ):
+        await _bind_projection_stage(
+            database,
+            schema,
+            lease,
+            _StageBinding(schema, arbitrary_relation, arbitrary_oid, None),
+        )
+
+
+async def _bind_once_and_reject_replacement(
+    database,
+    schema,
+    lease,
+    completed_shard,
+):
+    stage = await _create_projection_stage(
+        database,
+        schema,
+        label="bind-once-stage",
+        physical_projection_id=lease.recipe.recipe_id,
+        raw_shard=completed_shard,
+        install_trigger=False,
+    )
+    await _bind_projection_stage(database, schema, lease, stage)
+    await _bind_projection_stage(database, schema, lease, stage)
+    replacement_stage = await _create_projection_stage(
+        database,
+        schema,
+        label="replacement-stage",
+        physical_projection_id=lease.recipe.recipe_id,
+        raw_shard=completed_shard,
+        install_trigger=False,
+    )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_recipe_transition_invalid",
+    ):
+        await _bind_projection_stage(database, schema, lease, replacement_stage)
+    return stage
+
+
+async def _assert_proof_ready_requires_attestation(
+    database,
+    schema,
+    lease,
+    projection_proof,
+) -> None:
+    with pytest.raises(
+        ProviderDirectoryProjectionError,
+        match="provider_directory_projection_action_invalid",
+    ):
+        await _mark_projection_proof_ready(
+            database, schema, lease, projection_proof
+        )
+    with pytest.raises(
+        DBAPIError,
+        match="provider_directory_projection_native_attestation_required",
+    ):
+        async with database.transaction():
+            await database.status(
+                "SET LOCAL healthporta.provider_directory_projection_action "
+                "= 'proof_ready';"
+            )
+            await database.status(
+                f"""
+                UPDATE "{schema}".provider_directory_projection_recipe
+                   SET status = 'proof_ready',
+                       prepared_proof_json =
+                           CAST(:prepared_proof_json AS jsonb),
+                       updated_at = clock_timestamp()
+                 WHERE recipe_id = :recipe_id;
+                """,
+                prepared_proof_json=stable_json(projection_proof),
+                recipe_id=lease.recipe.recipe_id,
+            )
+
+
+async def _assert_immutable_stage_identity(database, schema, lease, stage) -> None:
+    stored_stage = await database.first(
+        f"""
+        SELECT stage_schema, stage_relation, stage_relation_oid, status
+          FROM "{schema}".provider_directory_projection_recipe
+         WHERE recipe_id = :recipe_id;
+        """,
+        recipe_id=lease.recipe.recipe_id,
+    )
+    assert tuple(stored_stage) == (
+        schema,
+        stage.relation,
+        stage.relation_oid,
+        "building",
+    )
+    assert stage.trigger_oid == await database.scalar(
+        """
+        SELECT oid::bigint FROM pg_trigger
+         WHERE tgrelid = CAST(:relation_oid AS oid)
+           AND tgname = 'provider_directory_projection_stage_immutable'
+           AND NOT tgisinternal;
+        """,
+        relation_oid=stage.relation_oid,
+    )
+
+
 @pytest.mark.asyncio
 async def test_stage_bind_requires_real_identity_and_freezes_after_first_bind(
     monkeypatch,
@@ -2928,149 +3267,17 @@ async def test_stage_bind_requires_real_identity_and_freezes_after_first_bind(
         await postgres.upgrade()
         database = postgres.database
         schema = postgres.schema
-        lease = await _registered_projection_lease(
-            postgres,
-            "stage-bind-campaign",
+        lease, completed_shard, projection_proof = await _stage_bind_fixture(postgres)
+        await _assert_invalid_stage_identities_rejected(database, schema, lease)
+        stage = await _bind_once_and_reject_replacement(
+            database, schema, lease, completed_shard
         )
-        completed_shard = await _complete_registered_projection_shard(
-            database,
-            schema,
-            lease,
-        )
-        projection_proof = _physical_projection_proof(
-            lease.recipe.recipe_id,
-            completed_shard,
-        )
-
-        nonexistent_stage = _StageBinding(
-            schema,
-            "missing_projection_stage",
-            2_147_483_647,
-            None,
-        )
-        with pytest.raises(
-            DBAPIError,
-            match="provider_directory_projection_recipe_transition_invalid",
-        ):
-            await _bind_projection_stage(
-                database,
-                schema,
-                lease,
-                nonexistent_stage,
-            )
-
-        arbitrary_relation = f"arbitrary_stage_{_digest('one-column')[:12]}"
-        await database.status(
-            f'CREATE TABLE "{schema}"."{arbitrary_relation}" '
-            "(stage_row_id bigint);"
-        )
-        arbitrary_oid = int(
-            await database.scalar(
-                "SELECT to_regclass(:qualified_relation)::oid::bigint;",
-                qualified_relation=f"{schema}.{arbitrary_relation}",
-            )
-        )
-        with pytest.raises(
-            DBAPIError,
-            match="provider_directory_projection_recipe_transition_invalid",
-        ):
-            await _bind_projection_stage(
-                database,
-                schema,
-                lease,
-                _StageBinding(
-                    schema,
-                    arbitrary_relation,
-                    arbitrary_oid,
-                    None,
-                ),
-            )
-
-        stage = await _create_projection_stage(
-            database,
-            schema,
-            label="bind-once-stage",
-            physical_projection_id=lease.recipe.recipe_id,
-            raw_shard=completed_shard,
-            install_trigger=False,
-        )
-        await _bind_projection_stage(database, schema, lease, stage)
-        await _bind_projection_stage(database, schema, lease, stage)
-
-        replacement_stage = await _create_projection_stage(
-            database,
-            schema,
-            label="replacement-stage",
-            physical_projection_id=lease.recipe.recipe_id,
-            raw_shard=completed_shard,
-            install_trigger=False,
-        )
-        with pytest.raises(
-            DBAPIError,
-            match="provider_directory_projection_recipe_transition_invalid",
-        ):
-            await _bind_projection_stage(
-                database,
-                schema,
-                lease,
-                replacement_stage,
-            )
-
-        with pytest.raises(
-            ProviderDirectoryProjectionError,
-            match="provider_directory_projection_action_invalid",
-        ):
-            await _mark_projection_proof_ready(
-                database,
-                schema,
-                lease,
-                projection_proof,
-            )
-
         immutable_stage = await _install_projection_stage_trigger(database, stage)
-        with pytest.raises(
-            DBAPIError,
-            match="provider_directory_projection_native_attestation_required",
-        ):
-            async with database.transaction():
-                await database.status(
-                    "SET LOCAL healthporta.provider_directory_projection_action "
-                    "= 'proof_ready';"
-                )
-                await database.status(
-                    f"""
-                    UPDATE "{schema}".provider_directory_projection_recipe
-                       SET status = 'proof_ready',
-                           prepared_proof_json =
-                               CAST(:prepared_proof_json AS jsonb),
-                           updated_at = clock_timestamp()
-                     WHERE recipe_id = :recipe_id;
-                    """,
-                    prepared_proof_json=stable_json(projection_proof),
-                    recipe_id=lease.recipe.recipe_id,
-                )
-        stored_stage = await database.first(
-            f"""
-            SELECT stage_schema, stage_relation, stage_relation_oid, status
-              FROM "{schema}".provider_directory_projection_recipe
-             WHERE recipe_id = :recipe_id;
-            """,
-            recipe_id=lease.recipe.recipe_id,
+        await _assert_proof_ready_requires_attestation(
+            database, schema, lease, projection_proof
         )
-        assert tuple(stored_stage) == (
-            schema,
-            immutable_stage.relation,
-            immutable_stage.relation_oid,
-            "building",
-        )
-        assert immutable_stage.trigger_oid == await database.scalar(
-            """
-            SELECT oid::bigint FROM pg_trigger
-             WHERE tgrelid = CAST(:relation_oid AS oid)
-               AND tgname = 'provider_directory_projection_stage_immutable'
-               AND NOT tgisinternal;
-            """,
-            relation_oid=immutable_stage.relation_oid,
+        await _assert_immutable_stage_identity(
+            database, schema, lease, immutable_stage
         )
 
 @pytest.mark.asyncio
@@ -3113,6 +3320,5 @@ async def test_foundation_rejects_unattested_physical_storage(monkeypatch) -> No
                 projection_proof,
                 _partition_records(projection_proof),
                 retain_seconds=0,
-                attach_stage=False,
-                set_action=False,
+                options=_SealOptions(attach_stage=False, set_action=False),
             )

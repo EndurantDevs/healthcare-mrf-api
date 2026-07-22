@@ -30,6 +30,7 @@ from process.provider_directory_retained_handoff import (
 from process.provider_directory_retained_store_support import (
     database_record,
     database_record_list,
+    database_schema,
     database_table,
 )
 
@@ -275,6 +276,11 @@ async def release_retained_campaign_consumer(
     require_positive_int(consumer_claim_generation, "consumer_claim_generation")
     tables = claim_tables()
     async with connection.transaction():
+        await _lock_projection_release_dependencies(
+            connection,
+            campaign_id,
+            consumer_recipe_id,
+        )
         await _lock_consumer_campaign(connection, campaign_id)
         consumer_state_by_field = database_record(
             await connection.fetchrow(
@@ -302,6 +308,146 @@ async def release_retained_campaign_consumer(
             campaign_id,
             consumer_recipe_id,
             consumer_claim_generation,
+        )
+
+
+async def _has_projection_release_relations(
+    connection: asyncpg.Connection,
+) -> bool:
+    """Return whether the optional projection owner relations exist."""
+
+    schema = database_schema()
+    return bool(
+        await connection.fetchval(
+            "SELECT to_regclass($1) IS NOT NULL "
+            "AND to_regclass($2) IS NOT NULL;",
+            f"{schema}.provider_directory_projection_admission",
+            f"{schema}.provider_directory_projection_recipe",
+        )
+    )
+
+
+async def _projection_release_candidate_records(
+    connection: asyncpg.Connection,
+    admission_table: str,
+    campaign_id: str,
+    consumer_recipe_id: str,
+) -> list[dict[str, Any]]:
+    return database_record_list(
+        await connection.fetch(
+            f"""SELECT admission_id, recipe_id
+                   FROM {admission_table}
+                  WHERE retained_campaign_id=$1
+                    AND retained_consumer_recipe_id=$2
+                  ORDER BY recipe_id NULLS FIRST, admission_id;""",
+            campaign_id,
+            consumer_recipe_id,
+        )
+    )
+
+
+async def _locked_projection_recipe_records(
+    connection: asyncpg.Connection,
+    recipe_table: str,
+    recipe_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not recipe_ids:
+        return []
+    return database_record_list(
+        await connection.fetch(
+            f"""SELECT recipe_id, status
+                   FROM {recipe_table}
+                  WHERE recipe_id=ANY($1::text[])
+                  ORDER BY recipe_id FOR SHARE;""",
+            recipe_ids,
+        )
+    )
+
+
+async def _locked_projection_admission_records(
+    connection: asyncpg.Connection,
+    admission_table: str,
+    campaign_id: str,
+    consumer_recipe_id: str,
+) -> list[dict[str, Any]]:
+    return database_record_list(
+        await connection.fetch(
+            f"""SELECT admission_id, recipe_id, status
+                   FROM {admission_table}
+                  WHERE retained_campaign_id=$1
+                    AND retained_consumer_recipe_id=$2
+                  ORDER BY recipe_id NULLS FIRST, admission_id FOR SHARE;""",
+            campaign_id,
+            consumer_recipe_id,
+        )
+    )
+
+
+def _is_projection_release_live(
+    candidate_records: list[dict[str, Any]],
+    recipe_records: list[dict[str, Any]],
+    admission_records: list[dict[str, Any]],
+    recipe_ids: list[str],
+) -> bool:
+    candidate_identity_list = [
+        (candidate.get("admission_id"), candidate.get("recipe_id"))
+        for candidate in candidate_records
+    ]
+    locked_identity_list = [
+        (admission.get("admission_id"), admission.get("recipe_id"))
+        for admission in admission_records
+    ]
+    return bool(
+        locked_identity_list != candidate_identity_list
+        or {recipe.get("recipe_id") for recipe in recipe_records}
+        != set(recipe_ids)
+        or any(
+            admission.get("status") != "released"
+            for admission in admission_records
+        )
+        or any(
+            recipe.get("status") in {"building", "proof_ready"}
+            for recipe in recipe_records
+        )
+    )
+
+
+async def _lock_projection_release_dependencies(
+    connection: asyncpg.Connection,
+    campaign_id: str,
+    consumer_recipe_id: str,
+) -> None:
+    """Lock projection owners before their retained parent is released."""
+
+    if not await _has_projection_release_relations(connection):
+        return
+    admission_table = database_table("provider_directory_projection_admission")
+    candidate_records = await _projection_release_candidate_records(
+        connection, admission_table, campaign_id, consumer_recipe_id
+    )
+    if not candidate_records:
+        return
+    recipe_ids = sorted({
+        str(candidate["recipe_id"])
+        for candidate in candidate_records
+        if candidate.get("recipe_id") is not None
+    })
+    recipe_records = await _locked_projection_recipe_records(
+        connection,
+        database_table("provider_directory_projection_recipe"),
+        recipe_ids,
+    )
+    admission_records = await _locked_projection_admission_records(
+        connection, admission_table, campaign_id, consumer_recipe_id
+    )
+    if _is_projection_release_live(
+        candidate_records,
+        recipe_records,
+        admission_records,
+        recipe_ids,
+    ):
+        raise RetainedArtifactError(
+            "provider_directory_projection_retained_parent_live"
         )
 
 
