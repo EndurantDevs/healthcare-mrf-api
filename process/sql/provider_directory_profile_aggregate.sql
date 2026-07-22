@@ -15,6 +15,7 @@ INSERT INTO {{TARGET_REF}} ("npi", "profile_json", "evidence_json", "source_ids"
                    ) AS evidence_count
               FROM {{EVIDENCE_REF}} AS evidence
               JOIN affected_npis ON affected_npis.npi = evidence.npi
+              {{EVIDENCE_NPI_SCOPE_SQL}}
         ), facts AS MATERIALIZED (
             SELECT npi, fact_type, fact_key,
                    (array_agg(
@@ -120,8 +121,7 @@ INSERT INTO {{TARGET_REF}} ("npi", "profile_json", "evidence_json", "source_ids"
                    evidence.endpoint_id, evidence.dataset_id,
                    evidence.canonical_api_base, evidence.source_org_name,
                    evidence.source_plan_name
-              FROM {{EVIDENCE_REF}} AS evidence
-              JOIN affected_npis ON affected_npis.npi = evidence.npi
+              FROM scoped_evidence AS evidence
         ), profile_sources AS MATERIALIZED (
             SELECT evidence.npi,
                    array_agg(DISTINCT evidence.source_id ORDER BY evidence.source_id) AS source_ids,

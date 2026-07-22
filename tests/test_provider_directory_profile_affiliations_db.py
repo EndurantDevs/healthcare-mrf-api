@@ -948,23 +948,29 @@ async def test_five_million_npi_batch_uses_evidence_range_indexes(monkeypatch):
         ):
             await database.status(index_sql)
         await database.status(f"ANALYZE {evidence_ref};")
-        plan = await database.scalar(
-            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
-            + profile.profile_insert_sql(
-                evidence_ref=evidence_ref,
-                target_ref=profile_ref,
-                old_evidence_ref=None,
-                rebuild_all=True,
-                npi_start=profile.NPI_MIN,
-                npi_end=profile.NPI_MIN + profile.PROFILE_NPI_BATCH_SIZE,
-            ),
-            generation_id="profile-index-plan",
-            profile_as_of="2026-07-19",
-            profile_npi_start=profile.NPI_MIN,
-            profile_npi_end=(
-                profile.NPI_MIN + profile.PROFILE_NPI_BATCH_SIZE
-            ),
-        )
+        late_npi_start = profile.NPI_MIN + 995_000_000
+        async with database.transaction():
+            await database.status("SET LOCAL enable_nestloop = off;")
+            await database.status("SET LOCAL enable_hashjoin = off;")
+            plan = await database.scalar(
+                "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+                + profile.profile_insert_sql(
+                    evidence_ref=evidence_ref,
+                    target_ref=profile_ref,
+                    old_evidence_ref=None,
+                    rebuild_all=True,
+                    npi_start=late_npi_start,
+                    npi_end=(
+                        late_npi_start + profile.PROFILE_NPI_BATCH_SIZE
+                    ),
+                ),
+                generation_id="profile-index-plan",
+                profile_as_of="2026-07-19",
+                profile_npi_start=late_npi_start,
+                profile_npi_end=(
+                    late_npi_start + profile.PROFILE_NPI_BATCH_SIZE
+                ),
+            )
 
     evidence_nodes = _plan_relation_nodes(plan, evidence_table)
     assert evidence_nodes

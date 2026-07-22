@@ -337,6 +337,8 @@ def test_profile_aggregation_is_deterministic_and_evidence_bounded():
     assert "evidence.canonical_api_base," in sql
     assert "'[?#].*$'" in sql
     assert "'^([^:/?#]+://)[^/?#@]*@'" in sql
+    assert sql.count('FROM "fixture"."evidence" AS evidence') == 1
+    assert "FROM scoped_evidence AS evidence" in sql
 
 
 def test_profile_aggregation_supports_bounded_npi_ranges():
@@ -351,6 +353,10 @@ def test_profile_aggregation_supports_bounded_npi_ranges():
 
     assert "npi >= CAST(:profile_npi_start AS bigint)" in sql
     assert "npi < CAST(:profile_npi_end AS bigint)" in sql
+    assert (
+        "WHERE evidence.npi >= CAST(:profile_npi_start AS bigint)" in sql
+    )
+    assert "FROM scoped_evidence AS evidence" in sql
 
     with pytest.raises(ValueError, match="requires both bounds"):
         profile.profile_insert_sql(
@@ -375,6 +381,34 @@ def test_profile_aggregation_supports_bounded_npi_ranges():
                 npi_start=npi_start,
                 npi_end=npi_end,
             )
+
+
+def test_candidate_profile_metrics_allow_only_the_explicit_empty_scope_skip():
+    """Keep a deliberate empty Profile scope distinct from missing artifacts."""
+    importer._assert_candidate_artifact_metrics_complete(
+        {"profile"},
+        {
+            "profile": {
+                "skipped": True,
+                "reason": "no_profile_enabled_sources_in_scope",
+            }
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_candidate_artifact_metric_missing:profile",
+    ):
+        importer._assert_candidate_artifact_metrics_complete({"profile"}, {})
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_candidate_artifact_skipped:corroboration",
+    ):
+        importer._assert_candidate_artifact_metrics_complete(
+            {"corroboration"},
+            {},
+        )
 
 
 def test_profile_source_dataset_pairs_preserve_sorted_alignment():
