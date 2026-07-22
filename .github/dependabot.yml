@@ -9,6 +9,10 @@ updates:
       python-runtime:
         patterns:
           - "*"
+    ignore:
+      - dependency-name: "redis"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: "cargo"
     directory: "/support/ptg2_scanner"
