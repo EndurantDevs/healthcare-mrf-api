@@ -128,7 +128,7 @@ def ordered_campaign_plan(
 def registry_artifact(label: str, artifact_kind: str) -> ProducedArtifact:
     """Build one immutable single-range artifact identity without filesystem I/O."""
 
-    artifact_bytes = f'{{"id":"{label}"}}\n'.encode("utf-8")
+    artifact_bytes = registry_artifact_payload(label)
     artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
     layout_range = ArtifactLayoutRange(
         range_ordinal=0,
@@ -162,6 +162,12 @@ def registry_artifact(label: str, artifact_kind: str) -> ProducedArtifact:
         provisional_artifact,
         range_set_sha256=expected_range_set_digest(provisional_artifact),
     )
+
+
+def registry_artifact_payload(label: str) -> bytes:
+    """Return the exact bytes described by ``registry_artifact``."""
+
+    return f'{{"id":"{label}"}}\n'.encode("utf-8")
 
 
 def _load_migration():

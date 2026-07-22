@@ -281,6 +281,32 @@ non-importable coverage blockers from unresolved endpoint-discovery gaps.
 - `provider_directory_organization_affiliation`
 - `provider_directory_endpoint`
 
+### Retained artifact byte access
+
+`HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT` is mandatory for retained artifact
+reads. It must name a persistent absolute directory outside filesystem roots and
+system temporary trees. The root and every existing ancestor must be real
+directories, not symlinks. Deployment creates the root explicitly; a read never
+creates a missing blob directory.
+
+Every retained producer and reader shares one canonical relative layout:
+`blobs/<sha256[0:2]>/<sha256[2:4]>/<sha256>`. Code must obtain those components
+from `retained_artifact_blob_components`; producers must not invent another
+layout. Producers create and durably install content explicitly before registry
+admission. Consumers receive neither the configured root nor a path, locator, or
+file descriptor.
+
+The public reader claims the sealed campaign once, binds the exact consumer
+claim generation, and uses descriptor-relative `openat` traversal with
+`O_DIRECTORY` and `O_NOFOLLOW`. It retains directory descriptors while bytes are
+streamed and revalidates the path, inode, mode, size, active claim, campaign
+digest, consumer reference, artifact, layout, and selected range before
+completion. Full and layout-range reads hash exactly the bytes they stream; they
+do not add whole-artifact pre-read or post-read hashing passes. Successful
+context exit requires at least one completed verified read and releases the
+exact claim generation. Consumer exceptions remain primary while cleanup is
+best effort.
+
 ### Endpoint dataset publication
 
 `provider_directory_source` remains the plan/source alias catalog, but each
