@@ -49,6 +49,12 @@ def _assert_catalog_only_inventory(catalog_document):
     assert catalog_document["plan_reference_file_count"] == 24
     assert catalog_document["catalog_contract"] == catalog_types.CATALOG_CONTRACT
     assert catalog_document["catalog_limits"] == catalog_types.CATALOG_CONTRACT_LIMITS
+    assert catalog_document["entry_id"] == "uhc"
+    assert catalog_document["source_entry_id"] == "uhc-provider-files"
+    assert catalog_document["owner_id"] == "unitedhealthcare"
+    assert catalog_document["source_ids"] == []
+    assert catalog_document["registered_source_id"] is None
+    assert catalog_document["profile_eligible"] is False
     assert summary_by_collection[("cs", "provider_membership")]["file_count"] == 53
     assert summary_by_collection[("cs", "plan_reference")]["file_count"] == 0
     assert summary_by_collection[("ifp", "provider_membership")]["file_count"] == 25
@@ -105,6 +111,28 @@ async def test_empty_and_unknown_historical_catalogs_are_distinct(monkeypatch):
     assert empty_catalog["acquisition_runnable"] is False
     with pytest.raises(catalog_types.UHCFileCatalogNotFound):
         await catalog_module.uhc_provider_file_catalog(raw_set_sha256="c" * 64)
+
+
+def test_catalog_wire_preserves_current_downstream_fixed_contract():
+    catalog_document = catalog_module._empty_catalog_payload()
+
+    assert catalog_document["entry_id"] == "uhc"
+    assert catalog_document["source_entry_id"] == "uhc-provider-files"
+    assert catalog_document["catalog_contract"] == (
+        "healthporta-uhc-provider-file-catalog-v1"
+    )
+    assert catalog_document["catalog_mode"] == "catalog_only"
+    assert catalog_document["latest_file_outcomes_available"] is False
+    assert catalog_document["latest_file_outcomes_reason"] == (
+        "catalog_only_not_imported"
+    )
+    for capability_flag in (
+        "acquisition_runnable",
+        "provider_directory_current",
+        "fhir_publication_ready",
+        "reference_aware_gc_ready",
+    ):
+        assert catalog_document[capability_flag] is False
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "contract": "healthporta-provider-directory-source-neutral-registry-v1",
+  "entries": [
+    {
+      "entry_id": "uhc-provider-files",
+      "display_name": "UnitedHealthcare Official Provider Files",
+      "owner_id": "unitedhealthcare",
+      "source_kind": "official_provider_files",
+      "portal_base": "https://www.uhc.com/legal/interoperability-apis",
+      "catalog_base": "https://providermrf.uhc.com",
+      "adapter_id": "uhc-provider-file-catalog",
+      "adapter_contract": "healthporta-uhc-provider-file-catalog-v1",
+      "registered_source_id": null,
+      "acquisition_manifest_entry_id": null,
+      "acquisition_runnable": false,
+      "profile_eligible": false,
+      "publication_ready": false,
+      "enabling_gate": "Register a corporate official-file source without FHIR endpoint semantics, establish authoritative product jurisdiction metadata, then prove a complete reproducible build and reviewed publication contract before enabling acquisition or Profile selection."
+    }
+  ]
+}

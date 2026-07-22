@@ -43,12 +43,21 @@ from process.uhc_provider_file_catalog_types import (
     observed_catalog_from_payloads,
     validate_observed_catalog,
 )
+from process.uhc_provider_file_source_identity import (
+    UHC_PROVIDER_FILE_ADAPTER_ID,
+    UHC_PROVIDER_FILE_CATALOG_SOURCE_ID,
+    UHC_PROVIDER_FILE_DISPLAY_NAME,
+    UHC_PROVIDER_FILE_ENTRY_ID,
+    UHC_PROVIDER_FILE_OWNER_ID,
+    UHC_PROVIDER_FILE_PORTAL_BASE,
+)
 
 
 DEFAULT_STALE_SECONDS = 24 * 60 * 60
 UHC_ENTRY_ID = "uhc"
-UHC_CATALOG_SOURCE_ID = "uhc_provider_files"
-UHC_PROFILE_SOURCE_IDS = ("pdfhir_0b5cfd565c53364a73981dcb",)
+UHC_SOURCE_ENTRY_ID = UHC_PROVIDER_FILE_ENTRY_ID
+UHC_CATALOG_SOURCE_ID = UHC_PROVIDER_FILE_CATALOG_SOURCE_ID
+UHC_PROFILE_SOURCE_IDS: tuple[str, ...] = ()
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -174,11 +183,18 @@ def _empty_catalog_payload() -> dict[str, Any]:
         "catalog_contract": CATALOG_CONTRACT,
         "catalog_limits": dict(CATALOG_CONTRACT_LIMITS),
         "entry_id": UHC_ENTRY_ID,
+        "source_entry_id": UHC_SOURCE_ENTRY_ID,
+        "display_name": UHC_PROVIDER_FILE_DISPLAY_NAME,
+        "owner_id": UHC_PROVIDER_FILE_OWNER_ID,
         "catalog_source_id": UHC_CATALOG_SOURCE_ID,
+        "portal_base": UHC_PROVIDER_FILE_PORTAL_BASE,
+        "adapter_id": UHC_PROVIDER_FILE_ADAPTER_ID,
+        "registered_source_id": None,
         "source_ids": list(UHC_PROFILE_SOURCE_IDS),
         "catalog_mode": "catalog_only",
         "catalog_observed": False,
         "acquisition_runnable": False,
+        "profile_eligible": False,
         "provider_directory_current": False,
         "fhir_publication_ready": False,
         "reference_aware_gc_ready": False,
@@ -322,11 +338,18 @@ def _observed_catalog_document(
         "catalog_contract": CATALOG_CONTRACT,
         "catalog_limits": dict(CATALOG_CONTRACT_LIMITS),
         "entry_id": UHC_ENTRY_ID,
+        "source_entry_id": UHC_SOURCE_ENTRY_ID,
+        "display_name": UHC_PROVIDER_FILE_DISPLAY_NAME,
+        "owner_id": UHC_PROVIDER_FILE_OWNER_ID,
         "catalog_source_id": UHC_CATALOG_SOURCE_ID,
+        "portal_base": UHC_PROVIDER_FILE_PORTAL_BASE,
+        "adapter_id": UHC_PROVIDER_FILE_ADAPTER_ID,
+        "registered_source_id": None,
         "source_ids": list(UHC_PROFILE_SOURCE_IDS),
         "catalog_mode": "catalog_only",
         "catalog_observed": True,
         "acquisition_runnable": False,
+        "profile_eligible": False,
         "provider_directory_current": False,
         "fhir_publication_ready": False,
         "reference_aware_gc_ready": False,
