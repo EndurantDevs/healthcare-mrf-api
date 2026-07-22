@@ -14,9 +14,27 @@ from api.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     AuditBatchChallenge,
 )
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
 GraphLookup = Callable[..., Awaitable[dict[int, tuple[int, ...]]]]
+_GRAPH_CHUNK_READ_ONCE_LIMIT_ERROR = (
+    "shared PTG graph chunks exceed the read-once byte limit"
+)
+
+
+class ChallengeGraphScopeTooLarge(PTG2ManifestArtifactError):
+    """Preserve the loaded NPI groups for a bounded reverse fallback."""
+
+    def __init__(
+        self,
+        group_keys_by_npi: Mapping[int, tuple[int, ...]],
+    ) -> None:
+        super().__init__(_GRAPH_CHUNK_READ_ONCE_LIMIT_ERROR)
+        self.group_keys_by_npi = {
+            int(npi): tuple(int(group_key) for group_key in group_keys)
+            for npi, group_keys in group_keys_by_npi.items()
+        }
 
 
 def _challenge_group_keys(
@@ -103,6 +121,82 @@ async def _add_reverse_persisted_memberships(
             provider_keys_by_npi[npi].add(provider_set_key)
 
 
+async def prove_provider_candidates_by_npi(
+    lookup_graph_members: GraphLookup,
+    session: Any,
+    shared_snapshot_key: int,
+    schema_name: str,
+    candidate_provider_set_keys_by_npi: Mapping[int, Iterable[int]],
+    group_keys_by_npi: Mapping[int, tuple[int, ...]],
+) -> dict[int, tuple[int, ...]]:
+    """Prove bounded provider candidates through the reverse graph."""
+
+    provider_set_keys = tuple(
+        sorted(
+            {
+                int(provider_set_key)
+                for candidate_keys in candidate_provider_set_keys_by_npi.values()
+                for provider_set_key in candidate_keys
+            }
+        )
+    )
+    groups_by_provider_key = (
+        await lookup_graph_members(
+            session,
+            shared_snapshot_key,
+            PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+            provider_set_keys,
+            schema_name=schema_name,
+        )
+        if provider_set_keys
+        else {}
+    )
+    group_key_sets_by_npi = {
+        int(npi): frozenset(group_keys)
+        for npi, group_keys in group_keys_by_npi.items()
+    }
+    return {
+        int(npi): tuple(
+            sorted(
+                {
+                    int(provider_set_key)
+                    for provider_set_key in candidate_keys
+                    if group_key_sets_by_npi.get(int(npi), frozenset()).intersection(
+                        groups_by_provider_key.get(int(provider_set_key), ())
+                    )
+                }
+            )
+        )
+        for npi, candidate_keys in candidate_provider_set_keys_by_npi.items()
+    }
+
+
+async def _challenge_provider_keys_by_group(
+    lookup_graph_members: GraphLookup,
+    session: Any,
+    shared_snapshot_key: int,
+    schema_name: str,
+    group_keys: tuple[int, ...],
+    group_keys_by_npi: Mapping[int, tuple[int, ...]],
+) -> dict[int, tuple[int, ...]]:
+    """Load the broad graph or preserve its NPI side for reverse proof."""
+
+    if not group_keys:
+        return {}
+    try:
+        return await lookup_graph_members(
+            session,
+            shared_snapshot_key,
+            PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+            group_keys,
+            schema_name=schema_name,
+        )
+    except PTG2ManifestArtifactError as exc:
+        if str(exc) != _GRAPH_CHUNK_READ_ONCE_LIMIT_ERROR:
+            raise
+        raise ChallengeGraphScopeTooLarge(group_keys_by_npi) from exc
+
+
 async def provider_set_keys_by_npi(
     lookup_graph_members: GraphLookup,
     session: Any,
@@ -128,16 +222,13 @@ async def provider_set_keys_by_npi(
         schema_name=schema_name,
     )
     group_keys = _challenge_group_keys(challenge_npis, group_keys_by_npi)
-    provider_keys_by_group = (
-        await lookup_graph_members(
-            session,
-            shared_snapshot_key,
-            PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
-            group_keys,
-            schema_name=schema_name,
-        )
-        if group_keys
-        else {}
+    provider_keys_by_group = await _challenge_provider_keys_by_group(
+        lookup_graph_members,
+        session,
+        shared_snapshot_key,
+        schema_name,
+        group_keys,
+        group_keys_by_npi,
     )
     provider_keys_by_npi = _provider_keys_for_challenges(
         npis,
@@ -162,4 +253,8 @@ async def provider_set_keys_by_npi(
     }
 
 
-__all__ = ["provider_set_keys_by_npi"]
+__all__ = [
+    "ChallengeGraphScopeTooLarge",
+    "provider_set_keys_by_npi",
+    "prove_provider_candidates_by_npi",
+]

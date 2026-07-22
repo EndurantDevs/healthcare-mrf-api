@@ -14,6 +14,17 @@ def test_parse_pagination_defaults_to_page_mode():
     assert params.source == "page"
 
 
+def test_parse_pagination_replaces_zero_limit_with_default():
+    params = parse_pagination(
+        {"limit": "0"},
+        default_limit=50,
+        max_limit=200,
+        default_page=1,
+    )
+
+    assert params.limit == 50
+
+
 def test_parse_pagination_accepts_page_size_alias():
     params = parse_pagination(
         {"page": "2", "page_size": "25"},
@@ -37,6 +48,18 @@ def test_parse_pagination_accepts_offset_mode():
     assert params.offset == 40
     assert params.page == 3
     assert params.source == "offset"
+
+
+def test_parse_pagination_accepts_matching_page_and_offset_window():
+    params = parse_pagination(
+        {"page": "3", "limit": "25", "offset": "50"},
+        default_limit=50,
+        max_limit=200,
+        default_page=1,
+    )
+
+    assert params.page == 3
+    assert params.offset == 50
 
 
 def test_parse_pagination_rejects_limit_page_size_conflict():
