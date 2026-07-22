@@ -3911,6 +3911,37 @@ async def _shared_rate_provider_groups(
     )
 
 
+async def _shared_rate_code_rows(
+    session,
+    scope_join_sql: str,
+    filters: list[str],
+    params: dict[str, Any],
+    plan_order: str,
+) -> list[dict[str, Any]]:
+    """Read canonical code metadata for one shared plan/code scope."""
+
+    code_query_result = await session.execute(
+        text(
+            f"""
+            SELECT code_metadata.code_key,
+                   logical_scope.plan_id,
+                   logical_scope.plan_market_type,
+                   code_metadata.reported_code_system,
+                   code_metadata.reported_code
+              FROM {_shared_v3_code_table()} code_metadata
+              {scope_join_sql}
+             WHERE {" AND ".join(filters)}
+             ORDER BY {plan_order}, code_metadata.reported_code, code_metadata.code_key
+            """
+        ),
+        params,
+    )
+    return [
+        _canonical_code_metadata_row(code_record)
+        for code_record in code_query_result
+    ]
+
+
 async def _shared_rate_provider_set_keys(
     session,
     serving_tables: PTG2ServingTables,
@@ -3946,26 +3977,13 @@ async def _shared_rate_provider_set_keys(
         column="code_metadata.reported_code_system",
         code_system=code_system,
     )
-    code_query_result = await session.execute(
-        text(
-            f"""
-            SELECT code_metadata.code_key,
-                   logical_scope.plan_id,
-                   logical_scope.plan_market_type,
-                   code_metadata.reported_code_system,
-                   code_metadata.reported_code
-              FROM {_shared_v3_code_table()} code_metadata
-              {scope_join_sql}
-             WHERE {" AND ".join(filters)}
-             ORDER BY {plan_order}, code_metadata.reported_code, code_metadata.code_key
-            """
-        ),
+    code_rows = await _shared_rate_code_rows(
+        session,
+        scope_join_sql,
+        filters,
         params,
+        plan_order,
     )
-    code_rows = [
-        _canonical_code_metadata_row(code_record)
-        for code_record in code_query_result
-    ]
     if not code_rows:
         return ()
     forward_rows = await _shared_forward_entries_for_code_rows(
@@ -6745,6 +6763,25 @@ async def _graph_candidates_for_rate_scope(
     )
 
 
+def _scoped_graph_provider_set_keys(
+    provider_set_keys: Iterable[int] | None,
+    explicit_npi_scope: _ExplicitNpiGraphScope | None,
+) -> set[int] | None:
+    """Intersect an optional caller scope with exact-NPI graph membership."""
+
+    normalized_provider_set_keys = (
+        {int(provider_set_key) for provider_set_key in provider_set_keys}
+        if provider_set_keys is not None
+        else None
+    )
+    if explicit_npi_scope is None:
+        return normalized_provider_set_keys
+    explicit_provider_set_keys = set(explicit_npi_scope.provider_set_keys)
+    if normalized_provider_set_keys is None:
+        return explicit_provider_set_keys
+    return normalized_provider_set_keys.intersection(explicit_provider_set_keys)
+
+
 async def _graph_candidates_for_request(
     session,
     serving_tables: PTG2ServingTables,
@@ -6767,18 +6804,10 @@ async def _graph_candidates_for_request(
         )
     if explicit_npi_scope is not None and not explicit_npi_scope.provider_set_keys:
         return _GraphLocationCandidates([], {})
-    scoped_provider_set_keys = (
-        set(int(provider_set_key) for provider_set_key in provider_set_keys)
-        if provider_set_keys is not None
-        else None
+    scoped_provider_set_keys = _scoped_graph_provider_set_keys(
+        provider_set_keys,
+        explicit_npi_scope,
     )
-    if explicit_npi_scope is not None:
-        explicit_provider_set_keys = set(explicit_npi_scope.provider_set_keys)
-        scoped_provider_set_keys = (
-            explicit_provider_set_keys
-            if scoped_provider_set_keys is None
-            else scoped_provider_set_keys.intersection(explicit_provider_set_keys)
-        )
     if scoped_provider_set_keys is not None and not scoped_provider_set_keys:
         return _GraphLocationCandidates([], {})
     rate_provider_set_keys = frozenset(

@@ -344,10 +344,9 @@ async def test_v3_provider_set_scope_uses_dense_graph_keys(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_v3_exact_npi_graph_filters_code_before_location_scan(monkeypatch):
-    explicit_scope = ptg2_serving._ExplicitNpiGraphScope(
-        npi=1234567890,
-        provider_set_keys=(3,),
-    )
+    """Exact NPI traversal intersects dense code keys before location reads."""
+
+    explicit_scope = ptg2_serving._ExplicitNpiGraphScope(1234567890, (3,))
     rate_scope_probe = AsyncMock(return_value=(3,))
     location_rows = [{"npi": 1234567890}]
     projected_result = ({"provider-set"}, {"provider-set": location_rows})
