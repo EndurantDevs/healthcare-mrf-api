@@ -9,6 +9,7 @@ from api import ptg2_candidate_audit_batch as batch
 from api import ptg2_candidate_audit_graph as candidate_graph
 from api import ptg2_candidate_audit_reverse as reverse_scope
 from api.ptg2_candidate_audit_capacity import (
+    PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES,
     CandidateAuditDecodedRetentionBudget,
     CandidateAuditDecodedRetentionError,
 )
@@ -348,7 +349,7 @@ async def test_candidate_provider_scope_falls_back_only_for_oversized_graph(
     assert reverse_scope_loader.await_args.kwargs["retention_budget"] is not None
     assert (
         reverse_scope_loader.await_args.kwargs["retention_budget"].maximum_bytes
-        == 64 * 1024 * 1024
+        == PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES
     )
 
 

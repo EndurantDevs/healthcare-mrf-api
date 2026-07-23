@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from api.endpoint import pricing
 from api import ptg2_candidate_audit_capacity as capacity
 from api.ptg2_candidate_audit_capacity import (
     PTG2_CANDIDATE_AUDIT_MAX_PROCESS_BYTES,
@@ -14,6 +15,7 @@ from api.ptg2_candidate_audit_capacity import (
     retain_unique_integer_key_set,
     retain_unique_integer_keys,
 )
+from api.ptg2_shared_blocks import PTG2SharedBlockError
 
 
 class _AuditAbort(BaseException):
@@ -22,6 +24,52 @@ class _AuditAbort(BaseException):
 
 class _LeaseConstructionAbort(BaseException):
     pass
+
+
+def test_default_partition_capacity_fits_one_process_admission_slot():
+    raw_limit = pricing._candidate_audit_batch_raw_limit()
+    partition_weight = pricing._candidate_audit_partition_weight(raw_limit)
+
+    assert raw_limit == 512 * 1024 * 1024
+    assert partition_weight == 768 * 1024 * 1024
+    assert partition_weight <= pricing.PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES
+    assert (
+        2 * partition_weight
+        > pricing.PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES
+    )
+
+
+def test_raw_audit_capacity_rejects_non_positive_configuration(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG2_AUDIT_BATCH_MAX_RAW_BYTES", "0")
+
+    with pytest.raises(PTG2SharedBlockError, match="must be positive"):
+        pricing._candidate_audit_batch_raw_limit()
+
+
+def test_partition_access_rejects_non_mapping_payload():
+    with pytest.raises(
+        Exception,
+        match="audit_batch_request_fields_invalid",
+    ) as exc_info:
+        pricing._candidate_audit_batch_access(object(), ())
+
+    assert exc_info.value.status_code == 400
+
+
+def test_partition_access_requires_verified_candidate_scope(monkeypatch):
+    monkeypatch.setattr(
+        pricing,
+        "candidate_audit_access_from_verified_request",
+        lambda *_args: None,
+    )
+
+    with pytest.raises(
+        Exception,
+        match="candidate audit access is required",
+    ) as exc_info:
+        pricing._candidate_audit_batch_access(object(), {})
+
+    assert type(exc_info.value).__name__ == "Forbidden"
 
 
 def _aborting_keys():

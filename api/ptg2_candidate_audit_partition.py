@@ -9,7 +9,10 @@ from sqlalchemy import text
 
 from api import ptg2_candidate_audit_batch as candidate_batch
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
-from api.ptg2_candidate_audit_capacity import CandidateAuditDecodedRetentionBudget
+from api.ptg2_candidate_audit_capacity import (
+    PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES,
+    CandidateAuditDecodedRetentionBudget,
+)
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
@@ -154,7 +157,11 @@ async def audit_candidate_partition(
         plan_market_type=binding.plan_market_type,
     ):
         raise PTG2ManifestArtifactError("PTG2 candidate audit access mismatch")
-    retention_budget = CandidateAuditDecodedRetentionBudget()
+    retention_budget = CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=(
+            PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
+        )
+    )
     bind_shared_block_decoded_retention_budget(retention_budget)
     await session.execute(
         text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")

@@ -11,6 +11,10 @@ from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
 PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES = 64 * 1024 * 1024
+# One 50-item partition can retain the decoded group map and its per-NPI
+# projection together. Keep that measured peak inside a strict per-request
+# bound while the partition process gate accounts raw plus decoded capacity.
+PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES = 256 * 1024 * 1024
 PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES = 1024 * 1024 * 1024
 PTG2_CANDIDATE_AUDIT_MAX_PROCESS_BYTES = 8 * 1024 * 1024 * 1024
 INTEGER_KEY_SET_BYTES = 256
@@ -364,6 +368,7 @@ __all__ = [
     "CandidateAuditProcessAdmissionLease",
     "PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES",
     "PTG2_CANDIDATE_AUDIT_MAX_PROCESS_BYTES",
+    "PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES",
     "PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES",
     "retain_unique_integer_key_set",
     "retain_unique_integer_keys",

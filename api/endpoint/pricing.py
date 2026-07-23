@@ -41,7 +41,7 @@ from api.ptg2_candidate_audit_capacity import (
     CandidateAuditProcessAdmissionError,
     CandidateAuditProcessConfigurationError,
     PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES,
-    PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES,
+    PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES,
 )
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
@@ -10587,7 +10587,10 @@ def _candidate_audit_process_admission() -> CandidateAuditProcessAdmission:
 def _candidate_audit_partition_weight(raw_limit: int) -> int:
     """Reserve both independent raw and decoded request allowances."""
 
-    return raw_limit + PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES
+    return (
+        raw_limit
+        + PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
+    )
 
 
 def _read_once_block_io_map(read_once_scope) -> dict[str, int]:

@@ -17,7 +17,10 @@ from api.ptg2_candidate_audit import (
     PTG2CandidateAuditAccess,
 )
 from api.ptg2_shared_blocks import PTG2SharedBlockError
-from api.ptg2_candidate_audit_capacity import CandidateAuditProcessAdmission
+from api.ptg2_candidate_audit_capacity import (
+    PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES,
+    CandidateAuditProcessAdmission,
+)
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts import ptg2_partitioned_candidate_audit_contract as contract
 from process.ptg_parts.ptg2_candidate_audit_evidence import (
@@ -125,16 +128,10 @@ async def test_partition_resolver_receives_only_explicit_coordinates(monkeypatch
     audit_request = _request()
     session = _Session()
     monkeypatch.setattr(
-        candidate_batch,
-        "snapshot_serving_tables",
-        AsyncMock(return_value=object()),
+        candidate_batch, "snapshot_serving_tables", AsyncMock(return_value=object())
     )
     binding_validator = AsyncMock()
-    monkeypatch.setattr(
-        candidate_partition,
-        "_validate_partition_binding",
-        binding_validator,
-    )
+    monkeypatch.setattr(candidate_partition, "_validate_partition_binding", binding_validator)
     challenge = audit_request.source_challenges[0]
     condition_key = (
         challenge.code_system,
@@ -179,6 +176,9 @@ async def test_partition_resolver_receives_only_explicit_coordinates(monkeypatch
     kwargs = data_loader.await_args.kwargs
     assert len(kwargs["challenges"]) == 1
     assert len(kwargs["persisted_audit_occurrences"]) == 1
+    assert kwargs["retention_budget"].maximum_bytes == (
+        PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
+    )
     binding_validator.assert_awaited_once()
 
 
