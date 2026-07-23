@@ -9,7 +9,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import Any, AsyncIterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from db.connection import db
@@ -697,6 +697,7 @@ async def run_batch_release_audit(
     candidate_target: CandidateAuditTarget,
     *,
     http_config: FastAuditHttpConfig | None = None,
+    progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Load sealed evidence once, then run bounded API partitions."""
 
@@ -729,6 +730,7 @@ async def run_batch_release_audit(
             ),
             witness=witness,
             persisted_sample=persisted_sample,
+            progress_callback=progress_callback,
             http_config=(
                 http_config
                 if http_config is not None
@@ -890,6 +892,41 @@ async def _progress(
     )
 
 
+async def _partition_progress(
+    run_id: str | None,
+    *,
+    snapshot_id: str | None,
+    completed: int,
+    total: int,
+) -> None:
+    """Publish exact audit counters within the release-audit progress band."""
+
+    if not run_id:
+        return
+    bounded_total = max(int(total), 1)
+    bounded_completed = min(max(int(completed), 0), bounded_total)
+    pct = 20 + int((bounded_completed / bounded_total) * 64)
+    message = (
+        f"completed {bounded_completed:,} of {bounded_total:,} "
+        "audit partitions"
+    )
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="candidate release audit",
+        progress_message=message,
+        snapshot_id=snapshot_id,
+        progress={
+            "unit": "partition",
+            "done": bounded_completed,
+            "total": bounded_total,
+            "pct": pct,
+            "message": message,
+            "phase": "candidate release audit",
+        },
+    )
+
+
 @asynccontextmanager
 async def candidate_audit_guard(candidate_run_id: str) -> AsyncIterator[None]:
     """Serialize duplicate audits for one candidate across workers and nodes."""
@@ -941,6 +978,12 @@ async def _execute_release_audit(
         return await run_batch_release_audit(
             candidate_target,
             http_config=http_config,
+            progress_callback=lambda completed, total: _partition_progress(
+                control_run_id,
+                snapshot_id=candidate_target.snapshot_id,
+                completed=completed,
+                total=total,
+            ),
         )
 
     await _progress(

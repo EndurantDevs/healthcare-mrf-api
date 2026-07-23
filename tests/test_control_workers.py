@@ -253,6 +253,10 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_ENV_FROM_CONFIGMAP", "mrf-api-config")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "mrf-api-secret")
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_ENV_JSON",
+        '[{"name":"EXAMPLE_STATUS_TOKEN","secretName":"runtime-secret","key":"status-token"}]',
+    )
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_NAME", "import-workdir")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", "/work")
     monkeypatch.setenv(
@@ -282,6 +286,15 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     container = job["spec"]["template"]["spec"]["containers"][0]
     assert container["image"] == "ghcr.io/endurantdevs/healthcare-mrf-api:dev"
     assert {"name": "HLTHPRT_CONTROL_RUN_ID", "value": "run_123"} in container["env"]
+    assert {
+        "name": "EXAMPLE_STATUS_TOKEN",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": "runtime-secret",
+                "key": "status-token",
+            }
+        },
+    } in container["env"]
     assert {"configMapRef": {"name": "mrf-api-config"}} in container["envFrom"]
     assert {"secretRef": {"name": "mrf-api-secret"}} in container["envFrom"]
     assert container["volumeMounts"] == [
@@ -302,6 +315,40 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     assert "parallelism" not in job["spec"]
     assert "completions" not in job["spec"]
     assert job["spec"]["activeDeadlineSeconds"] == 43200
+
+
+def test_worker_secret_env_rejects_invalid_specs_and_supports_optional_keys(
+    monkeypatch,
+):
+    monkeypatch.delenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", raising=False)
+    assert control_workers._worker_job_secret_env() == []
+
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", "not-json")
+    assert control_workers._worker_job_secret_env() == []
+
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", "{}")
+    assert control_workers._worker_job_secret_env() == []
+
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_ENV_JSON",
+        (
+            '[null,{},{"name":"MISSING_KEY","secretName":"runtime-secret"},'
+            '{"name":"OPTIONAL_TOKEN","secret_name":"runtime-secret",'
+            '"key":"optional-token","optional":true}]'
+        ),
+    )
+    assert control_workers._worker_job_secret_env() == [
+        {
+            "name": "OPTIONAL_TOKEN",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": "runtime-secret",
+                    "key": "optional-token",
+                    "optional": True,
+                }
+            },
+        }
+    ]
 
 
 def test_ensure_kubernetes_job_requires_worker_image(monkeypatch):

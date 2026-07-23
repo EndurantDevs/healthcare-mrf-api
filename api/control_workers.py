@@ -638,6 +638,7 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
                 "value": target_job_id,
             }
         )
+    env_list.extend(_worker_job_secret_env())
 
     container_dict: dict[str, Any] = {
         "name": "worker",
@@ -731,6 +732,47 @@ def _worker_job_env_from() -> list[dict[str, Any]]:
     for name in _csv(os.getenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "")):
         env_from_list.append({"secretRef": {"name": name}})
     return env_from_list
+
+
+def _worker_job_secret_env() -> list[dict[str, Any]]:
+    """Build explicitly named worker environment values from secret keys."""
+
+    raw = os.getenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", "").strip()
+    if not raw:
+        return []
+    try:
+        secret_env_spec_list = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(secret_env_spec_list, list):
+        return []
+
+    environment_by_name: dict[str, dict[str, Any]] = {}
+    for secret_env_spec in secret_env_spec_list:
+        if not isinstance(secret_env_spec, dict):
+            continue
+        environment_name = str(secret_env_spec.get("name") or "").strip()
+        secret_name = str(
+            secret_env_spec.get("secretName")
+            or secret_env_spec.get("secret_name")
+            or ""
+        ).strip()
+        secret_key = str(secret_env_spec.get("key") or "").strip()
+        if not environment_name or not secret_name or not secret_key:
+            continue
+        secret_key_reference_by_field: dict[str, Any] = {
+            "name": secret_name,
+            "key": secret_key,
+        }
+        if bool(secret_env_spec.get("optional", False)):
+            secret_key_reference_by_field["optional"] = True
+        environment_by_name[environment_name] = {
+            "name": environment_name,
+            "valueFrom": {
+                "secretKeyRef": secret_key_reference_by_field
+            },
+        }
+    return list(environment_by_name.values())
 
 
 def _worker_job_container_security_context() -> dict[str, Any]:

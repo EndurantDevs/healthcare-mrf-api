@@ -950,7 +950,11 @@ async def test_release_audit_loads_once_and_uses_partitioned_http_configuration(
     monkeypatch.setattr(ptg_candidate_audit, "load_persisted_audit_sample", sample_loader)
     monkeypatch.setattr(ptg_candidate_audit, "run_partitioned_candidate_audit", runner)
 
-    report = await ptg_candidate_audit.run_batch_release_audit(_target())
+    progress_callback = AsyncMock()
+    report = await ptg_candidate_audit.run_batch_release_audit(
+        _target(),
+        progress_callback=progress_callback,
+    )
 
     assert report is expected_report
     kwargs = runner.await_args.kwargs
@@ -961,6 +965,7 @@ async def test_release_audit_loads_once_and_uses_partitioned_http_configuration(
     )
     assert kwargs["witness"] is witness
     assert kwargs["persisted_sample"] is persisted_sample
+    assert kwargs["progress_callback"] is progress_callback
     assert kwargs["http_config"].concurrency == 2
     assert kwargs["http_config"].deadline_seconds == 55.0
     assert kwargs["http_config"].verify_tls is False
@@ -1133,6 +1138,30 @@ async def test_progress_reports_phase_for_control_run(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_partition_progress_reports_exact_counters_within_audit_band(
+    monkeypatch,
+):
+    mark_control_run = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "mark_control_run", mark_control_run)
+
+    await ptg_candidate_audit._partition_progress(
+        "control-run",
+        snapshot_id="candidate-snapshot",
+        completed=3,
+        total=4,
+    )
+
+    assert mark_control_run.await_args.kwargs["progress"] == {
+        "unit": "partition",
+        "done": 3,
+        "total": 4,
+        "pct": 68,
+        "message": "completed 3 of 4 audit partitions",
+        "phase": "candidate release audit",
+    }
+
+
+@pytest.mark.asyncio
 async def test_rolling_v3_writer_path_loads_witness_once(monkeypatch):
     witness = Mock(occurrence_records=(object(), object()))
     report = _passing_report()
@@ -1181,10 +1210,11 @@ async def test_default_v4_audit_attests_then_activates(
         witness_loader,
     )
 
-    async def audit(target, *, http_config):
+    async def audit(target, *, http_config, progress_callback):
         events.append("audit")
         assert target.snapshot_key == 17
         assert http_config is None
+        assert progress_callback is not None
         return report
 
     monkeypatch.setattr(ptg_candidate_audit, "run_batch_release_audit", audit)
@@ -1229,8 +1259,14 @@ async def test_default_v4_audit_attests_then_activates(
 async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
     expected_report = _passing_batch_report()
     batch_audit = AsyncMock(return_value=expected_report)
+    partition_progress = AsyncMock()
     witness_loader = AsyncMock()
     monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_partition_progress",
+        partition_progress,
+    )
     monkeypatch.setattr(
         ptg_candidate_audit,
         "run_batch_release_audit",
@@ -1250,6 +1286,14 @@ async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
 
     assert report is expected_report
     batch_audit.assert_awaited_once()
+    progress_callback = batch_audit.await_args.kwargs["progress_callback"]
+    await progress_callback(2, 4)
+    partition_progress.assert_awaited_once_with(
+        "control-run",
+        snapshot_id="candidate-snapshot",
+        completed=2,
+        total=4,
+    )
     witness_loader.assert_not_awaited()
 
 

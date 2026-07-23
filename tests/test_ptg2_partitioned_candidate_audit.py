@@ -222,8 +222,6 @@ async def test_executes_five_requests_at_two_starts_per_second_with_overlap(
         later - earlier >= 0.45
         for earlier, later in zip(starts, starts[1:])
     )
-
-
 @pytest.mark.asyncio
 async def test_transient_response_is_not_retried(unused_tcp_port):
     counters_by_name = {"request_count": 0}
@@ -427,14 +425,20 @@ async def test_run_builds_report_from_complete_request_accounting(monkeypatch):
         lambda report_input: {"requests": report_input.metrics.completed_request_count},
     )
 
+    progress_callback = AsyncMock()
     report = await audit.run_partitioned_candidate_audit(
         audit_target=object(),
         witness=witness,
         persisted_sample=object(),
         http_config=_http("https://audit.internal.example"),
+        progress_callback=progress_callback,
     )
 
     assert report == {"requests": 1}
+    assert (
+        audit._execute_partition_plan.await_args.kwargs["progress_callback"]
+        is progress_callback
+    )
 
 
 @pytest.mark.asyncio
