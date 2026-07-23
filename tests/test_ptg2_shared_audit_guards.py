@@ -212,13 +212,13 @@ async def test_graph_owner_locator_guards():
         owner_keys=(),
     ) == {}
 
-    invalid_row = {
+    invalid_database_row_by_column = {
         "owner_key": 1,
         "first_chunk": -1,
         "member_offset": 0,
         "member_count": 1,
     }
-    reader.session = Session((invalid_row,))
+    reader.session = Session((invalid_database_row_by_column,))
     with pytest.raises(RuntimeError, match="locator is invalid"):
         await audit._graph_owner_locators(
             reader,
@@ -226,8 +226,13 @@ async def test_graph_owner_locator_guards():
             owner_keys=(1,),
         )
 
-    valid_row = {**invalid_row, "first_chunk": 0}
-    reader.session = Session((valid_row, valid_row))
+    valid_database_row_by_column = {
+        **invalid_database_row_by_column,
+        "first_chunk": 0,
+    }
+    reader.session = Session(
+        (valid_database_row_by_column, valid_database_row_by_column)
+    )
     with pytest.raises(RuntimeError, match="locator is duplicated"):
         await audit._graph_owner_locators(
             reader,
@@ -291,15 +296,15 @@ def test_graph_member_decode_guards():
 
     chunk_end = audit.PTG2_V3_GRAPH_CHUNK_BYTES - 4
     locator = audit._GraphOwnerLocator(0, chunk_end, 1)
-    payload = b"\x01" * audit.PTG2_V3_GRAPH_CHUNK_BYTES
+    graph_chunk_payload = b"\x01" * audit.PTG2_V3_GRAPH_CHUNK_BYTES
     assert audit._decode_graph_member(
-        {0: (payload, 0), 1: (b"\x02" * 4, 0)},
+        {0: (graph_chunk_payload, 0), 1: (b"\x02" * 4, 0)},
         locator,
         0,
         8,
     ) == int.from_bytes(b"\x01" * 4 + b"\x02" * 4, "little")
     with pytest.raises(RuntimeError, match="stream is truncated"):
-        audit._decode_graph_member({0: (payload, 0)}, locator, 0, 8)
+        audit._decode_graph_member({0: (graph_chunk_payload, 0)}, locator, 0, 8)
 
 
 @pytest.mark.asyncio
