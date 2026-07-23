@@ -61,7 +61,7 @@ async def relation_size_rows(
             relation_name,
         )
         exists = await connection.fetchval(
-            "SELECT to_regclass(format('%I.%I', $1, $2)) IS NOT NULL",
+            "SELECT to_regclass(format('%I.%I', $1::text, $2::text)) IS NOT NULL",
             schema_name,
             relation_name,
         )
