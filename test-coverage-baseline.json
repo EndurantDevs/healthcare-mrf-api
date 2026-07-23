@@ -7,6 +7,7 @@
         "api/control.py",
         "api/control_auth.py",
         "api/control_imports.py",
+        "api/control_snapshot_rollback.py",
         "api/control_workers.py",
         "api/endpoint/__init__.py",
         "api/endpoint/clinical.py",
@@ -318,6 +319,12 @@
         "process/ptg_parts/source_jobs.py",
         "process/ptg_parts/source_pointers.py",
         "process/ptg_parts/source_snapshot_control.py",
+        "process/ptg_parts/source_snapshot_rollback.py",
+        "process/ptg_parts/source_snapshot_rollback_allowed.py",
+        "process/ptg_parts/source_snapshot_rollback_relations.py",
+        "process/ptg_parts/source_snapshot_rollback_state.py",
+        "process/ptg_parts/source_snapshot_rollback_store.py",
+        "process/ptg_parts/source_snapshot_rollback_types.py",
         "process/ptg_parts/source_versions.py",
         "process/ptg_parts/table_setup.py",
         "process/ptg_parts/toc_entries.py",
@@ -356,12 +363,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 28367,
-          "total": 37154
+          "covered": 28974,
+          "total": 37268
         },
         "lines": {
-          "covered": 92856,
-          "total": 109067
+          "covered": 94665,
+          "total": 109456
         }
       },
       "one_time_floor_reset": {
