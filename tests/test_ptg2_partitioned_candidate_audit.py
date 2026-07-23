@@ -159,6 +159,11 @@ def _http(base_url: str):
 
 
 @pytest.mark.asyncio
+async def test_partitioned_event_loop_contract():
+    assert audit._event_loop_contract(require_uvloop=False)
+
+
+@pytest.mark.asyncio
 async def test_executes_five_requests_at_two_starts_per_second_with_overlap(
     unused_tcp_port,
 ):

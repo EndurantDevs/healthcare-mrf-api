@@ -78,6 +78,33 @@ def _is_valid_nonnegative_number(value: object) -> bool:
     )
 
 
+def _is_start_rate_consistent_with_span(
+    start_rate: object,
+    start_span: object,
+    *,
+    expected_request_count: int,
+) -> bool:
+    """Return whether rounded start metrics describe the same starts."""
+
+    if (
+        not _is_valid_nonnegative_number(start_rate)
+        or not _is_valid_nonnegative_number(start_span)
+    ):
+        return False
+    normalized_span = float(start_span)
+    if expected_request_count == 1:
+        return normalized_span == 0 and float(start_rate) == 0
+    if normalized_span == 0:
+        return False
+    expected_start_rate = (expected_request_count - 1) / normalized_span
+    return math.isclose(
+        float(start_rate),
+        expected_start_rate,
+        rel_tol=0.0,
+        abs_tol=0.000003,
+    )
+
+
 def validate_partitioned_http_metrics(
     http_metrics_by_name: Mapping[str, Any],
     *,
@@ -114,9 +141,12 @@ def validate_partitioned_http_metrics(
         http_metrics_by_name != expected_metrics_by_name
         or type(maximum_concurrency) is not int
         or maximum_concurrency not in range(1, maximum_allowed_concurrency + 1)
-        or not _is_valid_nonnegative_number(start_rate)
+        or not _is_start_rate_consistent_with_span(
+            start_rate,
+            start_span,
+            expected_request_count=expected_request_count,
+        )
         or float(start_rate) > 2.1
-        or not _is_valid_nonnegative_number(start_span)
         or (
             expected_request_count > 1
             and float(start_span) < minimum_start_span

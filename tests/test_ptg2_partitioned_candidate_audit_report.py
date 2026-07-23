@@ -7,10 +7,16 @@ import pytest
 
 from process.ptg_parts import ptg2_partitioned_candidate_audit as audit
 from process.ptg_parts import ptg2_partitioned_candidate_audit_contract as contract
+from process.ptg_parts import (
+    ptg2_batch_candidate_audit_report_sections as report_sections,
+)
 from process.ptg_parts.ptg2_partitioned_candidate_audit_report import (
     PartitionedAuditHttpMetrics,
     PartitionedAuditReportInput,
     build_partitioned_audit_report,
+)
+from process.ptg_parts.ptg2_partitioned_candidate_audit_report_validation import (
+    validate_partitioned_http_metrics,
 )
 from process.ptg_parts.ptg2_batch_candidate_audit_report import (
     BatchAuditReportTarget,
@@ -243,6 +249,93 @@ def test_partitioned_report_validates_dynamic_request_count_and_wall_time():
     assert evidence["batch_api_actual_http_requests"] == 5
 
 
+def test_partitioned_report_validates_truthful_slow_start_span():
+    report = deepcopy(_report())
+    completed_at = datetime.datetime.now(datetime.timezone.utc)
+    report["started_at"] = (
+        completed_at - datetime.timedelta(seconds=106)
+    ).isoformat()
+    report["completed_at"] = completed_at.isoformat()
+    report["duration_seconds"] = 106
+    report["http"]["request_start_span_seconds"] = 90
+    report["http"]["request_start_rate_actual_per_second"] = round(
+        (report["checks"]["batch_requests_executed"] - 1) / 90,
+        6,
+    )
+
+    evidence = validate_batch_candidate_release_audit_report(
+        report,
+        snapshot_id="candidate-snapshot",
+        source_key="test-source",
+        plan_id="12-3456789",
+        plan_market_type="group",
+    )
+
+    assert evidence["batch_api_actual_http_requests"] == 5
+
+
+def _partitioned_timing_report(
+    *,
+    duration_seconds=916,
+    request_start_span_seconds=900,
+):
+    completed_at = datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "started_at": (
+            completed_at - datetime.timedelta(seconds=duration_seconds)
+        ).isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "duration_seconds": duration_seconds,
+        "batch": {
+            "request_contract": (
+                report_sections
+                .PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+            ),
+        },
+        "checks": {"batch_requests_executed": 243},
+        "http": {
+            "request_start_span_seconds": request_start_span_seconds,
+        },
+    }, completed_at
+
+
+def test_partitioned_report_timing_uses_measured_request_start_span():
+    report_by_field, completed_at = _partitioned_timing_report()
+
+    assert report_sections.validate_report_timing(
+        report_by_field,
+        evaluated_at=completed_at,
+    ) == completed_at
+
+
+@pytest.mark.parametrize(
+    ("duration_seconds", "request_start_span_seconds"),
+    (
+        (961, 900),
+        (100, 102),
+        (20_000, 19_950),
+        (100, True),
+        (100, -1),
+        (100, float("inf")),
+        (100, float("nan")),
+    ),
+)
+def test_partitioned_report_timing_rejects_invalid_duration_envelope(
+    duration_seconds,
+    request_start_span_seconds,
+):
+    report_by_field, completed_at = _partitioned_timing_report(
+        duration_seconds=duration_seconds,
+        request_start_span_seconds=request_start_span_seconds,
+    )
+
+    with pytest.raises(ValueError, match="timing is invalid"):
+        report_sections.validate_report_timing(
+            report_by_field,
+            evaluated_at=completed_at,
+        )
+
+
 def test_partitioned_report_rejects_forged_request_count():
     report = deepcopy(_report())
     report["http"]["batch_api_actual_http_requests"] = 2
@@ -280,11 +373,33 @@ def test_http_metrics_report_zero_rate_until_two_distinct_starts_exist():
     assert metrics.actual_start_rate_per_second == 0
 
 
+def test_single_request_partitioned_http_metrics_require_zero_start_span():
+    report = deepcopy(_report())
+    for field_name in (
+        "batch_api_planned_http_requests",
+        "batch_api_actual_http_requests",
+        "batch_api_completed_http_requests",
+    ):
+        report["http"][field_name] = 1
+    report["http"]["max_concurrency"] = 1
+    report["http"]["request_start_rate_actual_per_second"] = 0
+    report["http"]["request_start_span_seconds"] = 0.5
+
+    with pytest.raises(ValueError, match="HTTP accounting"):
+        validate_partitioned_http_metrics(
+            report["http"],
+            expected_request_count=1,
+        )
+
+
 @pytest.mark.parametrize(
     ("field_name", "invalid_value"),
     [
         ("max_concurrency", 0),
         ("request_start_rate_actual_per_second", 2.2),
+        ("request_start_rate_actual_per_second", 1.5),
+        ("request_start_rate_actual_per_second", True),
+        ("request_start_span_seconds", 0),
         ("request_start_span_seconds", 0.1),
     ],
 )
