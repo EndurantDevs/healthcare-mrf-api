@@ -20,6 +20,14 @@ def _strict_index(**values):
     }
 
 
+def _strict_v4_index(**values):
+    return {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v4",
+        **values,
+    }
+
+
 def _allowed_manifest(source_key, previous_snapshot_id=None):
     return {
         "source_key": source_key,
@@ -137,6 +145,34 @@ def test_gc_plan_selects_only_unreferenced_strict_v3_snapshots():
 
     assert plan.candidate_snapshot_ids == ("failed", "stale")
     assert plan.shared_snapshot_ids == ("failed", "stale")
+    assert plan.tables == ()
+
+
+def test_gc_plan_additively_selects_unreferenced_strict_v4_snapshots():
+    executor = _Executor(
+        [
+            {
+                "snapshot_id": "v4-current",
+                "status": "published",
+                "source_key": "source_a",
+                "serving_index": _strict_v4_index(),
+            },
+            {
+                "snapshot_id": "v4-failed",
+                "status": "failed",
+                "source_key": "source_a",
+                "serving_index": _strict_v4_index(),
+            },
+        ],
+        current_snapshot_ids=("v4-current",),
+    )
+
+    plan = asyncio.run(
+        snapshot_gc.build_ptg2_source_snapshot_gc_plan(executor=executor)
+    )
+
+    assert plan.candidate_snapshot_ids == ("v4-failed",)
+    assert plan.shared_snapshot_ids == ("v4-failed",)
     assert plan.tables == ()
 
 
@@ -296,9 +332,17 @@ def test_execute_gc_deletes_v3_metadata_with_strict_sql_admission(monkeypatch):
     assert plan.candidate_snapshot_ids == ("failed",)
     statements = [statement for statement, _params in connection.status_calls]
     assert not any("DROP TABLE IF EXISTS" in statement for statement in statements)
-    snapshot_delete = next(statement for statement in statements if "DELETE FROM \"mrf\".ptg2_snapshot" in statement)
+    snapshot_delete, delete_parameters = next(
+        (statement, parameters)
+        for statement, parameters in connection.status_calls
+        if "DELETE FROM \"mrf\".ptg2_snapshot" in statement
+    )
     assert "arch_version" in snapshot_delete
     assert "storage_generation" in snapshot_delete
+    assert delete_parameters["shared_generations"] == [
+        "shared_blocks_v3",
+        "shared_blocks_v4",
+    ]
     release.assert_awaited_once_with(
         schema_name="mrf",
         executor=connection,
@@ -365,6 +409,13 @@ async def test_real_postgres_stale_cutoff_is_utc_naive_under_non_utc_session(
                     plan_source_key varchar(96) PRIMARY KEY,
                     snapshot_id varchar(96),
                     previous_snapshot_id varchar(96)
+                )
+                """
+            )
+            await connection.status(
+                f"""
+                CREATE TABLE {schema}.ptg2_snapshot_pin (
+                    snapshot_id varchar(96) PRIMARY KEY
                 )
                 """
             )

@@ -34,14 +34,19 @@ def control_observations(monkeypatch):
         ptg_calls.append(kwargs)
         return {"snapshot_id": "ptg2:test"}
 
-    async def fake_mark_control_run(*args, **kwargs):
+    async def is_control_run_marked(*args, **kwargs):
         run_marks.append((args, kwargs))
+        return True
 
     async def fake_flush_terminal_status_events():
         return None
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        is_control_run_marked,
+    )
     monkeypatch.setattr(
         ptg_control,
         "_flush_terminal_status_events",
@@ -152,7 +157,13 @@ async def test_ptg_control_applies_private_full_rebuild_scope(control_observatio
         **_PROOF_METRICS_BY_NAME,
     }
 
-    assert ptg_calls == [_expected_ptg_call(_INTERNAL_SCOPE_DIGEST)]
+    assert len(ptg_calls) == 1
+    ptg_call_by_field = dict(ptg_calls[0])
+    attempt_id = ptg_call_by_field.pop("control_attempt_id")
+    attempt_started_at = ptg_call_by_field.pop("control_attempt_started_at")
+    assert attempt_id.startswith("run_ptg:")
+    assert attempt_started_at
+    assert ptg_call_by_field == _expected_ptg_call(_INTERNAL_SCOPE_DIGEST)
     assert run_marks[-1][1]["metrics"] == expected_metrics_by_name
     assert control_response == {
         **expected_metrics_by_name,

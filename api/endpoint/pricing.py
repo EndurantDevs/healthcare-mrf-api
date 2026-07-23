@@ -59,6 +59,7 @@ from api.ptg2_serving import (
     _ptg2_address_zip5_sql,
     _ptg2_geo_distance_miles_sql,
     _ptg2_geo_dwithin_sql,
+    _ptg2_npi_scope_table,
     _ptg2_provider_name_sql,
     normalize_ptg2_mode,
     search_current_ptg2_index,
@@ -7181,6 +7182,7 @@ async def group_plan_providers(request):
     # snapshot instead.
     snapshots = []
     shared_snapshot_keys: list[int] = []
+    npi_scope_table_by_snapshot_key: dict[int, str] = {}
     release_binding_by_snapshot = {
         (binding.source_key, binding.snapshot_id): binding
         for binding in (
@@ -7226,14 +7228,22 @@ async def group_plan_providers(request):
         })
         if pair_snapshot_key is not None:
             shared_snapshot_keys.append(pair_snapshot_key)
+            npi_scope_table_by_snapshot_key[pair_snapshot_key] = (
+                _ptg2_npi_scope_table(
+                    pair_tables,
+                    schema_name=PRICING_SCHEMA,
+                )
+            )
     if len(shared_snapshot_keys) != len(snapshot_pairs):
         raise RuntimeError(
             "published plan snapshot is not bound to strict shared-block V3 storage"
         )
-    group_member_table = (
-        f"(SELECT npi FROM {PRICING_SCHEMA}.ptg2_v3_npi_scope "
-        "WHERE snapshot_key = ANY(:snapshot_keys))"
-    )
+    npi_scope_tables = tuple(sorted(set(npi_scope_table_by_snapshot_key.values())))
+    group_member_table = "(" + " UNION ALL ".join(
+        f"SELECT npi FROM {table_name} "
+        "WHERE snapshot_key = ANY(:snapshot_keys)"
+        for table_name in npi_scope_tables
+    ) + ")"
 
     # current_network_snapshots_for_plan resolves the plan's per-SOURCE serving
     # snapshot, which for PTG group-plan imports is snapshot-scoped to a single
@@ -7413,9 +7423,10 @@ async def group_plan_providers(request):
         split_query_params_by_name = {**query_params_by_name, "limit": split_limit}
         provider_npi_set: set[int] = set()
         for split_snapshot_key in sorted(set(shared_snapshot_keys)):
+            split_npi_scope_table = npi_scope_table_by_snapshot_key[split_snapshot_key]
             provider_sql = f"""
                 SELECT DISTINCT gm.npi
-                  FROM {PRICING_SCHEMA}.ptg2_v3_npi_scope gm
+                  FROM {split_npi_scope_table} gm
                  WHERE gm.npi BETWEEN :npi_min AND :npi_max
                    AND gm.snapshot_key = :split_snapshot_key
                    AND gm.npi > :cursor_npi{taxonomy_where}{provider_sex_where}{location_where}

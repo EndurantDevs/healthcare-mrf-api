@@ -195,7 +195,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260722170000_projection_child_decoded_census"
+        "20260723100000_ptg2_v4_snapshot_map_pack"
     ]
 
 
@@ -884,8 +884,6 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
             ("code_key", "negotiation_arrangement", "rate_count"),
         ),
     }
-    # The primary key already supplies the exact (snapshot_key, npi) lookup
-    # index; a second identical index would only add COPY and storage cost.
     assert _index_shapes(npi_scope) == {}
     assert _index_shapes(PTG2V3GCCandidate.__table__) == {
         "ptg2_v3_gc_candidate_eligible_at_idx": (("eligible_at",), ()),
@@ -961,7 +959,9 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
             "ptg2_v3_provider_group_global_id_check",
             "ptg2_v3_provider_group_key_check",
         },
-        PTG2V3NPIScope: {"ptg2_v3_npi_scope_npi_check"},
+        PTG2V3NPIScope: {
+            "ptg2_v3_npi_scope_npi_check",
+        },
         PTG2V3AuditOccurrence: {
             "ptg2_v3_audit_occurrence_id_check",
             "ptg2_v3_audit_occurrence_code_key_check",

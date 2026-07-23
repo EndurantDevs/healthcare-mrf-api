@@ -4,16 +4,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import math
 import os
 import resource
 import shutil
+import subprocess
+import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from process.ptg_parts.config import (
     PTG2_V3_FINALIZER_CONFIGURED_MEMORY_DENOMINATOR,
@@ -58,6 +63,9 @@ PTG2_V3_SERVING_RUN_RECORD_BYTES = 52
 PTG2_V3_CODE_DICTIONARY_FORMAT = "ptg2_v3_serving_code_dictionary"
 PTG2_V3_CODE_DICTIONARY_VERSION = 4
 PTG2_V3_SOURCE_RUN_CONTRACT_VERSION = 1
+_FINALIZER_PROGRESS_CALLBACK: contextvars.ContextVar[
+    Callable[[str, int], None] | None
+] = contextvars.ContextVar("ptg2_finalizer_progress_callback", default=None)
 PTG2_V3_CODE_DICTIONARY_SOURCE_CONTRACT_VERSION = 1
 PTG2_V3_PROVIDER_SET_METADATA_FORMAT = "ptg2_v3_provider_set_metadata_copy"
 PTG2_V3_PROVIDER_SET_METADATA_VERSION = 1
@@ -1943,6 +1951,180 @@ async def _await_cleanup_task(task: asyncio.Task[Any]) -> Any:
                 return task.result()
 
 
+def _finalizer_output_usage(
+    output_directory: Path,
+    *,
+    process_id: int,
+) -> tuple[int, int]:
+    """Measure durable or in-flight finalizer artifacts without opening them."""
+
+    roots = [output_directory]
+    roots.extend(
+        output_directory.parent.glob(
+            f".{output_directory.name}.ptg2-finalizer-{process_id}-*.tmp"
+        )
+    )
+    byte_count = 0
+    file_count = 0
+    for root in roots:
+        candidates = (root,) if root.is_file() else root.rglob("*") if root.is_dir() else ()
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    byte_count += candidate.stat().st_size
+                    file_count += 1
+            except FileNotFoundError:
+                continue
+    return byte_count, file_count
+
+
+def _parse_process_cpu_milliseconds(raw_cpu_time: str) -> int:
+    """Parse portable ps CPU time into a monotonic millisecond counter."""
+
+    try:
+        day_parts = raw_cpu_time.strip().split("-", 1)
+        days = int(day_parts[0]) if len(day_parts) == 2 else 0
+        clock_parts = day_parts[-1].split(":")
+        if len(clock_parts) == 3:
+            hours, minutes = map(int, clock_parts[:2])
+            seconds = Decimal(clock_parts[2])
+        elif len(clock_parts) == 2:
+            hours = 0
+            minutes = int(clock_parts[0])
+            seconds = Decimal(clock_parts[1])
+        else:
+            return 0
+    except (InvalidOperation, TypeError, ValueError):
+        return 0
+    if (
+        min(days, hours, minutes) < 0
+        or minutes >= 60
+        or not seconds.is_finite()
+        or seconds < 0
+        or seconds >= 60
+    ):
+        return 0
+    total_seconds = Decimal(((days * 24 + hours) * 60 + minutes) * 60) + seconds
+    return int(total_seconds * 1_000)
+
+
+def _finalizer_process_usage(process_id: int) -> tuple[int, int]:
+    """Read actual child CPU and I/O work from the operating system."""
+
+    proc_root = Path(f"/proc/{int(process_id)}")
+    if sys.platform.startswith("linux") and proc_root.is_dir():
+        try:
+            stat_text = (proc_root / "stat").read_text(encoding="ascii")
+            stat_fields = stat_text[stat_text.rfind(")") + 2 :].split()
+            clock_ticks = int(os.sysconf("SC_CLK_TCK"))
+            cpu_ticks = int(stat_fields[11]) + int(stat_fields[12])
+            io_by_name = {}
+            for raw_line in (proc_root / "io").read_text(encoding="ascii").splitlines():
+                field_name, raw_count = raw_line.split(":", 1)
+                io_by_name[field_name] = int(raw_count.strip())
+            io_bytes = (
+                io_by_name.get("read_bytes", 0)
+                + io_by_name.get("write_bytes", 0)
+            )
+            return (cpu_ticks * 1_000) // clock_ticks, io_bytes
+        except (FileNotFoundError, IndexError, OSError, ValueError):
+            return 0, 0
+    try:
+        completed = subprocess.run(
+            ("ps", "-o", "time=", "-p", str(int(process_id))),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0, 0
+    return _parse_process_cpu_milliseconds(completed.stdout), 0
+
+
+async def _monitor_finalizer_output(
+    *,
+    output_directory: Path,
+    process_id: int,
+    stop: asyncio.Event,
+    progress_callback: Callable[[str, int], None],
+    poll_seconds: float,
+) -> None:
+    """Report monotonic high-water bytes/files while the Rust finalizer runs."""
+
+    high_water_bytes = 0
+    high_water_files = 0
+    high_water_cpu_milliseconds = 0
+    high_water_io_bytes = 0
+    while True:
+        byte_count, file_count = _finalizer_output_usage(
+            output_directory,
+            process_id=process_id,
+        )
+        if byte_count > high_water_bytes:
+            progress_callback("artifact_bytes", byte_count - high_water_bytes)
+            high_water_bytes = byte_count
+        if file_count > high_water_files:
+            progress_callback("artifact_files", file_count - high_water_files)
+            high_water_files = file_count
+        cpu_milliseconds, io_bytes = _finalizer_process_usage(process_id)
+        if cpu_milliseconds > high_water_cpu_milliseconds:
+            progress_callback(
+                "process_cpu_milliseconds",
+                cpu_milliseconds - high_water_cpu_milliseconds,
+            )
+            high_water_cpu_milliseconds = cpu_milliseconds
+        if io_bytes > high_water_io_bytes:
+            progress_callback("process_io_bytes", io_bytes - high_water_io_bytes)
+            high_water_io_bytes = io_bytes
+        if stop.is_set():
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
+        except TimeoutError:
+            continue
+
+
+@contextmanager
+def observe_v3_finalizer_progress(
+    progress_callback: Callable[[str, int], None] | None,
+):
+    """Bind one task-local progress observer without changing V3 invocation inputs."""
+
+    token = _FINALIZER_PROGRESS_CALLBACK.set(progress_callback)
+    try:
+        yield
+    finally:
+        _FINALIZER_PROGRESS_CALLBACK.reset(token)
+
+
+async def _communicate_with_finalizer_progress(
+    process: asyncio.subprocess.Process,
+    *,
+    output_directory: Path,
+) -> tuple[bytes, bytes]:
+    """Collect finalizer output while measuring task-local artifact growth."""
+
+    progress_callback = _FINALIZER_PROGRESS_CALLBACK.get()
+    if progress_callback is None:
+        return await process.communicate()
+    progress_stop = asyncio.Event()
+    progress_task = asyncio.create_task(
+        _monitor_finalizer_output(
+            output_directory=output_directory,
+            process_id=int(process.pid),
+            stop=progress_stop,
+            progress_callback=progress_callback,
+            poll_seconds=2.0,
+        )
+    )
+    try:
+        return await process.communicate()
+    finally:
+        progress_stop.set()
+        await _await_cleanup_task(progress_task)
+
+
 async def run_v3_direct_finalizer(
     *,
     work_directory: str | Path,
@@ -2016,7 +2198,10 @@ async def run_v3_direct_finalizer(
             )
         )
         process = await asyncio.shield(spawn_task)
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await _communicate_with_finalizer_progress(
+            process,
+            output_directory=output_directory,
+        )
         if process.returncode != 0:
             stderr_text = stderr.decode("utf-8", errors="replace")[-4000:]
             raise RuntimeError(
@@ -2071,6 +2256,7 @@ __all__ = [
     "attach_v3_dictionary_contract",
     "attach_v3_source_run_contract",
     "parse_v3_finalizer_stdout",
+    "observe_v3_finalizer_progress",
     "run_v3_direct_finalizer",
     "validate_v3_finalizer_summary",
     "write_v3_finalizer_input_manifest",

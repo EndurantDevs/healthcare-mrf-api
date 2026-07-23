@@ -21,6 +21,9 @@ class FakeResult:
     def one_or_none(self):
         return self._scalar
 
+    def first(self):
+        return self._scalar
+
 
 class FakeSession:
     def __init__(self, results):
@@ -112,6 +115,162 @@ def strict_serving_index(snapshot_key=41):
                 "storage": {"compressed_records": 0},
             },
         },
+    }
+
+
+def _sealed_v4_hot_limits() -> dict:
+    """Return the positive limits copied into the sealed test manifest."""
+
+    return {
+        "npi_prefix_target": 201,
+        "max_set_patterns_per_set": 1024,
+        "max_set_components_per_fallback_set": 4096,
+        "max_online_group_keys_per_set": 4096,
+        "max_online_source_owners_per_set": 4096,
+        "max_online_source_members_per_set": 16384,
+        "max_online_source_pages_per_set": 64,
+        "max_online_source_bytes_per_set": 1048576,
+        "online_group_npi_batch_size": 32,
+        "max_online_group_npi_members_per_set": 32768,
+        "max_online_group_npi_locator_pages_per_set": 16,
+        "max_online_group_npi_member_pages_per_set": 128,
+        "max_online_group_npi_bytes_per_set": 4194304,
+        "max_online_group_npi_batches_per_set": 4,
+        "provider_expansion_rate_page_rows": 64,
+        "max_online_provider_expansion_rate_rows": 256,
+        "max_online_provider_expansion_provider_sets": 64,
+        "max_online_provider_expansion_graph_batches": 64,
+    }
+
+
+def _worst_v4_owner_diagnostic() -> dict:
+    """Return the sparse-override canary evidence for the strict fixture."""
+
+    return {
+        "maximum_group_npi_member_work": 100,
+        "maximum_group_npi_locator_page_work": 1,
+        "maximum_group_npi_member_page_work": 1,
+        "maximum_group_npi_byte_work": 1000,
+        "maximum_group_npi_batch_work": 1,
+        "group_unsafe_set_count": 1,
+        "physical_unsafe_set_count": 0,
+        "simulated_set_count": 1,
+        "override_owner_count": 1,
+        "override_member_count": 3,
+        "override_raw_bytes": 12,
+        "worst_provider_set_key": 1,
+        "worst_groups_to_target": 4097,
+        "worst_uses_override": True,
+        "worst_uses_component_fallback": False,
+        "worst_member_count": 3,
+        "worst_member_digest": "a" * 64,
+        "worst_source_owner_work": 1,
+        "worst_source_member_work": 1,
+        "worst_source_page_work": 1,
+        "worst_source_byte_work": 16,
+        "worst_group_npi_member_work": 100,
+        "worst_group_npi_locator_page_work": 1,
+        "worst_group_npi_member_page_work": 1,
+        "worst_group_npi_byte_work": 1000,
+        "worst_group_npi_batch_work": 1,
+    }
+
+
+def _online_v4_owner_diagnostic() -> dict:
+    """Return the bounded online canary evidence for the strict fixture."""
+
+    return {
+        "worst_online_provider_set_key": 2,
+        "worst_online_groups_to_target": 2,
+        "worst_online_groups_to_target_exact": True,
+        "worst_online_uses_component_fallback": False,
+        "worst_online_group_work_bound": 2,
+        "worst_online_member_count": 3,
+        "worst_online_member_digest": "b" * 64,
+        "worst_online_source_owner_work": 1,
+        "worst_online_source_member_work": 1,
+        "worst_online_source_page_work": 1,
+        "worst_online_source_byte_work": 16,
+        "worst_online_group_npi_member_work": 100,
+        "worst_online_group_npi_locator_page_work": 1,
+        "worst_online_group_npi_member_page_work": 1,
+        "worst_online_group_npi_byte_work": 1000,
+        "worst_online_group_npi_batch_work": 1,
+    }
+
+
+def _strict_v4_hot_prefix_manifest() -> dict:
+    """Build one exact sealed hot-prefix manifest for contract tests."""
+
+    return {
+        **_sealed_v4_hot_limits(),
+        **_worst_v4_owner_diagnostic(),
+        **_online_v4_owner_diagnostic(),
+    }
+
+
+def strict_v4_serving_index(snapshot_key=43):
+    """Build the strict V4 serving manifest used by table-contract tests."""
+
+    serving_index_by_field = strict_serving_index(snapshot_key)
+    serving_index_by_field.update(
+        {
+            "type": "ptg2_shared_blocks_v4",
+            "storage_generation": "shared_blocks_v4",
+            "provider_scope_strategy": "postgres_packed_graph_v4",
+            "shared_block_layout": "packed_snapshot_maps_v4",
+        }
+    )
+    serving_index_by_field["serving_binary"]["provider_graph_v4"] = {
+        "contract": "ptg2_provider_graph_v4",
+        "representation": "pattern_v1",
+        "map_format": "packed_coordinate_hash_v1",
+        "projection_id_scope": "snapshot_local_v1",
+        "map_digest": "d" * 64,
+        "locator_page_contract": "packed_owner_locator_page_v1",
+        "member_page_contract": "packed_member_page_v1",
+        "npi_table": "ptg2_v4_npi_scope",
+        "component_table": "ptg2_v4_provider_component",
+        "pattern_table": "ptg2_v4_pattern",
+        "relation_manifest_table": "ptg2_v4_relation_manifest",
+        "heavy_owner_table": "ptg2_v4_heavy_owner",
+        "npi_prefix_table": "ptg2_v4_provider_set_npi_prefix",
+        "diagnostic_table": "ptg2_v4_provider_graph_diagnostic",
+        "resource_admission": {
+            "compressed_acquisition_bytes": 1024,
+            "input_factor_bytes": 512,
+            "factor_edge_count": 9,
+            "empty_npi_tin_only_normalization_count": 0,
+        },
+        "hot_prefix": _strict_v4_hot_prefix_manifest(),
+    }
+    return serving_index_by_field
+
+
+def strict_v4_root_row(serving_index_by_field, *, representation=None):
+    """Mirror the sealed V4 root and diagnostic row for one manifest."""
+
+    provider_graph_by_field = serving_index_by_field["serving_binary"][
+        "provider_graph_v4"
+    ]
+    hot_prefix_by_field = dict(provider_graph_by_field["hot_prefix"])
+    for digest_field in (
+        "worst_member_digest",
+        "worst_online_member_digest",
+    ):
+        digest = hot_prefix_by_field.get(digest_field)
+        hot_prefix_by_field[digest_field] = (
+            bytes.fromhex(digest) if digest is not None else None
+        )
+    return {
+        "representation": (
+            representation or provider_graph_by_field["representation"]
+        ),
+        "map_format": provider_graph_by_field["map_format"],
+        "projection_id_scope": provider_graph_by_field["projection_id_scope"],
+        "map_digest": provider_graph_by_field["map_digest"],
+        **hot_prefix_by_field,
+        **provider_graph_by_field["resource_admission"],
     }
 
 
@@ -373,6 +532,114 @@ def test_strict_v3_contract_rejects_cold_unsafe_metadata(mutator, message):
 
     with pytest.raises(ptg2_tables.PTG2ManifestArtifactError, match=message):
         ptg2_tables._strict_v3_manifest_fields(serving_index)
+
+
+def test_v4_manifest_accepts_v3_price_contract() -> None:
+    shared_snapshot_key, generation, cold_contract, _audit = (
+        ptg2_tables._strict_v3_manifest_fields(strict_v4_serving_index())
+    )
+    assert shared_snapshot_key == 43
+    assert generation == "shared_blocks_v4"
+    assert cold_contract == "ptg_v3_cold_v2"
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda value: value["serving_binary"].pop("provider_graph_v4"),
+        lambda value: value["serving_binary"]["provider_graph_v4"].update(
+            representation="source_component_v1"
+        ),
+        lambda value: value["serving_binary"]["provider_graph_v4"].update(
+            map_digest="not-a-digest"
+        ),
+        lambda value: value["serving_binary"]["provider_graph_v4"].update(
+            npi_table="ptg2_v3_npi_scope"
+        ),
+        lambda value: value["serving_binary"]["provider_graph_v4"][
+            "hot_prefix"
+        ].update(max_online_group_npi_batches_per_set=0),
+        lambda value: value["serving_binary"]["provider_graph_v4"][
+            "hot_prefix"
+        ].update(provider_expansion_rate_page_rows=0),
+    ],
+)
+def test_strict_manifest_rejects_unservable_v4_graph_metadata(mutator) -> None:
+    serving_index = strict_v4_serving_index()
+    mutator(serving_index)
+    with pytest.raises(ptg2_tables.PTG2ManifestArtifactError, match="V4"):
+        ptg2_tables._strict_v3_manifest_fields(serving_index)
+
+
+@pytest.mark.parametrize(
+    "normalization_count",
+    [-1, None],
+)
+def test_v4_manifest_rejects_invalid_empty_npi_resource(
+    normalization_count,
+) -> None:
+    serving_index = strict_v4_serving_index()
+    resources = serving_index["serving_binary"]["provider_graph_v4"][
+        "resource_admission"
+    ]
+    resources["empty_npi_tin_only_normalization_count"] = normalization_count
+
+    with pytest.raises(ptg2_tables.PTG2ManifestArtifactError, match="V4"):
+        ptg2_tables._strict_v3_manifest_fields(serving_index)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_binds_v4_manifest_to_completed_root() -> None:
+    serving_index = strict_v4_serving_index()
+    tables = await ptg2_tables.snapshot_serving_tables(
+        FakeSession(
+            [
+                strict_snapshot_row(serving_index),
+                strict_v4_root_row(serving_index),
+            ]
+        ),
+        "strict-v4",
+    )
+    assert tables.storage_generation == "shared_blocks_v4"
+    assert tables.shared_block_layout == "packed_snapshot_maps_v4"
+    assert tables.uses_v4_graph is True
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_rejects_v4_root_manifest_mismatch() -> None:
+    serving_index = strict_v4_serving_index()
+    root_by_field = strict_v4_root_row(
+        serving_index,
+        representation="direct_v1",
+    )
+    with pytest.raises(
+        ptg2_tables.PTG2ManifestArtifactError,
+        match="map root does not match",
+    ):
+        await ptg2_tables.snapshot_serving_tables(
+            FakeSession(
+                [strict_snapshot_row(serving_index), root_by_field]
+            ),
+            "strict-v4-mismatch",
+        )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_rejects_empty_npi_resource_tamper() -> None:
+    serving_index = strict_v4_serving_index()
+    root_by_field = strict_v4_root_row(serving_index)
+    root_by_field["empty_npi_tin_only_normalization_count"] = 1
+
+    with pytest.raises(
+        ptg2_tables.PTG2ManifestArtifactError,
+        match="graph resources do not match",
+    ):
+        await ptg2_tables.snapshot_serving_tables(
+            FakeSession(
+                [strict_snapshot_row(serving_index), root_by_field]
+            ),
+            "strict-v4-resource-tamper",
+        )
 
 
 @pytest.mark.parametrize(

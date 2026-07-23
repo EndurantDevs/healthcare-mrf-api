@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -21,6 +23,7 @@ from process.ptg_parts.ptg2_manifest_publish import (
 )
 from process.ptg_parts.ptg2_serving_binary_v3 import select_atom_key_bits
 from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_V3_SHARED_GENERATION,
     lock_shared_layout_for_dense_write,
     shared_support_digest,
 )
@@ -47,6 +50,9 @@ _DEFAULT_COPY_WORK_MEM = "128MB"
 _MAX_COPY_PARALLEL_WORKERS_PER_GATHER = 8
 _MAX_DENSE_KEY_COUNT = 1 << 32
 PTG2_V3_PRICE_KEY_ORDER = "minimum_negotiated_rate_then_global_id_128_v1"
+_PRICE_PROGRESS_CALLBACK: contextvars.ContextVar[
+    Callable[[str, int], None] | None
+] = contextvars.ContextVar("ptg2_price_progress_callback", default=None)
 _WORK_MEM_RE = re.compile(r"^[1-9][0-9]*(?:kB|MB|GB|TB)?$")
 _V3_ATTRIBUTE_KEY_COLUMNS = (
     "negotiated_type_key",
@@ -57,6 +63,27 @@ _V3_ATTRIBUTE_KEY_COLUMNS = (
     "billing_code_modifier_key",
     "additional_information_key",
 )
+
+
+@contextmanager
+def observe_shared_price_progress(
+    progress_callback: Callable[[str, int], None] | None,
+):
+    """Bind task-local price progress without changing V3 publication inputs."""
+
+    token = _PRICE_PROGRESS_CALLBACK.set(progress_callback)
+    try:
+        yield
+    finally:
+        _PRICE_PROGRESS_CALLBACK.reset(token)
+
+
+def _report_price_progress(metric: str, amount: int) -> None:
+    """Report one positive measured price work delta when observation is active."""
+
+    progress_callback = _PRICE_PROGRESS_CALLBACK.get()
+    if progress_callback is not None and int(amount) > 0:
+        progress_callback(metric, int(amount))
 
 
 @dataclass(frozen=True)
@@ -257,6 +284,7 @@ async def _encoder_stdout_chunks(
         metrics["target_copy_bytes"] = int(metrics.get("target_copy_bytes") or 0) + len(
             chunk
         )
+        _report_price_progress("copy_bytes", len(chunk))
         metrics.setdefault("target_first_byte_seconds", time.monotonic() - started_at)
         yield chunk
     metrics["target_copy_complete_seconds"] = time.monotonic() - started_at
@@ -372,6 +400,7 @@ async def _stream_shared_price_copy(
     target_table: str,
     atom_key_bits: int,
 ) -> dict[str, Any]:
+    """Stream one exact price relation while exposing encoded COPY bytes."""
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
         raise RuntimeError("PTG2 strict price publication requires the Rust scanner binary")
@@ -934,6 +963,7 @@ async def _publish_price_attributes(
     build_token: str,
     dictionary_table: str | None,
     constant_values: Mapping[str, Any],
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> tuple[int, bytes]:
     """Persist price attributes and return their row count and support digest."""
 
@@ -973,8 +1003,10 @@ async def _publish_price_attributes(
             schema_name=schema_name,
             snapshot_key=int(snapshot_key),
             build_token=build_token,
+            expected_generation=expected_generation,
         )
         for start in range(0, len(attribute_rows), batch_size):
+            batch = attribute_rows[start : start + batch_size]
             await session.execute(
                 db.text(
                     f"""
@@ -984,8 +1016,9 @@ async def _publish_price_attributes(
                         (:snapshot_key, :attribute_kind, :attribute_key, :value)
                     """
                 ),
-                attribute_rows[start : start + batch_size],
+                batch,
             )
+            _report_price_progress("published_rows", len(batch))
     digest = shared_support_digest(
         {
             "price_attributes": [
@@ -1079,6 +1112,10 @@ async def prepare_shared_price_artifacts(
                         price_atom_table=price_atom_table,
                     )
                 )
+                _report_price_progress(
+                    "prepared_rows",
+                    int(stage_metrics_map.get("rows_after") or 0),
+                )
                 stage_metrics_map["normalization_seconds"] = (
                     time.monotonic() - stage_started_at
                 )
@@ -1093,6 +1130,7 @@ async def prepare_shared_price_artifacts(
             stage_metrics_map["dictionary_rewrite_seconds"] = (
                 time.monotonic() - stage_started_at
             )
+            _report_price_progress("publish_batches", 1)
             if not isinstance(lean_price_manifest, dict):
                 raise RuntimeError(
                     "strict V3 price atom rewrite did not produce a dictionary contract"
@@ -1102,6 +1140,10 @@ async def prepare_shared_price_artifacts(
                 schema_name=schema_name,
                 price_atom_table=price_atom_table,
                 stage_table=atom_key_map,
+            )
+            _report_price_progress(
+                "prepared_rows",
+                int(atom_stats.get("row_count") or 0),
             )
             if normalized_summary_source_count == 1:
                 atom_row_count = int(atom_stats.get("row_count") or 0)
@@ -1124,6 +1166,10 @@ async def prepare_shared_price_artifacts(
                 price_set_summary_table=price_set_summary_table,
                 price_set_summary_source_count=normalized_summary_source_count,
                 stage_table=price_key_map,
+            )
+            _report_price_progress(
+                "prepared_rows",
+                int(price_map_stats.get("row_count") or 0),
             )
             stage_metrics_map["price_key_build_seconds"] = (
                 time.monotonic() - stage_started_at
@@ -1243,6 +1289,7 @@ async def publish_shared_price_artifacts(
     expected_price_set_count: int,
     expected_price_key_order: str,
     prepared: PreparedSharedPriceArtifacts,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> SharedPricePublication:
     """Build only compact price blocks; never materialize the serving-rate relation."""
 
@@ -1316,6 +1363,12 @@ async def publish_shared_price_artifacts(
             stage_table=block_stage,
             snapshot_key=int(snapshot_key),
             build_token=build_token,
+            expected_generation=expected_generation,
+            **(
+                {"progress_callback": _PRICE_PROGRESS_CALLBACK.get()}
+                if _PRICE_PROGRESS_CALLBACK.get() is not None
+                else {}
+            ),
         )
         dictionary_table = lean_layout_map.get("price_atom_dictionary_table")
         price_attribute_count, price_support_digest = await _publish_price_attributes(
@@ -1324,6 +1377,7 @@ async def publish_shared_price_artifacts(
             build_token=build_token,
             dictionary_table=str(dictionary_table) if dictionary_table else None,
             constant_values=price_atom_constant_value_by_kind,
+            expected_generation=expected_generation,
         )
         return SharedPricePublication(
             object_kinds=block_publication.object_kinds,
@@ -1358,6 +1412,7 @@ __all__ = [
     "PTG2_V3_PRICE_KEY_ORDER",
     "cleanup_prepared_shared_price_artifacts",
     "export_shared_price_key_map",
+    "observe_shared_price_progress",
     "prepare_shared_price_artifacts",
     "publish_shared_price_artifacts",
 ]

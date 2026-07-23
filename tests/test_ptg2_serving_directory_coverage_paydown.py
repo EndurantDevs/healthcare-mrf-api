@@ -189,6 +189,30 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
 
 
 @pytest.mark.asyncio
+async def test_membership_location_query_uses_v4_local_npi_dictionary(monkeypatch):
+    monkeypatch.setattr(
+        serving,
+        "_ptg2_address_serving_table",
+        AsyncMock(return_value="mrf.npi_address"),
+    )
+    tables = strict_v3_tables(
+        storage_generation="shared_blocks_v4",
+        shared_block_layout="packed_snapshot_maps_v4",
+    )
+
+    query = await serving._membership_location_query(
+        object(),
+        tables,
+        {"state": "IL"},
+        candidate_npis=None,
+        limit=10,
+    )
+
+    assert query is not None
+    assert query.npi_scope_table == "mrf.ptg2_v4_npi_scope"
+
+
+@pytest.mark.asyncio
 async def test_overlay_corroboration_passthrough_paths(monkeypatch):
     provider_rows = [{"npi": 11, "provider_name": "Eleven"}]
 

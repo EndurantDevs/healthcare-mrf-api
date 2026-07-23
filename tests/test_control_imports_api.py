@@ -592,6 +592,13 @@ async def test_render_prometheus_metrics_includes_engine_health_and_runs(monkeyp
     assert 'hp_mrf_api_active_runs_by_importer{importer="ptg"} 1.000000' in body
     assert 'hp_mrf_api_queue_depth{queue="arq:PTG"} 2.000000' in body
     assert 'hp_mrf_api_worker_running{queue="arq:PTG"} 1.000000' in body
+    assert "hp_mrf_ptg_v4_graph_hot_group_npi_bytes_total " in body
+    assert "hp_mrf_ptg_v4_graph_hot_group_npi_batches_total " in body
+    assert "hp_mrf_ptg_v4_graph_hot_npi_dictionary_reads_total " in body
+    assert "hp_mrf_ptg_v4_provider_expansion_rate_rows_total " in body
+    assert "hp_mrf_ptg_v4_provider_expansion_provider_sets_total " in body
+    assert "hp_mrf_ptg_v4_provider_expansion_graph_batches_total " in body
+    assert "hp_mrf_ptg_v4_provider_expansion_rejections_total " in body
 
 
 def test_normalize_run_overlays_live_progress_for_any_active_importer(monkeypatch):

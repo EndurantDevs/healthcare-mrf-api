@@ -10,8 +10,9 @@ from process.control_lifecycle import control_single_job_start
 async def test_control_job_persists_failure_audit_metrics(monkeypatch):
     run_marks = []
 
-    async def fake_mark(run_id, **kwargs):
+    async def is_control_run_marked(run_id, **kwargs):
         run_marks.append((run_id, kwargs))
+        return True
 
     async def fake_target(ctx, _task):
         ctx.setdefault("context", {})["audit"] = {
@@ -23,7 +24,11 @@ async def test_control_job_persists_failure_audit_metrics(monkeypatch):
     class FakeModule:
         process_data = staticmethod(fake_target)
 
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(
+        control_lifecycle,
+        "mark_control_run",
+        is_control_run_marked,
+    )
     monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: FakeModule)
 
     with pytest.raises(TimeoutError):
@@ -57,8 +62,9 @@ async def test_control_job_preserves_importer_retry_contract(monkeypatch):
         control_error_code = "deterministic_failure"
         retryable = False
 
-    async def fake_mark(run_id, **kwargs):
+    async def is_control_run_marked(run_id, **kwargs):
         run_marks.append((run_id, kwargs))
+        return True
 
     async def fake_target(_ctx, _task):
         raise DeterministicFailure("evidence mismatch")
@@ -66,7 +72,11 @@ async def test_control_job_preserves_importer_retry_contract(monkeypatch):
     class FakeModule:
         process_data = staticmethod(fake_target)
 
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(
+        control_lifecycle,
+        "mark_control_run",
+        is_control_run_marked,
+    )
     monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: FakeModule)
 
     with pytest.raises(DeterministicFailure):

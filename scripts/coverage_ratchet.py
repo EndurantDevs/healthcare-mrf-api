@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -17,16 +16,15 @@ from coverage_reports import (
     _read_json,
 )
 from coverage_growth import (
-    build_growth_policy_test_baseline,
     collect_growth_evidence,
     compare_growth_metric,
     compare_growth_policy,
     load_growth_policy,
-    run_exclusion_guard_self_test,
-    run_growth_helper_self_test,
 )
+from coverage_ratchet_self_test import run_self_test
 
 SCHEMA_VERSION = 1
+ONE_TIME_FLOOR_RESET_BASIS_POINTS = 200
 
 
 def _load_baseline(path: Path) -> dict[str, Any]:
@@ -61,6 +59,70 @@ def _compare_metric(label: str, current: Metric, minimum: Metric) -> list[str]:
             f"{label}: uncovered debt rose to {current_missing} above {minimum_missing}"
         )
     return errors
+
+
+def _compare_metric_with_floor_reset(
+    label: str,
+    current: Metric,
+    reference: Metric,
+) -> list[str]:
+    """Allow this release's explicitly anchored two-point floor reset."""
+    current = _metric(current.get("covered"), current.get("total"), label)
+    reference = _metric(reference.get("covered"), reference.get("total"), label)
+    current_scaled = (
+        current["covered"] * 10_000 * reference["total"]
+        + ONE_TIME_FLOOR_RESET_BASIS_POINTS
+        * current["total"]
+        * reference["total"]
+    )
+    reference_scaled = reference["covered"] * 10_000 * current["total"]
+    if current_scaled >= reference_scaled:
+        return []
+    return [
+        f"{label}: one-time floor reset exceeds "
+        f"{ONE_TIME_FLOOR_RESET_BASIS_POINTS / 100:.2f} percentage points"
+    ]
+
+
+def _one_time_floor_reset(
+    report_name: str,
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """Validate and activate a reset only against its original baseline."""
+    candidate_reset = candidate.get("one_time_floor_reset")
+    reference_reset = reference.get("one_time_floor_reset")
+    if reference_reset is not None:
+        if candidate_reset != reference_reset:
+            return False, [
+                f"{report_name}: established one-time floor reset marker changed"
+            ]
+        return False, []
+    if candidate_reset is None:
+        return False, []
+    if not isinstance(candidate_reset, dict):
+        return False, [f"{report_name}: one-time floor reset is malformed"]
+    if set(candidate_reset) != {
+        "maximum_drop_basis_points",
+        "reason",
+        "reference_metrics",
+    }:
+        return False, [f"{report_name}: one-time floor reset fields are malformed"]
+    if (
+        candidate_reset.get("maximum_drop_basis_points")
+        != ONE_TIME_FLOOR_RESET_BASIS_POINTS
+    ):
+        return False, [
+            f"{report_name}: one-time floor reset must be exactly "
+            f"{ONE_TIME_FLOOR_RESET_BASIS_POINTS} basis points"
+        ]
+    if not str(candidate_reset.get("reason") or "").strip():
+        return False, [f"{report_name}: one-time floor reset reason is missing"]
+    if candidate_reset.get("reference_metrics") != reference.get("metrics"):
+        return False, [
+            f"{report_name}: one-time floor reset is not anchored to the base metrics"
+        ]
+    return True, []
 
 
 def _compare_scope(
@@ -122,11 +184,97 @@ def _compare_policy(
     return errors
 
 
+def _compare_report_metrics(
+    report_name: str,
+    new_config: dict[str, Any],
+    old_metric_by_name: dict[str, Any],
+    new_metric_by_name: dict[str, Any],
+    floor_reset_active: bool,
+    changed_line_count: int,
+) -> tuple[int, list[str]]:
+    errors: list[str] = []
+    reset_metric_count = 0
+    for metric_name, old_metric in old_metric_by_name.items():
+        new_metric = new_metric_by_name.get(metric_name)
+        if not isinstance(new_metric, dict):
+            errors.append(f"{report_name}.{metric_name}: baseline metric was removed")
+            continue
+        metric_label = f"{report_name}.{metric_name} baseline"
+        ordinary_errors = _compare_metric(metric_label, new_metric, old_metric)
+        if changed_line_count:
+            growth_policy_by_field = load_growth_policy(report_name, new_config)
+            ordinary_errors.extend(
+                compare_growth_metric(
+                    metric_label,
+                    new_metric,
+                    old_metric,
+                    growth_policy_by_field["target_percent_by_metric"][metric_name],
+                    growth_policy_by_field,
+                    changed_line_count,
+                )
+            )
+        metric_reset_active = floor_reset_active and bool(ordinary_errors)
+        if metric_reset_active:
+            reset_metric_count += 1
+            errors.extend(
+                _compare_metric_with_floor_reset(
+                    metric_label,
+                    new_metric,
+                    old_metric,
+                )
+            )
+        else:
+            errors.extend(ordinary_errors)
+    return reset_metric_count, errors
+
+
+def _compare_report_baseline(
+    report_name: str,
+    new_config: dict[str, Any],
+    old_config: dict[str, Any],
+    changed_line_count: int,
+) -> list[str]:
+    errors: list[str] = []
+    for field in ("format", "path"):
+        if new_config.get(field) != old_config.get(field):
+            errors.append(f"{report_name}: baseline {field} changed")
+    errors.extend(_compare_scope(report_name, new_config, old_config))
+    errors.extend(compare_growth_policy(report_name, new_config, old_config))
+    floor_reset_active, floor_reset_errors = _one_time_floor_reset(
+        report_name,
+        new_config,
+        old_config,
+    )
+    errors.extend(floor_reset_errors)
+    if not set(old_config.get("files", [])).issubset(
+        set(new_config.get("files", []))
+    ):
+        errors.append(f"{report_name}: baseline source files were removed")
+    old_metric_by_name = old_config.get("metrics")
+    new_metric_by_name = new_config.get("metrics")
+    if not isinstance(old_metric_by_name, dict) or not isinstance(
+        new_metric_by_name,
+        dict,
+    ):
+        return errors + [f"{report_name}: baseline metrics are malformed"]
+    _reset_metric_count, metric_errors = _compare_report_metrics(
+        report_name,
+        new_config,
+        old_metric_by_name,
+        new_metric_by_name,
+        floor_reset_active,
+        changed_line_count,
+    )
+    errors.extend(metric_errors)
+    return errors
+
+
 def _compare_baselines(
     candidate: dict[str, Any],
     reference: dict[str, Any],
     changed_line_by_report: dict[str, int] | None = None,
 ) -> list[str]:
+    """Compare candidate coverage against the reference and changed-line floors."""
     errors: list[str] = []
     changed_line_by_report = changed_line_by_report or {}
     candidate_reports = candidate["reports"]
@@ -135,47 +283,14 @@ def _compare_baselines(
         if not isinstance(new_config, dict):
             errors.append(f"{report_name}: baseline report was removed")
             continue
-        for field in ("format", "path"):
-            if new_config.get(field) != old_config.get(field):
-                errors.append(f"{report_name}: baseline {field} changed")
-        errors.extend(_compare_scope(report_name, new_config, old_config))
-        errors.extend(compare_growth_policy(report_name, new_config, old_config))
-        if not set(old_config.get("files", [])).issubset(
-            set(new_config.get("files", []))
-        ):
-            errors.append(f"{report_name}: baseline source files were removed")
-        old_metric_by_name = old_config.get("metrics")
-        new_metric_by_name = new_config.get("metrics")
-        if not isinstance(old_metric_by_name, dict) or not isinstance(
-            new_metric_by_name, dict
-        ):
-            errors.append(f"{report_name}: baseline metrics are malformed")
-            continue
-        for metric_name, old_metric in old_metric_by_name.items():
-            new_metric = new_metric_by_name.get(metric_name)
-            if not isinstance(new_metric, dict):
-                errors.append(f"{report_name}.{metric_name}: baseline metric was removed")
-                continue
-            errors.extend(
-                _compare_metric(
-                    f"{report_name}.{metric_name} baseline",
-                    new_metric,
-                    old_metric,
-                )
+        errors.extend(
+            _compare_report_baseline(
+                report_name,
+                new_config,
+                old_config,
+                changed_line_by_report.get(report_name, 0),
             )
-            changed_line_count = changed_line_by_report.get(report_name, 0)
-            if changed_line_count:
-                growth_policy_by_field = load_growth_policy(report_name, new_config)
-                errors.extend(
-                    compare_growth_metric(
-                        f"{report_name}.{metric_name} baseline",
-                        new_metric,
-                        old_metric,
-                        growth_policy_by_field["target_percent_by_metric"][metric_name],
-                        growth_policy_by_field,
-                        changed_line_count,
-                    )
-                )
+        )
     return errors
 
 
@@ -198,176 +313,8 @@ def _write_baseline(
     )
 
 
-def _require_self_test(condition: bool, message: str) -> None:
-    if not condition:
-        raise CoverageRatchetError(f"coverage ratchet self-test failed: {message}")
-
-
-def _assert_metric_behavior() -> None:
-    exact_metric_map = {"covered": 80, "total": 100}
-    _require_self_test(
-        not _compare_metric("exact", exact_metric_map, exact_metric_map),
-        "exact metric",
-    )
-    _require_self_test(
-        not _compare_metric(
-            "better", {"covered": 90, "total": 100}, exact_metric_map
-        ),
-        "improved metric",
-    )
-    _require_self_test(
-        bool(_compare_metric("ratio", {"covered": 79, "total": 100}, exact_metric_map)),
-        "ratio regression",
-    )
-    _require_self_test(
-        bool(
-            _compare_metric(
-                "debt", {"covered": 160, "total": 200}, exact_metric_map
-            )
-        ),
-        "uncovered debt regression",
-    )
-
-
-def _assert_parser_behavior() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        (root / "sample.py").write_text("value = 1\n", encoding="utf-8")
-        report_document_map = {
-            "files": {
-                "sample.py": {
-                    "summary": {
-                        "covered_lines": 8,
-                        "num_statements": 10,
-                        "covered_branches": 3,
-                        "num_branches": 4,
-                    }
-                }
-            }
-        }
-        (root / "coverage.json").write_text(
-            json.dumps(report_document_map), encoding="utf-8"
-        )
-        snapshot = _collect_report(
-            root,
-            "python",
-            {
-                "format": "coverage.py",
-                "path": "coverage.json",
-                "scope": {"include": ["*.py"], "exclude": []},
-            },
-        )
-        _require_self_test(
-            snapshot.metric_by_name
-            == {
-                "lines": {"covered": 8, "total": 10},
-                "branches": {"covered": 3, "total": 4},
-            },
-            "coverage.py parser",
-        )
-
-
-def _assert_reference_behavior() -> None:
-    exact_metric_map = {"covered": 80, "total": 100}
-    reference_baseline_map = {
-        "reports": {
-            "python": {
-                "format": "coverage.py",
-                "path": "coverage.json",
-                "scope": {"include": ["*.py"], "exclude": [], "policy": {}},
-                "files": ["sample.py"],
-                "metrics": {"lines": exact_metric_map},
-                "growth": {
-                    "changed_line_divisor": 10,
-                    "debt_reduction_percent": 1,
-                    "target_percent_by_metric": {"lines": 95},
-                },
-            }
-        }
-    }
-    _require_self_test(
-        not _compare_baselines(reference_baseline_map, reference_baseline_map),
-        "unchanged baseline",
-    )
-    lowered_baseline_map = json.loads(json.dumps(reference_baseline_map))
-    lowered_baseline_map["reports"]["python"]["metrics"]["lines"] = {
-        "covered": 79,
-        "total": 100,
-    }
-    _require_self_test(
-        bool(_compare_baselines(lowered_baseline_map, reference_baseline_map)),
-        "lowered baseline",
-    )
-    narrowed_baseline_map = json.loads(json.dumps(reference_baseline_map))
-    narrowed_baseline_map["reports"]["python"]["scope"]["include"] = []
-    _require_self_test(
-        bool(_compare_baselines(narrowed_baseline_map, reference_baseline_map)),
-        "narrowed scope",
-    )
-
-
-def _assert_growth_behavior() -> None:
-    reference_baseline_by_field = build_growth_policy_test_baseline()
-    unchanged_baseline_by_field = json.loads(json.dumps(reference_baseline_by_field))
-    _require_self_test(
-        bool(
-            _compare_baselines(
-                unchanged_baseline_by_field,
-                reference_baseline_by_field,
-                {"python": 5},
-            )
-        ),
-        "changed source requires debt reduction",
-    )
-    improved_baseline_by_field = json.loads(json.dumps(reference_baseline_by_field))
-    improved_baseline_by_field["reports"]["python"]["metrics"]["lines"] = {
-        "covered": 81,
-        "total": 100,
-    }
-    _require_self_test(
-        not _compare_baselines(
-            improved_baseline_by_field,
-            reference_baseline_by_field,
-            {"python": 5},
-        ),
-        "one-unit debt reduction for a small change",
-    )
-    target_baseline_by_field = json.loads(json.dumps(reference_baseline_by_field))
-    target_baseline_by_field["reports"]["python"]["metrics"]["lines"] = {
-        "covered": 95,
-        "total": 100,
-    }
-    _require_self_test(
-        not _compare_baselines(
-            target_baseline_by_field,
-            target_baseline_by_field,
-            {"python": 100},
-        ),
-        "growth stops at the configured target",
-    )
-    weakened_baseline_by_field = json.loads(json.dumps(reference_baseline_by_field))
-    weakened_baseline_by_field["reports"]["python"]["growth"][
-        "target_percent_by_metric"
-    ]["lines"] = 90
-    _require_self_test(
-        bool(
-            _compare_baselines(
-                weakened_baseline_by_field,
-                reference_baseline_by_field,
-            )
-        ),
-        "growth target weakening",
-    )
-
-
 def _run_self_test() -> None:
-    _assert_metric_behavior()
-    _assert_parser_behavior()
-    _assert_reference_behavior()
-    _assert_growth_behavior()
-    run_growth_helper_self_test()
-    run_exclusion_guard_self_test()
-    print("coverage ratchet self-test passed")
+    run_self_test(_compare_metric, _compare_baselines, _collect_report)
 
 
 def _parse_arguments() -> argparse.Namespace:

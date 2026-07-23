@@ -10,6 +10,7 @@ from sqlalchemy import select, text, update
 
 from api import control_imports
 from db.models import ImportRun, db
+from process import control_lifecycle
 from process.control_lifecycle import mark_control_run
 from tests.control_imports_cancel_race_support import (
     finish_cancel_race_run,
@@ -174,7 +175,6 @@ async def test_fhir_admission_matrix(monkeypatch):
         assert len(active_rows) == 3
     finally:
         await _drop_import_run_schema()
-
 
 async def test_fhir_artifact_admission_race(monkeypatch):
     await _reset_import_run_schema()
@@ -467,15 +467,15 @@ async def test_running_status_clears_previous_finished_at(monkeypatch):
                 engine=control_imports.ENGINE_NAME,
                 importer="ptg",
                 family="pricing",
-                status="failed",
-                phase_detail="ptg import failed",
+                    status="queued",
+                    phase_detail="ptg import queued",
                 params={},
                 created_at=control_imports.utc_now(),
                 started_at=control_imports.utc_now(),
                 finished_at=finished_at,
                 heartbeat_at=finished_at,
-                progress={"unit": "run", "total": 1, "done": 1, "pct": 100, "message": "failed"},
-                error={"code": "low_memory_pause"},
+                    progress={"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "queued"},
+                    error=None,
             )
         )
 

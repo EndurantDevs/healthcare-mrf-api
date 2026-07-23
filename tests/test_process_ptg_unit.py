@@ -25,6 +25,7 @@ from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from aiohttp import web
+from tests.live_progress_atomic_redis import AtomicLiveProgressRedis
 
 
 process_pkg = importlib.import_module("process")
@@ -137,6 +138,117 @@ def _empty_provider_identifier_quarantine_scanner_summary():
             }
         }
     }
+
+
+def _v4_empty_npi_normalization_payload(count):
+    digest = hashlib.sha256()
+    digest.update(
+        process_ptg._V4_EMPTY_NPI_NORMALIZATION_HASH_DOMAIN
+    )
+    digest.update(int(count).to_bytes(8, "big"))
+    return {
+        "contract": process_ptg._V4_EMPTY_NPI_NORMALIZATION_CONTRACT,
+        "source_shape": "empty_array",
+        "canonical_equivalent": "zero_marker",
+        "occurrence_count": count,
+        "emitted_npi_edge_count": 0,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def test_shared_v4_empty_npi_evidence_is_exact_and_skips_duplicates():
+    file_results = [
+        {
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "empty_npi_tin_only_normalization": (
+                            _v4_empty_npi_normalization_payload(2)
+                        )
+                    }
+                }
+            }
+        },
+        {
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "empty_npi_tin_only_normalization": (
+                            _v4_empty_npi_normalization_payload(3)
+                        )
+                    }
+                }
+            }
+        },
+        {
+            "skipped": True,
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "empty_npi_tin_only_normalization": (
+                            _v4_empty_npi_normalization_payload(11)
+                        )
+                    }
+                }
+            },
+        },
+    ]
+
+    assert process_ptg._sum_v4_tin_only_audits(
+        file_results
+    ) == 5
+
+
+def test_shared_v4_empty_npi_evidence_rejects_digest_tamper():
+    payload = _v4_empty_npi_normalization_payload(2)
+    payload["occurrence_count"] = 3
+    file_results = [
+        {
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "empty_npi_tin_only_normalization": payload
+                    }
+                }
+            }
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="digest changed"):
+        process_ptg._sum_v4_tin_only_audits(file_results)
+
+
+@pytest.mark.parametrize(
+    ("normalization_audit", "expected_error"),
+    [
+        (None, "omitted empty-NPI normalization evidence"),
+        (
+            {
+                **_v4_empty_npi_normalization_payload(0),
+                "occurrence_count": -1,
+            },
+            "normalization evidence is invalid",
+        ),
+    ],
+)
+def test_shared_v4_empty_npi_evidence_rejects_missing_or_negative_count(
+    normalization_audit,
+    expected_error,
+):
+    file_results = [
+        {
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "empty_npi_tin_only_normalization": normalization_audit
+                    }
+                }
+            }
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        process_ptg._sum_v4_tin_only_audits(file_results)
 
 
 def test_shared_v3_quarantine_combines_scanners_and_skips_duplicates():
@@ -431,15 +543,129 @@ def test_progress_split_keeps_facade_helpers_stable():
     assert ptg_progress._scale_stage_progress_pct(50, 5, 20) == 12.5
 
 
+def _weighted_progress_fixture(monkeypatch):
+    """Create the two-file weighted progress fixture shared by focused tests."""
+
+    events = []
+    monkeypatch.setattr(
+        ptg_progress,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+    coordinator = ptg_progress.PTGFileProgressCoordinator(
+        [1, 99],
+        ["https://payer.test/small.json.gz", "https://payer.test/large.json.gz"],
+        stage_start_pct=20,
+        stage_end_pct=90,
+    )
+
+    return coordinator, events
+
+
+def test_weighted_file_progress_tracks_dominant_input(monkeypatch):
+    """Weight stage progress by input size and expose the dominant file."""
+
+    coordinator, events = _weighted_progress_fixture(monkeypatch)
+    coordinator.observe(
+        0,
+        {
+            "phase_pct": 80,
+            "counters": {"provider_references": 100},
+        },
+    )
+    coordinator.complete(0)
+    assert events[-1]["pct"] == pytest.approx(20.7)
+    assert events[-1]["counters"]["provider_references"] == 100
+    coordinator.observe(
+        1,
+        {
+            "phase": "compact-serving scanner",
+            "phase_pct": 50,
+            "counters": {
+                "provider_references": 50,
+                "indexed_rates_completed": 900,
+            },
+        },
+    )
+    assert events[-1]["pct"] == pytest.approx(55.35)
+    assert events[-1]["file_index"] == 2
+    assert events[-1]["file_count"] == 2
+    assert events[-1]["file_name"] == "large.json.gz"
+    assert events[-1]["dominant_file"] is True
+    assert events[-1]["file_weight_pct"] == pytest.approx(99)
+    assert events[-1]["counters"]["provider_references"] == 150
+    assert events[-1]["counters"]["indexed_rates_completed"] == 900
+
+
+def test_weighted_file_progress_does_not_regress(monkeypatch):
+    """Keep progress and monotonic counters stable across delayed events."""
+
+    coordinator, events = _weighted_progress_fixture(monkeypatch)
+    coordinator.observe(0, {"phase_pct": 80, "counters": {"provider_references": 100}})
+    coordinator.complete(0)
+    coordinator.observe(
+        1,
+        {
+            "phase": "compact-serving scanner",
+            "phase_pct": 50,
+            "counters": {
+                "provider_references": 50,
+                "indexed_rates_completed": 900,
+            },
+        },
+    )
+    coordinator.observe(
+        1,
+        {
+            "phase_pct": 40,
+            "message": "delayed",
+            "counters": {"indexed_rates_completed": 800},
+        },
+    )
+    assert events[-1]["pct"] == pytest.approx(55.35)
+    assert events[-1]["counters"]["indexed_rates_completed"] == 900
+    coordinator.observe(1, {"message": "scanner summary"})
+    assert events[-1]["counters"]["provider_references"] == 150
+    coordinator.observe(1, {"phase_pct": 100, "message": "scanner done"})
+    assert events[-1]["pct"] < 90
+    coordinator.complete(1)
+    assert events[-1]["pct"] == 90
+    assert events[-1]["done"] == events[-1]["total"]
+    assert events[-1]["counters"]["indexed_rates_completed"] == 900
+
+
+def test_weighted_file_progress_zero_weight_duplicate_does_not_add_work(
+    monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        ptg_progress,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+    coordinator = ptg_progress.PTGFileProgressCoordinator(
+        [100, 0],
+        ["source.json.gz", "duplicate.json.gz"],
+        stage_start_pct=30,
+        stage_end_pct=90,
+    )
+
+    coordinator.complete(1)
+    assert events[-1]["pct"] == 30
+    assert events[-1]["total"] == 100
+    assert events[-1]["counters"]["files_completed"] == 1
+
+
 def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch):
     writes = []
     events = []
 
-    class FakeRedis:
-        def setex(self, key, ttl, value):
-            writes.append((key, ttl, value))
-
-    monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
+    fake_redis = AtomicLiveProgressRedis(
+        on_progress_write=lambda key, ttl, value: writes.append(
+            (key, ttl, value)
+        )
+    )
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
     monkeypatch.setattr(live_progress, "enqueue_status_event", events.append)
     token = ptg_live_progress.set_live_progress_context(run_id="run_ptg", snapshot_id="snap_1")
     try:
@@ -467,15 +693,17 @@ def test_live_progress_preserves_earliest_started_at(monkeypatch):
         "updated_at": "2026-06-03T12:01:00Z",
     }
 
-    class FakeRedis:
-        def get(self, key):
-            assert key == "import:progress:run_any"
-            return json.dumps(previous_map).encode("utf-8")
-
-        def setex(self, key, ttl, value):
-            writes.append((key, ttl, value))
-
-    monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
+    fake_redis = AtomicLiveProgressRedis(
+        {
+            "import:progress:run_any": json.dumps(previous_map).encode(
+                "utf-8"
+            )
+        },
+        on_progress_write=lambda key, ttl, value: writes.append(
+            (key, ttl, value)
+        ),
+    )
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
     monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
 
     live_progress.write_live_progress(
@@ -496,14 +724,8 @@ def test_live_progress_preserves_earliest_started_at(monkeypatch):
 def test_live_progress_heartbeat_preserves_recent_importer_progress(monkeypatch):
     store_map = {}
 
-    class FakeRedis:
-        def get(self, key):
-            return store_map.get(key)
-
-        def setex(self, key, _ttl, value):
-            store_map[key] = value
-
-    monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
+    fake_redis = AtomicLiveProgressRedis(store_map)
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
     monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
 
     live_progress.write_live_progress(
@@ -881,6 +1103,39 @@ def test_source_download_progress_scales_to_overall_run_progress(monkeypatch):
     assert events[0]["pct"] == 12.5
     assert events[0]["phase_pct"] == 50.0
     assert events[0]["detail"].startswith("download 50.00%")
+
+
+def test_multi_file_download_progress_preserves_stage_order(
+    monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        ptg_source_download,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+    token = ptg_live_progress.set_live_progress_context(
+        run_id="run_ptg",
+        overall_progress_start_pct=5,
+        overall_progress_end_pct=5,
+        run_progress_hold_pct=5,
+        file_count=2,
+    )
+    try:
+        for completed_bytes in (90, 10):
+            ptg_source_download._emit_download_progress(
+                url=f"https://example.com/rates-{completed_bytes}.json.gz",
+                bytes_read=completed_bytes,
+                total_bytes=100,
+                started_at=time.monotonic() - 1,
+                done=False,
+            )
+    finally:
+        ptg_live_progress.reset_live_progress_context(token)
+
+    assert [event["pct"] for event in events] == [5, 5]
+    assert [event["stage_pct"] for event in events] == [0, 0]
+    assert [event["phase_pct"] for event in events] == [90, 10]
 
 
 def test_download_worker_propagates_live_progress_context(monkeypatch):
@@ -1308,6 +1563,197 @@ def test_rust_scanner_progress_uses_object_throughput_when_bytes_are_deferred(mo
     assert "throughput=1.03M objects/s" in progress_update["message"]
     assert "elapsed=1m 59s" in progress_update["message"]
     assert "input=14,274.6 MiB" in progress_update["message"]
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected_basis", "expected_done", "expected_total", "counter_name"),
+    (
+        (
+            "progress_basis=indexed_objects\tindexed_objects_completed=75\t"
+            "indexed_objects_total=100\tindexed_rates_completed=900\t"
+            "indexed_raw_bytes_completed=4096",
+            "indexed_objects",
+            75,
+            100,
+            "indexed_rates_completed",
+        ),
+        (
+            "progress_basis=plain_reordered_objects\t"
+            "in_network_objects_completed=30\tin_network_objects_total=40\t"
+            "negotiated_rates_completed=800",
+            "plain_reordered_objects",
+            30,
+            40,
+            "negotiated_rates_completed",
+        ),
+    ),
+)
+def test_rust_scanner_progress_preserves_indexed_and_plain_denominators(
+    monkeypatch,
+    frame,
+    expected_basis,
+    expected_done,
+    expected_total,
+    counter_name,
+):
+    events = []
+    monkeypatch.setattr(
+        ptg_rust_scanner,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+
+    ptg_rust_scanner._emit_scanner_live_progress(
+        "PTG2_SCANNER_PROGRESS\tpath=/work/raw/rates.json.gz\t"
+        f"{frame}\tpercent=75.00\telapsed_seconds=3\teta_seconds=1\tdone=false",
+        phase="compact-serving scanner",
+        live_progress_context={
+            "run_id": "run-ptg-progress-v2",
+            "overall_progress_start_pct": 20,
+            "overall_progress_end_pct": 90,
+        },
+    )
+
+    [progress] = events
+    assert progress["unit"] == expected_basis
+    assert progress["basis"] == expected_basis
+    assert progress["done"] == expected_done
+    assert progress["total"] == expected_total
+    assert progress["phase_pct"] == 75
+    assert progress["pct"] == 72.5
+    assert progress["counters"][counter_name] > 0
+    assert "indexed_objects_completed" not in progress["counters"]
+    assert "in_network_objects_completed" not in progress["counters"]
+
+
+def test_rust_scanner_semantic_progress_advances_during_one_long_item(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        ptg_rust_scanner,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+
+    for completed, chunks in ((65_536, 1), (131_072, 2)):
+        ptg_rust_scanner._emit_scanner_live_progress(
+            "PTG2_SCANNER_PROGRESS\tpath=/work/raw/reference-extreme.json.gz\t"
+            "progress_basis=semantic_work\t"
+            f"semantic_work_completed={completed}\t"
+            "compressed_bytes=99\ttotal_bytes=100\tpercent=99.00\t"
+            "elapsed_seconds=8\teta_seconds=unknown\tobjects=1\t"
+            f"rate_chunks_completed={chunks}\tin_network=0\tdone=false",
+            phase="compact-serving scanner",
+            live_progress_context={"run_id": "run-semantic-long-item"},
+        )
+
+    assert [event["done"] for event in events] == [65_536, 131_072]
+    assert all(event["total"] is None for event in events)
+    assert all(event["basis"] == "semantic_work" for event in events)
+    assert [event["counters"]["rate_chunks_completed"] for event in events] == [1, 2]
+    assert all(event["counters"]["in_network"] == 0 for event in events)
+    assert all("semantic_work_completed" not in event["counters"] for event in events)
+
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    live_progress._sequence_progress(events[0], None, now=now, succeeded=False)
+    live_progress._sequence_progress(events[1], events[0], now=now, succeeded=False)
+    assert events[1]["progress_seq"] == events[0]["progress_seq"] + 1
+
+
+def _install_timed_progress_capture(monkeypatch, elapsed_seconds):
+    progress_writes = []
+    base_time = datetime.datetime(2026, 7, 23, 10, 0, 0)
+    fake_redis = AtomicLiveProgressRedis(
+        on_progress_write=lambda _key, _ttl, encoded_progress: progress_writes.append(
+            (elapsed_seconds[0], json.loads(encoded_progress))
+        )
+    )
+    monkeypatch.setattr(process_ptg, "_ptg2_monotonic", lambda: elapsed_seconds[0])
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(
+        live_progress,
+        "_utc_now",
+        lambda: base_time + datetime.timedelta(seconds=elapsed_seconds[0]),
+    )
+    monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
+    return progress_writes
+
+
+def _slow_manifest_copy(elapsed_seconds):
+    async def copy_file(unused_copy_path, *, target_table, progress_callback):
+        del unused_copy_path
+        assert target_table == "price_atom_stage"
+        for _byte_index in range(10):
+            elapsed_seconds[0] += 1.0
+            progress_callback(1)
+
+    return copy_file
+
+
+def _assert_manifest_copy_cadence(progress_writes):
+    progress_snapshots = [
+        progress_snapshot for _at, progress_snapshot in progress_writes
+    ]
+    intermediate_bytes = [
+        progress_snapshot["counters"]["manifest_copy_bytes"]
+        for progress_snapshot in progress_snapshots
+        if 0
+        < int(
+            (progress_snapshot.get("counters") or {}).get(
+                "manifest_copy_bytes"
+            )
+            or 0
+        )
+        < 10
+    ]
+    progress_gaps = [
+        later_at - earlier_at
+        for (earlier_at, _earlier), (later_at, _later) in zip(
+            progress_writes,
+            progress_writes[1:],
+        )
+    ]
+    assert intermediate_bytes == [4, 8]
+    assert max(progress_gaps) <= 4.0
+    assert [
+        progress_snapshot["progress_seq"]
+        for progress_snapshot in progress_snapshots
+    ] == list(range(1, len(progress_snapshots) + 1))
+
+
+@pytest.mark.asyncio
+async def test_manifest_copy_reports_semantic_bytes_every_four_seconds(
+    monkeypatch,
+    tmp_path,
+):
+    """A single slow COPY must move progress_seq before the file completes."""
+
+    copy_path = tmp_path / "price-atoms.copy"
+    copy_path.write_bytes(b"0123456789")
+    elapsed_seconds = [0.0]
+    progress_writes = _install_timed_progress_capture(
+        monkeypatch,
+        elapsed_seconds,
+    )
+
+    token = ptg_live_progress.set_live_progress_context(
+        run_id="run-slow-manifest-copy",
+        attempt_id="attempt-1",
+        attempt_started_at="2026-07-23T10:00:00Z",
+    )
+    try:
+        await process_ptg._copy_manifest_files_direct_with_progress(
+            "price_atom",
+            target_table="price_atom_stage",
+            input_paths=[copy_path],
+            copy_func=_slow_manifest_copy(elapsed_seconds),
+            completed_steps_before_copy=0,
+            total_steps=1,
+            emitted_rows=10,
+        )
+    finally:
+        ptg_live_progress.reset_live_progress_context(token)
+
+    _assert_manifest_copy_cadence(progress_writes)
 
 
 def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
@@ -3835,9 +4281,13 @@ def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(monkeypat
 
 def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
     started_list = []
+    progress_contexts = []
 
     def fake_download(job, **_kwargs):
         started_list.append(job["url"])
+        progress_contexts.append(
+            ptg_live_progress.current_live_progress_context()
+        )
         if "slow" in job["url"]:
             time.sleep(0.05)
         return process_ptg.PTG2DownloadedJob(job=job)
@@ -3867,6 +4317,16 @@ def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
     ]
     assert yielded[0] == "https://example.test/fast.json.gz"
     assert yielded[1] == "https://example.test/slow.json.gz"
+    assert {context["run_progress_hold_pct"] for context in progress_contexts} == {
+        5.0
+    }
+    assert {context["file_index"] for context in progress_contexts} == {1, 2}
+    assert all(
+        context["overall_progress_start_pct"]
+        == context["overall_progress_end_pct"]
+        == 5.0
+        for context in progress_contexts
+    )
 
 
 def test_cancel_and_wait_tasks_joins_cancelled_children():
@@ -3900,6 +4360,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     pushed_list = []
     concurrency_map = {"active": 0, "max_active": 0}
     processed_jobs = []
+    publish_call_kwargs_by_name = {}
 
     async def fake_push(rows, cls, **_kwargs):
         pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
@@ -3935,7 +4396,8 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
                 },
         )
 
-    async def fake_publish(*_args, **_kwargs):
+    async def fake_publish(*_args, **kwargs):
+        publish_call_kwargs_by_name.update(kwargs)
         return SimpleNamespace(
             snapshot_key=7,
             serving_index={
@@ -4033,6 +4495,10 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     assert [job["source_network_names"] for job in processed_jobs] == [["C2"], ["C2"]]
     assert import_result["files_processed"] == 2
     assert import_result["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
+    assert (
+        "empty_npi_tin_only_normalization_count"
+        not in publish_call_kwargs_by_name
+    )
     refresh_mock.assert_awaited_once()
     refresh_kwargs = refresh_mock.await_args.kwargs
     assert refresh_kwargs["source_key"] == "file_concurrency_test"
@@ -5337,23 +5803,38 @@ def test_ptg2_provider_membership_sidecars_round_trip_through_python_reader(tmp_
 
 
 
-def _strict_v3_scanner_frame_stream(*, summary: dict | None = None) -> bytes:
-    records = (
-        (
-            "scanner_config",
-            {
-                "snapshot_arch": "postgres_binary_v3",
-                "storage_generation": "shared_blocks_v3",
-                "serving_row_semantics": "source_multiset_v1",
-                "serving_run_format": "ptg2_v3_serving_run",
-                "serving_run_version": 1,
-            },
-        ),
-        ("scanner_summary", summary or {}),
+def _strict_v3_scanner_frame_stream(
+    *,
+    summary: dict | None = None,
+    factor_mode: bool | None = None,
+) -> bytes:
+    scanner_config_map = {
+        "snapshot_arch": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
+        "serving_row_semantics": "source_multiset_v1",
+        "serving_run_format": "ptg2_v3_serving_run",
+        "serving_run_version": 1,
+    }
+    scanner_summary_map = dict(summary or {})
+    if factor_mode is not None:
+        scanner_config_map["factor_mode"] = factor_mode
+        scanner_config_map["provider_graph_v4_factor_mode"] = factor_mode
+        scanner_summary_map["factor_mode"] = factor_mode
+        scanner_summary_map["provider_graph_v4_factor_mode"] = factor_mode
+        if factor_mode:
+            scanner_summary_map["empty_npi_tin_only_normalization"] = (
+                _v4_empty_npi_normalization_payload(0)
+            )
+    framed_payloads = (
+        ("scanner_config", scanner_config_map),
+        ("scanner_summary", scanner_summary_map),
     )
     stream = bytearray()
-    for kind, payload in records:
-        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    for kind, frame_payload_by_field in framed_payloads:
+        encoded = json.dumps(
+            frame_payload_by_field,
+            separators=(",", ":"),
+        ).encode("utf-8")
         stream.extend(f"{kind}\t{len(encoded)}\n".encode("ascii"))
         stream.extend(encoded)
         stream.extend(b"\n")
@@ -5403,6 +5884,153 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
     )
     assert "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH" not in captured_env_map
     assert captured_env_map["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
+
+
+def test_v4_flag_enables_rust_factor_mode(
+    monkeypatch,
+    tmp_path,
+):
+    captured_env_map = {}
+
+    class FakeProcess:
+        stdout = io.BytesIO(_strict_v3_scanner_frame_stream(factor_mode=True))
+        stderr = None
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(_args, stdout, stderr, env):
+        captured_env_map.update(env)
+        return FakeProcess()
+
+    monkeypatch.setenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "1")
+    monkeypatch.setenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4_FACTORS", "0")
+    monkeypatch.setattr(
+        ptg_rust_scanner,
+        "_ptg2_rust_scanner_binary",
+        lambda: tmp_path / "ptg2_scanner",
+    )
+    monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", fake_popen)
+
+    framed_records = list(
+        process_ptg._iter_compact_serving_records_rust(
+            tmp_path / "rates.json.gz",
+            raw_source_sha256="a" * 64,
+            snapshot_id="snap",
+            plan_id="plan",
+            coverage_scope_id="c" * 64,
+            plan_month_id="month",
+            source_trace_set_hash="trace",
+            v3_serving_run_directory=tmp_path / "v3-runs",
+            manifest_provider_set_component_sidecar_path=tmp_path
+            / "set-component.ptg2sc",
+            manifest_provider_component_group_sidecar_path=tmp_path
+            / "component-group.ptg2sc",
+            manifest_only=True,
+        )
+    )
+
+    assert captured_env_map["HLTHPRT_PTG2_PROVIDER_GRAPH_V4"] == "true"
+    assert captured_env_map["HLTHPRT_PTG2_PROVIDER_GRAPH_V4_FACTORS"] == "true"
+    assert framed_records[0][1]["factor_mode"] is True
+    assert framed_records[1][1]["factor_mode"] is True
+
+
+@pytest.mark.parametrize("configured_factor_paths", [(False, False), (True, False)])
+def test_ptg2_rust_compact_rejects_incomplete_v4_factor_paths(
+    configured_factor_paths,
+    monkeypatch,
+    tmp_path,
+):
+    has_set_path, has_component_path = configured_factor_paths
+    monkeypatch.setenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "1")
+    monkeypatch.setattr(
+        ptg_rust_scanner,
+        "_ptg2_rust_scanner_binary",
+        lambda: tmp_path / "ptg2_scanner",
+    )
+    monkeypatch.setattr(
+        ptg_rust_scanner.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("scanner must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match="require.*both"):
+        list(
+            process_ptg._iter_compact_serving_records_rust(
+                tmp_path / "rates.json.gz",
+                raw_source_sha256="a" * 64,
+                snapshot_id="snap",
+                plan_id="plan",
+                coverage_scope_id="c" * 64,
+                plan_month_id="month",
+                source_trace_set_hash="trace",
+                v3_serving_run_directory=tmp_path / "v3-runs",
+                manifest_provider_set_component_sidecar_path=(
+                    tmp_path / "set-component.ptg2sc" if has_set_path else None
+                ),
+                manifest_provider_component_group_sidecar_path=(
+                    tmp_path / "component-group.ptg2sc"
+                    if has_component_path
+                    else None
+                ),
+                manifest_only=True,
+            )
+        )
+
+
+def test_v4_factor_frames_are_required_when_main_mode_is_expected():
+    inactive_factor_map = {
+        "factor_mode": False,
+        "provider_graph_v4_factor_mode": False,
+    }
+    scanner_config_map = {
+        "snapshot_arch": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
+        "serving_row_semantics": "source_multiset_v1",
+        "serving_run_format": "ptg2_v3_serving_run",
+        "serving_run_version": 1,
+        **inactive_factor_map,
+    }
+    with pytest.raises(RuntimeError, match="did not activate required V4 factor mode"):
+        ptg_rust_scanner._validate_v3_scanner_config(
+            scanner_config_map,
+            expect_factor_mode=True,
+        )
+    with pytest.raises(RuntimeError, match="did not confirm required V4 factor mode"):
+        ptg_rust_scanner._validate_v3_scanner_summary(
+            inactive_factor_map,
+            expect_factor_mode=True,
+        )
+
+
+def test_v4_factor_summary_rejects_tampered_empty_npi_audit():
+    normalization_audit = _v4_empty_npi_normalization_payload(2)
+    normalization_audit["occurrence_count"] = 3
+
+    with pytest.raises(RuntimeError, match="digest changed"):
+        ptg_rust_scanner._validate_v3_scanner_summary(
+            {
+                "factor_mode": True,
+                "provider_graph_v4_factor_mode": True,
+                "empty_npi_tin_only_normalization": normalization_audit,
+            },
+            expect_factor_mode=True,
+        )
+
+
+def test_v3_scanner_summary_rejects_v4_only_empty_npi_audit():
+    with pytest.raises(RuntimeError, match="V4-only empty-NPI evidence"):
+        ptg_rust_scanner._validate_v3_scanner_summary(
+            {
+                "empty_npi_tin_only_normalization": (
+                    _v4_empty_npi_normalization_payload(0)
+                ),
+            },
+        )
 
 
 def test_ptg2_rust_compact_retries_short_pipe_reads(monkeypatch, tmp_path):
@@ -6911,6 +7539,42 @@ def test_reused_v3_serving_index_copies_only_physical_contract_fields():
     assert "future_logical_provenance" not in serving_result
 
 
+def test_reused_v4_serving_index_requires_packed_graph_contract():
+    quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload({})
+    layout_manifest = _reusable_v3_layout_manifest(quarantine)
+    serving_index = layout_manifest["serving_index"]
+    serving_index.update(
+        {
+            "type": "ptg2_shared_blocks_v4",
+            "storage_generation": "shared_blocks_v4",
+            "shared_block_layout": "packed_snapshot_maps_v4",
+            "provider_scope_strategy": "postgres_packed_graph_v4",
+            "snapshot_map": {
+                "contract": "ptg_v4_packed_snapshot_map_v1",
+                "map_digest": "ab" * 32,
+            },
+        }
+    )
+    serving_index.setdefault("serving_binary", {})["provider_graph_v4"] = {
+        "contract": "ptg2_provider_graph_v4",
+        "representation": "pattern_v1",
+        "npi_table": "ptg2_v4_npi_scope",
+    }
+
+    serving_result = process_ptg._reused_shared_v3_serving_index(
+        layout_manifest,
+        source_key="current-source",
+        shared_snapshot_key=9,
+        expected_generation="shared_blocks_v4",
+    )
+
+    assert serving_result["storage_generation"] == "shared_blocks_v4"
+    assert serving_result["snapshot_map"]["map_digest"] == "ab" * 32
+    assert serving_result["serving_binary"]["provider_graph_v4"]["contract"] == (
+        "ptg2_provider_graph_v4"
+    )
+
+
 @pytest.mark.parametrize("evidence_failure", ["missing", "tampered"])
 def test_reused_v3_serving_index_rejects_invalid_quarantine_evidence(
     evidence_failure,
@@ -6983,6 +7647,59 @@ def test_shared_v3_physical_identity_binds_source_witness_publisher(
     assert changed["publisher_source_sha256"] != baseline["publisher_source_sha256"]
 
 
+def test_scanner_fingerprint_isolates_v4_sources_when_disabled(
+    tmp_path,
+    monkeypatch,
+):
+    scanner_binary = tmp_path / "ptg2_scanner"
+    compiler_binary = tmp_path / "ptg2_provider_graph_v4"
+    scanner_binary.write_bytes(b"scanner")
+    compiler_binary.write_bytes(b"compiler")
+    monkeypatch.setattr(
+        process_ptg,
+        "_ptg2_rust_scanner_binary",
+        lambda: scanner_binary,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_resolve_v4_graph_compiler_binary",
+        lambda: compiler_binary,
+    )
+    monkeypatch.delenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", raising=False)
+    v3_baseline = process_ptg._shared_v3_scanner_identity()
+    monkeypatch.setenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "1")
+    v4_baseline = process_ptg._shared_v3_scanner_identity()
+
+    original_read_bytes = Path.read_bytes
+
+    def changed_v4_source(path):
+        source_bytes = original_read_bytes(path)
+        if path.name == "ptg2_v4_graph_compiler.py":
+            return source_bytes + b"\n# v4-only-physical-contract-change\n"
+        return source_bytes
+
+    monkeypatch.setattr(Path, "read_bytes", changed_v4_source)
+    monkeypatch.delenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", raising=False)
+    v3_after_v4_change = process_ptg._shared_v3_scanner_identity()
+    monkeypatch.setenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "1")
+    v4_after_v4_change = process_ptg._shared_v3_scanner_identity()
+
+    assert v3_baseline["contract_version"] == 3
+    assert v3_after_v4_change["publisher_source_sha256"] == (
+        v3_baseline["publisher_source_sha256"]
+    )
+    assert v3_after_v4_change["publisher_source_bytes"] == (
+        v3_baseline["publisher_source_bytes"]
+    )
+    assert v4_baseline["contract_version"] == 4
+    assert v4_after_v4_change["publisher_source_sha256"] != (
+        v4_baseline["publisher_source_sha256"]
+    )
+    assert v4_after_v4_change["publisher_source_bytes"] > (
+        v4_baseline["publisher_source_bytes"]
+    )
+
+
 def _strict_v3_downloaded_job(job):
     artifact_digest = hashlib.sha256(str(job.get("url") or "").encode()).hexdigest()
     scoped_job_map = {
@@ -7006,6 +7723,95 @@ def _strict_v3_downloaded_job(job):
             logical_hash_deferred=False,
         ),
     )
+
+
+def _patch_v4_identity_binaries(tmp_path, monkeypatch) -> None:
+    scanner_binary = tmp_path / "ptg2_scanner"
+    compiler_binary = tmp_path / "ptg2_provider_graph_v4"
+    scanner_binary.write_bytes(b"scanner")
+    compiler_binary.write_bytes(b"compiler")
+    monkeypatch.setenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "1")
+    monkeypatch.setattr(
+        process_ptg,
+        "_ptg2_rust_scanner_binary",
+        lambda: scanner_binary,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_resolve_v4_graph_compiler_binary",
+        lambda: compiler_binary,
+    )
+
+
+def _v4_identity_fingerprint(downloaded) -> str:
+    return process_ptg.shared_physical_input_identity(
+        [downloaded],
+        options={},
+        scanner_canon_version=process_ptg._shared_v3_scanner_identity(),
+    ).semantic_fingerprint
+
+
+def _expected_v4_graph_encoding_policy() -> dict[str, int]:
+    return {
+        "member_page_bytes": 16 * 1024,
+        "locator_page_bytes": 16 * 1024,
+        "heavy_owner_member_threshold": 4096,
+        "heavy_bitmap_minimum_savings_bytes": 512,
+        "max_set_patterns_per_set": 1024,
+        "max_set_components_per_fallback_set": 4096,
+        "max_online_group_keys_per_set": 4096,
+        "max_online_source_owners_per_set": 4096,
+        "max_online_source_members_per_set": 16_384,
+        "max_online_source_pages_per_set": 64,
+        "max_online_source_bytes_per_set": 1024 * 1024,
+        "online_group_npi_batch_size": 32,
+        "max_online_group_npi_members_per_set": 32_768,
+        "max_online_group_npi_locator_pages_per_set": 16,
+        "max_online_group_npi_member_pages_per_set": 128,
+        "max_online_group_npi_bytes_per_set": 4 * 1024 * 1024,
+        "max_online_group_npi_batches_per_set": 4,
+        "provider_expansion_rate_page_rows": 64,
+        "max_online_provider_expansion_rate_rows": 256,
+        "max_online_provider_expansion_provider_sets": 64,
+        "max_online_provider_expansion_graph_batches": 64,
+        "npi_prefix_target": 201,
+        "max_npi_prefix_override_owners": 50_000,
+        "max_npi_prefix_override_bytes": 64 * 1024 * 1024,
+    }
+
+
+def test_v4_physical_identity_binds_encoding_policy_but_not_admission_caps(
+    tmp_path,
+    monkeypatch,
+):
+    """Bind physical identity to bytes-on-disk policy, not admission caps."""
+
+    _patch_v4_identity_binaries(tmp_path, monkeypatch)
+    downloaded = _strict_v3_downloaded_job(
+        {
+            "url": "https://example.test/rates",
+            "type": "in_network",
+        }
+    )
+
+    baseline = _v4_identity_fingerprint(downloaded)
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V4_GRAPH_MEMBER_PAGE_BYTES",
+        "32768",
+    )
+    changed_encoding = _v4_identity_fingerprint(downloaded)
+    monkeypatch.delenv("HLTHPRT_PTG2_V4_GRAPH_MEMBER_PAGE_BYTES")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V4_GRAPH_MAX_ESTIMATED_MODEL_BYTES",
+        "777777777",
+    )
+    changed_admission = _v4_identity_fingerprint(downloaded)
+
+    assert changed_encoding != baseline
+    assert changed_admission == baseline
+    assert process_ptg._shared_v3_scanner_identity()[
+        "provider_graph_encoding_policy"
+    ] == _expected_v4_graph_encoding_policy()
 
 
 def test_full_rebuild_proof_metrics_are_opt_in_and_count_raw_reuse():
@@ -8608,6 +9414,21 @@ def test_scanner_error_labels_sigterm():
 
     assert "signal 15 (SIGTERM)" in message
     assert "PTG2_DEDUPE_SUMMARY" in message
+
+
+def test_scanner_typed_witness_limit_frame_survives_stderr_context():
+    error = ptg_rust_scanner._scanner_failure_exception(
+        "PTG2 Rust compact scanner",
+        1,
+        [
+            "scanner diagnostic",
+            'PTG2_SCANNER_ERROR\t{"code":"witness_payload_limit",'
+            '"message":"source witness exceeded its fail-closed budget"}',
+        ],
+    )
+
+    assert isinstance(error, ptg_rust_scanner.WitnessPayloadLimitError)
+    assert "fail-closed budget" in str(error)
 
 
 def test_scanner_allows_sigterm_after_dedupe():

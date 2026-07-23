@@ -103,11 +103,14 @@ CLAIMS_MAX_YEAR = max(int(os.getenv("HLTHPRT_CLAIMS_MAX_YEAR", "2023")), CLAIMS_
 CLAIMS_YEAR_WINDOW = tuple(range(CLAIMS_MIN_YEAR, CLAIMS_MAX_YEAR + 1))
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _is_env_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+_env_bool = _is_env_enabled
 
 
 CLAIMS_PARALLEL_LOAD = _env_bool("HLTHPRT_CLAIMS_PARALLEL_LOAD", default=True)
@@ -283,10 +286,13 @@ async def _get_run_progress(redis, run_id: str, expected_default: int) -> tuple[
     return total_chunks, done_chunks
 
 
-async def _claim_finalize_lock(redis, run_id: str) -> bool:
+async def _is_finalize_lock_claimed(redis, run_id: str) -> bool:
     lock_key = _state_key(run_id, "finalize_lock")
     lock_set = await redis.set(lock_key, "1", ex=CLAIMS_REDIS_TTL_SECONDS, nx=True)
     return bool(lock_set)
+
+
+_claim_finalize_lock = _is_finalize_lock_claimed
 
 
 def _print_row_progress(stage: str, parsed: int, accepted: int, start_time: float, final: bool = False) -> None:
@@ -332,10 +338,10 @@ def _is_deadlock_error(exc: BaseException) -> bool:
 def _dedupe_rows(rows: list[dict[str, Any]], key_fields: tuple[str, ...]) -> list[dict[str, Any]]:
     if not rows:
         return rows
-    deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    row_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
-        deduped[tuple(row.get(field) for field in key_fields)] = row
-    return list(deduped.values())
+        row_by_key[tuple(row.get(field) for field in key_fields)] = row
+    return list(row_by_key.values())
 
 
 def _chunk_rows(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
@@ -448,21 +454,21 @@ def _select_csv_distributions_by_year(
     dataset: dict[str, Any],
     years: set[int],
 ) -> dict[int, dict[str, Any]]:
-    selected: dict[int, dict[str, Any]] = {}
+    distribution_by_year: dict[int, dict[str, Any]] = {}
     for distribution in _csv_distributions(dataset):
         url = str(distribution.get("downloadURL") or "")
         year = _extract_reporting_year(url)
         if year not in years:
             continue
-        previous = selected.get(year)
+        previous = distribution_by_year.get(year)
         if previous is None:
-            selected[year] = distribution
+            distribution_by_year[year] = distribution
             continue
         previous_key = (_parse_modified(previous), str(previous.get("downloadURL") or ""))
         candidate_key = (_parse_modified(distribution), url)
         if candidate_key > previous_key:
-            selected[year] = distribution
-    return selected
+            distribution_by_year[year] = distribution
+    return distribution_by_year
 
 
 def _find_dataset(catalog: dict[str, Any], landing_page: str) -> dict[str, Any]:
@@ -620,9 +626,12 @@ def _location_key(
     return _signed_hash64([npi, year, procedure_code, city or "", state or "", zip5 or "", key_extra or ""])
 
 
-def _row_allowed_for_test(row_number: int) -> bool:
+def _is_row_allowed_for_test(row_number: int) -> bool:
     # Deterministic sparse sampling pattern for large files.
     return row_number % 11 == 0
+
+
+_row_allowed_for_test = _is_row_allowed_for_test
 
 
 async def _ensure_indexes(obj: type, db_schema: str) -> None:
@@ -658,7 +667,7 @@ async def _ensure_indexes(obj: type, db_schema: str) -> None:
 async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str, type], str]:
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
-    dynamic: dict[str, type] = {}
+    classes_by_name: dict[str, type] = {}
 
     for cls in (
         PricingProvider,
@@ -670,7 +679,7 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
         PricingProcedureGeoBenchmark,
     ):
         obj = make_class(cls, stage_suffix, schema_override=db_schema)
-        dynamic[cls.__name__] = obj
+        classes_by_name[cls.__name__] = obj
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
         # Defensive cleanup for rare orphan composite types after interrupted DDL.
         await db.status(f"DROP TYPE IF EXISTS {db_schema}.{obj.__tablename__} CASCADE;")
@@ -678,7 +687,7 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
         if not CLAIMS_DEFER_STAGE_INDEXES:
             await _ensure_indexes(obj, db_schema)
 
-    return dynamic, db_schema
+    return classes_by_name, db_schema
 
 
 async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
@@ -754,7 +763,7 @@ def _select_csv_distribution_for_test(dataset: dict[str, Any]) -> dict[str, Any]
 
 
 def _resolve_sources(catalog: dict[str, Any], test_mode: bool = False) -> dict[str, list[dict[str, Any]]]:
-    resolved: dict[str, list[dict[str, Any]]] = {}
+    sources_by_dataset: dict[str, list[dict[str, Any]]] = {}
     requested_years = set(CLAIMS_YEAR_WINDOW)
     for config in DATASETS:
         dataset = _find_dataset(catalog, config.landing_page)
@@ -784,8 +793,8 @@ def _resolve_sources(catalog: dict[str, Any], test_mode: bool = False) -> dict[s
                     "dataset_title": dataset.get("title"),
                 }
             )
-        resolved[config.key] = per_dataset_sources
-    return resolved
+        sources_by_dataset[config.key] = per_dataset_sources
+    return sources_by_dataset
 
 
 async def _download_csv_head(url: str, path: str, max_bytes: int) -> None:
@@ -814,7 +823,7 @@ async def _download_csv_head(url: str, path: str, max_bytes: int) -> None:
 
 async def _download_source_file(
     dataset_key: str,
-    source: dict[str, Any],
+    source_by_field: dict[str, Any],
     temp_dir: str,
     test_mode: bool,
     reporting_year: int | None = None,
@@ -831,9 +840,13 @@ async def _download_source_file(
     for attempt in range(1, DOWNLOAD_RETRIES + 1):
         try:
             if test_mode:
-                await _download_csv_head(source["url"], path, TEST_MAX_DOWNLOAD_BYTES)
+                await _download_csv_head(
+                    source_by_field["url"],
+                    path,
+                    TEST_MAX_DOWNLOAD_BYTES,
+                )
             else:
-                await download_it_and_save(source["url"], path)
+                await download_it_and_save(source_by_field["url"], path)
             return path
         except Retry as exc:
             if attempt >= DOWNLOAD_RETRIES:
@@ -842,7 +855,7 @@ async def _download_source_file(
                 "Retrying download (%s/%s) for %s due to %r",
                 attempt,
                 DOWNLOAD_RETRIES,
-                source["url"],
+                source_by_field["url"],
                 exc,
             )
             await asyncio.sleep(min(5 * attempt, 20))
@@ -853,7 +866,7 @@ async def _download_source_file(
                 "Retrying download (%s/%s) for %s due to %r",
                 attempt,
                 DOWNLOAD_RETRIES,
-                source["url"],
+                source_by_field["url"],
                 exc,
             )
             await asyncio.sleep(min(5 * attempt, 20))
@@ -892,16 +905,18 @@ async def _split_provider_service_into_chunks(
     bucket_count = max(1, min(est_chunks, CLAIMS_PROVIDER_DRUG_MAX_BUCKETS))
     row_limit = TEST_PROVIDER_SERVICE_ROW_LIMIT if test_mode else None
 
-    writers: dict[int, Any] = {}
-    handles: dict[int, Any] = {}
-    rows_per_bucket: dict[int, int] = {idx: 0 for idx in range(bucket_count)}
+    writer_by_bucket: dict[int, Any] = {}
+    handle_by_bucket: dict[int, Any] = {}
+    row_count_by_bucket: dict[int, int] = {
+        idx: 0 for idx in range(bucket_count)
+    }
     parsed_rows = 0
     accepted_rows = 0
 
     try:
         async with async_open(source_path, "r", encoding="utf-8-sig") as source_handle:
             reader = AsyncDictReader(source_handle)
-            async for row in reader:
+            async for source_row in reader:
                 parsed_rows += 1
                 if test_mode:
                     if not _row_allowed_for_test(parsed_rows):
@@ -909,31 +924,40 @@ async def _split_provider_service_into_chunks(
                     if row_limit is not None and accepted_rows >= row_limit:
                         break
 
-                npi = _to_npi(_row_value(row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
+                npi = _to_npi(
+                    _row_value(
+                        source_row,
+                        "Rndrng_NPI",
+                        "PRSCRBR_NPI",
+                        "Prscrbr_NPI",
+                    )
+                )
                 if npi is None:
                     continue
                 bucket = abs(int(npi)) % bucket_count
 
-                if bucket not in writers:
+                if bucket not in writer_by_bucket:
                     chunk_path = chunks_dir / f"chunk_{bucket:05d}.csv"
                     handle = open(chunk_path, "w", encoding="utf-8", newline="")
-                    fieldnames = [key for key in row.keys() if key is not None]
+                    fieldnames = [
+                        key for key in source_row.keys() if key is not None
+                    ]
                     writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
                     writer.writeheader()
-                    handles[bucket] = handle
-                    writers[bucket] = writer
+                    handle_by_bucket[bucket] = handle
+                    writer_by_bucket[bucket] = writer
 
-                writers[bucket].writerow(row)
-                rows_per_bucket[bucket] += 1
+                writer_by_bucket[bucket].writerow(source_row)
+                row_count_by_bucket[bucket] += 1
                 accepted_rows += 1
     finally:
-        for handle in handles.values():
+        for handle in handle_by_bucket.values():
             handle.close()
 
     chunks: list[dict[str, Any]] = []
     chunk_index = 0
     for bucket in range(bucket_count):
-        rows_in_bucket = rows_per_bucket.get(bucket, 0)
+        rows_in_bucket = row_count_by_bucket.get(bucket, 0)
         if rows_in_bucket <= 0:
             continue
         chunk_path = chunks_dir / f"chunk_{bucket:05d}.csv"
@@ -1083,7 +1107,7 @@ async def _split_sources_to_chunks(
 async def _load_provider_rows(path: str, provider_cls: type, year: int, test_mode: bool) -> None:
     """Load normalized provider rows from a claims source file."""
 
-    rows: list[dict[str, Any]] = []
+    provider_rows: list[dict[str, Any]] = []
     accepted = 0
     skipped_invalid_state = 0
     progress_start = time.monotonic()
@@ -1091,56 +1115,125 @@ async def _load_provider_rows(path: str, provider_cls: type, year: int, test_mod
     async with async_open(path, "r", encoding="utf-8-sig") as handle:
         reader = AsyncDictReader(handle)
         row_number = 0
-        async for row in reader:
+        async for source_row in reader:
             row_number += 1
             now = time.monotonic()
             if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
                 _print_row_progress("providers", row_number, accepted, progress_start)
                 progress_last = now
-            npi = _to_npi(_row_value(row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
+            npi = _to_npi(
+                _row_value(
+                    source_row,
+                    "Rndrng_NPI",
+                    "PRSCRBR_NPI",
+                    "Prscrbr_NPI",
+                )
+            )
             if npi is None:
                 continue
             if test_mode and not _row_allowed_for_test(row_number):
                 continue
-            raw_state = _row_value(row, "Rndrng_Prvdr_State_Abrvtn", "Prscrbr_State_Abrvtn")
+            raw_state = _row_value(
+                source_row,
+                "Rndrng_Prvdr_State_Abrvtn",
+                "Prscrbr_State_Abrvtn",
+            )
             state = _normalize_state(raw_state)
             if _has_value(raw_state) and state is None:
                 skipped_invalid_state += 1
                 continue
-            raw_zip5 = _row_value(row, "Rndrng_Prvdr_Zip5", "Prscrbr_zip5")
-            first_name = _to_str(_row_value(row, "Rndrng_Prvdr_First_Name", "Prscrbr_First_Name"))
-            last_org_name = _to_str(_row_value(row, "Rndrng_Prvdr_Last_Org_Name", "Prscrbr_Last_Org_Name"))
-            provider_row = {
+            raw_zip5 = _row_value(
+                source_row,
+                "Rndrng_Prvdr_Zip5",
+                "Prscrbr_zip5",
+            )
+            first_name = _to_str(
+                _row_value(
+                    source_row,
+                    "Rndrng_Prvdr_First_Name",
+                    "Prscrbr_First_Name",
+                )
+            )
+            last_org_name = _to_str(
+                _row_value(
+                    source_row,
+                    "Rndrng_Prvdr_Last_Org_Name",
+                    "Prscrbr_Last_Org_Name",
+                )
+            )
+            provider_row_by_field = {
                 "provider_key": _provider_key(npi, year),
                 "npi": npi,
                 "year": year,
                 "provider_name": _provider_name(last_org_name, first_name),
                 "first_name": first_name,
                 "last_org_name": last_org_name,
-                "credentials": _to_str(_row_value(row, "Rndrng_Prvdr_Crdntls", "Prscrbr_Crdntls")),
-                "provider_type": _to_str(_row_value(row, "Rndrng_Prvdr_Type", "Prscrbr_Type")),
-                "city": _to_str(_row_value(row, "Rndrng_Prvdr_City", "Prscrbr_City")),
+                "credentials": _to_str(
+                    _row_value(
+                        source_row,
+                        "Rndrng_Prvdr_Crdntls",
+                        "Prscrbr_Crdntls",
+                    )
+                ),
+                "provider_type": _to_str(
+                    _row_value(
+                        source_row,
+                        "Rndrng_Prvdr_Type",
+                        "Prscrbr_Type",
+                    )
+                ),
+                "city": _to_str(
+                    _row_value(
+                        source_row,
+                        "Rndrng_Prvdr_City",
+                        "Prscrbr_City",
+                    )
+                ),
                 "state": state,
                 "zip5": _normalize_zip5(raw_zip5),
-                "country": _to_str(_row_value(row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")),
-                "total_services": _to_float(_row_value(row, "Tot_Srvcs", "Tot_Clms")),
-                "total_distinct_hcpcs_codes": _to_float(_row_value(row, "Tot_HCPCS_Cds", "Tot_30day_Fills")),
-                "total_allowed_amount": _to_float(_row_value(row, "Tot_Mdcr_Alowd_Amt", "Tot_Drug_Cst")),
-                "total_submitted_charges": _to_float(_row_value(row, "Tot_Sbmtd_Chrg", "Tot_Day_Suply")),
-                "total_beneficiaries": _to_float(_row_value(row, "Tot_Benes")),
+                "country": _to_str(
+                    _row_value(
+                        source_row,
+                        "Rndrng_Prvdr_Cntry",
+                        "Prscrbr_Cntry",
+                    )
+                ),
+                "total_services": _to_float(
+                    _row_value(source_row, "Tot_Srvcs", "Tot_Clms")
+                ),
+                "total_distinct_hcpcs_codes": _to_float(
+                    _row_value(source_row, "Tot_HCPCS_Cds", "Tot_30day_Fills")
+                ),
+                "total_allowed_amount": _to_float(
+                    _row_value(
+                        source_row,
+                        "Tot_Mdcr_Alowd_Amt",
+                        "Tot_Drug_Cst",
+                    )
+                ),
+                "total_submitted_charges": _to_float(
+                    _row_value(
+                        source_row,
+                        "Tot_Sbmtd_Chrg",
+                        "Tot_Day_Suply",
+                    )
+                ),
+                "total_beneficiaries": _to_float(
+                    _row_value(source_row, "Tot_Benes")
+                ),
             }
-            rows.append(provider_row)
+            provider_rows.append(provider_row_by_field)
             accepted += 1
-            if len(rows) >= IMPORT_BATCH_SIZE:
-                rows = _dedupe_rows(rows, ("provider_key",))
-                await _push_objects_with_retry(rows, provider_cls)
-                rows.clear()
+            if len(provider_rows) >= IMPORT_BATCH_SIZE:
+                provider_rows = _dedupe_rows(provider_rows, ("provider_key",))
+                await _push_objects_with_retry(provider_rows, provider_cls)
+                provider_rows.clear()
             if test_mode and accepted >= TEST_PROVIDER_ROW_LIMIT:
                 break
 
-    if rows:
-        rows = _dedupe_rows(rows, ("provider_key",))
-        await _push_objects_with_retry(rows, provider_cls)
+    if provider_rows:
+        provider_rows = _dedupe_rows(provider_rows, ("provider_key",))
+        await _push_objects_with_retry(provider_rows, provider_cls)
     _print_row_progress("providers", row_number, accepted, progress_start, final=True)
     if accepted == 0:
         _safe_print(
@@ -1183,35 +1276,62 @@ async def _load_provider_service_rows(
     async with async_open(path, "r", encoding="utf-8-sig") as handle:
         reader = AsyncDictReader(handle)
         row_number = 0
-        async for row in reader:
+        async for source_row in reader:
             row_number += 1
             now = time.monotonic()
             if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
                 _print_row_progress("provider_service", row_number, accepted, progress_start)
                 progress_last = now
-            npi = _to_npi(_row_value(row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
+            npi = _to_npi(
+                _row_value(
+                    source_row,
+                    "Rndrng_NPI",
+                    "PRSCRBR_NPI",
+                    "Prscrbr_NPI",
+                )
+            )
             if npi is None:
                 continue
             if test_mode and not _row_allowed_for_test(row_number):
                 continue
 
-            service_code = _normalize_service_code(_row_value(row, "HCPCS_Cd", "HCPCS_CD"))
+            service_code = _normalize_service_code(
+                _row_value(source_row, "HCPCS_Cd", "HCPCS_CD")
+            )
             if service_code is None:
                 continue
             code_system = _detect_code_system(service_code)
             procedure_code = _procedure_code_from_service(code_system, service_code)
-            service_desc = _to_str(_row_value(row, "HCPCS_Desc", "HCPCS_DESC"))
-            city = _to_str(_row_value(row, "Rndrng_Prvdr_City", "Prscrbr_City"))
-            raw_state = _row_value(row, "Rndrng_Prvdr_State_Abrvtn", "Prscrbr_State_Abrvtn")
+            service_desc = _to_str(
+                _row_value(source_row, "HCPCS_Desc", "HCPCS_DESC")
+            )
+            city = _to_str(
+                _row_value(source_row, "Rndrng_Prvdr_City", "Prscrbr_City")
+            )
+            raw_state = _row_value(
+                source_row,
+                "Rndrng_Prvdr_State_Abrvtn",
+                "Prscrbr_State_Abrvtn",
+            )
             state = _normalize_state(raw_state)
             if _has_value(raw_state) and state is None:
                 skipped_invalid_state += 1
                 continue
-            zip5 = _normalize_zip5(_row_value(row, "Rndrng_Prvdr_Zip5", "Prscrbr_zip5"))
-            place_of_service = _to_str(_row_value(row, "Place_Of_Srvc", "PLACE_OF_SRVC"))
-            avg_allowed_amount = _to_float(_row_value(row, "Avg_Mdcr_Alowd_Amt"))
-            avg_submitted_charge = _to_float(_row_value(row, "Avg_Sbmtd_Chrg"))
-            total_services = _to_float(_row_value(row, "Tot_Srvcs", "Tot_Clms"))
+            zip5 = _normalize_zip5(
+                _row_value(source_row, "Rndrng_Prvdr_Zip5", "Prscrbr_zip5")
+            )
+            place_of_service = _to_str(
+                _row_value(source_row, "Place_Of_Srvc", "PLACE_OF_SRVC")
+            )
+            avg_allowed_amount = _to_float(
+                _row_value(source_row, "Avg_Mdcr_Alowd_Amt")
+            )
+            avg_submitted_charge = _to_float(
+                _row_value(source_row, "Avg_Sbmtd_Chrg")
+            )
+            total_services = _to_float(
+                _row_value(source_row, "Tot_Srvcs", "Tot_Clms")
+            )
             total_allowed_amount = None
             if avg_allowed_amount is not None and total_services is not None:
                 total_allowed_amount = avg_allowed_amount * total_services
@@ -1223,17 +1343,25 @@ async def _load_provider_service_rows(
             elif avg_submitted_charge is not None:
                 total_submitted_charge = avg_submitted_charge
 
-            provider_row = {
+            provider_row_by_field = {
                 "npi": npi,
                 "year": year,
                 "procedure_code": procedure_code,
                 "service_description": service_desc,
                 "reported_code": service_code,
                 "total_services": total_services,
-                "total_beneficiary_day_services": _to_float(_row_value(row, "Tot_Bene_Day_Srvcs", "Tot_30day_Fills")),
+                "total_beneficiary_day_services": _to_float(
+                    _row_value(
+                        source_row,
+                        "Tot_Bene_Day_Srvcs",
+                        "Tot_30day_Fills",
+                    )
+                ),
                 "total_submitted_charges": total_submitted_charge,
                 "total_allowed_amount": total_allowed_amount,
-                "total_beneficiaries": _to_float(_row_value(row, "Tot_Benes")),
+                "total_beneficiaries": _to_float(
+                    _row_value(source_row, "Tot_Benes")
+                ),
                 "ge65_total_services": None,
                 "ge65_total_allowed_amount": None,
                 "ge65_total_beneficiaries": None,
@@ -1241,21 +1369,40 @@ async def _load_provider_service_rows(
             proc_key = (npi, year, procedure_code)
             existing = provider_procedure_map.get(proc_key)
             if existing is None:
-                provider_procedure_map[proc_key] = provider_row
+                provider_procedure_map[proc_key] = provider_row_by_field
             else:
-                existing["total_services"] = _sum_optional(existing.get("total_services"), provider_row.get("total_services"))
+                existing["total_services"] = _sum_optional(
+                    existing.get("total_services"),
+                    provider_row_by_field.get("total_services"),
+                )
                 existing["total_beneficiary_day_services"] = _sum_optional(
-                    existing.get("total_beneficiary_day_services"), provider_row.get("total_beneficiary_day_services")
+                    existing.get("total_beneficiary_day_services"),
+                    provider_row_by_field.get("total_beneficiary_day_services"),
                 )
                 existing["total_submitted_charges"] = _sum_optional(
-                    existing.get("total_submitted_charges"), provider_row.get("total_submitted_charges")
+                    existing.get("total_submitted_charges"),
+                    provider_row_by_field.get("total_submitted_charges"),
                 )
-                existing["total_allowed_amount"] = _sum_optional(existing.get("total_allowed_amount"), provider_row.get("total_allowed_amount"))
-                existing["total_beneficiaries"] = _sum_optional(existing.get("total_beneficiaries"), provider_row.get("total_beneficiaries"))
-                if not existing.get("service_description") and provider_row.get("service_description"):
-                    existing["service_description"] = provider_row["service_description"]
-                if not existing.get("reported_code") and provider_row.get("reported_code"):
-                    existing["reported_code"] = provider_row["reported_code"]
+                existing["total_allowed_amount"] = _sum_optional(
+                    existing.get("total_allowed_amount"),
+                    provider_row_by_field.get("total_allowed_amount"),
+                )
+                existing["total_beneficiaries"] = _sum_optional(
+                    existing.get("total_beneficiaries"),
+                    provider_row_by_field.get("total_beneficiaries"),
+                )
+                if (
+                    not existing.get("service_description")
+                    and provider_row_by_field.get("service_description")
+                ):
+                    existing["service_description"] = provider_row_by_field[
+                        "service_description"
+                    ]
+                if (
+                    not existing.get("reported_code")
+                    and provider_row_by_field.get("reported_code")
+                ):
+                    existing["reported_code"] = provider_row_by_field["reported_code"]
 
             location_key = _location_key(npi, year, procedure_code, city, state, zip5, key_extra=place_of_service)
             if location_key not in seen_location_keys:
@@ -2180,17 +2327,17 @@ async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[
     )
     await ensure_database(test_mode)
 
-    t = _step_start("prepare staging tables")
+    step_started_at = _step_start("prepare staging tables")
     _classes, schema = await _prepare_tables(stage_suffix, test_mode)
-    _step_end("prepare staging tables", t)
+    _step_end("prepare staging tables", step_started_at)
 
-    t = _step_start("fetch CMS catalog")
+    step_started_at = _step_start("fetch CMS catalog")
     catalog = await _fetch_catalog()
-    _step_end("fetch CMS catalog", t)
+    _step_end("fetch CMS catalog", step_started_at)
 
-    t = _step_start("resolve CMS sources")
+    step_started_at = _step_start("resolve CMS sources")
     sources = _resolve_sources(catalog, test_mode=test_mode)
-    _step_end("resolve CMS sources", t)
+    _step_end("resolve CMS sources", step_started_at)
 
     work_dir = _run_dir(import_id_val, run_id)
     downloads_dir = work_dir / "downloads"
@@ -2233,7 +2380,7 @@ async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[
             finally:
                 _step_end(f"download+split {dataset_key} year={reporting_year}", step)
 
-    t = _step_start("download+split+enqueue chunks (streaming)")
+    step_started_at = _step_start("download+split+enqueue chunks (streaming)")
     dataset_tasks = [
         asyncio.create_task(_download_split_source(dataset.key, source, idx))
         for dataset in DATASETS
@@ -2278,7 +2425,7 @@ async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[
         for task_ref in dataset_tasks:
             if not task_ref.done():
                 task_ref.cancel()
-    _step_end("download+split+enqueue chunks (streaming)", t)
+    _step_end("download+split+enqueue chunks (streaming)", step_started_at)
 
     manifest = {
         "import_id": import_id_val,
@@ -2473,25 +2620,25 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
         )
 
     classes = _staging_classes(stage_suffix, schema)
-    t = _step_start("ensure live code tables")
+    step_started_at = _step_start("ensure live code tables")
     await _ensure_live_code_tables(schema)
-    _step_end("ensure live code tables", t)
-    t = _step_start("materialize procedure/code dimensions")
+    _step_end("ensure live code tables", step_started_at)
+    step_started_at = _step_start("materialize procedure/code dimensions")
     await _materialize_code_and_crosswalk_rows(classes, schema)
-    _step_end("materialize procedure/code dimensions", t)
-    t = _step_start("materialize cost-level profile and peer stats")
+    _step_end("materialize procedure/code dimensions", step_started_at)
+    step_started_at = _step_start("materialize cost-level profile and peer stats")
     await _materialize_cost_level_rows(classes, schema)
-    _step_end("materialize cost-level profile and peer stats", t)
-    t = _step_start("verify cost-level coverage diagnostics")
+    _step_end("materialize cost-level profile and peer stats", step_started_at)
+    step_started_at = _step_start("verify cost-level coverage diagnostics")
     cost_level_diagnostics = await _collect_cost_level_diagnostics(classes, schema)
-    _step_end("verify cost-level coverage diagnostics", t)
+    _step_end("verify cost-level coverage diagnostics", step_started_at)
     if CLAIMS_DEFER_STAGE_INDEXES:
-        t = _step_start("build staging indexes")
+        step_started_at = _step_start("build staging indexes")
         await _build_staging_indexes(classes, schema)
-        _step_end("build staging indexes", t)
-    t = _step_start("publish staging -> final (transactional rename)")
+        _step_end("build staging indexes", step_started_at)
+    step_started_at = _step_start("publish staging -> final (transactional rename)")
     await _publish_by_table_rename(classes, schema)
-    _step_end("publish staging -> final (transactional rename)", t)
+    _step_end("publish staging -> final (transactional rename)", step_started_at)
 
     if redis is not None and run_id:
         await redis.set(_state_key(run_id, "finalized"), "1", ex=CLAIMS_REDIS_TTL_SECONDS)

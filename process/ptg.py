@@ -19,7 +19,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import ijson
 from sqlalchemy import cast, func, literal
@@ -142,7 +142,8 @@ from process.ptg_parts.input_artifact_retention import (
     guard_artifact_lease,
     release_current_artifact_lease,
 )
-from process.ptg_parts.progress import (_artifact_progress_position,
+from process.ptg_parts.progress import (PTGFileProgressCoordinator,
+                                        _artifact_progress_position,
                                         _format_duration,
                                         _maybe_log_artifact_progress,
                                         _scale_stage_progress_pct, _utcnow)
@@ -198,6 +199,14 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_strict_shared_v3_layout,
     validate_reused_snapshot_sources,
 )
+from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_SHARED_GENERATION,
+    reserve_v4_shared_layout,
+)
+from process.ptg_parts.ptg2_v4_graph_compiler import (
+    _resolve_v4_graph_compiler_binary,
+    v4_graph_encoding_policy,
+)
 from process.ptg_parts.ptg2_source_witness_contract import (
     validate_source_witness_manifest,
 )
@@ -210,8 +219,14 @@ from process.ptg_parts.row_helpers import (_as_int_list, _as_list,
                                            _provider_group_hash_prefix,
                                            _provider_group_identity_hash)
 from process.ptg_parts.rust_scanner import (
-    _aiter_compact_serving_records_rust, _iter_compact_serving_records_rust,
-    _iter_top_level_object_bytes_rust, _ptg2_rust_scanner_binary)
+    _V4_EMPTY_NPI_NORMALIZATION_CONTRACT,
+    _V4_EMPTY_NPI_NORMALIZATION_HASH_DOMAIN,
+    _aiter_compact_serving_records_rust,
+    _iter_compact_serving_records_rust,
+    _iter_top_level_object_bytes_rust,
+    _ptg2_rust_scanner_binary,
+    _verify_v4_tin_only_audit,
+)
 from process.ptg_parts.screen import _emit_screen_line
 from process.ptg_parts.snapshot_cleanup import (
     _cleanup_old_ptg2_source_tables, _drop_ptg2_snapshot_table_names,
@@ -232,6 +247,7 @@ from process.ptg_parts.source_download import (PTG2_DEFAULT_MAX_BYTES,
                                                _emit_download_progress,
                                                _format_eta_seconds,
                                                _iter_downloaded_ptg_jobs,
+                                               _progress_job_index,
                                                _probe_http_range_support,
                                                download_raw_artifact,
                                                fetch_head_metadata,
@@ -286,6 +302,7 @@ from process.url_security import fetch_max_bytes
 
 logger = logging.getLogger(__name__)
 _ptg2_monotonic = time.monotonic
+_PTG2_PUBLISH_PROGRESS_INTERVAL_SECONDS = 4.0
 
 PTG2_SOURCE_SCOPED_TEST_ENV = "HLTHPRT_PTG2_SOURCE_SCOPED_TEST"
 PTG2_AUTO_ADDRESS_REFRESH_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH"
@@ -898,6 +915,66 @@ async def _copy_manifest_files_direct_with_progress(
     """Copy manifest worker files, emit progress, and return throughput metrics."""
     existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
     input_bytes = sum(input_path.stat().st_size for input_path in existing_paths)
+    copy_started_at = _ptg2_monotonic()
+    copy_progress_by_field = {
+        "copied_bytes": 0,
+        "last_emitted_bytes": 0,
+        "next_progress_at": (
+            copy_started_at + _PTG2_PUBLISH_PROGRESS_INTERVAL_SECONDS
+        ),
+    }
+    progress_lock = threading.Lock()
+
+    def report_copied_bytes(byte_count: int) -> None:
+        """Aggregate exact COPY reads and publish a bounded-rate movement event."""
+
+        if byte_count <= 0:
+            return
+        with progress_lock:
+            copy_progress_by_field["copied_bytes"] += int(byte_count)
+            now = _ptg2_monotonic()
+            if (
+                copy_progress_by_field["copied_bytes"]
+                <= copy_progress_by_field["last_emitted_bytes"]
+                or now < copy_progress_by_field["next_progress_at"]
+            ):
+                return
+            copy_progress_by_field["last_emitted_bytes"] = (
+                copy_progress_by_field["copied_bytes"]
+            )
+            copy_progress_by_field["next_progress_at"] = (
+                now + _PTG2_PUBLISH_PROGRESS_INTERVAL_SECONDS
+            )
+            elapsed_seconds = max(now - copy_started_at, 0.0)
+            copied_bytes = copy_progress_by_field["copied_bytes"]
+            _emit_ptg2_publish_progress(
+                f"copying {kind}",
+                completed_steps=completed_steps_before_copy,
+                total_steps=total_steps,
+                stage_start_pct=92.0,
+                stage_end_pct=95.0,
+                message_text=(
+                    f"copied {copied_bytes} of {input_bytes} {kind} "
+                    f"byte(s) into {target_table}"
+                ),
+                copy_kind=kind,
+                target_table=target_table,
+                input_files=len(existing_paths),
+                input_bytes=input_bytes,
+                direct_to_copy=True,
+                counters={
+                    "manifest_copy_bytes": copied_bytes,
+                    "manifest_copy_total_bytes": input_bytes,
+                },
+                throughput={
+                    "bytes_per_second": (
+                        copied_bytes / elapsed_seconds
+                        if elapsed_seconds > 0
+                        else None
+                    )
+                },
+            )
+
     copy_tasks = max(
         _env_int(
             PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV,
@@ -919,20 +996,27 @@ async def _copy_manifest_files_direct_with_progress(
         direct_to_copy=True,
         copy_tasks=min(copy_tasks, max(len(existing_paths), 1)),
     )
-    copy_started_at = time.monotonic()
     if copy_tasks <= 1 or len(existing_paths) <= 1:
         for input_path in existing_paths:
-            await copy_func(input_path, target_table=target_table)
+            await copy_func(
+                input_path,
+                target_table=target_table,
+                progress_callback=report_copied_bytes,
+            )
     else:
         semaphore = asyncio.Semaphore(copy_tasks)
 
         async def copy_one(input_path: Path) -> None:
             """Run one copy operation under the shared concurrency limit."""
             async with semaphore:
-                await copy_func(input_path, target_table=target_table)
+                await copy_func(
+                    input_path,
+                    target_table=target_table,
+                    progress_callback=report_copied_bytes,
+                )
 
         await asyncio.gather(*(copy_one(input_path) for input_path in existing_paths))
-    elapsed_seconds = time.monotonic() - copy_started_at
+    elapsed_seconds = _ptg2_monotonic() - copy_started_at
     row_count = int(emitted_rows or 0)
     _emit_ptg2_publish_progress(
         f"copied {kind}",
@@ -948,6 +1032,11 @@ async def _copy_manifest_files_direct_with_progress(
         input_rows=row_count,
         output_rows=row_count,
         dropped_rows=0,
+        counters={
+            "manifest_copy_bytes": copy_progress_by_field["copied_bytes"],
+            "manifest_copy_total_bytes": input_bytes,
+            "manifest_copy_rows": row_count,
+        },
         direct_to_copy=True,
         copy_tasks=min(copy_tasks, max(len(existing_paths), 1)),
         elapsed_seconds=elapsed_seconds,
@@ -1237,6 +1326,7 @@ async def _parse_strict_v3_file(
     max_items: int | None = None,
     ptg2_manifest_stage_table: str | None = None,
     source_network_names: list[str] | str | None = None,
+    progress_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Scan one file into strict V3 COPY artifacts and clean incomplete scratch state."""
 
@@ -1380,11 +1470,22 @@ async def _parse_strict_v3_file(
             dir=manifest_artifact_parent,
         )
     )
+    provider_graph_v4 = _env_bool("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", False)
     manifest_sidecar_paths_by_kind = {
-        "provider_forward": manifest_artifact_dir
-        / f"provider_forward_{manifest_file_token}.ptg2sc",
-        "provider_inverted": manifest_artifact_dir
-        / f"provider_inverted_{manifest_file_token}.ptg2sc",
+        "provider_forward": None
+        if provider_graph_v4
+        else manifest_artifact_dir / f"provider_forward_{manifest_file_token}.ptg2sc",
+        "provider_inverted": None
+        if provider_graph_v4
+        else manifest_artifact_dir / f"provider_inverted_{manifest_file_token}.ptg2sc",
+        "provider_set_component": manifest_artifact_dir
+        / f"provider_set_component_{manifest_file_token}.ptg2sc"
+        if provider_graph_v4
+        else None,
+        "provider_component_group": manifest_artifact_dir
+        / f"provider_component_group_{manifest_file_token}.ptg2sc"
+        if provider_graph_v4
+        else None,
         "provider_group_npi": manifest_artifact_dir
         / f"provider_group_npi_{manifest_file_token}.ptg2sc",
         "provider_npi_group": manifest_artifact_dir
@@ -1491,6 +1592,12 @@ async def _parse_strict_v3_file(
             manifest_provider_inverted_sidecar_path=manifest_sidecar_paths_by_kind[
                 "provider_inverted"
             ],
+            manifest_provider_set_component_sidecar_path=manifest_sidecar_paths_by_kind[
+                "provider_set_component"
+            ],
+            manifest_provider_component_group_sidecar_path=manifest_sidecar_paths_by_kind[
+                "provider_component_group"
+            ],
             manifest_provider_npi_sidecar_path=None,
             manifest_price_forward_sidecar_path=None,
             manifest_price_atom_copy_path=manifest_price_atom_copy_path,
@@ -1501,6 +1608,7 @@ async def _parse_strict_v3_file(
             manifest_provider_set_dictionary_copy_path=manifest_provider_set_metadata_copy_path,
             source_network_names=source_network_name_values,
             manifest_only=True,
+            progress_observer=progress_observer,
         ):
             if record_kind == "dedupe_summary":
                 rust_dedupe_summary_by_field = dict(record_row or {})
@@ -2218,6 +2326,7 @@ async def _process_in_network_file(
     raw_artifact: PTG2RawArtifact | None = None,
     logical_artifact: PTG2LogicalArtifact | None = None,
     recorded_provenance: Mapping[str, Any] | None = None,
+    progress_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> PTG2FileProcessResult:
     """Scan one in-network job into strict V3 staging and return its result."""
     url = job["url"]
@@ -2270,6 +2379,7 @@ async def _process_in_network_file(
             max_items=max_items,
             ptg2_manifest_stage_table=ptg2_manifest_stage_table,
             source_network_names=source_network_name_values,
+            progress_observer=progress_observer,
         )
     if not test_mode and int((parse_summary or {}).get("serving_rates") or 0) <= 0:
         no_data_summary_by_field = dict(parse_summary or {})
@@ -2522,9 +2632,15 @@ async def _is_failed_shared_layout_abandoned(
     shared_layout_reservation: Any,
     *,
     build_token: str,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> bool | None:
     """Abandon an owned unpublished layout, or defer interrupted cleanup to GC."""
     if shared_layout_reservation is None or shared_layout_reservation.reused:
+        return None
+    if expected_generation == PTG2_V4_SHARED_GENERATION:
+        # V4 graph reachability lives inside authenticated map packs.  Leave an
+        # interrupted building root to the generation-aware recurring GC so it
+        # can queue both map blocks and decoded target hashes before deletion.
         return None
     for attempt in range(3):
         try:
@@ -3335,6 +3451,7 @@ _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
         "timings",
         "audit_sample",
         "source_witness",
+        "snapshot_map",
     }
 )
 
@@ -3344,6 +3461,7 @@ def _reused_shared_v3_serving_index(
     *,
     source_key: str,
     shared_snapshot_key: int,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> dict[str, Any]:
     """Bind source-scoped metadata to one already sealed physical layout."""
 
@@ -3358,9 +3476,17 @@ def _reused_shared_v3_serving_index(
     }
     if str(serving_index.get("arch_version") or "").strip().lower() != "postgres_binary_v3":
         raise RuntimeError("reusable strict V3 layout has an incompatible architecture")
+    generation = str(expected_generation or "").strip().lower()
+    if generation not in {PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION}:
+        raise RuntimeError("reusable shared layout requested an unsupported generation")
+    expected_layout = (
+        "packed_snapshot_maps_v4"
+        if generation == PTG2_V4_SHARED_GENERATION
+        else "dense_shared_blocks_v3"
+    )
     if (
         str(serving_index.get("storage_generation") or "").strip().lower()
-        != PTG2_V3_SHARED_GENERATION
+        != generation
         or str(serving_index.get("cold_lookup_contract") or "").strip().lower()
         != PTG2_V3_COLD_LOOKUP_CONTRACT
         or str(serving_index.get("price_membership_semantics") or "").strip().lower()
@@ -3368,9 +3494,28 @@ def _reused_shared_v3_serving_index(
         or str(serving_index.get("serving_multiplicity_semantics") or "").strip().lower()
         != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
         or str(serving_index.get("shared_block_layout") or "").strip().lower()
-        != "dense_shared_blocks_v3"
+        != expected_layout
     ):
         raise RuntimeError("reusable strict V3 layout is missing the shared cold-read contract")
+    if generation == PTG2_V4_SHARED_GENERATION:
+        snapshot_map = serving_index.get("snapshot_map")
+        serving_binary = serving_index.get("serving_binary")
+        provider_graph = (
+            serving_binary.get("provider_graph_v4")
+            if isinstance(serving_binary, Mapping)
+            else None
+        )
+        if (
+            serving_index.get("type") != "ptg2_shared_blocks_v4"
+            or serving_index.get("provider_scope_strategy")
+            != "postgres_packed_graph_v4"
+            or not isinstance(snapshot_map, Mapping)
+            or not isinstance(provider_graph, Mapping)
+            or provider_graph.get("contract") != "ptg2_provider_graph_v4"
+        ):
+            raise RuntimeError(
+                "reusable PTG V4 layout is missing its packed graph contract"
+            )
     try:
         source_count = int(serving_index.get("source_count"))
     except (TypeError, ValueError) as exc:
@@ -3407,7 +3552,7 @@ def _reused_shared_v3_serving_index(
         {
             "source_key": source_key,
             "shared_snapshot_key": int(shared_snapshot_key),
-            "storage_generation": PTG2_V3_SHARED_GENERATION,
+            "storage_generation": generation,
             "cold_lookup_contract": PTG2_V3_COLD_LOOKUP_CONTRACT,
             "price_membership_semantics": PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
             "serving_multiplicity_semantics": PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
@@ -3570,6 +3715,48 @@ def _shared_v3_provider_identifier_quarantine(
             "strict V3 publication has no provider identifier quarantine evidence"
         )
     return combine_provider_identifier_quarantines(payloads)
+
+
+def _sum_v4_tin_only_audits(
+    source_file_results: Iterable[Mapping[str, Any]],
+) -> int:
+    """Combine exact V4 normalization counts across scanned source files."""
+
+    normalization_total = 0
+    observed_source_count = 0
+    for source_file_result in source_file_results:
+        if source_file_result.get("skipped"):
+            continue
+        file_summary = source_file_result.get("summary")
+        scanner_record = (
+            file_summary.get("scanner")
+            if isinstance(file_summary, Mapping)
+            else None
+        )
+        scanner_summary = (
+            scanner_record.get("summary")
+            if isinstance(scanner_record, Mapping)
+            else None
+        )
+        normalization_audit = (
+            scanner_summary.get("empty_npi_tin_only_normalization")
+            if isinstance(scanner_summary, Mapping)
+            else None
+        )
+        source_normalization_count = _verify_v4_tin_only_audit(
+            normalization_audit
+        )
+        normalization_total += source_normalization_count
+        observed_source_count += 1
+        if normalization_total > 2**63 - 1:
+            raise RuntimeError(
+                "PTG V4 empty-NPI normalization count overflow"
+            )
+    if observed_source_count == 0:
+        raise RuntimeError(
+            "PTG V4 publication has no empty-NPI normalization evidence"
+        )
+    return normalization_total
 
 
 def _shared_v3_source_set_metadata(
@@ -3795,6 +3982,10 @@ class _ReusedSharedV3AllowedContext:
 def _shared_v3_scanner_identity() -> dict[str, Any]:
     """Bind reuse to the exact scanner/finalizer executable that defines output."""
 
+    provider_graph_v4_enabled = _env_bool(
+        "HLTHPRT_PTG2_PROVIDER_GRAPH_V4",
+        False,
+    )
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
         raise RuntimeError("strict shared V3 requires the PTG2 Rust scanner binary")
@@ -3820,6 +4011,12 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
         source_root / "ptg_parts" / "ptg2_source_witness_codec.py",
         source_root / "ptg_parts" / "ptg2_source_witness_contract.py",
     )
+    if provider_graph_v4_enabled:
+        publisher_sources += (
+            source_root / "ptg_parts" / "ptg2_v4_audit.py",
+            source_root / "ptg_parts" / "ptg2_v4_graph_compiler.py",
+            source_root / "ptg_parts" / "ptg2_v4_snapshot_maps.py",
+        )
     publisher_digest = hashlib.sha256()
     publisher_byte_count = 0
     for source_path in publisher_sources:
@@ -3830,13 +4027,28 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
         publisher_digest.update(len(source_bytes).to_bytes(8, "big"))
         publisher_digest.update(source_bytes)
         publisher_byte_count += len(source_bytes)
-    return {
+    scanner_identity_by_field = {
         "contract_version": 3,
         "scanner_binary_sha256": digest,
         "scanner_binary_bytes": int(byte_count),
         "publisher_source_sha256": publisher_digest.hexdigest(),
         "publisher_source_bytes": publisher_byte_count,
     }
+    if provider_graph_v4_enabled:
+        compiler_binary = _resolve_v4_graph_compiler_binary()
+        if compiler_binary is None:
+            raise RuntimeError("strict PTG V4 requires its provider graph compiler")
+        compiler_digest, compiler_bytes = sha256_file(compiler_binary)
+        scanner_identity_by_field.update(
+            {
+                "contract_version": 4,
+                "storage_generation": PTG2_V4_SHARED_GENERATION,
+                "provider_graph_compiler_sha256": compiler_digest,
+                "provider_graph_compiler_bytes": int(compiler_bytes),
+                "provider_graph_encoding_policy": v4_graph_encoding_policy(),
+            }
+        )
+    return scanner_identity_by_field
 
 
 async def _publish_reused_shared_v3_snapshot(
@@ -3861,6 +4073,7 @@ async def _publish_reused_shared_v3_snapshot(
     test_mode: bool,
     import_started_monotonic: float,
     candidate_stage_flags_by_name: dict[str, bool] | None = None,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> dict[str, Any]:
     """Publish a logical snapshot binding without rescanning identical content."""
 
@@ -3931,6 +4144,7 @@ async def _publish_reused_shared_v3_snapshot(
         layout_manifest,
         source_key=source_key,
         shared_snapshot_key=shared_snapshot_key,
+        expected_generation=expected_generation,
     )
     serving_index["coverage_scope_id"] = bytes(coverage_scope_id).hex()
     serving_index["source_trace_set_hash"] = build_source_trace_set(
@@ -3956,6 +4170,7 @@ async def _publish_reused_shared_v3_snapshot(
         schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
         snapshot_key=int(shared_snapshot_key),
         logical_snapshot_id=snapshot_id,
+        expected_generation=expected_generation,
     )
     post_publish_started_monotonic = _ptg2_monotonic()
     post_publish_seconds_by_stage: dict[str, float] = {}
@@ -4239,6 +4454,9 @@ async def _load_allowed_file_result(
 def _write_allowed_file_progress(
     successful_file_count: int,
     attempted_file_count: int,
+    *,
+    progress_start_pct: float = 20.0,
+    progress_end_pct: float = 90.0,
 ) -> None:
     write_live_progress(
         phase="processing allowed amounts",
@@ -4246,12 +4464,12 @@ def _write_allowed_file_progress(
         done=successful_file_count,
         total=attempted_file_count,
         pct=min(
-            90.0,
-            20.0
+            progress_end_pct,
+            progress_start_pct
             + (
                 successful_file_count / max(attempted_file_count, 1)
             )
-            * 70.0,
+            * (progress_end_pct - progress_start_pct),
         ),
         message=(
             f"processed {successful_file_count} of {attempted_file_count} "
@@ -4282,6 +4500,8 @@ async def _process_allowed_snapshot_files(
     context: _AllowedFileProcessingContext,
     failure_report_by_field: dict[str, Any],
     artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
+    progress_start_pct: float = 20.0,
+    progress_end_pct: float = 90.0,
 ) -> list[dict[str, Any]]:
     """Download and parse the full allowed-only strict-V3 file set."""
 
@@ -4294,7 +4514,7 @@ async def _process_allowed_snapshot_files(
         unit="files",
         done=0,
         total=attempted_file_count,
-        pct=20,
+        pct=progress_start_pct,
         message=f"processing {attempted_file_count} allowed-amount file(s)",
     )
     async for downloaded in _iter_downloaded_ptg_jobs(
@@ -4302,6 +4522,8 @@ async def _process_allowed_snapshot_files(
         reuse_raw_artifacts=context.reuse_raw_artifacts,
         max_bytes=context.max_bytes,
         keep_partial_artifacts=context.keep_partial_artifacts,
+        progress_start_pct=5.0,
+        progress_end_pct=progress_start_pct,
         **(
             {"artifact_stage_observer": artifact_stage_observer}
             if artifact_stage_observer is not None
@@ -4315,6 +4537,8 @@ async def _process_allowed_snapshot_files(
             _write_allowed_file_progress(
                 len(successful_files),
                 attempted_file_count,
+                progress_start_pct=progress_start_pct,
+                progress_end_pct=progress_end_pct,
             )
         else:
             failed_files.append(file_by_field)
@@ -4659,6 +4883,8 @@ async def _main_with_artifact_lease(
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     control_run_id: str | None = None,
+    control_attempt_id: str | None = None,
+    control_attempt_started_at: str | None = None,
     full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -4668,6 +4894,15 @@ async def _main_with_artifact_lease(
     import_month_value = normalize_import_month(import_month)
     source_key_val = _normalize_source_key(source_key or os.getenv("HLTHPRT_PTG2_SOURCE_KEY"))
     snapshot_arch_version = _ptg2_snapshot_arch_from_env()
+    provider_graph_v4_enabled = _env_bool(
+        "HLTHPRT_PTG2_PROVIDER_GRAPH_V4",
+        False,
+    )
+    shared_storage_generation = (
+        PTG2_V4_SHARED_GENERATION
+        if provider_graph_v4_enabled
+        else PTG2_V3_SHARED_GENERATION
+    )
     rebuild_scope_digest = normalized_full_rebuild_scope_digest(
         full_rebuild_scope_digest
     )
@@ -4692,7 +4927,7 @@ async def _main_with_artifact_lease(
             in_network_url=in_network_url,
             allowed_url=allowed_url,
             provider_ref_url=provider_ref_url,
-            arch_variant=PTG2_V3_SHARED_GENERATION,
+            arch_variant=shared_storage_generation,
         )
     )
     import_run_id = _ptg2_import_run_id(
@@ -4727,7 +4962,7 @@ async def _main_with_artifact_lease(
         if should_keep_partial_artifacts is None
         else should_keep_partial_artifacts,
         "snapshot_arch": snapshot_arch_version,
-        "storage_generation": PTG2_V3_SHARED_GENERATION,
+        "storage_generation": shared_storage_generation,
         "test_mode": test_mode,
         "scanner_workers": max(
             _env_int(PTG2_RUST_WORKERS_ENV, PTG2_DEFAULT_RUST_WORKERS),
@@ -4760,6 +4995,9 @@ async def _main_with_artifact_lease(
     live_run_id = str(control_run_id or "").strip()
     live_token = set_live_progress_context(
         run_id=live_run_id,
+        attempt_id=control_attempt_id,
+        attempt_started_at=control_attempt_started_at,
+        started_at=control_attempt_started_at,
         source_key=source_key_val,
         snapshot_id=snapshot_id,
         import_run_id=import_run_id,
@@ -5013,6 +5251,7 @@ async def _main_with_artifact_lease(
             abandoned_layout = await _is_failed_shared_layout_abandoned(
                 shared_layout_reservation,
                 build_token=shared_layout_build_token,
+                expected_generation=shared_storage_generation,
             )
             if abandoned_layout is not None:
                 failure_report_by_field["shared_layout_abandoned"] = abandoned_layout
@@ -5041,7 +5280,6 @@ async def _main_with_artifact_lease(
         write_live_progress(
             status="failed",
             phase="failed",
-            pct=100,
             eta_seconds=0,
             message=progress_message or "PTG import failed; inspect worker logs",
         )
@@ -5261,6 +5499,8 @@ async def _main_with_artifact_lease(
                 allowed_jobs,
                 processing_context,
                 allowed_lane_report_by_field,
+                progress_start_pct=5.0 if selected_jobs else 20.0,
+                progress_end_pct=20.0 if selected_jobs else 90.0,
                 **(
                     {
                         "artifact_stage_observer": (
@@ -5312,6 +5552,8 @@ async def _main_with_artifact_lease(
         setup_stage_timer.mark("manifest_stage_table")
         processed_file_count_map = {"done": 0}
         attempted_files = len(selected_jobs)
+        download_start_pct = 20.0 if allowed_jobs else 5.0
+        scan_start_pct = 30.0 if allowed_jobs else 20.0
         for progress_index, job in enumerate(selected_jobs):
             job["_ptg_progress_index"] = progress_index
             job["_ptg_progress_total"] = max(attempted_files, 1)
@@ -5320,7 +5562,7 @@ async def _main_with_artifact_lease(
             unit="files",
             done=0,
             total=attempted_files,
-            pct=5 if attempted_files else 20,
+            pct=download_start_pct if attempted_files else scan_start_pct,
             message=f"downloading {attempted_files} PTG file(s)",
         )
         failed_files: list[dict[str, Any]] = []
@@ -5340,27 +5582,32 @@ async def _main_with_artifact_lease(
                 f"\tvalue={file_process_concurrency}"
                 f"\tfiles={attempted_files}"
             )
-        processing_tasks: set[asyncio.Task[PTG2FileProcessResult | None]] = set()
+        processing_tasks: set[
+            asyncio.Task[tuple[PTG2DownloadedJob, PTG2FileProcessResult | None]]
+        ] = set()
+        file_progress_coordinator: PTGFileProgressCoordinator | None = None
 
-        async def record_file_result(file_result: PTG2FileProcessResult | None) -> None:
+        async def record_file_result(
+            downloaded: PTG2DownloadedJob,
+            file_result: PTG2FileProcessResult | None,
+        ) -> None:
             """Classify a file result and update completion progress."""
             if file_result is None:
                 return
             if file_result.success:
+                if file_progress_coordinator is not None:
+                    file_progress_coordinator.complete(
+                        _progress_job_index(downloaded.job),
+                        message=(
+                            f"processed {processed_file_count_map['done'] + 1} "
+                            f"of {attempted_files} PTG file(s)"
+                        ),
+                    )
                 if file_result.skipped:
                     skipped_files.append(asdict(file_result))
                 else:
                     processed_file_count_map["done"] += 1
                     successful_files.append(asdict(file_result))
-                    if attempted_files:
-                        write_live_progress(
-                            phase="processing files",
-                            unit="files",
-                            done=processed_file_count_map["done"],
-                            total=attempted_files,
-                            pct=min(90.0, 20.0 + (processed_file_count_map["done"] / attempted_files) * 70.0),
-                            message=f"processed {processed_file_count_map['done']} of {attempted_files} PTG file(s)",
-                        )
             else:
                 failed_files.append(asdict(file_result))
 
@@ -5377,28 +5624,25 @@ async def _main_with_artifact_lease(
             processing_tasks.clear()
             processing_tasks.update(pending)
             for task in done:
-                await record_file_result(task.result())
+                downloaded, file_result = task.result()
+                await record_file_result(downloaded, file_result)
 
-        def file_progress_context(job: dict[str, Any], *, start_pct: float, end_pct: float) -> dict[str, Any]:
-            """Map one job's index onto its allocated overall progress interval."""
-            try:
-                job_index = max(int(job.get("_ptg_progress_index") or 0), 0)
-            except (TypeError, ValueError):
-                job_index = 0
-            try:
-                job_total = max(int(job.get("_ptg_progress_total") or attempted_files or 1), 1)
-            except (TypeError, ValueError):
-                job_total = max(attempted_files, 1)
+        def file_progress_context(job: dict[str, Any]) -> dict[str, Any]:
+            """Attach safe file context without assigning an independent run range."""
+            job_index = _progress_job_index(job)
             return {
                 **current_live_progress_context(),
-                "overall_progress_start_pct": start_pct + (job_index / job_total) * (end_pct - start_pct),
-                "overall_progress_end_pct": start_pct + ((job_index + 1) / job_total) * (end_pct - start_pct),
+                "file_index": job_index + 1,
+                "file_count": attempted_files,
+                "file_name": str(job.get("url") or ""),
             }
 
-        async def process_downloaded_job(downloaded) -> PTG2FileProcessResult | None:
+        async def process_downloaded_job(
+            downloaded: PTG2DownloadedJob,
+        ) -> tuple[PTG2DownloadedJob, PTG2FileProcessResult | None]:
             """Process a downloaded in-network artifact under its progress context."""
             job = downloaded.job
-            token = set_live_progress_context(**file_progress_context(job, start_pct=20.0, end_pct=90.0))
+            token = set_live_progress_context(**file_progress_context(job))
             try:
                 if job.get("type") == "in_network":
                     if shared_input_identity is None:
@@ -5419,6 +5663,13 @@ async def _main_with_artifact_lease(
                         source_network_names=job.get("source_network_names"),
                         raw_artifact=downloaded.raw_artifact,
                         logical_artifact=downloaded.logical_artifact,
+                        progress_observer=(
+                            file_progress_coordinator.observer(
+                                _progress_job_index(job)
+                            )
+                            if file_progress_coordinator is not None
+                            else None
+                        ),
                     )
                     file_result = _claim_strict_v3_file_result(
                         pending_strict_v3,
@@ -5426,8 +5677,8 @@ async def _main_with_artifact_lease(
                         shared_physical_artifact_identity(downloaded),
                         shared_logical_artifact_metadata(downloaded),
                     )
-                    return file_result
-                return None
+                    return downloaded, file_result
+                return downloaded, None
             finally:
                 reset_live_progress_context(token)
 
@@ -5438,6 +5689,8 @@ async def _main_with_artifact_lease(
                 reuse_raw_artifacts=should_reuse_raw_artifacts,
                 max_bytes=max_bytes,
                 keep_partial_artifacts=should_keep_partial_artifacts,
+                progress_start_pct=download_start_pct,
+                progress_end_pct=scan_start_pct,
                 **(
                     {
                         "artifact_stage_observer": (
@@ -5506,7 +5759,7 @@ async def _main_with_artifact_lease(
                 unit="files",
                 done=len(buffered_downloads),
                 total=len(buffered_downloads),
-                pct=20,
+                pct=scan_start_pct,
                 message="checking for an identical shared PostgreSQL layout",
             )
             shared_input_identity = shared_physical_input_identity(
@@ -5535,7 +5788,12 @@ async def _main_with_artifact_lease(
                     **canonical_plan_values_by_field,
                 }
             async with db.transaction() as session:
-                shared_layout_reservation = await reserve_shared_layout(
+                reserve_layout = (
+                    reserve_v4_shared_layout
+                    if provider_graph_v4_enabled
+                    else reserve_shared_layout
+                )
+                shared_layout_reservation = await reserve_layout(
                     session,
                     schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
                     semantic_fingerprint=shared_input_identity.semantic_fingerprint,
@@ -5598,7 +5856,58 @@ async def _main_with_artifact_lease(
                     test_mode=test_mode,
                     import_started_monotonic=import_started_monotonic,
                     candidate_stage_flags_by_name=candidate_stage_flags_by_name,
+                    expected_generation=shared_storage_generation,
                 )
+
+            progress_weights: list[int] = [0] * attempted_files
+            progress_labels: list[str] = ["PTG file"] * attempted_files
+            unique_downloads_by_logical_hash: dict[
+                str, list[PTG2DownloadedJob]
+            ] = {}
+            for buffered_download in buffered_downloads:
+                assert buffered_download.raw_artifact is not None
+                assert buffered_download.logical_artifact is not None
+                logical_hash = buffered_download.logical_artifact.logical_sha256
+                duplicate_physical_input = any(
+                    is_same_downloaded_physical_input(previous, buffered_download)
+                    for previous in unique_downloads_by_logical_hash.get(
+                        logical_hash,
+                        (),
+                    )
+                )
+                progress_index = _progress_job_index(buffered_download.job)
+                progress_weights[progress_index] = (
+                    0
+                    if duplicate_physical_input
+                    else max(
+                        int(
+                            getattr(
+                                buffered_download.raw_artifact,
+                                "byte_count",
+                                getattr(
+                                    buffered_download.logical_artifact,
+                                    "byte_count",
+                                    1,
+                                ),
+                            )
+                        ),
+                        1,
+                    )
+                )
+                progress_labels[progress_index] = (
+                    str(buffered_download.job.get("url") or "PTG file")
+                )
+                if not duplicate_physical_input:
+                    unique_downloads_by_logical_hash.setdefault(
+                        logical_hash,
+                        [],
+                    ).append(buffered_download)
+            file_progress_coordinator = PTGFileProgressCoordinator(
+                progress_weights,
+                progress_labels,
+                stage_start_pct=scan_start_pct,
+                stage_end_pct=90.0,
+            )
 
             async def iter_downloaded_jobs():
                 """Yield the fully validated download batch in discovery order."""
@@ -5679,7 +5988,7 @@ async def _main_with_artifact_lease(
                         [],
                     ).append(downloaded)
                 if file_result is not None:
-                    await record_file_result(file_result)
+                    await record_file_result(downloaded, file_result)
                     continue
 
                 processing_tasks.add(asyncio.create_task(process_downloaded_job(downloaded)))
@@ -5749,6 +6058,11 @@ async def _main_with_artifact_lease(
         )
         provider_identifier_quarantine = (
             _shared_v3_provider_identifier_quarantine(successful_files)
+        )
+        empty_npi_tin_only_normalization_count = (
+            _sum_v4_tin_only_audits(successful_files)
+            if provider_graph_v4_enabled
+            else None
         )
         await _publish_shared_v3_source_dictionary(
             shared_input_identity=shared_input_identity,
@@ -5834,6 +6148,31 @@ async def _main_with_artifact_lease(
             source_audit_witness_entries = strict_v3_copy_entries.get(
                 "source_audit_witness"
             ) or []
+            publication_progress_by_field = {"event_count": 0}
+
+            def report_snapshot_publication_progress(
+                stage_name: str,
+                counters_by_name: Mapping[str, int],
+            ) -> None:
+                """Expose exact V4 publication work without advancing fake time."""
+
+                publication_progress_by_field["event_count"] += 1
+                normalized_counters_by_name = {
+                    str(counter_name): int(counter_value)
+                    for counter_name, counter_value in counters_by_name.items()
+                }
+                normalized_counters_by_name["publication_progress_events"] = (
+                    publication_progress_by_field["event_count"]
+                )
+                _emit_ptg2_publish_progress(
+                    f"snapshot {stage_name}",
+                    completed_steps=5,
+                    total_steps=publish_progress_total,
+                    message_text=f"publishing PTG snapshot: {stage_name}",
+                    publication_stage=stage_name,
+                    counters=normalized_counters_by_name,
+                )
+
             try:
                 shared_publication = await publish_strict_shared_v3_layout(
                     schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
@@ -5866,7 +6205,38 @@ async def _main_with_artifact_lease(
                     ),
                     graph_artifact_entries=list(manifest_artifacts.get("sidecars") or []),
                     provider_identifier_quarantine=provider_identifier_quarantine,
+                    compressed_acquisition_entries=(
+                        tuple(
+                            {
+                                "raw_sha256": downloaded.raw_artifact.raw_sha256,
+                                "byte_count": downloaded.raw_artifact.byte_count,
+                            }
+                            for downloaded in buffered_downloads
+                            if downloaded.raw_artifact is not None
+                        )
+                        if provider_graph_v4_enabled
+                        else None
+                    ),
                     scratch_parent=ptg2_temp_parent(),
+                    provider_graph_v4=provider_graph_v4_enabled,
+                    **(
+                        {
+                            "progress_callback": (
+                                report_snapshot_publication_progress
+                            )
+                        }
+                        if provider_graph_v4_enabled
+                        else {}
+                    ),
+                    **(
+                        {
+                            "empty_npi_tin_only_normalization_count": (
+                                empty_npi_tin_only_normalization_count
+                            )
+                        }
+                        if provider_graph_v4_enabled
+                        else {}
+                    ),
                     **(
                         {"full_rebuild_scope_digest": rebuild_scope_digest}
                         if rebuild_scope_digest is not None
@@ -6260,10 +6630,15 @@ async def main(
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     control_run_id: str | None = None,
+    control_attempt_id: str | None = None,
+    control_attempt_started_at: str | None = None,
     full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
     """Run one PTG import while retaining shared inputs through a live lease."""
 
+    forwarded_arguments = locals().copy()
+    if full_rebuild_scope_digest is None:
+        forwarded_arguments.pop("full_rebuild_scope_digest")
     lease_owner = str(
         control_run_id
         or import_id
@@ -6273,32 +6648,7 @@ async def main(
     with artifact_lease_context(owner=f"ptg:{lease_owner}") as lease:
         return await guard_artifact_lease(
             lease,
-            _main_with_artifact_lease(
-                test_mode=test_mode,
-                toc_urls=toc_urls,
-                toc_list=toc_list,
-                in_network_url=in_network_url,
-                allowed_url=allowed_url,
-                provider_ref_url=provider_ref_url,
-                import_id=import_id,
-                source_key=source_key,
-                import_month=import_month,
-                max_files=max_files,
-                max_items=max_items,
-                plan_ids=plan_ids,
-                plan_name_contains=plan_name_contains,
-                plan_market_types=plan_market_types,
-                file_url_contains=file_url_contains,
-                source_network_names=source_network_names,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-                keep_partial_artifacts=keep_partial_artifacts,
-                control_run_id=control_run_id,
-                **(
-                    {"full_rebuild_scope_digest": full_rebuild_scope_digest}
-                    if full_rebuild_scope_digest is not None
-                    else {}
-                ),
-            ),
+            _main_with_artifact_lease(**forwarded_arguments),
         )
 
 

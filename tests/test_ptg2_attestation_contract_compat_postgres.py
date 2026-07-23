@@ -258,6 +258,10 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
                 state text NOT NULL,
                 generation text NOT NULL
             )""",
+            f"""CREATE TABLE {quoted_schema}.ptg2_v4_snapshot_map_root (
+                snapshot_key bigint PRIMARY KEY,
+                state text NOT NULL
+            )""",
             f"""CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_scope (
                 snapshot_id text PRIMARY KEY,
                 coverage_scope_id bytea NOT NULL,

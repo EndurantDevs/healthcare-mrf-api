@@ -1,4 +1,7 @@
-use crate::source_witness_spool::{ProviderSourceLocator, ProviderSourceSpools};
+use crate::source_witness_spool::{
+    ProviderSourceLocator, ProviderSourceSpools, RateSourceLocator, RateSourceSpools,
+    SourceWitnessScratchBudget,
+};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use serde_json::{json, Map, Value};
@@ -6,10 +9,10 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use xxhash_rust::xxh3::Xxh3;
 
 pub const SOURCE_WITNESS_CONTRACT: &str = "ptg2_v3_source_witness_v3";
@@ -24,6 +27,8 @@ pub const SOURCE_WITNESS_UNQUERYABLE_POLICY: &str = "count_but_exclude_from_npi_
 const SOURCE_WITNESS_MAGIC: &[u8; 8] = b"PTG2SW03";
 const SOURCE_WITNESS_RECORD_MAGIC: &[u8; 8] = b"PTG2SWR2";
 const SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES: usize = 8 * 1024 * 1024;
+const SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
+const SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 // Scanner bundles externalize and deduplicate exact source tokens before applying
 // the same 512 MiB safety bound as the persisted logical payload.
 const SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
@@ -57,9 +62,10 @@ pub struct RateOccurrenceWitnessInput<'a> {
     pub price_ordinal: u64,
     pub provider_ordinal: u64,
     pub provider_evidence: &'a Value,
-    pub procedure: &'a Map<String, Value>,
+    pub rate_source_locator: RateSourceLocator,
     pub raw_rate: &'a [u8],
-    pub linked_provider_raw: Option<&'a [u8]>,
+    pub linked_provider_locator: Option<ProviderSourceLocator>,
+    pub linked_provider_sha256: Option<[u8; 32]>,
     pub expected: &'a Value,
 }
 
@@ -99,11 +105,16 @@ impl SourceWitnessKind {
     }
 }
 
-struct SelectedSourceWitness {
+struct SelectedRateWitness {
     priority: u64,
     tie_breaker: [u8; 32],
-    compressed_record: Vec<u8>,
-    evidence_digests: Vec<[u8; 32]>,
+    coordinate: SourceWitnessCoordinate,
+    price_ordinal: u64,
+    provider_ordinal: u64,
+    provider_evidence: Value,
+    rate_source_locator: RateSourceLocator,
+    linked_provider_locator: Option<ProviderSourceLocator>,
+    expected: Value,
 }
 
 struct PreparedSourceEvidence {
@@ -112,15 +123,42 @@ struct PreparedSourceEvidence {
     compressed: Vec<u8>,
 }
 
+#[cfg(test)]
 struct SelectedSourceEvidence {
     raw_byte_count: u32,
     compressed: Vec<u8>,
     reference_count: usize,
 }
 
-struct SelectedSourceWitnessCohort {
-    records: Vec<SelectedSourceWitness>,
-    evidence_by_sha256: HashMap<[u8; 32], SelectedSourceEvidence>,
+#[derive(Clone, Copy)]
+struct StagedPayloadLocator {
+    offset: u64,
+    length: u32,
+}
+
+struct StagedSourceEvidence {
+    raw_byte_count: u32,
+    compressed_sha256: [u8; 32],
+    payload: StagedPayloadLocator,
+    reference_count: usize,
+}
+
+struct StagedSourceRecord {
+    payload: StagedPayloadLocator,
+}
+
+struct SourceWitnessBundleStage {
+    payload_file: tempfile::NamedTempFile,
+    scratch_budget: Arc<SourceWitnessScratchBudget>,
+    reserved_bytes: u64,
+    logical_body_bytes: u64,
+    decoded_evidence_bytes: u64,
+    decoded_evidence_byte_count_by_sha256: HashMap<[u8; 32], u32>,
+    evidence_by_sha256: HashMap<[u8; 32], StagedSourceEvidence>,
+    rate_records: Vec<StagedSourceRecord>,
+    provider_records: Vec<StagedSourceRecord>,
+    rate_record_bytes: u64,
+    provider_record_bytes: u64,
 }
 
 struct SelectedProviderWitness {
@@ -157,27 +195,27 @@ impl Ord for SelectedProviderWitness {
     }
 }
 
-impl SelectedSourceWitness {
+impl SelectedRateWitness {
     fn key(&self) -> (u64, [u8; 32]) {
         (self.priority, self.tie_breaker)
     }
 }
 
-impl PartialEq for SelectedSourceWitness {
+impl PartialEq for SelectedRateWitness {
     fn eq(&self, other: &Self) -> bool {
         self.key() == other.key()
     }
 }
 
-impl Eq for SelectedSourceWitness {}
+impl Eq for SelectedRateWitness {}
 
-impl PartialOrd for SelectedSourceWitness {
+impl PartialOrd for SelectedRateWitness {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for SelectedSourceWitness {
+impl Ord for SelectedRateWitness {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key().cmp(&other.key())
     }
@@ -185,10 +223,7 @@ impl Ord for SelectedSourceWitness {
 
 #[derive(Default)]
 struct SourceWitnessSamplerState {
-    selected: BinaryHeap<SelectedSourceWitness>,
-    compressed_record_bytes: u64,
-    compressed_evidence_bytes: u64,
-    evidence_by_sha256: HashMap<[u8; 32], SelectedSourceEvidence>,
+    selected: BinaryHeap<SelectedRateWitness>,
 }
 
 struct SourceWitnessSampler {
@@ -228,14 +263,16 @@ impl SourceWitnessSampler {
     }
 
     fn add_population(&self, count: u64) -> io::Result<()> {
-        self.population
-            .fetch_update(
+        io_result(
+            self.population.fetch_update(
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
                 |current| current.checked_add(count),
-            )
-            .map(|_| ())
-            .map_err(|_| io::Error::other("source witness population overflow"))
+            ),
+            io::ErrorKind::Other,
+            "source witness population overflow",
+        )
+        .map(|_| ())
     }
 
     fn population(&self) -> u64 {
@@ -250,144 +287,24 @@ impl SourceWitnessSampler {
         self.evaluated.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
-    fn insert(
-        &self,
-        priority: u64,
-        tie_breaker: [u8; 32],
-        compressed_record: Vec<u8>,
-        evidence: Vec<PreparedSourceEvidence>,
-    ) -> io::Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("source witness sampler mutex is poisoned"))?;
+    fn insert(&self, candidate: SelectedRateWitness) -> io::Result<()> {
+        let mut state = io_result(
+            self.state.lock(),
+            io::ErrorKind::Other,
+            "source witness sampler mutex is poisoned",
+        )?;
         if state.selected.len() >= self.target
             && state
                 .selected
                 .peek()
-                .is_some_and(|current| (priority, tie_breaker) >= current.key())
+                .is_some_and(|current| candidate.key() >= current.key())
         {
             return Ok(());
         }
-        if compressed_record.len() > SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES {
-            self.oversized.fetch_add(1, AtomicOrdering::Relaxed);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "selected source witness record is {} bytes, exceeding the fail-closed {}-byte limit",
-                    compressed_record.len(),
-                    SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES,
-                ),
-            ));
+        state.selected.push(candidate);
+        if state.selected.len() > self.target {
+            state.selected.pop();
         }
-        for evidence_entry in &evidence {
-            validate_compressed_record_size(evidence_entry.compressed.len())?;
-            if let Some(existing) = state.evidence_by_sha256.get(&evidence_entry.sha256) {
-                if existing.raw_byte_count != evidence_entry.raw_byte_count
-                    || existing.compressed != evidence_entry.compressed
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "source witness evidence digest is inconsistent",
-                    ));
-                }
-            }
-        }
-        let evidence_digests = evidence
-            .iter()
-            .map(|entry| entry.sha256)
-            .collect::<Vec<_>>();
-        let evicted = (state.selected.len() >= self.target)
-            .then(|| state.selected.peek())
-            .flatten();
-        let evicted_record_bytes =
-            evicted.map_or(0, |record| record.compressed_record.len() as u64);
-        let projected_bytes = state
-            .compressed_record_bytes
-            .saturating_add(state.compressed_evidence_bytes)
-            .saturating_sub(evicted_record_bytes)
-            .saturating_add(compressed_record.len() as u64)
-            .saturating_sub(
-                evicted
-                    .into_iter()
-                    .flat_map(|record| record.evidence_digests.iter())
-                    .filter_map(|digest| {
-                        let existing = state.evidence_by_sha256.get(digest)?;
-                        (existing.reference_count == 1 && !evidence_digests.contains(digest))
-                            .then_some(existing.compressed.len() as u64)
-                    })
-                    .sum::<u64>(),
-            )
-            .saturating_add(
-                evidence
-                    .iter()
-                    .filter(|entry| !state.evidence_by_sha256.contains_key(&entry.sha256))
-                    .map(|entry| entry.compressed.len() as u64)
-                    .sum::<u64>(),
-            );
-        if projected_bytes > self.compressed_byte_limit {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "selected source witness cohort would use {projected_bytes} bytes, exceeding the fail-closed {}-byte payload budget",
-                    self.compressed_byte_limit,
-                ),
-            ));
-        }
-        if state.selected.len() >= self.target {
-            let evicted = state
-                .selected
-                .pop()
-                .expect("source witness sampler target must be positive");
-            state.compressed_record_bytes = state
-                .compressed_record_bytes
-                .saturating_sub(evicted.compressed_record.len() as u64);
-            for digest in evicted.evidence_digests {
-                let remove = if let Some(existing) = state.evidence_by_sha256.get_mut(&digest) {
-                    existing.reference_count = existing.reference_count.saturating_sub(1);
-                    existing.reference_count == 0
-                } else {
-                    return Err(io::Error::other(
-                        "source witness evidence reference is missing",
-                    ));
-                };
-                if remove {
-                    let removed = state
-                        .evidence_by_sha256
-                        .remove(&digest)
-                        .expect("selected evidence must exist until its final reference");
-                    state.compressed_evidence_bytes = state
-                        .compressed_evidence_bytes
-                        .saturating_sub(removed.compressed.len() as u64);
-                }
-            }
-        }
-        for evidence_entry in evidence {
-            if let Some(existing) = state.evidence_by_sha256.get_mut(&evidence_entry.sha256) {
-                existing.reference_count = existing.reference_count.saturating_add(1);
-            } else {
-                state.compressed_evidence_bytes = state
-                    .compressed_evidence_bytes
-                    .saturating_add(evidence_entry.compressed.len() as u64);
-                state.evidence_by_sha256.insert(
-                    evidence_entry.sha256,
-                    SelectedSourceEvidence {
-                        raw_byte_count: evidence_entry.raw_byte_count,
-                        compressed: evidence_entry.compressed,
-                        reference_count: 1,
-                    },
-                );
-            }
-        }
-        state.compressed_record_bytes = state
-            .compressed_record_bytes
-            .saturating_add(compressed_record.len() as u64);
-        state.selected.push(SelectedSourceWitness {
-            priority,
-            tie_breaker,
-            compressed_record,
-            evidence_digests,
-        });
         let threshold = if state.selected.len() < self.target {
             u64::MAX
         } else {
@@ -400,20 +317,15 @@ impl SourceWitnessSampler {
         Ok(())
     }
 
-    fn take_sorted(&self) -> io::Result<SelectedSourceWitnessCohort> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("source witness sampler mutex is poisoned"))?;
+    fn take_sorted(&self) -> io::Result<Vec<SelectedRateWitness>> {
+        let mut state = io_result(
+            self.state.lock(),
+            io::ErrorKind::Other,
+            "source witness sampler mutex is poisoned",
+        )?;
         let mut selected = std::mem::take(&mut state.selected).into_vec();
-        selected.sort_unstable_by_key(SelectedSourceWitness::key);
-        state.compressed_record_bytes = 0;
-        state.compressed_evidence_bytes = 0;
-        let evidence_by_sha256 = std::mem::take(&mut state.evidence_by_sha256);
-        Ok(SelectedSourceWitnessCohort {
-            records: selected,
-            evidence_by_sha256,
-        })
+        selected.sort_unstable_by_key(SelectedRateWitness::key);
+        Ok(selected)
     }
 
     fn metrics(&self, selected_count: usize, compressed_bytes: u64) -> Value {
@@ -442,14 +354,16 @@ impl ProviderWitnessSampler {
     }
 
     fn add_population(&self, count: u64) -> io::Result<()> {
-        self.population
-            .fetch_update(
+        io_result(
+            self.population.fetch_update(
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
                 |current| current.checked_add(count),
-            )
-            .map(|_| ())
-            .map_err(|_| io::Error::other("source witness population overflow"))
+            ),
+            io::ErrorKind::Other,
+            "source witness population overflow",
+        )
+        .map(|_| ())
     }
 
     fn population(&self) -> u64 {
@@ -465,10 +379,11 @@ impl ProviderWitnessSampler {
     }
 
     fn insert(&self, candidate: SelectedProviderWitness) -> io::Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("provider witness sampler mutex is poisoned"))?;
+        let mut state = io_result(
+            self.state.lock(),
+            io::ErrorKind::Other,
+            "provider witness sampler mutex is poisoned",
+        )?;
         if state.selected.len() >= self.target
             && state
                 .selected
@@ -494,10 +409,11 @@ impl ProviderWitnessSampler {
     }
 
     fn take_sorted(&self) -> io::Result<Vec<SelectedProviderWitness>> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("provider witness sampler mutex is poisoned"))?;
+        let mut state = io_result(
+            self.state.lock(),
+            io::ErrorKind::Other,
+            "provider witness sampler mutex is poisoned",
+        )?;
         let mut selected = std::mem::take(&mut state.selected).into_vec();
         selected.sort_unstable_by_key(SelectedProviderWitness::key);
         Ok(selected)
@@ -552,6 +468,197 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
+impl SourceWitnessBundleStage {
+    fn new(scratch_budget: Arc<SourceWitnessScratchBudget>) -> io::Result<Self> {
+        let payload_file = tempfile::Builder::new()
+            .prefix("ptg2-source-witness-bundle-stage-")
+            .tempfile_in(scratch_budget.scratch_root())?;
+        Ok(Self {
+            payload_file,
+            scratch_budget,
+            reserved_bytes: 0,
+            // Evidence-count and record-count framing are always present.
+            logical_body_bytes: 8,
+            decoded_evidence_bytes: 0,
+            decoded_evidence_byte_count_by_sha256: HashMap::new(),
+            evidence_by_sha256: HashMap::new(),
+            rate_records: Vec::new(),
+            provider_records: Vec::new(),
+            rate_record_bytes: 0,
+            provider_record_bytes: 0,
+        })
+    }
+
+    fn reserve_logical_body(&mut self, byte_count: u64) -> io::Result<()> {
+        let projected = io_option(
+            self.logical_body_bytes.checked_add(byte_count),
+            io::ErrorKind::Other,
+            "source witness bundle byte count overflow",
+        )?;
+        if projected > SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "strict V3 source witness candidate bundle would use at least {projected} bytes, exceeding the fail-closed {SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES}-byte intermediate budget",
+                ),
+            ));
+        }
+        self.logical_body_bytes = projected;
+        Ok(())
+    }
+
+    fn append_payload(&mut self, payload: &[u8]) -> io::Result<StagedPayloadLocator> {
+        let payload_length = io_result(
+            u32::try_from(payload.len()),
+            io::ErrorKind::InvalidData,
+            "source witness staged payload exceeds the locator width",
+        )?;
+        let payload_file = self.payload_file.as_file_mut();
+        let offset = payload_file.seek(SeekFrom::End(0))?;
+        self.scratch_budget.reserve(u64::from(payload_length))?;
+        if let Err(error) = payload_file.write_all(payload) {
+            self.scratch_budget.release(u64::from(payload_length));
+            return Err(error);
+        }
+        self.reserved_bytes = self
+            .reserved_bytes
+            .saturating_add(u64::from(payload_length));
+        Ok(StagedPayloadLocator {
+            offset,
+            length: payload_length,
+        })
+    }
+
+    fn reserve_decoded_evidence(
+        &mut self,
+        sha256: [u8; 32],
+        raw_byte_count: u32,
+    ) -> io::Result<()> {
+        validate_decoded_evidence_size("token", raw_byte_count as usize)?;
+        if let Some(existing_count) = self.decoded_evidence_byte_count_by_sha256.get(&sha256) {
+            if *existing_count != raw_byte_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source witness evidence digest is inconsistent",
+                ));
+            }
+            return Ok(());
+        }
+        let projected_decoded_bytes = io_option(
+            self.decoded_evidence_bytes
+                .checked_add(u64::from(raw_byte_count)),
+            io::ErrorKind::Other,
+            "source witness decoded byte count overflow",
+        )?;
+        if projected_decoded_bytes > SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "strict V3 source witness evidence would decode to {projected_decoded_bytes} bytes, exceeding the fail-closed {SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES}-byte aggregate decoded budget",
+                ),
+            ));
+        }
+        self.decoded_evidence_byte_count_by_sha256
+            .insert(sha256, raw_byte_count);
+        self.decoded_evidence_bytes = projected_decoded_bytes;
+        Ok(())
+    }
+
+    fn preflight_raw_evidence(&mut self, raw_evidence: &[u8]) -> io::Result<()> {
+        validate_decoded_evidence_size("token", raw_evidence.len())?;
+        let raw_byte_count = io_result(
+            u32::try_from(raw_evidence.len()),
+            io::ErrorKind::InvalidData,
+            "source witness raw JSON token is too large",
+        )?;
+        self.reserve_decoded_evidence(Sha256::digest(raw_evidence).into(), raw_byte_count)
+    }
+
+    fn merge_evidence(&mut self, evidence: PreparedSourceEvidence) -> io::Result<()> {
+        self.reserve_decoded_evidence(evidence.sha256, evidence.raw_byte_count)?;
+        validate_compressed_record_size(evidence.compressed.len())?;
+        let compressed_sha256: [u8; 32] = Sha256::digest(&evidence.compressed).into();
+        if let Some(existing) = self.evidence_by_sha256.get_mut(&evidence.sha256) {
+            if existing.raw_byte_count != evidence.raw_byte_count
+                || existing.payload.length as usize != evidence.compressed.len()
+                || existing.compressed_sha256 != compressed_sha256
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source witness evidence digest is inconsistent",
+                ));
+            }
+            existing.reference_count = existing.reference_count.saturating_add(1);
+            return Ok(());
+        }
+        let framing_bytes = 32u64
+            .saturating_add(4)
+            .saturating_add(4)
+            .saturating_add(evidence.compressed.len() as u64);
+        self.reserve_logical_body(framing_bytes)?;
+        let payload = self.append_payload(&evidence.compressed)?;
+        self.evidence_by_sha256.insert(
+            evidence.sha256,
+            StagedSourceEvidence {
+                raw_byte_count: evidence.raw_byte_count,
+                compressed_sha256,
+                payload,
+                reference_count: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn push_record(
+        &mut self,
+        kind: SourceWitnessKind,
+        compressed_record: Vec<u8>,
+    ) -> io::Result<()> {
+        validate_compressed_record_size(compressed_record.len())?;
+        self.reserve_logical_body(4u64.saturating_add(compressed_record.len() as u64))?;
+        let payload = self.append_payload(&compressed_record)?;
+        let record = StagedSourceRecord { payload };
+        match kind {
+            SourceWitnessKind::RateOccurrence => {
+                self.rate_record_bytes = self
+                    .rate_record_bytes
+                    .saturating_add(u64::from(payload.length));
+                self.rate_records.push(record);
+            }
+            SourceWitnessKind::ProviderReference => {
+                self.provider_record_bytes = self
+                    .provider_record_bytes
+                    .saturating_add(u64::from(payload.length));
+                self.provider_records.push(record);
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_payload<W: Write>(
+        &mut self,
+        writer: &mut W,
+        locator: StagedPayloadLocator,
+    ) -> io::Result<()> {
+        let payload_file = self.payload_file.as_file_mut();
+        payload_file.seek(SeekFrom::Start(locator.offset))?;
+        let copied = io::copy(&mut payload_file.take(u64::from(locator.length)), writer)?;
+        if copied != u64::from(locator.length) {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "source witness staged payload is truncated",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SourceWitnessBundleStage {
+    fn drop(&mut self) {
+        self.scratch_budget.release(self.reserved_bytes);
+    }
+}
+
 pub struct SourceWitnessCollector {
     raw_source_sha256: [u8; 32],
     raw_source_sha256_hex: String,
@@ -560,6 +667,8 @@ pub struct SourceWitnessCollector {
     rate_rows: AtomicU64,
     unqueryable_rate_rows: AtomicU64,
     provider_spools: OnceLock<ProviderSourceSpools>,
+    rate_spools: OnceLock<RateSourceSpools>,
+    scratch_budget: Arc<SourceWitnessScratchBudget>,
 }
 
 impl SourceWitnessCollector {
@@ -573,13 +682,18 @@ impl SourceWitnessCollector {
         }
         let mut digest = [0u8; 32];
         for (index, chunk) in normalized.as_bytes().chunks_exact(2).enumerate() {
-            let text = std::str::from_utf8(chunk).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "raw source SHA-256 is invalid")
-            })?;
-            digest[index] = u8::from_str_radix(text, 16).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "raw source SHA-256 is invalid")
-            })?;
+            let text = io_result(
+                std::str::from_utf8(chunk),
+                io::ErrorKind::InvalidInput,
+                "raw source SHA-256 is invalid",
+            )?;
+            digest[index] = io_result(
+                u8::from_str_radix(text, 16),
+                io::ErrorKind::InvalidInput,
+                "raw source SHA-256 is invalid",
+            )?;
         }
+        let scratch_budget = SourceWitnessScratchBudget::from_env()?;
         Ok(Self {
             raw_source_sha256: digest,
             raw_source_sha256_hex: normalized,
@@ -591,13 +705,131 @@ impl SourceWitnessCollector {
             rate_rows: AtomicU64::new(0),
             unqueryable_rate_rows: AtomicU64::new(0),
             provider_spools: OnceLock::new(),
+            rate_spools: OnceLock::new(),
+            scratch_budget,
         })
     }
 
     pub fn configure_provider_spools(&self, shard_count: usize) -> io::Result<()> {
-        self.provider_spools
-            .set(ProviderSourceSpools::new(shard_count)?)
-            .map_err(|_| io::Error::other("provider source spools already configured"))
+        io_result(
+            self.provider_spools
+                .set(ProviderSourceSpools::new_provider_with_budget(
+                    shard_count,
+                    Arc::clone(&self.scratch_budget),
+                )?),
+            io::ErrorKind::Other,
+            "provider source spools already configured",
+        )
+    }
+
+    pub fn configure_rate_spools(&self, shard_count: usize) -> io::Result<()> {
+        io_result(
+            self.rate_spools.set(RateSourceSpools::new_rate_with_budget(
+                shard_count,
+                Arc::clone(&self.scratch_budget),
+            )?),
+            io::ErrorKind::Other,
+            "rate source spools already configured",
+        )
+    }
+
+    pub fn store_rate_source(
+        &self,
+        coordinate: SourceWitnessCoordinate,
+        procedure: &Map<String, Value>,
+        raw_rate: &[u8],
+    ) -> io::Result<RateSourceLocator> {
+        validate_decoded_evidence_size("rate token", raw_rate.len())?;
+        let procedure_bytes = serde_json::to_vec(procedure).map_err(to_io_error)?;
+        if procedure_bytes.len() > SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "source witness procedure is {} bytes, exceeding the fail-closed {}-byte metadata limit",
+                    procedure_bytes.len(),
+                    SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES,
+                ),
+            ));
+        }
+        let procedure_length = io_result(
+            u32::try_from(procedure_bytes.len()),
+            io::ErrorKind::InvalidData,
+            "source witness procedure exceeds the locator width",
+        )?;
+        let mut fragment = Vec::with_capacity(
+            4usize
+                .saturating_add(procedure_bytes.len())
+                .saturating_add(raw_rate.len()),
+        );
+        fragment.extend_from_slice(&procedure_length.to_be_bytes());
+        fragment.extend_from_slice(&procedure_bytes);
+        fragment.extend_from_slice(raw_rate);
+        let spools = io_option(
+            self.rate_spools.get(),
+            io::ErrorKind::Other,
+            "rate source spools are not configured",
+        )?;
+        let shard = coordinate.object_ordinal as usize % spools.shard_count();
+        spools.append(shard, &fragment)
+    }
+
+    fn seal_rate_sources(&self) -> io::Result<()> {
+        io_option(
+            self.rate_spools.get(),
+            io::ErrorKind::Other,
+            "rate source spools are not configured",
+        )?
+        .seal()
+    }
+
+    fn read_rate_source(
+        &self,
+        locator: RateSourceLocator,
+    ) -> io::Result<(Map<String, Value>, Vec<u8>)> {
+        let fragment = io_option(
+            self.rate_spools.get(),
+            io::ErrorKind::Other,
+            "rate source spools are not configured",
+        )?
+        .read_bounded(
+            locator,
+            SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES
+                .saturating_add(SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES)
+                .saturating_add(4),
+        )?;
+        let procedure_length_bytes: [u8; 4] = io_option(
+            fragment.get(..4),
+            io::ErrorKind::InvalidData,
+            "rate source fragment is truncated",
+        )?
+        .try_into()
+        .expect("four-byte slice");
+        let procedure_length = u32::from_be_bytes(procedure_length_bytes) as usize;
+        let procedure_end = io_option(
+            4usize.checked_add(procedure_length),
+            io::ErrorKind::InvalidData,
+            "rate source fragment length overflow",
+        )?;
+        let procedure_bytes = io_option(
+            fragment.get(4..procedure_end),
+            io::ErrorKind::InvalidData,
+            "rate source procedure is truncated",
+        )?;
+        let procedure = serde_json::from_slice::<Value>(procedure_bytes)
+            .map_err(to_io_error)?
+            .as_object()
+            .cloned();
+        let procedure = io_option(
+            procedure,
+            io::ErrorKind::InvalidData,
+            "rate source procedure is not a JSON object",
+        )?;
+        let raw_rate = io_option(
+            fragment.get(procedure_end..),
+            io::ErrorKind::InvalidData,
+            "rate source record is truncated",
+        )?;
+        Ok((procedure, raw_rate.to_vec()))
     }
 
     pub fn store_provider_source(
@@ -605,24 +837,30 @@ impl SourceWitnessCollector {
         shard: usize,
         raw_provider: &[u8],
     ) -> io::Result<ProviderSourceLocator> {
-        self.provider_spools
-            .get()
-            .ok_or_else(|| io::Error::other("provider source spools are not configured"))?
-            .append(shard, raw_provider)
+        io_option(
+            self.provider_spools.get(),
+            io::ErrorKind::Other,
+            "provider source spools are not configured",
+        )?
+        .append(shard, raw_provider)
     }
 
     pub fn seal_provider_sources(&self) -> io::Result<()> {
-        self.provider_spools
-            .get()
-            .ok_or_else(|| io::Error::other("provider source spools are not configured"))?
-            .seal()
+        io_option(
+            self.provider_spools.get(),
+            io::ErrorKind::Other,
+            "provider source spools are not configured",
+        )?
+        .seal()
     }
 
     pub fn read_provider_source(&self, locator: ProviderSourceLocator) -> io::Result<Vec<u8>> {
-        self.provider_spools
-            .get()
-            .ok_or_else(|| io::Error::other("provider source spools are not configured"))?
-            .read(locator)
+        io_option(
+            self.provider_spools.get(),
+            io::ErrorKind::Other,
+            "provider source spools are not configured",
+        )?
+        .read_bounded(locator, SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES)
     }
 
     #[cfg(test)]
@@ -648,20 +886,24 @@ impl SourceWitnessCollector {
         unqueryable_rate_rows: u64,
         occurrence_count: u64,
     ) -> io::Result<()> {
-        self.rate_rows
-            .fetch_update(
+        io_result(
+            self.rate_rows.fetch_update(
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
                 |current| current.checked_add(rate_rows),
-            )
-            .map_err(|_| io::Error::other("source witness rate-row population overflow"))?;
-        self.unqueryable_rate_rows
-            .fetch_update(
+            ),
+            io::ErrorKind::Other,
+            "source witness rate-row population overflow",
+        )?;
+        io_result(
+            self.unqueryable_rate_rows.fetch_update(
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
                 |current| current.checked_add(unqueryable_rate_rows),
-            )
-            .map_err(|_| io::Error::other("source witness unqueryable population overflow"))?;
+            ),
+            io::ErrorKind::Other,
+            "source witness unqueryable population overflow",
+        )?;
         self.rate_occurrences.add_population(occurrence_count)
     }
 
@@ -729,23 +971,19 @@ impl SourceWitnessCollector {
             input.price_ordinal,
             input.provider_ordinal,
             input.raw_rate,
-            input.linked_provider_raw,
+            input.linked_provider_sha256,
         );
-        let (compressed, evidence) = self.externalized_record(SourceWitnessRecordInput {
-            kind: SourceWitnessKind::RateOccurrence,
+        self.rate_occurrences.insert(SelectedRateWitness {
             priority: input.candidate.priority,
             tie_breaker,
             coordinate: input.coordinate,
             price_ordinal: input.price_ordinal,
             provider_ordinal: input.provider_ordinal,
-            provider_evidence: Some(input.provider_evidence),
-            procedure: Some(input.procedure),
-            raw: input.raw_rate,
-            linked_provider_raw: input.linked_provider_raw,
-            expected: input.expected,
-        })?;
-        self.rate_occurrences
-            .insert(input.candidate.priority, tie_breaker, compressed, evidence)
+            provider_evidence: input.provider_evidence.clone(),
+            rate_source_locator: input.rate_source_locator,
+            linked_provider_locator: input.linked_provider_locator,
+            expected: input.expected.clone(),
+        })
     }
 
     pub fn commit_provider_reference(
@@ -775,14 +1013,13 @@ impl SourceWitnessCollector {
 
     pub fn write_bundle(&self, directory: &Path) -> io::Result<Value> {
         fs::create_dir_all(directory)?;
-        let rate_cohort = self.rate_occurrences.take_sorted()?;
-        let mut rate_records = rate_cohort.records;
-        let mut evidence_by_sha256 = rate_cohort.evidence_by_sha256;
+        self.seal_rate_sources()?;
+        let mut rate_candidates = self.rate_occurrences.take_sorted()?;
         let mut provider_candidates = self.provider_references.take_sorted()?;
         validate_local_candidate_selection(
             "rate occurrence",
             self.rate_occurrences.population(),
-            rate_records.len(),
+            rate_candidates.len(),
             self.rate_occurrences.target,
         )?;
         validate_local_candidate_selection(
@@ -791,7 +1028,7 @@ impl SourceWitnessCollector {
             provider_candidates.len(),
             self.provider_references.target,
         )?;
-        if rate_records.is_empty() {
+        if rate_candidates.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "strict V3 scan produced no queryable source occurrence witnesses",
@@ -801,11 +1038,47 @@ impl SourceWitnessCollector {
             self.rate_occurrences.population(),
             self.provider_references.population(),
         )?;
-        rate_records.truncate(rate_target);
+        rate_candidates.truncate(rate_target);
         provider_candidates.truncate(provider_target);
-        let mut provider_records = Vec::with_capacity(provider_candidates.len());
+        let mut bundle_stage = SourceWitnessBundleStage::new(Arc::clone(&self.scratch_budget))?;
+        for candidate in rate_candidates {
+            let (procedure, raw_rate) = self.read_rate_source(candidate.rate_source_locator)?;
+            let linked_provider_raw = candidate
+                .linked_provider_locator
+                .map(|locator| self.read_provider_source(locator))
+                .transpose()?;
+            bundle_stage.preflight_raw_evidence(&raw_rate)?;
+            if let Some(linked_provider_raw) = linked_provider_raw.as_deref() {
+                bundle_stage.preflight_raw_evidence(linked_provider_raw)?;
+            }
+            let (compressed_record, evidence) =
+                self.externalized_record(SourceWitnessRecordInput {
+                    kind: SourceWitnessKind::RateOccurrence,
+                    priority: candidate.priority,
+                    tie_breaker: candidate.tie_breaker,
+                    coordinate: candidate.coordinate,
+                    price_ordinal: candidate.price_ordinal,
+                    provider_ordinal: candidate.provider_ordinal,
+                    provider_evidence: Some(&candidate.provider_evidence),
+                    procedure: Some(&procedure),
+                    raw: &raw_rate,
+                    linked_provider_raw: linked_provider_raw.as_deref(),
+                    expected: &candidate.expected,
+                })?;
+            if let Err(error) = validate_compressed_record_size(compressed_record.len()) {
+                self.rate_occurrences
+                    .oversized
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                return Err(error);
+            }
+            for evidence_entry in evidence {
+                bundle_stage.merge_evidence(evidence_entry)?;
+            }
+            bundle_stage.push_record(SourceWitnessKind::RateOccurrence, compressed_record)?;
+        }
         for candidate in provider_candidates {
             let raw_provider = self.read_provider_source(candidate.source_locator)?;
+            bundle_stage.preflight_raw_evidence(&raw_provider)?;
             let (compressed_record, evidence) =
                 self.externalized_record(SourceWitnessRecordInput {
                     kind: SourceWitnessKind::ProviderReference,
@@ -822,23 +1095,20 @@ impl SourceWitnessCollector {
                 })?;
             validate_compressed_record_size(compressed_record.len())?;
             for evidence_entry in evidence {
-                merge_selected_evidence(&mut evidence_by_sha256, evidence_entry)?;
+                bundle_stage.merge_evidence(evidence_entry)?;
             }
-            provider_records.push(SelectedSourceWitness {
-                priority: candidate.priority,
-                tie_breaker: candidate.tie_breaker,
-                compressed_record,
-                evidence_digests: Vec::new(),
-            });
+            bundle_stage.push_record(SourceWitnessKind::ProviderReference, compressed_record)?;
         }
-        let rate_bytes = compressed_bytes(&rate_records);
-        let provider_bytes = compressed_bytes(&provider_records);
+        let rate_bytes = bundle_stage.rate_record_bytes;
+        let provider_bytes = bundle_stage.provider_record_bytes;
         let mut rate_metrics = self
             .rate_occurrences
-            .metrics(rate_records.len(), rate_bytes);
-        let rate_metrics_map = rate_metrics
-            .as_object_mut()
-            .ok_or_else(|| io::Error::other("source witness rate metrics must be a JSON object"))?;
+            .metrics(bundle_stage.rate_records.len(), rate_bytes);
+        let rate_metrics_map = io_option(
+            rate_metrics.as_object_mut(),
+            io::ErrorKind::Other,
+            "source witness rate metrics must be a JSON object",
+        )?;
         rate_metrics_map.insert(
             "emitted_rate_row_count".to_string(),
             json!(self.rate_rows.load(AtomicOrdering::Relaxed)),
@@ -856,37 +1126,33 @@ impl SourceWitnessCollector {
         "occurrence_target": SOURCE_WITNESS_OCCURRENCE_TARGET,
         "total_target": SOURCE_WITNESS_TOTAL_TARGET,
             "provider_quota": SOURCE_WITNESS_PROVIDER_QUOTA,
+            "scratch": {
+                "spool_bytes": self.scratch_budget.used_bytes(),
+                "spool_byte_limit": self.scratch_budget.byte_limit(),
+                "representation": "source_fragment_locators_v1",
+            },
             "rate_occurrence": rate_metrics,
-            "provider_reference": self.provider_references.metrics(provider_records.len(), provider_bytes),
+            "provider_reference": self.provider_references.metrics(bundle_stage.provider_records.len(), provider_bytes),
         });
         let header_bytes = serde_json::to_vec(&header).map_err(to_io_error)?;
-        let header_length = u32::try_from(header_bytes.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "source witness header is too large",
-            )
-        })?;
-        let record_count = rate_records.len().saturating_add(provider_records.len());
-        let record_count_u32 = u32::try_from(record_count).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "source witness count is too large",
-            )
-        })?;
-        let evidence_bytes = evidence_by_sha256
-            .values()
-            .map(|entry| entry.compressed.len() as u64)
-            .sum::<u64>();
+        let header_length = io_result(
+            u32::try_from(header_bytes.len()),
+            io::ErrorKind::InvalidData,
+            "source witness header is too large",
+        )?;
+        let record_count = bundle_stage
+            .rate_records
+            .len()
+            .saturating_add(bundle_stage.provider_records.len());
+        let record_count_u32 = io_result(
+            u32::try_from(record_count),
+            io::ErrorKind::InvalidData,
+            "source witness count is too large",
+        )?;
         let projected_bundle_bytes = (SOURCE_WITNESS_MAGIC.len() as u64)
             .saturating_add(4)
             .saturating_add(header_bytes.len() as u64)
-            .saturating_add(4)
-            .saturating_add((evidence_by_sha256.len() as u64).saturating_mul(32 + 4 + 4))
-            .saturating_add(evidence_bytes)
-            .saturating_add(4)
-            .saturating_add((record_count as u64).saturating_mul(4))
-            .saturating_add(rate_bytes)
-            .saturating_add(provider_bytes);
+            .saturating_add(bundle_stage.logical_body_bytes);
         if projected_bundle_bytes > SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -905,38 +1171,34 @@ impl SourceWitnessCollector {
         writer.write_all(SOURCE_WITNESS_MAGIC)?;
         writer.write_all(&header_length.to_be_bytes())?;
         writer.write_all(&header_bytes)?;
-        let evidence_count = u32::try_from(evidence_by_sha256.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "source witness evidence dictionary is too large",
-            )
-        })?;
+        let evidence_count = io_result(
+            u32::try_from(bundle_stage.evidence_by_sha256.len()),
+            io::ErrorKind::InvalidData,
+            "source witness evidence dictionary is too large",
+        )?;
         writer.write_all(&evidence_count.to_be_bytes())?;
-        let mut evidence_entries = evidence_by_sha256.into_iter().collect::<Vec<_>>();
-        evidence_entries.sort_unstable_by_key(|(digest, _entry)| *digest);
-        for (digest, evidence_entry) in evidence_entries {
-            let compressed_length =
-                u32::try_from(evidence_entry.compressed.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "source witness evidence entry is too large",
-                    )
-                })?;
+        let mut evidence_entries = bundle_stage
+            .evidence_by_sha256
+            .iter()
+            .map(|(digest, entry)| (*digest, entry.raw_byte_count, entry.payload))
+            .collect::<Vec<_>>();
+        evidence_entries.sort_unstable_by_key(|(digest, _raw_byte_count, _payload)| *digest);
+        for (digest, raw_byte_count, payload) in evidence_entries {
             writer.write_all(&digest)?;
-            writer.write_all(&evidence_entry.raw_byte_count.to_be_bytes())?;
-            writer.write_all(&compressed_length.to_be_bytes())?;
-            writer.write_all(&evidence_entry.compressed)?;
+            writer.write_all(&raw_byte_count.to_be_bytes())?;
+            writer.write_all(&payload.length.to_be_bytes())?;
+            bundle_stage.copy_payload(&mut writer, payload)?;
         }
         writer.write_all(&record_count_u32.to_be_bytes())?;
-        for record in rate_records.iter().chain(provider_records.iter()) {
-            let length = u32::try_from(record.compressed_record.len()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "source witness record is too large",
-                )
-            })?;
-            writer.write_all(&length.to_be_bytes())?;
-            writer.write_all(&record.compressed_record)?;
+        let record_payloads = bundle_stage
+            .rate_records
+            .iter()
+            .chain(bundle_stage.provider_records.iter())
+            .map(|record| record.payload)
+            .collect::<Vec<_>>();
+        for payload in record_payloads {
+            writer.write_all(&payload.length.to_be_bytes())?;
+            bundle_stage.copy_payload(&mut writer, payload)?;
         }
         let (writer, digest, byte_count) = writer.finish()?;
         if byte_count != projected_bundle_bytes {
@@ -953,12 +1215,14 @@ impl SourceWitnessCollector {
             "selection_method": SOURCE_WITNESS_SELECTION,
             "raw_source_sha256": self.raw_source_sha256_hex,
             "row_count": record_count,
-            "occurrence_witness_count": rate_records.len(),
-            "provider_witness_count": provider_records.len(),
+            "occurrence_witness_count": bundle_stage.rate_records.len(),
+            "provider_witness_count": bundle_stage.provider_records.len(),
             "byte_count": byte_count,
             "sha256": hex_digest(&digest),
             "queryable_occurrence_population_count": self.rate_occurrences.population(),
             "provider_population_count": self.provider_references.population(),
+            "scratch_spool_bytes": self.scratch_budget.used_bytes(),
+            "scratch_spool_byte_limit": self.scratch_budget.byte_limit(),
         }))
     }
 
@@ -1013,6 +1277,10 @@ impl SourceWitnessCollector {
             linked_provider_raw,
             expected,
         } = input;
+        validate_decoded_evidence_size("raw token", raw.len())?;
+        if let Some(linked_provider_raw) = linked_provider_raw {
+            validate_decoded_evidence_size("linked provider token", linked_provider_raw.len())?;
+        }
         let raw_digest: [u8; 32] = Sha256::digest(raw).into();
         let linked_provider_digest = linked_provider_raw.map(Sha256::digest);
         let metadata = json!({
@@ -1033,25 +1301,22 @@ impl SourceWitnessCollector {
             "expected": expected,
         });
         let metadata_bytes = serde_json::to_vec(&metadata).map_err(to_io_error)?;
-        let metadata_length = u32::try_from(metadata_bytes.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "source witness record metadata is too large",
-            )
-        })?;
-        let raw_length = u32::try_from(raw.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "source witness raw JSON token is too large",
-            )
-        })?;
+        let metadata_length = io_result(
+            u32::try_from(metadata_bytes.len()),
+            io::ErrorKind::InvalidData,
+            "source witness record metadata is too large",
+        )?;
+        let raw_length = io_result(
+            u32::try_from(raw.len()),
+            io::ErrorKind::InvalidData,
+            "source witness raw JSON token is too large",
+        )?;
         let linked_provider_raw = linked_provider_raw.unwrap_or_default();
-        let linked_provider_length = u32::try_from(linked_provider_raw.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "source witness linked provider token is too large",
-            )
-        })?;
+        let linked_provider_length = io_result(
+            u32::try_from(linked_provider_raw.len()),
+            io::ErrorKind::InvalidData,
+            "source witness linked provider token is too large",
+        )?;
         let mut record = Vec::with_capacity(
             SOURCE_WITNESS_RECORD_MAGIC
                 .len()
@@ -1162,7 +1427,7 @@ fn record_tie_breaker(
     price_ordinal: u64,
     provider_ordinal: u64,
     raw: &[u8],
-    linked_provider_raw: Option<&[u8]>,
+    linked_provider_sha256: Option<[u8; 32]>,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(kind.domain());
@@ -1171,8 +1436,8 @@ fn record_tie_breaker(
     digest.update(price_ordinal.to_be_bytes());
     digest.update(provider_ordinal.to_be_bytes());
     digest.update(Sha256::digest(raw));
-    if let Some(linked_provider_raw) = linked_provider_raw {
-        digest.update(Sha256::digest(linked_provider_raw));
+    if let Some(linked_provider_sha256) = linked_provider_sha256 {
+        digest.update(linked_provider_sha256);
     }
     digest.finalize().into()
 }
@@ -1183,9 +1448,11 @@ fn local_source_witness_targets(
 ) -> io::Result<(usize, usize, usize)> {
     let occurrence_target = occurrence_population.min(SOURCE_WITNESS_OCCURRENCE_TARGET as u64);
     let provider_target = provider_population.min(SOURCE_WITNESS_PROVIDER_QUOTA as u64);
-    let total_target = occurrence_target
-        .checked_add(provider_target)
-        .ok_or_else(|| io::Error::other("source witness target overflow"))?;
+    let total_target = io_option(
+        occurrence_target.checked_add(provider_target),
+        io::ErrorKind::Other,
+        "source witness target overflow",
+    )?;
     Ok((
         occurrence_target as usize,
         provider_target as usize,
@@ -1211,6 +1478,19 @@ fn validate_local_candidate_selection(
     Ok(())
 }
 
+fn validate_decoded_evidence_size(label: &str, decoded_bytes: usize) -> io::Result<()> {
+    if decoded_bytes <= SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "source witness {label} is {decoded_bytes} bytes, exceeding the fail-closed {}-byte decoded evidence limit",
+            SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES,
+        ),
+    ))
+}
+
 fn validate_compressed_record_size(compressed_record_bytes: usize) -> io::Result<()> {
     if compressed_record_bytes <= SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES {
         return Ok(());
@@ -1224,13 +1504,7 @@ fn validate_compressed_record_size(compressed_record_bytes: usize) -> io::Result
     ))
 }
 
-fn compressed_bytes(records: &[SelectedSourceWitness]) -> u64 {
-    records
-        .iter()
-        .map(|record| record.compressed_record.len() as u64)
-        .sum()
-}
-
+#[cfg(test)]
 fn merge_selected_evidence(
     evidence_by_sha256: &mut HashMap<[u8; 32], SelectedSourceEvidence>,
     evidence_entry: PreparedSourceEvidence,
@@ -1288,6 +1562,24 @@ fn to_io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+fn io_result<T, E>(
+    result: Result<T, E>,
+    kind: io::ErrorKind,
+    message: &'static str,
+) -> io::Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(_) => Err(io::Error::new(kind, message)),
+    }
+}
+
+fn io_option<T>(value: Option<T>, kind: io::ErrorKind, message: &'static str) -> io::Result<T> {
+    match value {
+        Some(value) => Ok(value),
+        None => Err(io::Error::new(kind, message)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,23 +1589,32 @@ mod tests {
 
     type SelectedOccurrenceDigest = ((u64, [u8; 32]), [u8; 32]);
 
+    fn selected_rate(priority: u64) -> SelectedRateWitness {
+        SelectedRateWitness {
+            priority,
+            tie_breaker: [priority as u8; 32],
+            coordinate: SourceWitnessCoordinate::new(priority, 0),
+            price_ordinal: 0,
+            provider_ordinal: 0,
+            provider_evidence: json!({}),
+            rate_source_locator: RateSourceLocator {
+                shard: 0,
+                offset: priority,
+                length: 1,
+            },
+            linked_provider_locator: None,
+            expected: json!({}),
+        }
+    }
+
     #[test]
     fn sampler_is_order_independent_and_bounded() {
         let sampler = SourceWitnessSampler::new(3, 1_024);
         for priority in [9, 2, 7, 1, 3, 8] {
             sampler.add_population(1).unwrap();
-            sampler
-                .insert(
-                    priority,
-                    [priority as u8; 32],
-                    vec![priority as u8],
-                    Vec::new(),
-                )
-                .unwrap();
+            sampler.insert(selected_rate(priority)).unwrap();
         }
-        let cohort = sampler.take_sorted().unwrap();
-        let selected = cohort.records;
-        let evidence = cohort.evidence_by_sha256;
+        let selected = sampler.take_sorted().unwrap();
         assert_eq!(
             selected
                 .iter()
@@ -1321,7 +1622,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
-        assert!(evidence.is_empty());
         assert_eq!(sampler.population(), 6);
 
         let provider_sampler = ProviderWitnessSampler::new(1);
@@ -1345,12 +1645,7 @@ mod tests {
 
     #[test]
     fn witness_ordering_metrics_and_population_overflow_are_explicit() {
-        let source = |priority| SelectedSourceWitness {
-            priority,
-            tie_breaker: [priority as u8; 32],
-            compressed_record: vec![priority as u8],
-            evidence_digests: Vec::new(),
-        };
+        let source = selected_rate;
         let _ = source(1).eq(&source(1));
         let _ = source(1).eq(&source(2));
 
@@ -1472,9 +1767,117 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_samplers_and_unconfigured_rate_spools_fail_closed() {
+        let source_sampler = SourceWitnessSampler::new(1, 32);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = source_sampler.state.lock().unwrap();
+                    panic!("poison source sampler");
+                })
+                .join()
+                .unwrap_err();
+        });
+        assert!(source_sampler.insert(selected_rate(1)).is_err());
+        assert!(source_sampler.take_sorted().is_err());
+
+        let provider_sampler = ProviderWitnessSampler::new(1);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = provider_sampler.state.lock().unwrap();
+                    panic!("poison provider sampler");
+                })
+                .join()
+                .unwrap_err();
+        });
+        let selected_provider = SelectedProviderWitness {
+            priority: 1,
+            tie_breaker: [1; 32],
+            coordinate: SourceWitnessCoordinate::new(1, 0),
+            source_locator: ProviderSourceLocator {
+                shard: 0,
+                offset: 0,
+                length: 1,
+            },
+            expected: json!({}),
+        };
+        assert!(provider_sampler.insert(selected_provider).is_err());
+        assert!(provider_sampler.take_sorted().is_err());
+
+        let collector = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
+        let coordinate = SourceWitnessCoordinate::new(0, 0);
+        let procedure = Map::from_iter([("billing_code".to_owned(), json!("99213"))]);
+        assert!(collector
+            .store_rate_source(coordinate, &procedure, b"{}")
+            .is_err());
+        assert!(collector.seal_rate_sources().is_err());
+        assert!(collector
+            .read_rate_source(RateSourceLocator {
+                shard: 0,
+                offset: 0,
+                length: 1,
+            })
+            .is_err());
+        collector.configure_rate_spools(1).unwrap();
+        assert!(collector.configure_rate_spools(1).is_err());
+        collector
+            .rate_occurrences
+            .threshold
+            .store(0, AtomicOrdering::Relaxed);
+        assert!(collector
+            .rate_occurrence_candidates_untracked(coordinate, b"{}", b"{}", 10)
+            .unwrap()
+            .is_empty());
+
+        let output = tempfile::tempdir().unwrap();
+        let empty = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
+        empty.configure_rate_spools(1).unwrap();
+        let error = empty.write_bundle(output.path()).unwrap_err();
+        assert!(error.to_string().contains("no queryable source occurrence"));
+    }
+
+    #[test]
+    fn deterministic_rejection_and_identical_linked_evidence_are_explicit() {
+        let seed = [7; 32];
+        let bound = u64::MAX / 2 + 1;
+        let rejection_floor = u64::MAX - (u64::MAX % bound);
+        let counter = (0..10_000)
+            .find(|counter| {
+                deterministic_u64(&seed, b"permutation", *counter, 0) >= rejection_floor
+            })
+            .expect("fixture must exercise rejection sampling");
+        assert!(deterministic_bounded(&seed, counter, bound) < bound);
+
+        let collector = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
+        let raw = br#"{"provider_references":[7]}"#;
+        let (_record, evidence) = collector
+            .externalized_record(SourceWitnessRecordInput {
+                kind: SourceWitnessKind::RateOccurrence,
+                priority: 1,
+                tie_breaker: [2; 32],
+                coordinate: SourceWitnessCoordinate::new(0, 0),
+                price_ordinal: 0,
+                provider_ordinal: 0,
+                provider_evidence: Some(&json!({"source_kind": "provider_reference"})),
+                procedure: Some(&Map::new()),
+                raw,
+                linked_provider_raw: Some(raw),
+                expected: &json!({}),
+            })
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+    }
+
+    #[test]
     fn witness_validation_helpers_fail_closed_on_inconsistent_inputs() {
         validate_local_candidate_selection("rate", 2, 2, 10).unwrap();
         validate_local_candidate_selection("rate", 2, 1, 10).unwrap_err();
+        validate_decoded_evidence_size("token", SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES).unwrap();
+        let decoded_limit_error =
+            validate_decoded_evidence_size("token", SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES + 1)
+                .unwrap_err();
+        assert!(decoded_limit_error.to_string().contains("fail-closed"));
         validate_compressed_record_size(SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES).unwrap();
         validate_compressed_record_size(SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES + 1)
             .unwrap_err();
@@ -1523,6 +1926,101 @@ mod tests {
         empty
             .write_bundle(tempfile::tempdir().unwrap().path())
             .unwrap_err();
+    }
+
+    #[test]
+    fn bundle_stage_rejects_aggregate_budgets_before_writing_payload() {
+        let scratch_budget = SourceWitnessScratchBudget::from_env().unwrap();
+        let mut logical_stage = SourceWitnessBundleStage::new(Arc::clone(&scratch_budget)).unwrap();
+        logical_stage
+            .reserve_logical_body(
+                SOURCE_WITNESS_MAX_INTERMEDIATE_BUNDLE_BYTES - logical_stage.logical_body_bytes,
+            )
+            .unwrap();
+        let logical_error = logical_stage.reserve_logical_body(1).unwrap_err();
+        assert!(logical_error.to_string().contains("intermediate budget"));
+
+        let mut decoded_stage = SourceWitnessBundleStage::new(scratch_budget).unwrap();
+        decoded_stage.decoded_evidence_bytes = SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES - 1;
+        let decoded_error = decoded_stage.preflight_raw_evidence(b"xx").unwrap_err();
+
+        assert!(decoded_error
+            .to_string()
+            .contains("aggregate decoded budget"));
+        assert_eq!(
+            decoded_stage
+                .payload_file
+                .as_file()
+                .metadata()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(decoded_stage.evidence_by_sha256.is_empty());
+    }
+
+    #[test]
+    fn bundle_stage_rejects_inconsistent_and_truncated_staged_payloads() {
+        let scratch_budget = SourceWitnessScratchBudget::from_env().unwrap();
+
+        let mut overflow = SourceWitnessBundleStage::new(Arc::clone(&scratch_budget)).unwrap();
+        overflow.logical_body_bytes = u64::MAX;
+        assert!(overflow.reserve_logical_body(1).is_err());
+        overflow.decoded_evidence_bytes = u64::MAX;
+        assert!(overflow.reserve_decoded_evidence([1; 32], 1).is_err());
+
+        let mut inconsistent = SourceWitnessBundleStage::new(Arc::clone(&scratch_budget)).unwrap();
+        inconsistent.reserve_decoded_evidence([2; 32], 1).unwrap();
+        assert!(inconsistent.reserve_decoded_evidence([2; 32], 2).is_err());
+        inconsistent
+            .merge_evidence(PreparedSourceEvidence {
+                sha256: [3; 32],
+                raw_byte_count: 3,
+                compressed: vec![1, 2, 3],
+            })
+            .unwrap();
+        assert!(inconsistent
+            .merge_evidence(PreparedSourceEvidence {
+                sha256: [3; 32],
+                raw_byte_count: 3,
+                compressed: vec![3, 2, 1],
+            })
+            .is_err());
+
+        let mut truncated = SourceWitnessBundleStage::new(scratch_budget).unwrap();
+        let locator = truncated.append_payload(b"payload").unwrap();
+        truncated.payload_file.as_file_mut().set_len(1).unwrap();
+        assert!(truncated.copy_payload(&mut Vec::new(), locator).is_err());
+    }
+
+    #[test]
+    fn corrupt_rate_source_fragments_fail_at_the_exact_boundary() {
+        fn read_fragment(fragment: &[u8]) -> io::Result<(Map<String, Value>, Vec<u8>)> {
+            let collector = SourceWitnessCollector::new(&"ab".repeat(32))?;
+            collector.configure_rate_spools(1)?;
+            let locator = collector.rate_spools.get().unwrap().append(0, fragment)?;
+            collector.seal_rate_sources()?;
+            collector.read_rate_source(locator)
+        }
+
+        assert!(read_fragment(b"x").is_err());
+        assert!(read_fragment(&[0, 0, 0, 5, b'{', b'}']).is_err());
+        let mut scalar = 4u32.to_be_bytes().to_vec();
+        scalar.extend_from_slice(b"null");
+        assert!(read_fragment(&scalar).is_err());
+    }
+
+    #[test]
+    fn oversized_procedure_metadata_is_rejected_before_spooling() {
+        let collector = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
+        let procedure = Map::from_iter([(
+            "oversized".to_owned(),
+            Value::String("x".repeat(SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES)),
+        )]);
+        let error = collector
+            .store_rate_source(SourceWitnessCoordinate::new(0, 0), &procedure, b"{}")
+            .unwrap_err();
+        assert!(error.to_string().contains("metadata limit"));
     }
 
     #[test]
@@ -1611,6 +2109,7 @@ mod tests {
         object_order: impl IntoIterator<Item = u64>,
     ) -> Vec<SelectedOccurrenceDigest> {
         let collector = SourceWitnessCollector::new(&"cd".repeat(32)).unwrap();
+        collector.configure_rate_spools(2).unwrap();
         let procedure = Map::from_iter([
             ("billing_code_type".to_string(), json!("CPT")),
             ("billing_code".to_string(), json!("99213")),
@@ -1621,10 +2120,13 @@ mod tests {
                 "{{\"provider_references\":[7],\"negotiated_prices\":[{{\"negotiated_rate\":{object_ordinal}}}]}}"
             );
             let coordinate = SourceWitnessCoordinate::new(object_ordinal, 0);
-            for candidate in collector
+            let candidates = collector
                 .rate_occurrence_candidates(coordinate, &procedure_json, raw_rate.as_bytes(), 64)
-                .unwrap()
-            {
+                .unwrap();
+            let rate_source_locator = collector
+                .store_rate_source(coordinate, &procedure, raw_rate.as_bytes())
+                .unwrap();
+            for candidate in candidates {
                 let price_ordinal = candidate.occurrence_index / 8;
                 let provider_ordinal = candidate.occurrence_index % 8;
                 collector
@@ -1638,9 +2140,10 @@ mod tests {
                             "provider_group_ordinal": 0,
                             "npi_ordinal": provider_ordinal,
                         }),
-                        procedure: &procedure,
+                        rate_source_locator,
                         raw_rate: raw_rate.as_bytes(),
-                        linked_provider_raw: None,
+                        linked_provider_locator: None,
+                        linked_provider_sha256: None,
                         expected: &json!({"contract": "ptg2_v3_source_rate_occurrence_expected_v2"}),
                     })
                     .unwrap();
@@ -1650,12 +2153,8 @@ mod tests {
             .rate_occurrences
             .take_sorted()
             .unwrap()
-            .records
             .into_iter()
-            .map(|record| {
-                let digest: [u8; 32] = Sha256::digest(&record.compressed_record).into();
-                (record.key(), digest)
-            })
+            .map(|record| (record.key(), record.tie_breaker))
             .collect()
     }
 
@@ -1729,200 +2228,66 @@ mod tests {
 
     #[test]
     fn selected_oversized_record_fails_closed() {
-        let sampler = SourceWitnessSampler::new(1, u64::MAX);
-        let error = sampler
-            .insert(
-                1,
-                [0; 32],
-                vec![0; SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES + 1],
-                Vec::new(),
-            )
+        let error = validate_compressed_record_size(SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES + 1)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeding the fail-closed"));
     }
 
     #[test]
-    fn selected_record_above_the_old_limit_remains_bounded_and_is_accepted() {
+    fn selected_rate_heap_retains_locators_instead_of_materialized_records() {
         let sampler = SourceWitnessSampler::new(1, u64::MAX);
-        let compressed_record = vec![0; 512 * 1024 + 1];
-
-        sampler
-            .insert(1, [0; 32], compressed_record.clone(), Vec::new())
-            .unwrap();
-
-        let cohort = sampler.take_sorted().unwrap();
-        let selected = cohort.records;
-        let evidence = cohort.evidence_by_sha256;
+        sampler.insert(selected_rate(1)).unwrap();
+        let selected = sampler.take_sorted().unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].compressed_record, compressed_record);
-        assert!(evidence.is_empty());
+        assert_eq!(selected[0].rate_source_locator.offset, 1);
     }
 
     #[test]
-    fn sampler_deduplicates_shared_evidence_before_enforcing_budget() {
+    fn sampler_keeps_exact_bottom_k_without_materializing_evidence() {
         let sampler = SourceWitnessSampler::new(2, 12);
         for priority in [1, 2] {
-            sampler
-                .insert(
-                    priority,
-                    [priority as u8; 32],
-                    vec![priority as u8; 2],
-                    vec![PreparedSourceEvidence {
-                        sha256: [9; 32],
-                        raw_byte_count: 32,
-                        compressed: vec![7; 8],
-                    }],
-                )
-                .unwrap();
+            sampler.insert(selected_rate(priority)).unwrap();
         }
-        sampler
-            .insert(
-                0,
-                [0; 32],
-                vec![0; 2],
-                vec![PreparedSourceEvidence {
-                    sha256: [9; 32],
-                    raw_byte_count: 32,
-                    compressed: vec![7; 8],
-                }],
-            )
-            .unwrap();
-
-        let cohort = sampler.take_sorted().unwrap();
-        let selected = cohort.records;
-        let evidence = cohort.evidence_by_sha256;
+        sampler.insert(selected_rate(0)).unwrap();
+        let selected = sampler.take_sorted().unwrap();
         assert_eq!(selected.len(), 2);
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[&[9; 32]].reference_count, 2);
+        assert_eq!(selected[0].priority, 0);
+        assert_eq!(selected[1].priority, 1);
     }
 
     #[test]
-    fn sampler_replacement_releases_unreferenced_evidence() {
+    fn sampler_replacement_discards_the_worse_locator() {
         let sampler = SourceWitnessSampler::new(1, 64);
-        sampler
-            .insert(
-                2,
-                [2; 32],
-                vec![2; 2],
-                vec![PreparedSourceEvidence {
-                    sha256: [2; 32],
-                    raw_byte_count: 8,
-                    compressed: vec![2; 8],
-                }],
-            )
-            .unwrap();
-        sampler
-            .insert(
-                1,
-                [1; 32],
-                vec![1; 2],
-                vec![PreparedSourceEvidence {
-                    sha256: [1; 32],
-                    raw_byte_count: 8,
-                    compressed: vec![1; 8],
-                }],
-            )
-            .unwrap();
-
-        let cohort = sampler.take_sorted().unwrap();
-        assert_eq!(cohort.records[0].priority, 1);
-        assert_eq!(cohort.evidence_by_sha256.len(), 1);
-        assert!(cohort.evidence_by_sha256.contains_key(&[1; 32]));
+        sampler.insert(selected_rate(2)).unwrap();
+        sampler.insert(selected_rate(1)).unwrap();
+        let selected = sampler.take_sorted().unwrap();
+        assert_eq!(selected[0].priority, 1);
     }
 
     #[test]
-    fn sampler_rejects_evidence_that_exceeds_the_record_limit() {
-        let sampler = SourceWitnessSampler::new(1, u64::MAX);
-        let error = sampler
-            .insert(
-                1,
-                [0; 32],
-                vec![0],
-                vec![PreparedSourceEvidence {
-                    sha256: [1; 32],
-                    raw_byte_count: 1,
-                    compressed: vec![0; SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES + 1],
-                }],
-            )
+    fn final_materialization_rejects_oversized_evidence() {
+        let error = validate_compressed_record_size(SOURCE_WITNESS_MAX_COMPRESSED_RECORD_BYTES + 1)
             .unwrap_err();
-
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeding the fail-closed"));
     }
 
     #[test]
-    fn sampler_rejects_inconsistent_evidence_for_one_digest() {
-        let sampler = SourceWitnessSampler::new(2, 64);
-        sampler
-            .insert(
-                1,
-                [1; 32],
-                vec![1],
-                vec![PreparedSourceEvidence {
-                    sha256: [9; 32],
-                    raw_byte_count: 1,
-                    compressed: vec![9],
-                }],
-            )
+    fn rate_source_spool_round_trips_procedure_and_raw_rate() {
+        let collector = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
+        collector.configure_rate_spools(2).unwrap();
+        let coordinate = SourceWitnessCoordinate::new(3, 4);
+        let procedure = Map::from_iter([("billing_code".to_string(), json!("99213"))]);
+        let raw_rate = br#"{"provider_references":[7]}"#;
+        let locator = collector
+            .store_rate_source(coordinate, &procedure, raw_rate)
             .unwrap();
-        let error = sampler
-            .insert(
-                2,
-                [2; 32],
-                vec![2],
-                vec![PreparedSourceEvidence {
-                    sha256: [9; 32],
-                    raw_byte_count: 2,
-                    compressed: vec![9],
-                }],
-            )
-            .unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("digest is inconsistent"));
-    }
-
-    #[test]
-    fn sampler_enforces_budget_after_evidence_deduplication() {
-        let sampler = SourceWitnessSampler::new(1, 5);
-        let error = sampler
-            .insert(
-                1,
-                [1; 32],
-                vec![1; 2],
-                vec![PreparedSourceEvidence {
-                    sha256: [1; 32],
-                    raw_byte_count: 4,
-                    compressed: vec![1; 4],
-                }],
-            )
-            .unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("payload budget"));
-    }
-
-    #[test]
-    fn sampler_fails_closed_when_selected_evidence_reference_is_missing() {
-        let sampler = SourceWitnessSampler::new(1, 64);
-        sampler
-            .insert(
-                2,
-                [2; 32],
-                vec![2],
-                vec![PreparedSourceEvidence {
-                    sha256: [2; 32],
-                    raw_byte_count: 1,
-                    compressed: vec![2],
-                }],
-            )
-            .unwrap();
-        sampler.state.lock().unwrap().evidence_by_sha256.clear();
-
-        let error = sampler.insert(1, [1; 32], vec![1], Vec::new()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(error.to_string().contains("reference is missing"));
+        collector.read_rate_source(locator).unwrap_err();
+        collector.seal_rate_sources().unwrap();
+        let (restored_procedure, restored_rate) = collector.read_rate_source(locator).unwrap();
+        assert_eq!(restored_procedure, procedure);
+        assert_eq!(restored_rate, raw_rate);
     }
 
     #[test]

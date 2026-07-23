@@ -427,7 +427,20 @@ async def test_artifact_cutover_transaction_deadline_rolls_back(monkeypatch):
 
 def test_artifact_stage_names_are_unique_for_duplicate_runs():
     network_names = {importer._network_catalog_stage_table_name("run_1") for _index in range(10)}
-    overlay_names = {importer._address_overlay_stage_table_name("run_1") for _index in range(10)}
+    overlay_names = {
+        importer._address_overlay_stage_table_name("run_1")
+        for _index in range(1_000)
+    }
 
     assert len(network_names) == 10
-    assert len(overlay_names) == 10
+    assert len(overlay_names) == 1_000
+    assert all(
+        importer._is_address_overlay_stage_table_name(name)
+        for name in overlay_names
+    )
+    legacy_name = (
+        f"{importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX}_"
+        + "a"
+        * importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_LEGACY_IDENTIFIER_HEX_LENGTH
+    )
+    assert importer._is_address_overlay_stage_table_name(legacy_name)

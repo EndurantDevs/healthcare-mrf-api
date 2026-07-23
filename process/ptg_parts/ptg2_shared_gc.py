@@ -14,7 +14,14 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_CLEANUP_GENERATIONS,
     PTG2_V3_DENSE_LAYOUT_TABLES,
+    PTG2_V3_SHARED_FORMAT_VERSION,
     PTG2_V3_SHARED_GENERATION,
+    shared_block_hash,
+)
+from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_MAP_BLOCK_KIND,
+    PTG2_V4_SHARED_GENERATION,
+    decode_v4_snapshot_map_pack,
 )
 
 
@@ -29,6 +36,11 @@ PTG2_V3_BLOCK_GC_GRACE_SECONDS_DEFAULT = 21_600
 PTG2_V3_BLOCK_GC_MAX_BYTES_DEFAULT = 80 * 1024 * 1024 * 1024
 PTG2_V3_LAYOUT_GC_BATCH_ROWS_DEFAULT = 400
 PTG2_V3_BLOCK_GC_MAX_ROWS_DEFAULT = 1_000
+PTG2_V4_GC_MAP_PACK_BATCH_ROWS = 128
+PTG2_V4_GC_TABLE_NAMES = (
+    "ptg2_v4_snapshot_map_root",
+    "ptg2_v4_snapshot_map_pack",
+)
 
 PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (
     "ptg2_v3_snapshot_layout",
@@ -353,7 +365,254 @@ async def _has_shared_tables(
     return False
 
 
+async def _has_v4_map_tables(executor: Any, schema_name: str) -> bool:
+    """Return whether the additive V4 map migration is fully installed."""
+
+    table_records = await executor.all(
+        """
+        SELECT table_name
+          FROM information_schema.tables
+         WHERE table_schema = :schema_name
+           AND table_name = ANY(CAST(:table_names AS text[]))
+        """,
+        schema_name=schema_name,
+        table_names=list(PTG2_V4_GC_TABLE_NAMES),
+    )
+    present_names = {
+        str(_row_mapping(record).get("table_name") or "")
+        for record in table_records
+        if _row_mapping(record).get("table_name")
+    }
+    expected_names = set(PTG2_V4_GC_TABLE_NAMES)
+    installed_names = expected_names & present_names
+    if installed_names and installed_names != expected_names:
+        missing = ", ".join(sorted(expected_names - present_names))
+        raise RuntimeError(
+            "PTG V4 map GC requires the complete additive schema; "
+            f"missing tables: {missing}; run alembic upgrade head"
+        )
+    return installed_names == expected_names
+
+
+async def _v4_reachable_hashes(
+    executor: Any,
+    *,
+    schema_name: str,
+    snapshot_keys: Sequence[int] | None = None,
+    candidate_hashes: Iterable[bytes] | None = None,
+) -> set[bytes]:
+    """Decode authenticated map packs into exact V4 CAS reachability.
+
+    Sweep callers already hold candidate and target block row locks. A V4
+    publisher takes a conflicting key-share lock on every existing target
+    before publishing its pack, which closes the scan/delete race without a
+    relational target-edge expansion.
+    """
+
+    if snapshot_keys is not None and not snapshot_keys:
+        return set()
+    if not await _has_v4_map_tables(executor, schema_name):
+        return set()
+    candidates = (
+        {bytes(block_hash) for block_hash in candidate_hashes}
+        if candidate_hashes is not None
+        else None
+    )
+    if candidates is not None and not candidates:
+        return set()
+
+    schema = _quote_ident(schema_name)
+    reachable_hashes: set[bytes] = set()
+    last_coordinate = (-1, "", -1)
+    has_snapshot_filter = snapshot_keys is not None
+    normalized_snapshot_keys = [
+        int(snapshot_key) for snapshot_key in (snapshot_keys or ())
+    ]
+    while True:
+        map_pack_rows = await executor.all(
+            f"""
+            SELECT pack.snapshot_key, pack.object_kind, pack.pack_no,
+                   pack.first_block_key, pack.first_fragment_no,
+                   pack.last_block_key, pack.last_fragment_no,
+                   pack.coordinate_count, pack.entry_count,
+                   pack.map_block_hash,
+                   block.format_version, block.object_kind AS map_object_kind,
+                   block.codec, block.entry_count AS map_entry_count,
+                   block.raw_byte_count, block.stored_byte_count, block.payload
+              FROM {schema}.ptg2_v4_snapshot_map_pack AS pack
+              JOIN {schema}.ptg2_v4_snapshot_map_root AS root
+                ON root.snapshot_key = pack.snapshot_key
+              JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+                ON layout.snapshot_key = pack.snapshot_key
+              JOIN {schema}.ptg2_v3_block AS block
+                ON block.block_hash = pack.map_block_hash
+             WHERE root.state IN ('building', 'complete')
+               AND layout.generation = :v4_generation
+               AND (
+                    NOT :restrict_snapshot_keys
+                    OR pack.snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
+               )
+               AND (
+                    pack.snapshot_key > :last_snapshot_key
+                    OR (
+                        pack.snapshot_key = :last_snapshot_key
+                        AND pack.object_kind > :last_object_kind
+                    )
+                    OR (
+                        pack.snapshot_key = :last_snapshot_key
+                        AND pack.object_kind = :last_object_kind
+                        AND pack.pack_no > :last_pack_no
+                    )
+               )
+             ORDER BY pack.snapshot_key, pack.object_kind, pack.pack_no
+             LIMIT :batch_rows
+            """,
+            v4_generation=PTG2_V4_SHARED_GENERATION,
+            restrict_snapshot_keys=has_snapshot_filter,
+            snapshot_keys=normalized_snapshot_keys,
+            last_snapshot_key=last_coordinate[0],
+            last_object_kind=last_coordinate[1],
+            last_pack_no=last_coordinate[2],
+            batch_rows=PTG2_V4_GC_MAP_PACK_BATCH_ROWS,
+        )
+        if not map_pack_rows:
+            break
+        for raw_row in map_pack_rows:
+            map_pack_row = _row_mapping(raw_row)
+            coordinate = (
+                int(map_pack_row.get("snapshot_key")),
+                str(map_pack_row.get("object_kind") or ""),
+                int(map_pack_row.get("pack_no")),
+            )
+            if coordinate <= last_coordinate:
+                raise RuntimeError("PTG V4 GC map-pack ordering is not strict")
+            last_coordinate = coordinate
+            map_block_hash = bytes(map_pack_row.get("map_block_hash") or b"")
+            map_payload = bytes(map_pack_row.get("payload") or b"")
+            if (
+                len(map_block_hash) != 32
+                or int(map_pack_row.get("format_version") or -1)
+                != PTG2_V3_SHARED_FORMAT_VERSION
+                or map_pack_row.get("map_object_kind") != PTG2_V4_MAP_BLOCK_KIND
+                or map_pack_row.get("codec") != "none"
+                or int(map_pack_row.get("raw_byte_count") or -1)
+                != len(map_payload)
+                or int(map_pack_row.get("stored_byte_count") or -1)
+                != len(map_payload)
+                or shared_block_hash(
+                    format_version=PTG2_V3_SHARED_FORMAT_VERSION,
+                    object_kind=PTG2_V4_MAP_BLOCK_KIND,
+                    codec="none",
+                    payload=map_payload,
+                )
+                != map_block_hash
+            ):
+                raise RuntimeError("PTG V4 GC found an unauthenticated map block")
+            coordinates = decode_v4_snapshot_map_pack(
+                map_payload,
+                expected_object_kind=coordinate[1],
+            )
+            if not coordinates:
+                raise RuntimeError("PTG V4 GC found an empty persisted map pack")
+            if (
+                int(map_pack_row.get("coordinate_count") or -1)
+                != len(coordinates)
+                or int(map_pack_row.get("map_entry_count") or -1)
+                != len(coordinates)
+                or int(map_pack_row.get("entry_count") or -1)
+                != sum(
+                    int(map_coordinate.entry_count)
+                    for map_coordinate in coordinates
+                )
+                or (coordinates[0].block_key, coordinates[0].fragment_no)
+                != (
+                    int(map_pack_row.get("first_block_key")),
+                    int(map_pack_row.get("first_fragment_no")),
+                )
+                or (coordinates[-1].block_key, coordinates[-1].fragment_no)
+                != (
+                    int(map_pack_row.get("last_block_key")),
+                    int(map_pack_row.get("last_fragment_no")),
+                )
+            ):
+                raise RuntimeError("PTG V4 GC map metadata does not match its payload")
+            pack_hashes = {
+                map_block_hash,
+                *(map_coordinate.block_hash for map_coordinate in coordinates),
+            }
+            if candidates is None:
+                reachable_hashes.update(pack_hashes)
+            else:
+                reachable_hashes.update(candidates & pack_hashes)
+                if reachable_hashes == candidates:
+                    return reachable_hashes
+        if len(map_pack_rows) < PTG2_V4_GC_MAP_PACK_BATCH_ROWS:
+            break
+    return reachable_hashes
+
+
+async def _additional_v4_layout_stats(
+    executor: Any,
+    *,
+    schema_name: str,
+    snapshot_keys: Sequence[int],
+    v4_hashes: Iterable[bytes],
+) -> PTG2SharedLayoutGCStats:
+    """Count V4 hashes not already represented by selected V3 mappings."""
+
+    normalized_hashes = sorted({bytes(block_hash) for block_hash in v4_hashes})
+    if not normalized_hashes:
+        return PTG2SharedLayoutGCStats()
+    schema = _quote_ident(schema_name)
+    stat_rows = await executor.all(
+        f"""
+        WITH requested AS MATERIALIZED (
+            SELECT DISTINCT unnest(CAST(:block_hashes AS bytea[])) AS block_hash
+        )
+        SELECT COUNT(*)::bigint AS requested_count,
+               COUNT(block.block_hash)::bigint AS resolved_count,
+               COUNT(*) FILTER (
+                   WHERE block.block_hash IS NOT NULL
+                     AND NOT EXISTS (
+                         SELECT 1
+                           FROM {schema}.ptg2_v3_snapshot_block AS mapping
+                          WHERE mapping.snapshot_key = ANY(
+                                    CAST(:snapshot_keys AS bigint[])
+                                )
+                            AND mapping.block_hash = requested.block_hash
+                     )
+               )::bigint AS additional_count,
+               COALESCE(SUM(block.stored_byte_count) FILTER (
+                   WHERE NOT EXISTS (
+                         SELECT 1
+                           FROM {schema}.ptg2_v3_snapshot_block AS mapping
+                          WHERE mapping.snapshot_key = ANY(
+                                    CAST(:snapshot_keys AS bigint[])
+                                )
+                            AND mapping.block_hash = requested.block_hash
+                   )
+               ), 0)::bigint AS additional_stored_bytes
+          FROM requested
+          LEFT JOIN {schema}.ptg2_v3_block AS block
+            ON block.block_hash = requested.block_hash
+        """,
+        block_hashes=normalized_hashes,
+        snapshot_keys=[int(snapshot_key) for snapshot_key in snapshot_keys],
+    )
+    stat_row = _row_mapping(stat_rows[0]) if stat_rows else {}
+    if int(stat_row.get("requested_count") or 0) != int(
+        stat_row.get("resolved_count") or 0
+    ):
+        raise RuntimeError("PTG V4 layout references a missing CAS block")
+    return PTG2SharedLayoutGCStats(
+        candidate_hash_count=int(stat_row.get("additional_count") or 0),
+        stored_bytes=int(stat_row.get("additional_stored_bytes") or 0),
+    )
+
+
 def _layout_plan_sql(schema_name: str) -> str:
+    """Return bounded read-only SQL for eligible shared-layout accounting."""
+
     schema = _quote_ident(schema_name)
     return f"""
         WITH eligible_layouts AS MATERIALIZED (
@@ -406,6 +665,11 @@ def _layout_plan_sql(schema_name: str) -> str:
                 ON layout.snapshot_key = mapping.snapshot_key
         )
         SELECT (SELECT COUNT(*) FROM eligible_layouts) AS logical_layout_count,
+               ARRAY(
+                   SELECT snapshot_key
+                     FROM eligible_layouts
+                    ORDER BY snapshot_key
+               ) AS eligible_layout_keys,
                COUNT(block.block_hash) AS candidate_hash_count,
                COALESCE(SUM(block.stored_byte_count), 0) AS stored_bytes
           FROM mapped_blocks AS mapped
@@ -425,15 +689,42 @@ async def _build_layout_release_plan_ready(
     aggregate_records = await executor.all(
         _layout_plan_sql(schema_name),
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
-        removing_snapshot_ids=list(dict.fromkeys(str(value) for value in removing_snapshot_ids)),
+        removing_snapshot_ids=list(
+            dict.fromkeys(
+                str(snapshot_id) for snapshot_id in removing_snapshot_ids
+            )
+        ),
         building_max_age_seconds=building_max_age_seconds,
         layout_limit=layout_limit,
     )
     aggregate_record = _row_mapping(aggregate_records[0]) if aggregate_records else {}
+    eligible_layout_keys = tuple(
+        int(layout_key)
+        for layout_key in (
+            aggregate_record.get("eligible_layout_keys") or ()
+        )
+    )
+    v4_hashes = await _v4_reachable_hashes(
+        executor,
+        schema_name=schema_name,
+        snapshot_keys=eligible_layout_keys,
+    )
+    v4_stats = await _additional_v4_layout_stats(
+        executor,
+        schema_name=schema_name,
+        snapshot_keys=eligible_layout_keys,
+        v4_hashes=v4_hashes,
+    )
     return PTG2SharedLayoutGCStats(
         logical_layout_count=int(aggregate_record.get("logical_layout_count") or 0),
-        candidate_hash_count=int(aggregate_record.get("candidate_hash_count") or 0),
-        stored_bytes=int(aggregate_record.get("stored_bytes") or 0),
+        candidate_hash_count=(
+            int(aggregate_record.get("candidate_hash_count") or 0)
+            + v4_stats.candidate_hash_count
+        ),
+        stored_bytes=(
+            int(aggregate_record.get("stored_bytes") or 0)
+            + v4_stats.stored_bytes
+        ),
     )
 
 
@@ -556,6 +847,10 @@ def _release_layouts_sql(schema_name: str) -> str:
               FROM {schema}.ptg2_v3_snapshot_block AS mapping
               JOIN layout_batch AS layout
                 ON layout.snapshot_key = mapping.snapshot_key
+            UNION
+            SELECT DISTINCT v4_hash.block_hash
+              FROM unnest(CAST(:v4_block_hashes AS bytea[]))
+                       AS v4_hash(block_hash)
         ),
         queued_candidates AS (
             INSERT INTO {schema}.ptg2_v3_gc_candidate AS candidate
@@ -621,12 +916,18 @@ async def _release_layouts_ready(
     ]
     if not layout_keys:
         return PTG2SharedLayoutGCStats()
+    v4_block_hashes = await _v4_reachable_hashes(
+        executor,
+        schema_name=schema_name,
+        snapshot_keys=layout_keys,
+    )
     aggregate_records = await executor.all(
         _release_layouts_sql(schema_name),
         layout_keys=layout_keys,
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
         building_max_age_seconds=building_max_age_seconds,
         grace_seconds=grace_seconds,
+        v4_block_hashes=sorted(v4_block_hashes),
     )
     aggregate_record = _row_mapping(aggregate_records[0]) if aggregate_records else {}
     return PTG2SharedLayoutGCStats(
@@ -729,12 +1030,36 @@ async def _build_sweep_plan_ready(
     max_rows: int,
     lock_rows: bool,
 ) -> PTG2SharedBlockSweepPlan:
-    rows = await executor.all(
+    candidate_rows = await executor.all(
         _eligible_blocks_sql(schema_name, lock_rows=lock_rows),
         max_bytes=max_bytes,
         max_rows=max_rows,
     )
-    return _select_hashes_under_byte_cap(rows, max_bytes=max_bytes)
+    candidate_hashes = {
+        bytes(_row_mapping(candidate_row).get("block_hash") or b"")
+        for candidate_row in candidate_rows
+    }
+    v4_reachable = await _v4_reachable_hashes(
+        executor,
+        schema_name=schema_name,
+        candidate_hashes=candidate_hashes,
+    )
+    if lock_rows and v4_reachable:
+        schema = _quote_ident(schema_name)
+        await executor.status(
+            f"""
+            DELETE FROM {schema}.ptg2_v3_gc_candidate AS candidate
+             WHERE candidate.block_hash = ANY(CAST(:block_hashes AS bytea[]))
+            """,
+            block_hashes=sorted(v4_reachable),
+        )
+    filtered_rows = [
+        candidate_row
+        for candidate_row in candidate_rows
+        if bytes(_row_mapping(candidate_row).get("block_hash") or b"")
+        not in v4_reachable
+    ]
+    return _select_hashes_under_byte_cap(filtered_rows, max_bytes=max_bytes)
 
 
 async def build_shared_block_sweep_plan(
@@ -764,8 +1089,23 @@ async def build_shared_block_sweep_plan(
     )
 
 
-def _delete_blocks_sql(schema_name: str) -> str:
+def _delete_blocks_sql(
+    schema_name: str,
+    *,
+    v4_tables_available: bool,
+) -> str:
     schema = _quote_ident(schema_name)
+    v4_guard = (
+        f"""
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {schema}.ptg2_v4_snapshot_map_pack AS v4_mapping
+                 WHERE v4_mapping.map_block_hash = block.block_hash
+           )
+        """
+        if v4_tables_available
+        else ""
+    )
     return f"""
         DELETE FROM {schema}.ptg2_v3_block AS block
          WHERE block.block_hash = ANY(CAST(:block_hashes AS bytea[]))
@@ -774,6 +1114,7 @@ def _delete_blocks_sql(schema_name: str) -> str:
                   FROM {schema}.ptg2_v3_snapshot_block AS mapping
                  WHERE mapping.block_hash = block.block_hash
            )
+           {v4_guard}
         RETURNING block.block_hash, block.stored_byte_count
     """
 
@@ -814,8 +1155,12 @@ async def _sweep_ready(
     )
     deleted_rows: list[Any] = []
     if selected.selected_hashes:
+        v4_tables_available = await _has_v4_map_tables(executor, schema_name)
         deleted_rows = await executor.all(
-            _delete_blocks_sql(schema_name),
+            _delete_blocks_sql(
+                schema_name,
+                v4_tables_available=v4_tables_available,
+            ),
             block_hashes=list(selected.selected_hashes),
         )
     await executor.status(

@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from process.ptg_parts.ptg2_source_witness_bundle import read_scanner_bundle
+from process.ptg_parts.ptg2_source_witness_locator_reader import (
+    read_scanner_bundle_locators as read_scanner_bundle,
+)
 from process.ptg_parts.ptg2_source_witness_codec import decode_record
 from process.ptg_parts.ptg2_source_witness_contract import (
-    CompressedSourceWitnessRecord,
     LoadedSourceWitness,
     PTG2_V3_SOURCE_WITNESS_CONTRACT,
     PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES,
@@ -19,6 +20,7 @@ from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_SELECTION,
     PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
     PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
+    SourceWitnessCandidate,
     SourceWitnessRecord,
 )
 from process.ptg_parts.ptg2_source_witness_persisted_decode import (
@@ -26,7 +28,9 @@ from process.ptg_parts.ptg2_source_witness_persisted_decode import (
 )
 from process.ptg_parts.ptg2_source_witness_persisted_encode import (
     SourceWitnessPayloadCounts,
-    encode_persisted_source_witness,
+)
+from process.ptg_parts.ptg2_source_witness_streaming_encode import (
+    encode_persisted_source_witness_candidates,
 )
 from process.ptg_parts.ptg2_source_witness_primitives import sha256_hex
 from process.ptg_parts.ptg2_source_witness_selection import (
@@ -40,11 +44,11 @@ from process.ptg_parts.ptg2_source_witness_selection import (
 def _read_source_bundles(
     bundle_entries: Sequence[Mapping[str, Any]],
     expected_sources: Sequence[str],
-) -> tuple[list[dict[str, Any]], list[CompressedSourceWitnessRecord]]:
+) -> tuple[list[dict[str, Any]], list[SourceWitnessCandidate]]:
     if not bundle_entries or len(bundle_entries) != len(expected_sources):
         raise RuntimeError("strict V3 source witness coverage is incomplete")
     bundle_headers: list[dict[str, Any]] = []
-    candidate_records: list[CompressedSourceWitnessRecord] = []
+    candidate_records: list[SourceWitnessCandidate] = []
     for bundle_entry in bundle_entries:
         bundle_header, bundle_records = read_scanner_bundle(bundle_entry)
         bundle_headers.append(bundle_header)
@@ -88,7 +92,7 @@ def build_persisted_source_witness(
     )
     if occurrence_count <= 0:
         raise RuntimeError("strict V3 source witness has no queryable occurrence evidence")
-    return encode_persisted_source_witness(
+    return encode_persisted_source_witness_candidates(
         selected_records,
         SourceWitnessPayloadCounts(
             source_count=len(expected_sources),

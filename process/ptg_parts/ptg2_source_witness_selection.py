@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from process.ptg_parts.ptg2_source_witness_contract import (
-    CompressedSourceWitnessRecord,
     PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
     PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
+    SourceWitnessCandidate,
     source_witness_targets,
 )
 from process.ptg_parts.ptg2_source_witness_primitives import (
@@ -116,12 +116,12 @@ def local_source_witness_targets(
 
 
 def retain_source_witness_candidates(
-    candidate_records: Iterable[CompressedSourceWitnessRecord],
-) -> list[CompressedSourceWitnessRecord]:
+    candidate_records: Iterable[SourceWitnessCandidate],
+) -> list[SourceWitnessCandidate]:
     """Bound an intermediate global merge to each cohort's release target."""
 
     records = tuple(candidate_records)
-    selected_records: list[CompressedSourceWitnessRecord] = []
+    selected_records: list[SourceWitnessCandidate] = []
     for cohort_name, cohort_target in (
         ("rate_occurrence", PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET),
         ("provider_reference", PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA),
@@ -141,11 +141,11 @@ def retain_source_witness_candidates(
 
 
 def select_source_witness_records(
-    candidate_records: Sequence[CompressedSourceWitnessRecord],
+    candidate_records: Sequence[SourceWitnessCandidate],
     *,
     occurrence_population: int,
     provider_population: int,
-) -> tuple[list[CompressedSourceWitnessRecord], int, int, int]:
+) -> tuple[list[SourceWitnessCandidate], int, int, int]:
     """Select the exact deterministic occurrence/provider budget."""
 
     occurrence_target, provider_target, total_target = source_witness_targets(

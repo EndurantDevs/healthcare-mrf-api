@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from process.ptg_parts.ptg2_shared_publish import (
     create_shared_block_stage,
     publish_shared_block_stage,
     publish_shared_finalizer_dictionaries,
+    publish_v4_cas_block_stage,
     shared_block_stage_name,
 )
 from process.ptg_parts import ptg2_shared_publish
@@ -557,6 +559,161 @@ class _OneRowResult:
         return self.row[0]
 
 
+class _RowsResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def all(self):
+        return self.rows
+
+
+class _FirstBatchProgress:
+    def __init__(self):
+        self.events = []
+        self.first_batch_reported = asyncio.Event()
+
+    def __call__(self, metric, amount):
+        self.events.append((metric, amount))
+        if metric == "sql_stage_rows":
+            self.first_batch_reported.set()
+
+
+class _SlowSharedBlockSQLDriver:
+    batch_sizes = (32, 7)
+    new_hash_counts = (32, 5)
+
+    def __init__(self):
+        self.fetch_index = 0
+        self.scalar_index = 0
+        self.release_second_batch = asyncio.Event()
+
+    async def execute_stage_statement(self, statement, params=None):
+        statement_text = str(statement)
+        if statement_text.startswith("FETCH FORWARD"):
+            return await self._fetch_stage_rows()
+        if "LEFT JOIN \"mrf\".ptg2_v3_snapshot_block AS mapping" in statement_text:
+            batch_size = self.batch_sizes[self.fetch_index - 1]
+            return _OneRowResult(
+                (
+                    batch_size,
+                    batch_size * 10,
+                    batch_size * 7,
+                    ["serving"],
+                    False,
+                    False,
+                    False,
+                )
+            )
+        return _OneRowResult((0,))
+
+    async def _fetch_stage_rows(self):
+        current_index = self.fetch_index
+        self.fetch_index += 1
+        if current_index == 1:
+            await self.release_second_batch.wait()
+        if current_index >= len(self.batch_sizes):
+            return _RowsResult(())
+        return _RowsResult(
+            tuple(
+                (f"({current_index},{row_offset + 1})",)
+                for row_offset in range(self.batch_sizes[current_index])
+            )
+        )
+
+    async def read_identity_count(self, statement):
+        batch_index, identity_kind = divmod(self.scalar_index, 2)
+        self.scalar_index += 1
+        if identity_kind == 0:
+            return self.new_hash_counts[batch_index]
+        return self.batch_sizes[batch_index]
+
+
+class _SlowV4CASSQLDriver:
+    batch_sizes = (32, 4)
+    unique_counts = (30, 3)
+
+    def __init__(self):
+        self.fetch_index = 0
+        self.release_second_batch = asyncio.Event()
+
+    async def execute_stage_statement(self, statement, params=None):
+        statement_text = str(statement)
+        if statement_text.startswith("FETCH FORWARD"):
+            return await self._fetch_stage_rows()
+        batch_index = max(self.fetch_index - 1, 0)
+        if "SUM(staged.entry_count)" in statement_text:
+            batch_size = self.batch_sizes[batch_index]
+            return _OneRowResult(
+                (
+                    batch_size,
+                    batch_size * 2,
+                    batch_size * 10,
+                    batch_size * 7,
+                    ["v4_graph"],
+                    False,
+                    False,
+                    False,
+                )
+            )
+        if "JOIN \"mrf\".ptg2_v3_block AS stored USING" in statement_text:
+            unique_count = self.unique_counts[batch_index]
+            return _OneRowResult(
+                (unique_count, unique_count * 10, unique_count * 7)
+            )
+        return _OneRowResult((0,))
+
+    async def _fetch_stage_rows(self):
+        batch_index = self.fetch_index
+        self.fetch_index += 1
+        if batch_index == 1:
+            await self.release_second_batch.wait()
+        if batch_index >= len(self.batch_sizes):
+            return _RowsResult(())
+        return _RowsResult(
+            tuple(
+                (f"({batch_index},{row_offset + 1})",)
+                for row_offset in range(self.batch_sizes[batch_index])
+            )
+        )
+
+
+@asynccontextmanager
+async def _session_transaction(session):
+    yield session
+
+
+def _assert_slow_shared_block_publication(publication, progress_events, session):
+    assert publication.mapping_count == 39
+    assert publication.unique_block_count == 37
+    assert publication.logical_byte_count == 390
+    assert publication.stored_byte_count == 273
+    assert progress_events == [
+        ("sql_stage_rows", 32),
+        ("publish_batches", 1),
+        ("sql_stage_rows", 7),
+        ("publish_batches", 1),
+    ]
+    statements = "\n".join(
+        str(call.args[0]) for call in session.execute.await_args_list
+    )
+    assert "FETCH FORWARD 32" in statements
+    assert "JOIN \"ptg2_publish_batch_" in statements
+
+
+def _assert_slow_v4_cas_publication(publication, progress_events):
+    assert publication.staged_row_count == 36
+    assert publication.staged_entry_count == 72
+    assert publication.unique_block_count == 33
+    assert publication.logical_byte_count == 360
+    assert publication.stored_byte_count == 252
+    assert publication.unique_logical_byte_count == 330
+    assert publication.unique_stored_byte_count == 231
+    assert progress_events[-2:] == [
+        ("sql_stage_rows", 4),
+        ("publish_batches", 1),
+    ]
+
+
 def test_shared_publish_rejects_invalid_identifiers_and_summary_values():
     invalid_operations = (
         (lambda: ptg2_shared_publish._safe_identifier("mrf;drop"), ValueError, "unsafe"),
@@ -869,6 +1026,183 @@ async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatc
         stage_table="ptg2_v3_block_stage_proof",
         snapshot_key=42,
         expected_count=3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_slow_sql_stage_reports_exact_bounded_rows_before_completion(
+    monkeypatch,
+):
+    """A blocked later batch cannot hide completed, measured SQL work."""
+
+    sql_driver = _SlowSharedBlockSQLDriver()
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=sql_driver.execute_stage_statement),
+        scalar=AsyncMock(side_effect=sql_driver.read_identity_count),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish.db,
+        "transaction",
+        lambda: _session_transaction(session),
+    )
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_shared_layout_for_dense_write",
+        AsyncMock(),
+    )
+    progress_capture = _FirstBatchProgress()
+    publish_task = asyncio.create_task(
+        publish_shared_block_stage(
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_slow_sql",
+            snapshot_key=42,
+            build_token="build-42",
+            progress_callback=progress_capture,
+        )
+    )
+    await asyncio.wait_for(
+        progress_capture.first_batch_reported.wait(),
+        timeout=1.0,
+    )
+
+    assert not publish_task.done()
+    assert progress_capture.events == [
+        ("sql_stage_rows", 32),
+        ("publish_batches", 1),
+    ]
+    sql_driver.release_second_batch.set()
+    publication = await publish_task
+    _assert_slow_shared_block_publication(
+        publication,
+        progress_capture.events,
+        session,
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_cas_stage_publishes_exact_totals_without_snapshot_mappings(
+    monkeypatch,
+):
+    """Prove V4 publishes deduplicated CAS totals without legacy mappings."""
+
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                None,
+                None,
+                _OneRowResult(
+                    (
+                        3,
+                        18,
+                        2,
+                        30,
+                        20,
+                        20,
+                        14,
+                        ["a_kind", "z_kind"],
+                        False,
+                        False,
+                        False,
+                    )
+                ),
+                None,
+            ]
+        )
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    drop_stage = AsyncMock()
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", drop_stage)
+    layout_lock = AsyncMock()
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_v4_shared_layout_for_map_write",
+        layout_lock,
+    )
+
+    publication = await publish_v4_cas_block_stage(
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_v4proof",
+        snapshot_key=42,
+        build_token="build-v4",
+    )
+
+    assert publication.object_kinds == ("a_kind", "z_kind")
+    assert publication.staged_row_count == 3
+    assert publication.staged_entry_count == 18
+    assert publication.unique_block_count == 2
+    assert publication.logical_byte_count == 30
+    assert publication.stored_byte_count == 20
+    assert publication.unique_logical_byte_count == 20
+    assert publication.unique_stored_byte_count == 14
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert "FOR KEY SHARE OF stored" in statements[0]
+    assert "INSERT INTO \"mrf\".ptg2_v3_block" in statements[1]
+    assert "WITH canonical AS MATERIALIZED" in statements[2]
+    assert "DELETE FROM \"mrf\".ptg2_v3_gc_candidate" in statements[3]
+    assert not any("ptg2_v3_snapshot_block" in statement for statement in statements)
+    layout_lock.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
+        snapshot_key=42,
+        build_token="build-v4",
+    )
+    drop_stage.assert_awaited_once_with(
+        'DROP TABLE IF EXISTS "mrf"."ptg2_v3_block_stage_v4proof";'
+    )
+
+
+@pytest.mark.asyncio
+async def test_slow_v4_cas_sql_reports_exact_batches_before_completion(
+    monkeypatch,
+):
+    """V4 CAS publication exposes completed rows while a later batch waits."""
+
+    sql_driver = _SlowV4CASSQLDriver()
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=sql_driver.execute_stage_statement)
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish.db,
+        "transaction",
+        lambda: _session_transaction(session),
+    )
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_v4_shared_layout_for_map_write",
+        AsyncMock(),
+    )
+    progress_capture = _FirstBatchProgress()
+    publish_task = asyncio.create_task(
+        publish_v4_cas_block_stage(
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_v4_slow_sql",
+            snapshot_key=42,
+            build_token="build-v4",
+            progress_callback=progress_capture,
+        )
+    )
+    await asyncio.wait_for(
+        progress_capture.first_batch_reported.wait(),
+        timeout=1.0,
+    )
+
+    assert not publish_task.done()
+    assert progress_capture.events == [
+        ("sql_stage_rows", 32),
+        ("publish_batches", 1),
+    ]
+    sql_driver.release_second_batch.set()
+    publication = await publish_task
+    _assert_slow_v4_cas_publication(
+        publication,
+        progress_capture.events,
     )
 
 

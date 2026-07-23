@@ -254,6 +254,7 @@ def _current_table_row(**overrides):
     row_by_field = {
         "snapshot_id": "snapshot-a",
         "snapshot_key": "41",
+        "storage_generation": serving.PTG2_V3_SHARED_GENERATION,
         "layout_snapshot_key": 41,
         "layout_code_count": "2",
         "layout_source_count": 1,
@@ -277,6 +278,9 @@ def test_network_serving_table_currentness_accepts_exact_chain_only():
     )
     assert not serving._is_network_serving_tables_current(
         tables, _current_table_row(snapshot_key="invalid")
+    )
+    assert not serving._is_network_serving_tables_current(
+        tables, _current_table_row(storage_generation="shared_blocks_v4")
     )
     assert not serving._is_network_serving_tables_current(
         tables, _current_table_row(attested_source_set_digest="other")
