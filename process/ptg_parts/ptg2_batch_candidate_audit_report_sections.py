@@ -34,8 +34,10 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_DEADLINE_SECONDS,
 )
 from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_RESULT_CONTRACT,
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND,
 )
 from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine_evidence,
@@ -66,6 +68,54 @@ class ValidatedSourceEvidence:
     quarantine_evidence: Mapping[str, Any]
 
 
+def _partitioned_request_start_span(
+    report_by_field: Mapping[str, Any],
+    *,
+    duration_seconds: float,
+) -> float:
+    """Return a bounded, measured request-start span."""
+
+    checks_by_field = report_by_field.get("checks")
+    request_count = (
+        checks_by_field.get("batch_requests_executed")
+        if isinstance(checks_by_field, Mapping)
+        else None
+    )
+    http_by_field = report_by_field.get("http")
+    request_start_span_seconds = (
+        http_by_field.get("request_start_span_seconds")
+        if isinstance(http_by_field, Mapping)
+        else None
+    )
+    if (
+        type(request_count) is not int
+        or request_count < 1
+        or isinstance(request_start_span_seconds, bool)
+        or not isinstance(request_start_span_seconds, (int, float))
+        or not math.isfinite(float(request_start_span_seconds))
+        or float(request_start_span_seconds) < 0
+    ):
+        raise ValueError("batch audit report timing is invalid")
+    remaining_start_count = request_count - 1
+    full_request_waves, trailing_start_count = divmod(
+        remaining_start_count,
+        PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT,
+    )
+    maximum_contract_start_span = (
+        full_request_waves * PTG2_FAST_AUDIT_DEADLINE_SECONDS
+        + trailing_start_count
+        / PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND
+        + 5.0
+    )
+    normalized_start_span = float(request_start_span_seconds)
+    if (
+        normalized_start_span > duration_seconds + 1.0
+        or normalized_start_span > maximum_contract_start_span
+    ):
+        raise ValueError("batch audit report timing is invalid")
+    return normalized_start_span
+
+
 def validate_report_timing(
     report_by_field: Mapping[str, Any],
     *,
@@ -83,32 +133,34 @@ def validate_report_timing(
     )
     duration_seconds = report_by_field.get("duration_seconds")
     batch_by_field = report_by_field.get("batch")
-    checks_by_field = report_by_field.get("checks")
     partitioned = (
         isinstance(batch_by_field, Mapping)
         and batch_by_field.get("request_contract")
         == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
     )
-    request_count = (
-        checks_by_field.get("batch_requests_executed")
-        if isinstance(checks_by_field, Mapping)
-        else None
-    )
-    maximum_duration_seconds = PTG2_FAST_AUDIT_DEADLINE_SECONDS
-    if partitioned:
-        if type(request_count) is not int or request_count < 1:
-            raise ValueError("batch audit report timing is invalid")
-        maximum_duration_seconds += max(request_count - 1, 0) / 2.0 + 5.0
     if (
         isinstance(duration_seconds, bool)
         or not isinstance(duration_seconds, (int, float))
         or not math.isfinite(float(duration_seconds))
         or float(duration_seconds) < 0
-        or float(duration_seconds) > maximum_duration_seconds
+    ):
+        raise ValueError("batch audit report timing is invalid")
+    normalized_duration_seconds = float(duration_seconds)
+    maximum_duration_seconds = PTG2_FAST_AUDIT_DEADLINE_SECONDS
+    if partitioned:
+        maximum_duration_seconds += (
+            _partitioned_request_start_span(
+                report_by_field,
+                duration_seconds=normalized_duration_seconds,
+            )
+            + 5.0
+        )
+    if (
+        normalized_duration_seconds > maximum_duration_seconds
         or started_at > completed_at
         or abs(
             (completed_at - started_at).total_seconds()
-            - float(duration_seconds)
+            - normalized_duration_seconds
         )
         > 1.0
     ):

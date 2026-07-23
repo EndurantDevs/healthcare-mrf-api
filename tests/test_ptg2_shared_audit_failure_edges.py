@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,6 +22,19 @@ def _candidate(
         provider_count,
         candidate_ordinal=candidate_ordinal,
     )
+
+
+def _sealed_metadata():
+    return {
+        "contract": audit.PTG2_V3_AUDIT_CONTRACT,
+        "format_version": 2,
+        "method": audit.PTG2_V3_AUDIT_METHOD,
+        "serving_multiplicity_semantics": (
+            audit.PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
+        ),
+        "sample_count": 1,
+        "sample_digest": "a" * 64,
+    }
 
 
 def test_candidate_path_rejects_output_directory_escape(tmp_path):
@@ -172,3 +186,86 @@ async def test_price_memberships_require_every_requested_price():
             atom_key_bits=1,
             block_span=16,
         )
+
+
+def test_zero_row_limit():
+    assert audit.build_audit_occurrences(
+        candidates=(_candidate(),),
+        provider_npis={0: (1_234_567_890,)},
+        price_memberships={3: (4,)},
+        core_layout_id=b"\x01" * 32,
+        budget=audit._ReadBudget(),
+        maximum_rows=0,
+    ) == ()
+
+
+def test_occurrence_collision_rejected(monkeypatch):
+    candidate = _candidate()
+    original = audit._occurrence(
+        b"\x02" * 32,
+        candidate,
+        1_234_567_890,
+        0,
+        4,
+    )
+    collision = replace(original, npi=1_234_567_891)
+    monkeypatch.setattr(audit, "_occurrence", lambda *_args: collision)
+
+    with pytest.raises(RuntimeError, match="hash collision"):
+        audit._store_audit_occurrence(
+            {original.occurrence_id: original},
+            core_layout_id=b"\x02" * 32,
+            candidate=candidate,
+            npi=collision.npi,
+            atom_ordinal=collision.atom_ordinal,
+            atom_key=collision.atom_key,
+            budget=audit._ReadBudget(),
+            row_limit=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mapping_digest", "core_support_digest", "message"),
+    (
+        (b"\x03" * 32, b"\x04" * 31, "core support digest"),
+        (b"\x03" * 31, b"\x04" * 32, "mapping digest"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_publication_rejects_invalid_digests(
+    mapping_digest,
+    core_support_digest,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        await audit.publish_shared_audit_sample(
+            schema_name="mrf",
+            build_ownership=None,
+            logical_snapshot_id="snapshot",
+            finalizer_summary={},
+            mapping_digest=mapping_digest,
+            core_support_digest=core_support_digest,
+            atom_key_bits=1,
+            price_membership_block_span=1,
+        )
+
+
+def test_layout_requires_audit_metadata():
+    with pytest.raises(RuntimeError, match="audit sample contract"):
+        audit._audit_metadata_from_layout({})
+
+
+@pytest.mark.parametrize(
+    "invalid_field_by_name",
+    (
+        {"contract": "invalid"},
+        {"sample_count": audit.PTG2_V3_AUDIT_MAX_SAMPLE_ROWS + 1},
+        {"sample_digest": "invalid"},
+    ),
+)
+def test_sealed_contract_rejects_invalid_metadata(invalid_field_by_name):
+    metadata = _sealed_metadata()
+    metadata.update(invalid_field_by_name)
+
+    with pytest.raises(RuntimeError, match="reused strict V3 layout"):
+        audit._validated_sealed_audit_contract(metadata)
