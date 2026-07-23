@@ -927,8 +927,9 @@ class _V4PersistedGraphReader:
                     member_field[0]
                     for member_field in struct.iter_unpack("<I", block.payload)
                 )
-                if any(left >= right for left, right in zip(members, members[1:])):
-                    raise RuntimeError("PTG V4 audit member page is not strictly ordered")
+                # One physical page may straddle several owners.  Each owner's
+                # locator span is ordered, but the next owner may restart at a
+                # lower member key.
                 self._member_page_cache[(manifest.member_object_kind, page_key)] = members
                 members_by_page[page_key] = members
         return members_by_page

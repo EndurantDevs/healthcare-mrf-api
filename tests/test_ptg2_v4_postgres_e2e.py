@@ -20,7 +20,7 @@ import sqlalchemy as sa
 
 from api import ptg2_v4_graph as graph
 from db.connection import Database
-from process.ptg_parts import ptg2_shared_publish
+from process.ptg_parts import ptg2_shared_publish, ptg2_v4_audit
 from process.ptg_parts import ptg2_shared_snapshot_publish as snapshot_publish
 from process.ptg_parts.ptg2_v4_graph_compiler import (
     compile_provider_graph_v4_rust,
@@ -173,7 +173,7 @@ def _direct_factor_fixture(
         _write_membership(
             tmp_path / "direct-component-group.sidecar",
             name="provider_component_group",
-            pairs=list(zip(components, groups, strict=True)),
+            pairs=list(zip(components, reversed(groups), strict=True)),
         ),
         _write_membership(
             tmp_path / "direct-group-npi.sidecar",
@@ -771,9 +771,26 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
                 owner_keys=(0, 1),
                 schema_name=schema_name,
             )
-        assert set_groups == {0: (0,), 1: (1,)}
-        assert group_sets == {0: (0,), 1: (1,)}
+            audit_reader = ptg2_v4_audit._V4PersistedGraphReader(
+                session,
+                schema_name=schema_name,
+                snapshot_key=sealed.snapshot_key,
+                representation="direct_v1",
+                budget=ptg2_v4_audit._ReadBudget(),
+            )
+            audit_membership = await audit_reader.contains_edges(
+                "set_groups_direct",
+                ((0, 0), (0, 1), (1, 0), (1, 1)),
+            )
+        assert set_groups == {0: (1,), 1: (0,)}
+        assert group_sets == {0: (1,), 1: (0,)}
         assert npi_groups == {0: (0,), 1: (1,)}
+        assert audit_membership == {
+            (0, 0): False,
+            (0, 1): True,
+            (1, 0): True,
+            (1, 1): False,
+        }
 
         persisted_relations = {
             str(relation_row[0])
