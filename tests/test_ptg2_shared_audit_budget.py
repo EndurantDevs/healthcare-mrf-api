@@ -94,6 +94,49 @@ def test_hydration_candidates_are_bounded_repeatable_and_source_preserving():
     assert first[-1].candidate_ordinal == 4095
 
 
+def test_hydration_candidate_edge_limits_are_explicit():
+    candidate = audit.AuditCandidate(1, 2, 3, 0, 1)
+
+    assert audit._equal_interval_indices(0, 1) == ()
+    assert audit._equal_interval_indices(5, 1) == (0,)
+    assert audit._stratified_hydration_candidates(
+        (candidate,),
+        maximum_candidates=0,
+    ) == ()
+
+
+@pytest.mark.asyncio
+async def test_candidate_hydration_handles_zero_budget_and_inactive_candidates(
+    monkeypatch,
+):
+    candidate = audit.AuditCandidate(1, 2, 3, 0, 1)
+
+    assert await audit._candidate_npis_by_ordinal(
+        object(),
+        candidates=(candidate,),
+        price_memberships={3: (4,)},
+        core_layout_id=b"\x53" * 32,
+        maximum_selections=0,
+    ) == {}
+
+    async def locators(_reader, *, direction, owner_keys):
+        assert direction == audit.PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP
+        return {
+            key: audit._GraphOwnerLocator(0, 0, 1)
+            for key in owner_keys
+        }
+
+    monkeypatch.setattr(audit, "_graph_owner_locators", locators)
+
+    assert await audit._candidate_npis_by_ordinal(
+        object(),
+        candidates=(candidate,),
+        price_memberships={},
+        core_layout_id=b"\x53" * 32,
+        maximum_selections=1,
+    ) == {0: ()}
+
+
 def test_reused_layout_accepts_legacy_provider_selection_metadata():
     metadata = {
         "contract": audit.PTG2_V3_AUDIT_CONTRACT,
