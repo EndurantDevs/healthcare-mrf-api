@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import time
+import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_BLOCK_LAYOUT,
     PTG2_V3_SHARED_GENERATION,
+    SharedBlockReference,
     SharedLayoutBuildOwnership,
     SharedMappingDigestSummary,
     seal_shared_layout,
@@ -59,9 +62,11 @@ from process.ptg_parts.ptg2_shared_publish import (
     _validated_coverage_scope_id,
     copy_shared_block_binary_file,
     create_shared_block_stage,
+    _copy_binary_file_to_stage,
     publish_shared_block_stage,
     publish_shared_finalizer_dictionaries,
     publish_shared_graph,
+    publish_v4_cas_block_stage,
     shared_block_stage_name,
     shared_graph_bundles_from_artifacts,
 )
@@ -74,6 +79,24 @@ from process.ptg_parts.ptg2_shared_reuse import (
     shared_source_set_metadata,
 )
 from process.ptg_parts.ptg2_source_witness_store import publish_shared_source_witness
+from process.ptg_parts.ptg2_v4_graph_compiler import (
+    V4GraphCompilationResult,
+    compile_provider_graph_v4_rust,
+)
+from process.ptg_parts.ptg2_v4_audit import publish_v4_audit_sample
+from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
+    PTG2_V4_GRAPH_RESOURCE_FIELDS,
+    PTG2_V4_NPI_TABLE,
+    PTG2_V4_SHARED_GENERATION,
+    V4SnapshotMapSummary,
+    lock_v4_shared_layout_for_map_write,
+    publish_v4_heavy_owners,
+    publish_v4_relation_manifests,
+    publish_v4_snapshot_maps,
+    seal_v4_shared_layout,
+    touch_v4_shared_layout_build,
+)
 
 
 _REQUIRED_OBJECT_KINDS = frozenset(
@@ -92,6 +115,12 @@ _REQUIRED_OBJECT_KINDS = frozenset(
         "graph_provider_set_groups_v1",
     }
 )
+_REQUIRED_PRICE_OBJECT_KINDS = _REQUIRED_OBJECT_KINDS - {
+    "graph_npi_groups_v1",
+    "graph_group_npis_v1",
+    "graph_group_provider_sets_v1",
+    "graph_provider_set_groups_v1",
+}
 
 
 @dataclass(frozen=True)
@@ -146,6 +175,26 @@ class _FinalizerBlockPublicationResult:
             "price_dictionary": self.price_dictionary_copy.as_dict(),
             "total": total.as_dict(),
         }
+
+
+@dataclass(frozen=True)
+class _V4GraphPublication:
+    """Published V4 graph CAS, packed maps, and relational dictionaries."""
+
+    object_kinds: tuple[str, ...]
+    mapping_count: int
+    unique_block_count: int
+    block_count: int
+    owner_count: int
+    provider_group_count: int
+    npi_count: int
+    support_digest: bytes
+    logical_byte_count: int
+    stored_byte_count: int
+    map_summary: V4SnapshotMapSummary
+    representation: str
+    compiler_summary: Mapping[str, Any]
+    audit_witness_path: Path
 
 
 def _completed_prepared_price(
@@ -775,6 +824,7 @@ async def validate_reused_snapshot_sources(
     schema_name: str,
     snapshot_key: int,
     logical_snapshot_id: str,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> dict[str, Any]:
     """Validate reused physical audit source keys against this logical dictionary."""
 
@@ -784,6 +834,7 @@ async def validate_reused_snapshot_sources(
             schema_name=schema_name,
             snapshot_key=int(snapshot_key),
             logical_snapshot_id=str(logical_snapshot_id),
+            expected_generation=expected_generation,
         )
 
 
@@ -865,6 +916,956 @@ async def _convert_shared_graph_natively(
         provider_set_key_map_path=Path(provider_set_key_map_path),
         output_directory=Path(work_directory) / "provider-graph-native",
     )
+
+
+def _v4_compiler_artifact(
+    compilation: V4GraphCompilationResult,
+    name: str,
+) -> Any:
+    matches = tuple(
+        artifact for artifact in compilation.output_artifacts if artifact.name == name
+    )
+    if len(matches) != 1:
+        raise RuntimeError(f"PTG V4 compiler output is missing {name!r}")
+    return matches[0]
+
+
+def _iter_v4_block_references(path: Path) -> Iterable[SharedBlockReference]:
+    """Re-read the authenticated compiler coordinates as a bounded stream."""
+
+    previous_coordinate: tuple[str, int, int] | None = None
+    with path.open("rb") as reference_file:
+        for line_number, line in enumerate(reference_file, 1):
+            if not line or len(line) > 64 * 1024:
+                raise RuntimeError("PTG V4 graph reference record is not bounded")
+            try:
+                raw = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"PTG V4 graph reference {line_number} is invalid JSON"
+                ) from exc
+            if not isinstance(raw, dict) or raw.get("codec") != "none":
+                raise RuntimeError("PTG V4 graph reference has an invalid codec")
+            try:
+                object_kind = str(raw["object_kind"])
+                block_key = int(raw["block_key"])
+                fragment_no = int(raw["fragment_no"])
+                entry_count = int(raw["entry_count"])
+                raw_byte_count = int(raw["raw_byte_count"])
+                stored_byte_count = int(raw["stored_byte_count"])
+                block_hash = bytes.fromhex(str(raw["hash"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("PTG V4 graph reference fields are invalid") from exc
+            coordinate = (object_kind, block_key, fragment_no)
+            if (
+                not object_kind.startswith("v4_")
+                or min(block_key, fragment_no, entry_count, raw_byte_count) < 0
+                or stored_byte_count != raw_byte_count
+                or len(block_hash) != 32
+                or (previous_coordinate is not None and coordinate <= previous_coordinate)
+            ):
+                raise RuntimeError("PTG V4 graph reference ordering or metadata changed")
+            previous_coordinate = coordinate
+            yield SharedBlockReference(
+                object_kind=object_kind,
+                block_key=block_key,
+                fragment_no=fragment_no,
+                entry_count=entry_count,
+                block_hash=block_hash,
+                raw_byte_count=raw_byte_count,
+            )
+
+
+async def _queue_failed_v4_graph_blocks(
+    *,
+    schema_name: str,
+    reference_manifest_path: Path,
+) -> None:
+    """Queue orphanable compiler CAS hashes; the normal sweep rechecks reachability."""
+
+    schema = _quote_ident(schema_name)
+    hashes: list[bytes] = []
+
+    async def flush() -> None:
+        """Persist the currently buffered unreachable block hashes."""
+
+        if not hashes:
+            return
+        async with db.transaction() as session:
+            await session.execute(
+                db.text(
+                    f"""
+                    INSERT INTO {schema}.ptg2_v3_gc_candidate AS candidate
+                        (block_hash, eligible_at, queued_at)
+                    SELECT DISTINCT block_hash, transaction_timestamp(),
+                           transaction_timestamp()
+                      FROM unnest(CAST(:block_hashes AS bytea[]))
+                           AS requested(block_hash)
+                    ON CONFLICT (block_hash) DO UPDATE
+                        SET eligible_at = GREATEST(
+                            candidate.eligible_at,
+                            EXCLUDED.eligible_at
+                        )
+                    """
+                ),
+                {"block_hashes": list(hashes)},
+            )
+        hashes.clear()
+
+    for reference in _iter_v4_block_references(reference_manifest_path):
+        hashes.append(bytes(reference.block_hash))
+        if len(hashes) >= 8_192:
+            await flush()
+    await flush()
+
+
+async def _publish_v4_dictionaries_and_maps(
+    compilation: V4GraphCompilationResult,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+    compressed_acquisition_bytes: int,
+    empty_npi_tin_only_normalization_count: int,
+) -> V4SnapshotMapSummary:
+    """Bulk-copy dense dictionaries, then publish exact metadata and packed maps."""
+
+    if int(compressed_acquisition_bytes) <= 0:
+        raise RuntimeError(
+            "PTG V4 compressed acquisition bytes must be positive"
+        )
+    if int(empty_npi_tin_only_normalization_count) < 0:
+        raise RuntimeError(
+            "PTG V4 empty-NPI TIN-only normalization count cannot be negative"
+        )
+    schema = _quote_ident(schema_name)
+    token = uuid.uuid4().hex[:20]
+    group_stage = f"ptg2_v4_group_stage_{token}"
+    component_stage = f"ptg2_v4_component_stage_{token}"
+    npi_stage = f"ptg2_v4_npi_stage_{token}"
+    pattern_stage = f"ptg2_v4_pattern_stage_{token}"
+    prefix_stage = f"ptg2_v4_npi_prefix_stage_{token}"
+    stages = [group_stage, component_stage, npi_stage, prefix_stage]
+    if compilation.pattern_copy_path is not None:
+        stages.append(pattern_stage)
+    stage_create_statements = [
+        f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(group_stage)} "
+        "(provider_group_key integer NOT NULL, "
+        " provider_group_global_id_128 bytea NOT NULL)",
+        f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(component_stage)} "
+        "(component_key integer NOT NULL, component_global_id_128 bytea NOT NULL)",
+        f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(npi_stage)} "
+        "(npi_key integer NOT NULL, npi bigint NOT NULL)",
+        f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(prefix_stage)} "
+        "(provider_set_key integer NOT NULL, member_count integer NOT NULL, "
+        " member_digest bytea NOT NULL)",
+    ]
+    if compilation.pattern_copy_path is not None:
+        stage_create_statements.append(
+            f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(pattern_stage)} "
+            "(pattern_key integer NOT NULL, pattern_digest bytea NOT NULL, "
+            " set_count bigint NOT NULL)"
+        )
+    for statement in stage_create_statements:
+        await db.status(statement)
+    try:
+        await _copy_binary_file_to_stage(
+            compilation.group_copy_path,
+            schema_name=schema_name,
+            stage_table=group_stage,
+            columns=("provider_group_key", "provider_group_global_id_128"),
+        )
+        await _copy_binary_file_to_stage(
+            compilation.component_copy_path,
+            schema_name=schema_name,
+            stage_table=component_stage,
+            columns=("component_key", "component_global_id_128"),
+        )
+        await _copy_binary_file_to_stage(
+            compilation.npi_copy_path,
+            schema_name=schema_name,
+            stage_table=npi_stage,
+            columns=("npi_key", "npi"),
+        )
+        await _copy_binary_file_to_stage(
+            compilation.provider_set_npi_prefix_override_copy_path,
+            schema_name=schema_name,
+            stage_table=prefix_stage,
+            columns=("provider_set_key", "member_count", "member_digest"),
+        )
+        if compilation.pattern_copy_path is not None:
+            await _copy_binary_file_to_stage(
+                compilation.pattern_copy_path,
+                schema_name=schema_name,
+                stage_table=pattern_stage,
+                columns=("pattern_key", "pattern_digest", "set_count"),
+            )
+
+        expected_group_count = int(compilation.observe.get("group_count") or 0)
+        expected_component_count = int(
+            compilation.observe.get("component_count") or 0
+        )
+        expected_npi_count = int(compilation.observe.get("npi_count") or 0)
+        expected_pattern_count = int(
+            compilation.observe.get("pattern_count") or 0
+        )
+        expected_prefix_owner_count = int(
+            compilation.observe.get("npi_prefix_override_owner_count") or 0
+        )
+        expected_prefix_member_count = int(
+            compilation.observe.get("npi_prefix_override_member_count") or 0
+        )
+        prefix_target = int(compilation.summary["npi_prefix_target"])
+        published_pattern_count = (
+            expected_pattern_count
+            if compilation.pattern_copy_path is not None
+            else 0
+        )
+        async with db.transaction() as session:
+            await lock_v4_shared_layout_for_map_write(
+                session,
+                schema_name=schema_name,
+                snapshot_key=int(snapshot_key),
+                build_token=build_token,
+            )
+            stage_result = await session.execute(
+                db.text(
+                    f"""
+                    SELECT
+                      (SELECT COUNT(*) FROM {schema}.{_quote_ident(group_stage)}),
+                      (SELECT COUNT(DISTINCT provider_group_key)
+                         FROM {schema}.{_quote_ident(group_stage)}),
+                      (SELECT COUNT(DISTINCT provider_group_global_id_128)
+                         FROM {schema}.{_quote_ident(group_stage)}),
+                      (SELECT COALESCE(BOOL_AND(
+                                  octet_length(provider_group_global_id_128) = 16
+                              ), TRUE)
+                         FROM {schema}.{_quote_ident(group_stage)}),
+                      (SELECT COUNT(*) FROM {schema}.{_quote_ident(component_stage)}),
+                      (SELECT COUNT(DISTINCT component_key)
+                         FROM {schema}.{_quote_ident(component_stage)}),
+                      (SELECT COALESCE(BOOL_AND(
+                                  octet_length(component_global_id_128) = 16
+                              ), TRUE)
+                         FROM {schema}.{_quote_ident(component_stage)}),
+                      (SELECT COUNT(*) FROM {schema}.{_quote_ident(npi_stage)}),
+                      (SELECT COUNT(DISTINCT npi_key)
+                         FROM {schema}.{_quote_ident(npi_stage)}),
+                      (SELECT COUNT(DISTINCT npi)
+                         FROM {schema}.{_quote_ident(npi_stage)}),
+                      (SELECT COALESCE(BOOL_AND(
+                                  npi BETWEEN 1000000000 AND 9999999999
+                              ), TRUE)
+                         FROM {schema}.{_quote_ident(npi_stage)}),
+                      (SELECT COUNT(*)
+                         FROM {schema}.{_quote_ident(prefix_stage)}),
+                      (SELECT COUNT(DISTINCT provider_set_key)
+                         FROM {schema}.{_quote_ident(prefix_stage)}),
+                      (SELECT COALESCE(SUM(member_count), 0)
+                         FROM {schema}.{_quote_ident(prefix_stage)}),
+                      (SELECT COALESCE(BOOL_AND(
+                                  member_count BETWEEN 0 AND :prefix_target
+                                  AND octet_length(member_digest) = 32
+                              ), TRUE)
+                         FROM {schema}.{_quote_ident(prefix_stage)})
+                    """
+                ),
+                {"prefix_target": prefix_target},
+            )
+            counts = stage_result.one()
+            if (
+                tuple(int(counts[index]) for index in (0, 1, 2))
+                != (expected_group_count,) * 3
+                or not bool(counts[3])
+                or tuple(int(counts[index]) for index in (4, 5))
+                != (expected_component_count,) * 2
+                or not bool(counts[6])
+                or tuple(int(counts[index]) for index in (7, 8, 9))
+                != (expected_npi_count,) * 3
+                or not bool(counts[10])
+                or tuple(int(counts[index]) for index in (11, 12))
+                != (expected_prefix_owner_count,) * 2
+                or int(counts[13]) != expected_prefix_member_count
+                or not bool(counts[14])
+            ):
+                raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
+            for stage_name, key_name, expected_count in (
+                (group_stage, "provider_group_key", expected_group_count),
+                (component_stage, "component_key", expected_component_count),
+                (npi_stage, "npi_key", expected_npi_count),
+            ):
+                dense_result = await session.execute(
+                    db.text(
+                        f"SELECT MIN({key_name}), MAX({key_name}) "
+                        f"FROM {schema}.{_quote_ident(stage_name)}"
+                    )
+                )
+                first_key, last_key = dense_result.one()
+                if (
+                    first_key != (0 if expected_count else None)
+                    or last_key != (expected_count - 1 if expected_count else None)
+                ):
+                    raise RuntimeError("PTG V4 dictionary keys are not dense from zero")
+
+            if compilation.pattern_copy_path is not None:
+                pattern_result = await session.execute(
+                    db.text(
+                        f"""
+                        SELECT COUNT(*), COUNT(DISTINCT pattern_key),
+                               MIN(pattern_key), MAX(pattern_key),
+                               COALESCE(BOOL_AND(
+                                   octet_length(pattern_digest) = 32
+                                   AND set_count >= 0
+                               ), TRUE)
+                          FROM {schema}.{_quote_ident(pattern_stage)}
+                        """
+                    )
+                )
+                pattern = pattern_result.one()
+                if (
+                    int(pattern[0]) != expected_pattern_count
+                    or int(pattern[1]) != expected_pattern_count
+                    or pattern[2] != (0 if expected_pattern_count else None)
+                    or pattern[3]
+                    != (expected_pattern_count - 1 if expected_pattern_count else None)
+                    or not bool(pattern[4])
+                ):
+                    raise RuntimeError("PTG V4 pattern dictionary is invalid")
+
+            # Metadata tables are trigger-fenced by the building map root.
+            # Publish the authenticated coordinate map first in this same
+            # transaction, then attach dictionaries/manifests beneath it.
+            map_summary = await publish_v4_snapshot_maps(
+                session,
+                schema_name=schema_name,
+                snapshot_key=int(snapshot_key),
+                build_token=build_token,
+                representation=(
+                    "pattern_v1"
+                    if compilation.selected_layout == "pattern"
+                    else "direct_v1"
+                ),
+                references=_iter_v4_block_references(
+                    compilation.reference_manifest_path
+                ),
+            )
+
+            snapshot_parameter_map = {"snapshot_key": int(snapshot_key)}
+            statements = [
+                f"""
+                INSERT INTO {schema}.ptg2_v3_provider_group
+                    (snapshot_key, provider_group_key,
+                     provider_group_global_id_128)
+                SELECT :snapshot_key, provider_group_key,
+                       provider_group_global_id_128
+                  FROM {schema}.{_quote_ident(group_stage)}
+                 ORDER BY provider_group_key
+                ON CONFLICT DO NOTHING
+                """,
+                f"""
+                INSERT INTO {schema}.ptg2_v4_provider_component
+                    (snapshot_key, component_key, component_global_id_128)
+                SELECT :snapshot_key, component_key, component_global_id_128
+                  FROM {schema}.{_quote_ident(component_stage)}
+                 ORDER BY component_key
+                ON CONFLICT DO NOTHING
+                """,
+                f"""
+                INSERT INTO {schema}.{PTG2_V4_NPI_TABLE}
+                    (snapshot_key, npi_key, npi)
+                SELECT :snapshot_key, npi_key, npi
+                  FROM {schema}.{_quote_ident(npi_stage)}
+                 ORDER BY npi_key
+                ON CONFLICT DO NOTHING
+                """,
+                f"""
+                INSERT INTO {schema}.ptg2_v4_provider_set_npi_prefix
+                    (snapshot_key, provider_set_key, member_count, member_digest)
+                SELECT :snapshot_key, provider_set_key, member_count, member_digest
+                  FROM {schema}.{_quote_ident(prefix_stage)}
+                 ORDER BY provider_set_key
+                ON CONFLICT DO NOTHING
+                """,
+            ]
+            if compilation.pattern_copy_path is not None:
+                statements.append(
+                    f"""
+                    INSERT INTO {schema}.ptg2_v4_pattern
+                        (snapshot_key, pattern_key, pattern_digest, set_count)
+                    SELECT :snapshot_key, pattern_key, pattern_digest, set_count
+                      FROM {schema}.{_quote_ident(pattern_stage)}
+                     ORDER BY pattern_key
+                    ON CONFLICT DO NOTHING
+                    """
+                )
+            for statement in statements:
+                await session.execute(db.text(statement), snapshot_parameter_map)
+
+            diagnostic_parameters_by_name = {
+                "snapshot_key": int(snapshot_key),
+                "compressed_acquisition_bytes": int(
+                    compressed_acquisition_bytes
+                ),
+                "input_factor_bytes": int(
+                    compilation.resource_admission["input_factor_bytes"]
+                ),
+                "factor_edge_count": int(
+                    compilation.resource_admission["factor_edge_count"]
+                ),
+                "empty_npi_tin_only_normalization_count": int(
+                    empty_npi_tin_only_normalization_count
+                ),
+                "npi_prefix_target": prefix_target,
+                "max_set_patterns_per_set": int(
+                    compilation.summary["max_set_patterns_per_set"]
+                ),
+                "max_set_components_per_fallback_set": int(
+                    compilation.summary[
+                        "max_set_components_per_fallback_set"
+                    ]
+                ),
+                "max_online_group_keys_per_set": int(
+                    compilation.summary["max_online_group_keys_per_set"]
+                ),
+                "max_online_source_owners_per_set": int(
+                    compilation.summary["max_online_source_owners_per_set"]
+                ),
+                "max_online_source_members_per_set": int(
+                    compilation.summary["max_online_source_members_per_set"]
+                ),
+                "max_online_source_pages_per_set": int(
+                    compilation.summary["max_online_source_pages_per_set"]
+                ),
+                "max_online_source_bytes_per_set": int(
+                    compilation.summary["max_online_source_bytes_per_set"]
+                ),
+                "online_group_npi_batch_size": int(
+                    compilation.summary["online_group_npi_batch_size"]
+                ),
+                "max_online_group_npi_members_per_set": int(
+                    compilation.summary[
+                        "max_online_group_npi_members_per_set"
+                    ]
+                ),
+                "max_online_group_npi_locator_pages_per_set": int(
+                    compilation.summary[
+                        "max_online_group_npi_locator_pages_per_set"
+                    ]
+                ),
+                "max_online_group_npi_member_pages_per_set": int(
+                    compilation.summary[
+                        "max_online_group_npi_member_pages_per_set"
+                    ]
+                ),
+                "max_online_group_npi_bytes_per_set": int(
+                    compilation.summary[
+                        "max_online_group_npi_bytes_per_set"
+                    ]
+                ),
+                "max_online_group_npi_batches_per_set": int(
+                    compilation.summary[
+                        "max_online_group_npi_batches_per_set"
+                    ]
+                ),
+                "provider_expansion_rate_page_rows": int(
+                    compilation.summary["provider_expansion_rate_page_rows"]
+                ),
+                "max_online_provider_expansion_rate_rows": int(
+                    compilation.summary[
+                        "max_online_provider_expansion_rate_rows"
+                    ]
+                ),
+                "max_online_provider_expansion_provider_sets": int(
+                    compilation.summary[
+                        "max_online_provider_expansion_provider_sets"
+                    ]
+                ),
+                "max_online_provider_expansion_graph_batches": int(
+                    compilation.summary[
+                        "max_online_provider_expansion_graph_batches"
+                    ]
+                ),
+                "maximum_group_npi_member_work": int(
+                    compilation.observe[
+                        "maximum_online_group_npi_member_work"
+                    ]
+                ),
+                "maximum_group_npi_locator_page_work": int(
+                    compilation.observe[
+                        "maximum_online_group_npi_locator_page_work"
+                    ]
+                ),
+                "maximum_group_npi_member_page_work": int(
+                    compilation.observe[
+                        "maximum_online_group_npi_member_page_work"
+                    ]
+                ),
+                "maximum_group_npi_byte_work": int(
+                    compilation.observe[
+                        "maximum_online_group_npi_byte_work"
+                    ]
+                ),
+                "maximum_group_npi_batch_work": int(
+                    compilation.observe[
+                        "maximum_online_group_npi_batch_work"
+                    ]
+                ),
+                "group_unsafe_set_count": int(
+                    compilation.observe["npi_prefix_group_unsafe_set_count"]
+                ),
+                "physical_unsafe_set_count": int(
+                    compilation.observe["npi_prefix_physical_unsafe_set_count"]
+                ),
+                "simulated_set_count": int(
+                    compilation.observe["npi_prefix_simulated_set_count"]
+                ),
+                "override_owner_count": expected_prefix_owner_count,
+                "override_member_count": expected_prefix_member_count,
+                "override_raw_bytes": int(
+                    compilation.observe["npi_prefix_override_raw_bytes"]
+                ),
+                "worst_provider_set_key": compilation.observe[
+                    "npi_prefix_worst_provider_set_key"
+                ],
+                "worst_groups_to_target": int(
+                    compilation.observe["npi_prefix_worst_groups_to_target"]
+                ),
+                "worst_uses_override": bool(
+                    compilation.observe[
+                        "npi_prefix_worst_provider_set_uses_override"
+                    ]
+                ),
+                "worst_uses_component_fallback": bool(
+                    compilation.observe[
+                        "npi_prefix_worst_uses_component_fallback"
+                    ]
+                ),
+                "worst_member_count": int(
+                    compilation.observe["npi_prefix_worst_member_count"]
+                ),
+                "worst_member_digest": (
+                    bytes.fromhex(
+                        str(
+                            compilation.observe[
+                                "npi_prefix_worst_member_digest"
+                            ]
+                        )
+                    )
+                    if compilation.observe.get("npi_prefix_worst_member_digest")
+                    is not None
+                    else None
+                ),
+                "worst_source_owner_work": int(
+                    compilation.observe["npi_prefix_worst_source_owner_work"]
+                ),
+                "worst_source_member_work": int(
+                    compilation.observe["npi_prefix_worst_source_member_work"]
+                ),
+                "worst_source_page_work": int(
+                    compilation.observe["npi_prefix_worst_source_page_work"]
+                ),
+                "worst_source_byte_work": int(
+                    compilation.observe["npi_prefix_worst_source_byte_work"]
+                ),
+                "worst_group_npi_member_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_group_npi_member_work"
+                    ]
+                ),
+                "worst_group_npi_locator_page_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_group_npi_locator_page_work"
+                    ]
+                ),
+                "worst_group_npi_member_page_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_group_npi_member_page_work"
+                    ]
+                ),
+                "worst_group_npi_byte_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_group_npi_byte_work"
+                    ]
+                ),
+                "worst_group_npi_batch_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_group_npi_batch_work"
+                    ]
+                ),
+                "worst_online_provider_set_key": compilation.observe[
+                    "npi_prefix_worst_online_provider_set_key"
+                ],
+                "worst_online_groups_to_target": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_groups_to_target"
+                    ]
+                ),
+                "worst_online_groups_to_target_exact": bool(
+                    compilation.observe[
+                        "npi_prefix_worst_online_groups_to_target_exact"
+                    ]
+                ),
+                "worst_online_uses_component_fallback": bool(
+                    compilation.observe[
+                        "npi_prefix_worst_online_uses_component_fallback"
+                    ]
+                ),
+                "worst_online_group_work_bound": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_group_work_bound"
+                    ]
+                ),
+                "worst_online_member_count": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_member_count"
+                    ]
+                ),
+                "worst_online_member_digest": (
+                    bytes.fromhex(
+                        str(
+                            compilation.observe[
+                                "npi_prefix_worst_online_member_digest"
+                            ]
+                        )
+                    )
+                    if compilation.observe.get(
+                        "npi_prefix_worst_online_member_digest"
+                    )
+                    is not None
+                    else None
+                ),
+                "worst_online_source_owner_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_source_owner_work"
+                    ]
+                ),
+                "worst_online_source_member_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_source_member_work"
+                    ]
+                ),
+                "worst_online_source_page_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_source_page_work"
+                    ]
+                ),
+                "worst_online_source_byte_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_source_byte_work"
+                    ]
+                ),
+                "worst_online_group_npi_member_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_group_npi_member_work"
+                    ]
+                ),
+                "worst_online_group_npi_locator_page_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_group_npi_locator_page_work"
+                    ]
+                ),
+                "worst_online_group_npi_member_page_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_group_npi_member_page_work"
+                    ]
+                ),
+                "worst_online_group_npi_byte_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_group_npi_byte_work"
+                    ]
+                ),
+                "worst_online_group_npi_batch_work": int(
+                    compilation.observe[
+                        "npi_prefix_worst_online_group_npi_batch_work"
+                    ]
+                ),
+            }
+            diagnostic_columns = (
+                *PTG2_V4_GRAPH_RESOURCE_FIELDS,
+                *PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
+            )
+            diagnostic_column_sql = ", ".join(diagnostic_columns)
+            diagnostic_value_sql = ", ".join(
+                f":{column}" for column in diagnostic_columns
+            )
+            await session.execute(
+                db.text(
+                    f"""
+                    INSERT INTO {schema}.ptg2_v4_provider_graph_diagnostic
+                        (snapshot_key, {diagnostic_column_sql})
+                    VALUES
+                        (:snapshot_key, {diagnostic_value_sql})
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                diagnostic_parameters_by_name,
+            )
+            diagnostic_result = await session.execute(
+                db.text(
+                    f"""
+                    SELECT {diagnostic_column_sql}
+                      FROM {schema}.ptg2_v4_provider_graph_diagnostic
+                     WHERE snapshot_key = :snapshot_key
+                    """
+                ),
+                snapshot_parameter_map,
+            )
+            if tuple(diagnostic_result.one()) != tuple(
+                diagnostic_parameters_by_name[column]
+                for column in diagnostic_columns
+            ):
+                raise RuntimeError("PTG V4 persisted graph diagnostics changed")
+
+            persisted_result = await session.execute(
+                db.text(
+                    f"""
+                    SELECT
+                      (SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_group
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*)
+                         FROM {schema}.{_quote_ident(group_stage)} AS staged
+                         JOIN {schema}.ptg2_v3_provider_group AS stored
+                           ON stored.snapshot_key = :snapshot_key
+                          AND stored.provider_group_key = staged.provider_group_key
+                          AND stored.provider_group_global_id_128 =
+                              staged.provider_group_global_id_128),
+                      (SELECT COUNT(*) FROM {schema}.ptg2_v4_provider_component
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*)
+                         FROM {schema}.{_quote_ident(component_stage)} AS staged
+                         JOIN {schema}.ptg2_v4_provider_component AS stored
+                           ON stored.snapshot_key = :snapshot_key
+                          AND stored.component_key = staged.component_key
+                          AND stored.component_global_id_128 =
+                              staged.component_global_id_128),
+                      (SELECT COUNT(*) FROM {schema}.{PTG2_V4_NPI_TABLE}
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*)
+                         FROM {schema}.{_quote_ident(npi_stage)} AS staged
+                         JOIN {schema}.{PTG2_V4_NPI_TABLE} AS stored
+                           ON stored.snapshot_key = :snapshot_key
+                          AND stored.npi_key = staged.npi_key
+                          AND stored.npi = staged.npi),
+                      (SELECT COUNT(*) FROM {schema}.ptg2_v4_pattern
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*)
+                         FROM {schema}.ptg2_v4_pattern AS stored
+                         {(
+                            f'JOIN {schema}.{_quote_ident(pattern_stage)} AS staged '
+                            'ON stored.snapshot_key = :snapshot_key '
+                            'AND stored.pattern_key = staged.pattern_key '
+                            'AND stored.pattern_digest = staged.pattern_digest '
+                            'AND stored.set_count = staged.set_count'
+                         ) if compilation.pattern_copy_path is not None else 'WHERE FALSE'})
+                      ,
+                      (SELECT COUNT(*)
+                         FROM {schema}.ptg2_v4_provider_set_npi_prefix
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*)
+                         FROM {schema}.{_quote_ident(prefix_stage)} AS staged
+                         JOIN {schema}.ptg2_v4_provider_set_npi_prefix AS stored
+                           ON stored.snapshot_key = :snapshot_key
+                          AND stored.provider_set_key = staged.provider_set_key
+                          AND stored.member_count = staged.member_count
+                          AND stored.member_digest = staged.member_digest),
+                      (SELECT COUNT(*)
+                         FROM {schema}.ptg2_v4_provider_graph_diagnostic
+                        WHERE snapshot_key = :snapshot_key)
+                    """
+                ),
+                snapshot_parameter_map,
+            )
+            if tuple(int(persisted_count) for persisted_count in persisted_result.one()) != (
+                expected_group_count,
+                expected_group_count,
+                expected_component_count,
+                expected_component_count,
+                expected_npi_count,
+                expected_npi_count,
+                published_pattern_count,
+                published_pattern_count,
+                expected_prefix_owner_count,
+                expected_prefix_owner_count,
+                1,
+            ):
+                raise RuntimeError("PTG V4 persisted dictionary counts changed")
+
+            await publish_v4_relation_manifests(
+                session,
+                schema_name=schema_name,
+                snapshot_key=int(snapshot_key),
+                build_token=build_token,
+                entries=tuple(
+                    sorted(compilation.relation_summaries, key=lambda row: row["relation"])
+                ),
+            )
+            await publish_v4_heavy_owners(
+                session,
+                schema_name=schema_name,
+                snapshot_key=int(snapshot_key),
+                build_token=build_token,
+                entries=tuple(
+                    {
+                        **dict(bitmap_summary),
+                        "fragment_count": int(bitmap_summary["block_count"]),
+                    }
+                    for bitmap_summary in sorted(
+                        compilation.heavy_bitmaps,
+                        key=lambda summary: (
+                            summary["relation"],
+                            int(summary["owner_key"]),
+                        ),
+                    )
+                ),
+            )
+            return map_summary
+    finally:
+        await db.status(
+            "DROP TABLE IF EXISTS "
+            + ", ".join(f"{schema}.{_quote_ident(stage)}" for stage in stages)
+            + ";"
+        )
+
+
+async def _publish_v4_graph(
+    compilation: V4GraphCompilationResult,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+    compressed_acquisition_bytes: int,
+    empty_npi_tin_only_normalization_count: int,
+) -> _V4GraphPublication:
+    """Publish graph blocks only to CAS, then make packed maps authoritative."""
+
+    block_artifact = _v4_compiler_artifact(compilation, "graph_blocks")
+    block_stage = shared_block_stage_name(f"v4-graph-{snapshot_key}")
+    await create_shared_block_stage(schema_name=schema_name, stage_table=block_stage)
+    try:
+        await copy_shared_block_binary_file(
+            compilation.block_copy_path,
+            schema_name=schema_name,
+            stage_table=block_stage,
+            expected_copy_bytes=int(block_artifact.byte_count),
+            expected_copy_sha256=str(block_artifact.sha256),
+            reuse_existing=True,
+        )
+        cas_publication = await publish_v4_cas_block_stage(
+            schema_name=schema_name,
+            stage_table=block_stage,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+        )
+        map_summary = await _publish_v4_dictionaries_and_maps(
+            compilation,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+            compressed_acquisition_bytes=int(compressed_acquisition_bytes),
+            empty_npi_tin_only_normalization_count=int(
+                empty_npi_tin_only_normalization_count
+            ),
+        )
+    except BaseException:
+        await _queue_failed_v4_graph_blocks(
+            schema_name=schema_name,
+            reference_manifest_path=compilation.reference_manifest_path,
+        )
+        raise
+    finally:
+        await db.status(
+            "DROP TABLE IF EXISTS "
+            f"{_quote_ident(schema_name)}.{_quote_ident(block_stage)};"
+        )
+
+    artifact_contracts = tuple(
+        {
+            "name": artifact.name,
+            "sha256": artifact.sha256,
+            "row_count": int(artifact.row_count),
+            "byte_count": int(artifact.byte_count),
+        }
+        for artifact in compilation.output_artifacts
+    )
+    support_digest = shared_support_digest(
+        {
+            "contract_version": 1,
+            "compiler_format": compilation.summary.get("format"),
+            "selected_layout": compilation.selected_layout,
+            "map_digest": map_summary.map_digest.hex(),
+            "artifacts": artifact_contracts,
+            "relation_summaries": tuple(compilation.relation_summaries),
+            "heavy_bitmaps": tuple(compilation.heavy_bitmaps),
+            "observe": dict(compilation.observe),
+            "resource_admission": {
+                "compressed_acquisition_bytes": int(
+                    compressed_acquisition_bytes
+                ),
+                "empty_npi_tin_only_normalization_count": int(
+                    empty_npi_tin_only_normalization_count
+                ),
+                **dict(compilation.resource_admission),
+            },
+        }
+    )
+    return _V4GraphPublication(
+        object_kinds=map_summary.object_kinds,
+        mapping_count=map_summary.coordinate_count,
+        unique_block_count=int(cas_publication.unique_block_count),
+        block_count=int(compilation.block_count),
+        owner_count=sum(
+            int(relation.get("owner_count") or 0)
+            for relation in compilation.relation_summaries
+        ),
+        provider_group_count=int(compilation.observe.get("group_count") or 0),
+        npi_count=int(compilation.observe.get("npi_count") or 0),
+        support_digest=support_digest,
+        logical_byte_count=int(cas_publication.logical_byte_count),
+        stored_byte_count=(
+            int(cas_publication.stored_byte_count)
+            + int(map_summary.stored_map_byte_count)
+        ),
+        map_summary=map_summary,
+        representation=(
+            "pattern_v1" if compilation.selected_layout == "pattern" else "direct_v1"
+        ),
+        compiler_summary=dict(compilation.summary),
+        audit_witness_path=compilation.provider_set_audit_npi_copy_path,
+    )
+
+
+async def _sealed_shared_serving_index(
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    expected_generation: str,
+) -> dict[str, Any]:
+    """Read back the exact serving index committed by the physical seal."""
+
+    schema = _quote_ident(schema_name)
+    async with db.transaction() as session:
+        manifest_result = await session.execute(
+            db.text(
+                f"""
+                SELECT layout_manifest
+                  FROM {schema}.ptg2_v3_snapshot_layout
+                 WHERE snapshot_key = :snapshot_key
+                   AND state = 'sealed'
+                   AND generation = :generation
+                """
+            ),
+            {
+                "snapshot_key": int(snapshot_key),
+                "generation": str(expected_generation),
+            },
+        )
+        manifest = manifest_result.scalar()
+    serving_index = (
+        manifest.get("serving_index") if isinstance(manifest, Mapping) else None
+    )
+    if not isinstance(serving_index, Mapping):
+        raise RuntimeError("sealed shared PTG layout is missing its serving index")
+    return dict(serving_index)
 
 
 def _physical_serving_index(
@@ -1016,6 +2017,9 @@ async def _publish_prepared_shared_layout(
     prepared_finalizer: _PreparedFinalizer | None = None,
     prepared_price_publication: _PreparedPricePublication | None = None,
     full_rebuild_scope_digest: str | None = None,
+    provider_graph_v4: bool = False,
+    compressed_acquisition_bytes: int | None = None,
+    empty_npi_tin_only_normalization_count: int | None = None,
 ) -> SharedSnapshotPublication:
     """Finalize, validate, publish, and atomically seal one physical layout."""
 
@@ -1028,10 +2032,24 @@ async def _publish_prepared_shared_layout(
 
         publication_timing_map[f"{stage_name}_seconds"] = time.monotonic() - started_at
 
+    shared_generation = (
+        PTG2_V4_SHARED_GENERATION
+        if provider_graph_v4
+        else PTG2_V3_SHARED_GENERATION
+    )
+    if provider_graph_v4 and (
+        compressed_acquisition_bytes is None
+        or int(compressed_acquisition_bytes) <= 0
+        or empty_npi_tin_only_normalization_count is None
+        or int(empty_npi_tin_only_normalization_count) < 0
+    ):
+        raise RuntimeError(
+            "PTG V4 publication requires authenticated resource evidence"
+        )
     configured_schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip()
     if str(schema_name).strip() != configured_schema:
         raise RuntimeError(
-            "strict V3 publication must use the configured PostgreSQL schema"
+            "strict shared publication must use the configured PostgreSQL schema"
         )
     coverage_scope_id = _validated_coverage_scope_id(expected_coverage_scope_id)
     quarantine = validate_provider_identifier_quarantine(
@@ -1042,7 +2060,12 @@ async def _publish_prepared_shared_layout(
         """Refresh the reserved layout's build heartbeat transactionally."""
 
         async with db.transaction() as session:
-            await touch_shared_layout_build(
+            touch = (
+                touch_v4_shared_layout_build
+                if provider_graph_v4
+                else touch_shared_layout_build
+            )
+            await touch(
                 session,
                 schema_name=schema_name,
                 snapshot_key=int(reserved_snapshot_key),
@@ -1053,7 +2076,11 @@ async def _publish_prepared_shared_layout(
 
     work_directory_context = (
         tempfile.TemporaryDirectory(
-            prefix="ptg2-v3-shared-publish-",
+            prefix=(
+                "ptg2-v4-shared-publish-"
+                if provider_graph_v4
+                else "ptg2-v3-shared-publish-"
+            ),
             dir=str(scratch_parent) if scratch_parent is not None else None,
         )
         if prepared_work_directory is None
@@ -1116,6 +2143,7 @@ async def _publish_prepared_shared_layout(
             build_token=build_token,
             expected_coverage_scope_id=coverage_scope_id,
             provider_set_metadata_entries=provider_set_metadata_entries,
+            expected_generation=shared_generation,
         )
         record_stage("dictionary_publish", stage_started_at)
         await touch_build()
@@ -1127,11 +2155,36 @@ async def _publish_prepared_shared_layout(
         )
         record_stage("provider_set_key_export", stage_started_at)
         stage_started_at = time.monotonic()
-        graph_conversion = await _convert_shared_graph_natively(
-            graph_artifact_entries=graph_artifact_entries,
-            provider_set_key_map_path=provider_set_keys,
-            work_directory=Path(raw_work_directory),
-        )
+        if provider_graph_v4:
+            compile_task = asyncio.create_task(
+                compile_provider_graph_v4_rust(
+                    graph_artifact_entries=graph_artifact_entries,
+                    provider_set_key_map_path=provider_set_keys,
+                    output_directory=(
+                        Path(raw_work_directory) / "provider-graph-v4-native"
+                    ),
+                )
+            )
+            try:
+                while True:
+                    try:
+                        graph_conversion = await asyncio.wait_for(
+                            asyncio.shield(compile_task),
+                            timeout=30.0,
+                        )
+                        break
+                    except TimeoutError:
+                        await touch_build()
+            except BaseException:
+                compile_task.cancel()
+                await asyncio.gather(compile_task, return_exceptions=True)
+                raise
+        else:
+            graph_conversion = await _convert_shared_graph_natively(
+                graph_artifact_entries=graph_artifact_entries,
+                provider_set_key_map_path=provider_set_keys,
+                work_directory=Path(raw_work_directory),
+            )
         record_stage("provider_graph_convert", stage_started_at)
 
         block_stage = shared_block_stage_name(f"final-{reserved_snapshot_key}")
@@ -1180,6 +2233,7 @@ async def _publish_prepared_shared_layout(
                     stage_table=block_stage,
                     snapshot_key=int(reserved_snapshot_key),
                     build_token=build_token,
+                    expected_generation=shared_generation,
                 )
                 return _FinalizerBlockPublicationResult(
                     publication=publication,
@@ -1198,6 +2252,19 @@ async def _publish_prepared_shared_layout(
 
             stage_started_at = time.monotonic()
             try:
+                if provider_graph_v4:
+                    return await _publish_v4_graph(
+                        graph_conversion,
+                        schema_name=schema_name,
+                        snapshot_key=int(reserved_snapshot_key),
+                        build_token=build_token,
+                        compressed_acquisition_bytes=int(
+                            compressed_acquisition_bytes or 0
+                        ),
+                        empty_npi_tin_only_normalization_count=int(
+                            empty_npi_tin_only_normalization_count or 0
+                        ),
+                    )
                 return await publish_shared_graph(
                     graph_conversion,
                     schema_name=schema_name,
@@ -1242,6 +2309,7 @@ async def _publish_prepared_shared_layout(
                     expected_price_set_count=expected_price_set_count,
                     expected_price_key_order=expected_price_key_order,
                     prepared=prepared_price,
+                    expected_generation=shared_generation,
                 )
             finally:
                 record_stage("price_publish", stage_started_at)
@@ -1259,6 +2327,7 @@ async def _publish_prepared_shared_layout(
                     ),
                     entries=tuple(source_audit_witness_entries),
                     expected_raw_source_sha256=tuple(expected_raw_source_sha256),
+                    expected_generation=shared_generation,
                 )
             finally:
                 record_stage("source_witness_publish", stage_started_at)
@@ -1277,7 +2346,12 @@ async def _publish_prepared_shared_layout(
                 source_witness=publish_source_witness,
             )
         finally:
-            graph_conversion.cleanup()
+            # The V4 audit re-authenticates the compiler's bounded witness
+            # against the packed graph before seal.  Keep that witness alive
+            # until the audit has completed; the V3 publisher has no such
+            # post-publication dependency.
+            if not provider_graph_v4:
+                graph_conversion.cleanup()
         record_stage(
             "independent_publish_wall",
             independent_publish_started_at,
@@ -1296,17 +2370,19 @@ async def _publish_prepared_shared_layout(
         _validate_authoritative_mapping_summary(
             mapping_summary,
             finalizer_block_publication,
-            graph_publication,
+            *(() if provider_graph_v4 else (graph_publication,)),
             price_publication,
         )
         observed_kinds = set(mapping_summary.object_kinds)
-        missing_kinds = _REQUIRED_OBJECT_KINDS - observed_kinds
+        missing_kinds = (
+            _REQUIRED_PRICE_OBJECT_KINDS if provider_graph_v4 else _REQUIRED_OBJECT_KINDS
+        ) - observed_kinds
         if missing_kinds:
             raise RuntimeError(
                 f"strict V3 physical layout is missing required blocks: {sorted(missing_kinds)}"
             )
         core_support_map = {
-            "contract_version": 1,
+            "contract_version": 2 if provider_graph_v4 else 1,
             "serving_multiplicity_semantics": (PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS),
             "finalizer_dictionaries": dictionary_publication.support_digest.hex(),
             "provider_graph": graph_publication.support_digest.hex(),
@@ -1314,6 +2390,16 @@ async def _publish_prepared_shared_layout(
             "source_witness": source_witness_publication.support_digest.hex(),
             "provider_identifier_quarantine": quarantine["sha256"],
         }
+        if provider_graph_v4:
+            # The V4 root digest owns only the factored provider graph.  Bind
+            # the unchanged V3 rate/finalizer mappings into the support digest
+            # so a graph-identical but rate-different layout cannot be reused.
+            core_support_map["price_finalizer_mapping_digest"] = (
+                mapping_summary.mapping_digest.hex()
+            )
+            core_support_map["price_finalizer_mapping_count"] = int(
+                mapping_summary.mapping_count
+            )
         core_support_digest = shared_support_digest(core_support_map)
         price_membership_summary = _mapping(
             price_publication.stream_summaries.get("price_set_atom_memberships_v3"),
@@ -1326,19 +2412,36 @@ async def _publish_prepared_shared_layout(
         if price_membership_block_span <= 0:
             raise RuntimeError("strict V3 price membership block span must be positive")
         stage_started_at = time.monotonic()
-        audit_publication = await publish_shared_audit_sample(
-            schema_name=schema_name,
-            build_ownership=SharedLayoutBuildOwnership(
-                snapshot_key=int(reserved_snapshot_key),
-                build_token=build_token,
-            ),
-            logical_snapshot_id=str(logical_snapshot_id),
-            finalizer_summary=finalizer_summary_by_field,
-            mapping_digest=mapping_summary.mapping_digest,
-            core_support_digest=core_support_digest,
-            atom_key_bits=int(price_publication.atom_key_bits),
-            price_membership_block_span=price_membership_block_span,
+        audit_build_ownership = SharedLayoutBuildOwnership(
+            snapshot_key=int(reserved_snapshot_key),
+            build_token=build_token,
         )
+        if provider_graph_v4:
+            try:
+                audit_publication = await publish_v4_audit_sample(
+                    schema_name=schema_name,
+                    build_ownership=audit_build_ownership,
+                    logical_snapshot_id=str(logical_snapshot_id),
+                    finalizer_summary=finalizer_summary_by_field,
+                    mapping_digest=graph_publication.map_summary.map_digest,
+                    core_support_digest=core_support_digest,
+                    atom_key_bits=int(price_publication.atom_key_bits),
+                    price_membership_block_span=price_membership_block_span,
+                    graph_compilation=graph_conversion,
+                )
+            finally:
+                graph_conversion.cleanup()
+        else:
+            audit_publication = await publish_shared_audit_sample(
+                schema_name=schema_name,
+                build_ownership=audit_build_ownership,
+                logical_snapshot_id=str(logical_snapshot_id),
+                finalizer_summary=finalizer_summary_by_field,
+                mapping_digest=mapping_summary.mapping_digest,
+                core_support_digest=core_support_digest,
+                atom_key_bits=int(price_publication.atom_key_bits),
+                price_membership_block_span=price_membership_block_span,
+            )
         record_stage("audit_publish", stage_started_at)
         await touch_build()
         support_digest = _shared_layout_support_digest(
@@ -1373,43 +2476,79 @@ async def _publish_prepared_shared_layout(
         }
         stage_started_at = time.monotonic()
         async with db.transaction() as session:
-            sealed = await seal_shared_layout(
-                session,
-                schema_name=schema_name,
-                snapshot_key=int(reserved_snapshot_key),
-                build_token=str(build_token),
-                expected_summary=mapping_summary,
-                support_digest=support_digest,
-                layout_manifest={"serving_index": provisional_serving_index},
-            )
-            sealed_audit_sample = (
-                await sealed_audit_sample_metadata(
+            if provider_graph_v4:
+                sealed = await seal_v4_shared_layout(
                     session,
                     schema_name=schema_name,
-                    snapshot_key=int(sealed.snapshot_key),
-                    logical_snapshot_id=str(logical_snapshot_id),
+                    snapshot_key=int(reserved_snapshot_key),
+                    build_token=str(build_token),
+                    expected_summary=graph_publication.map_summary,
+                    support_digest=support_digest,
+                    layout_manifest={"serving_index": provisional_serving_index},
                 )
-                if sealed.reused
-                else dict(audit_publication.metadata)
-            )
+                sealed_audit_metadata_map = dict(audit_publication.metadata)
+            else:
+                sealed = await seal_shared_layout(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_key=int(reserved_snapshot_key),
+                    build_token=str(build_token),
+                    expected_summary=mapping_summary,
+                    support_digest=support_digest,
+                    layout_manifest={"serving_index": provisional_serving_index},
+                )
+                sealed_audit_metadata_map = (
+                    await sealed_audit_sample_metadata(
+                        session,
+                        schema_name=schema_name,
+                        snapshot_key=int(sealed.snapshot_key),
+                        logical_snapshot_id=str(logical_snapshot_id),
+                    )
+                    if sealed.reused
+                    else dict(audit_publication.metadata)
+                )
         record_stage("seal", stage_started_at)
         publication_timing_map["shared_publish_total_seconds"] = (
             time.monotonic() - publication_started_at
         )
-        serving_index = dict(provisional_serving_index)
+        serving_index = (
+            await _sealed_shared_serving_index(
+                schema_name=schema_name,
+                snapshot_key=int(sealed.snapshot_key),
+                expected_generation=PTG2_V4_SHARED_GENERATION,
+            )
+            if provider_graph_v4
+            else dict(provisional_serving_index)
+        )
         serving_index["timings"] = {
             **dict(serving_index.get("timings") or {}),
             **publication_timing_map,
         }
         serving_index["shared_snapshot_key"] = int(sealed.snapshot_key)
-        serving_index["audit_sample"] = sealed_audit_sample
+        serving_index["audit_sample"] = sealed_audit_metadata_map
         return SharedSnapshotPublication(
             snapshot_key=int(sealed.snapshot_key),
             serving_index=serving_index,
-            object_kinds=mapping_summary.object_kinds,
-            mapping_count=mapping_summary.mapping_count,
-            unique_block_count=mapping_summary.unique_block_count,
-            mapping_digest=mapping_summary.mapping_digest,
+            object_kinds=(
+                graph_publication.object_kinds
+                if provider_graph_v4
+                else mapping_summary.object_kinds
+            ),
+            mapping_count=(
+                graph_publication.mapping_count
+                if provider_graph_v4
+                else mapping_summary.mapping_count
+            ),
+            unique_block_count=(
+                graph_publication.unique_block_count
+                if provider_graph_v4
+                else mapping_summary.unique_block_count
+            ),
+            mapping_digest=(
+                graph_publication.map_summary.map_digest
+                if provider_graph_v4
+                else mapping_summary.mapping_digest
+            ),
             finalizer_summary=dict(finalizer_summary_by_field),
             layout_reused_at_seal=bool(sealed.reused),
             stored_byte_count=stored_byte_count,
@@ -1437,6 +2576,9 @@ async def publish_strict_shared_v3_layout(
     provider_identifier_quarantine: Mapping[str, Any],
     scratch_parent: str | Path | None = None,
     full_rebuild_scope_digest: str | None = None,
+    provider_graph_v4: bool = False,
+    compressed_acquisition_entries: Iterable[Mapping[str, Any]] | None = None,
+    empty_npi_tin_only_normalization_count: int | None = None,
 ) -> SharedSnapshotPublication:
     """Prepare exact price ranks once, then publish and clean every temporary map."""
 
@@ -1447,21 +2589,79 @@ async def publish_strict_shared_v3_layout(
     code_dictionary_entries = tuple(code_dictionary_entries)
     provider_set_metadata_entries = tuple(provider_set_metadata_entries)
     expected_source_identities = tuple(expected_source_identities)
+    expected_raw_source_digests = tuple(
+        str(raw_hash or "").strip().lower()
+        for raw_hash in expected_raw_source_sha256
+    )
+    compressed_acquisition_bytes: int | None = None
+    if provider_graph_v4:
+        if (
+            empty_npi_tin_only_normalization_count is None
+            or int(empty_npi_tin_only_normalization_count) < 0
+        ):
+            raise RuntimeError(
+                "PTG V4 empty-NPI TIN-only normalization evidence is invalid"
+            )
+        byte_count_by_hash: dict[str, int] = {}
+        for raw_entry in tuple(compressed_acquisition_entries or ()):
+            raw_hash = str(raw_entry.get("raw_sha256") or "").strip().lower()
+            try:
+                byte_count = int(raw_entry.get("byte_count"))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "PTG V4 compressed acquisition entry is invalid"
+                ) from exc
+            if (
+                len(raw_hash) != 64
+                or any(character not in "0123456789abcdef" for character in raw_hash)
+                or byte_count <= 0
+                or (
+                    raw_hash in byte_count_by_hash
+                    and byte_count_by_hash[raw_hash] != byte_count
+                )
+            ):
+                raise RuntimeError(
+                    "PTG V4 compressed acquisition entry is invalid"
+                )
+            byte_count_by_hash[raw_hash] = byte_count
+        if set(byte_count_by_hash) != set(expected_raw_source_digests):
+            raise RuntimeError(
+                "PTG V4 compressed acquisition inputs do not match source hashes"
+            )
+        compressed_acquisition_bytes = sum(byte_count_by_hash.values())
+        if compressed_acquisition_bytes <= 0:
+            raise RuntimeError(
+                "PTG V4 compressed acquisition bytes must be positive"
+            )
     publication_started_at = time.monotonic()
     configured_schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip()
     if str(schema_name).strip() != configured_schema:
         raise RuntimeError(
             "strict V3 publication must use the configured PostgreSQL schema"
         )
+    shared_generation = (
+        PTG2_V4_SHARED_GENERATION
+        if provider_graph_v4
+        else PTG2_V3_SHARED_GENERATION
+    )
     async with db.transaction() as session:
-        await touch_shared_layout_build(
+        touch = (
+            touch_v4_shared_layout_build
+            if provider_graph_v4
+            else touch_shared_layout_build
+        )
+        await touch(
             session,
             schema_name=schema_name,
             snapshot_key=int(reserved_snapshot_key),
             build_token=str(build_token),
         )
     with tempfile.TemporaryDirectory(
-        prefix="ptg2-v3-shared-publish-",
+        prefix=(
+            "ptg2-v4-shared-publish-"
+            if provider_graph_v4
+            else "ptg2-v3-shared-publish-"
+        ),
         dir=str(scratch_parent) if scratch_parent is not None else None,
     ) as raw_work_directory:
         async def publish_prepared_price_early(
@@ -1477,6 +2677,7 @@ async def publish_strict_shared_v3_layout(
                 expected_price_set_count=int(prepared.price_set_count),
                 expected_price_key_order=PTG2_V3_PRICE_KEY_ORDER,
                 prepared=prepared,
+                expected_generation=shared_generation,
             )
 
         (
@@ -1508,7 +2709,7 @@ async def publish_strict_shared_v3_layout(
                 code_dictionary_entries=code_dictionary_entries,
                 provider_set_metadata_entries=provider_set_metadata_entries,
                 source_audit_witness_entries=source_audit_witness_entries,
-                expected_raw_source_sha256=expected_raw_source_sha256,
+                expected_raw_source_sha256=expected_raw_source_digests,
                 graph_artifact_entries=graph_artifact_entries,
                 provider_identifier_quarantine=provider_identifier_quarantine,
                 prepared_price=prepared_price,
@@ -1519,6 +2720,11 @@ async def publish_strict_shared_v3_layout(
                 prepared_finalizer=prepared_finalizer,
                 prepared_price_publication=prepared_price_publication,
                 full_rebuild_scope_digest=normalized_rebuild_digest,
+                provider_graph_v4=provider_graph_v4,
+                compressed_acquisition_bytes=compressed_acquisition_bytes,
+                empty_npi_tin_only_normalization_count=(
+                    empty_npi_tin_only_normalization_count
+                ),
             )
         except BaseException:
             cleanup_task = asyncio.create_task(

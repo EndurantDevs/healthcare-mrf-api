@@ -11,9 +11,9 @@ RUN apt-get update \
     && python3 -m pip install --break-system-packages --no-cache-dir "maturin>=1.14,<2" \
     && rm -rf /var/lib/apt/lists/*
 RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
-        RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" cargo build --release --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
+        RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" cargo build --release --bins --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
     else \
-        cargo build --release --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
+        cargo build --release --bins --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
     fi
 RUN cd /build/support/ptg2_scanner \
     && if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
@@ -84,6 +84,7 @@ ENV HLTHPRT_DB_SCHEMA=${HLTHPRT_DB_SCHEMA}
 ENV HLTHPRT_REDIS_ADDRESS=${HLTHPRT_REDIS_ADDRESS}
 ENV HLTHPRT_SAVE_PER_PACK=${HLTHPRT_SAVE_PER_PACK}
 ENV HLTHPRT_PTG2_RUST_SCANNER_BIN=/opt/support/ptg2_scanner/target/release/ptg2_scanner
+ENV HLTHPRT_PTG2_PROVIDER_GRAPH_V4_BIN=/opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
 ENV HLTHPRT_PTG2_RUST_REQUIRE_RELEASE=true
 ENV PYTHONDONTWRITEBYTECODE=1
 
@@ -104,6 +105,9 @@ COPY support/ /opt/support/
 COPY --from=ptg2-scanner-builder \
     /build/support/ptg2_scanner/target/release/ptg2_scanner \
     /opt/support/ptg2_scanner/target/release/ptg2_scanner
+COPY --from=ptg2-scanner-builder \
+    /build/support/ptg2_scanner/target/release/ptg2_provider_graph_v4 \
+    /opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
 COPY --from=ptg2-scanner-builder /build/wheels/ /tmp/ptg2-address-canon-wheels/
 RUN . /opt/venv/bin/activate \
     && pip install --no-compile /tmp/ptg2-address-canon-wheels/*.whl \

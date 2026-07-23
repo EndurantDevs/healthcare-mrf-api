@@ -406,6 +406,8 @@ def _run_scanner(
     provider_forward_path = run_directory / "provider-forward.sidecar"
     provider_inverted_path = run_directory / "provider-inverted.sidecar"
     serving_run_directory = run_directory / "serving-runs"
+    source_witness_scratch_directory = serving_run_directory / "source-witness-scratch"
+    source_witness_scratch_directory.mkdir(parents=True)
     scanner_environment_map = dict(os.environ)
     for output_env in (
         *_SUPPORT_MODULE.COPY_ENV_BY_KIND.values(),
@@ -447,6 +449,9 @@ def _run_scanner(
                 provider_inverted_path
             ),
             "HLTHPRT_PTG2_V3_SERVING_RUN_DIR": str(serving_run_directory),
+            "HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR": str(
+                source_witness_scratch_directory
+            ),
             "HLTHPRT_PTG2_V3_SERVING_RUN_PARTITIONS": "4",
             "HLTHPRT_PTG2_V3_SERVING_RUN_PARTITION_BUFFER_BYTES": "52",
             "HLTHPRT_PTG2_RUST_WORKERS": "2",

@@ -10,6 +10,8 @@ from sanic import Blueprint, response
 from sqlalchemy import func, select
 
 from api.control_imports import ACTIVE_STATUSES, node_health
+from api.ptg2_v4_graph import v4_graph_metrics_snapshot
+from api.runtime_identity import runtime_identity
 from db.models import ImportRun, db
 
 blueprint = Blueprint("metrics")
@@ -62,6 +64,158 @@ async def render_prometheus_metrics() -> str:
     for queue, item in sorted(workers.items()):
         if isinstance(item, dict):
             lines.append(_metric("hp_mrf_api_worker_running", 1 if item.get("running") else 0, queue=str(queue)))
+    v4_graph = v4_graph_metrics_snapshot()
+    process_identity = runtime_identity()
+    lines.extend(
+        [
+            "# HELP hp_mrf_api_process_identity_info Exact API process and image identity for direct-pod canaries.",
+            "# TYPE hp_mrf_api_process_identity_info gauge",
+            _metric(
+                "hp_mrf_api_process_identity_info",
+                1,
+                identity=process_identity["process_identity"],
+                image=process_identity["image_identity"],
+                started_at=process_identity["process_started_at"],
+            ),
+            "# HELP hp_mrf_ptg_v4_graph_database_bytes_per_request Bytes fetched from PostgreSQL for packed V4 graph pages per API request.",
+            "# TYPE hp_mrf_ptg_v4_graph_database_bytes_per_request histogram",
+        ]
+    )
+    for upper_bound, count in sorted(v4_graph["buckets"].items()):
+        lines.append(
+            _metric(
+                "hp_mrf_ptg_v4_graph_database_bytes_per_request_bucket",
+                count,
+                le=str(upper_bound),
+            )
+        )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_database_bytes_per_request_bucket",
+            v4_graph["infinite_bucket_count"],
+            le="+Inf",
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_database_bytes_per_request_sum",
+            v4_graph["database_bytes"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_database_bytes_per_request_count",
+            v4_graph["request_count"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_database_blocks_total",
+            v4_graph["database_blocks"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_cache_hit_bytes_total",
+            v4_graph["cache_hit_bytes"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_logical_lookups_total",
+            v4_graph["logical_lookups"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_bitmap_owner_hits_total",
+            v4_graph["bitmap_owner_hits"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_component_fallback_sets_total",
+            v4_graph["component_fallback_sets"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_hot_prefix_requests_total",
+            v4_graph["hot_prefix_requests"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_cold_exact_requests_total",
+            v4_graph["cold_exact_requests"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_npi_prefix_override_sets_total",
+            v4_graph["npi_prefix_override_sets"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_hot_group_npi_members_total",
+            v4_graph["hot_group_npi_members"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_hot_group_npi_locator_pages_total",
+            v4_graph["hot_group_npi_locator_pages"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_hot_group_npi_member_pages_total",
+            v4_graph["hot_group_npi_member_pages"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_hot_group_npi_bytes_total",
+            v4_graph["hot_group_npi_bytes"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_hot_group_npi_batches_total",
+            v4_graph["hot_group_npi_batches"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_graph_hot_npi_dictionary_reads_total",
+            v4_graph["hot_npi_dictionary_reads"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_provider_expansion_rate_rows_total",
+            v4_graph["provider_expansion_rate_rows"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_provider_expansion_provider_sets_total",
+            v4_graph["provider_expansion_provider_sets"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_provider_expansion_graph_batches_total",
+            v4_graph["provider_expansion_graph_batches"],
+        )
+    )
+    lines.append(
+        _metric(
+            "hp_mrf_ptg_v4_provider_expansion_rejections_total",
+            v4_graph["provider_expansion_rejections"],
+        )
+    )
     return "\n".join(lines) + "\n"
 
 

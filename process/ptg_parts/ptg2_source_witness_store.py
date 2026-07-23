@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_V3_SHARED_GENERATION,
     SharedLayoutBuildOwnership,
     lock_shared_layout_for_dense_write,
     shared_support_digest,
@@ -311,6 +312,7 @@ async def publish_shared_source_witness(
     build_ownership: SharedLayoutBuildOwnership,
     entries: Sequence[Mapping[str, Any]],
     expected_raw_source_sha256: Sequence[str],
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> SourceWitnessPublication:
     """Publish one source witness while holding the immutable layout build lease."""
 
@@ -326,6 +328,7 @@ async def publish_shared_source_witness(
             schema_name=schema_name,
             snapshot_key=snapshot_key,
             build_token=str(build_ownership.build_token),
+            expected_generation=expected_generation,
         )
         await _replace_source_witness_row(
             schema=schema,

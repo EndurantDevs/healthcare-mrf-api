@@ -8,6 +8,7 @@ import concurrent.futures
 import datetime
 import gzip
 import hashlib
+import itertools
 import logging
 import math
 import os
@@ -496,6 +497,8 @@ def _emit_download_progress(
     started_at: float,
     done: bool,
 ) -> None:
+    """Publish one weighted compressed-download progress observation."""
+
     elapsed = max(time.monotonic() - started_at, 0.0)
     mib_s = (bytes_read / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
     if total_bytes and total_bytes > 0:
@@ -1703,22 +1706,21 @@ async def _iter_downloaded_ptg_jobs(
     base_live_progress_context = current_live_progress_context()
     artifact_lease_id = current_artifact_lease_id()
     job_count = max(len(jobs), 1)
-    scheduled_job_count = 0
+    scheduled_job_indexes = itertools.count()
 
     def schedule_more() -> None:
         """Start downloads until the configured in-flight task limit is reached."""
-        nonlocal scheduled_job_count
         while len(pending_tasks) < download_tasks:
             try:
                 job = next(job_iter)
             except StopIteration:
                 return
+            scheduled_job_index = next(scheduled_job_indexes)
             job_index = (
                 _progress_job_index(job)
                 if "_ptg_progress_index" in job
-                else scheduled_job_count
+                else scheduled_job_index
             )
-            scheduled_job_count += 1
             job_total = max(_progress_job_total(job, job_count), 1)
             if job_count == 1 and progress_end_pct > progress_start_pct:
                 progress_start = progress_start_pct

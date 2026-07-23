@@ -2891,6 +2891,458 @@ class PTG2V3SnapshotBlock(Base, JSONOutputMixin):
     block_hash = Column(LargeBinary, nullable=False)
 
 
+class PTG2V4SnapshotMapRoot(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_snapshot_map_root"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            name="ptg2_v4_snapshot_map_root_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v3_snapshot_layout.snapshot_key"
+            ],
+            name="ptg2_v4_snapshot_map_root_layout_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "state IN ('building', 'complete')",
+            name="ptg2_v4_snapshot_map_root_state_check",
+        ),
+        CheckConstraint(
+            "format_version = 1",
+            name="ptg2_v4_snapshot_map_root_format_check",
+        ),
+        CheckConstraint(
+            "map_format = 'packed_coordinate_hash_v1'",
+            name="ptg2_v4_snapshot_map_root_map_format_check",
+        ),
+        CheckConstraint(
+            "representation IN "
+            "('direct_v1', 'pattern_v1', 'source_component_v1')",
+            name="ptg2_v4_snapshot_map_root_representation_check",
+        ),
+        CheckConstraint(
+            "projection_id_scope = 'snapshot_local_v1'",
+            name="ptg2_v4_snapshot_map_root_id_scope_check",
+        ),
+        CheckConstraint(
+            "map_digest IS NULL OR octet_length(map_digest) = 32",
+            name="ptg2_v4_snapshot_map_root_digest_check",
+        ),
+        CheckConstraint(
+            "object_kind_count >= 0 AND map_pack_count >= 0 "
+            "AND coordinate_count >= 0 AND entry_count >= 0 "
+            "AND logical_byte_count >= 0 AND stored_map_byte_count >= 0 "
+            "AND npi_count >= 0 AND component_count >= 0 AND pattern_count >= 0 "
+            "AND relation_count >= 0 AND heavy_owner_count >= 0",
+            name="ptg2_v4_snapshot_map_root_counts_check",
+        ),
+        CheckConstraint(
+            "(state = 'building' AND map_digest IS NULL "
+            "AND completed_at IS NULL) OR "
+            "(state = 'complete' AND map_digest IS NOT NULL "
+            "AND completed_at IS NOT NULL AND object_kind_count > 0 "
+            "AND map_pack_count > 0 AND coordinate_count > 0)",
+            name="ptg2_v4_snapshot_map_root_completion_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    state = Column(String(16), nullable=False)
+    format_version = Column(SMALLINT, nullable=False)
+    map_format = Column(String(32), nullable=False)
+    representation = Column(String(32), nullable=False)
+    projection_id_scope = Column(String(32), nullable=False)
+    map_digest = Column(LargeBinary)
+    object_kind_count = Column(Integer, nullable=False, server_default=text("0"))
+    map_pack_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    coordinate_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    entry_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    logical_byte_count = Column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    stored_map_byte_count = Column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    npi_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    component_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    pattern_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    relation_count = Column(Integer, nullable=False, server_default=text("0"))
+    heavy_owner_count = Column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+    completed_at = Column(DateTime(timezone=True))
+
+
+class PTG2V4SnapshotMapPack(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_snapshot_map_pack"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "object_kind",
+            "pack_no",
+            name="ptg2_v4_snapshot_map_pack_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "object_kind",
+            "first_block_key",
+            "first_fragment_no",
+            name="ptg2_v4_snapshot_map_pack_start_key",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_snapshot_map_root.snapshot_key"
+            ],
+            name="ptg2_v4_snapshot_map_pack_root_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["map_block_hash"],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_block.block_hash"],
+            name="ptg2_v4_snapshot_map_pack_block_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "object_kind <> ''",
+            name="ptg2_v4_snapshot_map_pack_kind_check",
+        ),
+        CheckConstraint(
+            "pack_no >= 0",
+            name="ptg2_v4_snapshot_map_pack_number_check",
+        ),
+        CheckConstraint(
+            "first_block_key >= 0 AND first_fragment_no >= 0 "
+            "AND last_block_key >= 0 AND last_fragment_no >= 0 "
+            "AND ROW(first_block_key, first_fragment_no) "
+            "<= ROW(last_block_key, last_fragment_no)",
+            name="ptg2_v4_snapshot_map_pack_range_check",
+        ),
+        CheckConstraint(
+            "coordinate_count > 0 AND entry_count >= 0 "
+            "AND logical_byte_count >= 0",
+            name="ptg2_v4_snapshot_map_pack_counts_check",
+        ),
+        CheckConstraint(
+            "octet_length(map_block_hash) = 32",
+            name="ptg2_v4_snapshot_map_pack_hash_check",
+        ),
+        Index("ptg2_v4_snapshot_map_pack_block_hash_idx", "map_block_hash"),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    object_kind = Column(String(64), nullable=False)
+    pack_no = Column(Integer, nullable=False)
+    first_block_key = Column(BigInteger, nullable=False)
+    first_fragment_no = Column(Integer, nullable=False)
+    last_block_key = Column(BigInteger, nullable=False)
+    last_fragment_no = Column(Integer, nullable=False)
+    coordinate_count = Column(Integer, nullable=False)
+    entry_count = Column(BigInteger, nullable=False)
+    logical_byte_count = Column(BigInteger, nullable=False)
+    map_block_hash = Column(LargeBinary, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V4NPIScope(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_npi_scope"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "npi_key",
+            name="ptg2_v4_npi_scope_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "npi",
+            name="ptg2_v4_npi_scope_npi_key",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_snapshot_map_root.snapshot_key"
+            ],
+            name="ptg2_v4_npi_scope_root_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "npi_key >= 0",
+            name="ptg2_v4_npi_scope_npi_key_check",
+        ),
+        CheckConstraint(
+            "npi BETWEEN 1000000000 AND 9999999999",
+            name="ptg2_v4_npi_scope_npi_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    npi_key = Column(Integer, nullable=False)
+    npi = Column(BigInteger, nullable=False)
+
+
+class PTG2V4ProviderComponent(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_provider_component"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "component_key",
+            name="ptg2_v4_provider_component_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "component_global_id_128",
+            name="ptg2_v4_provider_component_global_id_key",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_snapshot_map_root.snapshot_key"
+            ],
+            name="ptg2_v4_provider_component_root_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "component_key >= 0",
+            name="ptg2_v4_provider_component_key_check",
+        ),
+        CheckConstraint(
+            "octet_length(component_global_id_128) = 16",
+            name="ptg2_v4_provider_component_global_id_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    component_key = Column(Integer, nullable=False)
+    component_global_id_128 = Column(LargeBinary, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V4Pattern(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_pattern"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "pattern_key",
+            name="ptg2_v4_pattern_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "pattern_digest",
+            name="ptg2_v4_pattern_digest_key",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_snapshot_map_root.snapshot_key"
+            ],
+            name="ptg2_v4_pattern_root_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "pattern_key >= 0",
+            name="ptg2_v4_pattern_key_check",
+        ),
+        CheckConstraint(
+            "octet_length(pattern_digest) = 32",
+            name="ptg2_v4_pattern_digest_check",
+        ),
+        CheckConstraint(
+            "set_count >= 0",
+            name="ptg2_v4_pattern_set_count_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    pattern_key = Column(Integer, nullable=False)
+    pattern_digest = Column(LargeBinary, nullable=False)
+    set_count = Column(BigInteger, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V4RelationManifest(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_relation_manifest"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "relation",
+            name="ptg2_v4_relation_manifest_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "member_object_kind",
+            name="ptg2_v4_relation_manifest_member_kind_key",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "locator_object_kind",
+            name="ptg2_v4_relation_manifest_locator_kind_key",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_snapshot_map_root.snapshot_key"
+            ],
+            name="ptg2_v4_relation_manifest_root_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "relation <> '' AND member_object_kind <> '' "
+            "AND locator_object_kind <> '' "
+            "AND member_object_kind <> locator_object_kind",
+            name="ptg2_v4_relation_manifest_names_check",
+        ),
+        CheckConstraint(
+            "owner_base >= 0 AND owner_count >= 0 "
+            "AND logical_member_count >= 0 AND vector_member_count >= 0 "
+            "AND vector_member_count <= logical_member_count "
+            "AND member_width IN (1, 2, 4, 8) "
+            "AND member_page_bytes > 0 AND locator_page_bytes > 0 "
+            "AND locator_owner_span > 0",
+            name="ptg2_v4_relation_manifest_counts_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    relation = Column(String(32), nullable=False)
+    member_object_kind = Column(String(64), nullable=False)
+    locator_object_kind = Column(String(64), nullable=False)
+    owner_base = Column(BigInteger, nullable=False)
+    owner_count = Column(BigInteger, nullable=False)
+    logical_member_count = Column(BigInteger, nullable=False)
+    vector_member_count = Column(BigInteger, nullable=False)
+    member_width = Column(SMALLINT, nullable=False)
+    member_page_bytes = Column(Integer, nullable=False)
+    locator_page_bytes = Column(Integer, nullable=False)
+    locator_owner_span = Column(Integer, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V4HeavyOwner(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_heavy_owner"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "relation",
+            "owner_key",
+            name="ptg2_v4_heavy_owner_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_snapshot_map_root.snapshot_key"
+            ],
+            name="ptg2_v4_heavy_owner_root_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key", "relation"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_relation_manifest.snapshot_key",
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_relation_manifest.relation",
+            ],
+            name="ptg2_v4_heavy_owner_relation_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "relation <> '' AND object_kind <> ''",
+            name="ptg2_v4_heavy_owner_names_check",
+        ),
+        CheckConstraint(
+            "owner_key >= 0 AND member_count >= 0 AND member_base >= 0 "
+            "AND member_span > 0 AND fragment_count > 0",
+            name="ptg2_v4_heavy_owner_counts_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    relation = Column(String(32), nullable=False)
+    owner_key = Column(BigInteger, nullable=False)
+    object_kind = Column(String(64), nullable=False)
+    member_count = Column(BigInteger, nullable=False)
+    member_base = Column(BigInteger, nullable=False)
+    member_span = Column(BigInteger, nullable=False)
+    fragment_count = Column(Integer, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
 class PTG2V3GraphOwner(Base, JSONOutputMixin):
     __tablename__ = "ptg2_v3_graph_owner"
     __main_table__ = __tablename__

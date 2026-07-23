@@ -37,6 +37,10 @@ PTG2_V3_SOURCE_WITNESS_MAX_PART_COUNT = (
 PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES = PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES
 PTG2_V3_SOURCE_WITNESS_MAX_RECORD_BYTES = 8 * 1024 * 1024
 PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
+# The merge may decode evidence one item at a time, but the persisted audit still
+# needs to consume the complete exact sample.  Bound that logical expansion
+# independently from both the compressed bundle and the process heap.
+PTG2_V3_SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES = 512 * 1024 * 1024
 SOURCE_BUNDLE_MAGIC = b"PTG2SW02"
 SOURCE_DICTIONARY_BUNDLE_MAGIC = b"PTG2SW03"
 SOURCE_RECORD_MAGIC = b"PTG2SWR2"
@@ -144,8 +148,59 @@ class CompressedSourceWitnessRecord:
         return self.priority, self.tie_breaker, self.raw_source_sha256
 
 
+@dataclass(frozen=True)
+class SourceWitnessBundleIdentity:
+    """Bind locators to one already authenticated immutable scanner bundle."""
+
+    path: str
+    sha256: str
+    byte_count: int
+    device: int
+    inode: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
+class SourceWitnessEvidenceLocator:
+    """Locate one compressed source token inside an authenticated bundle."""
+
+    sha256: str
+    raw_byte_count: int
+    offset: int
+    length: int
+
+
+@dataclass(frozen=True)
+class SourceWitnessRecordLocator:
+    """Carry only selection metadata and source coordinates through merge."""
+
+    kind: str
+    priority: int
+    tie_breaker: str
+    raw_source_sha256: str
+    raw_sha256: str
+    linked_provider_sha256: str | None
+    bundle: SourceWitnessBundleIdentity
+    offset: int
+    length: int
+    compressed_sha256: str
+    evidence_by_sha256: Mapping[str, SourceWitnessEvidenceLocator]
+
+    @property
+    def selection_key(self) -> tuple[int, str, str]:
+        """Return the exact existing global bottom-k ordering key."""
+
+        return self.priority, self.tie_breaker, self.raw_source_sha256
+
+
+SourceWitnessCandidate = CompressedSourceWitnessRecord | SourceWitnessRecordLocator
+
+
 class WitnessPayloadLimitError(RuntimeError):
     """Report a deterministic persisted-witness safety-bound violation."""
+
+    control_error_code = "ptg_source_witness_payload_budget_exceeded"
+    retryable = False
 
 
 def source_witness_targets(
@@ -340,6 +395,7 @@ __all__ = [
     "PTG2_V3_SOURCE_WITNESS_CONTRACT",
     "PTG2_V3_SOURCE_WITNESS_MAX_BUNDLE_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES",
+    "PTG2_V3_SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_FILE_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_PART_BYTES",
     "PTG2_V3_SOURCE_WITNESS_MAX_PART_COUNT",
@@ -358,8 +414,12 @@ __all__ = [
     "SOURCE_BUNDLE_MAGIC",
     "SOURCE_DICTIONARY_BUNDLE_MAGIC",
     "SOURCE_RECORD_MAGIC",
+    "SourceWitnessBundleIdentity",
+    "SourceWitnessCandidate",
+    "SourceWitnessEvidenceLocator",
     "SourceWitnessPublication",
     "SourceWitnessRecord",
+    "SourceWitnessRecordLocator",
     "source_witness_targets",
     "source_witness_manifest_projection",
     "validate_source_witness_manifest",

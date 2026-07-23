@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import os
-import threading
+import uuid
 from contextlib import contextmanager
 from typing import Any
 
-from db.models import db
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
     _live_progress_heartbeat,
@@ -17,7 +16,10 @@ from process.control_lifecycle import (
     mark_control_run,
 )
 from process.import_status_events import bind_status_event_loop, flush_status_events
-from process.live_progress import write_live_progress
+from process.live_progress import (
+    reset_live_progress_context,
+    set_live_progress_context,
+)
 from process.ptg import (
     PTG2FullRebuildFreshnessError,
     full_rebuild_failure_metrics,
@@ -44,12 +46,16 @@ from process.ptg_parts.config import (
 from process.ptg_parts.ptg2_source_witness_contract import (
     WitnessPayloadLimitError,
 )
+from process.ptg_control_runtime import (
+    PTG_CONTROL_HEARTBEAT_SOURCE,
+    _stale_ptg_job_result,
+    _start_threaded_ptg_heartbeat,
+    _stop_threaded_ptg_heartbeat,
+)
 
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
-PTG_CONTROL_HEARTBEAT_SOURCE = "engine-heartbeat"
 _FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
-_TERMINAL_RUN_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 _PROVIDER_GROUP_DEFINITION_ERROR_MARKERS = (
     "conflicting provider_group_id definition:",
     "duplicate provider_group_id definition:",
@@ -66,7 +72,7 @@ def _exception_leaves(error: BaseException) -> tuple[BaseException, ...]:
     return (error,)
 
 
-def _ptg_failure_error(error: BaseException) -> dict[str, str]:
+def _ptg_failure_error(error: BaseException) -> dict[str, Any]:
     leaves = _exception_leaves(error)
     witness_budget_error = next(
         (
@@ -80,6 +86,7 @@ def _ptg_failure_error(error: BaseException) -> dict[str, str]:
         return {
             "code": "ptg_source_witness_payload_budget_exceeded",
             "message": str(witness_budget_error),
+            "retryable": False,
         }
     provider_group_error = next(
         (
@@ -116,6 +123,10 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         if isinstance(task_payload.get("params"), dict)
         else task_payload
     )
+    attempt_started_at = dt.datetime.now(dt.UTC).isoformat(
+        timespec="microseconds"
+    )
+    attempt_id = f"{run_id}:{uuid.uuid4().hex}" if run_id else None
     stale_result = await _stale_ptg_job_result(run_id)
     if stale_result is not None:
         return stale_result
@@ -123,14 +134,49 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     full_rebuild_proof_metrics_by_name: dict[str, bool] = {}
     heartbeat_task = None
     heartbeat_stop = None
+    live_token = (
+        set_live_progress_context(
+            run_id=run_id,
+            importer="ptg",
+            status="running",
+            started_at=attempt_started_at,
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at,
+        )
+        if run_id
+        else None
+    )
     try:
-        await mark_control_run(run_id, status="running", phase_detail="ptg import running", progress_message="running")
+        attempt_claimed = await mark_control_run(
+            run_id,
+            status="running",
+            phase_detail="ptg import running",
+            progress_message="running",
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at if run_id else None,
+        )
+        if run_id and attempt_claimed is not True:
+            return {
+                "status": "skipped",
+                "run_id": run_id,
+                "reason": "newer_attempt_active",
+            }
         if run_id:
-            started_at = dt.datetime.now(dt.UTC).isoformat()
             heartbeat_task = asyncio.create_task(
-                _live_progress_heartbeat(run_id, "ptg", "ptg_control_start", started_at)
+                _live_progress_heartbeat(
+                    run_id,
+                    "ptg",
+                    "ptg_control_start",
+                    attempt_started_at,
+                    attempt_id=attempt_id,
+                    attempt_started_at=attempt_started_at,
+                )
             )
-            heartbeat_stop = _start_threaded_ptg_heartbeat(run_id, started_at)
+            heartbeat_stop = _start_threaded_ptg_heartbeat(
+                run_id,
+                attempt_started_at,
+                attempt_id=attempt_id,
+            )
         full_rebuild_scope_digest = _full_rebuild_scope_digest(
             params,
         )
@@ -167,6 +213,10 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 reuse_raw_artifacts=should_reuse_raw_artifacts,
                 keep_partial_artifacts=should_keep_partial_artifacts,
                 control_run_id=run_id,
+                control_attempt_id=attempt_id,
+                control_attempt_started_at=(
+                    attempt_started_at if run_id else None
+                ),
                 **(
                     {"full_rebuild_scope_digest": full_rebuild_scope_digest}
                     if full_rebuild_scope_digest is not None
@@ -188,6 +238,8 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 if failure_metrics_by_name
                 else {}
             ),
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at if run_id else None,
         )
         await _flush_terminal_status_events()
         return {"status": "canceled", "run_id": run_id}
@@ -207,6 +259,8 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 if failure_metrics_by_name
                 else {}
             ),
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at if run_id else None,
         )
         await _flush_terminal_status_events()
         raise
@@ -226,6 +280,8 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 "code": "ptg_full_rebuild_reuse_detected",
                 "message": "controlled PTG full rebuild reused prior work",
             },
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at if run_id else None,
         )
         await _flush_terminal_status_events()
         raise
@@ -253,12 +309,16 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 if failure_metrics_by_name
                 else {}
             ),
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at if run_id else None,
         )
         await _flush_terminal_status_events()
         raise
     finally:
         _stop_threaded_ptg_heartbeat(heartbeat_stop)
         await _stop_live_progress_heartbeat(heartbeat_task)
+        if live_token is not None:
+            reset_live_progress_context(live_token)
     result_metrics_by_name = import_result if isinstance(import_result, dict) else {}
     if full_rebuild_proof_metrics_by_name:
         result_metrics_by_name = {
@@ -275,67 +335,11 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             str(result_metrics_by_name.get("snapshot_id") or "").strip()
             or None
         ),
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at if run_id else None,
     )
     await _flush_terminal_status_events()
     return {**result_metrics_by_name, "status": "succeeded", "run_id": run_id}
-
-
-def _start_threaded_ptg_heartbeat(run_id: str, started_at: str) -> threading.Event:
-    stop_event = threading.Event()
-    interval = float(os.getenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "15"))
-    if interval <= 0:
-        return stop_event
-
-    def _heartbeat() -> None:
-        while not stop_event.wait(interval):
-            write_live_progress(
-                run_id=run_id,
-                importer="ptg",
-                status="running",
-                phase="ptg import running",
-                unit="run",
-                done=0,
-                total=1,
-                pct=0,
-                message="running",
-                started_at=started_at,
-                source=PTG_CONTROL_HEARTBEAT_SOURCE,
-                confidence="heartbeat",
-                publish_event=False,
-            )
-
-    thread = threading.Thread(target=_heartbeat, name=f"ptg-heartbeat-{run_id[:12]}", daemon=True)
-    thread.start()
-    return stop_event
-
-
-def _stop_threaded_ptg_heartbeat(stop_event: threading.Event | None) -> None:
-    if stop_event is not None:
-        stop_event.set()
-
-
-async def _stale_ptg_job_result(run_id: str) -> dict[str, Any] | None:
-    if not run_id:
-        return None
-    row = await db.first(
-        """
-        SELECT ir.status
-          FROM mrf.import_run ir
-         WHERE ir.run_id = :run_id
-         LIMIT 1
-        """,
-        run_id=run_id,
-    )
-    if row is None:
-        return None
-    run_status = str(row[0] or "").strip().lower()
-    if run_status in _TERMINAL_RUN_STATUSES:
-        return {
-            "status": "skipped",
-            "run_id": run_id,
-            "reason": f"run_{run_status}",
-        }
-    return None
 
 
 async def _flush_terminal_status_events() -> None:

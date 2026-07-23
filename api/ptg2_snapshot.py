@@ -59,7 +59,16 @@ def _serving_relation_available_sql(
               {attestation_join}
              WHERE shared_binding.snapshot_id = {snapshot_alias}.snapshot_id
                AND shared_layout.state = 'sealed'
-               AND shared_layout.generation = 'shared_blocks_v3'
+               AND shared_layout.generation IN ('shared_blocks_v3', 'shared_blocks_v4')
+               AND (
+                    shared_layout.generation <> 'shared_blocks_v4'
+                    OR EXISTS (
+                        SELECT 1
+                          FROM {PTG2_SCHEMA}.ptg2_v4_snapshot_map_root v4_root
+                         WHERE v4_root.snapshot_key = shared_layout.snapshot_key
+                           AND v4_root.state = 'complete'
+                    )
+               )
                {attestation_checks}
         )
     """

@@ -25,14 +25,18 @@ def _row_to_dict(row):
     mapping = getattr(row, "_mapping", None)
     if mapping is not None:
         try:
-            return dict(mapping)
+            row_by_field = dict(mapping)
         except (TypeError, ValueError):
-            pass
+            row_by_field = None
+        if row_by_field is not None:
+            return row_by_field
     if hasattr(row, "keys") and hasattr(row, "__getitem__"):
         try:
-            return {key: row[key] for key in row.keys()}
+            row_by_field = {key: row[key] for key in row.keys()}
         except (TypeError, ValueError):
-            pass
+            row_by_field = None
+        if row_by_field is not None:
+            return row_by_field
     if isinstance(row, dict):
         return dict(row)
     try:

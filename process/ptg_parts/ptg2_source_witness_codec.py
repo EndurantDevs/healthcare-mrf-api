@@ -33,6 +33,17 @@ class _RecordFields:
     expected_evidence: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SourceWitnessLocatorFields:
+    """Validated selection and evidence metadata without materialized tokens."""
+
+    kind: str
+    priority: int
+    tie_breaker: str
+    raw_sha256: str
+    linked_provider_sha256: str | None
+
+
 def _decompress_record(compressed_record: bytes) -> bytes:
     decompressor = zlib.decompressobj()
     try:
@@ -244,6 +255,53 @@ def _record_fields(record_metadata: Mapping[str, Any]) -> _RecordFields:
     )
 
 
+def decode_record_locator_fields(
+    compressed_record: bytes,
+) -> SourceWitnessLocatorFields:
+    """Validate one dictionary record while leaving source evidence on disk."""
+
+    decoded_record, record_metadata, metadata_end = _decoded_record_metadata(
+        compressed_record
+    )
+    record_fields = _record_fields(record_metadata)
+    _coordinate(record_metadata)
+    raw_json, linked_provider_json = _framed_raw_tokens(
+        decoded_record,
+        metadata_end,
+    )
+    if raw_json or linked_provider_json is not None:
+        raise RuntimeError(
+            "strict V3 locator witness unexpectedly embeds source evidence"
+        )
+    raw_sha256 = sha256_hex(
+        record_metadata.get("raw_sha256"),
+        field_name="raw record digest",
+    )
+    linked_provider_sha256 = record_metadata.get("linked_provider_sha256")
+    if linked_provider_sha256 is not None:
+        linked_provider_sha256 = sha256_hex(
+            linked_provider_sha256,
+            field_name="linked provider digest",
+        )
+    _validate_record_shape(
+        witness_kind=record_fields.witness_kind,
+        procedure=record_fields.procedure,
+        provider_evidence=record_fields.provider_evidence,
+        linked_provider_json=(
+            b"dictionary-reference"
+            if linked_provider_sha256 is not None
+            else None
+        ),
+    )
+    return SourceWitnessLocatorFields(
+        kind=record_fields.witness_kind,
+        priority=record_fields.priority,
+        tie_breaker=record_fields.tie_breaker,
+        raw_sha256=raw_sha256,
+        linked_provider_sha256=linked_provider_sha256,
+    )
+
+
 def _decode_record(
     compressed_record: bytes,
     raw_source_sha256: str,
@@ -369,8 +427,10 @@ def _validate_record_shape(
 
 
 __all__ = [
+    "SourceWitnessLocatorFields",
     "U32",
     "decode_record",
+    "decode_record_locator_fields",
     "decode_persisted_record",
     "externalize_source_evidence_record",
     "nonnegative_int",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -12,6 +13,7 @@ import queue
 import signal
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -49,11 +51,15 @@ from process.ptg_parts.ptg2_shared_graph import (
     SharedGraphIntegrityMetrics,
     SharedGraphShardBundle,
 )
+from process.ptg_parts.ptg2_source_witness_contract import (
+    WitnessPayloadLimitError,
+)
 from process.ptg_parts.screen import _emit_screen_line
 
 logger = logging.getLogger(__name__)
 
 _SCANNER_PROGRESS_PREFIX = "PTG2_SCANNER_PROGRESS\t"
+_SCANNER_ERROR_PREFIX = "PTG2_SCANNER_ERROR\t"
 _SCANNER_PROGRESS_BASE_KEYS = {
     "path",
     "compressed_bytes",
@@ -69,8 +75,38 @@ _SCANNER_PROGRESS_BASE_KEYS = {
     "indexed_objects_total",
     "in_network_objects_completed",
     "in_network_objects_total",
+    "semantic_work_completed",
+}
+_SCANNER_PROGRESS_WORK_FIELDS = {
+    "indexed_objects": ("indexed_objects_completed", "indexed_objects_total"),
+    "plain_reordered_objects": (
+        "in_network_objects_completed",
+        "in_network_objects_total",
+    ),
+    "semantic_work": ("semantic_work_completed", None),
 }
 _SCANNER_METRIC_RECORD_KINDS = {"scanner_config", "scanner_summary"}
+_PROVIDER_GRAPH_V4_ENV = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4"
+_PROVIDER_GRAPH_V4_FACTORS_ENV = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4_FACTORS"
+_V4_EMPTY_NPI_NORMALIZATION_CONTRACT = (
+    "ptg2_v4_empty_npi_tin_only_normalization_v1"
+)
+_V4_EMPTY_NPI_NORMALIZATION_HASH_DOMAIN = (
+    b"PTG2_V4_EMPTY_NPI_TIN_ONLY_NORMALIZATION_V1\0"
+)
+_V4_EMPTY_NPI_NORMALIZATION_FIELDS = frozenset(
+    {
+        "contract",
+        "source_shape",
+        "canonical_equivalent",
+        "occurrence_count",
+        "emitted_npi_edge_count",
+        "sha256",
+    }
+)
+_SOURCE_WITNESS_SCRATCH_DIR_ENV = "HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR"
+_SOURCE_WITNESS_SCRATCH_PREFIX = ".ptg2-source-witness-scratch-"
+_SOURCE_WITNESS_SCRATCH_MARKER = ".healthporta-source-witness-scratch-v1"
 _V3_SERVING_RUN_FORMAT = "ptg2_v3_serving_run"
 _V3_SERVING_RUN_VERSION = 1
 _V3_CODE_DICTIONARY_FORMAT = "ptg2_v3_serving_code_dictionary"
@@ -143,6 +179,88 @@ def _subprocess_session_options(spawn: Any | None = None) -> dict[str, bool]:
         ):
             return {}
     return {"start_new_session": True}
+
+
+def _source_witness_scratch_marker(path: Path) -> Path:
+    return path / _SOURCE_WITNESS_SCRATCH_MARKER
+
+
+def _is_live_local_process(process_id: int) -> bool:
+    if process_id <= 0:
+        return False
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _validated_source_witness_scratch_owner(path: Path) -> int | None:
+    """Return the local owner PID only for our exact private scratch contract."""
+
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return None
+        marker_path = _source_witness_scratch_marker(path)
+        if marker_path.is_symlink() or not marker_path.is_file():
+            return None
+        marker = json.loads(marker_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict) or marker.get("contract") != (
+        "healthporta_ptg2_source_witness_scratch_v1"
+    ):
+        return None
+    process_id = marker.get("pid")
+    return process_id if type(process_id) is int and process_id > 0 else None
+
+
+def _is_source_witness_scratch_removed(path: Path, *, require_orphan: bool) -> bool:
+    """Remove only an authenticated child scratch directory, never arbitrary data."""
+
+    process_id = _validated_source_witness_scratch_owner(path)
+    if process_id is None or (require_orphan and _is_live_local_process(process_id)):
+        return False
+    shutil.rmtree(path)
+    return True
+
+
+def _prepare_source_witness_scratch_directory(run_directory: Path) -> Path:
+    """Create one Python-owned scanner scratch root and reap safe local orphans."""
+
+    run_directory.mkdir(parents=True, exist_ok=True)
+    for candidate in run_directory.iterdir():
+        if not candidate.name.startswith(_SOURCE_WITNESS_SCRATCH_PREFIX):
+            continue
+        try:
+            _is_source_witness_scratch_removed(candidate, require_orphan=True)
+        except OSError:
+            logger.warning(
+                "Unable to remove orphaned PTG2 source-witness scratch directory"
+            )
+    scratch_path = Path(
+        tempfile.mkdtemp(prefix=_SOURCE_WITNESS_SCRATCH_PREFIX, dir=run_directory)
+    )
+    try:
+        scratch_path.chmod(0o700)
+        marker_payload = json.dumps(
+            {
+                "contract": "healthporta_ptg2_source_witness_scratch_v1",
+                "pid": os.getpid(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        _source_witness_scratch_marker(scratch_path).write_text(
+            marker_payload,
+            encoding="ascii",
+        )
+    except BaseException:
+        shutil.rmtree(scratch_path, ignore_errors=True)
+        raise
+    return scratch_path
 
 
 def _is_process_group_alive(process_group_id: int) -> bool:
@@ -968,8 +1086,12 @@ def _validated_v3_file_frame(
     return field_by_name
 
 
-def _validate_v3_scanner_config(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
+def _validate_v3_scanner_config(
+    scanner_config_by_field: Any,
+    *,
+    expect_factor_mode: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(scanner_config_by_field, dict):
         raise RuntimeError("strict V3 scanner emitted invalid scanner_config")
     required_value_by_name = {
         "snapshot_arch": "postgres_binary_v3",
@@ -978,15 +1100,112 @@ def _validate_v3_scanner_config(payload: Any) -> dict[str, Any]:
         "serving_run_format": _V3_SERVING_RUN_FORMAT,
     }
     for field_name, expected in required_value_by_name.items():
-        if str(payload.get(field_name) or "") != expected:
+        if str(scanner_config_by_field.get(field_name) or "") != expected:
             raise RuntimeError(
                 f"strict V3 scanner_config has incompatible {field_name}"
             )
     if _strict_non_negative_int(
-        payload.get("serving_run_version"), "serving_run_version"
+        scanner_config_by_field.get("serving_run_version"),
+        "serving_run_version",
     ) != _V3_SERVING_RUN_VERSION:
         raise RuntimeError("strict V3 scanner_config has incompatible serving_run_version")
+    if expect_factor_mode and (
+        scanner_config_by_field.get("factor_mode") is not True
+        or scanner_config_by_field.get("provider_graph_v4_factor_mode")
+        is not True
+    ):
+        raise RuntimeError(
+            "strict V3 scanner_config did not activate required V4 factor mode"
+        )
+    return scanner_config_by_field
+
+
+def _validate_v3_scanner_summary(
+    payload: Any,
+    *,
+    expect_factor_mode: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("strict V3 scanner emitted invalid scanner_summary")
+    if expect_factor_mode and (
+        payload.get("factor_mode") is not True
+        or payload.get("provider_graph_v4_factor_mode") is not True
+    ):
+        raise RuntimeError(
+            "strict V3 scanner_summary did not confirm required V4 factor mode"
+        )
+    empty_npi_evidence = payload.get("empty_npi_tin_only_normalization")
+    if expect_factor_mode:
+        _verify_v4_tin_only_audit(empty_npi_evidence)
+    elif empty_npi_evidence is not None:
+        raise RuntimeError(
+            "strict V3 scanner_summary emitted V4-only empty-NPI evidence"
+        )
     return payload
+
+
+def _verify_v4_tin_only_audit(
+    normalization_audit: Any,
+) -> int:
+    """Authenticate one scanner's V4-only empty-NPI normalization evidence."""
+
+    if not isinstance(normalization_audit, Mapping) or set(normalization_audit) != (
+        _V4_EMPTY_NPI_NORMALIZATION_FIELDS
+    ):
+        raise RuntimeError(
+            "PTG V4 scanner omitted empty-NPI normalization evidence"
+        )
+    occurrence_count = normalization_audit.get("occurrence_count")
+    emitted_edge_count = normalization_audit.get("emitted_npi_edge_count")
+    if (
+        normalization_audit.get("contract")
+        != _V4_EMPTY_NPI_NORMALIZATION_CONTRACT
+        or normalization_audit.get("source_shape") != "empty_array"
+        or normalization_audit.get("canonical_equivalent") != "zero_marker"
+        or type(occurrence_count) is not int
+        or not 0 <= occurrence_count <= 2**64 - 1
+        or type(emitted_edge_count) is not int
+        or emitted_edge_count != 0
+    ):
+        raise RuntimeError(
+            "PTG V4 scanner empty-NPI normalization evidence is invalid"
+        )
+    digest = hashlib.sha256()
+    digest.update(_V4_EMPTY_NPI_NORMALIZATION_HASH_DOMAIN)
+    digest.update(occurrence_count.to_bytes(8, "big"))
+    if normalization_audit.get("sha256") != digest.hexdigest():
+        raise RuntimeError(
+            "PTG V4 scanner empty-NPI normalization digest changed"
+        )
+    return occurrence_count
+
+
+def _use_v4_provider_factors(
+    scanner_environment_map: dict[str, str],
+    *,
+    provider_set_component_path: str | Path | None,
+    provider_component_group_path: str | Path | None,
+) -> bool:
+    """Fence factor-mode activation to the main V4 flag and paired outputs."""
+    has_set_component_path = provider_set_component_path is not None
+    has_component_group_path = provider_component_group_path is not None
+    if has_set_component_path != has_component_group_path:
+        raise RuntimeError(
+            "V4 provider factor outputs require both set-to-component and "
+            "component-to-group sidecar paths"
+        )
+    expect_factor_mode = _env_bool(_PROVIDER_GRAPH_V4_ENV, False)
+    if expect_factor_mode and not has_set_component_path:
+        raise RuntimeError(
+            f"{_PROVIDER_GRAPH_V4_ENV} requires both V4 provider factor sidecar paths"
+        )
+    scanner_environment_map.pop(_PROVIDER_GRAPH_V4_FACTORS_ENV, None)
+    if expect_factor_mode:
+        scanner_environment_map[_PROVIDER_GRAPH_V4_ENV] = "true"
+        # Keep older scanner binaries compatible, but derive this value here;
+        # deployment no longer has to configure an independent feature flag.
+        scanner_environment_map[_PROVIDER_GRAPH_V4_FACTORS_ENV] = "true"
+    return expect_factor_mode
 
 
 def _ptg2_rust_scanner_binary() -> Path | None:
@@ -1106,12 +1325,10 @@ async def convert_membership_shards_to_shared_graph_rust(
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
             stderr_tail = stderr.decode("utf-8", errors="replace")[-2000:]
-            raise RuntimeError(
-                _scanner_error_message(
-                    "strict V3 shared-graph converter",
-                    int(process.returncode or 0),
-                    [stderr_tail],
-                )
+            raise _scanner_failure_exception(
+                "strict V3 shared-graph converter",
+                int(process.returncode or 0),
+                [stderr_tail],
             )
         if stderr:
             logger.info(
@@ -1140,6 +1357,29 @@ async def convert_membership_shards_to_shared_graph_rust(
 
 def _scanner_error_message(prefix: str, return_code: int, stderr_tail: list[str]) -> str:
     return f"{prefix} failed with {_scanner_return_code_label(return_code)}: {chr(10).join(stderr_tail)[-1000:]}"
+
+
+def _scanner_failure_exception(
+    prefix: str,
+    return_code: int,
+    stderr_tail: list[str],
+) -> RuntimeError:
+    """Translate authenticated scanner error frames into stable Python types."""
+
+    for line in reversed(stderr_tail):
+        marker_index = line.find(_SCANNER_ERROR_PREFIX)
+        if marker_index < 0:
+            continue
+        try:
+            payload = json.loads(line[marker_index + len(_SCANNER_ERROR_PREFIX):])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        message = str(payload.get("message") or "").strip()
+        if payload.get("code") == "witness_payload_limit" and message:
+            return WitnessPayloadLimitError(message)
+    return RuntimeError(_scanner_error_message(prefix, return_code, stderr_tail))
 
 
 def _scanner_progress_fields(line: str) -> dict[str, str] | None:
@@ -1215,22 +1455,20 @@ class _ScannerProgress(NamedTuple):
 def _parse_scanner_progress(fields: dict[str, str]) -> _ScannerProgress:
     scanner_object_count_by_kind = {
         key: count
-        for key, value in fields.items()
+        for key, field_value in fields.items()
         if key not in _SCANNER_PROGRESS_BASE_KEYS
-        and (count := _coerce_progress_int(value)) is not None
+        and (count := _coerce_progress_int(field_value)) is not None
     }
     compressed_bytes = _coerce_progress_int(fields.get("compressed_bytes"))
     total_bytes = _coerce_progress_int(fields.get("total_bytes"))
     object_count = _coerce_progress_int(fields.get("objects"))
     declared_basis = str(fields.get("progress_basis") or "").strip()
-    if declared_basis == "indexed_objects":
+    declared_work_fields = _SCANNER_PROGRESS_WORK_FIELDS.get(declared_basis)
+    if declared_work_fields is not None:
+        completed_field, total_field = declared_work_fields
         progress_basis = declared_basis
-        work_done = _coerce_progress_int(fields.get("indexed_objects_completed"))
-        work_total = _coerce_progress_int(fields.get("indexed_objects_total"))
-    elif declared_basis == "plain_reordered_objects":
-        progress_basis = declared_basis
-        work_done = _coerce_progress_int(fields.get("in_network_objects_completed"))
-        work_total = _coerce_progress_int(fields.get("in_network_objects_total"))
+        work_done = _coerce_progress_int(fields.get(completed_field))
+        work_total = _coerce_progress_int(fields.get(total_field)) if total_field else None
     elif compressed_bytes is not None and compressed_bytes > 0:
         progress_basis = "compressed_bytes"
         work_done = compressed_bytes
@@ -1489,7 +1727,7 @@ def _emit_scanner_metric_progress(
         if context_value not in (None, "")
     }
     try:
-        progress_payload = dict(
+        progress_by_field = dict(
             **progress_context_map,
             phase="compact-serving scanner",
             message=message,
@@ -1501,9 +1739,9 @@ def _emit_scanner_metric_progress(
             scanner_fallback_reason=metric_fields.get("top_level_byte_scan_fallback_reason"),
         )
         if progress_observer is not None:
-            progress_observer(progress_payload)
+            progress_observer(progress_by_field)
         else:
-            write_live_progress(**progress_payload)
+            write_live_progress(**progress_by_field)
     except Exception:
         logger.debug("Failed to write PTG2 scanner metric progress", exc_info=True)
 
@@ -1589,8 +1827,10 @@ def _iter_top_level_object_bytes_rust(
         if stderr_thread is not None:
             stderr_thread.join()
         if return_code != 0 and not is_terminated_by_consumer:
-            raise RuntimeError(
-                _scanner_error_message("PTG2 Rust scanner", return_code, stderr_lines)
+            raise _scanner_failure_exception(
+                "PTG2 Rust scanner",
+                return_code,
+                stderr_lines,
             )
 
 
@@ -1619,6 +1859,8 @@ def _iter_compact_serving_records_rust(
     v3_serving_run_directory: str | Path | None = None,
     manifest_provider_forward_sidecar_path: str | Path | None = None,
     manifest_provider_inverted_sidecar_path: str | Path | None = None,
+    manifest_provider_set_component_sidecar_path: str | Path | None = None,
+    manifest_provider_component_group_sidecar_path: str | Path | None = None,
     manifest_provider_npi_sidecar_path: str | Path | None = None,
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
@@ -1654,6 +1896,11 @@ def _iter_compact_serving_records_rust(
         "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": source_trace_set_hash,
         "HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE": confidence_code,
     }
+    is_factor_mode_expected = _use_v4_provider_factors(
+        scanner_environment_map,
+        provider_set_component_path=manifest_provider_set_component_sidecar_path,
+        provider_component_group_path=manifest_provider_component_group_sidecar_path,
+    )
     scanner_environment_map.pop("HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON", None)
     if compact_copy_path is not None:
         scanner_environment_map["HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH"] = str(
@@ -1705,11 +1952,10 @@ def _iter_compact_serving_records_rust(
         )
     if v3_serving_run_directory is None:
         raise RuntimeError("strict V3 scanner requires an explicit serving-run directory")
-    scanner_environment_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(
-        v3_serving_run_directory
-    )
+    serving_run_path = Path(v3_serving_run_directory)
+    scanner_environment_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"] = str(serving_run_path)
     scanner_environment_map["HLTHPRT_PTG2_MANIFEST_SPILL_DIR"] = str(
-        v3_serving_run_directory
+        serving_run_path
     )
     if manifest_provider_forward_sidecar_path is not None:
         scanner_environment_map[
@@ -1719,6 +1965,14 @@ def _iter_compact_serving_records_rust(
         scanner_environment_map[
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH"
         ] = str(manifest_provider_inverted_sidecar_path)
+    if manifest_provider_set_component_sidecar_path is not None:
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH"
+        ] = str(manifest_provider_set_component_sidecar_path)
+    if manifest_provider_component_group_sidecar_path is not None:
+        scanner_environment_map[
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH"
+        ] = str(manifest_provider_component_group_sidecar_path)
     if manifest_provider_npi_sidecar_path is not None:
         scanner_environment_map["HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH"] = str(
             manifest_provider_npi_sidecar_path
@@ -1768,52 +2022,96 @@ def _iter_compact_serving_records_rust(
         PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV,
         str(PTG2_DEFAULT_RUST_SPLIT_NEGOTIATED_RATES),
     )
-    process_control = _process_control or _ScannerProcessControl()
-    process = subprocess.Popen(
-        [str(binary), "--compact-serving", str(path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=scanner_environment_map,
-        **_subprocess_session_options(subprocess.Popen),
+    source_witness_scratch_path = _prepare_source_witness_scratch_directory(
+        serving_run_path
     )
-    process_control.attach(process)
-    assert process.stdout is not None
+    scanner_environment_map[_SOURCE_WITNESS_SCRATCH_DIR_ENV] = str(
+        source_witness_scratch_path
+    )
+    process_control = _process_control or _ScannerProcessControl()
+    try:
+        process = subprocess.Popen(
+            [str(binary), "--compact-serving", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=scanner_environment_map,
+            **_subprocess_session_options(subprocess.Popen),
+        )
+    except BaseException:
+        try:
+            _is_source_witness_scratch_removed(
+                source_witness_scratch_path,
+                require_orphan=False,
+            )
+        except OSError:
+            logger.warning(
+                "Unable to remove PTG2 source-witness scratch directory after spawn failure"
+            )
+        raise
     stderr_lines: list[str] = []
     stderr_thread: threading.Thread | None = None
-    if process.stderr is not None:
+    is_process_attached = False
+    try:
+        process_control.attach(process)
+        is_process_attached = True
+        if process.stdout is None:
+            raise RuntimeError("PTG2 Rust compact scanner stdout is unavailable")
+        if process.stderr is not None:
 
-        def _read_scanner_stderr() -> None:
-            assert process.stderr is not None
-            for raw_line in iter(process.stderr.readline, b""):
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                stderr_lines.append(line)
-                if len(stderr_lines) > 20:
-                    del stderr_lines[:-20]
-                if (
-                    line.startswith(_SCANNER_PROGRESS_PREFIX)
-                    or line.startswith("PTG2_DEDUPE_SUMMARY\t")
-                    or line.startswith("PTG2_SCANNER_WORKER_FAILED\t")
-                ):
-                    _emit_screen_line(line)
-                    logger.info(line)
-                    if line.startswith(_SCANNER_PROGRESS_PREFIX):
-                        _emit_scanner_live_progress(
-                            line,
-                            phase="compact-serving scanner",
-                            live_progress_context=live_progress_context,
-                            progress_observer=progress_observer,
-                        )
+            def _read_scanner_stderr() -> None:
+                assert process.stderr is not None
+                for raw_line in iter(process.stderr.readline, b""):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    stderr_lines.append(line)
+                    if len(stderr_lines) > 20:
+                        del stderr_lines[:-20]
+                    if (
+                        line.startswith(_SCANNER_PROGRESS_PREFIX)
+                        or line.startswith("PTG2_DEDUPE_SUMMARY\t")
+                        or line.startswith("PTG2_SCANNER_WORKER_FAILED\t")
+                    ):
+                        _emit_screen_line(line)
+                        logger.info(line)
+                        if line.startswith(_SCANNER_PROGRESS_PREFIX):
+                            _emit_scanner_live_progress(
+                                line,
+                                phase="compact-serving scanner",
+                                live_progress_context=live_progress_context,
+                                progress_observer=progress_observer,
+                            )
+                    else:
+                        logger.warning("PTG2 Rust compact scanner stderr: %s", line)
+
+            stderr_thread = threading.Thread(
+                target=_read_scanner_stderr,
+                name="ptg2-rust-compact-stderr",
+                daemon=True,
+            )
+            stderr_thread.start()
+    except BaseException:
+        try:
+            if process.poll() is None:
+                if is_process_attached:
+                    process_control.terminate()
                 else:
-                    logger.warning("PTG2 Rust compact scanner stderr: %s", line)
-
-        stderr_thread = threading.Thread(
-            target=_read_scanner_stderr,
-            name="ptg2-rust-compact-stderr",
-            daemon=True,
-        )
-        stderr_thread.start()
+                    _terminate_subprocess_group(process)
+            else:
+                process.wait()
+            if stderr_thread is not None:
+                stderr_thread.join()
+        finally:
+            try:
+                _is_source_witness_scratch_removed(
+                    source_witness_scratch_path,
+                    require_orphan=False,
+                )
+            except OSError:
+                logger.warning(
+                    "Unable to remove PTG2 source-witness scratch directory after setup failure"
+                )
+        raise
     is_terminated_by_consumer = False
     has_frame_stream_failure = False
     has_stdout_terminal_summary = False
@@ -1889,7 +2187,11 @@ def _iter_compact_serving_records_rust(
                         expected_version=_V3_CODE_DICTIONARY_VERSION,
                     )
                 )
-            elif record_kind == "scanner_summary" and isinstance(frame_field_map, dict):
+            elif record_kind == "scanner_summary":
+                frame_field_map = _validate_v3_scanner_summary(
+                    frame_field_map,
+                    expect_factor_mode=is_factor_mode_expected,
+                )
                 has_scanner_summary = True
                 frame_field_map = {
                     **frame_field_map,
@@ -1898,10 +2200,11 @@ def _iter_compact_serving_records_rust(
                         serving_run_code_dictionary_files
                     ),
                 }
-            elif record_kind == "scanner_summary":
-                raise RuntimeError("strict V3 scanner emitted invalid scanner_summary")
             elif record_kind == "scanner_config":
-                frame_field_map = _validate_v3_scanner_config(frame_field_map)
+                frame_field_map = _validate_v3_scanner_config(
+                    frame_field_map,
+                    expect_factor_mode=is_factor_mode_expected,
+                )
                 has_scanner_config = True
             if record_kind in {"dedupe_summary", "scanner_summary"}:
                 has_stdout_terminal_summary = True
@@ -1920,15 +2223,26 @@ def _iter_compact_serving_records_rust(
                 "strict V3 scanner completed without its required config and summary frames"
             )
     finally:
-        is_terminated_by_consumer = (
-            is_terminated_by_consumer or process_control.is_termination_requested
-        )
-        if process.poll() is None:
-            is_terminated_by_consumer = True
-            process_control.terminate()
-        return_code = process.wait()
-        if stderr_thread is not None:
-            stderr_thread.join()
+        try:
+            is_terminated_by_consumer = (
+                is_terminated_by_consumer or process_control.is_termination_requested
+            )
+            if process.poll() is None:
+                is_terminated_by_consumer = True
+                process_control.terminate()
+            return_code = process.wait()
+            if stderr_thread is not None:
+                stderr_thread.join()
+        finally:
+            try:
+                _is_source_witness_scratch_removed(
+                    source_witness_scratch_path,
+                    require_orphan=False,
+                )
+            except OSError:
+                logger.warning(
+                    "Unable to remove PTG2 source-witness scratch directory"
+                )
         if (
             return_code != 0
             and not is_terminated_by_consumer
@@ -1939,10 +2253,10 @@ def _iter_compact_serving_records_rust(
                 has_stdout_terminal_summary=has_stdout_terminal_summary,
             )
         ):
-            raise RuntimeError(
-                _scanner_error_message(
-                    "PTG2 Rust compact scanner", return_code, stderr_lines
-                )
+            raise _scanner_failure_exception(
+                "PTG2 Rust compact scanner",
+                return_code,
+                stderr_lines,
             )
 
 
@@ -1971,6 +2285,8 @@ async def _aiter_compact_serving_records_rust(
     v3_serving_run_directory: str | Path | None = None,
     manifest_provider_forward_sidecar_path: str | Path | None = None,
     manifest_provider_inverted_sidecar_path: str | Path | None = None,
+    manifest_provider_set_component_sidecar_path: str | Path | None = None,
+    manifest_provider_component_group_sidecar_path: str | Path | None = None,
     manifest_provider_npi_sidecar_path: str | Path | None = None,
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
@@ -2010,6 +2326,8 @@ async def _aiter_compact_serving_records_rust(
         v3_serving_run_directory=v3_serving_run_directory,
         manifest_provider_forward_sidecar_path=manifest_provider_forward_sidecar_path,
         manifest_provider_inverted_sidecar_path=manifest_provider_inverted_sidecar_path,
+        manifest_provider_set_component_sidecar_path=manifest_provider_set_component_sidecar_path,
+        manifest_provider_component_group_sidecar_path=manifest_provider_component_group_sidecar_path,
         manifest_provider_npi_sidecar_path=manifest_provider_npi_sidecar_path,
         manifest_price_forward_sidecar_path=manifest_price_forward_sidecar_path,
         manifest_price_atom_copy_path=manifest_price_atom_copy_path,

@@ -21,6 +21,7 @@ from process.ptg_parts.ptg2_manifest_publish import (
 )
 from process.ptg_parts.ptg2_serving_binary_v3 import select_atom_key_bits
 from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_V3_SHARED_GENERATION,
     lock_shared_layout_for_dense_write,
     shared_support_digest,
 )
@@ -934,6 +935,7 @@ async def _publish_price_attributes(
     build_token: str,
     dictionary_table: str | None,
     constant_values: Mapping[str, Any],
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> tuple[int, bytes]:
     """Persist price attributes and return their row count and support digest."""
 
@@ -973,6 +975,7 @@ async def _publish_price_attributes(
             schema_name=schema_name,
             snapshot_key=int(snapshot_key),
             build_token=build_token,
+            expected_generation=expected_generation,
         )
         for start in range(0, len(attribute_rows), batch_size):
             await session.execute(
@@ -1243,6 +1246,7 @@ async def publish_shared_price_artifacts(
     expected_price_set_count: int,
     expected_price_key_order: str,
     prepared: PreparedSharedPriceArtifacts,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> SharedPricePublication:
     """Build only compact price blocks; never materialize the serving-rate relation."""
 
@@ -1316,6 +1320,7 @@ async def publish_shared_price_artifacts(
             stage_table=block_stage,
             snapshot_key=int(snapshot_key),
             build_token=build_token,
+            expected_generation=expected_generation,
         )
         dictionary_table = lean_layout_map.get("price_atom_dictionary_table")
         price_attribute_count, price_support_digest = await _publish_price_attributes(
@@ -1324,6 +1329,7 @@ async def publish_shared_price_artifacts(
             build_token=build_token,
             dictionary_table=str(dictionary_table) if dictionary_table else None,
             constant_values=price_atom_constant_value_by_kind,
+            expected_generation=expected_generation,
         )
         return SharedPricePublication(
             object_kinds=block_publication.object_kinds,

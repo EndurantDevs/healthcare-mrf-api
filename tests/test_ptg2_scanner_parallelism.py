@@ -148,12 +148,17 @@ def _canonical_rows_digest(rows: tuple[bytes, ...]) -> str:
 def _scanner_environment(
     workers: int, queue_size: int | None, serving_run_directory: Path
 ) -> dict[str, str]:
+    source_witness_scratch_directory = serving_run_directory / "source-witness-scratch"
+    source_witness_scratch_directory.mkdir(parents=True, exist_ok=True)
     scanner_env_map = {
         **os.environ,
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
         "HLTHPRT_PTG2_RAW_SOURCE_SHA256": "00" * 32,
         "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
         "HLTHPRT_PTG2_V3_SERVING_RUN_DIR": str(serving_run_directory),
+        "HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR": str(
+            source_witness_scratch_directory
+        ),
         "HLTHPRT_PTG2_V3_SERVING_RUN_PARTITIONS": "4",
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot-parallelism-v3",
         "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan-parallelism-v3",

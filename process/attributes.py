@@ -428,7 +428,7 @@ async def process_benefits(ctx, task):
                     try:
                         obj["limit_qty"] = float(row["LimitQty"])
                     except ValueError:
-                        pass
+                        obj["limit_qty"] = None
 
                 try:
                     if row["BusinessYear"]:

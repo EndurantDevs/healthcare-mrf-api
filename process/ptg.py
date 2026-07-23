@@ -199,6 +199,14 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_strict_shared_v3_layout,
     validate_reused_snapshot_sources,
 )
+from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_SHARED_GENERATION,
+    reserve_v4_shared_layout,
+)
+from process.ptg_parts.ptg2_v4_graph_compiler import (
+    _resolve_v4_graph_compiler_binary,
+    v4_graph_encoding_policy,
+)
 from process.ptg_parts.ptg2_source_witness_contract import (
     validate_source_witness_manifest,
 )
@@ -211,8 +219,14 @@ from process.ptg_parts.row_helpers import (_as_int_list, _as_list,
                                            _provider_group_hash_prefix,
                                            _provider_group_identity_hash)
 from process.ptg_parts.rust_scanner import (
-    _aiter_compact_serving_records_rust, _iter_compact_serving_records_rust,
-    _iter_top_level_object_bytes_rust, _ptg2_rust_scanner_binary)
+    _V4_EMPTY_NPI_NORMALIZATION_CONTRACT,
+    _V4_EMPTY_NPI_NORMALIZATION_HASH_DOMAIN,
+    _aiter_compact_serving_records_rust,
+    _iter_compact_serving_records_rust,
+    _iter_top_level_object_bytes_rust,
+    _ptg2_rust_scanner_binary,
+    _verify_v4_tin_only_audit,
+)
 from process.ptg_parts.screen import _emit_screen_line
 from process.ptg_parts.snapshot_cleanup import (
     _cleanup_old_ptg2_source_tables, _drop_ptg2_snapshot_table_names,
@@ -1383,11 +1397,22 @@ async def _parse_strict_v3_file(
             dir=manifest_artifact_parent,
         )
     )
+    provider_graph_v4 = _env_bool("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", False)
     manifest_sidecar_paths_by_kind = {
-        "provider_forward": manifest_artifact_dir
-        / f"provider_forward_{manifest_file_token}.ptg2sc",
-        "provider_inverted": manifest_artifact_dir
-        / f"provider_inverted_{manifest_file_token}.ptg2sc",
+        "provider_forward": None
+        if provider_graph_v4
+        else manifest_artifact_dir / f"provider_forward_{manifest_file_token}.ptg2sc",
+        "provider_inverted": None
+        if provider_graph_v4
+        else manifest_artifact_dir / f"provider_inverted_{manifest_file_token}.ptg2sc",
+        "provider_set_component": manifest_artifact_dir
+        / f"provider_set_component_{manifest_file_token}.ptg2sc"
+        if provider_graph_v4
+        else None,
+        "provider_component_group": manifest_artifact_dir
+        / f"provider_component_group_{manifest_file_token}.ptg2sc"
+        if provider_graph_v4
+        else None,
         "provider_group_npi": manifest_artifact_dir
         / f"provider_group_npi_{manifest_file_token}.ptg2sc",
         "provider_npi_group": manifest_artifact_dir
@@ -1493,6 +1518,12 @@ async def _parse_strict_v3_file(
             ],
             manifest_provider_inverted_sidecar_path=manifest_sidecar_paths_by_kind[
                 "provider_inverted"
+            ],
+            manifest_provider_set_component_sidecar_path=manifest_sidecar_paths_by_kind[
+                "provider_set_component"
+            ],
+            manifest_provider_component_group_sidecar_path=manifest_sidecar_paths_by_kind[
+                "provider_component_group"
             ],
             manifest_provider_npi_sidecar_path=None,
             manifest_price_forward_sidecar_path=None,
@@ -2528,9 +2559,15 @@ async def _is_failed_shared_layout_abandoned(
     shared_layout_reservation: Any,
     *,
     build_token: str,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> bool | None:
     """Abandon an owned unpublished layout, or defer interrupted cleanup to GC."""
     if shared_layout_reservation is None or shared_layout_reservation.reused:
+        return None
+    if expected_generation == PTG2_V4_SHARED_GENERATION:
+        # V4 graph reachability lives inside authenticated map packs.  Leave an
+        # interrupted building root to the generation-aware recurring GC so it
+        # can queue both map blocks and decoded target hashes before deletion.
         return None
     for attempt in range(3):
         try:
@@ -3341,6 +3378,7 @@ _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
         "timings",
         "audit_sample",
         "source_witness",
+        "snapshot_map",
     }
 )
 
@@ -3350,6 +3388,7 @@ def _reused_shared_v3_serving_index(
     *,
     source_key: str,
     shared_snapshot_key: int,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> dict[str, Any]:
     """Bind source-scoped metadata to one already sealed physical layout."""
 
@@ -3364,9 +3403,17 @@ def _reused_shared_v3_serving_index(
     }
     if str(serving_index.get("arch_version") or "").strip().lower() != "postgres_binary_v3":
         raise RuntimeError("reusable strict V3 layout has an incompatible architecture")
+    generation = str(expected_generation or "").strip().lower()
+    if generation not in {PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION}:
+        raise RuntimeError("reusable shared layout requested an unsupported generation")
+    expected_layout = (
+        "packed_snapshot_maps_v4"
+        if generation == PTG2_V4_SHARED_GENERATION
+        else "dense_shared_blocks_v3"
+    )
     if (
         str(serving_index.get("storage_generation") or "").strip().lower()
-        != PTG2_V3_SHARED_GENERATION
+        != generation
         or str(serving_index.get("cold_lookup_contract") or "").strip().lower()
         != PTG2_V3_COLD_LOOKUP_CONTRACT
         or str(serving_index.get("price_membership_semantics") or "").strip().lower()
@@ -3374,9 +3421,28 @@ def _reused_shared_v3_serving_index(
         or str(serving_index.get("serving_multiplicity_semantics") or "").strip().lower()
         != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
         or str(serving_index.get("shared_block_layout") or "").strip().lower()
-        != "dense_shared_blocks_v3"
+        != expected_layout
     ):
         raise RuntimeError("reusable strict V3 layout is missing the shared cold-read contract")
+    if generation == PTG2_V4_SHARED_GENERATION:
+        snapshot_map = serving_index.get("snapshot_map")
+        serving_binary = serving_index.get("serving_binary")
+        provider_graph = (
+            serving_binary.get("provider_graph_v4")
+            if isinstance(serving_binary, Mapping)
+            else None
+        )
+        if (
+            serving_index.get("type") != "ptg2_shared_blocks_v4"
+            or serving_index.get("provider_scope_strategy")
+            != "postgres_packed_graph_v4"
+            or not isinstance(snapshot_map, Mapping)
+            or not isinstance(provider_graph, Mapping)
+            or provider_graph.get("contract") != "ptg2_provider_graph_v4"
+        ):
+            raise RuntimeError(
+                "reusable PTG V4 layout is missing its packed graph contract"
+            )
     try:
         source_count = int(serving_index.get("source_count"))
     except (TypeError, ValueError) as exc:
@@ -3413,7 +3479,7 @@ def _reused_shared_v3_serving_index(
         {
             "source_key": source_key,
             "shared_snapshot_key": int(shared_snapshot_key),
-            "storage_generation": PTG2_V3_SHARED_GENERATION,
+            "storage_generation": generation,
             "cold_lookup_contract": PTG2_V3_COLD_LOOKUP_CONTRACT,
             "price_membership_semantics": PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
             "serving_multiplicity_semantics": PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
@@ -3576,6 +3642,48 @@ def _shared_v3_provider_identifier_quarantine(
             "strict V3 publication has no provider identifier quarantine evidence"
         )
     return combine_provider_identifier_quarantines(payloads)
+
+
+def _sum_v4_tin_only_audits(
+    source_file_results: Iterable[Mapping[str, Any]],
+) -> int:
+    """Combine exact V4 normalization counts across scanned source files."""
+
+    normalization_total = 0
+    observed_source_count = 0
+    for source_file_result in source_file_results:
+        if source_file_result.get("skipped"):
+            continue
+        file_summary = source_file_result.get("summary")
+        scanner_record = (
+            file_summary.get("scanner")
+            if isinstance(file_summary, Mapping)
+            else None
+        )
+        scanner_summary = (
+            scanner_record.get("summary")
+            if isinstance(scanner_record, Mapping)
+            else None
+        )
+        normalization_audit = (
+            scanner_summary.get("empty_npi_tin_only_normalization")
+            if isinstance(scanner_summary, Mapping)
+            else None
+        )
+        source_normalization_count = _verify_v4_tin_only_audit(
+            normalization_audit
+        )
+        normalization_total += source_normalization_count
+        observed_source_count += 1
+        if normalization_total > 2**63 - 1:
+            raise RuntimeError(
+                "PTG V4 empty-NPI normalization count overflow"
+            )
+    if observed_source_count == 0:
+        raise RuntimeError(
+            "PTG V4 publication has no empty-NPI normalization evidence"
+        )
+    return normalization_total
 
 
 def _shared_v3_source_set_metadata(
@@ -3801,6 +3909,10 @@ class _ReusedSharedV3AllowedContext:
 def _shared_v3_scanner_identity() -> dict[str, Any]:
     """Bind reuse to the exact scanner/finalizer executable that defines output."""
 
+    provider_graph_v4_enabled = _env_bool(
+        "HLTHPRT_PTG2_PROVIDER_GRAPH_V4",
+        False,
+    )
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
         raise RuntimeError("strict shared V3 requires the PTG2 Rust scanner binary")
@@ -3826,6 +3938,12 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
         source_root / "ptg_parts" / "ptg2_source_witness_codec.py",
         source_root / "ptg_parts" / "ptg2_source_witness_contract.py",
     )
+    if provider_graph_v4_enabled:
+        publisher_sources += (
+            source_root / "ptg_parts" / "ptg2_v4_audit.py",
+            source_root / "ptg_parts" / "ptg2_v4_graph_compiler.py",
+            source_root / "ptg_parts" / "ptg2_v4_snapshot_maps.py",
+        )
     publisher_digest = hashlib.sha256()
     publisher_byte_count = 0
     for source_path in publisher_sources:
@@ -3836,13 +3954,28 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
         publisher_digest.update(len(source_bytes).to_bytes(8, "big"))
         publisher_digest.update(source_bytes)
         publisher_byte_count += len(source_bytes)
-    return {
+    scanner_identity_by_field = {
         "contract_version": 3,
         "scanner_binary_sha256": digest,
         "scanner_binary_bytes": int(byte_count),
         "publisher_source_sha256": publisher_digest.hexdigest(),
         "publisher_source_bytes": publisher_byte_count,
     }
+    if provider_graph_v4_enabled:
+        compiler_binary = _resolve_v4_graph_compiler_binary()
+        if compiler_binary is None:
+            raise RuntimeError("strict PTG V4 requires its provider graph compiler")
+        compiler_digest, compiler_bytes = sha256_file(compiler_binary)
+        scanner_identity_by_field.update(
+            {
+                "contract_version": 4,
+                "storage_generation": PTG2_V4_SHARED_GENERATION,
+                "provider_graph_compiler_sha256": compiler_digest,
+                "provider_graph_compiler_bytes": int(compiler_bytes),
+                "provider_graph_encoding_policy": v4_graph_encoding_policy(),
+            }
+        )
+    return scanner_identity_by_field
 
 
 async def _publish_reused_shared_v3_snapshot(
@@ -3867,6 +4000,7 @@ async def _publish_reused_shared_v3_snapshot(
     test_mode: bool,
     import_started_monotonic: float,
     candidate_stage_flags_by_name: dict[str, bool] | None = None,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> dict[str, Any]:
     """Publish a logical snapshot binding without rescanning identical content."""
 
@@ -3937,6 +4071,7 @@ async def _publish_reused_shared_v3_snapshot(
         layout_manifest,
         source_key=source_key,
         shared_snapshot_key=shared_snapshot_key,
+        expected_generation=expected_generation,
     )
     serving_index["coverage_scope_id"] = bytes(coverage_scope_id).hex()
     serving_index["source_trace_set_hash"] = build_source_trace_set(
@@ -3962,6 +4097,7 @@ async def _publish_reused_shared_v3_snapshot(
         schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
         snapshot_key=int(shared_snapshot_key),
         logical_snapshot_id=snapshot_id,
+        expected_generation=expected_generation,
     )
     post_publish_started_monotonic = _ptg2_monotonic()
     post_publish_seconds_by_stage: dict[str, float] = {}
@@ -4674,6 +4810,8 @@ async def _main_with_artifact_lease(
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     control_run_id: str | None = None,
+    control_attempt_id: str | None = None,
+    control_attempt_started_at: str | None = None,
     full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -4683,6 +4821,15 @@ async def _main_with_artifact_lease(
     import_month_value = normalize_import_month(import_month)
     source_key_val = _normalize_source_key(source_key or os.getenv("HLTHPRT_PTG2_SOURCE_KEY"))
     snapshot_arch_version = _ptg2_snapshot_arch_from_env()
+    provider_graph_v4_enabled = _env_bool(
+        "HLTHPRT_PTG2_PROVIDER_GRAPH_V4",
+        False,
+    )
+    shared_storage_generation = (
+        PTG2_V4_SHARED_GENERATION
+        if provider_graph_v4_enabled
+        else PTG2_V3_SHARED_GENERATION
+    )
     rebuild_scope_digest = normalized_full_rebuild_scope_digest(
         full_rebuild_scope_digest
     )
@@ -4707,7 +4854,7 @@ async def _main_with_artifact_lease(
             in_network_url=in_network_url,
             allowed_url=allowed_url,
             provider_ref_url=provider_ref_url,
-            arch_variant=PTG2_V3_SHARED_GENERATION,
+            arch_variant=shared_storage_generation,
         )
     )
     import_run_id = _ptg2_import_run_id(
@@ -4742,7 +4889,7 @@ async def _main_with_artifact_lease(
         if should_keep_partial_artifacts is None
         else should_keep_partial_artifacts,
         "snapshot_arch": snapshot_arch_version,
-        "storage_generation": PTG2_V3_SHARED_GENERATION,
+        "storage_generation": shared_storage_generation,
         "test_mode": test_mode,
         "scanner_workers": max(
             _env_int(PTG2_RUST_WORKERS_ENV, PTG2_DEFAULT_RUST_WORKERS),
@@ -4775,6 +4922,9 @@ async def _main_with_artifact_lease(
     live_run_id = str(control_run_id or "").strip()
     live_token = set_live_progress_context(
         run_id=live_run_id,
+        attempt_id=control_attempt_id,
+        attempt_started_at=control_attempt_started_at,
+        started_at=control_attempt_started_at,
         source_key=source_key_val,
         snapshot_id=snapshot_id,
         import_run_id=import_run_id,
@@ -5028,6 +5178,7 @@ async def _main_with_artifact_lease(
             abandoned_layout = await _is_failed_shared_layout_abandoned(
                 shared_layout_reservation,
                 build_token=shared_layout_build_token,
+                expected_generation=shared_storage_generation,
             )
             if abandoned_layout is not None:
                 failure_report_by_field["shared_layout_abandoned"] = abandoned_layout
@@ -5564,7 +5715,12 @@ async def _main_with_artifact_lease(
                     **canonical_plan_values_by_field,
                 }
             async with db.transaction() as session:
-                shared_layout_reservation = await reserve_shared_layout(
+                reserve_layout = (
+                    reserve_v4_shared_layout
+                    if provider_graph_v4_enabled
+                    else reserve_shared_layout
+                )
+                shared_layout_reservation = await reserve_layout(
                     session,
                     schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
                     semantic_fingerprint=shared_input_identity.semantic_fingerprint,
@@ -5627,6 +5783,7 @@ async def _main_with_artifact_lease(
                     test_mode=test_mode,
                     import_started_monotonic=import_started_monotonic,
                     candidate_stage_flags_by_name=candidate_stage_flags_by_name,
+                    expected_generation=shared_storage_generation,
                 )
 
             progress_weights: list[int] = [0] * attempted_files
@@ -5829,6 +5986,11 @@ async def _main_with_artifact_lease(
         provider_identifier_quarantine = (
             _shared_v3_provider_identifier_quarantine(successful_files)
         )
+        empty_npi_tin_only_normalization_count = (
+            _sum_v4_tin_only_audits(successful_files)
+            if provider_graph_v4_enabled
+            else None
+        )
         await _publish_shared_v3_source_dictionary(
             shared_input_identity=shared_input_identity,
             identity_trace_pairs=source_identity_traces,
@@ -5945,7 +6107,29 @@ async def _main_with_artifact_lease(
                     ),
                     graph_artifact_entries=list(manifest_artifacts.get("sidecars") or []),
                     provider_identifier_quarantine=provider_identifier_quarantine,
+                    compressed_acquisition_entries=(
+                        tuple(
+                            {
+                                "raw_sha256": downloaded.raw_artifact.raw_sha256,
+                                "byte_count": downloaded.raw_artifact.byte_count,
+                            }
+                            for downloaded in buffered_downloads
+                            if downloaded.raw_artifact is not None
+                        )
+                        if provider_graph_v4_enabled
+                        else None
+                    ),
                     scratch_parent=ptg2_temp_parent(),
+                    provider_graph_v4=provider_graph_v4_enabled,
+                    **(
+                        {
+                            "empty_npi_tin_only_normalization_count": (
+                                empty_npi_tin_only_normalization_count
+                            )
+                        }
+                        if provider_graph_v4_enabled
+                        else {}
+                    ),
                     **(
                         {"full_rebuild_scope_digest": rebuild_scope_digest}
                         if rebuild_scope_digest is not None
@@ -6339,10 +6523,15 @@ async def main(
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     control_run_id: str | None = None,
+    control_attempt_id: str | None = None,
+    control_attempt_started_at: str | None = None,
     full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
     """Run one PTG import while retaining shared inputs through a live lease."""
 
+    forwarded_arguments = locals().copy()
+    if full_rebuild_scope_digest is None:
+        forwarded_arguments.pop("full_rebuild_scope_digest")
     lease_owner = str(
         control_run_id
         or import_id
@@ -6352,32 +6541,7 @@ async def main(
     with artifact_lease_context(owner=f"ptg:{lease_owner}") as lease:
         return await guard_artifact_lease(
             lease,
-            _main_with_artifact_lease(
-                test_mode=test_mode,
-                toc_urls=toc_urls,
-                toc_list=toc_list,
-                in_network_url=in_network_url,
-                allowed_url=allowed_url,
-                provider_ref_url=provider_ref_url,
-                import_id=import_id,
-                source_key=source_key,
-                import_month=import_month,
-                max_files=max_files,
-                max_items=max_items,
-                plan_ids=plan_ids,
-                plan_name_contains=plan_name_contains,
-                plan_market_types=plan_market_types,
-                file_url_contains=file_url_contains,
-                source_network_names=source_network_names,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-                keep_partial_artifacts=keep_partial_artifacts,
-                control_run_id=control_run_id,
-                **(
-                    {"full_rebuild_scope_digest": full_rebuild_scope_digest}
-                    if full_rebuild_scope_digest is not None
-                    else {}
-                ),
-            ),
+            _main_with_artifact_lease(**forwarded_arguments),
         )
 
 

@@ -17,10 +17,15 @@ from process.ptg_parts.db_tables import _quote_ident
 
 
 PTG2_V3_SHARED_GENERATION = "shared_blocks_v3"
+PTG2_V4_SHARED_GENERATION = "shared_blocks_v4"
+PTG2_SHARED_DENSE_WRITE_GENERATIONS = frozenset(
+    {PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION}
+)
 PTG2_V3_CLEANUP_GENERATIONS = (
     "shared_blocks_v1",
     "shared_blocks_v2",
     PTG2_V3_SHARED_GENERATION,
+    "shared_blocks_v4",
 )
 PTG2_V3_COLD_LOOKUP_CONTRACT = "ptg_v3_cold_v2"
 PTG2_V3_SHARED_BLOCK_LAYOUT = "dense_shared_blocks_v3"
@@ -855,10 +860,14 @@ async def lock_shared_layout_for_dense_write(
     schema_name: str,
     snapshot_key: int,
     build_token: str,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> None:
-    """Fence GC while one transaction writes dense rows without foreign keys."""
+    """Fence GC for one explicitly selected compatible physical generation."""
 
     schema = _quote_ident(schema_name)
+    generation = str(expected_generation or "").strip().lower()
+    if generation not in PTG2_SHARED_DENSE_WRITE_GENERATIONS:
+        raise ValueError("unsupported shared PTG dense-write generation")
     ownership_result = await session.execute(
         text(
             f"""
@@ -873,7 +882,7 @@ async def lock_shared_layout_for_dense_write(
         ),
         {
             "snapshot_key": int(snapshot_key),
-            "generation": PTG2_V3_SHARED_GENERATION,
+            "generation": generation,
             "build_token": str(build_token),
         },
     )
@@ -1342,16 +1351,16 @@ async def bind_snapshot_to_shared_layout(
     snapshot_id: str,
     snapshot_key: int,
 ) -> None:
-    """Bind one logical published snapshot to one sealed physical layout."""
+    """Bind one logical snapshot to a sealed V3 or complete-map V4 layout."""
 
     schema = _quote_ident(schema_name)
-    binding_result = await session.execute(
+    v3_binding_result = await session.execute(
         text(
             f"""
             INSERT INTO {schema}.ptg2_v3_snapshot_binding
                 (snapshot_id, snapshot_key, created_at)
             SELECT :snapshot_id, layout.snapshot_key, :created_at
-              FROM {schema}.ptg2_v3_snapshot_layout layout
+              FROM {schema}.ptg2_v3_snapshot_layout AS layout
              WHERE layout.snapshot_key = :snapshot_key
                AND layout.state = 'sealed'
                AND layout.generation = :generation
@@ -1366,7 +1375,7 @@ async def bind_snapshot_to_shared_layout(
             "created_at": _utcnow(),
         },
     )
-    if binding_result.scalar() is not None:
+    if v3_binding_result.scalar() is not None:
         return
     existing_result = await session.execute(
         text(
@@ -1379,6 +1388,62 @@ async def bind_snapshot_to_shared_layout(
         {"snapshot_id": str(snapshot_id)},
     )
     existing_snapshot_key = existing_result.scalar()
-    if existing_snapshot_key is not None and int(existing_snapshot_key) == int(snapshot_key):
+    if existing_snapshot_key is not None:
+        if int(existing_snapshot_key) == int(snapshot_key):
+            return
+        raise RuntimeError("logical PTG snapshot is already bound to another layout")
+
+    layout_result = await session.execute(
+        text(
+            f"""
+            SELECT layout.mapping_digest
+              FROM {schema}.ptg2_v3_snapshot_layout AS layout
+              JOIN {schema}.ptg2_v4_snapshot_map_root AS root
+                ON root.snapshot_key = layout.snapshot_key
+               AND root.state = 'complete'
+               AND root.map_digest = layout.mapping_digest
+             WHERE layout.snapshot_key = :snapshot_key
+               AND layout.state = 'sealed'
+               AND layout.generation = :generation
+             FOR KEY SHARE OF layout, root
+            """
+        ),
+        {
+            "snapshot_key": int(snapshot_key),
+            "generation": PTG2_V4_SHARED_GENERATION,
+        },
+    )
+    if layout_result.scalar() is None:
+        raise RuntimeError("logical PTG snapshot requires a complete V4 map root")
+    v4_binding_result = await session.execute(
+        text(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_snapshot_binding
+                (snapshot_id, snapshot_key, created_at)
+            VALUES (:snapshot_id, :snapshot_key, :created_at)
+            ON CONFLICT (snapshot_id) DO NOTHING
+            RETURNING snapshot_id
+            """
+        ),
+        {
+            "snapshot_id": str(snapshot_id),
+            "snapshot_key": int(snapshot_key),
+            "created_at": _utcnow(),
+        },
+    )
+    if v4_binding_result.scalar() is not None:
+        return
+    retry_result = await session.execute(
+        text(
+            f"""
+            SELECT snapshot_key
+              FROM {schema}.ptg2_v3_snapshot_binding
+             WHERE snapshot_id = :snapshot_id
+            """
+        ),
+        {"snapshot_id": str(snapshot_id)},
+    )
+    retry_snapshot_key = retry_result.scalar()
+    if retry_snapshot_key is not None and int(retry_snapshot_key) == int(snapshot_key):
         return
     raise RuntimeError("logical PTG snapshot is bound to another layout or physical layout is not sealed")

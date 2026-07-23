@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,6 +22,228 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
 def test_snapshot_publish_rejects_missing_summary_mapping():
     with pytest.raises(RuntimeError, match="missing blocks"):
         shared_snapshot_publish._mapping(None, "blocks")
+
+
+def test_v4_reference_manifest_streams_exact_sorted_coordinates(tmp_path):
+    path = tmp_path / "references.jsonl"
+    rows = [
+        {
+            "object_kind": "v4_group_npis_exact_members_v1",
+            "block_key": block_key,
+            "fragment_no": 0,
+            "entry_count": 2,
+            "raw_byte_count": 8,
+            "stored_byte_count": 8,
+            "codec": "none",
+            "hash": (bytes([block_key + 1]) * 32).hex(),
+        }
+        for block_key in (0, 4)
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    references = tuple(shared_snapshot_publish._iter_v4_block_references(path))
+
+    assert tuple(reference.block_key for reference in references) == (0, 4)
+    assert tuple(reference.entry_count for reference in references) == (2, 2)
+    assert references[0].block_hash == b"\x01" * 32
+
+
+def test_v4_reference_manifest_rejects_noncanonical_order(tmp_path):
+    path = tmp_path / "references.jsonl"
+    rows = [
+        {
+            "object_kind": "v4_set_patterns_members_v1",
+            "block_key": block_key,
+            "fragment_no": 0,
+            "entry_count": 1,
+            "raw_byte_count": 4,
+            "stored_byte_count": 4,
+            "codec": "none",
+            "hash": (bytes([block_key + 1]) * 32).hex(),
+        }
+        for block_key in (1, 0)
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    with pytest.raises(RuntimeError, match="ordering"):
+        tuple(shared_snapshot_publish._iter_v4_block_references(path))
+
+
+def _v4_graph_publication_fixture(tmp_path):
+    artifact = SimpleNamespace(
+        name="graph_blocks",
+        byte_count=12,
+        sha256="a" * 64,
+        row_count=1,
+    )
+    compilation = SimpleNamespace(
+        output_artifacts=(artifact,),
+        block_copy_path=tmp_path / "graph.copy",
+        reference_manifest_path=tmp_path / "references.jsonl",
+        selected_layout="pattern",
+        summary={"format": "ptg2_provider_graph_v4"},
+        relation_summaries=(),
+        heavy_bitmaps=(),
+        observe={"group_count": 3, "npi_count": 2},
+        resource_admission={
+            "input_factor_bytes": 512,
+            "factor_edge_count": 9,
+        },
+        block_count=1,
+        provider_set_audit_npi_copy_path=tmp_path / "audit.copy",
+    )
+    cas_publication = SimpleNamespace(
+        unique_block_count=1,
+        logical_byte_count=12,
+        stored_byte_count=12,
+    )
+    map_summary = SimpleNamespace(
+        map_digest=b"m" * 32,
+        object_kinds=("v4_set_patterns_members_v1",),
+        coordinate_count=1,
+        stored_map_byte_count=64,
+    )
+    return compilation, cas_publication, map_summary
+
+
+def _patch_v4_graph_publication(
+    monkeypatch,
+    cas_publication,
+    map_summary,
+):
+    publish_cas_mock = AsyncMock(return_value=cas_publication)
+    publish_maps_mock = AsyncMock(return_value=map_summary)
+    replacements_by_name = {
+        "create_shared_block_stage": AsyncMock(),
+        "copy_shared_block_binary_file": AsyncMock(),
+        "publish_v4_cas_block_stage": publish_cas_mock,
+        "_publish_v4_dictionaries_and_maps": publish_maps_mock,
+    }
+    for name, replacement in replacements_by_name.items():
+        monkeypatch.setattr(shared_snapshot_publish, name, replacement)
+    monkeypatch.setattr(
+        shared_snapshot_publish.db,
+        "status",
+        AsyncMock(),
+    )
+    return publish_cas_mock, publish_maps_mock
+
+
+@pytest.mark.asyncio
+async def test_v4_graph_publish_threads_compressed_acquisition_resources(
+    monkeypatch,
+    tmp_path,
+):
+    """Seal acquisition bytes with graph diagnostics, not the CAS stage."""
+
+    compilation, cas_publication, map_summary = (
+        _v4_graph_publication_fixture(tmp_path)
+    )
+    publish_cas_mock, publish_maps_mock = _patch_v4_graph_publication(
+        monkeypatch,
+        cas_publication,
+        map_summary,
+    )
+
+    publication = await shared_snapshot_publish._publish_v4_graph(
+        compilation,
+        schema_name="mrf",
+        snapshot_key=17,
+        build_token="token",
+        compressed_acquisition_bytes=4_096,
+        empty_npi_tin_only_normalization_count=2,
+    )
+
+    assert publication.stored_byte_count == 76
+    assert publish_cas_mock.await_args.kwargs == {
+        "schema_name": "mrf",
+        "stage_table": publish_cas_mock.await_args.kwargs["stage_table"],
+        "snapshot_key": 17,
+        "build_token": "token",
+    }
+    assert publish_maps_mock.await_args.kwargs[
+        "compressed_acquisition_bytes"
+    ] == 4_096
+    assert publish_maps_mock.await_args.kwargs[
+        "empty_npi_tin_only_normalization_count"
+    ] == 2
+
+
+def _patch_disabled_v4_publication(monkeypatch):
+    prepared_price = object()
+
+    @asynccontextmanager
+    async def transaction():
+        yield object()
+
+    state = SimpleNamespace(
+        prepared_price=prepared_price,
+        prepare_mock=AsyncMock(
+            return_value=(prepared_price, 0.0, None, None)
+        ),
+        publish_v3_mock=AsyncMock(return_value="v3-publication"),
+        compile_v4_mock=AsyncMock(),
+        publish_v4_mock=AsyncMock(),
+        cleanup_mock=AsyncMock(),
+    )
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    monkeypatch.setattr(shared_snapshot_publish.db, "transaction", transaction)
+    replacements_by_name = {
+        "touch_shared_layout_build": AsyncMock(),
+        "_prepare_price_with_early_finalizer": state.prepare_mock,
+        "_publish_prepared_shared_layout": state.publish_v3_mock,
+        "compile_provider_graph_v4_rust": state.compile_v4_mock,
+        "_publish_v4_graph": state.publish_v4_mock,
+        "cleanup_prepared_shared_price_artifacts": state.cleanup_mock,
+    }
+    for name, replacement in replacements_by_name.items():
+        monkeypatch.setattr(shared_snapshot_publish, name, replacement)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_v4_disabled_publication_keeps_v3_path(
+    monkeypatch,
+) -> None:
+    """Leave the reviewed V3 publication path independent of V4 evidence."""
+
+    state = _patch_disabled_v4_publication(monkeypatch)
+
+    publication = await shared_snapshot_publish.publish_strict_shared_v3_layout(
+        schema_name="mrf",
+        manifest_stage_table="manifest-stage",
+        reserved_snapshot_key=7,
+        build_token="token",
+        expected_coverage_scope_id=b"c" * 32,
+        logical_snapshot_id="snapshot",
+        expected_source_identities=(),
+        serving_run_entries=(),
+        code_dictionary_entries=(),
+        provider_set_metadata_entries=(),
+        source_audit_witness_entries=(),
+        expected_raw_source_sha256=(),
+        graph_artifact_entries=(),
+        provider_identifier_quarantine={},
+        provider_graph_v4=False,
+    )
+
+    assert publication == "v3-publication"
+    assert state.publish_v3_mock.await_args.kwargs["provider_graph_v4"] is False
+    assert (
+        state.publish_v3_mock.await_args.kwargs[
+            "compressed_acquisition_bytes"
+        ]
+        is None
+    )
+    assert (
+        state.publish_v3_mock.await_args.kwargs[
+            "empty_npi_tin_only_normalization_count"
+        ]
+        is None
+    )
+    state.compile_v4_mock.assert_not_awaited()
+    state.publish_v4_mock.assert_not_awaited()
+    state.cleanup_mock.assert_awaited_once_with(state.prepared_price)
 
 
 @pytest.mark.asyncio

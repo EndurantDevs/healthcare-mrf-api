@@ -196,16 +196,34 @@ pub fn strict_integer(value: &Value, field_name: &str) -> io::Result<i64> {
 pub struct StrictNpiList {
     pub valid: Vec<i64>,
     pub quarantined: Vec<i64>,
+    /// A publisher supplied `[]` instead of the TiC TIN-only marker `[0]`.
+    /// The semantic NPI membership is still empty, but callers must surface
+    /// this normalization in the scanner attestation.
+    pub empty_array_normalized: bool,
 }
 
 pub fn strict_npi_partition(value: Option<&Value>) -> io::Result<StrictNpiList> {
+    strict_npi_partition_with_policy(value, false)
+}
+
+pub fn strict_npi_partition_allow_empty_tin_only(
+    value: Option<&Value>,
+) -> io::Result<StrictNpiList> {
+    strict_npi_partition_with_policy(value, true)
+}
+
+fn strict_npi_partition_with_policy(
+    value: Option<&Value>,
+    allow_empty_tin_only: bool,
+) -> io::Result<StrictNpiList> {
     let Some(Value::Array(items)) = value else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "provider group npi must be an array of JSON integers",
         ));
     };
-    if items.is_empty() {
+    let empty_array_normalized = items.is_empty();
+    if empty_array_normalized && !allow_empty_tin_only {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "provider group npi must contain at least one JSON integer",
@@ -228,7 +246,11 @@ pub fn strict_npi_partition(value: Option<&Value>) -> io::Result<StrictNpiList> 
     valid.sort_unstable();
     valid.dedup();
     quarantined.sort_unstable();
-    Ok(StrictNpiList { valid, quarantined })
+    Ok(StrictNpiList {
+        valid,
+        quarantined,
+        empty_array_normalized,
+    })
 }
 
 pub fn strict_npi_list(value: Option<&Value>) -> io::Result<Vec<i64>> {
@@ -544,7 +566,8 @@ mod tests {
         normalize_string, normalize_tin_type, normalize_tin_value, normalized_money_from_reader,
         normalized_scalar_from_reader, normalized_string_list_from_reader, npi_list,
         strict_integer, strict_integer_text, strict_money_number, strict_money_number_from_reader,
-        strict_npi_list, strict_npi_partition, strict_string_array_from_reader, StrictNpiList,
+        strict_npi_list, strict_npi_partition, strict_npi_partition_allow_empty_tin_only,
+        strict_string_array_from_reader, StrictNpiList,
     };
     use serde_json::{json, Value};
     use struson::reader::JsonStreamReader;
@@ -645,6 +668,7 @@ mod tests {
             StrictNpiList {
                 valid: vec![1234567890],
                 quarantined: vec![123456789, 123456789],
+                empty_array_normalized: false,
             }
         );
         assert_eq!(
@@ -652,11 +676,25 @@ mod tests {
             StrictNpiList {
                 valid: vec![1234567890],
                 quarantined: Vec::new(),
+                empty_array_normalized: false,
             }
         );
         assert_eq!(
             strict_npi_partition(Some(&json!([0, 0]))).unwrap(),
             StrictNpiList::default(),
+        );
+        assert_eq!(
+            strict_npi_partition_allow_empty_tin_only(Some(&json!([]))).unwrap(),
+            StrictNpiList {
+                empty_array_normalized: true,
+                ..StrictNpiList::default()
+            },
+        );
+        assert_eq!(
+            strict_npi_partition_allow_empty_tin_only(Some(&json!([])))
+                .unwrap()
+                .valid,
+            strict_npi_list(Some(&json!([0]))).unwrap(),
         );
         for invalid in [
             json!(1234567890_i64),

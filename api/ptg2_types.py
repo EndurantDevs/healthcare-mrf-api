@@ -68,20 +68,35 @@ class PTG2ServingTables:
     source_witness: dict[str, Any] | None = None
     source_set: dict[str, Any] | None = None
     database_evidence: dict[str, Any] | None = None
+    provider_graph_v4_hot_prefix: dict[str, Any] | None = None
 
     @property
     def uses_shared_blocks(self) -> bool:
-        """Return true only for the strict cache-free V3 storage contract."""
+        """Return true for a strict sealed V3-price shared-block layout."""
+
+        generation = (self.storage_generation or "").strip().lower()
+        expected_layout = {
+            "shared_blocks_v3": "dense_shared_blocks_v3",
+            "shared_blocks_v4": "packed_snapshot_maps_v4",
+        }.get(generation)
         return (
             (self.arch_version or "").strip().lower() == "postgres_binary_v3"
-            and (self.storage_generation or "").strip().lower() == "shared_blocks_v3"
+            and expected_layout is not None
             and (self.cold_lookup_contract or "").strip().lower() == "ptg_v3_cold_v2"
             and (self.shared_block_layout or "").strip().lower()
-            == "dense_shared_blocks_v3"
+            == expected_layout
             and isinstance(self.shared_snapshot_key, int)
             and not isinstance(self.shared_snapshot_key, bool)
             and self.shared_snapshot_key > 0
             and isinstance(self.source_count, int)
             and not isinstance(self.source_count, bool)
             and 0 < self.source_count <= 2**31
+        )
+
+    @property
+    def uses_v4_graph(self) -> bool:
+        """Return true only for the packed V4 provider-graph generation."""
+
+        return self.uses_shared_blocks and (
+            (self.storage_generation or "").strip().lower() == "shared_blocks_v4"
         )

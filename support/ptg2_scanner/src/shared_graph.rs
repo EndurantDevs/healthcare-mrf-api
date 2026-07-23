@@ -271,10 +271,11 @@ impl ValidatedArtifact {
                         "unsupported membership sidecar version: {version}"
                     )));
                 }
-                let expected_globals =
-                    descriptor.metadata.member_global_count.ok_or_else(|| {
-                        invalid("dense membership metadata requires member_global_count")
-                    })?;
+                let Some(expected_globals) = descriptor.metadata.member_global_count else {
+                    return Err(invalid(
+                        "dense membership metadata requires member_global_count",
+                    ));
+                };
                 if globals != expected_globals {
                     return Err(invalid("dense membership dictionary count mismatch"));
                 }
@@ -292,26 +293,25 @@ impl ValidatedArtifact {
             .map_err(|_| invalid("membership member count exceeds addressable memory"))?;
         let member_global_count_usize = usize::try_from(member_global_count)
             .map_err(|_| invalid("membership dictionary count exceeds addressable memory"))?;
-        let index_bytes = owner_count_usize
-            .checked_mul(OWNER_RECORD_BYTES)
-            .ok_or_else(|| invalid("membership owner index size overflows"))?;
-        let dictionary_start = header_size
-            .checked_add(index_bytes)
-            .ok_or_else(|| invalid("membership layout size overflows"))?;
-        let dictionary_bytes = member_global_count_usize
-            .checked_mul(GLOBAL_ID_BYTES)
-            .ok_or_else(|| invalid("membership dictionary size overflows"))?;
-        let members_start = dictionary_start
-            .checked_add(dictionary_bytes)
-            .ok_or_else(|| invalid("membership layout size overflows"))?;
+        let Some(index_bytes) = owner_count_usize.checked_mul(OWNER_RECORD_BYTES) else {
+            return Err(invalid("membership owner index size overflows"));
+        };
+        let Some(dictionary_start) = header_size.checked_add(index_bytes) else {
+            return Err(invalid("membership layout size overflows"));
+        };
+        let Some(dictionary_bytes) = member_global_count_usize.checked_mul(GLOBAL_ID_BYTES) else {
+            return Err(invalid("membership dictionary size overflows"));
+        };
+        let Some(members_start) = dictionary_start.checked_add(dictionary_bytes) else {
+            return Err(invalid("membership layout size overflows"));
+        };
         let member_width = if dense { 4 } else { GLOBAL_ID_BYTES };
-        let expected_size = members_start
-            .checked_add(
-                member_count_usize
-                    .checked_mul(member_width)
-                    .ok_or_else(|| invalid("membership member block size overflows"))?,
-            )
-            .ok_or_else(|| invalid("membership layout size overflows"))?;
+        let Some(member_bytes) = member_count_usize.checked_mul(member_width) else {
+            return Err(invalid("membership member block size overflows"));
+        };
+        let Some(expected_size) = members_start.checked_add(member_bytes) else {
+            return Err(invalid("membership layout size overflows"));
+        };
         if expected_size != bytes.len() {
             return Err(invalid(format!(
                 "membership sidecar layout size mismatch: expected {expected_size}, got {}",
@@ -370,16 +370,20 @@ impl ValidatedArtifact {
             if direction == Direction::NpiToGroup {
                 npi_from_global_id(owner.owner)?;
             } else if direction == Direction::ProviderSetToGroup {
-                provider_map
-                    .ok_or_else(|| invalid("provider-set map is required for validation"))?
-                    .key(owner.owner)?;
+                let Some(provider_map) = provider_map else {
+                    return Err(invalid("provider-set map is required for validation"));
+                };
+                provider_map.key(owner.owner)?;
             }
             if owner.member_offset != expected_member_offset {
                 return Err(invalid("membership member offsets are not contiguous"));
             }
-            expected_member_offset = expected_member_offset
-                .checked_add(u64::from(owner.member_count))
-                .ok_or_else(|| invalid("membership member count overflows"))?;
+            let Some(next_member_offset) =
+                expected_member_offset.checked_add(u64::from(owner.member_count))
+            else {
+                return Err(invalid("membership member count overflows"));
+            };
+            expected_member_offset = next_member_offset;
             let mut previous_member = None;
             for member_index in
                 owner.member_offset..owner.member_offset + u64::from(owner.member_count)
@@ -390,9 +394,10 @@ impl ValidatedArtifact {
                 }
                 update_edge_fingerprint(&mut fingerprint, direction, owner.owner, member)?;
                 if direction == Direction::GroupToProviderSet {
-                    provider_map
-                        .ok_or_else(|| invalid("provider-set map is required for validation"))?
-                        .key(member)?;
+                    let Some(provider_map) = provider_map else {
+                        return Err(invalid("provider-set map is required for validation"));
+                    };
+                    provider_map.key(member)?;
                 }
                 previous_member = Some(member);
             }
@@ -410,10 +415,9 @@ impl ValidatedArtifact {
         }
         let index = usize::try_from(index)
             .map_err(|_| invalid("membership owner index exceeds addressable memory"))?;
-        let offset = self
-            .index_start
-            .checked_add(index * OWNER_RECORD_BYTES)
-            .ok_or_else(|| invalid("membership owner offset overflows"))?;
+        let Some(offset) = self.index_start.checked_add(index * OWNER_RECORD_BYTES) else {
+            return Err(invalid("membership owner offset overflows"));
+        };
         let owner = read_global_id(&self.bytes, offset)?;
         Ok(OwnerRecord {
             owner,
@@ -768,12 +772,12 @@ impl DenseMap {
                 )));
             }
             let expected_key = if let Some(start) = first_key {
-                start
-                    .checked_add(
-                        u32::try_from(index)
-                            .map_err(|_| invalid(format!("{label} map exceeds uint32")))?,
-                    )
-                    .ok_or_else(|| invalid(format!("{label} map key overflows uint32")))?
+                let index = u32::try_from(index)
+                    .map_err(|_| invalid(format!("{label} map exceeds uint32")))?;
+                let Some(expected_key) = start.checked_add(index) else {
+                    return Err(invalid(format!("{label} map key overflows uint32")));
+                };
+                expected_key
             } else {
                 if !expected_starts.contains(&key) {
                     return Err(invalid(format!(
@@ -801,12 +805,12 @@ impl DenseMap {
     fn key(&self, target: GlobalId) -> SharedGraphResult<u32> {
         let mut low = 0usize;
         let mut high = self.count;
-        let bytes = self.bytes.as_deref().ok_or_else(|| {
-            invalid(format!(
+        let Some(bytes) = self.bytes.as_deref() else {
+            return Err(invalid(format!(
                 "graph references an ID absent from the authoritative {} map",
                 self.label
-            ))
-        })?;
+            )));
+        };
         while low < high {
             let middle = (low + high) / 2;
             let (candidate, _) = dense_map_record(bytes, middle)?;
@@ -836,12 +840,10 @@ impl DenseMap {
         if index >= self.count {
             return Err(invalid(format!("{} map index is out of range", self.label)));
         }
-        dense_map_record(
-            self.bytes
-                .as_deref()
-                .ok_or_else(|| invalid(format!("{} map is empty", self.label)))?,
-            index,
-        )
+        let Some(bytes) = self.bytes.as_deref() else {
+            return Err(invalid(format!("{} map is empty", self.label)));
+        };
+        dense_map_record(bytes, index)
     }
 }
 
@@ -862,12 +864,12 @@ fn build_provider_set_map(source: &Path, destination: &Path) -> SharedGraphResul
             line.pop();
         }
         let mut fields = line.split('\t');
-        let global_hex = fields
-            .next()
-            .ok_or_else(|| invalid("provider-set dictionary export has an invalid row"))?;
-        let key_text = fields
-            .next()
-            .ok_or_else(|| invalid("provider-set dictionary export has an invalid row"))?;
+        let Some(global_hex) = fields.next() else {
+            return Err(invalid("provider-set dictionary export has an invalid row"));
+        };
+        let Some(key_text) = fields.next() else {
+            return Err(invalid("provider-set dictionary export has an invalid row"));
+        };
         if fields.next().is_some() {
             return Err(invalid("provider-set dictionary export has an invalid row"));
         }
@@ -888,10 +890,12 @@ fn build_provider_set_map(source: &Path, destination: &Path) -> SharedGraphResul
             }
             first_key = Some(key);
         }
-        let expected = first_key
+        let Some(expected) = first_key
             .expect("first key assigned")
             .checked_add(row_index)
-            .ok_or_else(|| invalid("provider-set dictionary key overflows uint32"))?;
+        else {
+            return Err(invalid("provider-set dictionary key overflows uint32"));
+        };
         if key != expected {
             return Err(invalid(
                 "provider-set dictionary keys must be dense and follow sorted global IDs",
@@ -900,9 +904,10 @@ fn build_provider_set_map(source: &Path, destination: &Path) -> SharedGraphResul
         destination_writer.write_all(&global_id)?;
         destination_writer.write_all(&key.to_be_bytes())?;
         previous = Some(global_id);
-        row_index = row_index
-            .checked_add(1)
-            .ok_or_else(|| invalid("provider-set dictionary exceeds uint32 capacity"))?;
+        let Some(next_row_index) = row_index.checked_add(1) else {
+            return Err(invalid("provider-set dictionary exceeds uint32 capacity"));
+        };
+        row_index = next_row_index;
     }
     destination_writer.flush()?;
     drop(destination_writer);
@@ -931,9 +936,10 @@ fn merge_owner_ids(
             matching.push(owners.pop().expect("peeked owner exists"));
         }
         consume(owner, count)?;
-        count = count
-            .checked_add(1)
-            .ok_or_else(|| invalid("merged owner count overflows uint64"))?;
+        let Some(next_count) = count.checked_add(1) else {
+            return Err(invalid("merged owner count overflows uint64"));
+        };
+        count = next_count;
         for matched in matching {
             let artifact = artifacts[matched.artifact_index];
             let next_index = matched.owner_index + 1;
@@ -992,10 +998,11 @@ impl TranslationTable {
         writer.flush()?;
         drop(writer);
         let file = File::open(path)?;
-        let expected_size = usize::try_from(artifact.member_global_count)
-            .map_err(|_| invalid("translation table count exceeds addressable memory"))?
-            .checked_mul(4)
-            .ok_or_else(|| invalid("translation table size overflows"))?;
+        let member_global_count = usize::try_from(artifact.member_global_count)
+            .map_err(|_| invalid("translation table count exceeds addressable memory"))?;
+        let Some(expected_size) = member_global_count.checked_mul(4) else {
+            return Err(invalid("translation table size overflows"));
+        };
         let bytes = if expected_size == 0 {
             None
         } else {
@@ -1016,12 +1023,10 @@ impl TranslationTable {
         if u64::from(local_id) >= self.count {
             return Err(invalid("translation table local id is out of range"));
         }
-        read_u32_le(
-            self.bytes
-                .as_deref()
-                .ok_or_else(|| invalid("translation table is empty"))?,
-            local_id as usize * 4,
-        )
+        let Some(bytes) = self.bytes.as_deref() else {
+            return Err(invalid("translation table is empty"));
+        };
+        read_u32_le(bytes, local_id as usize * 4)
     }
 }
 
@@ -1144,10 +1149,10 @@ impl<'a> BlockStream<'a> {
 
     fn append_u32(&mut self, value: u32) -> SharedGraphResult<()> {
         self.payload.extend_from_slice(&value.to_le_bytes());
-        self.member_count = self
-            .member_count
-            .checked_add(1)
-            .ok_or_else(|| invalid("graph member count overflows uint64"))?;
+        let Some(member_count) = self.member_count.checked_add(1) else {
+            return Err(invalid("graph member count overflows uint64"));
+        };
+        self.member_count = member_count;
         if self.payload.len() == GRAPH_CHUNK_BYTES {
             self.flush_block()?;
         }
@@ -1156,10 +1161,10 @@ impl<'a> BlockStream<'a> {
 
     fn append_u64(&mut self, value: u64) -> SharedGraphResult<()> {
         self.payload.extend_from_slice(&value.to_le_bytes());
-        self.member_count = self
-            .member_count
-            .checked_add(1)
-            .ok_or_else(|| invalid("graph member count overflows uint64"))?;
+        let Some(member_count) = self.member_count.checked_add(1) else {
+            return Err(invalid("graph member count overflows uint64"));
+        };
+        self.member_count = member_count;
         if self.payload.len() == GRAPH_CHUNK_BYTES {
             self.flush_block()?;
         }
@@ -1256,21 +1261,21 @@ impl DirectionSink for BlockStream<'_> {
     }
 
     fn end_owner(&mut self, member_count: u64) -> SharedGraphResult<()> {
-        let owner_key = self
-            .owner_key
-            .take()
-            .ok_or_else(|| invalid("graph owner stream is not open"))?;
-        let observed_count = self
-            .member_count
-            .checked_sub(self.owner_first_member)
-            .ok_or_else(|| invalid("graph owner member count underflows"))?;
+        let Some(owner_key) = self.owner_key.take() else {
+            return Err(invalid("graph owner stream is not open"));
+        };
+        let Some(observed_count) = self.member_count.checked_sub(self.owner_first_member) else {
+            return Err(invalid("graph owner member count underflows"));
+        };
         if observed_count != member_count {
             return Err(invalid("graph owner member count changed while encoding"));
         }
-        let absolute_offset = self
+        let Some(absolute_offset) = self
             .owner_first_member
             .checked_mul(self.direction.member_width() as u64)
-            .ok_or_else(|| invalid("graph owner byte offset overflows"))?;
+        else {
+            return Err(invalid("graph owner byte offset overflows"));
+        };
         let first_chunk = absolute_offset / GRAPH_CHUNK_BYTES as u64;
         let member_offset = absolute_offset % GRAPH_CHUNK_BYTES as u64;
         let first_chunk_u32 =
@@ -1581,10 +1586,12 @@ fn convert_shared_provider_graph_inner(
         };
         let merged = merge_direction(&artifacts, direction, &mut stream)?;
         let block_count = stream.finish()?;
-        let raw_byte_count = merged
+        let Some(raw_byte_count) = merged
             .member_count
             .checked_mul(direction.member_width() as u64)
-            .ok_or_else(|| invalid("graph raw byte count overflows uint64"))?;
+        else {
+            return Err(invalid("graph raw byte count overflows uint64"));
+        };
         direction_metrics.push(SharedGraphDirectionMetrics {
             direction: direction.id(),
             object_kind: direction.object_kind(),
@@ -1632,33 +1639,41 @@ fn convert_shared_provider_graph_inner(
     npi_copy.finish()?;
 
     let group_npi_input = shards.iter().try_fold(0u64, |total, shard| {
-        total
-            .checked_add(shard.group_npi.member_count)
-            .ok_or_else(|| invalid("group-NPI input edge count overflows uint64"))
+        match total.checked_add(shard.group_npi.member_count) {
+            Some(total) => Ok(total),
+            None => Err(invalid("group-NPI input edge count overflows uint64")),
+        }
     })?;
     let group_provider_input = shards.iter().try_fold(0u64, |total, shard| {
-        total
-            .checked_add(shard.group_provider_set.member_count)
-            .ok_or_else(|| invalid("group-provider input edge count overflows uint64"))
+        match total.checked_add(shard.group_provider_set.member_count) {
+            Some(total) => Ok(total),
+            None => Err(invalid("group-provider input edge count overflows uint64")),
+        }
     })?;
     let group_npi_unique = global_merges[0].member_count;
     let group_provider_unique = global_merges[2].member_count;
+    let Some(group_npi_duplicate_count) = group_npi_input.checked_sub(group_npi_unique) else {
+        return Err(invalid("group-NPI unique edge count exceeds input count"));
+    };
+    let Some(group_provider_duplicate_count) =
+        group_provider_input.checked_sub(group_provider_unique)
+    else {
+        return Err(invalid(
+            "group-provider unique edge count exceeds input count",
+        ));
+    };
     let edge_metrics = vec![
         SharedGraphEdgeMetrics {
             edge_kind: "group_npi",
             input_edge_count: group_npi_input,
             unique_edge_count: group_npi_unique,
-            duplicate_edge_count: group_npi_input
-                .checked_sub(group_npi_unique)
-                .ok_or_else(|| invalid("group-NPI unique edge count exceeds input count"))?,
+            duplicate_edge_count: group_npi_duplicate_count,
         },
         SharedGraphEdgeMetrics {
             edge_kind: "group_provider_set",
             input_edge_count: group_provider_input,
             unique_edge_count: group_provider_unique,
-            duplicate_edge_count: group_provider_input
-                .checked_sub(group_provider_unique)
-                .ok_or_else(|| invalid("group-provider unique edge count exceeds input count"))?,
+            duplicate_edge_count: group_provider_duplicate_count,
         },
     ];
     let input_byte_count = shards.iter().try_fold(0u64, |total, shard| {
@@ -1670,33 +1685,44 @@ fn convert_shared_provider_graph_inner(
         ]
         .into_iter()
         .try_fold(total, |subtotal, artifact| {
-            subtotal
-                .checked_add(artifact.byte_count)
-                .ok_or_else(|| invalid("membership input byte count overflows uint64"))
+            match subtotal.checked_add(artifact.byte_count) {
+                Some(subtotal) => Ok(subtotal),
+                None => Err(invalid("membership input byte count overflows uint64")),
+            }
         })
     })?;
-    let raw_block_byte_count = direction_metrics.iter().try_fold(0u64, |total, metric| {
-        total
-            .checked_add(metric.raw_byte_count)
-            .ok_or_else(|| invalid("graph raw block byte count overflows uint64"))
-    })?;
-    let input_edge_count = group_npi_input
-        .checked_add(group_provider_input)
-        .ok_or_else(|| invalid("graph input edge count overflows uint64"))?;
-    let unique_edge_count = group_npi_unique
-        .checked_add(group_provider_unique)
-        .ok_or_else(|| invalid("graph unique edge count overflows uint64"))?;
+    let raw_block_byte_count =
+        direction_metrics.iter().try_fold(0u64, |total, metric| {
+            match total.checked_add(metric.raw_byte_count) {
+                Some(total) => Ok(total),
+                None => Err(invalid("graph raw block byte count overflows uint64")),
+            }
+        })?;
+    let Some(input_edge_count) = group_npi_input.checked_add(group_provider_input) else {
+        return Err(invalid("graph input edge count overflows uint64"));
+    };
+    let Some(unique_edge_count) = group_npi_unique.checked_add(group_provider_unique) else {
+        return Err(invalid("graph unique edge count overflows uint64"));
+    };
     let block_count = direction_metrics.iter().try_fold(0u64, |total, metric| {
-        total
-            .checked_add(metric.block_count)
-            .ok_or_else(|| invalid("graph block count overflows uint64"))
+        match total.checked_add(metric.block_count) {
+            Some(total) => Ok(total),
+            None => Err(invalid("graph block count overflows uint64")),
+        }
     })?;
     let owner_count = direction_metrics.iter().try_fold(0u64, |total, metric| {
-        total
-            .checked_add(metric.owner_count)
-            .ok_or_else(|| invalid("graph owner count overflows uint64"))
+        match total.checked_add(metric.owner_count) {
+            Some(total) => Ok(total),
+            None => Err(invalid("graph owner count overflows uint64")),
+        }
     })?;
     let support_digest: [u8; 32] = support_hasher.finalize().into();
+    let Some(artifact_count) = (shards.len() as u64).checked_mul(4) else {
+        return Err(invalid("artifact count overflows uint64"));
+    };
+    let Some(duplicate_edge_count) = input_edge_count.checked_sub(unique_edge_count) else {
+        return Err(invalid("graph unique edge count exceeds input count"));
+    };
 
     Ok(SharedGraphConversionSummary {
         scratch_directory: output_directory.to_path_buf(),
@@ -1721,17 +1747,13 @@ fn convert_shared_provider_graph_inner(
         stored_block_byte_count: raw_block_byte_count,
         integrity: SharedGraphIntegrityMetrics {
             shard_count: shards.len() as u64,
-            artifact_count: (shards.len() as u64)
-                .checked_mul(4)
-                .ok_or_else(|| invalid("artifact count overflows uint64"))?,
+            artifact_count,
             checksum_byte_count: input_byte_count,
             reciprocal_pair_count: 2,
             reciprocal_edge_count: unique_edge_count,
             input_edge_count,
             unique_edge_count,
-            duplicate_edge_count: input_edge_count
-                .checked_sub(unique_edge_count)
-                .ok_or_else(|| invalid("graph unique edge count exceeds input count"))?,
+            duplicate_edge_count,
         },
     })
 }
@@ -1799,55 +1821,51 @@ fn decode_hex(value: u8) -> SharedGraphResult<u8> {
 }
 
 fn read_global_id(bytes: &[u8], offset: usize) -> SharedGraphResult<GlobalId> {
-    let end = offset
-        .checked_add(GLOBAL_ID_BYTES)
-        .ok_or_else(|| invalid("global ID offset overflows"))?;
-    bytes
-        .get(offset..end)
-        .ok_or_else(|| invalid("membership sidecar is truncated"))?
+    let Some(end) = offset.checked_add(GLOBAL_ID_BYTES) else {
+        return Err(invalid("global ID offset overflows"));
+    };
+    let Some(value) = bytes.get(offset..end) else {
+        return Err(invalid("membership sidecar is truncated"));
+    };
+    value
         .try_into()
         .map_err(|_| invalid("membership sidecar has an invalid global ID"))
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> SharedGraphResult<u32> {
-    let end = offset
-        .checked_add(4)
-        .ok_or_else(|| invalid("uint32 offset overflows"))?;
+    let Some(end) = offset.checked_add(4) else {
+        return Err(invalid("uint32 offset overflows"));
+    };
+    let Some(value) = bytes.get(offset..end) else {
+        return Err(invalid("membership sidecar is truncated"));
+    };
     Ok(u32::from_le_bytes(
-        bytes
-            .get(offset..end)
-            .ok_or_else(|| invalid("membership sidecar is truncated"))?
-            .try_into()
-            .expect("fixed uint32 width"),
+        value.try_into().expect("fixed uint32 width"),
     ))
 }
 
 fn read_u64_le(bytes: &[u8], offset: usize) -> SharedGraphResult<u64> {
-    let end = offset
-        .checked_add(8)
-        .ok_or_else(|| invalid("uint64 offset overflows"))?;
+    let Some(end) = offset.checked_add(8) else {
+        return Err(invalid("uint64 offset overflows"));
+    };
+    let Some(value) = bytes.get(offset..end) else {
+        return Err(invalid("membership sidecar is truncated"));
+    };
     Ok(u64::from_le_bytes(
-        bytes
-            .get(offset..end)
-            .ok_or_else(|| invalid("membership sidecar is truncated"))?
-            .try_into()
-            .expect("fixed uint64 width"),
+        value.try_into().expect("fixed uint64 width"),
     ))
 }
 
 fn dense_map_record(bytes: &[u8], index: usize) -> SharedGraphResult<(GlobalId, u32)> {
-    let offset = index
-        .checked_mul(DENSE_MAP_RECORD_BYTES)
-        .ok_or_else(|| invalid("dense map offset overflows"))?;
+    let Some(offset) = index.checked_mul(DENSE_MAP_RECORD_BYTES) else {
+        return Err(invalid("dense map offset overflows"));
+    };
     let global_id = read_global_id(bytes, offset)?;
     let key_end = offset + DENSE_MAP_RECORD_BYTES;
-    let key = u32::from_be_bytes(
-        bytes
-            .get(offset + GLOBAL_ID_BYTES..key_end)
-            .ok_or_else(|| invalid("dense map is truncated"))?
-            .try_into()
-            .expect("fixed dense key width"),
-    );
+    let Some(value) = bytes.get(offset + GLOBAL_ID_BYTES..key_end) else {
+        return Err(invalid("dense map is truncated"));
+    };
+    let key = u32::from_be_bytes(value.try_into().expect("fixed dense key width"));
     Ok((global_id, key))
 }
 

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import json
+import struct
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,24 @@ def _golden_cases():
 
 def test_pyo3_canon_version_matches_python():
     assert ptg2_address_canon.canon_version() == address_canon.current_canon_version()
+
+
+def test_pyo3_v4_graph_primitives_are_exact_and_fail_closed():
+    assert ptg2_address_canon.intersect_sorted_u32(
+        [1, 3, 7, 9], [2, 3, 4, 9]
+    ) == [3, 9]
+    with pytest.raises(ValueError):
+        ptg2_address_canon.intersect_sorted_u32([2, 1], [1])
+
+    payload = struct.pack("<4I", 0, 1, 255, 0xFFFFFFFF)
+    assert ptg2_address_canon.ptg2_decode_u32_le(payload) == [
+        0,
+        1,
+        255,
+        0xFFFFFFFF,
+    ]
+    with pytest.raises(ValueError):
+        ptg2_address_canon.ptg2_decode_u32_le(b"bad")
 
 
 def test_pyo3_address_canonical_golden_corpus_matches_frozen_expected_values():

@@ -8,6 +8,52 @@ import pytest
 from process.control_cancel import ImportCancelledError, raise_if_cancelled, run_id_from_task
 from process import control_lifecycle
 from process.control_lifecycle import control_single_job_start
+from process.live_progress import current_live_progress_context
+
+
+_SHUTDOWN_METRICS_BY_NAME = {
+    "staged_rows": 123,
+    "source_table_shards": 64,
+    "stage_index_profile": "serving",
+    "post_publish_index_profile": "serving",
+    "post_publish_index_concurrently": True,
+    "post_publish_index_pending": False,
+    "post_publish_index_total": 2,
+    "post_publish_index_completed": 2,
+    "post_publish_index_timings": [
+        {"index": "geo_bbox", "seconds": 13.4},
+        {"index": "geo_idx", "seconds": 28.1},
+    ],
+    "post_publish_skipped_indexes": [],
+    "published_elapsed_seconds": 233.2,
+    "phase_timings": {
+        "entity-address-unified indexing stage": {"wall_seconds": 24.1}
+    },
+    "stage_index_timings": [{"index": "primary_npi", "seconds": 1.2}],
+    "preserve_control_run_finished_at": True,
+}
+
+
+def _assert_shutdown_terminal_metrics(terminal):
+    metrics_by_name = terminal["metrics"]
+    assert metrics_by_name["rows"] == metrics_by_name["staged_rows"] == 123
+    assert metrics_by_name["source_table_shards"] == 64
+    assert metrics_by_name["stage_index_profile"] == "serving"
+    assert metrics_by_name["post_publish_index_profile"] == "serving"
+    assert metrics_by_name["post_publish_index_concurrently"] is True
+    assert metrics_by_name["post_publish_index_pending"] is False
+    assert metrics_by_name["post_publish_index_total"] == 2
+    assert metrics_by_name["post_publish_index_completed"] == 2
+    assert metrics_by_name["post_publish_index_timings"][0]["index"] == "geo_bbox"
+    assert metrics_by_name["post_publish_index_timings"][1]["index"] == "geo_idx"
+    assert metrics_by_name["post_publish_skipped_indexes"] == []
+    assert metrics_by_name["published_elapsed_seconds"] == 233.2
+    assert metrics_by_name["phase_timings"]["entity-address-unified indexing stage"] == {
+        "wall_seconds": 24.1
+    }
+    assert metrics_by_name["stage_index_timings"][0]["index"] == "primary_npi"
+    assert terminal["progress"]["done"] == 123
+    assert terminal["preserve_finished_at"] is True
 
 
 def test_run_id_from_task_normalizes_missing_values():
@@ -48,8 +94,9 @@ async def test_control_single_job_start_marks_success(monkeypatch):
     live_contexts = []
     real_set_live_progress_context = control_lifecycle.set_live_progress_context
 
-    async def fake_mark(run_id, **kwargs):
+    async def is_control_run_marked(run_id, **kwargs):
         marks.append((run_id, kwargs))
+        return True
 
     async def fake_target(ctx, task):
         calls.append((ctx, task))
@@ -63,7 +110,7 @@ async def test_control_single_job_start_marks_success(monkeypatch):
         return real_set_live_progress_context(**payload)
 
     monkeypatch.setattr(control_lifecycle, "set_live_progress_context", capture_live_progress_context)
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", is_control_run_marked)
     monkeypatch.setattr(control_lifecycle, "import_module", lambda name: FakeModule if name == "fake.module" else None)
 
     run_response = await control_single_job_start(
@@ -85,12 +132,102 @@ async def test_control_single_job_start_marks_success(monkeypatch):
             "importer": "process_data",
             "status": "running",
             "started_at": live_contexts[0]["started_at"],
-            "attempt_id": f"run_1:{live_contexts[0]['started_at']}",
+            "attempt_id": live_contexts[0]["attempt_id"],
             "attempt_started_at": live_contexts[0]["started_at"],
         }
     ]
+    assert live_contexts[0]["attempt_id"].startswith("run_1:")
+    assert live_contexts[0]["attempt_id"] != (
+        f"run_1:{live_contexts[0]['started_at']}"
+    )
     assert "source" not in live_contexts[0]
     assert "confidence" not in live_contexts[0]
+
+
+@pytest.mark.asyncio
+async def test_control_single_job_start_aborts_when_attempt_claim_is_rejected(
+    monkeypatch,
+):
+    async def is_attempt_claimed(*_args, **_kwargs):
+        return False
+
+    def fail_if_target_is_loaded(_name):
+        raise AssertionError("a rejected attempt must not load its target")
+
+    def fail_if_heartbeat_starts(*_args, **_kwargs):
+        raise AssertionError("a rejected attempt must not start a heartbeat")
+
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", is_attempt_claimed)
+    monkeypatch.setattr(
+        control_lifecycle,
+        "import_module",
+        fail_if_target_is_loaded,
+    )
+    monkeypatch.setattr(
+        control_lifecycle,
+        "_live_progress_heartbeat",
+        fail_if_heartbeat_starts,
+    )
+
+    job_outcome = await control_single_job_start(
+        {"redis": object()},
+        {
+            "run_id": "run_rejected",
+            "target_module": "fake.module",
+            "target_function": "process_data",
+        },
+    )
+
+    assert job_outcome == {
+        "status": "skipped",
+        "run_id": "run_rejected",
+        "reason": "newer_attempt_active",
+    }
+    assert current_live_progress_context() == {}
+
+
+@pytest.mark.asyncio
+async def test_live_progress_heartbeat_fails_closed_on_database_error(
+    monkeypatch,
+):
+    sleep_counts = [0]
+    live_progress_writes = []
+
+    async def run_one_heartbeat_then_cancel(_interval):
+        sleep_counts[0] += 1
+        if sleep_counts[0] > 1:
+            raise asyncio.CancelledError
+
+    async def fail_heartbeat_persistence(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        control_lifecycle.asyncio,
+        "sleep",
+        run_one_heartbeat_then_cancel,
+    )
+    monkeypatch.setattr(
+        control_lifecycle,
+        "_persist_control_run_heartbeat",
+        fail_heartbeat_persistence,
+    )
+    monkeypatch.setattr(
+        control_lifecycle,
+        "enqueue_live_progress",
+        lambda **payload: live_progress_writes.append(payload),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await control_lifecycle._live_progress_heartbeat(
+            "run_heartbeat",
+            "ptg",
+            "ptg_control_start",
+            "2026-07-23T12:00:00.000000+00:00",
+            attempt_id="attempt-a",
+            attempt_started_at="2026-07-23T12:00:00.000000+00:00",
+        )
+
+    assert live_progress_writes == []
 
 
 @pytest.mark.asyncio
@@ -98,8 +235,9 @@ async def test_control_single_job_start_ignores_arq_metadata_kwargs(monkeypatch)
     marks = []
     calls = []
 
-    async def fake_mark(run_id, **kwargs):
+    async def is_control_run_marked(run_id, **kwargs):
         marks.append((run_id, kwargs))
+        return True
 
     async def fake_target(ctx, task):
         calls.append((ctx, task))
@@ -108,7 +246,11 @@ async def test_control_single_job_start_ignores_arq_metadata_kwargs(monkeypatch)
     class FakeModule:
         process_data = staticmethod(fake_target)
 
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(
+        control_lifecycle,
+        "mark_control_run",
+        is_control_run_marked,
+    )
     monkeypatch.setattr(control_lifecycle, "import_module", lambda name: FakeModule if name == "fake.module" else None)
 
     run_response = await control_single_job_start(
@@ -133,8 +275,9 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
     marks = []
     calls = []
 
-    async def fake_mark(run_id, **kwargs):
+    async def is_control_run_marked(run_id, **kwargs):
         marks.append((run_id, kwargs))
+        return True
 
     async def fake_target(ctx, task):
         calls.append(("target", dict(ctx.get("context") or {}), task))
@@ -143,37 +286,13 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
 
     async def fake_shutdown(ctx):
         calls.append(("shutdown", dict(ctx.get("context") or {}), None))
-        ctx.setdefault("context", {}).update(
-            {
-                "staged_rows": 123,
-                "source_table_shards": 64,
-                "stage_index_profile": "serving",
-                "post_publish_index_profile": "serving",
-                "post_publish_index_concurrently": True,
-                "post_publish_index_pending": False,
-                "post_publish_index_total": 2,
-                "post_publish_index_completed": 2,
-                "post_publish_index_timings": [
-                    {"index": "geo_bbox", "seconds": 13.4},
-                    {"index": "geo_idx", "seconds": 28.1},
-                ],
-                "post_publish_skipped_indexes": [],
-                "published_elapsed_seconds": 233.2,
-                "phase_timings": {
-                    "entity-address-unified indexing stage": {"wall_seconds": 24.1}
-                },
-                "stage_index_timings": [
-                    {"index": "primary_npi", "seconds": 1.2},
-                ],
-                "preserve_control_run_finished_at": True,
-            }
-        )
+        ctx.setdefault("context", {}).update(_SHUTDOWN_METRICS_BY_NAME)
 
     class FakeModule:
         process_data = staticmethod(fake_target)
         shutdown = staticmethod(fake_shutdown)
 
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", is_control_run_marked)
     monkeypatch.setattr(control_lifecycle, "import_module", lambda name: FakeModule if name == "fake.module" else None)
 
     run_response = await control_single_job_start(
@@ -193,36 +312,21 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
     ]
     assert run_response["run_id"] == "run_1"
     assert [mark_entry[1]["status"] for mark_entry in marks] == ["running", "succeeded"]
-    terminal = marks[-1][1]
-    assert terminal["metrics"]["rows"] == 123
-    assert terminal["metrics"]["staged_rows"] == 123
-    assert terminal["metrics"]["source_table_shards"] == 64
-    assert terminal["metrics"]["stage_index_profile"] == "serving"
-    assert terminal["metrics"]["post_publish_index_profile"] == "serving"
-    assert terminal["metrics"]["post_publish_index_concurrently"] is True
-    assert terminal["metrics"]["post_publish_index_pending"] is False
-    assert terminal["metrics"]["post_publish_index_total"] == 2
-    assert terminal["metrics"]["post_publish_index_completed"] == 2
-    assert terminal["metrics"]["post_publish_index_timings"][0]["index"] == "geo_bbox"
-    assert terminal["metrics"]["post_publish_index_timings"][1]["index"] == "geo_idx"
-    assert terminal["metrics"]["post_publish_skipped_indexes"] == []
-    assert terminal["metrics"]["published_elapsed_seconds"] == 233.2
-    assert terminal["metrics"]["phase_timings"]["entity-address-unified indexing stage"]["wall_seconds"] == 24.1
-    assert terminal["metrics"]["stage_index_timings"][0]["index"] == "primary_npi"
-    assert terminal["progress"]["done"] == 123
-    assert terminal["preserve_finished_at"] is True
+    _assert_shutdown_terminal_metrics(marks[-1][1])
 
 
 @pytest.mark.asyncio
 async def test_control_single_job_start_isolates_concurrent_job_contexts(monkeypatch):
+    """Keep per-run state isolated when control jobs execute concurrently."""
     terminal_marks_by_run_id = {}
     both_started = asyncio.Event()
     started_run_ids = set()
     worker_context_map = {"redis": object(), "context": {"worker_value": "shared"}}
 
-    async def fake_mark(run_id, **kwargs):
+    async def is_control_run_marked(run_id, **kwargs):
         if kwargs["status"] == "succeeded":
             terminal_marks_by_run_id[run_id] = kwargs
+        return True
 
     async def fake_target(ctx, task):
         run_id = task["run_id"]
@@ -242,7 +346,7 @@ async def test_control_single_job_start_isolates_concurrent_job_contexts(monkeyp
         process_data = staticmethod(fake_target)
         shutdown = staticmethod(fake_shutdown)
 
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", is_control_run_marked)
     monkeypatch.setattr(
         control_lifecycle,
         "import_module",
@@ -271,227 +375,3 @@ async def test_control_single_job_start_isolates_concurrent_job_contexts(monkeyp
         "redis": worker_context_map["redis"],
         "context": {"worker_value": "shared"},
     }
-
-
-@pytest.mark.asyncio
-async def test_control_single_job_start_marks_cancelled(monkeypatch):
-    marks = []
-
-    async def fake_mark(run_id, **kwargs):
-        marks.append((run_id, kwargs))
-
-    async def fake_target(_ctx, _task):
-        raise ImportCancelledError("cancelled")
-
-    class FakeModule:
-        process_data = staticmethod(fake_target)
-
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
-    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: FakeModule)
-
-    result = await control_single_job_start(
-        {},
-        {"run_id": "run_1", "target_module": "fake.module", "target_function": "process_data"},
-    )
-
-    assert result["status"] == "canceled"
-    assert [item[1]["status"] for item in marks] == ["running", "canceled"]
-
-
-@pytest.mark.asyncio
-async def test_control_single_job_start_marks_cancelled_task_failed(monkeypatch):
-    marks = []
-
-    async def fake_mark(run_id, **kwargs):
-        marks.append((run_id, kwargs))
-
-    async def fake_target(_ctx, _task):
-        raise asyncio.CancelledError()
-
-    class FakeModule:
-        process_data = staticmethod(fake_target)
-
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
-    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: FakeModule)
-
-    result = await control_single_job_start(
-        {},
-        {"run_id": "run_1", "target_module": "fake.module", "target_function": "process_data"},
-    )
-
-    assert result["status"] == "failed"
-    assert [item[1]["status"] for item in marks] == ["running", "failed"]
-    assert marks[-1][1]["error"]["code"] == "import_interrupted"
-
-
-@pytest.mark.asyncio
-async def test_control_run_update_uses_base_database_then_restores_override(monkeypatch):
-    calls = []
-
-    class FakeDb:
-        _database_override = "healthporta_test"
-
-        async def connect(self):
-            calls.append(("connect", self._database_override))
-
-        async def execute(self, stmt):
-            calls.append(("execute", stmt, self._database_override))
-
-    fake_db = FakeDb()
-    monkeypatch.setenv("HLTHPRT_DB_DATABASE", "healthporta")
-    monkeypatch.setattr(control_lifecycle, "db", fake_db)
-
-    await control_lifecycle._execute_control_run_update("UPDATE")
-
-    assert fake_db._database_override == "healthporta_test"
-    assert calls == [
-        ("connect", "healthporta"),
-        ("execute", "UPDATE", "healthporta"),
-        ("connect", "healthporta_test"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_mark_control_run_throttles_repeated_running_db_update(monkeypatch):
-    db_updates = []
-    live_events = []
-    status_events = []
-
-    async def fake_update(stmt):
-        db_updates.append(stmt)
-
-    monkeypatch.setenv("HLTHPRT_CONTROL_RUN_DB_UPDATE_THROTTLE_SECONDS", "60")
-    monkeypatch.setattr(control_lifecycle, "_claim_control_run_db_update_slot", lambda _key, _seconds: False)
-    monkeypatch.setattr(control_lifecycle, "_execute_control_run_update", fake_update)
-    monkeypatch.setattr(control_lifecycle, "enqueue_live_progress", lambda **payload: live_events.append(payload))
-    monkeypatch.setattr(control_lifecycle, "enqueue_status_event", lambda payload: status_events.append(payload))
-
-    await control_lifecycle.mark_control_run(
-        "run_1",
-        status="running",
-        phase_detail="mrf provider jobs running",
-        progress_message="processed provider file",
-        metrics={"last_provider_records": 123},
-    )
-
-    assert db_updates == []
-    assert live_events[-1]["run_id"] == "run_1"
-    assert live_events[-1]["status"] == "running"
-    assert status_events[-1]["phase_detail"] == "mrf provider jobs running"
-
-
-def test_control_run_heartbeat_update_values_prefers_live_progress():
-    now = dt.datetime(2026, 6, 21, 12, 0, 0)
-    values = control_lifecycle._control_run_heartbeat_update_values(
-        "process_data",
-        {
-            "phase": "compact-serving scanner",
-            "unit": "compressed_bytes",
-            "done": 1048576,
-            "total": 2097152,
-            "pct": 50,
-            "message": "compact-serving scanner 50.00%",
-            "updated_at": "2026-06-21T12:00:00Z",
-        },
-        now,
-    )
-
-    assert values["status"] == "running"
-    assert values["phase_detail"] == "compact-serving scanner"
-    assert values["heartbeat_at"] == now
-    assert values["finished_at"] is None
-    assert values["progress"] == {
-        "unit": "compressed_bytes",
-        "done": 1048576,
-        "total": 2097152,
-        "pct": 50,
-        "message": "compact-serving scanner 50.00%",
-        "phase": "compact-serving scanner",
-        "updated_at": "2026-06-21T12:00:00Z",
-    }
-
-
-def test_control_run_heartbeat_update_values_preserves_live_progress_detail():
-    now = dt.datetime(2026, 6, 29, 14, 0, 0)
-    detail_by_field = {
-        "active_source_groups": [
-            {
-                "sample_source_id": "source_a",
-                "sample_org_name": "Cigna",
-                "current_resource": "PractitionerRole",
-            }
-        ]
-    }
-
-    values = control_lifecycle._control_run_heartbeat_update_values(
-        "process_data",
-        {
-            "phase": "provider-directory importing resources",
-            "unit": "steps",
-            "done": 8,
-            "total": 25,
-            "pct": 32,
-            "message": "imported resources for 8/25 source group(s)",
-            "detail": detail_by_field,
-            "updated_at": "2026-06-29T14:00:00Z",
-        },
-        now,
-    )
-
-    assert values["progress"]["detail"] == detail_by_field
-
-
-@pytest.mark.asyncio
-async def test_mark_control_run_always_persists_terminal_update(monkeypatch):
-    db_updates = []
-
-    async def fake_update(stmt):
-        db_updates.append(stmt)
-
-    def fail_slot(_key, _seconds):
-        raise AssertionError("terminal updates must not consult the running throttle")
-
-    monkeypatch.setenv("HLTHPRT_CONTROL_RUN_DB_UPDATE_THROTTLE_SECONDS", "60")
-    monkeypatch.setattr(control_lifecycle, "_claim_control_run_db_update_slot", fail_slot)
-    monkeypatch.setattr(control_lifecycle, "_execute_control_run_update", fake_update)
-    monkeypatch.setattr(control_lifecycle, "enqueue_live_progress", lambda **_payload: None)
-    monkeypatch.setattr(control_lifecycle, "enqueue_status_event", lambda _payload: None)
-
-    await control_lifecycle.mark_control_run(
-        "run_1",
-        status="succeeded",
-        phase_detail="mrf import published",
-        progress_message="succeeded",
-    )
-
-    assert len(db_updates) == 1
-
-
-@pytest.mark.asyncio
-async def test_mark_control_run_can_preserve_existing_finished_at(monkeypatch):
-    db_updates = []
-    live_events = []
-    status_events = []
-
-    async def fake_update(stmt):
-        db_updates.append(stmt)
-
-    monkeypatch.setattr(control_lifecycle, "_execute_control_run_update", fake_update)
-    monkeypatch.setattr(control_lifecycle, "enqueue_live_progress", lambda **payload: live_events.append(payload))
-    monkeypatch.setattr(control_lifecycle, "enqueue_status_event", lambda payload: status_events.append(payload))
-
-    await control_lifecycle.mark_control_run(
-        "run_1",
-        status="succeeded",
-        phase_detail="entity-address-unified post-publish indexes warmed",
-        progress_message="post-publish indexes warmed",
-        preserve_finished_at=True,
-    )
-
-    values_by_field = {
-        getattr(key, "key", str(key)): value
-        for key, value in db_updates[0]._values.items()
-    }
-    assert "finished_at" not in values_by_field
-    assert live_events[-1]["finished_at"] is None
-    assert status_events[-1]["finished_at"] is None

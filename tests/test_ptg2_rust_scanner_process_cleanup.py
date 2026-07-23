@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 
 from process.ptg_parts import rust_scanner
 
@@ -39,6 +40,8 @@ def test_compact_scanner_reaps_process_still_running_after_stdout(
     tmp_path,
     monkeypatch,
 ):
+    """Prove framed EOF cannot leave the scanner process or scratch alive."""
+
     binary = tmp_path / "ptg2_scanner"
     binary.write_text("fake", encoding="ascii")
     binary.chmod(0o755)
@@ -53,6 +56,7 @@ def test_compact_scanner_reaps_process_still_running_after_stdout(
         _frame("scanner_config", scanner_config_map) + _frame("scanner_summary", {})
     )
     terminated_process_list = []
+    observed_scratch_paths: list[Path] = []
 
     def terminate(running_process):
         terminated_process_list.append(running_process)
@@ -60,10 +64,20 @@ def test_compact_scanner_reaps_process_still_running_after_stdout(
         return running_process.returncode
 
     monkeypatch.setattr(rust_scanner, "_ptg2_rust_scanner_binary", lambda: binary)
+
+    def fake_popen(*_args, **kwargs):
+        scratch_path = Path(
+            kwargs["env"][rust_scanner._SOURCE_WITNESS_SCRATCH_DIR_ENV]
+        )
+        assert scratch_path.is_dir()
+        assert rust_scanner._source_witness_scratch_marker(scratch_path).is_file()
+        observed_scratch_paths.append(scratch_path)
+        return process
+
     monkeypatch.setattr(
         rust_scanner.subprocess,
         "Popen",
-        lambda *_args, **_kwargs: process,
+        fake_popen,
     )
     monkeypatch.setattr(rust_scanner, "_terminate_subprocess_group", terminate)
 
@@ -86,6 +100,85 @@ def test_compact_scanner_reaps_process_still_running_after_stdout(
     ]
     assert terminated_process_list == [process]
     assert process.wait_calls == 1
+    assert len(observed_scratch_paths) == 1
+    assert not observed_scratch_paths[0].exists()
+
+
+def test_compact_scanner_removes_scratch_when_spawn_fails(tmp_path, monkeypatch):
+    binary = tmp_path / "ptg2_scanner"
+    binary.write_text("fake", encoding="ascii")
+    binary.chmod(0o755)
+    observed_scratch_paths: list[Path] = []
+
+    def fail_spawn(*_args, **kwargs):
+        scratch_path = Path(
+            kwargs["env"][rust_scanner._SOURCE_WITNESS_SCRATCH_DIR_ENV]
+        )
+        assert scratch_path.is_dir()
+        observed_scratch_paths.append(scratch_path)
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(rust_scanner, "_ptg2_rust_scanner_binary", lambda: binary)
+    monkeypatch.setattr(rust_scanner.subprocess, "Popen", fail_spawn)
+
+    try:
+        list(
+            rust_scanner._iter_compact_serving_records_rust(
+                tmp_path / "input.json",
+                raw_source_sha256="a" * 64,
+                snapshot_id="snapshot",
+                plan_id="plan",
+                coverage_scope_id="cc" * 32,
+                plan_month_id="month",
+                source_trace_set_hash="trace",
+                v3_serving_run_directory=tmp_path / "runs",
+            )
+        )
+    except OSError as exc:
+        assert "spawn failed" in str(exc)
+    else:
+        raise AssertionError("scanner spawn failure was not propagated")
+
+    assert len(observed_scratch_paths) == 1
+    assert not observed_scratch_paths[0].exists()
+
+
+def test_scratch_orphan_reaper_requires_authenticated_dead_owner(
+    tmp_path,
+    monkeypatch,
+):
+    run_directory = tmp_path / "runs"
+    run_directory.mkdir()
+    orphan = run_directory / f"{rust_scanner._SOURCE_WITNESS_SCRATCH_PREFIX}orphan"
+    orphan.mkdir()
+    rust_scanner._source_witness_scratch_marker(orphan).write_text(
+        json.dumps(
+            {
+                "contract": "healthporta_ptg2_source_witness_scratch_v1",
+                "pid": 424242,
+            }
+        ),
+        encoding="ascii",
+    )
+    unmarked = run_directory / f"{rust_scanner._SOURCE_WITNESS_SCRATCH_PREFIX}unmarked"
+    unmarked.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    symlink = run_directory / f"{rust_scanner._SOURCE_WITNESS_SCRATCH_PREFIX}symlink"
+    symlink.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(rust_scanner, "_is_live_local_process", lambda _pid: False)
+
+    created = rust_scanner._prepare_source_witness_scratch_directory(run_directory)
+
+    assert not orphan.exists()
+    assert unmarked.is_dir()
+    assert symlink.is_symlink()
+    assert outside.is_dir()
+    assert created.is_dir()
+    assert rust_scanner._is_source_witness_scratch_removed(
+        created,
+        require_orphan=False,
+    )
 
 
 def test_top_level_scanner_frames_and_reaps_process(

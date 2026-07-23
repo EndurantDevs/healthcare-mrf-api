@@ -26,7 +26,7 @@ use ptg2_scanner::dedupe::{
 };
 use ptg2_scanner::hashing::{
     checksum_i64_list, hash_i64_list, hash_string_list, hash_text, make_checksum, semantic_hash,
-    xxh3_63,
+    update_hash_string_list, xxh3_63,
 };
 use ptg2_scanner::input::{
     is_gzip, open_full_scan_json_reader, open_full_scan_reader,
@@ -46,11 +46,16 @@ use ptg2_scanner::normalize::{
     normalize_catalog_code, normalize_code, normalize_code_system, normalize_string,
     normalize_tin_type, normalize_tin_value, strict_integer_text, strict_money_number,
     strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
-    strict_string_array_from_reader, StrictNpiList,
+    strict_npi_partition_allow_empty_tin_only, strict_string_array_from_reader, StrictNpiList,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
-use ptg2_scanner::progress::emit_progress;
+use ptg2_scanner::progress::{
+    emit_progress, ScannerSemanticProgress, ScannerSemanticProgressReporter,
+};
 use ptg2_scanner::provider_directory_projection::run_provider_directory_materialization_stdio_v2_cli;
+use ptg2_scanner::rate_schedule_observe::{
+    rate_schedule_observe_memory_upper_bound_bytes, RateScheduleObserver, RateScheduleOccurrence,
+};
 use ptg2_scanner::shared_graph::{
     convert_shared_provider_graph, MembershipArtifactDescriptor, MembershipMetadata,
     SharedGraphShardDescriptor,
@@ -81,7 +86,7 @@ use source_witness::{RateOccurrenceWitnessInput, SourceWitnessCollector, SourceW
 use source_witness_spool::ProviderSourceLocator;
 use std::any::Any;
 use std::cell::Cell;
-use std::cmp::Ordering as CmpOrdering;
+use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fmt::Display;
@@ -98,6 +103,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use struson::reader::{JsonReader, JsonStreamReader, ValueType};
 use struson::writer::{JsonStreamWriter, JsonWriter};
+use xxhash_rust::xxh3::Xxh3;
 
 const DEFAULT_PROVIDER_REF_CHUNK_ITEMS: usize = 1024;
 const DEFAULT_INDEXED_RANGE_PRODUCERS: usize = 4;
@@ -113,6 +119,8 @@ const V3_SCRATCH_DURABILITY_CONTRACT: &str = "ptg2_v3_scratch_durability_v1";
 const V3_COVERAGE_SCOPE_ID_ENV: &str = "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID";
 const V3_RAW_SOURCE_SHA256_ENV: &str = "HLTHPRT_PTG2_RAW_SOURCE_SHA256";
 const GROUP_NEGOTIATED_RATE_CHUNKS_ENV: &str = "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS";
+const RATE_SCHEDULE_OBSERVE_ENV: &str = "HLTHPRT_PTG2_RATE_SCHEDULE_OBSERVE";
+const PROVIDER_GRAPH_V4_ENV: &str = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4";
 
 thread_local! {
     static SIDECAR_LOCK_WAIT_MICROS: Cell<u128> = const { Cell::new(0) };
@@ -636,6 +644,8 @@ struct CopyPathConfig {
     v3_coverage_scope_id: Option<[u8; COVERAGE_SCOPE_ID_BYTES]>,
     manifest_provider_forward_sidecar: Option<String>,
     manifest_provider_inverted_sidecar: Option<String>,
+    manifest_provider_set_component_sidecar: Option<String>,
+    manifest_provider_component_group_sidecar: Option<String>,
     manifest_provider_npi_sidecar: Option<String>,
     manifest_price_forward_sidecar: Option<String>,
     manifest_price_atom: Option<String>,
@@ -654,6 +664,25 @@ struct CopyPathConfig {
     provider_entry_component: Option<String>,
     provider_group_member: Option<String>,
     manifest_only: bool,
+}
+
+fn configured_v4_factor_mode(paths: &CopyPathConfig) -> io::Result<bool> {
+    let enabled = env_bool(PROVIDER_GRAPH_V4_ENV, false);
+    let has_set_component_path = paths.manifest_provider_set_component_sidecar.is_some();
+    let has_component_group_path = paths.manifest_provider_component_group_sidecar.is_some();
+    if has_set_component_path != has_component_group_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "V4 provider factor outputs require both set-to-component and component-to-group sidecar paths",
+        ));
+    }
+    if enabled && !has_set_component_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{PROVIDER_GRAPH_V4_ENV} requires both V4 provider factor sidecar paths"),
+        ));
+    }
+    Ok(enabled)
 }
 
 impl CopyPathConfig {
@@ -693,7 +722,7 @@ impl CopyPathConfig {
                 )
             })?)?;
 
-        Ok(Self {
+        let config = Self {
             v3_serving_run_directory: Some(v3_serving_run_directory),
             v3_coverage_scope_id: Some(v3_coverage_scope_id),
             manifest_provider_forward_sidecar: env_path(
@@ -701,6 +730,12 @@ impl CopyPathConfig {
             ),
             manifest_provider_inverted_sidecar: env_path(
                 "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH",
+            ),
+            manifest_provider_set_component_sidecar: env_path(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH",
+            ),
+            manifest_provider_component_group_sidecar: env_path(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH",
             ),
             manifest_price_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"),
             manifest_price_set_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH"),
@@ -715,7 +750,9 @@ impl CopyPathConfig {
             ),
             manifest_only: true,
             ..Self::default()
-        })
+        };
+        configured_v4_factor_mode(&config)?;
+        Ok(config)
     }
 
     fn has_file_paths(&self) -> bool {
@@ -744,6 +781,8 @@ impl CopyPathConfig {
     fn has_manifest_sidecar_paths(&self) -> bool {
         self.manifest_provider_forward_sidecar.is_some()
             || self.manifest_provider_inverted_sidecar.is_some()
+            || self.manifest_provider_set_component_sidecar.is_some()
+            || self.manifest_provider_component_group_sidecar.is_some()
             || self.manifest_provider_npi_sidecar.is_some()
             || self.manifest_price_forward_sidecar.is_some()
     }
@@ -764,6 +803,12 @@ impl CopyPathConfig {
             v3_coverage_scope_id: self.v3_coverage_scope_id,
             manifest_provider_forward_sidecar: self.manifest_provider_forward_sidecar.clone(),
             manifest_provider_inverted_sidecar: self.manifest_provider_inverted_sidecar.clone(),
+            manifest_provider_set_component_sidecar: self
+                .manifest_provider_set_component_sidecar
+                .clone(),
+            manifest_provider_component_group_sidecar: self
+                .manifest_provider_component_group_sidecar
+                .clone(),
             manifest_provider_npi_sidecar: self.manifest_provider_npi_sidecar.clone(),
             manifest_price_forward_sidecar: self.manifest_price_forward_sidecar.clone(),
             manifest_price_atom: self
@@ -840,6 +885,12 @@ impl CopyPathConfig {
             v3_coverage_scope_id: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
+            manifest_provider_set_component_sidecar: self
+                .manifest_provider_set_component_sidecar
+                .clone(),
+            manifest_provider_component_group_sidecar: self
+                .manifest_provider_component_group_sidecar
+                .clone(),
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -1131,14 +1182,21 @@ fn validate_optional_string_value(value: Option<&Value>, field_name: &str) -> io
     ))
 }
 
-fn validate_provider_group(group: &Value) -> io::Result<StrictNpiList> {
+fn validate_provider_group(
+    group: &Value,
+    allow_empty_npi_tin_only: bool,
+) -> io::Result<StrictNpiList> {
     let group = group.as_object().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "provider_groups elements must be JSON objects",
         )
     })?;
-    let npi_partition = strict_npi_partition(group.get("npi"))?;
+    let npi_partition = if allow_empty_npi_tin_only {
+        strict_npi_partition_allow_empty_tin_only(group.get("npi"))?
+    } else {
+        strict_npi_partition(group.get("npi"))?
+    };
     let tin = group.get("tin").and_then(Value::as_object).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1219,7 +1277,10 @@ fn provider_set_checksum_from_group_payloads(mut group_payload_jsons: Vec<String
     xxh3_63(payload.as_bytes()) as i64
 }
 
-fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
+fn build_provider_entry_audited(
+    provider_ref: &Value,
+    allow_empty_npi_tin_only: bool,
+) -> io::Result<(ProviderEntry, u64)> {
     validate_provider_reference_metadata(provider_ref)?;
     let network_names = canonical_text_list(
         provider_ref
@@ -1252,8 +1313,19 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
     let mut group_hashes: Vec<i64> = Vec::new();
     let mut provider_npis: Vec<i64> = Vec::new();
     let mut quarantined_npis: Vec<i64> = Vec::new();
+    let mut empty_npi_tin_only_normalization_count = 0u64;
     for group in groups {
-        let npi_partition = validate_provider_group(group)?;
+        let npi_partition = validate_provider_group(group, allow_empty_npi_tin_only)?;
+        if npi_partition.empty_array_normalized {
+            empty_npi_tin_only_normalization_count = empty_npi_tin_only_normalization_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty NPI TIN-only normalization count overflow",
+                    )
+                })?;
+        }
         let tin = group.get("tin").unwrap_or(&Value::Null);
         let npi = npi_partition.valid;
         let quarantined_npi = npi_partition.quarantined;
@@ -1286,15 +1358,22 @@ fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
     } else {
         group_hashes[0]
     };
-    Ok(ProviderEntry {
-        entry_hash,
-        provider_count: i64::try_from(provider_npis.len()).unwrap_or(i64::MAX),
-        provider_group_hashes: group_hashes,
-        npi: provider_npis,
-        quarantined_npi: quarantined_npis,
-        network_names,
-        source_locator: None,
-    })
+    Ok((
+        ProviderEntry {
+            entry_hash,
+            provider_count: i64::try_from(provider_npis.len()).unwrap_or(i64::MAX),
+            provider_group_hashes: group_hashes,
+            npi: provider_npis,
+            quarantined_npi: quarantined_npis,
+            network_names,
+            source_locator: None,
+        },
+        empty_npi_tin_only_normalization_count,
+    ))
+}
+
+fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
+    build_provider_entry_audited(provider_ref, false).map(|(entry, _normalization_count)| entry)
 }
 
 fn provider_ref_key(value: &Value) -> io::Result<ProviderRefKey> {
@@ -1308,13 +1387,23 @@ fn provider_ref_key(value: &Value) -> io::Result<ProviderRefKey> {
 }
 
 fn provider_ref_definition(value: &Value) -> io::Result<(ProviderRefKey, ProviderEntry)> {
+    provider_ref_definition_audited(value, false)
+        .map(|(key, entry, _normalization_count)| (key, entry))
+}
+
+fn provider_ref_definition_audited(
+    value: &Value,
+    allow_empty_npi_tin_only: bool,
+) -> io::Result<(ProviderRefKey, ProviderEntry, u64)> {
     let key_value = value.get("provider_group_id").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "provider reference is missing provider_group_id",
         )
     })?;
-    Ok((provider_ref_key(key_value)?, build_provider_entry(value)?))
+    let (entry, normalization_count) =
+        build_provider_entry_audited(value, allow_empty_npi_tin_only)?;
+    Ok((provider_ref_key(key_value)?, entry, normalization_count))
 }
 
 fn provider_identifier_quarantine_payload(
@@ -1326,6 +1415,44 @@ fn provider_identifier_quarantine_payload(
         quarantine.record(&entry.quarantined_npi)?;
     }
     quarantine.payload()
+}
+
+fn empty_npi_tin_only_normalization_payload(occurrence_count: u64) -> Value {
+    const HASH_DOMAIN: &[u8] = b"PTG2_V4_EMPTY_NPI_TIN_ONLY_NORMALIZATION_V1\0";
+    let mut digest = Sha256::new();
+    digest.update(HASH_DOMAIN);
+    digest.update(occurrence_count.to_be_bytes());
+    let digest = digest.finalize();
+    let mut sha256 = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut sha256, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    json!({
+        "contract": "ptg2_v4_empty_npi_tin_only_normalization_v1",
+        "source_shape": "empty_array",
+        "canonical_equivalent": "zero_marker",
+        "occurrence_count": occurrence_count,
+        "emitted_npi_edge_count": 0,
+        "sha256": sha256,
+    })
+}
+
+fn scanner_summary_with_v4_empty_npi_audit(
+    mut summary: Value,
+    factor_mode: bool,
+    occurrence_count: u64,
+) -> Value {
+    if factor_mode {
+        summary
+            .as_object_mut()
+            .expect("scanner summary must be a JSON object")
+            .insert(
+                "empty_npi_tin_only_normalization".to_string(),
+                empty_npi_tin_only_normalization_payload(occurrence_count),
+            );
+    }
+    summary
 }
 
 fn insert_provider_definition(
@@ -1597,6 +1724,11 @@ fn price_set_global_id(price_set: &PriceSetLite) -> GlobalId128 {
 fn provider_group_global_id_from_hash(provider_group_hash: i64) -> GlobalId128 {
     let hash_text = provider_group_hash.to_string();
     GlobalId128::from_parts("provider_group_manifest", &[&hash_text])
+}
+
+fn provider_component_global_id_from_hash(provider_component_hash: i64) -> GlobalId128 {
+    let hash_text = provider_component_hash.to_string();
+    GlobalId128::from_parts("provider_component_manifest_v1", &[&hash_text])
 }
 
 fn npi_member_id(npi: i64) -> GlobalId128 {
@@ -2155,6 +2287,8 @@ impl Drop for ManifestPairSpool {
 struct ManifestSidecarSpools {
     provider_forward: Option<ManifestPairSpool>,
     provider_inverted: Option<ManifestPairSpool>,
+    provider_set_component: Option<ManifestPairSpool>,
+    provider_component_group: Option<ManifestPairSpool>,
     provider_npi: Option<ManifestPairSpool>,
     price_forward: Option<ManifestPairSpool>,
 }
@@ -2169,6 +2303,14 @@ impl ManifestSidecarSpools {
             provider_inverted: manifest_pair_spool_if(
                 paths.manifest_provider_inverted_sidecar.is_some(),
                 "provider_inverted",
+            )?,
+            provider_set_component: manifest_pair_spool_if(
+                paths.manifest_provider_set_component_sidecar.is_some(),
+                "provider_set_component",
+            )?,
+            provider_component_group: manifest_pair_spool_if(
+                paths.manifest_provider_component_group_sidecar.is_some(),
+                "provider_component_group",
             )?,
             provider_npi: manifest_pair_spool_if(
                 paths.manifest_provider_npi_sidecar.is_some(),
@@ -2186,6 +2328,8 @@ impl ManifestSidecarSpools {
         Ok(Self {
             provider_forward: Some(ManifestPairSpool::new("provider_forward")?),
             provider_inverted: Some(ManifestPairSpool::new("provider_inverted")?),
+            provider_set_component: Some(ManifestPairSpool::new("provider_set_component")?),
+            provider_component_group: Some(ManifestPairSpool::new("provider_component_group")?),
             provider_npi: Some(ManifestPairSpool::new("provider_npi")?),
             price_forward: Some(ManifestPairSpool::new("price_forward")?),
         })
@@ -2200,6 +2344,8 @@ fn manifest_pair_spool_if(enabled: bool, kind: &str) -> io::Result<Option<Manife
 struct ManifestSidecarCollector {
     provider_forward: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     provider_inverted: BTreeMap<GlobalId128, Vec<GlobalId128>>,
+    provider_set_component: BTreeMap<GlobalId128, Vec<GlobalId128>>,
+    provider_component_group: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     provider_npi: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     price_forward: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     spools: Option<ManifestSidecarSpools>,
@@ -2221,6 +2367,7 @@ impl ManifestSidecarCollector {
         &mut self,
         provider_set_global_id: GlobalId128,
         provider_group_hashes: &[i64],
+        provider_component_hashes: &[i64],
         provider_npis: &[i64],
     ) -> io::Result<()> {
         let mut provider_group_ids: Vec<GlobalId128> = provider_group_hashes
@@ -2250,6 +2397,24 @@ impl ManifestSidecarCollector {
                     .push(provider_set_global_id);
             }
         }
+        let mut provider_component_ids: Vec<GlobalId128> = provider_component_hashes
+            .iter()
+            .map(|hash| provider_component_global_id_from_hash(*hash))
+            .collect();
+        provider_component_ids.sort_unstable();
+        provider_component_ids.dedup();
+        if let Some(spools) = self.spools.as_mut() {
+            if let Some(spool) = spools.provider_set_component.as_mut() {
+                for provider_component_id in provider_component_ids {
+                    spool.push(provider_set_global_id, provider_component_id)?;
+                }
+            }
+        } else {
+            self.provider_set_component
+                .entry(provider_set_global_id)
+                .or_default()
+                .extend(provider_component_ids);
+        }
         let provider_npi_ids = provider_npis
             .iter()
             .copied()
@@ -2267,6 +2432,33 @@ impl ManifestSidecarCollector {
                 .entry(provider_set_global_id)
                 .or_default()
                 .extend(provider_npi_ids);
+        }
+        Ok(())
+    }
+
+    fn record_provider_component(
+        &mut self,
+        provider_component_hash: i64,
+        provider_group_hashes: &[i64],
+    ) -> io::Result<()> {
+        let provider_component_id = provider_component_global_id_from_hash(provider_component_hash);
+        let mut provider_group_ids: Vec<GlobalId128> = provider_group_hashes
+            .iter()
+            .map(|hash| provider_group_global_id_from_hash(*hash))
+            .collect();
+        provider_group_ids.sort_unstable();
+        provider_group_ids.dedup();
+        if let Some(spools) = self.spools.as_mut() {
+            if let Some(spool) = spools.provider_component_group.as_mut() {
+                for provider_group_id in provider_group_ids {
+                    spool.push(provider_component_id, provider_group_id)?;
+                }
+            }
+        } else {
+            self.provider_component_group
+                .entry(provider_component_id)
+                .or_default()
+                .extend(provider_group_ids);
         }
         Ok(())
     }
@@ -2310,6 +2502,32 @@ impl ManifestSidecarCollector {
         Ok(normalized_sidecar_entries(self.provider_inverted.clone()))
     }
 
+    fn provider_set_component_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
+        if let Some(spool) = self
+            .spools
+            .as_mut()
+            .and_then(|spools| spools.provider_set_component.as_mut())
+        {
+            return spool.entries();
+        }
+        Ok(normalized_sidecar_entries(
+            self.provider_set_component.clone(),
+        ))
+    }
+
+    fn provider_component_group_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
+        if let Some(spool) = self
+            .spools
+            .as_mut()
+            .and_then(|spools| spools.provider_component_group.as_mut())
+        {
+            return spool.entries();
+        }
+        Ok(normalized_sidecar_entries(
+            self.provider_component_group.clone(),
+        ))
+    }
+
     fn provider_npi_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
         if let Some(spool) = self
             .spools
@@ -2344,6 +2562,8 @@ impl ManifestSidecarCollector {
         let spool = match sidecar_name {
             "provider_forward" => spools.provider_forward.as_mut(),
             "provider_inverted" => spools.provider_inverted.as_mut(),
+            "provider_set_component" => spools.provider_set_component.as_mut(),
+            "provider_component_group" => spools.provider_component_group.as_mut(),
             "provider_npi" => spools.provider_npi.as_mut(),
             "price_forward" => spools.price_forward.as_mut(),
             _ => return Ok(None),
@@ -2384,6 +2604,8 @@ fn configured_spooled_manifest_sidecars(
     let ManifestSidecarSpools {
         provider_forward,
         provider_inverted,
+        provider_set_component,
+        provider_component_group,
         provider_npi,
         price_forward,
     } = spools;
@@ -2407,6 +2629,22 @@ fn configured_spooled_manifest_sidecars(
     push_manifest_sidecar_write_job(
         &mut jobs,
         2,
+        "provider_set_component",
+        "manifest_provider_set_component_sidecar_file",
+        paths.manifest_provider_set_component_sidecar.as_deref(),
+        provider_set_component,
+    )?;
+    push_manifest_sidecar_write_job(
+        &mut jobs,
+        3,
+        "provider_component_group",
+        "manifest_provider_component_group_sidecar_file",
+        paths.manifest_provider_component_group_sidecar.as_deref(),
+        provider_component_group,
+    )?;
+    push_manifest_sidecar_write_job(
+        &mut jobs,
+        4,
         "provider_npi",
         "manifest_provider_npi_sidecar_file",
         paths.manifest_provider_npi_sidecar.as_deref(),
@@ -2414,7 +2652,7 @@ fn configured_spooled_manifest_sidecars(
     )?;
     push_manifest_sidecar_write_job(
         &mut jobs,
-        3,
+        5,
         "price_forward",
         "manifest_price_forward_sidecar_file",
         paths.manifest_price_forward_sidecar.as_deref(),
@@ -2666,6 +2904,46 @@ fn emit_configured_manifest_sidecars<W: Write>(
                 "manifest_provider_inverted_sidecar_file",
                 path,
                 &collector.provider_inverted_entries()?,
+                true,
+            )?;
+        }
+    }
+    if let Some(path) = paths.manifest_provider_set_component_sidecar.as_deref() {
+        if let Some((entry_count, _member_count)) =
+            collector.write_spooled_standard_sidecar("provider_set_component", path, true)?
+        {
+            emit_manifest_sidecar_path(
+                writer,
+                "manifest_provider_set_component_sidecar_file",
+                path,
+                entry_count,
+            )?;
+        } else {
+            emit_manifest_sidecar_file(
+                writer,
+                "manifest_provider_set_component_sidecar_file",
+                path,
+                &collector.provider_set_component_entries()?,
+                true,
+            )?;
+        }
+    }
+    if let Some(path) = paths.manifest_provider_component_group_sidecar.as_deref() {
+        if let Some((entry_count, _member_count)) =
+            collector.write_spooled_standard_sidecar("provider_component_group", path, true)?
+        {
+            emit_manifest_sidecar_path(
+                writer,
+                "manifest_provider_component_group_sidecar_file",
+                path,
+                entry_count,
+            )?;
+        } else {
+            emit_manifest_sidecar_file(
+                writer,
+                "manifest_provider_component_group_sidecar_file",
+                path,
+                &collector.provider_component_group_entries()?,
                 true,
             )?;
         }
@@ -4099,6 +4377,7 @@ impl DictionaryCopySinks {
         &mut self,
         provider_ref: &Value,
         dedupe: &SharedDedupe,
+        allow_empty_npi_tin_only: bool,
     ) -> io::Result<()> {
         let Some(groups) = provider_ref
             .get("provider_groups")
@@ -4110,7 +4389,11 @@ impl DictionaryCopySinks {
         let mut manifest_rows_written = 0u64;
         for group in groups {
             let tin = group.get("tin").unwrap_or(&Value::Null);
-            let npi_partition = strict_npi_partition(group.get("npi"))?;
+            let npi_partition = if allow_empty_npi_tin_only {
+                strict_npi_partition_allow_empty_tin_only(group.get("npi"))?
+            } else {
+                strict_npi_partition(group.get("npi"))?
+            };
             let group_hash =
                 provider_group_hash(tin, &npi_partition.valid, &npi_partition.quarantined);
             let npi = npi_partition.valid;
@@ -4543,9 +4826,13 @@ fn process_compact_rate_lites<W: Write>(
                 &network_names,
             )?;
             if let Some(sidecars) = outputs.manifest_sidecars.as_deref_mut() {
+                for (component_hash, component_groups) in &group.provider_entry_components {
+                    sidecars.record_provider_component(*component_hash, component_groups)?;
+                }
                 sidecars.record_provider_set(
                     provider_set_global_id,
                     &sorted_provider_hashes,
+                    &sorted_provider_entry_hashes,
                     &sorted_provider_npis,
                 )?;
             }
@@ -4765,7 +5052,7 @@ fn linked_provider_source_evidence(
     provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     context: &CompactContext,
     selected_npi: i64,
-) -> io::Result<(Value, Option<Vec<u8>>)> {
+) -> io::Result<(Value, Option<ProviderSourceLocator>, Option<[u8; 32]>)> {
     if let Some((group_ordinal, npi_ordinal)) =
         npi_source_coordinate(&rate.provider_groups, selected_npi)
     {
@@ -4775,6 +5062,7 @@ fn linked_provider_source_evidence(
                 "provider_group_ordinal": group_ordinal,
                 "npi_ordinal": npi_ordinal,
             }),
+            None,
             None,
         ));
     }
@@ -4831,7 +5119,8 @@ fn linked_provider_source_evidence(
                 "provider_group_ordinal": group_ordinal,
                 "npi_ordinal": npi_ordinal,
             }),
-            Some(raw_provider),
+            Some(locator),
+            Some(Sha256::digest(&raw_provider).into()),
         ));
     }
     Err(io::Error::new(
@@ -4840,10 +5129,71 @@ fn linked_provider_source_evidence(
     ))
 }
 
+#[derive(Clone, Copy)]
+enum EmittedProviderNpis<'a> {
+    Exact(&'a [i64]),
+    Factor {
+        provider_count: u64,
+        inline_npis: &'a [i64],
+    },
+}
+
+impl EmittedProviderNpis<'_> {
+    fn len(self) -> u64 {
+        match self {
+            Self::Exact(npis) => u64::try_from(npis.len()).unwrap_or(u64::MAX),
+            Self::Factor { provider_count, .. } => provider_count,
+        }
+    }
+
+    fn nth(
+        self,
+        ordinal: u64,
+        rate: &RateLite,
+        provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
+    ) -> io::Result<i64> {
+        match self {
+            Self::Exact(npis) => {
+                let Some(npi) = npis.get(ordinal as usize).copied() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "source witness NPI ordinal is outside the exact provider set",
+                    ));
+                };
+                Ok(npi)
+            }
+            Self::Factor { inline_npis, .. } => {
+                let mut lists = Vec::with_capacity(
+                    rate.provider_refs.len() + usize::from(!inline_npis.is_empty()),
+                );
+                for key in &rate.provider_refs {
+                    let Some(entry) = provider_map.get(key) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unresolved provider reference: {key}"),
+                        ));
+                    };
+                    lists.push(entry.npi.as_slice());
+                }
+                if !inline_npis.is_empty() {
+                    lists.push(inline_npis);
+                }
+                let Some(npi) = sorted_unique_i64_nth(&lists, ordinal) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "source witness NPI ordinal is outside the factored provider set",
+                    ));
+                };
+                Ok(npi)
+            }
+        }
+    }
+}
+
 struct EmittedSourceRateWitnessInput<'a> {
     procedure: &'a Map<String, Value>,
     rate: &'a RateLite,
-    emitted_provider_npis: &'a [i64],
+    emitted_provider_npis: EmittedProviderNpis<'a>,
     emitted_price_count: usize,
     provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     context: &'a CompactContext,
@@ -4874,10 +5224,10 @@ fn capture_emitted_source_rate_occurrences(
             "source witness price population differs from emitted V3 prices",
         ));
     }
-    if emitted_provider_npis.is_empty() || emitted_price_count == 0 {
+    if emitted_provider_npis.len() == 0 || emitted_price_count == 0 {
         return population_delta.record_rate(0);
     }
-    let provider_count = u64::try_from(emitted_provider_npis.len()).map_err(to_io_error)?;
+    let provider_count = emitted_provider_npis.len();
     let price_count = u64::try_from(emitted_price_count).map_err(to_io_error)?;
     let occurrence_count = provider_count.checked_mul(price_count).ok_or_else(|| {
         io::Error::new(
@@ -4886,19 +5236,25 @@ fn capture_emitted_source_rate_occurrences(
         )
     })?;
     population_delta.record_rate(occurrence_count)?;
-    for candidate in context
+    let candidates = context
         .source_witness
         .rate_occurrence_candidates_untracked(
             coordinate,
             procedure_json,
             raw_rate,
             occurrence_count,
-        )?
-    {
+        )?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let rate_source_locator = context
+        .source_witness
+        .store_rate_source(coordinate, procedure, raw_rate)?;
+    for candidate in candidates {
         let price_ordinal = candidate.occurrence_index / provider_count;
         let provider_ordinal = candidate.occurrence_index % provider_count;
-        let selected_npi = emitted_provider_npis[provider_ordinal as usize];
-        let (provider_evidence, linked_provider_raw) =
+        let selected_npi = emitted_provider_npis.nth(provider_ordinal, rate, provider_map)?;
+        let (provider_evidence, linked_provider_locator, linked_provider_sha256) =
             linked_provider_source_evidence(rate, provider_map, context, selected_npi)?;
         context
             .source_witness
@@ -4908,9 +5264,10 @@ fn capture_emitted_source_rate_occurrences(
                 price_ordinal,
                 provider_ordinal,
                 provider_evidence: &provider_evidence,
-                procedure,
+                rate_source_locator,
                 raw_rate,
-                linked_provider_raw: linked_provider_raw.as_deref(),
+                linked_provider_locator,
+                linked_provider_sha256,
                 expected: &source_rate_witness_expected(),
             })?;
     }
@@ -4937,13 +5294,438 @@ fn provider_set_scope_hash(
     )
 }
 
-#[derive(Default)]
 struct ProviderSetScopeCache {
     buckets: HashMap<i64, Vec<ProviderSetScopeCacheEntry>>,
     entry_count: usize,
+    v4_factors: V4ProviderSetFactorCache,
 }
 
 const PROVIDER_SET_SCOPE_CACHE_MAX_ENTRIES: usize = 131_072;
+
+impl Default for ProviderSetScopeCache {
+    fn default() -> Self {
+        Self::with_v4_factor_mode(false)
+    }
+}
+
+impl ProviderSetScopeCache {
+    fn configured(
+        shared: Arc<V4ProviderSetFactorSharedCache>,
+        provider_graph_v4_factor_mode: bool,
+    ) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            entry_count: 0,
+            v4_factors: V4ProviderSetFactorCache::new(provider_graph_v4_factor_mode, shared),
+        }
+    }
+
+    fn with_v4_factor_mode(enabled: bool) -> Self {
+        let shared = Arc::new(V4ProviderSetFactorSharedCache::new(u64::MAX));
+        Self {
+            buckets: HashMap::new(),
+            entry_count: 0,
+            v4_factors: V4ProviderSetFactorCache::new(enabled, shared),
+        }
+    }
+
+    fn v4_factor_mode(&self) -> bool {
+        self.v4_factors.enabled
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct V4ProviderSetFactorMetrics {
+    reference_only_rates: u64,
+    inline_only_rates: u64,
+    mixed_rates: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_resets: u64,
+    npi_union_attempts: u64,
+    flat_group_union_attempts: u64,
+}
+
+#[derive(Debug)]
+struct V4ProviderSetFactorCacheEntry {
+    component_hashes: Vec<i64>,
+    network_names: Vec<String>,
+    provider_set_hash: String,
+    provider_set_global_id: GlobalId128,
+    provider_count: i64,
+}
+
+const V4_PROVIDER_FACTOR_CACHE_SHARDS: usize = 64;
+const DEFAULT_V4_PROVIDER_FACTOR_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+struct V4ProviderSetFactorSharedCache {
+    buckets: Vec<Mutex<HashMap<i64, Vec<Arc<V4ProviderSetFactorCacheEntry>>>>>,
+    entry_count: AtomicU64,
+    estimated_bytes: AtomicU64,
+    max_estimated_bytes: u64,
+    semantic_progress: Arc<ScannerSemanticProgress>,
+}
+
+impl V4ProviderSetFactorSharedCache {
+    fn configured() -> io::Result<Self> {
+        let name = "HLTHPRT_PTG2_V4_FACTOR_CACHE_MAX_BYTES";
+        let max_bytes = match env::var(name) {
+            Ok(raw) => {
+                let Some(max_bytes) = raw.trim().parse::<u64>().ok().filter(|value| *value > 0)
+                else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{name} must be a positive integer byte count"),
+                    ));
+                };
+                max_bytes
+            }
+            Err(env::VarError::NotPresent) => DEFAULT_V4_PROVIDER_FACTOR_CACHE_MAX_BYTES as u64,
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} is unreadable: {error}"),
+                ));
+            }
+        };
+        Ok(Self::new(max_bytes))
+    }
+
+    fn new(max_estimated_bytes: u64) -> Self {
+        Self {
+            buckets: (0..V4_PROVIDER_FACTOR_CACHE_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            entry_count: AtomicU64::new(0),
+            estimated_bytes: AtomicU64::new(0),
+            max_estimated_bytes,
+            semantic_progress: Arc::new(ScannerSemanticProgress::default()),
+        }
+    }
+
+    fn insert_reserved_bytes(&self, amount: u64) -> io::Result<()> {
+        let previous = self.estimated_bytes.fetch_add(amount, Ordering::AcqRel);
+        if previous.saturating_add(amount) > self.max_estimated_bytes {
+            self.estimated_bytes.fetch_sub(amount, Ordering::AcqRel);
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "V4 provider factor cache admission rejected estimated {} bytes above configured limit {}",
+                    previous.saturating_add(amount),
+                    self.max_estimated_bytes,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.entry_count.load(Ordering::Acquire),
+            self.estimated_bytes.load(Ordering::Acquire),
+            self.max_estimated_bytes,
+        )
+    }
+
+    fn semantic_progress(&self) -> Arc<ScannerSemanticProgress> {
+        Arc::clone(&self.semantic_progress)
+    }
+}
+
+struct V4ProviderSetFactorCache {
+    enabled: bool,
+    buckets: HashMap<i64, Vec<Arc<V4ProviderSetFactorCacheEntry>>>,
+    shared: Arc<V4ProviderSetFactorSharedCache>,
+    metrics: V4ProviderSetFactorMetrics,
+}
+
+impl V4ProviderSetFactorCache {
+    fn new(enabled: bool, shared: Arc<V4ProviderSetFactorSharedCache>) -> Self {
+        Self {
+            enabled,
+            buckets: HashMap::new(),
+            shared,
+            metrics: V4ProviderSetFactorMetrics::default(),
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
+        provider_refs: &[ProviderRefKey],
+        inline: Option<&ProviderEntry>,
+        rate: &RateLite,
+        context: &CompactContext,
+    ) -> io::Result<Option<Arc<V4ProviderSetFactorCacheEntry>>> {
+        debug_assert!(self.enabled);
+        match (provider_refs.is_empty(), inline.is_some()) {
+            (false, false) => {
+                self.metrics.reference_only_rates =
+                    self.metrics.reference_only_rates.saturating_add(1)
+            }
+            (true, true) => {
+                self.metrics.inline_only_rates = self.metrics.inline_only_rates.saturating_add(1)
+            }
+            (false, true) => self.metrics.mixed_rates = self.metrics.mixed_rates.saturating_add(1),
+            (true, false) => return Ok(None),
+        }
+
+        // Only component IDs and small network labels participate in the hot
+        // cache probe. The exact group/NPI unions run only on a shared cache
+        // miss and are streamed without retaining the expanded vectors.
+        let mut component_hashes =
+            Vec::with_capacity(provider_refs.len() + usize::from(inline.is_some()));
+        let mut provider_network_names = Vec::new();
+        let mut components = BTreeMap::new();
+        for key in provider_refs {
+            let Some(entry) = provider_map.get(key) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unresolved provider reference: {key}"),
+                ));
+            };
+            component_hashes.push(entry.entry_hash);
+            provider_network_names.extend(entry.network_names.iter().cloned());
+            components.entry(entry.entry_hash).or_insert(entry);
+        }
+        if let Some(entry) = inline {
+            component_hashes.push(entry.entry_hash);
+            provider_network_names.extend(entry.network_names.iter().cloned());
+            components.entry(entry.entry_hash).or_insert(entry);
+        }
+        component_hashes.sort_unstable();
+        component_hashes.dedup();
+        provider_network_names = canonical_text_list(provider_network_names, false);
+        if component_hashes.is_empty() {
+            return Ok(None);
+        }
+        let network_names = rate_network_names(rate, &provider_network_names, context);
+        let component_key =
+            checksum_i64_list("provider_set_factor_components_v1", &component_hashes);
+        let network_key = hash_string_list("provider_set_factor_networks_v1", &network_names);
+        let mut key_payload = component_key.to_string();
+        key_payload.push('\x1f');
+        key_payload.push_str(&network_key);
+        let bucket_key = xxh3_63(key_payload.as_bytes()) as i64;
+        if let Some(entry_index) = self.buckets.get(&bucket_key).and_then(|bucket| {
+            bucket.iter().position(|entry| {
+                entry.component_hashes == component_hashes && entry.network_names == network_names
+            })
+        }) {
+            self.metrics.cache_hits = self.metrics.cache_hits.saturating_add(1);
+            return Ok(self
+                .buckets
+                .get(&bucket_key)
+                .and_then(|bucket| bucket.get(entry_index))
+                .cloned());
+        }
+
+        self.metrics.cache_misses = self.metrics.cache_misses.saturating_add(1);
+        let shared_index = (bucket_key as u64 as usize) % self.shared.buckets.len();
+        let mut shared_bucket = self.shared.buckets[shared_index].lock().unwrap();
+        let shared_entry = if let Some(entry) = shared_bucket
+            .get(&bucket_key)
+            .and_then(|bucket| {
+                bucket.iter().find(|entry| {
+                    entry.component_hashes == component_hashes
+                        && entry.network_names == network_names
+                })
+            })
+            .cloned()
+        {
+            entry
+        } else {
+            let group_lists = components
+                .values()
+                .map(|entry| entry.provider_group_hashes.as_slice())
+                .collect::<Vec<_>>();
+            let npi_lists = components
+                .values()
+                .map(|entry| entry.npi.as_slice())
+                .collect::<Vec<_>>();
+            let (provider_set_hash, provider_set_global_id) =
+                legacy_provider_set_identity_from_sorted_lists(
+                    &group_lists,
+                    &network_names,
+                    self.shared.semantic_progress.as_ref(),
+                )?;
+            let provider_count =
+                i64::try_from(sorted_unique_i64_count_with_visits(&npi_lists, |amount| {
+                    self.shared
+                        .semantic_progress
+                        .record_provider_npi_union_visits(amount);
+                }))
+                .unwrap_or(i64::MAX);
+            let entry = Arc::new(V4ProviderSetFactorCacheEntry {
+                component_hashes: component_hashes.clone(),
+                network_names: network_names.clone(),
+                provider_set_hash,
+                provider_set_global_id,
+                provider_count,
+            });
+            let estimated_bytes = estimated_v4_factor_entry_bytes(&entry);
+            self.shared.insert_reserved_bytes(estimated_bytes)?;
+            shared_bucket
+                .entry(bucket_key)
+                .or_default()
+                .push(Arc::clone(&entry));
+            self.shared.entry_count.fetch_add(1, Ordering::AcqRel);
+            self.metrics.flat_group_union_attempts =
+                self.metrics.flat_group_union_attempts.saturating_add(1);
+            self.metrics.npi_union_attempts = self.metrics.npi_union_attempts.saturating_add(1);
+            entry
+        };
+        drop(shared_bucket);
+        self.buckets
+            .entry(bucket_key)
+            .or_default()
+            .push(Arc::clone(&shared_entry));
+        Ok(Some(shared_entry))
+    }
+}
+
+fn estimated_v4_factor_entry_bytes(entry: &V4ProviderSetFactorCacheEntry) -> u64 {
+    let strings = entry
+        .network_names
+        .iter()
+        .map(|value| value.capacity() as u64)
+        .sum::<u64>();
+    (std::mem::size_of::<V4ProviderSetFactorCacheEntry>() as u64)
+        .saturating_add((entry.component_hashes.capacity() * std::mem::size_of::<i64>()) as u64)
+        .saturating_add((entry.network_names.capacity() * std::mem::size_of::<String>()) as u64)
+        .saturating_add(strings)
+        .saturating_add(entry.provider_set_hash.capacity() as u64)
+        // Conservatively cover the shared HashMap bucket plus per-worker
+        // front-cache Arc/map entries without retaining any union members.
+        .saturating_add(1024)
+}
+
+const SEMANTIC_UNION_VISIT_BATCH: u64 = 65_536;
+
+fn for_each_sorted_unique_i64_with_visits(
+    lists: &[&[i64]],
+    mut consume: impl FnMut(i64),
+    mut record_visits: impl FnMut(u64),
+) -> u64 {
+    let mut heap = BinaryHeap::new();
+    for (list_index, list) in lists.iter().enumerate() {
+        if let Some(&value) = list.first() {
+            heap.push(Reverse((value, list_index, 0usize)));
+        }
+    }
+    let mut previous = None;
+    let mut count = 0u64;
+    let mut pending_visits = 0u64;
+    while let Some(Reverse((value, list_index, item_index))) = heap.pop() {
+        pending_visits = pending_visits.saturating_add(1);
+        if pending_visits >= SEMANTIC_UNION_VISIT_BATCH {
+            record_visits(pending_visits);
+            pending_visits = 0;
+        }
+        if previous != Some(value) {
+            consume(value);
+            count = count.saturating_add(1);
+            previous = Some(value);
+        }
+        let next_index = item_index + 1;
+        if let Some(&next) = lists[list_index].get(next_index) {
+            heap.push(Reverse((next, list_index, next_index)));
+        }
+    }
+    record_visits(pending_visits);
+    count
+}
+
+fn sorted_unique_i64_count_with_visits(lists: &[&[i64]], record_visits: impl FnMut(u64)) -> u64 {
+    for_each_sorted_unique_i64_with_visits(lists, |_| {}, record_visits)
+}
+
+fn sorted_unique_i64_nth(lists: &[&[i64]], wanted: u64) -> Option<i64> {
+    let mut heap = BinaryHeap::new();
+    for (list_index, list) in lists.iter().enumerate() {
+        if let Some(&value) = list.first() {
+            heap.push(Reverse((value, list_index, 0usize)));
+        }
+    }
+    let mut previous = None;
+    let mut ordinal = 0u64;
+    while let Some(Reverse((value, list_index, item_index))) = heap.pop() {
+        if previous != Some(value) {
+            if ordinal == wanted {
+                return Some(value);
+            }
+            ordinal = ordinal.saturating_add(1);
+            previous = Some(value);
+        }
+        let next_index = item_index + 1;
+        if let Some(&next) = lists[list_index].get(next_index) {
+            heap.push(Reverse((next, list_index, next_index)));
+        }
+    }
+    None
+}
+
+fn update_v4_factor_hash_field(hasher: &mut Xxh3, value: &[u8]) {
+    let mut length = itoa::Buffer::new();
+    hasher.update(b"\x1f");
+    hasher.update(length.format(value.len()).as_bytes());
+    hasher.update(b":");
+    hasher.update(value);
+}
+
+fn legacy_provider_set_identity_from_sorted_lists(
+    group_lists: &[&[i64]],
+    network_names: &[String],
+    semantic_progress: &ScannerSemanticProgress,
+) -> io::Result<(String, GlobalId128)> {
+    let group_count = sorted_unique_i64_count_with_visits(group_lists, |amount| {
+        semantic_progress.record_provider_group_union_visits(amount);
+    });
+    let group_count = match usize::try_from(group_count) {
+        Ok(group_count) => group_count,
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V4 provider group union exceeds addressable identity width",
+            ));
+        }
+    };
+    let mut member_hasher = Xxh3::new();
+    member_hasher.update(b"provider_set_members_v1");
+    member_hasher.update(b"I");
+    let mut count_buffer = itoa::Buffer::new();
+    update_v4_factor_hash_field(
+        &mut member_hasher,
+        count_buffer.format(group_count).as_bytes(),
+    );
+    let mut global_hasher = Xxh3::new();
+    global_hasher.update(b"provider_set_network_manifest_v1");
+    for_each_sorted_unique_i64_with_visits(
+        group_lists,
+        |group| {
+            let mut value_buffer = itoa::Buffer::new();
+            update_v4_factor_hash_field(&mut member_hasher, value_buffer.format(group).as_bytes());
+            global_hasher.update(b"\x1fgroup:");
+            global_hasher.update(&group.to_le_bytes());
+        },
+        |amount| {
+            semantic_progress.record_provider_group_union_visits(amount);
+        },
+    );
+    let group_digest = format!("{:016x}", member_hasher.digest() & ((1u64 << 63) - 1));
+    let provider_set_hash = hash_text(
+        "provider_set_network_scope_v1",
+        &[
+            group_digest,
+            hash_string_list("provider_set_network_names_v1", network_names),
+        ],
+    );
+    update_hash_string_list(&mut global_hasher, network_names);
+    Ok((
+        provider_set_hash,
+        GlobalId128(global_hasher.digest128().to_le_bytes()),
+    ))
+}
 
 struct ProviderSetScopeCacheEntry {
     provider_group_hashes: Vec<i64>,
@@ -5310,6 +6092,15 @@ struct CompactWorkerMetrics {
     local_price_set_dedupe_resets: u64,
     local_price_atom_dedupe_resets: u64,
     local_provider_set_dedupe_resets: u64,
+    provider_graph_v4_factor_mode: bool,
+    provider_graph_v4_reference_only_rates: u64,
+    provider_graph_v4_inline_only_rates: u64,
+    provider_graph_v4_mixed_rates: u64,
+    provider_graph_v4_factor_cache_hits: u64,
+    provider_graph_v4_factor_cache_misses: u64,
+    provider_graph_v4_factor_cache_resets: u64,
+    provider_graph_v4_npi_union_attempts: u64,
+    provider_graph_v4_flat_group_union_attempts: u64,
 }
 
 impl CompactWorkerMetrics {
@@ -5339,6 +6130,16 @@ impl CompactWorkerMetrics {
             "local_price_set_dedupe_resets": self.local_price_set_dedupe_resets,
             "local_price_atom_dedupe_resets": self.local_price_atom_dedupe_resets,
             "local_provider_set_dedupe_resets": self.local_provider_set_dedupe_resets,
+            "factor_mode": self.provider_graph_v4_factor_mode,
+            "provider_graph_v4_factor_mode": self.provider_graph_v4_factor_mode,
+            "provider_graph_v4_reference_only_rates": self.provider_graph_v4_reference_only_rates,
+            "provider_graph_v4_inline_only_rates": self.provider_graph_v4_inline_only_rates,
+            "provider_graph_v4_mixed_rates": self.provider_graph_v4_mixed_rates,
+            "provider_graph_v4_factor_cache_hits": self.provider_graph_v4_factor_cache_hits,
+            "provider_graph_v4_factor_cache_misses": self.provider_graph_v4_factor_cache_misses,
+            "provider_graph_v4_factor_cache_resets": self.provider_graph_v4_factor_cache_resets,
+            "provider_graph_v4_npi_union_attempts": self.provider_graph_v4_npi_union_attempts,
+            "provider_graph_v4_flat_group_union_attempts": self.provider_graph_v4_flat_group_union_attempts,
             "elapsed_seconds": elapsed_seconds,
             "jobs_per_second": if elapsed_seconds > 0.0 { self.jobs as f64 / elapsed_seconds } else { 0.0 },
             "rates_per_second": if elapsed_seconds > 0.0 { self.rates_seen as f64 / elapsed_seconds } else { 0.0 },
@@ -5378,17 +6179,24 @@ impl WorkerJob {
     }
 }
 
+struct ProviderRefBatchContext<'a> {
+    dedupe: &'a SharedDedupe,
+    source_witness: &'a SourceWitnessCollector,
+    manifest_sidecars: Option<&'a Arc<Mutex<ManifestSidecarCollector>>>,
+    allow_empty_npi_tin_only: bool,
+}
+
 fn process_provider_ref_raw_batch_with_metrics(
     raw_refs: &RawRateChunk,
     provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
-    dedupe: &SharedDedupe,
-    source_witness: &SourceWitnessCollector,
+    context: ProviderRefBatchContext<'_>,
     metrics: &mut ProviderRefWorkerMetrics,
 ) -> io::Result<()> {
     for (coordinate, raw_ref) in raw_refs.iter_with_coordinates() {
-        let witness_priority =
-            source_witness.provider_priority_if_candidate(coordinate, raw_ref)?;
+        let witness_priority = context
+            .source_witness
+            .provider_priority_if_candidate(coordinate, raw_ref)?;
         let parse_started_at = Instant::now();
         let value = parse_json_value_from_raw_bytes(raw_ref)?;
         metrics.parse_micros = metrics
@@ -5396,16 +6204,19 @@ fn process_provider_ref_raw_batch_with_metrics(
             .saturating_add(parse_started_at.elapsed().as_micros());
 
         let transform_started_at = Instant::now();
-        let provider_entry = provider_ref_definition(&value)?;
+        let provider_entry =
+            provider_ref_definition_audited(&value, context.allow_empty_npi_tin_only)?;
         metrics.transform_micros = metrics
             .transform_micros
             .saturating_add(transform_started_at.elapsed().as_micros());
 
-        let (key, mut entry) = provider_entry;
-        let source_locator = source_witness.store_provider_source(metrics.worker_id, raw_ref)?;
+        let (key, mut entry, empty_npi_tin_only_normalization_count) = provider_entry;
+        let source_locator = context
+            .source_witness
+            .store_provider_source(metrics.worker_id, raw_ref)?;
         entry.source_locator = Some(source_locator);
         if let Some(priority) = witness_priority {
-            source_witness.commit_provider_reference(
+            context.source_witness.commit_provider_reference(
                 priority,
                 coordinate,
                 source_locator,
@@ -5413,9 +6224,20 @@ fn process_provider_ref_raw_batch_with_metrics(
                 &source_provider_witness_expected(&key, &entry),
             )?;
         }
+        if let Some(sidecars) = context.manifest_sidecars {
+            lock_manifest_sidecars(sidecars)
+                .record_provider_component(entry.entry_hash, &entry.provider_group_hashes)?;
+        }
         insert_provider_definition(provider_map, key, entry)?;
+        context
+            .dedupe
+            .record_empty_npi_tin_only_normalizations(empty_npi_tin_only_normalization_count);
         let write_started_at = Instant::now();
-        dictionary_copy_sinks.write_provider_group_members_shared(&value, dedupe)?;
+        dictionary_copy_sinks.write_provider_group_members_shared(
+            &value,
+            context.dedupe,
+            context.allow_empty_npi_tin_only,
+        )?;
         metrics.write_micros = metrics
             .write_micros
             .saturating_add(write_started_at.elapsed().as_micros());
@@ -5430,6 +6252,7 @@ fn process_provider_ref_raw_batch(
     provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     dedupe: &SharedDedupe,
+    allow_empty_npi_tin_only: bool,
 ) -> io::Result<u64> {
     let mut metrics = ProviderRefWorkerMetrics::default();
     let source_witness = SourceWitnessCollector::new(&"00".repeat(32))?;
@@ -5438,8 +6261,12 @@ fn process_provider_ref_raw_batch(
         raw_refs,
         provider_map,
         dictionary_copy_sinks,
-        dedupe,
-        &source_witness,
+        ProviderRefBatchContext {
+            dedupe,
+            source_witness: &source_witness,
+            manifest_sidecars: None,
+            allow_empty_npi_tin_only,
+        },
         &mut metrics,
     )?;
     Ok(metrics.provider_refs)
@@ -5449,10 +6276,12 @@ fn process_provider_ref_raw_batch(
 struct ProviderRefWorkerConfig {
     dedupe: Arc<SharedDedupe>,
     source_witness: Arc<SourceWitnessCollector>,
+    manifest_sidecars: Option<Arc<Mutex<ManifestSidecarCollector>>>,
     copy_paths: CopyPathConfig,
     rotate_bytes: u64,
     queue_bytes: Arc<QueueByteMetrics>,
     recycle_tx: Option<Sender<RawRateChunk>>,
+    allow_empty_npi_tin_only: bool,
 }
 
 fn provider_ref_worker_loop(
@@ -5479,8 +6308,12 @@ fn provider_ref_worker_loop(
             &raw_refs,
             &mut provider_map,
             &mut dictionary_copy_sinks,
-            &config.dedupe,
-            &config.source_witness,
+            ProviderRefBatchContext {
+                dedupe: &config.dedupe,
+                source_witness: &config.source_witness,
+                manifest_sidecars: config.manifest_sidecars.as_ref(),
+                allow_empty_npi_tin_only: config.allow_empty_npi_tin_only,
+            },
             &mut metrics,
         )?;
         let write_started_at = Instant::now();
@@ -6281,7 +7114,7 @@ fn provider_entry_view_for_worker_rate<'a>(
     }
 
     let provider_ref = json!({"provider_groups": rate.provider_groups});
-    dictionary_copy_sinks.write_provider_group_members_shared(&provider_ref, dedupe)?;
+    dictionary_copy_sinks.write_provider_group_members_shared(&provider_ref, dedupe, false)?;
     let inline_entry = build_provider_entry(&provider_ref)?;
     dedupe.record_quarantined_provider_identifiers(&inline_entry.quarantined_npi)?;
     if rate.provider_refs.is_empty() {
@@ -6295,6 +7128,152 @@ fn provider_entry_view_for_worker_rate<'a>(
         referenced_entry,
         inline_entry,
     ))))
+}
+
+enum ResolvedWorkerProvider<'a> {
+    Legacy {
+        entry: ProviderEntryView<'a>,
+        component_hashes: [i64; 1],
+    },
+    V4Factor {
+        entry: Arc<V4ProviderSetFactorCacheEntry>,
+        inline_component: Option<(i64, Vec<i64>, Vec<i64>)>,
+    },
+}
+
+impl ResolvedWorkerProvider<'_> {
+    fn component_hashes(&self) -> &[i64] {
+        match self {
+            Self::Legacy {
+                component_hashes, ..
+            } => component_hashes,
+            Self::V4Factor { entry, .. } => &entry.component_hashes,
+        }
+    }
+
+    fn provider_group_hashes(&self) -> &[i64] {
+        match self {
+            Self::Legacy { entry, .. } => entry.provider_group_hashes(),
+            Self::V4Factor { .. } => &[],
+        }
+    }
+
+    fn provider_npis(&self) -> &[i64] {
+        match self {
+            Self::Legacy { entry, .. } => entry.npi(),
+            Self::V4Factor { .. } => &[],
+        }
+    }
+
+    fn provider_count(&self) -> i64 {
+        match self {
+            Self::Legacy { entry, .. } => entry.provider_count(),
+            Self::V4Factor { entry, .. } => entry.provider_count,
+        }
+    }
+
+    fn is_v4_factor(&self) -> bool {
+        matches!(self, Self::V4Factor { .. })
+    }
+
+    fn inline_component(&self) -> Option<(i64, &[i64])> {
+        match self {
+            Self::V4Factor {
+                inline_component: Some((component, groups, _)),
+                ..
+            } => Some((*component, groups)),
+            _ => None,
+        }
+    }
+
+    fn legacy_entry(&self) -> Option<&ProviderEntryView<'_>> {
+        match self {
+            Self::Legacy { entry, .. } => Some(entry),
+            Self::V4Factor { .. } => None,
+        }
+    }
+
+    fn factor_entry(&self) -> Option<&V4ProviderSetFactorCacheEntry> {
+        match self {
+            Self::V4Factor { entry, .. } => Some(entry),
+            Self::Legacy { .. } => None,
+        }
+    }
+
+    fn factor_inline_npis(&self) -> &[i64] {
+        match self {
+            Self::V4Factor {
+                inline_component: Some((_, _, npis)),
+                ..
+            } => npis,
+            _ => &[],
+        }
+    }
+
+    fn emitted_npis(&self) -> EmittedProviderNpis<'_> {
+        match self {
+            Self::Legacy { entry, .. } => EmittedProviderNpis::Exact(entry.npi()),
+            Self::V4Factor { entry, .. } => EmittedProviderNpis::Factor {
+                provider_count: u64::try_from(entry.provider_count).unwrap_or(u64::MAX),
+                inline_npis: self.factor_inline_npis(),
+            },
+        }
+    }
+}
+
+fn resolve_worker_provider<'a>(
+    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
+    rate: &RateLite,
+    dictionary_copy_sinks: &mut DictionaryCopySinks,
+    dedupe: &SharedDedupe,
+    provider_set_scope_cache: &mut ProviderSetScopeCache,
+    context: &CompactContext,
+) -> io::Result<Option<ResolvedWorkerProvider<'a>>> {
+    if !provider_set_scope_cache.v4_factor_mode() {
+        let Some(entry) =
+            provider_entry_view_for_worker_rate(provider_map, rate, dictionary_copy_sinks, dedupe)?
+        else {
+            return Ok(None);
+        };
+        let component_hashes = [entry.entry_hash()];
+        return Ok(Some(ResolvedWorkerProvider::Legacy {
+            entry,
+            component_hashes,
+        }));
+    }
+
+    let inline_entry = if rate.provider_groups.is_empty() {
+        None
+    } else {
+        let provider_ref = json!({"provider_groups": rate.provider_groups});
+        dictionary_copy_sinks.write_provider_group_members_shared(&provider_ref, dedupe, true)?;
+        let (inline_entry, empty_npi_tin_only_normalization_count) =
+            build_provider_entry_audited(&provider_ref, true)?;
+        dedupe.record_empty_npi_tin_only_normalizations(empty_npi_tin_only_normalization_count);
+        dedupe.record_quarantined_provider_identifiers(&inline_entry.quarantined_npi)?;
+        Some(inline_entry)
+    };
+    let inline_component = inline_entry.as_ref().map(|entry| {
+        (
+            entry.entry_hash,
+            entry.provider_group_hashes.clone(),
+            entry.npi.clone(),
+        )
+    });
+    let Some(entry) = provider_set_scope_cache.v4_factors.resolve(
+        provider_map,
+        &rate.provider_refs,
+        inline_entry.as_ref(),
+        rate,
+        context,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ResolvedWorkerProvider::V4Factor {
+        entry,
+        inline_component,
+    }))
 }
 
 fn process_compact_rate_lites_worker<W: Write>(
@@ -6454,51 +7433,39 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
     if !group_negotiated_rate_chunks {
         let mut code_count_rows = 0usize;
         for (rate_index, rate) in rates.iter().enumerate() {
+            provider_set_scope_cache
+                .v4_factors
+                .shared
+                .semantic_progress
+                .record_negotiated_rate_transform_started();
             let source_input = source_inputs.map(|inputs| inputs[rate_index]);
-            let provider_entry = if rate.provider_groups.is_empty() && rate.provider_refs.len() == 1
+            if let Some(unresolved_reference) = rate
+                .provider_refs
+                .iter()
+                .find(|provider_reference| !provider_map.contains_key(*provider_reference))
             {
-                let provider_reference = &rate.provider_refs[0];
-                match provider_map.get(provider_reference) {
-                    Some(provider_entry) => ProviderEntryView::Borrowed(provider_entry),
-                    None if source_input.is_some() => {
-                        mark_source_rate_unqueryable(&mut source_witness_population)?;
-                        continue;
-                    }
-                    None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unresolved provider reference: {provider_reference}"),
-                        ));
-                    }
-                }
-            } else {
-                if let Some(unresolved_reference) = rate
-                    .provider_refs
-                    .iter()
-                    .find(|provider_reference| !provider_map.contains_key(*provider_reference))
-                {
-                    if source_input.is_some() {
-                        mark_source_rate_unqueryable(&mut source_witness_population)?;
-                        continue;
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unresolved provider reference: {unresolved_reference}"),
-                    ));
-                }
-                let Some(provider_entry) = provider_entry_view_for_worker_rate(
-                    provider_map,
-                    rate,
-                    dictionary_copy_sinks,
-                    dedupe,
-                )?
-                else {
-                    if source_input.is_some() {
-                        mark_source_rate_unqueryable(&mut source_witness_population)?;
-                    }
+                if source_input.is_some() {
+                    mark_source_rate_unqueryable(&mut source_witness_population)?;
                     continue;
-                };
-                provider_entry
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unresolved provider reference: {unresolved_reference}"),
+                ));
+            }
+            let Some(provider_resolution) = resolve_worker_provider(
+                provider_map,
+                rate,
+                dictionary_copy_sinks,
+                dedupe,
+                provider_set_scope_cache,
+                context,
+            )?
+            else {
+                if source_input.is_some() {
+                    mark_source_rate_unqueryable(&mut source_witness_population)?;
+                }
+                continue;
             };
             let Some(price_set) = rate_price_set(rate) else {
                 if source_input.is_some() {
@@ -6506,19 +7473,36 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 }
                 continue;
             };
-            let sorted_provider_entry_hashes = [provider_entry.entry_hash()];
-            let sorted_provider_hashes = provider_entry.provider_group_hashes();
-            let sorted_provider_npis = provider_entry.npi();
-            let provider_count = if sorted_provider_npis.is_empty() {
-                provider_entry.provider_count()
-            } else {
-                i64::try_from(sorted_provider_npis.len()).unwrap_or(i64::MAX)
-            };
-            let provider_set_scope =
-                provider_set_scope_cache.resolve(&provider_entry, rate, context);
-            let provider_set_hash = provider_set_scope.provider_set_hash;
-            let provider_set_global_id = provider_set_scope.provider_set_global_id;
-            let network_names = provider_set_scope.network_names;
+            let sorted_provider_entry_hashes = provider_resolution.component_hashes();
+            let sorted_provider_hashes = provider_resolution.provider_group_hashes();
+            let sorted_provider_npis = provider_resolution.provider_npis();
+            let provider_count = provider_resolution.provider_count();
+            let (provider_set_hash, provider_set_global_id, network_names) =
+                if provider_resolution.is_v4_factor() {
+                    let entry = provider_resolution
+                        .factor_entry()
+                        .expect("factor provider resolution has an exact identity");
+                    (
+                        entry.provider_set_hash.clone(),
+                        entry.provider_set_global_id,
+                        entry.network_names.clone(),
+                    )
+                } else {
+                    let provider_set_scope = provider_set_scope_cache.resolve(
+                        provider_resolution
+                            .legacy_entry()
+                            .expect("legacy provider resolution has an entry"),
+                        rate,
+                        context,
+                    );
+                    (
+                        provider_set_scope.provider_set_hash.to_owned(),
+                        provider_set_scope.provider_set_global_id,
+                        provider_set_scope.network_names.to_vec(),
+                    )
+                };
+            let provider_set_hash = provider_set_hash.as_str();
+            let network_names = network_names.as_slice();
             let legacy_price_set_id =
                 (!state.suppress_legacy_row_output).then(|| price_set.global_id.to_hex());
             let legacy_identity = legacy_serving_identity(
@@ -6566,55 +7550,79 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                     network_names,
                 )?;
                 if let Some(sidecars) = manifest_sidecars {
-                    lock_manifest_sidecars(sidecars).record_provider_set(
-                        provider_set_global_id,
-                        sorted_provider_hashes,
-                        sorted_provider_npis,
-                    )?;
+                    let mut sidecars = lock_manifest_sidecars(sidecars);
+                    if provider_resolution.is_v4_factor() {
+                        if let Some((component_hash, component_groups)) =
+                            provider_resolution.inline_component()
+                        {
+                            sidecars.record_provider_component(component_hash, component_groups)?;
+                        }
+                        sidecars.record_provider_set(
+                            provider_set_global_id,
+                            &[],
+                            sorted_provider_entry_hashes,
+                            &[],
+                        )?;
+                    } else {
+                        if rate.provider_refs.len() != 1 || !rate.provider_groups.is_empty() {
+                            sidecars.record_provider_component(
+                                sorted_provider_entry_hashes[0],
+                                sorted_provider_hashes,
+                            )?;
+                        }
+                        sidecars.record_provider_set(
+                            provider_set_global_id,
+                            sorted_provider_hashes,
+                            sorted_provider_entry_hashes,
+                            sorted_provider_npis,
+                        )?;
+                    }
                 }
-                if !dictionary_copy_sinks.write_provider_set(
-                    provider_set_hash,
-                    provider_count,
-                    sorted_provider_hashes,
-                )? && !state.suppress_legacy_row_output
-                {
-                    emit_json_record(
-                        writer,
-                        "provider_set",
-                        &json!({
-                            "provider_set_hash": provider_set_hash,
-                            "hash_prefix": &provider_set_hash[..provider_set_hash.len().min(16)],
-                            "provider_count": provider_count,
-                            "npi": Value::Null,
-                            "tin_type": "set",
-                            "tin_value": Value::Null,
-                            "canonical_payload": {
-                                "provider_group_hashes": sorted_provider_hashes,
-                                "provider_group_count": sorted_provider_hashes.len(),
+                if !provider_resolution.is_v4_factor() {
+                    if !dictionary_copy_sinks.write_provider_set(
+                        provider_set_hash,
+                        provider_count,
+                        sorted_provider_hashes,
+                    )? && !state.suppress_legacy_row_output
+                    {
+                        emit_json_record(
+                            writer,
+                            "provider_set",
+                            &json!({
+                                "provider_set_hash": provider_set_hash,
+                                "hash_prefix": &provider_set_hash[..provider_set_hash.len().min(16)],
                                 "provider_count": provider_count,
-                                "provider_count_mode": "exact_npi_union",
-                                "npi_inline": false,
+                                "npi": Value::Null,
                                 "tin_type": "set",
                                 "tin_value": Value::Null,
-                            },
-                        }),
+                                "canonical_payload": {
+                                    "provider_group_hashes": sorted_provider_hashes,
+                                    "provider_group_count": sorted_provider_hashes.len(),
+                                    "provider_count": provider_count,
+                                    "provider_count_mode": "exact_npi_union",
+                                    "npi_inline": false,
+                                    "tin_type": "set",
+                                    "tin_value": Value::Null,
+                                },
+                            }),
+                        )?;
+                    }
+                    dictionary_copy_sinks.write_provider_set_entries_shared(
+                        provider_set_hash,
+                        sorted_provider_entry_hashes,
+                        dedupe,
+                    )?;
+                    dictionary_copy_sinks.write_provider_set_components_shared(
+                        provider_set_hash,
+                        sorted_provider_hashes,
+                        dedupe,
+                    )?;
+                    dictionary_copy_sinks.write_provider_entry_components_shared(
+                        sorted_provider_entry_hashes[0],
+                        sorted_provider_hashes,
+                        dedupe,
                     )?;
                 }
-                dictionary_copy_sinks.write_provider_set_entries_shared(
-                    provider_set_hash,
-                    &sorted_provider_entry_hashes,
-                    dedupe,
-                )?;
-                dictionary_copy_sinks.write_provider_set_components_shared(
-                    provider_set_hash,
-                    sorted_provider_hashes,
-                    dedupe,
-                )?;
-                dictionary_copy_sinks.write_provider_entry_components_shared(
-                    provider_entry.entry_hash(),
-                    sorted_provider_hashes,
-                    dedupe,
-                )?;
             }
             let unique_for_legacy = match legacy_identity {
                 Some(legacy_identity) => {
@@ -6697,7 +7705,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                     capture_emitted_source_rate_occurrences(EmittedSourceRateWitnessInput {
                         procedure: source_procedure.expect("source procedure validated above"),
                         rate,
-                        emitted_provider_npis: provider_entry.npi(),
+                        emitted_provider_npis: provider_resolution.emitted_npis(),
                         emitted_price_count: price_set.atoms.len(),
                         provider_map,
                         context,
@@ -6836,9 +7844,14 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                 &network_names,
             )?;
             if let Some(sidecars) = manifest_sidecars {
-                lock_manifest_sidecars(sidecars).record_provider_set(
+                let mut sidecars = lock_manifest_sidecars(sidecars);
+                for (component_hash, component_groups) in &group.provider_entry_components {
+                    sidecars.record_provider_component(*component_hash, component_groups)?;
+                }
+                sidecars.record_provider_set(
                     provider_set_global_id,
                     &sorted_provider_hashes,
+                    &sorted_provider_entry_hashes,
                     &sorted_provider_npis,
                 )?;
             }
@@ -6983,6 +7996,7 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
 
 fn read_rate_lite_struson<R: Read>(
     json_reader: &mut JsonStreamReader<R>,
+    allow_empty_npi_tin_only: bool,
 ) -> io::Result<Option<RateLite>> {
     let mut provider_refs: Vec<ProviderRefKey> = Vec::new();
     let mut provider_groups: Vec<Value> = Vec::new();
@@ -7002,7 +8016,11 @@ fn read_rate_lite_struson<R: Read>(
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                    strict_npi_list(value.get("npi"))?;
+                    if allow_empty_npi_tin_only {
+                        strict_npi_partition_allow_empty_tin_only(value.get("npi"))?;
+                    } else {
+                        strict_npi_list(value.get("npi"))?;
+                    }
                     provider_groups.push(value);
                 }
                 json_reader.end_array().map_err(to_io_error)?;
@@ -7102,7 +8120,10 @@ fn trim_optional_wire_text(value: Option<String>) -> Option<String> {
     }
 }
 
-fn read_rate_lite_bytes_typed(raw: &[u8]) -> io::Result<Option<RateLite>> {
+fn read_rate_lite_bytes_typed(
+    raw: &[u8],
+    allow_empty_npi_tin_only: bool,
+) -> io::Result<Option<RateLite>> {
     let wire: RateLiteWire = serde_json::from_slice(raw).map_err(to_io_error)?;
     let mut provider_refs = Vec::with_capacity(wire.provider_references.len());
     for provider_reference in wire.provider_references {
@@ -7112,7 +8133,11 @@ fn read_rate_lite_bytes_typed(raw: &[u8]) -> io::Result<Option<RateLite>> {
         )?);
     }
     for provider_group in &wire.provider_groups {
-        strict_npi_list(provider_group.get("npi"))?;
+        if allow_empty_npi_tin_only {
+            strict_npi_partition_allow_empty_tin_only(provider_group.get("npi"))?;
+        } else {
+            strict_npi_list(provider_group.get("npi"))?;
+        }
     }
     if provider_refs.is_empty() && wire.provider_groups.is_empty() {
         return Err(io::Error::new(
@@ -7158,16 +8183,34 @@ fn read_rate_lite_bytes_typed(raw: &[u8]) -> io::Result<Option<RateLite>> {
     }))
 }
 
-fn read_rate_lite_bytes_streaming(raw: &[u8]) -> io::Result<Option<RateLite>> {
+fn read_rate_lite_bytes_streaming(
+    raw: &[u8],
+    allow_empty_npi_tin_only: bool,
+) -> io::Result<Option<RateLite>> {
     std::str::from_utf8(raw).map_err(to_io_error)?;
-    read_rate_lite_from_reader(raw)
+    let mut json_reader = JsonStreamReader::new(raw);
+    let rate = read_rate_lite_struson(&mut json_reader, allow_empty_npi_tin_only)?;
+    json_reader
+        .consume_trailing_whitespace()
+        .map_err(to_io_error)?;
+    Ok(rate)
 }
 
-fn read_rate_lite_bytes_profiled(raw: &[u8]) -> io::Result<(Option<RateLite>, bool)> {
-    match read_rate_lite_bytes_typed(raw) {
+fn read_rate_lite_bytes_profiled_with_policy(
+    raw: &[u8],
+    allow_empty_npi_tin_only: bool,
+) -> io::Result<(Option<RateLite>, bool)> {
+    match read_rate_lite_bytes_typed(raw, allow_empty_npi_tin_only) {
         Ok(rate) => Ok((rate, true)),
-        Err(_) => read_rate_lite_bytes_streaming(raw).map(|rate| (rate, false)),
+        Err(_) => {
+            read_rate_lite_bytes_streaming(raw, allow_empty_npi_tin_only).map(|rate| (rate, false))
+        }
     }
+}
+
+#[cfg(test)]
+fn read_rate_lite_bytes_profiled(raw: &[u8]) -> io::Result<(Option<RateLite>, bool)> {
+    read_rate_lite_bytes_profiled_with_policy(raw, false)
 }
 
 #[cfg(test)]
@@ -7175,9 +8218,10 @@ fn read_rate_lite_bytes(raw: &[u8]) -> io::Result<Option<RateLite>> {
     read_rate_lite_bytes_profiled(raw).map(|(rate, _typed)| rate)
 }
 
+#[cfg(test)]
 fn read_rate_lite_from_reader<R: Read>(reader: R) -> io::Result<Option<RateLite>> {
     let mut json_reader = JsonStreamReader::new(reader);
-    let rate = read_rate_lite_struson(&mut json_reader)?;
+    let rate = read_rate_lite_struson(&mut json_reader, false)?;
     json_reader
         .consume_trailing_whitespace()
         .map_err(to_io_error)?;
@@ -7401,7 +8445,7 @@ fn process_in_network_struson<R: Read, W: Write>(
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     rate_count += 1;
-                    if let Some(rate) = read_rate_lite_struson(json_reader)? {
+                    if let Some(rate) = read_rate_lite_struson(json_reader, false)? {
                         rate_chunk.push(rate);
                         if rate_chunk.len() >= state.chunk_size {
                             validate_procedure_for_rate_dispatch(&procedure)?;
@@ -7700,7 +8744,7 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                             drain_copy_file_events(io_state.event_rx, io_state.writer)?;
                             capture_batch_started_at = Some(Instant::now());
                         }
-                    } else if let Some(rate) = read_rate_lite_struson(json_reader)? {
+                    } else if let Some(rate) = read_rate_lite_struson(json_reader, false)? {
                         rate_chunk.push(rate);
                         if rate_chunk.len() >= chunk_size {
                             validate_procedure_for_rate_dispatch(&procedure)?;
@@ -7807,6 +8851,8 @@ struct CompactWorkerConfig {
     copy_paths: CopyPathConfig,
     rotate_bytes: u64,
     context: CompactContext,
+    provider_graph_v4_factor_cache: Arc<V4ProviderSetFactorSharedCache>,
+    provider_graph_v4_factor_mode: bool,
 }
 
 fn compact_sink_write_micros(
@@ -7861,13 +8907,17 @@ fn compact_worker_loop(
     let mut dictionary_copy_sinks =
         DictionaryCopySinks::from_paths(&worker_paths, config.rotate_bytes)?;
     let mut sink = io::sink();
-    let mut provider_set_scope_cache = ProviderSetScopeCache::default();
+    let mut provider_set_scope_cache = ProviderSetScopeCache::configured(
+        Arc::clone(&config.provider_graph_v4_factor_cache),
+        config.provider_graph_v4_factor_mode,
+    );
     let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
     let mut worker_dedupe_cache = WorkerDedupeCache::from_env();
     let mut metrics = CompactWorkerMetrics {
         worker_id,
         ..CompactWorkerMetrics::default()
     };
+    let semantic_progress = config.provider_graph_v4_factor_cache.semantic_progress();
 
     for job in rx.iter() {
         config.queue_bytes.finish_receive(job.raw_byte_len());
@@ -7876,6 +8926,7 @@ fn compact_worker_loop(
             WorkerJob::Rates { procedure, rates } => {
                 metrics.rates_seen = metrics.rates_seen.saturating_add(rates.len() as u64);
                 metrics.rates_parsed = metrics.rates_parsed.saturating_add(rates.len() as u64);
+                semantic_progress.record_negotiated_rates_parsed(rates.len() as u64);
                 let procedure_value = Value::Object(procedure);
                 let write_micros_before = compact_sink_write_micros(
                     &compact_copy_writer,
@@ -7932,7 +8983,11 @@ fn compact_worker_loop(
                 let mut rates = Vec::with_capacity(raw_rates.len());
                 let mut source_inputs = Vec::with_capacity(raw_rates.len());
                 for (coordinate, raw_rate) in raw_rates.iter_with_coordinates() {
-                    let (rate, typed) = read_rate_lite_bytes_profiled(raw_rate)?;
+                    let (rate, typed) = read_rate_lite_bytes_profiled_with_policy(
+                        raw_rate,
+                        config.provider_graph_v4_factor_mode,
+                    )?;
+                    semantic_progress.record_negotiated_rate_parsed();
                     if typed {
                         metrics.typed_rate_parses = metrics.typed_rate_parses.saturating_add(1);
                     } else {
@@ -8006,6 +9061,7 @@ fn compact_worker_loop(
                 }
             }
         }
+        semantic_progress.record_rate_chunk_completed();
         let write_started_at = Instant::now();
         if let Some(copy_writer) = compact_copy_writer.as_mut() {
             if let Some(event) = copy_writer.maybe_rotate_silent()? {
@@ -8059,6 +9115,16 @@ fn compact_worker_loop(
     metrics.local_price_set_dedupe_resets = worker_dedupe_cache.price_set_resets;
     metrics.local_price_atom_dedupe_resets = worker_dedupe_cache.price_atom_resets;
     metrics.local_provider_set_dedupe_resets = worker_dedupe_cache.provider_set_resets;
+    let factor_metrics = provider_set_scope_cache.v4_factors.metrics;
+    metrics.provider_graph_v4_factor_mode = provider_set_scope_cache.v4_factor_mode();
+    metrics.provider_graph_v4_reference_only_rates = factor_metrics.reference_only_rates;
+    metrics.provider_graph_v4_inline_only_rates = factor_metrics.inline_only_rates;
+    metrics.provider_graph_v4_mixed_rates = factor_metrics.mixed_rates;
+    metrics.provider_graph_v4_factor_cache_hits = factor_metrics.cache_hits;
+    metrics.provider_graph_v4_factor_cache_misses = factor_metrics.cache_misses;
+    metrics.provider_graph_v4_factor_cache_resets = factor_metrics.cache_resets;
+    metrics.provider_graph_v4_npi_union_attempts = factor_metrics.npi_union_attempts;
+    metrics.provider_graph_v4_flat_group_union_attempts = factor_metrics.flat_group_union_attempts;
     metrics.write_micros = metrics
         .write_micros
         .saturating_add(write_started_at.elapsed().as_micros());
@@ -8536,6 +9602,7 @@ fn scan_compact_byte_top_level_parallel(
     compact_copy_rotate_bytes: u64,
     options: CompactByteScanOptions,
 ) -> io::Result<()> {
+    let factor_mode = configured_v4_factor_mode(&copy_paths)?;
     let CompactByteScanOptions {
         preflight_metrics,
         rapidgzip_config,
@@ -8678,6 +9745,7 @@ fn scan_compact_byte_top_level_parallel(
     context
         .source_witness
         .configure_provider_spools(provider_ref_worker_count)?;
+    context.source_witness.configure_rate_spools(worker_count)?;
     let provider_ref_queue_size = env_usize(
         "HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE",
         provider_ref_worker_count.max(queue_size).max(1),
@@ -8708,6 +9776,14 @@ fn scan_compact_byte_top_level_parallel(
         worker_count,
         !copy_paths.manifest_only,
     ));
+    let provider_graph_v4_factor_cache = Arc::new(V4ProviderSetFactorSharedCache::configured()?);
+    let mut semantic_progress_reporter = Some(ScannerSemanticProgressReporter::start(
+        path,
+        total_bytes,
+        Arc::clone(&compressed_bytes_read),
+        provider_graph_v4_factor_cache.semantic_progress(),
+        started_at,
+    )?);
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
         Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
             &copy_paths,
@@ -8813,6 +9889,9 @@ fn scan_compact_byte_top_level_parallel(
             "storage_generation": REQUIRED_STORAGE_GENERATION,
             "serving_row_semantics": "source_multiset_v1",
             "group_negotiated_rate_chunks": false,
+            "factor_mode": factor_mode,
+            "provider_graph_v4_factor_mode": factor_mode,
+            "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.max_estimated_bytes,
             "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
             "price_forward_sidecar": copy_paths.manifest_price_forward_sidecar.is_some(),
             "serving_run_format": SERVING_RUN_FORMAT,
@@ -8831,10 +9910,12 @@ fn scan_compact_byte_top_level_parallel(
         ProviderRefWorkerConfig {
             dedupe: Arc::clone(&dedupe),
             source_witness: Arc::clone(&context.source_witness),
+            manifest_sidecars: manifest_sidecars.as_ref().map(Arc::clone),
             copy_paths: provider_ref_paths,
             rotate_bytes: compact_copy_rotate_bytes,
             queue_bytes: Arc::clone(&provider_ref_raw_chunk_stats.queue_bytes),
             recycle_tx: Some(provider_ref_recycle_tx),
+            allow_empty_npi_tin_only: factor_mode,
         },
     );
     let mut raw_refs = provider_ref_raw_chunk_stats.allocate_chunk(
@@ -9008,6 +10089,8 @@ fn scan_compact_byte_top_level_parallel(
                         let worker_manifest_sidecars = manifest_sidecars.as_ref().map(Arc::clone);
                         let worker_copy_paths = copy_paths.clone();
                         let worker_context = context.clone();
+                        let worker_provider_graph_v4_factor_cache =
+                            Arc::clone(&provider_graph_v4_factor_cache);
                         let worker_queue_bytes = Arc::clone(&raw_chunk_stats.queue_bytes);
                         let worker_recycle_tx = raw_recycle_tx.clone();
                         let worker_cancelled = Arc::clone(&indexed_cancelled);
@@ -9028,6 +10111,9 @@ fn scan_compact_byte_top_level_parallel(
                                             copy_paths: worker_copy_paths,
                                             rotate_bytes: compact_copy_rotate_bytes,
                                             context: worker_context,
+                                            provider_graph_v4_factor_cache:
+                                                worker_provider_graph_v4_factor_cache,
+                                            provider_graph_v4_factor_mode: factor_mode,
                                         },
                                     )
                                 }));
@@ -9213,6 +10299,9 @@ fn scan_compact_byte_top_level_parallel(
                                 producer_blocked_micros.saturating_add(metrics.blocked_micros);
                             *object_counts.entry("in_network".to_string()).or_insert(0) +=
                                 metrics.range.object_count;
+                            provider_graph_v4_factor_cache
+                                .semantic_progress
+                                .record_in_network_objects_completed(metrics.range.object_count);
                             *object_counts
                                 .entry("negotiated_rates".to_string())
                                 .or_insert(0) += metrics.rate_count;
@@ -9283,6 +10372,9 @@ fn scan_compact_byte_top_level_parallel(
                                     drain_copy_file_events(&event_rx, &mut writer)?;
                                     *object_counts.entry("in_network".to_string()).or_insert(0) +=
                                         1;
+                                    provider_graph_v4_factor_cache
+                                        .semantic_progress
+                                        .record_in_network_object_completed();
                                     *object_counts
                                         .entry("negotiated_rates".to_string())
                                         .or_insert(0) += rate_count;
@@ -9354,6 +10446,9 @@ fn scan_compact_byte_top_level_parallel(
                                     drain_copy_file_events(&event_rx, &mut writer)?;
                                     *object_counts.entry("in_network".to_string()).or_insert(0) +=
                                         1;
+                                    provider_graph_v4_factor_cache
+                                        .semantic_progress
+                                        .record_in_network_object_completed();
                                     *object_counts
                                         .entry("negotiated_rates".to_string())
                                         .or_insert(0) += rate_count;
@@ -9523,130 +10618,147 @@ fn scan_compact_byte_top_level_parallel(
                     emit_json_record(
                         &mut writer,
                         "scanner_summary",
-                        &json!({
-                            "provider_identifier_quarantine": provider_identifier_quarantine_payload(
-                                &provider_map,
-                                dedupe.provider_identifier_quarantine()?,
-                            )?,
-                            "worker_count": worker_count,
-                            "work_queue": bounded_queue_size,
-                            "event_queue": event_queue_size,
-                            "event_queue_unbounded": false,
-                            "split_negotiated_rates": negotiated_rate_chunk_size,
-                            "raw_chunk_bytes": raw_chunk_byte_limit,
-                            "raw_chunk_count": raw_chunk_stats.chunk_count,
-                            "raw_chunk_total_bytes": raw_chunk_stats.total_bytes,
-                            "raw_chunk_max_bytes": raw_chunk_stats.max_bytes,
-                            "raw_chunk_max_rates": raw_chunk_stats.max_rates,
-                            "raw_buffer_allocations": raw_chunk_stats.buffer_allocations,
-                            "raw_buffer_reuses": raw_chunk_stats.buffer_reuses,
-                            "work_queue_high_water": raw_chunk_stats.queue_high_water,
-                            "work_queue_blocked_sends": raw_chunk_stats.queue_blocked_sends,
-                            "peak_queued_bytes": raw_chunk_stats.queue_bytes.peak_bytes(),
-                            "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
-                            "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
-                            "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
-                            "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
-                            "producer_byte_capture_timing_granularity": "raw_chunk",
-                            "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
-                            "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
-                            "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
-                            "provider_ref_raw_chunk_max_items": provider_ref_raw_chunk_stats.max_rates,
-                            "provider_ref_buffer_allocations": provider_ref_raw_chunk_stats.buffer_allocations,
-                            "provider_ref_buffer_reuses": provider_ref_raw_chunk_stats.buffer_reuses,
-                            "provider_ref_queue_high_water": provider_ref_raw_chunk_stats.queue_high_water,
-                            "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
-                            "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
-                            "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
-                            "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
-                            "provider_capture_seconds": provider_capture_seconds,
-                            "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
-                            "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
-                            "provider_parse_seconds": provider_parse_seconds,
-                            "provider_transform_seconds": provider_transform_seconds,
-                            "provider_write_seconds": provider_write_seconds,
-                            "provider_worker_join_seconds": provider_worker_join_seconds,
-                            "provider_map_merge_seconds": provider_map_merge_seconds,
-                            "provider_workers": provider_worker_metrics.iter().map(ProviderRefWorkerMetrics::payload).collect::<Vec<_>>(),
-                            "parse_in_workers": parse_in_workers,
-                            "producer_blocked_micros": producer_blocked_micros,
-                            "producer_blocked_seconds": producer_blocked_seconds,
-                            "producer_nonblocked_seconds": producer_nonblocked_seconds,
-                            "producer_backpressure_pct": producer_backpressure_pct,
-                            "producer_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, in_network_enqueue_seconds),
-                            "producer_nonblocked_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, producer_nonblocked_seconds),
-                            "producer_nonblocked_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, producer_nonblocked_seconds),
-                            "provider_ref_producer_blocked_micros": provider_ref_producer_blocked_micros,
-                            "provider_refs_seconds": provider_refs_seconds,
-                            "in_network_enqueue_seconds": in_network_enqueue_seconds,
-                            "in_network_compressed_bytes": in_network_compressed_bytes,
-                            "in_network_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, in_network_enqueue_seconds),
-                            "worker_join_seconds": worker_join_seconds,
-                            "worker_sidecar_lock_wait_seconds": worker_sidecar_lock_wait_seconds,
-                            "sidecar_finalize_lock_wait_seconds": sidecar_finalize_lock_wait_seconds,
-                            "sidecar_merge_write_seconds": sidecar_merge_write_seconds,
-                            "typed_rate_parses": compact_worker_metrics.iter().map(|metrics| metrics.typed_rate_parses).sum::<u64>(),
-                            "streaming_rate_parse_fallbacks": compact_worker_metrics.iter().map(|metrics| metrics.streaming_rate_parse_fallbacks).sum::<u64>(),
-                            "local_price_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_hits).sum::<u64>(),
-                            "local_price_atom_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_hits).sum::<u64>(),
-                            "local_provider_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_hits).sum::<u64>(),
-                            "local_price_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_resets).sum::<u64>(),
-                            "local_price_atom_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_resets).sum::<u64>(),
-                            "local_provider_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_resets).sum::<u64>(),
-                            "serving_run_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_files).sum::<u64>(),
-                            "serving_run_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_rows).sum::<u64>(),
-                            "serving_run_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_bytes).sum::<u64>(),
-                            "serving_code_dictionary_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_files).sum::<u64>(),
-                            "serving_code_dictionary_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_rows).sum::<u64>(),
-                            "serving_code_dictionary_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_bytes).sum::<u64>(),
-                            "workers": compact_worker_metrics.iter().map(CompactWorkerMetrics::payload).collect::<Vec<_>>(),
-                            "top_level_byte_scan": true,
-                            "top_level_byte_scan_selected": true,
-                            "decompression": if rapidgzip_config.enabled { "rapidgzip" } else { "flate2" },
-                            "rapidgzip_threads": if rapidgzip_config.enabled {
-                                Some(rapidgzip_config.decoder_threads)
-                            } else {
-                                None
-                            },
-                            "provider_reference_order": provider_reference_order_label,
-                            "rapidgzip_index_bytes": indexed_reorder_bytes,
-                            "rapidgzip_index_threads": indexed_reorder_decoder_threads,
-                        "indexed_range_producers_requested": indexed_range_producers_requested,
-                        "indexed_range_producers_selected": indexed_range_producers_selected,
-                            "indexed_range_decoder_threads_selected": indexed_range_decoder_threads_selected,
-                            "indexed_range_count": indexed_range_count,
-                            "indexed_ranges": indexed_range_metrics.iter().map(IndexedRangeProducerOutput::payload).collect::<Vec<_>>(),
-                            "indexed_range_coverage_bytes": indexed_range_coverage_bytes,
-                            "indexed_range_coverage_object_count": indexed_range_coverage_objects,
-                            "plain_range_reorder": plain_reorder_used,
-                            "plain_provider_range_offset": plain_provider_range_offset,
-                            "plain_provider_range_bytes": plain_provider_range_bytes,
-                            "plain_in_network_range_offset": plain_in_network_range_offset,
-                            "plain_in_network_range_bytes": plain_in_network_range_bytes,
-                            "plain_in_network_object_count": plain_in_network_object_count,
-                            "indexed_range_completed_object_count": indexed_producer_progress.completed_objects.load(Ordering::Acquire),
-                            "indexed_range_completed_rate_count": indexed_producer_progress.completed_rates.load(Ordering::Relaxed),
-                            "indexed_range_completed_raw_bytes": indexed_producer_progress.completed_raw_bytes.load(Ordering::Relaxed),
-                            "indexed_range_peer_cancellation_can_interrupt_external_read": if indexed_reorder_used {
-                                Some(false)
-                            } else {
-                                None
-                            },
-                            "indexed_range_cancellation_limitation": if indexed_reorder_used {
-                                Some("peer cancellation cannot interrupt a child blocked inside external rapidgzip read")
-                            } else {
-                                None
-                            },
-                            "full_decompression_passes": if indexed_reorder_used { 2 } else { 1 },
-                            "order_probe_partial_pass": provider_reference_order_label != "missing",
-                            "order_detection_seconds": preflight_metrics.order_detection_seconds,
-                            "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
-                            "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
-                            "raw_rate_byte_capture": parse_in_workers,
-                            "scan_compressed_bytes": scan_compressed_bytes,
-                            "scan_compressed_mib_s": compressed_mib_per_second(scan_compressed_bytes, elapsed_seconds),
-                            "elapsed_seconds": elapsed_seconds,
-                        }),
+                        &scanner_summary_with_v4_empty_npi_audit(
+                            json!({
+                                "provider_identifier_quarantine": provider_identifier_quarantine_payload(
+                                    &provider_map,
+                                    dedupe.provider_identifier_quarantine()?,
+                                )?,
+                                "worker_count": worker_count,
+                                "work_queue": bounded_queue_size,
+                                "event_queue": event_queue_size,
+                                "event_queue_unbounded": false,
+                                "split_negotiated_rates": negotiated_rate_chunk_size,
+                                "raw_chunk_bytes": raw_chunk_byte_limit,
+                                "raw_chunk_count": raw_chunk_stats.chunk_count,
+                                "raw_chunk_total_bytes": raw_chunk_stats.total_bytes,
+                                "raw_chunk_max_bytes": raw_chunk_stats.max_bytes,
+                                "raw_chunk_max_rates": raw_chunk_stats.max_rates,
+                                "raw_buffer_allocations": raw_chunk_stats.buffer_allocations,
+                                "raw_buffer_reuses": raw_chunk_stats.buffer_reuses,
+                                "work_queue_high_water": raw_chunk_stats.queue_high_water,
+                                "work_queue_blocked_sends": raw_chunk_stats.queue_blocked_sends,
+                                "peak_queued_bytes": raw_chunk_stats.queue_bytes.peak_bytes(),
+                                "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
+                                "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
+                                "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
+                                "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
+                                "producer_byte_capture_timing_granularity": "raw_chunk",
+                                "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
+                                "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
+                                "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
+                                "provider_ref_raw_chunk_max_items": provider_ref_raw_chunk_stats.max_rates,
+                                "provider_ref_buffer_allocations": provider_ref_raw_chunk_stats.buffer_allocations,
+                                "provider_ref_buffer_reuses": provider_ref_raw_chunk_stats.buffer_reuses,
+                                "provider_ref_queue_high_water": provider_ref_raw_chunk_stats.queue_high_water,
+                                "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
+                                "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
+                                "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
+                                "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
+                                "provider_capture_seconds": provider_capture_seconds,
+                                "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
+                                "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
+                                "provider_parse_seconds": provider_parse_seconds,
+                                "provider_transform_seconds": provider_transform_seconds,
+                                "provider_write_seconds": provider_write_seconds,
+                                "provider_worker_join_seconds": provider_worker_join_seconds,
+                                "provider_map_merge_seconds": provider_map_merge_seconds,
+                                "provider_workers": provider_worker_metrics.iter().map(ProviderRefWorkerMetrics::payload).collect::<Vec<_>>(),
+                                "parse_in_workers": parse_in_workers,
+                                "producer_blocked_micros": producer_blocked_micros,
+                                "producer_blocked_seconds": producer_blocked_seconds,
+                                "producer_nonblocked_seconds": producer_nonblocked_seconds,
+                                "producer_backpressure_pct": producer_backpressure_pct,
+                                "producer_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, in_network_enqueue_seconds),
+                                "producer_nonblocked_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, producer_nonblocked_seconds),
+                                "producer_nonblocked_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, producer_nonblocked_seconds),
+                                "provider_ref_producer_blocked_micros": provider_ref_producer_blocked_micros,
+                                "provider_refs_seconds": provider_refs_seconds,
+                                "in_network_enqueue_seconds": in_network_enqueue_seconds,
+                                "in_network_compressed_bytes": in_network_compressed_bytes,
+                                "in_network_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, in_network_enqueue_seconds),
+                                "worker_join_seconds": worker_join_seconds,
+                                "worker_sidecar_lock_wait_seconds": worker_sidecar_lock_wait_seconds,
+                                "sidecar_finalize_lock_wait_seconds": sidecar_finalize_lock_wait_seconds,
+                                "sidecar_merge_write_seconds": sidecar_merge_write_seconds,
+                                "typed_rate_parses": compact_worker_metrics.iter().map(|metrics| metrics.typed_rate_parses).sum::<u64>(),
+                                "streaming_rate_parse_fallbacks": compact_worker_metrics.iter().map(|metrics| metrics.streaming_rate_parse_fallbacks).sum::<u64>(),
+                                "local_price_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_hits).sum::<u64>(),
+                                "local_price_atom_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_hits).sum::<u64>(),
+                                "local_provider_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_hits).sum::<u64>(),
+                                "local_price_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_resets).sum::<u64>(),
+                                "local_price_atom_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_resets).sum::<u64>(),
+                                "local_provider_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_resets).sum::<u64>(),
+                                "serving_run_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_files).sum::<u64>(),
+                                "serving_run_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_rows).sum::<u64>(),
+                                "serving_run_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_bytes).sum::<u64>(),
+                                "serving_code_dictionary_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_files).sum::<u64>(),
+                                "serving_code_dictionary_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_rows).sum::<u64>(),
+                                "serving_code_dictionary_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_bytes).sum::<u64>(),
+                                "factor_mode": factor_mode,
+                                "provider_graph_v4_factor_mode": factor_mode,
+                                "provider_graph_v4_reference_only_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_reference_only_rates).sum::<u64>(),
+                                "provider_graph_v4_inline_only_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_inline_only_rates).sum::<u64>(),
+                                "provider_graph_v4_mixed_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_mixed_rates).sum::<u64>(),
+                                "provider_graph_v4_factor_cache_hits": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_hits).sum::<u64>(),
+                                "provider_graph_v4_factor_cache_misses": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_misses).sum::<u64>(),
+                                "provider_graph_v4_factor_cache_resets": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_resets).sum::<u64>(),
+                                "provider_graph_v4_npi_union_attempts": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_npi_union_attempts).sum::<u64>(),
+                                "provider_graph_v4_flat_group_union_attempts": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_flat_group_union_attempts).sum::<u64>(),
+                                "provider_graph_v4_factor_cache_entries": provider_graph_v4_factor_cache.snapshot().0,
+                                "provider_graph_v4_factor_cache_estimated_bytes": provider_graph_v4_factor_cache.snapshot().1,
+                                "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.snapshot().2,
+                                "workers": compact_worker_metrics.iter().map(CompactWorkerMetrics::payload).collect::<Vec<_>>(),
+                                "top_level_byte_scan": true,
+                                "top_level_byte_scan_selected": true,
+                                "decompression": if rapidgzip_config.enabled { "rapidgzip" } else { "flate2" },
+                                "rapidgzip_threads": if rapidgzip_config.enabled {
+                                    Some(rapidgzip_config.decoder_threads)
+                                } else {
+                                    None
+                                },
+                                "provider_reference_order": provider_reference_order_label,
+                                "rapidgzip_index_bytes": indexed_reorder_bytes,
+                                "rapidgzip_index_threads": indexed_reorder_decoder_threads,
+                            "indexed_range_producers_requested": indexed_range_producers_requested,
+                            "indexed_range_producers_selected": indexed_range_producers_selected,
+                                "indexed_range_decoder_threads_selected": indexed_range_decoder_threads_selected,
+                                "indexed_range_count": indexed_range_count,
+                                "indexed_ranges": indexed_range_metrics.iter().map(IndexedRangeProducerOutput::payload).collect::<Vec<_>>(),
+                                "indexed_range_coverage_bytes": indexed_range_coverage_bytes,
+                                "indexed_range_coverage_object_count": indexed_range_coverage_objects,
+                                "plain_range_reorder": plain_reorder_used,
+                                "plain_provider_range_offset": plain_provider_range_offset,
+                                "plain_provider_range_bytes": plain_provider_range_bytes,
+                                "plain_in_network_range_offset": plain_in_network_range_offset,
+                                "plain_in_network_range_bytes": plain_in_network_range_bytes,
+                                "plain_in_network_object_count": plain_in_network_object_count,
+                                "indexed_range_completed_object_count": indexed_producer_progress.completed_objects.load(Ordering::Acquire),
+                                "indexed_range_completed_rate_count": indexed_producer_progress.completed_rates.load(Ordering::Relaxed),
+                                "indexed_range_completed_raw_bytes": indexed_producer_progress.completed_raw_bytes.load(Ordering::Relaxed),
+                                "indexed_range_peer_cancellation_can_interrupt_external_read": if indexed_reorder_used {
+                                    Some(false)
+                                } else {
+                                    None
+                                },
+                                "indexed_range_cancellation_limitation": if indexed_reorder_used {
+                                    Some("peer cancellation cannot interrupt a child blocked inside external rapidgzip read")
+                                } else {
+                                    None
+                                },
+                                "full_decompression_passes": if indexed_reorder_used { 2 } else { 1 },
+                                "order_probe_partial_pass": provider_reference_order_label != "missing",
+                                "order_detection_seconds": preflight_metrics.order_detection_seconds,
+                                "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
+                                "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
+                                "raw_rate_byte_capture": parse_in_workers,
+                                "scan_compressed_bytes": scan_compressed_bytes,
+                                "scan_compressed_mib_s": compressed_mib_per_second(scan_compressed_bytes, elapsed_seconds),
+                                "elapsed_seconds": elapsed_seconds,
+                            }),
+                            factor_mode,
+                            dedupe.empty_npi_tin_only_normalization_count(),
+                        ),
                     )?;
                     writer.flush()?;
                     if indexed_reorder_used {
@@ -9781,6 +10893,7 @@ fn scan_compact_byte_top_level_parallel(
     drop(provider_tx);
     let _ = join_provider_ref_workers(&mut writer, provider_handles)?;
     writer.flush()?;
+    drop(semantic_progress_reporter.take());
     emit_progress(
         path,
         total_bytes,
@@ -9801,6 +10914,7 @@ fn scan_compact_struson_parallel(
     compact_copy_rotate_bytes: u64,
     scan_selection: CompactParallelScanSelection,
 ) -> io::Result<()> {
+    let factor_mode = configured_v4_factor_mode(&copy_paths)?;
     let CompactParallelScanSelection {
         preflight_metrics,
         top_level_byte_scan_requested,
@@ -9857,6 +10971,14 @@ fn scan_compact_struson_parallel(
         worker_count,
         !copy_paths.manifest_only,
     ));
+    let provider_graph_v4_factor_cache = Arc::new(V4ProviderSetFactorSharedCache::configured()?);
+    let mut semantic_progress_reporter = Some(ScannerSemanticProgressReporter::start(
+        path,
+        total_bytes,
+        Arc::clone(&compressed_bytes_read),
+        provider_graph_v4_factor_cache.semantic_progress(),
+        started_at,
+    )?);
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
         Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
             &copy_paths,
@@ -9931,6 +11053,9 @@ fn scan_compact_struson_parallel(
             "storage_generation": REQUIRED_STORAGE_GENERATION,
             "serving_row_semantics": "source_multiset_v1",
             "group_negotiated_rate_chunks": false,
+            "factor_mode": factor_mode,
+            "provider_graph_v4_factor_mode": factor_mode,
+            "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.max_estimated_bytes,
             "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
             "price_forward_sidecar": copy_paths.manifest_price_forward_sidecar.is_some(),
             "serving_run_format": SERVING_RUN_FORMAT,
@@ -9958,10 +11083,12 @@ fn scan_compact_struson_parallel(
                         ProviderRefWorkerConfig {
                             dedupe: Arc::clone(&dedupe),
                             source_witness: Arc::clone(&context.source_witness),
+                            manifest_sidecars: manifest_sidecars.as_ref().map(Arc::clone),
                             copy_paths: provider_ref_paths.clone(),
                             rotate_bytes: compact_copy_rotate_bytes,
                             queue_bytes: Arc::clone(&provider_ref_raw_chunk_stats.queue_bytes),
                             recycle_tx: Some(provider_ref_recycle_tx.clone()),
+                            allow_empty_npi_tin_only: factor_mode,
                         },
                     );
 
@@ -10050,15 +11177,27 @@ fn scan_compact_struson_parallel(
                             .parse_micros
                             .saturating_add(parse_started_at.elapsed().as_micros());
                         let transform_started_at = Instant::now();
-                        let provider_entry = provider_ref_definition(&value)?;
+                        let provider_entry = provider_ref_definition_audited(&value, factor_mode)?;
                         serial_provider_metrics.transform_micros = serial_provider_metrics
                             .transform_micros
                             .saturating_add(transform_started_at.elapsed().as_micros());
-                        let (key, entry) = provider_entry;
+                        let (key, entry, empty_npi_tin_only_normalization_count) = provider_entry;
+                        if let Some(sidecars) = manifest_sidecars.as_ref() {
+                            lock_manifest_sidecars(sidecars).record_provider_component(
+                                entry.entry_hash,
+                                &entry.provider_group_hashes,
+                            )?;
+                        }
                         insert_provider_definition(&mut provider_map, key, entry)?;
+                        dedupe.record_empty_npi_tin_only_normalizations(
+                            empty_npi_tin_only_normalization_count,
+                        );
                         let write_started_at = Instant::now();
-                        provider_ref_copy_sinks
-                            .write_provider_group_members_shared(&value, &dedupe)?;
+                        provider_ref_copy_sinks.write_provider_group_members_shared(
+                            &value,
+                            &dedupe,
+                            factor_mode,
+                        )?;
                         serial_provider_metrics.write_micros = serial_provider_metrics
                             .write_micros
                             .saturating_add(write_started_at.elapsed().as_micros());
@@ -10103,6 +11242,8 @@ fn scan_compact_struson_parallel(
                     let worker_manifest_sidecars = manifest_sidecars.as_ref().map(Arc::clone);
                     let worker_copy_paths = copy_paths.clone();
                     let worker_context = context.clone();
+                    let worker_provider_graph_v4_factor_cache =
+                        Arc::clone(&provider_graph_v4_factor_cache);
                     let worker_queue_bytes = Arc::clone(&raw_chunk_stats.queue_bytes);
                     let worker_recycle_tx = raw_recycle_tx.clone();
                     handles.push((
@@ -10122,6 +11263,9 @@ fn scan_compact_struson_parallel(
                                         copy_paths: worker_copy_paths,
                                         rotate_bytes: compact_copy_rotate_bytes,
                                         context: worker_context,
+                                        provider_graph_v4_factor_cache:
+                                            worker_provider_graph_v4_factor_cache,
+                                        provider_graph_v4_factor_mode: factor_mode,
                                     },
                                 )
                             }));
@@ -10175,6 +11319,9 @@ fn scan_compact_struson_parallel(
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
                                 *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
+                                provider_graph_v4_factor_cache
+                                    .semantic_progress
+                                    .record_in_network_object_completed();
                                 *object_counts
                                     .entry("negotiated_rates".to_string())
                                     .or_insert(0) += rate_count;
@@ -10320,99 +11467,117 @@ fn scan_compact_struson_parallel(
                 emit_json_record(
                     &mut writer,
                     "scanner_summary",
-                    &json!({
-                        "provider_identifier_quarantine": provider_identifier_quarantine_payload(
-                            &provider_map,
-                            dedupe.provider_identifier_quarantine()?,
-                        )?,
-                        "worker_count": worker_count,
-                        "work_queue": bounded_queue_size,
-                        "event_queue": event_queue_size,
-                        "split_negotiated_rates": negotiated_rate_chunk_size,
-                        "raw_chunk_bytes": raw_chunk_byte_limit,
-                        "raw_chunk_count": raw_chunk_stats.chunk_count,
-                        "raw_chunk_total_bytes": raw_chunk_stats.total_bytes,
-                        "raw_chunk_max_bytes": raw_chunk_stats.max_bytes,
-                        "raw_chunk_max_rates": raw_chunk_stats.max_rates,
-                        "raw_buffer_allocations": raw_chunk_stats.buffer_allocations,
-                        "raw_buffer_reuses": raw_chunk_stats.buffer_reuses,
-                        "work_queue_high_water": raw_chunk_stats.queue_high_water,
-                        "work_queue_blocked_sends": raw_chunk_stats.queue_blocked_sends,
-                        "peak_queued_bytes": raw_chunk_stats.queue_bytes.peak_bytes(),
-                        "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
-                        "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
-                        "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
-                        "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
-                        "producer_byte_capture_timing_granularity": "raw_chunk",
-                        "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
-                        "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
-                        "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
-                        "provider_ref_raw_chunk_max_items": provider_ref_raw_chunk_stats.max_rates,
-                        "provider_ref_buffer_allocations": provider_ref_raw_chunk_stats.buffer_allocations,
-                        "provider_ref_buffer_reuses": provider_ref_raw_chunk_stats.buffer_reuses,
-                        "provider_ref_queue_high_water": provider_ref_raw_chunk_stats.queue_high_water,
-                        "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
-                        "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
-                        "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
-                        "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
-                        "provider_capture_seconds": provider_capture_seconds,
-                        "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
-                        "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
-                        "provider_parse_seconds": provider_parse_seconds,
-                        "provider_transform_seconds": provider_transform_seconds,
-                        "provider_write_seconds": provider_write_seconds,
-                        "provider_worker_join_seconds": provider_worker_join_seconds,
-                        "provider_map_merge_seconds": provider_map_merge_seconds,
-                        "provider_workers": provider_worker_metrics.iter().map(ProviderRefWorkerMetrics::payload).collect::<Vec<_>>(),
-                        "parse_in_workers": parse_in_workers,
-                        "producer_blocked_micros": producer_blocked_micros,
-                        "producer_blocked_seconds": producer_blocked_seconds,
-                        "producer_nonblocked_seconds": producer_nonblocked_seconds,
-                        "producer_backpressure_pct": producer_backpressure_pct,
-                        "producer_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, in_network_enqueue_seconds),
-                        "producer_nonblocked_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, producer_nonblocked_seconds),
-                        "producer_nonblocked_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, producer_nonblocked_seconds),
-                        "provider_ref_producer_blocked_micros": provider_ref_producer_blocked_micros,
-                        "provider_refs_seconds": provider_refs_seconds,
-                        "in_network_enqueue_seconds": in_network_enqueue_seconds,
-                        "in_network_compressed_bytes": in_network_compressed_bytes,
-                        "in_network_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, in_network_enqueue_seconds),
-                        "worker_join_seconds": worker_join_seconds,
-                        "worker_sidecar_lock_wait_seconds": worker_sidecar_lock_wait_seconds,
-                        "sidecar_finalize_lock_wait_seconds": sidecar_finalize_lock_wait_seconds,
-                        "sidecar_merge_write_seconds": sidecar_merge_write_seconds,
-                        "typed_rate_parses": compact_worker_metrics.iter().map(|metrics| metrics.typed_rate_parses).sum::<u64>(),
-                        "streaming_rate_parse_fallbacks": compact_worker_metrics.iter().map(|metrics| metrics.streaming_rate_parse_fallbacks).sum::<u64>(),
-                        "local_price_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_hits).sum::<u64>(),
-                        "local_price_atom_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_hits).sum::<u64>(),
-                        "local_provider_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_hits).sum::<u64>(),
-                        "local_price_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_resets).sum::<u64>(),
-                        "local_price_atom_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_resets).sum::<u64>(),
-                        "local_provider_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_resets).sum::<u64>(),
-                        "serving_run_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_files).sum::<u64>(),
-                        "serving_run_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_rows).sum::<u64>(),
-                        "serving_run_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_bytes).sum::<u64>(),
-                        "serving_code_dictionary_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_files).sum::<u64>(),
-                        "serving_code_dictionary_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_rows).sum::<u64>(),
-                        "serving_code_dictionary_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_bytes).sum::<u64>(),
-                        "workers": compact_worker_metrics.iter().map(CompactWorkerMetrics::payload).collect::<Vec<_>>(),
-                        "top_level_byte_scan_requested": top_level_byte_scan_requested,
-                        "top_level_byte_scan_selected": false,
-                        "top_level_byte_scan_fallback_reason": top_level_byte_scan_fallback_reason,
-                        "provider_reference_order": "before_in_network",
-                        "order_detection_seconds": preflight_metrics.order_detection_seconds,
-                        "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
-                        "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
-                        "scan_compressed_bytes": scan_compressed_bytes,
-                        "scan_compressed_mib_s": compressed_mib_per_second(scan_compressed_bytes, elapsed_seconds),
-                        "elapsed_seconds": elapsed_seconds,
-                    }),
+                    &scanner_summary_with_v4_empty_npi_audit(
+                        json!({
+                            "provider_identifier_quarantine": provider_identifier_quarantine_payload(
+                                &provider_map,
+                                dedupe.provider_identifier_quarantine()?,
+                            )?,
+                            "worker_count": worker_count,
+                            "work_queue": bounded_queue_size,
+                            "event_queue": event_queue_size,
+                            "split_negotiated_rates": negotiated_rate_chunk_size,
+                            "raw_chunk_bytes": raw_chunk_byte_limit,
+                            "raw_chunk_count": raw_chunk_stats.chunk_count,
+                            "raw_chunk_total_bytes": raw_chunk_stats.total_bytes,
+                            "raw_chunk_max_bytes": raw_chunk_stats.max_bytes,
+                            "raw_chunk_max_rates": raw_chunk_stats.max_rates,
+                            "raw_buffer_allocations": raw_chunk_stats.buffer_allocations,
+                            "raw_buffer_reuses": raw_chunk_stats.buffer_reuses,
+                            "work_queue_high_water": raw_chunk_stats.queue_high_water,
+                            "work_queue_blocked_sends": raw_chunk_stats.queue_blocked_sends,
+                            "peak_queued_bytes": raw_chunk_stats.queue_bytes.peak_bytes(),
+                            "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
+                            "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
+                            "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
+                            "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
+                            "producer_byte_capture_timing_granularity": "raw_chunk",
+                            "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
+                            "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
+                            "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
+                            "provider_ref_raw_chunk_max_items": provider_ref_raw_chunk_stats.max_rates,
+                            "provider_ref_buffer_allocations": provider_ref_raw_chunk_stats.buffer_allocations,
+                            "provider_ref_buffer_reuses": provider_ref_raw_chunk_stats.buffer_reuses,
+                            "provider_ref_queue_high_water": provider_ref_raw_chunk_stats.queue_high_water,
+                            "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
+                            "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
+                            "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
+                            "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
+                            "provider_capture_seconds": provider_capture_seconds,
+                            "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
+                            "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
+                            "provider_parse_seconds": provider_parse_seconds,
+                            "provider_transform_seconds": provider_transform_seconds,
+                            "provider_write_seconds": provider_write_seconds,
+                            "provider_worker_join_seconds": provider_worker_join_seconds,
+                            "provider_map_merge_seconds": provider_map_merge_seconds,
+                            "provider_workers": provider_worker_metrics.iter().map(ProviderRefWorkerMetrics::payload).collect::<Vec<_>>(),
+                            "parse_in_workers": parse_in_workers,
+                            "producer_blocked_micros": producer_blocked_micros,
+                            "producer_blocked_seconds": producer_blocked_seconds,
+                            "producer_nonblocked_seconds": producer_nonblocked_seconds,
+                            "producer_backpressure_pct": producer_backpressure_pct,
+                            "producer_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, in_network_enqueue_seconds),
+                            "producer_nonblocked_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, producer_nonblocked_seconds),
+                            "producer_nonblocked_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, producer_nonblocked_seconds),
+                            "provider_ref_producer_blocked_micros": provider_ref_producer_blocked_micros,
+                            "provider_refs_seconds": provider_refs_seconds,
+                            "in_network_enqueue_seconds": in_network_enqueue_seconds,
+                            "in_network_compressed_bytes": in_network_compressed_bytes,
+                            "in_network_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, in_network_enqueue_seconds),
+                            "worker_join_seconds": worker_join_seconds,
+                            "worker_sidecar_lock_wait_seconds": worker_sidecar_lock_wait_seconds,
+                            "sidecar_finalize_lock_wait_seconds": sidecar_finalize_lock_wait_seconds,
+                            "sidecar_merge_write_seconds": sidecar_merge_write_seconds,
+                            "typed_rate_parses": compact_worker_metrics.iter().map(|metrics| metrics.typed_rate_parses).sum::<u64>(),
+                            "streaming_rate_parse_fallbacks": compact_worker_metrics.iter().map(|metrics| metrics.streaming_rate_parse_fallbacks).sum::<u64>(),
+                            "local_price_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_hits).sum::<u64>(),
+                            "local_price_atom_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_hits).sum::<u64>(),
+                            "local_provider_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_hits).sum::<u64>(),
+                            "local_price_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_resets).sum::<u64>(),
+                            "local_price_atom_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_resets).sum::<u64>(),
+                            "local_provider_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_resets).sum::<u64>(),
+                            "serving_run_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_files).sum::<u64>(),
+                            "serving_run_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_rows).sum::<u64>(),
+                            "serving_run_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_bytes).sum::<u64>(),
+                            "serving_code_dictionary_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_files).sum::<u64>(),
+                            "serving_code_dictionary_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_rows).sum::<u64>(),
+                            "serving_code_dictionary_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_bytes).sum::<u64>(),
+                            "factor_mode": factor_mode,
+                            "provider_graph_v4_factor_mode": factor_mode,
+                            "provider_graph_v4_reference_only_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_reference_only_rates).sum::<u64>(),
+                            "provider_graph_v4_inline_only_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_inline_only_rates).sum::<u64>(),
+                            "provider_graph_v4_mixed_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_mixed_rates).sum::<u64>(),
+                            "provider_graph_v4_factor_cache_hits": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_hits).sum::<u64>(),
+                            "provider_graph_v4_factor_cache_misses": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_misses).sum::<u64>(),
+                            "provider_graph_v4_factor_cache_resets": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_resets).sum::<u64>(),
+                            "provider_graph_v4_npi_union_attempts": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_npi_union_attempts).sum::<u64>(),
+                            "provider_graph_v4_flat_group_union_attempts": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_flat_group_union_attempts).sum::<u64>(),
+                            "provider_graph_v4_factor_cache_entries": provider_graph_v4_factor_cache.snapshot().0,
+                            "provider_graph_v4_factor_cache_estimated_bytes": provider_graph_v4_factor_cache.snapshot().1,
+                            "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.snapshot().2,
+                            "workers": compact_worker_metrics.iter().map(CompactWorkerMetrics::payload).collect::<Vec<_>>(),
+                            "top_level_byte_scan_requested": top_level_byte_scan_requested,
+                            "top_level_byte_scan_selected": false,
+                            "top_level_byte_scan_fallback_reason": top_level_byte_scan_fallback_reason,
+                            "provider_reference_order": "before_in_network",
+                            "order_detection_seconds": preflight_metrics.order_detection_seconds,
+                            "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
+                            "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
+                            "scan_compressed_bytes": scan_compressed_bytes,
+                            "scan_compressed_mib_s": compressed_mib_per_second(scan_compressed_bytes, elapsed_seconds),
+                            "elapsed_seconds": elapsed_seconds,
+                        }),
+                        factor_mode,
+                        dedupe.empty_npi_tin_only_normalization_count(),
+                    ),
                 )?;
                 writer.flush()?;
                 json_reader.end_object().map_err(to_io_error)?;
                 json_reader
                     .consume_trailing_whitespace()
                     .map_err(to_io_error)?;
+                drop(semantic_progress_reporter.take());
                 emit_progress(
                     path,
                     total_bytes,
@@ -10433,6 +11598,7 @@ fn scan_compact_struson_parallel(
         .consume_trailing_whitespace()
         .map_err(to_io_error)?;
     drop(tx);
+    drop(semantic_progress_reporter.take());
     emit_progress(
         path,
         total_bytes,
@@ -11155,6 +12321,7 @@ fn scan_compact_struson_inner(
     copy_paths: CopyPathConfig,
     source_witness: Arc<SourceWitnessCollector>,
 ) -> io::Result<()> {
+    let factor_mode = configured_v4_factor_mode(&copy_paths)?;
     let snapshot_id = env::var("HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID").unwrap_or_default();
     let plan_id = env::var("HLTHPRT_PTG2_COMPACT_PLAN_ID").unwrap_or_default();
     let plan_month_id = env::var("HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID").unwrap_or_default();
@@ -11312,6 +12479,12 @@ fn scan_compact_struson_inner(
             },
         );
     }
+    if factor_mode {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "V4 provider factor mode requires the parallel compact scanner",
+        ));
+    }
     let top_level_byte_scan_fallback_reason = if !copy_paths.has_file_paths() {
         "no_file_outputs"
     } else {
@@ -11451,6 +12624,8 @@ fn scan_compact_struson_inner(
             "storage_generation": REQUIRED_STORAGE_GENERATION,
             "serving_row_semantics": "source_multiset_v1",
             "group_negotiated_rate_chunks": false,
+            "factor_mode": factor_mode,
+            "provider_graph_v4_factor_mode": factor_mode,
             "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
             "price_forward_sidecar": copy_paths.manifest_price_forward_sidecar.is_some(),
             "serving_run_format": SERVING_RUN_FORMAT,
@@ -11480,6 +12655,12 @@ fn scan_compact_struson_inner(
                     provider_transform_micros = provider_transform_micros
                         .saturating_add(transform_started_at.elapsed().as_micros());
                     let (key, entry) = provider_entry;
+                    if let Some(sidecars) = manifest_sidecars.as_mut() {
+                        sidecars.record_provider_component(
+                            entry.entry_hash,
+                            &entry.provider_group_hashes,
+                        )?;
+                    }
                     let insert_started_at = Instant::now();
                     if provider_references_preloaded {
                         validate_preloaded_provider_definition(&provider_map, &key, &entry)?;
@@ -11625,6 +12806,8 @@ fn scan_compact_struson_inner(
             "worker_count": 1,
             "requested_worker_count": rust_worker_count,
             "execution_mode": "serial_struson",
+            "factor_mode": factor_mode,
+            "provider_graph_v4_factor_mode": factor_mode,
             "provider_reference_order": provider_reference_order_label,
             "top_level_byte_scan_selected": false,
             "top_level_byte_scan_fallback_reason": top_level_byte_scan_fallback_reason,
@@ -15332,6 +16515,7 @@ struct AssignedV3EncoderOptions {
     provider_set_count: Option<usize>,
     provider_code_count: Option<usize>,
     provider_code_bitmap_max_bytes: usize,
+    rate_schedule_observe: bool,
     source: SourceEncoding,
 }
 
@@ -16880,6 +18064,7 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_limi
             provider_set_count: None,
             provider_code_count: None,
             provider_code_bitmap_max_bytes: 0,
+            rate_schedule_observe: false,
             source: SourceEncoding {
                 count: 1,
                 key_bits: 0,
@@ -16923,6 +18108,7 @@ fn write_serving_binary_v3_assigned_rows_copy_with_provenance<R: AssignedV3RowSo
         provider_set_count,
         provider_code_count,
         provider_code_bitmap_max_bytes,
+        rate_schedule_observe,
         source,
     } = options;
     let source_count = source.count;
@@ -16963,6 +18149,17 @@ fn write_serving_binary_v3_assigned_rows_copy_with_provenance<R: AssignedV3RowSo
         provider_code_count,
         provider_code_bitmap_max_bytes,
     )?;
+    let mut rate_schedule_observer = if rate_schedule_observe {
+        let Some(provider_set_count) = provider_set_count else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rate-schedule observe mode requires the exact provider-set count",
+            ));
+        };
+        Some(RateScheduleObserver::new(provider_set_count)?)
+    } else {
+        None
+    };
     let mut previous_provider_code_pair: Option<(i32, i32)> = None;
 
     while let Some(AssignedV3Row {
@@ -16989,6 +18186,32 @@ fn write_serving_binary_v3_assigned_rows_copy_with_provenance<R: AssignedV3RowSo
             ));
         }
         previous_row_key = Some(row_key);
+        if let Some(observer) = rate_schedule_observer.as_mut() {
+            let provider_set_key = match u32::try_from(provider_set_key) {
+                Ok(provider_set_key) => provider_set_key,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rate-schedule provider_set_key cannot be negative",
+                    ));
+                }
+            };
+            let code_key = match u32::try_from(code_key) {
+                Ok(code_key) => code_key,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rate-schedule code_key cannot be negative",
+                    ));
+                }
+            };
+            observer.observe(RateScheduleOccurrence {
+                provider_set_key,
+                code_key,
+                price_set_key: price_key,
+                source_key,
+            })?;
+        }
         let provider_code_pair = (provider_set_key, code_key);
         if previous_provider_code_pair != Some(provider_code_pair) {
             provider_code_index.push(provider_set_key, code_key)?;
@@ -17244,6 +18467,25 @@ fn write_serving_binary_v3_assigned_rows_copy_with_provenance<R: AssignedV3RowSo
     write_serving_binary_copy_trailer(writer, target_format)?;
     writer.flush()?;
     let price_key_upper_bound = maximum_price_key.map_or(0u64, |key| u64::from(key) + 1);
+    let rate_schedule_observe_summary = match rate_schedule_observer {
+        Some(observer) => {
+            let observe_summary = observer.finish()?;
+            if observe_summary.rate_occurrence_count_r != row_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "rate-schedule observe occurrence count differs from encoded rows",
+                ));
+            }
+            serde_json::to_value(observe_summary).map_err(to_io_error)?
+        }
+        None => json!({
+            "enabled": false,
+            "format": "ptg2_rate_schedule_observe_v1",
+            "representation_effect": "observe_only_no_serving_change",
+            "gate_environment": RATE_SCHEDULE_OBSERVE_ENV,
+            "reason": "feature_flag_disabled",
+        }),
+    };
     Ok(json!({
         "name": "serving_binary_v3_assigned_by_code",
         "format": PTG2_SERVING_BINARY_V3_FORMAT,
@@ -17286,6 +18528,7 @@ fn write_serving_binary_v3_assigned_rows_copy_with_provenance<R: AssignedV3RowSo
         "provider_set_codes": provider_code_summary,
         "by_code_page": forward_page_summary,
         "provider_set_page": provider_page_summary,
+        "rate_schedule_observe": rate_schedule_observe_summary,
         "shared_block_preparation": writer.shared_block_preparation_summary(),
         "byte_count": writer.byte_count(),
         "block_bytes": grouped_payload_bytes,
@@ -21448,6 +22691,15 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             )
         })?;
     let provider_map_bytes = DenseIdentityMap::estimated_memory_bytes(provider_map_entries)?;
+    let rate_schedule_observe = env_bool(
+        RATE_SCHEDULE_OBSERVE_ENV,
+        env_bool("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", false),
+    );
+    let rate_schedule_observe_memory_charge_bytes = if rate_schedule_observe {
+        rate_schedule_observe_memory_upper_bound_bytes(provider_map_entries)?
+    } else {
+        0
+    };
     let identity_scan_seconds = 0.0;
     let preparation_scratch = V3ScratchBytes::default();
 
@@ -21505,6 +22757,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     let estimated_resident_state_without_provider_code_bitmap_bytes = identity_scan_peak_bytes
         .checked_add(provider_projection_max_bytes)
         .and_then(|value| value.checked_add(encoder_workspace_max_bytes))
+        .and_then(|value| value.checked_add(rate_schedule_observe_memory_charge_bytes))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -21516,7 +22769,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "identity maps, coverage bitmaps, bounded provider projections, and encoder workspace require {estimated_resident_state_without_provider_code_bitmap_bytes} bytes, exceeding --identity-map-max-bytes {}",
+                "identity maps, coverage bitmaps, bounded provider projections, rate-schedule observation, and encoder workspace require {estimated_resident_state_without_provider_code_bitmap_bytes} bytes, exceeding --identity-map-max-bytes {}",
                 options.identity_map_max_bytes
             ),
         ));
@@ -21689,6 +22942,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
                 provider_set_count: Some(provider_map_entries),
                 provider_code_count: Some(code_map.len()),
                 provider_code_bitmap_max_bytes: provider_code_bitmap_maximum_bytes,
+                rate_schedule_observe,
                 source: source_encoding,
             },
         )
@@ -21816,6 +23070,14 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
     for category in [assigned_final_run_sync, price_copy_sync, serving_copy_sync] {
         total_sync_stats.add(category);
     }
+    let Some(rate_schedule_observe_summary) =
+        assigned_summary.get("rate_schedule_observe").cloned()
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "assigned encoder summary lacks rate-schedule observe status",
+        ));
+    };
 
     let summary = json!({
         "format": "ptg2_v3_direct_finalizer_v3",
@@ -21829,6 +23091,7 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
         "source_key_bits": inputs.source_key_bits,
         "source_key_bytes": inputs.source_key_bytes,
         "tagged_record_bytes": inputs.tagged_record_bytes,
+        "rate_schedule_observe": rate_schedule_observe_summary,
         "source": {
             "source_count": inputs.source_count,
             "source_key_bits": inputs.source_key_bits,
@@ -21917,6 +23180,8 @@ fn finalize_v3_runs(options: &V3FinalizerOptions) -> io::Result<Value> {
             "identity_scan_peak_bytes": identity_scan_peak_bytes,
             "provider_projection_max_bytes": provider_projection_max_bytes,
             "provider_projection_dense_index_bytes": provider_projection_dense_index_bytes,
+            "rate_schedule_observe_enabled": rate_schedule_observe,
+            "rate_schedule_observe_memory_charge_bytes": rate_schedule_observe_memory_charge_bytes,
             "provider_code_bitmap_candidate_bytes": provider_code_bitmap_candidate_bytes,
             "provider_code_bitmap_charged_bytes": provider_code_bitmap_charged_bytes,
             "provider_code_bitmap_maximum_bytes": provider_code_bitmap_maximum_bytes,
@@ -22333,6 +23598,12 @@ mod tests {
         fn set(name: &'static str, value: &str) -> Self {
             let previous = std::env::var(name).ok();
             std::env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var(name).ok();
+            std::env::remove_var(name);
             Self { name, previous }
         }
     }
@@ -22839,6 +24110,7 @@ mod tests {
         let raw_rate = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":100,"service_code":["11"]},{"negotiated_type":"negotiated","negotiated_rate":200,"service_code":["22"]}]}"#;
         let source_witness = Arc::new(SourceWitnessCollector::new(&"ab".repeat(32)).unwrap());
         source_witness.configure_provider_spools(1).unwrap();
+        source_witness.configure_rate_spools(1).unwrap();
         let source_locator = source_witness
             .store_provider_source(0, raw_provider)
             .unwrap();
@@ -23108,6 +24380,44 @@ mod tests {
     }
 
     #[test]
+    fn strict_v4_factor_config_uses_main_flag_and_requires_paired_paths() {
+        let _lock = scanner_env_lock().lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("ptg2-v4-factor-config-{}", std::process::id()));
+        let _strict_env = strict_scan_env(&directory);
+        let _main_v4 = TestEnvVar::set(PROVIDER_GRAPH_V4_ENV, "true");
+        let _stale_factor_toggle =
+            TestEnvVar::set("HLTHPRT_PTG2_PROVIDER_GRAPH_V4_FACTORS", "false");
+        let _set_path_absent =
+            TestEnvVar::remove("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH");
+        let _component_path_absent =
+            TestEnvVar::remove("HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH");
+
+        let missing_paths_error = CopyPathConfig::from_env().err().unwrap();
+        assert!(missing_paths_error
+            .to_string()
+            .contains("requires both V4 provider factor sidecar paths"));
+
+        let set_path = directory.join("set-component.ptg2sc");
+        let _set_path = TestEnvVar::set(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH",
+            set_path.to_str().unwrap(),
+        );
+        let missing_component_error = CopyPathConfig::from_env().err().unwrap();
+        assert!(missing_component_error
+            .to_string()
+            .contains("outputs require both set-to-component and component-to-group"));
+
+        let component_path = directory.join("component-group.ptg2sc");
+        let _component_path = TestEnvVar::set(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH",
+            component_path.to_str().unwrap(),
+        );
+        let config = CopyPathConfig::from_env().unwrap();
+        assert!(configured_v4_factor_mode(&config).unwrap());
+    }
+
+    #[test]
     fn worker_copy_paths_suffix_every_worker_owned_output() {
         let coverage_scope_id = [7_u8; COVERAGE_SCOPE_ID_BYTES];
         let paths = CopyPathConfig {
@@ -23118,6 +24428,12 @@ mod tests {
             v3_coverage_scope_id: Some(coverage_scope_id),
             manifest_provider_forward_sidecar: Some("provider-forward.copy".to_string()),
             manifest_provider_inverted_sidecar: Some("provider-inverted.copy".to_string()),
+            manifest_provider_set_component_sidecar: Some(
+                "provider-set-component.sidecar".to_string(),
+            ),
+            manifest_provider_component_group_sidecar: Some(
+                "provider-component-group.sidecar".to_string(),
+            ),
             manifest_provider_npi_sidecar: Some("provider-npi.copy".to_string()),
             manifest_price_forward_sidecar: Some("price-forward.copy".to_string()),
             manifest_price_atom: Some("manifest-price-atom.copy".to_string()),
@@ -23266,6 +24582,8 @@ mod tests {
             v3_coverage_scope_id: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
+            manifest_provider_set_component_sidecar: None,
+            manifest_provider_component_group_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -23320,6 +24638,8 @@ mod tests {
             v3_coverage_scope_id: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
+            manifest_provider_set_component_sidecar: None,
+            manifest_provider_component_group_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: Some(base.join("unused-price.copy").to_string_lossy().to_string()),
@@ -23357,10 +24677,10 @@ mod tests {
         });
 
         sinks
-            .write_provider_group_members_shared(&provider_ref, &dedupe)
+            .write_provider_group_members_shared(&provider_ref, &dedupe, false)
             .unwrap();
         sinks
-            .write_provider_group_members_shared(&provider_ref, &dedupe)
+            .write_provider_group_members_shared(&provider_ref, &dedupe, false)
             .unwrap();
         let events = sinks.finish_silent().unwrap();
 
@@ -23508,6 +24828,387 @@ mod tests {
     }
 
     #[test]
+    fn v4_factor_cache_preserves_legacy_identity_for_equivalent_compositions() {
+        let mut provider_map = HashMap::new();
+        provider_map.insert(
+            ProviderRefKey::from("a"),
+            ProviderEntry {
+                entry_hash: 11,
+                provider_count: 2,
+                provider_group_hashes: vec![101],
+                npi: vec![1_000_000_001, 1_000_000_002],
+                quarantined_npi: Vec::new(),
+                network_names: vec!["shared".to_string()],
+                source_locator: None,
+            },
+        );
+        provider_map.insert(
+            ProviderRefKey::from("b"),
+            ProviderEntry {
+                entry_hash: 12,
+                provider_count: 2,
+                provider_group_hashes: vec![202],
+                npi: vec![1_000_000_002, 1_000_000_003],
+                quarantined_npi: Vec::new(),
+                network_names: vec!["shared".to_string()],
+                source_locator: None,
+            },
+        );
+        provider_map.insert(
+            ProviderRefKey::from("c"),
+            ProviderEntry {
+                entry_hash: 13,
+                provider_count: 3,
+                provider_group_hashes: vec![101, 202],
+                npi: vec![1_000_000_001, 1_000_000_002, 1_000_000_003],
+                quarantined_npi: Vec::new(),
+                network_names: vec!["shared".to_string()],
+                source_locator: None,
+            },
+        );
+        let context = test_compact_context();
+        let rate_ab = RateLite {
+            provider_refs: vec![ProviderRefKey::from("b"), ProviderRefKey::from("a")],
+            provider_groups: Vec::new(),
+            network_names: vec!["rate".to_string()],
+            prices: vec![test_price_lite("100.00")],
+            prepared_price_set: None,
+        };
+        let rate_c = RateLite {
+            provider_refs: vec![ProviderRefKey::from("c")],
+            ..rate_ab.clone()
+        };
+        let legacy_ab = provider_set_from_ref_keys(&provider_map, &rate_ab.provider_refs)
+            .unwrap()
+            .unwrap();
+        let expected_networks = rate_network_names(&rate_ab, &legacy_ab.network_names, &context);
+        let expected_hash =
+            provider_set_scope_hash(&legacy_ab.provider_group_hashes, &expected_networks);
+        let expected_global = provider_set_global_id_from_group_hashes_and_network_names(
+            &legacy_ab.provider_group_hashes,
+            &expected_networks,
+        );
+
+        let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
+        let mut cache = V4ProviderSetFactorCache::new(true, Arc::clone(&shared));
+        let factored_ab = cache
+            .resolve(
+                &provider_map,
+                &rate_ab.provider_refs,
+                None,
+                &rate_ab,
+                &context,
+            )
+            .unwrap()
+            .unwrap();
+        let factored_c = cache
+            .resolve(
+                &provider_map,
+                &rate_c.provider_refs,
+                None,
+                &rate_c,
+                &context,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(factored_ab.provider_set_hash, expected_hash);
+        assert_eq!(factored_ab.provider_set_global_id, expected_global);
+        assert_eq!(factored_c.provider_set_global_id, expected_global);
+        assert_eq!(factored_ab.provider_count, 3);
+        assert_eq!(factored_c.provider_count, 3);
+        assert_eq!(
+            HashSet::from([
+                factored_ab.provider_set_global_id,
+                factored_c.provider_set_global_id,
+            ])
+            .len(),
+            1
+        );
+
+        let before = cache.metrics;
+        let repeated = cache
+            .resolve(
+                &provider_map,
+                &rate_ab.provider_refs,
+                None,
+                &rate_ab,
+                &context,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.provider_set_global_id, expected_global);
+        assert_eq!(
+            cache.metrics.flat_group_union_attempts,
+            before.flat_group_union_attempts
+        );
+        assert_eq!(cache.metrics.npi_union_attempts, before.npi_union_attempts);
+        assert_eq!(cache.metrics.flat_group_union_attempts, 2);
+        assert_eq!(cache.metrics.npi_union_attempts, 2);
+        assert_eq!(cache.metrics.cache_hits, 1);
+        assert_eq!(cache.metrics.cache_misses, 2);
+        assert_eq!(cache.metrics.cache_resets, 0);
+
+        let source = EmittedProviderNpis::Factor {
+            provider_count: factored_ab.provider_count as u64,
+            inline_npis: &[],
+        };
+        assert_eq!(
+            source.nth(0, &rate_ab, &provider_map).unwrap(),
+            1_000_000_001
+        );
+        assert_eq!(
+            source.nth(2, &rate_ab, &provider_map).unwrap(),
+            1_000_000_003
+        );
+        let (entries, estimated_bytes, max_bytes) = shared.snapshot();
+        assert_eq!(entries, 2);
+        assert!(estimated_bytes > 0);
+        assert!(estimated_bytes < 4096);
+        assert_eq!(max_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn v4_factor_resolution_advances_semantic_progress_before_object_completion() {
+        let group_hashes = (1..=65_537).collect::<Vec<_>>();
+        let npis = (1_000_000_000..1_000_065_537).collect::<Vec<_>>();
+        let key = ProviderRefKey::from("wide");
+        let provider_map = HashMap::from([(
+            key.clone(),
+            ProviderEntry {
+                entry_hash: 91,
+                provider_count: npis.len() as i64,
+                provider_group_hashes: group_hashes,
+                npi: npis,
+                quarantined_npi: Vec::new(),
+                network_names: Vec::new(),
+                source_locator: None,
+            },
+        )]);
+        let rate = RateLite {
+            provider_refs: vec![key],
+            provider_groups: Vec::new(),
+            network_names: Vec::new(),
+            prices: vec![test_price_lite("1")],
+            prepared_price_set: None,
+        };
+        let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
+        let progress = shared.semantic_progress();
+        let before = progress.snapshot();
+        let mut cache = V4ProviderSetFactorCache::new(true, shared);
+
+        cache
+            .resolve(
+                &provider_map,
+                &rate.provider_refs,
+                None,
+                &rate,
+                &test_compact_context(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let after = progress.snapshot();
+        assert_eq!(
+            before,
+            ptg2_scanner::progress::ScannerSemanticSnapshot::default()
+        );
+        assert!(after.semantic_work_completed > before.semantic_work_completed);
+        assert!(after.provider_group_union_visits >= 65_537 * 2);
+        assert!(after.provider_npi_union_visits >= 65_537);
+        assert_eq!(after.in_network_objects_completed, 0);
+    }
+
+    #[test]
+    fn v4_factor_cache_fails_admission_without_retaining_expanded_unions() {
+        let provider_map = HashMap::from([(
+            ProviderRefKey::from("wide"),
+            ProviderEntry {
+                entry_hash: 91,
+                provider_count: 4,
+                provider_group_hashes: vec![1, 2, 3, 4],
+                npi: vec![1_000_000_001, 1_000_000_002, 1_000_000_003, 1_000_000_004],
+                quarantined_npi: Vec::new(),
+                network_names: Vec::new(),
+                source_locator: None,
+            },
+        )]);
+        let rate = RateLite {
+            provider_refs: vec![ProviderRefKey::from("wide")],
+            provider_groups: Vec::new(),
+            network_names: Vec::new(),
+            prices: vec![test_price_lite("1")],
+            prepared_price_set: None,
+        };
+        let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1));
+        let mut cache = V4ProviderSetFactorCache::new(true, Arc::clone(&shared));
+        let error = cache
+            .resolve(
+                &provider_map,
+                &rate.provider_refs,
+                None,
+                &rate,
+                &test_compact_context(),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(shared.snapshot(), (0, 0, 1));
+        assert!(cache.buckets.is_empty());
+    }
+
+    #[test]
+    fn v4_factor_cache_covers_source_ordinals_and_shared_cache_paths() {
+        let key = ProviderRefKey::from("component");
+        let component = ProviderEntry {
+            entry_hash: 71,
+            provider_count: 2,
+            provider_group_hashes: vec![101, 202],
+            npi: vec![1_000_000_001, 1_000_000_002],
+            quarantined_npi: Vec::new(),
+            network_names: vec!["component-network".to_string()],
+            source_locator: None,
+        };
+        let inline = ProviderEntry {
+            entry_hash: 72,
+            provider_count: 2,
+            provider_group_hashes: vec![202, 303],
+            npi: vec![1_000_000_002, 1_000_000_003],
+            quarantined_npi: Vec::new(),
+            network_names: vec!["inline-network".to_string()],
+            source_locator: None,
+        };
+        let provider_map = HashMap::from([(key.clone(), component)]);
+        let rate = RateLite {
+            provider_refs: vec![key.clone()],
+            provider_groups: Vec::new(),
+            network_names: vec!["rate-network".to_string()],
+            prices: vec![test_price_lite("1")],
+            prepared_price_set: None,
+        };
+        let context = test_compact_context();
+
+        let exact_error = EmittedProviderNpis::Exact(&[1_000_000_001])
+            .nth(1, &rate, &provider_map)
+            .unwrap_err();
+        assert!(exact_error
+            .to_string()
+            .contains("outside the exact provider set"));
+
+        let missing_rate = RateLite {
+            provider_refs: vec![ProviderRefKey::from("missing")],
+            ..rate.clone()
+        };
+        let missing_error = EmittedProviderNpis::Factor {
+            provider_count: 1,
+            inline_npis: &[],
+        }
+        .nth(0, &missing_rate, &provider_map)
+        .unwrap_err();
+        assert!(missing_error
+            .to_string()
+            .contains("unresolved provider reference"));
+
+        let ordinal_error = EmittedProviderNpis::Factor {
+            provider_count: 2,
+            inline_npis: &[],
+        }
+        .nth(2, &rate, &provider_map)
+        .unwrap_err();
+        assert!(ordinal_error
+            .to_string()
+            .contains("outside the factored provider set"));
+        assert_eq!(sorted_unique_i64_nth(&[&[1, 2]], 3), None);
+
+        let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
+        let mut first = V4ProviderSetFactorCache::new(true, Arc::clone(&shared));
+        let first_entry = first
+            .resolve(&provider_map, &rate.provider_refs, None, &rate, &context)
+            .unwrap()
+            .unwrap();
+        let mut second = V4ProviderSetFactorCache::new(true, Arc::clone(&shared));
+        let shared_entry = second
+            .resolve(&provider_map, &rate.provider_refs, None, &rate, &context)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first_entry, &shared_entry));
+        assert_eq!(second.metrics.cache_misses, 1);
+        assert_eq!(second.metrics.flat_group_union_attempts, 0);
+
+        let mixed = second
+            .resolve(
+                &provider_map,
+                &rate.provider_refs,
+                Some(&inline),
+                &rate,
+                &context,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(mixed.provider_count, 3);
+        assert_eq!(second.metrics.mixed_rates, 1);
+
+        let inline_rate = RateLite {
+            provider_refs: Vec::new(),
+            ..rate.clone()
+        };
+        assert!(second
+            .resolve(&provider_map, &[], Some(&inline), &inline_rate, &context)
+            .unwrap()
+            .is_some());
+        assert_eq!(second.metrics.inline_only_rates, 1);
+        assert!(second
+            .resolve(&provider_map, &[], None, &inline_rate, &context)
+            .unwrap()
+            .is_none());
+
+        let unresolved_error = second
+            .resolve(
+                &provider_map,
+                &missing_rate.provider_refs,
+                None,
+                &missing_rate,
+                &context,
+            )
+            .unwrap_err();
+        assert!(unresolved_error
+            .to_string()
+            .contains("unresolved provider reference"));
+    }
+
+    #[test]
+    fn v4_factor_shared_cache_configuration_validates_byte_limit() {
+        const NAME: &str = "HLTHPRT_PTG2_V4_FACTOR_CACHE_MAX_BYTES";
+        let _lock = scanner_env_lock().lock().unwrap();
+
+        {
+            let _unset = TestEnvVar::remove(NAME);
+            assert_eq!(
+                V4ProviderSetFactorSharedCache::configured()
+                    .unwrap()
+                    .snapshot()
+                    .2,
+                DEFAULT_V4_PROVIDER_FACTOR_CACHE_MAX_BYTES as u64
+            );
+        }
+        {
+            let _configured = TestEnvVar::set(NAME, "4096");
+            assert_eq!(
+                V4ProviderSetFactorSharedCache::configured()
+                    .unwrap()
+                    .snapshot()
+                    .2,
+                4096
+            );
+        }
+        for invalid in ["0", "not-a-byte-count"] {
+            let configured = TestEnvVar::set(NAME, invalid);
+            let error = V4ProviderSetFactorSharedCache::configured().err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("positive integer byte count"));
+            drop(configured);
+        }
+    }
+
+    #[test]
     fn tin_only_provider_group_has_no_npi_members() {
         let entry = build_provider_entry(&json!({
             "provider_groups": [{
@@ -23553,8 +25254,8 @@ mod tests {
 
         for raw in fixtures {
             assert_eq!(
-                read_rate_lite_bytes_typed(raw).unwrap(),
-                read_rate_lite_bytes_streaming(raw).unwrap()
+                read_rate_lite_bytes_typed(raw, false).unwrap(),
+                read_rate_lite_bytes_streaming(raw, false).unwrap()
             );
         }
     }
@@ -23583,7 +25284,7 @@ mod tests {
 
         for raw in fixtures {
             let profiled = read_rate_lite_bytes_profiled(raw);
-            let streaming = read_rate_lite_bytes_streaming(raw);
+            let streaming = read_rate_lite_bytes_streaming(raw, false);
             match (profiled, streaming) {
                 (Ok((profiled, _)), Ok(streaming)) => assert_eq!(profiled, streaming),
                 (Err(profiled), Err(streaming)) => {
@@ -23609,13 +25310,13 @@ mod tests {
 
         let started_at = Instant::now();
         for _ in 0..ITERATIONS {
-            std::hint::black_box(read_rate_lite_bytes_streaming(raw).unwrap());
+            std::hint::black_box(read_rate_lite_bytes_streaming(raw, false).unwrap());
         }
         let streaming_seconds = started_at.elapsed().as_secs_f64();
 
         let started_at = Instant::now();
         for _ in 0..ITERATIONS {
-            std::hint::black_box(read_rate_lite_bytes_typed(raw).unwrap());
+            std::hint::black_box(read_rate_lite_bytes_typed(raw, false).unwrap());
         }
         let typed_seconds = started_at.elapsed().as_secs_f64();
 
@@ -23839,7 +25540,6 @@ mod tests {
 
         for invalid_npi in [
             json!(1234567890_i64),
-            json!([]),
             json!(["1234567890"]),
             json!([true]),
             json!([{}]),
@@ -23852,6 +25552,52 @@ mod tests {
             let error = provider_ref_definition(&provider_ref).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn v3_mode_rejects_empty_npi_array_while_v4_normalizes_it() {
+        let mut empty_npi = valid_provider_reference();
+        empty_npi["provider_groups"][0]["npi"] = json!([]);
+        let mut zero_marker = valid_provider_reference();
+        zero_marker["provider_groups"][0]["npi"] = json!([0]);
+
+        assert!(build_provider_entry(&empty_npi).is_err());
+        let (empty_entry, empty_normalizations) =
+            build_provider_entry_audited(&empty_npi, true).unwrap();
+        let (zero_entry, zero_normalizations) =
+            build_provider_entry_audited(&zero_marker, true).unwrap();
+
+        assert_eq!(empty_normalizations, 1);
+        assert_eq!(zero_normalizations, 0);
+        assert_eq!(empty_entry.entry_hash, zero_entry.entry_hash);
+        assert_eq!(
+            empty_entry.provider_group_hashes,
+            zero_entry.provider_group_hashes
+        );
+        assert_eq!(empty_entry.provider_count, 0);
+        assert!(empty_entry.npi.is_empty());
+        assert!(empty_entry.quarantined_npi.is_empty());
+        assert_eq!(
+            empty_npi_tin_only_normalization_payload(empty_normalizations),
+            json!({
+                "contract": "ptg2_v4_empty_npi_tin_only_normalization_v1",
+                "source_shape": "empty_array",
+                "canonical_equivalent": "zero_marker",
+                "occurrence_count": 1,
+                "emitted_npi_edge_count": 0,
+                "sha256": "db13782e1535049353cacb9fd1a2f6943a7c461cc09596d23e631741728a0216",
+            }),
+        );
+        let v3_summary = json!({"factor_mode": false});
+        assert_eq!(
+            scanner_summary_with_v4_empty_npi_audit(v3_summary.clone(), false, 1),
+            v3_summary,
+        );
+        assert_eq!(
+            scanner_summary_with_v4_empty_npi_audit(json!({"factor_mode": true}), true, 1)
+                ["empty_npi_tin_only_normalization"]["occurrence_count"],
+            1,
+        );
     }
 
     #[test]
@@ -24022,12 +25768,44 @@ mod tests {
             raw_refs.push_current_value_span(start);
         }
 
-        let processed =
-            process_provider_ref_raw_batch(&raw_refs, &mut provider_map, &mut sinks, &dedupe)
-                .unwrap();
+        let processed = process_provider_ref_raw_batch(
+            &raw_refs,
+            &mut provider_map,
+            &mut sinks,
+            &dedupe,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(processed, 2);
         assert_eq!(provider_map.len(), 1);
+    }
+
+    #[test]
+    fn raw_provider_reference_worker_preserves_empty_npi_group_without_edges() {
+        let mut provider_ref = valid_provider_reference();
+        provider_ref["provider_groups"][0]["npi"] = json!([]);
+        let raw_ref = serde_json::to_vec(&provider_ref).unwrap();
+        let mut raw_refs = RawRateChunk::with_capacity(1, raw_ref.len());
+        raw_refs.bytes.extend_from_slice(&raw_ref);
+        raw_refs.push_current_value_span(0);
+
+        let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+        let dedupe = SharedDedupe::new(2);
+        let mut provider_map = HashMap::new();
+        let processed =
+            process_provider_ref_raw_batch(&raw_refs, &mut provider_map, &mut sinks, &dedupe, true)
+                .unwrap();
+
+        assert_eq!(processed, 1);
+        assert_eq!(provider_map.len(), 1);
+        let entry = provider_map.values().next().unwrap();
+        assert_eq!(entry.provider_count, 0);
+        assert!(entry.npi.is_empty());
+        let summary = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(dedupe.empty_npi_tin_only_normalization_count(), 1);
+        assert_eq!(summary["provider_group_attempted"], 1);
+        assert_eq!(summary["provider_group_member_attempted"], 0);
     }
 
     #[test]
@@ -24203,6 +25981,8 @@ mod tests {
             v3_coverage_scope_id: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
+            manifest_provider_set_component_sidecar: None,
+            manifest_provider_component_group_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -24237,9 +26017,14 @@ mod tests {
             raw_refs.push_current_value_span(start);
         }
 
-        let processed =
-            process_provider_ref_raw_batch(&raw_refs, &mut provider_map, &mut sinks, &dedupe)
-                .unwrap();
+        let processed = process_provider_ref_raw_batch(
+            &raw_refs,
+            &mut provider_map,
+            &mut sinks,
+            &dedupe,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(processed, 3);
         assert_eq!(provider_map.len(), 3);
@@ -24409,6 +26194,9 @@ mod tests {
                 .iter()
                 .any(|entry| entry.members.contains(&npi_member_id(npi))));
         }
+        assert!(provider_npi_entries
+            .iter()
+            .all(|entry| !entry.members.contains(&npi_member_id(0))));
         assert!(sidecars.price_forward_entries().unwrap().is_empty());
         drop(sidecars);
         let _ = std::fs::remove_dir_all(base);
@@ -24417,6 +26205,55 @@ mod tests {
     #[test]
     fn worker_handles_mixed_top_level_references_and_inline_provider_groups() {
         assert_worker_handles_mixed_referenced_and_inline_rates(false);
+    }
+
+    #[test]
+    fn v4_inline_empty_npi_rate_preserves_price_and_group_without_npi_edges() {
+        let raw_rate = br#"{
+            "provider_groups":[{
+                "tin":{"type":"ein","value":"444444444"},
+                "npi":[]
+            }],
+            "negotiated_prices":[{"negotiated_rate":103.00}]
+        }"#;
+        assert!(read_rate_lite_bytes_profiled_with_policy(raw_rate, false).is_err());
+        let (rate, _typed) = read_rate_lite_bytes_profiled_with_policy(raw_rate, true).unwrap();
+        let rate = rate.unwrap();
+        let price_set = rate_price_set(&rate).unwrap();
+        assert_eq!(price_set.atoms.len(), 1);
+        assert_eq!(price_set.atoms[0].negotiated_rate, "103");
+
+        let mut dictionary_sinks =
+            DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+        let dedupe = SharedDedupe::new(2);
+        let mut provider_cache = ProviderSetScopeCache::with_v4_factor_mode(true);
+        let provider_map = HashMap::new();
+        let resolved = resolve_worker_provider(
+            &provider_map,
+            &rate,
+            &mut dictionary_sinks,
+            &dedupe,
+            &mut provider_cache,
+            &test_compact_context(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(resolved.is_v4_factor());
+        assert_eq!(resolved.provider_count(), 0);
+        assert_eq!(resolved.emitted_npis().len(), 0);
+        let (component_hash, group_hashes) = resolved.inline_component().unwrap();
+        assert_ne!(component_hash, 0);
+        assert_eq!(group_hashes.len(), 1);
+        assert_eq!(
+            group_hashes[0],
+            provider_group_hash(&rate.provider_groups[0]["tin"], &[], &[])
+        );
+        assert_eq!(dedupe.empty_npi_tin_only_normalization_count(), 1);
+        let dedupe_summary = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(dedupe_summary["provider_group_attempted"], 1);
+        assert_eq!(dedupe_summary["provider_group_unique"], 1);
+        assert_eq!(dedupe_summary["provider_group_member_attempted"], 0);
     }
 
     #[test]
@@ -24735,6 +26572,8 @@ mod tests {
             v3_coverage_scope_id: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
+            manifest_provider_set_component_sidecar: None,
+            manifest_provider_component_group_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -24843,6 +26682,8 @@ mod tests {
             v3_coverage_scope_id: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
+            manifest_provider_set_component_sidecar: None,
+            manifest_provider_component_group_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -24873,9 +26714,14 @@ mod tests {
         raw_refs.bytes.extend_from_slice(&raw_ref);
         raw_refs.push_current_value_span(start);
 
-        let error =
-            process_provider_ref_raw_batch(&raw_refs, &mut provider_map, &mut sinks, &dedupe)
-                .unwrap_err();
+        let error = process_provider_ref_raw_batch(
+            &raw_refs,
+            &mut provider_map,
+            &mut sinks,
+            &dedupe,
+            false,
+        )
+        .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(provider_map.is_empty());
@@ -26563,6 +28409,7 @@ mod tests {
                 provider_set_count: None,
                 provider_code_count: None,
                 provider_code_bitmap_max_bytes: 0,
+                rate_schedule_observe: false,
                 source: SourceEncoding {
                     count: source_count,
                     key_bits: source_key_bits(source_count).unwrap(),
@@ -29300,6 +31147,7 @@ mod tests {
             provider_set_count: None,
             provider_code_count: None,
             provider_code_bitmap_max_bytes: 0,
+            rate_schedule_observe: false,
             source: SourceEncoding {
                 count: 3,
                 key_bits: 2,
@@ -29353,6 +31201,108 @@ mod tests {
         assert_eq!(fixed_reader.distinct_record_count(), rows.len() as u64);
         assert_eq!(fixed_reader.duplicate_record_count(), 0);
         assert!(!fixed_reader.audit_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn serving_binary_v3_reports_exact_observe_only_rate_schedule_reuse() {
+        let rows = [
+            AssignedV3Row {
+                code_key: 1,
+                provider_set_key: 0,
+                provider_count: 1,
+                price_key: 2,
+                source_key: 0,
+            },
+            AssignedV3Row {
+                code_key: 1,
+                provider_set_key: 1,
+                provider_count: 1,
+                price_key: 2,
+                source_key: 0,
+            },
+            AssignedV3Row {
+                code_key: 2,
+                provider_set_key: 0,
+                provider_count: 1,
+                price_key: 3,
+                source_key: 1,
+            },
+            AssignedV3Row {
+                code_key: 2,
+                provider_set_key: 1,
+                provider_count: 1,
+                price_key: 3,
+                source_key: 1,
+            },
+        ];
+        let pg_rows = rows
+            .iter()
+            .map(|row| {
+                vec![
+                    pg_i32_field(row.code_key),
+                    pg_i32_field(row.provider_set_key),
+                    pg_i64_field(row.provider_count as i64),
+                    pg_i64_field(i64::from(row.price_key)),
+                    pg_i64_field(i64::from(row.source_key)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut reader = Cursor::new(pg_binary_copy_rows(&pg_rows));
+        let mut writer = CountingWriter::new(Vec::new());
+        let summary =
+            write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader_with_provenance(
+                &mut reader,
+                &mut writer,
+                ServingBinaryTargetCopyFormat::SharedBinary,
+                AssignedV3EncoderOptions {
+                    grouped_payload_bytes: 1024,
+                    hot_payload_bytes: 1024,
+                    provider_code_sort_chunk_bytes: 1024,
+                    provider_set_count: Some(2),
+                    provider_code_count: Some(3),
+                    provider_code_bitmap_max_bytes: 1024,
+                    rate_schedule_observe: true,
+                    source: SourceEncoding {
+                        count: 2,
+                        key_bits: 1,
+                        tagged_codec: TaggedServingRunCodec::new(2, 1).unwrap(),
+                    },
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(summary["rate_schedule_observe"]["enabled"], true);
+        assert_eq!(
+            summary["rate_schedule_observe"]["representation_effect"],
+            "observe_only_no_serving_change"
+        );
+        assert_eq!(summary["rate_schedule_observe"]["provider_set_count_s"], 2);
+        assert_eq!(
+            summary["rate_schedule_observe"]["distinct_schedule_count_k"],
+            1
+        );
+        assert_eq!(
+            summary["rate_schedule_observe"]["rate_occurrence_count_r"],
+            4
+        );
+        assert_eq!(
+            summary["rate_schedule_observe"]["unique_schedule_occurrence_count_u"],
+            2
+        );
+        assert_eq!(
+            summary["rate_schedule_observe"]["distinct_schedule_code_incidence_count_i"],
+            2
+        );
+        assert_eq!(
+            summary["rate_schedule_observe"]["weighted_reuse_r_over_u"],
+            2.0
+        );
+        assert_eq!(
+            summary["rate_schedule_observe"]["occurrence_external_sort"],
+            false
+        );
+        assert_eq!(summary["rate_schedule_observe"]["scratch_bytes_written"], 0);
     }
 
     #[test]
@@ -29490,6 +31440,7 @@ mod tests {
                         provider_set_count,
                         provider_code_count: None,
                         provider_code_bitmap_max_bytes: 0,
+                        rate_schedule_observe: false,
                         source: SourceEncoding {
                             count: 1,
                             key_bits: 0,
@@ -29612,6 +31563,7 @@ mod tests {
                         provider_set_count: Some(3),
                         provider_code_count: Some(128),
                         provider_code_bitmap_max_bytes: bitmap_maximum_bytes,
+                        rate_schedule_observe: false,
                         source: SourceEncoding {
                             count: 1,
                             key_bits: 0,
@@ -29947,6 +31899,7 @@ mod tests {
                     provider_set_count: None,
                     provider_code_count: None,
                     provider_code_bitmap_max_bytes: 0,
+                    rate_schedule_observe: false,
                     source,
                 },
                 true,
@@ -30910,7 +32863,12 @@ mod tests {
         let mut collector = ManifestSidecarCollector::default();
 
         collector
-            .record_provider_set(provider_set_id, &[20, 10, 20], &[1003002106, 1003007311])
+            .record_provider_set(
+                provider_set_id,
+                &[20, 10, 20],
+                &[91, 92],
+                &[1003002106, 1003007311],
+            )
             .unwrap();
 
         let entries = collector.provider_forward_entries().unwrap();
@@ -30938,7 +32896,12 @@ mod tests {
         };
 
         collector
-            .record_provider_set(provider_set_id, &[20, 10, 20], &[1003002106, 1003007311])
+            .record_provider_set(
+                provider_set_id,
+                &[20, 10, 20],
+                &[91, 92],
+                &[1003002106, 1003007311],
+            )
             .unwrap();
 
         assert!(collector.provider_forward.is_empty());
@@ -30989,6 +32952,7 @@ mod tests {
             .record_provider_set(
                 GlobalId128([5; GLOBAL_ID_BYTES]),
                 &[20, 10, 20],
+                &[91, 92],
                 &[1003002106, 1003007311],
             )
             .unwrap();
@@ -31031,7 +32995,12 @@ mod tests {
             ..ManifestSidecarCollector::default()
         };
         collector
-            .record_provider_set(GlobalId128([5; GLOBAL_ID_BYTES]), &[20], &[1003002106])
+            .record_provider_set(
+                GlobalId128([5; GLOBAL_ID_BYTES]),
+                &[20],
+                &[91],
+                &[1003002106],
+            )
             .unwrap();
 
         let results = configured_spooled_manifest_sidecars(&paths, &mut collector)
@@ -31386,6 +33355,161 @@ mod tests {
             Some("source-1")
         );
     }
+
+    #[test]
+    fn v4_manifest_factor_collectors_cover_spooled_and_in_memory_directions() {
+        let provider_set = GlobalId128([1; GLOBAL_ID_BYTES]);
+        let atom = GlobalId128([9; GLOBAL_ID_BYTES]);
+        let price_set = PriceSetLite {
+            global_id: GlobalId128([8; GLOBAL_ID_BYTES]),
+            atoms: Vec::new(),
+            atom_ids: vec![atom],
+        };
+
+        let mut in_memory = ManifestSidecarCollector::default();
+        in_memory
+            .record_provider_set(provider_set, &[2, 1, 1], &[4, 3, 3], &[1_234_567_890, 0])
+            .unwrap();
+        in_memory.record_provider_component(3, &[2, 1, 1]).unwrap();
+        in_memory.record_provider_component(4, &[2]).unwrap();
+        in_memory.record_price_set(&price_set).unwrap();
+        assert_eq!(in_memory.provider_forward_entries().unwrap().len(), 1);
+        assert_eq!(in_memory.provider_inverted_entries().unwrap().len(), 2);
+        assert_eq!(in_memory.provider_set_component_entries().unwrap().len(), 1);
+        assert_eq!(
+            in_memory.provider_component_group_entries().unwrap().len(),
+            2
+        );
+        assert_eq!(in_memory.provider_npi_entries().unwrap().len(), 1);
+        assert_eq!(in_memory.price_forward_entries().unwrap().len(), 1);
+        assert!(in_memory
+            .write_spooled_standard_sidecar("unknown", "unused", false)
+            .unwrap()
+            .is_none());
+
+        let factor_paths = CopyPathConfig {
+            manifest_provider_set_component_sidecar: Some("set-component".to_owned()),
+            manifest_provider_component_group_sidecar: Some("component-group".to_owned()),
+            ..CopyPathConfig::default()
+        };
+        let mut spooled = ManifestSidecarCollector {
+            spools: Some(ManifestSidecarSpools::for_paths(&factor_paths).unwrap()),
+            ..ManifestSidecarCollector::default()
+        };
+        spooled
+            .record_provider_set(provider_set, &[2, 1], &[4, 3], &[1_234_567_890])
+            .unwrap();
+        spooled.record_provider_component(3, &[2, 1]).unwrap();
+        assert!(spooled.provider_set_component_entries().unwrap().len() == 1);
+        assert!(spooled.provider_component_group_entries().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn configured_manifest_sidecar_emission_covers_memory_and_spooled_outputs() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-sidecar-emission-test-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let paths_for = |directory: &Path| CopyPathConfig {
+            manifest_provider_forward_sidecar: Some(
+                directory
+                    .join("provider-forward.ptg2sc")
+                    .display()
+                    .to_string(),
+            ),
+            manifest_provider_inverted_sidecar: Some(
+                directory
+                    .join("provider-inverted.ptg2sc")
+                    .display()
+                    .to_string(),
+            ),
+            manifest_provider_set_component_sidecar: Some(
+                directory.join("set-component.ptg2sc").display().to_string(),
+            ),
+            manifest_provider_component_group_sidecar: Some(
+                directory
+                    .join("component-group.ptg2sc")
+                    .display()
+                    .to_string(),
+            ),
+            manifest_provider_npi_sidecar: Some(
+                directory.join("provider-npi.ptg2sc").display().to_string(),
+            ),
+            manifest_price_forward_sidecar: Some(
+                directory.join("price-forward.ptg2sc").display().to_string(),
+            ),
+            ..CopyPathConfig::default()
+        };
+        let provider_set = GlobalId128([1; GLOBAL_ID_BYTES]);
+        let price_set = PriceSetLite {
+            global_id: GlobalId128([8; GLOBAL_ID_BYTES]),
+            atoms: Vec::new(),
+            atom_ids: vec![GlobalId128([9; GLOBAL_ID_BYTES])],
+        };
+
+        let memory_directory = base.join("memory");
+        let memory_paths = paths_for(&memory_directory);
+        let mut in_memory = ManifestSidecarCollector::default();
+        in_memory
+            .record_provider_set(provider_set, &[2, 1], &[4, 3], &[1_234_567_890])
+            .unwrap();
+        in_memory.record_provider_component(3, &[2, 1]).unwrap();
+        in_memory.record_price_set(&price_set).unwrap();
+        let mut memory_events = Vec::new();
+        emit_configured_manifest_sidecars(&mut memory_events, &memory_paths, Some(&mut in_memory))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(memory_events).unwrap().lines().count(),
+            12
+        );
+
+        let spool_directory = base.join("spooled");
+        let spool_paths = paths_for(&spool_directory);
+        let mut spooled = ManifestSidecarCollector {
+            spools: Some(ManifestSidecarSpools::for_paths(&spool_paths).unwrap()),
+            ..ManifestSidecarCollector::default()
+        };
+        spooled
+            .record_provider_set(provider_set, &[2, 1], &[4, 3], &[1_234_567_890])
+            .unwrap();
+        spooled.record_provider_component(3, &[2, 1]).unwrap();
+        spooled.record_price_set(&price_set).unwrap();
+        let mut spool_events = Vec::new();
+        emit_configured_manifest_sidecars(&mut spool_events, &spool_paths, Some(&mut spooled))
+            .unwrap();
+        assert_eq!(String::from_utf8(spool_events).unwrap().lines().count(), 12);
+
+        let mut no_events = Vec::new();
+        emit_configured_manifest_sidecars(&mut no_events, &CopyPathConfig::default(), None)
+            .unwrap();
+        assert!(no_events.is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn witness_failure_code_distinguishes_payload_limits() {
+        for message in [
+            "source witness payload budget exceeded",
+            "source witness intermediate budget exceeded",
+            "source witness fail-closed limit",
+            "source witness spool byte limit exceeded",
+        ] {
+            assert_eq!(
+                scanner_failure_code(&io::Error::new(io::ErrorKind::InvalidData, message)),
+                "witness_payload_limit",
+            );
+        }
+        assert_eq!(
+            scanner_failure_code(&io::Error::other("source witness parse failed")),
+            "scanner_failure",
+        );
+        assert_eq!(
+            scanner_failure_code(&io::Error::other("unrelated")),
+            "scanner_failure",
+        );
+    }
 }
 
 fn shared_graph_manifest_error(message: impl Into<String>) -> io::Error {
@@ -31647,7 +33771,7 @@ fn run_shared_graph_converter(arguments: &[String]) -> io::Result<()> {
     stdout.flush()
 }
 
-fn main() -> io::Result<()> {
+fn run_cli() -> io::Result<()> {
     let mut args = env::args().skip(1);
     let first_arg = args.next().ok_or_else(|| {
         io::Error::new(
@@ -31780,4 +33904,30 @@ fn main() -> io::Result<()> {
         ));
     }
     scan(Path::new(&first_arg), &arrays)
+}
+
+fn scanner_failure_code(error: &io::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("source witness")
+        && (message.contains("payload budget")
+            || message.contains("intermediate budget")
+            || message.contains("fail-closed")
+            || message.contains("spool byte limit"))
+    {
+        "witness_payload_limit"
+    } else {
+        "scanner_failure"
+    }
+}
+
+fn main() {
+    if let Err(error) = run_cli() {
+        let payload = json!({
+            "code": scanner_failure_code(&error),
+            "kind": format!("{:?}", error.kind()),
+            "message": error.to_string(),
+        });
+        eprintln!("PTG2_SCANNER_ERROR\t{payload}");
+        std::process::exit(1);
+    }
 }

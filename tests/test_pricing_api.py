@@ -97,7 +97,7 @@ async def fake_plan_snapshot_pairs(_session, _plan_fields):
     return [("ptg_test", "ptg2:test")]
 
 
-def strict_snapshot_tables(snapshot_id="ptg2:test"):
+def strict_snapshot_tables(snapshot_id="ptg2:test", *, v4=False):
     snapshot_key_by_id = {
         "ptg2:test": 17,
         "ptg2:test:ndc": 41,
@@ -105,6 +105,7 @@ def strict_snapshot_tables(snapshot_id="ptg2:test"):
     }
     return types.SimpleNamespace(
         uses_shared_blocks=True,
+        uses_v4_graph=bool(v4),
         shared_snapshot_key=snapshot_key_by_id[snapshot_id],
     )
 
@@ -219,6 +220,35 @@ async def test_group_plan_providers_pages_strict_v3_npi_scope(monkeypatch):
     sql = str(request.ctx.sa_session.executions[0][0][0])
     assert "FROM mrf.ptg2_v3_npi_scope" in sql
     assert "snapshot_key = ANY(:snapshot_keys)" in sql
+
+
+@pytest.mark.asyncio
+async def test_group_plan_providers_pages_v4_npi_scope(monkeypatch):
+    async def fake_snapshot_serving_tables(_session, snapshot_id):
+        return strict_snapshot_tables(snapshot_id, v4=True)
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_network_snapshots_for_plan",
+        fake_plan_snapshot_pairs,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "snapshot_serving_tables",
+        fake_snapshot_serving_tables,
+    )
+    request = make_request(
+        [FakeResult(rows=[types.SimpleNamespace(npi=1234567890)])],
+        args={"plan_id": "TESTPLAN001", "market_type": "group", "limit": "10"},
+    )
+
+    response = await group_plan_providers(request)
+    pricing_response = json.loads(response.body)
+
+    assert pricing_response["providers"]["items"][0]["npi"] == 1234567890
+    sql = str(request.ctx.sa_session.executions[0][0][0])
+    assert "FROM mrf.ptg2_v4_npi_scope" in sql
+    assert "ptg2_v3_npi_scope" not in sql
 
 
 @pytest.mark.asyncio
@@ -656,6 +686,42 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
     assert "SELECT npi FROM mrf.ptg2_v3_npi_scope" in provider_sql
     assert "snapshot_key = ANY(:snapshot_keys)" in provider_sql
     assert "(SELECT npi FROM" in provider_sql
+
+
+@pytest.mark.asyncio
+async def test_group_providers_union_v3_v4_npis(monkeypatch):
+    async def fake_network_snapshot_pairs(_session, _plan_fields):
+        return [("ptg_ndc", "ptg2:test:ndc"), ("ptg_c2", "ptg2:test:c2")]
+
+    async def fake_snapshot_serving_tables(_session, snapshot_id):
+        return strict_snapshot_tables(snapshot_id, v4=snapshot_id.endswith(":c2"))
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_network_snapshots_for_plan",
+        fake_network_snapshot_pairs,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "snapshot_serving_tables",
+        fake_snapshot_serving_tables,
+    )
+    request = make_request(
+        [FakeResult(rows=[types.SimpleNamespace(npi=1073913877)])],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "enrich": "0",
+            "limit": "10",
+        },
+    )
+
+    await group_plan_providers(request)
+
+    provider_sql = str(request.ctx.sa_session.executions[0][0][0])
+    assert "SELECT npi FROM mrf.ptg2_v3_npi_scope" in provider_sql
+    assert "SELECT npi FROM mrf.ptg2_v4_npi_scope" in provider_sql
+    assert "UNION ALL" in provider_sql
 
 
 def _canonical_directory_selection():

@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_V3_SHARED_GENERATION,
     PTG2_V3_SHARED_FORMAT_VERSION,
     SharedBlock,
     lock_shared_layout_for_dense_write,
@@ -29,6 +30,9 @@ from process.ptg_parts.ptg2_shared_graph import SharedGraphConversionResult
 from process.ptg_parts.ptg2_shared_graph import (
     MembershipArtifact,
     SharedGraphShardBundle,
+)
+from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    lock_v4_shared_layout_for_map_write,
 )
 
 
@@ -78,6 +82,20 @@ class SharedBlockStagePublication:
     unique_block_count: int
     logical_byte_count: int
     stored_byte_count: int
+
+
+@dataclass(frozen=True)
+class V4CASBlockStagePublication:
+    """Exact logical and physical totals for one V4 CAS-only block stage."""
+
+    object_kinds: tuple[str, ...]
+    staged_row_count: int
+    staged_entry_count: int
+    unique_block_count: int
+    logical_byte_count: int
+    stored_byte_count: int
+    unique_logical_byte_count: int
+    unique_stored_byte_count: int
 
 
 @dataclass(frozen=True)
@@ -762,6 +780,7 @@ async def publish_shared_finalizer_dictionaries(
     build_token: str,
     expected_coverage_scope_id: bytes,
     provider_set_metadata_entries: Iterable[dict[str, Any]],
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> SharedDictionaryPublication:
     """Load small fixed dictionaries while keeping the large projections block-only."""
 
@@ -919,6 +938,7 @@ async def publish_shared_finalizer_dictionaries(
                 schema_name=schema_name,
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
+                expected_generation=expected_generation,
             )
             observed_code = await session.execute(
                 db.text(
@@ -1150,6 +1170,7 @@ async def publish_shared_block_stage(
     stage_table: str,
     snapshot_key: int,
     build_token: str,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> SharedBlockStagePublication:
     """Publish a compact Rust-generated block stage without reading payloads in Python."""
 
@@ -1162,6 +1183,7 @@ async def publish_shared_block_stage(
                 schema_name=schema_name,
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
+                expected_generation=expected_generation,
             )
             await session.execute(
                 db.text(
@@ -1264,6 +1286,194 @@ async def publish_shared_block_stage(
             unique_block_count=unique_block_count,
             logical_byte_count=logical_byte_count,
             stored_byte_count=stored_byte_count,
+        )
+    finally:
+        await db.status(f"DROP TABLE IF EXISTS {schema}.{stage};")
+
+
+async def publish_v4_cas_block_stage(
+    *,
+    schema_name: str,
+    stage_table: str,
+    snapshot_key: int,
+    build_token: str,
+) -> V4CASBlockStagePublication:
+    """Publish authenticated V4 compiler blocks without relational mappings.
+
+    The existing binary-COPY stage remains the ingestion boundary.  This path
+    writes and reconciles only the immutable CAS rows; packed snapshot maps are
+    the sole durable coordinate and reachability owner for V4.
+    """
+
+    schema = _quote_ident(_safe_identifier(schema_name))
+    stage = _quote_ident(_safe_identifier(stage_table))
+    try:
+        async with db.transaction() as session:
+            await lock_v4_shared_layout_for_map_write(
+                session,
+                schema_name=schema_name,
+                snapshot_key=int(snapshot_key),
+                build_token=build_token,
+            )
+            # Hold existing target rows against a concurrent GC sweep until
+            # the candidate cancellation below commits. New hashes cannot yet
+            # be candidates and are protected by the active layout lease.
+            await session.execute(
+                db.text(
+                    f"""
+                    SELECT stored.block_hash
+                      FROM {schema}.ptg2_v3_block AS stored
+                      JOIN (
+                           SELECT DISTINCT block_hash
+                             FROM {schema}.{stage}
+                      ) AS staged
+                        ON staged.block_hash = stored.block_hash
+                     FOR KEY SHARE OF stored
+                    """
+                )
+            )
+            await session.execute(
+                db.text(
+                    f"""
+                    INSERT INTO {schema}.ptg2_v3_block
+                        (block_hash, format_version, object_kind, codec,
+                         entry_count, raw_byte_count, stored_byte_count,
+                         payload, created_at)
+                    SELECT DISTINCT ON (staged.block_hash)
+                           staged.block_hash, staged.format_version,
+                           staged.object_kind, staged.codec, staged.entry_count,
+                           staged.raw_byte_count, staged.stored_byte_count,
+                           staged.payload, now()
+                      FROM {schema}.{stage} AS staged
+                     WHERE staged.format_version = :format_version
+                       AND staged.payload IS NOT NULL
+                     ORDER BY staged.block_hash, staged.object_kind,
+                              staged.codec, staged.entry_count,
+                              staged.raw_byte_count, staged.stored_byte_count
+                    ON CONFLICT (block_hash) DO NOTHING
+                    """
+                ),
+                {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
+            )
+            aggregate_result = await session.execute(
+                db.text(
+                    f"""
+                    WITH canonical AS MATERIALIZED (
+                        SELECT DISTINCT ON (staged.block_hash)
+                               staged.block_hash, staged.raw_byte_count,
+                               staged.stored_byte_count
+                          FROM {schema}.{stage} AS staged
+                         ORDER BY staged.block_hash, staged.object_kind,
+                                  staged.codec, staged.entry_count,
+                                  staged.raw_byte_count,
+                                  staged.stored_byte_count
+                    )
+                    SELECT COUNT(*)::bigint,
+                           COALESCE(SUM(staged.entry_count), 0)::bigint,
+                           (SELECT COUNT(*)::bigint FROM canonical),
+                           COALESCE(SUM(staged.raw_byte_count), 0)::bigint,
+                           COALESCE(SUM(staged.stored_byte_count), 0)::bigint,
+                           COALESCE((
+                               SELECT SUM(raw_byte_count)::bigint FROM canonical
+                           ), 0)::bigint,
+                           COALESCE((
+                               SELECT SUM(stored_byte_count)::bigint FROM canonical
+                           ), 0)::bigint,
+                           COALESCE(
+                               ARRAY_AGG(
+                                   DISTINCT staged.object_kind
+                                   ORDER BY staged.object_kind
+                               ),
+                               ARRAY[]::text[]
+                           ),
+                           COALESCE(
+                               BOOL_OR(staged.format_version <> :format_version),
+                               FALSE
+                           ),
+                           COALESCE(
+                               BOOL_OR(
+                                   staged.payload IS NULL
+                                   AND stored.block_hash IS NULL
+                               ),
+                               FALSE
+                           ),
+                           COALESCE(
+                               BOOL_OR(
+                                   stored.block_hash IS NULL
+                                   OR stored.format_version <> staged.format_version
+                                   OR stored.object_kind <> staged.object_kind
+                                   OR stored.codec <> staged.codec
+                                   OR stored.entry_count <> staged.entry_count
+                                   OR stored.raw_byte_count <> staged.raw_byte_count
+                                   OR stored.stored_byte_count <>
+                                      staged.stored_byte_count
+                               ),
+                               FALSE
+                           )
+                      FROM {schema}.{stage} AS staged
+                      LEFT JOIN {schema}.ptg2_v3_block AS stored
+                        ON stored.block_hash = staged.block_hash
+                    """
+                ),
+                {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
+            )
+            aggregate_row = aggregate_result.one()
+            if bool(aggregate_row[8]):
+                raise RuntimeError(
+                    "PTG V4 CAS block stage uses an incompatible format version"
+                )
+            if bool(aggregate_row[9]):
+                raise RuntimeError(
+                    "PTG V4 CAS block stage has no payload or durable CAS row"
+                )
+            if bool(aggregate_row[10]):
+                raise RuntimeError(
+                    "PTG V4 CAS block conflicts with stored content metadata"
+                )
+            await session.execute(
+                db.text(
+                    f"""
+                    DELETE FROM {schema}.ptg2_v3_gc_candidate AS candidate
+                     USING (
+                           SELECT DISTINCT block_hash
+                             FROM {schema}.{stage}
+                     ) AS staged
+                     WHERE candidate.block_hash = staged.block_hash
+                    """
+                )
+            )
+
+        numeric_totals = tuple(int(aggregate_row[index]) for index in range(7))
+        (
+            staged_row_count,
+            staged_entry_count,
+            unique_block_count,
+            logical_byte_count,
+            stored_byte_count,
+            unique_logical_byte_count,
+            unique_stored_byte_count,
+        ) = numeric_totals
+        if (
+            min(numeric_totals) < 0
+            or unique_block_count > staged_row_count
+            or unique_logical_byte_count > logical_byte_count
+            or unique_stored_byte_count > stored_byte_count
+        ):
+            raise RuntimeError("PTG V4 CAS block stage returned invalid aggregates")
+        object_kinds = tuple(
+            str(object_kind) for object_kind in (aggregate_row[7] or ())
+        )
+        if object_kinds != tuple(sorted(set(object_kinds))):
+            raise RuntimeError("PTG V4 CAS block stage returned invalid object kinds")
+        return V4CASBlockStagePublication(
+            object_kinds=object_kinds,
+            staged_row_count=staged_row_count,
+            staged_entry_count=staged_entry_count,
+            unique_block_count=unique_block_count,
+            logical_byte_count=logical_byte_count,
+            stored_byte_count=stored_byte_count,
+            unique_logical_byte_count=unique_logical_byte_count,
+            unique_stored_byte_count=unique_stored_byte_count,
         )
     finally:
         await db.status(f"DROP TABLE IF EXISTS {schema}.{stage};")
@@ -1480,11 +1690,13 @@ __all__ = [
     "SharedBlockStagePublication",
     "SharedDictionaryPublication",
     "SharedGraphPublication",
+    "V4CASBlockStagePublication",
     "copy_shared_block_binary_file",
     "create_shared_block_stage",
     "publish_shared_block_stage",
     "publish_shared_finalizer_dictionaries",
     "publish_shared_graph",
+    "publish_v4_cas_block_stage",
     "shared_graph_bundles_from_artifacts",
     "shared_block_stage_name",
 ]

@@ -205,7 +205,7 @@ jobs:
           python scripts/coverage_ratchet.py --self-test
           reference_args=()
           if [ -z "$BASE_SHA" ]; then
-            BASE_SHA="$(git rev-parse HEAD^ 2>/dev/null || true)"
+            BASE_SHA="$(git rev-parse origin/main 2>/dev/null || git rev-parse HEAD^ 2>/dev/null || true)"
           fi
           if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:test-coverage-baseline.json" 2>/dev/null; then
             git show "$BASE_SHA:test-coverage-baseline.json" > "$RUNNER_TEMP/test-coverage-base.json"
@@ -274,7 +274,7 @@ jobs:
           python scripts/coverage_ratchet.py --self-test
           reference_args=()
           if [ -z "$BASE_SHA" ]; then
-            BASE_SHA="$(git rev-parse HEAD^ 2>/dev/null || true)"
+            BASE_SHA="$(git rev-parse origin/main 2>/dev/null || git rev-parse HEAD^ 2>/dev/null || true)"
           fi
           if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:test-coverage-baseline.json" 2>/dev/null; then
             git show "$BASE_SHA:test-coverage-baseline.json" > "$RUNNER_TEMP/test-coverage-base.json"
@@ -290,7 +290,7 @@ jobs:
           cd support/ptg2_scanner
           cargo audit
       - name: Build release scanner
-        run: cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
+        run: cargo build --release --bins --manifest-path support/ptg2_scanner/Cargo.toml
       - name: Cross-language Provider Directory COPY contract
         env:
           HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_TEST_BIN: ${{ github.workspace }}/support/ptg2_scanner/target/release/ptg2_scanner
@@ -315,6 +315,29 @@ jobs:
           support/ptg2_scanner/target/release/ptg2_scanner \
             --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"
           test -s "$tmp/keyed.copy"
+
+  container-package:
+    name: linux container package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build production image with both PTG binaries
+        run: >
+          docker build
+          --platform linux/amd64
+          --tag healthcare-mrf-api:ptg-v4-gate
+          .
+      - name: Smoke packaged scanner, graph compiler, and native decoder
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            healthcare-mrf-api:ptg-v4-gate \
+            -ec '
+              test -x /opt/support/ptg2_scanner/target/release/ptg2_scanner
+              test -x /opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
+              /opt/venv/bin/python -c "import ptg2_address_canon as m; assert hasattr(m, '\''intersect_sorted_u32'\''); assert hasattr(m, '\''ptg2_decode_u32_le'\'')"
+            '
 
   security:
     name: dependency and semgrep security
@@ -490,7 +513,9 @@ jobs:
             --port "$HLTHPRT_DB_PORT" \
             --username "$HLTHPRT_DB_USER" \
             control_imports_test_ci_runner
-          python -m pytest -q tests/test_control_imports_db.py
+          python -m pytest -q \
+            tests/test_control_imports_db.py \
+            tests/test_control_import_attempt_fence_db.py
       - name: Run retained UHC admission PostgreSQL gate
         env:
           HLTHPRT_UHC_RETAINED_ADMISSION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/uhc_retained_admission_test_ci_runner"
@@ -523,6 +548,16 @@ jobs:
           tests/test_ptg2_shared_graph_postgres.py
           tests/test_ptg2_shared_price_postgres.py
           tests/test_ptg2_shared_snapshot_publish_postgres.py
+      - name: Run packed PTG V4 PostgreSQL publication gate
+        env:
+          HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST: "1"
+          HLTHPRT_PTG2_V4_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+          HLTHPRT_PTG2_PROVIDER_GRAPH_V4_BIN: "${{ github.workspace }}/support/ptg2_scanner/target/debug/ptg2_provider_graph_v4"
+        run: >
+          python -m pytest -q
+          tests/test_ptg2_v4_migration_postgres.py
+          tests/test_ptg2_v4_snapshot_maps.py
+          tests/test_ptg2_v4_postgres_e2e.py
       - name: Run strict shared PTG PostgreSQL GC and removal tests
         env:
           HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST: "1"

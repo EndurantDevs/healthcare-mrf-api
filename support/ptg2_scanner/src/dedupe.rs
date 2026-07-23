@@ -216,6 +216,7 @@ pub struct SharedDedupe {
     provider_group_counter: DedupeCounter,
     provider_group_member_counter: DedupeCounter,
     provider_identifier_quarantine: Mutex<ProviderIdentifierQuarantine>,
+    empty_npi_tin_only_normalization_count: AtomicU64,
 }
 
 impl SharedDedupe {
@@ -258,6 +259,7 @@ impl SharedDedupe {
             provider_group_counter: DedupeCounter::new(),
             provider_group_member_counter: DedupeCounter::new(),
             provider_identifier_quarantine: Mutex::new(ProviderIdentifierQuarantine::default()),
+            empty_npi_tin_only_normalization_count: AtomicU64::new(0),
         }
     }
 
@@ -400,6 +402,16 @@ impl SharedDedupe {
             .lock()
             .map_err(|_| io::Error::other("provider identifier quarantine lock poisoned"))
             .map(|quarantine| quarantine.clone())
+    }
+
+    pub fn record_empty_npi_tin_only_normalizations(&self, count: u64) {
+        self.empty_npi_tin_only_normalization_count
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn empty_npi_tin_only_normalization_count(&self) -> u64 {
+        self.empty_npi_tin_only_normalization_count
+            .load(Ordering::Relaxed)
     }
 }
 

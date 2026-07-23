@@ -89,15 +89,17 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _SAFE_FILE_CHARS = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _is_env_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-PARTD_DEFER_ADDITIONAL_INDEXES = _env_bool("HLTHPRT_PARTD_DEFER_ADDITIONAL_INDEXES", default=True)
-PARTD_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT = _env_bool(
+PARTD_DEFER_ADDITIONAL_INDEXES = _is_env_enabled(
+    "HLTHPRT_PARTD_DEFER_ADDITIONAL_INDEXES", default=True
+)
+PARTD_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT = _is_env_enabled(
     "HLTHPRT_PARTD_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT",
     default=True,
 )
@@ -179,14 +181,16 @@ def _parse_date(value: Any) -> datetime.date | None:
         return None
     if re.fullmatch(r"20\d{2}-\d{2}", text):
         try:
-            return datetime.date.fromisoformat(f"{text}-01")
+            parsed_month = datetime.date.fromisoformat(f"{text}-01")
         except ValueError:
-            pass
+            parsed_month = None
+        if parsed_month is not None:
+            return parsed_month
     for candidate in (text, text.split("T", 1)[0], text.split(" ", 1)[0]):
         try:
             return datetime.date.fromisoformat(candidate)
         except ValueError:
-            pass
+            continue
     match = _DATE_PATTERN.search(text)
     if match:
         year, month, day = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
@@ -270,14 +274,16 @@ def _row_value(values: dict[str, Any], *keys: str) -> Any:
 
 
 def _row_index(row: dict[str, Any]) -> dict[str, Any]:
-    indexed: dict[str, Any] = {}
+    index_by_normalized_key: dict[str, Any] = {}
     for key, value in row.items():
-        indexed[_normalize_key(key)] = value
-    return indexed
+        index_by_normalized_key[_normalize_key(key)] = value
+    return index_by_normalized_key
 
-def _extract_dispensing_fee_fields(values: dict[str, Any]) -> dict[str, float | None]:
+def _extract_dispensing_fee_fields(
+    source_field_map: dict[str, Any],
+) -> dict[str, float | None]:
     """Extract normalized dispensing fees from a source row."""
-    field_candidates = {
+    candidates_by_target = {
         "dispensing_fee_brand_30": (
             "branddispensingfee30dayssupply",
             "branddispensingfee30day",
@@ -333,15 +339,17 @@ def _extract_dispensing_fee_fields(values: dict[str, Any]) -> dict[str, float | 
             "selecteddrugsdispensingfee90dayssupply",
         ),
     }
-    extracted: dict[str, float | None] = {}
-    for target_key, candidates in field_candidates.items():
-        extracted[target_key] = _to_float(_row_value(values, *candidates))
-    return extracted
+    extracted_by_field: dict[str, float | None] = {}
+    for target_key, candidates in candidates_by_target.items():
+        extracted_by_field[target_key] = _to_float(
+            _row_value(source_field_map, *candidates)
+        )
+    return extracted_by_field
 
 
 def _match_cost_fields(row: dict[str, Any]) -> list[tuple[str, float]]:
     entries: list[tuple[str, float]] = []
-    seen: set[str] = set()
+    seen_cost_types: set[str] = set()
     for raw_key, raw_value in row.items():
         key = _normalize_key(raw_key)
         if not key:
@@ -352,10 +360,10 @@ def _match_cost_fields(row: dict[str, Any]) -> list[tuple[str, float]]:
         if amount is None:
             continue
         cost_type = key[:64]
-        if cost_type in seen:
+        if cost_type in seen_cost_types:
             continue
         entries.append((cost_type, amount))
-        seen.add(cost_type)
+        seen_cost_types.add(cost_type)
         if len(entries) >= 32:
             break
     return entries
@@ -398,7 +406,7 @@ def _resolve_dataset(catalog: dict[str, Any], title: str) -> dict[str, Any]:
 
 
 def _zip_distributions(dataset: dict[str, Any]) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
+    selected_distributions: list[dict[str, Any]] = []
     for distribution in dataset.get("distribution", []):
         url = str(distribution.get("downloadURL") or "").strip()
         if not url or not url.lower().endswith(".zip"):
@@ -406,15 +414,18 @@ def _zip_distributions(dataset: dict[str, Any]) -> list[dict[str, Any]]:
         release_date = _extract_distribution_release_date(distribution)
         if release_date is None:
             continue
-        selected.append(
+        selected_distributions.append(
             {
                 "url": url,
                 "release_date": release_date,
                 "artifact_name": _artifact_name(url),
             }
         )
-    selected.sort(key=lambda item: (item["release_date"], item["url"]), reverse=True)
-    return selected
+    selected_distributions.sort(
+        key=lambda distribution: (distribution["release_date"], distribution["url"]),
+        reverse=True,
+    )
+    return selected_distributions
 
 
 def _resolve_artifacts(catalog: dict[str, Any], test_mode: bool) -> list[SourceArtifact]:
@@ -439,16 +450,18 @@ def _resolve_artifacts(catalog: dict[str, Any], test_mode: bool) -> list[SourceA
     ]
 
     monthly_dist = _zip_distributions(monthly_dataset)
-    monthly_after_cutoff = [
+    eligible_monthly_distributions = [
         dist
         for dist in monthly_dist
         if _month_floor(dist["release_date"]) > cutoff_month
     ]
-    monthly_after_cutoff.sort(key=lambda item: item["release_date"])
+    eligible_monthly_distributions.sort(
+        key=lambda distribution: distribution["release_date"]
+    )
     if test_mode:
-        monthly_after_cutoff = monthly_after_cutoff[:2]
+        eligible_monthly_distributions = eligible_monthly_distributions[:2]
 
-    for distribution in monthly_after_cutoff:
+    for distribution in eligible_monthly_distributions:
         artifacts.append(
             SourceArtifact(
                 source_type="monthly",
@@ -466,18 +479,22 @@ def _explicit_artifacts(task: dict[str, Any]) -> list[SourceArtifact]:
     if raw_items is None:
         raw_items = task.get("source_urls")
     if isinstance(raw_items, str):
-        raw_items = [item.strip() for item in raw_items.split(",") if item.strip()]
+        raw_items = [
+            source_url.strip()
+            for source_url in raw_items.split(",")
+            if source_url.strip()
+        ]
     if not isinstance(raw_items, list):
         return []
 
     today = datetime.date.today()
     artifacts: list[SourceArtifact] = []
-    for index, item in enumerate(raw_items):
-        if isinstance(item, str):
-            url = item.strip()
+    for index, artifact_entry in enumerate(raw_items):
+        if isinstance(artifact_entry, str):
+            url = artifact_entry.strip()
             metadata: dict[str, Any] = {}
-        elif isinstance(item, dict):
-            metadata = dict(item)
+        elif isinstance(artifact_entry, dict):
+            metadata = dict(artifact_entry)
             url = str(metadata.get("url") or metadata.get("source_url") or metadata.get("file") or "").strip()
         else:
             continue
@@ -879,13 +896,13 @@ async def _wait_for_activity_chunks(redis, run_id: str, snapshot_id: str, total_
             progress.bytes_done,
             progress.started_chunks,
         )
-        progress_advanced = signature != last_signature
-        if progress_advanced:
+        has_progress_advanced = signature != last_signature
+        if has_progress_advanced:
             last_signature = signature
             last_progress_at = datetime.datetime.utcnow()
         stall_seconds = (datetime.datetime.utcnow() - last_progress_at).total_seconds()
         now_monotonic = time.monotonic()
-        if progress_advanced or now_monotonic - last_emit_at >= 30.0:
+        if has_progress_advanced or now_monotonic - last_emit_at >= 30.0:
             pct = progress.pct()
             byte_message = ""
             if progress.bytes_total > 0:
@@ -965,7 +982,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
     await _fill_activity_address_from_npi(schema, PartDPharmacyActivityStage.__tablename__)
     await _fill_activity_state_from_zip(schema, PartDPharmacyActivityStage.__tablename__)
     if source_enabled("partd"):
-        address_fields = {
+        address_field_map = {
             "first_line": "address_line1",
             "second_line": "address_line2",
             "city": "city",
@@ -975,12 +992,12 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
         }
         await stamp_address_keys(
             PartDPharmacyActivityStage.__tablename__,
-            address_fields,
+            address_field_map,
             schema=schema,
         )
         stats = await resolve_into_archive(
             PartDPharmacyActivityStage.__tablename__,
-            address_fields,
+            address_field_map,
             source_bit=64,
             priority=7,
             schema=schema,
@@ -1413,11 +1430,11 @@ def _safe_file_name(name: str) -> str:
 
 def _extract_data_files(zip_path: Path, workdir: Path) -> list[tuple[Path, str]]:
     extracted_files: list[tuple[Path, str]] = []
-    queue: list[tuple[Path, str]] = [(zip_path, zip_path.name)]
+    pending_archives: list[tuple[Path, str]] = [(zip_path, zip_path.name)]
     counter = 0
 
-    while queue:
-        current_zip_path, zip_label = queue.pop(0)
+    while pending_archives:
+        current_zip_path, zip_label = pending_archives.pop(0)
         with zipfile.ZipFile(current_zip_path) as archive:
             for member_name in archive.namelist():
                 if member_name.endswith("/"):
@@ -1445,7 +1462,7 @@ def _extract_data_files(zip_path: Path, workdir: Path) -> list[tuple[Path, str]]
                 with archive.open(member_name, "r") as src, out_path.open("wb") as dst:
                     shutil.copyfileobj(src, dst)
                 if suffix == ".zip":
-                    queue.append((out_path, logical_name))
+                    pending_archives.append((out_path, logical_name))
                 elif suffix in {".txt", ".csv"}:
                     extracted_files.append((out_path, logical_name))
                 else:
@@ -1465,7 +1482,7 @@ def _extract_plan_fields(values: dict[str, Any]) -> tuple[str, str, str, str]:
 
 
 def _load_plan_formulary_map(file_path: Path) -> dict[tuple[str, str, str], str]:
-    mapping: dict[tuple[str, str, str], str] = {}
+    formulary_by_plan: dict[tuple[str, str, str], str] = {}
     delimiter = _detect_delimiter(file_path)
     with file_path.open("r", encoding="utf-8", errors="replace") as handle:
         reader = csv.DictReader(handle, delimiter=delimiter)
@@ -1475,12 +1492,14 @@ def _load_plan_formulary_map(file_path: Path) -> dict[tuple[str, str, str], str]
             formulary_id = str(_row_value(values, "formularyid", "formulary") or "").strip()
             if not formulary_id:
                 continue
-            mapping[(contract_id, plan_component, segment_id)] = formulary_id[:32]
-    return mapping
+            formulary_by_plan[(contract_id, plan_component, segment_id)] = (
+                formulary_id[:32]
+            )
+    return formulary_by_plan
 
 
 def _load_formulary_ndc_map(file_path: Path) -> dict[tuple[str, str], str]:
-    mapping: dict[tuple[str, str], str] = {}
+    rxnorm_by_formulary_ndc: dict[tuple[str, str], str] = {}
     delimiter = _detect_delimiter(file_path)
     with file_path.open("r", encoding="utf-8", errors="replace") as handle:
         reader = csv.DictReader(handle, delimiter=delimiter)
@@ -1492,42 +1511,68 @@ def _load_formulary_ndc_map(file_path: Path) -> dict[tuple[str, str], str]:
             if not formulary_id or not ndc11 or not rxnorm_id:
                 continue
             key = (formulary_id[:32], ndc11[:16])
-            if key not in mapping:
-                mapping[key] = rxnorm_id[:32]
+            if key not in rxnorm_by_formulary_ndc:
+                rxnorm_by_formulary_ndc[key] = rxnorm_id[:32]
             fallback_key = ("*", ndc11[:16])
-            if fallback_key not in mapping:
-                mapping[fallback_key] = rxnorm_id[:32]
-    return mapping
+            if fallback_key not in rxnorm_by_formulary_ndc:
+                rxnorm_by_formulary_ndc[fallback_key] = rxnorm_id[:32]
+    return rxnorm_by_formulary_ndc
 
 def _activity_row_from_source(
-    row: dict[str, Any],
+    source_row: dict[str, Any],
     *,
     snapshot_id: str,
     source_type: str,
     default_date: datetime.date,
 ) -> dict[str, Any] | None:
     """Normalize one pharmacy activity source row."""
-    values = _row_index(row)
-    npi = _to_npi(_row_value(values, "npi", "pharmacynpi", "pharmacynumber", "pharmacyid", "providernpi"))
+    source_field_map = _row_index(source_row)
+    npi = _to_npi(
+        _row_value(
+            source_field_map,
+            "npi",
+            "pharmacynpi",
+            "pharmacynumber",
+            "pharmacyid",
+            "providernpi",
+        )
+    )
     if npi is None:
         return None
-    dispensing_fees = _extract_dispensing_fee_fields(values)
+    dispensing_fees = _extract_dispensing_fee_fields(source_field_map)
 
-    _contract_id, _plan_component, _segment_id, plan_id = _extract_plan_fields(values)
+    _contract_id, _plan_component, _segment_id, plan_id = _extract_plan_fields(
+        source_field_map
+    )
 
-    year = _to_int(_row_value(values, "year", "contractyear", "planyear"))
-    retail_flag = _to_bool(_row_value(values, "pharmacyretail", "retail", "isretail"))
-    mail_flag = _to_bool(_row_value(values, "pharmacymail", "mailorder", "mail"))
-    in_area_flag = _to_bool(_row_value(values, "inareaflag", "inarea", "insvcarea"))
-    active = _to_bool(_row_value(values, "medicareactive", "active", "isactive", "innetwork", "status"))
-    if active is None:
-        active = any(flag is True for flag in (retail_flag, mail_flag, in_area_flag))
-    if active is None:
-        active = True
+    year = _to_int(_row_value(source_field_map, "year", "contractyear", "planyear"))
+    retail_flag = _to_bool(
+        _row_value(source_field_map, "pharmacyretail", "retail", "isretail")
+    )
+    mail_flag = _to_bool(
+        _row_value(source_field_map, "pharmacymail", "mailorder", "mail")
+    )
+    in_area_flag = _to_bool(
+        _row_value(source_field_map, "inareaflag", "inarea", "insvcarea")
+    )
+    is_active = _to_bool(
+        _row_value(
+            source_field_map,
+            "medicareactive",
+            "active",
+            "isactive",
+            "innetwork",
+            "status",
+        )
+    )
+    if is_active is None:
+        is_active = any(flag is True for flag in (retail_flag, mail_flag, in_area_flag))
+    if is_active is None:
+        is_active = True
 
     effective_from = _parse_date(
         _row_value(
-            values,
+            source_field_map,
             "effectivefrom",
             "effectivedate",
             "startdate",
@@ -1537,9 +1582,11 @@ def _activity_row_from_source(
         )
     ) or default_date
     effective_to = _parse_date(
-        _row_value(values, "effectiveto", "enddate", "coverageto")
+        _row_value(source_field_map, "effectiveto", "enddate", "coverageto")
     )
-    pharmacy_type = _row_value(values, "pharmacytype", "networktype", "pharmacynetworktype")
+    pharmacy_type = _row_value(
+        source_field_map, "pharmacytype", "networktype", "pharmacynetworktype"
+    )
     if not pharmacy_type:
         if retail_flag and mail_flag:
             pharmacy_type = "retail_mail"
@@ -1555,15 +1602,27 @@ def _activity_row_from_source(
         "npi": npi,
         "plan_id": plan_id[:32],
         "year": year or effective_from.year,
-        "medicare_active": bool(active),
-        "pharmacy_name": _row_value(values, "pharmacyname", "name", "providername"),
-        "address_line1": _row_value(values, "address1", "addressline1", "firstline"),
-        "address_line2": _row_value(values, "address2", "addressline2", "secondline"),
-        "city": _row_value(values, "city", "cityname"),
-        "state": _row_value(values, "state", "statecode", "statename"),
-        "zip_code": _row_value(values, "pharmacyzipcode", "zip", "zipcode", "postalcode"),
+        "medicare_active": bool(is_active),
+        "pharmacy_name": _row_value(
+            source_field_map, "pharmacyname", "name", "providername"
+        ),
+        "address_line1": _row_value(
+            source_field_map, "address1", "addressline1", "firstline"
+        ),
+        "address_line2": _row_value(
+            source_field_map, "address2", "addressline2", "secondline"
+        ),
+        "city": _row_value(source_field_map, "city", "cityname"),
+        "state": _row_value(source_field_map, "state", "statecode", "statename"),
+        "zip_code": _row_value(
+            source_field_map, "pharmacyzipcode", "zip", "zipcode", "postalcode"
+        ),
         "pharmacy_type": pharmacy_type,
-        "mail_order": mail_flag if mail_flag is not None else _to_bool(_row_value(values, "mailorder", "ismailorder", "mailorderflag")),
+        "mail_order": mail_flag
+        if mail_flag is not None
+        else _to_bool(
+            _row_value(source_field_map, "mailorder", "ismailorder", "mailorderflag")
+        ),
         "dispensing_fee_brand_30": dispensing_fees["dispensing_fee_brand_30"],
         "dispensing_fee_brand_60": dispensing_fees["dispensing_fee_brand_60"],
         "dispensing_fee_brand_90": dispensing_fees["dispensing_fee_brand_90"],
@@ -1579,7 +1638,7 @@ def _activity_row_from_source(
     }
 
 def _pricing_rows_from_source(
-    row: dict[str, Any],
+    source_row: dict[str, Any],
     *,
     snapshot_id: str,
     source_type: str,
@@ -1588,18 +1647,45 @@ def _pricing_rows_from_source(
     formulary_ndc_to_rxnorm: dict[tuple[str, str], str],
 ) -> list[dict[str, Any]]:
     """Normalize one source row into medication cost rows."""
-    values = _row_index(row)
-    contract_id, plan_component, segment_id, plan_id = _extract_plan_fields(values)
+    source_field_map = _row_index(source_row)
+    contract_id, plan_component, segment_id, plan_id = _extract_plan_fields(
+        source_field_map
+    )
 
-    year = _to_int(_row_value(values, "year", "contractyear", "planyear"))
+    year = _to_int(
+        _row_value(source_field_map, "year", "contractyear", "planyear")
+    )
     effective_from = _parse_date(
-        _row_value(values, "effectivefrom", "effectivedate", "startdate", "month", "snapshotmonth")
+        _row_value(
+            source_field_map,
+            "effectivefrom",
+            "effectivedate",
+            "startdate",
+            "month",
+            "snapshotmonth",
+        )
     ) or default_date
-    effective_to = _parse_date(_row_value(values, "effectiveto", "enddate"))
-    days_supply = _to_int(_row_value(values, "dayssupply", "supplydays", "days")) or 0
+    effective_to = _parse_date(
+        _row_value(source_field_map, "effectiveto", "enddate")
+    )
+    days_supply = (
+        _to_int(_row_value(source_field_map, "dayssupply", "supplydays", "days"))
+        or 0
+    )
 
-    rxnorm_id = _normalize_code_digits(_row_value(values, "rxnorm", "rxnormid", "rxcui"))
-    ndc11 = _normalize_code_digits(_row_value(values, "ndc11", "ndc", "ndccode", "packagecode", "productcode"))
+    rxnorm_id = _normalize_code_digits(
+        _row_value(source_field_map, "rxnorm", "rxnormid", "rxcui")
+    )
+    ndc11 = _normalize_code_digits(
+        _row_value(
+            source_field_map,
+            "ndc11",
+            "ndc",
+            "ndccode",
+            "packagecode",
+            "productcode",
+        )
+    )
     if not rxnorm_id and ndc11:
         formulary_id = plan_to_formulary.get((contract_id, plan_component, segment_id))
         if formulary_id:
@@ -1620,20 +1706,20 @@ def _pricing_rows_from_source(
     else:
         return []
 
-    cost_fields = _match_cost_fields(row)
+    cost_fields = _match_cost_fields(source_row)
     if not cost_fields:
-        unit_cost = _to_float(_row_value(values, "unitcost"))
+        unit_cost = _to_float(_row_value(source_field_map, "unitcost"))
         if unit_cost is not None:
             cost_fields = [("unit_cost", unit_cost)]
     if not cost_fields:
         return []
 
-    rows: list[dict[str, Any]] = []
+    pricing_rows: list[dict[str, Any]] = []
     for cost_type, amount in cost_fields:
         normalized_cost_type = cost_type
         if days_supply:
             normalized_cost_type = f"{cost_type}_days_{days_supply}"
-        rows.append(
+        pricing_rows.append(
             {
                 "snapshot_id": snapshot_id,
                 "plan_id": plan_id[:32],
@@ -1644,10 +1730,21 @@ def _pricing_rows_from_source(
                 "rxnorm_id": rxnorm_id[:32] if rxnorm_id else None,
                 "ndc11": ndc11[:16] if ndc11 else None,
                 "days_supply": days_supply,
-                "drug_name": _row_value(values, "drugname", "rxname", "genericname", "brandname"),
-                "tier": _row_value(values, "tier", "drugtier"),
-                "pharmacy_type": _row_value(values, "pharmacytype", "networktype"),
-                "mail_order": _to_bool(_row_value(values, "mailorder", "ismailorder", "mailorderflag")),
+                "drug_name": _row_value(
+                    source_field_map, "drugname", "rxname", "genericname", "brandname"
+                ),
+                "tier": _row_value(source_field_map, "tier", "drugtier"),
+                "pharmacy_type": _row_value(
+                    source_field_map, "pharmacytype", "networktype"
+                ),
+                "mail_order": _to_bool(
+                    _row_value(
+                        source_field_map,
+                        "mailorder",
+                        "ismailorder",
+                        "mailorderflag",
+                    )
+                ),
                 "cost_type": normalized_cost_type[:64],
                 "cost_amount": amount,
                 "effective_from": effective_from,
@@ -1655,127 +1752,129 @@ def _pricing_rows_from_source(
                 "source_type": source_type,
             }
         )
-    return rows
+    return pricing_rows
 
 async def _flush_batches(
-    activity_batch: list[dict[str, Any]],
-    pricing_batch: list[dict[str, Any]],
+    activity_batch_rows: list[dict[str, Any]],
+    pricing_batch_rows: list[dict[str, Any]],
 ) -> None:
     """Flush normalized activity and pricing batches to staging."""
-    def _activity_stage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _activity_stage_rows(
+        source_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """Aggregate duplicate activity rows within one chunk."""
         # Chunk-level pre-aggregation to reduce stage footprint before COPY.
-        grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
-        for row in rows:
-            plan_id = str(row.get("plan_id") or "").strip()
+        aggregate_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for activity_fields in source_rows:
+            plan_id = str(activity_fields.get("plan_id") or "").strip()
             if not plan_id:
                 continue
             key = (
-                row.get("snapshot_id"),
-                row.get("npi"),
-                row.get("year"),
-                row.get("medicare_active"),
-                row.get("pharmacy_name"),
-                row.get("address_line1"),
-                row.get("address_line2"),
-                row.get("city"),
-                row.get("state"),
-                row.get("zip_code"),
-                row.get("pharmacy_type"),
-                row.get("mail_order"),
-                row.get("dispensing_fee_brand_30"),
-                row.get("dispensing_fee_brand_60"),
-                row.get("dispensing_fee_brand_90"),
-                row.get("dispensing_fee_generic_30"),
-                row.get("dispensing_fee_generic_60"),
-                row.get("dispensing_fee_generic_90"),
-                row.get("dispensing_fee_selected_drug_30"),
-                row.get("dispensing_fee_selected_drug_60"),
-                row.get("dispensing_fee_selected_drug_90"),
-                row.get("effective_from"),
-                row.get("effective_to"),
-                row.get("source_type"),
+                activity_fields.get("snapshot_id"),
+                activity_fields.get("npi"),
+                activity_fields.get("year"),
+                activity_fields.get("medicare_active"),
+                activity_fields.get("pharmacy_name"),
+                activity_fields.get("address_line1"),
+                activity_fields.get("address_line2"),
+                activity_fields.get("city"),
+                activity_fields.get("state"),
+                activity_fields.get("zip_code"),
+                activity_fields.get("pharmacy_type"),
+                activity_fields.get("mail_order"),
+                activity_fields.get("dispensing_fee_brand_30"),
+                activity_fields.get("dispensing_fee_brand_60"),
+                activity_fields.get("dispensing_fee_brand_90"),
+                activity_fields.get("dispensing_fee_generic_30"),
+                activity_fields.get("dispensing_fee_generic_60"),
+                activity_fields.get("dispensing_fee_generic_90"),
+                activity_fields.get("dispensing_fee_selected_drug_30"),
+                activity_fields.get("dispensing_fee_selected_drug_60"),
+                activity_fields.get("dispensing_fee_selected_drug_90"),
+                activity_fields.get("effective_from"),
+                activity_fields.get("effective_to"),
+                activity_fields.get("source_type"),
             )
-            entry = grouped.get(key)
-            if entry is None:
-                entry = {
-                    "snapshot_id": row.get("snapshot_id"),
-                    "npi": row.get("npi"),
-                    "year": row.get("year"),
-                    "medicare_active": row.get("medicare_active"),
-                    "pharmacy_name": row.get("pharmacy_name"),
-                    "address_line1": row.get("address_line1"),
-                    "address_line2": row.get("address_line2"),
-                    "city": row.get("city"),
-                    "state": row.get("state"),
-                    "zip_code": row.get("zip_code"),
-                    "pharmacy_type": row.get("pharmacy_type"),
-                    "mail_order": row.get("mail_order"),
-                    "dispensing_fee_brand_30": row.get("dispensing_fee_brand_30"),
-                    "dispensing_fee_brand_60": row.get("dispensing_fee_brand_60"),
-                    "dispensing_fee_brand_90": row.get("dispensing_fee_brand_90"),
-                    "dispensing_fee_generic_30": row.get("dispensing_fee_generic_30"),
-                    "dispensing_fee_generic_60": row.get("dispensing_fee_generic_60"),
-                    "dispensing_fee_generic_90": row.get("dispensing_fee_generic_90"),
-                    "dispensing_fee_selected_drug_30": row.get("dispensing_fee_selected_drug_30"),
-                    "dispensing_fee_selected_drug_60": row.get("dispensing_fee_selected_drug_60"),
-                    "dispensing_fee_selected_drug_90": row.get("dispensing_fee_selected_drug_90"),
-                    "effective_from": row.get("effective_from"),
-                    "effective_to": row.get("effective_to"),
-                    "source_type": row.get("source_type"),
+            aggregated_field_map = aggregate_by_key.get(key)
+            if aggregated_field_map is None:
+                aggregated_field_map = {
+                    "snapshot_id": activity_fields.get("snapshot_id"),
+                    "npi": activity_fields.get("npi"),
+                    "year": activity_fields.get("year"),
+                    "medicare_active": activity_fields.get("medicare_active"),
+                    "pharmacy_name": activity_fields.get("pharmacy_name"),
+                    "address_line1": activity_fields.get("address_line1"),
+                    "address_line2": activity_fields.get("address_line2"),
+                    "city": activity_fields.get("city"),
+                    "state": activity_fields.get("state"),
+                    "zip_code": activity_fields.get("zip_code"),
+                    "pharmacy_type": activity_fields.get("pharmacy_type"),
+                    "mail_order": activity_fields.get("mail_order"),
+                    "dispensing_fee_brand_30": activity_fields.get("dispensing_fee_brand_30"),
+                    "dispensing_fee_brand_60": activity_fields.get("dispensing_fee_brand_60"),
+                    "dispensing_fee_brand_90": activity_fields.get("dispensing_fee_brand_90"),
+                    "dispensing_fee_generic_30": activity_fields.get("dispensing_fee_generic_30"),
+                    "dispensing_fee_generic_60": activity_fields.get("dispensing_fee_generic_60"),
+                    "dispensing_fee_generic_90": activity_fields.get("dispensing_fee_generic_90"),
+                    "dispensing_fee_selected_drug_30": activity_fields.get("dispensing_fee_selected_drug_30"),
+                    "dispensing_fee_selected_drug_60": activity_fields.get("dispensing_fee_selected_drug_60"),
+                    "dispensing_fee_selected_drug_90": activity_fields.get("dispensing_fee_selected_drug_90"),
+                    "effective_from": activity_fields.get("effective_from"),
+                    "effective_to": activity_fields.get("effective_to"),
+                    "source_type": activity_fields.get("source_type"),
                     "_plans": set(),
                 }
-                grouped[key] = entry
-            entry["_plans"].add(plan_id[:32])
+                aggregate_by_key[key] = aggregated_field_map
+            aggregated_field_map["_plans"].add(plan_id[:32])
 
-        aggregated: list[dict[str, Any]] = []
-        for entry in grouped.values():
-            plans = sorted(entry.pop("_plans"))
+        aggregated_rows: list[dict[str, Any]] = []
+        for aggregated_field_map in aggregate_by_key.values():
+            plans = sorted(aggregated_field_map.pop("_plans"))
             if not plans:
                 continue
-            entry["plan_ids"] = plans
-            aggregated.append(entry)
-        return aggregated
+            aggregated_field_map["plan_ids"] = plans
+            aggregated_rows.append(aggregated_field_map)
+        return aggregated_rows
 
-    def _pricing_stage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        seen: set[tuple[Any, ...]] = set()
-        deduped: list[dict[str, Any]] = []
-        for row in rows:
+    def _pricing_stage_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen_keys: set[tuple[Any, ...]] = set()
+        deduplicated_rows: list[dict[str, Any]] = []
+        for pricing_fields in source_rows:
             key = (
-                row.get("snapshot_id"),
-                row.get("plan_id"),
-                row.get("year"),
-                row.get("code_system"),
-                row.get("code"),
-                row.get("normalized_code"),
-                row.get("rxnorm_id"),
-                row.get("ndc11"),
-                row.get("days_supply"),
-                row.get("drug_name"),
-                row.get("tier"),
-                row.get("pharmacy_type"),
-                row.get("mail_order"),
-                row.get("cost_type"),
-                row.get("cost_amount"),
-                row.get("effective_from"),
-                row.get("effective_to"),
-                row.get("source_type"),
+                pricing_fields.get("snapshot_id"),
+                pricing_fields.get("plan_id"),
+                pricing_fields.get("year"),
+                pricing_fields.get("code_system"),
+                pricing_fields.get("code"),
+                pricing_fields.get("normalized_code"),
+                pricing_fields.get("rxnorm_id"),
+                pricing_fields.get("ndc11"),
+                pricing_fields.get("days_supply"),
+                pricing_fields.get("drug_name"),
+                pricing_fields.get("tier"),
+                pricing_fields.get("pharmacy_type"),
+                pricing_fields.get("mail_order"),
+                pricing_fields.get("cost_type"),
+                pricing_fields.get("cost_amount"),
+                pricing_fields.get("effective_from"),
+                pricing_fields.get("effective_to"),
+                pricing_fields.get("source_type"),
             )
-            if key in seen:
+            if key in seen_keys:
                 continue
-            seen.add(key)
-            deduped.append(row)
-        return deduped
+            seen_keys.add(key)
+            deduplicated_rows.append(pricing_fields)
+        return deduplicated_rows
 
     tasks: list[Any] = []
-    if activity_batch:
-        activity_rows = _activity_stage_rows(list(activity_batch))
-        activity_batch.clear()
+    if activity_batch_rows:
+        activity_rows = _activity_stage_rows(list(activity_batch_rows))
+        activity_batch_rows.clear()
         if activity_rows:
             tasks.append(push_objects(activity_rows, PartDPharmacyActivityStage, rewrite=False, use_copy=True))
-    if pricing_batch:
-        pricing_rows = _pricing_stage_rows(list(pricing_batch))
-        pricing_batch.clear()
+    if pricing_batch_rows:
+        pricing_rows = _pricing_stage_rows(list(pricing_batch_rows))
+        pricing_batch_rows.clear()
         if pricing_rows:
             tasks.append(push_objects(pricing_rows, PartDMedicationCostStage, rewrite=False, use_copy=True))
     if tasks:
@@ -1792,46 +1891,50 @@ async def _process_activity_file(
 ) -> int:
     activity_count = 0
     processed_rows = 0
-    activity_batch: list[dict[str, Any]] = []
-    pricing_batch: list[dict[str, Any]] = []
+    activity_batch_rows: list[dict[str, Any]] = []
+    pricing_batch_rows: list[dict[str, Any]] = []
     delimiter = _detect_delimiter(file_path)
     total_bytes = file_path.stat().st_size
-    bytes_read = 0
+    bytes_read_counts = [0]
 
     async def _maybe_emit_progress(*, final: bool = False) -> None:
         if progress_callback is None:
             return
         if not final and activity_count % PARTD_PROGRESS_INTERVAL_ROWS != 0:
             return
-        await progress_callback(processed_rows, activity_count, bytes_read, total_bytes)
+        await progress_callback(
+            processed_rows,
+            activity_count,
+            bytes_read_counts[0],
+            total_bytes,
+        )
 
     with file_path.open("rb") as handle:
         def _iter_lines():
-            nonlocal bytes_read
             for raw_line in handle:
-                bytes_read += len(raw_line)
+                bytes_read_counts[0] += len(raw_line)
                 yield raw_line.decode("utf-8", "replace")
 
         reader = csv.DictReader(_iter_lines(), delimiter=delimiter)
-        for row in reader:
+        for source_row in reader:
             activity_row = _activity_row_from_source(
-                row,
+                source_row,
                 snapshot_id=snapshot_id,
                 source_type=source_type,
                 default_date=default_date,
             )
             if activity_row is None:
                 continue
-            activity_batch.append(activity_row)
+            activity_batch_rows.append(activity_row)
             activity_count += 1
             processed_rows += 1
-            if len(activity_batch) >= PARTD_BATCH_SIZE:
-                await _flush_batches(activity_batch, pricing_batch)
+            if len(activity_batch_rows) >= PARTD_BATCH_SIZE:
+                await _flush_batches(activity_batch_rows, pricing_batch_rows)
                 await _maybe_emit_progress()
             if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
                 break
             await _maybe_emit_progress()
-    await _flush_batches(activity_batch, pricing_batch)
+    await _flush_batches(activity_batch_rows, pricing_batch_rows)
     await _maybe_emit_progress(final=True)
     return activity_count
 
@@ -1858,15 +1961,15 @@ async def _import_artifact(
 
         activity_count = 0
         pricing_count = 0
-        activity_batch: list[dict[str, Any]] = []
-        pricing_batch: list[dict[str, Any]] = []
-        plan_to_formulary: dict[tuple[str, str, str], str] = {}
-        formulary_ndc_to_rxnorm: dict[tuple[str, str], str] = {}
+        activity_batch_rows: list[dict[str, Any]] = []
+        pricing_batch_rows: list[dict[str, Any]] = []
+        plan_to_formulary_map: dict[tuple[str, str, str], str] = {}
+        formulary_ndc_to_rxnorm_map: dict[tuple[str, str], str] = {}
         for file_path, _logical_name, kind in classified_files:
             if kind == "plan_info":
-                plan_to_formulary.update(_load_plan_formulary_map(file_path))
+                plan_to_formulary_map.update(_load_plan_formulary_map(file_path))
             elif kind == "formulary_map":
-                formulary_ndc_to_rxnorm.update(_load_formulary_ndc_map(file_path))
+                formulary_ndc_to_rxnorm_map.update(_load_formulary_ndc_map(file_path))
 
         activity_members = [(path, logical_name) for path, logical_name, kind in classified_files if kind == "activity"]
         pricing_members = [(path, logical_name) for path, logical_name, kind in classified_files if kind == "pricing"]
@@ -1960,28 +2063,28 @@ async def _import_artifact(
             delimiter = _detect_delimiter(file_path)
             with file_path.open("r", encoding="utf-8", errors="replace") as handle:
                 reader = csv.DictReader(handle, delimiter=delimiter)
-                for row in reader:
+                for pricing_source_row in reader:
                     pricing_rows = _pricing_rows_from_source(
-                        row,
+                        pricing_source_row,
                         snapshot_id=snapshot_id,
                         source_type=artifact.source_type,
                         default_date=artifact.cutoff_month,
-                        plan_to_formulary=plan_to_formulary,
-                        formulary_ndc_to_rxnorm=formulary_ndc_to_rxnorm,
+                        plan_to_formulary=plan_to_formulary_map,
+                        formulary_ndc_to_rxnorm=formulary_ndc_to_rxnorm_map,
                     )
                     if not pricing_rows:
                         continue
-                    pricing_batch.extend(pricing_rows)
+                    pricing_batch_rows.extend(pricing_rows)
                     pricing_count += len(pricing_rows)
                     processed_rows += 1
-                    if len(pricing_batch) >= PARTD_BATCH_SIZE:
-                        await _flush_batches(activity_batch, pricing_batch)
+                    if len(pricing_batch_rows) >= PARTD_BATCH_SIZE:
+                        await _flush_batches(activity_batch_rows, pricing_batch_rows)
                     if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
                         break
             if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
                 break
 
-        await _flush_batches(activity_batch, pricing_batch)
+        await _flush_batches(activity_batch_rows, pricing_batch_rows)
         await _materialize_activity_snapshot(schema, snapshot_id)
         await _materialize_pricing_snapshot(schema, snapshot_id)
         return activity_count, pricing_count
@@ -2098,10 +2201,10 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
     try:
         artifacts = _explicit_artifacts(task)
         if artifacts:
-            catalog = {}
+            catalog_metadata_map = {}
         else:
-            catalog = await _fetch_catalog()
-            artifacts = _resolve_artifacts(catalog, test_mode=test_mode)
+            catalog_metadata_map = await _fetch_catalog()
+            artifacts = _resolve_artifacts(catalog_metadata_map, test_mode=test_mode)
         enqueue_live_progress(
             run_id=run_id,
             importer="partd-formulary-network",

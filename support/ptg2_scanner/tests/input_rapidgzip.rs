@@ -1,14 +1,14 @@
 use flate2::{write::GzEncoder, Compression};
 use ptg2_scanner::input::{
-    open_full_scan_reader, open_full_scan_reader_exporting_index, open_indexed_ranges_reader,
-    RapidgzipConfig,
+    open_full_scan_json_reader, open_full_scan_reader, open_full_scan_reader_exporting_index,
+    open_indexed_ranges_reader, RapidgzipConfig,
 };
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -132,6 +132,11 @@ fn full_scan_reader_surfaces_nonzero_exit_and_bounded_stderr() {
     );
     assert!(message.len() <= 17 * 1024);
     assert_eq!(bytes_read.load(Ordering::Relaxed), 0);
+    let repeated_error = reader
+        .read(&mut [0u8; 1])
+        .expect_err("a failed reader must remain failed");
+    assert_eq!(repeated_error.kind(), error.kind());
+    assert_eq!(repeated_error.to_string(), message);
     std::fs::remove_file(input_path).ok();
     std::fs::remove_file(executable_path).ok();
 }
@@ -401,4 +406,78 @@ fn full_scan_reader_retries_an_executable_that_is_temporarily_busy() {
     assert_eq!(output, "busy-retry-ok");
     std::fs::remove_file(input_path).ok();
     std::fs::remove_file(executable_path).ok();
+}
+
+#[test]
+fn default_and_unsupported_indexed_modes_are_explicit() {
+    let config = RapidgzipConfig::default();
+    assert!(!config.enabled);
+    assert_eq!(config.executable, PathBuf::from("rapidgzip"));
+    assert_eq!(config.decoder_threads, 1);
+
+    let input_path = temp_path("unsupported.json.gz");
+    let plain_path = temp_path("unsupported.json");
+    let index_path = temp_path("unsupported.index");
+    write_gzip(&input_path, br#"{"ok":true}"#);
+    std::fs::write(&plain_path, br#"{"ok":true}"#).expect("write plain input");
+
+    let export_error = open_full_scan_reader_exporting_index(
+        &input_path,
+        Arc::new(AtomicU64::new(0)),
+        &config,
+        &index_path,
+    )
+    .err()
+    .expect("disabled index export must fail");
+    assert_eq!(export_error.kind(), std::io::ErrorKind::Unsupported);
+
+    let range_error = open_indexed_ranges_reader(
+        &input_path,
+        Arc::new(AtomicU64::new(0)),
+        &config,
+        &index_path,
+        "0@1",
+    )
+    .err()
+    .expect("disabled indexed ranges must fail");
+    assert_eq!(range_error.kind(), std::io::ErrorKind::Unsupported);
+
+    let enabled_for_plain = RapidgzipConfig {
+        enabled: true,
+        ..config.clone()
+    };
+    let plain_error = open_indexed_ranges_reader(
+        &plain_path,
+        Arc::new(AtomicU64::new(0)),
+        &enabled_for_plain,
+        &index_path,
+        "0@1",
+    )
+    .err()
+    .expect("plain indexed ranges must fail");
+    assert_eq!(plain_error.kind(), std::io::ErrorKind::Unsupported);
+
+    let cancelled_error = enabled_for_plain
+        .open_indexed_ranges_reader_cancellable(
+            &plain_path,
+            Arc::new(AtomicU64::new(0)),
+            &index_path,
+            "0@1",
+            Arc::new(AtomicBool::new(false)),
+        )
+        .err()
+        .expect("plain cancellable indexed ranges must fail");
+    assert_eq!(cancelled_error.kind(), std::io::ErrorKind::Unsupported);
+
+    let mut json_reader =
+        open_full_scan_json_reader(&input_path, Arc::new(AtomicU64::new(0)), &config)
+            .expect("open strict JSON fallback reader");
+    let mut payload = String::new();
+    json_reader
+        .read_to_string(&mut payload)
+        .expect("read strict JSON fallback");
+    assert_eq!(payload, r#"{"ok":true}"#);
+
+    std::fs::remove_file(input_path).ok();
+    std::fs::remove_file(plain_path).ok();
 }

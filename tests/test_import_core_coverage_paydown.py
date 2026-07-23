@@ -15,6 +15,7 @@ import pytest
 import main
 from process import import_status_events as status_events
 from process import live_progress
+from tests.live_progress_atomic_redis import AtomicLiveProgressRedis
 
 
 class _QueueProbe:
@@ -183,11 +184,11 @@ def test_status_enqueue_handles_absent_sink_and_event_loop(monkeypatch):
 async def test_status_event_bridge_delivers_worker_thread_and_prebound_events(
     monkeypatch,
 ):
-    posted: list[dict[str, object]] = []
+    posted_events: list[dict[str, object]] = []
     monkeypatch.setattr(
         status_events, "_status_event_url", lambda: "https://sink.invalid/events"
     )
-    monkeypatch.setattr(status_events, "_post_event", posted.append)
+    monkeypatch.setattr(status_events, "_post_event", posted_events.append)
     monkeypatch.setattr(status_events, "_throttle_seconds", lambda: 0.0)
 
     thread = threading.Thread(
@@ -196,7 +197,7 @@ async def test_status_event_bridge_delivers_worker_thread_and_prebound_events(
     )
     thread.start()
     thread.join()
-    assert not posted
+    assert not posted_events
 
     status_events.bind_status_event_loop()
     await asyncio.to_thread(
@@ -205,7 +206,7 @@ async def test_status_event_bridge_delivers_worker_thread_and_prebound_events(
     )
     await status_events.flush_status_events()
 
-    assert [event["run_id"] for event in posted] == [
+    assert [event["run_id"] for event in posted_events] == [
         "run-before-bind",
         "run-from-thread",
     ]
@@ -213,11 +214,11 @@ async def test_status_event_bridge_delivers_worker_thread_and_prebound_events(
 
 @pytest.mark.asyncio
 async def test_status_event_bridge_worker_loop_cannot_steal_bound_owner(monkeypatch):
-    posted: list[dict[str, object]] = []
+    posted_events: list[dict[str, object]] = []
     monkeypatch.setattr(
         status_events, "_status_event_url", lambda: "https://sink.invalid/events"
     )
-    monkeypatch.setattr(status_events, "_post_event", posted.append)
+    monkeypatch.setattr(status_events, "_post_event", posted_events.append)
     monkeypatch.setattr(status_events, "_throttle_seconds", lambda: 0.0)
     status_events.bind_status_event_loop()
     owner_loop = status_events._publisher_state.loop
@@ -232,18 +233,18 @@ async def test_status_event_bridge_worker_loop_cannot_steal_bound_owner(monkeypa
     await status_events.flush_status_events()
 
     assert status_events._publisher_state.loop is owner_loop
-    assert [event["run_id"] for event in posted] == ["run-from-worker-loop"]
+    assert [event["run_id"] for event in posted_events] == ["run-from-worker-loop"]
 
 
 @pytest.mark.asyncio
 async def test_status_event_bridge_coalesces_latest_progress_at_fixed_rate(
     monkeypatch,
 ):
-    posted: list[dict[str, object]] = []
+    posted_events: list[dict[str, object]] = []
     monkeypatch.setattr(
         status_events, "_status_event_url", lambda: "https://sink.invalid/events"
     )
-    monkeypatch.setattr(status_events, "_post_event", posted.append)
+    monkeypatch.setattr(status_events, "_post_event", posted_events.append)
     monkeypatch.setattr(status_events, "_throttle_seconds", lambda: 0.02)
     status_events.bind_status_event_loop()
 
@@ -259,7 +260,7 @@ async def test_status_event_bridge_coalesces_latest_progress_at_fixed_rate(
     await asyncio.sleep(0.03)
     await status_events.flush_status_events()
 
-    assert [event["progress"]["event_seq"] for event in posted] == [1, 3]
+    assert [event["progress"]["event_seq"] for event in posted_events] == [1, 3]
 
 
 @pytest.mark.asyncio
@@ -458,21 +459,23 @@ def test_main_cli_repairs_missing_or_non_uvloop_event_loop(monkeypatch):
 
 def test_live_progress_recovers_previous_metadata_and_terminal_totals(monkeypatch):
     writes: list[tuple[str, int, str]] = []
-    fake_redis = SimpleNamespace(
-        setex=lambda key, ttl, value: writes.append((key, ttl, value))
-    )
     previous_progress_by_field = {
         "importer": "provider-directory-fhir",
         "source": "source-progress",
         "confidence": "measured",
         "started_at": "2026-07-22T00:00:00Z",
     }
-    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
-    monkeypatch.setattr(
-        live_progress,
-        "_read_live_progress_payload",
-        lambda _run_id: previous_progress_by_field,
+    fake_redis = AtomicLiveProgressRedis(
+        {
+            "import:progress:run-live": json.dumps(
+                previous_progress_by_field
+            )
+        },
+        on_progress_write=lambda key, ttl, value: writes.append(
+            (key, ttl, value)
+        ),
     )
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
     monkeypatch.setattr(
         live_progress, "_utc_now", lambda: dt.datetime(2026, 7, 22, 1, 0, 0)
     )
@@ -494,16 +497,13 @@ def test_live_progress_recovers_previous_metadata_and_terminal_totals(monkeypatc
     assert '"label": "example.test/file.ndjson"' in writes[0][2]
 
 
-def test_live_progress_emits_central_event_when_local_redis_is_unavailable(
+def test_live_progress_does_not_emit_unaccepted_event_when_redis_is_unavailable(
     monkeypatch,
 ):
     events: list[dict[str, object]] = []
 
     class FailingRedis:
-        def get(self, _key):
-            raise OSError("redis unavailable")
-
-        def setex(self, *_args):
+        def set(self, *_args, **_kwargs):
             raise OSError("redis unavailable")
 
     monkeypatch.setattr(live_progress, "_redis", lambda: FailingRedis())
@@ -518,12 +518,11 @@ def test_live_progress_emits_central_event_when_local_redis_is_unavailable(
         pct=12,
     )
 
-    assert events[0]["run_id"] == "run-without-redis"
-    assert events[0]["progress"]["pct"] == 12
+    assert events == []
 
 
 def test_live_progress_heartbeat_advances_observation_not_work(monkeypatch):
-    stored: dict[str, str] = {}
+    stored_by_key: dict[str, str] = {}
     instants = iter(
         (
             dt.datetime(2026, 7, 23, 10, 0, 0),
@@ -531,14 +530,8 @@ def test_live_progress_heartbeat_advances_observation_not_work(monkeypatch):
         )
     )
 
-    class FakeRedis:
-        def get(self, key):
-            return stored.get(key)
-
-        def setex(self, key, _ttl, value):
-            stored[key] = value
-
-    monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
+    fake_redis = AtomicLiveProgressRedis(stored_by_key)
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
     monkeypatch.setattr(live_progress, "_utc_now", lambda: next(instants))
     monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
 
@@ -551,7 +544,7 @@ def test_live_progress_heartbeat_advances_observation_not_work(monkeypatch):
         stage_ordinal=3,
         pct=12,
     )
-    first = json.loads(stored["import:progress:run-heartbeat-v2"])
+    first = json.loads(stored_by_key["import:progress:run-heartbeat-v2"])
     live_progress.write_live_progress(
         run_id="run-heartbeat-v2",
         importer="ptg",
@@ -563,13 +556,450 @@ def test_live_progress_heartbeat_advances_observation_not_work(monkeypatch):
         total=1,
         pct=0,
     )
-    heartbeat = json.loads(stored["import:progress:run-heartbeat-v2"])
+    heartbeat = json.loads(stored_by_key["import:progress:run-heartbeat-v2"])
 
     assert heartbeat["event_seq"] > first["event_seq"]
     assert heartbeat["progress_seq"] == first["progress_seq"]
     assert heartbeat["progressed_at"] == first["progressed_at"]
     assert heartbeat["observed_at"] > first["observed_at"]
     assert heartbeat["pct"] == 12
+
+
+def test_live_progress_new_attempt_resets_progress_and_sequences(monkeypatch):
+    stored_by_key: dict[str, str] = {}
+    instants = iter(
+        (
+            dt.datetime(2026, 7, 23, 10, 0, 10),
+            dt.datetime(2026, 7, 23, 11, 0, 4),
+        )
+    )
+
+    fake_redis = AtomicLiveProgressRedis(stored_by_key)
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(live_progress, "_utc_now", lambda: next(instants))
+
+    run_id = "run-new-attempt-reset"
+    live_progress.write_live_progress(
+        run_id=run_id,
+        attempt_id=f"{run_id}:first",
+        attempt_started_at="2026-07-23T10:00:00Z",
+        started_at="2026-07-23T10:00:00Z",
+        status="failed",
+        stage_id="scan",
+        stage_ordinal=3,
+        phase="scanning",
+        done=80,
+        total=100,
+        pct=80,
+        counters={"groups": 99},
+        publish_event=False,
+    )
+    first = json.loads(stored_by_key[live_progress.live_progress_key(run_id)])
+    assert first["event_seq"] == 1
+    assert first["progress_seq"] == 1
+
+    live_progress.write_live_progress(
+        run_id=run_id,
+        attempt_id=f"{run_id}:second",
+        attempt_started_at="2026-07-23T11:00:00Z",
+        started_at="2026-07-23T11:00:00Z",
+        phase="restarting",
+        done=1,
+        total=4,
+        pct=25,
+        publish_event=False,
+    )
+    restarted = json.loads(stored_by_key[live_progress.live_progress_key(run_id)])
+
+    assert restarted["attempt_id"] == f"{run_id}:second"
+    assert restarted["attempt_started_at"] == "2026-07-23T11:00:00Z"
+    assert restarted["started_at"] == "2026-07-23T10:00:00Z"
+    assert restarted["status"] == "running"
+    assert restarted["phase"] == "restarting"
+    assert restarted["pct"] == 25
+    assert restarted["eta_seconds"] == 12
+    assert restarted["event_seq"] == 1
+    assert restarted["progress_seq"] == 1
+    assert "stage_id" not in restarted
+    assert "stage_ordinal" not in restarted
+    assert "counters" not in restarted
+
+
+def test_live_progress_same_attempt_keeps_ordinal_and_sequence_fences(monkeypatch):
+    stored_by_key: dict[str, str] = {}
+    instants = iter(
+        (
+            dt.datetime(2026, 7, 23, 10, 0, 0),
+            dt.datetime(2026, 7, 23, 10, 0, 1),
+        )
+    )
+
+    fake_redis = AtomicLiveProgressRedis(stored_by_key)
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(live_progress, "_utc_now", lambda: next(instants))
+
+    run_id = "run-same-attempt-fence"
+    attempt_id = f"{run_id}:current"
+    attempt_started_at = "2026-07-23T09:00:00Z"
+    live_progress.write_live_progress(
+        run_id=run_id,
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+        stage_id="publish",
+        stage_ordinal=5,
+        pct=90,
+        publish_event=False,
+    )
+    first = json.loads(stored_by_key[live_progress.live_progress_key(run_id)])
+
+    live_progress.write_live_progress(
+        run_id=run_id,
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+        stage_id="scan",
+        stage_ordinal=3,
+        pct=10,
+        publish_event=False,
+    )
+    fenced = json.loads(stored_by_key[live_progress.live_progress_key(run_id)])
+
+    assert fenced["attempt_id"] == attempt_id
+    assert fenced["stage_id"] == "publish"
+    assert fenced["stage_ordinal"] == 5
+    assert fenced["pct"] == 90
+    assert fenced["event_seq"] == first["event_seq"] + 1
+    assert fenced["progress_seq"] == first["progress_seq"]
+
+
+def test_live_progress_rejects_delayed_older_attempt(monkeypatch):
+    stored_by_key: dict[str, str] = {}
+    write_counts = [0]
+
+    def count_write(_key, _ttl, _value):
+        write_counts[0] += 1
+
+    fake_redis = AtomicLiveProgressRedis(
+        stored_by_key,
+        on_progress_write=count_write,
+    )
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(
+        live_progress,
+        "_utc_now",
+        lambda: dt.datetime(2026, 7, 23, 12, 0, 0),
+    )
+
+    run_id = "run-reject-old-attempt"
+    live_progress.write_live_progress(
+        run_id=run_id,
+        attempt_id=f"{run_id}:current",
+        attempt_started_at="2026-07-23T11:00:00Z",
+        status="running",
+        stage_id="publish",
+        stage_ordinal=5,
+        pct=90,
+        publish_event=False,
+    )
+    current_payload = stored_by_key[live_progress.live_progress_key(run_id)]
+
+    live_progress.write_live_progress(
+        run_id=run_id,
+        attempt_id=f"{run_id}:old",
+        attempt_started_at="2026-07-23T10:00:00Z",
+        status="failed",
+        stage_id="scan",
+        stage_ordinal=3,
+        pct=10,
+        publish_event=False,
+    )
+
+    assert write_counts[0] == 1
+    assert stored_by_key[live_progress.live_progress_key(run_id)] == current_payload
+
+
+@pytest.mark.parametrize("attempt_started_at", [None, "not-a-timestamp"])
+def test_live_progress_rejects_unordered_attempt_against_timestamped_current(
+    monkeypatch,
+    attempt_started_at,
+):
+    stored_by_key: dict[str, str] = {}
+
+    fake_redis = AtomicLiveProgressRedis(stored_by_key)
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(
+        live_progress,
+        "_utc_now",
+        lambda: dt.datetime(2026, 7, 23, 12, 0, 0),
+    )
+
+    run_id = f"run-unordered-attempt-{attempt_started_at}"
+    live_progress.write_live_progress(
+        run_id=run_id,
+        attempt_id=f"{run_id}:current",
+        attempt_started_at="2026-07-23T11:00:00Z",
+        stage_id="publish",
+        stage_ordinal=5,
+        pct=90,
+        publish_event=False,
+    )
+    current_payload = stored_by_key[live_progress.live_progress_key(run_id)]
+
+    live_progress.write_live_progress(
+        run_id=run_id,
+        attempt_id=f"{run_id}:unknown",
+        attempt_started_at=attempt_started_at,
+        status="failed",
+        pct=1,
+        publish_event=False,
+    )
+
+    assert stored_by_key[live_progress.live_progress_key(run_id)] == current_payload
+
+
+def test_live_progress_attempt_ordering_fails_closed_for_malformed_named_current():
+    run_id = "run-malformed-current-attempt"
+
+    assert (
+        live_progress._attempt_disposition(
+            {
+                "run_id": run_id,
+                "attempt_id": f"{run_id}:incoming",
+                "attempt_started_at": "2026-07-23T12:00:00Z",
+            },
+            {
+                "run_id": run_id,
+                "attempt_id": f"{run_id}:current",
+                "attempt_started_at": "invalid",
+            },
+        )
+        == live_progress._ATTEMPT_REJECT
+    )
+
+
+def test_live_progress_attempt_ordering_accepts_timestamped_run_id_alias():
+    run_id = "run-thread-attempt-alias"
+    attempt_started_at = "2026-07-23T12:00:00Z"
+
+    assert (
+        live_progress._attempt_disposition(
+            {
+                "run_id": run_id,
+                "attempt_id": run_id,
+                "started_at": attempt_started_at,
+            },
+            {
+                "run_id": run_id,
+                "attempt_id": f"{run_id}:{attempt_started_at}",
+                "attempt_started_at": attempt_started_at,
+            },
+        )
+        == live_progress._ATTEMPT_CURRENT
+    )
+
+
+class _LiveProgressCasRaceHarness:
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.key = live_progress.live_progress_key(run_id)
+        self.storage_by_key: dict[str, object] = {}
+        self.shared_lock = threading.Lock()
+        self.first_reads = threading.Barrier(2)
+        self.events: list[dict[str, object]] = []
+        self.event_lock = threading.Lock()
+        self.write_results: list[bool] = []
+        self.clients = (self._new_client(), self._new_client())
+
+    def _new_client(self) -> AtomicLiveProgressRedis:
+        wait_flags = [False]
+
+        def before_get(candidate_key):
+            if candidate_key == self.key and not wait_flags[0]:
+                wait_flags[0] = True
+                self.first_reads.wait(timeout=2)
+
+        return AtomicLiveProgressRedis(
+            self.storage_by_key,
+            before_get=before_get,
+            shared_lock=self.shared_lock,
+        )
+
+    def capture_event(self, status_event: dict[str, object]) -> None:
+        with self.event_lock:
+            self.events.append(status_event)
+
+    def write_progress(
+        self,
+        redis_client: AtomicLiveProgressRedis,
+        attempt_id: str,
+        attempt_started_at: str,
+    ) -> None:
+        self.write_results.append(
+            live_progress._write_live_progress_with_cas(
+                redis_client=redis_client,
+                run_id=self.run_id,
+                context={},
+                payload={
+                    "attempt_id": attempt_id,
+                    "attempt_started_at": attempt_started_at,
+                    "status": "running",
+                    "stage_id": "scan",
+                    "stage_ordinal": 1,
+                    "pct": 5,
+                },
+                observed_at="2026-07-23T12:00:01Z",
+                now=dt.datetime(2026, 7, 23, 12, 0, 1),
+                status_event_payload=None,
+            )
+        )
+
+    def run_threads(self) -> tuple[threading.Thread, threading.Thread]:
+        old_thread = threading.Thread(
+            target=self.write_progress,
+            args=(self.clients[0], f"{self.run_id}:old", "2026-07-23T10:00:00Z"),
+        )
+        new_thread = threading.Thread(
+            target=self.write_progress,
+            args=(self.clients[1], f"{self.run_id}:new", "2026-07-23T11:00:00Z"),
+        )
+        old_thread.start()
+        new_thread.start()
+        old_thread.join(timeout=3)
+        new_thread.join(timeout=3)
+        return old_thread, new_thread
+
+
+def test_live_progress_cas_two_clients_converges_on_newer_attempt(
+    monkeypatch,
+):
+    """Two stale readers cannot overwrite the newer attempt after CAS."""
+
+    run_id = "run-two-client-cas"
+    harness = _LiveProgressCasRaceHarness(run_id)
+    monkeypatch.setattr(
+        live_progress,
+        "enqueue_status_event",
+        harness.capture_event,
+    )
+    old_thread, new_thread = harness.run_threads()
+
+    assert not old_thread.is_alive()
+    assert not new_thread.is_alive()
+    retained = json.loads(str(harness.storage_by_key[harness.key]))
+    assert retained["attempt_id"] == f"{run_id}:new"
+    event_attempts = [
+        event["progress"]["attempt_id"]
+        for event in harness.events
+    ]
+    assert event_attempts[-1] == f"{run_id}:new"
+    if f"{run_id}:old" in event_attempts:
+        assert event_attempts.index(f"{run_id}:old") < event_attempts.index(
+            f"{run_id}:new"
+        )
+    assert any(harness.write_results)
+
+
+class _LiveProgressAttemptGateHarness:
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.storage_by_key: dict[str, object] = {}
+        self.shared_lock = threading.Lock()
+        self.old_event_entered = threading.Event()
+        self.release_old_event = threading.Event()
+        self.new_lock_attempted = threading.Event()
+        self.events: list[str] = []
+        self.thread_client = threading.local()
+        self.write_result_by_label: dict[str, bool] = {}
+        self.clients = (
+            AtomicLiveProgressRedis(self.storage_by_key, shared_lock=self.shared_lock),
+            self._new_lock_observing_client(),
+        )
+        self.attempt_by_label = {
+            "old": (self.clients[0], "2026-07-23T10:00:00Z", "failed"),
+            "new": (self.clients[1], "2026-07-23T11:00:00Z", "running"),
+        }
+
+    def _new_lock_observing_client(self) -> AtomicLiveProgressRedis:
+        return AtomicLiveProgressRedis(
+            self.storage_by_key,
+            before_set=lambda key: (
+                self.new_lock_attempted.set()
+                if key == live_progress._progress_publication_lock_key(self.run_id)
+                else None
+            ),
+            shared_lock=self.shared_lock,
+        )
+
+    def redis_for_thread(self) -> AtomicLiveProgressRedis:
+        return self.thread_client.value
+
+    def capture_event(self, status_event: dict[str, object]) -> None:
+        attempt_id = status_event["progress"]["attempt_id"]
+        if attempt_id == f"{self.run_id}:old":
+            self.old_event_entered.set()
+            assert self.release_old_event.wait(timeout=2)
+        self.events.append(attempt_id)
+
+    def write_progress(self, label: str) -> None:
+        client, started_at, status = self.attempt_by_label[label]
+        self.thread_client.value = client
+        self.write_result_by_label[label] = live_progress.write_live_progress(
+            run_id=self.run_id,
+            attempt_id=f"{self.run_id}:{label}",
+            attempt_started_at=started_at,
+            status=status,
+            pct=90 if label == "old" else 1,
+        )
+
+    def old_thread(self) -> threading.Thread:
+        return threading.Thread(target=self.write_progress, args=("old",))
+
+    def new_thread(self) -> threading.Thread:
+        return threading.Thread(target=self.write_progress, args=("new",))
+
+
+def test_live_progress_holds_attempt_gate_through_terminal_event_enqueue(
+    monkeypatch,
+):
+    """A newer claim waits until an accepted older event is already queued."""
+
+    run_id = "run-event-order-gate"
+    harness = _LiveProgressAttemptGateHarness(run_id)
+    storage_by_key = harness.storage_by_key
+    old_event_entered = harness.old_event_entered
+    release_old_event = harness.release_old_event
+    new_lock_attempted = harness.new_lock_attempted
+    events = harness.events
+    write_result_by_label = harness.write_result_by_label
+
+    monkeypatch.setattr(live_progress, "_redis", harness.redis_for_thread)
+    monkeypatch.setattr(
+        live_progress,
+        "_progress_lock_for",
+        lambda _run_id: threading.Lock(),
+    )
+    monkeypatch.setattr(live_progress, "enqueue_status_event", harness.capture_event)
+    old_thread = harness.old_thread()
+    new_thread = harness.new_thread()
+
+    old_thread.start()
+    assert old_event_entered.wait(timeout=2)
+    new_thread.start()
+    assert new_lock_attempted.wait(timeout=2)
+    assert new_thread.is_alive()
+    assert events == []
+
+    release_old_event.set()
+    old_thread.join(timeout=3)
+    new_thread.join(timeout=3)
+
+    assert not old_thread.is_alive()
+    assert not new_thread.is_alive()
+    assert write_result_by_label == {"old": True, "new": True}
+    assert events == [f"{run_id}:old", f"{run_id}:new"]
+    retained = json.loads(
+        str(storage_by_key[live_progress.live_progress_key(run_id)])
+    )
+    assert retained["attempt_id"] == f"{run_id}:new"
 
 
 def test_live_progress_scheduling_reads_and_parsing_edges(monkeypatch):
@@ -621,15 +1051,18 @@ def test_live_progress_normalization_and_safe_display_edges():
     live_progress._normalize_estimate_fields(estimate_by_field, now=now, terminal=False)
     assert estimate_by_field["eta_seconds"] == 8
 
-    estimate_from_start_by_field = {
+    estimate_from_attempt_start_by_field = {
         "done": 2,
         "total": 6,
-        "started_at": now - dt.timedelta(seconds=4),
+        "started_at": now - dt.timedelta(hours=1),
+        "attempt_started_at": now - dt.timedelta(seconds=4),
     }
     live_progress._normalize_estimate_fields(
-        estimate_from_start_by_field, now=now, terminal=False
+        estimate_from_attempt_start_by_field,
+        now=now,
+        terminal=False,
     )
-    assert estimate_from_start_by_field["eta_seconds"] == 8
+    assert estimate_from_attempt_start_by_field["eta_seconds"] == 8
 
     assert (
         live_progress._safe_label("https://example.test/path/file.ndjson")

@@ -3074,6 +3074,53 @@ async def test_snapshot_binding_retry_is_idempotent_only_for_same_layout():
 
 
 @pytest.mark.asyncio
+async def test_snapshot_binding_accepts_only_complete_v4_map_root():
+    session = _ScriptedSession(
+        [
+            _Result(scalar_value=None),
+            _Result(scalar_value=None),
+            _Result(scalar_value=b"m" * 32),
+            _Result(scalar_value="snapshot-v4"),
+        ]
+    )
+
+    await bind_snapshot_to_shared_layout(
+        session,
+        schema_name="mrf",
+        snapshot_id="snapshot-v4",
+        snapshot_key=44,
+    )
+
+    assert len(session.calls) == 4
+    assert "ptg2_v4_snapshot_map_root" in session.calls[2][0]
+    assert "root.state = 'complete'" in session.calls[2][0]
+    assert session.calls[2][1]["generation"] == "shared_blocks_v4"
+
+
+@pytest.mark.asyncio
+async def test_dense_write_lock_fences_the_explicit_v4_generation():
+    session = _ScriptedSession([_Result(scalar_value=44)])
+
+    await lock_shared_layout_for_dense_write(
+        session,
+        schema_name="mrf",
+        snapshot_key=44,
+        build_token="build-v4",
+        expected_generation="shared_blocks_v4",
+    )
+
+    assert session.calls[0][1]["generation"] == "shared_blocks_v4"
+    with pytest.raises(ValueError, match="unsupported"):
+        await lock_shared_layout_for_dense_write(
+            session,
+            schema_name="mrf",
+            snapshot_key=44,
+            build_token="build-v4",
+            expected_generation="shared_blocks_v5",
+        )
+
+
+@pytest.mark.asyncio
 async def test_build_heartbeat_is_owned_and_extends_the_gc_lease():
     session = _ScriptedSession([_Result(scalar_value=41)])
 

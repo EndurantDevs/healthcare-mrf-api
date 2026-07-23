@@ -107,16 +107,16 @@ def enqueue_status_event(payload: dict[str, Any]) -> None:
 def _event_stage_signature(event: dict[str, Any]) -> str:
     """Return the fields that are allowed to bypass rate limiting."""
 
-    progress = event.get("progress")
-    if not isinstance(progress, dict):
-        progress = {}
+    progress_by_field = event.get("progress")
+    if not isinstance(progress_by_field, dict):
+        progress_by_field = {}
     return json.dumps(
         {
             "status": event.get("status"),
-            "phase": event.get("phase_detail") or progress.get("phase"),
-            "attempt_id": progress.get("attempt_id"),
-            "stage_id": progress.get("stage_id"),
-            "stage_ordinal": progress.get("stage_ordinal"),
+            "phase": event.get("phase_detail") or progress_by_field.get("phase"),
+            "attempt_id": progress_by_field.get("attempt_id"),
+            "stage_id": progress_by_field.get("stage_id"),
+            "stage_ordinal": progress_by_field.get("stage_ordinal"),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -286,12 +286,12 @@ def _ensure_queue(loop: asyncio.AbstractEventLoop) -> asyncio.Queue[dict[str, An
                 )
             )
         queue = _publisher_state.queue
-        pending = tuple(_publisher_state.pending)
+        pending_events = tuple(_publisher_state.pending)
         _publisher_state.pending.clear()
         worker = _publisher_state.worker
         if worker is None or worker.done():
             _publisher_state.worker = loop.create_task(_publisher_worker(queue))
-    for event in pending:
+    for event in pending_events:
         loop.call_soon(_accept_event_on_loop, loop, event)
     return queue
 

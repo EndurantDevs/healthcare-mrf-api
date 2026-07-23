@@ -25,6 +25,7 @@ from api.ptg2_capacity_evidence import (
     CapacityEvidenceError,
     guard_isolated_capacity_process_request,
 )
+from api.runtime_identity import add_runtime_identity_headers
 from db.connection import db
 
 
@@ -46,6 +47,7 @@ def init_api(api):
 
     db.init_app(api)
     api.register_middleware(_capacity_process_request_guard, "request")
+    api.register_middleware(add_runtime_identity_headers, "response")
     api.blueprint(control_blueprint)
     api.blueprint(metrics_blueprint)
     api_bluenprint = Blueprint.group(

@@ -41,7 +41,7 @@ def test_shared_schema_requires_all_migration_owned_lifecycle_tables():
 
 
 def test_cleanup_recognizes_current_and_legacy_shared_generations_only():
-    for generation in ("shared_blocks_v1", "shared_blocks_v3"):
+    for generation in ("shared_blocks_v1", "shared_blocks_v3", "shared_blocks_v4"):
         assert shared_gc.is_shared_blocks_cleanup_manifest(
             {"storage_generation": generation}
         )

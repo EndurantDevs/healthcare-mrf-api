@@ -562,7 +562,9 @@ def test_snapshot_availability_branches_v3_to_binding_and_layout():
     assert "ptg2_v3_snapshot_binding" in sql
     assert "ptg2_v3_snapshot_layout" in sql
     assert "shared_layout.state = 'sealed'" in sql
-    assert "shared_layout.generation = 'shared_blocks_v3'" in sql
+    assert "shared_layout.generation IN ('shared_blocks_v3', 'shared_blocks_v4')" in sql
+    assert "ptg2_v4_snapshot_map_root" in sql
+    assert "v4_root.state = 'complete'" in sql
     assert "ptg2_v3_candidate_audit_attestation" in sql
     assert "shared_attestation.activated_at IS NOT NULL" in sql
     assert "shared_attestation.contract" in sql

@@ -161,22 +161,22 @@ PUBLIC_NESTED_TAXONOMY_EXCLUDED_COLUMNS = {"npi", "checksum"}
 
 def _public_nested_taxonomy_rows(rows: Sequence[Any]) -> list[dict[str, Any]]:
     public_rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen_keys: set[str] = set()
     for entry in rows or []:
         if not isinstance(entry, Mapping):
             continue
-        public_entry = {
+        public_entry_map = {
             str(key): value
             for key, value in entry.items()
             if str(key) not in PUBLIC_NESTED_TAXONOMY_EXCLUDED_COLUMNS
         }
-        if not public_entry:
+        if not public_entry_map:
             continue
-        dedupe_key = json.dumps(public_entry, default=str, sort_keys=True, separators=(",", ":"))
-        if dedupe_key in seen:
+        dedupe_key = json.dumps(public_entry_map, default=str, sort_keys=True, separators=(",", ":"))
+        if dedupe_key in seen_keys:
             continue
-        seen.add(dedupe_key)
-        public_rows.append(public_entry)
+        seen_keys.add(dedupe_key)
+        public_rows.append(public_entry_map)
     return public_rows
 
 
@@ -874,8 +874,8 @@ def _address_type_rank(address: Mapping[str, Any]) -> int:
 
 
 def _merge_unique_list_values(first: Any, second: Any) -> list[Any]:
-    merged: list[Any] = []
-    seen: set[str] = set()
+    merged_values: list[Any] = []
+    seen_markers: set[str] = set()
     for values in (first, second):
         if values is None:
             continue
@@ -884,11 +884,11 @@ def _merge_unique_list_values(first: Any, second: Any) -> list[Any]:
             if value in (None, ""):
                 continue
             marker = json.dumps(value, sort_keys=True, default=str)
-            if marker in seen:
+            if marker in seen_markers:
                 continue
-            seen.add(marker)
-            merged.append(value)
-    return merged
+            seen_markers.add(marker)
+            merged_values.append(value)
+    return merged_values
 
 
 def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any]) -> None:
@@ -985,24 +985,24 @@ def _address_dedupe_key(address: Mapping[str, Any]) -> str:
 
 
 def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
-    keyed: dict[str, dict[str, Any]] = {}
-    unkeyed: list[dict[str, Any]] = []
+    addresses_by_key: dict[str, dict[str, Any]] = {}
+    unkeyed_addresses: list[dict[str, Any]] = []
     for address in sorted(
         (entry for entry in addresses if isinstance(entry, dict)),
         key=lambda entry: (_address_type_rank(entry), str(entry.get("first_line") or "")),
     ):
         key = _address_dedupe_key(address)
         if not key:
-            unkeyed.append(address)
+            unkeyed_addresses.append(address)
             continue
-        existing = keyed.get(key)
+        existing = addresses_by_key.get(key)
         if existing is None:
-            keyed[key] = address
+            addresses_by_key[key] = address
             continue
         _merge_duplicate_address(existing, address)
     return [
         _add_canonical_contact_fields_to_address(address)
-        for address in (list(keyed.values()) + unkeyed)
+        for address in (list(addresses_by_key.values()) + unkeyed_addresses)
     ]
 
 
@@ -1011,16 +1011,16 @@ def _provider_directory_source_ids_from_record_ids(record_ids: Any) -> list[str]
         return []
     candidates = record_ids if isinstance(record_ids, (list, tuple, set)) else [record_ids]
     source_ids: list[str] = []
-    seen: set[str] = set()
+    seen_source_ids: set[str] = set()
     for raw in candidates:
         value = str(raw or "").strip()
         parts = value.split(":")
         if len(parts) < 3 or parts[0] != "provider_directory_fhir":
             continue
         source_id = parts[2].strip()
-        if not source_id or source_id in seen:
+        if not source_id or source_id in seen_source_ids:
             continue
-        seen.add(source_id)
+        seen_source_ids.add(source_id)
         source_ids.append(source_id)
     return source_ids
 
@@ -1034,16 +1034,16 @@ def _provider_directory_record_ids_from_address(address: Mapping[str, Any]) -> l
 
 def _provider_directory_source_ids_from_addresses(addresses: Sequence[Any]) -> list[str]:
     source_ids: list[str] = []
-    seen: set[str] = set()
+    seen_source_ids: set[str] = set()
     for address in addresses or []:
         if not isinstance(address, Mapping):
             continue
         for source_id in _provider_directory_source_ids_from_record_ids(
             _provider_directory_record_ids_from_address(address)
         ):
-            if source_id in seen:
+            if source_id in seen_source_ids:
                 continue
-            seen.add(source_id)
+            seen_source_ids.add(source_id)
             source_ids.append(source_id)
     return source_ids
 
@@ -3881,8 +3881,8 @@ def _normalize_provider_enrichment_view(raw_value: Any) -> str:
 
 
 def _unique_non_empty(values: Sequence[Any]) -> list[Any]:
-    seen: set[Any] = set()
-    output: list[Any] = []
+    seen_values: set[Any] = set()
+    output_values: list[Any] = []
     for value in values:
         if value is None:
             continue
@@ -3890,11 +3890,11 @@ def _unique_non_empty(values: Sequence[Any]) -> list[Any]:
             value = value.strip()
             if not value:
                 continue
-        if value in seen:
+        if value in seen_values:
             continue
-        seen.add(value)
-        output.append(value)
-    return output
+        seen_values.add(value)
+        output_values.append(value)
+    return output_values
 
 
 def _serialize_ffs_reassignment_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -4111,9 +4111,9 @@ async def _fetch_ffs_summary_overrides(
 
 
 async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -> int:
-    cached = _has_insurance_total_cache_get(city, state)
-    if cached is not None:
-        return cached
+    has_cached_insurance_count = _has_insurance_total_cache_get(city, state)
+    if has_cached_insurance_count is not None:
+        return has_cached_insurance_count
 
     required_columns = {"npi", "type", "plans_network_array"}
     if city:
@@ -4519,7 +4519,7 @@ def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str 
         prefix = f"{prefix}."
     expr = NAME_LIKE_TEMPLATE.format(alias=prefix)
     clauses = []
-    params = {}
+    parameter_map = {}
     for idx, name in enumerate(names):
         param_like = f"{base_param}_{idx}"
         if ENABLE_TRGM_FUZZY_NAME_SEARCH:
@@ -4527,12 +4527,12 @@ def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str 
             clauses.append(
                 f"(({expr} LIKE :{param_like}) OR ({expr} % :{param_fuzzy}))"
             )
-            params[param_fuzzy] = name.lower()
+            parameter_map[param_fuzzy] = name.lower()
         else:
             clauses.append(f"({expr} LIKE :{param_like})")
-        params[param_like] = f"%{name.lower()}%"
+        parameter_map[param_like] = f"%{name.lower()}%"
     joined = " OR ".join(clauses)
-    return f"({joined})", params
+    return f"({joined})", parameter_map
 
 
 def _normalize_zip_code(raw: Optional[str], param_name: str) -> Optional[str]:
@@ -4607,7 +4607,7 @@ def _parse_code_tokens(raw: Optional[str], param_name: str) -> list[str]:
     if raw is None:
         return []
     tokens: list[str] = []
-    seen: set[str] = set()
+    seen_tokens: set[str] = set()
     for item in str(raw).split(","):
         token = item.strip().upper()
         if not token:
@@ -4616,27 +4616,27 @@ def _parse_code_tokens(raw: Optional[str], param_name: str) -> list[str]:
             raise sanic.exceptions.InvalidUsage(
                 f"{param_name} contains invalid code token: {item!r}"
             )
-        if token in seen:
+        if token in seen_tokens:
             continue
-        seen.add(token)
+        seen_tokens.add(token)
         tokens.append(token)
     return tokens
 
 
 def _to_int_codes(values: Sequence[str], param_name: str) -> list[int]:
-    out: list[int] = []
-    seen: set[int] = set()
+    parsed_codes: list[int] = []
+    seen_codes: set[int] = set()
     for value in values:
         if not INT_CODE_PATTERN.fullmatch(str(value)):
             raise sanic.exceptions.InvalidUsage(
                 f"{param_name} must contain numeric codes for internal matching"
             )
         parsed = int(value)
-        if parsed in seen:
+        if parsed in seen_codes:
             continue
-        seen.add(parsed)
-        out.append(parsed)
-    return out
+        seen_codes.add(parsed)
+        parsed_codes.append(parsed)
+    return parsed_codes
 
 
 def _parse_optional_year(raw: Optional[str], param_name: str = "year") -> Optional[int]:
@@ -5139,9 +5139,9 @@ def _public_address_serving_column_keys() -> set[str]:
 async def _address_serving_model(required_columns: set[str] | None = None, *, session: Any = None):
     if not _is_unified_address_serving_requested():
         return NPIAddress
-    required = set(required_columns or ())
+    required_columns_set = set(required_columns or ())
     columns = await _table_columns(EntityAddressUnified.__tablename__, session=session)
-    if columns and required.issubset(columns):
+    if columns and required_columns_set.issubset(columns):
         return EntityAddressUnified
     return NPIAddress
 
@@ -5393,11 +5393,11 @@ def _provider_enrichment_visibility(summary: Optional[dict[str, Any]], *, includ
 def _public_provider_enrichment_summary(summary: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if not isinstance(summary, dict):
         return summary
-    public_summary = dict(summary)
-    public_summary.pop("ffs_chain_hidden", None)
-    public_summary.pop("ffs_chain_enrollment_count", None)
-    public_summary.pop("ffs_chain_enrollment_ids", None)
-    return public_summary
+    public_summary_map = dict(summary)
+    public_summary_map.pop("ffs_chain_hidden", None)
+    public_summary_map.pop("ffs_chain_enrollment_count", None)
+    public_summary_map.pop("ffs_chain_enrollment_ids", None)
+    return public_summary_map
 
 
 async def _fetch_provider_enrichment_summary_detail(
@@ -5781,31 +5781,31 @@ def _build_npi_where_clause(
         prefix = f"{prefix}."
 
     clauses: list[str] = []
-    params: dict[str, object] = {}
+    parameter_map: dict[str, object] = {}
 
     if names_like:
         name_clause, name_params = _names_like_filter_clause(alias, names_like)
         if name_clause:
             clauses.append(name_clause)
-            params.update(name_params)
+            parameter_map.update(name_params)
 
     if first_name:
         clauses.append(f"LOWER(COALESCE({prefix}provider_first_name, '')) LIKE :first_name")
-        params["first_name"] = f"%{first_name.lower()}%"
+        parameter_map["first_name"] = f"%{first_name.lower()}%"
     if last_name:
         clauses.append(f"LOWER(COALESCE({prefix}provider_last_name, '')) LIKE :last_name")
-        params["last_name"] = f"%{last_name.lower()}%"
+        parameter_map["last_name"] = f"%{last_name.lower()}%"
     if organization_name:
         org_expr = ORGANIZATION_LIKE_TEMPLATE.format(alias=prefix)
         clauses.append(f"({org_expr} LIKE :organization_name)")
-        params["organization_name"] = f"%{organization_name.lower()}%"
+        parameter_map["organization_name"] = f"%{organization_name.lower()}%"
     if entity_type_code is not None:
         clauses.append(f"{prefix}entity_type_code = :entity_type_code")
-        params["entity_type_code"] = entity_type_code
+        parameter_map["entity_type_code"] = entity_type_code
 
     if not clauses:
         return "", {}
-    return " AND ".join(clauses), params
+    return " AND ".join(clauses), parameter_map
 
 
 def _extract_name_filters(request) -> list[str]:
@@ -5825,17 +5825,17 @@ def _extract_name_filters(request) -> list[str]:
     single = args.get("name_like")
     if single:
         names.append(single)
-    normalized = []
-    seen = set()
+    normalized_names = []
+    seen_names = set()
     for name in names:
         if not name:
             continue
         lower = str(name).lower()
-        if lower in seen:
+        if lower in seen_names:
             continue
-        seen.add(lower)
-        normalized.append(lower)
-    return normalized
+        seen_names.add(lower)
+        normalized_names.append(lower)
+    return normalized_names
 
 
 async def _compute_npi_counts():
@@ -6203,7 +6203,7 @@ def _taxonomy_scope_tokens(raw_value: Any) -> tuple[tuple[str, ...], tuple[str, 
         return (), ()
     exact_codes: list[str] = []
     prefixes: list[str] = []
-    seen: set[str] = set()
+    seen_tokens: set[str] = set()
     for raw_item in re.split(r"[,;]", str(raw_value)):
         item = raw_item.strip().upper()
         if not item:
@@ -6215,9 +6215,9 @@ def _taxonomy_scope_tokens(raw_value: Any) -> tuple[tuple[str, ...], tuple[str, 
                 "taxonomy_scope must contain NUCC codes or prefixes like 261Q*"
             )
         dedupe_key = f"{token}*" if is_prefix else token
-        if dedupe_key in seen:
+        if dedupe_key in seen_tokens:
             continue
-        seen.add(dedupe_key)
+        seen_tokens.add(dedupe_key)
         if is_prefix:
             prefixes.append(token)
         else:
@@ -6297,8 +6297,8 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
     limit = _normalize_match_candidate_limit(args.get("limit"))
 
     locator_count = sum(
-        bool(value)
-        for value in (
+        bool(locator_value)
+        for locator_value in (
             address_site_key,
             address_key,
             latitude is not None and longitude is not None,
@@ -6366,19 +6366,19 @@ def _match_geo_distance_expr(params: dict[str, Any], alias: str = "a") -> str:
 
 
 def _match_candidate_column_sql(address_table_sql: str) -> dict[str, str]:
-    unified = _is_unified_address_table(address_table_sql)
+    is_unified = _is_unified_address_table(address_table_sql)
     return {
-        "provider_npi": "COALESCE(a.npi, a.inferred_npi)" if unified else "a.npi",
-        "premise_key": "a.premise_key::text" if unified else "NULL::text",
-        "address_precision": "a.address_precision" if unified else "NULL::text",
-        "address_sources": "a.address_sources" if unified else "ARRAY[]::varchar[]",
-        "source_record_ids": "a.source_record_ids" if unified else "ARRAY[]::varchar[]",
-        "source_count": "a.source_count" if unified else "0",
-        "independent_source_count": "a.independent_source_count" if unified else "0",
-        "multi_source_confirmed": "a.multi_source_confirmed" if unified else "false",
-        "entity_name": "a.entity_name" if unified else "NULL::text",
-        "location_key": "a.location_key" if unified else "a.checksum::text",
-        "updated_at": "a.updated_at" if unified else "a.date_added::timestamp",
+        "provider_npi": "COALESCE(a.npi, a.inferred_npi)" if is_unified else "a.npi",
+        "premise_key": "a.premise_key::text" if is_unified else "NULL::text",
+        "address_precision": "a.address_precision" if is_unified else "NULL::text",
+        "address_sources": "a.address_sources" if is_unified else "ARRAY[]::varchar[]",
+        "source_record_ids": "a.source_record_ids" if is_unified else "ARRAY[]::varchar[]",
+        "source_count": "a.source_count" if is_unified else "0",
+        "independent_source_count": "a.independent_source_count" if is_unified else "0",
+        "multi_source_confirmed": "a.multi_source_confirmed" if is_unified else "false",
+        "entity_name": "a.entity_name" if is_unified else "NULL::text",
+        "location_key": "a.location_key" if is_unified else "a.checksum::text",
+        "updated_at": "a.updated_at" if is_unified else "a.date_added::timestamp",
     }
 
 
@@ -6491,14 +6491,14 @@ def _match_candidate_taxonomy_filter_sql(
 def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tuple[Any, dict[str, Any]]:
     """Build the bounded provider candidate query and its bound parameters."""
     columns = _match_candidate_column_sql(address_table_sql)
-    query_params: dict[str, Any] = {
+    bound_parameter_map: dict[str, Any] = {
         "limit": int(params["limit"]),
         "candidate_limit": min(
             max(int(params["limit"]) * 8, 100),
             _MATCH_CANDIDATES_MAX_INTERNAL_ROWS,
         ),
     }
-    address_where = [
+    address_predicates = [
         _provider_list_address_type_clause(
             "a",
             address_table_sql,
@@ -6508,15 +6508,15 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     ]
     address_site_locator = None
     if params.get("address_site_key"):
-        query_params["address_site_key"] = params["address_site_key"]
+        bound_parameter_map["address_site_key"] = params["address_site_key"]
         address_site_locator = _address_site_key_filter("a", address_table_sql)
     address_key_locator = None
     if params.get("address_key"):
-        query_params["address_key"] = params["address_key"]
+        bound_parameter_map["address_key"] = params["address_key"]
         address_key_locator = "a.address_key = CAST(:address_key AS uuid)"
     phone_locator = None
     if params.get("phone_digits"):
-        query_params["phone_digits"] = params["phone_digits"]
+        bound_parameter_map["phone_digits"] = params["phone_digits"]
         phone_locator = _address_phone_digits_filter("a", address_table_sql)
     locator_candidates = [
         ("address_site_key", address_site_locator),
@@ -6536,7 +6536,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     phone_source_record_ids = "ARRAY[]::varchar[]"
     if selected_locator_name == "phone" and _is_unified_address_table(address_table_sql):
         phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
-        query_params["candidate_limit"] = min(
+        bound_parameter_map["candidate_limit"] = min(
             max(int(params["limit"]) * 8, 20),
             _MATCH_CANDIDATES_MAX_INTERNAL_ROWS,
         )
@@ -6550,14 +6550,14 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         )
         selected_locator = "true"
     geo_distance_expr = _match_geo_distance_expr(params)
-    geo_locator_where: list[str] = []
+    geo_locator_predicates: list[str] = []
     if params.get("lat") is not None and params.get("long") is not None:
         latitude = float(params["lat"])
         longitude = float(params["long"])
         radius = float(params["radius_miles"])
         lat_delta = radius / 69.0
         lon_delta = radius / max(1.0, 69.0 * abs(math.cos(math.radians(latitude))))
-        query_params.update(
+        bound_parameter_map.update(
             {
                 "lat": latitude,
                 "long": longitude,
@@ -6573,7 +6573,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             if _is_unified_address_table(address_table_sql)
             else ""
         )
-        geo_locator_where.append(
+        geo_locator_predicates.append(
             "a.lat IS NOT NULL AND a.long IS NOT NULL "
             f"{geo_precision_clause}"
             "AND a.lat BETWEEN CAST(:lat_min AS numeric) AND CAST(:lat_max AS numeric) "
@@ -6583,14 +6583,14 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     # Use the most precise locator supplied. Keeping less selective locators as
     # scoring signals avoids OR plans that combine indexed keys with broad geo
     # predicates over the serving table.
-    locator_where = ([selected_locator] if selected_locator else []) or geo_locator_where
-    address_where.append(f"({' OR '.join(locator_where)})")
+    locator_where = ([selected_locator] if selected_locator else []) or geo_locator_predicates
+    address_predicates.append(f"({' OR '.join(locator_where)})")
 
     npi_table_sql = _schema_cache_key(NPIData.__tablename__)
-    taxonomy_filter = _match_candidate_taxonomy_filter_sql(params, query_params)
+    taxonomy_filter = _match_candidate_taxonomy_filter_sql(params, bound_parameter_map)
     if params.get("entity_type_code") is not None:
-        query_params["entity_type_code"] = params["entity_type_code"]
-        address_where.append(
+        bound_parameter_map["entity_type_code"] = params["entity_type_code"]
+        address_predicates.append(
             f"""
             EXISTS (
                 SELECT 1
@@ -6601,20 +6601,20 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             """
         )
     if taxonomy_filter != "1=1":
-        address_where.append(
+        address_predicates.append(
             _match_candidate_taxonomy_filter_sql(
                 params,
-                query_params,
+                bound_parameter_map,
                 npi_sql=columns["provider_npi"],
             )
         )
 
-    npi_where: list[str] = []
+    npi_predicates: list[str] = []
     if params.get("entity_type_code") is not None:
-        npi_where.append("n.entity_type_code = :entity_type_code")
+        npi_predicates.append("n.entity_type_code = :entity_type_code")
     if taxonomy_filter != "1=1":
-        npi_where.append(taxonomy_filter)
-    npi_where_sql = " AND ".join(npi_where) if npi_where else "1=1"
+        npi_predicates.append(taxonomy_filter)
+    npi_where_sql = " AND ".join(npi_predicates) if npi_predicates else "1=1"
 
     address_site_match = (
         "a.premise_key = CAST(:address_site_key AS uuid)"
@@ -6676,7 +6676,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                        AS phone_provider_directory_matched,
                    ({geo_distance_expr}) AS geo_distance_miles
               {address_from_sql}
-             WHERE {' AND '.join(address_where)}
+             WHERE {' AND '.join(address_predicates)}
           ORDER BY {columns['provider_npi']},
                    address_site_key_matched DESC,
                    address_key_matched DESC,
@@ -6734,7 +6734,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
          LIMIT :candidate_limit
         """
     )
-    return query, query_params
+    return query, bound_parameter_map
 
 
 async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = None) -> list[dict[str, Any]]:
@@ -6820,16 +6820,16 @@ def _match_candidate_name(row: Mapping[str, Any]) -> str:
 
 
 def _primary_taxonomy(taxonomy_list: Sequence[Any]) -> dict[str, Any]:
-    first: dict[str, Any] = {}
+    first_taxonomy_map: dict[str, Any] = {}
     for raw in taxonomy_list:
         if not isinstance(raw, Mapping):
             continue
-        item = dict(raw)
-        if not first:
-            first = item
-        if item.get("primary") is True:
-            return item
-    return first
+        taxonomy_map = dict(raw)
+        if not first_taxonomy_map:
+            first_taxonomy_map = taxonomy_map
+        if taxonomy_map.get("primary") is True:
+            return taxonomy_map
+    return first_taxonomy_map
 
 
 def _facility_payload(
@@ -7096,7 +7096,7 @@ def _match_candidate_output(
         or enrichment.get("has_ffs_enrollment")
         or enrichment.get("has_medicare_claims")
     ))
-    taxonomy_matched = _is_provider_type_filter_matched(provider_row, params)
+    is_taxonomy_matched = _is_provider_type_filter_matched(provider_row, params)
     is_provider_type_matched = _is_provider_type_taxonomy_matched(provider_row, params)
     is_general_acute_care_matched = _should_boost_general_acute_care_candidate(
         provider_row,
@@ -7107,7 +7107,7 @@ def _match_candidate_output(
     match_signals, match_score = _match_signal_payload(
         provider_row,
         params,
-        taxonomy_matched,
+        is_taxonomy_matched,
         is_provider_type_matched,
         fhir_matched,
         ffs_matched,
@@ -7448,7 +7448,7 @@ async def match_candidates(request):
 @blueprint.get("/all")
 async def get_all(request):
     """Search, count, or page through public NPI provider records."""
-    count_only = str(request.args.get("count_only", "0")).strip() == "1"
+    is_count_only = str(request.args.get("count_only", "0")).strip() == "1"
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     response_format = request.args.get("format") or request.args.get("response_format")
     response_format = str(response_format).strip().lower() if response_format else None
@@ -7472,23 +7472,26 @@ async def get_all(request):
         include_evidence = True
     q_value = str(request.args.get("q") or "").strip().lower()
     include_total_raw = request.args.get("include_total")
-    include_total = _parse_bool_arg(include_total_raw, default=_should_include_npi_all_total(request.args, count_only))
+    include_total = _parse_bool_arg(
+        include_total_raw,
+        default=_should_include_npi_all_total(request.args, is_count_only),
+    )
     view_mode = str(request.args.get("view") or "").strip().lower()
     classification = request.args.get("classification")
-    sitemap_limit_mode = (
+    is_sitemap_limit_mode = (
         view_mode == "sitemap"
         and str(classification or "").strip().lower() == "pharmacy"
     )
     names_like: list[str] = []
     if q_value:
         names_like.append(q_value)
-    for value in legacy_name_like:
-        if value not in names_like:
-            names_like.append(value)
+    for legacy_name_filter in legacy_name_like:
+        if legacy_name_filter not in names_like:
+            names_like.append(legacy_name_filter)
     pagination = parse_pagination(
         request.args,
         default_limit=50,
-        max_limit=20000 if sitemap_limit_mode else 200,
+        max_limit=20000 if is_sitemap_limit_mode else 200,
         default_page=1,
         allow_offset=True,
         allow_start=True,
@@ -8187,9 +8190,9 @@ async def get_all(request):
     procedure_filter_unresolved = bool(requested_procedure_codes) and not bool(procedure_internal_codes)
     medication_filter_unresolved = bool(requested_medication_codes) and not bool(medication_internal_codes)
     if procedure_filter_unresolved or medication_filter_unresolved:
-        if count_only and response_format in {"all", "full_taxonomy", "classification"}:
+        if is_count_only and response_format in {"all", "full_taxonomy", "classification"}:
             return response.json({"rows": {}}, default=str)
-        if count_only:
+        if is_count_only:
             return response.json({"rows": 0}, default=str)
         return response.json(
             {
@@ -8202,18 +8205,18 @@ async def get_all(request):
             default=str,
         )
 
-    if count_only and not simple_filter_present and not has_insurance and not city and not state:
+    if is_count_only and not simple_filter_present and not has_insurance and not city and not state:
         return response.json({"rows": await _fast_primary_npi_count()}, default=str)
 
-    if count_only and has_insurance and not simple_filter_present:
+    if is_count_only and has_insurance and not simple_filter_present:
         insurance_provider_count = await _fast_has_insurance_count(city, state)
         return response.json({"rows": insurance_provider_count}, default=str)
 
-    if count_only and response_format == "all":
+    if is_count_only and response_format == "all":
         mapping = await get_classification_count_map(filters)
         return response.json({"rows": mapping}, default=str)
 
-    if count_only and response_format in {"full_taxonomy", "classification"}:
+    if is_count_only and response_format in {"full_taxonomy", "classification"}:
         mapping = await get_formatted_count(response_format)
         return response.json({"rows": mapping}, default=str)
 
@@ -8673,9 +8676,9 @@ async def get_all(request):
             _redact_internal_address_fields(provider_result)
         return provider_results
 
-    if count_only:
-        rows = await get_count(filters)
-        return response.json({"rows": rows}, default=str)
+    if is_count_only:
+        count_rows = await get_count(filters)
+        return response.json({"rows": count_rows}, default=str)
 
     async def _count_with_timeout() -> Optional[int]:
         if not include_total:
@@ -8713,7 +8716,7 @@ async def get_all(request):
 
     use_sitemap_fast_path = (
         view_mode == "sitemap"
-        and not count_only
+        and not is_count_only
         and str(classification or "").strip().lower() == "pharmacy"
         and not any(
             [
@@ -8744,10 +8747,10 @@ async def get_all(request):
     )
 
     if use_sitemap_fast_path:
-        rows = await get_sitemap_results(start, limit, "Pharmacy")
+        result_rows = await get_sitemap_results(start, limit, "Pharmacy")
         raw_total = None if not include_total else await _count_with_timeout()
     else:
-        raw_total, rows = await asyncio.gather(
+        raw_total, result_rows = await asyncio.gather(
             _count_with_timeout(),
             get_results(start, limit, filters),
         )
@@ -8755,51 +8758,55 @@ async def get_all(request):
         total = int(raw_total)
         total_source = "computed"
     elif include_total:
-        total = pagination.offset + len(rows)
+        total = pagination.offset + len(result_rows)
         total_source = "estimated_timeout_floor"
     else:
-        total = pagination.offset + len(rows)
+        total = pagination.offset + len(result_rows)
         total_source = "estimated_page_floor"
     summary_map: dict[int, dict[str, Any]] = {}
     try:
         summary_map = await _fetch_provider_enrichment_summary_map(
-            [row.get("npi") for row in rows if isinstance(row, dict)],
+            [
+                provider_result.get("npi")
+                for provider_result in result_rows
+                if isinstance(provider_result, dict)
+            ],
             include_chain=include_chain_enrichment,
             session=request_session,
         )
     except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
         logger.debug("Provider enrichment summary fetch failed: %s", exc)
     if summary_map:
-        for row in rows:
-            if not isinstance(row, dict):
+        for provider_result in result_rows:
+            if not isinstance(provider_result, dict):
                 continue
-            npi_value = row.get("npi")
+            npi_value = provider_result.get("npi")
             if npi_value is None:
                 continue
             summary = summary_map.get(int(npi_value))
             if summary:
-                row["provider_enrichment_summary"] = summary
+                provider_result["provider_enrichment_summary"] = summary
     if include_sources or include_evidence:
         await _attach_provider_directory_source_details(
-            rows,
+            result_rows,
             include_role_evidence=include_evidence,
             session=request_session,
         )
     if not include_evidence:
-        for row in rows:
-            if isinstance(row, dict):
-                row.pop("source_record_ids", None)
+        for provider_result in result_rows:
+            if isinstance(provider_result, dict):
+                provider_result.pop("source_record_ids", None)
 
-    payload: dict[str, Any] = {
+    response_map: dict[str, Any] = {
         "total": total,
         "page": pagination.page,
         "limit": pagination.limit,
         "offset": pagination.offset,
-        "rows": rows,
+        "rows": result_rows,
         "total_source": total_source,
     }
     if requested_procedure_codes or requested_medication_codes:
-        payload["query"] = {
+        response_map["query"] = {
             "year": filter_year,
             "year_source": filter_year_source,
             "input_procedure_codes": requested_procedure_codes or None,
@@ -8812,7 +8819,7 @@ async def get_all(request):
             "medication_matched_via": medication_match_via,
         }
     return response.json(
-        payload,
+        response_map,
         default=str,
     )
 
@@ -8858,7 +8865,7 @@ async def get_facility_connected_providers(request):
 
     table_name = enrollment_model.__tablename__
     if not await _table_exists(table_name, session=request_session):
-        payload: dict[str, Any] = {
+        response_map: dict[str, Any] = {
             "query": {
                 "facility_type": facility_type,
                 "ccn": ccn,
@@ -8874,8 +8881,8 @@ async def get_facility_connected_providers(request):
             "providers": [],
         }
         if include_specialty_stats:
-            payload["specialty_stats"] = []
-        return response.json(payload, default=str)
+            response_map["specialty_stats"] = []
+        return response.json(response_map, default=str)
 
     model_columns = _model_table_columns(enrollment_model)
     has_cah_ccn = "cah_or_hospital_ccn" in model_columns
@@ -8892,25 +8899,25 @@ async def get_facility_connected_providers(request):
     )
 
     where_clauses = ["1=1"]
-    params: dict[str, Any] = {}
+    query_parameter_map: dict[str, Any] = {}
     if ccn:
         where_clauses.append(f"UPPER(REPLACE({facility_ccn_expr}, ' ', '')) = :ccn")
-        params["ccn"] = ccn
+        query_parameter_map["ccn"] = ccn
     if organization_name:
         where_clauses.append(
             "LOWER(COALESCE(h.organization_name, '') || ' ' || COALESCE(h.doing_business_as_name, '')) "
             "LIKE :organization_name"
         )
-        params["organization_name"] = f"%{organization_name.lower()}%"
+        query_parameter_map["organization_name"] = f"%{organization_name.lower()}%"
     if city:
         where_clauses.append("UPPER(COALESCE(h.city, '')) = :city")
-        params["city"] = city.upper()
+        query_parameter_map["city"] = city.upper()
     if state:
         where_clauses.append("UPPER(COALESCE(h.state, '')) = :state")
-        params["state"] = state
+        query_parameter_map["state"] = state
     if reporting_year is not None:
         where_clauses.append("h.reporting_year = :reporting_year")
-        params["reporting_year"] = reporting_year
+        query_parameter_map["reporting_year"] = reporting_year
     where_sql = " AND ".join(where_clauses)
 
     total_sql = text(
@@ -9049,26 +9056,26 @@ async def get_facility_connected_providers(request):
         """
     )
 
-    execute_params = dict(params)
-    execute_params["limit"] = limit
-    execute_params["offset"] = offset
-    execute_params["stats_limit"] = stats_limit
+    execute_parameter_map = dict(query_parameter_map)
+    execute_parameter_map["limit"] = limit
+    execute_parameter_map["offset"] = offset
+    execute_parameter_map["stats_limit"] = stats_limit
 
     if request_session is not None:
         session = request_session
-        total_result = await session.execute(total_sql, params)
-        facility_result = await session.execute(facilities_sql, params)
-        providers_result = await session.execute(providers_sql, execute_params)
+        total_result = await session.execute(total_sql, query_parameter_map)
+        facility_result = await session.execute(facilities_sql, query_parameter_map)
+        providers_result = await session.execute(providers_sql, execute_parameter_map)
         specialty_result = (
-            await session.execute(specialty_sql, execute_params) if include_specialty_stats else None
+            await session.execute(specialty_sql, execute_parameter_map) if include_specialty_stats else None
         )
     else:
         async with db.session() as session:
-            total_result = await session.execute(total_sql, params)
-            facility_result = await session.execute(facilities_sql, params)
-            providers_result = await session.execute(providers_sql, execute_params)
+            total_result = await session.execute(total_sql, query_parameter_map)
+            facility_result = await session.execute(facilities_sql, query_parameter_map)
+            providers_result = await session.execute(providers_sql, execute_parameter_map)
             specialty_result = (
-                await session.execute(specialty_sql, execute_params) if include_specialty_stats else None
+                await session.execute(specialty_sql, execute_parameter_map) if include_specialty_stats else None
             )
 
     total_row = total_result.first()
@@ -9076,19 +9083,19 @@ async def get_facility_connected_providers(request):
 
     matched_facilities = [
         {
-            "ccn": row._mapping.get("facility_ccn"),
-            "organization_name": row._mapping.get("organization_name"),
-            "doing_business_as_name": row._mapping.get("doing_business_as_name"),
-            "city": row._mapping.get("city"),
-            "state": row._mapping.get("state"),
-            "provider_count": int(row._mapping.get("provider_count") or 0),
+            "ccn": facility_record._mapping.get("facility_ccn"),
+            "organization_name": facility_record._mapping.get("organization_name"),
+            "doing_business_as_name": facility_record._mapping.get("doing_business_as_name"),
+            "city": facility_record._mapping.get("city"),
+            "state": facility_record._mapping.get("state"),
+            "provider_count": int(facility_record._mapping.get("provider_count") or 0),
         }
-        for row in facility_result.all()
+        for facility_record in facility_result.all()
     ]
 
     providers = []
-    for row in providers_result.all():
-        mapping = row._mapping
+    for provider_record in providers_result.all():
+        mapping = provider_record._mapping
         providers.append(
             {
                 "npi": int(mapping.get("npi")) if mapping.get("npi") is not None else None,
@@ -9116,7 +9123,7 @@ async def get_facility_connected_providers(request):
             }
         )
 
-    payload: dict[str, Any] = {
+    response_map: dict[str, Any] = {
         "query": {
             "facility_type": facility_type,
             "ccn": ccn,
@@ -9135,16 +9142,16 @@ async def get_facility_connected_providers(request):
     }
 
     if include_specialty_stats and specialty_result is not None:
-        payload["specialty_stats"] = [
+        response_map["specialty_stats"] = [
             {
-                "specialty": row._mapping.get("specialty"),
-                "classification": row._mapping.get("classification"),
-                "provider_count": int(row._mapping.get("provider_count") or 0),
+                "specialty": specialty_record._mapping.get("specialty"),
+                "classification": specialty_record._mapping.get("classification"),
+                "provider_count": int(specialty_record._mapping.get("provider_count") or 0),
             }
-            for row in specialty_result.all()
+            for specialty_record in specialty_result.all()
         ]
 
-    return response.json(payload, default=str)
+    return response.json(response_map, default=str)
 
 
 @blueprint.get("/near/")
@@ -9693,7 +9700,7 @@ async def get_near_npi(request):
 @blueprint.get("/id/<npi>/full_taxonomy")
 async def get_full_taxonomy_list(_request, npi):
     """Return all NUCC taxonomy details attached to one NPI."""
-    t = []
+    taxonomy_rows = []
     npi = int(npi)
     # plan_data = await db.select(
     #     [Plan.marketing_name, Plan.plan_id, PlanAttributes.full_plan_id, Plan.year]).select_from(
@@ -9709,8 +9716,8 @@ async def get_full_taxonomy_list(_request, npi):
     for taxonomy, nucc in result.all():
         payload = taxonomy.to_json_dict()
         payload["nucc_taxonomy"] = nucc.to_json_dict()
-        t.append(payload)
-    return response.json(t)
+        taxonomy_rows.append(payload)
+    return response.json(taxonomy_rows)
 
 
 @blueprint.get("/plans_by_npi/<npi>")
@@ -9718,8 +9725,8 @@ async def get_plans_by_npi(_request, npi):
     """Return issuer plan links recorded for one NPI."""
 
     data = []
-    plan_data = []
-    issuer_data = []
+    plan_rows = []
+    issuer_rows = []
     npi = int(npi)
 
     query = (
@@ -9732,7 +9739,7 @@ async def get_plans_by_npi(_request, npi):
     async for plan_raw, issuer in query.iterate():
         data.append({"npi_info": plan_raw.to_json_dict(), "issuer_info": issuer.to_json_dict()})
 
-    return response.json({"npi_data": data, "plan_data": plan_data, "issuer_data": issuer_data})
+    return response.json({"npi_data": data, "plan_data": plan_rows, "issuer_data": issuer_rows})
 
 
 @blueprint.get("/id/<npi>")
@@ -9885,7 +9892,7 @@ async def get_npi(request, npi):
     async def _archive_coordinates_for(address):
         archive_table = await _v2_archive_table()
         if archive_table:
-            archive_params = {
+            archive_parameter_map = {
                 "first_line": address.get("first_line"),
                 "second_line": address.get("second_line"),
                 "city_name": address.get("city_name"),
@@ -9901,25 +9908,29 @@ async def get_npi(request, npi):
                  )
                    AND lat IS NOT NULL
                    AND long IS NOT NULL
-                """
+            """
             if request_session is not None:
-                result = await _execute_stmt(text(archive_sql), session=request_session, params=archive_params)
-                row = result.first()
+                query_result = await _execute_stmt(
+                    text(archive_sql),
+                    session=request_session,
+                    params=archive_parameter_map,
+                )
+                coordinate_record = query_result.first()
             else:
-                row = await db.first(archive_sql, **archive_params)
-            if row:
-                data = row._mapping
+                coordinate_record = await db.first(archive_sql, **archive_parameter_map)
+            if coordinate_record:
+                coordinate_map = coordinate_record._mapping
                 return SimpleNamespace(
-                    long=data["long"],
-                    lat=data["lat"],
-                    formatted_address=data["formatted_address"],
-                    place_id=data["place_id"],
-                    geo_source=data.get("geo_source"),
+                    long=coordinate_map["long"],
+                    lat=coordinate_map["lat"],
+                    formatted_address=coordinate_map["formatted_address"],
+                    place_id=coordinate_map["place_id"],
+                    geo_source=coordinate_map.get("geo_source"),
                 )
         legacy_stmt = select(AddressArchive).where(AddressArchive.checksum == address["checksum"])
         if request_session is not None:
-            result = await _execute_stmt(legacy_stmt, session=request_session)
-            return result.scalar()
+            query_result = await _execute_stmt(legacy_stmt, session=request_session)
+            return query_result.scalar()
         return await db.scalar(legacy_stmt)
 
     async def _openaddresses_coordinates_for(address):
@@ -9979,8 +9990,8 @@ async def get_npi(request, npi):
             )
             .status()
         )
-        row = await db.scalar(select(NPIAddress).where(NPIAddress.checksum == checksum))
-        if row is None:
+        address_record = await db.scalar(select(NPIAddress).where(NPIAddress.checksum == checksum))
+        if address_record is None:
             return
         archive_table = await _v2_archive_table()
         if archive_table:
@@ -10046,7 +10057,10 @@ async def get_npi(request, npi):
                 geocode_quality=geocode_quality,
             )
             return
-        obj = {column.key: getattr(row, column.key, None) for column in AddressArchive.__table__.columns}
+        archive_value_map = {
+            column.key: getattr(address_record, column.key, None)
+            for column in AddressArchive.__table__.columns
+        }
 
         # long = long,
         # lat = lat,
@@ -10056,10 +10070,10 @@ async def get_npi(request, npi):
         try:
             await (
                 db.insert(AddressArchive)
-                .values(obj)
+                .values(archive_value_map)
                 .on_conflict_do_update(
                     index_elements=AddressArchive.__my_index_elements__,
-                    set_=obj,
+                    set_=archive_value_map,
                 )
                 .status()
             )
@@ -10139,36 +10153,38 @@ async def get_npi(request, npi):
             #         d['place_id'] = None
             # except:
             #     pass
-            update_geo = False
+            should_update_geo = False
             if request.app.config.get("NPI_API_UPDATE_GEOCODE") and not d["lat"]:
-                update_geo = True
+                should_update_geo = True
 
             if lookup_stored_geocode and (not d["lat"]) and (not force_address_update):
-                res = await _archive_coordinates_for(x)
-                if res:
-                    d["long"] = res.long
-                    d["lat"] = res.lat
-                    d["formatted_address"] = res.formatted_address
-                    d["place_id"] = res.place_id
-                    d["geo_source"] = getattr(res, "geo_source", None) or ("google" if res.place_id else None)
+                stored_coordinates = await _archive_coordinates_for(x)
+                if stored_coordinates:
+                    d["long"] = stored_coordinates.long
+                    d["lat"] = stored_coordinates.lat
+                    d["formatted_address"] = stored_coordinates.formatted_address
+                    d["place_id"] = stored_coordinates.place_id
+                    d["geo_source"] = getattr(stored_coordinates, "geo_source", None) or (
+                        "google" if stored_coordinates.place_id else None
+                    )
 
             if (lookup_stored_geocode or sync_geocode or force_address_update) and not d["lat"]:
                 try:
-                    res = await _openaddresses_coordinates_for(x)
-                    if res:
-                        d["long"] = res.long
-                        d["lat"] = res.lat
-                        d["formatted_address"] = res.formatted_address
-                        d["place_id"] = res.place_id
-                        d["geo_source"] = res.geo_source
-                        d["geocode_source"] = res.geocode_source
-                        d["geocode_quality"] = res.geocode_quality
+                    openaddresses_coordinates = await _openaddresses_coordinates_for(x)
+                    if openaddresses_coordinates:
+                        d["long"] = openaddresses_coordinates.long
+                        d["lat"] = openaddresses_coordinates.lat
+                        d["formatted_address"] = openaddresses_coordinates.formatted_address
+                        d["place_id"] = openaddresses_coordinates.place_id
+                        d["geo_source"] = openaddresses_coordinates.geo_source
+                        d["geocode_source"] = openaddresses_coordinates.geocode_source
+                        d["geocode_quality"] = openaddresses_coordinates.geocode_quality
                 except Exception as exc:
                     logger.debug("OpenAddresses geocoding failed for %s: %s", t_addr, exc)
 
             if (sync_geocode or force_address_update) and not d["lat"]:
                 try:
-                    params = {
+                    geocoder_parameter_map = {
                         request.app.config.get("GEOCODE_MAPBOX_STYLE_KEY_PARAM"): random.choice(
                             json.loads(request.app.config.get("GEOCODE_MAPBOX_STYLE_KEY"))
                         )
@@ -10176,7 +10192,7 @@ async def get_npi(request, npi):
                     encoded_params = ".json?".join(
                         (
                             urllib.parse.quote_plus(t_addr),
-                            urllib.parse.urlencode(params, doseq=True),
+                            urllib.parse.urlencode(geocoder_parameter_map, doseq=True),
                         )
                     )
                     if qp := request.app.config.get("GEOCODE_MAPBOX_STYLE_ADDITIONAL_QUERY_PARAMS"):
@@ -10203,13 +10219,13 @@ async def get_npi(request, npi):
 
             if (sync_geocode or force_address_update) and not d["lat"]:
                 try:
-                    params = {
+                    geocoder_parameter_map = {
                         request.app.config.get("GEOCODE_GOOGLE_STYLE_ADDRESS_PARAM"): t_addr,
                         request.app.config.get("GEOCODE_GOOGLE_STYLE_KEY_PARAM"): request.app.config.get(
                             "GEOCODE_GOOGLE_STYLE_KEY"
                         ),
                     }
-                    encoded_params = urllib.parse.urlencode(params, doseq=True)
+                    encoded_params = urllib.parse.urlencode(geocoder_parameter_map, doseq=True)
                     if qp := request.app.config.get("GEOCODE_GOOGLE_STYLE_ADDITIONAL_QUERY_PARAMS"):
                         encoded_params = "&".join(
                             (
@@ -10234,7 +10250,7 @@ async def get_npi(request, npi):
                 except Exception as exc:
                     logger.warning("Google geocoding failed for %s: %s", t_addr, exc)
 
-            if update_geo and d.get("lat"):
+            if should_update_geo and d.get("lat"):
                 request.app.add_task(
                     update_addr_coordinates(
                         x,
@@ -10250,18 +10266,18 @@ async def get_npi(request, npi):
 
         return d
 
-    build_kwargs: dict[str, Any] = {
+    detail_build_map: dict[str, Any] = {
         "address_limit": address_limit,
         "address_offset": address_offset,
         "include_address_total": include_address_total,
         "address_key": address_key,
     }
     if request_session is not None:
-        build_kwargs["session"] = request_session
+        detail_build_map["session"] = request_session
     if include_sources or include_evidence:
-        build_kwargs["include_sources"] = include_sources
-        build_kwargs["include_evidence"] = include_evidence
-    data = await _build_npi_details(npi, **build_kwargs)
+        detail_build_map["include_sources"] = include_sources
+        detail_build_map["include_evidence"] = include_evidence
+    data = await _build_npi_details(npi, **detail_build_map)
 
     if not data:
         if not profile_record:
@@ -10376,9 +10392,9 @@ async def get_npi(request, npi):
         provider_enrichment_payload = None
     data["other_name_list"] = other_names
 
-    existing_dba = [name for name in (data.get("do_business_as") or []) if name]
-    if existing_dba:
-        data["do_business_as"] = list(dict.fromkeys(existing_dba))
+    existing_dba_names = [name for name in (data.get("do_business_as") or []) if name]
+    if existing_dba_names:
+        data["do_business_as"] = list(dict.fromkeys(existing_dba_names))
     else:
         candidates = [
             entry.get("other_provider_identifier")

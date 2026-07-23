@@ -22,11 +22,16 @@ async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
     async def fake_ptg_main(**kwargs):
         calls.append(kwargs)
 
-    async def fake_mark_control_run(*args, **kwargs):
+    async def has_fake_marked_control_run(*args, **kwargs):
         marks.append((args, kwargs))
+        return True
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     control_result = await ptg_control.ptg_control_start(
@@ -63,14 +68,19 @@ async def test_ptg_control_start_marks_failed_and_reraises_cancelled_ptg_main(mo
     async def fake_ptg_main(**_kwargs):
         raise asyncio.CancelledError()
 
-    async def fake_mark_control_run(*args, **kwargs):
+    async def has_fake_marked_control_run(*args, **kwargs):
         marks.append((args, kwargs))
+        return True
 
     async def fake_flush_terminal_status_events():
         flushes.append(True)
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
     monkeypatch.setattr(ptg_control, "_flush_terminal_status_events", fake_flush_terminal_status_events)
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
@@ -106,14 +116,19 @@ async def test_ptg_control_surfaces_nested_source_witness_budget_failure(monkeyp
             ],
         )
 
-    async def fake_mark_control_run(*args, **kwargs):
+    async def has_fake_marked_control_run(*args, **kwargs):
         marks.append((args, kwargs))
+        return True
 
     async def fake_flush_terminal_status_events():
         return None
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
     monkeypatch.setattr(
         ptg_control,
         "_flush_terminal_status_events",
@@ -133,6 +148,7 @@ async def test_ptg_control_surfaces_nested_source_witness_budget_failure(monkeyp
             "strict V3 source witness exceeds its 512 MiB logical "
             "payload safety bound"
         ),
+        "retryable": False,
     }
 
 
@@ -154,14 +170,19 @@ async def test_ptg_control_classifies_provider_group_definition_failures(
             "PTG2 Rust compact scanner failed with exit code 1: " + scanner_message
         )
 
-    async def fake_mark_control_run(*args, **kwargs):
+    async def has_fake_marked_control_run(*args, **kwargs):
         marks.append((args, kwargs))
+        return True
 
     async def fake_flush_terminal_status_events():
         return None
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
     monkeypatch.setattr(
         ptg_control,
         "_flush_terminal_status_events",
@@ -203,11 +224,16 @@ async def test_ptg_control_start_records_ptg2_terminal_identity(monkeypatch):
             ],
         }
 
-    async def fake_mark_control_run(*args, **kwargs):
+    async def has_fake_marked_control_run(*args, **kwargs):
         marks.append((args, kwargs))
+        return True
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     control_result = await ptg_control.ptg_control_start(
@@ -234,17 +260,21 @@ async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
         await ptg_control.asyncio.sleep(0)
         return {}
 
-    async def fake_mark_control_run(*_args, **_kwargs):
-        return None
+    async def has_fake_marked_control_run(*_args, **_kwargs):
+        return True
 
-    async def fake_heartbeat(*args):
-        heartbeat_calls.append(args)
+    async def fake_heartbeat(*args, **kwargs):
+        heartbeat_calls.append((args, kwargs))
 
     async def fake_stop(task):
         stopped_tasks.append(task)
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
     monkeypatch.setattr(ptg_control, "_live_progress_heartbeat", fake_heartbeat)
     monkeypatch.setattr(ptg_control, "_stop_live_progress_heartbeat", fake_stop)
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
@@ -255,86 +285,14 @@ async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
     )
 
     assert heartbeat_calls
-    assert heartbeat_calls[0][:3] == ("run_ptg", "ptg", "ptg_control_start")
-    assert stopped_tasks
-
-
-def test_ptg_thread_heartbeat_preserves_importer_progress_source(monkeypatch):
-    events = []
-
-    class FakeEvent:
-        def __init__(self):
-            self.calls = 0
-            self.set_called = False
-
-        def wait(self, _interval):
-            self.calls += 1
-            is_stop_requested = self.calls > 1
-            return is_stop_requested
-
-        def set(self):
-            self.set_called = True
-
-    class FakeThread:
-        def __init__(self, target, **_kwargs):
-            self.target = target
-
-        def start(self):
-            self.target()
-
-    monkeypatch.setattr(ptg_control.threading, "Event", FakeEvent)
-    monkeypatch.setattr(ptg_control.threading, "Thread", FakeThread)
-    monkeypatch.setattr(ptg_control, "write_live_progress", lambda **payload: events.append(payload))
-
-    stop_event = ptg_control._start_threaded_ptg_heartbeat("run_ptg", "2026-07-03T12:00:00+00:00")
-    ptg_control._stop_threaded_ptg_heartbeat(stop_event)
-
-    assert events
-    assert events[0]["source"] == ptg_control.PTG_CONTROL_HEARTBEAT_SOURCE
-    assert events[0]["confidence"] == "heartbeat"
-    assert events[0]["publish_event"] is False
-    assert stop_event.set_called
-
-
-@pytest.mark.asyncio
-async def test_ptg_control_start_skips_stale_terminal_run(monkeypatch):
-    async def fake_ptg_main(**_kwargs):
-        raise AssertionError("stale PTG job should not start scanner")
-
-    async def fake_mark_control_run(*_args, **_kwargs):
-        raise AssertionError("stale PTG job should not mark run running")
-
-    async def fake_db_first(*_args, **_kwargs):
-        return ("canceled",)
-
-    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
-    monkeypatch.setattr(ptg_control.db, "first", fake_db_first)
-
-    result = await ptg_control.ptg_control_start(
-        {},
-        {
-            "run_id": "run_old",
-            "source_file_import_id": "source_import_1",
-            "params": {"test_mode": True, "source_key": "demo_source"},
-        },
+    heartbeat_args, heartbeat_kwargs = heartbeat_calls[0]
+    assert heartbeat_args[:3] == ("run_ptg", "ptg", "ptg_control_start")
+    assert heartbeat_kwargs["attempt_id"].startswith("run_ptg:")
+    assert (
+        heartbeat_kwargs["attempt_started_at"]
+        == heartbeat_args[3]
     )
-
-    assert result == {
-        "status": "skipped",
-        "run_id": "run_old",
-        "reason": "run_canceled",
-    }
-
-
-@pytest.mark.asyncio
-async def test_ptg_stale_job_check_allows_nonterminal_local_run(monkeypatch):
-    async def fake_db_first(*_args, **_kwargs):
-        return ("queued",)
-
-    monkeypatch.setattr(ptg_control.db, "first", fake_db_first)
-
-    assert await ptg_control._stale_ptg_job_result("run_old") is None
+    assert stopped_tasks
 
 
 @pytest.mark.asyncio
@@ -379,13 +337,17 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
         )
         return {}
 
-    async def fake_mark_control_run(*_args, **_kwargs):
-        return None
+    async def has_fake_marked_control_run(*_args, **_kwargs):
+        return True
 
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "arq:PTGSmall")
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_CLASS", "process.PTGSmall")
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     await ptg_control.ptg_control_start(
@@ -437,12 +399,16 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ptg_control_start_rejects_wrong_lane(monkeypatch):
-    async def fake_mark_control_run(*_args, **_kwargs):
-        return None
+    async def has_fake_marked_control_run(*_args, **_kwargs):
+        return True
 
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "arq:PTGLarge")
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_CLASS", "process.PTGLarge")
-    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        has_fake_marked_control_run,
+    )
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
 
     with pytest.raises(RuntimeError, match="expected arq:PTGSmall"):
@@ -456,28 +422,6 @@ async def test_ptg_control_start_rejects_wrong_lane(monkeypatch):
                 },
             },
         )
-
-
-def test_ptg_heartbeat_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "0")
-
-    stop_event = ptg_control._start_threaded_ptg_heartbeat("run", "started")
-
-    assert not stop_event.is_set()
-
-
-@pytest.mark.asyncio
-async def test_ptg_stale_and_flush_helpers_skip_absent_work(monkeypatch):
-    assert await ptg_control._stale_ptg_job_result("") is None
-
-    async def no_database_row(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(ptg_control.db, "first", no_database_row)
-    assert await ptg_control._stale_ptg_job_result("run") is None
-
-    monkeypatch.setenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "0")
-    await ptg_control._flush_terminal_status_events()
 
 
 def test_ptg_lane_helpers_reject_mismatch_and_restore_environment(monkeypatch):

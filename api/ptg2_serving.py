@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import math
 import hashlib
 import json
@@ -112,7 +113,29 @@ from api.ptg2_shared_blocks import (
     PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
     fetch_snapshot_source_provenance,
 )
+from api.ptg2_v4_graph import (
+    load_v4_graph_root,
+    load_v4_relation_manifest,
+    lookup_v4_ordered_npi_prefix_overrides,
+    lookup_v4_relation_member_prefixes,
+    lookup_v4_relation_members,
+    record_v4_cold_exact_request,
+    record_v4_component_fallback_sets,
+    record_v4_hot_prefix_request,
+    record_v4_npi_prefix_override_sets,
+    record_v4_provider_expansion_work,
+    v4_graph_hot_npi_scope,
+    v4_graph_hot_source_scope,
+    v4_graph_request_scope,
+    v4_npi_keys_for_values,
+    v4_npi_values_for_keys,
+)
+from api.ptg2_v4_intersection import intersect_sorted_u32
 from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
+from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_NPI_PREFIX_TABLE,
+    PTG2_V4_SHARED_GENERATION,
+)
 from process.ptg_parts.ptg2_candidate_attestation import (
     PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
 )
@@ -148,6 +171,7 @@ _PTG2_NETWORK_SERVING_TABLES_CACHE: OrderedDict[
     PTG2ServingTables,
 ] = OrderedDict()
 _PTG2_PROVIDER_NPI_PREFIX_CACHE_MAX_ENTRIES = 4096
+_PTG2_V4_NPI_PREFIX_DIGEST_DOMAIN = b"PTG2V4NPI-PREFIX\x01"
 _PTG2_PROVIDER_NPI_PREFIX_CACHE: OrderedDict[
     tuple[int, str],
     tuple[int, tuple[int, ...], bool],
@@ -163,6 +187,7 @@ _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE: OrderedDict[
 _PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL = f"""
     SELECT snapshot.snapshot_id,
            binding.snapshot_key,
+           layout.generation AS storage_generation,
            layout.layout_manifest->'serving_index'->>'shared_snapshot_key'
                AS layout_snapshot_key,
            layout.layout_manifest->'serving_index'->>'coverage_scope_id'
@@ -196,7 +221,7 @@ _PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL = f"""
      WHERE snapshot.snapshot_id = ANY(CAST(:snapshot_ids AS text[]))
        AND snapshot.status = 'published'
        AND layout.state = 'sealed'
-       AND layout.generation = :storage_generation
+       AND layout.generation = ANY(CAST(:storage_generations AS text[]))
        AND attestation.contract = ANY(CAST(:attestation_contracts AS text[]))
        AND attestation.activated_at IS NOT NULL
        AND attestation.plan_id = snapshot_scope.plan_id
@@ -1437,6 +1462,7 @@ def _shape_ptg2_manifest_response(
     args: dict[str, Any],
     *,
     database_evidence: Mapping[str, Any] | None = None,
+    storage_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> dict[str, Any]:
     manifest_response_by_field = dict(response_by_field)
     manifest_response_by_field["query"] = {
@@ -1449,7 +1475,7 @@ def _shape_ptg2_manifest_response(
     query_payload = manifest_response_by_field["query"]
     manifest_response_by_field["provenance"] = {
         "arch_version": PTG2_V3_ARCH_VERSION,
-        "storage_generation": PTG2_V3_SHARED_GENERATION,
+        "storage_generation": str(storage_generation),
         "database_backend": "postgresql",
         "plan_id": str(
             query_payload.get("plan_id")
@@ -1842,34 +1868,143 @@ async def _hydrate_provider_set_network_names(
             provider_entry["network_names"] = network_names_by_id[provider_set_id]
 
 
+@dataclass(frozen=True)
+class _ProviderSetGraphMetadata:
+    """Authenticated dictionary and sparse hot-prefix metadata for one set."""
+
+    provider_set_key: int
+    provider_count: int
+    prefix_member_count: int | None = None
+    prefix_member_digest: bytes | None = None
+
+
+def _v4_prefix_query_fragments(
+    serving_tables: PTG2ServingTables,
+) -> tuple[str, str]:
+    if not serving_tables.uses_v4_graph:
+        return "", ""
+    return (
+        """
+                   , prefix.member_count AS prefix_member_count
+                   , prefix.member_digest AS prefix_member_digest
+        """,
+        f"""
+              LEFT JOIN {PTG2_SCHEMA}.{PTG2_V4_NPI_PREFIX_TABLE} AS prefix
+                ON prefix.snapshot_key = provider_set.snapshot_key
+               AND prefix.provider_set_key = provider_set.provider_set_key
+        """,
+    )
+
+
+def _provider_set_metadata_from_fields(
+    record_fields: Mapping[str, Any],
+) -> tuple[str, _ProviderSetGraphMetadata] | None:
+    provider_set_id = _ptg2_manifest_id(
+        record_fields.get("provider_set_global_id_128")
+    )
+    if provider_set_id is None or record_fields.get("provider_set_key") is None:
+        return None
+    provider_count = int(record_fields.get("provider_count") or 0)
+    if provider_count < 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 provider-set dictionary has a negative provider count"
+        )
+    raw_prefix_count = record_fields.get("prefix_member_count")
+    raw_prefix_digest = record_fields.get("prefix_member_digest")
+    if (raw_prefix_count is None) != (raw_prefix_digest is None):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sparse NPI prefix metadata is incomplete"
+        )
+    prefix_member_count = (
+        None if raw_prefix_count is None else int(raw_prefix_count)
+    )
+    prefix_member_digest = (
+        None if raw_prefix_digest is None else bytes(raw_prefix_digest)
+    )
+    if prefix_member_count is not None and (
+        prefix_member_count < 0
+        or prefix_member_digest is None
+        or len(prefix_member_digest) != 32
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sparse NPI prefix metadata is invalid"
+        )
+    return (
+        provider_set_id,
+        _ProviderSetGraphMetadata(
+            provider_set_key=int(record_fields["provider_set_key"]),
+            provider_count=provider_count,
+            prefix_member_count=prefix_member_count,
+            prefix_member_digest=prefix_member_digest,
+        ),
+    )
+
+
+async def _provider_set_metadata_for_ids(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_ids: Iterable[str],
+) -> dict[str, _ProviderSetGraphMetadata]:
+    """Load authenticated provider-set cardinality and sparse-prefix metadata."""
+
+    normalized_ids = list(_deduplicate_ptg2_manifest_ids(tuple(provider_set_ids)))
+    if not normalized_ids:
+        return {}
+    _require_strict_shared_v3(serving_tables)
+    prefix_projection, prefix_join = _v4_prefix_query_fragments(serving_tables)
+    query_parameters_by_name = {
+        "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
+        "provider_set_ids": [
+            bytes.fromhex(provider_set_id) for provider_set_id in normalized_ids
+        ],
+    }
+    query_result = await session.execute(
+        text(
+            f"""
+            SELECT provider_set.provider_set_key,
+                   provider_set.provider_set_global_id_128,
+                   provider_set.provider_count
+                   {prefix_projection}
+              FROM {_shared_v3_provider_set_table()} AS provider_set
+              {prefix_join}
+             WHERE provider_set.snapshot_key = :shared_snapshot_key
+               AND provider_set.provider_set_global_id_128
+                   = ANY(CAST(:provider_set_ids AS bytea[]))
+            """
+        ),
+        query_parameters_by_name,
+    )
+    metadata_by_id: dict[str, _ProviderSetGraphMetadata] = {}
+    for query_record in query_result:
+        metadata_entry = _provider_set_metadata_from_fields(
+            _row_mapping(query_record)
+        )
+        if metadata_entry is None:
+            continue
+        provider_set_id, provider_metadata = metadata_entry
+        if provider_set_id in metadata_by_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 provider-set dictionary returned a duplicate identity"
+            )
+        metadata_by_id[provider_set_id] = provider_metadata
+    return metadata_by_id
+
+
 async def _provider_set_keys_for_ids(
     session,
     serving_tables: PTG2ServingTables,
     provider_set_ids: Iterable[str],
 ) -> dict[str, int]:
-    normalized_ids = list(_deduplicate_ptg2_manifest_ids(tuple(provider_set_ids)))
-    if not normalized_ids:
-        return {}
-    _require_strict_shared_v3(serving_tables)
-    query_parameters_by_name = {
-        "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
-        "provider_set_ids": [bytes.fromhex(provider_set_id) for provider_set_id in normalized_ids],
-    }
-    result = await session.execute(
-        text(
-            f"""
-            SELECT provider_set_key, provider_set_global_id_128
-            FROM {_shared_v3_provider_set_table()}
-            WHERE snapshot_key = :shared_snapshot_key
-              AND provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS bytea[]))
-            """
-        ),
-        query_parameters_by_name,
+    """Return dense keys while sharing the exact provider-set metadata query."""
+
+    metadata_by_id = await _provider_set_metadata_for_ids(
+        session,
+        serving_tables,
+        provider_set_ids,
     )
     return {
-        _ptg2_manifest_id(data.get("provider_set_global_id_128")): int(data.get("provider_set_key"))
-        for data in (_row_mapping(row) for row in result)
-        if data.get("provider_set_key") is not None and _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+        provider_set_id: metadata.provider_set_key
+        for provider_set_id, metadata in metadata_by_id.items()
     }
 
 
@@ -3668,6 +3803,698 @@ async def _shared_provider_group_keys_for_ids(
     }
 
 
+def _v4_group_source_owner_keys(
+    group_sources: _V4SetGroupSources,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    pattern_keys = tuple(
+        sorted(
+            {
+                int(pattern_key)
+                for members in group_sources.pattern_keys_by_set.values()
+                for pattern_key in members
+            }
+        )
+    )
+    component_keys = tuple(
+        sorted(
+            {
+                int(component_key)
+                for members in group_sources.component_keys_by_set.values()
+                for component_key in members
+            }
+        )
+    )
+    return pattern_keys, component_keys
+
+
+def _merge_v4_source_groups(
+    provider_set_key: int,
+    group_sources: _V4SetGroupSources,
+    groups_by_pattern: Mapping[int, tuple[int, ...]],
+    groups_by_component: Mapping[int, tuple[int, ...]],
+) -> tuple[int, ...]:
+    if provider_set_key in group_sources.component_keys_by_set:
+        group_keys = {
+            int(group_key)
+            for component_key in group_sources.component_keys_by_set[
+                provider_set_key
+            ]
+            for group_key in groups_by_component.get(int(component_key), ())
+        }
+    else:
+        group_keys = {
+            int(group_key)
+            for pattern_key in group_sources.pattern_keys_by_set.get(
+                provider_set_key, ()
+            )
+            for group_key in groups_by_pattern.get(int(pattern_key), ())
+        }
+    return tuple(sorted(group_keys))
+
+
+async def _v4_groups_via_sources(
+    session,
+    *,
+    snapshot_key: int,
+    provider_set_keys: Iterable[int],
+    max_members: int | None,
+    maximum_pattern_degree: int,
+    maximum_component_degree: int,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve exact set groups through a bounded per-set pattern/component hop."""
+
+    normalized_set_keys = tuple(
+        sorted({int(provider_set_key) for provider_set_key in provider_set_keys})
+    )
+    if not normalized_set_keys:
+        return {}
+    member_budget = None if max_members is None else int(max_members)
+    group_sources = await _load_v4_pattern_set_group_sources(
+        session,
+        snapshot_key=int(snapshot_key),
+        provider_set_keys=normalized_set_keys,
+        maximum_pattern_degree=maximum_pattern_degree,
+        maximum_component_degree=maximum_component_degree,
+    )
+    pattern_keys, component_keys = _v4_group_source_owner_keys(group_sources)
+    groups_by_pattern, groups_by_component = await _load_v4_source_groups(
+        session,
+        snapshot_key=int(snapshot_key),
+        pattern_keys=pattern_keys,
+        component_keys=component_keys,
+        member_budget=member_budget,
+    )
+    if (
+        set(groups_by_pattern) != set(pattern_keys)
+        or set(groups_by_component) != set(component_keys)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 provider-group relation is incomplete"
+        )
+    members_by_set: dict[int, tuple[int, ...]] = {}
+    returned_member_count = 0
+    for provider_set_key in normalized_set_keys:
+        members = _merge_v4_source_groups(
+            provider_set_key,
+            group_sources,
+            groups_by_pattern,
+            groups_by_component,
+        )
+        if member_budget is not None and len(members) > member_budget:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 graph selection exceeds max_members"
+            )
+        returned_member_count += len(members)
+        if member_budget is not None and returned_member_count > member_budget:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 graph selection exceeds max_members"
+            )
+        members_by_set[provider_set_key] = members
+    return members_by_set
+
+
+_v4_set_group_members_through_sources = _v4_groups_via_sources
+
+
+async def _load_v4_source_groups(
+    session,
+    *,
+    snapshot_key: int,
+    pattern_keys: tuple[int, ...],
+    component_keys: tuple[int, ...],
+    member_budget: int | None,
+) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]]]:
+    groups_by_pattern = (
+        await lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation="pattern_groups",
+            owner_keys=pattern_keys,
+            schema_name=PTG2_SCHEMA,
+            max_members=member_budget,
+        )
+        if pattern_keys
+        else {}
+    )
+    groups_by_component = (
+        await lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation="component_groups",
+            owner_keys=component_keys,
+            schema_name=PTG2_SCHEMA,
+            max_members=member_budget,
+        )
+        if component_keys
+        else {}
+    )
+    return groups_by_pattern, groups_by_component
+
+
+async def _v4_members_through_projection(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    owner_keys: Iterable[int],
+    direct_relation: str,
+    projection_relation: str,
+    projected_member_relation: str,
+    max_members: int | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve a direct or pattern-factored relation without flat expansion."""
+
+    member_budget = None if max_members is None else int(max_members)
+    if member_budget is not None and member_budget < 0:
+        raise PTG2ManifestArtifactError("max_members must be non-negative")
+    normalized_owner_keys = tuple(sorted({int(owner_key) for owner_key in owner_keys}))
+    if not normalized_owner_keys:
+        return {}
+    snapshot_key = _required_shared_snapshot_key(serving_tables)
+    root = await load_v4_graph_root(
+        session,
+        snapshot_key,
+        schema_name=PTG2_SCHEMA,
+    )
+    if root.representation == "direct_v1":
+        return await lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation=direct_relation,
+            owner_keys=normalized_owner_keys,
+            schema_name=PTG2_SCHEMA,
+            max_members=member_budget,
+        )
+    if (
+        projection_relation == "set_patterns"
+        and projected_member_relation == "pattern_groups"
+    ):
+        hot_limits = _v4_hot_prefix_limits(serving_tables)
+        return await _v4_set_group_members_through_sources(
+            session,
+            snapshot_key=snapshot_key,
+            provider_set_keys=normalized_owner_keys,
+            max_members=member_budget,
+            maximum_pattern_degree=hot_limits.maximum_patterns_per_set,
+            maximum_component_degree=(
+                hot_limits.maximum_components_per_fallback_set
+            ),
+        )
+    # The set-to-pattern count lower-bounds final group occurrences because
+    # every selected pattern owns a non-empty, disjoint group partition. The
+    # group-to-pattern direction remains uncapped here: an exact orphan group
+    # may map to the snapshot's empty-set pattern. Caller input limits bound
+    # that scalar first hop; the unique pattern-to-set hop and final returned
+    # total remain budgeted below.
+    projection_budget = member_budget if projection_relation == "set_patterns" else None
+    projections_by_owner = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation=projection_relation,
+        owner_keys=normalized_owner_keys,
+        schema_name=PTG2_SCHEMA,
+        max_members=projection_budget,
+    )
+    projection_keys = tuple(
+        sorted(
+            {
+                int(projection_key)
+                for projection_members in projections_by_owner.values()
+                for projection_key in projection_members
+            }
+        )
+    )
+    members_by_projection = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation=projected_member_relation,
+        owner_keys=projection_keys,
+        schema_name=PTG2_SCHEMA,
+        # Each unique projection is used by at least one requested owner. Its
+        # loaded members therefore form a lower bound on the returned total.
+        max_members=member_budget,
+    )
+    members_by_owner: dict[int, tuple[int, ...]] = {}
+    returned_member_count = 0
+    for owner_key in normalized_owner_keys:
+        members = tuple(
+            sorted(
+                {
+                    int(member_key)
+                    for projection_key in projections_by_owner.get(owner_key, ())
+                    for member_key in members_by_projection.get(
+                        int(projection_key), ()
+                    )
+                }
+            )
+        )
+        if member_budget is not None and len(members) > member_budget:
+            raise PTG2ManifestArtifactError("PTG2 V4 graph selection exceeds max_members")
+        returned_member_count += len(members)
+        if member_budget is not None and returned_member_count > member_budget:
+            raise PTG2ManifestArtifactError("PTG2 V4 graph selection exceeds max_members")
+        members_by_owner[owner_key] = members
+    return members_by_owner
+
+
+def _is_v4_reverse_scope_cheaper(
+    *,
+    first_member_count: int,
+    allowed_provider_set_count: int,
+    forward_member_count: int,
+    forward_owner_count: int,
+    reverse_member_count: int,
+    reverse_owner_count: int,
+) -> bool:
+    """Compare exact integer cross-products of the two average fanouts."""
+
+    if not first_member_count or not allowed_provider_set_count:
+        return True
+    if not forward_owner_count:
+        return False
+    if not reverse_owner_count:
+        return True
+    forward_score = (
+        int(first_member_count)
+        * int(forward_member_count)
+        * int(reverse_owner_count)
+    )
+    reverse_score = (
+        int(allowed_provider_set_count)
+        * int(reverse_member_count)
+        * int(forward_owner_count)
+    )
+    return reverse_score <= forward_score
+
+
+def _v4_sets_by_npi_reverse(
+    *,
+    normalized_npis: tuple[int, ...],
+    npi_key_by_value: Mapping[int, int],
+    first_members_by_npi_key: Mapping[int, tuple[int, ...]],
+    first_members_by_allowed_set: Mapping[int, tuple[int, ...]],
+    allowed_provider_sets: tuple[int, ...],
+) -> dict[int, tuple[int, ...]]:
+    """Invert only the code-scoped set edges, never the whole snapshot graph."""
+
+    if len(normalized_npis) == 1:
+        npi = normalized_npis[0]
+        npi_key = npi_key_by_value.get(npi)
+        if npi_key is None:
+            return {npi: ()}
+        first_member_set = frozenset(
+            first_members_by_npi_key.get(npi_key, ())
+        )
+        return {
+            npi: tuple(
+                provider_set_key
+                for provider_set_key in allowed_provider_sets
+                if not first_member_set.isdisjoint(
+                    first_members_by_allowed_set.get(provider_set_key, ())
+                )
+            )
+        }
+    npis_by_first_member: dict[int, list[int]] = defaultdict(list)
+    for npi in normalized_npis:
+        npi_key = npi_key_by_value.get(npi)
+        if npi_key is None:
+            continue
+        for first_member in first_members_by_npi_key.get(npi_key, ()):
+            npis_by_first_member[int(first_member)].append(npi)
+    matches_by_npi: dict[int, list[int]] = {
+        npi: [] for npi in normalized_npis
+    }
+    for provider_set_key in allowed_provider_sets:
+        matched_npis: set[int] = set()
+        for first_member in first_members_by_allowed_set.get(provider_set_key, ()):
+            matched_npis.update(npis_by_first_member.get(int(first_member), ()))
+        for npi in matched_npis:
+            matches_by_npi[npi].append(provider_set_key)
+    return {
+        npi: tuple(provider_set_keys)
+        for npi, provider_set_keys in matches_by_npi.items()
+    }
+
+
+def _v4_npi_projection_relations(
+    representation: str,
+) -> tuple[str, str, str]:
+    if representation == "pattern_v1":
+        return "npi_patterns", "pattern_sets", "set_patterns"
+    return "npi_groups_exact", "group_sets_direct", "set_groups_direct"
+
+
+async def _v4_reverse_members_for_sets(
+    session,
+    *,
+    snapshot_key: int,
+    representation: str,
+    first_member_count: int,
+    allowed_provider_sets: tuple[int, ...],
+    forward_relation: str,
+    maximum_pattern_degree: int,
+) -> Mapping[int, tuple[int, ...]] | None:
+    _, _, reverse_relation = _v4_npi_projection_relations(representation)
+    forward_manifest = await load_v4_relation_manifest(
+        session,
+        snapshot_key=snapshot_key,
+        relation=forward_relation,
+        schema_name=PTG2_SCHEMA,
+    )
+    reverse_manifest = await load_v4_relation_manifest(
+        session,
+        snapshot_key=snapshot_key,
+        relation=reverse_relation,
+        schema_name=PTG2_SCHEMA,
+    )
+    if not _is_v4_reverse_scope_cheaper(
+        first_member_count=first_member_count,
+        allowed_provider_set_count=len(allowed_provider_sets),
+        forward_member_count=forward_manifest.logical_member_count,
+        forward_owner_count=forward_manifest.owner_count,
+        reverse_member_count=reverse_manifest.logical_member_count,
+        reverse_owner_count=reverse_manifest.owner_count,
+    ):
+        return None
+    if representation != "pattern_v1":
+        return await lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation=reverse_relation,
+            owner_keys=allowed_provider_sets,
+            schema_name=PTG2_SCHEMA,
+        )
+    bounded_patterns = await lookup_v4_relation_member_prefixes(
+        session,
+        snapshot_key=snapshot_key,
+        relation=reverse_relation,
+        owner_keys=allowed_provider_sets,
+        schema_name=PTG2_SCHEMA,
+        limit_per_owner=maximum_pattern_degree + 1,
+    )
+    if set(bounded_patterns) != set(allowed_provider_sets):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 set-pattern relation is incomplete"
+        )
+    if any(
+        len(pattern_keys) > maximum_pattern_degree
+        for pattern_keys in bounded_patterns.values()
+    ):
+        return None
+    return bounded_patterns
+
+
+def _v4_sets_from_first_members(
+    normalized_npis: tuple[int, ...],
+    npi_key_by_value: Mapping[int, int],
+    first_members_by_npi_key: Mapping[int, tuple[int, ...]],
+    provider_sets_by_first_member: Mapping[int, tuple[int, ...]],
+    allowed_provider_sets: tuple[int, ...] | None,
+) -> dict[int, tuple[int, ...]]:
+    provider_set_keys_by_npi: dict[int, tuple[int, ...]] = {}
+    allowed_provider_set_key_set = (
+        None if allowed_provider_sets is None else frozenset(allowed_provider_sets)
+    )
+    for npi in normalized_npis:
+        npi_key = npi_key_by_value.get(npi)
+        if npi_key is None:
+            provider_set_keys_by_npi[npi] = ()
+            continue
+        provider_set_keys = tuple(
+            sorted(
+                {
+                    int(provider_set_key)
+                    for first_member_key in first_members_by_npi_key.get(npi_key, ())
+                    for provider_set_key in provider_sets_by_first_member.get(
+                        int(first_member_key), ()
+                    )
+                    if allowed_provider_set_key_set is None
+                    or int(provider_set_key) in allowed_provider_set_key_set
+                }
+            )
+        )
+        if allowed_provider_sets is not None and provider_set_keys:
+            provider_set_keys = intersect_sorted_u32(
+                provider_set_keys, allowed_provider_sets
+            )
+        provider_set_keys_by_npi[npi] = provider_set_keys
+    return provider_set_keys_by_npi
+
+
+async def _v4_sets_by_npi(
+    session,
+    serving_tables: PTG2ServingTables,
+    npis: Iterable[int],
+    *,
+    allowed_provider_set_keys: frozenset[int] | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve hot NPI-to-set membership through the selected V4 representation."""
+
+    normalized_npis = tuple(sorted({int(npi) for npi in npis}))
+    if not normalized_npis:
+        return {}
+    allowed_provider_sets = (
+        tuple(
+            sorted(int(provider_set_key) for provider_set_key in allowed_provider_set_keys)
+        )
+        if allowed_provider_set_keys is not None
+        else None
+    )
+    snapshot_key = _required_shared_snapshot_key(serving_tables)
+    with v4_graph_request_scope():
+        npi_key_by_value = await v4_npi_keys_for_values(
+            session,
+            snapshot_key=snapshot_key,
+            npis=normalized_npis,
+            schema_name=PTG2_SCHEMA,
+        )
+        root = await load_v4_graph_root(
+            session,
+            snapshot_key,
+            schema_name=PTG2_SCHEMA,
+        )
+        first_relation, second_relation, _ = _v4_npi_projection_relations(
+            root.representation
+        )
+        first_members_by_npi_key = await lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation=first_relation,
+            owner_keys=npi_key_by_value.values(),
+            schema_name=PTG2_SCHEMA,
+        )
+        first_member_keys = tuple(
+            sorted(
+                {
+                    int(first_member_key)
+                    for members in first_members_by_npi_key.values()
+                    for first_member_key in members
+                }
+            )
+        )
+        if not first_member_keys:
+            return {npi: () for npi in normalized_npis}
+        if allowed_provider_sets is not None:
+            first_members_by_allowed_set = await _v4_reverse_members_for_sets(
+                session,
+                snapshot_key=snapshot_key,
+                representation=root.representation,
+                first_member_count=len(first_member_keys),
+                allowed_provider_sets=allowed_provider_sets,
+                forward_relation=second_relation,
+                maximum_pattern_degree=(
+                    _v4_hot_prefix_limits(
+                        serving_tables
+                    ).maximum_patterns_per_set
+                ),
+            )
+            if first_members_by_allowed_set is not None:
+                return _v4_sets_by_npi_reverse(
+                    normalized_npis=normalized_npis,
+                    npi_key_by_value=npi_key_by_value,
+                    first_members_by_npi_key=first_members_by_npi_key,
+                    first_members_by_allowed_set=first_members_by_allowed_set,
+                    allowed_provider_sets=allowed_provider_sets,
+                )
+        provider_sets_by_first_member = await lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation=second_relation,
+            owner_keys=first_member_keys,
+            schema_name=PTG2_SCHEMA,
+        )
+    return _v4_sets_from_first_members(
+        normalized_npis,
+        npi_key_by_value,
+        first_members_by_npi_key,
+        provider_sets_by_first_member,
+        allowed_provider_sets,
+    )
+
+
+async def _v4_shared_graph_members_many(
+    session,
+    serving_tables: PTG2ServingTables,
+    name: str,
+    owner_ids: list[str],
+    *,
+    max_members: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Translate legacy graph artifact names through packed V4 relations."""
+
+    snapshot_key = _required_shared_snapshot_key(serving_tables)
+    with v4_graph_request_scope():
+        if name == "provider_npi_group":
+            npi_by_owner_id = {
+                owner_id: npi
+                for owner_id in owner_ids
+                if (npi := _ptg2_npi_from_member_id(owner_id)) is not None
+            }
+            if len(npi_by_owner_id) != len(owner_ids):
+                raise PTG2ManifestArtifactError("PTG2 V4 NPI graph owner is malformed")
+            npi_key_by_value = await v4_npi_keys_for_values(
+                session,
+                snapshot_key=snapshot_key,
+                npis=npi_by_owner_id.values(),
+                schema_name=PTG2_SCHEMA,
+            )
+            group_keys_by_npi_key = await lookup_v4_relation_members(
+                session,
+                snapshot_key=snapshot_key,
+                relation="npi_groups_exact",
+                owner_keys=npi_key_by_value.values(),
+                schema_name=PTG2_SCHEMA,
+                max_members=max_members,
+            )
+            group_keys = {
+                int(group_key)
+                for members in group_keys_by_npi_key.values()
+                for group_key in members
+            }
+            group_id_by_key = await _shared_provider_group_ids_for_keys(
+                session, serving_tables, group_keys
+            )
+            if set(group_id_by_key) != group_keys:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 V4 graph references a missing provider-group key"
+                )
+            return {
+                owner_id: tuple(
+                    group_id_by_key[group_key]
+                    for group_key in group_keys_by_npi_key.get(
+                        npi_key_by_value.get(npi_by_owner_id[owner_id], -1), ()
+                    )
+                )
+                for owner_id in owner_ids
+            }
+
+        if name == "provider_group_npi":
+            owner_key_by_id = await _shared_provider_group_keys_for_ids(
+                session, serving_tables, owner_ids
+            )
+            npi_keys_by_group = await lookup_v4_relation_members(
+                session,
+                snapshot_key=snapshot_key,
+                relation="group_npis_exact",
+                owner_keys=owner_key_by_id.values(),
+                schema_name=PTG2_SCHEMA,
+                max_members=max_members,
+            )
+            npi_keys = {
+                int(npi_key)
+                for members in npi_keys_by_group.values()
+                for npi_key in members
+            }
+            npi_by_key = await v4_npi_values_for_keys(
+                session,
+                snapshot_key=snapshot_key,
+                npi_keys=npi_keys,
+                schema_name=PTG2_SCHEMA,
+            )
+            if set(npi_by_key) != npi_keys:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 V4 graph references a missing NPI dictionary key"
+                )
+            return {
+                owner_id: tuple(
+                    _ptg2_npi_member_id(npi_by_key[npi_key])
+                    for npi_key in npi_keys_by_group.get(
+                        owner_key_by_id.get(owner_id, -1), ()
+                    )
+                )
+                for owner_id in owner_ids
+            }
+
+        if name == "provider_inverted":
+            owner_key_by_id = await _shared_provider_group_keys_for_ids(
+                session, serving_tables, owner_ids
+            )
+            members_by_owner_key = await _v4_members_through_projection(
+                session,
+                serving_tables,
+                owner_keys=owner_key_by_id.values(),
+                direct_relation="group_sets_direct",
+                projection_relation="group_patterns",
+                projected_member_relation="pattern_sets",
+                max_members=max_members,
+            )
+            member_id_by_key = await _provider_set_ids_for_keys(
+                session,
+                serving_tables,
+                {
+                    int(member_key)
+                    for members in members_by_owner_key.values()
+                    for member_key in members
+                },
+            )
+        elif name == "provider_forward":
+            owner_key_by_id = await _provider_set_keys_for_ids(
+                session, serving_tables, owner_ids
+            )
+            members_by_owner_key = await _v4_members_through_projection(
+                session,
+                serving_tables,
+                owner_keys=owner_key_by_id.values(),
+                direct_relation="set_groups_direct",
+                projection_relation="set_patterns",
+                projected_member_relation="pattern_groups",
+                max_members=max_members,
+            )
+            member_id_by_key = await _shared_provider_group_ids_for_keys(
+                session,
+                serving_tables,
+                {
+                    int(member_key)
+                    for members in members_by_owner_key.values()
+                    for member_key in members
+                },
+            )
+        else:
+            raise PTG2ManifestArtifactError(
+                f"unsupported PTG V4 shared graph artifact: {name}"
+            )
+        expected_member_keys = {
+            int(member_key)
+            for members in members_by_owner_key.values()
+            for member_key in members
+        }
+        if set(member_id_by_key) != expected_member_keys:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 graph references a missing support dictionary key"
+            )
+        total_member_count = sum(len(members) for members in members_by_owner_key.values())
+        if max_members is not None and total_member_count > int(max_members):
+            raise PTG2ManifestArtifactError("PTG2 V4 graph selection exceeds max_members")
+        return {
+            owner_id: tuple(
+                member_id_by_key[member_key]
+                for member_key in members_by_owner_key.get(
+                    owner_key_by_id.get(owner_id, -1), ()
+                )
+            )
+            for owner_id in owner_ids
+        }
+
+
 async def _shared_graph_members_many(
     session,
     serving_tables: PTG2ServingTables,
@@ -3677,6 +4504,14 @@ async def _shared_graph_members_many(
     max_members: int | None,
 ) -> dict[str, tuple[str, ...]]:
     """Resolve shared-graph member IDs for each requested owner ID."""
+    if serving_tables.uses_v4_graph:
+        return await _v4_shared_graph_members_many(
+            session,
+            serving_tables,
+            name,
+            owner_ids,
+            max_members=max_members,
+        )
     direction_by_name = {
         "provider_npi_group": PTG2_V3_GRAPH_NPI_TO_GROUP,
         "provider_group_npi": PTG2_V3_GRAPH_GROUP_TO_NPI,
@@ -3865,6 +4700,35 @@ async def _shared_group_ids_for_set_keys(
     )
     if not normalized_provider_set_keys:
         return ()
+    if serving_tables.uses_v4_graph:
+        with v4_graph_request_scope():
+            groups_by_provider_set = await _v4_members_through_projection(
+                session,
+                serving_tables,
+                owner_keys=normalized_provider_set_keys,
+                direct_relation="set_groups_direct",
+                projection_relation="set_patterns",
+                projected_member_relation="pattern_groups",
+            )
+        group_keys = tuple(
+            sorted(
+                {
+                    int(group_key)
+                    for provider_set_group_keys in groups_by_provider_set.values()
+                    for group_key in provider_set_group_keys
+                }
+            )
+        )
+        group_id_by_key = await _shared_provider_group_ids_for_keys(
+            session,
+            serving_tables,
+            group_keys,
+        )
+        if set(group_id_by_key) != set(group_keys):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 graph references a missing provider-group dictionary key"
+            )
+        return tuple(group_id_by_key[group_key] for group_key in group_keys)
     groups_by_provider_set = await lookup_shared_graph_members_from_db(
         session,
         _required_shared_snapshot_key(serving_tables),
@@ -4149,6 +5013,43 @@ async def _provider_npi_member_ids_by_set(
     """Resolve provider-set NPI membership through the dense shared graph."""
 
     _require_strict_shared_v3(serving_tables)
+    if serving_tables.uses_v4_graph:
+        with v4_graph_request_scope():
+            hot_target = _v4_hot_prefix_limits(serving_tables).target
+            if (
+                limit_per_set is not None
+                and max(int(limit_per_set), 1) <= hot_target
+            ):
+                return await _v4_npi_prefixes_by_set(
+                    session,
+                    serving_tables,
+                    provider_set_ids,
+                    limit_per_set=max(int(limit_per_set), 1),
+                )
+            record_v4_cold_exact_request()
+            return await _cold_provider_npi_member_ids_by_set(
+                session,
+                serving_tables,
+                provider_set_ids,
+                limit_per_set=limit_per_set,
+            )
+    return await _cold_provider_npi_member_ids_by_set(
+        session,
+        serving_tables,
+        provider_set_ids,
+        limit_per_set=limit_per_set,
+    )
+
+
+async def _cold_npi_members_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_ids: tuple[str, ...],
+    *,
+    limit_per_set: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Use retained exact V3 graph indexes without a hot-latency promise."""
+
     groups_by_set = await _shared_graph_members_by_id(
         session,
         serving_tables,
@@ -4185,6 +5086,1006 @@ async def _provider_npi_member_ids_by_set(
         )
         for provider_set_id in provider_set_ids
     }
+
+
+_cold_provider_npi_member_ids_by_set = _cold_npi_members_by_set
+
+
+def _merge_sorted_group_keys(
+    member_lists: Iterable[tuple[int, ...]],
+    limit: int,
+) -> tuple[int, ...]:
+    """Merge ordered owner prefixes into one deterministic unique prefix."""
+
+    selected_member_keys: list[int] = []
+    previous: int | None = None
+    has_previous = False
+    for member_key in heapq.merge(*member_lists):
+        normalized_key = int(member_key)
+        if has_previous and normalized_key == previous:
+            continue
+        selected_member_keys.append(normalized_key)
+        previous = normalized_key
+        has_previous = True
+        if len(selected_member_keys) >= int(limit):
+            break
+    return tuple(selected_member_keys)
+
+
+def _is_v4_group_prefix_complete(
+    group_prefix: tuple[int, ...],
+    source_prefixes: Iterable[tuple[int, ...]],
+    requested_prefix: int,
+) -> bool:
+    """Return true only when every source and the merged view are exhausted."""
+
+    return (
+        len(group_prefix) < int(requested_prefix)
+        and all(
+            len(source_prefix) < int(requested_prefix)
+            for source_prefix in source_prefixes
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _V4SetGroupSources:
+    """Per-set exact first-hop owners for one pattern-layout request."""
+
+    pattern_keys_by_set: Mapping[int, tuple[int, ...]]
+    component_keys_by_set: Mapping[int, tuple[int, ...]]
+
+
+@dataclass(frozen=True)
+class _V4NpiGroupSources:
+    provider_set_key_by_id: Mapping[str, int]
+    provider_count_by_id: Mapping[str, int]
+    prefix_override_by_id: Mapping[str, _ProviderSetGraphMetadata]
+    pattern_keys_by_set: Mapping[int, tuple[int, ...]] | None
+    component_keys_by_set: Mapping[int, tuple[int, ...]] = field(
+        default_factory=dict
+    )
+
+
+@dataclass(frozen=True)
+class _V4NpiSourceMetadata:
+    provider_set_key_by_id: Mapping[str, int]
+    provider_count_by_id: Mapping[str, int]
+    prefix_override_by_id: Mapping[str, _ProviderSetGraphMetadata]
+    ordinary_provider_set_keys: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _V4HotPrefixLimits:
+    target: int
+    maximum_patterns_per_set: int
+    maximum_components_per_fallback_set: int
+    maximum_group_keys_per_set: int
+    maximum_source_owners_per_set: int
+    maximum_source_members_per_set: int
+    maximum_source_pages_per_set: int
+    maximum_source_bytes_per_set: int
+    group_npi_batch_size: int
+    maximum_group_npi_members_per_set: int
+    maximum_group_npi_locator_pages_per_set: int
+    maximum_group_npi_member_pages_per_set: int
+    maximum_group_npi_bytes_per_set: int
+    maximum_group_npi_batches_per_set: int
+    provider_expansion_rate_page_rows: int
+    maximum_provider_expansion_rate_rows: int
+    maximum_provider_expansion_provider_sets: int
+    maximum_provider_expansion_graph_batches: int
+
+
+def _v4_hot_prefix_limits(
+    serving_tables: PTG2ServingTables,
+) -> _V4HotPrefixLimits:
+    """Read hard online limits from the already-sealed serving manifest."""
+
+    sealed_limits_by_field = serving_tables.provider_graph_v4_hot_prefix
+    if not isinstance(sealed_limits_by_field, dict):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 serving tables are missing sealed hot-prefix limits"
+        )
+    field_names = (
+        "npi_prefix_target",
+        "max_set_patterns_per_set",
+        "max_set_components_per_fallback_set",
+        "max_online_group_keys_per_set",
+        "max_online_source_owners_per_set",
+        "max_online_source_members_per_set",
+        "max_online_source_pages_per_set",
+        "max_online_source_bytes_per_set",
+        "online_group_npi_batch_size",
+        "max_online_group_npi_members_per_set",
+        "max_online_group_npi_locator_pages_per_set",
+        "max_online_group_npi_member_pages_per_set",
+        "max_online_group_npi_bytes_per_set",
+        "max_online_group_npi_batches_per_set",
+        "provider_expansion_rate_page_rows",
+        "max_online_provider_expansion_rate_rows",
+        "max_online_provider_expansion_provider_sets",
+        "max_online_provider_expansion_graph_batches",
+    )
+    try:
+        parsed_limits = tuple(
+            int(sealed_limits_by_field[field_name])
+            for field_name in field_names
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sealed hot-prefix limits are malformed"
+        ) from exc
+    if any(parsed_limit <= 0 for parsed_limit in parsed_limits):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sealed hot-prefix limits must be positive"
+        )
+    return _V4HotPrefixLimits(*parsed_limits)
+
+
+def _v4_npi_prefix_digest(npi_keys: Iterable[int]) -> bytes:
+    normalized_keys = tuple(int(npi_key) for npi_key in npi_keys)
+    digest = hashlib.sha256()
+    digest.update(_PTG2_V4_NPI_PREFIX_DIGEST_DOMAIN)
+    digest.update(len(normalized_keys).to_bytes(8, "big"))
+    for npi_key in normalized_keys:
+        if npi_key < 0 or npi_key > 0xFFFFFFFF:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 ordered NPI prefix contains an invalid key"
+            )
+        digest.update(npi_key.to_bytes(4, "big"))
+    return digest.digest()
+
+
+@dataclass(frozen=True)
+class _V4GroupPrefixRound:
+    group_keys_by_set: Mapping[str, tuple[int, ...]]
+    is_complete_by_set: Mapping[str, bool]
+
+
+@dataclass
+class _V4NpiPrefixState:
+    selected_npi_keys_by_set: dict[str, list[int]]
+    seen_npi_keys_by_set: dict[str, set[int]]
+    group_keys_by_set: dict[str, tuple[int, ...]]
+    completed_provider_set_ids: set[str]
+
+    @classmethod
+    def for_provider_sets(
+        cls,
+        provider_set_ids: tuple[str, ...],
+    ) -> _V4NpiPrefixState:
+        """Initialize empty exact-prefix state for each requested provider set."""
+
+        return cls(
+            selected_npi_keys_by_set={
+                provider_set_id: [] for provider_set_id in provider_set_ids
+            },
+            seen_npi_keys_by_set={
+                provider_set_id: set() for provider_set_id in provider_set_ids
+            },
+            group_keys_by_set={
+                provider_set_id: () for provider_set_id in provider_set_ids
+            },
+            completed_provider_set_ids=set(),
+        )
+
+    def active_provider_set_ids(
+        self,
+        provider_set_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """Return requested provider sets whose exact prefix is not complete."""
+
+        return tuple(
+            provider_set_id
+            for provider_set_id in provider_set_ids
+            if provider_set_id not in self.completed_provider_set_ids
+        )
+
+
+def _v4_override_metadata_by_key(
+    group_sources: _V4NpiGroupSources,
+    prefix_target: int,
+) -> tuple[dict[int, int], dict[int, _ProviderSetGraphMetadata]]:
+    expected_count_by_key: dict[int, int] = {}
+    metadata_by_key: dict[int, _ProviderSetGraphMetadata] = {}
+    for metadata in group_sources.prefix_override_by_id.values():
+        expected_count = min(
+            int(metadata.provider_count),
+            int(prefix_target),
+        )
+        if (
+            metadata.prefix_member_count != expected_count
+            or metadata.prefix_member_digest is None
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 sparse NPI prefix count is inconsistent"
+            )
+        expected_count_by_key[metadata.provider_set_key] = expected_count
+        metadata_by_key[metadata.provider_set_key] = metadata
+    return expected_count_by_key, metadata_by_key
+
+
+async def _apply_v4_npi_prefix_overrides(
+    session,
+    snapshot_key: int,
+    group_sources: _V4NpiGroupSources,
+    target_count_by_set: Mapping[str, int],
+    state: _V4NpiPrefixState,
+    prefix_target: int,
+) -> None:
+    """Authenticate sparse exact prefixes and mark their owners complete."""
+
+    if not group_sources.prefix_override_by_id:
+        return
+    expected_count_by_key, metadata_by_key = _v4_override_metadata_by_key(
+        group_sources,
+        prefix_target,
+    )
+    prefixes_by_key = await lookup_v4_ordered_npi_prefix_overrides(
+        session,
+        snapshot_key=int(snapshot_key),
+        provider_set_keys=expected_count_by_key,
+        schema_name=PTG2_SCHEMA,
+        max_members=sum(expected_count_by_key.values()),
+    )
+    if set(prefixes_by_key) != set(expected_count_by_key):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sparse NPI prefix relation is incomplete"
+        )
+    for provider_set_id, metadata in group_sources.prefix_override_by_id.items():
+        prefix_members = prefixes_by_key[metadata.provider_set_key]
+        if (
+            len(prefix_members)
+            != expected_count_by_key[metadata.provider_set_key]
+            or _v4_npi_prefix_digest(prefix_members)
+            != metadata_by_key[
+                metadata.provider_set_key
+            ].prefix_member_digest
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 sparse NPI prefix failed authentication"
+            )
+        selected_members = prefix_members[
+            : target_count_by_set[provider_set_id]
+        ]
+        state.selected_npi_keys_by_set[provider_set_id].extend(
+            selected_members
+        )
+        state.seen_npi_keys_by_set[provider_set_id].update(selected_members)
+        state.completed_provider_set_ids.add(provider_set_id)
+    record_v4_npi_prefix_override_sets(
+        len(group_sources.prefix_override_by_id)
+    )
+
+
+async def _load_v4_component_sources(
+    session,
+    *,
+    snapshot_key: int,
+    overflow_set_keys: tuple[int, ...],
+    maximum_component_degree: int,
+) -> dict[int, tuple[int, ...]]:
+    component_prefixes = await lookup_v4_relation_member_prefixes(
+        session,
+        snapshot_key=int(snapshot_key),
+        relation="set_components",
+        owner_keys=overflow_set_keys,
+        schema_name=PTG2_SCHEMA,
+        limit_per_owner=maximum_component_degree + 1,
+    )
+    if set(component_prefixes) != set(overflow_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 set-component fallback relation is incomplete"
+        )
+    if any(
+        len(component_prefixes[provider_set_key]) > maximum_component_degree
+        for provider_set_key in overflow_set_keys
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 set-component fallback degree exceeds its configured maximum"
+        )
+    record_v4_component_fallback_sets(len(overflow_set_keys))
+    return {
+        provider_set_key: component_prefixes[provider_set_key]
+        for provider_set_key in overflow_set_keys
+    }
+
+
+async def _load_v4_group_sources(
+    session,
+    *,
+    snapshot_key: int,
+    provider_set_keys: Iterable[int],
+    maximum_pattern_degree: int,
+    maximum_component_degree: int,
+) -> _V4SetGroupSources:
+    """Choose the bounded pattern or exact component first hop per set."""
+
+    normalized_set_keys = tuple(
+        sorted({int(provider_set_key) for provider_set_key in provider_set_keys})
+    )
+    if not normalized_set_keys:
+        return _V4SetGroupSources({}, {})
+    pattern_prefixes = await lookup_v4_relation_member_prefixes(
+        session,
+        snapshot_key=int(snapshot_key),
+        relation="set_patterns",
+        owner_keys=normalized_set_keys,
+        schema_name=PTG2_SCHEMA,
+        limit_per_owner=maximum_pattern_degree + 1,
+    )
+    if set(pattern_prefixes) != set(normalized_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 set-pattern relation is incomplete"
+        )
+    overflow_set_keys = tuple(
+        provider_set_key
+        for provider_set_key in normalized_set_keys
+        if len(pattern_prefixes[provider_set_key]) > maximum_pattern_degree
+    )
+    overflow_set_key_set = frozenset(overflow_set_keys)
+    pattern_keys_by_set = {
+        provider_set_key: pattern_prefixes[provider_set_key]
+        for provider_set_key in normalized_set_keys
+        if provider_set_key not in overflow_set_key_set
+    }
+    if not overflow_set_keys:
+        return _V4SetGroupSources(pattern_keys_by_set, {})
+    component_keys_by_set = await _load_v4_component_sources(
+        session,
+        snapshot_key=int(snapshot_key),
+        overflow_set_keys=overflow_set_keys,
+        maximum_component_degree=maximum_component_degree,
+    )
+    return _V4SetGroupSources(
+        pattern_keys_by_set=pattern_keys_by_set,
+        component_keys_by_set=component_keys_by_set,
+    )
+
+
+_load_v4_pattern_set_group_sources = _load_v4_group_sources
+
+
+def _v4_npi_source_metadata(
+    metadata_by_id: Mapping[str, _ProviderSetGraphMetadata],
+    provider_set_ids: tuple[str, ...],
+) -> _V4NpiSourceMetadata:
+    """Separate ordinary provider sets from exact prefix overrides."""
+
+    provider_set_key_by_id = {
+        provider_set_id: metadata.provider_set_key
+        for provider_set_id, metadata in metadata_by_id.items()
+    }
+    provider_count_by_id = {
+        provider_set_id: metadata.provider_count
+        for provider_set_id, metadata in metadata_by_id.items()
+    }
+    if set(provider_set_key_by_id) != set(provider_set_ids):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 provider-set dictionary is incomplete"
+        )
+    prefix_override_by_id = {
+        provider_set_id: metadata
+        for provider_set_id, metadata in metadata_by_id.items()
+        if metadata.prefix_member_count is not None
+    }
+    ordinary_provider_set_keys = tuple(
+        metadata.provider_set_key
+        for provider_set_id, metadata in metadata_by_id.items()
+        if provider_set_id not in prefix_override_by_id
+    )
+    return _V4NpiSourceMetadata(
+        provider_set_key_by_id,
+        provider_count_by_id,
+        prefix_override_by_id,
+        ordinary_provider_set_keys,
+    )
+
+
+async def _load_v4_npi_group_sources(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_ids: tuple[str, ...],
+) -> _V4NpiGroupSources:
+    """Load the compact relation owners needed by bounded provider serving."""
+
+    snapshot_key = _required_shared_snapshot_key(serving_tables)
+    metadata_by_id = await _provider_set_metadata_for_ids(
+        session,
+        serving_tables,
+        provider_set_ids,
+    )
+    source_metadata = _v4_npi_source_metadata(
+        metadata_by_id,
+        provider_set_ids,
+    )
+    root = await load_v4_graph_root(
+        session,
+        snapshot_key,
+        schema_name=PTG2_SCHEMA,
+    )
+    pattern_keys_by_set: Mapping[int, tuple[int, ...]] | None = None
+    component_keys_by_set: Mapping[int, tuple[int, ...]] = {}
+    if (
+        root.representation == "pattern_v1"
+        and source_metadata.ordinary_provider_set_keys
+    ):
+        hot_limits = _v4_hot_prefix_limits(serving_tables)
+        group_sources = await _load_v4_pattern_set_group_sources(
+            session,
+            snapshot_key=snapshot_key,
+            provider_set_keys=source_metadata.ordinary_provider_set_keys,
+            maximum_pattern_degree=hot_limits.maximum_patterns_per_set,
+            maximum_component_degree=(
+                hot_limits.maximum_components_per_fallback_set
+            ),
+        )
+        pattern_keys_by_set = group_sources.pattern_keys_by_set
+        component_keys_by_set = group_sources.component_keys_by_set
+    return _V4NpiGroupSources(
+        provider_set_key_by_id=source_metadata.provider_set_key_by_id,
+        provider_count_by_id=source_metadata.provider_count_by_id,
+        prefix_override_by_id=source_metadata.prefix_override_by_id,
+        pattern_keys_by_set=pattern_keys_by_set,
+        component_keys_by_set=component_keys_by_set,
+    )
+
+
+def _v4_npi_targets_by_set(
+    sources: _V4NpiGroupSources,
+    requested_limit: int,
+) -> dict[str, int]:
+    """Bound each graph walk by its audited exact provider-set cardinality."""
+
+    if set(sources.provider_count_by_id) != set(
+        sources.provider_set_key_by_id
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 provider counts are incomplete"
+        )
+    normalized_counts_by_id: dict[str, int] = {}
+    for provider_set_id, provider_count in sources.provider_count_by_id.items():
+        normalized_count = int(provider_count)
+        if normalized_count < 0:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 provider count is negative"
+            )
+        normalized_counts_by_id[provider_set_id] = normalized_count
+    return {
+        provider_set_id: min(
+            int(requested_limit),
+            normalized_counts_by_id[provider_set_id],
+        )
+        for provider_set_id in sources.provider_set_key_by_id
+    }
+
+
+def _v4_group_source_scopes(
+    group_sources: _V4NpiGroupSources,
+    active_provider_set_ids: tuple[str, ...],
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Choose direct, pattern, and component owners for one prefix round."""
+
+    if group_sources.pattern_keys_by_set is None:
+        return (
+            (
+                "set_groups_direct",
+                tuple(
+                    group_sources.provider_set_key_by_id[provider_set_id]
+                    for provider_set_id in active_provider_set_ids
+                ),
+            ),
+        )
+    scopes: list[tuple[str, tuple[int, ...]]] = []
+    pattern_keys = tuple(
+        sorted(
+            {
+                int(pattern_key)
+                for provider_set_id in active_provider_set_ids
+                for pattern_key in group_sources.pattern_keys_by_set.get(
+                    group_sources.provider_set_key_by_id[provider_set_id],
+                    (),
+                )
+            }
+        )
+    )
+    if pattern_keys:
+        scopes.append(("pattern_groups", pattern_keys))
+    component_keys = tuple(
+        sorted(
+            {
+                int(component_key)
+                for provider_set_id in active_provider_set_ids
+                for component_key in group_sources.component_keys_by_set.get(
+                    group_sources.provider_set_key_by_id[provider_set_id],
+                    (),
+                )
+            }
+        )
+    )
+    if component_keys:
+        scopes.append(("component_groups", component_keys))
+    return tuple(scopes)
+
+
+def _v4_group_prefix_for_set(
+    group_sources: _V4NpiGroupSources,
+    provider_set_id: str,
+    group_keys_by_relation: Mapping[str, Mapping[int, tuple[int, ...]]],
+    prefix_size: int,
+) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    provider_set_key = group_sources.provider_set_key_by_id[provider_set_id]
+    if group_sources.pattern_keys_by_set is None:
+        groups_by_source = group_keys_by_relation.get("set_groups_direct", {})
+        source_prefixes = (groups_by_source.get(provider_set_key, ()),)
+        return source_prefixes[0], source_prefixes
+    if provider_set_key in group_sources.component_keys_by_set:
+        groups_by_source = group_keys_by_relation.get("component_groups", {})
+        source_prefixes = tuple(
+            groups_by_source.get(int(component_key), ())
+            for component_key in group_sources.component_keys_by_set[
+                provider_set_key
+            ]
+        )
+    else:
+        groups_by_source = group_keys_by_relation.get("pattern_groups", {})
+        source_prefixes = tuple(
+            groups_by_source.get(int(pattern_key), ())
+            for pattern_key in group_sources.pattern_keys_by_set.get(
+                provider_set_key,
+                (),
+            )
+        )
+    return (
+        _merge_sorted_group_keys(source_prefixes, prefix_size),
+        source_prefixes,
+    )
+
+
+async def _read_v4_group_prefixes(
+    session,
+    snapshot_key: int,
+    group_sources: _V4NpiGroupSources,
+    active_provider_set_ids: tuple[str, ...],
+    prefix_size: int,
+) -> _V4GroupPrefixRound:
+    """Read and merge one bounded group window for every active set."""
+
+    source_scopes = _v4_group_source_scopes(
+        group_sources,
+        active_provider_set_ids,
+    )
+    group_keys_by_relation: dict[
+        str, Mapping[int, tuple[int, ...]]
+    ] = {}
+    for source_relation, source_owner_keys in source_scopes:
+        group_keys_by_source = await lookup_v4_relation_member_prefixes(
+            session,
+            snapshot_key=snapshot_key,
+            relation=source_relation,
+            owner_keys=source_owner_keys,
+            schema_name=PTG2_SCHEMA,
+            limit_per_owner=prefix_size,
+        )
+        if set(group_keys_by_source) != set(source_owner_keys):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 provider-group relation is incomplete"
+            )
+        group_keys_by_relation[source_relation] = group_keys_by_source
+    group_keys_by_set: dict[str, tuple[int, ...]] = {}
+    is_complete_by_set: dict[str, bool] = {}
+    for provider_set_id in active_provider_set_ids:
+        group_keys, source_prefixes = _v4_group_prefix_for_set(
+            group_sources,
+            provider_set_id,
+            group_keys_by_relation,
+            prefix_size,
+        )
+        group_keys_by_set[provider_set_id] = group_keys
+        is_complete_by_set[provider_set_id] = _is_v4_group_prefix_complete(
+            group_keys,
+            source_prefixes,
+            prefix_size,
+        )
+    return _V4GroupPrefixRound(group_keys_by_set, is_complete_by_set)
+
+
+def _index_new_v4_groups(
+    prefix_round: _V4GroupPrefixRound,
+    state: _V4NpiPrefixState,
+) -> dict[int, list[str]]:
+    """Index only newly exposed groups while enforcing stable prefix growth."""
+
+    provider_set_ids_by_group: dict[int, list[str]] = defaultdict(list)
+    for provider_set_id, group_keys in prefix_round.group_keys_by_set.items():
+        previous_group_keys = state.group_keys_by_set[provider_set_id]
+        if group_keys[: len(previous_group_keys)] != previous_group_keys:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 provider-group prefix changed"
+            )
+        for group_key in group_keys[len(previous_group_keys) :]:
+            provider_set_ids_by_group[int(group_key)].append(provider_set_id)
+        state.group_keys_by_set[provider_set_id] = group_keys
+    return provider_set_ids_by_group
+
+
+def _append_v4_group_npis(
+    state: _V4NpiPrefixState,
+    group_npi_keys: tuple[int, ...],
+    provider_set_ids: Iterable[str],
+    target_count_by_set: Mapping[str, int],
+) -> None:
+    """Append one group's ordered NPIs to every still-active owner."""
+
+    for provider_set_id in provider_set_ids:
+        if provider_set_id in state.completed_provider_set_ids:
+            continue
+        selected_npi_keys = state.selected_npi_keys_by_set[provider_set_id]
+        seen_npi_keys = state.seen_npi_keys_by_set[provider_set_id]
+        target_count = target_count_by_set[provider_set_id]
+        for npi_key in group_npi_keys:
+            normalized_npi_key = int(npi_key)
+            if normalized_npi_key in seen_npi_keys:
+                continue
+            seen_npi_keys.add(normalized_npi_key)
+            selected_npi_keys.append(normalized_npi_key)
+            if len(selected_npi_keys) >= target_count:
+                state.completed_provider_set_ids.add(provider_set_id)
+                break
+
+
+def _active_v4_group_batch(
+    ordered_group_keys: tuple[int, ...],
+    batch_start: int,
+    batch_size: int,
+    provider_set_ids_by_group: Mapping[int, list[str]],
+    state: _V4NpiPrefixState,
+) -> tuple[int, ...]:
+    return tuple(
+        group_key
+        for group_key in ordered_group_keys[
+            batch_start : batch_start + batch_size
+        ]
+        if any(
+            provider_set_id not in state.completed_provider_set_ids
+            for provider_set_id in provider_set_ids_by_group[group_key]
+        )
+    )
+
+
+def _v4_group_batch_member_limit(
+    group_batch_keys: tuple[int, ...],
+    provider_set_ids_by_group: Mapping[int, list[str]],
+    state: _V4NpiPrefixState,
+    target_count_by_set: Mapping[str, int],
+) -> int:
+    active_provider_set_ids = {
+        provider_set_id
+        for group_key in group_batch_keys
+        for provider_set_id in provider_set_ids_by_group[group_key]
+        if provider_set_id not in state.completed_provider_set_ids
+    }
+    return max(
+        target_count_by_set[provider_set_id]
+        for provider_set_id in active_provider_set_ids
+    )
+
+
+async def _collect_v4_npi_batches(
+    session,
+    snapshot_key: int,
+    provider_set_ids_by_group: Mapping[int, list[str]],
+    state: _V4NpiPrefixState,
+    target_count_by_set: Mapping[str, int],
+    maximum_batch_size: int,
+) -> None:
+    """Read small group batches until each owner has its exact NPI prefix."""
+
+    ordered_group_keys = tuple(sorted(provider_set_ids_by_group))
+    batch_size = _v4_npi_batch_size(
+        provider_set_ids_by_group,
+        state,
+        target_count_by_set,
+        maximum_batch_size,
+    )
+    for batch_start in range(
+        0,
+        len(ordered_group_keys),
+        batch_size,
+    ):
+        group_batch_keys = _active_v4_group_batch(
+            ordered_group_keys,
+            batch_start,
+            batch_size,
+            provider_set_ids_by_group,
+            state,
+        )
+        if not group_batch_keys:
+            continue
+        group_member_limit = _v4_group_batch_member_limit(
+            group_batch_keys,
+            provider_set_ids_by_group,
+            state,
+            target_count_by_set,
+        )
+        # Every group owner is sorted and unique. While a set still has fewer
+        # than L selected NPIs, that group's first L members either supply
+        # enough non-duplicates to reach L or prove the group is exhausted;
+        # no later member can be needed for this bounded prefix.
+        npi_keys_by_group = await lookup_v4_relation_member_prefixes(
+            session,
+            snapshot_key=snapshot_key,
+            relation="group_npis_exact",
+            owner_keys=group_batch_keys,
+            schema_name=PTG2_SCHEMA,
+            limit_per_owner=group_member_limit,
+        )
+        if set(npi_keys_by_group) != set(group_batch_keys):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 group-NPI relation is incomplete"
+            )
+        for group_key in group_batch_keys:
+            _append_v4_group_npis(
+                state,
+                npi_keys_by_group[group_key],
+                provider_set_ids_by_group[group_key],
+                target_count_by_set,
+            )
+
+
+def _v4_npi_batch_size(
+    provider_set_ids_by_group: Mapping[int, list[str]],
+    state: _V4NpiPrefixState,
+    target_count_by_set: Mapping[str, int],
+    maximum_batch_size: int,
+) -> int:
+    active_targets = tuple(
+        int(target_count_by_set[provider_set_id])
+        for provider_set_ids in provider_set_ids_by_group.values()
+        for provider_set_id in provider_set_ids
+        if provider_set_id not in state.completed_provider_set_ids
+    )
+    return max(
+        1,
+        min(
+            int(maximum_batch_size),
+            max(active_targets, default=1),
+        ),
+    )
+
+
+def _mark_v4_prefix_completion(
+    prefix_round: _V4GroupPrefixRound,
+    state: _V4NpiPrefixState,
+    target_count_by_set: Mapping[str, int],
+) -> None:
+    for provider_set_id, is_complete in prefix_round.is_complete_by_set.items():
+        selected_count = len(state.selected_npi_keys_by_set[provider_set_id])
+        target_count = target_count_by_set[provider_set_id]
+        if selected_count >= target_count:
+            state.completed_provider_set_ids.add(provider_set_id)
+        elif is_complete:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 provider count exceeds exact graph membership"
+            )
+
+
+def _bounded_v4_prefix_round(
+    raw_prefix_round: _V4GroupPrefixRound,
+    group_limit: int,
+) -> _V4GroupPrefixRound:
+    return _V4GroupPrefixRound(
+        group_keys_by_set={
+            provider_set_id: group_keys[:group_limit]
+            for provider_set_id, group_keys in (
+                raw_prefix_round.group_keys_by_set.items()
+            )
+        },
+        is_complete_by_set={
+            provider_set_id: (
+                raw_prefix_round.is_complete_by_set[provider_set_id]
+                and len(group_keys) <= group_limit
+            )
+            for provider_set_id, group_keys in (
+                raw_prefix_round.group_keys_by_set.items()
+            )
+        },
+    )
+
+
+async def _walk_v4_npi_prefixes(
+    session,
+    snapshot_key: int,
+    group_sources: _V4NpiGroupSources,
+    provider_set_ids: tuple[str, ...],
+    target_count_by_set: Mapping[str, int],
+    state: _V4NpiPrefixState,
+    group_work_limit: int,
+    maximum_batch_size: int,
+) -> None:
+    """Walk each ordinary set once within its sealed group-work limit."""
+
+    state.completed_provider_set_ids.update(
+        provider_set_id
+        for provider_set_id, target_count in target_count_by_set.items()
+        if target_count == 0
+    )
+    active_provider_set_ids = state.active_provider_set_ids(provider_set_ids)
+    if not active_provider_set_ids:
+        return
+    normalized_group_limit = int(group_work_limit)
+    if normalized_group_limit <= 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 hot group-work limit must be positive"
+        )
+    raw_prefix_round = await _read_v4_group_prefixes(
+        session,
+        snapshot_key,
+        group_sources,
+        active_provider_set_ids,
+        normalized_group_limit + 1,
+    )
+    prefix_round = _bounded_v4_prefix_round(
+        raw_prefix_round,
+        normalized_group_limit,
+    )
+    provider_set_ids_by_group = _index_new_v4_groups(
+        prefix_round,
+        state,
+    )
+    await _collect_v4_npi_batches(
+        session,
+        snapshot_key,
+        provider_set_ids_by_group,
+        state,
+        target_count_by_set,
+        maximum_batch_size,
+    )
+    _mark_v4_prefix_completion(
+        prefix_round,
+        state,
+        target_count_by_set,
+    )
+    if state.active_provider_set_ids(provider_set_ids):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 hot provider traversal exceeds its sealed group-work limit"
+        )
+
+
+async def _resolve_v4_npi_member_ids(
+    session,
+    snapshot_key: int,
+    provider_set_ids: tuple[str, ...],
+    state: _V4NpiPrefixState,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve dense keys only after bounded graph traversal completes."""
+
+    selected_npi_keys = {
+        npi_key
+        for provider_set_npi_keys in state.selected_npi_keys_by_set.values()
+        for npi_key in provider_set_npi_keys
+    }
+    npi_by_key = await v4_npi_values_for_keys(
+        session,
+        snapshot_key=snapshot_key,
+        npi_keys=selected_npi_keys,
+        schema_name=PTG2_SCHEMA,
+    )
+    if set(npi_by_key) != selected_npi_keys:
+        raise PTG2ManifestArtifactError("PTG2 V4 NPI dictionary is incomplete")
+    return {
+        provider_set_id: tuple(
+            _ptg2_npi_member_id(npi_by_key[npi_key])
+            for npi_key in state.selected_npi_keys_by_set[provider_set_id]
+        )
+        for provider_set_id in provider_set_ids
+    }
+
+
+def _v4_source_scope(
+    hot_limits: _V4HotPrefixLimits,
+    provider_set_count: int,
+):
+    request_set_count = max(int(provider_set_count), 1)
+    return v4_graph_hot_source_scope(
+        maximum_owners=(
+            hot_limits.maximum_source_owners_per_set * request_set_count
+        ),
+        maximum_members=(
+            hot_limits.maximum_source_members_per_set * request_set_count
+        ),
+        maximum_pages=(
+            hot_limits.maximum_source_pages_per_set * request_set_count
+        ),
+        maximum_bytes=(
+            hot_limits.maximum_source_bytes_per_set * request_set_count
+        ),
+    )
+
+
+def _v4_npi_scope(
+    hot_limits: _V4HotPrefixLimits,
+    provider_set_count: int,
+):
+    request_set_count = max(int(provider_set_count), 1)
+    return v4_graph_hot_npi_scope(
+        maximum_members=(
+            hot_limits.maximum_group_npi_members_per_set * request_set_count
+        ),
+        maximum_locator_pages=(
+            hot_limits.maximum_group_npi_locator_pages_per_set
+            * request_set_count
+        ),
+        maximum_member_pages=(
+            hot_limits.maximum_group_npi_member_pages_per_set
+            * request_set_count
+        ),
+        maximum_bytes=(
+            hot_limits.maximum_group_npi_bytes_per_set * request_set_count
+        ),
+        maximum_batches=(
+            hot_limits.maximum_group_npi_batches_per_set * request_set_count
+        ),
+    )
+
+
+async def _v4_npi_prefixes_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_ids: tuple[str, ...],
+    *,
+    limit_per_set: int,
+) -> dict[str, tuple[str, ...]]:
+    """Read exact group-first NPI prefixes without expanding complete V4 sets."""
+
+    requested_limit = max(int(limit_per_set), 1)
+    hot_limits = _v4_hot_prefix_limits(serving_tables)
+    if requested_limit > hot_limits.target:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 hot prefix request exceeds its sealed target"
+        )
+    snapshot_key = _required_shared_snapshot_key(serving_tables)
+    state = _V4NpiPrefixState.for_provider_sets(provider_set_ids)
+    with v4_graph_request_scope():
+        record_v4_hot_prefix_request()
+        with _v4_source_scope(
+            hot_limits,
+            len(provider_set_ids),
+        ), _v4_npi_scope(hot_limits, len(provider_set_ids)):
+            group_sources = await _load_v4_npi_group_sources(
+                session,
+                serving_tables,
+                provider_set_ids,
+            )
+            target_count_by_set = _v4_npi_targets_by_set(
+                group_sources,
+                requested_limit,
+            )
+            await _apply_v4_npi_prefix_overrides(
+                session,
+                snapshot_key,
+                group_sources,
+                target_count_by_set,
+                state,
+                hot_limits.target,
+            )
+            await _walk_v4_npi_prefixes(
+                session,
+                snapshot_key,
+                group_sources,
+                provider_set_ids,
+                target_count_by_set,
+                state,
+                hot_limits.maximum_group_keys_per_set,
+                hot_limits.group_npi_batch_size,
+            )
+            return await _resolve_v4_npi_member_ids(
+                session,
+                snapshot_key,
+                provider_set_ids,
+                state,
+            )
 
 
 async def _limited_graph_member_ids_by_set(
@@ -6045,6 +7946,21 @@ def _membership_knn_order_sql(
     return _ptg2_geo_knn_meters_sql("addr.lat", "addr.long")
 
 
+def _ptg2_npi_scope_table(
+    serving_tables: PTG2ServingTables,
+    *,
+    schema_name: str = PTG2_SCHEMA,
+) -> str:
+    """Choose the generation-local NPI dictionary without duplicating V4 rows."""
+
+    table_name = (
+        "ptg2_v4_npi_scope"
+        if bool(getattr(serving_tables, "uses_v4_graph", False))
+        else "ptg2_v3_npi_scope"
+    )
+    return f"{schema_name}.{table_name}"
+
+
 async def _membership_location_query(
     session,
     serving_tables: PTG2ServingTables,
@@ -6056,7 +7972,7 @@ async def _membership_location_query(
 ) -> _MembershipLocationQuery | None:
     """Build one bounded address lookup against immutable snapshot membership."""
     _require_strict_shared_v3(serving_tables)
-    provider_npi_scope_table = f"{PTG2_SCHEMA}.ptg2_v3_npi_scope"
+    provider_npi_scope_table = _ptg2_npi_scope_table(serving_tables)
     has_geo_filter = args.get("lat") not in (None, "", "null") or args.get("long") not in (None, "", "null")
     address_table = await _ptg2_address_serving_table(
         session,
@@ -6222,6 +8138,19 @@ async def _shared_provider_set_keys_by_npi(
     )
     if not normalized_npis or not allowed_provider_set_keys:
         return {}
+    if serving_tables.uses_v4_graph:
+        return {
+            npi: set(provider_set_keys)
+            for npi, provider_set_keys in (
+                await _v4_sets_by_npi(
+                    session,
+                    serving_tables,
+                    normalized_npis,
+                    allowed_provider_set_keys=allowed_provider_set_keys,
+                )
+            ).items()
+            if provider_set_keys
+        }
     shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
     group_keys_by_npi = await lookup_shared_graph_members_from_db(
         session,
@@ -6694,6 +8623,37 @@ async def _version_three_explicit_npi_graph_scope(
     requested_npi = _normalize_npi(args.get("npi"))
     if requested_npi is None:
         return None
+    if serving_tables.uses_v4_graph:
+        allowed_provider_set_keys: frozenset[int] | None = None
+        requested_plan_code = _ptg2_manifest_plan_code_values(dict(args))
+        if requested_plan_code is not None:
+            requested_plan, requested_system, requested_code = requested_plan_code
+            allowed_provider_set_keys = frozenset(
+                await _shared_rate_provider_set_keys(
+                    session,
+                    serving_tables,
+                    plan_id=requested_plan,
+                    plan_market_type=str(
+                        args.get("plan_market_type")
+                        or args.get("market_type")
+                        or ""
+                    ),
+                    reported_code=requested_code,
+                    code_system=requested_system,
+                )
+            )
+            if not allowed_provider_set_keys:
+                return _ExplicitNpiGraphScope(requested_npi, ())
+        provider_set_keys_by_npi = await _v4_sets_by_npi(
+            session,
+            serving_tables,
+            (requested_npi,),
+            allowed_provider_set_keys=allowed_provider_set_keys,
+        )
+        return _ExplicitNpiGraphScope(
+            requested_npi,
+            provider_set_keys_by_npi.get(requested_npi, ()),
+        )
     shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
     group_keys_by_npi = await lookup_shared_graph_members_from_db(
         session,
@@ -7053,6 +9013,26 @@ async def _provider_sets_from_membership_graph(
     """Resolve reverse NPI membership from the strict shared graph."""
 
     _require_strict_shared_v3(serving_tables)
+    if serving_tables.uses_v4_graph:
+        provider_set_keys_by_npi = await _v4_sets_by_npi(
+            session,
+            serving_tables,
+            (npi,),
+        )
+        provider_set_keys = provider_set_keys_by_npi.get(int(npi), ())
+        provider_set_id_by_key = await _provider_set_ids_for_keys(
+            session,
+            serving_tables,
+            provider_set_keys,
+        )
+        if set(provider_set_id_by_key) != set(provider_set_keys):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 graph references a missing provider-set dictionary key"
+            )
+        return tuple(
+            provider_set_id_by_key[provider_set_key]
+            for provider_set_key in provider_set_keys
+        )
     group_ids = await _shared_graph_members_for_id(
         session,
         serving_tables,
@@ -7131,6 +9111,23 @@ def _provider_expansion_selection_cache_key(
         bool(descending),
         selection_signature,
     )
+
+
+def _cache_provider_expansion_selection(
+    cache_key: tuple[int, str, int, bool, str] | None,
+    selection: _ProviderExpansionSelection,
+) -> None:
+    """Retain one sealed-snapshot expansion proof under the bounded LRU."""
+
+    if cache_key is None:
+        return
+    _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE[cache_key] = deepcopy(selection)
+    _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.move_to_end(cache_key)
+    while (
+        len(_PTG2_PROVIDER_EXPANSION_SELECTION_CACHE)
+        > _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_ENTRIES
+    ):
+        _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.popitem(last=False)
 
 
 def _provider_expansion_key(
@@ -7395,11 +9392,53 @@ async def _provider_set_ids_for_selected_npis(
     session,
     serving_tables: PTG2ServingTables,
     npis: tuple[int, ...],
+    *,
+    allowed_provider_set_keys: frozenset[int] | None = None,
 ) -> dict[int, tuple[str, ...]]:
     """Resolve provider-set memberships for selected NPIs with sealed caching."""
 
     if not npis:
         return {}
+    normalized_allowed_keys = (
+        None
+        if allowed_provider_set_keys is None
+        else frozenset(
+            int(provider_set_key)
+            for provider_set_key in allowed_provider_set_keys
+        )
+    )
+    if serving_tables.uses_v4_graph and normalized_allowed_keys is not None:
+        if not normalized_allowed_keys:
+            return {npi: () for npi in npis}
+        scoped_keys_by_npi = await _v4_sets_by_npi(
+            session,
+            serving_tables,
+            npis,
+            allowed_provider_set_keys=normalized_allowed_keys,
+        )
+        referenced_keys = {
+            int(provider_set_key)
+            for provider_set_keys in scoped_keys_by_npi.values()
+            for provider_set_key in provider_set_keys
+        }
+        provider_set_id_by_key = await _provider_set_ids_for_keys(
+            session,
+            serving_tables,
+            referenced_keys,
+        )
+        if set(provider_set_id_by_key) != referenced_keys:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 graph references a missing provider-set dictionary key"
+            )
+        # Scoped membership is specific to this CPT/rate set. It must never
+        # satisfy the snapshot-wide reverse-membership cache.
+        return {
+            npi: tuple(
+                provider_set_id_by_key[provider_set_key]
+                for provider_set_key in scoped_keys_by_npi.get(npi, ())
+            )
+            for npi in npis
+        }
     shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
     provider_set_ids_by_npi, uncached_npis = (
         _cached_provider_set_ids_for_npis(
@@ -7408,6 +9447,39 @@ async def _provider_set_ids_for_selected_npis(
         )
     )
     if not uncached_npis:
+        return provider_set_ids_by_npi
+    if serving_tables.uses_v4_graph:
+        provider_set_keys_by_npi = await _v4_sets_by_npi(
+            session,
+            serving_tables,
+            uncached_npis,
+        )
+        all_provider_set_keys = {
+            int(provider_set_key)
+            for provider_set_keys in provider_set_keys_by_npi.values()
+            for provider_set_key in provider_set_keys
+        }
+        provider_set_id_by_key = await _provider_set_ids_for_keys(
+            session,
+            serving_tables,
+            all_provider_set_keys,
+        )
+        if set(provider_set_id_by_key) != all_provider_set_keys:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 graph references a missing provider-set dictionary key"
+            )
+        resolved_provider_set_ids_by_npi = {
+            npi: tuple(
+                provider_set_id_by_key[provider_set_key]
+                for provider_set_key in provider_set_keys_by_npi.get(npi, ())
+            )
+            for npi in uncached_npis
+        }
+        provider_set_ids_by_npi.update(resolved_provider_set_ids_by_npi)
+        _cache_provider_set_ids_for_npis(
+            shared_snapshot_key,
+            resolved_provider_set_ids_by_npi,
+        )
         return provider_set_ids_by_npi
     member_id_by_npi = {
         npi: _ptg2_npi_member_id(npi)
@@ -7555,6 +9627,826 @@ async def _exact_npi_provider_rows_by_set(
     )
 
 
+@dataclass(frozen=True)
+class _V4ProviderExpansionRequestCaps:
+    """Aggregate hot-work ceilings for one provider-expanded CPT request."""
+
+    rate_page_rows: int
+    maximum_rate_rows: int
+    maximum_provider_sets: int
+    maximum_graph_batches: int
+
+
+def _v4_provider_expansion_request_caps(
+    serving_tables: PTG2ServingTables,
+    *,
+    target_count: int,
+) -> _V4ProviderExpansionRequestCaps:
+    """Combine sealed per-set graph limits with aggregate request limits."""
+
+    sealed_hot_limits = _v4_hot_prefix_limits(serving_tables)
+    if max(int(target_count), 1) > sealed_hot_limits.target:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 provider expansion exceeds the sealed hot-prefix target; "
+            "an explicit exact cold request is required"
+        )
+    return _V4ProviderExpansionRequestCaps(
+        rate_page_rows=sealed_hot_limits.provider_expansion_rate_page_rows,
+        maximum_rate_rows=(
+            sealed_hot_limits.maximum_provider_expansion_rate_rows
+        ),
+        maximum_provider_sets=(
+            sealed_hot_limits.maximum_provider_expansion_provider_sets
+        ),
+        maximum_graph_batches=(
+            sealed_hot_limits.maximum_provider_expansion_graph_batches
+        ),
+    )
+
+
+@dataclass
+class _V4ProviderExpansionBudget:
+    """Track only rate rows and provider sets actually visited by this request."""
+
+    caps: _V4ProviderExpansionRequestCaps
+    rate_rows: int = 0
+    graph_batches: int = 0
+    provider_set_ids: set[str] = field(default_factory=set)
+
+    @property
+    def remaining_rate_rows(self) -> int:
+        """Return the sealed logical-rate capacity left in this request."""
+
+        return max(self.caps.maximum_rate_rows - self.rate_rows, 0)
+
+    def require_rate_capacity(self, row_count: int) -> None:
+        """Fail before a logical read that cannot fit the sealed request cap."""
+
+        if max(int(row_count), 0) > self.remaining_rate_rows:
+            record_v4_provider_expansion_work(rejections=1)
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 hot provider expansion exceeded its rate-row cap; "
+                "an explicit exact cold request is required"
+            )
+
+    def charge_rate_rows(self, row_count: int) -> None:
+        """Charge every logical rate row returned by one physical page."""
+
+        normalized_count = max(int(row_count), 0)
+        self.require_rate_capacity(normalized_count)
+        self.rate_rows += normalized_count
+        record_v4_provider_expansion_work(rate_rows=normalized_count)
+
+    def require_graph_batch_capacity(self) -> None:
+        """Fail before a graph traversal that exceeds the sealed batch cap."""
+
+        if self.graph_batches >= self.caps.maximum_graph_batches:
+            record_v4_provider_expansion_work(rejections=1)
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 hot provider expansion exceeded its graph-batch cap; "
+                "an explicit exact cold request is required"
+            )
+
+    def charge_provider_set_batch(
+        self,
+        provider_set_ids: tuple[str, ...],
+    ) -> None:
+        """Charge one graph batch containing only first-seen provider sets."""
+
+        if not provider_set_ids or any(
+            provider_set_id in self.provider_set_ids
+            for provider_set_id in provider_set_ids
+        ):
+            record_v4_provider_expansion_work(rejections=1)
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 provider expansion graph batch is empty or repeated"
+            )
+        if (
+            len(self.provider_set_ids) + len(provider_set_ids)
+            > self.caps.maximum_provider_sets
+        ):
+            record_v4_provider_expansion_work(rejections=1)
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 hot provider expansion exceeded its distinct-provider-set "
+                "cap; an explicit exact cold request is required"
+            )
+        self.require_graph_batch_capacity()
+        self.provider_set_ids.update(provider_set_ids)
+        self.graph_batches += 1
+        record_v4_provider_expansion_work(
+            provider_sets=len(provider_set_ids),
+            graph_batches=1,
+        )
+
+    def charge_completion_provider_sets(
+        self,
+        provider_set_ids: tuple[str, ...],
+    ) -> None:
+        """Charge one scoped reverse traversal and its exact set union."""
+
+        normalized_provider_set_ids = set(provider_set_ids)
+        if not normalized_provider_set_ids:
+            record_v4_provider_expansion_work(rejections=1)
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 provider completion returned no provider sets"
+            )
+        if (
+            len(self.provider_set_ids | normalized_provider_set_ids)
+            > self.caps.maximum_provider_sets
+        ):
+            record_v4_provider_expansion_work(rejections=1)
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 hot provider expansion exceeded its distinct-provider-set "
+                "cap; an explicit exact cold request is required"
+            )
+        self.require_graph_batch_capacity()
+        new_provider_set_count = len(
+            normalized_provider_set_ids - self.provider_set_ids
+        )
+        self.provider_set_ids.update(normalized_provider_set_ids)
+        self.graph_batches += 1
+        record_v4_provider_expansion_work(
+            provider_sets=new_provider_set_count,
+            graph_batches=1,
+        )
+
+
+@dataclass
+class _IncrementalProviderExpansionState:
+    """Ordered distinct provider keys proven by an incremental rate prefix."""
+
+    target_count: int
+    row_data: list[dict[str, Any]] = field(default_factory=list)
+    npis_by_set: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    rank_by_key: dict[_ProviderExpansionKey, int] = field(default_factory=dict)
+    selected_npis: dict[int, None] = field(default_factory=dict)
+    selected_provider_set_ids: dict[str, None] = field(default_factory=dict)
+
+    @property
+    def is_full(self) -> bool:
+        """Return true once the requested ordered distinct prefix is proven."""
+
+        return len(self.rank_by_key) >= self.target_count
+
+    def provider_set_id(self, serving_row: Mapping[str, Any]) -> str:
+        """Read the authenticated provider-set identity for one rate row."""
+
+        provider_set_id = _ptg2_manifest_id(
+            serving_row.get("provider_set_global_id_128")
+        )
+        if not provider_set_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 strict V3 rate is missing its provider-set identity"
+            )
+        return provider_set_id
+
+    def append_rate_row(self, serving_row: dict[str, Any]) -> None:
+        """Append one ordered row and any new provider expansion keys it proves."""
+
+        provider_set_id = self.provider_set_id(serving_row)
+        if provider_set_id not in self.npis_by_set:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 provider expansion used an unvisited provider set"
+            )
+        self.row_data.append(serving_row)
+        provider_npis = self.npis_by_set[provider_set_id]
+        candidates: tuple[int | None, ...] = provider_npis or (None,)
+        for npi in candidates:
+            expansion_key = _provider_expansion_key(serving_row, npi=npi)
+            if expansion_key in self.rank_by_key:
+                continue
+            self.rank_by_key[expansion_key] = len(self.rank_by_key)
+            self.selected_provider_set_ids[provider_set_id] = None
+            if npi is not None:
+                self.selected_npis[int(npi)] = None
+            if self.is_full:
+                break
+
+
+def _incremental_provider_set_ids_by_npi(
+    state: _IncrementalProviderExpansionState,
+) -> dict[int, tuple[str, ...]]:
+    """Invert only memoized visited sets for selected provider NPIs."""
+
+    return {
+        npi: tuple(
+            provider_set_id
+            for provider_set_id, provider_npis in state.npis_by_set.items()
+            if npi in provider_npis
+        )
+        for npi in state.selected_npis
+    }
+
+
+@dataclass(frozen=True)
+class _IncrementalProviderExpansionRequest:
+    """Immutable ordered-rate inputs for one V4 expansion proof."""
+
+    code_rows: list[Mapping[str, Any]]
+    args: Mapping[str, Any]
+    snapshot_id: str
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    target_count: int
+    descending: bool
+    declared_rate_count: int
+
+
+@dataclass(frozen=True)
+class _IncrementalProviderCompletionScope:
+    """Exact selected-NPI memberships and rate work for one CPT scope."""
+
+    provider_set_ids_by_npi: dict[int, tuple[str, ...]]
+    provider_set_keys: frozenset[int]
+    rate_row_count: int
+
+
+def _incremental_selected_provider_set_keys(
+    state: _IncrementalProviderExpansionState,
+) -> dict[str, int]:
+    """Recover authenticated dense keys for selected NPI-free rank rows."""
+
+    provider_set_key_by_id: dict[str, int] = {}
+    for serving_row in state.row_data:
+        provider_set_id = state.provider_set_id(serving_row)
+        if provider_set_id not in state.selected_provider_set_ids:
+            continue
+        raw_provider_set_key = serving_row.get("_ptg_provider_set_key")
+        if isinstance(raw_provider_set_key, bool):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 completion row has an invalid provider-set key"
+            )
+        try:
+            provider_set_key = int(raw_provider_set_key)
+        except (TypeError, ValueError) as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 completion row is missing its provider-set key"
+            ) from exc
+        existing_key = provider_set_key_by_id.setdefault(
+            provider_set_id,
+            provider_set_key,
+        )
+        if existing_key != provider_set_key:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 completion rows disagree on provider-set identity"
+            )
+    if set(provider_set_key_by_id) != set(state.selected_provider_set_ids):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 completion is missing a selected provider-set key"
+        )
+    return provider_set_key_by_id
+
+
+def _incremental_code_scope_provider_set_keys(
+    code_scope_entries: Iterable[Any],
+) -> tuple[int, ...]:
+    """Validate compact CPT entries while retaining occurrence cardinality."""
+
+    provider_set_keys: list[int] = []
+    for code_scope_entry in code_scope_entries:
+        raw_provider_set_key = getattr(
+            code_scope_entry,
+            "provider_set_key",
+            None,
+        )
+        if isinstance(raw_provider_set_key, bool):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 compact code scope has an invalid provider-set key"
+            )
+        try:
+            provider_set_keys.append(int(raw_provider_set_key))
+        except (TypeError, ValueError) as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 compact code scope is missing a provider-set key"
+            ) from exc
+    if not provider_set_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 code scope is missing its provider sets"
+        )
+    return tuple(provider_set_keys)
+
+
+def _validate_incremental_completion_memberships(
+    state: _IncrementalProviderExpansionState,
+    provider_set_ids_by_npi: Mapping[int, tuple[str, ...]],
+) -> None:
+    """Require scoped reverse membership to include every ranked witness."""
+
+    visited_provider_set_ids_by_npi = (
+        _incremental_provider_set_ids_by_npi(state)
+    )
+    if any(
+        not set(visited_provider_set_ids).issubset(
+            provider_set_ids_by_npi.get(npi, ())
+        )
+        for npi, visited_provider_set_ids in (
+            visited_provider_set_ids_by_npi.items()
+        )
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 scoped NPI completion is missing a ranked membership"
+        )
+
+
+async def _incremental_completion_keys_by_npi(
+    session,
+    serving_tables: PTG2ServingTables,
+    state: _IncrementalProviderExpansionState,
+    allowed_provider_set_keys: frozenset[int],
+    budget: _V4ProviderExpansionBudget,
+) -> dict[int, tuple[int, ...]]:
+    """Intersect selected NPI memberships with the exact compact CPT scope."""
+
+    budget.require_graph_batch_capacity()
+    selected_npis = tuple(state.selected_npis)
+    provider_set_keys_by_npi = await _v4_sets_by_npi(
+        session,
+        serving_tables,
+        selected_npis,
+        allowed_provider_set_keys=allowed_provider_set_keys,
+    )
+    normalized_keys_by_npi = {
+        npi: tuple(
+            int(provider_set_key)
+            for provider_set_key in provider_set_keys_by_npi.get(npi, ())
+        )
+        for npi in selected_npis
+    }
+    if any(
+        not set(provider_set_keys).issubset(allowed_provider_set_keys)
+        for provider_set_keys in normalized_keys_by_npi.values()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 scoped NPI completion escaped its CPT provider sets"
+        )
+    return normalized_keys_by_npi
+
+
+async def _incremental_completion_ids_by_npi(
+    session,
+    serving_tables: PTG2ServingTables,
+    state: _IncrementalProviderExpansionState,
+    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+) -> tuple[dict[int, tuple[str, ...]], dict[int, str]]:
+    """Map scoped dense memberships to authenticated provider-set IDs."""
+
+    referenced_provider_set_keys = {
+        provider_set_key
+        for provider_set_keys in provider_set_keys_by_npi.values()
+        for provider_set_key in provider_set_keys
+    }
+    provider_set_id_by_key = await _provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        referenced_provider_set_keys,
+    )
+    if set(provider_set_id_by_key) != referenced_provider_set_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 graph references a missing provider-set dictionary key"
+        )
+    provider_set_ids_by_npi = {
+        npi: tuple(
+            provider_set_id_by_key[provider_set_key]
+            for provider_set_key in provider_set_keys_by_npi.get(npi, ())
+        )
+        for npi in state.selected_npis
+    }
+    _validate_incremental_completion_memberships(
+        state,
+        provider_set_ids_by_npi,
+    )
+    return provider_set_ids_by_npi, provider_set_id_by_key
+
+
+def _incremental_completion_set_union(
+    state: _IncrementalProviderExpansionState,
+    provider_set_id_by_key: Mapping[int, str],
+    allowed_provider_set_keys: frozenset[int],
+) -> tuple[frozenset[int], dict[int, str]]:
+    """Add selected NPI-free rank sets to the reverse membership union."""
+
+    selected_provider_set_key_by_id = (
+        _incremental_selected_provider_set_keys(state)
+    )
+    completion_provider_set_keys = frozenset(
+        set(provider_set_id_by_key)
+        | set(selected_provider_set_key_by_id.values())
+    )
+    if not completion_provider_set_keys.issubset(allowed_provider_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 selected provider set is absent from its CPT code scope"
+        )
+    completion_provider_set_id_by_key = dict(provider_set_id_by_key)
+    for provider_set_id, provider_set_key in (
+        selected_provider_set_key_by_id.items()
+    ):
+        existing_provider_set_id = completion_provider_set_id_by_key.setdefault(
+            provider_set_key,
+            provider_set_id,
+        )
+        if existing_provider_set_id != provider_set_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 completion provider-set identity is inconsistent"
+            )
+    return completion_provider_set_keys, completion_provider_set_id_by_key
+
+
+async def _resolve_incremental_provider_completion_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    state: _IncrementalProviderExpansionState,
+    request: _IncrementalProviderExpansionRequest,
+    budget: _V4ProviderExpansionBudget,
+) -> _IncrementalProviderCompletionScope:
+    """Resolve selected NPIs only within the compact exact CPT set scope."""
+
+    code_scope_entries = await _shared_forward_entries_for_code_rows(
+        session,
+        serving_tables,
+        request.code_rows,
+    )
+    code_scope_provider_set_keys = (
+        _incremental_code_scope_provider_set_keys(code_scope_entries)
+    )
+    allowed_provider_set_keys = frozenset(code_scope_provider_set_keys)
+    provider_set_keys_by_npi = await _incremental_completion_keys_by_npi(
+        session,
+        serving_tables,
+        state,
+        allowed_provider_set_keys,
+        budget,
+    )
+    provider_set_ids_by_npi, provider_set_id_by_key = (
+        await _incremental_completion_ids_by_npi(
+            session,
+            serving_tables,
+            state,
+            provider_set_keys_by_npi,
+        )
+    )
+    completion_provider_set_keys, completion_provider_set_id_by_key = (
+        _incremental_completion_set_union(
+            state,
+            provider_set_id_by_key,
+            allowed_provider_set_keys,
+        )
+    )
+    budget.charge_completion_provider_sets(
+        tuple(
+            completion_provider_set_id_by_key[provider_set_key]
+            for provider_set_key in sorted(completion_provider_set_keys)
+        )
+    )
+    completion_rate_row_count = sum(
+        provider_set_key in completion_provider_set_keys
+        for provider_set_key in code_scope_provider_set_keys
+    )
+    if completion_rate_row_count <= 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 selected provider completion has no rate rows"
+        )
+    budget.require_rate_capacity(completion_rate_row_count)
+    return _IncrementalProviderCompletionScope(
+        provider_set_ids_by_npi=provider_set_ids_by_npi,
+        provider_set_keys=frozenset(completion_provider_set_keys),
+        rate_row_count=completion_rate_row_count,
+    )
+
+
+async def _read_incremental_v4_completion_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    request: _IncrementalProviderExpansionRequest,
+    completion_scope: _IncrementalProviderCompletionScope,
+    budget: _V4ProviderExpansionBudget,
+) -> list[dict[str, Any]] | None:
+    """Read the exact completion set through sealed-size physical pages."""
+
+    completion_rows: list[dict[str, Any]] = []
+    completion_offset = 0
+    while completion_offset < completion_scope.rate_row_count:
+        page_limit = min(
+            budget.caps.rate_page_rows,
+            completion_scope.rate_row_count - completion_offset,
+        )
+        page_rows = await _merge_manifest_code_variant_rows(
+            session,
+            serving_tables,
+            code_rows=request.code_rows,
+            provider_set_keys=completion_scope.provider_set_keys,
+            source_trace_set_hash=request.source_trace_set_hash,
+            network_names=request.network_names,
+            limit=page_limit,
+            offset=completion_offset,
+            descending=request.descending,
+        )
+        if page_rows is None:
+            return None
+        if len(page_rows) != page_limit:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 selected provider completion is incomplete"
+            )
+        budget.charge_rate_rows(len(page_rows))
+        completion_rows.extend(page_rows)
+        completion_offset += len(page_rows)
+    return completion_rows
+
+
+async def _materialize_incremental_provider_selection(
+    session,
+    serving_tables: PTG2ServingTables,
+    state: _IncrementalProviderExpansionState,
+    *,
+    request: _IncrementalProviderExpansionRequest,
+    budget: _V4ProviderExpansionBudget,
+    exhausted: bool,
+) -> _ProviderExpansionSelection | None:
+    """Complete every selected NPI before materializing its merged rate item."""
+
+    selected_npis = tuple(state.selected_npis)
+    if selected_npis:
+        completion_scope = (
+            await _resolve_incremental_provider_completion_scope(
+                session,
+                serving_tables,
+                state,
+                request,
+                budget,
+            )
+        )
+        completion_rows = await _read_incremental_v4_completion_rows(
+            session,
+            serving_tables,
+            request=request,
+            completion_scope=completion_scope,
+            budget=budget,
+        )
+        if completion_rows is None:
+            return None
+        providers_by_set = await _selected_provider_rows_by_set(
+            session,
+            serving_tables,
+            npis=selected_npis,
+            provider_set_ids_by_npi=(
+                completion_scope.provider_set_ids_by_npi
+            ),
+            args=request.args,
+            snapshot_id=request.snapshot_id,
+        )
+        if providers_by_set is None:
+            return None
+    else:
+        completion_rows = state.row_data
+        providers_by_set = {}
+    for provider_set_id in state.selected_provider_set_ids:
+        providers_by_set.setdefault(provider_set_id, [])
+    return _ProviderExpansionSelection(
+        row_data=completion_rows,
+        providers_by_set=providers_by_set,
+        rank_by_key=state.rank_by_key,
+        exhausted=exhausted and not state.is_full,
+    )
+
+
+async def _read_incremental_v4_rate_page(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    request: _IncrementalProviderExpansionRequest,
+    rate_offset: int,
+    budget: _V4ProviderExpansionBudget,
+) -> tuple[bool, list[dict[str, Any]], bool]:
+    """Read one sealed-size physical page and charge every returned rate row."""
+
+    if budget.remaining_rate_rows <= 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 hot provider expansion exceeded its rate-row cap; "
+            "an explicit exact cold request is required"
+        )
+    page_limit = min(
+        budget.caps.rate_page_rows,
+        budget.remaining_rate_rows,
+        request.declared_rate_count - rate_offset,
+    )
+    rate_rows = await _merge_manifest_code_variant_rows(
+        session,
+        serving_tables,
+        code_rows=request.code_rows,
+        provider_set_keys=None,
+        source_trace_set_hash=request.source_trace_set_hash,
+        network_names=request.network_names,
+        limit=page_limit,
+        offset=rate_offset,
+        descending=request.descending,
+    )
+    if rate_rows is None:
+        return False, [], False
+    if len(rate_rows) > page_limit:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 incremental rate page exceeded its sealed row contract"
+        )
+    budget.charge_rate_rows(len(rate_rows))
+    return True, rate_rows, len(rate_rows) < page_limit
+
+
+def _rate_row_provider_count(serving_row: Mapping[str, Any]) -> int | None:
+    """Read an optional authenticated provider count used for safe batching."""
+
+    raw_provider_count = serving_row.get("provider_count")
+    if raw_provider_count is None:
+        return None
+    try:
+        provider_count = int(raw_provider_count)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 incremental rate row has an invalid provider count"
+        ) from exc
+    if provider_count < 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 incremental rate row has a negative provider count"
+        )
+    return provider_count
+
+
+def _next_incremental_provider_set_batch(
+    rate_rows: Sequence[dict[str, Any]],
+    state: _IncrementalProviderExpansionState,
+) -> tuple[str, ...]:
+    """Select only sets mathematically needed to cover the remaining prefix."""
+
+    remaining_results = state.target_count - len(state.rank_by_key)
+    provider_set_ids: list[str] = []
+    possible_result_count = 0
+    for serving_row in rate_rows:
+        provider_set_id = state.provider_set_id(serving_row)
+        if (
+            provider_set_id in state.npis_by_set
+            or provider_set_id in provider_set_ids
+        ):
+            break
+        provider_set_ids.append(provider_set_id)
+        provider_count = _rate_row_provider_count(serving_row)
+        possible_result_count += max(provider_count or 0, 1)
+        if possible_result_count >= remaining_results:
+            break
+    return tuple(provider_set_ids)
+
+
+def _validate_incremental_provider_set_prefixes(
+    provider_set_ids: tuple[str, ...],
+    rate_rows: Sequence[dict[str, Any]],
+    npis_by_set: Mapping[str, tuple[int, ...]],
+    state: _IncrementalProviderExpansionState,
+) -> None:
+    """Reject a provider prefix that exceeds its authenticated set count."""
+
+    provider_count_by_id: dict[str, int] = {}
+    for serving_row in rate_rows:
+        provider_set_id = state.provider_set_id(serving_row)
+        if provider_set_id not in provider_set_ids:
+            continue
+        provider_count = _rate_row_provider_count(serving_row)
+        if provider_count is not None:
+            existing_count = provider_count_by_id.setdefault(
+                provider_set_id,
+                provider_count,
+            )
+            if existing_count != provider_count:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 V4 rate rows disagree on their provider-set count"
+                )
+    if any(
+        len(npis_by_set.get(provider_set_id, ()))
+        != min(provider_count, state.target_count)
+        for provider_set_id, provider_count in provider_count_by_id.items()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 provider prefix disagrees with its authenticated provider count"
+        )
+    if any(
+        provider_set_id not in npis_by_set
+        for provider_set_id in provider_count_by_id
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 provider prefix is missing an authenticated provider set"
+        )
+
+
+async def _load_incremental_provider_set_batch(
+    session,
+    serving_tables: PTG2ServingTables,
+    rate_rows: Sequence[dict[str, Any]],
+    state: _IncrementalProviderExpansionState,
+    budget: _V4ProviderExpansionBudget,
+) -> None:
+    """Load one necessary first-seen set batch through the bounded V4 graph."""
+
+    provider_set_ids = _next_incremental_provider_set_batch(
+        rate_rows,
+        state,
+    )
+    budget.charge_provider_set_batch(provider_set_ids)
+    npis_by_set = await _provider_npis_for_sets(
+        session,
+        serving_tables,
+        provider_set_ids,
+        limit_per_set=state.target_count,
+    )
+    normalized_npis_by_set = {
+        provider_set_id: tuple(npis_by_set.get(provider_set_id, ()))
+        for provider_set_id in provider_set_ids
+    }
+    _validate_incremental_provider_set_prefixes(
+        provider_set_ids,
+        rate_rows,
+        normalized_npis_by_set,
+        state,
+    )
+    state.npis_by_set.update(normalized_npis_by_set)
+
+
+async def _consume_incremental_v4_rate_page(
+    session,
+    serving_tables: PTG2ServingTables,
+    rate_rows: Sequence[dict[str, Any]],
+    state: _IncrementalProviderExpansionState,
+    budget: _V4ProviderExpansionBudget,
+) -> None:
+    """Consume a physical rate page while graph-loading only its needed sets."""
+
+    rate_index = 0
+    while rate_index < len(rate_rows) and not state.is_full:
+        serving_row = rate_rows[rate_index]
+        provider_set_id = state.provider_set_id(serving_row)
+        if provider_set_id not in state.npis_by_set:
+            await _load_incremental_provider_set_batch(
+                session,
+                serving_tables,
+                rate_rows[rate_index:],
+                state,
+                budget,
+            )
+        state.append_rate_row(serving_row)
+        rate_index += 1
+
+
+async def _select_v4_provider_expansion(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _IncrementalProviderExpansionRequest,
+) -> _ProviderExpansionSelection | None:
+    """Prove a V4 provider prefix from bounded physical rate pages."""
+
+    normalized_target = max(int(request.target_count), 1)
+    budget = _V4ProviderExpansionBudget(
+        _v4_provider_expansion_request_caps(
+            serving_tables,
+            target_count=normalized_target,
+        )
+    )
+    state = _IncrementalProviderExpansionState(normalized_target)
+    rate_offset = 0
+    is_source_exhausted = False
+    while rate_offset < request.declared_rate_count and not state.is_full:
+        is_supported, rate_rows, is_short_page = (
+            await _read_incremental_v4_rate_page(
+                session,
+                serving_tables,
+                request=request,
+                rate_offset=rate_offset,
+                budget=budget,
+            )
+        )
+        if not is_supported:
+            return None
+        if not rate_rows:
+            is_source_exhausted = True
+            break
+        await _consume_incremental_v4_rate_page(
+            session,
+            serving_tables,
+            rate_rows,
+            state,
+            budget,
+        )
+        rate_offset += len(rate_rows)
+        if is_short_page:
+            is_source_exhausted = True
+            break
+    return await _materialize_incremental_provider_selection(
+        session,
+        serving_tables,
+        state,
+        request=request,
+        budget=budget,
+        exhausted=(
+            is_source_exhausted
+            or rate_offset >= request.declared_rate_count
+        ),
+    )
+
+
 def _next_provider_expansion_rate_window(
     current_window: int,
     *,
@@ -7607,6 +10499,35 @@ async def _strict_cost_provider_expansion_selection(
     )
     if declared_rate_count <= 0:
         return _ProviderExpansionSelection([], {}, {}, True)
+    is_provider_filter_requested = _is_ptg2_provider_filter_requested(
+        dict(args)
+    )
+    if (
+        bool(getattr(serving_tables, "uses_v4_graph", False))
+        and not is_provider_filter_requested
+    ):
+        incremental_selection = (
+            await _select_v4_provider_expansion(
+                session,
+                serving_tables,
+                _IncrementalProviderExpansionRequest(
+                    code_rows=code_rows,
+                    args=args,
+                    snapshot_id=snapshot_id,
+                    source_trace_set_hash=source_trace_set_hash,
+                    network_names=network_names,
+                    target_count=target_count,
+                    descending=descending,
+                    declared_rate_count=declared_rate_count,
+                ),
+            )
+        )
+        if incremental_selection is not None:
+            _cache_provider_expansion_selection(
+                cache_key,
+                incremental_selection,
+            )
+        return incremental_selection
     rate_window = min(
         declared_rate_count,
         max(PTG2_SERVING_BINARY_V3_PAGE_ROWS, max(int(target_count), 1)),
@@ -7617,7 +10538,6 @@ async def _strict_cost_provider_expansion_selection(
     is_exhausted = False
     serving_rows: list[dict[str, Any]] = []
     filtered_npis_by_set: dict[str, tuple[int, ...]] = {}
-    is_provider_filter_requested = _is_ptg2_provider_filter_requested(dict(args))
     while True:
         serving_rows = await _merge_manifest_code_variant_rows(
             session,
@@ -7686,11 +10606,33 @@ async def _strict_cost_provider_expansion_selection(
             )
         rate_window = next_window
 
-    provider_set_ids_by_npi = await _provider_set_ids_for_selected_npis(
-        session,
-        serving_tables,
-        selected_npis,
-    )
+    allowed_provider_set_keys: frozenset[int] | None = None
+    if bool(getattr(serving_tables, "uses_v4_graph", False)) and selected_npis:
+        code_scope_entries = await _shared_forward_entries_for_code_rows(
+            session,
+            serving_tables,
+            code_rows,
+        )
+        allowed_provider_set_keys = frozenset(
+            int(entry.provider_set_key) for entry in code_scope_entries
+        )
+        if not allowed_provider_set_keys:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 code scope is missing its provider sets"
+            )
+    if allowed_provider_set_keys is None:
+        provider_set_ids_by_npi = await _provider_set_ids_for_selected_npis(
+            session,
+            serving_tables,
+            selected_npis,
+        )
+    else:
+        provider_set_ids_by_npi = await _provider_set_ids_for_selected_npis(
+            session,
+            serving_tables,
+            selected_npis,
+            allowed_provider_set_keys=allowed_provider_set_keys,
+        )
     completion_provider_set_ids = tuple(
         dict.fromkeys(
             (
@@ -7743,16 +10685,7 @@ async def _strict_cost_provider_expansion_selection(
         rank_by_key=rank_by_key,
         exhausted=is_exhausted and len(rank_by_key) < target_count,
     )
-    if cache_key is not None:
-        _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE[cache_key] = deepcopy(
-            selection
-        )
-        _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.move_to_end(cache_key)
-        while (
-            len(_PTG2_PROVIDER_EXPANSION_SELECTION_CACHE)
-            > _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_ENTRIES
-        ):
-            _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.popitem(last=False)
+    _cache_provider_expansion_selection(cache_key, selection)
     return selection
 
 
@@ -7959,6 +10892,7 @@ async def _search_manifest_serving_table(
             },
             args,
             database_evidence=serving_tables.database_evidence,
+            storage_generation=str(serving_tables.storage_generation or ""),
         )
 
     location_providers_by_set: dict[str, list[dict[str, Any]]] = {}
@@ -8595,6 +11529,7 @@ async def _search_manifest_serving_table(
         },
         args,
         database_evidence=serving_tables.database_evidence,
+        storage_generation=str(serving_tables.storage_generation or ""),
     )
 
 
@@ -8912,6 +11847,16 @@ async def search_ptg2_serving_table(
     resolved_args_by_name = dict(args)
     if tables.source_key and not resolved_args_by_name.get("source_key"):
         resolved_args_by_name["source_key"] = tables.source_key
+    if tables.uses_v4_graph:
+        with v4_graph_request_scope():
+            return await _search_manifest_serving_table(
+                session,
+                snapshot_id,
+                resolved_args_by_name,
+                pagination,
+                tables,
+                mode_value,
+            )
     return await _search_manifest_serving_table(
         session,
         snapshot_id,
@@ -9185,6 +12130,16 @@ async def _search_ptg2_provider_procedures_snapshot(
     resolved_args_by_name = dict(args)
     if serving_tables.source_key and not resolved_args_by_name.get("source_key"):
         resolved_args_by_name["source_key"] = serving_tables.source_key
+    if serving_tables.uses_v4_graph:
+        with v4_graph_request_scope():
+            return await _search_ptg2_manifest_provider_procedures(
+                session,
+                npi,
+                resolved_args_by_name,
+                pagination,
+                snapshot_id=snapshot_id,
+                serving_tables=serving_tables,
+            )
     return await _search_ptg2_manifest_provider_procedures(
         session,
         npi,
@@ -9827,6 +12782,8 @@ def _is_network_serving_tables_current(
     source_set = serving_tables.source_set or {}
     return (
         snapshot_key == serving_tables.shared_snapshot_key
+        and str(row_fields.get("storage_generation") or "").strip().lower()
+        == str(serving_tables.storage_generation or "").strip().lower()
         and layout_snapshot_key == serving_tables.shared_snapshot_key
         and layout_code_count == serving_tables.code_count
         and layout_source_count == serving_tables.source_count
@@ -9862,7 +12819,10 @@ async def _is_cached_network_serving_tables_current(
         text(_PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL),
         {
             "snapshot_ids": list(snapshot_ids),
-            "storage_generation": PTG2_V3_SHARED_GENERATION,
+            "storage_generations": [
+                PTG2_V3_SHARED_GENERATION,
+                PTG2_V4_SHARED_GENERATION,
+            ],
             "attestation_contracts": list(
                 PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
             ),

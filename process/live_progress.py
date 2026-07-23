@@ -7,9 +7,12 @@ import asyncio
 import contextvars
 import datetime as dt
 import json
+import logging
 import math
 import os
 import threading
+import time
+import uuid
 from collections import OrderedDict
 from functools import lru_cache
 from typing import Any
@@ -19,6 +22,8 @@ import redis
 
 from process.import_status_events import bind_status_event_loop, enqueue_status_event
 from process.redis_config import build_redis_settings
+
+logger = logging.getLogger(__name__)
 
 IMPORT_LIVE_PROGRESS_TTL_SECONDS = int(
     os.getenv(
@@ -89,6 +94,37 @@ _PROGRESS_SNAPSHOT_FIELDS = tuple(
     for key in _CARRY_FORWARD_FIELDS
     if key not in {"event_seq", "observed_at"}
 )
+_ATTEMPT_CURRENT = "current"
+_ATTEMPT_NEWER = "newer"
+_ATTEMPT_REJECT = "reject"
+_ATTEMPT_SEQUENCE_FIELDS = (
+    "event_seq",
+    "progress_seq",
+    "progressed_at",
+)
+_PROGRESS_CAS_RETRIES = 8
+_PROGRESS_LOCK_WAIT_SECONDS = 0.25
+_PROGRESS_LOCK_LEASE_MILLISECONDS = 5_000
+_PROGRESS_CAS_SCRIPT = """
+local current = redis.call("GET", KEYS[1])
+local expected_missing = ARGV[1]
+local expected = ARGV[2]
+if expected_missing == "1" then
+    if current then
+        return 0
+    end
+elseif (not current) or current ~= expected then
+    return 0
+end
+redis.call("SETEX", KEYS[1], tonumber(ARGV[3]), ARGV[4])
+return 1
+"""
+_PROGRESS_UNLOCK_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+"""
 
 
 def live_progress_key(run_id: str) -> str:
@@ -123,65 +159,315 @@ def current_live_progress_context() -> dict[str, Any]:
     return dict(_context.get() or {})
 
 
-def write_live_progress(**payload: Any) -> None:
-    """Persist normalized progress and emit its best-effort status event."""
+def is_live_progress_written(**progress_by_field: Any) -> bool:
+    """Atomically persist progress and enqueue its event in attempt order."""
 
     context = current_live_progress_context()
-    run_id = str(payload.get("run_id") or context.get("run_id") or "").strip()
+    run_id = str(
+        progress_by_field.get("run_id") or context.get("run_id") or ""
+    ).strip()
     if not run_id:
-        return
+        return False
 
     now = _utc_now()
     observed_at = now.isoformat() + "Z"
+    status_event_payload = progress_by_field.pop("status_event_payload", None)
     with _progress_lock_for(run_id):
-        merged = {
-            "run_id": run_id,
-            "attempt_id": payload.get("attempt_id") or context.get("attempt_id") or run_id,
-            "importer": payload.get("importer") or context.get("importer") or "unknown",
-            "status": payload.get("status") or context.get("status") or "running",
-            "source": payload.get("source") or context.get("source") or "import-live-progress",
-            "confidence": payload.get("confidence") or context.get("confidence") or "live",
-            "updated_at": observed_at,
-            "observed_at": observed_at,
-            **{key: value for key, value in context.items() if key != "run_id"},
-            **{key: value for key, value in payload.items() if value is not None},
-        }
-        if not merged.get("attempt_started_at") and merged.get("started_at"):
-            merged["attempt_started_at"] = merged["started_at"]
-        publish_event = bool(merged.pop("publish_event", True))
-        previous = _read_live_progress_payload(run_id)
-        if previous:
-            _merge_previous_progress(merged, previous, now=now)
-        status = str(merged.get("status") or "").lower()
-        terminal = status in {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
-        succeeded = status == "succeeded"
-        _normalize_progress_fields(merged, succeeded=succeeded)
-        _normalize_estimate_fields(merged, now=now, terminal=terminal)
-        _sequence_progress(merged, previous, now=now, succeeded=succeeded)
-        if "label" in merged:
-            merged["label"] = _safe_label(str(merged["label"]))
         try:
-            _redis().setex(
-                live_progress_key(run_id),
-                IMPORT_LIVE_PROGRESS_TTL_SECONDS,
-                json.dumps(merged, default=str),
+            redis_client = _redis()
+            lock_token = _acquire_progress_publication_lock(
+                redis_client,
+                run_id,
             )
         except Exception:
-            pass
+            logger.debug(
+                "Unable to acquire atomic live-progress publication lock",
+                exc_info=True,
+            )
+            return False
+        if lock_token is None:
+            return False
+        try:
+            return _is_live_progress_written_with_cas(
+                redis_client=redis_client,
+                run_id=run_id,
+                context=context,
+                progress_by_field=progress_by_field,
+                observed_at=observed_at,
+                now=now,
+                status_event_payload=(
+                    status_event_payload
+                    if isinstance(status_event_payload, dict)
+                    else None
+                ),
+            )
+        finally:
+            _release_progress_publication_lock(
+                redis_client,
+                run_id,
+                lock_token,
+            )
 
-    if publish_event:
-        enqueue_status_event(
-            {
-                "run_id": run_id,
-                "importer": merged.get("importer"),
-                "status": merged.get("status") or "running",
-                "phase_detail": str(merged.get("phase") or "")[:128] or None,
-                "progress": progress_payload_from_live(merged),
-                "estimate": estimate_payload_from_live(merged),
-                "snapshot_id": merged.get("snapshot_id"),
-                "heartbeat_at": merged.get("observed_at") or merged.get("updated_at"),
-            }
+
+write_live_progress = is_live_progress_written
+
+
+def _is_live_progress_written_with_cas(
+    *,
+    redis_client: redis.Redis,
+    run_id: str,
+    context: dict[str, Any],
+    progress_by_field: dict[str, Any],
+    observed_at: str,
+    now: dt.datetime,
+    status_event_payload: dict[str, Any] | None,
+) -> bool:
+    """Compare-and-swap one snapshot while its event-order lock is held."""
+
+    key = live_progress_key(run_id)
+    for _attempt in range(_PROGRESS_CAS_RETRIES):
+        try:
+            previous_raw = redis_client.get(key)
+        except Exception:
+            logger.debug("Unable to read live progress for CAS", exc_info=True)
+            return False
+        previous = _decode_live_progress_payload(previous_raw)
+        merged = _merged_live_progress_candidate(
+            run_id=run_id,
+            context=context,
+            progress_by_field=progress_by_field,
+            observed_at=observed_at,
+            now=now,
+            previous=previous,
         )
+        if merged is None:
+            return False
+        candidate = json.dumps(merged, default=str)
+        try:
+            accepted = redis_client.eval(
+                _PROGRESS_CAS_SCRIPT,
+                1,
+                key,
+                "1" if previous_raw is None else "0",
+                previous_raw or b"",
+                IMPORT_LIVE_PROGRESS_TTL_SECONDS,
+                candidate,
+            )
+        except Exception:
+            logger.debug("Unable to CAS live progress", exc_info=True)
+            return False
+        if int(accepted or 0) != 1:
+            continue
+        publish_event = bool(progress_by_field.get("publish_event", True))
+        if status_event_payload is not None:
+            enqueue_status_event(
+                _status_event_for_accepted_progress(
+                    status_event_payload,
+                    merged,
+                )
+            )
+        elif publish_event:
+            enqueue_status_event(_default_status_event(merged))
+        return True
+    logger.debug("Live progress CAS contention exceeded bounded retry budget")
+    return False
+
+
+def _write_live_progress_with_cas(**arguments_by_name: Any):
+    """Preserve the internal CAS seam used by concurrency regression tests."""
+
+    progress_by_field = arguments_by_name.pop("payload")
+    is_written = _is_live_progress_written_with_cas(
+        progress_by_field=progress_by_field,
+        **arguments_by_name,
+    )
+    return is_written
+
+
+def _merged_live_progress_candidate(
+    *,
+    run_id: str,
+    context: dict[str, Any],
+    progress_by_field: dict[str, Any],
+    observed_at: str,
+    now: dt.datetime,
+    previous: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Merge one observation with the last snapshot for the same attempt."""
+
+    candidate_by_field = _new_live_progress_candidate_by_field(
+        run_id=run_id,
+        context=context,
+        progress_by_field=progress_by_field,
+        observed_at=observed_at,
+    )
+    sequence_previous = previous
+    if previous:
+        attempt_disposition = _merge_previous_progress(
+            candidate_by_field,
+            previous,
+            now=now,
+        )
+        if attempt_disposition == _ATTEMPT_REJECT:
+            return None
+        if attempt_disposition == _ATTEMPT_NEWER:
+            _reset_attempt_sequences(run_id)
+            sequence_previous = None
+    status = str(candidate_by_field.get("status") or "").lower()
+    is_terminal = status in {
+        "succeeded",
+        "failed",
+        "canceled",
+        "cancelled",
+        "dead_letter",
+    }
+    has_succeeded = status == "succeeded"
+    _normalize_progress_fields(candidate_by_field, succeeded=has_succeeded)
+    _normalize_estimate_fields(
+        candidate_by_field,
+        now=now,
+        terminal=is_terminal,
+    )
+    _sequence_progress(
+        candidate_by_field,
+        sequence_previous,
+        now=now,
+        succeeded=has_succeeded,
+    )
+    if "label" in candidate_by_field:
+        candidate_by_field["label"] = _safe_label(
+            str(candidate_by_field["label"])
+        )
+    return candidate_by_field
+
+
+def _new_live_progress_candidate_by_field(
+    *,
+    run_id: str,
+    context: dict[str, Any],
+    progress_by_field: dict[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    candidate_by_field = {
+        "run_id": run_id,
+        "attempt_id": (
+            progress_by_field.get("attempt_id")
+            or context.get("attempt_id")
+            or run_id
+        ),
+        "importer": (
+            progress_by_field.get("importer")
+            or context.get("importer")
+            or "unknown"
+        ),
+        "status": (
+            progress_by_field.get("status")
+            or context.get("status")
+            or "running"
+        ),
+        "source": (
+            progress_by_field.get("source")
+            or context.get("source")
+            or "import-live-progress"
+        ),
+        "confidence": (
+            progress_by_field.get("confidence")
+            or context.get("confidence")
+            or "live"
+        ),
+        "updated_at": observed_at,
+        "observed_at": observed_at,
+        **{
+            field_name: field_value
+            for field_name, field_value in context.items()
+            if field_name != "run_id"
+        },
+        **{
+            field_name: field_value
+            for field_name, field_value in progress_by_field.items()
+            if field_value is not None and field_name != "publish_event"
+        },
+    }
+    if (
+        not candidate_by_field.get("attempt_started_at")
+        and candidate_by_field.get("started_at")
+    ):
+        candidate_by_field["attempt_started_at"] = candidate_by_field[
+            "started_at"
+        ]
+    return candidate_by_field
+
+
+def _default_status_event(merged: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": merged["run_id"],
+        "importer": merged.get("importer"),
+        "status": merged.get("status") or "running",
+        "phase_detail": str(merged.get("phase") or "")[:128] or None,
+        "progress": progress_payload_from_live(merged),
+        "estimate": estimate_payload_from_live(merged),
+        "snapshot_id": merged.get("snapshot_id"),
+        "heartbeat_at": merged.get("observed_at") or merged.get("updated_at"),
+    }
+
+
+def _status_event_for_accepted_progress(
+    status_event_payload: dict[str, Any],
+    merged: dict[str, Any],
+) -> dict[str, Any]:
+    event_by_field = dict(status_event_payload)
+    progress_by_field = dict(event_by_field.get("progress") or {})
+    progress_by_field["attempt_id"] = merged.get("attempt_id")
+    progress_by_field["attempt_started_at"] = merged.get("attempt_started_at")
+    progress_by_field["event_seq"] = merged.get("event_seq")
+    progress_by_field["progress_seq"] = merged.get("progress_seq")
+    event_by_field["progress"] = progress_by_field
+    event_by_field["heartbeat_at"] = (
+        merged.get("observed_at")
+        or merged.get("updated_at")
+        or event_by_field.get("heartbeat_at")
+    )
+    return event_by_field
+
+
+def _progress_publication_lock_key(run_id: str) -> str:
+    return f"import:progress-lock:{run_id}"
+
+
+def _acquire_progress_publication_lock(
+    redis_client: redis.Redis,
+    run_id: str,
+) -> str | None:
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + _PROGRESS_LOCK_WAIT_SECONDS
+    key = _progress_publication_lock_key(run_id)
+    while True:
+        if redis_client.set(
+            key,
+            token,
+            nx=True,
+            px=_PROGRESS_LOCK_LEASE_MILLISECONDS,
+        ):
+            return token
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.002)
+
+
+def _release_progress_publication_lock(
+    redis_client: redis.Redis,
+    run_id: str,
+    token: str,
+) -> None:
+    try:
+        redis_client.eval(
+            _PROGRESS_UNLOCK_SCRIPT,
+            1,
+            _progress_publication_lock_key(run_id),
+            token,
+        )
+    except Exception:
+        logger.debug("Unable to release live-progress publication lock", exc_info=True)
 
 
 def enqueue_live_progress(**payload: Any) -> None:
@@ -221,6 +507,10 @@ def _read_live_progress_payload(run_id: str) -> dict[str, Any] | None:
         raw = _redis().get(live_progress_key(run_id))
     except Exception:
         return None
+    return _decode_live_progress_payload(raw)
+
+
+def _decode_live_progress_payload(raw: Any) -> dict[str, Any] | None:
     if not raw:
         return None
     try:
@@ -292,16 +582,89 @@ def _merge_previous_progress(
     previous: dict[str, Any],
     *,
     now: dt.datetime,
-) -> None:
+) -> str:
     """Carry forward rich progress while accepting a new observation."""
 
-    incoming_snapshot = dict(merged)
+    attempt_disposition = _attempt_disposition(merged, previous)
+    if attempt_disposition == _ATTEMPT_REJECT:
+        return attempt_disposition
+    if attempt_disposition == _ATTEMPT_NEWER:
+        for key in _ATTEMPT_SEQUENCE_FIELDS:
+            merged.pop(key, None)
+        _carry_forward_run_metadata(merged, previous)
+        return attempt_disposition
+
+    incoming_by_field = dict(merged)
     _preserve_progress_for_heartbeat(merged, previous, now=now)
-    if _incoming_progress_is_older(incoming_snapshot, previous):
+    if _is_incoming_progress_older(incoming_by_field, previous):
         _preserve_progress_snapshot(merged, previous)
     for key in _CARRY_FORWARD_FIELDS:
         if merged.get(key) is None and previous.get(key) is not None:
             merged[key] = previous[key]
+    _carry_forward_run_metadata(merged, previous)
+    return attempt_disposition
+
+
+def _attempt_disposition(
+    incoming: dict[str, Any],
+    previous: dict[str, Any],
+) -> str:
+    """Order attempt identities only when their start timestamps prove it."""
+
+    incoming_attempt = str(incoming.get("attempt_id") or "").strip()
+    previous_attempt = str(previous.get("attempt_id") or "").strip()
+    incoming_started_at = _attempt_started_at(incoming)
+    previous_started_at = _attempt_started_at(previous)
+    run_id = str(incoming.get("run_id") or previous.get("run_id") or "").strip()
+    if incoming_attempt == previous_attempt:
+        # Legacy callbacks used run_id for every retry. Compare their attempt
+        # timestamps before treating equal fallback IDs as the same execution.
+        if incoming_started_at is not None and previous_started_at is not None:
+            if incoming_started_at > previous_started_at:
+                return _ATTEMPT_NEWER
+            if incoming_started_at < previous_started_at:
+                return _ATTEMPT_REJECT
+        elif incoming_started_at is None and previous_started_at is not None:
+            return _ATTEMPT_REJECT
+        return _ATTEMPT_CURRENT
+
+    if incoming_started_at is None:
+        return _ATTEMPT_REJECT
+    if previous_started_at is None:
+        # A timestamped attempt may supersede a legacy row that had only the
+        # run-id fallback. A malformed timestamp on a named attempt is not
+        # enough evidence to let a different attempt replace it.
+        return (
+            _ATTEMPT_NEWER
+            if not previous_attempt or previous_attempt == run_id
+            else _ATTEMPT_REJECT
+        )
+    if incoming_started_at > previous_started_at:
+        return _ATTEMPT_NEWER
+    if incoming_started_at < previous_started_at:
+        return _ATTEMPT_REJECT
+    # Thread callbacks that lack context use run_id as their attempt fallback.
+    # Accept that alias only when its exact timestamp proves the same attempt.
+    if run_id and run_id in {incoming_attempt, previous_attempt}:
+        return _ATTEMPT_CURRENT
+    return _ATTEMPT_REJECT
+
+
+def _attempt_started_at(progress: dict[str, Any]) -> dt.datetime | None:
+    """Parse an attempt timestamp, falling back only for legacy missing fields."""
+
+    attempt_started_at = progress.get("attempt_started_at")
+    if attempt_started_at not in (None, ""):
+        return _parse_datetime(attempt_started_at)
+    return _parse_datetime(progress.get("started_at"))
+
+
+def _carry_forward_run_metadata(
+    merged: dict[str, Any],
+    previous: dict[str, Any],
+) -> None:
+    """Retain run-level identity without leaking prior-attempt progress."""
+
     for key in ("importer", "source", "confidence"):
         if not merged.get(key) or merged.get(key) == "unknown":
             merged[key] = previous.get(key) or merged.get(key)
@@ -313,16 +676,12 @@ def _merge_previous_progress(
         merged["started_at"] = previous.get("started_at")
 
 
-def _incoming_progress_is_older(
+def _is_incoming_progress_older(
     incoming: dict[str, Any],
     previous: dict[str, Any],
 ) -> bool:
     """Fence delayed concurrent callbacks without hiding new observations."""
 
-    incoming_attempt = str(incoming.get("attempt_id") or "")
-    previous_attempt = str(previous.get("attempt_id") or "")
-    if incoming_attempt and previous_attempt and incoming_attempt != previous_attempt:
-        return False
     incoming_stage = _coerce_int(incoming.get("stage_ordinal"))
     previous_stage = _coerce_int(previous.get("stage_ordinal"))
     if (
@@ -411,7 +770,7 @@ def _sequence_progress(
 
 
 def _movement_signature(progress: dict[str, Any]) -> str:
-    fields = {
+    fields_by_name = {
         key: progress.get(key)
         for key in (
             "stage_id",
@@ -430,7 +789,12 @@ def _movement_signature(progress: dict[str, Any]) -> str:
         )
         if progress.get(key) is not None
     }
-    return json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(
+        fields_by_name,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _preserve_progress_for_heartbeat(
@@ -458,7 +822,7 @@ def _normalize_estimate_fields(merged: dict[str, Any], *, now: dt.datetime, term
         total = _coerce_float(merged.get("total"))
         elapsed = _coerce_float(merged.get("elapsed_seconds"))
         if elapsed is None:
-            started_at = _parse_datetime(merged.get("started_at"))
+            started_at = _parse_datetime(merged.get("attempt_started_at"))
             if started_at is not None:
                 elapsed = max((now - started_at).total_seconds(), 0.0)
         if done is not None and total is not None and total > done > 0 and elapsed and elapsed > 0:
@@ -502,6 +866,13 @@ def _sequence_cache_for(
     """Return sequence state guarded by the run's striped progress lock."""
 
     return caches[hash(run_id) % len(caches)]
+
+
+def _reset_attempt_sequences(run_id: str) -> None:
+    """Discard process-local sequence continuity from the prior attempt."""
+
+    _sequence_cache_for(_event_sequences, run_id).pop(run_id, None)
+    _sequence_cache_for(_progress_sequences, run_id).pop(run_id, None)
 
 
 def _remember_sequence(

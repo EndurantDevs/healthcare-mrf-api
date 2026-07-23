@@ -24,6 +24,23 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_GENERATION,
 )
+from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_COMPONENT_TABLE,
+    PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
+    PTG2_V4_GRAPH_DIAGNOSTIC_TABLE,
+    PTG2_V4_GRAPH_RESOURCE_FIELDS,
+    PTG2_V4_HEAVY_OWNER_TABLE,
+    PTG2_V4_MAP_FORMAT,
+    PTG2_V4_MEMBER_PAGE_CONTRACT,
+    PTG2_V4_NPI_TABLE,
+    PTG2_V4_NPI_PREFIX_TABLE,
+    PTG2_V4_OWNER_LOCATOR_PAGE_CONTRACT,
+    PTG2_V4_PATTERN_TABLE,
+    PTG2_V4_PROJECTION_ID_SCOPE,
+    PTG2_V4_PROVIDER_GRAPH_CONTRACT,
+    PTG2_V4_RELATION_MANIFEST_TABLE,
+    PTG2_V4_SHARED_GENERATION,
+)
 from process.ptg_parts.ptg2_shared_source_set import (
     PTG2_V3_SOURCE_SET_CONTRACT,
     shared_source_set_metadata,
@@ -39,11 +56,23 @@ PTG2_V3_ARCH_VERSION = "postgres_binary_v3"
 PTG2_V3_STORAGE_TYPE = "ptg2_shared_blocks_v3"
 PTG2_V3_SERVING_LAYOUT = "lean_provider_key_v1"
 PTG2_V3_SHARED_BLOCK_LAYOUT = "dense_shared_blocks_v3"
+PTG2_V4_STORAGE_TYPE = "ptg2_shared_blocks_v4"
+PTG2_V4_PROVIDER_SCOPE_STRATEGY = "postgres_packed_graph_v4"
+PTG2_V4_SHARED_BLOCK_LAYOUT = "packed_snapshot_maps_v4"
 PTG2_V3_AUDIT_CONTRACT = "persisted_served_occurrence_sample_v2"
 PTG2_V3_AUDIT_METHOD = "publish_time_stratified_v1"
 PTG2_V3_AUDIT_MAX_SAMPLE_ROWS = 2560
 PTG2_DATABASE_EVIDENCE_CONTRACT = "postgresql_session_v1"
 _COVERAGE_SCOPE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _row_mapping(row: Any) -> dict[str, Any]:
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return dict(mapping)
+    if isinstance(row, Mapping):
+        return dict(row)
+    return dict(row or {})
 
 
 def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | None:
@@ -66,6 +95,145 @@ def _optional_integer(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _has_valid_v4_fields(manifest: Any) -> bool:
+    if not isinstance(manifest, dict) or set(manifest) != set(
+        PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS
+    ):
+        return False
+    optional_keys = {
+        "worst_provider_set_key",
+        "worst_online_provider_set_key",
+    }
+    digest_fields = {
+        "worst_member_digest",
+        "worst_online_member_digest",
+    }
+    boolean_fields = {
+        "worst_uses_override",
+        "worst_uses_component_fallback",
+        "worst_online_groups_to_target_exact",
+        "worst_online_uses_component_fallback",
+    }
+    nonnegative_integer_fields = set(PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS).difference(
+        optional_keys,
+        digest_fields,
+        boolean_fields,
+        {"npi_prefix_target"},
+    )
+    for field_name, field_value in manifest.items():
+        if field_name in optional_keys:
+            optional_value = _optional_integer(field_value)
+            if field_value is None:
+                continue
+            if optional_value is None or optional_value < 0:
+                return False
+            continue
+        if field_name in digest_fields:
+            if field_value is not None and not _COVERAGE_SCOPE_ID_RE.fullmatch(
+                str(field_value)
+            ):
+                return False
+            continue
+        if field_name in boolean_fields:
+            if not isinstance(field_value, bool):
+                return False
+            continue
+        integer_value = _optional_integer(field_value)
+        if integer_value is None:
+            return False
+        if field_name in nonnegative_integer_fields and integer_value < 0:
+            return False
+    return True
+
+
+def _has_valid_v4_relations(manifest: dict[str, Any]) -> bool:
+    prefix_target = _optional_integer(manifest.get("npi_prefix_target")) or 0
+    worst_key = _optional_integer(manifest.get("worst_provider_set_key"))
+    online_key = _optional_integer(manifest.get("worst_online_provider_set_key"))
+    if prefix_target <= 0:
+        return False
+    if (worst_key is None) != (manifest.get("worst_member_digest") is None):
+        return False
+    if (online_key is None) != (
+        manifest.get("worst_online_member_digest") is None
+    ):
+        return False
+    return (
+        int(manifest["worst_member_count"]) <= prefix_target
+        and int(manifest["worst_online_member_count"]) <= prefix_target
+        and int(manifest["max_set_patterns_per_set"]) > 0
+        and int(manifest["max_set_components_per_fallback_set"]) > 0
+        and int(manifest["max_online_group_keys_per_set"]) > 0
+        and int(manifest["max_online_source_owners_per_set"]) > 0
+        and int(manifest["max_online_source_members_per_set"]) > 0
+        and int(manifest["max_online_source_pages_per_set"]) > 0
+        and int(manifest["max_online_source_bytes_per_set"]) > 0
+        and int(manifest["online_group_npi_batch_size"]) > 0
+        and int(manifest["max_online_group_npi_members_per_set"]) > 0
+        and int(manifest["max_online_group_npi_locator_pages_per_set"]) > 0
+        and int(manifest["max_online_group_npi_member_pages_per_set"]) > 0
+        and int(manifest["max_online_group_npi_bytes_per_set"]) > 0
+        and int(manifest["max_online_group_npi_batches_per_set"]) > 0
+        and int(manifest["provider_expansion_rate_page_rows"]) > 0
+        and int(manifest["max_online_provider_expansion_rate_rows"]) > 0
+        and int(manifest["max_online_provider_expansion_provider_sets"]) > 0
+        and int(manifest["max_online_provider_expansion_graph_batches"]) > 0
+        and int(manifest["worst_online_group_npi_member_work"])
+        <= int(manifest["max_online_group_npi_members_per_set"])
+        and int(manifest["worst_online_group_npi_locator_page_work"])
+        <= int(manifest["max_online_group_npi_locator_pages_per_set"])
+        and int(manifest["worst_online_group_npi_member_page_work"])
+        <= int(manifest["max_online_group_npi_member_pages_per_set"])
+        and int(manifest["worst_online_group_npi_byte_work"])
+        <= int(manifest["max_online_group_npi_bytes_per_set"])
+        and int(manifest["worst_online_group_npi_batch_work"])
+        <= int(manifest["max_online_group_npi_batches_per_set"])
+        and (
+            not bool(manifest["worst_uses_override"])
+            or int(manifest["override_owner_count"]) > 0
+        )
+        and int(manifest["override_owner_count"])
+        >= max(
+            int(manifest["group_unsafe_set_count"]),
+            int(manifest["physical_unsafe_set_count"]),
+        )
+        and int(manifest["override_owner_count"])
+        <= (
+            int(manifest["group_unsafe_set_count"])
+            + int(manifest["physical_unsafe_set_count"])
+        )
+    )
+
+
+def _has_valid_v4_manifest(manifest: Any) -> bool:
+    return _has_valid_v4_fields(manifest) and (
+        _has_valid_v4_relations(manifest)
+    )
+
+
+def _has_valid_v4_resources(manifest: Any) -> bool:
+    if not isinstance(manifest, dict) or set(manifest) != set(
+        PTG2_V4_GRAPH_RESOURCE_FIELDS
+    ):
+        return False
+    resources_by_field = {
+        field_name: _optional_integer(manifest.get(field_name))
+        for field_name in PTG2_V4_GRAPH_RESOURCE_FIELDS
+    }
+    return (
+        resources_by_field["compressed_acquisition_bytes"] is not None
+        and int(resources_by_field["compressed_acquisition_bytes"]) > 0
+        and resources_by_field["input_factor_bytes"] is not None
+        and int(resources_by_field["input_factor_bytes"]) >= 0
+        and resources_by_field["factor_edge_count"] is not None
+        and int(resources_by_field["factor_edge_count"]) >= 0
+        and resources_by_field["empty_npi_tin_only_normalization_count"]
+        is not None
+        and int(resources_by_field["empty_npi_tin_only_normalization_count"])
+        >= 0
+    )
 
 
 def _strict_coverage_scope_id(serving_index: dict[str, Any]) -> str:
@@ -384,9 +552,13 @@ def _strict_v3_manifest_fields(
         raise PTG2ManifestArtifactError(
             "only postgres_binary_v3 snapshots are supported; reimport the snapshot"
         )
-    if storage_generation != PTG2_V3_SHARED_GENERATION:
+    if storage_generation not in {
+        PTG2_V3_SHARED_GENERATION,
+        PTG2_V4_SHARED_GENERATION,
+    }:
         raise PTG2ManifestArtifactError(
-            "PTG2 postgres_binary_v3 snapshot is missing storage_generation=shared_blocks_v3; "
+            "PTG2 postgres_binary_v3 snapshot requires "
+            "storage_generation=shared_blocks_v3 or shared_blocks_v4; "
             "reimport the snapshot"
         )
     if cold_lookup_contract != PTG2_V3_COLD_LOOKUP_CONTRACT:
@@ -416,13 +588,23 @@ def _strict_v3_manifest_fields(
         )
     _strict_coverage_scope_id(serving_index)
 
+    generation_marker_values = {
+        PTG2_V3_SHARED_GENERATION: {
+            "type": PTG2_V3_STORAGE_TYPE,
+            "provider_scope_strategy": "postgres_shared_graph",
+            "shared_block_layout": PTG2_V3_SHARED_BLOCK_LAYOUT,
+        },
+        PTG2_V4_SHARED_GENERATION: {
+            "type": PTG2_V4_STORAGE_TYPE,
+            "provider_scope_strategy": PTG2_V4_PROVIDER_SCOPE_STRATEGY,
+            "shared_block_layout": PTG2_V4_SHARED_BLOCK_LAYOUT,
+        },
+    }[storage_generation]
     required_marker_values_by_field = {
         "storage": "manifest_snapshot",
-        "type": PTG2_V3_STORAGE_TYPE,
-        "provider_scope_strategy": "postgres_shared_graph",
         "id_storage": "binary128",
         "serving_table_layout": PTG2_V3_SERVING_LAYOUT,
-        "shared_block_layout": PTG2_V3_SHARED_BLOCK_LAYOUT,
+        **generation_marker_values,
     }
     for field_name, expected_value in required_marker_values_by_field.items():
         actual_value = str(serving_index.get(field_name) or "").strip().lower()
@@ -492,6 +674,47 @@ def _strict_v3_manifest_fields(
             "PTG2 postgres_binary_v3 snapshot has an invalid serving_binary format; "
             "reimport the snapshot"
         )
+    if storage_generation == PTG2_V4_SHARED_GENERATION:
+        provider_graph = serving_binary.get("provider_graph_v4")
+        if not isinstance(provider_graph, dict):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 snapshot is missing provider_graph_v4 metadata; reimport the snapshot"
+            )
+        map_digest = str(provider_graph.get("map_digest") or "").strip().lower()
+        if (
+            provider_graph.get("contract") != PTG2_V4_PROVIDER_GRAPH_CONTRACT
+            or str(provider_graph.get("representation") or "").strip().lower()
+            not in {"direct_v1", "pattern_v1"}
+            or str(provider_graph.get("map_format") or "").strip().lower()
+            != PTG2_V4_MAP_FORMAT
+            or str(provider_graph.get("projection_id_scope") or "").strip().lower()
+            != PTG2_V4_PROJECTION_ID_SCOPE
+            or provider_graph.get("locator_page_contract")
+            != PTG2_V4_OWNER_LOCATOR_PAGE_CONTRACT
+            or provider_graph.get("member_page_contract")
+            != PTG2_V4_MEMBER_PAGE_CONTRACT
+            or provider_graph.get("npi_table") != PTG2_V4_NPI_TABLE
+            or provider_graph.get("component_table") != PTG2_V4_COMPONENT_TABLE
+            or provider_graph.get("pattern_table") != PTG2_V4_PATTERN_TABLE
+            or provider_graph.get("relation_manifest_table")
+            != PTG2_V4_RELATION_MANIFEST_TABLE
+            or provider_graph.get("heavy_owner_table")
+            != PTG2_V4_HEAVY_OWNER_TABLE
+            or provider_graph.get("npi_prefix_table")
+            != PTG2_V4_NPI_PREFIX_TABLE
+            or provider_graph.get("diagnostic_table")
+            != PTG2_V4_GRAPH_DIAGNOSTIC_TABLE
+            or not _has_valid_v4_manifest(
+                provider_graph.get("hot_prefix")
+            )
+            or not _has_valid_v4_resources(
+                provider_graph.get("resource_admission")
+            )
+            or not _COVERAGE_SCOPE_ID_RE.fullmatch(map_digest)
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 provider graph metadata is invalid; reimport the snapshot"
+            )
 
     price_dictionary = serving_binary["price_dictionary"]
     membership = serving_binary["price_set_atom_memberships_v3"]
@@ -532,6 +755,125 @@ def _strict_v3_manifest_fields(
     )
 
 
+async def _load_v4_provider_graph_root(
+    session: Any,
+    *,
+    snapshot_key: int,
+) -> dict[str, Any]:
+    persisted_columns = ", ".join(
+        f"diagnostic.{field_name}"
+        for field_name in (
+            *PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
+            *PTG2_V4_GRAPH_RESOURCE_FIELDS,
+        )
+    )
+    root_query_result = await session.execute(
+        text(
+            f"""
+            SELECT root.representation, root.map_format,
+                   root.projection_id_scope,
+                   encode(root.map_digest, 'hex') AS map_digest,
+                   {persisted_columns}
+              FROM {PTG2_SCHEMA}.ptg2_v4_snapshot_map_root AS root
+              JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_layout AS layout
+                ON layout.snapshot_key = root.snapshot_key
+              JOIN {PTG2_SCHEMA}.{PTG2_V4_GRAPH_DIAGNOSTIC_TABLE}
+                    AS diagnostic
+                ON diagnostic.snapshot_key = root.snapshot_key
+             WHERE root.snapshot_key = :snapshot_key
+               AND root.state = 'complete'
+               AND layout.state = 'sealed'
+               AND layout.generation = :storage_generation
+            """
+        ),
+        {
+            "snapshot_key": int(snapshot_key),
+            "storage_generation": PTG2_V4_SHARED_GENERATION,
+        },
+    )
+    root_row = root_query_result.first()
+    return _row_mapping(root_row) if root_row is not None else {}
+
+
+def _validate_v4_provider_graph_fields(
+    fields: dict[str, Any],
+    provider_graph: dict[str, Any],
+) -> None:
+    expected_by_field = {
+        "representation": str(provider_graph.get("representation") or "")
+        .strip()
+        .lower(),
+        "map_format": str(provider_graph.get("map_format") or "")
+        .strip()
+        .lower(),
+        "projection_id_scope": str(
+            provider_graph.get("projection_id_scope") or ""
+        )
+        .strip()
+        .lower(),
+        "map_digest": str(provider_graph.get("map_digest") or "")
+        .strip()
+        .lower(),
+    }
+    if any(
+        str(fields.get(name) or "").strip().lower() != expected_value
+        for name, expected_value in expected_by_field.items()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sealed map root does not match its manifest; reimport the snapshot"
+        )
+    observed_hot_prefix_by_field = {
+        field_name: fields.get(field_name)
+        for field_name in PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS
+    }
+    for digest_field in (
+        "worst_member_digest",
+        "worst_online_member_digest",
+    ):
+        digest = observed_hot_prefix_by_field.get(digest_field)
+        observed_hot_prefix_by_field[digest_field] = (
+            bytes(digest).hex() if digest is not None else None
+        )
+    if observed_hot_prefix_by_field != dict(provider_graph.get("hot_prefix") or {}):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 provider diagnostics do not match its manifest; reimport the snapshot"
+        )
+    observed_resources_by_field = {
+        field_name: fields.get(field_name)
+        for field_name in PTG2_V4_GRAPH_RESOURCE_FIELDS
+    }
+    if observed_resources_by_field != dict(provider_graph.get("resource_admission") or {}):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 graph resources do not match its manifest; "
+            "reimport the snapshot"
+        )
+
+
+async def _validate_v4_provider_graph_root(
+    session: Any,
+    *,
+    snapshot_key: int,
+    serving_index: dict[str, Any],
+) -> None:
+    """Bind V4 manifest metadata to the authoritative completed map root."""
+
+    serving_binary = serving_index.get("serving_binary")
+    provider_graph = (
+        serving_binary.get("provider_graph_v4")
+        if isinstance(serving_binary, dict)
+        else None
+    )
+    if not isinstance(provider_graph, dict):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 snapshot is missing provider graph metadata"
+        )
+    fields = await _load_v4_provider_graph_root(
+        session,
+        snapshot_key=snapshot_key,
+    )
+    _validate_v4_provider_graph_fields(fields, provider_graph)
+
+
 async def snapshot_serving_tables(
     session: Any,
     snapshot_id: str,
@@ -542,7 +884,10 @@ async def snapshot_serving_tables(
 
     query_params_by_name: dict[str, Any] = {
         "snapshot_id": str(snapshot_id),
-        "storage_generation": PTG2_V3_SHARED_GENERATION,
+        "storage_generations": [
+            PTG2_V3_SHARED_GENERATION,
+            PTG2_V4_SHARED_GENERATION,
+        ],
     }
     if candidate_audit_access is not None:
         if candidate_audit_access.snapshot_id != str(snapshot_id):
@@ -611,7 +956,7 @@ async def snapshot_serving_tables(
                    snapshot.manifest->'serving_index'->>'source_key', ''
                ))) = :candidate_source_key
                AND layout.state = 'sealed'
-               AND layout.generation = :storage_generation
+               AND layout.generation = ANY(CAST(:storage_generations AS text[]))
                AND EXISTS (
                    SELECT 1
                      FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope
@@ -705,7 +1050,7 @@ async def snapshot_serving_tables(
              WHERE snapshot.snapshot_id = :snapshot_id
                AND snapshot.status = 'published'
                AND layout.state = 'sealed'
-               AND layout.generation = :storage_generation
+               AND layout.generation = ANY(CAST(:storage_generations AS text[]))
                AND attestation.contract = ANY(
                    CAST(:attestation_contracts AS text[])
                )
@@ -758,6 +1103,12 @@ async def snapshot_serving_tables(
         cold_lookup_contract,
         audit_sample,
     ) = _strict_v3_manifest_fields(serving_index)
+    if storage_generation == PTG2_V4_SHARED_GENERATION:
+        await _validate_v4_provider_graph_root(
+            session,
+            snapshot_key=int(shared_snapshot_key or 0),
+            serving_index=serving_index,
+        )
     coverage_scope_id = _strict_coverage_scope_id(serving_index)
     code_count = _optional_integer(serving_index.get("code_count"))
     source_count = _optional_integer(serving_index.get("source_count"))
@@ -923,6 +1274,25 @@ async def snapshot_serving_tables(
             "PTG2 shared layout is missing code metadata for a non-empty snapshot"
         )
     network_names = serving_index.get("network_names")
+    provider_graph_v4_hot_prefix_by_field: dict[str, Any] | None = None
+    if storage_generation == PTG2_V4_SHARED_GENERATION:
+        serving_binary = serving_index.get("serving_binary")
+        provider_graph = (
+            serving_binary.get("provider_graph_v4")
+            if isinstance(serving_binary, dict)
+            else None
+        )
+        raw_hot_prefix = (
+            provider_graph.get("hot_prefix")
+            if isinstance(provider_graph, dict)
+            else None
+        )
+        if not _has_valid_v4_manifest(raw_hot_prefix):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 snapshot is missing sealed hot-prefix limits; "
+                "reimport the snapshot"
+            )
+        provider_graph_v4_hot_prefix_by_field = dict(raw_hot_prefix)
     return PTG2ServingTables(
         snapshot_id=str(snapshot_id),
         arch_version=PTG2_V3_ARCH_VERSION,
@@ -931,7 +1301,11 @@ async def snapshot_serving_tables(
         storage_generation=storage_generation,
         cold_lookup_contract=cold_lookup_contract,
         serving_table_layout=PTG2_V3_SERVING_LAYOUT,
-        shared_block_layout=PTG2_V3_SHARED_BLOCK_LAYOUT,
+        shared_block_layout=(
+            PTG2_V4_SHARED_BLOCK_LAYOUT
+            if storage_generation == PTG2_V4_SHARED_GENERATION
+            else PTG2_V3_SHARED_BLOCK_LAYOUT
+        ),
         source_count=source_count,
         code_count=code_count,
         coverage_scope_id=coverage_scope_id,
@@ -944,6 +1318,7 @@ async def snapshot_serving_tables(
         source_witness=source_witness_by_field,
         source_set=source_set_by_field,
         database_evidence=_database_execution_evidence(row_fields),
+        provider_graph_v4_hot_prefix=provider_graph_v4_hot_prefix_by_field,
         source_trace_set_hash=str(
             serving_index.get("source_trace_set_hash") or ""
         ).strip()

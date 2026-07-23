@@ -1,0 +1,85 @@
+{
+  "reporting_entity_name": "V4 Coverage Fixture",
+  "provider_references": [
+    {
+      "provider_group_id": 7,
+      "provider_groups": [
+        {
+          "tin": {"type": "ein", "value": "123456789"},
+          "npi": [1234567890, 1234567891]
+        }
+      ]
+    },
+    {
+      "provider_group_id": 8,
+      "provider_groups": [
+        {
+          "tin": {"type": "ein", "value": "987654321"},
+          "npi": [1234567891, 1234567892]
+        }
+      ]
+    }
+  ],
+  "in_network": [
+    {
+      "billing_code_type": "CPT",
+      "billing_code_type_version": "2026",
+      "billing_code": "99213",
+      "description": "office visit",
+      "name": "office visit",
+      "negotiation_arrangement": "ffs",
+      "negotiated_rates": [
+        {
+          "provider_references": [7, 8],
+          "negotiated_prices": [
+            {
+              "negotiated_type": "negotiated",
+              "negotiated_rate": 100.25,
+              "service_code": ["11"],
+              "billing_class": "professional",
+              "expiration_date": "2026-12-31"
+            },
+            {
+              "negotiated_type": "fee schedule",
+              "negotiated_rate": 125,
+              "service_code": ["22"],
+              "billing_class": "institutional"
+            }
+          ]
+        },
+        {
+          "provider_groups": [
+            {
+              "tin": {"type": "ein", "value": "555555555"},
+              "npi": [1234567893]
+            }
+          ],
+          "negotiated_prices": [
+            {
+              "negotiated_type": "negotiated",
+              "negotiated_rate": 88,
+              "service_code": ["02", "11"]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "billing_code_type": "HCPCS",
+      "billing_code": "J1234",
+      "negotiation_arrangement": "bundle",
+      "negotiated_rates": [
+        {
+          "provider_references": [7],
+          "negotiated_prices": [
+            {
+              "negotiated_type": "derived",
+              "negotiated_rate": 45,
+              "service_code": ["11"]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

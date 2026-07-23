@@ -64,6 +64,8 @@ class PTGFileProgressCoordinator:
         self._validate_index(file_index)
 
         def observe(payload: dict[str, Any]) -> None:
+            """Forward one scanner observation to its bound file slot."""
+
             self.observe(file_index, payload)
 
         return observe
@@ -108,8 +110,10 @@ class PTGFileProgressCoordinator:
     def _publish_locked(
         self,
         file_index: int,
-        payload: Mapping[str, Any],
+        scanner_observation: Mapping[str, Any],
     ) -> None:
+        """Publish the aggregate run position while holding the coordinator lock."""
+
         weighted_done = sum(
             weight * fraction
             for weight, fraction in zip(
@@ -136,13 +140,15 @@ class PTGFileProgressCoordinator:
             }
         )
         original_message = str(
-            payload.get("message") or payload.get("phase") or "processing"
+            scanner_observation.get("message")
+            or scanner_observation.get("phase")
+            or "processing"
         )
         weight_label = f"{file_weight_pct:.1f}% of compressed input"
         if file_index == self._dominant_index:
             weight_label += "; largest file"
-        progress_payload = {
-            **dict(payload),
+        progress_by_field = {
+            **dict(scanner_observation),
             "stage_id": self._stage_id,
             "stage_ordinal": self._stage_ordinal,
             "stage_pct": stage_fraction * 100.0,
@@ -166,7 +172,7 @@ class PTGFileProgressCoordinator:
                 f"({weight_label}): {original_message}"
             )[:512],
         }
-        write_live_progress(**progress_payload)
+        write_live_progress(**progress_by_field)
 
     def _validate_index(self, file_index: int) -> None:
         if file_index < 0 or file_index >= len(self._weights):
@@ -216,16 +222,18 @@ def _aggregate_file_progress_counters(
 ) -> dict[str, Any]:
     """Sum numeric per-file counters while retaining simple shared metadata."""
 
-    aggregated: dict[str, Any] = {}
+    counters_by_name: dict[str, Any] = {}
     for file_counters in counters_by_index:
         for name, value in file_counters.items():
             if isinstance(value, bool):
-                aggregated[name] = bool(aggregated.get(name, False) or value)
+                counters_by_name[name] = bool(
+                    counters_by_name.get(name, False) or value
+                )
             elif isinstance(value, (int, float)):
-                aggregated[name] = aggregated.get(name, 0) + value
-            elif name not in aggregated:
-                aggregated[name] = value
-    return aggregated
+                counters_by_name[name] = counters_by_name.get(name, 0) + value
+            elif name not in counters_by_name:
+                counters_by_name[name] = value
+    return counters_by_name
 
 
 def _safe_progress_file_label(value: str) -> str:

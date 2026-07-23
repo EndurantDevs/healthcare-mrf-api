@@ -16,6 +16,7 @@ from process.ptg_parts.ptg2_shared_publish import (
     create_shared_block_stage,
     publish_shared_block_stage,
     publish_shared_finalizer_dictionaries,
+    publish_v4_cas_block_stage,
     shared_block_stage_name,
 )
 from process.ptg_parts import ptg2_shared_publish
@@ -869,6 +870,83 @@ async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatc
         stage_table="ptg2_v3_block_stage_proof",
         snapshot_key=42,
         expected_count=3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_cas_stage_publishes_exact_totals_without_snapshot_mappings(
+    monkeypatch,
+):
+    """Prove V4 publishes deduplicated CAS totals without legacy mappings."""
+
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                None,
+                None,
+                _OneRowResult(
+                    (
+                        3,
+                        18,
+                        2,
+                        30,
+                        20,
+                        20,
+                        14,
+                        ["a_kind", "z_kind"],
+                        False,
+                        False,
+                        False,
+                    )
+                ),
+                None,
+            ]
+        )
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
+    drop_stage = AsyncMock()
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", drop_stage)
+    layout_lock = AsyncMock()
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_v4_shared_layout_for_map_write",
+        layout_lock,
+    )
+
+    publication = await publish_v4_cas_block_stage(
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_v4proof",
+        snapshot_key=42,
+        build_token="build-v4",
+    )
+
+    assert publication.object_kinds == ("a_kind", "z_kind")
+    assert publication.staged_row_count == 3
+    assert publication.staged_entry_count == 18
+    assert publication.unique_block_count == 2
+    assert publication.logical_byte_count == 30
+    assert publication.stored_byte_count == 20
+    assert publication.unique_logical_byte_count == 20
+    assert publication.unique_stored_byte_count == 14
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert "FOR KEY SHARE OF stored" in statements[0]
+    assert "INSERT INTO \"mrf\".ptg2_v3_block" in statements[1]
+    assert "WITH canonical AS MATERIALIZED" in statements[2]
+    assert "DELETE FROM \"mrf\".ptg2_v3_gc_candidate" in statements[3]
+    assert not any("ptg2_v3_snapshot_block" in statement for statement in statements)
+    layout_lock.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
+        snapshot_key=42,
+        build_token="build-v4",
+    )
+    drop_stage.assert_awaited_once_with(
+        'DROP TABLE IF EXISTS "mrf"."ptg2_v3_block_stage_v4proof";'
     )
 
 

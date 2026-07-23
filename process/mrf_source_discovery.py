@@ -2091,7 +2091,7 @@ def _infer_entity_type(section: str, payer_name: str) -> str | None:
 
 def _infer_parent_group(section: str, payer_name: str) -> str | None:
     text = f"{section} {payer_name}".lower()
-    groups = {
+    group_by_keyword = {
         "united": "UHG",
         "elevance": "Elevance",
         "anthem": "Elevance",
@@ -2104,7 +2104,7 @@ def _infer_parent_group(section: str, payer_name: str) -> str | None:
         "kaiser": "Kaiser",
         "molina": "Molina",
     }
-    for needle, group in groups.items():
+    for needle, group in group_by_keyword.items():
         if needle in text:
             return group
     if "bcbs" in text or "blue cross" in text or "blue shield" in text:
@@ -2235,7 +2235,7 @@ async def _fetch_text(
         aiohttp.ServerDisconnectedError,
         BrowserFallbackRequired,
     ):
-        retry_headers = {
+        retry_headers_by_name = {
             "User-Agent": BROWSER_FALLBACK_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
             "Connection": "close",
@@ -2245,7 +2245,7 @@ async def _fetch_text(
         )
         retry_connector = _tcp_connector(limit=0)
         async with aiohttp.ClientSession(
-            headers=retry_headers,
+            headers=retry_headers_by_name,
             timeout=retry_timeout,
             connector=retry_connector,
             trust_env=False,
@@ -2506,12 +2506,12 @@ def _is_tic_toc_json_text(text: str) -> bool:
 def _repair_missing_array_object_commas(text: str) -> str:
     # Some payer TOCs are published with adjacent objects in an array but no comma.
     # Keep this intentionally narrow and only apply it to TiC TOC-looking payloads.
-    repaired: list[str] = []
+    repaired_chunks: list[str] = []
     is_in_string = False
     is_escaped = False
     length = len(text)
     for idx, char in enumerate(text):
-        repaired.append(char)
+        repaired_chunks.append(char)
         if is_in_string:
             if is_escaped:
                 is_escaped = False
@@ -2529,8 +2529,8 @@ def _repair_missing_array_object_commas(text: str) -> str:
         while lookahead < length and text[lookahead].isspace():
             lookahead += 1
         if lookahead < length and text[lookahead] == "{":
-            repaired.append(",")
-    return "".join(repaired)
+            repaired_chunks.append(",")
+    return "".join(repaired_chunks)
 
 
 def _loads_mrf_json_value(text: str) -> Any:
@@ -2953,10 +2953,10 @@ async def _store_candidates(
                     + (payer_row.get("source_coverage") or [])
                 )
             )
-            existing_metadata = dict(existing.get("metadata_json") or {})
-            existing_metadata["benefit_lines"] = sorted(
+            existing_metadata_by_field = dict(existing.get("metadata_json") or {})
+            existing_metadata_by_field["benefit_lines"] = sorted(
                 set(
-                    (existing_metadata.get("benefit_lines") or [])
+                    (existing_metadata_by_field.get("benefit_lines") or [])
                     + list(candidate.benefit_lines)
                 )
             )
@@ -2967,18 +2967,18 @@ async def _store_candidates(
                 "network_names",
                 "plan_names",
             ):
-                existing_metadata[key] = sorted(
+                existing_metadata_by_field[key] = sorted(
                     set(
-                        (existing_metadata.get(key) or [])
+                        (existing_metadata_by_field.get(key) or [])
                         + ((payer_row.get("metadata_json") or {}).get(key) or [])
                     )
                 )
-            existing_metadata["source_tier"] = _normalize_source_tier(
-                existing_metadata.get("source_tier")
+            existing_metadata_by_field["source_tier"] = _normalize_source_tier(
+                existing_metadata_by_field.get("source_tier")
                 or (payer_row.get("metadata_json") or {}).get("source_tier")
             )
             existing["metadata_json"] = {
-                **existing_metadata,
+                **existing_metadata_by_field,
                 "providers": sorted(
                     set(
                         (existing.get("metadata_json") or {}).get("providers", [])
@@ -3054,31 +3054,34 @@ async def _store_observations(
         """Check one source URL and return its normalized observation row."""
         async with semaphore:
             if test_mode:
-                head = {"status": "skipped_test_mode", "checked_at": _utc_now()}
+                head_by_field = {
+                    "status": "skipped_test_mode",
+                    "checked_at": _utc_now(),
+                }
             else:
-                head = await _head_url(str(url), session=session)
+                head_by_field = await _head_url(str(url), session=session)
             return {
                 "observation_id": _id(
                     "mrfurlobs",
                     {
                         "source_id": source_row["source_id"],
                         "url": url,
-                        "checked_at": head["checked_at"].isoformat(),
+                        "checked_at": head_by_field["checked_at"].isoformat(),
                     },
                 ),
                 "source_id": source_row["source_id"],
                 "url": str(url),
                 "canonical_url": _canonical_or_none(str(url)),
                 "url_type": "index_or_landing",
-                "status": str(head.get("status") or "unknown"),
-                "http_status": head.get("http_status"),
-                "etag": head.get("etag"),
-                "last_modified": head.get("last_modified"),
-                "content_length": head.get("content_length"),
-                "content_type": head.get("content_type"),
-                "final_url": head.get("final_url"),
-                "checked_at": head["checked_at"],
-                "error": head.get("error"),
+                "status": str(head_by_field.get("status") or "unknown"),
+                "http_status": head_by_field.get("http_status"),
+                "etag": head_by_field.get("etag"),
+                "last_modified": head_by_field.get("last_modified"),
+                "content_length": head_by_field.get("content_length"),
+                "content_type": head_by_field.get("content_type"),
+                "final_url": head_by_field.get("final_url"),
+                "checked_at": head_by_field["checked_at"],
+                "error": head_by_field.get("error"),
                 "metadata_json": {"run_id": run_id},
             }
 
@@ -3645,17 +3648,19 @@ def _parse_uhc_blob_listing(
         if not name or not url:
             continue
         lower_name = name.lower()
-        direct_embedded_vision = (
+        has_direct_embedded_vision = (
             "uhc---embedded-vision_uhc-vision" in lower_name
             and _is_direct_mrf_body_url(url)
             and _mrf_file_type_from_text(url, name) == "in-network"
         )
-        if "_index.json" not in lower_name and not direct_embedded_vision:
+        if "_index.json" not in lower_name and not has_direct_embedded_vision:
             continue
-        target_kind = "file_reference" if direct_embedded_vision else "toc_json"
+        target_kind = (
+            "file_reference" if has_direct_embedded_vision else "toc_json"
+        )
         target_file_type = (
             "in-network"
-            if direct_embedded_vision
+            if has_direct_embedded_vision
             else "table-of-contents"
         )
         blob_targets.append(
@@ -3663,7 +3668,7 @@ def _parse_uhc_blob_listing(
                 "url": url,
                 "label": (
                     "UHC Vision"
-                    if direct_embedded_vision
+                    if has_direct_embedded_vision
                     else _label_from_index_name(name)
                 ),
                 "name": name,
@@ -3845,10 +3850,13 @@ def _slug_label(value: str | None) -> str | None:
 def _mymedicalshopper_employer_selector(
     entity_slug: str, *, all_employers_searchable: bool
 ) -> dict[str, Any]:
-    selector: dict[str, Any] = {"tpaSlug": entity_slug, "status": "Enabled"}
+    selector_by_field: dict[str, Any] = {
+        "tpaSlug": entity_slug,
+        "status": "Enabled",
+    }
     if not all_employers_searchable:
-        selector["machineReadableFiles.makeMRFsSearchable"] = True
-    return selector
+        selector_by_field["machineReadableFiles.makeMRFsSearchable"] = True
+    return selector_by_field
 
 
 def _mymedicalshopper_employer_search_pattern(query: str | None) -> str | None:
@@ -4068,7 +4076,7 @@ async def _mymedicalshopper_ddp_subscribe_collect(
     await _mymedicalshopper_ddp_send(
         ws, {"msg": "sub", "id": sub_id, "name": name, "params": params}
     )
-    collected: list[dict[str, Any]] = []
+    collected_messages: list[dict[str, Any]] = []
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
         for message in await _mymedicalshopper_ddp_recv(
@@ -4078,10 +4086,10 @@ async def _mymedicalshopper_ddp_subscribe_collect(
             operation=f"subscription {name}",
         ):
             if message.get("msg") in {"added", "changed", "removed"}:
-                collected.append(message)
+                collected_messages.append(message)
                 continue
             if message.get("msg") == "ready" and sub_id in (message.get("subs") or []):
-                return collected
+                return collected_messages
             if message.get("msg") == "nosub" and message.get("id") == sub_id:
                 raise ValueError(
                     f"MyMedicalShopper DDP subscription {name} failed: {message.get('error') or message}"
@@ -4128,7 +4136,11 @@ def _mymedicalshopper_oid_value(value: Any) -> str:
 def _mymedicalshopper_tabular_info_from_messages(
     messages: list[dict[str, Any]], table_id: str = "EntityMRFEmployers"
 ) -> dict[str, Any]:
-    info: dict[str, Any] = {"ids": [], "records_total": 0, "records_filtered": 0}
+    info_by_field: dict[str, Any] = {
+        "ids": [],
+        "records_total": 0,
+        "records_filtered": 0,
+    }
     for message in messages:
         if (
             message.get("collection") != "tabular_records"
@@ -4139,18 +4151,21 @@ def _mymedicalshopper_tabular_info_from_messages(
             message.get("fields") if isinstance(message.get("fields"), dict) else {}
         )
         ids = fields.get("ids") if isinstance(fields.get("ids"), list) else []
-        info["ids"] = ids
-        info["records_total"] = _as_int(fields.get("recordsTotal")) or len(ids)
-        info["records_filtered"] = (
-            _as_int(fields.get("recordsFiltered")) or info["records_total"]
+        info_by_field["ids"] = ids
+        info_by_field["records_total"] = (
+            _as_int(fields.get("recordsTotal")) or len(ids)
         )
-    return info
+        info_by_field["records_filtered"] = (
+            _as_int(fields.get("recordsFiltered"))
+            or info_by_field["records_total"]
+        )
+    return info_by_field
 
 
 def _mymedicalshopper_employer_docs_from_messages(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    employers: dict[str, dict[str, Any]] = {}
+    employer_by_slug: dict[str, dict[str, Any]] = {}
     for message in messages:
         if message.get("collection") != "employers" or message.get("msg") not in {
             "added",
@@ -4163,11 +4178,11 @@ def _mymedicalshopper_employer_docs_from_messages(
         slug = str(fields.get("slug") or "").strip()
         if not slug:
             continue
-        employers[slug] = {
+        employer_by_slug[slug] = {
             "_id": _mymedicalshopper_oid_value(message.get("id")),
             **fields,
         }
-    return list(employers.values())
+    return list(employer_by_slug.values())
 
 
 def _mymedicalshopper_employer_search_values(employer: dict[str, Any]) -> list[Any]:
@@ -4698,9 +4713,9 @@ def _viva_health_employer_landing_target(
         "viva-health" if group_id else None
     )
     employer_name = _slug_label(employer_slug)
-    plan_info = []
+    plan_info_rows = []
     if employer_name or group_id:
-        plan_info.append(
+        plan_info_rows.append(
             {
                 "plan_id": group_id,
                 "plan_id_type": "group_number" if group_id else None,
@@ -4727,7 +4742,7 @@ def _viva_health_employer_landing_target(
             "tpa_slug": tpa_slug,
             "tpa_name": _slug_label(tpa_slug),
             "landing_reason": "public_employer_mrf_page",
-            "plan_info": plan_info,
+            "plan_info": plan_info_rows,
         },
     )
 
@@ -4958,7 +4973,7 @@ async def _resolve_magnacare_transparency_mrf(
     search_terms = _magnacare_search_terms(source_record, resolver)
     max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
     ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
-    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    grouped_by_target_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     max_targets = _as_int(resolver.get("max_targets"))
     for search_term in search_terms:
         results_url = _magnacare_results_url(url, search_term)
@@ -4976,7 +4991,7 @@ async def _resolve_magnacare_transparency_mrf(
             if not file_name or not file_type:
                 continue
             key = _magnacare_target_key(result_row)
-            grouped_result = grouped.setdefault(
+            grouped_result = grouped_by_target_key.setdefault(
                 key,
                 {
                     "row": result_row,
@@ -5000,13 +5015,15 @@ async def _resolve_magnacare_transparency_mrf(
                     continue
                 grouped_result["plan_keys"].add(plan_key)
                 grouped_result["plan_info"].append(plan)
-        if max_targets and len(grouped) >= max_targets:
+        if max_targets and len(grouped_by_target_key) >= max_targets:
             break
-    if not grouped:
+    if not grouped_by_target_key:
         raise ValueError(f"no MagnaCare transparency MRF rows found for {url}")
 
     crawl_targets: list[CrawlTarget] = []
-    for grouped_result in list(grouped.values())[: max_targets or len(grouped)]:
+    for grouped_result in list(grouped_by_target_key.values())[
+        : max_targets or len(grouped_by_target_key)
+    ]:
         result_row = grouped_result["row"]
         run_history_id = _clean_text(result_row.get("run_history_id"))
         dynamic_download_url = _magnacare_download_url(url, run_history_id, ip_address)
@@ -5138,22 +5155,25 @@ def _crawl_target_context_metadata(crawl_target: CrawlTarget) -> dict[str, Any]:
     return context_metadata_dict
 
 
-def _apply_crawl_target_context_to_file_rows(
+def _apply_crawl_context_to_file_rows(
     file_rows: list[dict[str, Any]], target: CrawlTarget
 ) -> list[dict[str, Any]]:
     context = _crawl_target_context_metadata(target)
     target_plan_info = _metadata_plan_info(dict(target.metadata or {}))
     if not context and not target_plan_info:
         return file_rows
-    annotated: list[dict[str, Any]] = []
+    annotated_rows: list[dict[str, Any]] = []
     for row in file_rows:
         metadata = dict(row.get("metadata_json") or {})
         for key, value in context.items():
             metadata.setdefault(key, value)
         if target_plan_info:
             metadata = _merge_crawl_target_plan_info(metadata, target_plan_info)
-        annotated.append({**row, "metadata_json": metadata})
-    return annotated
+        annotated_rows.append({**row, "metadata_json": metadata})
+    return annotated_rows
+
+
+_apply_crawl_target_context_to_file_rows = _apply_crawl_context_to_file_rows
 
 
 def _plan_info_match_key(plan: dict[str, Any]) -> tuple[str, str, str]:
@@ -5183,18 +5203,20 @@ def _merge_crawl_target_plan_info(
         if not isinstance(plan, dict):
             merged_plans.append(plan)
             continue
-        next_plan = dict(plan)
-        target_plan = target_by_key.get(_plan_info_match_key(next_plan)) or {}
+        next_plan_by_field = dict(plan)
+        target_plan = (
+            target_by_key.get(_plan_info_match_key(next_plan_by_field)) or {}
+        )
         for key in (
             "engine_plan_hash",
             "issuer_name",
             "plan_sponsor_name",
             "company_name",
         ):
-            if not next_plan.get(key) and target_plan.get(key):
-                next_plan[key] = target_plan[key]
+            if not next_plan_by_field.get(key) and target_plan.get(key):
+                next_plan_by_field[key] = target_plan[key]
                 has_changed = True
-        merged_plans.append(next_plan)
+        merged_plans.append(next_plan_by_field)
     if not has_changed:
         return metadata
     return {**metadata, "plan_info": merged_plans}
@@ -5268,13 +5290,13 @@ def _asr_configured_group_numbers(resolver: dict[str, Any]) -> list[str]:
 
 def _asr_group_targets_for_source(url: str, resolver: dict[str, Any]) -> list[dict[str, Any]]:
     group_targets: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen_group_numbers: set[str] = set()
     by_group: dict[str, dict[str, Any]] = {}
 
     def add_group(value: Any, metadata: dict[str, Any] | None = None) -> None:
         """Add a validated ASR group target, merging metadata for duplicates."""
         group_number = str(value or "").strip()
-        if not group_number or group_number in seen:
+        if not group_number or group_number in seen_group_numbers:
             if group_number and metadata:
                 by_group.get(group_number, {}).update(
                     {key: item for key, item in metadata.items() if item not in (None, "")}
@@ -5282,13 +5304,13 @@ def _asr_group_targets_for_source(url: str, resolver: dict[str, Any]) -> list[di
             return
         if not re.fullmatch(r"\d{4}", group_number):
             raise ValueError("ASR configured group numbers must be 4 digits")
-        seen.add(group_number)
-        target = {
+        seen_group_numbers.add(group_number)
+        target_by_field = {
             "group_number": group_number,
             **{key: item for key, item in (metadata or {}).items() if item not in (None, "")},
         }
-        by_group[group_number] = target
-        group_targets.append(target)
+        by_group[group_number] = target_by_field
+        group_targets.append(target_by_field)
 
     add_group(_asr_group_number_from_url(url))
     for seed_row in _asr_seed_rows_from_seed_list(
@@ -5325,7 +5347,7 @@ def _resolve_asr_health_benefits_mrf(
     crawl_targets: list[CrawlTarget] = []
     for group_target in _asr_group_targets_for_source(url, resolver):
         group_number = str(group_target["group_number"])
-        context_metadata = {
+        context_metadata_by_field = {
             metadata_key: metadata_value
             for metadata_key, metadata_value in group_target.items()
             if metadata_key != "group_number" and metadata_value not in (None, "")
@@ -5335,9 +5357,9 @@ def _resolve_asr_health_benefits_mrf(
             f"group {group_number}"
         )
         employer_label = (
-            context_metadata.get("company_name")
-            or context_metadata.get("employer_name")
-            or context_metadata.get("client_name")
+            context_metadata_by_field.get("company_name")
+            or context_metadata_by_field.get("employer_name")
+            or context_metadata_by_field.get("client_name")
         )
         if employer_label:
             label = f"{label} - {employer_label}"
@@ -5351,7 +5373,7 @@ def _resolve_asr_health_benefits_mrf(
                     "resolver": resolver_type,
                     "target_file_type": "table-of-contents",
                     "group_number": group_number,
-                    **context_metadata,
+                    **context_metadata_by_field,
                 },
             )
         )
@@ -5414,13 +5436,13 @@ def _parse_auxiant_directory_networks(
 ) -> list[dict[str, Any]]:
     content = _wordpress_entry_content(html_text)
     base_host = _domain(base_url)
-    networks: dict[str, dict[str, Any]] = {}
+    network_by_url: dict[str, dict[str, Any]] = {}
     for candidate in _auxiant_anchor_links(content, base_url=base_url):
         raw_label = str(candidate.get("label") or "").strip()
         if not raw_label:
             continue
-        data_available = raw_label.startswith("*")
-        if data_available_only and not data_available:
+        is_data_available = raw_label.startswith("*")
+        if data_available_only and not is_data_available:
             continue
         url = str(candidate.get("url") or "").strip()
         if _domain(url) != base_host:
@@ -5434,11 +5456,15 @@ def _parse_auxiant_directory_networks(
         if not label:
             continue
         key = _canonical_or_none(url) or url
-        previous = networks.get(key)
+        previous = network_by_url.get(key)
         if previous and previous.get("data_available"):
             continue
-        networks[key] = {"url": url, "label": label, "data_available": data_available}
-    return list(networks.values())
+        network_by_url[key] = {
+            "url": url,
+            "label": label,
+            "data_available": is_data_available,
+        }
+    return list(network_by_url.values())
 
 
 def _auxiant_download_extension(
@@ -5508,7 +5534,7 @@ def _auxiant_file_type(url: str | None, label: str | None = None) -> str:
 def _parse_auxiant_page_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     content = _wordpress_entry_content(html_text)
     base_host = _domain(base_url)
-    links: dict[tuple[str, str], dict[str, Any]] = {}
+    link_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for candidate in _html_link_candidates(content, base_url=base_url):
         if candidate.get("attr") != "href":
             continue
@@ -5525,7 +5551,7 @@ def _parse_auxiant_page_links(html_text: str, *, base_url: str) -> list[dict[str
         parsed = urlsplit(url)
         if _is_auxiant_download_link(url, label):
             key = ("file_reference", _canonical_or_none(url) or url)
-            links[key] = {
+            link_by_key[key] = {
                 "url": url,
                 "label": label,
                 "target_kind": "file_reference",
@@ -5535,13 +5561,13 @@ def _parse_auxiant_page_links(html_text: str, *, base_url: str) -> list[dict[str
             continue
         if parsed.scheme in {"http", "https"} and _domain(url) != base_host:
             key = ("external_landing", _canonical_or_none(url) or url)
-            links[key] = {
+            link_by_key[key] = {
                 "url": url,
                 "label": label,
                 "target_kind": "external_landing",
                 "hosting_platform": classify_hosting_platform(url),
             }
-    return list(links.values())
+    return list(link_by_key.values())
 
 
 def _auxiant_display_label(network_name: str) -> str:
@@ -5704,14 +5730,16 @@ async def _resolve_auxiant_wordpress_directory(
             if not external_url:
                 continue
             nested_platform = classify_hosting_platform(external_url)
-            nested_source_record = {
+            nested_source_by_field = {
                 **source_record,
                 "hosting_platform": nested_platform,
             }
             nested_error: str | None = None
             try:
                 nested_targets = await _crawl_targets_for_source(
-                    nested_source_record, external_url, session
+                    nested_source_by_field,
+                    external_url,
+                    session,
                 )
             except Exception as exc:
                 nested_targets = []
@@ -5810,7 +5838,7 @@ def _sapphire_toc_target(
 
 
 def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
-    urls: dict[str, dict[str, Any]] = {}
+    target_by_url: dict[str, dict[str, Any]] = {}
     for candidate in _html_link_candidates(html_text or "", base_url=base_url):
         target = _sapphire_toc_target(
             candidate.get("url"),
@@ -5819,7 +5847,9 @@ def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str
         )
         if not target:
             continue
-        urls[_canonical_or_none(str(target["url"])) or str(target["url"])] = target
+        target_by_url[
+            _canonical_or_none(str(target["url"])) or str(target["url"])
+        ] = target
     decoded_text = (html_text or "").replace("\\/", "/")
     for match in re.finditer(
         r"""(?P<quote>["'])(?P<url>(?:https?://[^"']+)?/tocs/[^"']+)(?P=quote)""",
@@ -5830,11 +5860,11 @@ def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str
         target = _sapphire_toc_target(raw, base_url=base_url)
         if not target:
             continue
-        urls.setdefault(
+        target_by_url.setdefault(
             _canonical_or_none(str(target["url"])) or str(target["url"]),
             target,
         )
-    return list(urls.values())
+    return list(target_by_url.values())
 
 
 def _sapphire_origin_url(url: str) -> str:
@@ -5849,13 +5879,13 @@ def _sapphire_query_slug_variants(query: str | None) -> list[str]:
     if not raw:
         return []
     normalized = raw.lower()
-    replacements = {
+    replacement_by_suffix = {
         " incorporated": " inc",
         " limited liability company": " llc",
         " corporation": " corp",
         " company": " co",
     }
-    for old, new in replacements.items():
+    for old, new in replacement_by_suffix.items():
         normalized = normalized.replace(old, new)
     tokens = re.findall(r"[a-z0-9]+", normalized)
     if not tokens:
@@ -5960,7 +5990,7 @@ def _parse_sapphire_static_query_toc_links(
         query_payload_dict = json.loads(query_text or "{}")
     except json.JSONDecodeError:
         return []
-    urls: dict[str, dict[str, Any]] = {}
+    target_by_url: dict[str, dict[str, Any]] = {}
 
     def visit(node: Any, context: dict[str, Any] | None = None) -> None:
         """Recursively inspect Sapphire query values and collect labeled links."""
@@ -5983,7 +6013,7 @@ def _parse_sapphire_static_query_toc_links(
                 )
                 if not toc_target_by_field:
                     continue
-                urls.setdefault(
+                target_by_url.setdefault(
                     _canonical_or_none(str(toc_target_by_field["url"]))
                     or str(toc_target_by_field["url"]),
                     toc_target_by_field,
@@ -6010,14 +6040,14 @@ def _parse_sapphire_static_query_toc_links(
                 payer_name=context.get("payer_name") if context else None,
             )
             if toc_target_by_field:
-                urls.setdefault(
+                target_by_url.setdefault(
                     _canonical_or_none(str(toc_target_by_field["url"]))
                     or str(toc_target_by_field["url"]),
                     toc_target_by_field,
                 )
 
     visit(query_payload_dict)
-    return list(urls.values())
+    return list(target_by_url.values())
 
 
 async def _resolve_sapphire_static_query_toc_links(
@@ -6072,7 +6102,7 @@ async def _resolve_sapphire_static_query_toc_links(
 def _parse_healthgram_network_pages(
     html_text: str, *, base_url: str
 ) -> list[dict[str, Any]]:
-    pages: dict[str, dict[str, Any]] = {}
+    page_by_url: dict[str, dict[str, Any]] = {}
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "").strip()
         parsed = urlsplit(url)
@@ -6081,8 +6111,11 @@ def _parse_healthgram_network_pages(
         ):
             continue
         label = _clean_text(candidate.get("label")) or Path(parsed.path).stem
-        pages[_canonical_or_none(url) or url] = {"url": url, "label": label}
-    return list(pages.values())
+        page_by_url[_canonical_or_none(url) or url] = {
+            "url": url,
+            "label": label,
+        }
+    return list(page_by_url.values())
 
 
 async def _resolve_healthgram_network_index(
@@ -6268,14 +6301,17 @@ async def _resolve_hcsc_asomrf_landing(
     )
     state_urls = _hcsc_asomrf_urls_from_html(html_text, base_url=url)
     max_state_pages = _as_int(resolver.get("max_state_pages")) or 10
-    nested_resolver = dict(resolver)
-    nested_resolver["type"] = "bcbs_asomrf_filelist"
-    nested_resolver.pop("max_targets", None)
+    nested_resolver_by_field = dict(resolver)
+    nested_resolver_by_field["type"] = "bcbs_asomrf_filelist"
+    nested_resolver_by_field.pop("max_targets", None)
     crawl_targets: list[CrawlTarget] = []
     for state_url in state_urls[:max_state_pages]:
         try:
             for delegated_target in await _resolve_bcbs_asomrf_filelist(
-                source_record, state_url, nested_resolver, session
+                source_record,
+                state_url,
+                nested_resolver_by_field,
+                session,
             ):
                 metadata = {
                     **dict(delegated_target.metadata or {}),
@@ -6408,7 +6444,7 @@ async def _resolve_html_delegated_mrf_links(
         :max_links
     ]:
         platform = classify_hosting_platform(delegated_url)
-        nested_source = {
+        nested_source_by_field = {
             **source_record,
             "hosting_platform": platform,
             "index_url": delegated_url,
@@ -6416,7 +6452,7 @@ async def _resolve_html_delegated_mrf_links(
         }
         try:
             delegated_targets = await _crawl_targets_for_source(
-                nested_source,
+                nested_source_by_field,
                 delegated_url,
                 session,
                 target_limit=_as_int(resolver.get("max_targets")),
@@ -6681,14 +6717,16 @@ def _wordpress_elfinder_configs_from_html(
             continue
         seen_manager_keys.add(manager_key)
         file_manager_matches = list(file_manager_pattern.finditer(prefix))
-        manager_config = {
+        manager_config_by_field = {
             "url": service_url,
             "data_key": data_key,
             "nonce": nonce,
         }
         if file_manager_matches:
-            manager_config["file_manager_id"] = file_manager_matches[-1].group(1)
-        manager_configs.append(manager_config)
+            manager_config_by_field["file_manager_id"] = file_manager_matches[
+                -1
+            ].group(1)
+        manager_configs.append(manager_config_by_field)
     return manager_configs
 
 
@@ -6826,12 +6864,12 @@ async def _resolve_wordpress_elfinder_mrf_links(
     timeout = getattr(session, "timeout", None) or aiohttp.ClientTimeout(
         total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
     )
-    headers = {
+    request_headers_by_name = {
         "User-Agent": BROWSER_FALLBACK_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     async with aiohttp.ClientSession(
-        headers=headers,
+        headers=request_headers_by_name,
         timeout=timeout,
         connector=_tcp_connector(limit=0),
         trust_env=False,
@@ -7076,7 +7114,7 @@ def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
             continue
         if host.endswith("cms.gov") and "price-transparency" in path:
             continue
-        azure_html_mrf_listing = (
+        is_azure_html_mrf_listing = (
             host.endswith(".blob.core.windows.net")
             and "mrf-output/" in path
             and file_name.endswith((".html", ".htm"))
@@ -7090,7 +7128,7 @@ def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
         if not (
             path.endswith("/")
             or "." not in file_name
-            or azure_html_mrf_listing
+            or is_azure_html_mrf_listing
             or autoindex_month_directory
         ):
             continue
@@ -7786,7 +7824,7 @@ def _payercompass_normalized_plan_info(plan: dict[str, Any]) -> dict[str, Any] |
     issuer_name = _clean_text(plan.get("issuer_name") or plan.get("issuerName"))
     if not any((plan_id, plan_name, sponsor_name, issuer_name)):
         return None
-    normalized = {
+    normalized_plan_by_field = {
         "plan_id": plan_id or None,
         "plan_id_type": _clean_text(plan.get("plan_id_type") or plan.get("planIdType"))
         or None,
@@ -7799,10 +7837,10 @@ def _payercompass_normalized_plan_info(plan: dict[str, Any]) -> dict[str, Any] |
         "plan_name": plan_name or None,
     }
     if sponsor_name:
-        normalized["plan_sponsor_name"] = sponsor_name
+        normalized_plan_by_field["plan_sponsor_name"] = sponsor_name
     if issuer_name:
-        normalized["issuer_name"] = issuer_name
-    return normalized
+        normalized_plan_by_field["issuer_name"] = issuer_name
+    return normalized_plan_by_field
 
 
 def _payercompass_plan_key(plan: dict[str, Any]) -> tuple[str, str, str, str, str]:
@@ -7836,7 +7874,7 @@ def _payercompass_plan_info_by_file_key(
     toc: dict[str, Any],
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str | None]]:
     plan_info_by_key: dict[str, list[dict[str, Any]]] = {}
-    toc_metadata = {
+    toc_metadata_by_field = {
         "reporting_entity_name": _clean_text(toc.get("reporting_entity_name")),
         "reporting_entity_type": _clean_text(toc.get("reporting_entity_type")),
     }
@@ -7860,7 +7898,7 @@ def _payercompass_plan_info_by_file_key(
             )
             for key in keys:
                 _payercompass_add_plan_info(plan_info_by_key, key, plans)
-    return plan_info_by_key, toc_metadata
+    return plan_info_by_key, toc_metadata_by_field
 
 
 def _is_payercompass_index_target(target: CrawlTarget) -> bool:
@@ -9187,7 +9225,7 @@ def _is_html_label_planish(label: str | None) -> bool:
     return bool(re.search(r"[a-z]", normalized))
 
 
-def _mrf_file_type_from_html_link_context(
+def _mrf_type_from_html_link_context(
     html_text: str, html_start: int | None, html_end: int | None
 ) -> str | None:
     if not isinstance(html_start, int) or not isinstance(html_end, int):
@@ -9200,6 +9238,9 @@ def _mrf_file_type_from_html_link_context(
         flags=re.I,
     )[0]
     return _mrf_file_type_from_html_section(after)
+
+
+_mrf_file_type_from_html_link_context = _mrf_type_from_html_link_context
 
 
 def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
@@ -9298,12 +9339,12 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
 
 
 def _dedupe_crawl_targets_by_url(targets: list[CrawlTarget]) -> list[CrawlTarget]:
-    deduped: dict[str, CrawlTarget] = {}
+    target_by_url: dict[str, CrawlTarget] = {}
     for target in targets:
         key = _canonical_or_none(target.url) or target.url
-        if key not in deduped:
-            deduped[key] = target
-    return list(deduped.values())
+        if key not in target_by_url:
+            target_by_url[key] = target
+    return list(target_by_url.values())
 
 
 def _crawl_targets_from_html_mrf_links(
@@ -10179,13 +10220,16 @@ async def _resolve_anthem_s3_context(
     return _merge_anthem_s3_employer_targets(resolved_targets)[:max_targets]
 
 
-def _anthem_s3_status_urls_from_script(script_text: str) -> list[str]:
+def _anthem_status_urls_from_script(script_text: str) -> list[str]:
     return [
         url
         for url in _embedded_http_urls(script_text)
         if urlsplit(url).netloc.endswith("amazonaws.com")
         and urlsplit(url).path.endswith("/status.json")
     ]
+
+
+_anthem_s3_status_urls_from_script = _anthem_status_urls_from_script
 
 
 def _anthem_s3_bases_from_script(script_text: str) -> list[str]:
@@ -10205,7 +10249,7 @@ def _anthem_s3_bases_from_script(script_text: str) -> list[str]:
     return bases
 
 
-def _anthem_s3_toc_patterns_from_script(
+def _anthem_toc_patterns_from_script(
     script_text: str, *, source_url: str
 ) -> list[tuple[str, str, str]]:
     patterns: list[tuple[str, str, str]] = []
@@ -10229,6 +10273,9 @@ def _anthem_s3_toc_patterns_from_script(
     if "healthlink" in host:
         return [("healthlink", "healthlink", ".json")]
     return [("anthem", "anthem", ".json.gz")]
+
+
+_anthem_s3_toc_patterns_from_script = _anthem_toc_patterns_from_script
 
 
 def _anthem_s3_toc_targets(
@@ -10323,15 +10370,20 @@ def _metadata_plan_info(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     for item in raw_plan_info:
         if not isinstance(item, dict):
             continue
-        plan_row = dict(item)
-        if "plan_market_type" not in plan_row and plan_row.get("market_type"):
-            plan_row["plan_market_type"] = plan_row.get("market_type")
+        plan_row_by_field = dict(item)
+        if (
+            "plan_market_type" not in plan_row_by_field
+            and plan_row_by_field.get("market_type")
+        ):
+            plan_row_by_field["plan_market_type"] = plan_row_by_field.get(
+                "market_type"
+            )
         if not any(
-            plan_row.get(key)
+            plan_row_by_field.get(key)
             for key in ("plan_id", "plan_name", "plan_sponsor_name", "issuer_name")
         ):
             continue
-        plan_info_rows.append(plan_row)
+        plan_info_rows.append(plan_row_by_field)
     return plan_info_rows
 
 
@@ -10748,13 +10800,16 @@ async def _resolve_healthcarebluebook_mrf(
         nested_platform = classify_hosting_platform(link_url)
         if not nested_platform:
             continue
-        nested_source = {**source_record, "hosting_platform": nested_platform}
+        nested_source_by_field = {
+            **source_record,
+            "hosting_platform": nested_platform,
+        }
         try:
             nested_target_limit = (
                 max_targets - len(targets_by_url) if max_targets else None
             )
             nested_targets = await _crawl_targets_for_source(
-                nested_source,
+                nested_source_by_field,
                 link_url,
                 session,
                 target_limit=nested_target_limit,
@@ -10832,24 +10887,30 @@ async def _resolve_html_mrf_with_healthcarebluebook(
         link_url = str(candidate.get("url") or "").strip()
         if _domain(link_url) != "mrf.healthcarebluebook.com":
             continue
-        nested_source = {
+        nested_source_by_field = {
             **source_record,
             "hosting_platform": "healthcarebluebook_mrf",
         }
-        nested_resolver = _platform_resolver_config("healthcarebluebook_mrf") or {
-            "type": "healthcarebluebook_mrf"
-        }
+        nested_resolver_by_field = (
+            _platform_resolver_config("healthcarebluebook_mrf")
+            or {"type": "healthcarebluebook_mrf"}
+        )
         max_targets = _as_int(resolver.get("max_targets"))
         if max_targets:
-            existing_nested_max = _as_int(nested_resolver.get("max_targets"))
-            nested_resolver["max_targets"] = (
+            existing_nested_max = _as_int(
+                nested_resolver_by_field.get("max_targets")
+            )
+            nested_resolver_by_field["max_targets"] = (
                 min(existing_nested_max, max_targets)
                 if existing_nested_max
                 else max_targets
             )
         try:
             nested_targets = await _resolve_healthcarebluebook_mrf(
-                nested_source, link_url, nested_resolver, session
+                nested_source_by_field,
+                link_url,
+                nested_resolver_by_field,
+                session,
             )
         except Exception as exc:
             logging.getLogger(__name__).debug(
@@ -11009,16 +11070,16 @@ def _is_socrata_dataset_match(dataset: dict[str, Any], resolver: dict[str, Any])
         _socrata_dataset_contact_text(dataset), resolver.get("contact_regex")
     ):
         return False
-    keyword_any = [
+    keyword_filters = [
         str(item or "").strip().lower()
         for item in (resolver.get("keyword_any") or [])
         if str(item or "").strip()
     ]
-    if keyword_any:
+    if keyword_filters:
         keyword_text = " ".join(
             str(item or "").lower() for item in (dataset.get("keyword") or [])
         )
-        if not any(keyword in keyword_text for keyword in keyword_any):
+        if not any(keyword in keyword_text for keyword in keyword_filters):
             return False
     download_url, _media_type = _socrata_dataset_download(dataset)
     return bool(download_url)
@@ -11369,22 +11430,25 @@ def _limit_crawl_targets_round_robin(
 ) -> list[CrawlTarget]:
     if not limit or limit <= 0 or len(targets) <= limit:
         return targets
-    buckets: dict[str, list[CrawlTarget]] = {}
+    targets_by_bucket: dict[str, list[CrawlTarget]] = {}
     for target in targets:
         bucket_key = str((target.metadata or {}).get(metadata_key) or "")
-        buckets.setdefault(bucket_key, []).append(target)
-    limited: list[CrawlTarget] = []
-    max_bucket_size = max((len(bucket) for bucket in buckets.values()), default=0)
+        targets_by_bucket.setdefault(bucket_key, []).append(target)
+    limited_targets: list[CrawlTarget] = []
+    max_bucket_size = max(
+        (len(bucket) for bucket in targets_by_bucket.values()),
+        default=0,
+    )
     for index in range(max_bucket_size):
-        for bucket in buckets.values():
+        for bucket in targets_by_bucket.values():
             if index < len(bucket):
-                limited.append(bucket[index])
-                if len(limited) >= limit:
-                    return limited
-    return limited
+                limited_targets.append(bucket[index])
+                if len(limited_targets) >= limit:
+                    return limited_targets
+    return limited_targets
 
 
-def _bcbs_global_solutions_toc_links_from_html(
+def _bcbs_global_toc_links_from_html(
     html_text: str, *, base_url: str
 ) -> list[dict[str, str]]:
     links_by_url: dict[str, dict[str, str]] = {}
@@ -11402,7 +11466,10 @@ def _bcbs_global_solutions_toc_links_from_html(
     return list(links_by_url.values())
 
 
-def _bcbs_global_solutions_landing_links_from_html(
+_bcbs_global_solutions_toc_links_from_html = _bcbs_global_toc_links_from_html
+
+
+def _bcbs_global_landing_links_from_html(
     html_text: str, *, base_url: str
 ) -> list[str]:
     urls: list[str] = []
@@ -11420,6 +11487,11 @@ def _bcbs_global_solutions_landing_links_from_html(
         seen_urls.add(key)
         urls.append(url)
     return urls
+
+
+_bcbs_global_solutions_landing_links_from_html = (
+    _bcbs_global_landing_links_from_html
+)
 
 
 def _is_bcbs_toc_in_network(payload: Any) -> bool:
@@ -11810,9 +11882,9 @@ def _kaiser_inventory_targets_from_text(
                 label=file_name,
                 resolved_from_url=inventory_url,
                 metadata={
-                    key: value
-                    for key, value in metadata.items()
-                    if value not in (None, "", [], False)
+                    metadata_key: metadata_value
+                    for metadata_key, metadata_value in metadata.items()
+                    if metadata_value not in (None, "", [], False)
                 },
             )
         )
@@ -12347,7 +12419,7 @@ def _healthez_normalized_outbound_url(url: str | None) -> str | None:
     ):
         return None
     pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    normalized: list[tuple[str, str]] = []
+    normalized_pairs: list[tuple[str, str]] = []
     has_network = any(key.lower() == "network" for key, _value in pairs)
     pending_network: str | None = None
     for key, value in pairs:
@@ -12357,10 +12429,10 @@ def _healthez_normalized_outbound_url(url: str | None) -> str | None:
                 value = group_name
                 if not has_network:
                     pending_network = network.upper()
-        normalized.append((key, value))
+        normalized_pairs.append((key, value))
     if pending_network:
-        normalized.append(("network", pending_network))
-    return parsed._replace(query=urlencode(normalized)).geturl()
+        normalized_pairs.append(("network", pending_network))
+    return parsed._replace(query=urlencode(normalized_pairs)).geturl()
 
 
 def _healthez_plan_label(url: str, label: str | None) -> str:
@@ -12439,7 +12511,66 @@ async def _resolve_healthez_benefits_mrf(
     return targets
 
 
-def _s3_xml_listing_targets_from_xml(
+def _s3_listing_prefixes(
+    resolver: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    include_prefixes = tuple(
+        str(object_element).strip()
+        for object_element in (resolver.get("include_prefixes") or ())
+        if str(object_element).strip()
+    )
+    exclude_prefixes = tuple(
+        str(object_element).strip()
+        for object_element in (resolver.get("exclude_prefixes") or ())
+        if str(object_element).strip()
+    )
+    return include_prefixes, exclude_prefixes
+
+
+def _s3_object_target(
+    source_row_dict: dict[str, Any],
+    object_element: ElementTree.Element,
+    *,
+    listing_url: str,
+    public_base_url: str,
+    resolver_type: str,
+    prefixes: tuple[tuple[str, ...], tuple[str, ...]],
+) -> CrawlTarget | None:
+    if object_element.tag.rsplit("}", 1)[-1] != "Contents":
+        return None
+    object_key = _xml_child_text(object_element, "Key")
+    include_prefixes, exclude_prefixes = prefixes
+    if (
+        not object_key
+        or object_key.endswith("/")
+        or (include_prefixes and not object_key.startswith(include_prefixes))
+        or (exclude_prefixes and object_key.startswith(exclude_prefixes))
+    ):
+        return None
+    file_url = f"{public_base_url}/{quote(object_key, safe='/')}"
+    label = Path(object_key).name
+    file_type = _mrf_file_type_from_text(file_url, label)
+    if not file_type:
+        return None
+    return CrawlTarget(
+        source=source_row_dict,
+        url=file_url,
+        label=_mrf_file_plan_label(label) or label,
+        resolved_from_url=listing_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": "file_reference",
+            "target_file_type": file_type,
+            "container_format": _container_format(file_url),
+            "object_key": object_key,
+            "content_length": _xml_child_text(object_element, "Size"),
+            "etag": _xml_child_text(object_element, "ETag").strip('"'),
+            "last_modified": _xml_child_text(object_element, "LastModified"),
+        },
+    )
+
+
+def _s3_listing_targets_from_xml(
     source_row_dict: dict[str, Any],
     xml_text: str,
     *,
@@ -12451,56 +12582,24 @@ def _s3_xml_listing_targets_from_xml(
     root = ElementTree.fromstring((xml_text or "").lstrip("\ufeff"))
     resolver_type = str(resolver.get("type") or "s3_xml_listing")
     public_base_url = str(resolver.get("public_base_url") or listing_url).rstrip("/")
-    include_prefixes = tuple(
-        str(object_element).strip()
-        for object_element in (resolver.get("include_prefixes") or ())
-        if str(object_element).strip()
-    )
-    exclude_prefixes = tuple(
-        str(object_element).strip()
-        for object_element in (resolver.get("exclude_prefixes") or ())
-        if str(object_element).strip()
-    )
-    crawl_targets: list[CrawlTarget] = []
-    seen_urls: set[str] = set()
+    prefixes = _s3_listing_prefixes(resolver)
+    target_by_url: dict[str, CrawlTarget] = {}
     for object_element in root.iter():
-        if object_element.tag.rsplit("}", 1)[-1] != "Contents":
-            continue
-        object_key = _xml_child_text(object_element, "Key")
-        if not object_key or object_key.endswith("/"):
-            continue
-        if include_prefixes and not object_key.startswith(include_prefixes):
-            continue
-        if exclude_prefixes and object_key.startswith(exclude_prefixes):
-            continue
-        file_url = f"{public_base_url}/{quote(object_key, safe='/')}"
-        label = Path(object_key).name
-        file_type = _mrf_file_type_from_text(file_url, label)
-        if not file_type:
-            continue
-        key = _canonical_or_none(file_url) or file_url
-        if key in seen_urls:
-            continue
-        seen_urls.add(key)
-        crawl_targets.append(
-            CrawlTarget(
-                source=source_row_dict,
-                url=file_url,
-                label=_mrf_file_plan_label(label) or label,
-                resolved_from_url=listing_url,
-                metadata={
-                    "resolver": resolver_type,
-                    "target_kind": "file_reference",
-                    "target_file_type": file_type,
-                    "container_format": _container_format(file_url),
-                    "object_key": object_key,
-                    "content_length": _xml_child_text(object_element, "Size"),
-                    "etag": _xml_child_text(object_element, "ETag").strip('"'),
-                    "last_modified": _xml_child_text(object_element, "LastModified"),
-                },
-            )
+        target = _s3_object_target(
+            source_row_dict,
+            object_element,
+            listing_url=listing_url,
+            public_base_url=public_base_url,
+            resolver_type=resolver_type,
+            prefixes=prefixes,
         )
-    return crawl_targets
+        if target is not None:
+            key = _canonical_or_none(target.url) or target.url
+            target_by_url.setdefault(key, target)
+    return list(target_by_url.values())
+
+
+_s3_xml_listing_targets_from_xml = _s3_listing_targets_from_xml
 
 
 async def _resolve_s3_xml_listing(
@@ -13588,9 +13687,12 @@ async def _crawl_targets_for_source(
             delegated_platform = classify_hosting_platform(delegated_url)
             if not delegated_platform:
                 continue
-            delegated_source = {**source_row, "hosting_platform": delegated_platform}
+            delegated_source_by_field = {
+                **source_row,
+                "hosting_platform": delegated_platform,
+            }
             nested_targets = await _crawl_targets_for_source(
-                delegated_source,
+                delegated_source_by_field,
                 delegated_url,
                 session,
                 target_limit=target_limit,
@@ -13892,17 +13994,17 @@ async def _resolve_crawl_targets(
         )
     except ValueError:
         source_resolve_timeout = 60.0
-    pending_labels = {
+    pending_label_by_index = {
         idx: _source_progress_label(source_row, url)
         for idx, source_row, url in source_items
     }
 
     def pending_detail() -> str | None:
         """Format a compact description of pending crawl work."""
-        if not pending_labels:
+        if not pending_label_by_index:
             return None
-        sample = list(pending_labels.values())[:5]
-        remaining = len(pending_labels) - len(sample)
+        sample = list(pending_label_by_index.values())[:5]
+        remaining = len(pending_label_by_index) - len(sample)
         suffix = f" +{remaining}" if remaining > 0 else ""
         return f"waiting on: {', '.join(sample)}{suffix}"
 
@@ -13988,7 +14090,7 @@ async def _resolve_crawl_targets(
     ]
     for done, task in enumerate(asyncio.as_completed(tasks), start=1):
         idx, resolved_targets, resolved_observations = await task
-        pending_labels.pop(idx, None)
+        pending_label_by_index.pop(idx, None)
         crawl_targets.extend(resolved_targets)
         observations.extend(resolved_observations)
         if progress_run_id:
@@ -14106,18 +14208,21 @@ def _toc_target_file_row(crawl_target: CrawlTarget) -> dict[str, Any]:
     """Convert a crawl target into a persisted TOC file row."""
     now = _utc_now()
     source_row = crawl_target.source
-    target_metadata = {
+    target_metadata_by_field = {
         key: metadata_value
         for key, metadata_value in dict(crawl_target.metadata or {}).items()
         if metadata_value not in (None, "")
     }
     context_metadata = _crawl_target_context_metadata(crawl_target)
-    file_type = str(target_metadata.get("target_file_type") or "table-of-contents")
-    plan_info = _metadata_plan_info(target_metadata)
+    file_type = str(
+        target_metadata_by_field.get("target_file_type")
+        or "table-of-contents"
+    )
+    plan_info = _metadata_plan_info(target_metadata_by_field)
     size_bytes = (
-        _parse_size_bytes(target_metadata.get("blob_size"))
-        or _parse_size_bytes(target_metadata.get("size_bytes"))
-        or _parse_size_bytes(target_metadata.get("content_length"))
+        _parse_size_bytes(target_metadata_by_field.get("blob_size"))
+        or _parse_size_bytes(target_metadata_by_field.get("size_bytes"))
+        or _parse_size_bytes(target_metadata_by_field.get("content_length"))
     )
     return {
         "mrf_file_id": _id(
@@ -14149,15 +14254,15 @@ def _toc_target_file_row(crawl_target: CrawlTarget) -> dict[str, Any]:
         ),
         "is_signed_url": _is_signed(crawl_target.url),
         "size_bytes": size_bytes,
-        "etag": target_metadata.get("etag"),
-        "last_modified": target_metadata.get("last_modified"),
+        "etag": target_metadata_by_field.get("etag"),
+        "last_modified": target_metadata_by_field.get("last_modified"),
         "schema_version": None,
         "metadata_json": {
-            "container_format": target_metadata.get("container_format")
+            "container_format": target_metadata_by_field.get("container_format")
             or _container_format(crawl_target.url),
             "resolved_from_url": crawl_target.resolved_from_url,
             "target_label": crawl_target.label,
-            **target_metadata,
+            **target_metadata_by_field,
             **context_metadata,
             **_file_benefit_metadata(
                 source_row,
@@ -14209,11 +14314,11 @@ def _dedupe_source_rows_for_crawl(
     source_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     by_url: dict[str, dict[str, Any]] = {}
-    no_url: list[dict[str, Any]] = []
+    no_url_rows: list[dict[str, Any]] = []
     for source in source_rows:
         url = source.get("index_url") or source.get("human_url")
         if not url:
-            no_url.append(source)
+            no_url_rows.append(source)
             continue
         key = _crawl_source_identity_key(source)
         previous = by_url.get(key)
@@ -14221,7 +14326,7 @@ def _dedupe_source_rows_for_crawl(
             previous
         ):
             by_url[key] = source
-    return list(by_url.values()) + no_url
+    return list(by_url.values()) + no_url_rows
 
 
 def _estimate_crawl_row_write_bytes(row_dict: dict[str, Any]) -> int:
@@ -14407,10 +14512,10 @@ def _query_tokens(value: Any) -> tuple[str, ...]:
 
 def _query_match_tokens(value: Any) -> tuple[str, ...]:
     tokens = _query_tokens(value)
-    substantive = tuple(
+    substantive_tokens = tuple(
         token for token in tokens if token not in LEGAL_ENTITY_QUERY_STOPWORDS
     )
-    return substantive or tokens
+    return substantive_tokens or tokens
 
 
 def _query_token_variants(token: str) -> tuple[str, ...]:
@@ -14619,17 +14724,17 @@ def _interleave_file_probe_targets_by_host(
     for target in targets:
         by_host.setdefault(_file_probe_target_host(target), []).append(target)
     ordered_hosts = sorted(by_host, key=lambda host: (-len(by_host[host]), host))
-    interleaved: list[dict[str, Any]] = []
+    interleaved_targets: list[dict[str, Any]] = []
     while ordered_hosts:
         next_hosts = []
         for host in ordered_hosts:
             bucket = by_host[host]
             if bucket:
-                interleaved.append(bucket.pop(0))
+                interleaved_targets.append(bucket.pop(0))
             if bucket:
                 next_hosts.append(host)
         ordered_hosts = next_hosts
-    return interleaved
+    return interleaved_targets
 
 
 def _file_probe_observation(
@@ -14674,19 +14779,19 @@ def _file_probe_update_values(
 ) -> dict[str, Any]:
     if str(head.get("status") or "") != "ok":
         return {}
-    values: dict[str, Any] = {}
+    update_values_by_field: dict[str, Any] = {}
     if head.get("content_length") is not None:
-        values["size_bytes"] = head.get("content_length")
+        update_values_by_field["size_bytes"] = head.get("content_length")
     if head.get("etag") is not None:
-        values["etag"] = head.get("etag")
+        update_values_by_field["etag"] = head.get("etag")
     if head.get("last_modified") is not None:
-        values["last_modified"] = head.get("last_modified")
+        update_values_by_field["last_modified"] = head.get("last_modified")
     return (
         {
             "mrf_file_id": target["mrf_file_id"],
-            **values,
+            **update_values_by_field,
         }
-        if values
+        if update_values_by_field
         else {}
     )
 
@@ -14695,13 +14800,19 @@ async def _update_mrf_file_probe_metadata(updates: list[dict[str, Any]]) -> None
     if not updates:
         return
     async with db.session() as session:
-        for item in updates:
-            file_id = item.get("mrf_file_id")
-            values = {key: value for key, value in item.items() if key != "mrf_file_id"}
-            if not file_id or not values:
+        for update_row in updates:
+            file_id = update_row.get("mrf_file_id")
+            update_values_by_field = {
+                field_name: field_value
+                for field_name, field_value in update_row.items()
+                if field_name != "mrf_file_id"
+            }
+            if not file_id or not update_values_by_field:
                 continue
             await session.execute(
-                update(MRFFile).where(MRFFile.mrf_file_id == file_id).values(**values)
+                update(MRFFile)
+                .where(MRFFile.mrf_file_id == file_id)
+                .values(**update_values_by_field)
             )
 
 

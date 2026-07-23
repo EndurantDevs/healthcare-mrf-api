@@ -737,11 +737,11 @@ def return_checksum(arr: list, crc=32):
     return crc32.cksum(checksum) - 2147483648
 
 
-async def log_error(type, error, issuer_array, url, source, level, cls):
+async def log_error(error_type, error, issuer_array, url, source, level, cls):
     """Buffer a deduplicated import error for each issuer."""
     for issuer_id in issuer_array:
         checksum = return_checksum(
-            [type, str(error), str(issuer_id), str(url), source, level]
+            [error_type, str(error), str(issuer_id), str(url), source, level]
         )
         if checksum in err_obj_key:
             return
@@ -751,7 +751,7 @@ async def log_error(type, error, issuer_array, url, source, level, cls):
             {
                 "issuer_id": issuer_id,
                 "checksum": checksum,
-                "type": type,
+                "type": error_type,
                 "text": error,
                 "url": url,
                 "source": source,

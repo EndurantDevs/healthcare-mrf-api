@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import uuid
 from contextlib import suppress
 from functools import lru_cache
 from inspect import signature
@@ -14,27 +15,30 @@ from importlib import import_module
 from typing import Any
 
 import redis
-from sqlalchemy import func, update
+from sqlalchemy import and_, func, or_, update
 
 from db.models import ImportRun, db
 from process.control_cancel import ImportCancelledError
 from process.import_status_events import (
     bind_status_event_loop,
-    enqueue_status_event,
     flush_status_events,
     isoformat_utc,
 )
 from process.live_progress import (
+    current_live_progress_context,
     enqueue_live_progress,
     progress_payload_from_live,
     read_live_progress,
     reset_live_progress_context,
     set_live_progress_context,
+    write_live_progress,
 )
 from process.redis_config import build_redis_settings
 
 
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
+_CONTROL_RUN_MARKED = True
+_CONTROL_RUN_NOT_MARKED = False
 logger = logging.getLogger(__name__)
 
 
@@ -57,17 +61,9 @@ async def control_single_job_start(
 
     if run_id:
         target_task = {**target_task, "run_id": run_id}
-    if not target_module or not target_function:
-        await mark_control_run(
-            run_id,
-            status="failed",
-            phase_detail="control wrapper target missing",
-            progress_message="target missing",
-            error={"code": "control_target_missing", "message": "target_module and target_function are required"},
-        )
-        raise RuntimeError("target_module and target_function are required")
 
-    started_at = dt.datetime.now(dt.UTC).isoformat()
+    started_at = dt.datetime.now(dt.UTC).isoformat(timespec="microseconds")
+    attempt_id = f"{run_id}:{uuid.uuid4().hex}" if run_id else None
     live_token = None
     heartbeat_task = None
     if run_id:
@@ -76,21 +72,72 @@ async def control_single_job_start(
             importer=importer,
             status="running",
             started_at=started_at,
-            attempt_id=f"{run_id}:{started_at}",
+            attempt_id=attempt_id,
             attempt_started_at=started_at,
         )
-        heartbeat_task = asyncio.create_task(_live_progress_heartbeat(run_id, importer, target_function, started_at))
 
-    await mark_control_run(run_id, status="running", phase_detail=f"{target_function} running", progress_message="running")
+    try:
+        attempt_claimed = await mark_control_run(
+            run_id,
+            status="running",
+            phase_detail=f"{target_function} running",
+            progress_message="running",
+            attempt_id=attempt_id,
+            attempt_started_at=started_at if run_id else None,
+        )
+    except BaseException:
+        if live_token is not None:
+            reset_live_progress_context(live_token)
+        raise
+    if run_id and attempt_claimed is not True:
+        if live_token is not None:
+            reset_live_progress_context(live_token)
+        return {
+            "status": "skipped",
+            "run_id": run_id,
+            "reason": "newer_attempt_active",
+        }
+    if not target_module or not target_function:
+        try:
+            await mark_control_run(
+                run_id,
+                status="failed",
+                phase_detail="control wrapper target missing",
+                progress_message="target missing",
+                error={
+                    "code": "control_target_missing",
+                    "message": (
+                        "target_module and target_function are required"
+                    ),
+                },
+                attempt_id=attempt_id,
+                attempt_started_at=started_at if run_id else None,
+            )
+            await _flush_terminal_status_events()
+        finally:
+            if live_token is not None:
+                reset_live_progress_context(live_token)
+        raise RuntimeError("target_module and target_function are required")
+    if run_id:
+        heartbeat_task = asyncio.create_task(
+            _live_progress_heartbeat(
+                run_id,
+                importer,
+                target_function,
+                started_at,
+                attempt_id=attempt_id,
+                attempt_started_at=started_at,
+            )
+        )
     try:
         module = import_module(target_module)
-        fn = getattr(module, target_function)
-        if call_style == "kwargs":
-            accepted = signature(fn).parameters
-            kwargs = {key: value for key, value in target_task.items() if key in accepted}
-            result = await fn(**kwargs)
-        else:
-            result = await fn(ctx, target_task)
+        target_result = await _invoke_control_target(
+            module,
+            target_function=target_function,
+            call_style=call_style,
+            control_context=ctx,
+            target_task_by_field=target_task,
+        )
         if run_shutdown:
             shutdown = getattr(module, "shutdown", None)
             if shutdown is None:
@@ -98,7 +145,14 @@ async def control_single_job_start(
             await shutdown(ctx)
             ctx.setdefault("context", {})["run"] = 0
     except ImportCancelledError:
-        await mark_control_run(run_id, status="canceled", phase_detail=f"{target_function} canceled", progress_message="canceled")
+        await mark_control_run(
+            run_id,
+            status="canceled",
+            phase_detail=f"{target_function} canceled",
+            progress_message="canceled",
+            attempt_id=attempt_id,
+            attempt_started_at=started_at if run_id else None,
+        )
         await _flush_terminal_status_events()
         return {"status": "canceled", "run_id": run_id}
     except asyncio.CancelledError as exc:
@@ -108,6 +162,8 @@ async def control_single_job_start(
             phase_detail=f"{target_function} interrupted",
             progress_message="interrupted",
             error={"code": "import_interrupted", "message": "worker task was cancelled"},
+            attempt_id=attempt_id,
+            attempt_started_at=started_at if run_id else None,
         )
         await _flush_terminal_status_events()
         return {"status": "failed", "run_id": run_id, "error": str(exc)}
@@ -118,6 +174,8 @@ async def control_single_job_start(
             phase_detail=f"{target_function} failed",
             progress_message="failed",
             error=_control_failure_error(exc), metrics=_terminal_metrics_from_context(ctx.get("context")),
+            attempt_id=attempt_id,
+            attempt_started_at=started_at if run_id else None,
         )
         await _flush_terminal_status_events()
         raise
@@ -126,10 +184,13 @@ async def control_single_job_start(
         if live_token is not None:
             reset_live_progress_context(live_token)
     terminal_metrics = _terminal_metrics_from_result(
-        result,
+        target_result,
         context=ctx.get("context") if run_shutdown else None,
     )
-    terminal_progress = _terminal_progress_from_result(target_function, terminal_metrics or result)
+    terminal_progress = _terminal_progress_from_result(
+        target_function,
+        terminal_metrics or target_result,
+    )
     preserve_finished_at = bool(
         run_shutdown
         and isinstance(ctx.get("context"), dict)
@@ -143,22 +204,68 @@ async def control_single_job_start(
         metrics=terminal_metrics,
         progress=terminal_progress,
         preserve_finished_at=preserve_finished_at,
+        attempt_id=attempt_id,
+        attempt_started_at=started_at if run_id else None,
     )
     await _flush_terminal_status_events()
-    return {"status": "succeeded", "run_id": run_id, "result": result}
+    return {
+        "status": "succeeded",
+        "run_id": run_id,
+        "result": target_result,
+    }
 
 
-async def _live_progress_heartbeat(run_id: str, importer: str, target_function: str, started_at: str) -> None:
+async def _invoke_control_target(
+    module: Any,
+    *,
+    target_function: str,
+    call_style: str,
+    control_context: dict[str, Any],
+    target_task_by_field: dict[str, Any],
+) -> Any:
+    """Invoke one configured importer using its declared calling convention."""
+
+    target_callable = getattr(module, target_function)
+    if call_style != "kwargs":
+        return await target_callable(control_context, target_task_by_field)
+    accepted_parameters = signature(target_callable).parameters
+    accepted_kwargs_by_name = {
+        field_name: field_value
+        for field_name, field_value in target_task_by_field.items()
+        if field_name in accepted_parameters
+    }
+    return await target_callable(**accepted_kwargs_by_name)
+
+
+async def _live_progress_heartbeat(
+    run_id: str,
+    importer: str,
+    target_function: str,
+    started_at: str,
+    *,
+    attempt_id: str | None = None,
+    attempt_started_at: str | None = None,
+) -> None:
     interval = float(os.getenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "15"))
     if interval <= 0:
         return
     phase = f"{target_function} running"
     while True:
         await asyncio.sleep(interval)
+        has_heartbeat_ownership = False
         try:
-            await _persist_control_run_heartbeat(run_id, target_function)
+            has_heartbeat_ownership = (
+                await _is_control_run_heartbeat_persisted(
+                    run_id,
+                    target_function,
+                    attempt_id=attempt_id,
+                    attempt_started_at=attempt_started_at,
+                )
+            )
         except Exception:
             logger.debug("Failed to persist live import heartbeat for run %s", run_id, exc_info=True)
+        if not has_heartbeat_ownership:
+            continue
         enqueue_live_progress(
             run_id=run_id,
             importer=importer,
@@ -170,28 +277,63 @@ async def _live_progress_heartbeat(run_id: str, importer: str, target_function: 
             pct=0,
             message="running",
             started_at=started_at,
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at,
             source="engine-heartbeat",
             confidence="heartbeat",
         )
 
 
-async def _persist_control_run_heartbeat(run_id: str, target_function: str) -> None:
+async def _is_control_run_heartbeat_persisted(
+    run_id: str,
+    target_function: str,
+    *,
+    attempt_id: str | None = None,
+    attempt_started_at: str | None = None,
+) -> bool:
     live = read_live_progress(run_id)
+    if attempt_id and attempt_started_at and not _is_progress_from_attempt(
+        live,
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+    ):
+        live = None
     now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
-    values = _control_run_heartbeat_update_values(target_function, live, now)
+    update_values_by_field = _control_run_heartbeat_update_values(
+        target_function,
+        live,
+        now,
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+    )
     blocked_statuses = sorted(_TERMINAL_STATUSES | {"canceling"})
     stmt = (
         update(ImportRun)
         .where(ImportRun.run_id == run_id)
         .where(ImportRun.status.notin_(blocked_statuses))
     )
-    await _execute_control_run_update(stmt.values(**values))
+    if attempt_id and attempt_started_at:
+        stmt = _where_control_attempt(
+            stmt,
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at,
+        )
+    affected_rows = await _execute_control_run_update(
+        stmt.values(**update_values_by_field).returning(ImportRun.run_id)
+    )
+    return affected_rows == 1
+
+
+_persist_control_run_heartbeat = _is_control_run_heartbeat_persisted
 
 
 def _control_run_heartbeat_update_values(
     target_function: str,
     live: dict[str, Any] | None,
     now: dt.datetime,
+    *,
+    attempt_id: str | None = None,
+    attempt_started_at: str | None = None,
 ) -> dict[str, Any]:
     fallback_phase = f"{target_function} running"
     if live:
@@ -214,6 +356,10 @@ def _control_run_heartbeat_update_values(
             "message": "running",
             "phase": fallback_phase,
         }
+    progress_payload = dict(progress_payload)
+    if attempt_id and attempt_started_at:
+        progress_payload["attempt_id"] = attempt_id
+        progress_payload["attempt_started_at"] = attempt_started_at
     return {
         "status": "running",
         "phase_detail": phase_detail,
@@ -350,11 +496,18 @@ async def mark_control_run(
     progress: dict[str, Any] | None = None,
     snapshot_id: str | None = None,
     preserve_finished_at: bool = False,
-) -> None:
+    attempt_id: str | None = None,
+    attempt_started_at: str | None = None,
+):
     """Persist and publish one authoritative control-run lifecycle transition."""
 
     if not run_id:
-        return
+        return _CONTROL_RUN_NOT_MARKED
+    attempt_id, attempt_started_at = _control_attempt_for_run(
+        run_id,
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+    )
     now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
     is_terminal = status in {
         "succeeded",
@@ -364,9 +517,9 @@ async def mark_control_run(
         "dead_letter",
     }
     if progress is not None:
-        progress_payload = progress
+        progress_by_field = progress
     elif status == "succeeded":
-        progress_payload = {
+        progress_by_field = {
             "unit": "run",
             "total": 1,
             "done": 1,
@@ -374,29 +527,45 @@ async def mark_control_run(
             "message": progress_message,
         }
     elif is_terminal:
-        live_progress = read_live_progress(run_id) or {}
-        progress_payload = progress_payload_from_live(live_progress) or {
+        live_progress_by_field = read_live_progress(run_id) or {}
+        if (
+            attempt_id
+            and attempt_started_at
+            and not _is_progress_from_attempt(
+                live_progress_by_field,
+                attempt_id=attempt_id,
+                attempt_started_at=attempt_started_at,
+            )
+        ):
+            live_progress_by_field = {}
+        progress_by_field = progress_payload_from_live(
+            live_progress_by_field
+        ) or {
             "unit": "run",
             "total": 1,
             "done": 0,
             "pct": 0,
         }
-        progress_payload["message"] = progress_message
+        progress_by_field["message"] = progress_message
     else:
-        progress_payload = {
+        progress_by_field = {
             "unit": "run",
             "total": 1,
             "done": 0,
             "pct": 0,
             "message": progress_message,
         }
-    live_started_at = now if status == "running" else None
+    progress_by_field = dict(progress_by_field)
+    if attempt_id and attempt_started_at:
+        progress_by_field["attempt_id"] = attempt_id
+        progress_by_field["attempt_started_at"] = attempt_started_at
+    live_started_at = (attempt_started_at or now) if status == "running" else None
     live_finished_at = now if is_terminal and not preserve_finished_at else None
     values: dict[str, Any] = {
         "status": status,
         "phase_detail": phase_detail,
         "heartbeat_at": now,
-        "progress": progress_payload,
+        "progress": progress_by_field,
         "error": error,
     }
     if metrics is not None:
@@ -408,43 +577,103 @@ async def mark_control_run(
         values["finished_at"] = None
     if is_terminal and not preserve_finished_at:
         values["finished_at"] = now
-    if await _should_update_control_run_db(
+    should_update_database = bool(
+        status == "running" and attempt_id and attempt_started_at
+    ) or await _should_update_control_run_db(
         run_id=run_id,
         status=status,
         phase_detail=phase_detail,
         error=error,
         snapshot_id=snapshot_id,
-    ):
+    )
+    if should_update_database:
         stmt = update(ImportRun).where(ImportRun.run_id == run_id)
-        if status in {"running", "succeeded", "failed", "dead_letter"}:
+        if status == "running":
+            stmt = stmt.where(
+                ImportRun.status.notin_(
+                    sorted(_TERMINAL_STATUSES | {"canceling"})
+                )
+            )
+            if not (attempt_id and attempt_started_at):
+                stmt = stmt.where(
+                    ImportRun.progress[
+                        "attempt_started_at"
+                    ].as_string().is_(None)
+                )
+        elif status in {"running", "succeeded", "failed", "dead_letter"}:
             stmt = stmt.where(ImportRun.status.notin_(["canceling", "canceled"]))
-        await _execute_control_run_update(stmt.values(**values))
+        if status == "running" and attempt_id and attempt_started_at:
+            stmt = _where_newer_control_attempt_claim(
+                stmt,
+                attempt_id=attempt_id,
+                attempt_started_at=attempt_started_at,
+            )
+        elif is_terminal and attempt_id and attempt_started_at:
+            stmt = _where_control_attempt(
+                stmt,
+                attempt_id=attempt_id,
+                attempt_started_at=attempt_started_at,
+            )
+        affected_rows = await _execute_control_run_update(
+            stmt.values(**values).returning(ImportRun.run_id)
+        )
+        if affected_rows != 1:
+            return _CONTROL_RUN_NOT_MARKED
     live_payload = {
-        **progress_payload,
+        **progress_by_field,
         "run_id": run_id,
         "status": status,
-        "phase": progress_payload.get("phase") or phase_detail,
-        "message": progress_payload.get("message") or progress_message,
+        "phase": progress_by_field.get("phase") or phase_detail,
+        "message": progress_by_field.get("message") or progress_message,
         "started_at": isoformat_utc(live_started_at) if live_started_at else None,
         "finished_at": isoformat_utc(live_finished_at) if live_finished_at else None,
         "snapshot_id": snapshot_id,
         "publish_event": False,
     }
-    enqueue_live_progress(**live_payload)
-    enqueue_status_event(
-        {
-            "run_id": run_id,
-            "status": status,
-            "phase_detail": phase_detail,
-            "progress": progress_payload,
-            "metrics": metrics or {},
-            "error": error,
-            "snapshot_id": snapshot_id,
-            "heartbeat_at": isoformat_utc(now),
-            "started_at": isoformat_utc(live_started_at) if live_started_at else None,
-            "finished_at": isoformat_utc(live_finished_at) if live_finished_at else None,
-        }
+    status_event_by_field = {
+        "run_id": run_id,
+        "status": status,
+        "phase_detail": phase_detail,
+        "progress": progress_by_field,
+        "metrics": metrics or {},
+        "error": error,
+        "snapshot_id": snapshot_id,
+        "heartbeat_at": isoformat_utc(now),
+        "started_at": isoformat_utc(live_started_at) if live_started_at else None,
+        "finished_at": (
+            isoformat_utc(live_finished_at)
+            if live_finished_at
+            else None
+        ),
+    }
+    await asyncio.to_thread(
+        write_live_progress,
+        **live_payload,
+        status_event_payload=status_event_by_field,
     )
+    return _CONTROL_RUN_MARKED
+
+
+def _control_attempt_for_run(
+    run_id: str,
+    *,
+    attempt_id: str | None,
+    attempt_started_at: str | None,
+) -> tuple[str | None, str | None]:
+    """Inherit wrapper ownership for progress emitted by its target."""
+
+    if attempt_id or attempt_started_at:
+        return attempt_id, attempt_started_at
+    context = current_live_progress_context()
+    if str(context.get("run_id") or "").strip() != run_id:
+        return None, None
+    context_attempt_id = str(context.get("attempt_id") or "").strip()
+    context_started_at = str(
+        context.get("attempt_started_at") or ""
+    ).strip()
+    if not context_attempt_id or not context_started_at:
+        return None, None
+    return context_attempt_id, context_started_at
 
 
 async def _should_update_control_run_db(
@@ -498,13 +727,76 @@ def _control_run_db_throttle_client() -> redis.Redis:
     )
 
 
-async def _execute_control_run_update(stmt: Any) -> None:
+def _where_control_attempt(
+    stmt: Any,
+    *,
+    attempt_id: str,
+    attempt_started_at: str,
+) -> Any:
+    """Fence a control-plane write to one immutable execution attempt."""
+
+    return stmt.where(
+        ImportRun.progress["attempt_id"].as_string() == attempt_id,
+        ImportRun.progress["attempt_started_at"].as_string()
+        == attempt_started_at,
+    )
+
+
+def _where_newer_control_attempt_claim(
+    stmt: Any,
+    *,
+    attempt_id: str,
+    attempt_started_at: str,
+) -> Any:
+    """Claim a run only when no newer immutable attempt already owns it."""
+
+    stored_attempt_id = ImportRun.progress["attempt_id"].as_string()
+    stored_started_at = ImportRun.progress[
+        "attempt_started_at"
+    ].as_string()
+    return stmt.where(
+        or_(
+            stored_started_at.is_(None),
+            stored_started_at < attempt_started_at,
+            and_(
+                stored_started_at == attempt_started_at,
+                stored_attempt_id == attempt_id,
+            ),
+        )
+    )
+
+
+def _is_progress_from_attempt(
+    progress: dict[str, Any] | None,
+    *,
+    attempt_id: str,
+    attempt_started_at: str,
+) -> bool:
+    """Accept live detail only when the caller already owns its identity."""
+
+    if not isinstance(progress, dict):
+        return False
+    return (
+        str(progress.get("attempt_id") or "") == attempt_id
+        and str(progress.get("attempt_started_at") or "")
+        == attempt_started_at
+    )
+
+
+async def _execute_control_run_update(stmt: Any) -> int:
     previous_override = getattr(db, "_database_override", None)
     base_database = os.getenv("HLTHPRT_DB_DATABASE", "postgres")
     db._database_override = base_database
     try:
         await db.connect()
-        await db.execute(stmt)
+        result = await db.execute(stmt)
+        if result is None:
+            return 0
+        try:
+            returned_rows = result.all()
+        except Exception:
+            return 0
+        return len(returned_rows)
     finally:
         db._database_override = previous_override
         if previous_override != base_database:

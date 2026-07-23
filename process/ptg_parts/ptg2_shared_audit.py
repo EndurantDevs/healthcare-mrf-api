@@ -20,6 +20,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_FORMAT_VERSION,
     PTG2_V3_SHARED_GENERATION,
+    PTG2_V4_SHARED_GENERATION,
     SharedLayoutBuildOwnership,
     lock_shared_layout_for_dense_write,
     shared_block_hash,
@@ -1680,6 +1681,7 @@ async def sealed_audit_sample_metadata(
     schema_name: str,
     snapshot_key: int,
     logical_snapshot_id: str,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> dict[str, Any]:
     """Return the authoritative audit contract from a sealed reused layout."""
 
@@ -1687,6 +1689,7 @@ async def sealed_audit_sample_metadata(
         session,
         schema_name=schema_name,
         snapshot_key=snapshot_key,
+        expected_generation=expected_generation,
     )
     metadata = _audit_metadata_from_layout(layout_manifest)
     sample_count, expected_digest = _validated_sealed_audit_contract(metadata)
@@ -1719,7 +1722,11 @@ async def _sealed_layout_manifest(
     *,
     schema_name: str,
     snapshot_key: int,
+    expected_generation: str = PTG2_V3_SHARED_GENERATION,
 ) -> Mapping[str, Any]:
+    generation = str(expected_generation or "").strip().lower()
+    if generation not in {PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION}:
+        raise ValueError("unsupported shared PTG audit generation")
     schema = _quote_ident(schema_name)
     layout_result = await session.execute(
         db.text(
@@ -1733,7 +1740,7 @@ async def _sealed_layout_manifest(
         ),
         {
             "snapshot_key": int(snapshot_key),
-            "generation": PTG2_V3_SHARED_GENERATION,
+            "generation": generation,
         },
     )
     layout_manifest = layout_result.scalar()
