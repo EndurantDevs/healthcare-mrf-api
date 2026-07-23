@@ -14,6 +14,7 @@ import struct
 import time
 import uuid
 
+import asyncpg
 import pytest
 import sqlalchemy as sa
 
@@ -29,6 +30,7 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     reserve_v4_shared_layout,
     seal_v4_shared_layout,
 )
+from scripts.ptg_v4_dev_canary_storage import relation_size_rows
 from tests.ptg2_v4_migration_catalog_support import (
     v3_provider_set_prerequisite_ddl,
 )
@@ -373,6 +375,30 @@ def _base_layout_manifest() -> dict[str, object]:
             },
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_v4_storage_relation_lookup_accepts_bound_identifiers_on_postgres() -> None:
+    """Prove the canary storage catalog lookup against real PostgreSQL."""
+
+    if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
+
+    dsn = os.environ["HLTHPRT_PTG2_V4_MIGRATION_POSTGRES_DSN"]
+    connection = await asyncpg.connect(dsn)
+    try:
+        relation_size_records = await relation_size_rows(
+            connection,
+            "pg_catalog",
+            ("pg_class",),
+        )
+
+        assert len(relation_size_records) == 1
+        assert relation_size_records[0]["relation"] == "pg_class"
+        assert relation_size_records[0]["exists"] is True
+        assert relation_size_records[0]["total_bytes"] > 0
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio
