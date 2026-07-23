@@ -10,6 +10,9 @@ import pytest
 
 from process.ptg_parts import ptg2_batch_candidate_audit as batch_audit
 from process.ptg_parts import ptg2_batch_candidate_audit_report_schema as report_schema
+from process.ptg_parts import (
+    ptg2_batch_candidate_audit_report_sections as report_sections,
+)
 from process.ptg_parts import ptg2_candidate_audit_batch_response as batch_response
 from process.ptg_parts import ptg2_candidate_audit_contract as audit_contract
 from process.ptg_parts import ptg2_fast_candidate_audit as fast_audit
@@ -280,6 +283,14 @@ def test_report_digest_rejects_wrong_length_or_nonhex(raw_digest, message):
         report_schema.report_digest_hex(raw_digest, field_name="digest")
 
 
+def test_report_digest_rejects_whitespace_hidden_short_digest():
+    raw_digest = ("00" * 15) + "  " + ("00" * 16)
+    assert len(raw_digest) == 64
+
+    with pytest.raises(ValueError, match="digest is invalid"):
+        report_schema.report_digest_hex(raw_digest, field_name="digest")
+
+
 def test_report_schema_rejects_noncanonical_and_malformed_scalars(monkeypatch):
     with pytest.raises(ValueError, match="not canonical JSON"):
         report_schema.canonical_report_bytes({"not_json": object()})
@@ -385,6 +396,17 @@ def test_v4_report_rejects_invalid_section_contracts(
     target_mapping[field_name] = invalid_value
 
     with pytest.raises(ValueError, match=message):
+        _validate(report_by_field)
+
+
+def test_partitioned_report_timing_requires_positive_request_count():
+    report_by_field = deepcopy(_v4_report())
+    report_by_field["batch"]["request_contract"] = (
+        report_sections.PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+    )
+    report_by_field["checks"]["batch_requests_executed"] = 0
+
+    with pytest.raises(ValueError, match="timing is invalid"):
         _validate(report_by_field)
 
 

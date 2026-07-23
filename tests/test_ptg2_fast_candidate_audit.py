@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 import json
 from dataclasses import replace
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import aiohttp
 import pytest
@@ -624,6 +625,22 @@ def test_candidate_no_match_is_reported_as_missing_source_witness():
         )
 
 
+def test_candidate_page_rejects_contract_drift():
+    payload = _api_contract_payload(_target(), response_items=[])
+    payload["query"]["snapshot_id"] = "different-snapshot"
+
+    with pytest.raises(
+        audit.FastCandidateAuditError,
+        match="api_contract_mismatch",
+    ):
+        audit._validated_candidate_page(
+            payload,
+            _target(),
+            requested_offset=0,
+            declared_total=None,
+        )
+
+
 @pytest.mark.asyncio
 async def test_http_latency_excludes_time_waiting_for_concurrency_slot(monkeypatch):
     events: list[str] = []
@@ -1073,6 +1090,12 @@ def _preflight_payload():
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
+        (
+            lambda payload: payload["query"].update(
+                snapshot_id="different-snapshot"
+            ),
+            "api_audit_contract_mismatch",
+        ),
         (lambda payload: payload["source_set"].update(source_count=2), "source_set"),
         (lambda payload: payload.update(audit_sample={}), "audit_sample"),
         (
@@ -1102,4 +1125,83 @@ async def test_preflight_rejects_source_sample_or_item_drift(
             _ImmediateSemaphore(),
             audit.FastAuditHttpMetrics(),
             _target(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_fast_audit_rejects_witness_count_drift_before_http():
+    witness = _witness(1)
+    witness = replace(
+        witness,
+        metadata={
+            **witness.metadata,
+            "occurrence_witness_count": 2,
+        },
+    )
+
+    with pytest.raises(
+        audit.FastCandidateAuditError,
+        match="source_witness_challenge_count_mismatch",
+    ):
+        await audit.run_fast_candidate_audit(
+            witness=witness,
+            audit_target=_target(),
+            http=_http(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "response_items",
+        "total",
+        "schema_errors",
+        "maximum_pages",
+        "expected_error",
+    ),
+    (
+        ([{}], 2, ("invalid tuple",), 2, "api_tuple_schema_mismatch"),
+        ([{}], 1, (), 2, "source_witness_missing_from_api"),
+        ([], 1, (), 2, "api_pagination_stalled"),
+        ([{}], 2, (), 1, "api_challenge_page_limit"),
+    ),
+)
+async def test_challenge_pagination_fails_closed(
+    monkeypatch,
+    response_items,
+    total,
+    schema_errors,
+    maximum_pages,
+    expected_error,
+):
+    monkeypatch.setattr(audit, "FAST_AUDIT_MAX_PAGES", maximum_pages)
+    monkeypatch.setattr(
+        audit,
+        "_request_json",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        audit,
+        "_validated_candidate_page",
+        lambda *_args, **_kwargs: audit._CandidatePage(
+            response_items=response_items,
+            total=total,
+        ),
+    )
+    monkeypatch.setattr(
+        audit.source_audit,
+        "extract_api_tuples",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            schema_errors=schema_errors,
+            tuples={},
+        ),
+    )
+
+    with pytest.raises(audit.FastCandidateAuditError, match=expected_error):
+        await audit._run_challenge(
+            object(),
+            _ImmediateSemaphore(),
+            audit.FastAuditHttpMetrics(),
+            _target(),
+            source_challenge(_occurrence_record()),
         )

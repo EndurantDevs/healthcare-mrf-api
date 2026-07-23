@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 import os
+import runpy
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -1713,3 +1714,22 @@ def test_retention_collector_honors_all_environment_caps(tmp_path, monkeypatch):
     assert captured_caps_by_name["target_bytes"] == 123
     assert captured_caps_by_name["max_delete_bytes"] == 456
     assert captured_caps_by_name["max_delete_files"] == 7
+
+
+def test_input_artifact_gc_module_entrypoint_invokes_retention_main(
+    monkeypatch,
+):
+    entrypoint_path = Path(retention.__file__).with_name(
+        "ptg2_input_artifact_gc.py"
+    )
+    calls = []
+    monkeypatch.setattr(retention, "main", lambda: calls.append("main"))
+
+    runpy.run_path(
+        str(entrypoint_path),
+        run_name="ptg2_input_artifact_gc_import",
+    )
+    assert calls == []
+
+    runpy.run_path(str(entrypoint_path), run_name="__main__")
+    assert calls == ["main"]

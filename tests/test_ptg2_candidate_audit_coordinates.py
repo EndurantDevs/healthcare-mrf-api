@@ -176,6 +176,22 @@ def test_candidate_code_index_unions_aliases_and_persisted_only_keys(monkeypatch
     assert tuple(code_index.by_key) == (7, 8)
 
 
+def test_candidate_code_index_deduplicates_alias_memberships(monkeypatch):
+    monkeypatch.setattr(codes, "_canonical_code_metadata_row", dict)
+    records_by_pair = {}
+    records_by_key = {}
+
+    for record in (_code_record(7), _code_record(7), _code_record(8)):
+        codes._index_candidate_code_record(
+            record,
+            records_by_pair,
+            records_by_key,
+        )
+
+    assert tuple(records_by_pair[("CPT", "99213")]) == (7, 8)
+    assert tuple(records_by_key) == (7, 8)
+
+
 def test_candidate_code_index_rejects_inconsistent_aliases(monkeypatch):
     monkeypatch.setattr(codes, "_canonical_code_metadata_row", dict)
 

@@ -50,6 +50,7 @@
         "api/ptg2_candidate_audit_capacity.py",
         "api/ptg2_candidate_audit_codes.py",
         "api/ptg2_candidate_audit_coordinates.py",
+        "api/ptg2_candidate_audit_dimensions.py",
         "api/ptg2_candidate_audit_forward.py",
         "api/ptg2_candidate_audit_graph.py",
         "api/ptg2_candidate_audit_integrity.py",
@@ -60,6 +61,7 @@
         "api/ptg2_candidate_audit_partition.py",
         "api/ptg2_candidate_audit_price_load.py",
         "api/ptg2_candidate_audit_projection.py",
+        "api/ptg2_candidate_audit_provider_code_sets.py",
         "api/ptg2_candidate_audit_provider_requests.py",
         "api/ptg2_candidate_audit_reverse.py",
         "api/ptg2_candidate_audit_selection.py",
@@ -344,12 +346,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 26688,
-          "total": 34688
+          "covered": 26839,
+          "total": 34746
         },
         "lines": {
-          "covered": 87685,
-          "total": 102069
+          "covered": 87924,
+          "total": 102217
         }
       },
       "path": "test-coverage-python.json",

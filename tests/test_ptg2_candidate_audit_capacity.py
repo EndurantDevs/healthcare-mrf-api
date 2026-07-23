@@ -35,7 +35,7 @@ def test_default_partition_capacity_fits_one_process_admission_slot():
     partition_weight = pricing._candidate_audit_partition_weight(raw_limit)
 
     assert raw_limit == 512 * 1024 * 1024
-    assert partition_weight == 896 * 1024 * 1024
+    assert partition_weight == 1024 * 1024 * 1024
     assert partition_weight <= pricing.PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES
     assert (
         2 * partition_weight
@@ -47,19 +47,19 @@ def test_dense_partition_has_bounded_headroom_without_changing_legacy_cap():
     assert PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES == 64 * 1024 * 1024
     assert (
         PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
-        == 384 * 1024 * 1024
+        == 512 * 1024 * 1024
     )
     budget = CandidateAuditDecodedRetentionBudget(
         maximum_bytes=PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
     )
 
-    budget.claim(320 * 1024 * 1024, category="a dense provider/code request")
-    budget.claim(64 * 1024 * 1024, category="bounded headroom")
+    budget.claim(384 * 1024 * 1024, category="a dense provider/code request")
+    budget.claim(128 * 1024 * 1024, category="bounded headroom")
     with pytest.raises(CandidateAuditDecodedRetentionError, match="byte limit"):
         budget.claim(1, category="an unbounded extra byte")
 
-    assert budget.retained_bytes == 384 * 1024 * 1024
-    assert budget.peak_retained_bytes == 384 * 1024 * 1024
+    assert budget.retained_bytes == 512 * 1024 * 1024
+    assert budget.peak_retained_bytes == 512 * 1024 * 1024
 
 
 @pytest.mark.parametrize("maximum_bytes", (0, -1, True))
@@ -81,6 +81,16 @@ def test_audit_counts_reject_incomplete_persisted_occurrence_validation():
         match="incomplete persisted occurrence count",
     ):
         pricing._validate_candidate_audit_batch_counts(batch_result, audit_request)
+
+
+@pytest.mark.asyncio
+async def test_candidate_audit_endpoint_rejects_oversized_request_before_auth():
+    request = SimpleNamespace(body=b"x" * (2 * 1024 * 1024 + 1))
+
+    with pytest.raises(Exception, match="request is too large") as exc_info:
+        await pricing.audit_ptg2_source_witness_batch(request)
+
+    assert type(exc_info.value).__name__ == "BadRequest"
 
 
 def test_raw_audit_capacity_rejects_non_positive_configuration(monkeypatch):
@@ -132,6 +142,75 @@ def test_unique_integer_tuple_releases_claims_on_base_exception():
         )
 
     assert budget.retained_bytes == 0
+
+
+def test_unique_integer_tuple_releases_claims_when_ordering_is_rejected():
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=400)
+
+    with pytest.raises(CandidateAuditDecodedRetentionError, match="byte limit"):
+        retain_unique_integer_keys(
+            (7,),
+            budget,
+            category="test",
+        )
+
+    assert budget.retained_bytes == 0
+
+
+def test_unique_integer_helpers_dedupe_and_reject_invalid_bounds():
+    with pytest.raises(ValueError, match="limit must be positive"):
+        retain_unique_integer_keys(
+            (),
+            None,
+            category="test",
+            maximum_count=0,
+        )
+
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=4096)
+    ordered_keys, retained_tuple_bytes = retain_unique_integer_keys(
+        (7, 7),
+        budget,
+        category="test",
+    )
+    assert ordered_keys == (7,)
+    budget.release(retained_tuple_bytes)
+
+    retained_keys, retained_set_bytes = retain_unique_integer_key_set(
+        (7, 7),
+        budget,
+        category="test",
+    )
+    assert retained_keys == {7}
+    budget.release(retained_set_bytes)
+    assert budget.retained_bytes == 0
+
+
+@pytest.mark.parametrize("with_budget", (False, True))
+def test_unique_integer_tuple_stops_at_bounded_count(with_budget):
+    budget = (
+        CandidateAuditDecodedRetentionBudget(maximum_bytes=4096)
+        if with_budget
+        else None
+    )
+    consumed_keys = []
+
+    def integer_keys():
+        for integer_key in range(10):
+            consumed_keys.append(integer_key)
+            yield integer_key
+
+    with pytest.raises(PTG2ManifestArtifactError, match="bounded test keys"):
+        retain_unique_integer_keys(
+            integer_keys(),
+            budget,
+            category="test",
+            maximum_count=2,
+            limit_error_message="bounded test keys",
+        )
+
+    assert consumed_keys == [0, 1, 2]
+    if budget is not None:
+        assert budget.retained_bytes == 0
 
 
 def test_unique_integer_set_releases_claims_on_base_exception():

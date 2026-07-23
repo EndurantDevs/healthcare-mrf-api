@@ -5,8 +5,15 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 
-from api.ptg2_candidate_audit_capacity import CandidateAuditDecodedRetentionBudget
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditDecodedRetentionBudget,
+)
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
+from api.ptg2_candidate_audit_dimensions import (
+    candidate_provider_set_keys as _candidate_provider_set_keys,
+    candidate_requested_code_keys as _candidate_requested_code_keys,
+    provider_code_request_upper_bound as _provider_code_request_upper_bound,
+)
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
 from api.ptg2_candidate_audit_maps import (
     INTEGER_MAP_BUCKET_BYTES as _INTEGER_MAP_BUCKET_BYTES,
@@ -19,6 +26,12 @@ from api.ptg2_candidate_audit_occurrences import (
 )
 from api.ptg2_candidate_audit_provider_requests import (
     requested_code_keys_by_provider_set as _bounded_provider_code_requests,
+)
+from api.ptg2_candidate_audit_provider_code_sets import (
+    ProviderCodeBounds as _ProviderCodeBounds,
+    ensure_complete_provider_code_map as _ensure_complete_provider_code_map,
+    freeze_nonempty_provider_code_sets as _freeze_nonempty_provider_code_sets,
+    load_bounded_provider_code_sets as _load_bounded_provider_code_sets,
 )
 from api.ptg2_db_sidecars import (
     _ValidatedProviderCodeRequests,
@@ -35,23 +48,6 @@ PTG2_AUDIT_BATCH_MAX_REQUESTED_CODE_KEYS = 100_000
 _INTEGER_SET_BYTES = 256
 _INTEGER_SET_MEMBERSHIP_BYTES = 112
 _COMPOSITE_SET_MEMBERSHIP_BYTES = 160
-_PROVIDER_CODE_REQUEST_BUCKET_BYTES = 160
-_PROVIDER_CODE_REQUEST_MEMBERSHIP_BYTES = 16
-
-
-def _bounded_integer_keys(
-    source_keys: Iterable[int],
-    maximum_count: int,
-    error_message: str,
-) -> tuple[int, ...]:
-    """Normalize unique integer keys while stopping at the first excess key."""
-
-    normalized_keys: set[int] = set()
-    for source_key in source_keys:
-        normalized_keys.add(int(source_key))
-        if len(normalized_keys) > maximum_count:
-            raise PTG2ManifestArtifactError(error_message)
-    return tuple(sorted(normalized_keys))
 
 
 def _add_provider_match(
@@ -111,7 +107,10 @@ def _add_challenge_provider_matches(
                 )
             seen_npi_codes.add(npi_code)
             for provider_set_key in provider_set_keys:
-                if code_key not in provider_code_sets[provider_set_key]:
+                if code_key not in provider_code_sets.get(
+                    provider_set_key,
+                    (),
+                ):
                     continue
                 retained_membership_count = _add_provider_match(
                     provider_sets_by_npi_code,
@@ -152,7 +151,10 @@ def candidate_provider_scope_by_npi_code(
         retention_budget,
     )
     for occurrence in persisted_audit_occurrences:
-        if occurrence.code_key not in provider_code_sets[occurrence.provider_set_key]:
+        if occurrence.code_key not in provider_code_sets.get(
+            occurrence.provider_set_key,
+            (),
+        ):
             raise PTG2ManifestArtifactError(
                 "PTG2 candidate persisted audit provider-code membership is missing"
             )
@@ -221,45 +223,100 @@ async def load_candidate_provider_code_sets(
     requested_code_keys: Iterable[int],
     *,
     schema_name: str,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, frozenset[int]]:
     """Retain only requested memberships from each sealed provider code set."""
 
-    requested_keys = _bounded_integer_keys(
+    return await _load_bounded_provider_code_sets(
+        lookup_shared_provider_code_intersections_from_db,
+        session,
+        shared_snapshot_key,
         provider_set_keys,
-        PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE,
-        "PTG2 candidate provider-code scope exceeds its bounded limit",
-    )
-    if not requested_keys:
-        return {}
-    normalized_code_keys = _bounded_integer_keys(
         requested_code_keys,
-        PTG2_AUDIT_BATCH_MAX_REQUESTED_CODE_KEYS,
-        "PTG2 candidate requested code scope exceeds its bounded limit",
+        bounds=_ProviderCodeBounds(
+            maximum_provider_keys=PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE,
+            maximum_code_keys=PTG2_AUDIT_BATCH_MAX_REQUESTED_CODE_KEYS,
+            schema_name=schema_name,
+        ),
+        retention_budget=retention_budget,
     )
-    if not normalized_code_keys:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate provider-code scope has no requested codes"
-        )
-    code_keys_by_provider_set = (
-        await lookup_shared_provider_code_intersections_from_db(
+
+
+async def _load_provider_codes_by_dimension(
+    session: Any,
+    shared_snapshot_key: int,
+    challenges: Sequence[AuditBatchChallenge],
+    code_index: CandidateCodeIndex,
+    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    persisted_audit_occurrences: Sequence[PersistedAuditOccurrence],
+    *,
+    schema_name: str,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[int, frozenset[int]]:
+    """Intersect dense scopes by bounded dimensions instead of pair products."""
+
+    return await load_candidate_provider_code_sets(
+        session,
+        shared_snapshot_key,
+        _candidate_provider_set_keys(
+            provider_set_keys_by_npi,
+            persisted_audit_occurrences,
+        ),
+        _candidate_requested_code_keys(
+            challenges,
+            code_index,
+            persisted_audit_occurrences,
+        ),
+        schema_name=schema_name,
+        retention_budget=retention_budget,
+    )
+
+
+async def _load_provider_codes_for_scope(
+    session: Any,
+    shared_snapshot_key: int,
+    challenges: Sequence[AuditBatchChallenge],
+    code_index: CandidateCodeIndex,
+    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    persisted_audit_occurrences: Sequence[PersistedAuditOccurrence],
+    *,
+    schema_name: str,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[int, frozenset[int]]:
+    """Choose exact pairs or a dimension-first intersection before retention."""
+
+    pair_upper_bound = _provider_code_request_upper_bound(
+        challenges,
+        code_index,
+        provider_set_keys_by_npi,
+        persisted_audit_occurrences,
+        maximum_memberships=PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE,
+    )
+    if pair_upper_bound > PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE:
+        return await _load_provider_codes_by_dimension(
             session,
             shared_snapshot_key,
-            requested_keys,
-            normalized_code_keys,
-            max_retained_memberships=(
-                PTG2_AUDIT_BATCH_MAX_PROVIDER_CODE_SCOPE
-            ),
+            challenges,
+            code_index,
+            provider_set_keys_by_npi,
+            persisted_audit_occurrences,
             schema_name=schema_name,
+            retention_budget=retention_budget,
         )
+    provider_code_requests = _requested_code_keys_by_provider_set(
+        challenges,
+        code_index,
+        provider_set_keys_by_npi,
+        persisted_audit_occurrences,
+        retention_budget,
     )
-    if set(code_keys_by_provider_set) != set(requested_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate provider-code artifact is missing a referenced provider set"
-        )
-    return {
-        provider_set_key: frozenset(code_keys)
-        for provider_set_key, code_keys in code_keys_by_provider_set.items()
-    }
+    return await _load_candidate_provider_code_sets_prepared(
+        session,
+        shared_snapshot_key,
+        provider_code_requests,
+        schema_name=schema_name,
+        retention_budget=retention_budget,
+    )
 
 
 async def _load_candidate_provider_code_sets_prepared(
@@ -290,30 +347,15 @@ async def _load_candidate_provider_code_sets_prepared(
             decoded_retention_budget=retention_budget,
         )
     )
-    if set(code_keys_by_provider_set) != set(requests.provider_set_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate provider-code artifact is missing a referenced provider set"
-        )
-    retained_map_bytes = (
-        _INTEGER_MAP_BYTES
-        + sum(
-            _PROVIDER_CODE_REQUEST_BUCKET_BYTES
-            + len(code_keys) * _PROVIDER_CODE_REQUEST_MEMBERSHIP_BYTES
-            for code_keys in code_keys_by_provider_set.values()
-        )
+    _ensure_complete_provider_code_map(
+        code_keys_by_provider_set,
+        requests.provider_set_keys,
+        retention_budget,
     )
-    if retention_budget is not None:
-        retention_budget.claim(
-            retained_map_bytes,
-            category="the frozen provider/code membership map",
-        )
-    frozen_code_keys_by_provider_set = {
-        provider_set_key: frozenset(code_keys)
-        for provider_set_key, code_keys in code_keys_by_provider_set.items()
-    }
-    if retention_budget is not None:
-        retention_budget.release(retained_map_bytes)
-    return frozen_code_keys_by_provider_set
+    return _freeze_nonempty_provider_code_sets(
+        code_keys_by_provider_set,
+        retention_budget,
+    )
 
 
 def _requested_code_keys_by_provider_set(
@@ -352,17 +394,13 @@ async def load_candidate_provider_indexes(
 ]:
     """Load and build the exact provider scope once for downstream readers."""
 
-    provider_code_requests = _requested_code_keys_by_provider_set(
+    provider_code_sets = await _load_provider_codes_for_scope(
+        session,
+        shared_snapshot_key,
         challenges,
         code_index,
         provider_set_keys_by_npi,
         persisted_audit_occurrences,
-        retention_budget,
-    )
-    provider_code_sets = await _load_candidate_provider_code_sets_prepared(
-        session,
-        shared_snapshot_key,
-        provider_code_requests,
         schema_name=schema_name,
         retention_budget=retention_budget,
     )

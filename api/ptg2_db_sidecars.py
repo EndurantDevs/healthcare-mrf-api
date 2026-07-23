@@ -16,7 +16,13 @@ from sqlalchemy import text
 
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
+    retain_unique_integer_key_set,
     retain_unique_integer_keys,
+)
+from api.ptg2_candidate_audit_maps import (
+    INTEGER_MAP_BUCKET_BYTES as _AUDIT_INTEGER_MAP_BUCKET_BYTES,
+    INTEGER_MAP_BYTES as _AUDIT_INTEGER_MAP_BYTES,
+    INTEGER_SET_MEMBERSHIP_BYTES as _AUDIT_INTEGER_SET_MEMBERSHIP_BYTES,
 )
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
@@ -3430,19 +3436,70 @@ async def lookup_provider_code_intersections_from_db(
     *,
     max_retained_memberships: int | None = None,
     schema_name: str = "mrf",
+    decoded_retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+    inputs_are_normalized: bool = False,
 ) -> dict[int, tuple[int, ...]]:
     """Validate memberships while retaining only the requested code keys."""
 
     from api.ptg2_db_serving_v3 import _requested_keys
 
-    return await _lookup_provider_code_keys_from_db(
-        session,
-        shared_snapshot_key,
-        _requested_keys(provider_set_keys),
-        requested_code_key_set=set(_requested_keys(requested_code_keys)),
-        max_retained_memberships=max_retained_memberships,
-        schema_name=schema_name,
+    if inputs_are_normalized:
+        normalized_provider_keys = _validated_prepared_keys(
+            provider_set_keys,
+            category="provider",
+        )
+        normalized_code_keys = _validated_prepared_keys(
+            requested_code_keys,
+            category="code",
+        )
+    else:
+        normalized_provider_keys = _requested_keys(provider_set_keys)
+        normalized_code_keys = _requested_keys(requested_code_keys)
+    requested_code_key_set, retained_code_set_bytes = (
+        retain_unique_integer_key_set(
+            normalized_code_keys,
+            decoded_retention_budget,
+            category="provider-code intersection",
+        )
     )
+    try:
+        return await _lookup_provider_code_keys_from_db(
+            session,
+            shared_snapshot_key,
+            normalized_provider_keys,
+            requested_code_key_set=requested_code_key_set,
+            max_retained_memberships=max_retained_memberships,
+            schema_name=schema_name,
+            decoded_retention_budget=decoded_retention_budget,
+        )
+    finally:
+        if decoded_retention_budget is not None:
+            decoded_retention_budget.release(retained_code_set_bytes)
+
+
+def _validated_prepared_keys(
+    integer_keys: Iterable[int],
+    *,
+    category: str,
+) -> tuple[int, ...]:
+    """Accept one already normalized dimension without copying it."""
+
+    if not isinstance(integer_keys, tuple):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 prepared {category} keys must be an immutable tuple"
+        )
+    previous_key: int | None = None
+    for integer_key in integer_keys:
+        if (
+            type(integer_key) is not int
+            or integer_key < 0
+            or (previous_key is not None and integer_key <= previous_key)
+        ):
+            raise PTG2ManifestArtifactError(
+                f"PTG2 prepared {category} keys must be unique sorted nonnegative integers"
+            )
+        previous_key = integer_key
+    return integer_keys
 
 
 async def lookup_provider_code_map_from_db(
@@ -3691,7 +3748,7 @@ async def _lookup_provider_code_keys_from_db(
     )
     return _provider_code_keys_from_aliases(
         logical_blocks,
-        requested_key_set=set(requested_keys),
+        requested_key_set=requested_keys,
         requested_code_selection=requested_code_selection,
         requested_code_keys_by_provider_set=requested_code_keys_by_provider_set,
         retention_budget=retention_budget,
@@ -3701,17 +3758,48 @@ async def _lookup_provider_code_keys_from_db(
 
 
 def _requested_offsets_by_block(
-    requested_key_set: AbstractSet[int],
+    requested_key_set: Iterable[int],
     *,
     block_span: int,
-) -> dict[int, set[int]]:
+    decoded_retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+) -> tuple[dict[int, set[int]], int]:
     """Partition requested provider offsets once by their logical block."""
 
+    retained_bytes = 0
+    if decoded_retention_budget is not None:
+        decoded_retention_budget.claim(
+            _AUDIT_INTEGER_MAP_BYTES,
+            category="the provider-code offset map",
+        )
+        retained_bytes = _AUDIT_INTEGER_MAP_BYTES
     offsets_by_block: dict[int, set[int]] = {}
-    for provider_set_key in requested_key_set:
-        block_key, requested_offset = divmod(provider_set_key, block_span)
-        offsets_by_block.setdefault(block_key, set()).add(requested_offset)
-    return offsets_by_block
+    try:
+        for provider_set_key in requested_key_set:
+            block_key, requested_offset = divmod(provider_set_key, block_span)
+            requested_offsets = offsets_by_block.get(block_key)
+            if requested_offsets is None:
+                if decoded_retention_budget is not None:
+                    decoded_retention_budget.claim(
+                        _AUDIT_INTEGER_MAP_BUCKET_BYTES,
+                        category="a provider-code offset bucket",
+                    )
+                    retained_bytes += _AUDIT_INTEGER_MAP_BUCKET_BYTES
+                requested_offsets = set()
+                offsets_by_block[block_key] = requested_offsets
+            if requested_offset in requested_offsets:
+                continue
+            if decoded_retention_budget is not None:
+                decoded_retention_budget.claim(
+                    _AUDIT_INTEGER_SET_MEMBERSHIP_BYTES,
+                    category="a provider-code requested offset",
+                )
+                retained_bytes += _AUDIT_INTEGER_SET_MEMBERSHIP_BYTES
+            requested_offsets.add(requested_offset)
+    except BaseException:
+        if decoded_retention_budget is not None:
+            decoded_retention_budget.release(retained_bytes)
+        raise
+    return offsets_by_block, retained_bytes
 
 
 @dataclass
@@ -4033,7 +4121,7 @@ def _retain_provider_code_alias_group(
 def _provider_code_keys_from_aliases(
     logical_blocks: Mapping[int, _SharedLogicalBlock],
     *,
-    requested_key_set: set[int],
+    requested_key_set: AbstractSet[int] | tuple[int, ...],
     requested_code_selection: Any | None = None,
     requested_code_keys_by_provider_set: _ProviderCodeRequests | None = None,
     retention_budget: _ProviderCodeRetentionBudget | None = None,
@@ -4046,37 +4134,36 @@ def _provider_code_keys_from_aliases(
     )
 
     block_span = PTG2_SERVING_BINARY_V3_PROVIDER_SET_KEY_BLOCK_SPAN
-    requested_offsets_by_block = _requested_offsets_by_block(
+    requested_offsets_by_block, retained_offset_bytes = _requested_offsets_by_block(
         requested_key_set,
         block_span=block_span,
-    )
-    if decoded_retention_budget is not None:
-        decoded_retention_budget.claim(
-            _PROVIDER_CODE_DECODED_MAP_BYTES,
-            category="the decoded provider/code map",
-        )
-    code_keys_by_provider: dict[int, tuple[int, ...]] = {}
-    physical_alias_groups = _logical_blocks_by_physical_identity(
-        logical_blocks
-    ).values()
-    alias_context = _ProviderCodeAliasContext(
-        requested_offsets_by_block=requested_offsets_by_block,
-        requested_code_selection=requested_code_selection,
-        requested_code_keys_by_provider_set=requested_code_keys_by_provider_set,
-        retention_budget=retention_budget,
         decoded_retention_budget=decoded_retention_budget,
-        schema_name=schema_name,
-        block_span=block_span,
     )
+    code_keys_by_provider: dict[int, tuple[int, ...]] = {}
+    is_decoded_map_claimed = False
     try:
-        for physical_aliases in physical_alias_groups:
-            _retain_provider_code_alias_group(
-                code_keys_by_provider,
-                physical_aliases,
-                alias_context,
-            )
-    except BaseException:
         if decoded_retention_budget is not None:
+            decoded_retention_budget.claim(
+                _PROVIDER_CODE_DECODED_MAP_BYTES,
+                category="the decoded provider/code map",
+            )
+            is_decoded_map_claimed = True
+        alias_context = _ProviderCodeAliasContext(
+            requested_offsets_by_block=requested_offsets_by_block,
+            requested_code_selection=requested_code_selection,
+            requested_code_keys_by_provider_set=requested_code_keys_by_provider_set,
+            retention_budget=retention_budget,
+            decoded_retention_budget=decoded_retention_budget,
+            schema_name=schema_name,
+            block_span=block_span,
+        )
+        _retain_provider_code_groups(
+            code_keys_by_provider,
+            logical_blocks,
+            alias_context,
+        )
+    except BaseException:
+        if decoded_retention_budget is not None and is_decoded_map_claimed:
             decoded_retention_budget.release(
                 _PROVIDER_CODE_DECODED_MAP_BYTES
                 + sum(
@@ -4086,7 +4173,28 @@ def _provider_code_keys_from_aliases(
                 )
             )
         raise
+    finally:
+        if decoded_retention_budget is not None:
+            decoded_retention_budget.release(retained_offset_bytes)
     return code_keys_by_provider
+
+
+def _retain_provider_code_groups(
+    code_keys_by_provider: dict[int, tuple[int, ...]],
+    logical_blocks: Mapping[int, _SharedLogicalBlock],
+    alias_context: _ProviderCodeAliasContext,
+) -> None:
+    """Decode and retain every distinct provider-code alias group."""
+
+    physical_alias_groups = _logical_blocks_by_physical_identity(
+        logical_blocks
+    ).values()
+    for physical_aliases in physical_alias_groups:
+        _retain_provider_code_alias_group(
+            code_keys_by_provider,
+            physical_aliases,
+            alias_context,
+        )
 
 
 lookup_shared_provider_code_keys_from_db = lookup_provider_code_keys_from_db
