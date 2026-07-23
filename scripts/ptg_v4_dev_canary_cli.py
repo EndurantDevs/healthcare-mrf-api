@@ -77,16 +77,9 @@ def _add_accept_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--reference-evidence", required=True)
     parser.add_argument("--rollback-owner-id", required=True)
     parser.add_argument("--internal-owner-evidence", required=True)
-    parser.add_argument(
-        "--expected-representation",
-        required=True,
-        choices=("direct_v1", "pattern_v1"),
-    )
     parser.add_argument("--expect-root-count", action="append", default=[])
     parser.add_argument("--expect-relation-count", action="append", default=[])
     parser.add_argument("--maximum-progress-gap-seconds", type=float, default=15.0)
-    parser.add_argument("--maximum-graph-storage-bytes", type=int, required=True)
-    parser.add_argument("--maximum-snapshot-storage-bytes", type=int, required=True)
     parser.add_argument("--warmup-samples", type=int, default=2)
     parser.add_argument("--warm-samples", type=int, default=20)
     parser.add_argument("--output")

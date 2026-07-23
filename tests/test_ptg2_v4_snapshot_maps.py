@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 from pathlib import Path
@@ -21,8 +22,15 @@ from db.models import (
     PTG2V4SnapshotMapPack,
     PTG2V4SnapshotMapRoot,
 )
-from process.ptg_parts import ptg2_shared_gc, ptg2_shared_publish
-from process.ptg_parts.ptg2_shared_blocks import SharedBlock
+from process.ptg_parts import (
+    ptg2_shared_gc,
+    ptg2_shared_publish,
+    ptg2_v4_snapshot_maps,
+)
+from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_V3_DENSE_LAYOUT_TABLES,
+    SharedBlock,
+)
 from process.ptg_parts.ptg2_shared_publish import publish_v4_cas_block_stage
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
@@ -534,6 +542,15 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             )
             """
         )
+        for table_name in PTG2_V3_DENSE_LAYOUT_TABLES:
+            if table_name in {
+                "ptg2_v3_npi_scope",
+                "ptg2_v3_provider_set",
+            }:
+                continue
+            await database.execute_ddl(
+                f'CREATE TABLE {schema}."{table_name}" (snapshot_key bigint)'
+            )
         for statement in recorder.executed:
             await database.execute_ddl(statement)
 
@@ -1071,6 +1088,165 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             "WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))",
             block_hashes=[references[0].block_hash, map_block_hash],
         ) == 2
+
+        # A publisher that already holds target KEY SHARE must make the
+        # candidate/block FOR UPDATE SKIP LOCKED sweep skip that target.  The
+        # same packed map must then keep both its target and map block until
+        # the unbound expired layout is released and queues both hashes.
+        race_block = SharedBlock(
+            "gc_race_v1",
+            0,
+            0,
+            1,
+            "none",
+            4,
+            b"race",
+        )
+        async with database.transaction() as session:
+            race_reservation = await reserve_v4_shared_layout(
+                session,
+                schema_name=schema_name,
+                semantic_fingerprint=b"r" * 32,
+                build_token="gc-race-v4",
+            )
+            await session.execute(
+                sa.text(
+                    f"""
+                    INSERT INTO {schema}.ptg2_v3_block
+                        (block_hash, format_version, object_kind, codec,
+                         entry_count, raw_byte_count, stored_byte_count, payload)
+                    VALUES
+                        (:block_hash, 2, :object_kind, 'none', :entry_count,
+                         :raw_byte_count, :stored_byte_count, :payload)
+                    """
+                ),
+                {
+                    "block_hash": race_block.block_hash,
+                    "object_kind": race_block.object_kind,
+                    "entry_count": race_block.entry_count,
+                    "raw_byte_count": race_block.raw_byte_count,
+                    "stored_byte_count": race_block.stored_byte_count,
+                    "payload": race_block.payload,
+                },
+            )
+            await session.execute(
+                sa.text(
+                    f"""
+                    INSERT INTO {schema}.ptg2_v3_gc_candidate
+                        (block_hash, eligible_at, queued_at)
+                    VALUES
+                        (:block_hash,
+                         transaction_timestamp() - INTERVAL '1 second',
+                         transaction_timestamp())
+                    """
+                ),
+                {"block_hash": race_block.block_hash},
+            )
+
+        target_locked = asyncio.Event()
+        continue_publication = asyncio.Event()
+        verify_target_blocks = ptg2_v4_snapshot_maps._verify_target_blocks
+
+        async def _pause_with_target_lock(*args, **kwargs):
+            await verify_target_blocks(*args, **kwargs)
+            target_locked.set()
+            await continue_publication.wait()
+
+        monkeypatch.setattr(
+            ptg2_v4_snapshot_maps,
+            "_verify_target_blocks",
+            _pause_with_target_lock,
+        )
+
+        async def _publish_race_map():
+            async with database.transaction() as session:
+                return await publish_v4_snapshot_maps(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_key=race_reservation.snapshot_key,
+                    build_token="gc-race-v4",
+                    representation="direct_v1",
+                    references=(race_block.reference(),),
+                    max_coordinates_per_pack=1,
+                )
+
+        publication_task = asyncio.create_task(_publish_race_map())
+        await asyncio.wait_for(target_locked.wait(), timeout=2)
+        async with database.acquire() as connection:
+            skipped = await ptg2_shared_gc._sweep_ready(
+                connection,
+                schema_name=schema_name,
+                max_bytes=10_000_000,
+                max_rows=10,
+            )
+        assert skipped.selected_hashes == ()
+        continue_publication.set()
+        race_summary = await asyncio.wait_for(publication_task, timeout=2)
+        monkeypatch.setattr(
+            ptg2_v4_snapshot_maps,
+            "_verify_target_blocks",
+            verify_target_blocks,
+        )
+        assert race_summary.coordinate_count == 1
+        assert await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate "
+            "WHERE block_hash = :block_hash",
+            block_hash=race_block.block_hash,
+        ) == 0
+        race_map_hash = await database.scalar(
+            f"SELECT map_block_hash FROM {schema}.ptg2_v4_snapshot_map_pack "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=race_reservation.snapshot_key,
+        )
+
+        async with database.acquire() as connection:
+            await connection.status(
+                f"""
+                UPDATE {schema}.ptg2_v3_snapshot_layout
+                   SET heartbeat_at =
+                           transaction_timestamp() - INTERVAL '7 hours',
+                       lease_until =
+                           transaction_timestamp() - INTERVAL '1 second'
+                 WHERE snapshot_key = :snapshot_key
+                """,
+                snapshot_key=race_reservation.snapshot_key,
+            )
+            released_race = await ptg2_shared_gc._release_layouts_ready(
+                connection,
+                schema_name=schema_name,
+                building_max_age_seconds=21_600,
+                grace_seconds=0,
+                max_layouts=10,
+                layout_keys=(race_reservation.snapshot_key,),
+            )
+        assert released_race.logical_layout_count == 1
+        assert released_race.candidate_hash_count == 2
+        assert await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=race_reservation.snapshot_key,
+        ) == 0
+        assert await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=race_reservation.snapshot_key,
+        ) == 0
+        async with database.acquire() as connection:
+            reclaimed_race = await ptg2_shared_gc._sweep_ready(
+                connection,
+                schema_name=schema_name,
+                max_bytes=10_000_000,
+                max_rows=10,
+            )
+        assert set(reclaimed_race.selected_hashes) == {
+            race_block.block_hash,
+            race_map_hash,
+        }
+        assert await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block "
+            "WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))",
+            block_hashes=[race_block.block_hash, race_map_hash],
+        ) == 0
 
         async with database.transaction() as session:
             cas_snapshot_key = (

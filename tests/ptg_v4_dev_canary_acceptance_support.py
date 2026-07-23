@@ -143,10 +143,21 @@ def cold_samples(sample_count: int) -> list[dict[str, object]]:
         {
             "process_identity": f"pod-{sample_index}",
             "process_started_at": f"2026-07-23T00:00:{sample_index:02d}Z",
+            "image_identity": "image-v4",
             "snapshot_id": "snapshot-1",
             "first_v4_request": True,
             "document_valid": True,
-            "graph_read_evidence": {"passed": True, "failures": []},
+            "graph_read_evidence": {
+                "passed": True,
+                "failures": [],
+                "runtime_identity": {
+                    "process_identity": f"pod-{sample_index}",
+                    "process_started_at": (
+                        f"2026-07-23T00:00:{sample_index:02d}Z"
+                    ),
+                    "image_identity": "image-v4",
+                },
+            },
             "latency_ms": 20 + sample_index,
         }
         for sample_index in range(sample_count)

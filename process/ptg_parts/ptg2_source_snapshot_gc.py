@@ -19,6 +19,7 @@ from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 from process.ptg_parts.ptg2_lifecycle_lock import PTG2_SOURCE_POINTER_GC_LOCK_KEY
+from process.ptg_parts.ptg2_shared_blocks import PTG2_V4_SHARED_GENERATION
 from process.ptg_parts.ptg2_shared_gc import (
     PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
     build_shared_layout_release_plan,
@@ -33,6 +34,10 @@ from process.ptg_parts.snapshot_cleanup import (
 
 _GC_CANDIDATE_STATUSES = frozenset({"published", "failed"})
 _AGE_GC_PROTECTED_STATUSES = frozenset({"validated"})
+_PTG2_SOURCE_GC_SHARED_GENERATIONS = (
+    "shared_blocks_v3",
+    PTG2_V4_SHARED_GENERATION,
+)
 _STALE_BUILD_SECONDS_ENV = "HLTHPRT_PTG2_STALE_BUILD_SECONDS"
 _STALE_BUILD_SECONDS_DEFAULT = 21_600
 _CURRENT_SNAPSHOT_IDS_SQL = """
@@ -120,7 +125,7 @@ DELETE FROM __SCHEMA__.ptg2_snapshot
             lower(COALESCE(manifest->'serving_index'->>'arch_version', ''))
                 = 'postgres_binary_v3'
             AND lower(COALESCE(manifest->'serving_index'->>'storage_generation', ''))
-                = 'shared_blocks_v3'
+                = ANY(CAST(:shared_generations AS text[]))
         )
         OR (
             manifest->'allowed_amount_index'->>'contract'
@@ -243,6 +248,25 @@ def _serving_index(row: dict[str, Any]) -> dict[str, Any]:
     return serving_index if isinstance(serving_index, dict) else {}
 
 
+def _is_gc_shared_manifest(
+    serving_index: dict[str, Any] | None,
+) -> bool:
+    """Admit V4 without changing the established strict V3 predicate."""
+
+    if is_strict_ptg2_v3_shared_blocks_manifest(serving_index):
+        return True
+    if not isinstance(serving_index, dict):
+        return False
+    return (
+        str(serving_index.get("arch_version") or "").strip().lower()
+        == "postgres_binary_v3"
+        and str(
+            serving_index.get("storage_generation") or ""
+        ).strip().lower()
+        == PTG2_V4_SHARED_GENERATION
+    )
+
+
 def _is_allowed_amount_snapshot(row: dict[str, Any]) -> bool:
     manifest = _manifest_dict(row.get("manifest"))
     allowed_amount_index = manifest.get("allowed_amount_index")
@@ -325,11 +349,11 @@ def _classify_snapshot_gc_candidates(
         snapshot_id = str(snapshot_by_field.get("snapshot_id") or "")
         snapshot_status = str(snapshot_by_field.get("status") or "")
         serving_index = _serving_index(snapshot_by_field)
-        is_shared_strict_v3 = is_strict_ptg2_v3_shared_blocks_manifest(
+        is_shared_strict = _is_gc_shared_manifest(
             serving_index
         )
         is_allowed_strict_v3 = _is_allowed_amount_snapshot(snapshot_by_field)
-        is_strict_v3 = is_shared_strict_v3 or is_allowed_strict_v3
+        is_strict_v3 = is_shared_strict or is_allowed_strict_v3
         table_names: tuple[str, ...] = ()
         if snapshot_status in _AGE_GC_PROTECTED_STATUSES:
             continue
@@ -359,7 +383,7 @@ def _classify_snapshot_gc_candidates(
                 snapshot_id=snapshot_id,
                 source_key=source_key,
                 table_names=table_names,
-                is_shared=is_shared_strict_v3,
+                is_shared=is_shared_strict,
                 reason="stale_building" if is_stale_building_candidate else "terminal",
             )
         )
@@ -675,6 +699,7 @@ async def _delete_snapshot_gc_metadata(
         _schema_sql(_DELETE_GC_SNAPSHOTS_SQL, schema_name),
         **query_parameters_by_name,
         allowed_amount_contract=PTG2_ALLOWED_AMOUNT_CONTRACT,
+        shared_generations=list(_PTG2_SOURCE_GC_SHARED_GENERATIONS),
     )
     return int(deleted_binding_count or 0)
 

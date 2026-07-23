@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import os
 import struct
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from sqlalchemy import text
 
@@ -119,6 +121,7 @@ PTG2_V4_REPRESENTATIONS = frozenset({"direct_v1", "pattern_v1"})
 PTG2_V4_FUTURE_REPRESENTATIONS = frozenset({"source_component_v1"})
 PTG2_V4_DEFAULT_COORDINATES_PER_PACK = 256
 PTG2_V4_MAX_COORDINATES_PER_PACK = 65_536
+PTG2_V4_METADATA_RANGE_ROWS = 10_000
 
 
 _MAP_MAGIC = b"PTG4MAP1"
@@ -126,6 +129,22 @@ _MAP_HEADER = struct.Struct(">8sHHI64s")
 _MAP_RECORD = struct.Struct(">QIQ32s")
 _MAP_DIGEST_DOMAIN = b"PTG2V4COORDINATEMAP\x01"
 _LAYOUT_FINGERPRINT_DOMAIN = b"PTG2V4PHYSICALLAYOUT\x01"
+_V4_SEAL_PROGRESS_CALLBACK: contextvars.ContextVar[
+    Callable[[str, int], None] | None
+] = contextvars.ContextVar("ptg2_v4_seal_progress_callback", default=None)
+
+
+@contextmanager
+def observe_v4_seal_progress(
+    progress_callback: Callable[[str, int], None] | None,
+):
+    """Bind measured seal progress to the current async task."""
+
+    token = _V4_SEAL_PROGRESS_CALLBACK.set(progress_callback)
+    try:
+        yield
+    finally:
+        _V4_SEAL_PROGRESS_CALLBACK.reset(token)
 
 
 def _utcnow() -> datetime:
@@ -1083,6 +1102,7 @@ async def summarize_persisted_v4_snapshot_maps(
     snapshot_key: int,
     batch_rows: int = 32,
     cancel_gc_candidates: bool = False,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> V4SnapshotMapSummary:
     """Recompute exact mapping and CAS reachability with bounded payload memory."""
 
@@ -1121,6 +1141,12 @@ async def summarize_persisted_v4_snapshot_maps(
         for pack_row, coordinates in decoded_rows:
             accumulator.add_pack(
                 _persisted_map_pack(pack_row, coordinates, metadata_by_hash)
+            )
+        if progress_callback is not None:
+            progress_callback("seal_map_packs", len(pack_rows))
+            progress_callback(
+                "seal_map_coordinates",
+                sum(len(coordinates) for _pack_row, coordinates in decoded_rows),
             )
         last_pack_row = pack_rows[-1]
         cursor.after_kind = str(last_pack_row["object_kind"])
@@ -1331,44 +1357,83 @@ class _MetadataCounts:
     heavy_owner_count: int
 
 
+async def _load_dense_metadata_count(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    table_name: str,
+    key_name: str,
+    progress_callback: Callable[[str, int], None] | None,
+) -> int:
+    """Count one dense dictionary through bounded indexed key ranges."""
+
+    table = _quote_ident(table_name)
+    key = _quote_ident(key_name)
+    maximum_key = await session.scalar(
+        text(
+            f"SELECT MAX({key}) FROM {schema}.{table} "
+            "WHERE snapshot_key = :snapshot_key"
+        ),
+        {"snapshot_key": int(snapshot_key)},
+    )
+    expected_count = int(maximum_key) + 1 if maximum_key is not None else 0
+    for range_start in range(0, expected_count, PTG2_V4_METADATA_RANGE_ROWS):
+        range_end = min(
+            range_start + PTG2_V4_METADATA_RANGE_ROWS,
+            expected_count,
+        )
+        observed_count = await session.scalar(
+            text(
+                f"SELECT COUNT(*)::bigint FROM {schema}.{table} "
+                "WHERE snapshot_key = :snapshot_key "
+                f"AND {key} >= :range_start AND {key} < :range_end"
+            ),
+            {
+                "snapshot_key": int(snapshot_key),
+                "range_start": range_start,
+                "range_end": range_end,
+            },
+        )
+        range_count = range_end - range_start
+        if int(observed_count or 0) != range_count:
+            raise RuntimeError("PTG V4 metadata dictionaries are not dense")
+        if progress_callback is not None:
+            progress_callback("seal_metadata_rows", range_count)
+            progress_callback("seal_metadata_batches", 1)
+    return expected_count
+
+
 async def _load_metadata_aggregate(
     session: Any,
     *,
     schema: str,
     snapshot_key: int,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> dict[str, Any]:
-    aggregate_result = await session.execute(
-        text(
-            f"""
-            SELECT
-                (SELECT COUNT(*)::bigint FROM {schema}.{PTG2_V4_NPI_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS npi_count,
-                (SELECT MIN(npi_key) FROM {schema}.{PTG2_V4_NPI_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS npi_min,
-                (SELECT MAX(npi_key) FROM {schema}.{PTG2_V4_NPI_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS npi_max,
-                (SELECT COUNT(*)::bigint FROM {schema}.{PTG2_V4_COMPONENT_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS component_count,
-                (SELECT MIN(component_key) FROM {schema}.{PTG2_V4_COMPONENT_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS component_min,
-                (SELECT MAX(component_key) FROM {schema}.{PTG2_V4_COMPONENT_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS component_max,
-                (SELECT COUNT(*)::bigint FROM {schema}.{PTG2_V4_PATTERN_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS pattern_count,
-                (SELECT MIN(pattern_key) FROM {schema}.{PTG2_V4_PATTERN_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS pattern_min,
-                (SELECT MAX(pattern_key) FROM {schema}.{PTG2_V4_PATTERN_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS pattern_max,
-                (SELECT COUNT(*)::bigint
-                   FROM {schema}.{PTG2_V4_RELATION_MANIFEST_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS relation_count,
-                (SELECT COUNT(*)::bigint FROM {schema}.{PTG2_V4_HEAVY_OWNER_TABLE}
-                  WHERE snapshot_key = :snapshot_key) AS heavy_owner_count
-            """
-        ),
-        {"snapshot_key": int(snapshot_key)},
-    )
-    return _row_mapping(aggregate_result.one())
+    count_by_prefix: dict[str, int] = {}
+    for prefix, table_name, key_name in (
+        ("npi", PTG2_V4_NPI_TABLE, "npi_key"),
+        ("component", PTG2_V4_COMPONENT_TABLE, "component_key"),
+        ("pattern", PTG2_V4_PATTERN_TABLE, "pattern_key"),
+    ):
+        count_by_prefix[prefix] = await _load_dense_metadata_count(
+            session,
+            schema=schema,
+            snapshot_key=int(snapshot_key),
+            table_name=table_name,
+            key_name=key_name,
+            progress_callback=progress_callback,
+        )
+    aggregate_by_field: dict[str, Any] = {
+        "relation_count": 0,
+        "heavy_owner_count": 0,
+    }
+    for prefix, row_count in count_by_prefix.items():
+        aggregate_by_field[f"{prefix}_count"] = row_count
+        aggregate_by_field[f"{prefix}_min"] = 0 if row_count else None
+        aggregate_by_field[f"{prefix}_max"] = row_count - 1 if row_count else None
+    return aggregate_by_field
 
 
 def _has_dense_span(aggregate: Mapping[str, Any], prefix: str, count: int) -> bool:
@@ -1820,7 +1885,7 @@ async def _validate_persisted_heavy_owners(
     snapshot_key: int,
     map_object_kinds: set[str],
     relation_by_name: Mapping[str, Mapping[str, Any]],
-) -> None:
+) -> int:
     observed_by_owner = await _load_heavy_owners(
         session,
         schema=schema,
@@ -1842,14 +1907,15 @@ async def _validate_persisted_heavy_owners(
         relation_by_name,
         member_count_by_relation,
     )
+    return len(observed_by_owner)
 
 
 async def summarize_persisted_v4_snapshot_metadata(
-    session: Any,
-    *,
+    session: Any, *,
     schema_name: str,
     snapshot_key: int,
     map_summary: V4SnapshotMapSummary,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> V4SnapshotMetadataSummary:
     """Validate dense dictionaries and the exact manifest-listed owner contracts."""
 
@@ -1858,6 +1924,11 @@ async def summarize_persisted_v4_snapshot_metadata(
         session,
         schema=schema,
         snapshot_key=int(snapshot_key),
+        **(
+            {"progress_callback": progress_callback}
+            if progress_callback is not None
+            else {}
+        ),
     )
     counts = _validated_metadata_counts(aggregate)
     map_object_kinds = set(map_summary.object_kinds)
@@ -1873,7 +1944,7 @@ async def summarize_persisted_v4_snapshot_metadata(
         snapshot_key=int(snapshot_key),
     )
     _validate_relation_entry_counts(relation_by_name, entry_count_by_kind)
-    await _validate_persisted_heavy_owners(
+    heavy_owner_count = await _validate_persisted_heavy_owners(
         session,
         schema=schema,
         snapshot_key=int(snapshot_key),
@@ -1894,8 +1965,8 @@ async def summarize_persisted_v4_snapshot_metadata(
         npi_count=counts.npi_count,
         component_count=counts.component_count,
         pattern_count=counts.pattern_count,
-        relation_count=counts.relation_count,
-        heavy_owner_count=counts.heavy_owner_count,
+        relation_count=len(relation_by_name),
+        heavy_owner_count=heavy_owner_count,
         provider_graph_diagnostics=provider_graph_diagnostics,
         provider_graph_resources=provider_graph_resources,
     )
@@ -3362,6 +3433,7 @@ async def publish_v4_snapshot_maps(
     representation: str,
     references: Iterable[SharedBlockReference],
     max_coordinates_per_pack: int = PTG2_V4_DEFAULT_COORDINATES_PER_PACK,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> V4SnapshotMapSummary:
     """Publish one exact packed map root from a bounded ordered stream."""
 
@@ -3389,6 +3461,9 @@ async def publish_v4_snapshot_maps(
             pack=pack,
         )
         accumulator.add_pack(pack)
+        if progress_callback is not None:
+            progress_callback("map_packs", 1)
+            progress_callback("map_coordinates", len(pack.references))
     # The root remains building so component/pattern/relation metadata can be
     # inserted under the same root fence. Seal performs the authoritative
     # reread and the only transition to complete.
@@ -3405,6 +3480,7 @@ async def seal_v4_shared_layout(
     support_digest: bytes,
     layout_manifest: Mapping[str, Any],
     summary_batch_rows: int = 32,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> SealedSharedLayout:
     """Authoritatively re-read, complete, and atomically seal one V4 root."""
 
@@ -3460,6 +3536,11 @@ async def seal_v4_shared_layout(
         snapshot_key=int(snapshot_key),
         batch_rows=summary_batch_rows,
         cancel_gc_candidates=True,
+        **(
+            {"progress_callback": progress_callback}
+            if progress_callback is not None
+            else {}
+        ),
     )
     _require_matching_summaries(
         expected_summary,
@@ -3471,6 +3552,11 @@ async def seal_v4_shared_layout(
         schema_name=schema_name,
         snapshot_key=int(snapshot_key),
         map_summary=observed_summary,
+        **(
+            {"progress_callback": progress_callback}
+            if progress_callback is not None
+            else {}
+        ),
     )
     if representation == "pattern_v1" and observed_metadata.pattern_count <= 0:
         raise RuntimeError("PTG V4 pattern representation has no pattern metadata")

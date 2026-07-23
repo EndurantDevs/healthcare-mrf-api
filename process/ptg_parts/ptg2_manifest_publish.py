@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from db.connection import db
@@ -586,67 +586,173 @@ async def _ensure_materialized_tables_logged(materialized_tables: Mapping[str, s
         )
 
 
-async def _copy_ptg2_manifest_serving_file(copy_path: Path, *, target_table: str) -> None:
-    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_SERVING_COLUMNS)
+class _MeasuredCopyReader:
+    """Report exact source bytes as the database driver consumes them."""
+
+    def __init__(
+        self,
+        source: Any,
+        progress_callback: Callable[[int], None] | None,
+    ) -> None:
+        self._source = source
+        self._progress_callback = progress_callback
+
+    def read(self, size: int = -1) -> bytes:
+        """Read one COPY chunk and report only bytes actually returned."""
+
+        chunk = self._source.read(size)
+        if chunk and self._progress_callback is not None:
+            self._progress_callback(len(chunk))
+        return chunk
 
 
-async def _copy_lean_manifest_serving_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_ptg2_manifest_serving_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_SERVING_COLUMNS,
+        progress_callback=progress_callback,
+    )
+
+
+async def _copy_lean_manifest_serving_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
     await _copy_ptg2_manifest_file(
         copy_path,
         target_table=target_table,
         columns=PTG2_MANIFEST_LEAN_SERVING_COLUMNS,
+        progress_callback=progress_callback,
     )
 
 
-async def _copy_price_atom_file(copy_path: Path, *, target_table: str) -> None:
-    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PRICE_ATOM_COLUMNS)
+async def _copy_price_atom_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_PRICE_ATOM_COLUMNS,
+        progress_callback=progress_callback,
+    )
 
 
-async def _copy_price_atom_member_file(copy_path: Path, *, target_table: str) -> None:
-    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PRICE_SET_ATOM_COLUMNS)
+async def _copy_price_atom_member_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_PRICE_SET_ATOM_COLUMNS,
+        progress_callback=progress_callback,
+    )
 
 
-async def _copy_price_set_summary_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_price_set_summary_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
     await _copy_ptg2_manifest_file(
         copy_path,
         target_table=target_table,
         columns=PTG2_MANIFEST_PRICE_SET_SUMMARY_COLUMNS,
+        progress_callback=progress_callback,
     )
 
 
-async def _copy_provider_group_member_file(copy_path: Path, *, target_table: str) -> None:
-    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS)
+async def _copy_provider_group_member_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS,
+        progress_callback=progress_callback,
+    )
 
 
-async def _copy_provider_npi_scope_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_provider_npi_scope_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
     await _copy_ptg2_manifest_file(
         copy_path,
         target_table=target_table,
         columns=PTG2_MANIFEST_PROVIDER_NPI_SCOPE_COLUMNS,
+        progress_callback=progress_callback,
     )
 
 
-async def _copy_code_count_file(copy_path: Path, *, target_table: str) -> None:
-    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_CODE_COUNT_COLUMNS)
+async def _copy_code_count_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_CODE_COUNT_COLUMNS,
+        progress_callback=progress_callback,
+    )
 
 
-async def _copy_provider_set_dictionary_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_provider_set_dictionary_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
     await _copy_ptg2_manifest_file(
         copy_path,
         target_table=target_table,
         columns=PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COLUMNS,
+        progress_callback=progress_callback,
     )
 
 
-async def _copy_manifest_component_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_manifest_component_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
     await _copy_ptg2_manifest_file(
         copy_path,
         target_table=target_table,
         columns=PTG2_MANIFEST_PROVIDER_SET_COMPONENT_COLUMNS,
+        progress_callback=progress_callback,
     )
 
 
-async def _copy_ptg2_manifest_file(copy_path: Path, *, target_table: str, columns: list[str]) -> None:
+async def _copy_ptg2_manifest_file(
+    copy_path: Path,
+    *,
+    target_table: str,
+    columns: list[str],
+    progress_callback: Callable[[int], None] | None = None,
+) -> None:
     if not copy_path.exists():
         return
     file_status = copy_path.stat()
@@ -659,10 +765,15 @@ async def _copy_ptg2_manifest_file(copy_path: Path, *, target_table: str, column
         copy_to_table = getattr(driver_conn, "copy_to_table", None)
         if copy_to_table is None:
             raise NotImplementedError("Active database driver does not expose copy_to_table")
-        with copy_path.open("rb") as source:
+        with copy_path.open("rb") as source_file:
+            measured_source = (
+                _MeasuredCopyReader(source_file, progress_callback)
+                if progress_callback is not None
+                else source_file
+            )
             await copy_to_table(
                 target_table,
-                source=source,
+                source=measured_source,
                 schema_name=schema_name,
                 columns=columns,
                 format="text",

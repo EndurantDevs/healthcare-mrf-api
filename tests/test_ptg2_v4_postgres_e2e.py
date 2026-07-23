@@ -456,6 +456,7 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
                 },
             )
         publication_started = time.perf_counter()
+        publication_progress: list[tuple[str, int]] = []
         publication = await snapshot_publish._publish_v4_graph(
             compilation,
             schema_name=schema_name,
@@ -463,6 +464,9 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
             build_token=build_token,
             compressed_acquisition_bytes=1024,
             empty_npi_tin_only_normalization_count=0,
+            progress_callback=lambda metric, amount: publication_progress.append(
+                (metric, int(amount))
+            ),
         )
         async with database.transaction() as session:
             sealed = await seal_v4_shared_layout(
@@ -475,6 +479,12 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
                 layout_manifest=_base_layout_manifest(),
             )
         publication_ms = (time.perf_counter() - publication_started) * 1_000
+        progress_by_metric: dict[str, int] = {}
+        for metric, amount in publication_progress:
+            progress_by_metric[metric] = progress_by_metric.get(metric, 0) + amount
+        assert progress_by_metric["validated_dictionary_rows"] > 0
+        assert progress_by_metric["published_dictionary_rows"] > 0
+        assert progress_by_metric["publish_batches"] > 0
         assert sealed.snapshot_key == reservation.snapshot_key
         assert publication.representation == "pattern_v1"
         assert publication.mapping_count > 0

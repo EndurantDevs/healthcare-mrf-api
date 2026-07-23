@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -62,6 +62,7 @@ from scripts.ptg_v4_dev_canary_identity import (
 from scripts.ptg_v4_dev_canary_internal_evaluation import (
     validate_internal_evidence,
 )
+from scripts.ptg_v4_dev_canary_storage_budget import storage_budget
 from scripts.ptg_v4_dev_canary_kubernetes import (
     collect_frozen_v3_candidate_evidence,
     require_frozen_v3_service_host,
@@ -219,6 +220,9 @@ async def _accept(args) -> dict[str, Any]:
     internal_by_field = validate_internal_evidence(
         internal_evidence,
         args.snapshot_id,
+        expected_image_identity=serving_by_field["bounded_read_counts"][
+            "runtime_identity"
+        ]["image_identity"],
     )
     sections_by_name = {
         "import_progress": progress_by_field,
@@ -242,9 +246,10 @@ def _evaluate_publication(
 ) -> dict[str, Any]:
     """Apply exact count and physical-storage gates to sealed DB evidence."""
 
+    budget = storage_budget(database_evidence_by_field)
     return evaluate_v4_evidence(
         database_evidence_by_field,
-        expected_representation=args.expected_representation,
+        storage_budget=budget,
         expected_root_counts=parse_count_expectations(
             args.expect_root_count,
             allowed_fields=ROOT_COUNT_FIELDS,
@@ -254,10 +259,6 @@ def _evaluate_publication(
             args.expect_relation_count,
             allowed_fields=RELATION_COUNT_FIELDS,
             relation_scoped=True,
-        ),
-        maximum_graph_physical_storage_bytes=args.maximum_graph_storage_bytes,
-        maximum_snapshot_physical_storage_bytes=(
-            args.maximum_snapshot_storage_bytes
         ),
     )
 

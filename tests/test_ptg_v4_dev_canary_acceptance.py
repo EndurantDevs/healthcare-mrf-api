@@ -252,6 +252,39 @@ def test_public_probe_rejects_poisoned_persisted_cold_evidence() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    ("process_identity", "process_started_at", "image_identity"),
+)
+def test_public_probe_rejects_cold_sample_without_metrics_identity(
+    missing_field: str,
+) -> None:
+    cold_sample_evidence = _cold_samples(20)
+    graph_evidence = cold_sample_evidence[-1]["graph_read_evidence"]
+    assert isinstance(graph_evidence, dict)
+    runtime_identity = graph_evidence["runtime_identity"]
+    assert isinstance(runtime_identity, dict)
+    del runtime_identity[missing_field]
+
+    report = evaluate_api_probe(
+        spec=_bounded_spec(),
+        cold_sample_evidence=cold_sample_evidence,
+        warm_samples_ms=[10, 11, 12],
+        response_documents=[_api_document()],
+        graph_read_evidence={"passed": True, "failures": []},
+    )
+
+    assert report["passed"] is False
+    assert (
+        "cold sample API and metrics runtime identities differ"
+        in report["failures"]
+    )
+    assert (
+        "cold p95 lacks the required unique fresh-process sample count"
+        in report["failures"]
+    )
+
+
 def test_explicit_snapshot_public_probe_requires_exactly_one_graph_scope() -> None:
     limits = GraphReadLimits(
         database_bytes=10_000,

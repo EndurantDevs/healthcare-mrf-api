@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
@@ -213,6 +213,7 @@ async def _replace_source_witness_row(
     witness_payload: bytes,
     witness_metadata: Mapping[str, Any],
     session: Any,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> None:
     """Replace one witness and all of its parts inside the caller transaction."""
 
@@ -224,11 +225,15 @@ async def _replace_source_witness_row(
         first_payload_part=payload_parts[0],
         session=session,
     )
+    if progress_callback is not None:
+        progress_callback("published_rows", 1)
+        progress_callback("published_bytes", len(payload_parts[0]))
     await _insert_source_witness_tail_parts(
         schema=schema,
         snapshot_key=snapshot_key,
         tail_payload_parts=payload_parts[1:],
         session=session,
+        progress_callback=progress_callback,
     )
 
 
@@ -286,6 +291,7 @@ async def _insert_source_witness_tail_parts(
     snapshot_key: int,
     tail_payload_parts: Sequence[bytes],
     session: Any,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> None:
     for part_number, payload_part in enumerate(tail_payload_parts, start=1):
         await session.execute(
@@ -304,6 +310,9 @@ async def _insert_source_witness_tail_parts(
                 "payload": payload_part,
             },
         )
+        if progress_callback is not None:
+            progress_callback("published_rows", 1)
+            progress_callback("published_bytes", len(payload_part))
 
 
 async def publish_shared_source_witness(
@@ -313,6 +322,7 @@ async def publish_shared_source_witness(
     entries: Sequence[Mapping[str, Any]],
     expected_raw_source_sha256: Sequence[str],
     expected_generation: str = PTG2_V3_SHARED_GENERATION,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> SourceWitnessPublication:
     """Publish one source witness while holding the immutable layout build lease."""
 
@@ -320,6 +330,11 @@ async def publish_shared_source_witness(
         entries,
         expected_raw_source_sha256=expected_raw_source_sha256,
     )
+    if progress_callback is not None:
+        progress_callback(
+            "prepared_rows",
+            int(witness_metadata["record_count"]),
+        )
     schema = _quote_ident(schema_name)
     snapshot_key = int(build_ownership.snapshot_key)
     async with db.transaction() as session:
@@ -336,6 +351,7 @@ async def publish_shared_source_witness(
             witness_payload=witness_payload,
             witness_metadata=witness_metadata,
             session=session,
+            progress_callback=progress_callback,
         )
     return SourceWitnessPublication(
         metadata=witness_metadata,

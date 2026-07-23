@@ -8,6 +8,7 @@ from api.runtime_identity import (
     IMAGE_IDENTITY_HEADER,
     PROCESS_IDENTITY_HEADER,
     PROCESS_STARTED_AT_HEADER,
+    RUNTIME_IDENTITY_HEADERS_ENV,
     RUNTIME_IMAGE_ENV,
     add_runtime_identity_headers,
     runtime_identity,
@@ -19,6 +20,7 @@ def test_runtime_identity_headers_match_prometheus_identity(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv(RUNTIME_IMAGE_ENV, "dev-main-example")
+    monkeypatch.setenv(RUNTIME_IDENTITY_HEADERS_ENV, "true")
     response = SimpleNamespace(headers={})
 
     add_runtime_identity_headers(None, response)
@@ -42,3 +44,16 @@ def test_runtime_identity_headers_match_prometheus_identity(
 def test_runtime_identity_middleware_ignores_missing_response() -> None:
     add_runtime_identity_headers(None, None)
     add_runtime_identity_headers(None, object())
+
+
+def test_runtime_identity_headers_are_candidate_opt_in(
+    monkeypatch,
+) -> None:
+    response = SimpleNamespace(headers={})
+
+    add_runtime_identity_headers(None, response)
+    assert response.headers == {}
+
+    monkeypatch.setenv(RUNTIME_IDENTITY_HEADERS_ENV, "false")
+    add_runtime_identity_headers(None, response)
+    assert response.headers == {}

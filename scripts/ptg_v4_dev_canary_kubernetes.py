@@ -18,7 +18,7 @@ FROZEN_V3_CANDIDATE_SERVICE = "healthcare-mrf-api-v3-candidate"
 FROZEN_V3_CANDIDATE_NAMESPACE = "healthporta-dev"
 FROZEN_V3_CANDIDATE_IMAGE = (
     "ghcr.io/endurantdevs/healthcare-mrf-api-dev:"
-    "dev-main-471858a0-20260717114337"
+    "dev-main-ca478d32-20260723160432"
 )
 _SERVICE_ACCOUNT_ROOT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 _SHA256_IMAGE_ID_PATTERN = re.compile(r"@sha256:([0-9a-f]{64})$")

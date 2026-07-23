@@ -186,16 +186,27 @@ def test_reference_rejects_recomputed_page_with_duplicate_expansion_keys() -> No
 def test_acceptance_rejects_cold_sample_from_another_reference_snapshot() -> None:
     reference = _reference()
     cold_samples = [
-        {
-            "process_identity": f"process-{index}",
-            "process_started_at": f"2026-07-23T00:00:{index:02d}Z",
-            "latency_ms": 10,
-            "first_v4_request": True,
-            "document_valid": True,
-            "graph_read_evidence": {"passed": True},
-            "semantic_page_digest": reference["page_digest"],
-            "reference_snapshot_id": reference["reference_snapshot_id"],
-        }
+            {
+                "process_identity": f"process-{index}",
+                "process_started_at": f"2026-07-23T00:00:{index:02d}Z",
+                "image_identity": "image-v4",
+                "snapshot_id": "v4-snapshot",
+                "latency_ms": 10,
+                "first_v4_request": True,
+                "document_valid": True,
+                "graph_read_evidence": {
+                    "passed": True,
+                    "runtime_identity": {
+                        "process_identity": f"process-{index}",
+                        "process_started_at": (
+                            f"2026-07-23T00:00:{index:02d}Z"
+                        ),
+                        "image_identity": "image-v4",
+                    },
+                },
+                "semantic_page_digest": reference["page_digest"],
+                "reference_snapshot_id": reference["reference_snapshot_id"],
+            }
         for index in range(20)
     ]
     cold_samples[-1]["reference_snapshot_id"] = "another-v3-snapshot"
@@ -205,7 +216,11 @@ def test_acceptance_rejects_cold_sample_from_another_reference_snapshot() -> Non
         cold_sample_evidence=cold_samples,
         warm_samples_ms=[10] * 20,
         response_documents=[_document("v4-snapshot", "shared_blocks_v4")],
-        graph_read_evidence={"passed": True, "failures": []},
+        graph_read_evidence={
+            "passed": True,
+            "failures": [],
+            "runtime_identity": {"image_identity": "image-v4"},
+        },
         semantic_reference=reference,
     )
 

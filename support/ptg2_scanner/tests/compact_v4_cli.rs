@@ -333,6 +333,8 @@ fn run_v3_finalizer(
 fn run_compact_v4(source: &Path, output: &Path) -> Output {
     let serving = output.join("serving");
     let witness_scratch = output.join("witness-scratch");
+    let raw_source_sha256 =
+        sha256_hex(&fs::read(source).expect("read compact V4 source for digest"));
     fs::create_dir_all(&serving).expect("create serving directory");
     fs::create_dir_all(&witness_scratch).expect("create witness scratch directory");
     Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
@@ -340,7 +342,7 @@ fn run_compact_v4(source: &Path, output: &Path) -> Output {
         .env("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
         .env("HLTHPRT_PTG2_V3_SERVING_RUN_DIR", &serving)
         .env("HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID", "11".repeat(32))
-        .env("HLTHPRT_PTG2_RAW_SOURCE_SHA256", sha256_hex(RAW_MRF))
+        .env("HLTHPRT_PTG2_RAW_SOURCE_SHA256", raw_source_sha256)
         .env("HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR", &witness_scratch)
         .env("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", "false")
         .env("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "true")
@@ -380,6 +382,65 @@ fn run_compact_v4(source: &Path, output: &Path) -> Output {
 }
 
 #[test]
+fn compact_cli_reuses_byte_identical_raw_inline_groups_before_deserialization() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    fs::create_dir(&output).expect("create output directory");
+    let raw = br#"{
+      "reporting_entity_name":"V4 raw cache fixture",
+      "provider_references":[],
+      "in_network":[{
+        "billing_code_type":"CPT",
+        "billing_code":"70553",
+        "negotiation_arrangement":"ffs",
+        "negotiated_rates":[
+          {"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}],"negotiated_prices":[{"negotiated_rate":100}]},
+          {"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}],"negotiated_prices":[{"negotiated_rate":125}]}
+        ]
+      }]
+    }"#;
+    fs::write(&source, raw).expect("write repeated inline-group fixture");
+
+    let completed = run_compact_v4(&source, &output);
+    assert!(
+        completed.status.success(),
+        "scanner failed: {}\nstdout:\n{}",
+        String::from_utf8_lossy(&completed.stderr),
+        String::from_utf8_lossy(&completed.stdout),
+    );
+    let records = String::from_utf8(completed.stdout).expect("UTF-8 scanner output");
+    let summary = records
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|payload| {
+            payload
+                .get("provider_graph_v4_inline_transform_cache_transforms")
+                .is_some()
+        })
+        .unwrap_or_else(|| panic!("parallel scanner summary in:\n{records}"));
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_transforms"],
+        1
+    );
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_misses"],
+        1
+    );
+    assert_eq!(summary["provider_graph_v4_inline_transform_cache_hits"], 1);
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_entries"],
+        1
+    );
+    assert!(
+        summary["provider_graph_v4_inline_transform_cache_estimated_bytes"]
+            .as_u64()
+            .zip(summary["provider_graph_v4_inline_transform_cache_max_bytes"].as_u64())
+            .is_some_and(|(estimated, maximum)| estimated <= maximum)
+    );
+}
+
+#[test]
 fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
     let temporary = tempfile::tempdir().expect("temporary fixture root");
     let source = temporary.path().join("rates.json");
@@ -412,6 +473,24 @@ fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
     assert_eq!(summary["provider_graph_v4_factor_cache_entries"], 3);
     assert_eq!(summary["provider_graph_v4_npi_union_attempts"], 3);
     assert_eq!(summary["provider_graph_v4_flat_group_union_attempts"], 3);
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_transforms"],
+        1
+    );
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_misses"],
+        1
+    );
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_entries"],
+        1
+    );
+    assert!(
+        summary["provider_graph_v4_inline_transform_cache_estimated_bytes"]
+            .as_u64()
+            .zip(summary["provider_graph_v4_inline_transform_cache_max_bytes"].as_u64())
+            .is_some_and(|(estimated, maximum)| estimated <= maximum)
+    );
     assert!(summary["provider_graph_v4_reference_only_rates"]
         .as_u64()
         .is_some_and(|value| value >= 2));

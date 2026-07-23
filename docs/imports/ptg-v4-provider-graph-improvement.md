@@ -16,6 +16,12 @@ provider-set dictionary, exact cold NPI/group relations, and content-addressed
 block store. Sharing those immutable foundations avoids duplicating storage;
 disabling V4 leaves the V3 reader and stored snapshot unchanged.
 
+The reviewed V3 candidate and oracle remain pinned to their original immutable
+image. A new-image V3 import is intentionally assigned the new scanner and
+publisher physical fingerprint; it must not reuse an older layout merely
+because V4 is disabled. This preserves the retained review artifact without
+weakening physical reuse safety.
+
 ## Representation
 
 The scanner retains exact common facts:
@@ -88,6 +94,41 @@ Physical storage acceptance includes tables, indexes, TOAST, packed maps, every
 map-reachable CAS block, ordered prefix overrides, and diagnostics. It reports
 both the V4 graph footprint and the whole coexisting snapshot footprint.
 
+The storage ceiling is not a canary command-line input. A source-controlled
+policy binds each rollout case to its frozen V3 snapshot, authenticated raw
+source-set digest, source count, retained base-layout logical bytes, and
+expected V4 representation. The first roster is HealthJoy 233 (direct),
+Aetna 391 (pattern), and Anthem 478 (pattern). Unknown or changed source sets
+fail closed until a reviewed policy change records the new immutable baseline.
+Individual raw source hashes are never stored in the policy.
+
+The first release deliberately marks all three roster entries as
+measurement-only. It records exact `graph_gate_bytes` and
+`snapshot_gate_bytes` from `pg_total_relation_size`, but cannot pass the
+promotion gate because no V4 physical result has been approved yet. Input-size
+or factor-edge formulas are not evidence that storage is minimal, and they are
+not used to self-approve promotion.
+
+Approval is a two-step, source-controlled workflow:
+
+1. Run the exact source-bound V4 canary and retain its snapshot id, import-run
+   id, immutable image identity, graph gate bytes, and whole-snapshot gate
+   bytes. This run must fail promotion with a clear unapproved-measurement
+   result.
+2. Review those physical measurements, check in both absolute byte ceilings
+   plus a small explicit basis-point tolerance and the measurement provenance,
+   then build a second image and reimport/reaccept. The checked-in ceiling must
+   equal the measured value plus exactly that tolerance; it cannot contain
+   hidden extra headroom.
+
+The compiler-authenticated factor resources remain in the acceptance report as
+scale evidence. The retained base-layout value is bound only to the frozen V3
+reference. The V4 factored logical byte count is measured independently and
+must reconcile across the sealed layout, completed packed-map root, and exact
+map rows. The report also records both values, the policy digest, and exact
+snapshot/import identity. Widening a limit therefore requires a reviewed image
+change; extra `accept` arguments cannot change it.
+
 Runtime metrics separately report physical graph bytes/pages/lookups, second-hop
 group-to-NPI work, and the actual provider-expansion rate rows, distinct sets,
 graph batches, and cap rejections. This keeps a low-latency answer auditable
@@ -109,6 +150,14 @@ criterion. The first source-controlled dev policy is 300 fixed seconds, plus
 30 seconds per compressed GiB, plus three seconds per million factor edges.
 Operators cannot override the sealed byte/fact counts or these coefficients at
 canary time.
+
+V4 also memoizes byte-identical inline provider-group arrays before JSON
+deserialization and normalization. A cache entry retains the exact raw bytes,
+their digest, parsed groups, normalized transform, and audit counts; digest
+matches are verified by full byte comparison. The cache is bounded to 256 MiB,
+and eviction can affect speed only, never output. This specifically removes
+repeated parsing work from jumbo inline-source shapes while leaving the V3
+parser and logical output unchanged.
 
 Publisher-invalid empty `npi` arrays are handled as an explicit compatibility
 case. The scanner retains the TIN-scoped group and its rates, emits no invented
@@ -134,7 +183,8 @@ V3 snapshot and blocks promotion beyond dev.
 4. The compiler-declared worst override owner and worst non-override online
    owner must each return the exact 201-member prefix within 50 ms, cold and
    warm, without exceeding physical read limits.
-5. Storage must pass both snapshot-attributed and positive import-delta gates.
+5. Storage must pass both snapshot-attributed and positive import-delta gates
+   against the source-controlled, source-set-bound ceiling.
 6. Progress must be visible from dispatch through terminal 100%, with polling
    no slower than five seconds and no unreported movement gap.
 7. Rerunning identical input must choose the same representation and produce

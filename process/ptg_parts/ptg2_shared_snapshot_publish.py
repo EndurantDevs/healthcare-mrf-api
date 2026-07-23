@@ -37,6 +37,7 @@ from process.ptg_parts.ptg2_shared_audit import (
 from process.ptg_parts.ptg2_shared_finalize import (
     PTG2_V3_DURABLE_SCRATCH_DURABILITY,
     PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
+    observe_v3_finalizer_progress,
     run_v3_direct_finalizer,
 )
 from process.ptg_parts.ptg2_shared_graph import SharedGraphConversionResult
@@ -54,6 +55,7 @@ from process.ptg_parts.ptg2_shared_price import (
     _await_cleanup_task,
     cleanup_prepared_shared_price_artifacts,
     export_shared_price_key_map,
+    observe_shared_price_progress,
     prepare_shared_price_artifacts,
     publish_shared_price_artifacts,
 )
@@ -121,6 +123,7 @@ _REQUIRED_PRICE_OBJECT_KINDS = _REQUIRED_OBJECT_KINDS - {
     "graph_group_provider_sets_v1",
     "graph_provider_set_groups_v1",
 }
+_V4_DICTIONARY_RANGE_ROWS = 10_000
 
 
 @dataclass(frozen=True)
@@ -175,6 +178,79 @@ class _FinalizerBlockPublicationResult:
             "price_dictionary": self.price_dictionary_copy.as_dict(),
             "total": total.as_dict(),
         }
+
+
+@dataclass(frozen=True)
+class _V4DenseDictionaryStage:
+    """One V4 stage with bounded validation and publication metadata."""
+
+    stage_table: str
+    key_name: str
+    expected_count: int
+    target_table: str
+    columns: tuple[str, ...]
+    value_predicate: str
+    sum_expression: str = "0"
+    expected_sum: int | None = None
+    dense_keys: bool = True
+
+
+class _MeasuredPublicationProgress:
+    """Coalesce exact lane counters into live movement at most every four seconds."""
+
+    def __init__(
+        self,
+        stage: str,
+        callback: Callable[[str, Mapping[str, int]], None] | None,
+        *,
+        interval_seconds: float = 4.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.stage = stage
+        self._callback = callback
+        self._interval_seconds = max(float(interval_seconds), 0.01)
+        self._clock = clock
+        self._totals: dict[str, int] = {}
+        self._last_emitted: dict[str, int] = {}
+        self._next_emit_at = self._clock() + self._interval_seconds
+
+    def add(self, metric: str, amount: int) -> None:
+        """Record one exact positive work delta and emit on the cadence."""
+
+        normalized_amount = int(amount)
+        if normalized_amount <= 0:
+            return
+        metric_name = str(metric or "").strip()
+        if not metric_name:
+            raise ValueError("publication progress metric must be non-empty")
+        self._totals[metric_name] = (
+            self._totals.get(metric_name, 0) + normalized_amount
+        )
+        now = self._clock()
+        if now >= self._next_emit_at:
+            self.flush(now=now)
+
+    def flush(self, *, now: float | None = None) -> None:
+        """Publish changed exact counters, including the final partial interval."""
+
+        if self._callback is None or self._totals == self._last_emitted:
+            return
+        observed_at = self._clock() if now is None else float(now)
+        self._callback(self.stage, dict(self._totals))
+        self._last_emitted = dict(self._totals)
+        self._next_emit_at = observed_at + self._interval_seconds
+
+
+def _progress_callback_kwargs(
+    progress_callback: Callable[..., None] | None,
+) -> dict[str, Callable[..., None]]:
+    """Return an optional progress keyword without perturbing the V3 call shape."""
+
+    return (
+        {"progress_callback": progress_callback}
+        if progress_callback is not None
+        else {}
+    )
 
 
 @dataclass(frozen=True)
@@ -284,6 +360,7 @@ async def _export_price_map_and_run_finalizer(
     expected_source_identities: Iterable[
         Mapping[str, Any] | SharedPhysicalArtifactIdentity
     ],
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> _PreparedFinalizer:
     """Export and finalize as soon as the independent price-key map is ready."""
 
@@ -295,16 +372,17 @@ async def _export_price_map_and_run_finalizer(
     )
     price_key_map_export_seconds = time.monotonic() - stage_started_at
     stage_started_at = time.monotonic()
-    finalizer_summary = await run_v3_direct_finalizer(
-        work_directory=raw_work_directory,
-        serving_run_entries=serving_run_entries,
-        code_dictionary_entries=code_dictionary_entries,
-        provider_set_metadata_entries=provider_set_metadata_entries,
-        expected_source_identities=expected_source_identities,
-        price_key_map_input=price_key_map_path,
-        price_key_map_row_count=prepared_price_key.price_set_count,
-        scratch_durability=PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
-    )
+    with observe_v3_finalizer_progress(progress_callback):
+        finalizer_summary = await run_v3_direct_finalizer(
+            work_directory=raw_work_directory,
+            serving_run_entries=serving_run_entries,
+            code_dictionary_entries=code_dictionary_entries,
+            provider_set_metadata_entries=provider_set_metadata_entries,
+            expected_source_identities=expected_source_identities,
+            price_key_map_input=price_key_map_path,
+            price_key_map_row_count=prepared_price_key.price_set_count,
+            scratch_durability=PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
+        )
     return _PreparedFinalizer(
         summary=dict(finalizer_summary),
         price_key_map_export_seconds=price_key_map_export_seconds,
@@ -329,6 +407,7 @@ async def _prepare_price_with_early_finalizer(
         [PreparedSharedPriceArtifacts], Awaitable[Any]
     ]
     | None = None,
+    finalizer_progress_callback: Callable[[str, int], None] | None = None,
 ) -> tuple[
     PreparedSharedPriceArtifacts,
     float,
@@ -402,6 +481,7 @@ async def _prepare_price_with_early_finalizer(
             code_dictionary_entries=code_dictionary_entries,
             provider_set_metadata_entries=provider_set_metadata_entries,
             expected_source_identities=expected_source_identities,
+            progress_callback=finalizer_progress_callback,
         )
     )
     early_price_task: asyncio.Task[_PreparedPricePublication] | None = None
@@ -904,6 +984,30 @@ async def _export_provider_set_key_map(
     return output_path
 
 
+async def _copy_finalizer_block(
+    finalizer_summary: Mapping[str, Any],
+    block_summary: Mapping[str, Any],
+    *,
+    schema_name: str,
+    stage_table: str,
+    progress_callback: Callable[[str, int], None] | None,
+) -> SharedBlockCopyMetrics | None:
+    """Copy one authenticated finalizer block while preserving selective reuse."""
+
+    return await copy_shared_block_binary_file(
+        _output_file(finalizer_summary, block_summary),
+        schema_name=schema_name,
+        stage_table=stage_table,
+        expected_copy_bytes=_integer(
+            block_summary.get("copy_bytes"),
+            "finalizer block COPY bytes",
+        ),
+        expected_copy_sha256=str(block_summary.get("copy_sha256") or ""),
+        reuse_existing=True,
+        **_progress_callback_kwargs(progress_callback),
+    )
+
+
 async def _convert_shared_graph_natively(
     *,
     graph_artifact_entries: Iterable[dict[str, Any]],
@@ -997,10 +1101,12 @@ async def _queue_failed_v4_graph_blocks(
                     f"""
                     INSERT INTO {schema}.ptg2_v3_gc_candidate AS candidate
                         (block_hash, eligible_at, queued_at)
-                    SELECT DISTINCT block_hash, transaction_timestamp(),
+                    SELECT DISTINCT requested.block_hash, transaction_timestamp(),
                            transaction_timestamp()
                       FROM unnest(CAST(:block_hashes AS bytea[]))
                            AS requested(block_hash)
+                      JOIN {schema}.ptg2_v3_block AS stored
+                        ON stored.block_hash = requested.block_hash
                     ON CONFLICT (block_hash) DO UPDATE
                         SET eligible_at = GREATEST(
                             candidate.eligible_at,
@@ -1019,6 +1125,348 @@ async def _queue_failed_v4_graph_blocks(
     await flush()
 
 
+def _v4_dictionary_ranges(expected_count: int) -> Iterable[tuple[int, int]]:
+    """Yield dense half-open key ranges small enough for observable SQL work."""
+
+    for range_start in range(0, int(expected_count), _V4_DICTIONARY_RANGE_ROWS):
+        yield range_start, min(
+            range_start + _V4_DICTIONARY_RANGE_ROWS,
+            int(expected_count),
+        )
+
+
+async def _validate_v4_dictionary_stage(
+    session: Any,
+    *,
+    schema: str,
+    stage: _V4DenseDictionaryStage,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """Validate dense stage keys and values in real bounded ranges."""
+
+    if not stage.dense_keys:
+        await _validate_v4_sparse_dictionary_stage(
+            session,
+            schema=schema,
+            stage=stage,
+            progress_callback=progress_callback,
+        )
+        return
+    stage_table = _quote_ident(stage.stage_table)
+    key_name = _quote_ident(stage.key_name)
+    observed_sum = 0
+    for range_start, range_end in _v4_dictionary_ranges(stage.expected_count):
+        range_summary_result = await session.execute(
+            db.text(
+                f"""
+                SELECT COUNT(*)::bigint, MIN({key_name}), MAX({key_name}),
+                       COALESCE(BOOL_AND({stage.value_predicate}), TRUE),
+                       COALESCE(SUM({stage.sum_expression}), 0)::bigint
+                  FROM {schema}.{stage_table}
+                 WHERE {key_name} >= :range_start
+                   AND {key_name} < :range_end
+                """
+            ),
+            {"range_start": range_start, "range_end": range_end},
+        )
+        range_summary = range_summary_result.one()
+        expected_rows = range_end - range_start
+        if (
+            int(range_summary[0]) != expected_rows
+            or range_summary[1] != range_start
+            or range_summary[2] != range_end - 1
+            or not bool(range_summary[3])
+        ):
+            raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
+        observed_sum += int(range_summary[4])
+        if progress_callback is not None:
+            progress_callback("validated_dictionary_rows", expected_rows)
+            progress_callback("publish_batches", 1)
+    has_out_of_range_key = await session.scalar(
+        db.text(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {schema}.{stage_table}
+                 WHERE {key_name} < 0
+                    OR {key_name} >= :expected_count
+                 LIMIT 1
+            )
+            """
+        ),
+        {"expected_count": int(stage.expected_count)},
+    )
+    if bool(has_out_of_range_key) or (
+        stage.expected_sum is not None
+        and observed_sum != int(stage.expected_sum)
+    ):
+        raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
+
+
+async def _validate_v4_sparse_dictionary_stage(
+    session: Any,
+    *,
+    schema: str,
+    stage: _V4DenseDictionaryStage,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """Validate one sparse-key dictionary through ordered physical batches."""
+
+    stage_table = _quote_ident(stage.stage_table)
+    key_name = _quote_ident(stage.key_name)
+    previous_key = -1
+    observed_count = 0
+    observed_sum = 0
+    while True:
+        batch_result = await session.execute(
+            db.text(
+                f"""
+                WITH batch AS MATERIALIZED (
+                    SELECT *
+                      FROM {schema}.{stage_table}
+                     WHERE {key_name} > :previous_key
+                     ORDER BY {key_name}
+                     LIMIT {_V4_DICTIONARY_RANGE_ROWS}
+                )
+                SELECT COUNT(*)::bigint, MIN({key_name}), MAX({key_name}),
+                       COALESCE(BOOL_AND({stage.value_predicate}), TRUE),
+                       COALESCE(SUM({stage.sum_expression}), 0)::bigint
+                  FROM batch
+                """
+            ),
+            {"previous_key": previous_key},
+        )
+        batch_summary = batch_result.one()
+        batch_count = int(batch_summary[0])
+        if batch_count == 0:
+            break
+        first_key = int(batch_summary[1])
+        last_key = int(batch_summary[2])
+        if (
+            first_key <= previous_key
+            or not bool(batch_summary[3])
+        ):
+            raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
+        observed_count += batch_count
+        observed_sum += int(batch_summary[4])
+        previous_key = last_key
+        if progress_callback is not None:
+            progress_callback("validated_dictionary_rows", batch_count)
+            progress_callback("publish_batches", 1)
+    if observed_count != int(stage.expected_count) or (
+        stage.expected_sum is not None
+        and observed_sum != int(stage.expected_sum)
+    ):
+        raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
+
+
+async def _publish_v4_dictionary_stage_ranges(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    stage: _V4DenseDictionaryStage,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """Publish one validated dictionary through bounded key-range statements."""
+
+    if not stage.dense_keys:
+        await _publish_v4_sparse_dictionary_stage_ranges(
+            session,
+            schema=schema,
+            snapshot_key=snapshot_key,
+            stage=stage,
+            progress_callback=progress_callback,
+        )
+        return
+    stage_table = _quote_ident(stage.stage_table)
+    target_table = _quote_ident(stage.target_table)
+    key_name = _quote_ident(stage.key_name)
+    quoted_columns = tuple(_quote_ident(column) for column in stage.columns)
+    columns = ", ".join(quoted_columns)
+    matching_columns = " AND ".join(
+        f"stored.{column} = staged.{column}" for column in quoted_columns
+    )
+    for range_start, range_end in _v4_dictionary_ranges(stage.expected_count):
+        range_parameters_by_name = {
+            "snapshot_key": int(snapshot_key),
+            "range_start": range_start,
+            "range_end": range_end,
+        }
+        await session.execute(
+            db.text(
+                f"""
+                INSERT INTO {schema}.{target_table} (snapshot_key, {columns})
+                SELECT :snapshot_key, {columns}
+                  FROM {schema}.{stage_table}
+                 WHERE {key_name} >= :range_start
+                   AND {key_name} < :range_end
+                 ORDER BY {key_name}
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            range_parameters_by_name,
+        )
+        matching_count = await session.scalar(
+            db.text(
+                f"""
+                SELECT COUNT(*)::bigint
+                  FROM {schema}.{stage_table} AS staged
+                  JOIN {schema}.{target_table} AS stored
+                    ON stored.snapshot_key = :snapshot_key
+                   AND {matching_columns}
+                 WHERE staged.{key_name} >= :range_start
+                   AND staged.{key_name} < :range_end
+                """
+            ),
+            range_parameters_by_name,
+        )
+        expected_rows = range_end - range_start
+        if int(matching_count or 0) != expected_rows:
+            raise RuntimeError("PTG V4 persisted dictionary rows changed")
+        if progress_callback is not None:
+            progress_callback("published_dictionary_rows", expected_rows)
+            progress_callback("publish_batches", 1)
+    await _reject_v4_dictionary_extra_keys(
+        session,
+        schema=schema,
+        target_table=target_table,
+        key_name=key_name,
+        snapshot_key=int(snapshot_key),
+        expected_count=int(stage.expected_count),
+    )
+
+
+async def _reject_v4_dictionary_extra_keys(
+    session: Any,
+    *,
+    schema: str,
+    target_table: str,
+    key_name: str,
+    snapshot_key: int,
+    expected_count: int,
+) -> None:
+    """Reject target keys outside the authenticated dense stage span."""
+
+    has_extra_target_key = await session.scalar(
+        db.text(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {schema}.{target_table}
+                 WHERE snapshot_key = :snapshot_key
+                   AND ({key_name} < 0 OR {key_name} >= :expected_count)
+                 LIMIT 1
+            )
+            """
+        ),
+        {
+            "snapshot_key": snapshot_key,
+            "expected_count": expected_count,
+        },
+    )
+    if bool(has_extra_target_key):
+        raise RuntimeError("PTG V4 persisted dictionary rows changed")
+
+
+async def _publish_v4_sparse_dictionary_stage_ranges(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    stage: _V4DenseDictionaryStage,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """Publish one sparse dictionary using ordered, bounded key batches."""
+
+    stage_table = _quote_ident(stage.stage_table)
+    target_table = _quote_ident(stage.target_table)
+    key_name = _quote_ident(stage.key_name)
+    quoted_columns = tuple(_quote_ident(column) for column in stage.columns)
+    columns = ", ".join(quoted_columns)
+    matching_columns = " AND ".join(
+        f"stored.{column} = staged.{column}" for column in quoted_columns
+    )
+    previous_key = -1
+    published_count = 0
+    while True:
+        batch_result = await session.execute(
+            db.text(
+                f"""
+                SELECT COUNT(*)::bigint, MAX({key_name})
+                  FROM (
+                        SELECT {key_name}
+                          FROM {schema}.{stage_table}
+                         WHERE {key_name} > :previous_key
+                         ORDER BY {key_name}
+                         LIMIT {_V4_DICTIONARY_RANGE_ROWS}
+                       ) AS batch
+                """
+            ),
+            {"previous_key": previous_key},
+        )
+        batch_count, raw_last_key = batch_result.one()
+        batch_count = int(batch_count)
+        if batch_count == 0:
+            break
+        last_key = int(raw_last_key)
+        batch_parameters_by_name = {
+            "snapshot_key": int(snapshot_key),
+            "previous_key": previous_key,
+            "last_key": last_key,
+        }
+        await session.execute(
+            db.text(
+                f"""
+                INSERT INTO {schema}.{target_table} (snapshot_key, {columns})
+                SELECT :snapshot_key, {columns}
+                  FROM {schema}.{stage_table}
+                 WHERE {key_name} > :previous_key
+                   AND {key_name} <= :last_key
+                 ORDER BY {key_name}
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            batch_parameters_by_name,
+        )
+        matching_count = await session.scalar(
+            db.text(
+                f"""
+                SELECT COUNT(*)::bigint
+                  FROM {schema}.{stage_table} AS staged
+                  JOIN {schema}.{target_table} AS stored
+                    ON stored.snapshot_key = :snapshot_key
+                   AND {matching_columns}
+                 WHERE staged.{key_name} > :previous_key
+                   AND staged.{key_name} <= :last_key
+                """
+            ),
+            batch_parameters_by_name,
+        )
+        if int(matching_count or 0) != batch_count:
+            raise RuntimeError("PTG V4 persisted dictionary rows changed")
+        published_count += batch_count
+        previous_key = last_key
+        if progress_callback is not None:
+            progress_callback("published_dictionary_rows", batch_count)
+            progress_callback("publish_batches", 1)
+    target_count = await session.scalar(
+        db.text(
+            f"""
+            SELECT COUNT(*)::bigint
+              FROM {schema}.{target_table}
+             WHERE snapshot_key = :snapshot_key
+            """
+        ),
+        {"snapshot_key": int(snapshot_key)},
+    )
+    if (
+        published_count != int(stage.expected_count)
+        or int(target_count or 0) != int(stage.expected_count)
+    ):
+        raise RuntimeError("PTG V4 persisted dictionary rows changed")
+
+
 async def _publish_v4_dictionaries_and_maps(
     compilation: V4GraphCompilationResult,
     *,
@@ -1027,6 +1475,7 @@ async def _publish_v4_dictionaries_and_maps(
     build_token: str,
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> V4SnapshotMapSummary:
     """Bulk-copy dense dictionaries, then publish exact metadata and packed maps."""
 
@@ -1040,6 +1489,19 @@ async def _publish_v4_dictionaries_and_maps(
         )
     schema = _quote_ident(schema_name)
     token = uuid.uuid4().hex[:20]
+    expected_group_count = int(compilation.observe.get("group_count") or 0)
+    expected_component_count = int(
+        compilation.observe.get("component_count") or 0
+    )
+    expected_npi_count = int(compilation.observe.get("npi_count") or 0)
+    expected_pattern_count = int(compilation.observe.get("pattern_count") or 0)
+    expected_prefix_owner_count = int(
+        compilation.observe.get("npi_prefix_override_owner_count") or 0
+    )
+    expected_prefix_member_count = int(
+        compilation.observe.get("npi_prefix_override_member_count") or 0
+    )
+    prefix_target = int(compilation.summary["npi_prefix_target"])
     group_stage = f"ptg2_v4_group_stage_{token}"
     component_stage = f"ptg2_v4_component_stage_{token}"
     npi_stage = f"ptg2_v4_npi_stage_{token}"
@@ -1050,48 +1512,61 @@ async def _publish_v4_dictionaries_and_maps(
         stages.append(pattern_stage)
     stage_create_statements = [
         f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(group_stage)} "
-        "(provider_group_key integer NOT NULL, "
-        " provider_group_global_id_128 bytea NOT NULL)",
+        "(provider_group_key integer PRIMARY KEY CHECK (provider_group_key >= 0), "
+        " provider_group_global_id_128 bytea NOT NULL UNIQUE "
+        " CHECK (octet_length(provider_group_global_id_128) = 16))",
         f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(component_stage)} "
-        "(component_key integer NOT NULL, component_global_id_128 bytea NOT NULL)",
+        "(component_key integer PRIMARY KEY CHECK (component_key >= 0), "
+        " component_global_id_128 bytea NOT NULL "
+        " CHECK (octet_length(component_global_id_128) = 16))",
         f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(npi_stage)} "
-        "(npi_key integer NOT NULL, npi bigint NOT NULL)",
+        "(npi_key integer PRIMARY KEY CHECK (npi_key >= 0), "
+        " npi bigint NOT NULL UNIQUE CHECK (npi BETWEEN 1000000000 AND 9999999999))",
         f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(prefix_stage)} "
-        "(provider_set_key integer NOT NULL, member_count integer NOT NULL, "
-        " member_digest bytea NOT NULL)",
+        "(provider_set_key integer PRIMARY KEY CHECK (provider_set_key >= 0), "
+        f" member_count integer NOT NULL CHECK (member_count BETWEEN 0 AND {prefix_target}), "
+        " member_digest bytea NOT NULL CHECK (octet_length(member_digest) = 32))",
     ]
     if compilation.pattern_copy_path is not None:
         stage_create_statements.append(
             f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(pattern_stage)} "
-            "(pattern_key integer NOT NULL, pattern_digest bytea NOT NULL, "
-            " set_count bigint NOT NULL)"
+            "(pattern_key integer PRIMARY KEY CHECK (pattern_key >= 0), "
+            " pattern_digest bytea NOT NULL "
+            " CHECK (octet_length(pattern_digest) = 32), "
+            " set_count bigint NOT NULL CHECK (set_count >= 0))"
         )
     for statement in stage_create_statements:
         await db.status(statement)
+        if progress_callback is not None:
+            progress_callback("publish_batches", 1)
     try:
         await _copy_binary_file_to_stage(
             compilation.group_copy_path,
             schema_name=schema_name,
             stage_table=group_stage,
             columns=("provider_group_key", "provider_group_global_id_128"),
+            **_progress_callback_kwargs(progress_callback),
         )
         await _copy_binary_file_to_stage(
             compilation.component_copy_path,
             schema_name=schema_name,
             stage_table=component_stage,
             columns=("component_key", "component_global_id_128"),
+            **_progress_callback_kwargs(progress_callback),
         )
         await _copy_binary_file_to_stage(
             compilation.npi_copy_path,
             schema_name=schema_name,
             stage_table=npi_stage,
             columns=("npi_key", "npi"),
+            **_progress_callback_kwargs(progress_callback),
         )
         await _copy_binary_file_to_stage(
             compilation.provider_set_npi_prefix_override_copy_path,
             schema_name=schema_name,
             stage_table=prefix_stage,
             columns=("provider_set_key", "member_count", "member_digest"),
+            **_progress_callback_kwargs(progress_callback),
         )
         if compilation.pattern_copy_path is not None:
             await _copy_binary_file_to_stage(
@@ -1099,138 +1574,82 @@ async def _publish_v4_dictionaries_and_maps(
                 schema_name=schema_name,
                 stage_table=pattern_stage,
                 columns=("pattern_key", "pattern_digest", "set_count"),
+                **_progress_callback_kwargs(progress_callback),
             )
 
-        expected_group_count = int(compilation.observe.get("group_count") or 0)
-        expected_component_count = int(
-            compilation.observe.get("component_count") or 0
-        )
-        expected_npi_count = int(compilation.observe.get("npi_count") or 0)
-        expected_pattern_count = int(
-            compilation.observe.get("pattern_count") or 0
-        )
-        expected_prefix_owner_count = int(
-            compilation.observe.get("npi_prefix_override_owner_count") or 0
-        )
-        expected_prefix_member_count = int(
-            compilation.observe.get("npi_prefix_override_member_count") or 0
-        )
-        prefix_target = int(compilation.summary["npi_prefix_target"])
-        published_pattern_count = (
-            expected_pattern_count
-            if compilation.pattern_copy_path is not None
-            else 0
-        )
+        dictionary_stages = [
+            _V4DenseDictionaryStage(
+                stage_table=group_stage,
+                key_name="provider_group_key",
+                expected_count=expected_group_count,
+                target_table="ptg2_v3_provider_group",
+                columns=(
+                    "provider_group_key",
+                    "provider_group_global_id_128",
+                ),
+                value_predicate=(
+                    "octet_length(provider_group_global_id_128) = 16"
+                ),
+            ),
+            _V4DenseDictionaryStage(
+                stage_table=component_stage,
+                key_name="component_key",
+                expected_count=expected_component_count,
+                target_table="ptg2_v4_provider_component",
+                columns=("component_key", "component_global_id_128"),
+                value_predicate="octet_length(component_global_id_128) = 16",
+            ),
+            _V4DenseDictionaryStage(
+                stage_table=npi_stage,
+                key_name="npi_key",
+                expected_count=expected_npi_count,
+                target_table=PTG2_V4_NPI_TABLE,
+                columns=("npi_key", "npi"),
+                value_predicate="npi BETWEEN 1000000000 AND 9999999999",
+            ),
+            _V4DenseDictionaryStage(
+                stage_table=prefix_stage,
+                key_name="provider_set_key",
+                expected_count=expected_prefix_owner_count,
+                target_table="ptg2_v4_provider_set_npi_prefix",
+                columns=("provider_set_key", "member_count", "member_digest"),
+                value_predicate=(
+                    f"member_count BETWEEN 0 AND {prefix_target} "
+                    "AND octet_length(member_digest) = 32"
+                ),
+                sum_expression="member_count",
+                expected_sum=expected_prefix_member_count,
+                dense_keys=False,
+            ),
+        ]
+        if compilation.pattern_copy_path is not None:
+            dictionary_stages.append(
+                _V4DenseDictionaryStage(
+                    stage_table=pattern_stage,
+                    key_name="pattern_key",
+                    expected_count=expected_pattern_count,
+                    target_table="ptg2_v4_pattern",
+                    columns=("pattern_key", "pattern_digest", "set_count"),
+                    value_predicate=(
+                        "octet_length(pattern_digest) = 32 AND set_count >= 0"
+                    ),
+                )
+            )
         async with db.transaction() as session:
+            snapshot_parameter_map = {"snapshot_key": int(snapshot_key)}
             await lock_v4_shared_layout_for_map_write(
                 session,
                 schema_name=schema_name,
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
             )
-            stage_result = await session.execute(
-                db.text(
-                    f"""
-                    SELECT
-                      (SELECT COUNT(*) FROM {schema}.{_quote_ident(group_stage)}),
-                      (SELECT COUNT(DISTINCT provider_group_key)
-                         FROM {schema}.{_quote_ident(group_stage)}),
-                      (SELECT COUNT(DISTINCT provider_group_global_id_128)
-                         FROM {schema}.{_quote_ident(group_stage)}),
-                      (SELECT COALESCE(BOOL_AND(
-                                  octet_length(provider_group_global_id_128) = 16
-                              ), TRUE)
-                         FROM {schema}.{_quote_ident(group_stage)}),
-                      (SELECT COUNT(*) FROM {schema}.{_quote_ident(component_stage)}),
-                      (SELECT COUNT(DISTINCT component_key)
-                         FROM {schema}.{_quote_ident(component_stage)}),
-                      (SELECT COALESCE(BOOL_AND(
-                                  octet_length(component_global_id_128) = 16
-                              ), TRUE)
-                         FROM {schema}.{_quote_ident(component_stage)}),
-                      (SELECT COUNT(*) FROM {schema}.{_quote_ident(npi_stage)}),
-                      (SELECT COUNT(DISTINCT npi_key)
-                         FROM {schema}.{_quote_ident(npi_stage)}),
-                      (SELECT COUNT(DISTINCT npi)
-                         FROM {schema}.{_quote_ident(npi_stage)}),
-                      (SELECT COALESCE(BOOL_AND(
-                                  npi BETWEEN 1000000000 AND 9999999999
-                              ), TRUE)
-                         FROM {schema}.{_quote_ident(npi_stage)}),
-                      (SELECT COUNT(*)
-                         FROM {schema}.{_quote_ident(prefix_stage)}),
-                      (SELECT COUNT(DISTINCT provider_set_key)
-                         FROM {schema}.{_quote_ident(prefix_stage)}),
-                      (SELECT COALESCE(SUM(member_count), 0)
-                         FROM {schema}.{_quote_ident(prefix_stage)}),
-                      (SELECT COALESCE(BOOL_AND(
-                                  member_count BETWEEN 0 AND :prefix_target
-                                  AND octet_length(member_digest) = 32
-                              ), TRUE)
-                         FROM {schema}.{_quote_ident(prefix_stage)})
-                    """
-                ),
-                {"prefix_target": prefix_target},
-            )
-            counts = stage_result.one()
-            if (
-                tuple(int(counts[index]) for index in (0, 1, 2))
-                != (expected_group_count,) * 3
-                or not bool(counts[3])
-                or tuple(int(counts[index]) for index in (4, 5))
-                != (expected_component_count,) * 2
-                or not bool(counts[6])
-                or tuple(int(counts[index]) for index in (7, 8, 9))
-                != (expected_npi_count,) * 3
-                or not bool(counts[10])
-                or tuple(int(counts[index]) for index in (11, 12))
-                != (expected_prefix_owner_count,) * 2
-                or int(counts[13]) != expected_prefix_member_count
-                or not bool(counts[14])
-            ):
-                raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
-            for stage_name, key_name, expected_count in (
-                (group_stage, "provider_group_key", expected_group_count),
-                (component_stage, "component_key", expected_component_count),
-                (npi_stage, "npi_key", expected_npi_count),
-            ):
-                dense_result = await session.execute(
-                    db.text(
-                        f"SELECT MIN({key_name}), MAX({key_name}) "
-                        f"FROM {schema}.{_quote_ident(stage_name)}"
-                    )
+            for dictionary_stage in dictionary_stages:
+                await _validate_v4_dictionary_stage(
+                    session,
+                    schema=schema,
+                    stage=dictionary_stage,
+                    progress_callback=progress_callback,
                 )
-                first_key, last_key = dense_result.one()
-                if (
-                    first_key != (0 if expected_count else None)
-                    or last_key != (expected_count - 1 if expected_count else None)
-                ):
-                    raise RuntimeError("PTG V4 dictionary keys are not dense from zero")
-
-            if compilation.pattern_copy_path is not None:
-                pattern_result = await session.execute(
-                    db.text(
-                        f"""
-                        SELECT COUNT(*), COUNT(DISTINCT pattern_key),
-                               MIN(pattern_key), MAX(pattern_key),
-                               COALESCE(BOOL_AND(
-                                   octet_length(pattern_digest) = 32
-                                   AND set_count >= 0
-                               ), TRUE)
-                          FROM {schema}.{_quote_ident(pattern_stage)}
-                        """
-                    )
-                )
-                pattern = pattern_result.one()
-                if (
-                    int(pattern[0]) != expected_pattern_count
-                    or int(pattern[1]) != expected_pattern_count
-                    or pattern[2] != (0 if expected_pattern_count else None)
-                    or pattern[3]
-                    != (expected_pattern_count - 1 if expected_pattern_count else None)
-                    or not bool(pattern[4])
-                ):
-                    raise RuntimeError("PTG V4 pattern dictionary is invalid")
 
             # Metadata tables are trigger-fenced by the building map root.
             # Publish the authenticated coordinate map first in this same
@@ -1248,58 +1667,17 @@ async def _publish_v4_dictionaries_and_maps(
                 references=_iter_v4_block_references(
                     compilation.reference_manifest_path
                 ),
+                **_progress_callback_kwargs(progress_callback),
             )
 
-            snapshot_parameter_map = {"snapshot_key": int(snapshot_key)}
-            statements = [
-                f"""
-                INSERT INTO {schema}.ptg2_v3_provider_group
-                    (snapshot_key, provider_group_key,
-                     provider_group_global_id_128)
-                SELECT :snapshot_key, provider_group_key,
-                       provider_group_global_id_128
-                  FROM {schema}.{_quote_ident(group_stage)}
-                 ORDER BY provider_group_key
-                ON CONFLICT DO NOTHING
-                """,
-                f"""
-                INSERT INTO {schema}.ptg2_v4_provider_component
-                    (snapshot_key, component_key, component_global_id_128)
-                SELECT :snapshot_key, component_key, component_global_id_128
-                  FROM {schema}.{_quote_ident(component_stage)}
-                 ORDER BY component_key
-                ON CONFLICT DO NOTHING
-                """,
-                f"""
-                INSERT INTO {schema}.{PTG2_V4_NPI_TABLE}
-                    (snapshot_key, npi_key, npi)
-                SELECT :snapshot_key, npi_key, npi
-                  FROM {schema}.{_quote_ident(npi_stage)}
-                 ORDER BY npi_key
-                ON CONFLICT DO NOTHING
-                """,
-                f"""
-                INSERT INTO {schema}.ptg2_v4_provider_set_npi_prefix
-                    (snapshot_key, provider_set_key, member_count, member_digest)
-                SELECT :snapshot_key, provider_set_key, member_count, member_digest
-                  FROM {schema}.{_quote_ident(prefix_stage)}
-                 ORDER BY provider_set_key
-                ON CONFLICT DO NOTHING
-                """,
-            ]
-            if compilation.pattern_copy_path is not None:
-                statements.append(
-                    f"""
-                    INSERT INTO {schema}.ptg2_v4_pattern
-                        (snapshot_key, pattern_key, pattern_digest, set_count)
-                    SELECT :snapshot_key, pattern_key, pattern_digest, set_count
-                      FROM {schema}.{_quote_ident(pattern_stage)}
-                     ORDER BY pattern_key
-                    ON CONFLICT DO NOTHING
-                    """
+            for dictionary_stage in dictionary_stages:
+                await _publish_v4_dictionary_stage_ranges(
+                    session,
+                    schema=schema,
+                    snapshot_key=int(snapshot_key),
+                    stage=dictionary_stage,
+                    progress_callback=progress_callback,
                 )
-            for statement in statements:
-                await session.execute(db.text(statement), snapshot_parameter_map)
 
             diagnostic_parameters_by_name = {
                 "snapshot_key": int(snapshot_key),
@@ -1616,79 +1994,22 @@ async def _publish_v4_dictionaries_and_maps(
             ):
                 raise RuntimeError("PTG V4 persisted graph diagnostics changed")
 
-            persisted_result = await session.execute(
-                db.text(
-                    f"""
-                    SELECT
-                      (SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_group
-                        WHERE snapshot_key = :snapshot_key),
-                      (SELECT COUNT(*)
-                         FROM {schema}.{_quote_ident(group_stage)} AS staged
-                         JOIN {schema}.ptg2_v3_provider_group AS stored
-                           ON stored.snapshot_key = :snapshot_key
-                          AND stored.provider_group_key = staged.provider_group_key
-                          AND stored.provider_group_global_id_128 =
-                              staged.provider_group_global_id_128),
-                      (SELECT COUNT(*) FROM {schema}.ptg2_v4_provider_component
-                        WHERE snapshot_key = :snapshot_key),
-                      (SELECT COUNT(*)
-                         FROM {schema}.{_quote_ident(component_stage)} AS staged
-                         JOIN {schema}.ptg2_v4_provider_component AS stored
-                           ON stored.snapshot_key = :snapshot_key
-                          AND stored.component_key = staged.component_key
-                          AND stored.component_global_id_128 =
-                              staged.component_global_id_128),
-                      (SELECT COUNT(*) FROM {schema}.{PTG2_V4_NPI_TABLE}
-                        WHERE snapshot_key = :snapshot_key),
-                      (SELECT COUNT(*)
-                         FROM {schema}.{_quote_ident(npi_stage)} AS staged
-                         JOIN {schema}.{PTG2_V4_NPI_TABLE} AS stored
-                           ON stored.snapshot_key = :snapshot_key
-                          AND stored.npi_key = staged.npi_key
-                          AND stored.npi = staged.npi),
-                      (SELECT COUNT(*) FROM {schema}.ptg2_v4_pattern
-                        WHERE snapshot_key = :snapshot_key),
-                      (SELECT COUNT(*)
-                         FROM {schema}.ptg2_v4_pattern AS stored
-                         {(
-                            f'JOIN {schema}.{_quote_ident(pattern_stage)} AS staged '
-                            'ON stored.snapshot_key = :snapshot_key '
-                            'AND stored.pattern_key = staged.pattern_key '
-                            'AND stored.pattern_digest = staged.pattern_digest '
-                            'AND stored.set_count = staged.set_count'
-                         ) if compilation.pattern_copy_path is not None else 'WHERE FALSE'})
-                      ,
-                      (SELECT COUNT(*)
-                         FROM {schema}.ptg2_v4_provider_set_npi_prefix
-                        WHERE snapshot_key = :snapshot_key),
-                      (SELECT COUNT(*)
-                         FROM {schema}.{_quote_ident(prefix_stage)} AS staged
-                         JOIN {schema}.ptg2_v4_provider_set_npi_prefix AS stored
-                           ON stored.snapshot_key = :snapshot_key
-                          AND stored.provider_set_key = staged.provider_set_key
-                          AND stored.member_count = staged.member_count
-                          AND stored.member_digest = staged.member_digest),
-                      (SELECT COUNT(*)
-                         FROM {schema}.ptg2_v4_provider_graph_diagnostic
-                        WHERE snapshot_key = :snapshot_key)
-                    """
-                ),
-                snapshot_parameter_map,
-            )
-            if tuple(int(persisted_count) for persisted_count in persisted_result.one()) != (
-                expected_group_count,
-                expected_group_count,
-                expected_component_count,
-                expected_component_count,
-                expected_npi_count,
-                expected_npi_count,
-                published_pattern_count,
-                published_pattern_count,
-                expected_prefix_owner_count,
-                expected_prefix_owner_count,
-                1,
-            ):
-                raise RuntimeError("PTG V4 persisted dictionary counts changed")
+            if compilation.pattern_copy_path is None:
+                has_unexpected_patterns = await session.scalar(
+                    db.text(
+                        f"""
+                        SELECT EXISTS (
+                            SELECT 1
+                              FROM {schema}.ptg2_v4_pattern
+                             WHERE snapshot_key = :snapshot_key
+                             LIMIT 1
+                        )
+                        """
+                    ),
+                    snapshot_parameter_map,
+                )
+                if bool(has_unexpected_patterns):
+                    raise RuntimeError("PTG V4 persisted dictionary rows changed")
 
             await publish_v4_relation_manifests(
                 session,
@@ -1735,6 +2056,7 @@ async def _publish_v4_graph(
     build_token: str,
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> _V4GraphPublication:
     """Publish graph blocks only to CAS, then make packed maps authoritative."""
 
@@ -1749,12 +2071,14 @@ async def _publish_v4_graph(
             expected_copy_bytes=int(block_artifact.byte_count),
             expected_copy_sha256=str(block_artifact.sha256),
             reuse_existing=True,
+            **_progress_callback_kwargs(progress_callback),
         )
         cas_publication = await publish_v4_cas_block_stage(
             schema_name=schema_name,
             stage_table=block_stage,
             snapshot_key=int(snapshot_key),
             build_token=build_token,
+            **_progress_callback_kwargs(progress_callback),
         )
         map_summary = await _publish_v4_dictionaries_and_maps(
             compilation,
@@ -1765,6 +2089,7 @@ async def _publish_v4_graph(
             empty_npi_tin_only_normalization_count=int(
                 empty_npi_tin_only_normalization_count
             ),
+            **_progress_callback_kwargs(progress_callback),
         )
     except BaseException:
         await _queue_failed_v4_graph_blocks(
@@ -2020,6 +2345,8 @@ async def _publish_prepared_shared_layout(
     provider_graph_v4: bool = False,
     compressed_acquisition_bytes: int | None = None,
     empty_npi_tin_only_normalization_count: int | None = None,
+    progress_callback: Callable[[str, Mapping[str, int]], None] | None = None,
+    progress_interval_seconds: float = 4.0,
 ) -> SharedSnapshotPublication:
     """Finalize, validate, publish, and atomically seal one physical layout."""
 
@@ -2031,6 +2358,21 @@ async def _publish_prepared_shared_layout(
         """Record elapsed wall time for a named publication stage."""
 
         publication_timing_map[f"{stage_name}_seconds"] = time.monotonic() - started_at
+
+    def completed_stage(stage_name: str, **counters_by_name: int) -> None:
+        """Report exact completed rows/bytes/batches for one bounded stage."""
+
+        if progress_callback is None:
+            return
+        normalized_by_name = {
+            str(name): int(value)
+            for name, value in counters_by_name.items()
+            if int(value) >= 0
+        }
+        normalized_by_name["completed_batches"] = (
+            normalized_by_name.get("completed_batches", 0) + 1
+        )
+        progress_callback(stage_name, normalized_by_name)
 
     shared_generation = (
         PTG2_V4_SHARED_GENERATION
@@ -2088,27 +2430,46 @@ async def _publish_prepared_shared_layout(
     )
     with work_directory_context as raw_work_directory:
         if prepared_finalizer is None:
+            direct_finalizer_progress = _MeasuredPublicationProgress(
+                "finalizer",
+                progress_callback,
+                interval_seconds=progress_interval_seconds,
+            )
             stage_started_at = time.monotonic()
             price_key_map_path = await export_shared_price_key_map(
                 prepared_price,
                 Path(raw_work_directory) / "price-key-map.copy",
             )
             record_stage("price_key_map_export", stage_started_at)
+            if progress_callback is not None:
+                completed_stage(
+                    "price key map export",
+                    exported_bytes=price_key_map_path.stat().st_size,
+                    exported_rows=int(prepared_price.price_set_count),
+                )
             stage_started_at = time.monotonic()
-            finalizer_summary_by_field = await run_v3_direct_finalizer(
-                work_directory=raw_work_directory,
-                serving_run_entries=serving_run_entries,
-                code_dictionary_entries=code_dictionary_entries,
-                provider_set_metadata_entries=provider_set_metadata_entries,
-                expected_source_identities=expected_source_identities,
-                price_key_map_input=price_key_map_path,
-                price_key_map_row_count=prepared_price.price_set_count,
-                scratch_durability=(
-                    PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY
-                    if prepared_work_directory is None
-                    else PTG2_V3_DURABLE_SCRATCH_DURABILITY
-                ),
-            )
+            try:
+                with observe_v3_finalizer_progress(
+                    direct_finalizer_progress.add
+                    if progress_callback is not None
+                    else None
+                ):
+                    finalizer_summary_by_field = await run_v3_direct_finalizer(
+                        work_directory=raw_work_directory,
+                        serving_run_entries=serving_run_entries,
+                        code_dictionary_entries=code_dictionary_entries,
+                        provider_set_metadata_entries=provider_set_metadata_entries,
+                        expected_source_identities=expected_source_identities,
+                        price_key_map_input=price_key_map_path,
+                        price_key_map_row_count=prepared_price.price_set_count,
+                        scratch_durability=(
+                            PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY
+                            if prepared_work_directory is None
+                            else PTG2_V3_DURABLE_SCRATCH_DURABILITY
+                        ),
+                    )
+            finally:
+                direct_finalizer_progress.flush()
             record_stage("finalizer", stage_started_at)
         else:
             finalizer_summary_by_field = dict(prepared_finalizer.summary)
@@ -2146,6 +2507,15 @@ async def _publish_prepared_shared_layout(
             expected_generation=shared_generation,
         )
         record_stage("dictionary_publish", stage_started_at)
+        if progress_callback is not None:
+            completed_stage(
+                "dictionary publication",
+                published_rows=(
+                    int(dictionary_publication.code_count)
+                    + int(dictionary_publication.provider_set_count)
+                    + int(dictionary_publication.serving_rate_count)
+                ),
+            )
         await touch_build()
         stage_started_at = time.monotonic()
         provider_set_keys = await _export_provider_set_key_map(
@@ -2154,6 +2524,12 @@ async def _publish_prepared_shared_layout(
             output_path=Path(raw_work_directory) / "provider-set-authoritative.tsv",
         )
         record_stage("provider_set_key_export", stage_started_at)
+        if progress_callback is not None:
+            completed_stage(
+                "provider set key export",
+                exported_bytes=provider_set_keys.stat().st_size,
+                exported_rows=int(dictionary_publication.provider_set_count),
+            )
         stage_started_at = time.monotonic()
         if provider_graph_v4:
             compile_task = asyncio.create_task(
@@ -2186,43 +2562,45 @@ async def _publish_prepared_shared_layout(
                 work_directory=Path(raw_work_directory),
             )
         record_stage("provider_graph_convert", stage_started_at)
+        if progress_callback is not None:
+            completed_stage(
+                "provider graph conversion",
+                converted_blocks=int(graph_conversion.block_count),
+            )
 
         block_stage = shared_block_stage_name(f"final-{reserved_snapshot_key}")
 
         async def publish_finalizer_blocks() -> Any:
             """Publish finalizer serving and price blocks."""
 
+            lane_progress = _MeasuredPublicationProgress(
+                "serving block publication",
+                progress_callback,
+                interval_seconds=progress_interval_seconds,
+            )
             stage_started_at = time.monotonic()
             await create_shared_block_stage(
                 schema_name=schema_name,
                 stage_table=block_stage,
             )
             try:
-                serving_copy_metrics = await copy_shared_block_binary_file(
-                    _output_file(finalizer_summary_by_field, serving_block_summary),
+                serving_copy_metrics = await _copy_finalizer_block(
+                    finalizer_summary_by_field,
+                    serving_block_summary,
                     schema_name=schema_name,
                     stage_table=block_stage,
-                    expected_copy_bytes=_integer(
-                        serving_block_summary.get("copy_bytes"),
-                        "serving block COPY bytes",
+                    progress_callback=(
+                        lane_progress.add if progress_callback is not None else None
                     ),
-                    expected_copy_sha256=str(
-                        serving_block_summary.get("copy_sha256") or ""
-                    ),
-                    reuse_existing=True,
                 )
-                price_copy_metrics = await copy_shared_block_binary_file(
-                    _output_file(finalizer_summary_by_field, price_block_summary),
+                price_copy_metrics = await _copy_finalizer_block(
+                    finalizer_summary_by_field,
+                    price_block_summary,
                     schema_name=schema_name,
                     stage_table=block_stage,
-                    expected_copy_bytes=_integer(
-                        price_block_summary.get("copy_bytes"),
-                        "price block COPY bytes",
+                    progress_callback=(
+                        lane_progress.add if progress_callback is not None else None
                     ),
-                    expected_copy_sha256=str(
-                        price_block_summary.get("copy_sha256") or ""
-                    ),
-                    reuse_existing=True,
                 )
                 if serving_copy_metrics is None or price_copy_metrics is None:
                     raise RuntimeError(
@@ -2234,6 +2612,9 @@ async def _publish_prepared_shared_layout(
                     snapshot_key=int(reserved_snapshot_key),
                     build_token=build_token,
                     expected_generation=shared_generation,
+                    **_progress_callback_kwargs(
+                        lane_progress.add if progress_callback is not None else None
+                    ),
                 )
                 return _FinalizerBlockPublicationResult(
                     publication=publication,
@@ -2241,6 +2622,7 @@ async def _publish_prepared_shared_layout(
                     price_dictionary_copy=price_copy_metrics,
                 )
             finally:
+                lane_progress.flush()
                 await db.status(
                     "DROP TABLE IF EXISTS "
                     f"{_quote_ident(schema_name)}.{_quote_ident(block_stage)};"
@@ -2250,6 +2632,11 @@ async def _publish_prepared_shared_layout(
         async def publish_provider_graph() -> Any:
             """Publish provider graph blocks and relational owner metadata."""
 
+            lane_progress = _MeasuredPublicationProgress(
+                "provider graph publication",
+                progress_callback,
+                interval_seconds=progress_interval_seconds,
+            )
             stage_started_at = time.monotonic()
             try:
                 if provider_graph_v4:
@@ -2264,14 +2651,23 @@ async def _publish_prepared_shared_layout(
                         empty_npi_tin_only_normalization_count=int(
                             empty_npi_tin_only_normalization_count or 0
                         ),
+                        **_progress_callback_kwargs(
+                            lane_progress.add
+                            if progress_callback is not None
+                            else None
+                        ),
                     )
                 return await publish_shared_graph(
                     graph_conversion,
                     schema_name=schema_name,
                     snapshot_key=int(reserved_snapshot_key),
                     build_token=build_token,
+                    **_progress_callback_kwargs(
+                        lane_progress.add if progress_callback is not None else None
+                    ),
                 )
             finally:
+                lane_progress.flush()
                 record_stage("provider_graph_publish", stage_started_at)
 
         dense_keys = _mapping(
@@ -2299,24 +2695,40 @@ async def _publish_prepared_shared_layout(
                     prepared_price_publication.publish_seconds
                 )
                 return prepared_price_publication.publication
+            lane_progress = _MeasuredPublicationProgress(
+                "price publication",
+                progress_callback,
+                interval_seconds=progress_interval_seconds,
+            )
             stage_started_at = time.monotonic()
             try:
-                return await publish_shared_price_artifacts(
-                    schema_name=schema_name,
-                    manifest_stage_table=manifest_stage_table,
-                    snapshot_key=int(reserved_snapshot_key),
-                    build_token=build_token,
-                    expected_price_set_count=expected_price_set_count,
-                    expected_price_key_order=expected_price_key_order,
-                    prepared=prepared_price,
-                    expected_generation=shared_generation,
-                )
+                with observe_shared_price_progress(
+                    lane_progress.add
+                    if progress_callback is not None
+                    else None
+                ):
+                    return await publish_shared_price_artifacts(
+                        schema_name=schema_name,
+                        manifest_stage_table=manifest_stage_table,
+                        snapshot_key=int(reserved_snapshot_key),
+                        build_token=build_token,
+                        expected_price_set_count=expected_price_set_count,
+                        expected_price_key_order=expected_price_key_order,
+                        prepared=prepared_price,
+                        expected_generation=shared_generation,
+                    )
             finally:
+                lane_progress.flush()
                 record_stage("price_publish", stage_started_at)
 
         async def publish_source_witness() -> Any:
             """Publish the bounded source-fidelity witness."""
 
+            lane_progress = _MeasuredPublicationProgress(
+                "source witness publication",
+                progress_callback,
+                interval_seconds=progress_interval_seconds,
+            )
             stage_started_at = time.monotonic()
             try:
                 return await publish_shared_source_witness(
@@ -2328,8 +2740,12 @@ async def _publish_prepared_shared_layout(
                     entries=tuple(source_audit_witness_entries),
                     expected_raw_source_sha256=tuple(expected_raw_source_sha256),
                     expected_generation=shared_generation,
+                    **_progress_callback_kwargs(
+                        lane_progress.add if progress_callback is not None else None
+                    ),
                 )
             finally:
+                lane_progress.flush()
                 record_stage("source_witness_publish", stage_started_at)
 
         independent_publish_started_at = time.monotonic()
@@ -2367,6 +2783,12 @@ async def _publish_prepared_shared_layout(
                 snapshot_key=int(reserved_snapshot_key),
             )
         record_stage("mapping_summary", stage_started_at)
+        if progress_callback is not None:
+            completed_stage(
+                "mapping summary",
+                summarized_rows=int(mapping_summary.mapping_count),
+                summarized_blocks=int(mapping_summary.unique_block_count),
+            )
         _validate_authoritative_mapping_summary(
             mapping_summary,
             finalizer_block_publication,
@@ -2443,6 +2865,11 @@ async def _publish_prepared_shared_layout(
                 price_membership_block_span=price_membership_block_span,
             )
         record_stage("audit_publish", stage_started_at)
+        if progress_callback is not None:
+            completed_stage(
+                "audit publication",
+                published_rows=int(audit_publication.row_count),
+            )
         await touch_build()
         support_digest = _shared_layout_support_digest(
             core_support=core_support_map,
@@ -2475,6 +2902,15 @@ async def _publish_prepared_shared_layout(
             **publication_timing_map,
         }
         stage_started_at = time.monotonic()
+        seal_progress = (
+            _MeasuredPublicationProgress(
+                "snapshot seal",
+                progress_callback,
+                interval_seconds=progress_interval_seconds,
+            )
+            if provider_graph_v4
+            else None
+        )
         async with db.transaction() as session:
             if provider_graph_v4:
                 sealed = await seal_v4_shared_layout(
@@ -2485,6 +2921,7 @@ async def _publish_prepared_shared_layout(
                     expected_summary=graph_publication.map_summary,
                     support_digest=support_digest,
                     layout_manifest={"serving_index": provisional_serving_index},
+                    progress_callback=seal_progress.add,
                 )
                 sealed_audit_metadata_map = dict(audit_publication.metadata)
             else:
@@ -2507,7 +2944,18 @@ async def _publish_prepared_shared_layout(
                     if sealed.reused
                     else dict(audit_publication.metadata)
                 )
+        if seal_progress is not None:
+            seal_progress.flush()
         record_stage("seal", stage_started_at)
+        if progress_callback is not None:
+            completed_stage(
+                "snapshot seal",
+                sealed_rows=int(
+                    graph_publication.mapping_count
+                    if provider_graph_v4
+                    else mapping_summary.mapping_count
+                ),
+            )
         publication_timing_map["shared_publish_total_seconds"] = (
             time.monotonic() - publication_started_at
         )
@@ -2579,6 +3027,8 @@ async def publish_strict_shared_v3_layout(
     provider_graph_v4: bool = False,
     compressed_acquisition_entries: Iterable[Mapping[str, Any]] | None = None,
     empty_npi_tin_only_normalization_count: int | None = None,
+    progress_callback: Callable[[str, Mapping[str, int]], None] | None = None,
+    progress_interval_seconds: float = 4.0,
 ) -> SharedSnapshotPublication:
     """Prepare exact price ranks once, then publish and clean every temporary map."""
 
@@ -2664,6 +3114,17 @@ async def publish_strict_shared_v3_layout(
         ),
         dir=str(scratch_parent) if scratch_parent is not None else None,
     ) as raw_work_directory:
+        price_work_progress = _MeasuredPublicationProgress(
+            "price preparation and publication",
+            progress_callback,
+            interval_seconds=progress_interval_seconds,
+        )
+        finalizer_progress = _MeasuredPublicationProgress(
+            "finalizer",
+            progress_callback,
+            interval_seconds=progress_interval_seconds,
+        )
+
         async def publish_prepared_price_early(
             prepared: PreparedSharedPriceArtifacts,
         ) -> Any:
@@ -2680,22 +3141,32 @@ async def publish_strict_shared_v3_layout(
                 expected_generation=shared_generation,
             )
 
-        (
-            prepared_price,
-            price_prepare_seconds,
-            prepared_finalizer,
-            prepared_price_publication,
-        ) = await _prepare_price_with_early_finalizer(
-            schema_name=schema_name,
-            manifest_stage_table=manifest_stage_table,
-            price_set_summary_source_count=price_set_summary_source_count,
-            raw_work_directory=raw_work_directory,
-            serving_run_entries=serving_run_entries,
-            code_dictionary_entries=code_dictionary_entries,
-            provider_set_metadata_entries=provider_set_metadata_entries,
-            expected_source_identities=expected_source_identities,
-            publish_prepared_price=publish_prepared_price_early,
-        )
+        with observe_shared_price_progress(
+            price_work_progress.add if progress_callback is not None else None
+        ):
+            (
+                prepared_price,
+                price_prepare_seconds,
+                prepared_finalizer,
+                prepared_price_publication,
+            ) = await _prepare_price_with_early_finalizer(
+                schema_name=schema_name,
+                manifest_stage_table=manifest_stage_table,
+                price_set_summary_source_count=price_set_summary_source_count,
+                raw_work_directory=raw_work_directory,
+                serving_run_entries=serving_run_entries,
+                code_dictionary_entries=code_dictionary_entries,
+                provider_set_metadata_entries=provider_set_metadata_entries,
+                expected_source_identities=expected_source_identities,
+                publish_prepared_price=publish_prepared_price_early,
+                finalizer_progress_callback=(
+                    finalizer_progress.add
+                    if progress_callback is not None
+                    else None
+                ),
+            )
+        price_work_progress.flush()
+        finalizer_progress.flush()
         try:
             publication = await _publish_prepared_shared_layout(
                 schema_name=schema_name,
@@ -2725,6 +3196,8 @@ async def publish_strict_shared_v3_layout(
                 empty_npi_tin_only_normalization_count=(
                     empty_npi_tin_only_normalization_count
                 ),
+                progress_callback=progress_callback,
+                progress_interval_seconds=progress_interval_seconds,
             )
         except BaseException:
             cleanup_task = asyncio.create_task(

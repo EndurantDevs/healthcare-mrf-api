@@ -383,6 +383,10 @@ impl SharedDedupe {
         inserted
     }
 
+    pub fn record_cached_provider_group_attempts(&self, count: u64) {
+        self.provider_group_counter.record_attempted(count);
+    }
+
     pub fn insert_provider_group_member(&self, group_hash: i64, npi: i64) -> bool {
         let key = provider_group_member_key(group_hash, npi);
         let inserted = self.provider_group_member.insert(key);

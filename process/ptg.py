@@ -302,6 +302,7 @@ from process.url_security import fetch_max_bytes
 
 logger = logging.getLogger(__name__)
 _ptg2_monotonic = time.monotonic
+_PTG2_PUBLISH_PROGRESS_INTERVAL_SECONDS = 4.0
 
 PTG2_SOURCE_SCOPED_TEST_ENV = "HLTHPRT_PTG2_SOURCE_SCOPED_TEST"
 PTG2_AUTO_ADDRESS_REFRESH_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH"
@@ -914,6 +915,66 @@ async def _copy_manifest_files_direct_with_progress(
     """Copy manifest worker files, emit progress, and return throughput metrics."""
     existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
     input_bytes = sum(input_path.stat().st_size for input_path in existing_paths)
+    copy_started_at = _ptg2_monotonic()
+    copy_progress_by_field = {
+        "copied_bytes": 0,
+        "last_emitted_bytes": 0,
+        "next_progress_at": (
+            copy_started_at + _PTG2_PUBLISH_PROGRESS_INTERVAL_SECONDS
+        ),
+    }
+    progress_lock = threading.Lock()
+
+    def report_copied_bytes(byte_count: int) -> None:
+        """Aggregate exact COPY reads and publish a bounded-rate movement event."""
+
+        if byte_count <= 0:
+            return
+        with progress_lock:
+            copy_progress_by_field["copied_bytes"] += int(byte_count)
+            now = _ptg2_monotonic()
+            if (
+                copy_progress_by_field["copied_bytes"]
+                <= copy_progress_by_field["last_emitted_bytes"]
+                or now < copy_progress_by_field["next_progress_at"]
+            ):
+                return
+            copy_progress_by_field["last_emitted_bytes"] = (
+                copy_progress_by_field["copied_bytes"]
+            )
+            copy_progress_by_field["next_progress_at"] = (
+                now + _PTG2_PUBLISH_PROGRESS_INTERVAL_SECONDS
+            )
+            elapsed_seconds = max(now - copy_started_at, 0.0)
+            copied_bytes = copy_progress_by_field["copied_bytes"]
+            _emit_ptg2_publish_progress(
+                f"copying {kind}",
+                completed_steps=completed_steps_before_copy,
+                total_steps=total_steps,
+                stage_start_pct=92.0,
+                stage_end_pct=95.0,
+                message_text=(
+                    f"copied {copied_bytes} of {input_bytes} {kind} "
+                    f"byte(s) into {target_table}"
+                ),
+                copy_kind=kind,
+                target_table=target_table,
+                input_files=len(existing_paths),
+                input_bytes=input_bytes,
+                direct_to_copy=True,
+                counters={
+                    "manifest_copy_bytes": copied_bytes,
+                    "manifest_copy_total_bytes": input_bytes,
+                },
+                throughput={
+                    "bytes_per_second": (
+                        copied_bytes / elapsed_seconds
+                        if elapsed_seconds > 0
+                        else None
+                    )
+                },
+            )
+
     copy_tasks = max(
         _env_int(
             PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV,
@@ -935,20 +996,27 @@ async def _copy_manifest_files_direct_with_progress(
         direct_to_copy=True,
         copy_tasks=min(copy_tasks, max(len(existing_paths), 1)),
     )
-    copy_started_at = time.monotonic()
     if copy_tasks <= 1 or len(existing_paths) <= 1:
         for input_path in existing_paths:
-            await copy_func(input_path, target_table=target_table)
+            await copy_func(
+                input_path,
+                target_table=target_table,
+                progress_callback=report_copied_bytes,
+            )
     else:
         semaphore = asyncio.Semaphore(copy_tasks)
 
         async def copy_one(input_path: Path) -> None:
             """Run one copy operation under the shared concurrency limit."""
             async with semaphore:
-                await copy_func(input_path, target_table=target_table)
+                await copy_func(
+                    input_path,
+                    target_table=target_table,
+                    progress_callback=report_copied_bytes,
+                )
 
         await asyncio.gather(*(copy_one(input_path) for input_path in existing_paths))
-    elapsed_seconds = time.monotonic() - copy_started_at
+    elapsed_seconds = _ptg2_monotonic() - copy_started_at
     row_count = int(emitted_rows or 0)
     _emit_ptg2_publish_progress(
         f"copied {kind}",
@@ -964,6 +1032,11 @@ async def _copy_manifest_files_direct_with_progress(
         input_rows=row_count,
         output_rows=row_count,
         dropped_rows=0,
+        counters={
+            "manifest_copy_bytes": copy_progress_by_field["copied_bytes"],
+            "manifest_copy_total_bytes": input_bytes,
+            "manifest_copy_rows": row_count,
+        },
         direct_to_copy=True,
         copy_tasks=min(copy_tasks, max(len(existing_paths), 1)),
         elapsed_seconds=elapsed_seconds,
@@ -6075,6 +6148,31 @@ async def _main_with_artifact_lease(
             source_audit_witness_entries = strict_v3_copy_entries.get(
                 "source_audit_witness"
             ) or []
+            publication_progress_by_field = {"event_count": 0}
+
+            def report_snapshot_publication_progress(
+                stage_name: str,
+                counters_by_name: Mapping[str, int],
+            ) -> None:
+                """Expose exact V4 publication work without advancing fake time."""
+
+                publication_progress_by_field["event_count"] += 1
+                normalized_counters_by_name = {
+                    str(counter_name): int(counter_value)
+                    for counter_name, counter_value in counters_by_name.items()
+                }
+                normalized_counters_by_name["publication_progress_events"] = (
+                    publication_progress_by_field["event_count"]
+                )
+                _emit_ptg2_publish_progress(
+                    f"snapshot {stage_name}",
+                    completed_steps=5,
+                    total_steps=publish_progress_total,
+                    message_text=f"publishing PTG snapshot: {stage_name}",
+                    publication_stage=stage_name,
+                    counters=normalized_counters_by_name,
+                )
+
             try:
                 shared_publication = await publish_strict_shared_v3_layout(
                     schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
@@ -6121,6 +6219,15 @@ async def _main_with_artifact_lease(
                     ),
                     scratch_parent=ptg2_temp_parent(),
                     provider_graph_v4=provider_graph_v4_enabled,
+                    **(
+                        {
+                            "progress_callback": (
+                                report_snapshot_publication_progress
+                            )
+                        }
+                        if provider_graph_v4_enabled
+                        else {}
+                    ),
                     **(
                         {
                             "empty_npi_tin_only_normalization_count": (

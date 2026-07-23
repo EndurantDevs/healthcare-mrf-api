@@ -9,6 +9,10 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_GRAPH_RESOURCE_FIELDS,
 )
 from scripts.ptg_v4_dev_canary_cas import REFERENCE_POPULATION
+from scripts.ptg_v4_dev_canary_storage_budget import (
+    UNAPPROVED_STORAGE_CEILING_FAILURE,
+    StorageBudget,
+)
 
 
 STORAGE_EVIDENCE_CONTRACT = "ptg_v4_physical_storage_v1"
@@ -58,11 +62,9 @@ WHOLE_SNAPSHOT_PHYSICAL_RELATIONS = frozenset(
 def evaluate_v4_evidence(
     evidence_by_field: Mapping[str, Any],
     *,
-    expected_representation: str,
+    storage_budget: StorageBudget,
     expected_root_counts: Mapping[str, int],
     expected_relation_counts: Mapping[str, int],
-    maximum_graph_physical_storage_bytes: int,
-    maximum_snapshot_physical_storage_bytes: int,
 ) -> dict[str, Any]:
     """Reconcile exact V4 rows and gate attributable physical PostgreSQL bytes."""
 
@@ -75,7 +77,12 @@ def evaluate_v4_evidence(
         evidence_by_field.get("provider_graph_diagnostic")
     )
     physical_storage = _mapping(evidence_by_field.get("physical_storage"))
-    _validate_v4_state(snapshot, root, expected_representation, failures)
+    _validate_v4_state(
+        snapshot,
+        root,
+        storage_budget.case.expected_representation,
+        failures,
+    )
     _reconcile_exact_counts(root, exact_counts, failures)
     _validate_provider_graph_diagnostic(
         provider_graph_diagnostic,
@@ -98,8 +105,7 @@ def evaluate_v4_evidence(
     )
     _validate_physical_storage(
         physical_storage,
-        maximum_graph_physical_storage_bytes,
-        maximum_snapshot_physical_storage_bytes,
+        storage_budget,
         failures,
     )
     return {
@@ -113,6 +119,14 @@ def evaluate_v4_evidence(
         "provider_graph_diagnostic": provider_graph_diagnostic,
         "manifest": manifest_summary,
         "physical_storage": physical_storage,
+        "storage_budget": storage_budget.report(
+            graph_gate_bytes=_optional_int(
+                physical_storage.get("graph_gate_bytes")
+            ),
+            snapshot_gate_bytes=_optional_int(
+                physical_storage.get("snapshot_gate_bytes")
+            ),
+        ),
     }
 
 
@@ -352,8 +366,7 @@ def _manifest_summary(
 
 def _validate_physical_storage(
     storage: Mapping[str, Any],
-    maximum_graph_bytes: int,
-    maximum_snapshot_bytes: int,
+    storage_budget: StorageBudget,
     failures: list[str],
 ) -> None:
     if storage.get("contract") != STORAGE_EVIDENCE_CONTRACT:
@@ -383,11 +396,30 @@ def _validate_physical_storage(
         failures.append("owner, locator, or coordinate-map CAS blocks are missing")
     _validate_cas_attribution(storage, failures)
     graph_gate_bytes = _optional_int(storage.get("graph_gate_bytes"))
-    if graph_gate_bytes is None or graph_gate_bytes > maximum_graph_bytes:
-        failures.append("attributable V4 graph storage exceeds its configured maximum")
     snapshot_gate_bytes = _optional_int(storage.get("snapshot_gate_bytes"))
-    if snapshot_gate_bytes is None or snapshot_gate_bytes > maximum_snapshot_bytes:
-        failures.append("whole-snapshot physical storage exceeds its configured maximum")
+    if graph_gate_bytes is None:
+        failures.append("attributable V4 graph storage measurement is missing")
+    if snapshot_gate_bytes is None:
+        failures.append("whole-snapshot physical storage measurement is missing")
+    if not storage_budget.promotion_approved:
+        failures.append(UNAPPROVED_STORAGE_CEILING_FAILURE)
+    elif (
+        graph_gate_bytes is not None
+        and graph_gate_bytes
+        > int(storage_budget.maximum_graph_physical_storage_bytes or 0)
+    ):
+        failures.append(
+            "attributable V4 graph storage exceeds its source-controlled maximum"
+        )
+    if (
+        storage_budget.promotion_approved
+        and snapshot_gate_bytes is not None
+        and snapshot_gate_bytes
+        > int(storage_budget.maximum_snapshot_physical_storage_bytes or 0)
+    ):
+        failures.append(
+            "whole-snapshot physical storage exceeds its source-controlled maximum"
+        )
     if storage.get("storage_claim_scope") != "whole_snapshot_and_v4_graph":
         failures.append("physical storage evidence is graph-only or ambiguously scoped")
 

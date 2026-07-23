@@ -123,15 +123,21 @@ def _has_matching_graph_identity(
     runtime_identity_by_field = _mapping(
         graph_evidence_by_field.get("runtime_identity")
     )
-    if not runtime_identity_by_field:
-        return True
-    return (
-        runtime_identity_by_field.get("process_identity")
-        == sample_by_field.get("process_identity")
-        and runtime_identity_by_field.get("process_started_at")
-        == sample_by_field.get("process_started_at")
-        and runtime_identity_by_field.get("image_identity")
-        == sample_by_field.get("image_identity")
+    identity_field_names = (
+        "process_identity",
+        "process_started_at",
+        "image_identity",
+    )
+    return bool(
+        all(
+            str(runtime_identity_by_field.get(field_name) or "").strip()
+            for field_name in identity_field_names
+        )
+        and all(
+            runtime_identity_by_field.get(field_name)
+            == sample_by_field.get(field_name)
+            for field_name in identity_field_names
+        )
     )
 
 
@@ -150,6 +156,7 @@ def _has_valid_sample_contract(
         and sample_by_field.get("first_v4_request") is True
         and sample_by_field.get("document_valid") is True
         and graph_evidence_by_field.get("passed") is True
+        and _has_matching_graph_identity(sample_by_field)
         and latency_ms >= 0
     )
 

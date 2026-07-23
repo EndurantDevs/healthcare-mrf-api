@@ -9,9 +9,9 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
@@ -50,6 +50,163 @@ _SHARED_BLOCK_STAGE_COLUMNS = (
     "payload",
 )
 _SHARED_BLOCK_EXISTENCE_BATCH_ROWS = 8_192
+_SHARED_BLOCK_PUBLISH_BATCH_ROWS = 32
+_BATCH_INSERT_BLOCK_SQL = """
+INSERT INTO {schema}.ptg2_v3_block
+    (block_hash, format_version, object_kind, codec, entry_count,
+     raw_byte_count, stored_byte_count, payload, created_at)
+SELECT DISTINCT ON (staged.block_hash)
+       staged.block_hash, staged.format_version, staged.object_kind,
+       staged.codec, staged.entry_count, staged.raw_byte_count,
+       staged.stored_byte_count, staged.payload, now()
+  FROM {schema}.{stage} AS staged
+  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+ WHERE staged.format_version = :format_version
+   AND staged.payload IS NOT NULL
+   AND NOT EXISTS (
+           SELECT 1
+             FROM {schema}.ptg2_v3_block AS stored
+            WHERE stored.block_hash = staged.block_hash
+       )
+ ORDER BY staged.block_hash
+ON CONFLICT (block_hash) DO NOTHING
+"""
+_BATCH_INSERT_MAPPING_SQL = """
+INSERT INTO {schema}.ptg2_v3_snapshot_block
+    (snapshot_key, object_kind, block_key, fragment_no, entry_count, block_hash)
+SELECT :snapshot_key, staged.object_kind, staged.block_key,
+       staged.fragment_no, staged.entry_count, staged.block_hash
+  FROM {schema}.{stage} AS staged
+  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+ON CONFLICT (snapshot_key, object_kind, block_key, fragment_no) DO NOTHING
+"""
+_BATCH_COUNT_HASH_SQL = """
+WITH inserted AS (
+    INSERT INTO {seen_hash} (block_hash)
+    SELECT DISTINCT staged.block_hash
+      FROM {schema}.{stage} AS staged
+      JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+    ON CONFLICT (block_hash) DO NOTHING
+    RETURNING 1
+)
+SELECT COUNT(*)::bigint FROM inserted
+"""
+_BATCH_COUNT_COORDINATE_SQL = """
+WITH inserted AS (
+    INSERT INTO {seen_coordinate} (object_kind, block_key, fragment_no)
+    SELECT DISTINCT staged.object_kind, staged.block_key, staged.fragment_no
+      FROM {schema}.{stage} AS staged
+      JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+    ON CONFLICT (object_kind, block_key, fragment_no) DO NOTHING
+    RETURNING 1
+)
+SELECT COUNT(*)::bigint FROM inserted
+"""
+_BATCH_AGGREGATE_SQL = """
+SELECT COUNT(*)::bigint,
+       COALESCE(SUM(staged.raw_byte_count), 0)::bigint,
+       COALESCE(SUM(staged.stored_byte_count), 0)::bigint,
+       COALESCE(
+           ARRAY_AGG(DISTINCT staged.object_kind ORDER BY staged.object_kind),
+           ARRAY[]::text[]
+       ),
+       COALESCE(
+           BOOL_OR(staged.format_version <> :format_version),
+           FALSE
+       ),
+       COALESCE(
+           BOOL_OR(
+               stored.block_hash IS NULL
+               OR stored.format_version <> staged.format_version
+               OR stored.object_kind <> staged.object_kind
+               OR stored.codec <> staged.codec
+               OR stored.entry_count <> staged.entry_count
+               OR stored.raw_byte_count <> staged.raw_byte_count
+               OR stored.stored_byte_count <> staged.stored_byte_count
+           ),
+           FALSE
+       ),
+       COALESCE(
+           BOOL_OR(
+               mapping.snapshot_key IS NULL
+               OR mapping.entry_count <> staged.entry_count
+               OR mapping.block_hash <> staged.block_hash
+           ),
+           FALSE
+       )
+  FROM {schema}.{stage} AS staged
+  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+  LEFT JOIN {schema}.ptg2_v3_block AS stored
+    ON stored.block_hash = staged.block_hash
+  LEFT JOIN {schema}.ptg2_v3_snapshot_block AS mapping
+    ON mapping.snapshot_key = :snapshot_key
+   AND mapping.object_kind = staged.object_kind
+   AND mapping.block_key = staged.block_key
+   AND mapping.fragment_no = staged.fragment_no
+"""
+_V4_BATCH_LOCK_SQL = """
+SELECT stored.block_hash
+  FROM {schema}.ptg2_v3_block AS stored
+  JOIN {schema}.{stage} AS staged
+    ON staged.block_hash = stored.block_hash
+  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+ FOR KEY SHARE OF stored
+"""
+_V4_BATCH_UNIQUE_TOTALS_SQL = """
+WITH inserted AS (
+    INSERT INTO {seen_hash} (block_hash)
+    SELECT DISTINCT staged.block_hash
+      FROM {schema}.{stage} AS staged
+      JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+    ON CONFLICT (block_hash) DO NOTHING
+    RETURNING block_hash
+)
+SELECT COUNT(*)::bigint,
+       COALESCE(SUM(stored.raw_byte_count), 0)::bigint,
+       COALESCE(SUM(stored.stored_byte_count), 0)::bigint
+  FROM inserted
+  JOIN {schema}.ptg2_v3_block AS stored USING (block_hash)
+"""
+_V4_BATCH_AGGREGATE_SQL = """
+SELECT COUNT(*)::bigint,
+       COALESCE(SUM(staged.entry_count), 0)::bigint,
+       COALESCE(SUM(staged.raw_byte_count), 0)::bigint,
+       COALESCE(SUM(staged.stored_byte_count), 0)::bigint,
+       COALESCE(
+           ARRAY_AGG(DISTINCT staged.object_kind ORDER BY staged.object_kind),
+           ARRAY[]::text[]
+       ),
+       COALESCE(
+           BOOL_OR(staged.format_version <> :format_version),
+           FALSE
+       ),
+       COALESCE(
+           BOOL_OR(staged.payload IS NULL AND stored.block_hash IS NULL),
+           FALSE
+       ),
+       COALESCE(
+           BOOL_OR(
+               stored.block_hash IS NULL
+               OR stored.format_version <> staged.format_version
+               OR stored.object_kind <> staged.object_kind
+               OR stored.codec <> staged.codec
+               OR stored.entry_count <> staged.entry_count
+               OR stored.raw_byte_count <> staged.raw_byte_count
+               OR stored.stored_byte_count <> staged.stored_byte_count
+           ),
+           FALSE
+       )
+  FROM {schema}.{stage} AS staged
+  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+  LEFT JOIN {schema}.ptg2_v3_block AS stored
+    ON stored.block_hash = staged.block_hash
+"""
+_V4_BATCH_DELETE_GC_SQL = """
+DELETE FROM {schema}.ptg2_v3_gc_candidate AS candidate
+ USING {schema}.{stage} AS staged, {batch} AS batch
+ WHERE batch.row_ctid = staged.ctid
+   AND candidate.block_hash = staged.block_hash
+"""
 _SHARED_BLOCK_COPY_INTEGER_METRIC_FIELDS = (
     "source_copy_bytes",
     "staged_copy_bytes",
@@ -175,6 +332,88 @@ class SharedBlockCopyMetrics:
         )
 
 
+@dataclass
+class _BatchedBlockStageSummary:
+    """Accumulate exact aggregates from bounded physical stage batches."""
+
+    mapping_count: int = 0
+    unique_block_count: int = 0
+    coordinate_count: int = 0
+    logical_byte_count: int = 0
+    stored_byte_count: int = 0
+    object_kinds: set[str] = field(default_factory=set)
+
+    def add(
+        self,
+        aggregate_row: Sequence[Any],
+        *,
+        unique_blocks: int,
+        unique_coordinates: int,
+    ) -> None:
+        """Merge one verified batch aggregate into the publication summary."""
+
+        self.mapping_count += int(aggregate_row[0])
+        self.unique_block_count += int(unique_blocks)
+        self.coordinate_count += int(unique_coordinates)
+        self.logical_byte_count += int(aggregate_row[1])
+        self.stored_byte_count += int(aggregate_row[2])
+        self.object_kinds.update(map(str, aggregate_row[3] or ()))
+        if bool(aggregate_row[4]):
+            raise RuntimeError(
+                "strict V3 shared-block stage uses an incompatible format version"
+            )
+        if bool(aggregate_row[5]):
+            raise RuntimeError(
+                "strict V3 shared block conflicts with stored content metadata"
+            )
+        if bool(aggregate_row[6]):
+            raise RuntimeError(
+                "strict V3 shared layout mapping conflicts with staged output"
+            )
+
+
+@dataclass
+class _BatchedV4CASStageSummary:
+    """Accumulate exact V4 CAS totals from bounded physical batches."""
+
+    staged_row_count: int = 0
+    staged_entry_count: int = 0
+    unique_block_count: int = 0
+    logical_byte_count: int = 0
+    stored_byte_count: int = 0
+    unique_logical_byte_count: int = 0
+    unique_stored_byte_count: int = 0
+    object_kinds: set[str] = field(default_factory=set)
+
+    def add(
+        self,
+        aggregate_row: Sequence[Any],
+        unique_row: Sequence[Any],
+    ) -> None:
+        """Merge one verified CAS batch into the stage summary."""
+
+        if bool(aggregate_row[5]):
+            raise RuntimeError(
+                "PTG V4 CAS block stage uses an incompatible format version"
+            )
+        if bool(aggregate_row[6]):
+            raise RuntimeError(
+                "PTG V4 CAS block stage has no payload or durable CAS row"
+            )
+        if bool(aggregate_row[7]):
+            raise RuntimeError(
+                "PTG V4 CAS block conflicts with stored content metadata"
+            )
+        self.staged_row_count += int(aggregate_row[0])
+        self.staged_entry_count += int(aggregate_row[1])
+        self.logical_byte_count += int(aggregate_row[2])
+        self.stored_byte_count += int(aggregate_row[3])
+        self.object_kinds.update(map(str, aggregate_row[4] or ()))
+        self.unique_block_count += int(unique_row[0])
+        self.unique_logical_byte_count += int(unique_row[1])
+        self.unique_stored_byte_count += int(unique_row[2])
+
+
 def _validate_shared_block_copy_metric_types(
     metrics: SharedBlockCopyMetrics,
 ) -> None:
@@ -255,6 +494,37 @@ class _DigestingReader:
         """Return the digest of exactly the bytes consumed so far."""
 
         return self._sha256.hexdigest()
+
+
+class _MeasuredReader:
+    """Report bytes actually handed to PostgreSQL without changing framing."""
+
+    def __init__(
+        self,
+        source: Any,
+        progress_callback: Callable[[str, int], None] | None,
+    ) -> None:
+        self._source = source
+        self._progress_callback = progress_callback
+
+    def read(self, size: int = -1) -> bytes:
+        """Read one driver chunk and report its exact byte count."""
+
+        chunk = self._source.read(size)
+        if chunk and self._progress_callback is not None:
+            self._progress_callback("copy_bytes", len(chunk))
+        return chunk
+
+
+def _report_publish_work(
+    progress_callback: Callable[[str, int], None] | None,
+    metric: str,
+    amount: int = 1,
+) -> None:
+    """Report a completed publication unit when progress reporting is enabled."""
+
+    if progress_callback is not None and amount > 0:
+        progress_callback(metric, int(amount))
 
 
 @dataclass(frozen=True)
@@ -499,6 +769,7 @@ async def copy_shared_block_binary_file(
     expected_copy_bytes: int | None = None,
     expected_copy_sha256: str | None = None,
     reuse_existing: bool = False,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> SharedBlockCopyMetrics | None:
     """Validate and binary-COPY a shared-block file into the staging table."""
 
@@ -567,9 +838,14 @@ async def copy_shared_block_binary_file(
                 )
             else:
                 copy_source = _DigestingReader(source_file)
+            measured_source = (
+                _MeasuredReader(copy_source, progress_callback)
+                if progress_callback is not None
+                else copy_source
+            )
             await copy_to_table(
                 _safe_identifier(stage_table),
-                source=copy_source,
+                source=measured_source,
                 schema_name=_safe_identifier(schema_name),
                 columns=list(_SHARED_BLOCK_STAGE_COLUMNS),
                 format="binary",
@@ -655,6 +931,7 @@ async def _copy_binary_file_to_stage(
     schema_name: str,
     stage_table: str,
     columns: Sequence[str],
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> None:
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
@@ -663,9 +940,14 @@ async def _copy_binary_file_to_stage(
         if copy_to_table is None:
             raise NotImplementedError("active database driver does not expose binary COPY")
         with path.open("rb") as source:
+            measured_source = (
+                _MeasuredReader(source, progress_callback)
+                if progress_callback is not None
+                else source
+            )
             await copy_to_table(
                 _safe_identifier(stage_table),
-                source=source,
+                source=measured_source,
                 schema_name=_safe_identifier(schema_name),
                 columns=list(columns),
                 format="binary",
@@ -1104,6 +1386,7 @@ async def _upsert_shared_block_mappings(
     stage_table: str,
     snapshot_key: int,
     expected_count: int | None = None,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> None:
     """Insert mappings once, reconciling only when the fast path conflicts."""
 
@@ -1131,6 +1414,7 @@ async def _upsert_shared_block_mappings(
         ),
         {"snapshot_key": int(snapshot_key)},
     )
+    _report_publish_work(progress_callback, "publish_batches")
     inserted_count = int(insert_result.rowcount or 0)
     if inserted_count == expected_count:
         return
@@ -1159,9 +1443,320 @@ async def _upsert_shared_block_mappings(
         ),
         {"snapshot_key": int(snapshot_key)},
     )
+    _report_publish_work(progress_callback, "publish_batches")
     applied_count = int(reconciliation_result.scalar() or 0)
     if applied_count != expected_count:
         raise RuntimeError("strict V3 shared layout mapping conflicts with staged output")
+
+
+def _batched_stage_object_names() -> tuple[str, str, str, str]:
+    """Return isolated temporary relation and cursor names."""
+
+    token = uuid.uuid4().hex[:20]
+    return tuple(
+        _quote_ident(f"ptg2_publish_{kind}_{token}")
+        for kind in ("cursor", "batch", "hash", "coordinate")
+    )
+
+
+async def _open_batched_stage_cursor(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+) -> tuple[str, str, str, str]:
+    """Create transaction-local identity sets and a sequential stage cursor."""
+
+    cursor, batch, seen_hash, seen_coordinate = _batched_stage_object_names()
+    await session.execute(
+        db.text(
+            f"CREATE TEMP TABLE {batch} "
+            "(row_ctid tid PRIMARY KEY) ON COMMIT DROP"
+        )
+    )
+    await session.execute(
+        db.text(
+            f"CREATE TEMP TABLE {seen_hash} "
+            "(block_hash bytea PRIMARY KEY) ON COMMIT DROP"
+        )
+    )
+    await session.execute(
+        db.text(
+            f"CREATE TEMP TABLE {seen_coordinate} "
+            "(object_kind varchar(64), block_key bigint, fragment_no integer, "
+            "PRIMARY KEY (object_kind, block_key, fragment_no)) ON COMMIT DROP"
+        )
+    )
+    await session.execute(
+        db.text(
+            f"DECLARE {cursor} NO SCROLL CURSOR FOR "
+            f"SELECT ctid::text FROM {schema}.{stage}"
+        )
+    )
+    return cursor, batch, seen_hash, seen_coordinate
+
+
+async def _load_next_stage_batch(
+    session: Any,
+    *,
+    cursor: str,
+    batch: str,
+) -> tuple[str, ...]:
+    """Fetch and materialize one bounded physical stage slice."""
+
+    result = await session.execute(
+        db.text(f"FETCH FORWARD {_SHARED_BLOCK_PUBLISH_BATCH_ROWS} FROM {cursor}")
+    )
+    row_ctids = tuple(str(row[0]) for row in result.all())
+    if not row_ctids:
+        return ()
+    await session.execute(db.text(f"TRUNCATE TABLE {batch}"))
+    await session.execute(
+        db.text(
+            f"INSERT INTO {batch} (row_ctid) "
+            "VALUES (CAST(CAST(:row_ctid AS text) AS tid))"
+        ),
+        [{"row_ctid": row_ctid} for row_ctid in row_ctids],
+    )
+    return row_ctids
+
+
+async def _publish_shared_block_batch(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    batch: str,
+    seen_hash: str,
+    seen_coordinate: str,
+    snapshot_key: int,
+) -> tuple[Sequence[Any], int, int]:
+    """Publish and verify one bounded stage batch."""
+
+    format_parameter_map = {
+        "format_version": PTG2_V3_SHARED_FORMAT_VERSION
+    }
+    template_name_map = {
+        "schema": schema,
+        "stage": stage,
+        "batch": batch,
+        "seen_hash": seen_hash,
+        "seen_coordinate": seen_coordinate,
+    }
+    await session.execute(
+        db.text(_BATCH_INSERT_BLOCK_SQL.format(**template_name_map)),
+        format_parameter_map,
+    )
+    await session.execute(
+        db.text(_BATCH_INSERT_MAPPING_SQL.format(**template_name_map)),
+        {"snapshot_key": int(snapshot_key)},
+    )
+    new_hashes = await session.scalar(
+        db.text(_BATCH_COUNT_HASH_SQL.format(**template_name_map))
+    )
+    new_coordinates = await session.scalar(
+        db.text(_BATCH_COUNT_COORDINATE_SQL.format(**template_name_map))
+    )
+    aggregate_result = await session.execute(
+        db.text(_BATCH_AGGREGATE_SQL.format(**template_name_map)),
+        {
+            "format_version": PTG2_V3_SHARED_FORMAT_VERSION,
+            "snapshot_key": int(snapshot_key),
+        },
+    )
+    return aggregate_result.one(), int(new_hashes or 0), int(new_coordinates or 0)
+
+
+def _validated_batched_stage_publication(
+    summary: _BatchedBlockStageSummary,
+) -> SharedBlockStagePublication:
+    """Validate exact accumulated counts from bounded stage batches."""
+
+    numeric_totals = (
+        summary.mapping_count,
+        summary.unique_block_count,
+        summary.logical_byte_count,
+        summary.stored_byte_count,
+    )
+    if (
+        min(numeric_totals) < 0
+        or summary.unique_block_count > summary.mapping_count
+    ):
+        raise RuntimeError("strict V3 shared block stage returned invalid aggregates")
+    if summary.coordinate_count != summary.mapping_count:
+        raise RuntimeError(
+            "strict V3 shared layout mapping conflicts with staged output"
+        )
+    object_kinds = tuple(sorted(summary.object_kinds))
+    return SharedBlockStagePublication(
+        object_kinds=object_kinds,
+        mapping_count=summary.mapping_count,
+        unique_block_count=summary.unique_block_count,
+        logical_byte_count=summary.logical_byte_count,
+        stored_byte_count=summary.stored_byte_count,
+    )
+
+
+async def _publish_shared_block_stage_batched(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    snapshot_key: int,
+    progress_callback: Callable[[str, int], None],
+) -> SharedBlockStagePublication:
+    """Publish a stage as genuine bounded SQL work with exact counters."""
+
+    cursor, batch, seen_hash, seen_coordinate = await _open_batched_stage_cursor(
+        session,
+        schema=schema,
+        stage=stage,
+    )
+    summary = _BatchedBlockStageSummary()
+    while True:
+        row_ctids = await _load_next_stage_batch(
+            session,
+            cursor=cursor,
+            batch=batch,
+        )
+        if not row_ctids:
+            break
+        aggregate_row, new_hashes, new_coordinates = (
+            await _publish_shared_block_batch(
+                session,
+                schema=schema,
+                stage=stage,
+                batch=batch,
+                seen_hash=seen_hash,
+                seen_coordinate=seen_coordinate,
+                snapshot_key=int(snapshot_key),
+            )
+        )
+        summary.add(
+            aggregate_row,
+            unique_blocks=new_hashes,
+            unique_coordinates=new_coordinates,
+        )
+        _report_publish_work(
+            progress_callback,
+            "sql_stage_rows",
+            int(aggregate_row[0]),
+        )
+        _report_publish_work(progress_callback, "publish_batches")
+    await session.execute(db.text(f"CLOSE {cursor}"))
+    return _validated_batched_stage_publication(summary)
+
+
+async def _publish_v4_cas_batch(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    batch: str,
+    seen_hash: str,
+) -> tuple[Sequence[Any], Sequence[Any]]:
+    """Publish, protect, and verify one bounded V4 CAS batch."""
+
+    template_name_map = {
+        "schema": schema,
+        "stage": stage,
+        "batch": batch,
+        "seen_hash": seen_hash,
+    }
+    await session.execute(
+        db.text(_V4_BATCH_LOCK_SQL.format(**template_name_map))
+    )
+    await session.execute(
+        db.text(_BATCH_INSERT_BLOCK_SQL.format(**template_name_map)),
+        {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
+    )
+    unique_result = await session.execute(
+        db.text(_V4_BATCH_UNIQUE_TOTALS_SQL.format(**template_name_map))
+    )
+    aggregate_result = await session.execute(
+        db.text(_V4_BATCH_AGGREGATE_SQL.format(**template_name_map)),
+        {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
+    )
+    await session.execute(
+        db.text(_V4_BATCH_DELETE_GC_SQL.format(**template_name_map))
+    )
+    return aggregate_result.one(), unique_result.one()
+
+
+def _validated_v4_cas_publication(
+    summary: _BatchedV4CASStageSummary,
+) -> V4CASBlockStagePublication:
+    """Validate and freeze exact totals accumulated from bounded CAS batches."""
+
+    numeric_totals = (
+        summary.staged_row_count,
+        summary.staged_entry_count,
+        summary.unique_block_count,
+        summary.logical_byte_count,
+        summary.stored_byte_count,
+        summary.unique_logical_byte_count,
+        summary.unique_stored_byte_count,
+    )
+    if (
+        min(numeric_totals) < 0
+        or summary.unique_block_count > summary.staged_row_count
+        or summary.unique_logical_byte_count > summary.logical_byte_count
+        or summary.unique_stored_byte_count > summary.stored_byte_count
+    ):
+        raise RuntimeError("PTG V4 CAS block stage returned invalid aggregates")
+    return V4CASBlockStagePublication(
+        object_kinds=tuple(sorted(summary.object_kinds)),
+        staged_row_count=summary.staged_row_count,
+        staged_entry_count=summary.staged_entry_count,
+        unique_block_count=summary.unique_block_count,
+        logical_byte_count=summary.logical_byte_count,
+        stored_byte_count=summary.stored_byte_count,
+        unique_logical_byte_count=summary.unique_logical_byte_count,
+        unique_stored_byte_count=summary.unique_stored_byte_count,
+    )
+
+
+async def _publish_v4_cas_stage_batched(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    progress_callback: Callable[[str, int], None],
+) -> V4CASBlockStagePublication:
+    """Publish a V4 CAS stage as genuine bounded SQL work."""
+
+    cursor, batch, seen_hash, _seen_coordinate = (
+        await _open_batched_stage_cursor(
+            session,
+            schema=schema,
+            stage=stage,
+        )
+    )
+    summary = _BatchedV4CASStageSummary()
+    while True:
+        row_ctids = await _load_next_stage_batch(
+            session,
+            cursor=cursor,
+            batch=batch,
+        )
+        if not row_ctids:
+            break
+        aggregate_row, unique_row = await _publish_v4_cas_batch(
+            session,
+            schema=schema,
+            stage=stage,
+            batch=batch,
+            seen_hash=seen_hash,
+        )
+        summary.add(aggregate_row, unique_row)
+        _report_publish_work(
+            progress_callback,
+            "sql_stage_rows",
+            int(aggregate_row[0]),
+        )
+        _report_publish_work(progress_callback, "publish_batches")
+    await session.execute(db.text(f"CLOSE {cursor}"))
+    return _validated_v4_cas_publication(summary)
 
 
 async def publish_shared_block_stage(
@@ -1171,6 +1766,7 @@ async def publish_shared_block_stage(
     snapshot_key: int,
     build_token: str,
     expected_generation: str = PTG2_V3_SHARED_GENERATION,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> SharedBlockStagePublication:
     """Publish a compact Rust-generated block stage without reading payloads in Python."""
 
@@ -1185,6 +1781,14 @@ async def publish_shared_block_stage(
                 build_token=build_token,
                 expected_generation=expected_generation,
             )
+            if progress_callback is not None:
+                return await _publish_shared_block_stage_batched(
+                    session,
+                    schema=schema,
+                    stage=stage,
+                    snapshot_key=int(snapshot_key),
+                    progress_callback=progress_callback,
+                )
             await session.execute(
                 db.text(
                     f"""
@@ -1210,6 +1814,7 @@ async def publish_shared_block_stage(
                 ),
                 {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
             )
+            _report_publish_work(progress_callback, "publish_batches")
             # block_hash is the SHA-256 identity for format, kind, codec, and payload;
             # mandatory audit and fail-closed serving reads recompute it before decode.
             aggregate_result = await session.execute(
@@ -1250,6 +1855,7 @@ async def publish_shared_block_stage(
                 {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
             )
             aggregate_row = aggregate_result.one()
+            _report_publish_work(progress_callback, "publish_batches")
             incompatible_version = bool(aggregate_row[5])
             if incompatible_version:
                 raise RuntimeError(
@@ -1265,6 +1871,11 @@ async def publish_shared_block_stage(
                 stage_table=stage_table,
                 snapshot_key=int(snapshot_key),
                 expected_count=mapping_count,
+                **(
+                    {"progress_callback": progress_callback}
+                    if progress_callback is not None
+                    else {}
+                ),
             )
 
         unique_block_count = int(aggregate_row[1])
@@ -1297,6 +1908,7 @@ async def publish_v4_cas_block_stage(
     stage_table: str,
     snapshot_key: int,
     build_token: str,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> V4CASBlockStagePublication:
     """Publish authenticated V4 compiler blocks without relational mappings.
 
@@ -1315,6 +1927,13 @@ async def publish_v4_cas_block_stage(
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
             )
+            if progress_callback is not None:
+                return await _publish_v4_cas_stage_batched(
+                    session,
+                    schema=schema,
+                    stage=stage,
+                    progress_callback=progress_callback,
+                )
             # Hold existing target rows against a concurrent GC sweep until
             # the candidate cancellation below commits. New hashes cannot yet
             # be candidates and are protected by the active layout lease.
@@ -1332,6 +1951,7 @@ async def publish_v4_cas_block_stage(
                     """
                 )
             )
+            _report_publish_work(progress_callback, "publish_batches")
             await session.execute(
                 db.text(
                     f"""
@@ -1355,6 +1975,7 @@ async def publish_v4_cas_block_stage(
                 ),
                 {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
             )
+            _report_publish_work(progress_callback, "publish_batches")
             aggregate_result = await session.execute(
                 db.text(
                     f"""
@@ -1418,6 +2039,7 @@ async def publish_v4_cas_block_stage(
                 {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
             )
             aggregate_row = aggregate_result.one()
+            _report_publish_work(progress_callback, "publish_batches")
             if bool(aggregate_row[8]):
                 raise RuntimeError(
                     "PTG V4 CAS block stage uses an incompatible format version"
@@ -1442,6 +2064,7 @@ async def publish_v4_cas_block_stage(
                     """
                 )
             )
+            _report_publish_work(progress_callback, "publish_batches")
 
         numeric_totals = tuple(int(aggregate_row[index]) for index in range(7))
         (
@@ -1486,6 +2109,7 @@ async def _publish_graph_block_stage(
     stage_table: str,
     snapshot_key: int,
     build_token: str,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> SharedBlockStagePublication:
     """Publish graph blocks through the common bounded aggregate stage path."""
 
@@ -1494,6 +2118,11 @@ async def _publish_graph_block_stage(
         stage_table=stage_table,
         snapshot_key=int(snapshot_key),
         build_token=build_token,
+        **(
+            {"progress_callback": progress_callback}
+            if progress_callback is not None
+            else {}
+        ),
     )
     if (
         publication.mapping_count != int(conversion.block_count)
@@ -1522,6 +2151,7 @@ async def publish_shared_graph(
     build_token: str,
     block_batch_rows: int = 32,
     row_batch_rows: int = 10_000,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> SharedGraphPublication:
     """Publish graph payloads and support rows entirely through binary COPY."""
 
@@ -1538,6 +2168,11 @@ async def publish_shared_graph(
             conversion.block_copy_path,
             schema_name=schema_name,
             stage_table=block_stage,
+            **(
+                {"progress_callback": progress_callback}
+                if progress_callback is not None
+                else {}
+            ),
         )
         block_publication = await _publish_graph_block_stage(
             conversion,
@@ -1545,6 +2180,11 @@ async def publish_shared_graph(
             stage_table=block_stage,
             snapshot_key=int(snapshot_key),
             build_token=build_token,
+            **(
+                {"progress_callback": progress_callback}
+                if progress_callback is not None
+                else {}
+            ),
         )
         for ddl in (
             f"""
@@ -1569,23 +2209,39 @@ async def publish_shared_graph(
             """,
         ):
             await db.status(ddl)
+            _report_publish_work(progress_callback, "publish_batches")
         await _copy_binary_file_to_stage(
             conversion.owner_copy_path,
             schema_name=schema_name,
             stage_table=owner_stage,
             columns=("direction", "owner_key", "first_chunk", "member_offset", "member_count"),
+            **(
+                {"progress_callback": progress_callback}
+                if progress_callback is not None
+                else {}
+            ),
         )
         await _copy_binary_file_to_stage(
             conversion.group_copy_path,
             schema_name=schema_name,
             stage_table=group_stage,
             columns=("provider_group_key", "provider_group_global_id_128"),
+            **(
+                {"progress_callback": progress_callback}
+                if progress_callback is not None
+                else {}
+            ),
         )
         await _copy_binary_file_to_stage(
             conversion.npi_copy_path,
             schema_name=schema_name,
             stage_table=npi_stage,
             columns=("npi",),
+            **(
+                {"progress_callback": progress_callback}
+                if progress_callback is not None
+                else {}
+            ),
         )
         async with db.transaction() as session:
             await lock_shared_layout_for_dense_write(
@@ -1615,6 +2271,7 @@ async def publish_shared_graph(
                 group_key_count,
                 group_id_count,
             ) = _integer_counts(observed.one())
+            _report_publish_work(progress_callback, "publish_batches")
             if (owner_count, group_count, npi_count) != _expected_graph_row_counts(
                 conversion
             ):
@@ -1647,6 +2304,7 @@ async def publish_shared_graph(
                 """,
             ):
                 await session.execute(db.text(statement), snapshot_parameter_map)
+                _report_publish_work(progress_callback, "publish_batches")
             published = await session.execute(
                 db.text(
                     f"""
@@ -1661,6 +2319,7 @@ async def publish_shared_graph(
                 ),
                 snapshot_parameter_map,
             )
+            _report_publish_work(progress_callback, "publish_batches")
             if _integer_counts(published.one()) != _expected_graph_row_counts(
                 conversion
             ):

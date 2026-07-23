@@ -7470,4 +7470,309 @@ mod tests {
                 .is_none()
         );
     }
+
+    fn blank_admission(max_estimated_model_bytes: Option<u64>) -> ResourceAdmissionTracker {
+        ResourceAdmissionTracker {
+            summary: V4ResourceAdmissionSummary {
+                formula: "coverage".to_owned(),
+                input_factor_bytes: 0,
+                provider_set_key_map_bytes: 0,
+                factor_edge_count: 0,
+                factor_owner_count: 0,
+                base_estimated_model_bytes: 0,
+                derived_projection_bytes: 0,
+                retained_scratch_high_water_bytes: 0,
+                bounded_emission_buffer_bytes: 0,
+                estimated_peak_bytes: 0,
+                max_estimated_model_bytes,
+                max_factor_edges: None,
+            },
+        }
+    }
+
+    #[test]
+    fn remaining_option_resource_and_factor_boundaries_fail_closed() {
+        for options in [
+            ProviderGraphV4Options {
+                max_set_components_per_fallback_set: 0,
+                ..ProviderGraphV4Options::default()
+            },
+            ProviderGraphV4Options {
+                max_online_group_keys_per_set: 0,
+                ..ProviderGraphV4Options::default()
+            },
+            ProviderGraphV4Options {
+                npi_prefix_target: 0,
+                ..ProviderGraphV4Options::default()
+            },
+            ProviderGraphV4Options {
+                max_npi_prefix_override_owners: 0,
+                ..ProviderGraphV4Options::default()
+            },
+            ProviderGraphV4Options {
+                max_npi_prefix_override_bytes: 0,
+                ..ProviderGraphV4Options::default()
+            },
+            ProviderGraphV4Options {
+                max_estimated_model_bytes: Some(0),
+                ..ProviderGraphV4Options::default()
+            },
+            ProviderGraphV4Options {
+                max_factor_edges: Some(0),
+                ..ProviderGraphV4Options::default()
+            },
+        ] {
+            assert!(options.validate().is_err());
+        }
+
+        let mut tracker = blank_admission(Some(8));
+        tracker.reserve_projection("within limit", 8).unwrap();
+        assert!(tracker.reserve_projection("over limit", 1).is_err());
+
+        let mut tracker = blank_admission(None);
+        tracker.summary.derived_projection_bytes = u64::MAX;
+        assert!(tracker.reserve_projection("overflow", 1).is_err());
+
+        let mut tracker = blank_admission(None);
+        tracker.summary.base_estimated_model_bytes = u64::MAX;
+        assert!(tracker.checked_peak(1, 0).is_err());
+        tracker.summary.base_estimated_model_bytes = 0;
+        assert!(tracker.checked_peak(u64::MAX, 1).is_err());
+        tracker.summary.bounded_emission_buffer_bytes = 1;
+        assert!(tracker.checked_peak(0, u64::MAX).is_err());
+
+        let mut tracker = blank_admission(None);
+        tracker.reserve_scratch_bytes("new high water", 8).unwrap();
+        tracker
+            .reserve_scratch_bytes("retained high water", 4)
+            .unwrap();
+        assert_eq!(tracker.summary.retained_scratch_high_water_bytes, 8);
+
+        assert!(estimated_u32_capacity_bytes(usize::MAX).is_err());
+        assert!(estimated_vec_owner_bytes(usize::MAX).is_err());
+        assert!(checked_estimated_sum([u64::MAX, 1], "coverage overflow").is_err());
+        assert!(map_key(&HashMap::new(), global(3, 1), "group").is_err());
+
+        let mut events = Vec::new();
+        let mut sink = |event: &V4ProgressEvent| events.push(event.clone());
+        let mut progress = ProgressReporter::new(&mut sink);
+        let mut done = u64::MAX;
+        assert!(advance_build_progress(&mut progress, &mut done, u64::MAX).is_err());
+
+        let fixture = independent_fixture();
+        let provider_sets = ProviderSetMap::read(&fixture.provider_map).unwrap();
+        let mut progress = ProgressReporter::new(&mut sink);
+        let mut raw =
+            load_raw_factors(std::slice::from_ref(&fixture.shard), &mut progress).unwrap();
+        let first_set = provider_sets.globals_by_index[0];
+        raw.set_components.insert(first_set, Vec::new());
+        assert!(validate_factor_completeness(&raw, &provider_sets).is_err());
+    }
+
+    #[test]
+    fn heavy_prefix_and_online_work_boundaries_are_exact() {
+        let dense = (100..612).collect::<Vec<_>>();
+        let options = ProviderGraphV4Options {
+            member_page_bytes: 64,
+            locator_page_bytes: 48,
+            heavy_owner_member_threshold: 1,
+            heavy_bitmap_minimum_savings_bytes: 0,
+            ..ProviderGraphV4Options::default()
+        };
+        let plan = maybe_heavy_bitmap("group_npis_exact", 0, &dense, &options)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            heavy_prefix_fragment_count(plan, &dense, 0, options.member_page_bytes).unwrap(),
+            0
+        );
+        assert!(
+            heavy_prefix_fragment_count(plan, &dense, 1, HEAVY_BITMAP_FRAGMENT_HEADER_BYTES)
+                .is_err()
+        );
+        assert_eq!(
+            heavy_prefix_fragment_count(plan, &dense, 1, options.member_page_bytes).unwrap(),
+            1
+        );
+        assert!(
+            heavy_prefix_fragment_count(plan, &dense, dense.len(), options.member_page_bytes)
+                .unwrap()
+                > 1
+        );
+
+        let group_npis = vec![dense.clone(), Vec::new()];
+        let physical = group_npi_physical_layout(&group_npis, &options).unwrap();
+        let work = group_npi_batch_work(
+            &[0, 1],
+            &group_npis,
+            &physical,
+            16,
+            options.member_page_bytes,
+        )
+        .unwrap();
+        assert_eq!(work.relation_members, 16);
+        assert_eq!(work.locator_pages, 1);
+        assert!(work.member_pages > 0);
+        assert_eq!(work.batches, 1);
+
+        let empty = ordered_npi_prefix_for_sources(
+            &[],
+            &[],
+            &[],
+            &group_npi_physical_layout(&[], &options).unwrap(),
+            &options,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(empty.members.is_empty());
+        assert!(empty.source_exhausted);
+
+        let source_groups = vec![vec![0, 1], vec![0, 2], Vec::new()];
+        let group_npis = vec![Vec::new(), vec![1], vec![2]];
+        let physical = group_npi_physical_layout(&group_npis, &options).unwrap();
+        let merged = ordered_npi_prefix_for_sources(
+            &[0, 1, 2],
+            &source_groups,
+            &group_npis,
+            &physical,
+            &options,
+            2,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(merged.members, vec![1, 2]);
+        assert_eq!(merged.unique_groups_visited, 3);
+        assert!(merged.source_exhausted);
+        assert!(merged.source_members_visited > merged.unique_groups_visited as u64);
+
+        let bounded = ordered_npi_prefix_for_sources(
+            &[0],
+            &source_groups,
+            &group_npis,
+            &physical,
+            &options,
+            2,
+            0,
+        )
+        .unwrap();
+        assert!(!bounded.source_exhausted);
+        assert!(bounded.members.is_empty());
+
+        assert_eq!(nearest_rank(&[], 95), 0);
+        assert_eq!(nearest_rank(&[1, 2, 3, 4], 50), 2);
+        assert_eq!(pages_for_member_range(4, 0, 4), 0);
+        assert_eq!(pages_for_member_range(3, 2, 4), 2);
+        assert_eq!(
+            pages_for_owner_prefixes(&[0, 1], &[Vec::new(), vec![1]], &[0, 0, 1], 1, 1),
+            1
+        );
+        assert_eq!(locator_pages_for_owners(&[0, 1, 4, 5], 4), 2);
+
+        for work in [
+            OnlineGroupNpiWork {
+                relation_members: 1,
+                ..OnlineGroupNpiWork::default()
+            },
+            OnlineGroupNpiWork {
+                locator_pages: 1,
+                ..OnlineGroupNpiWork::default()
+            },
+            OnlineGroupNpiWork {
+                member_pages: 1,
+                ..OnlineGroupNpiWork::default()
+            },
+            OnlineGroupNpiWork {
+                relation_bytes: 1,
+                ..OnlineGroupNpiWork::default()
+            },
+            OnlineGroupNpiWork {
+                batches: 1,
+                ..OnlineGroupNpiWork::default()
+            },
+        ] {
+            let zero_limits = ProviderGraphV4Options {
+                max_online_group_npi_members_per_set: 0,
+                max_online_group_npi_locator_pages_per_set: 0,
+                max_online_group_npi_member_pages_per_set: 0,
+                max_online_group_npi_bytes_per_set: 0,
+                max_online_group_npi_batches_per_set: 0,
+                ..ProviderGraphV4Options::default()
+            };
+            assert!(group_npi_work_exceeds_limits(work, &zero_limits));
+        }
+    }
+
+    #[test]
+    fn override_caps_manifest_and_direct_heavy_relations_are_exercised() {
+        let set_components = vec![vec![0]];
+        let component_groups = vec![vec![0]];
+        let set_patterns = vec![vec![0]];
+        let pattern_groups = vec![vec![0]];
+        let group_npis = vec![vec![0]];
+
+        for options in [
+            ProviderGraphV4Options {
+                max_online_group_keys_per_set: 0,
+                max_npi_prefix_override_owners: 0,
+                ..ProviderGraphV4Options::default()
+            },
+            ProviderGraphV4Options {
+                max_online_group_keys_per_set: 0,
+                max_npi_prefix_override_bytes: 1,
+                ..ProviderGraphV4Options::default()
+            },
+        ] {
+            let mut admission = blank_admission(None);
+            assert!(derive_npi_prefix_overrides(
+                NpiPrefixInputs {
+                    set_base: 0,
+                    set_components: &set_components,
+                    component_groups: &component_groups,
+                    set_patterns: &set_patterns,
+                    pattern_groups: &pattern_groups,
+                    group_npis: &group_npis,
+                },
+                &options,
+                &mut admission,
+            )
+            .is_err());
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let mut cas = CasBlockWriter::create(
+            &temporary.path().join("ordered.copy"),
+            &temporary.path().join("ordered.jsonl"),
+        )
+        .unwrap();
+        let mut emitter = RelationEmitter::new(
+            "ordered_coverage",
+            0,
+            1,
+            &mut cas,
+            &ProviderGraphV4Options::default(),
+        )
+        .unwrap();
+        assert!(emitter.push_ordered_owner(&[1, 1]).is_err());
+
+        let fixture = shared_pattern_fixture(1, 512);
+        let options = ProviderGraphV4Options {
+            member_page_bytes: 64,
+            heavy_owner_member_threshold: 1,
+            heavy_bitmap_minimum_savings_bytes: 0,
+            ..ProviderGraphV4Options::default()
+        };
+        let summary = compile_provider_graph_v4_manifest(ProviderGraphV4Manifest {
+            shards: vec![fixture.shard.clone()],
+            provider_set_key_map_path: fixture.provider_map.clone(),
+            output_directory: fixture.output.clone(),
+            options,
+        })
+        .unwrap();
+        assert_eq!(summary.selected_layout, ProviderGraphV4Layout::Direct);
+        assert!(summary
+            .heavy_bitmaps
+            .iter()
+            .any(|bitmap| bitmap.relation == "group_sets_direct"));
+    }
 }

@@ -78,6 +78,7 @@ async def _reference_snapshot_record(
                binding.snapshot_key,
                layout.state AS layout_state,
                layout.generation AS layout_generation,
+               layout.logical_byte_count AS layout_logical_byte_count,
                (
                    SELECT COUNT(*)::bigint
                      FROM {schema}.ptg2_v3_snapshot_block AS locator

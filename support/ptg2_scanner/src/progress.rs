@@ -26,6 +26,13 @@ pub struct ScannerSemanticSnapshot {
     pub provider_npi_union_visits: u64,
     pub rate_chunks_completed: u64,
     pub in_network_objects_completed: u64,
+    pub scan_finalize_jobs_started: u64,
+    pub scan_finalize_jobs_completed: u64,
+    pub scan_finalize_bytes_processed: u64,
+    pub scan_finalize_pairs_processed: u64,
+    pub scan_finalize_chunks_sorted: u64,
+    pub scan_finalize_chunks_merged: u64,
+    pub scan_finalize_sort_comparisons: u64,
 }
 
 impl ScannerSemanticSnapshot {
@@ -43,6 +50,13 @@ pub struct ScannerSemanticProgress {
     provider_npi_union_visits: AtomicU64,
     rate_chunks_completed: AtomicU64,
     in_network_objects_completed: AtomicU64,
+    scan_finalize_jobs_started: AtomicU64,
+    scan_finalize_jobs_completed: AtomicU64,
+    scan_finalize_bytes_processed: AtomicU64,
+    scan_finalize_pairs_processed: AtomicU64,
+    scan_finalize_chunks_sorted: AtomicU64,
+    scan_finalize_chunks_merged: AtomicU64,
+    scan_finalize_sort_comparisons: AtomicU64,
 }
 
 impl ScannerSemanticProgress {
@@ -106,6 +120,53 @@ impl ScannerSemanticProgress {
         self.record_work(amount);
     }
 
+    pub fn record_scan_finalize_job_started(&self) {
+        self.scan_finalize_jobs_started
+            .fetch_add(1, Ordering::AcqRel);
+        self.record_work(1);
+    }
+
+    pub fn record_scan_finalize_job_completed(&self) {
+        self.scan_finalize_jobs_completed
+            .fetch_add(1, Ordering::AcqRel);
+        self.record_work(1);
+    }
+
+    pub fn record_scan_finalize_work(
+        &self,
+        bytes_processed: u64,
+        pairs_processed: u64,
+        chunks_sorted: u64,
+        chunks_merged: u64,
+    ) {
+        if bytes_processed == 0 && pairs_processed == 0 && chunks_sorted == 0 && chunks_merged == 0
+        {
+            return;
+        }
+        self.scan_finalize_bytes_processed
+            .fetch_add(bytes_processed, Ordering::AcqRel);
+        self.scan_finalize_pairs_processed
+            .fetch_add(pairs_processed, Ordering::AcqRel);
+        self.scan_finalize_chunks_sorted
+            .fetch_add(chunks_sorted, Ordering::AcqRel);
+        self.scan_finalize_chunks_merged
+            .fetch_add(chunks_merged, Ordering::AcqRel);
+        let semantic_units = pairs_processed
+            .saturating_add(chunks_sorted)
+            .saturating_add(chunks_merged)
+            .max(1);
+        self.record_work(semantic_units);
+    }
+
+    pub fn record_scan_finalize_sort_comparisons(&self, comparisons: u64) {
+        if comparisons == 0 {
+            return;
+        }
+        self.scan_finalize_sort_comparisons
+            .fetch_add(comparisons, Ordering::AcqRel);
+        self.record_work(comparisons);
+    }
+
     pub fn snapshot(&self) -> ScannerSemanticSnapshot {
         ScannerSemanticSnapshot {
             semantic_work_completed: self.semantic_work_completed.load(Ordering::Acquire),
@@ -117,6 +178,19 @@ impl ScannerSemanticProgress {
             provider_npi_union_visits: self.provider_npi_union_visits.load(Ordering::Acquire),
             rate_chunks_completed: self.rate_chunks_completed.load(Ordering::Acquire),
             in_network_objects_completed: self.in_network_objects_completed.load(Ordering::Acquire),
+            scan_finalize_jobs_started: self.scan_finalize_jobs_started.load(Ordering::Acquire),
+            scan_finalize_jobs_completed: self.scan_finalize_jobs_completed.load(Ordering::Acquire),
+            scan_finalize_bytes_processed: self
+                .scan_finalize_bytes_processed
+                .load(Ordering::Acquire),
+            scan_finalize_pairs_processed: self
+                .scan_finalize_pairs_processed
+                .load(Ordering::Acquire),
+            scan_finalize_chunks_sorted: self.scan_finalize_chunks_sorted.load(Ordering::Acquire),
+            scan_finalize_chunks_merged: self.scan_finalize_chunks_merged.load(Ordering::Acquire),
+            scan_finalize_sort_comparisons: self
+                .scan_finalize_sort_comparisons
+                .load(Ordering::Acquire),
         }
     }
 }
@@ -219,9 +293,15 @@ fn semantic_progress_line(
     let negotiated_rates = snapshot
         .negotiated_rates_parsed
         .max(snapshot.negotiated_rates_transform_started);
+    let phase = if snapshot.scan_finalize_jobs_started > 0 {
+        "scan-finalize"
+    } else {
+        "scan"
+    };
     format!(
-        "PTG2_SCANNER_PROGRESS\tpath={}\tprogress_basis=semantic_work\tsemantic_work_completed={}\tcompressed_bytes={}\ttotal_bytes={}\tpercent={:.2}\tcompressed_mib_s={:.2}\telapsed_seconds={:.0}\teta_seconds=unknown\tobjects={}\tnegotiated_rates={}\tnegotiated_rates_parsed={}\tnegotiated_rates_transform_started={}\tprovider_group_union_visits={}\tprovider_npi_union_visits={}\trate_chunks_completed={}\tin_network={}\tdone=false",
+        "PTG2_SCANNER_PROGRESS\tpath={}\tphase={}\tprogress_basis=semantic_work\tsemantic_work_completed={}\tcompressed_bytes={}\ttotal_bytes={}\tpercent={:.2}\tcompressed_mib_s={:.2}\telapsed_seconds={:.0}\teta_seconds=unknown\tobjects={}\tnegotiated_rates={}\tnegotiated_rates_parsed={}\tnegotiated_rates_transform_started={}\tprovider_group_union_visits={}\tprovider_npi_union_visits={}\trate_chunks_completed={}\tin_network={}\tscan_finalize_jobs_started={}\tscan_finalize_jobs_completed={}\tscan_finalize_bytes_processed={}\tscan_finalize_pairs_processed={}\tscan_finalize_chunks_sorted={}\tscan_finalize_chunks_merged={}\tscan_finalize_sort_comparisons={}\tdone=false",
         path.display(),
+        phase,
         snapshot.semantic_work_completed,
         bytes_read,
         total_bytes,
@@ -236,6 +316,13 @@ fn semantic_progress_line(
         snapshot.provider_npi_union_visits,
         snapshot.rate_chunks_completed,
         snapshot.in_network_objects_completed,
+        snapshot.scan_finalize_jobs_started,
+        snapshot.scan_finalize_jobs_completed,
+        snapshot.scan_finalize_bytes_processed,
+        snapshot.scan_finalize_pairs_processed,
+        snapshot.scan_finalize_chunks_sorted,
+        snapshot.scan_finalize_chunks_merged,
+        snapshot.scan_finalize_sort_comparisons,
     )
 }
 
@@ -296,6 +383,7 @@ mod tests {
 
     #[test]
     fn semantic_progress_interval_stays_inside_five_second_contract() {
+        assert!(SEMANTIC_PROGRESS_INTERVAL <= Duration::from_secs(4));
         assert!(SEMANTIC_PROGRESS_INTERVAL < MAX_SEMANTIC_PROGRESS_INTERVAL);
     }
 
@@ -350,5 +438,106 @@ mod tests {
         assert!(line.contains("semantic_work_completed=7"));
         assert!(line.contains("provider_group_union_visits=4"));
         assert!(line.ends_with("done=false"));
+    }
+
+    #[test]
+    fn scan_finalize_progress_emits_movement_and_not_heartbeat_frames() {
+        let progress = Arc::new(ScannerSemanticProgress::default());
+        let (stop_tx, stop_rx) = bounded(1);
+        let (frame_tx, frame_rx) = unbounded();
+        let reporter_progress = Arc::clone(&progress);
+        let reporter = thread::spawn(move || {
+            run_semantic_progress_reporter(
+                stop_rx,
+                Duration::from_millis(5),
+                reporter_progress,
+                |snapshot| frame_tx.send(snapshot).unwrap(),
+            );
+        });
+
+        progress.record_scan_finalize_job_started();
+        let started = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(started.scan_finalize_jobs_started, 1);
+        assert_eq!(started.scan_finalize_pairs_processed, 0);
+        assert!(frame_rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+        progress.record_scan_finalize_work(32 * 4_096, 4_096, 1, 0);
+        let sorting = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_ne!(sorting, started);
+        assert_eq!(sorting.scan_finalize_pairs_processed, 4_096);
+        assert_eq!(sorting.scan_finalize_chunks_sorted, 1);
+
+        progress.record_scan_finalize_work(32 * 4_096, 4_096, 0, 1);
+        progress.record_scan_finalize_job_completed();
+        let mut merged = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        while merged.scan_finalize_jobs_completed == 0 {
+            merged = frame_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert!(merged.scan_finalize_pairs_processed > sorting.scan_finalize_pairs_processed);
+        assert_eq!(merged.scan_finalize_chunks_merged, 1);
+        assert_eq!(merged.scan_finalize_jobs_completed, 1);
+
+        stop_tx.send(()).unwrap();
+        reporter.join().unwrap();
+    }
+
+    #[test]
+    fn scan_finalize_progress_frame_names_the_phase_and_counters() {
+        let compressed_bytes_read = Arc::new(AtomicU64::new(100));
+        let snapshot = ScannerSemanticSnapshot {
+            semantic_work_completed: 12,
+            scan_finalize_jobs_started: 2,
+            scan_finalize_jobs_completed: 1,
+            scan_finalize_bytes_processed: 4_096,
+            scan_finalize_pairs_processed: 128,
+            scan_finalize_chunks_sorted: 3,
+            scan_finalize_chunks_merged: 2,
+            scan_finalize_sort_comparisons: 512,
+            ..ScannerSemanticSnapshot::default()
+        };
+        let line = semantic_progress_line(
+            Path::new("/tmp/rates.json.gz"),
+            100,
+            &compressed_bytes_read,
+            snapshot,
+            Instant::now(),
+        );
+
+        assert!(line.contains("\tphase=scan-finalize\t"));
+        assert!(line.contains("\tscan_finalize_bytes_processed=4096\t"));
+        assert!(line.contains("\tscan_finalize_pairs_processed=128\t"));
+        assert!(line.contains("\tscan_finalize_chunks_sorted=3\t"));
+        assert!(line.contains("\tscan_finalize_chunks_merged=2\t"));
+        assert!(line.contains("\tscan_finalize_sort_comparisons=512\t"));
+    }
+
+    #[test]
+    fn zero_semantic_updates_are_noops() {
+        let progress = ScannerSemanticProgress::default();
+        let before = progress.snapshot();
+
+        progress.record_negotiated_rates_parsed(0);
+        progress.record_provider_group_union_visits(0);
+        progress.record_in_network_objects_completed(0);
+        progress.record_scan_finalize_work(0, 0, 0, 0);
+        progress.record_scan_finalize_sort_comparisons(0);
+
+        assert_eq!(progress.snapshot(), before);
+    }
+
+    #[test]
+    fn semantic_progress_frame_handles_zero_input_and_zero_elapsed_time() {
+        let compressed_bytes_read = Arc::new(AtomicU64::new(0));
+        let line = semantic_progress_line(
+            Path::new("/tmp/empty.json"),
+            0,
+            &compressed_bytes_read,
+            ScannerSemanticSnapshot::default(),
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        assert!(line.contains("\tphase=scan\t"));
+        assert!(line.contains("\tpercent=0.00\t"));
+        assert!(line.contains("\tcompressed_mib_s=0.00\t"));
     }
 }

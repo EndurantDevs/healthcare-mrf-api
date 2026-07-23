@@ -135,14 +135,18 @@ def owner_mode(owner_spec: Any) -> str:
 def validate_internal_evidence(
     evidence_by_field: Mapping[str, Any],
     snapshot_id: str,
+    *,
+    expected_image_identity: str,
 ) -> dict[str, Any]:
-    """Bind a successful internal production probe to the accepted snapshot."""
+    """Bind a successful internal probe to the accepted snapshot and image."""
 
     failures = list(evidence_by_field.get("failures") or [])
     if evidence_by_field.get("contract") != "ptg_v4_internal_owner_probe_v1":
         failures.append("internal worst-owner evidence contract is missing")
     if evidence_by_field.get("snapshot_id") != snapshot_id:
         failures.append("internal worst-owner snapshot differs from acceptance")
+    if evidence_by_field.get("image_identity") != expected_image_identity:
+        failures.append("internal worst-owner image differs from public evidence")
     for field_name in (
         "process_identity",
         "process_started_at",

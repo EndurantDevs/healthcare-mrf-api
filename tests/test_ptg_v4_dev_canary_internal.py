@@ -324,7 +324,32 @@ def test_internal_evidence_requires_complete_runtime_identity(
     validated = validate_internal_evidence(
         evidence_by_field,
         "snapshot-1",
+        expected_image_identity="sha256:runtime-image",
     )
 
     assert validated["passed"] is False
     assert any(missing_field in failure for failure in validated["failures"])
+
+
+def test_internal_evidence_must_match_public_probe_image() -> None:
+    evidence_by_field = {
+        "contract": internal.INTERNAL_OWNER_EVIDENCE_CONTRACT,
+        "snapshot_id": "snapshot-1",
+        "process_identity": "runtime-process",
+        "process_started_at": "2026-07-23T00:00:00Z",
+        "image_identity": "sha256:older-image",
+        "passed": True,
+        "failures": [],
+    }
+
+    validated = validate_internal_evidence(
+        evidence_by_field,
+        "snapshot-1",
+        expected_image_identity="sha256:accepted-image",
+    )
+
+    assert validated["passed"] is False
+    assert (
+        "internal worst-owner image differs from public evidence"
+        in validated["failures"]
+    )

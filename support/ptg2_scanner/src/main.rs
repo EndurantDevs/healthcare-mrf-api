@@ -80,7 +80,7 @@ use ptg2_scanner::v3_runs::{
 };
 use rayon::prelude::*;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, value::RawValue, Map, Value};
 use sha2::{Digest, Sha256};
 use source_witness::{RateOccurrenceWitnessInput, SourceWitnessCollector, SourceWitnessCoordinate};
 use source_witness_spool::ProviderSourceLocator;
@@ -493,20 +493,42 @@ impl<'a> ProviderEntryView<'a> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct RateLite {
     provider_refs: Vec<ProviderRefKey>,
     provider_groups: Vec<Value>,
+    provider_groups_raw: Option<Box<RawValue>>,
     network_names: Vec<String>,
     prices: Vec<PriceLite>,
     prepared_price_set: Option<PriceSetLite>,
 }
+
+impl PartialEq for RateLite {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider_refs == other.provider_refs
+            && self.provider_groups == other.provider_groups
+            && self.provider_groups_raw.as_deref().map(RawValue::get)
+                == other.provider_groups_raw.as_deref().map(RawValue::get)
+            && self.network_names == other.network_names
+            && self.prices == other.prices
+            && self.prepared_price_set == other.prepared_price_set
+    }
+}
+
+impl Eq for RateLite {}
 
 impl RateLite {
     fn price_count(&self) -> usize {
         self.prepared_price_set
             .as_ref()
             .map_or(self.prices.len(), |price_set| price_set.atoms.len())
+    }
+
+    fn has_inline_provider_groups(&self) -> bool {
+        self.provider_groups_raw
+            .as_deref()
+            .is_some_and(|raw| !raw_provider_groups_is_empty(raw))
+            || !self.provider_groups.is_empty()
     }
 }
 
@@ -534,6 +556,52 @@ struct RateLiteWire {
     network_name: StringOrStrings,
     #[serde(default)]
     network_names: StringOrStrings,
+}
+
+#[derive(Deserialize)]
+struct V4RateLiteWire {
+    #[serde(default)]
+    provider_references: Vec<serde_json::Number>,
+    #[serde(default)]
+    provider_groups: Option<Box<RawValue>>,
+    #[serde(default)]
+    negotiated_prices: Vec<PriceLiteWire>,
+    #[serde(default)]
+    network_name: StringOrStrings,
+    #[serde(default)]
+    network_names: StringOrStrings,
+}
+
+fn raw_provider_groups_is_empty(raw: &RawValue) -> bool {
+    let bytes = raw.get().as_bytes();
+    let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace());
+    let end = bytes.iter().rposition(|byte| !byte.is_ascii_whitespace());
+    matches!(
+        (start, end),
+        (Some(start), Some(end))
+            if bytes[start] == b'['
+                && bytes[end] == b']'
+                && bytes[start + 1..end].iter().all(u8::is_ascii_whitespace)
+    )
+}
+
+fn validate_raw_provider_groups_array(raw: &RawValue) -> io::Result<bool> {
+    let bytes = raw.get().as_bytes();
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "provider_groups is empty"))?;
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .expect("nonempty JSON has a final byte");
+    if bytes[start] != b'[' || bytes[end] != b']' {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider_groups must be a JSON array",
+        ));
+    }
+    Ok(!bytes[start + 1..end].iter().all(u8::is_ascii_whitespace))
 }
 
 #[derive(Deserialize)]
@@ -1777,6 +1845,76 @@ struct ManifestPairSpool {
 
 const MANIFEST_PAIR_RECORD_BYTES: usize = GLOBAL_ID_BYTES * 2;
 const DEFAULT_MANIFEST_PAIR_SORT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+const MANIFEST_FINALIZE_PROGRESS_PAIR_BATCH: u64 = 4_096;
+const MANIFEST_FINALIZE_PROGRESS_COMPARISON_BATCH: u64 = 1_048_576;
+
+struct ManifestFinalizeProgress {
+    semantic_progress: Option<Arc<ScannerSemanticProgress>>,
+    pending_bytes: u64,
+    pending_pairs: u64,
+}
+
+impl ManifestFinalizeProgress {
+    fn new(semantic_progress: Option<Arc<ScannerSemanticProgress>>) -> Self {
+        Self {
+            semantic_progress,
+            pending_bytes: 0,
+            pending_pairs: 0,
+        }
+    }
+
+    fn record(&mut self, bytes_processed: u64, pairs_processed: u64) {
+        if self.semantic_progress.is_none() {
+            return;
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes_processed);
+        self.pending_pairs = self.pending_pairs.saturating_add(pairs_processed);
+        let byte_batch = MANIFEST_FINALIZE_PROGRESS_PAIR_BATCH * MANIFEST_PAIR_RECORD_BYTES as u64;
+        if self.pending_pairs >= MANIFEST_FINALIZE_PROGRESS_PAIR_BATCH
+            || self.pending_bytes >= byte_batch
+        {
+            self.flush();
+        }
+    }
+
+    fn record_chunk_sorted(&mut self) {
+        self.flush();
+        if let Some(progress) = self.semantic_progress.as_ref() {
+            progress.record_scan_finalize_work(0, 0, 1, 0);
+        }
+    }
+
+    fn record_chunk_merged(&mut self) {
+        self.flush();
+        if let Some(progress) = self.semantic_progress.as_ref() {
+            progress.record_scan_finalize_work(0, 0, 0, 1);
+        }
+    }
+
+    fn record_sort_comparisons(&mut self, comparisons: u64) {
+        self.flush();
+        if let Some(progress) = self.semantic_progress.as_ref() {
+            progress.record_scan_finalize_sort_comparisons(comparisons);
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending_bytes == 0 && self.pending_pairs == 0 {
+            return;
+        }
+        if let Some(progress) = self.semantic_progress.as_ref() {
+            progress.record_scan_finalize_work(self.pending_bytes, self.pending_pairs, 0, 0);
+        }
+        self.pending_bytes = 0;
+        self.pending_pairs = 0;
+    }
+}
+
+impl Drop for ManifestFinalizeProgress {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
 
 impl ManifestPairSpool {
     fn new(kind: &str) -> io::Result<Self> {
@@ -1876,30 +2014,65 @@ impl ManifestPairSpool {
     }
 
     fn write_dense_sidecar(&mut self, path: &str) -> io::Result<(u64, u64)> {
+        self.write_dense_sidecar_with_progress(path, None)
+    }
+
+    fn write_dense_sidecar_with_progress(
+        &mut self,
+        path: &str,
+        semantic_progress: Option<Arc<ScannerSemanticProgress>>,
+    ) -> io::Result<(u64, u64)> {
         let chunk_bytes = env_usize(
             "HLTHPRT_PTG2_MANIFEST_SIDECAR_SORT_CHUNK_BYTES",
             DEFAULT_MANIFEST_PAIR_SORT_CHUNK_BYTES,
         )
         .max(MANIFEST_PAIR_RECORD_BYTES);
-        self.write_dense_sidecar_with_chunk_bytes(path, chunk_bytes)
+        self.write_dense_sidecar_with_chunk_bytes_and_progress(path, chunk_bytes, semantic_progress)
     }
 
+    #[cfg(test)]
     fn write_dense_sidecar_with_chunk_bytes(
         &mut self,
         path: &str,
         chunk_bytes: usize,
     ) -> io::Result<(u64, u64)> {
+        self.write_dense_sidecar_with_chunk_bytes_and_progress(path, chunk_bytes, None)
+    }
+
+    fn write_dense_sidecar_with_chunk_bytes_and_progress(
+        &mut self,
+        path: &str,
+        chunk_bytes: usize,
+        semantic_progress: Option<Arc<ScannerSemanticProgress>>,
+    ) -> io::Result<(u64, u64)> {
+        if let Some(progress) = semantic_progress.as_ref() {
+            progress.record_scan_finalize_job_started();
+        }
+        let completion_progress = semantic_progress.clone();
+        let mut finalize_progress = ManifestFinalizeProgress::new(semantic_progress);
         let spool_bytes = self
             .row_count
             .saturating_mul(MANIFEST_PAIR_RECORD_BYTES as u64);
-        if spool_bytes <= chunk_bytes as u64 {
-            return self.write_dense_sidecar_in_memory(path);
+        let result = if spool_bytes <= chunk_bytes as u64 {
+            self.write_dense_sidecar_in_memory(path, &mut finalize_progress)
+        } else {
+            self.write_dense_sidecar_external(path, chunk_bytes, &mut finalize_progress)
+        };
+        finalize_progress.flush();
+        if result.is_ok() {
+            if let Some(progress) = completion_progress {
+                progress.record_scan_finalize_job_completed();
+            }
         }
-        self.write_dense_sidecar_external(path, chunk_bytes)
+        result
     }
 
-    fn write_dense_sidecar_in_memory(&mut self, path: &str) -> io::Result<(u64, u64)> {
-        let pairs = self.sorted_unique_pairs()?;
+    fn write_dense_sidecar_in_memory(
+        &mut self,
+        path: &str,
+        finalize_progress: &mut ManifestFinalizeProgress,
+    ) -> io::Result<(u64, u64)> {
+        let pairs = self.sorted_unique_pairs_with_progress(finalize_progress)?;
         let entry_count = count_pair_owners(&pairs);
         let member_count = pairs.len() as u64;
         let mut member_ids: Vec<[u8; GLOBAL_ID_BYTES]> = pairs
@@ -1910,8 +2083,8 @@ impl ManifestPairSpool {
                 member
             })
             .collect();
-        member_ids.sort_unstable();
-        member_ids.dedup();
+        sort_manifest_member_ids_with_progress(&mut member_ids, finalize_progress);
+        dedup_manifest_member_ids_with_progress(&mut member_ids, finalize_progress);
 
         ensure_manifest_sidecar_parent(path)?;
         let file = OpenOptions::new()
@@ -1924,6 +2097,7 @@ impl ManifestPairSpool {
         writer.write_all(&1u32.to_le_bytes())?;
         writer.write_all(&entry_count.to_le_bytes())?;
         writer.write_all(&(member_ids.len() as u64).to_le_bytes())?;
+        finalize_progress.record(28, 0);
 
         let mut offset = 0u64;
         let mut index = 0usize;
@@ -1939,9 +2113,11 @@ impl ManifestPairSpool {
             writer.write_all(&offset.to_le_bytes())?;
             writer.write_all(&count.to_le_bytes())?;
             offset = offset.saturating_add(u64::from(count));
+            finalize_progress.record(28, count as u64);
         }
         for member_id in &member_ids {
             writer.write_all(member_id)?;
+            finalize_progress.record(GLOBAL_ID_BYTES as u64, 0);
         }
         for pair in &pairs {
             let mut member = [0u8; GLOBAL_ID_BYTES];
@@ -1953,6 +2129,7 @@ impl ManifestPairSpool {
                 )
             })? as u32;
             writer.write_all(&local_id.to_le_bytes())?;
+            finalize_progress.record(u32::BITS as u64 / 8, 1);
         }
         writer.flush()?;
         Ok((entry_count, member_count))
@@ -1962,21 +2139,29 @@ impl ManifestPairSpool {
         &mut self,
         path: &str,
         chunk_bytes: usize,
+        finalize_progress: &mut ManifestFinalizeProgress,
     ) -> io::Result<(u64, u64)> {
         self.writer.flush()?;
         let mut temporary_files = ManifestPairTemporaryFiles::default();
-        let chunk_paths = self.write_sorted_pair_chunks(chunk_bytes, &mut temporary_files)?;
-        let merged = merge_sorted_pair_chunks(&self.path, &chunk_paths, &mut temporary_files)?;
+        let chunk_paths =
+            self.write_sorted_pair_chunks(chunk_bytes, &mut temporary_files, finalize_progress)?;
+        let merged = merge_sorted_pair_chunks(
+            &self.path,
+            &chunk_paths,
+            &mut temporary_files,
+            finalize_progress,
+        )?;
         for chunk_path in &chunk_paths {
             let _ = std::fs::remove_file(chunk_path);
         }
-        write_dense_sidecar_from_sorted_pairs(path, &merged)
+        write_dense_sidecar_from_sorted_pairs(path, &merged, finalize_progress)
     }
 
     fn write_sorted_pair_chunks(
         &self,
         chunk_bytes: usize,
         temporary_files: &mut ManifestPairTemporaryFiles,
+        finalize_progress: &mut ManifestFinalizeProgress,
     ) -> io::Result<Vec<PathBuf>> {
         let records_per_chunk = (chunk_bytes / MANIFEST_PAIR_RECORD_BYTES).max(1);
         let mut reader = BufReader::new(File::open(&self.path)?);
@@ -1988,17 +2173,20 @@ impl ManifestPairSpool {
                     break;
                 };
                 pairs.push(pair);
+                finalize_progress.record(MANIFEST_PAIR_RECORD_BYTES as u64, 1);
             }
             if pairs.is_empty() {
                 break;
             }
-            pairs.sort_unstable();
-            pairs.dedup();
+            sort_manifest_pairs_with_progress(&mut pairs, finalize_progress);
+            dedup_manifest_pairs_with_progress(&mut pairs, finalize_progress);
+            finalize_progress.record_chunk_sorted();
             let chunk_path =
                 manifest_pair_temporary_path(&self.path, "sorted-chunk", chunk_paths.len());
             let mut writer = BufWriter::new(File::create(&chunk_path)?);
             for pair in pairs {
                 writer.write_all(&pair)?;
+                finalize_progress.record(MANIFEST_PAIR_RECORD_BYTES as u64, 1);
             }
             writer.flush()?;
             temporary_files.track(chunk_path.clone());
@@ -2008,6 +2196,14 @@ impl ManifestPairSpool {
     }
 
     fn sorted_unique_pairs(&mut self) -> io::Result<Vec<[u8; GLOBAL_ID_BYTES * 2]>> {
+        let mut finalize_progress = ManifestFinalizeProgress::new(None);
+        self.sorted_unique_pairs_with_progress(&mut finalize_progress)
+    }
+
+    fn sorted_unique_pairs_with_progress(
+        &mut self,
+        finalize_progress: &mut ManifestFinalizeProgress,
+    ) -> io::Result<Vec<[u8; GLOBAL_ID_BYTES * 2]>> {
         self.writer.flush()?;
         let file = File::open(&self.path)?;
         let mut reader = BufReader::new(file);
@@ -2016,13 +2212,17 @@ impl ManifestPairSpool {
         loop {
             let mut pair = [0u8; GLOBAL_ID_BYTES * 2];
             match reader.read_exact(&mut pair) {
-                Ok(()) => pairs.push(pair),
+                Ok(()) => {
+                    pairs.push(pair);
+                    finalize_progress.record(MANIFEST_PAIR_RECORD_BYTES as u64, 1);
+                }
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
         }
-        pairs.sort_unstable();
-        pairs.dedup();
+        sort_manifest_pairs_with_progress(&mut pairs, finalize_progress);
+        dedup_manifest_pairs_with_progress(&mut pairs, finalize_progress);
+        finalize_progress.record_chunk_sorted();
         Ok(pairs)
     }
 }
@@ -2109,10 +2309,105 @@ fn read_manifest_pair<R: Read>(
     Ok(Some(pair))
 }
 
+fn record_manifest_pair_comparisons(
+    finalize_progress: &mut ManifestFinalizeProgress,
+    comparisons: u64,
+) {
+    finalize_progress.record_sort_comparisons(comparisons);
+}
+
+fn sort_manifest_pairs_with_progress(
+    pairs: &mut [[u8; MANIFEST_PAIR_RECORD_BYTES]],
+    finalize_progress: &mut ManifestFinalizeProgress,
+) {
+    if finalize_progress.semantic_progress.is_none() {
+        pairs.sort_unstable();
+        return;
+    }
+    let mut comparisons = 0u64;
+    pairs.sort_unstable_by(|left, right| {
+        comparisons += 1;
+        if comparisons >= MANIFEST_FINALIZE_PROGRESS_COMPARISON_BATCH {
+            record_manifest_pair_comparisons(finalize_progress, comparisons);
+            comparisons = 0;
+        }
+        left.cmp(right)
+    });
+    record_manifest_pair_comparisons(finalize_progress, comparisons);
+}
+
+fn dedup_manifest_pairs_with_progress(
+    pairs: &mut Vec<[u8; MANIFEST_PAIR_RECORD_BYTES]>,
+    finalize_progress: &mut ManifestFinalizeProgress,
+) {
+    if finalize_progress.semantic_progress.is_none() {
+        pairs.dedup();
+        return;
+    }
+    let mut comparisons = 0u64;
+    pairs.dedup_by(|left, right| {
+        comparisons += 1;
+        if comparisons >= MANIFEST_FINALIZE_PROGRESS_COMPARISON_BATCH {
+            record_manifest_pair_comparisons(finalize_progress, comparisons);
+            comparisons = 0;
+        }
+        left == right
+    });
+    record_manifest_pair_comparisons(finalize_progress, comparisons);
+}
+
+fn record_manifest_member_comparisons(
+    finalize_progress: &mut ManifestFinalizeProgress,
+    comparisons: u64,
+) {
+    finalize_progress.record_sort_comparisons(comparisons);
+}
+
+fn sort_manifest_member_ids_with_progress(
+    member_ids: &mut [[u8; GLOBAL_ID_BYTES]],
+    finalize_progress: &mut ManifestFinalizeProgress,
+) {
+    if finalize_progress.semantic_progress.is_none() {
+        member_ids.sort_unstable();
+        return;
+    }
+    let mut comparisons = 0u64;
+    member_ids.sort_unstable_by(|left, right| {
+        comparisons += 1;
+        if comparisons >= MANIFEST_FINALIZE_PROGRESS_COMPARISON_BATCH {
+            record_manifest_member_comparisons(finalize_progress, comparisons);
+            comparisons = 0;
+        }
+        left.cmp(right)
+    });
+    record_manifest_member_comparisons(finalize_progress, comparisons);
+}
+
+fn dedup_manifest_member_ids_with_progress(
+    member_ids: &mut Vec<[u8; GLOBAL_ID_BYTES]>,
+    finalize_progress: &mut ManifestFinalizeProgress,
+) {
+    if finalize_progress.semantic_progress.is_none() {
+        member_ids.dedup();
+        return;
+    }
+    let mut comparisons = 0u64;
+    member_ids.dedup_by(|left, right| {
+        comparisons += 1;
+        if comparisons >= MANIFEST_FINALIZE_PROGRESS_COMPARISON_BATCH {
+            record_manifest_member_comparisons(finalize_progress, comparisons);
+            comparisons = 0;
+        }
+        left == right
+    });
+    record_manifest_member_comparisons(finalize_progress, comparisons);
+}
+
 fn merge_sorted_pair_chunks(
     source_path: &Path,
     chunk_paths: &[PathBuf],
     temporary_files: &mut ManifestPairTemporaryFiles,
+    finalize_progress: &mut ManifestFinalizeProgress,
 ) -> io::Result<MergedManifestPairs> {
     let merged_path = manifest_pair_temporary_path(source_path, "sorted-unique", 0);
     let mut output = BufWriter::new(File::create(&merged_path)?);
@@ -2124,7 +2419,10 @@ fn merge_sorted_pair_chunks(
     let mut heap = BinaryHeap::new();
     for (reader_index, reader) in readers.iter_mut().enumerate() {
         if let Some(pair) = read_manifest_pair(reader)? {
+            finalize_progress.record(MANIFEST_PAIR_RECORD_BYTES as u64, 1);
             heap.push(ManifestPairMergeItem { pair, reader_index });
+        } else {
+            finalize_progress.record_chunk_merged();
         }
     }
 
@@ -2145,19 +2443,23 @@ fn merge_sorted_pair_chunks(
             member.copy_from_slice(&item.pair[GLOBAL_ID_BYTES..]);
             member_ids.insert(member);
             output.write_all(&item.pair)?;
+            finalize_progress.record(MANIFEST_PAIR_RECORD_BYTES as u64, 1);
             member_count = member_count.saturating_add(1);
             previous_pair = Some(item.pair);
         }
         if let Some(pair) = read_manifest_pair(&mut readers[item.reader_index])? {
+            finalize_progress.record(MANIFEST_PAIR_RECORD_BYTES as u64, 1);
             heap.push(ManifestPairMergeItem {
                 pair,
                 reader_index: item.reader_index,
             });
+        } else {
+            finalize_progress.record_chunk_merged();
         }
     }
     output.flush()?;
     let mut member_ids: Vec<[u8; GLOBAL_ID_BYTES]> = member_ids.into_iter().collect();
-    member_ids.sort_unstable();
+    sort_manifest_member_ids_with_progress(&mut member_ids, finalize_progress);
     Ok(MergedManifestPairs {
         path: merged_path,
         entry_count,
@@ -2169,6 +2471,7 @@ fn merge_sorted_pair_chunks(
 fn write_dense_sidecar_from_sorted_pairs(
     output_path: &str,
     merged: &MergedManifestPairs,
+    finalize_progress: &mut ManifestFinalizeProgress,
 ) -> io::Result<(u64, u64)> {
     ensure_manifest_sidecar_parent(output_path)?;
     let file = OpenOptions::new()
@@ -2181,9 +2484,16 @@ fn write_dense_sidecar_from_sorted_pairs(
     writer.write_all(&1u32.to_le_bytes())?;
     writer.write_all(&merged.entry_count.to_le_bytes())?;
     writer.write_all(&(merged.member_ids.len() as u64).to_le_bytes())?;
-    write_dense_sidecar_owner_index(&mut writer, &merged.path, merged.entry_count)?;
+    finalize_progress.record(28, 0);
+    write_dense_sidecar_owner_index(
+        &mut writer,
+        &merged.path,
+        merged.entry_count,
+        finalize_progress,
+    )?;
     for member_id in &merged.member_ids {
         writer.write_all(member_id)?;
+        finalize_progress.record(GLOBAL_ID_BYTES as u64, 0);
     }
     let mut local_ids = HashMap::with_capacity(merged.member_ids.len());
     for (index, member_id) in merged.member_ids.iter().copied().enumerate() {
@@ -2194,9 +2504,11 @@ fn write_dense_sidecar_from_sorted_pairs(
             )
         })?;
         local_ids.insert(member_id, local_id);
+        finalize_progress.record(GLOBAL_ID_BYTES as u64, 0);
     }
     let mut reader = BufReader::new(File::open(&merged.path)?);
     while let Some(pair) = read_manifest_pair(&mut reader)? {
+        finalize_progress.record(MANIFEST_PAIR_RECORD_BYTES as u64, 1);
         let mut member = [0u8; GLOBAL_ID_BYTES];
         member.copy_from_slice(&pair[GLOBAL_ID_BYTES..]);
         let local_id = local_ids.get(&member).ok_or_else(|| {
@@ -2206,6 +2518,7 @@ fn write_dense_sidecar_from_sorted_pairs(
             )
         })?;
         writer.write_all(&local_id.to_le_bytes())?;
+        finalize_progress.record(u32::BITS as u64 / 8, 1);
     }
     writer.flush()?;
     Ok((merged.entry_count, merged.member_count))
@@ -2215,6 +2528,7 @@ fn write_dense_sidecar_owner_index<W: Write>(
     writer: &mut W,
     pair_path: &Path,
     expected_entry_count: u64,
+    finalize_progress: &mut ManifestFinalizeProgress,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(File::open(pair_path)?);
     let mut current_owner = None;
@@ -2222,6 +2536,7 @@ fn write_dense_sidecar_owner_index<W: Write>(
     let mut offset = 0u64;
     let mut written_entries = 0u64;
     while let Some(pair) = read_manifest_pair(&mut reader)? {
+        finalize_progress.record(MANIFEST_PAIR_RECORD_BYTES as u64, 1);
         let mut owner = [0u8; GLOBAL_ID_BYTES];
         owner.copy_from_slice(&pair[..GLOBAL_ID_BYTES]);
         if current_owner == Some(owner) {
@@ -2235,6 +2550,7 @@ fn write_dense_sidecar_owner_index<W: Write>(
         }
         if let Some(previous_owner) = current_owner.replace(owner) {
             write_dense_sidecar_owner(writer, &previous_owner, offset, current_count)?;
+            finalize_progress.record(28, u64::from(current_count));
             offset = offset.saturating_add(u64::from(current_count));
             written_entries = written_entries.saturating_add(1);
         }
@@ -2242,6 +2558,7 @@ fn write_dense_sidecar_owner_index<W: Write>(
     }
     if let Some(owner) = current_owner {
         write_dense_sidecar_owner(writer, &owner, offset, current_count)?;
+        finalize_progress.record(28, u64::from(current_count));
         written_entries = written_entries.saturating_add(1);
     }
     if written_entries != expected_entry_count {
@@ -2597,6 +2914,7 @@ struct ManifestSidecarWriteResult {
 fn configured_spooled_manifest_sidecars(
     paths: &CopyPathConfig,
     collector: &mut ManifestSidecarCollector,
+    semantic_progress: Option<Arc<ScannerSemanticProgress>>,
 ) -> io::Result<Option<Vec<ManifestSidecarWriteResult>>> {
     let Some(spools) = collector.spools.take() else {
         return Ok(None);
@@ -2661,7 +2979,7 @@ fn configured_spooled_manifest_sidecars(
     let worker_count = env_usize("HLTHPRT_PTG2_MANIFEST_SIDECAR_WRITE_WORKERS", 4)
         .max(1)
         .min(jobs.len().max(1));
-    write_manifest_sidecar_jobs(jobs, worker_count).map(Some)
+    write_manifest_sidecar_jobs(jobs, worker_count, semantic_progress).map(Some)
 }
 
 fn push_manifest_sidecar_write_job(
@@ -2693,6 +3011,7 @@ fn push_manifest_sidecar_write_job(
 fn write_manifest_sidecar_jobs(
     jobs: Vec<ManifestSidecarWriteJob>,
     worker_count: usize,
+    semantic_progress: Option<Arc<ScannerSemanticProgress>>,
 ) -> io::Result<Vec<ManifestSidecarWriteResult>> {
     let mut pending_jobs = jobs.into_iter();
     let mut results = Vec::new();
@@ -2705,12 +3024,16 @@ fn write_manifest_sidecar_jobs(
         if batch.len() == 1 {
             results.push(write_manifest_sidecar_job(
                 batch.into_iter().next().unwrap(),
+                semantic_progress.clone(),
             )?);
             continue;
         }
         let handles: Vec<_> = batch
             .into_iter()
-            .map(|job| thread::spawn(move || write_manifest_sidecar_job(job)))
+            .map(|job| {
+                let semantic_progress = semantic_progress.clone();
+                thread::spawn(move || write_manifest_sidecar_job(job, semantic_progress))
+            })
             .collect();
         let mut first_error = None;
         for handle in handles {
@@ -2737,11 +3060,14 @@ fn write_manifest_sidecar_jobs(
 
 fn write_manifest_sidecar_job(
     mut job: ManifestSidecarWriteJob,
+    semantic_progress: Option<Arc<ScannerSemanticProgress>>,
 ) -> io::Result<ManifestSidecarWriteResult> {
     ensure_manifest_sidecar_parent(&job.path)?;
     let spool_path = job.spool.path.display().to_string();
-    let (entry_count, _member_count) =
-        job.spool.write_dense_sidecar(&job.path).map_err(|error| {
+    let (entry_count, _member_count) = job
+        .spool
+        .write_dense_sidecar_with_progress(&job.path, semantic_progress)
+        .map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -2853,11 +3179,14 @@ fn emit_configured_manifest_sidecars<W: Write>(
     writer: &mut W,
     paths: &CopyPathConfig,
     collector: Option<&mut ManifestSidecarCollector>,
+    semantic_progress: Option<Arc<ScannerSemanticProgress>>,
 ) -> io::Result<()> {
     let Some(collector) = collector else {
         return Ok(());
     };
-    if let Some(results) = configured_spooled_manifest_sidecars(paths, collector)? {
+    if let Some(results) =
+        configured_spooled_manifest_sidecars(paths, collector, semantic_progress)?
+    {
         for result in results {
             emit_manifest_sidecar_path(
                 writer,
@@ -5049,12 +5378,13 @@ fn npi_source_coordinate(groups: &[Value], selected_npi: i64) -> Option<(usize, 
 
 fn linked_provider_source_evidence(
     rate: &RateLite,
+    inline_provider_groups: &[Value],
     provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     context: &CompactContext,
     selected_npi: i64,
 ) -> io::Result<(Value, Option<ProviderSourceLocator>, Option<[u8; 32]>)> {
     if let Some((group_ordinal, npi_ordinal)) =
-        npi_source_coordinate(&rate.provider_groups, selected_npi)
+        npi_source_coordinate(inline_provider_groups, selected_npi)
     {
         return Ok((
             json!({
@@ -5193,6 +5523,7 @@ impl EmittedProviderNpis<'_> {
 struct EmittedSourceRateWitnessInput<'a> {
     procedure: &'a Map<String, Value>,
     rate: &'a RateLite,
+    inline_provider_groups: &'a [Value],
     emitted_provider_npis: EmittedProviderNpis<'a>,
     emitted_price_count: usize,
     provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
@@ -5209,6 +5540,7 @@ fn capture_emitted_source_rate_occurrences(
     let EmittedSourceRateWitnessInput {
         procedure,
         rate,
+        inline_provider_groups,
         emitted_provider_npis,
         emitted_price_count,
         provider_map,
@@ -5255,7 +5587,13 @@ fn capture_emitted_source_rate_occurrences(
         let provider_ordinal = candidate.occurrence_index % provider_count;
         let selected_npi = emitted_provider_npis.nth(provider_ordinal, rate, provider_map)?;
         let (provider_evidence, linked_provider_locator, linked_provider_sha256) =
-            linked_provider_source_evidence(rate, provider_map, context, selected_npi)?;
+            linked_provider_source_evidence(
+                rate,
+                inline_provider_groups,
+                provider_map,
+                context,
+                selected_npi,
+            )?;
         context
             .source_witness
             .commit_rate_occurrence(RateOccurrenceWitnessInput {
@@ -5357,17 +5695,293 @@ struct V4ProviderSetFactorCacheEntry {
 
 const V4_PROVIDER_FACTOR_CACHE_SHARDS: usize = 64;
 const DEFAULT_V4_PROVIDER_FACTOR_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const V4_INLINE_PROVIDER_TRANSFORM_CACHE_SHARDS: usize = 16;
+const DEFAULT_V4_INLINE_PROVIDER_TRANSFORM_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V4InlineProviderTransformCacheKeyKind {
+    ExactRawJson,
+    ParsedCanonicalJson,
+}
+
+fn v4_inline_provider_transform_digest(
+    kind: V4InlineProviderTransformCacheKeyKind,
+    bytes: &[u8],
+) -> u64 {
+    let mut hasher = Xxh3::new();
+    hasher.update(b"ptg2_v4_inline_provider_groups_raw_v1");
+    hasher.update(&[match kind {
+        V4InlineProviderTransformCacheKeyKind::ExactRawJson => 1,
+        V4InlineProviderTransformCacheKeyKind::ParsedCanonicalJson => 2,
+    }]);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    hasher.digest()
+}
+
+#[derive(Debug)]
+struct V4InlineProviderTransform {
+    cache_key_kind: V4InlineProviderTransformCacheKeyKind,
+    cache_key: Arc<[u8]>,
+    provider_groups: Arc<[Value]>,
+    entry: ProviderEntry,
+    empty_npi_tin_only_normalization_count: u64,
+    provider_group_attempts: u64,
+}
+
+fn estimated_json_value_heap_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        Value::String(value) => value.capacity() as u64,
+        Value::Array(values) => {
+            (values.capacity() * std::mem::size_of::<Value>()) as u64
+                + values
+                    .iter()
+                    .map(estimated_json_value_heap_bytes)
+                    .sum::<u64>()
+        }
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                (std::mem::size_of::<String>() + std::mem::size_of::<Value>() + 64) as u64
+                    + key.capacity() as u64
+                    + estimated_json_value_heap_bytes(value)
+            })
+            .sum(),
+    }
+}
+
+fn estimated_v4_inline_provider_transform_bytes(transform: &V4InlineProviderTransform) -> u64 {
+    let network_name_bytes = transform
+        .entry
+        .network_names
+        .iter()
+        .map(|value| value.capacity() as u64)
+        .sum::<u64>();
+    (std::mem::size_of::<V4InlineProviderTransform>() as u64)
+        .saturating_add(transform.cache_key.len() as u64)
+        .saturating_add((transform.provider_groups.len() * std::mem::size_of::<Value>()) as u64)
+        .saturating_add(
+            transform
+                .provider_groups
+                .iter()
+                .map(estimated_json_value_heap_bytes)
+                .sum::<u64>(),
+        )
+        .saturating_add(
+            (transform.entry.provider_group_hashes.capacity() * std::mem::size_of::<i64>()) as u64,
+        )
+        .saturating_add((transform.entry.npi.capacity() * std::mem::size_of::<i64>()) as u64)
+        .saturating_add(
+            (transform.entry.quarantined_npi.capacity() * std::mem::size_of::<i64>()) as u64,
+        )
+        .saturating_add(
+            (transform.entry.network_names.capacity() * std::mem::size_of::<String>()) as u64,
+        )
+        .saturating_add(network_name_bytes)
+        // Conservatively cover the Arc, collision bucket, and HashMap entry.
+        .saturating_add(512)
+}
+
+#[derive(Default)]
+struct V4InlineProviderTransformCacheShard {
+    buckets: HashMap<u64, Vec<Arc<V4InlineProviderTransform>>>,
+    entry_count: u64,
+    estimated_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct V4InlineProviderTransformCacheSnapshot {
+    hits: u64,
+    misses: u64,
+    transforms: u64,
+    evictions: u64,
+    evicted_entries: u64,
+    bypasses: u64,
+    entries: u64,
+    estimated_bytes: u64,
+    peak_estimated_bytes: u64,
+    max_estimated_bytes: u64,
+}
+
+struct V4InlineProviderTransformSharedCache {
+    shards: Vec<Mutex<V4InlineProviderTransformCacheShard>>,
+    shard_max_estimated_bytes: Vec<u64>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    transforms: AtomicU64,
+    evictions: AtomicU64,
+    evicted_entries: AtomicU64,
+    bypasses: AtomicU64,
+    entry_count: AtomicU64,
+    estimated_bytes: AtomicU64,
+    peak_estimated_bytes: AtomicU64,
+    max_estimated_bytes: u64,
+}
+
+impl V4InlineProviderTransformSharedCache {
+    fn configured() -> io::Result<Self> {
+        let name = "HLTHPRT_PTG2_V4_INLINE_TRANSFORM_CACHE_MAX_BYTES";
+        let max_bytes = match env::var(name) {
+            Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a non-negative integer byte count"),
+                )
+            })?,
+            Err(env::VarError::NotPresent) => {
+                DEFAULT_V4_INLINE_PROVIDER_TRANSFORM_CACHE_MAX_BYTES as u64
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} is unreadable: {error}"),
+                ));
+            }
+        };
+        Ok(Self::new(max_bytes))
+    }
+
+    fn new(max_estimated_bytes: u64) -> Self {
+        Self::new_with_shards(
+            max_estimated_bytes,
+            V4_INLINE_PROVIDER_TRANSFORM_CACHE_SHARDS,
+        )
+    }
+
+    fn new_with_shards(max_estimated_bytes: u64, shard_count: usize) -> Self {
+        let shard_count = shard_count.max(1);
+        let base = max_estimated_bytes / shard_count as u64;
+        let remainder = max_estimated_bytes % shard_count as u64;
+        let shard_max_estimated_bytes = (0..shard_count)
+            .map(|index| base + u64::from((index as u64) < remainder))
+            .collect();
+        Self {
+            shards: (0..shard_count)
+                .map(|_| Mutex::new(V4InlineProviderTransformCacheShard::default()))
+                .collect(),
+            shard_max_estimated_bytes,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            transforms: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            evicted_entries: AtomicU64::new(0),
+            bypasses: AtomicU64::new(0),
+            entry_count: AtomicU64::new(0),
+            estimated_bytes: AtomicU64::new(0),
+            peak_estimated_bytes: AtomicU64::new(0),
+            max_estimated_bytes,
+        }
+    }
+
+    fn resolve_or_insert(
+        &self,
+        digest: u64,
+        cache_key_kind: V4InlineProviderTransformCacheKeyKind,
+        cache_key: &[u8],
+        build: impl FnOnce() -> io::Result<(Vec<Value>, ProviderEntry, u64, u64)>,
+    ) -> io::Result<(Arc<V4InlineProviderTransform>, bool)> {
+        let shard_index = digest as usize % self.shards.len();
+        let mut shard = self.shards[shard_index]
+            .lock()
+            .map_err(|_| io::Error::other("V4 inline transform cache lock poisoned"))?;
+        if let Some(transform) = shard.buckets.get(&digest).and_then(|bucket| {
+            bucket.iter().find(|entry| {
+                entry.cache_key_kind == cache_key_kind && entry.cache_key.as_ref() == cache_key
+            })
+        }) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok((Arc::clone(transform), true));
+        }
+
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.transforms.fetch_add(1, Ordering::Relaxed);
+        let (
+            provider_groups,
+            entry,
+            empty_npi_tin_only_normalization_count,
+            provider_group_attempts,
+        ) = build()?;
+        let transform = Arc::new(V4InlineProviderTransform {
+            cache_key_kind,
+            cache_key: Arc::from(cache_key),
+            provider_groups: provider_groups.into(),
+            entry,
+            empty_npi_tin_only_normalization_count,
+            provider_group_attempts,
+        });
+        let estimated_bytes = estimated_v4_inline_provider_transform_bytes(&transform);
+        let shard_max_estimated_bytes = self.shard_max_estimated_bytes[shard_index];
+        if estimated_bytes > shard_max_estimated_bytes {
+            self.bypasses.fetch_add(1, Ordering::Relaxed);
+            return Ok((transform, false));
+        }
+
+        if shard.estimated_bytes.saturating_add(estimated_bytes) > shard_max_estimated_bytes {
+            let evicted_entries = shard.entry_count;
+            let evicted_bytes = shard.estimated_bytes;
+            shard.buckets.clear();
+            shard.entry_count = 0;
+            shard.estimated_bytes = 0;
+            self.entry_count
+                .fetch_sub(evicted_entries, Ordering::AcqRel);
+            self.estimated_bytes
+                .fetch_sub(evicted_bytes, Ordering::AcqRel);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            self.evicted_entries
+                .fetch_add(evicted_entries, Ordering::Relaxed);
+        }
+
+        shard
+            .buckets
+            .entry(digest)
+            .or_default()
+            .push(Arc::clone(&transform));
+        shard.entry_count = shard.entry_count.saturating_add(1);
+        shard.estimated_bytes = shard.estimated_bytes.saturating_add(estimated_bytes);
+        self.entry_count.fetch_add(1, Ordering::AcqRel);
+        let total_estimated_bytes = self
+            .estimated_bytes
+            .fetch_add(estimated_bytes, Ordering::AcqRel)
+            .saturating_add(estimated_bytes);
+        self.peak_estimated_bytes
+            .fetch_max(total_estimated_bytes, Ordering::AcqRel);
+        debug_assert!(total_estimated_bytes <= self.max_estimated_bytes);
+        Ok((transform, false))
+    }
+
+    fn snapshot(&self) -> V4InlineProviderTransformCacheSnapshot {
+        V4InlineProviderTransformCacheSnapshot {
+            hits: self.hits.load(Ordering::Acquire),
+            misses: self.misses.load(Ordering::Acquire),
+            transforms: self.transforms.load(Ordering::Acquire),
+            evictions: self.evictions.load(Ordering::Acquire),
+            evicted_entries: self.evicted_entries.load(Ordering::Acquire),
+            bypasses: self.bypasses.load(Ordering::Acquire),
+            entries: self.entry_count.load(Ordering::Acquire),
+            estimated_bytes: self.estimated_bytes.load(Ordering::Acquire),
+            peak_estimated_bytes: self.peak_estimated_bytes.load(Ordering::Acquire),
+            max_estimated_bytes: self.max_estimated_bytes,
+        }
+    }
+}
 
 struct V4ProviderSetFactorSharedCache {
     buckets: Vec<Mutex<HashMap<i64, Vec<Arc<V4ProviderSetFactorCacheEntry>>>>>,
     entry_count: AtomicU64,
     estimated_bytes: AtomicU64,
     max_estimated_bytes: u64,
-    semantic_progress: Arc<ScannerSemanticProgress>,
+    semantic_progress: Option<Arc<ScannerSemanticProgress>>,
+    inline_transforms: V4InlineProviderTransformSharedCache,
 }
 
 impl V4ProviderSetFactorSharedCache {
+    #[cfg(test)]
     fn configured() -> io::Result<Self> {
+        Self::configured_for_mode(true)
+    }
+
+    fn configured_for_mode(provider_graph_v4_factor_mode: bool) -> io::Result<Self> {
         let name = "HLTHPRT_PTG2_V4_FACTOR_CACHE_MAX_BYTES";
         let max_bytes = match env::var(name) {
             Ok(raw) => {
@@ -5388,10 +6002,39 @@ impl V4ProviderSetFactorSharedCache {
                 ));
             }
         };
-        Ok(Self::new(max_bytes))
+        let inline_transforms = if provider_graph_v4_factor_mode {
+            V4InlineProviderTransformSharedCache::configured()?
+        } else {
+            V4InlineProviderTransformSharedCache::new(0)
+        };
+        Ok(Self::new_with_inline_transforms_for_mode(
+            max_bytes,
+            inline_transforms,
+            provider_graph_v4_factor_mode,
+        ))
     }
 
     fn new(max_estimated_bytes: u64) -> Self {
+        Self::new_with_inline_transforms(
+            max_estimated_bytes,
+            V4InlineProviderTransformSharedCache::new(
+                DEFAULT_V4_INLINE_PROVIDER_TRANSFORM_CACHE_MAX_BYTES as u64,
+            ),
+        )
+    }
+
+    fn new_with_inline_transforms(
+        max_estimated_bytes: u64,
+        inline_transforms: V4InlineProviderTransformSharedCache,
+    ) -> Self {
+        Self::new_with_inline_transforms_for_mode(max_estimated_bytes, inline_transforms, true)
+    }
+
+    fn new_with_inline_transforms_for_mode(
+        max_estimated_bytes: u64,
+        inline_transforms: V4InlineProviderTransformSharedCache,
+        provider_graph_v4_factor_mode: bool,
+    ) -> Self {
         Self {
             buckets: (0..V4_PROVIDER_FACTOR_CACHE_SHARDS)
                 .map(|_| Mutex::new(HashMap::new()))
@@ -5399,7 +6042,9 @@ impl V4ProviderSetFactorSharedCache {
             entry_count: AtomicU64::new(0),
             estimated_bytes: AtomicU64::new(0),
             max_estimated_bytes,
-            semantic_progress: Arc::new(ScannerSemanticProgress::default()),
+            semantic_progress: provider_graph_v4_factor_mode
+                .then(|| Arc::new(ScannerSemanticProgress::default())),
+            inline_transforms,
         }
     }
 
@@ -5427,8 +6072,8 @@ impl V4ProviderSetFactorSharedCache {
         )
     }
 
-    fn semantic_progress(&self) -> Arc<ScannerSemanticProgress> {
-        Arc::clone(&self.semantic_progress)
+    fn semantic_progress_if_enabled(&self) -> Option<Arc<ScannerSemanticProgress>> {
+        self.semantic_progress.as_ref().map(Arc::clone)
     }
 }
 
@@ -5458,6 +6103,11 @@ impl V4ProviderSetFactorCache {
         context: &CompactContext,
     ) -> io::Result<Option<Arc<V4ProviderSetFactorCacheEntry>>> {
         debug_assert!(self.enabled);
+        let semantic_progress = self
+            .shared
+            .semantic_progress
+            .as_deref()
+            .expect("enabled V4 factor cache must retain semantic progress");
         match (provider_refs.is_empty(), inline.is_some()) {
             (false, false) => {
                 self.metrics.reference_only_rates =
@@ -5547,13 +6197,11 @@ impl V4ProviderSetFactorCache {
                 legacy_provider_set_identity_from_sorted_lists(
                     &group_lists,
                     &network_names,
-                    self.shared.semantic_progress.as_ref(),
+                    semantic_progress,
                 )?;
             let provider_count =
                 i64::try_from(sorted_unique_i64_count_with_visits(&npi_lists, |amount| {
-                    self.shared
-                        .semantic_progress
-                        .record_provider_npi_union_visits(amount);
+                    semantic_progress.record_provider_npi_union_visits(amount);
                 }))
                 .unwrap_or(i64::MAX);
             let entry = Arc::new(V4ProviderSetFactorCacheEntry {
@@ -7130,6 +7778,74 @@ fn provider_entry_view_for_worker_rate<'a>(
     ))))
 }
 
+fn resolve_v4_inline_provider_transform_with_key(
+    cache_key_kind: V4InlineProviderTransformCacheKeyKind,
+    cache_key: &[u8],
+    parsed_provider_groups: Option<&[Value]>,
+    dictionary_copy_sinks: &mut DictionaryCopySinks,
+    dedupe: &SharedDedupe,
+    cache: &V4InlineProviderTransformSharedCache,
+) -> io::Result<Arc<V4InlineProviderTransform>> {
+    let digest = v4_inline_provider_transform_digest(cache_key_kind, cache_key);
+    let (transform, cache_hit) =
+        cache.resolve_or_insert(digest, cache_key_kind, cache_key, || {
+            let provider_groups = match parsed_provider_groups {
+                Some(provider_groups) => provider_groups.to_vec(),
+                None => serde_json::from_slice::<Vec<Value>>(cache_key).map_err(to_io_error)?,
+            };
+            let provider_ref = json!({"provider_groups": &provider_groups});
+            dictionary_copy_sinks.write_provider_group_members_shared(
+                &provider_ref,
+                dedupe,
+                true,
+            )?;
+            let (entry, empty_npi_tin_only_normalization_count) =
+                build_provider_entry_audited(&provider_ref, true)?;
+            let provider_group_attempts = provider_groups.len() as u64;
+            Ok((
+                provider_groups,
+                entry,
+                empty_npi_tin_only_normalization_count,
+                provider_group_attempts,
+            ))
+        })?;
+    if cache_hit {
+        dedupe.record_cached_provider_group_attempts(transform.provider_group_attempts);
+    }
+    dedupe
+        .record_empty_npi_tin_only_normalizations(transform.empty_npi_tin_only_normalization_count);
+    dedupe.record_quarantined_provider_identifiers(&transform.entry.quarantined_npi)?;
+    Ok(transform)
+}
+
+fn resolve_v4_inline_provider_transform(
+    rate: &RateLite,
+    dictionary_copy_sinks: &mut DictionaryCopySinks,
+    dedupe: &SharedDedupe,
+    cache: &V4InlineProviderTransformSharedCache,
+) -> io::Result<Arc<V4InlineProviderTransform>> {
+    if let Some(raw_provider_groups) = rate.provider_groups_raw.as_deref() {
+        return resolve_v4_inline_provider_transform_with_key(
+            V4InlineProviderTransformCacheKeyKind::ExactRawJson,
+            raw_provider_groups.get().as_bytes(),
+            None,
+            dictionary_copy_sinks,
+            dedupe,
+            cache,
+        );
+    }
+    let canonical_provider_groups =
+        serde_json::to_vec(&rate.provider_groups).map_err(to_io_error)?;
+    resolve_v4_inline_provider_transform_with_key(
+        V4InlineProviderTransformCacheKeyKind::ParsedCanonicalJson,
+        &canonical_provider_groups,
+        Some(&rate.provider_groups),
+        dictionary_copy_sinks,
+        dedupe,
+        cache,
+    )
+}
+
 enum ResolvedWorkerProvider<'a> {
     Legacy {
         entry: ProviderEntryView<'a>,
@@ -7137,7 +7853,7 @@ enum ResolvedWorkerProvider<'a> {
     },
     V4Factor {
         entry: Arc<V4ProviderSetFactorCacheEntry>,
-        inline_component: Option<(i64, Vec<i64>, Vec<i64>)>,
+        inline_transform: Option<Arc<V4InlineProviderTransform>>,
     },
 }
 
@@ -7179,9 +7895,12 @@ impl ResolvedWorkerProvider<'_> {
     fn inline_component(&self) -> Option<(i64, &[i64])> {
         match self {
             Self::V4Factor {
-                inline_component: Some((component, groups, _)),
+                inline_transform: Some(transform),
                 ..
-            } => Some((*component, groups)),
+            } => Some((
+                transform.entry.entry_hash,
+                &transform.entry.provider_group_hashes,
+            )),
             _ => None,
         }
     }
@@ -7203,9 +7922,19 @@ impl ResolvedWorkerProvider<'_> {
     fn factor_inline_npis(&self) -> &[i64] {
         match self {
             Self::V4Factor {
-                inline_component: Some((_, _, npis)),
+                inline_transform: Some(transform),
                 ..
-            } => npis,
+            } => &transform.entry.npi,
+            _ => &[],
+        }
+    }
+
+    fn inline_provider_groups(&self) -> &[Value] {
+        match self {
+            Self::V4Factor {
+                inline_transform: Some(transform),
+                ..
+            } => &transform.provider_groups,
             _ => &[],
         }
     }
@@ -7242,28 +7971,20 @@ fn resolve_worker_provider<'a>(
         }));
     }
 
-    let inline_entry = if rate.provider_groups.is_empty() {
+    let inline_entry = if !rate.has_inline_provider_groups() {
         None
     } else {
-        let provider_ref = json!({"provider_groups": rate.provider_groups});
-        dictionary_copy_sinks.write_provider_group_members_shared(&provider_ref, dedupe, true)?;
-        let (inline_entry, empty_npi_tin_only_normalization_count) =
-            build_provider_entry_audited(&provider_ref, true)?;
-        dedupe.record_empty_npi_tin_only_normalizations(empty_npi_tin_only_normalization_count);
-        dedupe.record_quarantined_provider_identifiers(&inline_entry.quarantined_npi)?;
-        Some(inline_entry)
+        Some(resolve_v4_inline_provider_transform(
+            rate,
+            dictionary_copy_sinks,
+            dedupe,
+            &provider_set_scope_cache.v4_factors.shared.inline_transforms,
+        )?)
     };
-    let inline_component = inline_entry.as_ref().map(|entry| {
-        (
-            entry.entry_hash,
-            entry.provider_group_hashes.clone(),
-            entry.npi.clone(),
-        )
-    });
     let Some(entry) = provider_set_scope_cache.v4_factors.resolve(
         provider_map,
         &rate.provider_refs,
-        inline_entry.as_ref(),
+        inline_entry.as_ref().map(|entry| &entry.entry),
         rate,
         context,
     )?
@@ -7272,7 +7993,7 @@ fn resolve_worker_provider<'a>(
     };
     Ok(Some(ResolvedWorkerProvider::V4Factor {
         entry,
-        inline_component,
+        inline_transform: inline_entry,
     }))
 }
 
@@ -7433,11 +8154,14 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
     if !group_negotiated_rate_chunks {
         let mut code_count_rows = 0usize;
         for (rate_index, rate) in rates.iter().enumerate() {
-            provider_set_scope_cache
+            if let Some(semantic_progress) = provider_set_scope_cache
                 .v4_factors
                 .shared
                 .semantic_progress
-                .record_negotiated_rate_transform_started();
+                .as_ref()
+            {
+                semantic_progress.record_negotiated_rate_transform_started();
+            }
             let source_input = source_inputs.map(|inputs| inputs[rate_index]);
             if let Some(unresolved_reference) = rate
                 .provider_refs
@@ -7705,6 +8429,11 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
                     capture_emitted_source_rate_occurrences(EmittedSourceRateWitnessInput {
                         procedure: source_procedure.expect("source procedure validated above"),
                         rate,
+                        inline_provider_groups: if provider_resolution.is_v4_factor() {
+                            provider_resolution.inline_provider_groups()
+                        } else {
+                            &rate.provider_groups
+                        },
                         emitted_provider_npis: provider_resolution.emitted_npis(),
                         emitted_price_count: price_set.atoms.len(),
                         provider_map,
@@ -8084,6 +8813,7 @@ fn read_rate_lite_struson<R: Read>(
     Ok(Some(RateLite {
         provider_refs,
         provider_groups,
+        provider_groups_raw: None,
         network_names: canonical_text_list(network_names, false),
         prices: Vec::new(),
         prepared_price_set: Some(prepared_price_set),
@@ -8124,6 +8854,9 @@ fn read_rate_lite_bytes_typed(
     raw: &[u8],
     allow_empty_npi_tin_only: bool,
 ) -> io::Result<Option<RateLite>> {
+    if allow_empty_npi_tin_only {
+        return read_rate_lite_bytes_typed_v4(raw);
+    }
     let wire: RateLiteWire = serde_json::from_slice(raw).map_err(to_io_error)?;
     let mut provider_refs = Vec::with_capacity(wire.provider_references.len());
     for provider_reference in wire.provider_references {
@@ -8133,11 +8866,7 @@ fn read_rate_lite_bytes_typed(
         )?);
     }
     for provider_group in &wire.provider_groups {
-        if allow_empty_npi_tin_only {
-            strict_npi_partition_allow_empty_tin_only(provider_group.get("npi"))?;
-        } else {
-            strict_npi_list(provider_group.get("npi"))?;
-        }
+        strict_npi_list(provider_group.get("npi"))?;
     }
     if provider_refs.is_empty() && wire.provider_groups.is_empty() {
         return Err(io::Error::new(
@@ -8177,6 +8906,67 @@ fn read_rate_lite_bytes_typed(
     Ok(Some(RateLite {
         provider_refs,
         provider_groups: wire.provider_groups,
+        provider_groups_raw: None,
+        network_names: canonical_text_list(network_names, false),
+        prices: Vec::new(),
+        prepared_price_set: Some(prepared_price_set),
+    }))
+}
+
+fn read_rate_lite_bytes_typed_v4(raw: &[u8]) -> io::Result<Option<RateLite>> {
+    let wire: V4RateLiteWire = serde_json::from_slice(raw).map_err(to_io_error)?;
+    let has_inline_provider_groups = wire
+        .provider_groups
+        .as_deref()
+        .map(validate_raw_provider_groups_array)
+        .transpose()?
+        .unwrap_or(false);
+    let mut provider_refs = Vec::with_capacity(wire.provider_references.len());
+    for provider_reference in wire.provider_references {
+        provider_refs.push(ProviderRefKey::from_number(
+            provider_reference,
+            "provider_references element",
+        )?);
+    }
+    if provider_refs.is_empty() && !has_inline_provider_groups {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one provider reference or inline provider group",
+        ));
+    }
+    if wire.negotiated_prices.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one negotiated price",
+        ));
+    }
+
+    let mut network_names = Vec::new();
+    wire.network_name.append_to(&mut network_names);
+    wire.network_names.append_to(&mut network_names);
+    let mut price_atoms = Vec::with_capacity(wire.negotiated_prices.len());
+    for price in wire.negotiated_prices {
+        price_atoms.push(price_atom_from_owned_lite(PriceLite {
+            negotiated_type: trim_optional_wire_text(price.negotiated_type),
+            negotiated_rate: strict_money_number(&Value::Number(price.negotiated_rate))?,
+            expiration_date: trim_optional_wire_text(price.expiration_date),
+            service_code: canonical_text_list(price.service_code, false),
+            billing_class: trim_optional_wire_text(price.billing_class),
+            setting: trim_optional_wire_text(price.setting),
+            billing_code_modifier: canonical_modifier_list(price.billing_code_modifier),
+            additional_information: trim_optional_wire_text(price.additional_information),
+        }));
+    }
+    let prepared_price_set = price_set_from_atoms(price_atoms).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negotiated rate must contain at least one negotiated price",
+        )
+    })?;
+    Ok(Some(RateLite {
+        provider_refs,
+        provider_groups: Vec::new(),
+        provider_groups_raw: wire.provider_groups,
         network_names: canonical_text_list(network_names, false),
         prices: Vec::new(),
         prepared_price_set: Some(prepared_price_set),
@@ -8917,7 +9707,9 @@ fn compact_worker_loop(
         worker_id,
         ..CompactWorkerMetrics::default()
     };
-    let semantic_progress = config.provider_graph_v4_factor_cache.semantic_progress();
+    let semantic_progress = config
+        .provider_graph_v4_factor_cache
+        .semantic_progress_if_enabled();
 
     for job in rx.iter() {
         config.queue_bytes.finish_receive(job.raw_byte_len());
@@ -8926,7 +9718,9 @@ fn compact_worker_loop(
             WorkerJob::Rates { procedure, rates } => {
                 metrics.rates_seen = metrics.rates_seen.saturating_add(rates.len() as u64);
                 metrics.rates_parsed = metrics.rates_parsed.saturating_add(rates.len() as u64);
-                semantic_progress.record_negotiated_rates_parsed(rates.len() as u64);
+                if let Some(semantic_progress) = semantic_progress.as_ref() {
+                    semantic_progress.record_negotiated_rates_parsed(rates.len() as u64);
+                }
                 let procedure_value = Value::Object(procedure);
                 let write_micros_before = compact_sink_write_micros(
                     &compact_copy_writer,
@@ -8987,7 +9781,9 @@ fn compact_worker_loop(
                         raw_rate,
                         config.provider_graph_v4_factor_mode,
                     )?;
-                    semantic_progress.record_negotiated_rate_parsed();
+                    if let Some(semantic_progress) = semantic_progress.as_ref() {
+                        semantic_progress.record_negotiated_rate_parsed();
+                    }
                     if typed {
                         metrics.typed_rate_parses = metrics.typed_rate_parses.saturating_add(1);
                     } else {
@@ -9061,7 +9857,9 @@ fn compact_worker_loop(
                 }
             }
         }
-        semantic_progress.record_rate_chunk_completed();
+        if let Some(semantic_progress) = semantic_progress.as_ref() {
+            semantic_progress.record_rate_chunk_completed();
+        }
         let write_started_at = Instant::now();
         if let Some(copy_writer) = compact_copy_writer.as_mut() {
             if let Some(event) = copy_writer.maybe_rotate_silent()? {
@@ -9593,6 +10391,26 @@ fn produce_indexed_in_network_range(
     })
 }
 
+fn start_semantic_progress_reporter(
+    path: &Path,
+    total_bytes: u64,
+    compressed_bytes_read: &Arc<AtomicU64>,
+    semantic_progress: Option<&Arc<ScannerSemanticProgress>>,
+    started_at: Instant,
+) -> io::Result<Option<ScannerSemanticProgressReporter>> {
+    semantic_progress
+        .map(|progress| {
+            ScannerSemanticProgressReporter::start(
+                path,
+                total_bytes,
+                Arc::clone(compressed_bytes_read),
+                Arc::clone(progress),
+                started_at,
+            )
+        })
+        .transpose()
+}
+
 fn scan_compact_byte_top_level_parallel(
     path: &Path,
     context: CompactContext,
@@ -9776,14 +10594,17 @@ fn scan_compact_byte_top_level_parallel(
         worker_count,
         !copy_paths.manifest_only,
     ));
-    let provider_graph_v4_factor_cache = Arc::new(V4ProviderSetFactorSharedCache::configured()?);
-    let mut semantic_progress_reporter = Some(ScannerSemanticProgressReporter::start(
+    let provider_graph_v4_factor_cache = Arc::new(
+        V4ProviderSetFactorSharedCache::configured_for_mode(factor_mode)?,
+    );
+    let semantic_progress = provider_graph_v4_factor_cache.semantic_progress_if_enabled();
+    let mut semantic_progress_reporter = start_semantic_progress_reporter(
         path,
         total_bytes,
-        Arc::clone(&compressed_bytes_read),
-        provider_graph_v4_factor_cache.semantic_progress(),
+        &compressed_bytes_read,
+        semantic_progress.as_ref(),
         started_at,
-    )?);
+    )?;
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
         Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
             &copy_paths,
@@ -9892,6 +10713,7 @@ fn scan_compact_byte_top_level_parallel(
             "factor_mode": factor_mode,
             "provider_graph_v4_factor_mode": factor_mode,
             "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.max_estimated_bytes,
+            "provider_graph_v4_inline_transform_cache_max_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().max_estimated_bytes,
             "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
             "price_forward_sidecar": copy_paths.manifest_price_forward_sidecar.is_some(),
             "serving_run_format": SERVING_RUN_FORMAT,
@@ -10299,9 +11121,11 @@ fn scan_compact_byte_top_level_parallel(
                                 producer_blocked_micros.saturating_add(metrics.blocked_micros);
                             *object_counts.entry("in_network".to_string()).or_insert(0) +=
                                 metrics.range.object_count;
-                            provider_graph_v4_factor_cache
-                                .semantic_progress
-                                .record_in_network_objects_completed(metrics.range.object_count);
+                            if let Some(semantic_progress) = semantic_progress.as_ref() {
+                                semantic_progress.record_in_network_objects_completed(
+                                    metrics.range.object_count,
+                                );
+                            }
                             *object_counts
                                 .entry("negotiated_rates".to_string())
                                 .or_insert(0) += metrics.rate_count;
@@ -10372,9 +11196,9 @@ fn scan_compact_byte_top_level_parallel(
                                     drain_copy_file_events(&event_rx, &mut writer)?;
                                     *object_counts.entry("in_network".to_string()).or_insert(0) +=
                                         1;
-                                    provider_graph_v4_factor_cache
-                                        .semantic_progress
-                                        .record_in_network_object_completed();
+                                    if let Some(semantic_progress) = semantic_progress.as_ref() {
+                                        semantic_progress.record_in_network_object_completed();
+                                    }
                                     *object_counts
                                         .entry("negotiated_rates".to_string())
                                         .or_insert(0) += rate_count;
@@ -10446,9 +11270,9 @@ fn scan_compact_byte_top_level_parallel(
                                     drain_copy_file_events(&event_rx, &mut writer)?;
                                     *object_counts.entry("in_network".to_string()).or_insert(0) +=
                                         1;
-                                    provider_graph_v4_factor_cache
-                                        .semantic_progress
-                                        .record_in_network_object_completed();
+                                    if let Some(semantic_progress) = semantic_progress.as_ref() {
+                                        semantic_progress.record_in_network_object_completed();
+                                    }
                                     *object_counts
                                         .entry("negotiated_rates".to_string())
                                         .or_insert(0) += rate_count;
@@ -10580,6 +11404,7 @@ fn scan_compact_byte_top_level_parallel(
                             &mut writer,
                             &copy_paths,
                             Some(&mut sidecars),
+                            semantic_progress.as_ref().map(Arc::clone),
                         )?;
                         sidecar_merge_write_seconds +=
                             sidecar_finalize_started_at.elapsed().as_secs_f64();
@@ -10708,6 +11533,16 @@ fn scan_compact_byte_top_level_parallel(
                                 "provider_graph_v4_factor_cache_entries": provider_graph_v4_factor_cache.snapshot().0,
                                 "provider_graph_v4_factor_cache_estimated_bytes": provider_graph_v4_factor_cache.snapshot().1,
                                 "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.snapshot().2,
+                                "provider_graph_v4_inline_transform_cache_hits": provider_graph_v4_factor_cache.inline_transforms.snapshot().hits,
+                                "provider_graph_v4_inline_transform_cache_misses": provider_graph_v4_factor_cache.inline_transforms.snapshot().misses,
+                                "provider_graph_v4_inline_transform_cache_transforms": provider_graph_v4_factor_cache.inline_transforms.snapshot().transforms,
+                                "provider_graph_v4_inline_transform_cache_evictions": provider_graph_v4_factor_cache.inline_transforms.snapshot().evictions,
+                                "provider_graph_v4_inline_transform_cache_evicted_entries": provider_graph_v4_factor_cache.inline_transforms.snapshot().evicted_entries,
+                                "provider_graph_v4_inline_transform_cache_bypasses": provider_graph_v4_factor_cache.inline_transforms.snapshot().bypasses,
+                                "provider_graph_v4_inline_transform_cache_entries": provider_graph_v4_factor_cache.inline_transforms.snapshot().entries,
+                                "provider_graph_v4_inline_transform_cache_estimated_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().estimated_bytes,
+                                "provider_graph_v4_inline_transform_cache_peak_estimated_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().peak_estimated_bytes,
+                                "provider_graph_v4_inline_transform_cache_max_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().max_estimated_bytes,
                                 "workers": compact_worker_metrics.iter().map(CompactWorkerMetrics::payload).collect::<Vec<_>>(),
                                 "top_level_byte_scan": true,
                                 "top_level_byte_scan_selected": true,
@@ -10971,14 +11806,17 @@ fn scan_compact_struson_parallel(
         worker_count,
         !copy_paths.manifest_only,
     ));
-    let provider_graph_v4_factor_cache = Arc::new(V4ProviderSetFactorSharedCache::configured()?);
-    let mut semantic_progress_reporter = Some(ScannerSemanticProgressReporter::start(
+    let provider_graph_v4_factor_cache = Arc::new(
+        V4ProviderSetFactorSharedCache::configured_for_mode(factor_mode)?,
+    );
+    let semantic_progress = provider_graph_v4_factor_cache.semantic_progress_if_enabled();
+    let mut semantic_progress_reporter = start_semantic_progress_reporter(
         path,
         total_bytes,
-        Arc::clone(&compressed_bytes_read),
-        provider_graph_v4_factor_cache.semantic_progress(),
+        &compressed_bytes_read,
+        semantic_progress.as_ref(),
         started_at,
-    )?);
+    )?;
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
         Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
             &copy_paths,
@@ -11056,6 +11894,7 @@ fn scan_compact_struson_parallel(
             "factor_mode": factor_mode,
             "provider_graph_v4_factor_mode": factor_mode,
             "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.max_estimated_bytes,
+            "provider_graph_v4_inline_transform_cache_max_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().max_estimated_bytes,
             "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
             "price_forward_sidecar": copy_paths.manifest_price_forward_sidecar.is_some(),
             "serving_run_format": SERVING_RUN_FORMAT,
@@ -11319,9 +12158,9 @@ fn scan_compact_struson_parallel(
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
                                 *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
-                                provider_graph_v4_factor_cache
-                                    .semantic_progress
-                                    .record_in_network_object_completed();
+                                if let Some(semantic_progress) = semantic_progress.as_ref() {
+                                    semantic_progress.record_in_network_object_completed();
+                                }
                                 *object_counts
                                     .entry("negotiated_rates".to_string())
                                     .or_insert(0) += rate_count;
@@ -11429,6 +12268,7 @@ fn scan_compact_struson_parallel(
                         &mut writer,
                         &copy_paths,
                         Some(&mut sidecars),
+                        semantic_progress.as_ref().map(Arc::clone),
                     )?;
                     sidecar_merge_write_seconds +=
                         sidecar_finalize_started_at.elapsed().as_secs_f64();
@@ -11556,6 +12396,16 @@ fn scan_compact_struson_parallel(
                             "provider_graph_v4_factor_cache_entries": provider_graph_v4_factor_cache.snapshot().0,
                             "provider_graph_v4_factor_cache_estimated_bytes": provider_graph_v4_factor_cache.snapshot().1,
                             "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.snapshot().2,
+                            "provider_graph_v4_inline_transform_cache_hits": provider_graph_v4_factor_cache.inline_transforms.snapshot().hits,
+                            "provider_graph_v4_inline_transform_cache_misses": provider_graph_v4_factor_cache.inline_transforms.snapshot().misses,
+                            "provider_graph_v4_inline_transform_cache_transforms": provider_graph_v4_factor_cache.inline_transforms.snapshot().transforms,
+                            "provider_graph_v4_inline_transform_cache_evictions": provider_graph_v4_factor_cache.inline_transforms.snapshot().evictions,
+                            "provider_graph_v4_inline_transform_cache_evicted_entries": provider_graph_v4_factor_cache.inline_transforms.snapshot().evicted_entries,
+                            "provider_graph_v4_inline_transform_cache_bypasses": provider_graph_v4_factor_cache.inline_transforms.snapshot().bypasses,
+                            "provider_graph_v4_inline_transform_cache_entries": provider_graph_v4_factor_cache.inline_transforms.snapshot().entries,
+                            "provider_graph_v4_inline_transform_cache_estimated_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().estimated_bytes,
+                            "provider_graph_v4_inline_transform_cache_peak_estimated_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().peak_estimated_bytes,
+                            "provider_graph_v4_inline_transform_cache_max_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().max_estimated_bytes,
                             "workers": compact_worker_metrics.iter().map(CompactWorkerMetrics::payload).collect::<Vec<_>>(),
                             "top_level_byte_scan_requested": top_level_byte_scan_requested,
                             "top_level_byte_scan_selected": false,
@@ -12791,7 +13641,7 @@ fn scan_compact_struson_inner(
     };
     dictionary_copy_sinks.finish(&mut writer)?;
     let sidecar_started_at = Instant::now();
-    emit_configured_manifest_sidecars(&mut writer, &copy_paths, manifest_sidecars.as_mut())?;
+    emit_configured_manifest_sidecars(&mut writer, &copy_paths, manifest_sidecars.as_mut(), None)?;
     sidecar_merge_write_seconds += sidecar_started_at.elapsed().as_secs_f64();
     let elapsed_seconds = started_at.elapsed().as_secs_f64();
     let scan_compressed_bytes = compressed_bytes_read.load(Ordering::Relaxed);
@@ -23959,6 +24809,7 @@ mod tests {
         let rate = RateLite {
             provider_refs: vec!["7".into()],
             provider_groups: Vec::new(),
+            provider_groups_raw: None,
             network_names: vec!["A network".to_string(), "Shared".to_string()],
             prices: vec![test_price_lite("100.00")],
             prepared_price_set: None,
@@ -24256,6 +25107,7 @@ mod tests {
         let rate = RateLite {
             provider_refs: Vec::new(),
             provider_groups: Vec::new(),
+            provider_groups_raw: None,
             network_names: vec![" Rate Network ".to_string(), "Shared".to_string()],
             prices: Vec::new(),
             prepared_price_set: None,
@@ -24276,6 +25128,7 @@ mod tests {
             &RateLite {
                 provider_refs: Vec::new(),
                 provider_groups: Vec::new(),
+                provider_groups_raw: None,
                 network_names: Vec::new(),
                 prices: Vec::new(),
                 prepared_price_set: None,
@@ -24870,6 +25723,7 @@ mod tests {
         let rate_ab = RateLite {
             provider_refs: vec![ProviderRefKey::from("b"), ProviderRefKey::from("a")],
             provider_groups: Vec::new(),
+            provider_groups_raw: None,
             network_names: vec!["rate".to_string()],
             prices: vec![test_price_lite("100.00")],
             prepared_price_set: None,
@@ -24987,12 +25841,13 @@ mod tests {
         let rate = RateLite {
             provider_refs: vec![key],
             provider_groups: Vec::new(),
+            provider_groups_raw: None,
             network_names: Vec::new(),
             prices: vec![test_price_lite("1")],
             prepared_price_set: None,
         };
         let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
-        let progress = shared.semantic_progress();
+        let progress = shared.semantic_progress_if_enabled().unwrap();
         let before = progress.snapshot();
         let mut cache = V4ProviderSetFactorCache::new(true, shared);
 
@@ -25035,6 +25890,7 @@ mod tests {
         let rate = RateLite {
             provider_refs: vec![ProviderRefKey::from("wide")],
             provider_groups: Vec::new(),
+            provider_groups_raw: None,
             network_names: Vec::new(),
             prices: vec![test_price_lite("1")],
             prepared_price_set: None,
@@ -25080,6 +25936,7 @@ mod tests {
         let rate = RateLite {
             provider_refs: vec![key.clone()],
             provider_groups: Vec::new(),
+            provider_groups_raw: None,
             network_names: vec!["rate-network".to_string()],
             prices: vec![test_price_lite("1")],
             prepared_price_set: None,
@@ -25209,6 +26066,528 @@ mod tests {
     }
 
     #[test]
+    fn v3_factor_mode_omits_v4_semantic_reporter_counters_and_sidecar_instrumentation() {
+        const FACTOR_CACHE_NAME: &str = "HLTHPRT_PTG2_V4_FACTOR_CACHE_MAX_BYTES";
+        const INLINE_CACHE_NAME: &str = "HLTHPRT_PTG2_V4_INLINE_TRANSFORM_CACHE_MAX_BYTES";
+        let _lock = scanner_env_lock().lock().unwrap();
+        let _factor_cache = TestEnvVar::remove(FACTOR_CACHE_NAME);
+        let invalid_inline_cache = TestEnvVar::set(INLINE_CACHE_NAME, "invalid-for-v4");
+
+        let v3_cache = V4ProviderSetFactorSharedCache::configured_for_mode(false).unwrap();
+        assert!(v3_cache.semantic_progress_if_enabled().is_none());
+
+        let compressed_bytes_read = Arc::new(AtomicU64::new(0));
+        let reporter = start_semantic_progress_reporter(
+            Path::new("synthetic-v3.mrf.json"),
+            0,
+            &compressed_bytes_read,
+            v3_cache.semantic_progress_if_enabled().as_ref(),
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(reporter.is_none());
+
+        let v3_finalize_progress =
+            ManifestFinalizeProgress::new(v3_cache.semantic_progress_if_enabled());
+        assert!(v3_finalize_progress.semantic_progress.is_none());
+
+        drop(invalid_inline_cache);
+        let _inline_cache = TestEnvVar::remove(INLINE_CACHE_NAME);
+        let v4_cache = V4ProviderSetFactorSharedCache::configured_for_mode(true).unwrap();
+        let v4_progress = v4_cache.semantic_progress_if_enabled();
+        assert!(v4_progress.is_some());
+        let reporter = start_semantic_progress_reporter(
+            Path::new("synthetic-v4.mrf.json"),
+            0,
+            &compressed_bytes_read,
+            v4_progress.as_ref(),
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(reporter.is_some());
+        drop(reporter);
+
+        let v4_finalize_progress = ManifestFinalizeProgress::new(v4_progress);
+        assert!(v4_finalize_progress.semantic_progress.is_some());
+    }
+
+    fn anthem_inline_provider_groups() -> Vec<Value> {
+        vec![
+            json!({
+                "tin": {"type": "ein", "value": "123456789"},
+                "npi": [1234567890i64, -7i64],
+            }),
+            json!({
+                "tin": {"type": "ein", "value": "987654321"},
+                "npi": [],
+            }),
+        ]
+    }
+
+    fn raw_provider_groups(value: &str) -> Box<RawValue> {
+        RawValue::from_string(value.to_owned()).expect("valid raw provider_groups JSON")
+    }
+
+    fn anthem_inline_rate() -> RateLite {
+        RateLite {
+            provider_refs: Vec::new(),
+            provider_groups: Vec::new(),
+            provider_groups_raw: Some(raw_provider_groups(
+                r#"[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890,-7]},{"tin":{"type":"ein","value":"987654321"},"npi":[]}]"#,
+            )),
+            network_names: Vec::new(),
+            prices: vec![test_price_lite("1")],
+            prepared_price_set: None,
+        }
+    }
+
+    fn audited_inline_transform(groups: &[Value]) -> (ProviderEntry, u64, u64) {
+        let provider_ref = json!({"provider_groups": groups});
+        let (entry, normalization_count) =
+            build_provider_entry_audited(&provider_ref, true).unwrap();
+        (entry, normalization_count, groups.len() as u64)
+    }
+
+    struct AnthemInlineCacheRun {
+        output_sha256: [u8; 32],
+        dedupe: Value,
+        quarantine: Value,
+        empty_npi_normalizations: u64,
+        cache: V4InlineProviderTransformCacheSnapshot,
+    }
+
+    fn run_anthem_inline_cache_case(
+        worker_count: usize,
+        cache_max_bytes: u64,
+    ) -> AnthemInlineCacheRun {
+        const RATE_ATTEMPTS: usize = 6_250;
+        let rate = Arc::new(anthem_inline_rate());
+        let cache = Arc::new(V4InlineProviderTransformSharedCache::new(cache_max_bytes));
+        let dedupe = Arc::new(SharedDedupe::new(worker_count));
+        let mut handles = Vec::new();
+        for worker_id in 0..worker_count {
+            let rate = Arc::clone(&rate);
+            let cache = Arc::clone(&cache);
+            let dedupe = Arc::clone(&dedupe);
+            handles.push(thread::spawn(move || {
+                let mut sinks =
+                    DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+                let mut outputs = Vec::new();
+                for ordinal in (worker_id..RATE_ATTEMPTS).step_by(worker_count) {
+                    let transform = resolve_v4_inline_provider_transform(
+                        &rate,
+                        &mut sinks,
+                        &dedupe,
+                        &cache,
+                    )
+                    .unwrap();
+                    outputs.push((
+                        ordinal,
+                        serde_json::to_vec(&json!({
+                            "entry_hash": transform.entry.entry_hash,
+                            "provider_count": transform.entry.provider_count,
+                            "provider_group_hashes": transform.entry.provider_group_hashes,
+                            "npi": transform.entry.npi,
+                            "quarantined_npi": transform.entry.quarantined_npi,
+                            "empty_npi_tin_only_normalization_count": transform.empty_npi_tin_only_normalization_count,
+                        }))
+                        .unwrap(),
+                    ));
+                }
+                outputs
+            }));
+        }
+        let mut outputs = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        outputs.sort_by_key(|(ordinal, _)| *ordinal);
+        let mut output_digest = Sha256::new();
+        for (ordinal, payload) in outputs {
+            output_digest.update(ordinal.to_le_bytes());
+            output_digest.update((payload.len() as u64).to_le_bytes());
+            output_digest.update(payload);
+        }
+        AnthemInlineCacheRun {
+            output_sha256: output_digest.finalize().into(),
+            dedupe: dedupe_summary_payload(&dedupe, &HashMap::new()),
+            quarantine: dedupe
+                .provider_identifier_quarantine()
+                .unwrap()
+                .payload()
+                .unwrap(),
+            empty_npi_normalizations: dedupe.empty_npi_tin_only_normalization_count(),
+            cache: cache.snapshot(),
+        }
+    }
+
+    #[test]
+    fn anthem_shaped_inline_cache_is_exact_bounded_and_shared_across_workers() {
+        let uncached_single = run_anthem_inline_cache_case(1, 0);
+        let uncached_parallel = run_anthem_inline_cache_case(4, 0);
+        let cached_single = run_anthem_inline_cache_case(1, 16 * 1024 * 1024);
+        let cached_parallel = run_anthem_inline_cache_case(4, 16 * 1024 * 1024);
+
+        for candidate in [&uncached_parallel, &cached_single, &cached_parallel] {
+            assert_eq!(candidate.output_sha256, uncached_single.output_sha256);
+            assert_eq!(candidate.dedupe, uncached_single.dedupe);
+            assert_eq!(candidate.quarantine, uncached_single.quarantine);
+            assert_eq!(
+                candidate.empty_npi_normalizations,
+                uncached_single.empty_npi_normalizations
+            );
+            assert!(candidate.cache.estimated_bytes <= candidate.cache.max_estimated_bytes);
+            assert!(candidate.cache.peak_estimated_bytes <= candidate.cache.max_estimated_bytes);
+        }
+
+        // Two raw group attempts per rate, with exactly two unique groups:
+        // (12_500 - 2) / 12_500 = 99.984% duplicates.
+        assert_eq!(uncached_single.dedupe["provider_group_attempted"], 12_500);
+        assert_eq!(uncached_single.dedupe["provider_group_unique"], 2);
+        assert_eq!(uncached_single.dedupe["provider_group_duplicate"], 12_498);
+        assert_eq!(uncached_single.dedupe["provider_group_member_attempted"], 1);
+        assert_eq!(uncached_single.quarantine["occurrence_count"], 6_250);
+        assert_eq!(uncached_single.empty_npi_normalizations, 6_250);
+
+        assert_eq!(cached_single.cache.transforms, 1);
+        assert_eq!(cached_single.cache.misses, 1);
+        assert_eq!(cached_single.cache.hits, 6_249);
+        assert_eq!(cached_parallel.cache.transforms, 1);
+        assert_eq!(cached_parallel.cache.misses, 1);
+        assert_eq!(cached_parallel.cache.hits, 6_249);
+        assert_eq!(uncached_single.cache.transforms, 6_250);
+        assert_eq!(uncached_single.cache.bypasses, 6_250);
+    }
+
+    fn parse_v4_inline_rate(raw_provider_groups: &str) -> RateLite {
+        let raw_rate = format!(
+            r#"{{"provider_groups":{raw_provider_groups},"negotiated_prices":[{{"negotiated_rate":1}}]}}"#
+        );
+        let (rate, typed) =
+            read_rate_lite_bytes_profiled_with_policy(raw_rate.as_bytes(), true).unwrap();
+        assert!(typed, "V4 production parser should retain the raw array");
+        rate.expect("V4 inline rate")
+    }
+
+    #[test]
+    fn v4_production_parse_probes_raw_cache_before_deserialization_and_retains_arc() {
+        let raw_provider_groups =
+            r#"[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}]"#;
+        let first_rate = parse_v4_inline_rate(raw_provider_groups);
+        let second_rate = parse_v4_inline_rate(raw_provider_groups);
+        assert!(first_rate.provider_groups.is_empty());
+        assert_eq!(
+            first_rate.provider_groups_raw.as_deref().map(RawValue::get),
+            Some(raw_provider_groups)
+        );
+
+        let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
+        let mut scope_cache = ProviderSetScopeCache::configured(Arc::clone(&shared), true);
+        let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+        let dedupe = SharedDedupe::new(1);
+        let provider_map = HashMap::new();
+        let context = test_compact_context();
+        let first = resolve_worker_provider(
+            &provider_map,
+            &first_rate,
+            &mut sinks,
+            &dedupe,
+            &mut scope_cache,
+            &context,
+        )
+        .unwrap()
+        .unwrap();
+        let second = resolve_worker_provider(
+            &provider_map,
+            &second_rate,
+            &mut sinks,
+            &dedupe,
+            &mut scope_cache,
+            &context,
+        )
+        .unwrap()
+        .unwrap();
+        let (
+            ResolvedWorkerProvider::V4Factor {
+                inline_transform: Some(first_transform),
+                ..
+            },
+            ResolvedWorkerProvider::V4Factor {
+                inline_transform: Some(second_transform),
+                ..
+            },
+        ) = (&first, &second)
+        else {
+            panic!("V4 inline rates must retain their cached transforms");
+        };
+        assert!(Arc::ptr_eq(first_transform, second_transform));
+        assert_eq!(first.inline_provider_groups().len(), 1);
+        assert_eq!(
+            first.inline_component(),
+            second.inline_component(),
+            "cache hits must preserve exact normalized factors"
+        );
+        let cache = shared.inline_transforms.snapshot();
+        assert_eq!(cache.transforms, 1);
+        assert_eq!(cache.misses, 1);
+        assert_eq!(cache.hits, 1);
+        assert!(cache.estimated_bytes >= raw_provider_groups.len() as u64);
+        assert!(cache.estimated_bytes <= cache.max_estimated_bytes);
+        let audit = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(audit["provider_group_attempted"], 2);
+        assert_eq!(audit["provider_group_unique"], 1);
+        assert_eq!(audit["provider_group_duplicate"], 1);
+    }
+
+    #[test]
+    fn v4_raw_spelling_mismatch_misses_but_preserves_semantic_output() {
+        let first_rate = parse_v4_inline_rate(
+            r#"[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}]"#,
+        );
+        let second_rate = parse_v4_inline_rate(
+            r#"[ { "npi" : [1234567890], "tin" : { "value" : "123456789", "type" : "ein" } } ]"#,
+        );
+        let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
+        let mut scope_cache = ProviderSetScopeCache::configured(Arc::clone(&shared), true);
+        let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+        let dedupe = SharedDedupe::new(1);
+        let provider_map = HashMap::new();
+        let context = test_compact_context();
+        let first = resolve_worker_provider(
+            &provider_map,
+            &first_rate,
+            &mut sinks,
+            &dedupe,
+            &mut scope_cache,
+            &context,
+        )
+        .unwrap()
+        .unwrap();
+        let second = resolve_worker_provider(
+            &provider_map,
+            &second_rate,
+            &mut sinks,
+            &dedupe,
+            &mut scope_cache,
+            &context,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(first.inline_component(), second.inline_component());
+        assert_eq!(
+            first.factor_entry().unwrap().provider_set_global_id,
+            second.factor_entry().unwrap().provider_set_global_id
+        );
+        let cache = shared.inline_transforms.snapshot();
+        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses, 2);
+        assert_eq!(cache.transforms, 2);
+        let audit = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(audit["provider_group_attempted"], 2);
+        assert_eq!(audit["provider_group_unique"], 1);
+        assert_eq!(audit["provider_group_duplicate"], 1);
+    }
+
+    #[test]
+    fn v4_inline_cache_full_compares_collision_buckets_and_eviction_only_changes_speed() {
+        let groups_a = anthem_inline_provider_groups();
+        let mut groups_b = anthem_inline_provider_groups();
+        groups_b[0]["tin"]["value"] = json!("111111111");
+        let (entry_a, normalization_a, attempts_a) = audited_inline_transform(&groups_a);
+        let (entry_b, normalization_b, attempts_b) = audited_inline_transform(&groups_b);
+        assert_ne!(entry_a.entry_hash, entry_b.entry_hash);
+        let raw_a = serde_json::to_vec(&groups_a).unwrap();
+        let raw_b = serde_json::to_vec(&groups_b).unwrap();
+        let key_kind = V4InlineProviderTransformCacheKeyKind::ExactRawJson;
+        let estimated_a =
+            estimated_v4_inline_provider_transform_bytes(&V4InlineProviderTransform {
+                cache_key_kind: key_kind,
+                cache_key: Arc::from(raw_a.as_slice()),
+                provider_groups: groups_a.clone().into(),
+                entry: entry_a.clone(),
+                empty_npi_tin_only_normalization_count: normalization_a,
+                provider_group_attempts: attempts_a,
+            });
+        let estimated_b =
+            estimated_v4_inline_provider_transform_bytes(&V4InlineProviderTransform {
+                cache_key_kind: key_kind,
+                cache_key: Arc::from(raw_b.as_slice()),
+                provider_groups: groups_b.clone().into(),
+                entry: entry_b.clone(),
+                empty_npi_tin_only_normalization_count: normalization_b,
+                provider_group_attempts: attempts_b,
+            });
+
+        let collision_cache = V4InlineProviderTransformSharedCache::new_with_shards(1024 * 1024, 1);
+        let (first_a, hit) = collision_cache
+            .resolve_or_insert(7, key_kind, &raw_a, || {
+                Ok((
+                    groups_a.clone(),
+                    entry_a.clone(),
+                    normalization_a,
+                    attempts_a,
+                ))
+            })
+            .unwrap();
+        assert!(!hit);
+        let (first_b, hit) = collision_cache
+            .resolve_or_insert(7, key_kind, &raw_b, || {
+                Ok((
+                    groups_b.clone(),
+                    entry_b.clone(),
+                    normalization_b,
+                    attempts_b,
+                ))
+            })
+            .unwrap();
+        assert!(!hit);
+        let (again_a, hit) = collision_cache
+            .resolve_or_insert(7, key_kind, &raw_a, || {
+                panic!("full value comparison must find the first collision entry")
+            })
+            .unwrap();
+        assert!(hit);
+        let (again_b, hit) = collision_cache
+            .resolve_or_insert(7, key_kind, &raw_b, || {
+                panic!("full value comparison must find the second collision entry")
+            })
+            .unwrap();
+        assert!(hit);
+        assert_eq!(first_a.entry, again_a.entry);
+        assert_eq!(first_b.entry, again_b.entry);
+        assert_ne!(again_a.entry.entry_hash, again_b.entry.entry_hash);
+        assert_eq!(collision_cache.snapshot().transforms, 2);
+
+        let one_entry_limit = estimated_a.max(estimated_b);
+        let eviction_cache =
+            V4InlineProviderTransformSharedCache::new_with_shards(one_entry_limit, 1);
+        let (eviction_a, _) = eviction_cache
+            .resolve_or_insert(9, key_kind, &raw_a, || {
+                Ok((
+                    groups_a.clone(),
+                    entry_a.clone(),
+                    normalization_a,
+                    attempts_a,
+                ))
+            })
+            .unwrap();
+        let (eviction_b, _) = eviction_cache
+            .resolve_or_insert(9, key_kind, &raw_b, || {
+                Ok((
+                    groups_b.clone(),
+                    entry_b.clone(),
+                    normalization_b,
+                    attempts_b,
+                ))
+            })
+            .unwrap();
+        let (eviction_a_again, hit) = eviction_cache
+            .resolve_or_insert(9, key_kind, &raw_a, || {
+                Ok((
+                    groups_a.clone(),
+                    entry_a.clone(),
+                    normalization_a,
+                    attempts_a,
+                ))
+            })
+            .unwrap();
+        assert!(!hit);
+        assert_eq!(eviction_a.entry, eviction_a_again.entry);
+        assert_eq!(eviction_b.entry, entry_b);
+        let snapshot = eviction_cache.snapshot();
+        assert!(snapshot.evictions >= 2);
+        assert!(snapshot.evicted_entries >= 2);
+        assert_eq!(snapshot.entries, 1);
+        assert!(snapshot.estimated_bytes <= snapshot.max_estimated_bytes);
+        assert!(snapshot.peak_estimated_bytes <= snapshot.max_estimated_bytes);
+    }
+
+    #[test]
+    fn v4_inline_transform_cache_configuration_accepts_zero_and_rejects_invalid_values() {
+        const NAME: &str = "HLTHPRT_PTG2_V4_INLINE_TRANSFORM_CACHE_MAX_BYTES";
+        let _lock = scanner_env_lock().lock().unwrap();
+
+        {
+            let _unset = TestEnvVar::remove(NAME);
+            assert_eq!(
+                V4InlineProviderTransformSharedCache::configured()
+                    .unwrap()
+                    .snapshot()
+                    .max_estimated_bytes,
+                DEFAULT_V4_INLINE_PROVIDER_TRANSFORM_CACHE_MAX_BYTES as u64
+            );
+        }
+        {
+            let _disabled = TestEnvVar::set(NAME, "0");
+            assert_eq!(
+                V4InlineProviderTransformSharedCache::configured()
+                    .unwrap()
+                    .snapshot()
+                    .max_estimated_bytes,
+                0
+            );
+        }
+        {
+            let _invalid = TestEnvVar::set(NAME, "not-a-byte-count");
+            let error = V4InlineProviderTransformSharedCache::configured()
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error
+                .to_string()
+                .contains("non-negative integer byte count"));
+            assert_eq!(
+                V4ProviderSetFactorSharedCache::configured_for_mode(false)
+                    .unwrap()
+                    .inline_transforms
+                    .snapshot()
+                    .max_estimated_bytes,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_inline_resolution_does_not_touch_v4_transform_cache() {
+        let raw_rate = br#"{"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}],"negotiated_prices":[{"negotiated_rate":1}]}"#;
+        let (rate, typed) = read_rate_lite_bytes_profiled_with_policy(raw_rate, false).unwrap();
+        let rate = rate.expect("legacy inline rate");
+        assert!(typed);
+        assert!(rate.provider_groups_raw.is_none());
+        assert_eq!(rate.provider_groups.len(), 1);
+        let expected = audited_inline_transform(&rate.provider_groups).0;
+        let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
+        let mut scope_cache = ProviderSetScopeCache::configured(Arc::clone(&shared), false);
+        let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+        let dedupe = SharedDedupe::new(1);
+        let provider_map = HashMap::new();
+        let resolved = resolve_worker_provider(
+            &provider_map,
+            &rate,
+            &mut sinks,
+            &dedupe,
+            &mut scope_cache,
+            &test_compact_context(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(!resolved.is_v4_factor());
+        assert_eq!(
+            resolved.legacy_entry().unwrap().entry_hash(),
+            expected.entry_hash
+        );
+        assert_eq!(
+            shared.inline_transforms.snapshot(),
+            V4InlineProviderTransformCacheSnapshot {
+                max_estimated_bytes: DEFAULT_V4_INLINE_PROVIDER_TRANSFORM_CACHE_MAX_BYTES as u64,
+                ..V4InlineProviderTransformCacheSnapshot::default()
+            }
+        );
+    }
+
+    #[test]
     fn tin_only_provider_group_has_no_npi_members() {
         let entry = build_provider_entry(&json!({
             "provider_groups": [{
@@ -25258,6 +26637,26 @@ mod tests {
                 read_rate_lite_bytes_streaming(raw, false).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn v4_typed_rate_parser_retains_raw_inline_groups_without_deserializing_them() {
+        let raw_provider_groups =
+            br#"[ { "tin": { "type": "ein", "value": "123456789" }, "npi": [1234567890] } ]"#;
+        let raw = br#"{"provider_groups":[ { "tin": { "type": "ein", "value": "123456789" }, "npi": [1234567890] } ],"negotiated_prices":[{"negotiated_rate":12.50}]}"#;
+
+        let rate = read_rate_lite_bytes_typed(raw, true)
+            .unwrap()
+            .expect("typed inline rate");
+
+        assert!(rate.provider_groups.is_empty());
+        assert_eq!(
+            rate.provider_groups_raw
+                .as_deref()
+                .map(RawValue::get)
+                .map(str::as_bytes),
+            Some(raw_provider_groups.as_slice())
+        );
     }
 
     #[test]
@@ -26075,6 +27474,7 @@ mod tests {
             RateLite {
                 provider_refs: vec![ProviderRefKey::from("top-level-ref")],
                 provider_groups: Vec::new(),
+                provider_groups_raw: None,
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("100.00")],
                 prepared_price_set: None,
@@ -26082,6 +27482,7 @@ mod tests {
             RateLite {
                 provider_refs: Vec::new(),
                 provider_groups: vec![inline_group.clone()],
+                provider_groups_raw: None,
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("101.00")],
                 prepared_price_set: None,
@@ -26089,6 +27490,7 @@ mod tests {
             RateLite {
                 provider_refs: vec![ProviderRefKey::from("top-level-ref")],
                 provider_groups: vec![inline_group.clone()],
+                provider_groups_raw: None,
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("102.00")],
                 prepared_price_set: None,
@@ -26096,6 +27498,7 @@ mod tests {
             RateLite {
                 provider_refs: Vec::new(),
                 provider_groups: vec![inline_group.clone()],
+                provider_groups_raw: None,
                 network_names: Vec::new(),
                 prices: vec![test_price_lite("101.00")],
                 prepared_price_set: None,
@@ -26247,7 +27650,7 @@ mod tests {
         assert_eq!(group_hashes.len(), 1);
         assert_eq!(
             group_hashes[0],
-            provider_group_hash(&rate.provider_groups[0]["tin"], &[], &[])
+            provider_group_hash(&resolved.inline_provider_groups()[0]["tin"], &[], &[])
         );
         assert_eq!(dedupe.empty_npi_tin_only_normalization_count(), 1);
         let dedupe_summary = dedupe_summary_payload(&dedupe, &HashMap::new());
@@ -26275,6 +27678,7 @@ mod tests {
                 ProviderRefKey::from("dangling-ref"),
             ],
             provider_groups: Vec::new(),
+            provider_groups_raw: None,
             network_names: Vec::new(),
             prices: vec![test_price_lite("100.00")],
             prepared_price_set: None,
@@ -32957,9 +34361,14 @@ mod tests {
             )
             .unwrap();
 
-        let results = configured_spooled_manifest_sidecars(&paths, &mut collector)
-            .unwrap()
-            .unwrap();
+        let semantic_progress = Arc::new(ScannerSemanticProgress::default());
+        let results = configured_spooled_manifest_sidecars(
+            &paths,
+            &mut collector,
+            Some(Arc::clone(&semantic_progress)),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(
@@ -32974,6 +34383,12 @@ mod tests {
         assert_eq!(results[1].entry_count, 2);
         assert_eq!(&std::fs::read(&forward_path).unwrap()[..8], b"PTG2MNDS");
         assert_eq!(&std::fs::read(&inverted_path).unwrap()[..8], b"PTG2MNDS");
+        let progress = semantic_progress.snapshot();
+        assert_eq!(progress.scan_finalize_jobs_started, 2);
+        assert_eq!(progress.scan_finalize_jobs_completed, 2);
+        assert!(progress.scan_finalize_bytes_processed > 0);
+        assert!(progress.scan_finalize_pairs_processed > 0);
+        assert_eq!(progress.scan_finalize_chunks_sorted, 2);
         let _ = std::fs::remove_file(forward_path);
         let _ = std::fs::remove_file(inverted_path);
     }
@@ -33003,7 +34418,7 @@ mod tests {
             )
             .unwrap();
 
-        let results = configured_spooled_manifest_sidecars(&paths, &mut collector)
+        let results = configured_spooled_manifest_sidecars(&paths, &mut collector, None)
             .unwrap()
             .unwrap();
 
@@ -33051,12 +34466,15 @@ mod tests {
         let spool_path = spool.path.clone();
         std::fs::remove_file(&spool_path).unwrap();
 
-        let error = match write_manifest_sidecar_job(ManifestSidecarWriteJob {
-            order: 0,
-            record_kind: "manifest_provider_forward_sidecar_file",
-            path: output_path.display().to_string(),
-            spool,
-        }) {
+        let error = match write_manifest_sidecar_job(
+            ManifestSidecarWriteJob {
+                order: 0,
+                record_kind: "manifest_provider_forward_sidecar_file",
+                path: output_path.display().to_string(),
+                spool,
+            },
+            None,
+        ) {
             Ok(_) => panic!("missing manifest spool unexpectedly finalized"),
             Err(error) => error,
         };
@@ -33099,10 +34517,12 @@ mod tests {
         let in_memory_metrics = in_memory_spool
             .write_dense_sidecar_with_chunk_bytes(in_memory_path.to_str().unwrap(), usize::MAX)
             .unwrap();
+        let semantic_progress = Arc::new(ScannerSemanticProgress::default());
         let external_metrics = external_spool
-            .write_dense_sidecar_with_chunk_bytes(
+            .write_dense_sidecar_with_chunk_bytes_and_progress(
                 external_path.to_str().unwrap(),
                 MANIFEST_PAIR_RECORD_BYTES * 2,
+                Some(Arc::clone(&semantic_progress)),
             )
             .unwrap();
 
@@ -33112,8 +34532,56 @@ mod tests {
             std::fs::read(&external_path).unwrap(),
             std::fs::read(&in_memory_path).unwrap()
         );
+        let progress = semantic_progress.snapshot();
+        assert_eq!(progress.scan_finalize_jobs_started, 1);
+        assert_eq!(progress.scan_finalize_jobs_completed, 1);
+        assert!(progress.scan_finalize_bytes_processed > 0);
+        assert!(progress.scan_finalize_pairs_processed > pairs.len() as u64);
+        assert_eq!(progress.scan_finalize_chunks_sorted, 3);
+        assert_eq!(progress.scan_finalize_chunks_merged, 3);
+        assert!(progress.scan_finalize_sort_comparisons > 0);
         let _ = std::fs::remove_file(in_memory_path);
         let _ = std::fs::remove_file(external_path);
+    }
+
+    #[test]
+    fn manifest_standard_sidecar_is_sorted_deduplicated_and_handles_empty_input() {
+        let temporary = tempfile::tempdir().unwrap();
+        let populated_path = temporary.path().join("populated.ptg2sc");
+        let empty_path = temporary.path().join("empty.ptg2sc");
+        let owner_a = GlobalId128([1; GLOBAL_ID_BYTES]);
+        let owner_b = GlobalId128([2; GLOBAL_ID_BYTES]);
+        let member_a = GlobalId128([7; GLOBAL_ID_BYTES]);
+        let member_b = GlobalId128([8; GLOBAL_ID_BYTES]);
+        let mut populated = ManifestPairSpool::new("standard_populated").unwrap();
+        for pair in [
+            (owner_b, member_b),
+            (owner_a, member_b),
+            (owner_a, member_a),
+            (owner_a, member_b),
+        ] {
+            populated.push(pair.0, pair.1).unwrap();
+        }
+        assert_eq!(
+            populated
+                .write_standard_sidecar(populated_path.to_str().unwrap())
+                .unwrap(),
+            (2, 3)
+        );
+        let bytes = std::fs::read(&populated_path).unwrap();
+        assert_eq!(&bytes[..8], b"PTG2MNSC");
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(bytes[12..20].try_into().unwrap()), 2);
+        assert_eq!(bytes.len(), 20 + 2 * 28 + 3 * GLOBAL_ID_BYTES);
+
+        let mut empty = ManifestPairSpool::new("standard_empty").unwrap();
+        assert_eq!(
+            empty
+                .write_standard_sidecar(empty_path.to_str().unwrap())
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(std::fs::read(&empty_path).unwrap().len(), 20);
     }
 
     #[test]
@@ -33405,6 +34873,78 @@ mod tests {
     }
 
     #[test]
+    fn v4_provider_membership_sidecars_preserve_exact_edges_and_reject_bad_rows() {
+        let temporary = tempfile::tempdir().unwrap();
+        let group_a = GlobalId128([5; GLOBAL_ID_BYTES]).to_hex();
+        let group_b = GlobalId128([6; GLOBAL_ID_BYTES]).to_hex();
+        let input_a = temporary.path().join("membership-a.copy");
+        let input_b = temporary.path().join("membership-b.copy");
+        std::fs::write(
+            &input_a,
+            format!(
+                "{group_a}\t1234567890\r\n\
+                 {group_b}\t0\n\
+                 {group_a}\t1234567890\textra\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(&input_b, format!("{group_b}\t2222222222\n")).unwrap();
+        let group_npi = temporary.path().join("group-npi.sidecar");
+        let npi_group = temporary.path().join("npi-group.sidecar");
+        let npi_scope = temporary.path().join("npi-scope.copy");
+        write_provider_membership_sidecars(
+            &group_npi,
+            &npi_group,
+            &npi_scope,
+            &[
+                temporary.path().join("missing.copy").display().to_string(),
+                input_a.display().to_string(),
+                input_b.display().to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(&std::fs::read(&group_npi).unwrap()[..8], b"PTG2MNDS");
+        assert_eq!(&std::fs::read(&npi_group).unwrap()[..8], b"PTG2MNDS");
+        assert_eq!(
+            std::fs::read_to_string(&npi_scope).unwrap(),
+            "1234567890\n2222222222\n"
+        );
+
+        assert!(global_id_from_hex_bytes(b"short").is_err());
+        assert!(global_id_from_hex_bytes(&[b'g'; GLOBAL_ID_BYTES * 2]).is_err());
+        let mut invalid_low = [b'0'; GLOBAL_ID_BYTES * 2];
+        invalid_low[1] = b'g';
+        assert!(global_id_from_hex_bytes(&invalid_low).is_err());
+
+        for (name, row) in [
+            ("missing-group", b"\t1234567890\n".as_slice()),
+            (
+                "invalid-group",
+                b"0000000000000000000000000000000g\t1234567890\n".as_slice(),
+            ),
+            (
+                "invalid-npi",
+                b"05050505050505050505050505050505\tnot-an-npi\n".as_slice(),
+            ),
+            (
+                "invalid-utf8",
+                b"05050505050505050505050505050505\t\xff\n".as_slice(),
+            ),
+        ] {
+            let input = temporary.path().join(format!("{name}.copy"));
+            std::fs::write(&input, row).unwrap();
+            assert!(write_provider_membership_sidecars(
+                &temporary.path().join(format!("{name}-group.sidecar")),
+                &temporary.path().join(format!("{name}-npi.sidecar")),
+                &temporary.path().join(format!("{name}-scope.copy")),
+                &[input.display().to_string()],
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn configured_manifest_sidecar_emission_covers_memory_and_spooled_outputs() {
         let base = std::env::temp_dir().join(format!(
             "ptg2-sidecar-emission-test-{}-{:?}",
@@ -33458,8 +34998,13 @@ mod tests {
         in_memory.record_provider_component(3, &[2, 1]).unwrap();
         in_memory.record_price_set(&price_set).unwrap();
         let mut memory_events = Vec::new();
-        emit_configured_manifest_sidecars(&mut memory_events, &memory_paths, Some(&mut in_memory))
-            .unwrap();
+        emit_configured_manifest_sidecars(
+            &mut memory_events,
+            &memory_paths,
+            Some(&mut in_memory),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(memory_events).unwrap().lines().count(),
             12
@@ -33477,12 +35022,17 @@ mod tests {
         spooled.record_provider_component(3, &[2, 1]).unwrap();
         spooled.record_price_set(&price_set).unwrap();
         let mut spool_events = Vec::new();
-        emit_configured_manifest_sidecars(&mut spool_events, &spool_paths, Some(&mut spooled))
-            .unwrap();
+        emit_configured_manifest_sidecars(
+            &mut spool_events,
+            &spool_paths,
+            Some(&mut spooled),
+            None,
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(spool_events).unwrap().lines().count(), 12);
 
         let mut no_events = Vec::new();
-        emit_configured_manifest_sidecars(&mut no_events, &CopyPathConfig::default(), None)
+        emit_configured_manifest_sidecars(&mut no_events, &CopyPathConfig::default(), None, None)
             .unwrap();
         assert!(no_events.is_empty());
         std::fs::remove_dir_all(base).unwrap();

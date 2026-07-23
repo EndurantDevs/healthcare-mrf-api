@@ -229,6 +229,103 @@ fn write_direct_manifest(root: &Path) -> PathBuf {
     manifest_path
 }
 
+fn write_heavy_direct_manifest(root: &Path) -> PathBuf {
+    let shard_id = "heavy-direct-shard";
+    let component = global(2, 1);
+    let group = global(3, 1);
+    let sets = (1..=512).map(|value| global(1, value)).collect::<Vec<_>>();
+    let npis = (1..=512)
+        .map(|value| global(0, 1_000_000_000 + value))
+        .collect::<Vec<_>>();
+    let set_component = write_membership(
+        &root.join("heavy-direct-set-component.sidecar"),
+        "provider_set_component",
+        shard_id,
+        sets.iter()
+            .copied()
+            .map(|owner| SidecarEntry {
+                owner,
+                members: vec![component],
+            })
+            .collect(),
+    );
+    let component_group = write_membership(
+        &root.join("heavy-direct-component-group.sidecar"),
+        "provider_component_group",
+        shard_id,
+        vec![SidecarEntry {
+            owner: component,
+            members: vec![group],
+        }],
+    );
+    let group_npi = write_membership(
+        &root.join("heavy-direct-group-npi.sidecar"),
+        "provider_group_npi",
+        shard_id,
+        vec![SidecarEntry {
+            owner: group,
+            members: npis.clone(),
+        }],
+    );
+    let npi_group = write_membership(
+        &root.join("heavy-direct-npi-group.sidecar"),
+        "provider_npi_group",
+        shard_id,
+        npis.iter()
+            .copied()
+            .map(|owner| SidecarEntry {
+                owner,
+                members: vec![group],
+            })
+            .collect(),
+    );
+    let provider_map = root.join("heavy-direct-provider-map.copy");
+    fs::write(
+        &provider_map,
+        sets.iter()
+            .enumerate()
+            .map(|(index, provider_set)| format!("{}\t{}\n", hex(*provider_set), index + 1))
+            .collect::<String>(),
+    )
+    .expect("write heavy direct provider-set key map");
+    let manifest_path = root.join("heavy-direct-manifest.json");
+    let manifest = json!({
+        "shards": [{
+            "shard_id": shard_id,
+            "provider_set_component": set_component,
+            "provider_component_group": component_group,
+            "provider_group_npi": group_npi,
+            "provider_npi_group": npi_group,
+        }],
+        "provider_set_key_map_path": provider_map,
+        "output_directory": root.join("heavy-direct-compiled"),
+        "options": {
+            "member_page_bytes": 64,
+            "locator_page_bytes": 48,
+            "heavy_owner_member_threshold": 1,
+            "heavy_bitmap_minimum_savings_bytes": 0,
+            "npi_prefix_target": 201,
+        }
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode heavy direct manifest"),
+    )
+    .expect("write heavy direct manifest");
+    manifest_path
+}
+
+fn run_manifest_variant(root: &Path, name: &str, mut manifest: Value) -> Output {
+    manifest["output_directory"] = json!(root.join(format!("{name}-output")));
+    let path = root.join(format!("{name}.json"));
+    fs::write(
+        &path,
+        serde_json::to_vec(&manifest).expect("encode manifest variant"),
+    )
+    .expect("write manifest variant");
+    run(&[path.to_str().expect("UTF-8 manifest variant path")])
+}
+
 fn run(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ptg2_provider_graph_v4"))
         .args(arguments)
@@ -362,4 +459,127 @@ fn compiler_cli_covers_direct_layout_and_fail_closed_admission() {
     let empty_output = run(&[empty_path.to_str().expect("UTF-8 empty manifest")]);
     assert!(!empty_output.status.success());
     assert!(String::from_utf8_lossy(&empty_output.stderr).contains("at least one shard"));
+}
+
+#[test]
+fn compiler_cli_covers_heavy_direct_prefix_and_strict_manifest_boundaries() {
+    let temporary = tempfile::tempdir().expect("temporary heavy direct fixture");
+    let heavy_manifest = write_heavy_direct_manifest(temporary.path());
+    let heavy = run(&[heavy_manifest
+        .to_str()
+        .expect("UTF-8 heavy direct manifest")]);
+    assert!(
+        heavy.status.success(),
+        "heavy direct compiler failed: {}",
+        String::from_utf8_lossy(&heavy.stderr),
+    );
+    let summary: Value = serde_json::from_slice(&heavy.stdout).expect("heavy direct summary");
+    assert_eq!(summary["selected_layout"], "direct");
+    assert_eq!(summary["observe"]["npi_prefix_worst_member_count"], 201);
+    for relation in ["group_npis_exact", "group_sets_direct"] {
+        assert!(summary["heavy_bitmaps"]
+            .as_array()
+            .expect("heavy bitmap summaries")
+            .iter()
+            .any(|bitmap| bitmap["relation"] == relation));
+    }
+
+    let boundary_root = temporary.path().join("boundaries");
+    fs::create_dir(&boundary_root).expect("create boundary fixture");
+    let boundary_manifest = write_manifest(&boundary_root);
+    let original: Value =
+        serde_json::from_slice(&fs::read(&boundary_manifest).expect("read boundary manifest"))
+            .expect("parse boundary manifest");
+    for field in [
+        "member_page_bytes",
+        "locator_page_bytes",
+        "heavy_owner_member_threshold",
+        "max_set_patterns_per_set",
+        "max_set_components_per_fallback_set",
+        "max_online_group_keys_per_set",
+        "max_online_source_owners_per_set",
+        "max_online_source_members_per_set",
+        "max_online_source_pages_per_set",
+        "max_online_source_bytes_per_set",
+        "online_group_npi_batch_size",
+        "max_online_group_npi_members_per_set",
+        "max_online_group_npi_locator_pages_per_set",
+        "max_online_group_npi_member_pages_per_set",
+        "max_online_group_npi_bytes_per_set",
+        "max_online_group_npi_batches_per_set",
+        "provider_expansion_rate_page_rows",
+        "max_online_provider_expansion_rate_rows",
+        "max_online_provider_expansion_provider_sets",
+        "max_online_provider_expansion_graph_batches",
+        "npi_prefix_target",
+        "max_npi_prefix_override_owners",
+        "max_npi_prefix_override_bytes",
+        "max_estimated_model_bytes",
+        "max_factor_edges",
+    ] {
+        let mut invalid = original.clone();
+        invalid["options"][field] = json!(0);
+        let output = run_manifest_variant(&boundary_root, &format!("zero-{field}"), invalid);
+        assert!(
+            !output.status.success(),
+            "zero-valued option unexpectedly succeeded: {field}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("must be"));
+    }
+
+    for (name, field, value) in [
+        ("short-digest", "sha256", json!("short")),
+        ("wrong-size", "byte_count", json!(0)),
+        ("wrong-digest", "sha256", json!("00".repeat(32))),
+        ("wrong-format", "record_format", json!("wrong")),
+        ("wrong-owners", "owner_count", json!(0)),
+        ("wrong-members", "member_count", json!(0)),
+        ("wrong-dictionary", "member_global_count", json!(0)),
+    ] {
+        let mut invalid = original.clone();
+        invalid["shards"][0]["provider_set_component"]["metadata"][field] = value;
+        let output = run_manifest_variant(&boundary_root, name, invalid);
+        assert!(
+            !output.status.success(),
+            "invalid membership metadata unexpectedly succeeded: {name}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("PTG2_PROVIDER_GRAPH_V4_ERROR"));
+    }
+
+    let mut missing = original.clone();
+    missing["shards"][0]["provider_set_component"]["path"] =
+        json!(boundary_root.join("missing.sidecar"));
+    let missing_output = run_manifest_variant(&boundary_root, "missing-sidecar", missing);
+    assert!(!missing_output.status.success());
+    assert!(String::from_utf8_lossy(&missing_output.stderr).contains("unavailable"));
+
+    let mut blank_shard = original.clone();
+    blank_shard["shards"][0]["shard_id"] = json!(" ");
+    let blank_output = run_manifest_variant(&boundary_root, "blank-shard", blank_shard);
+    assert!(!blank_output.status.success());
+    assert!(String::from_utf8_lossy(&blank_output.stderr).contains("non-empty and unique"));
+
+    let mut duplicate_shard = original.clone();
+    duplicate_shard["shards"] =
+        json!([original["shards"][0].clone(), original["shards"][0].clone()]);
+    let duplicate_output = run_manifest_variant(&boundary_root, "duplicate-shard", duplicate_shard);
+    assert!(!duplicate_output.status.success());
+    assert!(String::from_utf8_lossy(&duplicate_output.stderr).contains("non-empty and unique"));
+
+    let mut contradictory = original.clone();
+    contradictory["shards"][0]["provider_set_component"]["metadata"]["shard_id"] =
+        json!("other-shard");
+    let contradictory_output =
+        run_manifest_variant(&boundary_root, "contradictory-shard", contradictory);
+    assert!(!contradictory_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&contradictory_output.stderr).contains("contradictory shard IDs")
+    );
+
+    let mut mismatched = original;
+    mismatched["shards"][0]["provider_set_component"]["metadata"]["source_shard_id"] =
+        json!("other-shard");
+    let mismatched_output = run_manifest_variant(&boundary_root, "mismatched-shard", mismatched);
+    assert!(!mismatched_output.status.success());
+    assert!(String::from_utf8_lossy(&mismatched_output.stderr).contains("does not match bundle"));
 }

@@ -1659,6 +1659,103 @@ def test_rust_scanner_semantic_progress_advances_during_one_long_item(monkeypatc
     assert events[1]["progress_seq"] == events[0]["progress_seq"] + 1
 
 
+def _install_timed_progress_capture(monkeypatch, elapsed_seconds):
+    progress_writes = []
+    base_time = datetime.datetime(2026, 7, 23, 10, 0, 0)
+    fake_redis = AtomicLiveProgressRedis(
+        on_progress_write=lambda _key, _ttl, encoded_progress: progress_writes.append(
+            (elapsed_seconds[0], json.loads(encoded_progress))
+        )
+    )
+    monkeypatch.setattr(process_ptg, "_ptg2_monotonic", lambda: elapsed_seconds[0])
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(
+        live_progress,
+        "_utc_now",
+        lambda: base_time + datetime.timedelta(seconds=elapsed_seconds[0]),
+    )
+    monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
+    return progress_writes
+
+
+def _slow_manifest_copy(elapsed_seconds):
+    async def copy_file(unused_copy_path, *, target_table, progress_callback):
+        del unused_copy_path
+        assert target_table == "price_atom_stage"
+        for _byte_index in range(10):
+            elapsed_seconds[0] += 1.0
+            progress_callback(1)
+
+    return copy_file
+
+
+def _assert_manifest_copy_cadence(progress_writes):
+    progress_snapshots = [
+        progress_snapshot for _at, progress_snapshot in progress_writes
+    ]
+    intermediate_bytes = [
+        progress_snapshot["counters"]["manifest_copy_bytes"]
+        for progress_snapshot in progress_snapshots
+        if 0
+        < int(
+            (progress_snapshot.get("counters") or {}).get(
+                "manifest_copy_bytes"
+            )
+            or 0
+        )
+        < 10
+    ]
+    progress_gaps = [
+        later_at - earlier_at
+        for (earlier_at, _earlier), (later_at, _later) in zip(
+            progress_writes,
+            progress_writes[1:],
+        )
+    ]
+    assert intermediate_bytes == [4, 8]
+    assert max(progress_gaps) <= 4.0
+    assert [
+        progress_snapshot["progress_seq"]
+        for progress_snapshot in progress_snapshots
+    ] == list(range(1, len(progress_snapshots) + 1))
+
+
+@pytest.mark.asyncio
+async def test_manifest_copy_reports_semantic_bytes_every_four_seconds(
+    monkeypatch,
+    tmp_path,
+):
+    """A single slow COPY must move progress_seq before the file completes."""
+
+    copy_path = tmp_path / "price-atoms.copy"
+    copy_path.write_bytes(b"0123456789")
+    elapsed_seconds = [0.0]
+    progress_writes = _install_timed_progress_capture(
+        monkeypatch,
+        elapsed_seconds,
+    )
+
+    token = ptg_live_progress.set_live_progress_context(
+        run_id="run-slow-manifest-copy",
+        attempt_id="attempt-1",
+        attempt_started_at="2026-07-23T10:00:00Z",
+    )
+    try:
+        await process_ptg._copy_manifest_files_direct_with_progress(
+            "price_atom",
+            target_table="price_atom_stage",
+            input_paths=[copy_path],
+            copy_func=_slow_manifest_copy(elapsed_seconds),
+            completed_steps_before_copy=0,
+            total_steps=1,
+            emitted_rows=10,
+        )
+    finally:
+        ptg_live_progress.reset_live_progress_context(token)
+
+    _assert_manifest_copy_cadence(progress_writes)
+
+
 def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
     captured_map = {}
 
