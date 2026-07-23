@@ -28,6 +28,7 @@ INTERNAL_OWNER_EVIDENCE_CONTRACT = "ptg_v4_internal_owner_probe_v1"
 _MINIMUM_SAMPLE_COUNT = 5
 _EXACT_PREFIX_LIMIT = 201
 
+
 @dataclass(frozen=True)
 class _OwnerSpec:
     """Compiler-selected owner identity and its expected serving mode."""
@@ -95,6 +96,21 @@ async def run_internal_owner_probe(
             )
             for owner_spec in owner_specs
         ]
+    return _persist_internal_report(
+        args,
+        runtime_identity_by_field=runtime_identity_by_field,
+        owner_reports=owner_reports,
+    )
+
+
+def _persist_internal_report(
+    args: Any,
+    *,
+    runtime_identity_by_field: Mapping[str, str],
+    owner_reports: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Persist the provenance-bound two-owner probe report."""
+
     failures = [
         failure
         for owner_report in owner_reports
@@ -103,10 +119,11 @@ async def run_internal_owner_probe(
     report_by_field = {
         "contract": INTERNAL_OWNER_EVIDENCE_CONTRACT,
         "snapshot_id": args.snapshot_id,
+        "reference_snapshot_id": args.reference_snapshot_id,
         **runtime_identity_by_field,
         "passed": not failures,
         "failures": failures,
-        "owners": owner_reports,
+        "owners": list(owner_reports),
     }
     write_json(Path(args.output), report_by_field)
     return report_by_field
@@ -136,6 +153,8 @@ def _validated_runtime_identity_by_field(
 def _validate_probe_arguments(args: Any) -> None:
     """Reject weak sampling, a non-production prefix, or nonpositive gates."""
 
+    if not str(args.reference_snapshot_id).strip():
+        raise ValueError("internal owner probe reference snapshot is missing")
     if int(args.prefix_limit) != _EXACT_PREFIX_LIMIT:
         raise ValueError("internal owner probe requires limit_per_set=201")
     if (
@@ -146,9 +165,6 @@ def _validate_probe_arguments(args: Any) -> None:
     positive_values = (
         args.cold_p95_limit_ms,
         args.warm_p95_limit_ms,
-        args.maximum_database_bytes,
-        args.maximum_database_blocks,
-        args.maximum_logical_lookups,
     )
     if any(float(value) <= 0 for value in positive_values):
         raise ValueError("internal owner probe gates must be positive")
@@ -209,15 +225,21 @@ def _build_owner_spec(
     """Read one complete owner identity from compiler-authenticated fields."""
 
     key = diagnostic.get(f"{prefix}_provider_set_key")
+    member_count = diagnostic.get(f"{prefix}_member_count")
     digest = diagnostic.get(f"{prefix}_member_digest")
     if (
         isinstance(key, bool)
         or not isinstance(key, int)
         or key < 0
+        or isinstance(member_count, bool)
+        or not isinstance(member_count, int)
+        or member_count != _EXACT_PREFIX_LIMIT
         or not isinstance(digest, str)
         or len(digest) != 64
     ):
-        raise RuntimeError(f"compiler diagnostic lacks {role} owner evidence")
+        raise RuntimeError(
+            f"compiler diagnostic lacks exact 201-member {role} evidence"
+        )
     uses_override = (
         bool(diagnostic.get("worst_uses_override"))
         if prefix == "worst"
@@ -226,7 +248,7 @@ def _build_owner_spec(
     return _OwnerSpec(
         role=role,
         provider_set_key=key,
-        expected_member_count=int(diagnostic[f"{prefix}_member_count"]),
+        expected_member_count=member_count,
         expected_member_digest=digest,
         uses_override=uses_override,
         uses_component_fallback=bool(
@@ -410,6 +432,10 @@ def _evaluate_owner(
         or actual_digest != owner_spec.expected_member_digest
     ):
         failures.append(f"{owner_spec.role} prefix differs from compiler digest")
+    if len(dense_keys) != _EXACT_PREFIX_LIMIT:
+        failures.append(
+            f"{owner_spec.role} prefix is not the exact 201-member workload"
+        )
     cold_p95 = nearest_rank(cold.latencies_ms, 0.95)
     warm_p95 = nearest_rank(warm.latencies_ms, 0.95)
     if cold_p95 > float(args.cold_p95_limit_ms):
@@ -419,7 +445,7 @@ def _evaluate_owner(
     for phase_name, series in (("cold", cold), ("warm", warm)):
         failures.extend(
             _metric_failures(
-                args,
+                diagnostic=diagnostic,
                 owner_spec=owner_spec,
                 phase_name=phase_name,
                 metric_deltas=series.metric_deltas,

@@ -62,6 +62,9 @@ from scripts.ptg_v4_dev_canary_identity import (
 from scripts.ptg_v4_dev_canary_internal_evaluation import (
     validate_internal_evidence,
 )
+from scripts.ptg_v4_dev_canary_graph_budget import (
+    evaluate_graph_read_budget,
+)
 from scripts.ptg_v4_dev_canary_storage_budget import storage_budget
 from scripts.ptg_v4_dev_canary_kubernetes import (
     collect_frozen_v3_candidate_evidence,
@@ -204,7 +207,6 @@ async def _accept(args) -> dict[str, Any]:
         budget=_elapsed_budget(database_evidence),
         maximum_update_gap_seconds=args.maximum_progress_gap_seconds,
     )
-    publication_by_field = _evaluate_publication(args, database_evidence)
     reference_equivalence_by_field = evaluate_database_reference_evidence(
         database_evidence.get("reference_equivalence", {})
     )
@@ -217,12 +219,18 @@ async def _accept(args) -> dict[str, Any]:
         cold_sample_evidence,
         cold_not_before=cold_not_before,
     )
-    internal_by_field = validate_internal_evidence(
-        internal_evidence,
-        args.snapshot_id,
-        expected_image_identity=serving_by_field["bounded_read_counts"][
-            "runtime_identity"
-        ]["image_identity"],
+    publication_by_field = _publication_from_serving(
+        args, database_evidence, serving_by_field
+    )
+    internal_by_field, graph_read_budget_by_field = (
+        _graph_serving_sections(
+            args,
+            database_evidence,
+            reference_evidence,
+            internal_evidence,
+            cold_sample_evidence,
+            serving_by_field,
+        )
     )
     sections_by_name = {
         "import_progress": progress_by_field,
@@ -230,6 +238,7 @@ async def _accept(args) -> dict[str, Any]:
         "v3_reference_equivalence": reference_equivalence_by_field,
         "public_cpt_70553": serving_by_field,
         "internal_worst_owner": internal_by_field,
+        "graph_read_budget": graph_read_budget_by_field,
     }
     failures = _section_failures(sections_by_name.values())
     return {
@@ -240,9 +249,73 @@ async def _accept(args) -> dict[str, Any]:
     }
 
 
+def _graph_serving_sections(
+    args: Any,
+    database_evidence: Mapping[str, Any],
+    reference_evidence: Mapping[str, Any],
+    internal_evidence: Mapping[str, Any],
+    cold_sample_evidence: list[Mapping[str, Any]],
+    serving_by_field: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate internal evidence and evaluate the separate graph budget."""
+
+    image_identity = serving_by_field["bounded_read_counts"][
+        "runtime_identity"
+    ]["image_identity"]
+    reference_snapshot_id = str(
+        reference_evidence.get("reference_snapshot_id") or ""
+    )
+    internal_by_field = validate_internal_evidence(
+        internal_evidence,
+        args.snapshot_id,
+        expected_reference_snapshot_id=reference_snapshot_id,
+        expected_image_identity=image_identity,
+    )
+    graph_read_budget_by_field = _evaluate_graph_read_policy(
+        database_evidence,
+        reference_snapshot_id=reference_snapshot_id,
+        image_identity=image_identity,
+        cold_sample_evidence=cold_sample_evidence,
+        serving_by_field=serving_by_field,
+        internal_by_field=internal_by_field,
+    )
+    return internal_by_field, graph_read_budget_by_field
+
+
+def _evaluate_graph_read_policy(
+    database_evidence_by_field: Mapping[str, Any],
+    *,
+    reference_snapshot_id: str,
+    image_identity: str,
+    cold_sample_evidence: list[Mapping[str, Any]],
+    serving_by_field: Mapping[str, Any],
+    internal_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind measured graph reads to the sealed import and reviewed case."""
+
+    snapshot_by_field = database_evidence_by_field.get("snapshot")
+    if not isinstance(snapshot_by_field, Mapping):
+        raise CanaryConfigurationError(
+            "published V4 snapshot evidence is missing"
+        )
+    return evaluate_graph_read_budget(
+        reference_snapshot_id=reference_snapshot_id,
+        snapshot_id=str(snapshot_by_field.get("snapshot_id") or ""),
+        import_run_id=str(snapshot_by_field.get("import_run_id") or ""),
+        image_identity=image_identity,
+        public_cold_samples=cold_sample_evidence,
+        public_warm_graph_evidence=serving_by_field[
+            "bounded_read_counts"
+        ],
+        internal_owner_evidence=internal_by_field,
+    )
+
+
 def _evaluate_publication(
     args: Any,
     database_evidence_by_field: Mapping[str, Any],
+    *,
+    measurement_image_identity: str,
 ) -> dict[str, Any]:
     """Apply exact count and physical-storage gates to sealed DB evidence."""
 
@@ -250,6 +323,7 @@ def _evaluate_publication(
     return evaluate_v4_evidence(
         database_evidence_by_field,
         storage_budget=budget,
+        measurement_image_identity=measurement_image_identity,
         expected_root_counts=parse_count_expectations(
             args.expect_root_count,
             allowed_fields=ROOT_COUNT_FIELDS,
@@ -260,6 +334,23 @@ def _evaluate_publication(
             allowed_fields=RELATION_COUNT_FIELDS,
             relation_scoped=True,
         ),
+    )
+
+
+def _publication_from_serving(
+    args: Any,
+    database_evidence_by_field: Mapping[str, Any],
+    serving_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the storage measurement to the serving image under test."""
+
+    image_identity = serving_by_field["bounded_read_counts"][
+        "runtime_identity"
+    ]["image_identity"]
+    return _evaluate_publication(
+        args,
+        database_evidence_by_field,
+        measurement_image_identity=image_identity,
     )
 
 

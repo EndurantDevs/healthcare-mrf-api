@@ -231,11 +231,13 @@ def test_acceptance_passes_only_derived_storage_budget(
         database_evidence_by_field,
         *,
         storage_budget,
+        measurement_image_identity,
         expected_root_counts,
         expected_relation_counts,
     ):
         captured_by_field["evidence"] = database_evidence_by_field
         captured_by_field["budget"] = storage_budget
+        captured_by_field["image_identity"] = measurement_image_identity
         captured_by_field["root_counts"] = expected_root_counts
         captured_by_field["relation_counts"] = expected_relation_counts
         return {"passed": True}
@@ -246,11 +248,16 @@ def test_acceptance_passes_only_derived_storage_budget(
         expect_relation_count=[],
     )
 
-    report = acceptance._evaluate_publication(arguments, deepcopy(evidence))
+    report = acceptance._evaluate_publication(
+        arguments,
+        deepcopy(evidence),
+        measurement_image_identity="sha256:measured-image",
+    )
 
     assert report == {"passed": True}
     assert captured_by_field["evidence"] == evidence
     assert captured_by_field["budget"].case.case_name == "reference_extreme_478"
+    assert captured_by_field["image_identity"] == "sha256:measured-image"
     assert captured_by_field["root_counts"] == {}
     assert captured_by_field["relation_counts"] == {}
 
@@ -292,6 +299,32 @@ def _physical_storage_evidence(
     }
 
 
+def _physical_storage_approval(
+    *,
+    case: StorageCanaryCase,
+) -> PhysicalStorageApproval:
+    approval = PhysicalStorageApproval(
+        measurement_reference_snapshot_id=case.reference_snapshot_id,
+        measurement_snapshot_id="ptg2:v4:measured",
+        measurement_import_run_id="run_measured",
+        measurement_image_identity="sha256:measured-image",
+        measurement_evidence_sha256="",
+        measured_graph_gate_bytes=1_000,
+        measured_snapshot_gate_bytes=2_000,
+        tolerance_basis_points=200,
+        approved_graph_physical_storage_bytes=1_020,
+        approved_snapshot_physical_storage_bytes=2_040,
+    )
+    return replace(
+        approval,
+        measurement_evidence_sha256=(
+            storage_policy.physical_storage_measurement_evidence_sha256(
+                approval
+            )
+        ),
+    )
+
+
 def test_unapproved_measurement_reports_bytes_but_blocks_promotion() -> None:
     case = STORAGE_CANARY_CASES[1]
     budget = storage_budget(_database_evidence(case, factor_edge_count=10))
@@ -310,32 +343,50 @@ def test_unapproved_measurement_reports_bytes_but_blocks_promotion() -> None:
     report = budget.report(
         graph_gate_bytes=1_000,
         snapshot_gate_bytes=2_000,
+        measurement_image_identity="sha256:measured-image",
     )
     assert report["graph_gate_bytes"] == 1_000
     assert report["snapshot_gate_bytes"] == 2_000
     assert report["promotion_approved"] is False
+    assert report["measurement_evidence"] == {
+        "contract": storage_policy.STORAGE_MEASUREMENT_EVIDENCE_CONTRACT,
+        "measurement_reference_snapshot_id": case.reference_snapshot_id,
+        "measurement_snapshot_id": f"ptg2:v4:{case.case_name}",
+        "measurement_import_run_id": f"run_{case.case_name}",
+        "measurement_image_identity": "sha256:measured-image",
+        "measured_graph_gate_bytes": 1_000,
+        "measured_snapshot_gate_bytes": 2_000,
+    }
+    measured_approval = replace(
+        _physical_storage_approval(case=case),
+        measurement_snapshot_id=f"ptg2:v4:{case.case_name}",
+        measurement_import_run_id=f"run_{case.case_name}",
+    )
+    measured_approval = replace(
+        measured_approval,
+        measurement_evidence_sha256=(
+            storage_policy.physical_storage_measurement_evidence_sha256(
+                measured_approval
+            )
+        ),
+    )
+    assert report["measurement_evidence_sha256"] == (
+        measured_approval.measurement_evidence_sha256
+    )
 
 
 def test_checked_in_absolute_ceiling_requires_exact_reviewed_tolerance() -> None:
-    approval = PhysicalStorageApproval(
-        measurement_snapshot_id="ptg2:v4:measured",
-        measurement_import_run_id="run_measured",
-        measurement_image_identity="sha256:measured-image",
-        measured_graph_gate_bytes=1_000,
-        measured_snapshot_gate_bytes=2_000,
-        tolerance_basis_points=200,
-        approved_graph_physical_storage_bytes=1_020,
-        approved_snapshot_physical_storage_bytes=2_040,
-    )
-    storage_policy._validate_storage_approval(approval)
-    case = replace(
-        STORAGE_CANARY_CASES[1],
+    measured_case = STORAGE_CANARY_CASES[1]
+    approval = _physical_storage_approval(case=measured_case)
+    storage_policy._validate_storage_approval(measured_case, approval)
+    approved_case = replace(
+        measured_case,
         physical_storage_approval=approval,
     )
     unapproved_budget = storage_budget(
-        _database_evidence(STORAGE_CANARY_CASES[1], factor_edge_count=10)
+        _database_evidence(measured_case, factor_edge_count=10)
     )
-    approved_budget = replace(unapproved_budget, case=case)
+    approved_budget = replace(unapproved_budget, case=approved_case)
     failures: list[str] = []
 
     publication._validate_physical_storage(
@@ -352,21 +403,56 @@ def test_checked_in_absolute_ceiling_requires_exact_reviewed_tolerance() -> None
 
 
 def test_checked_in_absolute_ceiling_rejects_unreviewed_extra_headroom() -> None:
-    inconsistent_approval = PhysicalStorageApproval(
-        measurement_snapshot_id="ptg2:v4:measured",
-        measurement_import_run_id="run_measured",
-        measurement_image_identity="sha256:measured-image",
-        measured_graph_gate_bytes=1_000,
-        measured_snapshot_gate_bytes=2_000,
-        tolerance_basis_points=200,
+    case = STORAGE_CANARY_CASES[1]
+    inconsistent_approval = replace(
+        _physical_storage_approval(case=case),
         approved_graph_physical_storage_bytes=1_021,
-        approved_snapshot_physical_storage_bytes=2_040,
     )
 
     with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
-        storage_policy._validate_storage_approval(inconsistent_approval)
+        storage_policy._validate_storage_approval(
+            case,
+            inconsistent_approval,
+        )
 
     with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
         storage_policy._validate_storage_approval(
+            case,
             replace(inconsistent_approval, measurement_image_identity="")
+        )
+
+
+def test_storage_approval_requires_exact_two_percent() -> None:
+    case = STORAGE_CANARY_CASES[1]
+    approval = _physical_storage_approval(case=case)
+
+    for tolerance_basis_points in (199, 201):
+        with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
+            storage_policy._validate_storage_approval(
+                case,
+                replace(
+                    approval,
+                    tolerance_basis_points=tolerance_basis_points,
+                ),
+            )
+
+
+def test_storage_approval_rejects_cross_case_or_mistyped_evidence() -> None:
+    case = STORAGE_CANARY_CASES[1]
+    approval = _physical_storage_approval(case=case)
+
+    with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
+        storage_policy._validate_storage_approval(
+            STORAGE_CANARY_CASES[2],
+            approval,
+        )
+    with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
+        storage_policy._validate_storage_approval(
+            case,
+            replace(approval, measurement_evidence_sha256="0" * 64),
+        )
+    with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
+        storage_policy._validate_storage_approval(
+            case,
+            replace(approval, measurement_snapshot_id="ptg2:v4:mistyped"),
         )

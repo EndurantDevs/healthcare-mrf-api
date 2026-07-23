@@ -6,6 +6,15 @@ import hashlib
 import struct
 from typing import Any, Mapping, Sequence
 
+from scripts.ptg_v4_dev_canary_graph_budget import (
+    INTERNAL_MAXIMUM_DATABASE_BLOCKS,
+    INTERNAL_MAXIMUM_DATABASE_BYTES,
+    INTERNAL_MAXIMUM_GRAPH_PAGES,
+    INTERNAL_MAXIMUM_LOCATOR_PAGES,
+    INTERNAL_MAXIMUM_LOGICAL_LOOKUPS,
+    INTERNAL_MAXIMUM_MEMBER_PAGES,
+    INTERNAL_MAXIMUM_SOURCE_PAGES,
+)
 
 _PREFIX_DIGEST_DOMAIN = b"PTG2V4NPI-PREFIX\x01"
 _DELTA_FIELDS = (
@@ -17,12 +26,14 @@ _DELTA_FIELDS = (
     "hot_prefix_requests",
     "cold_exact_requests",
     "npi_prefix_override_sets",
+    "hot_group_npi_locator_pages",
+    "hot_group_npi_member_pages",
 )
 
 
 def metric_failures(
-    args: Any,
     *,
+    diagnostic: Mapping[str, Any],
     owner_spec: Any,
     phase_name: str,
     metric_deltas: Sequence[Mapping[str, int]],
@@ -41,10 +52,15 @@ def metric_failures(
         ),
     }
     maximum_by_field = {
-        "database_bytes": int(args.maximum_database_bytes),
-        "database_blocks": int(args.maximum_database_blocks),
-        "logical_lookups": int(args.maximum_logical_lookups),
+        "database_bytes": INTERNAL_MAXIMUM_DATABASE_BYTES,
+        "database_blocks": INTERNAL_MAXIMUM_DATABASE_BLOCKS,
+        "logical_lookups": INTERNAL_MAXIMUM_LOGICAL_LOOKUPS,
     }
+    source_pages = (
+        0
+        if owner_spec.uses_override
+        else compiler_work(diagnostic, owner_spec)["observed"]["source_pages"]
+    )
     failures: list[str] = []
     for sample_index, metric_delta_by_field in enumerate(metric_deltas):
         if any(
@@ -62,7 +78,38 @@ def metric_failures(
             failures.append(
                 f"{owner_spec.role} {phase_name} sample {sample_index} I/O exceeds bounds"
             )
+        if _is_sample_outside_page_envelope(
+            metric_delta_by_field,
+            source_pages=source_pages,
+        ):
+            failures.append(
+                f"{owner_spec.role} {phase_name} sample {sample_index} "
+                "graph pages exceed bounds"
+            )
     return failures
+
+
+def _is_sample_outside_page_envelope(
+    metric_delta_by_field: Mapping[str, int],
+    *,
+    source_pages: int,
+) -> bool:
+    """Return whether one owner request exceeds any packed-page hard cap."""
+
+    locator_pages = int(
+        metric_delta_by_field.get("hot_group_npi_locator_pages", -1)
+    )
+    member_pages = int(
+        metric_delta_by_field.get("hot_group_npi_member_pages", -1)
+    )
+    return bool(
+        locator_pages < 0
+        or locator_pages > INTERNAL_MAXIMUM_LOCATOR_PAGES
+        or member_pages < 0
+        or member_pages > INTERNAL_MAXIMUM_MEMBER_PAGES
+        or source_pages + locator_pages + member_pages
+        > INTERNAL_MAXIMUM_GRAPH_PAGES
+    )
 
 
 def compiler_work_failures(
@@ -79,7 +126,7 @@ def compiler_work_failures(
     if any(
         observed_by_field[field_name] > maximum_by_field[field_name]
         for field_name in maximum_by_field
-    ):
+    ) or observed_by_field["source_pages"] > INTERNAL_MAXIMUM_SOURCE_PAGES:
         return [f"{owner_spec.role} compiler work exceeds sealed online caps"]
     return []
 
@@ -132,10 +179,46 @@ def owner_mode(owner_spec: Any) -> str:
     return "online_factor"
 
 
+def _owner_workload_failures(
+    evidence_by_field: Mapping[str, Any],
+) -> list[str]:
+    """Require both compiler-selected probes to prove exactly 201 members."""
+
+    owners = evidence_by_field.get("owners")
+    if not isinstance(owners, list):
+        return ["internal worst-owner evidence lacks owner workloads"]
+    owners_by_role = {
+        str(owner.get("role") or ""): owner
+        for owner in owners
+        if isinstance(owner, Mapping)
+    }
+    required_roles = {"overall_worst", "worst_online_non_override"}
+    failures: list[str] = []
+    if len(owners) != 2 or set(owners_by_role) != required_roles:
+        failures.append(
+            "internal worst-owner evidence does not contain exactly two selected owners"
+        )
+    for role in sorted(required_roles):
+        owner = owners_by_role.get(role)
+        if owner is None:
+            failures.append(f"internal {role} workload is missing")
+            continue
+        if (
+            owner.get("expected_member_count") != 201
+            or owner.get("actual_member_count") != 201
+            or owner.get("passed") is not True
+        ):
+            failures.append(
+                f"internal {role} workload is not an accepted exact 201-member prefix"
+            )
+    return failures
+
+
 def validate_internal_evidence(
     evidence_by_field: Mapping[str, Any],
     snapshot_id: str,
     *,
+    expected_reference_snapshot_id: str,
     expected_image_identity: str,
 ) -> dict[str, Any]:
     """Bind a successful internal probe to the accepted snapshot and image."""
@@ -145,6 +228,13 @@ def validate_internal_evidence(
         failures.append("internal worst-owner evidence contract is missing")
     if evidence_by_field.get("snapshot_id") != snapshot_id:
         failures.append("internal worst-owner snapshot differs from acceptance")
+    if (
+        evidence_by_field.get("reference_snapshot_id")
+        != expected_reference_snapshot_id
+    ):
+        failures.append(
+            "internal worst-owner reference snapshot differs from acceptance"
+        )
     if evidence_by_field.get("image_identity") != expected_image_identity:
         failures.append("internal worst-owner image differs from public evidence")
     for field_name in (
@@ -159,6 +249,7 @@ def validate_internal_evidence(
             )
     if evidence_by_field.get("passed") is not True:
         failures.append("internal worst-owner production probe did not pass")
+    failures.extend(_owner_workload_failures(evidence_by_field))
     return {
         **dict(evidence_by_field),
         "passed": not failures,

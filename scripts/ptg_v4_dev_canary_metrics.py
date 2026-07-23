@@ -42,11 +42,11 @@ _PROCESS_IDENTITY_PATTERN = re.compile(
 
 @dataclass(frozen=True)
 class GraphReadLimits:
-    """Maximum cumulative metric deltas for one direct-pod traversal."""
+    """Optional reviewed maxima plus required direct-pod traversal shape."""
 
-    database_bytes: int
-    database_blocks: int
-    logical_lookups: int
+    database_bytes: int | None
+    database_blocks: int | None
+    logical_lookups: int | None
     minimum_request_scopes: int
     maximum_request_scopes: int
     component_fallback_mode: str
@@ -122,7 +122,7 @@ def evaluate_graph_metric_delta(
     }
     for field_name, maximum in maximum_by_field.items():
         delta = deltas_by_field[field_name]
-        if delta < 0 or delta > maximum:
+        if delta < 0 or (maximum is not None and delta > maximum):
             failures.append(f"direct-pod {field_name} delta exceeds its bound")
     _validate_component_fallback_delta(
         deltas_by_field["component_fallbacks"],

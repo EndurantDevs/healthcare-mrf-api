@@ -12,6 +12,12 @@ from process.ptg_parts.ptg2_shared_source_set import (
     PTG2_V3_SOURCE_SET_CONTRACT,
 )
 from scripts.ptg_v4_dev_canary_budget import sealed_resource_admission
+from scripts.ptg_v4_dev_canary_measurement_evidence import (
+    STORAGE_MEASUREMENT_EVIDENCE_CONTRACT,
+    measurement_evidence_sha256,
+    physical_storage_measurement_evidence,
+    physical_storage_measurement_report,
+)
 from scripts.ptg_v4_dev_canary_support import CanaryConfigurationError
 
 
@@ -21,9 +27,8 @@ UNAPPROVED_STORAGE_CEILING_FAILURE = (
     "source-controlled physical storage ceiling has not been approved "
     "from a measured V4 import"
 )
-# Safety bound only, not the rollout default. The checked-in tolerance must be
-# justified from repeat physical measurements and may be much smaller.
-MAX_APPROVED_TOLERANCE_BASIS_POINTS = 500
+APPROVED_TOLERANCE_BASIS_POINTS = 200
+MAX_APPROVED_TOLERANCE_BASIS_POINTS = APPROVED_TOLERANCE_BASIS_POINTS
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -31,9 +36,11 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 class PhysicalStorageApproval:
     """Reviewed absolute ceilings derived from one exact V4 measure run."""
 
+    measurement_reference_snapshot_id: str
     measurement_snapshot_id: str
     measurement_import_run_id: str
     measurement_image_identity: str
+    measurement_evidence_sha256: str
     measured_graph_gate_bytes: int
     measured_snapshot_gate_bytes: int
     tolerance_basis_points: int
@@ -139,6 +146,7 @@ class StorageBudget:
         *,
         graph_gate_bytes: int | None = None,
         snapshot_gate_bytes: int | None = None,
+        measurement_image_identity: str | None = None,
     ) -> dict[str, Any]:
         """Return the exact immutable policy, bindings, and derived ceilings."""
 
@@ -169,6 +177,16 @@ class StorageBudget:
             "factor_edge_count": self.factor_edge_count,
             "graph_gate_bytes": graph_gate_bytes,
             "snapshot_gate_bytes": snapshot_gate_bytes,
+            **physical_storage_measurement_report(
+                measurement_reference_snapshot_id=(
+                    self.case.reference_snapshot_id
+                ),
+                measurement_snapshot_id=self.snapshot_id,
+                measurement_import_run_id=self.import_run_id,
+                measurement_image_identity=measurement_image_identity,
+                measured_graph_gate_bytes=graph_gate_bytes,
+                measured_snapshot_gate_bytes=snapshot_gate_bytes,
+            ),
             "physical_storage_approval": (
                 asdict(approval) if approval is not None else None
             ),
@@ -375,7 +393,7 @@ def _policy_document() -> dict[str, Any]:
             or case.expected_representation not in {"direct_v1", "pattern_v1"}
         ):
             raise RuntimeError("PTG V4 source-controlled storage case is invalid")
-        _validate_storage_approval(case.physical_storage_approval)
+        _validate_storage_approval(case, case.physical_storage_approval)
     if (
         len(case_names) != len(STORAGE_CANARY_CASES)
         or len(_CASE_BY_REFERENCE_SNAPSHOT_ID) != len(STORAGE_CANARY_CASES)
@@ -383,14 +401,33 @@ def _policy_document() -> dict[str, Any]:
         raise RuntimeError("PTG V4 source-controlled storage cases are duplicated")
     return {
         "policy": STORAGE_BUDGET_POLICY,
-        "maximum_approved_tolerance_basis_points": (
-            MAX_APPROVED_TOLERANCE_BASIS_POINTS
+        "required_approved_tolerance_basis_points": (
+            APPROVED_TOLERANCE_BASIS_POINTS
         ),
         "cases": [asdict(case) for case in STORAGE_CANARY_CASES],
     }
 
 
+def physical_storage_measurement_evidence_sha256(
+    approval: PhysicalStorageApproval,
+) -> str:
+    """Hash only the immutable first-pass storage measurement and provenance."""
+
+    evidence_by_field = physical_storage_measurement_evidence(
+        measurement_reference_snapshot_id=(
+            approval.measurement_reference_snapshot_id
+        ),
+        measurement_snapshot_id=approval.measurement_snapshot_id,
+        measurement_import_run_id=approval.measurement_import_run_id,
+        measurement_image_identity=approval.measurement_image_identity,
+        measured_graph_gate_bytes=approval.measured_graph_gate_bytes,
+        measured_snapshot_gate_bytes=approval.measured_snapshot_gate_bytes,
+    )
+    return measurement_evidence_sha256(evidence_by_field)
+
+
 def _validate_storage_approval(
+    case: StorageCanaryCase,
     approval: PhysicalStorageApproval | None,
 ) -> None:
     """Reject incomplete or non-reproducible checked-in approvals."""
@@ -411,13 +448,16 @@ def _validate_storage_approval(
         for measured_value in measured_values
     )
     if (
-        not approval.measurement_snapshot_id.strip()
+        approval.measurement_reference_snapshot_id
+        != case.reference_snapshot_id
+        or not approval.measurement_snapshot_id.strip()
         or not approval.measurement_import_run_id.strip()
         or not approval.measurement_image_identity.strip()
+        or approval.measurement_evidence_sha256
+        != physical_storage_measurement_evidence_sha256(approval)
         or any(value <= 0 for value in measured_values)
         or any(value <= 0 for value in approved_values)
-        or tolerance < 0
-        or tolerance > MAX_APPROVED_TOLERANCE_BASIS_POINTS
+        or tolerance != APPROVED_TOLERANCE_BASIS_POINTS
         or approved_values != expected_approved_values
     ):
         raise RuntimeError(
@@ -443,14 +483,17 @@ STORAGE_BUDGET_POLICY_DIGEST = hashlib.sha256(
 
 
 __all__ = [
+    "APPROVED_TOLERANCE_BASIS_POINTS",
     "MAX_APPROVED_TOLERANCE_BASIS_POINTS",
     "STORAGE_BUDGET_CONTRACT",
     "STORAGE_BUDGET_POLICY",
     "STORAGE_BUDGET_POLICY_DIGEST",
     "STORAGE_CANARY_CASES",
+    "STORAGE_MEASUREMENT_EVIDENCE_CONTRACT",
     "UNAPPROVED_STORAGE_CEILING_FAILURE",
     "PhysicalStorageApproval",
     "StorageBudget",
     "StorageCanaryCase",
+    "physical_storage_measurement_evidence_sha256",
     "storage_budget",
 ]

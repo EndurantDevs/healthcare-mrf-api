@@ -112,15 +112,13 @@ def _add_internal_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Run the in-pod production provider-prefix path for the worst admitted set.",
     )
     parser.add_argument("--snapshot-id", required=True)
+    parser.add_argument("--reference-snapshot-id", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--prefix-limit", type=int, default=201)
     parser.add_argument("--cold-samples", type=int, default=20)
     parser.add_argument("--warm-samples", type=int, default=20)
     parser.add_argument("--cold-p95-limit-ms", type=float, default=50.0)
     parser.add_argument("--warm-p95-limit-ms", type=float, default=50.0)
-    parser.add_argument("--maximum-database-bytes", type=int, required=True)
-    parser.add_argument("--maximum-database-blocks", type=int, required=True)
-    parser.add_argument("--maximum-logical-lookups", type=int, required=True)
 
 
 def _add_database_arguments(
@@ -154,7 +152,4 @@ def _add_http_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cold-p95-limit-ms", type=float, default=50.0)
     parser.add_argument("--warm-p95-limit-ms", type=float, default=50.0)
     parser.add_argument("--minimum-cold-process-samples", type=int, default=20)
-    parser.add_argument("--maximum-database-bytes", type=int, required=True)
-    parser.add_argument("--maximum-database-blocks", type=int, required=True)
-    parser.add_argument("--maximum-logical-lookups", type=int, required=True)
     parser.add_argument("--allow-insecure-http", action="store_true")

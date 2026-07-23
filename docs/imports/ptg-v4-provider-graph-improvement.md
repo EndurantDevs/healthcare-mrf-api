@@ -122,6 +122,13 @@ Approval is a two-step, source-controlled workflow:
    equal the measured value plus exactly that tolerance; it cannot contain
    hidden extra headroom.
 
+For this rollout the tolerance is fixed at exactly 200 basis points (2%).
+Both physical-storage and graph-read first passes emit a canonical,
+case-bound measurement-evidence object and SHA-256. A checked-in approval must
+name the same frozen reference snapshot, reproduce that digest, and derive
+every ceiling from the measured value plus exactly 2%. Operator-provided graph
+ceilings are not accepted.
+
 The compiler-authenticated factor resources remain in the acceptance report as
 scale evidence. The retained base-layout value is bound only to the frozen V3
 reference. The V4 factored logical byte count is measured independently and
@@ -195,6 +202,16 @@ The dev canary order covers a low-fanout/direct shape, a
 reference-fragmented/pattern shape, and a jumbo fragmented shape. Each canary
 is independently accepted; a failure stops the sequence and triggers rollback
 to the retained V3 snapshot.
+
+During this isolated window, generic planned-import dispatch is fenced while
+candidate-audit dispatch remains active. An exact reimport is first created
+under a node-independent deterministic identity; node selection happens only
+inside the atomic dispatch reservation, so concurrent requests cannot start
+two attempts. Rollback is a separate authenticated operation that accepts only
+the exact pinned predecessor and reverses source, plan, same-source global, and
+declared allowed-amount pointers in one lifecycle-locked transaction. It
+validates the retained snapshot's sealed scope and activated audit attestation
+before changing any pointer, and an exact retry performs no writes.
 
 The V3 oracle is a separately deployed, scale-to-zero candidate pinned to its
 reviewed image. Reference capture first attests the singular ready Deployment
