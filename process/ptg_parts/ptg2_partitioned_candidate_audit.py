@@ -6,8 +6,9 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 import aiohttp
 
@@ -61,6 +62,9 @@ from process.ptg_parts.ptg2_source_witness_contract import (
 
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+logger = logging.getLogger(__name__)
+
+PartitionProgressCallback = Callable[[int, int], Awaitable[None]]
 
 
 class _RequestStartGate:
@@ -286,6 +290,7 @@ async def _execute_partition_plan(
     *,
     plan: PartitionedCandidateAuditPlan,
     http_config: FastAuditHttpConfig,
+    progress_callback: PartitionProgressCallback | None = None,
 ) -> tuple[Any, PartitionedAuditHttpMetrics]:
     """Execute every planned request once with bounded paced concurrency."""
 
@@ -307,6 +312,7 @@ async def _execute_partition_plan(
     semaphore = asyncio.Semaphore(concurrency)
     start_gate = _RequestStartGate(PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND)
     tasks: list[asyncio.Task[PartitionedCandidateAuditResult]] = []
+    partition_results: list[PartitionedCandidateAuditResult] = []
     try:
         async with aiohttp.ClientSession(
             base_url=http_config.api_base_url.rstrip("/"),
@@ -315,20 +321,20 @@ async def _execute_partition_plan(
             connector=connector,
             trust_env=False,
         ) as client:
-            tasks = [
-                asyncio.create_task(
-                    _post_partition(
-                        client=client,
-                        semaphore=semaphore,
-                        start_gate=start_gate,
-                        metrics=metrics,
-                        request=request,
-                        verify_tls=http_config.verify_tls,
-                    )
-                )
-                for request in plan.requests
-            ]
-            partition_results = await asyncio.gather(*tasks)
+            tasks = _create_partition_tasks(
+                client=client,
+                plan=plan,
+                semaphore=semaphore,
+                start_gate=start_gate,
+                metrics=metrics,
+                verify_tls=http_config.verify_tls,
+            )
+            partition_results = await _collect_partition_results(
+                tasks=tasks,
+                metrics=metrics,
+                progress_callback=progress_callback,
+                total=plan.request_count,
+            )
     finally:
         incomplete_tasks = [task for task in tasks if not task.done()]
         for task in incomplete_tasks:
@@ -338,12 +344,88 @@ async def _execute_partition_plan(
     return validate_partitioned_candidate_audit_results(plan, partition_results), metrics
 
 
+def _create_partition_tasks(
+    *,
+    client: aiohttp.ClientSession,
+    plan: PartitionedCandidateAuditPlan,
+    semaphore: asyncio.Semaphore,
+    start_gate: _RequestStartGate,
+    metrics: PartitionedAuditHttpMetrics,
+    verify_tls: bool,
+) -> list[asyncio.Task[PartitionedCandidateAuditResult]]:
+    """Schedule every immutable partition exactly once."""
+
+    return [
+        asyncio.create_task(
+            _post_partition(
+                client=client,
+                semaphore=semaphore,
+                start_gate=start_gate,
+                metrics=metrics,
+                request=request,
+                verify_tls=verify_tls,
+            )
+        )
+        for request in plan.requests
+    ]
+
+
+async def _collect_partition_results(
+    *,
+    tasks: list[asyncio.Task[PartitionedCandidateAuditResult]],
+    metrics: PartitionedAuditHttpMetrics,
+    progress_callback: PartitionProgressCallback | None,
+    total: int,
+) -> list[PartitionedCandidateAuditResult]:
+    """Collect completed requests while publishing monotonic exact counters."""
+
+    await _publish_partition_progress(
+        progress_callback,
+        completed=0,
+        total=total,
+    )
+    partition_result_list: list[PartitionedCandidateAuditResult] = []
+    last_reported_completed = 0
+    for completed_task in asyncio.as_completed(tasks):
+        partition_result_list.append(await completed_task)
+        completed_count = metrics.completed_request_count
+        if completed_count <= last_reported_completed:
+            continue
+        last_reported_completed = completed_count
+        await _publish_partition_progress(
+            progress_callback,
+            completed=completed_count,
+            total=total,
+        )
+    return partition_result_list
+
+
+async def _publish_partition_progress(
+    progress_callback: PartitionProgressCallback | None,
+    *,
+    completed: int,
+    total: int,
+) -> None:
+    """Report bounded counters without making observability part of the gate."""
+
+    if progress_callback is None:
+        return
+    try:
+        await progress_callback(completed, total)
+    except Exception:
+        logger.debug(
+            "candidate audit partition progress callback failed",
+            exc_info=True,
+        )
+
+
 async def run_partitioned_candidate_audit(
     *,
     audit_target: BatchAuditReportTarget,
     witness: LoadedSourceWitness,
     persisted_sample: PersistedAuditSample,
     http_config: FastAuditHttpConfig,
+    progress_callback: PartitionProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Execute every exact partition once at two request starts per second."""
 
@@ -359,6 +441,7 @@ async def run_partitioned_candidate_audit(
     aggregate, metrics = await _execute_partition_plan(
         plan=plan,
         http_config=http_config,
+        progress_callback=progress_callback,
     )
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     if (
@@ -389,6 +472,7 @@ async def run_partitioned_candidate_audit(
 __all__ = [
     "PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT",
     "PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND",
+    "PartitionProgressCallback",
     "PartitionedAuditHttpMetrics",
     "build_candidate_audit_partition_plan",
     "run_partitioned_candidate_audit",
