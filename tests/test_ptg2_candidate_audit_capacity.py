@@ -19,6 +19,7 @@ from api.ptg2_candidate_audit_capacity import (
     retain_unique_integer_keys,
 )
 from api.ptg2_shared_blocks import PTG2SharedBlockError
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
 class _AuditAbort(BaseException):
@@ -65,6 +66,21 @@ def test_dense_partition_has_bounded_headroom_without_changing_legacy_cap():
 def test_decoded_retention_budget_rejects_invalid_limits(maximum_bytes):
     with pytest.raises(ValueError, match="limit must be positive"):
         CandidateAuditDecodedRetentionBudget(maximum_bytes=maximum_bytes)
+
+
+def test_audit_counts_reject_incomplete_persisted_occurrence_validation():
+    batch_result = SimpleNamespace(
+        matched_challenge_count=1,
+        persisted_audit_occurrence_count=1,
+        validated_persisted_audit_occurrence_count=0,
+    )
+    audit_request = SimpleNamespace(challenge_count=1)
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="incomplete persisted occurrence count",
+    ):
+        pricing._validate_candidate_audit_batch_counts(batch_result, audit_request)
 
 
 def test_raw_audit_capacity_rejects_non_positive_configuration(monkeypatch):
