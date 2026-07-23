@@ -101,6 +101,30 @@ def test_source_key_map_one_byte_under_stops_before_tuple_conversion():
     )
 
 
+def test_source_key_retention_deduplicates_membership():
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=1024)
+    source_keys_by_code = {}
+
+    first_claim = reverse_scope._retain_source_key(
+        source_keys_by_code,
+        7,
+        3,
+        budget,
+    )
+    retained_bytes = budget.retained_bytes
+    second_claim = reverse_scope._retain_source_key(
+        source_keys_by_code,
+        7,
+        3,
+        budget,
+    )
+
+    assert first_claim > 0
+    assert second_claim == 0
+    assert source_keys_by_code == {7: {3}}
+    assert budget.retained_bytes == retained_bytes
+
+
 @pytest.mark.parametrize("npi_count", (1, 5, 19))
 def test_code_source_npi_set_exact_and_one_byte_under(npi_count):
     challenges = tuple(
@@ -143,6 +167,20 @@ def test_code_source_npi_set_exact_and_one_byte_under(npi_count):
         + reverse_scope._CODE_SOURCE_NPI_BUCKET_BYTES
         + (npi_count - 1) * reverse_scope._CODE_SOURCE_NPI_MEMBERSHIP_BYTES
     )
+
+
+def test_code_source_npis_deduplicates_repeated_challenge():
+    challenge = _challenge()
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=2048)
+
+    result = reverse_scope._code_source_npis(
+        (challenge, challenge),
+        _code_index(),
+        budget,
+    )
+
+    assert result.npis_by_code_source == {(7, 0): {challenge.npi}}
+    assert budget.retained_bytes == result.retained_bytes
 
 
 def _npi_provider_bytes(provider_count: int) -> int:
@@ -198,6 +236,28 @@ def test_npi_provider_set_exact_budget(provider_count):
         1234567890: set(range(provider_count))
     }
     assert exact_budget.retained_bytes == required_bytes
+
+
+def test_npi_provider_retention_deduplicates_membership():
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=1024)
+    candidate_keys_by_npi = {}
+
+    reverse_scope._retain_npi_provider_membership(
+        candidate_keys_by_npi,
+        1234567890,
+        5,
+        budget,
+    )
+    retained_bytes = budget.retained_bytes
+    reverse_scope._retain_npi_provider_membership(
+        candidate_keys_by_npi,
+        1234567890,
+        5,
+        budget,
+    )
+
+    assert candidate_keys_by_npi == {1234567890: {5}}
+    assert budget.retained_bytes == retained_bytes
 
 
 @pytest.mark.parametrize("provider_count", (0, 5, 19))

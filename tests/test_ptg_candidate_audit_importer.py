@@ -961,7 +961,7 @@ async def test_release_audit_loads_once_and_uses_partitioned_http_configuration(
     )
     assert kwargs["witness"] is witness
     assert kwargs["persisted_sample"] is persisted_sample
-    assert kwargs["http_config"].concurrency == 8
+    assert kwargs["http_config"].concurrency == 2
     assert kwargs["http_config"].deadline_seconds == 55.0
     assert kwargs["http_config"].verify_tls is False
     assert kwargs["http_config"].require_uvloop is True

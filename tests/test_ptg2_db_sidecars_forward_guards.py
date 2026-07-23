@@ -232,6 +232,29 @@ def test_forward_fragment_rejects_provider_regression():
         )
 
 
+def test_forward_fragment_filters_unselected_source():
+    payload_bytes = _grouped_forward_payload(2, ((5, ((8, 1),)),))
+    observed_occurrences = []
+
+    cursor, source_count = sidecars._visit_forward_fragment_unchecked(
+        _forward_fragment_row(payload_bytes),
+        provider_filter=frozenset((5,)),
+        fragment_cursor=sidecars._ForwardFragmentCursor(),
+        validation=sidecars._ForwardFragmentValidation(
+            expected_source_count=2,
+            source_filter=frozenset((0,)),
+        ),
+        occurrence_consumer=lambda *occurrence: observed_occurrences.append(
+            occurrence
+        ),
+    )
+
+    assert observed_occurrences == []
+    assert cursor.provider_set_key == 5
+    assert cursor.occurrence == (8, 1)
+    assert source_count == 2
+
+
 @pytest.mark.parametrize(
     ("missing_provider_key", "missing_occurrence"),
     ((True, False), (False, True)),

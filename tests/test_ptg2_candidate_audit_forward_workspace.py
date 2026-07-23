@@ -257,6 +257,69 @@ async def _fetch_fragment_workspace_views(retention):
 
 
 @pytest.mark.asyncio
+async def test_discovered_shards_receive_temporary_retention(monkeypatch):
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=4096)
+    retention = sidecars._ForwardTemporaryRetention(budget)
+    discover_shards = AsyncMock(return_value={7: ()})
+    monkeypatch.setattr(
+        sidecars,
+        "_discover_forward_shard_keys",
+        discover_shards,
+    )
+
+    observed = await sidecars._forward_batch_shards_and_filters(
+        object(),
+        _exact_options(),
+        (7,),
+        None,
+        retention,
+    )
+
+    assert observed == ({7: ()}, {7: None}, True)
+    assert (
+        discover_shards.await_args.kwargs["temporary_retention"]
+        is retention
+    )
+
+
+@pytest.mark.asyncio
+async def test_fragment_fetch_without_retention_skips_workspace_claim(
+    monkeypatch,
+):
+    block_key = 7 * sidecars._SERVING_BINARY_BY_CODE_BLOCK_SPAN
+    monkeypatch.setattr(
+        sidecars,
+        "_forward_batch_shards_and_filters",
+        AsyncMock(return_value=({7: (block_key,)}, {7: (5,)}, False)),
+    )
+    monkeypatch.setattr(
+        sidecars,
+        "_shared_serving_binary_payload_rows_for_keys",
+        AsyncMock(return_value=()),
+    )
+    monkeypatch.setattr(
+        sidecars,
+        "_group_forward_fragments_by_code",
+        Mock(return_value={7: ()}),
+    )
+    monkeypatch.setattr(
+        sidecars,
+        "_forward_batch_fragment_views",
+        Mock(return_value=()),
+    )
+
+    observed = await sidecars._fetch_forward_batch_fragment_views(
+        object(),
+        (7,),
+        _exact_options(),
+        {7: frozenset((0,))},
+        {7: frozenset(((5, 0),))},
+    )
+
+    assert observed == ()
+
+
+@pytest.mark.asyncio
 async def test_fragment_workspace_claim_precedes_view_build(monkeypatch):
     expected_bytes = 2 * sidecars._FORWARD_FRAGMENT_WORKSPACE_RETAINED_BYTES
     context = _fragment_workspace_context(monkeypatch, expected_bytes)

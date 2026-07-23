@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from sqlalchemy import text
 
+from api import ptg2_candidate_audit_provider_code_sets as provider_code_sets
 from api import ptg2_db_serving_v3, ptg2_db_sidecars
 from api import ptg2_shared_blocks as shared_readers
 from api.ptg2_candidate_audit_capacity import (
@@ -1833,6 +1834,8 @@ async def test_partially_aliased_fragments_prepare_once_and_parse_each_logical_p
 async def test_provider_code_intersections_keep_alias_reads_and_processing_once(
     monkeypatch,
 ):
+    """Account one normalized dimension lookup without repeated block work."""
+
     mapping_rows, physical_rows, raw_parts = _partially_aliased_provider_rows()
     session = _ReadOnceSession(
         mapping_rows=mapping_rows,
@@ -1860,6 +1863,7 @@ async def test_provider_code_intersections_keep_alias_reads_and_processing_once(
                 requested_code_keys=(2,),
                 max_retained_memberships=1,
                 schema_name="mrf",
+                inputs_are_normalized=True,
             )
         )
         scope.assert_processed_once()
@@ -1883,6 +1887,61 @@ async def test_provider_code_intersections_keep_alias_reads_and_processing_once(
     assert ledger["repeated_physical_decodes"] == 0
     assert ledger["repeated_logical_payload_processes"] == 0
     assert ledger["peak_raw_bytes"] == sum(len(raw_part) for raw_part in raw_parts)
+
+
+@pytest.mark.asyncio
+async def test_provider_code_dimension_intersection_matches_exact_request():
+    """Prove the global-code decoder matches exact per-provider requests."""
+
+    mapping_rows, physical_rows, _raw_parts = _partially_aliased_provider_rows()
+    dimension_session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    decoded_budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=64 * 1024)
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        dimension_code_keys_by_provider = await (
+            ptg2_db_sidecars.lookup_provider_code_intersections_from_db(
+                dimension_session,
+                12,
+                provider_set_keys=(0, 1024),
+                requested_code_keys=(2,),
+                max_retained_memberships=1,
+                schema_name="mrf",
+                decoded_retention_budget=decoded_budget,
+                inputs_are_normalized=True,
+            )
+        )
+        scope.assert_processed_once()
+
+    exact_session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+    )
+    exact_requests = ptg2_db_sidecars._ValidatedProviderCodeRequests(
+        provider_set_keys=(0, 1024),
+        code_keys_by_provider_set={0: (2,), 1024: (2,)},
+        membership_count=2,
+    )
+    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+        exact_code_keys_by_provider = await (
+            ptg2_db_sidecars._lookup_prepared_code_map_from_db(
+                exact_session,
+                12,
+                exact_requests,
+                max_retained_memberships=2,
+                schema_name="mrf",
+            )
+        )
+        scope.assert_processed_once()
+
+    assert exact_code_keys_by_provider == dimension_code_keys_by_provider
+    assert decoded_budget.retained_bytes == (
+        provider_code_sets.decoded_provider_code_bytes(
+            dimension_code_keys_by_provider
+        )
+    )
+    assert decoded_budget.peak_retained_bytes > decoded_budget.retained_bytes
 
 
 @pytest.mark.asyncio

@@ -203,6 +203,7 @@ async def test_provider_code_lookup_requires_complete_filtered_memberships(
     assert lookup.await_args.args[3] == (7, 8)
     assert lookup.await_args.kwargs["max_retained_memberships"] == 1_000_000
     assert lookup.await_args.kwargs["schema_name"] == "mrf"
+    assert lookup.await_args.kwargs["decoded_retention_budget"] is None
 
     lookup.return_value = {5: (7,), 6: ()}
     assert await selection.load_candidate_provider_code_sets(
@@ -211,7 +212,7 @@ async def test_provider_code_lookup_requires_complete_filtered_memberships(
         (5, 6),
         (7,),
         schema_name="mrf",
-    ) == {5: frozenset((7,)), 6: frozenset()}
+    ) == {5: frozenset((7,))}
 
     lookup.return_value = {5: (7,)}
     with pytest.raises(PTG2ManifestArtifactError, match="provider-code artifact"):

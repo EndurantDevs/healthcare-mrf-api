@@ -12,9 +12,9 @@ from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES = 64 * 1024 * 1024
 # A dense 50-item partition can retain the decoded group map and its per-NPI
-# projection together beyond 256 MiB. Keep that bounded with headroom while
+# projection together beyond 384 MiB. Keep that bounded with headroom while
 # the partition process gate accounts raw plus decoded capacity.
-PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES = 384 * 1024 * 1024
+PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES = 512 * 1024 * 1024
 PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES = 1024 * 1024 * 1024
 PTG2_CANDIDATE_AUDIT_MAX_PROCESS_BYTES = 8 * 1024 * 1024 * 1024
 INTEGER_KEY_SET_BYTES = 256
@@ -44,6 +44,29 @@ class CandidateAuditProcessAdmissionError(RuntimeError):
 
 class CandidateAuditProcessConfigurationError(RuntimeError):
     """Raised when the process-wide audit allowance is not usable."""
+
+
+def _bounded_unique_integer_keys_without_budget(
+    integer_keys: Iterable[int],
+    *,
+    category: str,
+    maximum_count: int | None,
+    limit_error_message: str | None,
+) -> tuple[int, ...]:
+    """Normalize bounded keys without decoded-retention accounting."""
+
+    normalized_keys: set[int] = set()
+    for raw_integer_key in integer_keys:
+        integer_key = int(raw_integer_key)
+        if integer_key in normalized_keys:
+            continue
+        if maximum_count is not None and len(normalized_keys) >= maximum_count:
+            raise PTG2ManifestArtifactError(
+                limit_error_message
+                or f"{category} exceeds its bounded limit"
+            )
+        normalized_keys.add(integer_key)
+    return tuple(sorted(normalized_keys))
 
 
 @dataclass
@@ -89,16 +112,25 @@ def retain_unique_integer_keys(
     retention_budget: CandidateAuditDecodedRetentionBudget | None,
     *,
     category: str,
+    maximum_count: int | None = None,
+    limit_error_message: str | None = None,
 ) -> tuple[tuple[int, ...], int]:
     """Normalize integer keys with their set-to-tuple peak claimed."""
 
+    if maximum_count is not None and maximum_count < 1:
+        raise ValueError("unique integer key limit must be positive")
     if retention_budget is None:
-        return tuple(sorted({int(integer_key) for integer_key in integer_keys})), 0
+        return (
+            _bounded_unique_integer_keys_without_budget(
+                integer_keys,
+                category=category,
+                maximum_count=maximum_count,
+                limit_error_message=limit_error_message,
+            ),
+            0,
+        )
     retained_set_bytes = INTEGER_KEY_SET_BYTES
-    retention_budget.claim(
-        retained_set_bytes,
-        category=f"the {category} set",
-    )
+    retention_budget.claim(retained_set_bytes, category=f"the {category} set")
     normalized_keys: set[int] = set()
     ordering_bytes = 0
     try:
@@ -106,20 +138,25 @@ def retain_unique_integer_keys(
             integer_key = int(raw_integer_key)
             if integer_key in normalized_keys:
                 continue
+            if maximum_count is not None and len(normalized_keys) >= maximum_count:
+                raise PTG2ManifestArtifactError(
+                    limit_error_message or f"{category} exceeds its bounded limit"
+                )
             retention_budget.claim(
                 INTEGER_KEY_SET_MEMBERSHIP_BYTES,
                 category=f"a {category} key",
             )
             retained_set_bytes += INTEGER_KEY_SET_MEMBERSHIP_BYTES
             normalized_keys.add(integer_key)
-        ordering_bytes = (
+        requested_ordering_bytes = (
             INTEGER_KEY_ORDERING_BYTES
             + len(normalized_keys) * INTEGER_KEY_ORDERING_MEMBERSHIP_BYTES
         )
         retention_budget.claim(
-            ordering_bytes,
+            requested_ordering_bytes,
             category=f"the ordered {category} keys",
         )
+        ordering_bytes = requested_ordering_bytes
         ordered_keys = tuple(sorted(normalized_keys))
     except BaseException:
         retention_budget.release(retained_set_bytes + ordering_bytes)
