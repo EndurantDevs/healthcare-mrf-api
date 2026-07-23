@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -175,6 +176,26 @@ def test_candidate_npis_skip_missing_graph_selection():
 
 
 @pytest.mark.asyncio
+async def test_group_npis_skip_missing_locator(monkeypatch):
+    monkeypatch.setattr(
+        audit,
+        "_graph_owner_locators",
+        AsyncMock(return_value={}),
+    )
+    targeted_members = AsyncMock(return_value={})
+    monkeypatch.setattr(audit, "_graph_targeted_members", targeted_members)
+
+    assert await audit._selected_group_npis(
+        AsyncMock(),
+        active_candidates=(_candidate(),),
+        group_key_by_selection={(0, 0): 2},
+        core_layout_id=b"\x05" * 32,
+        selections_per_candidate=1,
+    ) == ({}, {})
+    targeted_members.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_price_memberships_require_every_requested_price():
     reader = AsyncMock()
     reader.logical_blocks.return_value = {}
@@ -253,6 +274,44 @@ async def test_publication_rejects_invalid_digests(
 def test_layout_requires_audit_metadata():
     with pytest.raises(RuntimeError, match="audit sample contract"):
         audit._audit_metadata_from_layout({})
+
+
+@pytest.mark.asyncio
+async def test_sealed_layout_requires_manifest():
+    session = AsyncMock()
+    session.execute.return_value = SimpleNamespace(scalar=lambda: None)
+
+    with pytest.raises(RuntimeError, match="missing its manifest"):
+        await audit._sealed_layout_manifest(
+            session,
+            schema_name="mrf",
+            snapshot_key=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_sealed_sample_requires_matching_rows(monkeypatch):
+    metadata = {**_sealed_metadata(), "source_count": 1}
+    monkeypatch.setattr(
+        audit,
+        "_sealed_layout_manifest",
+        AsyncMock(
+            return_value={"serving_index": {"audit_sample": metadata}},
+        ),
+    )
+    monkeypatch.setattr(
+        audit,
+        "_sealed_audit_occurrences",
+        AsyncMock(return_value=()),
+    )
+
+    with pytest.raises(RuntimeError, match="rows disagree"):
+        await audit.sealed_audit_sample_metadata(
+            AsyncMock(),
+            schema_name="mrf",
+            snapshot_key=1,
+            logical_snapshot_id="snapshot",
+        )
 
 
 @pytest.mark.parametrize(
