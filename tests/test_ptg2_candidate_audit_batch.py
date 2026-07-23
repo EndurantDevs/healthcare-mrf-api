@@ -17,6 +17,9 @@ from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_HEADER,
     PTG2CandidateAuditAccess,
 )
+from api.ptg2_candidate_audit_capacity import (
+    PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES,
+)
 from api.ptg2_response import _response_wire_value
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     AuditBatchChallenge,
@@ -292,6 +295,10 @@ async def test_batch_audit_uses_one_read_only_transaction_and_matches_multiplici
         ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", {})
     ]
     load_data.assert_awaited_once()
+    assert (
+        load_data.await_args.args[3].maximum_bytes
+        == PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES
+    )
 
 
 @pytest.mark.asyncio
