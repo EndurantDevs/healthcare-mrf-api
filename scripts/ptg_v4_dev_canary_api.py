@@ -195,20 +195,13 @@ def reference_spec(args: Any) -> BoundedApiSpec:
     )
 
 
-def graph_limits(args: Any, *, fallback_mode: str) -> GraphReadLimits:
-    """Build positive sealed graph-read limits for one public request."""
+def graph_limits(_args: Any, *, fallback_mode: str) -> GraphReadLimits:
+    """Build measurement-only graph checks for one public request scope."""
 
-    numeric_values = (
-        args.maximum_database_bytes,
-        args.maximum_database_blocks,
-        args.maximum_logical_lookups,
-    )
-    if any(value < 1 for value in numeric_values):
-        raise CanaryConfigurationError("graph read limits must be positive")
     return GraphReadLimits(
-        database_bytes=args.maximum_database_bytes,
-        database_blocks=args.maximum_database_blocks,
-        logical_lookups=args.maximum_logical_lookups,
+        database_bytes=None,
+        database_blocks=None,
+        logical_lookups=None,
         minimum_request_scopes=1,
         maximum_request_scopes=1,
         component_fallback_mode=fallback_mode,

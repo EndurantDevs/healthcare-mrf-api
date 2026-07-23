@@ -63,6 +63,7 @@ def evaluate_v4_evidence(
     evidence_by_field: Mapping[str, Any],
     *,
     storage_budget: StorageBudget,
+    measurement_image_identity: str,
     expected_root_counts: Mapping[str, int],
     expected_relation_counts: Mapping[str, int],
 ) -> dict[str, Any]:
@@ -126,6 +127,7 @@ def evaluate_v4_evidence(
             snapshot_gate_bytes=_optional_int(
                 physical_storage.get("snapshot_gate_bytes")
             ),
+            measurement_image_identity=measurement_image_identity,
         ),
     }
 

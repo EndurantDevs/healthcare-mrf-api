@@ -59,8 +59,8 @@ class _Clock:
 
 
 def _diagnostic() -> dict[str, Any]:
-    overall_keys = (3, 5)
-    online_keys = (11, 13)
+    overall_keys = tuple(range(1, 202))
+    online_keys = tuple(range(1_001, 1_202))
     return {
         "npi_prefix_target": 201,
         "max_online_group_keys_per_set": 4_096,
@@ -93,6 +93,7 @@ def _diagnostic() -> dict[str, Any]:
 def _arguments() -> SimpleNamespace:
     return SimpleNamespace(
         snapshot_id="snapshot-1",
+        reference_snapshot_id="ptg2:202607:bbc0656036ca",
         output="unused.json",
         process_identity="operator-forged-process",
         process_started_at="operator-forged-start",
@@ -102,9 +103,6 @@ def _arguments() -> SimpleNamespace:
         warm_samples=5,
         cold_p95_limit_ms=50,
         warm_p95_limit_ms=50,
-        maximum_database_bytes=100_000,
-        maximum_database_blocks=100,
-        maximum_logical_lookups=100,
     )
 
 
@@ -139,23 +137,24 @@ class _FakeProbeServices:
         self.metrics_by_field["hot_prefix_requests"] += 1
         self.metrics_by_field["npi_prefix_override_sets"] += int(uses_override)
         self.metrics_by_field["component_fallback_sets"] += int(not uses_override)
-        values = (
-            (9_000_000_001, 9_000_000_002)
+        base_npi = (
+            9_000_000_000
             if uses_override
-            else (9_000_000_003, 9_000_000_004)
+            else 9_100_000_000
         )
+        values = tuple(base_npi + offset for offset in range(1, 202))
         return {owner_id: values}
 
     async def npi_keys(self, _session, *, npis, **_kwargs):
         """Map external fixture NPIs to their exact dense compiler keys."""
 
-        keys_by_npi = {
-            9_000_000_001: 3,
-            9_000_000_002: 5,
-            9_000_000_003: 11,
-            9_000_000_004: 13,
-        }
-        return {npi: keys_by_npi[npi] for npi in npis}
+        keys_by_npi = {}
+        for npi in npis:
+            if npi <= 9_000_000_201:
+                keys_by_npi[npi] = npi - 9_000_000_000
+            else:
+                keys_by_npi[npi] = 1_000 + npi - 9_100_000_000
+        return keys_by_npi
 
     def reset_cold(self) -> None:
         """Record one cold cache reset."""
@@ -228,10 +227,21 @@ async def test_internal_probe_gates_both_compiler_selected_owners(
     assert report["process_identity"] == "runtime-process"
     assert report["process_started_at"] == "2026-07-23T00:00:00Z"
     assert report["image_identity"] == "sha256:runtime-image"
+    assert (
+        report["reference_snapshot_id"]
+        == "ptg2:202607:bbc0656036ca"
+    )
     serialized = json.dumps(report)
     assert "operator-forged" not in serialized
     assert "aaaaaaaa" not in serialized
     assert "9000000001" not in serialized
+    validated = validate_internal_evidence(
+        report,
+        "snapshot-1",
+        expected_reference_snapshot_id="ptg2:202607:bbc0656036ca",
+        expected_image_identity="sha256:runtime-image",
+    )
+    assert validated["passed"] is True
 
 
 def test_internal_probe_requires_exact_201_member_limit() -> None:
@@ -240,6 +250,46 @@ def test_internal_probe_requires_exact_201_member_limit() -> None:
 
     with pytest.raises(ValueError, match="limit_per_set=201"):
         internal._validate_probe_arguments(arguments)
+
+
+@pytest.mark.parametrize(
+    "count_field",
+    ("worst_member_count", "worst_online_member_count"),
+)
+def test_internal_probe_rejects_compiler_owner_without_exact_201_members(
+    count_field: str,
+) -> None:
+    diagnostic = _diagnostic()
+    diagnostic[count_field] = 200
+
+    with pytest.raises(RuntimeError, match="exact 201-member"):
+        internal._compiler_owner_specs(diagnostic)
+
+
+def test_internal_probe_uses_fixed_hard_io_envelope() -> None:
+    diagnostic = _diagnostic()
+    owner_spec = internal._compiler_owner_specs(diagnostic)[0]
+    failures = internal._metric_failures(
+        diagnostic=diagnostic,
+        owner_spec=owner_spec,
+        phase_name="cold",
+        metric_deltas=[
+            {
+                "request_count": 1,
+                "database_bytes": 1,
+                "database_blocks": 417,
+                "logical_lookups": 1,
+                "hot_prefix_requests": 1,
+                "cold_exact_requests": 0,
+                "npi_prefix_override_sets": 1,
+                "component_fallback_sets": 0,
+                "hot_group_npi_locator_pages": 0,
+                "hot_group_npi_member_pages": 0,
+            }
+        ],
+    )
+
+    assert any("I/O exceeds bounds" in failure for failure in failures)
 
 
 @pytest.mark.parametrize(
@@ -253,14 +303,10 @@ def test_internal_probe_cli_rejects_operator_identity_arguments(
         "internal-owner-probe",
         "--snapshot-id",
         "snapshot-1",
+        "--reference-snapshot-id",
+        "ptg2:202607:bbc0656036ca",
         "--output",
         "unused.json",
-        "--maximum-database-bytes",
-        "100000",
-        "--maximum-database-blocks",
-        "100",
-        "--maximum-logical-lookups",
-        "100",
         legacy_argument,
         "operator-forged",
     ]
@@ -313,6 +359,7 @@ def test_internal_evidence_requires_complete_runtime_identity(
     evidence_by_field = {
         "contract": internal.INTERNAL_OWNER_EVIDENCE_CONTRACT,
         "snapshot_id": "snapshot-1",
+        "reference_snapshot_id": "ptg2:202607:bbc0656036ca",
         "process_identity": "runtime-process",
         "process_started_at": "2026-07-23T00:00:00Z",
         "image_identity": "sha256:runtime-image",
@@ -324,6 +371,7 @@ def test_internal_evidence_requires_complete_runtime_identity(
     validated = validate_internal_evidence(
         evidence_by_field,
         "snapshot-1",
+        expected_reference_snapshot_id="ptg2:202607:bbc0656036ca",
         expected_image_identity="sha256:runtime-image",
     )
 
@@ -335,6 +383,7 @@ def test_internal_evidence_must_match_public_probe_image() -> None:
     evidence_by_field = {
         "contract": internal.INTERNAL_OWNER_EVIDENCE_CONTRACT,
         "snapshot_id": "snapshot-1",
+        "reference_snapshot_id": "ptg2:202607:bbc0656036ca",
         "process_identity": "runtime-process",
         "process_started_at": "2026-07-23T00:00:00Z",
         "image_identity": "sha256:older-image",
@@ -345,11 +394,73 @@ def test_internal_evidence_must_match_public_probe_image() -> None:
     validated = validate_internal_evidence(
         evidence_by_field,
         "snapshot-1",
+        expected_reference_snapshot_id="ptg2:202607:bbc0656036ca",
         expected_image_identity="sha256:accepted-image",
     )
 
     assert validated["passed"] is False
     assert (
         "internal worst-owner image differs from public evidence"
+        in validated["failures"]
+    )
+
+
+def test_internal_evidence_rejects_non_201_member_owner_workload() -> None:
+    evidence_by_field = {
+        "contract": internal.INTERNAL_OWNER_EVIDENCE_CONTRACT,
+        "snapshot_id": "snapshot-1",
+        "reference_snapshot_id": "ptg2:202607:bbc0656036ca",
+        "process_identity": "runtime-process",
+        "process_started_at": "2026-07-23T00:00:00Z",
+        "image_identity": "sha256:runtime-image",
+        "passed": True,
+        "failures": [],
+        "owners": [
+            {
+                "role": role,
+                "expected_member_count": 201,
+                "actual_member_count": 200 if role == "overall_worst" else 201,
+                "passed": True,
+            }
+            for role in ("overall_worst", "worst_online_non_override")
+        ],
+    }
+
+    validated = validate_internal_evidence(
+        evidence_by_field,
+        "snapshot-1",
+        expected_reference_snapshot_id="ptg2:202607:bbc0656036ca",
+        expected_image_identity="sha256:runtime-image",
+    )
+
+    assert validated["passed"] is False
+    assert any(
+        "exact 201-member prefix" in failure
+        for failure in validated["failures"]
+    )
+
+
+def test_internal_evidence_must_match_reference_snapshot() -> None:
+    evidence_by_field = {
+        "contract": internal.INTERNAL_OWNER_EVIDENCE_CONTRACT,
+        "snapshot_id": "snapshot-1",
+        "reference_snapshot_id": "ptg2:202607:different",
+        "process_identity": "runtime-process",
+        "process_started_at": "2026-07-23T00:00:00Z",
+        "image_identity": "sha256:runtime-image",
+        "passed": True,
+        "failures": [],
+    }
+
+    validated = validate_internal_evidence(
+        evidence_by_field,
+        "snapshot-1",
+        expected_reference_snapshot_id="ptg2:202607:bbc0656036ca",
+        expected_image_identity="sha256:runtime-image",
+    )
+
+    assert validated["passed"] is False
+    assert (
+        "internal worst-owner reference snapshot differs from acceptance"
         in validated["failures"]
     )

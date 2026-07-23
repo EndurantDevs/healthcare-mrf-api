@@ -486,7 +486,11 @@ jobs:
       - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
         env:
           HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
-        run: python -m pytest -q tests/test_ptg2_v3_migrated_lifecycle_postgres.py
+          HLTHPRT_PTG2_ROLLBACK_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+        run: >
+          python -m pytest -q
+          tests/test_ptg2_v3_migrated_lifecycle_postgres.py
+          tests/test_ptg_source_snapshot_rollback_postgres.py
       - name: Run candidate attestation reader/writer compatibility gate
         env:
           HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST: "1"

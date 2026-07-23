@@ -22,7 +22,8 @@ def _snapshot_table_statements(schema: str) -> tuple[str, ...]:
         CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
             snapshot_key bigint PRIMARY KEY,
             state varchar(16) NOT NULL,
-            generation varchar(32) NOT NULL
+            generation varchar(32) NOT NULL,
+            logical_byte_count bigint NOT NULL
         )
         """,
         f"""
@@ -84,10 +85,10 @@ def _fixture_data_statements(schema: str) -> tuple[str, ...]:
         """,
         f"""
         INSERT INTO {schema}.ptg2_v3_snapshot_layout
-            (snapshot_key, state, generation)
+            (snapshot_key, state, generation, logical_byte_count)
         VALUES
-            (3, 'sealed', 'shared_blocks_v3'),
-            (4, 'sealed', 'shared_blocks_v4')
+            (3, 'sealed', 'shared_blocks_v3', 1),
+            (4, 'sealed', 'shared_blocks_v4', 1)
         """,
         f"""
         INSERT INTO {schema}.ptg2_v3_snapshot_binding

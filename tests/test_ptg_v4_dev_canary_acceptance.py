@@ -322,6 +322,44 @@ def test_explicit_snapshot_public_probe_requires_exactly_one_graph_scope() -> No
     )
 
 
+def test_public_graph_collection_measures_without_operator_ceiling() -> None:
+    limits = GraphReadLimits(
+        database_bytes=None,
+        database_blocks=None,
+        logical_lookups=None,
+        minimum_request_scopes=1,
+        maximum_request_scopes=1,
+        component_fallback_mode="allowed",
+    )
+    metrics_before_by_field = {
+        "request_count": 0,
+        "database_bytes": 0,
+        "database_blocks": 0,
+        "logical_lookups": 0,
+        "component_fallbacks": 0,
+    }
+    metrics_after_by_field = {
+        "request_count": 1,
+        "database_bytes": 100_000_000,
+        "database_blocks": 10_000,
+        "logical_lookups": 1_000,
+        "component_fallbacks": 0,
+    }
+
+    report = evaluate_graph_metric_delta(
+        metrics_before_by_field,
+        metrics_after_by_field,
+        limits=limits,
+    )
+
+    assert report["passed"] is True
+    assert report["maximums"] == {
+        "database_bytes": None,
+        "database_blocks": None,
+        "logical_lookups": None,
+    }
+
+
 def test_prometheus_parser_reads_exact_runtime_metric_names() -> None:
     payload = "\n".join(
         (
