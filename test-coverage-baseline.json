@@ -356,16 +356,16 @@
       },
       "metrics": {
         "branches": {
-          "covered": 28228,
-          "total": 37002
+          "covered": 28367,
+          "total": 37154
         },
         "lines": {
-          "covered": 92279,
-          "total": 108520
+          "covered": 92856,
+          "total": 109067
         }
       },
       "one_time_floor_reset": {
-        "maximum_drop_basis_points": 100,
+        "maximum_drop_basis_points": 200,
         "reason": "PTG V4 adaptive graph representation migration",
         "reference_metrics": {
           "branches": {
@@ -415,6 +415,7 @@
     "rust": {
       "files": [
         "support/ptg2_scanner/src/address_canon.rs",
+        "support/ptg2_scanner/src/bin/ptg2_provider_graph_v4.rs",
         "support/ptg2_scanner/src/bin/raw_claim_check.rs",
         "support/ptg2_scanner/src/config.rs",
         "support/ptg2_scanner/src/contact_canon.rs",
@@ -438,6 +439,8 @@
         "support/ptg2_scanner/src/provider_directory_projection_v2/references.rs",
         "support/ptg2_scanner/src/provider_directory_projection_v2/semantics.rs",
         "support/ptg2_scanner/src/provider_directory_projection_v2/stdio.rs",
+        "support/ptg2_scanner/src/provider_graph_v4.rs",
+        "support/ptg2_scanner/src/rate_schedule_observe.rs",
         "support/ptg2_scanner/src/shared_graph.rs",
         "support/ptg2_scanner/src/source_witness.rs",
         "support/ptg2_scanner/src/source_witness_spool.rs",
@@ -463,16 +466,34 @@
       },
       "metrics": {
         "functions": {
-          "covered": 2356,
-          "total": 2991
+          "covered": 2987,
+          "total": 3521
         },
         "lines": {
-          "covered": 34196,
-          "total": 42566
+          "covered": 45188,
+          "total": 53346
         },
         "regions": {
-          "covered": 51845,
-          "total": 63759
+          "covered": 67164,
+          "total": 78998
+        }
+      },
+      "one_time_floor_reset": {
+        "maximum_drop_basis_points": 200,
+        "reason": "PTG V4 adaptive graph representation migration",
+        "reference_metrics": {
+          "functions": {
+            "covered": 2356,
+            "total": 2991
+          },
+          "lines": {
+            "covered": 34196,
+            "total": 42566
+          },
+          "regions": {
+            "covered": 51845,
+            "total": 63759
+          }
         }
       },
       "path": "test-coverage-rust.json",

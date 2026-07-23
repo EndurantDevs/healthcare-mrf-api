@@ -432,6 +432,143 @@ def test_readability_ratchet_zero_percent_prevents_net_growth(tmp_path):
     assert readability_budget.main(ratchet_args) == 1
 
 
+def _synthetic_readability_snapshot(issue_count):
+    issues = [
+        {
+            "id": f"long_function:pkg/module.py:function_{index}",
+            "line": index + 1,
+            "path": "pkg/module.py",
+        }
+        for index in range(issue_count)
+    ]
+    return {
+        "version": 1,
+        "rules": {"readability": {}, "thresholds": {}},
+        "thresholds": {},
+        "issue_counts": {"long_functions": issue_count},
+        "issues": {"long_functions": issues},
+    }
+
+
+def _baseline_with_readability_reset(snapshot, reference):
+    baseline_by_field = readability_cli._baseline_snapshot(snapshot)
+    baseline_by_field["one_time_debt_reset"] = {
+        "maximum_increase_basis_points": 200,
+        "reason": "PTG V4 adaptive graph representation migration",
+        "reference_baseline_sha256": readability_cli._baseline_anchor_sha256(
+            reference
+        ),
+        "reference_total": readability_cli._total_issue_count(reference),
+    }
+    return baseline_by_field
+
+
+def test_readability_reset_is_two_percent_base_anchored_and_non_repeatable(tmp_path):
+    reference_snapshot = _synthetic_readability_snapshot(50)
+    reference_baseline = readability_cli._baseline_snapshot(reference_snapshot)
+    reference_path = tmp_path / "readability-base.json"
+    reference_path.write_text(json.dumps(reference_baseline), encoding="utf-8")
+
+    boundary_snapshot = _synthetic_readability_snapshot(51)
+    boundary_baseline = _baseline_with_readability_reset(
+        boundary_snapshot,
+        reference_baseline,
+    )
+    assert (
+        readability_cli._check_readability_ratchet(
+            boundary_snapshot,
+            boundary_baseline,
+            reference_path,
+            1,
+        )
+        == 0
+    )
+
+    over_limit_snapshot = _synthetic_readability_snapshot(52)
+    over_limit_baseline = _baseline_with_readability_reset(
+        over_limit_snapshot,
+        reference_baseline,
+    )
+    assert (
+        readability_cli._check_readability_ratchet(
+            over_limit_snapshot,
+            over_limit_baseline,
+            reference_path,
+            1,
+        )
+        == 1
+    )
+
+    stale_anchor_baseline = _baseline_with_readability_reset(
+        boundary_snapshot,
+        reference_baseline,
+    )
+    stale_anchor_baseline["one_time_debt_reset"][
+        "reference_baseline_sha256"
+    ] = "0" * 64
+    assert (
+        readability_cli._check_readability_ratchet(
+            boundary_snapshot,
+            stale_anchor_baseline,
+            reference_path,
+            1,
+        )
+        == 2
+    )
+    stale_total_baseline = _baseline_with_readability_reset(
+        boundary_snapshot,
+        reference_baseline,
+    )
+    stale_total_baseline["one_time_debt_reset"]["reference_total"] = 49
+    assert (
+        readability_cli._check_readability_ratchet(
+            boundary_snapshot,
+            stale_total_baseline,
+            reference_path,
+            1,
+        )
+        == 2
+    )
+
+    reference_path.write_text(json.dumps(boundary_baseline), encoding="utf-8")
+    repeated_baseline = readability_cli._baseline_snapshot(over_limit_snapshot)
+    repeated_baseline["one_time_debt_reset"] = boundary_baseline[
+        "one_time_debt_reset"
+    ]
+    assert (
+        readability_cli._check_readability_ratchet(
+            over_limit_snapshot,
+            repeated_baseline,
+            reference_path,
+            0,
+        )
+        == 1
+    )
+
+
+def test_write_readability_baseline_preserves_established_reset_marker(tmp_path):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "module.py").write_text("def clean():\n    return 1\n", encoding="utf-8")
+    _write_config(tmp_path)
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--write-baseline"]) == 0
+
+    baseline_path = tmp_path / "readability-baseline.json"
+    baseline_by_field = json.loads(baseline_path.read_text(encoding="utf-8"))
+    marker_by_field = {
+        "maximum_increase_basis_points": 200,
+        "reason": "test migration",
+        "reference_baseline_sha256": "1" * 64,
+        "reference_total": 0,
+    }
+    baseline_by_field["one_time_debt_reset"] = marker_by_field
+    baseline_path.write_text(json.dumps(baseline_by_field), encoding="utf-8")
+
+    assert readability_budget.main(["--repo-root", str(tmp_path), "--write-baseline"]) == 0
+    refreshed_by_field = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert refreshed_by_field["one_time_debt_reset"] == marker_by_field
+
+
 def test_readability_ratchet_allows_one_time_confusable_name_rule_migration():
     base_rules_by_section = {
         "readability": {"ambiguous_function_names": ["process_data"]},

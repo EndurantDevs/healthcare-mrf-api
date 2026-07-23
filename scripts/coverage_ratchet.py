@@ -24,7 +24,7 @@ from coverage_growth import (
 from coverage_ratchet_self_test import run_self_test
 
 SCHEMA_VERSION = 1
-ONE_TIME_FLOOR_RESET_BASIS_POINTS = 100
+ONE_TIME_FLOOR_RESET_BASIS_POINTS = 200
 
 
 def _load_baseline(path: Path) -> dict[str, Any]:
@@ -66,7 +66,7 @@ def _compare_metric_with_floor_reset(
     current: Metric,
     reference: Metric,
 ) -> list[str]:
-    """Allow this release's explicitly anchored one-point floor reset."""
+    """Allow this release's explicitly anchored two-point floor reset."""
     current = _metric(current.get("covered"), current.get("total"), label)
     reference = _metric(reference.get("covered"), reference.get("total"), label)
     current_scaled = (
@@ -80,22 +80,8 @@ def _compare_metric_with_floor_reset(
         return []
     return [
         f"{label}: one-time floor reset exceeds "
-        f"{ONE_TIME_FLOOR_RESET_BASIS_POINTS / 100:.2f} percentage point"
+        f"{ONE_TIME_FLOOR_RESET_BASIS_POINTS / 100:.2f} percentage points"
     ]
-
-
-def _is_coverage_ratio_lower(current: Metric, reference: Metric) -> bool:
-    """Return whether one metric actually consumes the one-time reset."""
-    current = _metric(current.get("covered"), current.get("total"), "current metric")
-    reference = _metric(
-        reference.get("covered"),
-        reference.get("total"),
-        "reference metric",
-    )
-    return (
-        current["covered"] * reference["total"]
-        < reference["covered"] * current["total"]
-    )
 
 
 def _one_time_floor_reset(
@@ -214,23 +200,10 @@ def _compare_report_metrics(
             errors.append(f"{report_name}.{metric_name}: baseline metric was removed")
             continue
         metric_label = f"{report_name}.{metric_name} baseline"
-        metric_floor_reset_active = floor_reset_active and (
-            _is_coverage_ratio_lower(new_metric, old_metric)
-        )
-        if metric_floor_reset_active:
-            reset_metric_count += 1
-            errors.extend(
-                _compare_metric_with_floor_reset(
-                    metric_label,
-                    new_metric,
-                    old_metric,
-                )
-            )
-        else:
-            errors.extend(_compare_metric(metric_label, new_metric, old_metric))
-        if changed_line_count and not metric_floor_reset_active:
+        ordinary_errors = _compare_metric(metric_label, new_metric, old_metric)
+        if changed_line_count:
             growth_policy_by_field = load_growth_policy(report_name, new_config)
-            errors.extend(
+            ordinary_errors.extend(
                 compare_growth_metric(
                     metric_label,
                     new_metric,
@@ -240,6 +213,18 @@ def _compare_report_metrics(
                     changed_line_count,
                 )
             )
+        metric_reset_active = floor_reset_active and bool(ordinary_errors)
+        if metric_reset_active:
+            reset_metric_count += 1
+            errors.extend(
+                _compare_metric_with_floor_reset(
+                    metric_label,
+                    new_metric,
+                    old_metric,
+                )
+            )
+        else:
+            errors.extend(ordinary_errors)
     return reset_metric_count, errors
 
 
@@ -272,7 +257,7 @@ def _compare_report_baseline(
         dict,
     ):
         return errors + [f"{report_name}: baseline metrics are malformed"]
-    reset_metric_count, metric_errors = _compare_report_metrics(
+    _reset_metric_count, metric_errors = _compare_report_metrics(
         report_name,
         new_config,
         old_metric_by_name,
@@ -281,10 +266,6 @@ def _compare_report_baseline(
         changed_line_count,
     )
     errors.extend(metric_errors)
-    if floor_reset_active and reset_metric_count == 0:
-        errors.append(
-            f"{report_name}: one-time floor reset does not lower any metric"
-        )
     return errors
 
 

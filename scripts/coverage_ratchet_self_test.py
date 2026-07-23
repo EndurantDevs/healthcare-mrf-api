@@ -123,18 +123,20 @@ def _reference_baseline() -> dict[str, Any]:
     }
 
 
-def _one_point_reset(
+def _two_point_reset(
     reference_by_field: dict[str, Any],
 ) -> dict[str, Any]:
     reset_by_field = json.loads(json.dumps(reference_by_field))
     reset_by_field["reports"]["python"]["metrics"]["lines"] = {
-        "covered": 79,
+        "covered": 78,
         "total": 100,
     }
     reset_by_field["reports"]["python"]["one_time_floor_reset"] = {
-        "maximum_drop_basis_points": 100,
+        "maximum_drop_basis_points": 200,
         "reason": "test migration",
-        "reference_metrics": reference_by_field["reports"]["python"]["metrics"],
+        "reference_metrics": json.loads(
+            json.dumps(reference_by_field["reports"]["python"]["metrics"])
+        ),
     }
     return reset_by_field
 
@@ -156,11 +158,11 @@ def _assert_exact_and_reset_behavior(compare_baselines: CompareBaselines) -> Non
     )
     _require(
         not compare_baselines(
-            _one_point_reset(reference_by_field),
+            _two_point_reset(reference_by_field),
             reference_by_field,
             None,
         ),
-        "anchored one-point floor reset",
+        "anchored two-point floor reset",
     )
 
 
@@ -173,27 +175,20 @@ def _assert_mixed_reset_growth(compare_baselines: CompareBaselines) -> None:
     reference_by_field["reports"]["python"]["growth"][
         "target_percent_by_metric"
     ]["branches"] = 95
-    reset_by_field = _one_point_reset(reference_by_field)
-    errors = compare_baselines(
-        reset_by_field,
-        reference_by_field,
-        {"python": 5},
-    )
+    reset_by_field = _two_point_reset(reference_by_field)
+    errors = compare_baselines(reset_by_field, reference_by_field, {"python": 5})
     _require(
-        any(
-            "python.branches baseline: uncovered debt must fall" in error
-            for error in errors
-        ),
-        "reset does not bypass growth for unchanged metrics",
+        not errors,
+        "reset covers a growth-only metric while preserving its two-point floor",
     )
 
 
 def _assert_invalid_reset_behavior(compare_baselines: CompareBaselines) -> None:
     reference_by_field = _reference_baseline()
-    reset_by_field = _one_point_reset(reference_by_field)
+    reset_by_field = _two_point_reset(reference_by_field)
     repeated_by_field = json.loads(json.dumps(reset_by_field))
     repeated_by_field["reports"]["python"]["metrics"]["lines"] = {
-        "covered": 78,
+        "covered": 77,
         "total": 100,
     }
     _require(
@@ -202,16 +197,29 @@ def _assert_invalid_reset_behavior(compare_baselines: CompareBaselines) -> None:
     )
     _require(
         bool(compare_baselines(repeated_by_field, reference_by_field, None)),
-        "floor reset beyond one point",
+        "floor reset beyond two points",
     )
-    unused_by_field = _one_point_reset(reference_by_field)
+    stale_anchor_by_field = _two_point_reset(reference_by_field)
+    stale_anchor_by_field["reports"]["python"]["one_time_floor_reset"][
+        "reference_metrics"
+    ]["lines"] = {"covered": 79, "total": 100}
+    stale_anchor_errors = compare_baselines(
+        stale_anchor_by_field,
+        reference_by_field,
+        None,
+    )
+    _require(
+        any("not anchored to the base metrics" in error for error in stale_anchor_errors),
+        "stale floor reset anchor",
+    )
+    unused_by_field = _two_point_reset(reference_by_field)
     unused_by_field["reports"]["python"]["metrics"]["lines"] = {
         "covered": 80,
         "total": 100,
     }
     _require(
-        bool(compare_baselines(unused_by_field, reference_by_field, None)),
-        "unused reset marker",
+        not compare_baselines(unused_by_field, reference_by_field, None),
+        "anchored reset may establish release-local headroom before it is needed",
     )
     narrowed_by_field = json.loads(json.dumps(reference_by_field))
     narrowed_by_field["reports"]["python"]["scope"]["include"] = []

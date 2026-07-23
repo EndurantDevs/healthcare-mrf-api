@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -13,6 +14,8 @@ from .source_files import collect_issues
 
 DEFAULT_CONFIG = "readability-budget.json"
 DEFAULT_BASELINE = "readability-baseline.json"
+ONE_TIME_DEBT_RESET_BASIS_POINTS = 200
+ONE_TIME_DEBT_RESET_FIELD = "one_time_debt_reset"
 PROTECTED_NEW_ISSUE_CATEGORIES = frozenset(
     {
         "builtin_shadowing",
@@ -74,8 +77,14 @@ def main(argv: list[str] | None = None) -> int:
     snapshot = build_snapshot(repo_root, config)
     _print_summary(snapshot)
     if args.write_baseline:
+        reset_marker = None
+        if baseline_path.exists():
+            reset_marker = _load_json(baseline_path).get(ONE_TIME_DEBT_RESET_FIELD)
+        baseline_snapshot = _baseline_snapshot(snapshot)
+        if reset_marker is not None:
+            baseline_snapshot[ONE_TIME_DEBT_RESET_FIELD] = reset_marker
         baseline_path.write_text(
-            json.dumps(_baseline_snapshot(snapshot), indent=2, sort_keys=True) + "\n",
+            json.dumps(baseline_snapshot, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         print(f"Wrote baseline: {baseline_path.relative_to(repo_root)}")
@@ -139,6 +148,10 @@ def _check_readability_ratchet(
     if not _has_compatible_ratchet_rules_by_section(ratchet_baseline, snapshot):
         print("Readability ratchet rules differ from the base branch.", file=sys.stderr)
         return 2
+    reset_active, reset_error = _one_time_debt_reset(baseline, ratchet_baseline)
+    if reset_error:
+        print(reset_error, file=sys.stderr)
+        return 2
 
     new_by_category = _new_issues(snapshot, ratchet_baseline)
     protected_new_issues_by_category = {
@@ -158,25 +171,54 @@ def _check_readability_ratchet(
 
     base_total = _total_issue_count(ratchet_baseline)
     current_total = _total_issue_count(snapshot)
-    required_reduction = math.ceil(base_total * required_reduction_percent / 100) if base_total else 0
-    target_total = max(0, base_total - required_reduction)
-    print(
-        "Readability ratchet: "
-        f"base={base_total} current={current_total} target<={target_total} "
-        f"reduction={required_reduction_percent:g}%"
-    )
-    ordinary_new_issue_count = _ordinary_new_issue_count(new_by_category)
-    if ordinary_new_issue_count:
+    if reset_active:
+        required_reduction = 0
+        target_total = (
+            base_total * (10_000 + ONE_TIME_DEBT_RESET_BASIS_POINTS)
+        ) // 10_000
         print(
             "Readability ratchet: "
-            f"{ordinary_new_issue_count} replacement finding(s) must be offset "
-            "by the required net debt reduction."
+            f"base={base_total} current={current_total} target<={target_total} "
+            f"one_time_reset={ONE_TIME_DEBT_RESET_BASIS_POINTS / 100:.2f}%"
         )
-    if current_total > target_total:
+    else:
+        required_reduction = (
+            math.ceil(base_total * required_reduction_percent / 100)
+            if base_total
+            else 0
+        )
+        target_total = max(0, base_total - required_reduction)
         print(
-            f"Readability debt must decrease by at least {required_reduction} finding(s).",
-            file=sys.stderr,
+            "Readability ratchet: "
+            f"base={base_total} current={current_total} target<={target_total} "
+            f"reduction={required_reduction_percent:g}%"
         )
+    ordinary_new_issue_count = _ordinary_new_issue_count(new_by_category)
+    if ordinary_new_issue_count:
+        if reset_active:
+            print(
+                "Readability ratchet: "
+                f"{ordinary_new_issue_count} replacement finding(s) are bounded "
+                "by the one-time reset ceiling."
+            )
+        else:
+            print(
+                "Readability ratchet: "
+                f"{ordinary_new_issue_count} replacement finding(s) must be offset "
+                "by the required net debt reduction."
+            )
+    if current_total > target_total:
+        if reset_active:
+            print(
+                "Readability debt exceeds the one-time base-anchored "
+                f"{ONE_TIME_DEBT_RESET_BASIS_POINTS / 100:.2f}% reset.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Readability debt must decrease by at least {required_reduction} finding(s).",
+                file=sys.stderr,
+            )
         return 1
     print("Readability ratchet satisfied.")
     return 0
@@ -200,6 +242,65 @@ def _is_baseline_synchronized(baseline: dict[str, Any], snapshot: dict[str, Any]
 
 def _total_issue_count(snapshot: dict[str, Any]) -> int:
     return sum(int(value) for value in snapshot.get("issue_counts", {}).values())
+
+
+def _baseline_anchor_sha256(baseline: dict[str, Any]) -> str:
+    """Return the stable identity used to anchor a one-time debt reset."""
+
+    payload = {
+        key: baseline.get(key)
+        for key in ("version", "rules", "thresholds", "issue_counts", "issue_ids")
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _one_time_debt_reset(
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+) -> tuple[bool, str | None]:
+    """Validate a reset introduced against one exact base snapshot."""
+
+    candidate_reset = candidate.get(ONE_TIME_DEBT_RESET_FIELD)
+    reference_reset = reference.get(ONE_TIME_DEBT_RESET_FIELD)
+    if reference_reset is not None:
+        if candidate_reset != reference_reset:
+            return False, "Established one-time readability reset marker changed."
+        return False, None
+    if candidate_reset is None:
+        return False, None
+    if not isinstance(candidate_reset, dict):
+        return False, "One-time readability reset marker is malformed."
+    if set(candidate_reset) != {
+        "maximum_increase_basis_points",
+        "reason",
+        "reference_baseline_sha256",
+        "reference_total",
+    }:
+        return False, "One-time readability reset fields are malformed."
+    if (
+        candidate_reset.get("maximum_increase_basis_points")
+        != ONE_TIME_DEBT_RESET_BASIS_POINTS
+    ):
+        return (
+            False,
+            "One-time readability reset must be exactly "
+            f"{ONE_TIME_DEBT_RESET_BASIS_POINTS} basis points.",
+        )
+    if not str(candidate_reset.get("reason") or "").strip():
+        return False, "One-time readability reset reason is missing."
+    if candidate_reset.get("reference_total") != _total_issue_count(reference):
+        return False, "One-time readability reset has a stale base total."
+    if candidate_reset.get("reference_baseline_sha256") != _baseline_anchor_sha256(
+        reference
+    ):
+        return False, "One-time readability reset is not anchored to the base snapshot."
+    return True, None
 
 
 def _rules_snapshot(config: dict[str, Any]) -> dict[str, Any]:

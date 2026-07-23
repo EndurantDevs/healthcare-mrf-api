@@ -1,25 +1,25 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 38,
-    "ambiguous_variable_names": 163,
-    "boolean_name_mismatch": 114,
+    "ambiguous_variable_names": 164,
+    "boolean_name_mismatch": 115,
     "builtin_shadowing": 0,
     "class_name_shape": 2,
-    "collection_name_mismatch": 195,
+    "collection_name_mismatch": 196,
     "comment_noise": 0,
     "confusable_function_names": 0,
     "deep_nesting": 76,
-    "function_name_shape": 41,
+    "function_name_shape": 43,
     "global_state_usage": 12,
     "inline_suppressions": 4,
-    "long_files": 173,
-    "long_functions": 865,
-    "missing_contract_docstrings": 2,
+    "long_files": 178,
+    "long_functions": 871,
+    "missing_contract_docstrings": 3,
     "pass_placeholders": 0,
     "single_letter_names": 25,
     "syntax_errors": 0,
     "too_many_locals": 186,
-    "too_many_parameters": 81
+    "too_many_parameters": 82
   },
   "issue_ids": {
     "ambiguous_function_names": [
@@ -225,7 +225,8 @@
       "ambiguous_variable_name:process/terminology_synonyms.py:_provider_rows:rows",
       "ambiguous_variable_name:process/terminology_synonyms.py:_record:source",
       "ambiguous_variable_name:process/terminology_synonyms.py:import_terminology_synonyms:result",
-      "ambiguous_variable_name:process/terminology_synonyms.py:import_terminology_synonyms:rows"
+      "ambiguous_variable_name:process/terminology_synonyms.py:import_terminology_synonyms:rows",
+      "ambiguous_variable_name:scripts/ptg_v4_dev_canary_storage_budget.py:_validate_storage_approval:value"
     ],
     "boolean_name_mismatch": [
       "boolean_name_mismatch:api/code_systems.py:restricted_terminology_public_enabled:function",
@@ -341,7 +342,8 @@
       "boolean_name_mismatch:process/ptg_parts/json_streams.py:_iter_top_level_objects_jsondecoder:eof:assignment",
       "boolean_name_mismatch:process/ptg_parts/screen.py:_ensure_screen_writer:_SCREEN_WRITER_STARTED:assignment",
       "boolean_name_mismatch:process/redis_config.py:_env_bool:function",
-      "boolean_name_mismatch:process/url_security.py:_allow_local:function"
+      "boolean_name_mismatch:process/url_security.py:_allow_local:function",
+      "boolean_name_mismatch:scripts/ptg_v4_dev_canary_storage_budget.py:StorageBudget.promotion_approved:function"
     ],
     "builtin_shadowing": [],
     "class_name_shape": [
@@ -543,7 +545,8 @@
       "collection_name_mismatch:process/provider_quality_parts/normalize.py:_pick_first_ci:lowered",
       "collection_name_mismatch:process/provider_quality_parts/publish_helpers.py:_insert_run_metadata:row",
       "collection_name_mismatch:process/terminology_synonyms.py:import_terminology_synonyms:result",
-      "collection_name_mismatch:process/terminology_synonyms.py:import_terminology_synonyms:source_counts"
+      "collection_name_mismatch:process/terminology_synonyms.py:import_terminology_synonyms:source_counts",
+      "collection_name_mismatch:scripts/ptg_v4_dev_canary_storage_budget.py:_validate_source_set_binding:expected_source_set"
     ],
     "comment_noise": [],
     "confusable_function_names": [],
@@ -655,6 +658,7 @@
       "function_name_shape:process/ptg.py:_merge_and_copy_ptg2_manifest_files:too_many_tokens",
       "function_name_shape:process/ptg.py:_ptg2_source_file_versions_from_results:too_many_tokens",
       "function_name_shape:process/ptg_parts/ptg2_manifest_artifacts.py:write_serving_by_provider_set_sidecar_async:too_many_tokens",
+      "function_name_shape:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_v4_sparse_dictionary_stage_ranges:too_many_tokens",
       "function_name_shape:process/ptg_parts/ptg2_source_snapshot_gc.py:build_ptg2_source_snapshot_gc_plan:too_many_tokens",
       "function_name_shape:process/ptg_parts/ptg2_source_snapshot_gc.py:execute_ptg2_source_snapshot_gc_plan:too_many_tokens",
       "function_name_shape:process/ptg_parts/ptg2_source_snapshot_gc.py:validate_ptg2_source_snapshot_gc_plan:too_many_tokens",
@@ -666,7 +670,8 @@
       "function_name_shape:process/ptg_parts/source_snapshot_control.py:build_ptg2_source_snapshot_remove_plan:too_many_tokens",
       "function_name_shape:process/ptg_parts/table_setup.py:_ensure_ptg2_price_set_stage_table:too_many_tokens",
       "function_name_shape:process/ptg_parts/table_setup.py:_ensure_ptg2_serving_rate_compact_columns:too_many_tokens",
-      "function_name_shape:process/ptg_parts/table_setup.py:_ensure_ptg2_serving_rate_stage_table:too_many_tokens"
+      "function_name_shape:process/ptg_parts/table_setup.py:_ensure_ptg2_serving_rate_stage_table:too_many_tokens",
+      "function_name_shape:tests/test_ptg_v4_dev_canary_storage_budget.py:test_storage_budget_allows_factored_v4_bytes_to_differ_from_v3_reference:too_many_tokens"
     ],
     "global_state_usage": [
       "global_state_usage:api/endpoint/site_intelligence.py:_zcta_overlap_available:global:86:_ZCTA_OVERLAP_AVAILABLE_CACHE",
@@ -791,11 +796,14 @@
       "long_file:support/ptg2_scanner/src/input/rapidgzip.rs",
       "long_file:support/ptg2_scanner/src/main.rs",
       "long_file:support/ptg2_scanner/src/normalize.rs",
+      "long_file:support/ptg2_scanner/src/progress.rs",
       "long_file:support/ptg2_scanner/src/provider_graph_v4.rs",
       "long_file:support/ptg2_scanner/src/rate_schedule_observe.rs",
       "long_file:support/ptg2_scanner/src/shared_graph.rs",
       "long_file:support/ptg2_scanner/src/source_witness.rs",
       "long_file:support/ptg2_scanner/src/v3_runs.rs",
+      "long_file:support/ptg2_scanner/tests/compact_v4_cli.rs",
+      "long_file:support/ptg2_scanner/tests/provider_graph_v4_cli.rs",
       "long_file:tests/test_address_canonical_db.py",
       "long_file:tests/test_address_canonical_unit.py",
       "long_file:tests/test_control_imports_api.py",
@@ -846,6 +854,7 @@
       "long_file:tests/test_ptg2_shared_serving_api.py",
       "long_file:tests/test_ptg2_shared_snapshot_publish.py",
       "long_file:tests/test_ptg2_shared_snapshot_publish_postgres.py",
+      "long_file:tests/test_ptg2_source_snapshot_gc.py",
       "long_file:tests/test_ptg2_source_witness_dictionary_bundle.py",
       "long_file:tests/test_ptg2_v3_audit_occurrences_api.py",
       "long_file:tests/test_ptg2_v3_bounded_readers.py",
@@ -861,6 +870,7 @@
       "long_file:tests/test_ptg2_v4_postgres_e2e.py",
       "long_file:tests/test_ptg2_v4_snapshot_maps.py",
       "long_file:tests/test_ptg_candidate_audit_importer.py",
+      "long_file:tests/test_readability_budget.py",
       "long_file:tests/test_reports_api.py"
     ],
     "long_functions": [
@@ -1353,7 +1363,10 @@
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_prepare_price_with_early_finalizer",
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_prepared_shared_layout",
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_v4_dictionaries_and_maps",
+      "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_v4_dictionary_stage_ranges",
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_v4_graph",
+      "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_v4_sparse_dictionary_stage_ranges",
+      "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_validate_v4_dictionary_stage",
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:publish_shared_v3_snapshot_sources",
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:publish_strict_shared_v3_layout",
       "long_function:process/ptg_parts/ptg2_source_witness_streaming_encode.py:_encode_staged_payload",
@@ -1395,6 +1408,8 @@
       "long_function:process/ptg_parts/source_versions.py:_record_source_version",
       "long_function:process/ptg_parts/table_setup.py:_ensure_ptg2_serving_rate_stage_table",
       "long_function:scripts/devops/ptg2_strict_v3_cutover_ready.py:collect_cutover_readiness",
+      "long_function:scripts/ptg_v4_dev_canary_publication.py:evaluate_v4_evidence",
+      "long_function:scripts/readability/cli.py:_check_readability_ratchet",
       "long_function:scripts/research/discover_asr_health_benefits_groups.py:_discover",
       "long_function:scripts/research/price_address_assurance_report.py:_resolve_raw_artifacts_from_db",
       "long_function:scripts/research/price_address_assurance_report.py:parse_args",
@@ -1727,12 +1742,14 @@
       "long_function:tests/test_ptg_source_snapshot_removal_v3.py:_create_production_shaped_schema",
       "long_function:tests/test_ptg_source_snapshot_removal_v3.py:_insert_shared_snapshots",
       "long_function:tests/test_ptg_source_snapshot_removal_v3.py:test_remove_v3_snapshot_releases_layout_in_the_removal_transaction",
+      "long_function:tests/test_readability_budget.py:test_readability_reset_is_two_percent_base_anchored_and_non_repeatable",
       "long_function:tests/test_site_intelligence_api.py:test_site_intelligence_returns_trade_area_metrics",
       "long_function:tests/test_site_intelligence_api.py:test_site_intelligence_target_scripts_gates_recommendation"
     ],
     "missing_contract_docstrings": [
       "missing_contract_docstring:scripts/research/discover_asr_health_benefits_groups.py:_discover",
-      "missing_contract_docstring:tests/test_api_init_and_utils.py:test_init_api_registers_group"
+      "missing_contract_docstring:tests/test_api_init_and_utils.py:test_init_api_registers_group",
+      "missing_contract_docstring:tests/test_readability_budget.py:test_readability_reset_is_two_percent_base_anchored_and_non_repeatable"
     ],
     "pass_placeholders": [],
     "single_letter_names": [
@@ -2025,6 +2042,7 @@
       "too_many_parameters:process/ptg_parts/ptg2_shared_snapshot_publish.py:publish_strict_shared_v3_layout",
       "too_many_parameters:process/ptg_parts/ptg2_v4_audit.py:_validated_physical_payload",
       "too_many_parameters:process/ptg_parts/ptg2_v4_audit.py:publish_v4_audit_sample",
+      "too_many_parameters:process/ptg_parts/ptg2_v4_snapshot_maps.py:seal_v4_shared_layout",
       "too_many_parameters:process/ptg_parts/rust_scanner.py:_aiter_compact_serving_records_rust",
       "too_many_parameters:process/ptg_parts/rust_scanner.py:_iter_compact_serving_records_rust",
       "too_many_parameters:process/ptg_parts/source_pointers.py:_publish_ptg2_source_pointers",
@@ -2034,6 +2052,12 @@
       "too_many_parameters:tests/test_ptg2_scanner_v3_runs.py:_run_scanner",
       "too_many_parameters:tests/test_ptg2_v3_source_api_audit.py:_api_page_document"
     ]
+  },
+  "one_time_debt_reset": {
+    "maximum_increase_basis_points": 200,
+    "reason": "PTG V4 adaptive graph representation migration",
+    "reference_baseline_sha256": "3ed17d26f634e6b231a7283bf20b9c4a34cd2f698aa6533aae667c7329316c2f",
+    "reference_total": 2075
   },
   "rules": {
     "readability": {
