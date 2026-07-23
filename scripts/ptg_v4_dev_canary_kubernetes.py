@@ -21,7 +21,9 @@ FROZEN_V3_CANDIDATE_IMAGE = (
     "dev-main-ca478d32-20260723160432"
 )
 _SERVICE_ACCOUNT_ROOT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
-_SHA256_IMAGE_ID_PATTERN = re.compile(r"@sha256:([0-9a-f]{64})$")
+_SHA256_IMAGE_ID_PATTERN = re.compile(
+    r"(?:^|@)sha256:([0-9a-f]{64})$"
+)
 _ALLOWED_SERVICE_HOSTS = frozenset(
     {
         FROZEN_V3_CANDIDATE_SERVICE,

@@ -83,10 +83,26 @@ def _pod_list() -> dict[str, object]:
     }
 
 
-def test_frozen_candidate_attestation_binds_service_tag_and_digest() -> None:
+@pytest.mark.parametrize(
+    "image_identity",
+    (
+        (
+            "docker-pullable://ghcr.io/endurantdevs/"
+            f"healthcare-mrf-api-dev@sha256:{'a' * 64}"
+        ),
+        f"sha256:{'a' * 64}",
+    ),
+)
+def test_frozen_candidate_attestation_binds_service_tag_and_digest(
+    image_identity: str,
+) -> None:
+    pod_list = _pod_list()
+    pod_list["items"][0]["status"]["containerStatuses"][0][
+        "imageID"
+    ] = image_identity
     evidence = build_frozen_v3_runtime_evidence(
         _deployment(),
-        _pod_list(),
+        pod_list,
     )
 
     assert validate_frozen_v3_runtime_evidence(evidence) == []
