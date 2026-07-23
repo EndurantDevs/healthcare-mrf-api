@@ -1528,8 +1528,20 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             == "source_multiset_v1"
         )
         assert publication.serving_index["audit_sample"]["provider_selection"] == (
-            "hash_targeted_owner_ordinals_v1"
+            "hash_targeted_budgeted_owner_ordinals_v2"
         )
+        assert publication.serving_index["audit_sample"][
+            "hydration_candidate_selection"
+        ] == "source_preserving_equal_interval_v1"
+        assert publication.serving_index["audit_sample"][
+            "price_hydration_candidate_count"
+        ] == 2
+        assert publication.serving_index["audit_sample"][
+            "hydrated_candidate_count"
+        ] == 2
+        assert 0 < publication.serving_index["audit_sample"][
+            "provider_selection_count"
+        ] <= publication.serving_index["audit_sample"]["provider_selection_budget"]
         assert (
             publication.serving_index["audit_sample"]["price_membership_block_span"]
             == publication.serving_index["serving_binary"][

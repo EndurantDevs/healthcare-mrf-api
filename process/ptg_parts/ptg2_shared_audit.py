@@ -42,6 +42,10 @@ PTG2_V3_AUDIT_MAX_SAMPLE_ROWS = 2560
 PTG2_V3_AUDIT_MAX_BLOCK_BYTES = 256 * 1024 * 1024
 PTG2_V3_AUDIT_MAX_MEMBER_ATTEMPTS = 1_000_000
 PTG2_V3_AUDIT_MAX_COMBINATION_ATTEMPTS = 1_000_000
+PTG2_V3_AUDIT_PRICE_BLOCK_RESERVE_BYTES = PTG2_V3_AUDIT_MAX_BLOCK_BYTES // 2
+PTG2_V3_AUDIT_MAX_GRAPH_CHUNKS_PER_DIRECTION = 2
+PTG2_V3_AUDIT_HYDRATION_SELECTION = "source_preserving_equal_interval_v1"
+PTG2_V3_AUDIT_PROVIDER_SELECTION = "hash_targeted_budgeted_owner_ordinals_v2"
 
 _CANDIDATE_RECORD = struct.Struct(">IIIII")
 _OCCURRENCE_ID_COORDINATES = struct.Struct(">QIIIQQQQ")
@@ -92,6 +96,114 @@ class _GraphOwnerLocator:
     first_chunk: int
     member_offset: int
     member_count: int
+
+
+@dataclass(frozen=True)
+class _HydrationWork:
+    price_candidate_count: int
+    provider_candidate_count: int
+    represented_source_count: int
+    provider_selection_budget: int
+    provider_selection_count: int
+
+
+@dataclass(frozen=True)
+class _HydratedAuditSample:
+    audit_occurrences: tuple[AuditOccurrence, ...]
+    work: _HydrationWork
+
+
+def _equal_interval_indices(
+    population_count: int,
+    selection_count: int,
+) -> tuple[int, ...]:
+    normalized_population = max(int(population_count), 0)
+    normalized_selection = min(max(int(selection_count), 0), normalized_population)
+    if normalized_selection <= 0:
+        return ()
+    if normalized_selection == 1:
+        return (0,)
+    if normalized_selection == normalized_population:
+        return tuple(range(normalized_population))
+    return tuple(
+        selection_ordinal * (normalized_population - 1)
+        // (normalized_selection - 1)
+        for selection_ordinal in range(normalized_selection)
+    )
+
+
+def _graph_selection_capacity(available_block_bytes: int) -> int:
+    """Return the safe count when a member can span two chunks per direction."""
+
+    bytes_per_selection = (
+        len(_GRAPH_LAYOUT)
+        * PTG2_V3_AUDIT_MAX_GRAPH_CHUNKS_PER_DIRECTION
+        * PTG2_V3_GRAPH_CHUNK_BYTES
+    )
+    return min(
+        PTG2_V3_AUDIT_MAX_SAMPLE_ROWS,
+        max(int(available_block_bytes), 0) // bytes_per_selection,
+    )
+
+
+def _hydration_candidate_limit() -> int:
+    """Reserve half of the hard block budget for price memberships."""
+
+    graph_block_budget = (
+        PTG2_V3_AUDIT_MAX_BLOCK_BYTES - PTG2_V3_AUDIT_PRICE_BLOCK_RESERVE_BYTES
+    )
+    return min(
+        PTG2_V3_AUDIT_MAX_CANDIDATES,
+        _graph_selection_capacity(graph_block_budget),
+    )
+
+
+def _stratified_hydration_candidates(
+    candidates: Sequence[AuditCandidate],
+    *,
+    maximum_candidates: int | None = None,
+) -> tuple[AuditCandidate, ...]:
+    """Choose a source-preserving deterministic subset of the candidate census."""
+
+    candidate_limit = (
+        _hydration_candidate_limit()
+        if maximum_candidates is None
+        else max(int(maximum_candidates), 0)
+    )
+    candidate_count = len(candidates)
+    if candidate_count <= candidate_limit:
+        return tuple(candidates)
+    if candidate_limit <= 0:
+        return ()
+
+    candidate_indices_by_source: dict[int, list[int]] = {}
+    for candidate_index, candidate in enumerate(candidates):
+        candidate_indices_by_source.setdefault(candidate.source_key, []).append(
+            candidate_index
+        )
+    source_keys = tuple(candidate_indices_by_source)
+    selected_indices = {
+        candidate_indices_by_source[source_keys[source_index]][
+            len(candidate_indices_by_source[source_keys[source_index]]) // 2
+        ]
+        for source_index in _equal_interval_indices(
+            len(source_keys),
+            min(candidate_limit, len(source_keys)),
+        )
+    }
+    remaining_candidate_indices = tuple(
+        candidate_index
+        for candidate_index in range(candidate_count)
+        if candidate_index not in selected_indices
+    )
+    selected_indices.update(
+        remaining_candidate_indices[remaining_index]
+        for remaining_index in _equal_interval_indices(
+            len(remaining_candidate_indices),
+            candidate_limit - len(selected_indices),
+        )
+    )
+    return tuple(candidates[index] for index in sorted(selected_indices))
 
 
 def _mapping(value: Any, name: str) -> dict[str, Any]:
@@ -285,6 +397,11 @@ class _ReadBudget:
             raise RuntimeError("strict V3 audit block-byte cap was exceeded")
         self._blocks.add(identity)
         self.block_bytes = next_total
+
+    def available_block_bytes(self) -> int:
+        """Return the raw block bytes still permitted by the hard cap."""
+
+        return max(PTG2_V3_AUDIT_MAX_BLOCK_BYTES - self.block_bytes, 0)
 
     def available_members(self) -> int:
         """Return the number of graph-member reads still permitted."""
@@ -809,33 +926,30 @@ async def _candidate_npis_by_ordinal(
     candidates: Sequence[AuditCandidate],
     price_memberships: Mapping[int, Sequence[int]],
     core_layout_id: bytes,
+    maximum_selections: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Select bounded, deterministic NPIs for each candidate occurrence."""
 
-    provider_locator_by_key = await _graph_owner_locators(
+    selection_budget = _provider_selection_budget(maximum_selections)
+    (
+        hydrated_candidates,
+        provider_locator_by_key,
+        active_candidates,
+    ) = await _active_hydration_candidates(
         reader,
-        direction=PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
-        owner_keys=(candidate.provider_set_key for candidate in candidates),
+        candidates=candidates,
+        price_memberships=price_memberships,
+        selection_budget=selection_budget,
     )
-    active_candidates = tuple(
-        candidate
-        for candidate in candidates
-        if provider_locator_by_key.get(
-            candidate.provider_set_key,
-            _GraphOwnerLocator(0, 0, 0),
-        ).member_count
-        > 0
-        and price_memberships.get(candidate.price_key)
-    )
+    if not hydrated_candidates:
+        return {}
     if not active_candidates:
-        return {candidate.candidate_ordinal: () for candidate in candidates}
-    selections_per_candidate = min(
-        PTG2_V3_AUDIT_MAX_SAMPLE_ROWS,
-        max(
-            1,
-            (PTG2_V3_AUDIT_MAX_SAMPLE_ROWS + len(active_candidates) - 1)
-            // len(active_candidates),
-        ),
+        return {
+            candidate.candidate_ordinal: () for candidate in hydrated_candidates
+        }
+    selections_per_candidate = max(
+        1,
+        selection_budget // len(active_candidates),
     )
     group_key_by_selection = await _selected_provider_groups(
         reader,
@@ -852,12 +966,58 @@ async def _candidate_npis_by_ordinal(
         selections_per_candidate=selections_per_candidate,
     )
     return _candidate_npis_from_selections(
-        candidates,
+        hydrated_candidates,
         selections_per_candidate=selections_per_candidate,
         group_key_by_selection=group_key_by_selection,
         npi_ordinal_by_selection=npi_ordinal_by_selection,
         npi_by_ordinal_by_group=npi_by_ordinal_by_group,
     )
+
+
+def _provider_selection_budget(maximum_selections: int | None) -> int:
+    requested_maximum = (
+        _hydration_candidate_limit()
+        if maximum_selections is None
+        else int(maximum_selections)
+    )
+    return min(PTG2_V3_AUDIT_MAX_SAMPLE_ROWS, max(requested_maximum, 0))
+
+
+async def _active_hydration_candidates(
+    reader: _BuildingBlockReader,
+    *,
+    candidates: Sequence[AuditCandidate],
+    price_memberships: Mapping[int, Sequence[int]],
+    selection_budget: int,
+) -> tuple[
+    tuple[AuditCandidate, ...],
+    dict[int, _GraphOwnerLocator],
+    tuple[AuditCandidate, ...],
+]:
+    hydrated_candidates = _stratified_hydration_candidates(
+        candidates,
+        maximum_candidates=selection_budget,
+    )
+    if not hydrated_candidates:
+        return (), {}, ()
+    provider_locator_by_key = await _graph_owner_locators(
+        reader,
+        direction=PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+        owner_keys=(
+            candidate.provider_set_key for candidate in hydrated_candidates
+        ),
+    )
+    active_candidates = tuple(
+        candidate
+        for candidate in hydrated_candidates
+        if provider_locator_by_key.get(
+            candidate.provider_set_key,
+            _GraphOwnerLocator(0, 0, 0),
+        ).member_count
+        > 0
+        and price_memberships.get(candidate.price_key)
+    )
+    return hydrated_candidates, provider_locator_by_key, active_candidates
 
 
 async def _selected_provider_groups(
@@ -1129,6 +1289,17 @@ def build_audit_occurrences(
     )
 
 
+def _require_positive_publication_sample(
+    candidates: Sequence[AuditCandidate],
+    audit_occurrences: Sequence[AuditOccurrence],
+) -> None:
+    if candidates and not audit_occurrences:
+        raise RuntimeError(
+            "strict V3 audit could not hydrate a positive occurrence sample "
+            "within the block-byte cap"
+        )
+
+
 def _store_candidate_expansions(
     occurrence_by_id: dict[bytes, AuditOccurrence],
     *,
@@ -1291,7 +1462,7 @@ async def publish_shared_audit_sample(
     core_layout_id = hashlib.sha256(
         _CORE_LAYOUT_DOMAIN + normalized_mapping_digest + normalized_core_support
     ).digest()
-    audit_occurrences, budget = await _persist_publication_occurrences(
+    audit_occurrences, budget, hydration_work = await _persist_publication_occurrences(
         schema_name=schema_name,
         build_ownership=build_ownership,
         logical_snapshot_id=logical_snapshot_id,
@@ -1304,6 +1475,7 @@ async def publish_shared_audit_sample(
     metadata = _publication_metadata(
         audit_occurrences=audit_occurrences,
         candidates=candidates,
+        hydration_work=hydration_work,
         candidate_summary=candidate_summary,
         source_count=source_count,
         core_layout_id=core_layout_id,
@@ -1328,7 +1500,9 @@ async def _persist_publication_occurrences(
     core_layout_id: bytes,
     atom_key_bits: int,
     price_membership_block_span: int,
-) -> tuple[tuple[AuditOccurrence, ...], _ReadBudget]:
+) -> tuple[tuple[AuditOccurrence, ...], _ReadBudget, _HydrationWork]:
+    """Validate, hydrate, and persist one bounded publication audit sample."""
+
     snapshot_key = int(build_ownership.snapshot_key)
     budget = _ReadBudget()
     async with db.transaction() as session:
@@ -1346,32 +1520,73 @@ async def _persist_publication_occurrences(
             snapshot_key=snapshot_key,
             budget=budget,
         )
-        price_memberships = await _price_memberships(
+        hydrated_sample = await _hydrate_publication_occurrences(
             reader,
-            price_keys=(candidate.price_key for candidate in candidates),
+            candidates=candidates,
+            core_layout_id=core_layout_id,
             atom_key_bits=int(atom_key_bits),
-            block_span=int(price_membership_block_span),
-        )
-        candidate_npis = await _candidate_npis_by_ordinal(
-            reader,
-            candidates=candidates,
-            price_memberships=price_memberships,
-            core_layout_id=core_layout_id,
-        )
-        audit_occurrences = build_audit_occurrences(
-            candidates=candidates,
-            provider_npis=candidate_npis,
-            price_memberships=price_memberships,
-            core_layout_id=core_layout_id,
-            budget=budget,
+            price_membership_block_span=int(price_membership_block_span),
         )
         await _insert_occurrences(
             session,
             schema_name=schema_name,
             snapshot_key=snapshot_key,
-            audit_occurrences=audit_occurrences,
+            audit_occurrences=hydrated_sample.audit_occurrences,
         )
-    return audit_occurrences, budget
+    return hydrated_sample.audit_occurrences, budget, hydrated_sample.work
+
+
+async def _hydrate_publication_occurrences(
+    reader: _BuildingBlockReader,
+    *,
+    candidates: Sequence[AuditCandidate],
+    core_layout_id: bytes,
+    atom_key_bits: int,
+    price_membership_block_span: int,
+) -> _HydratedAuditSample:
+    """Hydrate an evenly spread sample within the hard raw-block budget."""
+
+    price_hydration_candidates = _stratified_hydration_candidates(candidates)
+    price_memberships = await _price_memberships(
+        reader,
+        price_keys=(candidate.price_key for candidate in price_hydration_candidates),
+        atom_key_bits=atom_key_bits,
+        block_span=price_membership_block_span,
+    )
+    graph_selection_capacity = _graph_selection_capacity(
+        reader.budget.available_block_bytes()
+    )
+    hydrated_candidates = _stratified_hydration_candidates(
+        price_hydration_candidates,
+        maximum_candidates=graph_selection_capacity,
+    )
+    candidate_npis = await _candidate_npis_by_ordinal(
+        reader,
+        candidates=hydrated_candidates,
+        price_memberships=price_memberships,
+        core_layout_id=core_layout_id,
+        maximum_selections=graph_selection_capacity,
+    )
+    audit_occurrences = build_audit_occurrences(
+        candidates=candidates,
+        provider_npis=candidate_npis,
+        price_memberships=price_memberships,
+        core_layout_id=core_layout_id,
+        budget=reader.budget,
+    )
+    _require_positive_publication_sample(candidates, audit_occurrences)
+    hydration_work = _HydrationWork(
+        price_candidate_count=len(price_hydration_candidates),
+        provider_candidate_count=len(hydrated_candidates),
+        represented_source_count=len(
+            {candidate.source_key for candidate in hydrated_candidates}
+        ),
+        provider_selection_budget=graph_selection_capacity,
+        provider_selection_count=sum(
+            len(provider_npis) for provider_npis in candidate_npis.values()
+        ),
+    )
+    return _HydratedAuditSample(audit_occurrences, hydration_work)
 
 
 async def _validate_publication_context(
@@ -1409,6 +1624,7 @@ def _publication_metadata(
     *,
     audit_occurrences: Sequence[AuditOccurrence],
     candidates: Sequence[AuditCandidate],
+    hydration_work: _HydrationWork,
     candidate_summary: Mapping[str, Any],
     source_count: int,
     core_layout_id: bytes,
@@ -1431,7 +1647,14 @@ def _publication_metadata(
         "candidate_count": len(candidates),
         "candidate_maximum": PTG2_V3_AUDIT_MAX_CANDIDATES,
         "candidate_selection": PTG2_V3_AUDIT_CANDIDATE_SELECTION,
-        "provider_selection": "hash_targeted_owner_ordinals_v1",
+        "hydration_candidate_selection": PTG2_V3_AUDIT_HYDRATION_SELECTION,
+        "price_hydration_candidate_count": hydration_work.price_candidate_count,
+        "hydrated_candidate_count": hydration_work.provider_candidate_count,
+        "hydrated_candidate_maximum": _hydration_candidate_limit(),
+        "hydrated_source_count": hydration_work.represented_source_count,
+        "provider_selection": PTG2_V3_AUDIT_PROVIDER_SELECTION,
+        "provider_selection_budget": hydration_work.provider_selection_budget,
+        "provider_selection_count": hydration_work.provider_selection_count,
         "price_membership_block_span": int(price_membership_block_span),
         "candidate_row_digest": str(candidate_summary["row_digest"]).lower(),
         "source_row_count": _integer(
