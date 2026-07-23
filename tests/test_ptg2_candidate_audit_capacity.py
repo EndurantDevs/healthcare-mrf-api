@@ -8,8 +8,11 @@ import pytest
 from api.endpoint import pricing
 from api import ptg2_candidate_audit_capacity as capacity
 from api.ptg2_candidate_audit_capacity import (
+    PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES,
     PTG2_CANDIDATE_AUDIT_MAX_PROCESS_BYTES,
+    PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES,
     CandidateAuditDecodedRetentionBudget,
+    CandidateAuditDecodedRetentionError,
     CandidateAuditProcessAdmission,
     CandidateAuditProcessAdmissionError,
     retain_unique_integer_key_set,
@@ -31,12 +34,31 @@ def test_default_partition_capacity_fits_one_process_admission_slot():
     partition_weight = pricing._candidate_audit_partition_weight(raw_limit)
 
     assert raw_limit == 512 * 1024 * 1024
-    assert partition_weight == 768 * 1024 * 1024
+    assert partition_weight == 896 * 1024 * 1024
     assert partition_weight <= pricing.PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES
     assert (
         2 * partition_weight
         > pricing.PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES
     )
+
+
+def test_dense_partition_has_bounded_headroom_without_changing_legacy_cap():
+    assert PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES == 64 * 1024 * 1024
+    assert (
+        PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
+        == 384 * 1024 * 1024
+    )
+    budget = CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
+    )
+
+    budget.claim(320 * 1024 * 1024, category="a dense provider/code request")
+    budget.claim(64 * 1024 * 1024, category="bounded headroom")
+    with pytest.raises(CandidateAuditDecodedRetentionError, match="byte limit"):
+        budget.claim(1, category="an unbounded extra byte")
+
+    assert budget.retained_bytes == 384 * 1024 * 1024
+    assert budget.peak_retained_bytes == 384 * 1024 * 1024
 
 
 def test_raw_audit_capacity_rejects_non_positive_configuration(monkeypatch):
