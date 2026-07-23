@@ -61,6 +61,12 @@ def test_dense_partition_has_bounded_headroom_without_changing_legacy_cap():
     assert budget.peak_retained_bytes == 384 * 1024 * 1024
 
 
+@pytest.mark.parametrize("maximum_bytes", (0, -1, True))
+def test_decoded_retention_budget_rejects_invalid_limits(maximum_bytes):
+    with pytest.raises(ValueError, match="limit must be positive"):
+        CandidateAuditDecodedRetentionBudget(maximum_bytes=maximum_bytes)
+
+
 def test_raw_audit_capacity_rejects_non_positive_configuration(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PTG2_AUDIT_BATCH_MAX_RAW_BYTES", "0")
 
