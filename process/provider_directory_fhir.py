@@ -40175,6 +40175,12 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_LIMIT = 16
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_HISTORY_LIMIT = 4096
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_MIN_AGE_SECONDS = 6 * 60 * 60
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_TOKEN_LENGTH = 12
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_LEGACY_IDENTIFIER_HEX_LENGTH = 16
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_NONCE_HEX_LENGTH = 10
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_IDENTIFIER_HEX_LENGTH = (
+    PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_TOKEN_LENGTH
+    + PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_NONCE_HEX_LENGTH
+)
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
     "source_record_idx",
     "npi_idx",
@@ -40188,12 +40194,17 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
 def _address_overlay_stage_table_name(run_id: str | None = None) -> str:
     if run_id:
         owner_token = _address_overlay_stage_owner_token(run_id)
-        digest = f"{owner_token}{os.urandom(2).hex()}"
+        nonce = os.urandom(
+            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_NONCE_HEX_LENGTH // 2
+        ).hex()
+        digest = f"{owner_token}{nonce}"
     else:
         raw_identifier = f"full:{os.getpid()}:{time.time_ns()}:{os.urandom(8).hex()}"
         digest = hashlib.sha1(
             raw_identifier.encode("utf-8", errors="ignore")
-        ).hexdigest()[:16]
+        ).hexdigest()[
+            :PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_IDENTIFIER_HEX_LENGTH
+        ]
     return f"{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX}_{digest}"
 
 
@@ -40208,7 +40219,11 @@ def _is_address_overlay_stage_table_name(table_name: str) -> bool:
 
     return bool(
         re.fullmatch(
-            rf"{re.escape(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX)}_[0-9a-f]{{16}}",
+            rf"{re.escape(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX)}_"
+            rf"(?:"
+            rf"[0-9a-f]{{{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_LEGACY_IDENTIFIER_HEX_LENGTH}}}"
+            rf"|[0-9a-f]{{{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_IDENTIFIER_HEX_LENGTH}}}"
+            rf")",
             table_name,
         )
     )
