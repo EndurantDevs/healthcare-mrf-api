@@ -26111,7 +26111,7 @@ mod tests {
         assert!(v4_finalize_progress.semantic_progress.is_some());
     }
 
-    fn anthem_inline_provider_groups() -> Vec<Value> {
+    fn reference_extreme_inline_provider_groups() -> Vec<Value> {
         vec![
             json!({
                 "tin": {"type": "ein", "value": "123456789"},
@@ -26128,7 +26128,7 @@ mod tests {
         RawValue::from_string(value.to_owned()).expect("valid raw provider_groups JSON")
     }
 
-    fn anthem_inline_rate() -> RateLite {
+    fn reference_extreme_inline_rate() -> RateLite {
         RateLite {
             provider_refs: Vec::new(),
             provider_groups: Vec::new(),
@@ -26148,7 +26148,7 @@ mod tests {
         (entry, normalization_count, groups.len() as u64)
     }
 
-    struct AnthemInlineCacheRun {
+    struct ReferenceExtremeInlineCacheRun {
         output_sha256: [u8; 32],
         dedupe: Value,
         quarantine: Value,
@@ -26156,12 +26156,12 @@ mod tests {
         cache: V4InlineProviderTransformCacheSnapshot,
     }
 
-    fn run_anthem_inline_cache_case(
+    fn run_reference_extreme_inline_cache_case(
         worker_count: usize,
         cache_max_bytes: u64,
-    ) -> AnthemInlineCacheRun {
+    ) -> ReferenceExtremeInlineCacheRun {
         const RATE_ATTEMPTS: usize = 6_250;
-        let rate = Arc::new(anthem_inline_rate());
+        let rate = Arc::new(reference_extreme_inline_rate());
         let cache = Arc::new(V4InlineProviderTransformSharedCache::new(cache_max_bytes));
         let dedupe = Arc::new(SharedDedupe::new(worker_count));
         let mut handles = Vec::new();
@@ -26208,7 +26208,7 @@ mod tests {
             output_digest.update((payload.len() as u64).to_le_bytes());
             output_digest.update(payload);
         }
-        AnthemInlineCacheRun {
+        ReferenceExtremeInlineCacheRun {
             output_sha256: output_digest.finalize().into(),
             dedupe: dedupe_summary_payload(&dedupe, &HashMap::new()),
             quarantine: dedupe
@@ -26222,11 +26222,11 @@ mod tests {
     }
 
     #[test]
-    fn anthem_shaped_inline_cache_is_exact_bounded_and_shared_across_workers() {
-        let uncached_single = run_anthem_inline_cache_case(1, 0);
-        let uncached_parallel = run_anthem_inline_cache_case(4, 0);
-        let cached_single = run_anthem_inline_cache_case(1, 16 * 1024 * 1024);
-        let cached_parallel = run_anthem_inline_cache_case(4, 16 * 1024 * 1024);
+    fn reference_extreme_inline_cache_is_exact_bounded_and_shared_across_workers() {
+        let uncached_single = run_reference_extreme_inline_cache_case(1, 0);
+        let uncached_parallel = run_reference_extreme_inline_cache_case(4, 0);
+        let cached_single = run_reference_extreme_inline_cache_case(1, 16 * 1024 * 1024);
+        let cached_parallel = run_reference_extreme_inline_cache_case(4, 16 * 1024 * 1024);
 
         for candidate in [&uncached_parallel, &cached_single, &cached_parallel] {
             assert_eq!(candidate.output_sha256, uncached_single.output_sha256);
@@ -26391,8 +26391,8 @@ mod tests {
 
     #[test]
     fn v4_inline_cache_full_compares_collision_buckets_and_eviction_only_changes_speed() {
-        let groups_a = anthem_inline_provider_groups();
-        let mut groups_b = anthem_inline_provider_groups();
+        let groups_a = reference_extreme_inline_provider_groups();
+        let mut groups_b = reference_extreme_inline_provider_groups();
         groups_b[0]["tin"]["value"] = json!("111111111");
         let (entry_a, normalization_a, attempts_a) = audited_inline_transform(&groups_a);
         let (entry_b, normalization_b, attempts_b) = audited_inline_transform(&groups_b);
@@ -26853,7 +26853,7 @@ mod tests {
     #[test]
     fn manifest_global_id_cache_reuses_canonical_provider_set_identity() {
         let groups = [7_i64, 3_i64];
-        let networks = ["Aetna PPO".to_string(), "Choice POS".to_string()];
+        let networks = ["Network Alpha".to_string(), "Network Beta".to_string()];
         let expected =
             provider_set_global_id_from_group_hashes_and_network_names(&groups, &networks);
         let mut cache = ManifestGlobalIdCache::default();

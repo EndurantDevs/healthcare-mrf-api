@@ -240,7 +240,7 @@ def _database_evidence_by_field() -> dict[str, object]:
     return {
         "v4_snapshot_id": "v4-snapshot",
         "reference_snapshot_id": "v3-snapshot",
-        "rollback_owner_id": "aetna-391",
+        "rollback_owner_id": "fragmented-case-391",
         "same_raw_sources": True,
         "same_source_trace_sets": True,
         "v4_source_set": source_set_by_field,
@@ -254,7 +254,7 @@ def _database_evidence_by_field() -> dict[str, object]:
         },
         "rollback_pin": {
             "owner_type": "ptg_v4_rollback",
-            "owner_id": "aetna-391",
+            "owner_id": "fragmented-case-391",
             "snapshot_id": "v3-snapshot",
             "reason": "retain V3 rollback",
         },

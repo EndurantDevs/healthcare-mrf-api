@@ -97,9 +97,10 @@ both the V4 graph footprint and the whole coexisting snapshot footprint.
 The storage ceiling is not a canary command-line input. A source-controlled
 policy binds each rollout case to its frozen V3 snapshot, authenticated raw
 source-set digest, source count, retained base-layout logical bytes, and
-expected V4 representation. The first roster is HealthJoy 233 (direct),
-Aetna 391 (pattern), and Anthem 478 (pattern). Unknown or changed source sets
-fail closed until a reviewed policy change records the new immutable baseline.
+expected V4 representation. The first roster covers a direct-layout baseline,
+a provider-fragmented pattern case, and a reference-extreme pattern case.
+Unknown or changed source sets fail closed until a reviewed policy change
+records the new immutable baseline.
 Individual raw source hashes are never stored in the policy.
 
 The first release deliberately marks all three roster entries as

@@ -423,4 +423,3 @@ def test_preserve_single_get_partial_writes_resume_or_resets(tmp_path) -> None:
     )
     assert not path.exists()
     assert state.byte_count == 0 and state.validator is None
-

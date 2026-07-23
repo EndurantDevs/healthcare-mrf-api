@@ -102,4 +102,3 @@ def test_fresh_truncated_gzip_fails_full_integrity_check(tmp_path, monkeypatch) 
                 keep_partial_artifacts=True,
             )
         )
-

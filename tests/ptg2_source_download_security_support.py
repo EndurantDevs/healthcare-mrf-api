@@ -150,4 +150,3 @@ def _state(path: Path, **changes) -> source_download._SingleGetDownloadState:
     }
     state_values_by_field.update(changes)
     return source_download._SingleGetDownloadState(**state_values_by_field)
-

@@ -107,7 +107,7 @@ def _fixture_data_statements(schema: str) -> tuple[str, ...]:
         INSERT INTO {schema}.ptg2_snapshot_pin
             (owner_type, owner_id, snapshot_id, reason)
         VALUES
-            ('ptg_v4_rollback', 'aetna-391', 'v3-snapshot',
+            ('ptg_v4_rollback', 'fragmented-case-391', 'v3-snapshot',
              'retain V3 during V4 review')
         """,
         f"""

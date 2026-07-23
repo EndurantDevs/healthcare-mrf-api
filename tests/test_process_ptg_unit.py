@@ -1636,7 +1636,7 @@ def test_rust_scanner_semantic_progress_advances_during_one_long_item(monkeypatc
 
     for completed, chunks in ((65_536, 1), (131_072, 2)):
         ptg_rust_scanner._emit_scanner_live_progress(
-            "PTG2_SCANNER_PROGRESS\tpath=/work/raw/aetna.json.gz\t"
+            "PTG2_SCANNER_PROGRESS\tpath=/work/raw/reference-extreme.json.gz\t"
             "progress_basis=semantic_work\t"
             f"semantic_work_completed={completed}\t"
             "compressed_bytes=99\ttotal_bytes=100\tpercent=99.00\t"

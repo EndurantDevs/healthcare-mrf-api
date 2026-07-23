@@ -423,4 +423,3 @@ def test_top_level_scanner_malformed_frames_and_typed_failure(
                 live_progress_context={},
             )
         )
-

@@ -57,7 +57,7 @@ async def test_reference_query_proves_pin_fk_and_exact_raw_source_set() -> None:
             ReferenceEquivalenceScope(
                 v4_snapshot_id="v4-snapshot",
                 reference_snapshot_id="v3-snapshot",
-                rollback_owner_id="aetna-391",
+                rollback_owner_id="fragmented-case-391",
             ),
         )
 
@@ -76,7 +76,7 @@ async def test_reference_query_proves_pin_fk_and_exact_raw_source_set() -> None:
             ReferenceEquivalenceScope(
                 v4_snapshot_id="v4-snapshot",
                 reference_snapshot_id="v3-snapshot",
-                rollback_owner_id="aetna-391",
+                rollback_owner_id="fragmented-case-391",
             ),
         )
         assert (

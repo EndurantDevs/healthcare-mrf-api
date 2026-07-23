@@ -162,7 +162,6 @@ def test_reader_rejects_invalid_stats_and_stream_size_changes() -> None:
             {"byte_count": 4},
             SimpleNamespace(**base_stat_by_field),
         )
-
     with pytest.raises(RuntimeError, match="changed while reading"):
         reader._stream_authenticated_digest(BytesIO(b"ab"), bundle_size=3)
     with pytest.raises(RuntimeError, match="changed while reading"):
@@ -486,4 +485,3 @@ def test_materialized_record_locator_consistency(monkeypatch) -> None:
             locator,
             {},
         )
-

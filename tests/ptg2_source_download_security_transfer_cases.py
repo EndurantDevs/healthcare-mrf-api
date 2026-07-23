@@ -422,4 +422,3 @@ def test_environment_host_and_small_container_branches(tmp_path, monkeypatch) ->
     not_gzip.write_bytes(b"no")
     assert "gzip header" in source_download._gzip_integrity_error(str(not_gzip), not_gzip)
     assert source_download._zip_container_error(str(tmp_path / "plain.json"), tmp_path / "plain.json") is None
-

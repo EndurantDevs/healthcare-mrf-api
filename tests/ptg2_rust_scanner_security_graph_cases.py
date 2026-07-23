@@ -54,7 +54,6 @@ def test_shared_graph_digest_directory_and_total_mismatch_guards(
                 expected_output_directory=output,
                 expected=expected,
             )
-
     for field_name in ("block_count", "owner_count", "raw_block_byte_count"):
         invalid_summary_by_field = dict(summary_by_field)
         invalid_summary_by_field[field_name] = (
@@ -66,4 +65,3 @@ def test_shared_graph_digest_directory_and_total_mismatch_guards(
                 expected_output_directory=output,
                 expected=expected,
             )
-

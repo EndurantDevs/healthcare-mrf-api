@@ -56,7 +56,7 @@ class StorageCanaryCase:
 
 STORAGE_CANARY_CASES = (
     StorageCanaryCase(
-        case_name="healthjoy_233",
+        case_name="direct_baseline_233",
         reference_snapshot_id="ptg2:202607:bbc0656036ca",
         source_count=1,
         source_set_digest=(
@@ -67,7 +67,7 @@ STORAGE_CANARY_CASES = (
         physical_storage_approval=None,
     ),
     StorageCanaryCase(
-        case_name="aetna_391",
+        case_name="provider_fragmented_391",
         reference_snapshot_id="ptg2:202607:8a2b4b34d0f9",
         source_count=1,
         source_set_digest=(
@@ -78,7 +78,7 @@ STORAGE_CANARY_CASES = (
         physical_storage_approval=None,
     ),
     StorageCanaryCase(
-        case_name="anthem_478",
+        case_name="reference_extreme_478",
         reference_snapshot_id="ptg2:202607:bc93867480ed",
         source_count=7,
         source_set_digest=(

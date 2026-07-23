@@ -460,4 +460,3 @@ def test_single_get_resumes_complete_prefix_and_advances_threshold(tmp_path, mon
     )
     assert path.read_bytes() == b"abcd"
     assert requested_headers == [{"Range": "bytes=2-", "If-Match": '"strong"'}]
-

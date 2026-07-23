@@ -250,7 +250,7 @@ def test_acceptance_passes_only_derived_storage_budget(
 
     assert report == {"passed": True}
     assert captured_by_field["evidence"] == evidence
-    assert captured_by_field["budget"].case.case_name == "anthem_478"
+    assert captured_by_field["budget"].case.case_name == "reference_extreme_478"
     assert captured_by_field["root_counts"] == {}
     assert captured_by_field["relation_counts"] == {}
 
