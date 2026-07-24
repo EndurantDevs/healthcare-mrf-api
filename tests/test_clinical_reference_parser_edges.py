@@ -80,6 +80,7 @@ def _write_rxnorm_main_archive(path: Path) -> Path:
     concept_text = "".join(
         [
             "too|short\n",
+            "|".join(["malformed"] * 17) + "\n",
             _rxnorm_concept_row("bad-language", "French", lat="FRE"),
             _rxnorm_concept_row("bad-source", "Other source", sab="MTHSPL"),
             _rxnorm_concept_row("bad-suppress", "Suppressed", suppress="Y"),
