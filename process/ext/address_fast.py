@@ -12,6 +12,7 @@ import importlib
 import logging
 import re
 from collections.abc import Iterable, Sequence
+from functools import lru_cache
 from typing import Any
 
 from process.ext import address_canon
@@ -20,8 +21,6 @@ from process.ext import address_canon
 logger = logging.getLogger(__name__)
 
 AddressRow = tuple[Any, Any, Any, Any, Any, Any]
-_FAST_MODULE: Any | None = None
-_FAST_MODULE_CHECKED = False
 
 
 def _as_optional_text(value: Any) -> str | None:
@@ -70,11 +69,8 @@ def _python_canonicalize(row: AddressRow) -> dict[str, str | None]:
     }
 
 
+@lru_cache(maxsize=1)
 def _fast_module() -> Any | None:
-    global _FAST_MODULE, _FAST_MODULE_CHECKED
-    if _FAST_MODULE_CHECKED:
-        return _FAST_MODULE
-    _FAST_MODULE_CHECKED = True
     try:
         module = importlib.import_module("ptg2_address_canon")
     except ImportError:
@@ -92,21 +88,20 @@ def _fast_module() -> Any | None:
             address_canon.current_canon_version(),
         )
         return None
-    _FAST_MODULE = module
-    return _FAST_MODULE
+    return module
 
 
 def canonicalize_batch(rows: Iterable[Sequence[Any]]) -> list[dict[str, str | None]]:
     """Canonicalize address rows with the compatible fast path or fallback."""
 
-    prepared = [_row_tuple(row) for row in rows]
+    prepared_rows = [_row_tuple(row) for row in rows]
     module = _fast_module()
     if module is not None:
         try:
-            return list(module.canonicalize_batch(prepared))
+            return list(module.canonicalize_batch(prepared_rows))
         except Exception as exc:
             logger.warning("Rust/PyO3 address canonicalizer failed; using Python fallback: %s", exc)
-    return [_python_canonicalize(row) for row in prepared]
+    return [_python_canonicalize(row) for row in prepared_rows]
 
 
 def canonicalize_one(row: Sequence[Any]) -> dict[str, str | None]:

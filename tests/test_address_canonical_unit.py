@@ -366,8 +366,7 @@ def test_python_address_canonical_golden_corpus_matches_frozen_expected_values()
 
 def test_address_fast_python_fallback_matches_reference(monkeypatch):
     address_fast = importlib.import_module("process.ext.address_fast")
-    monkeypatch.setattr(address_fast, "_FAST_MODULE_CHECKED", True)
-    monkeypatch.setattr(address_fast, "_FAST_MODULE", None)
+    monkeypatch.setattr(address_fast, "_fast_module", lambda: None)
 
     result = address_fast.canonicalize_batch([
         ("123 Main St", "Suite 200", "Austin", "TX", "78701-1234", "US"),

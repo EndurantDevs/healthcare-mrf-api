@@ -3412,7 +3412,7 @@ async def pharmacy_license_finalize(_ctx, task=None):  # pragma: no cover
 async def queue_pharmacy_license_import(
     test_mode: bool = False,
     import_id: str | None = None,
-):  # pragma: no cover
+):
     """Queue a pharmacy-license import and return its generated run ID."""
     run_id = _normalize_run_id(None)
     normalized_import_id = _normalize_import_id(import_id)

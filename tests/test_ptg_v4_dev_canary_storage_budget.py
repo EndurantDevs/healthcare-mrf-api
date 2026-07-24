@@ -111,7 +111,7 @@ def test_storage_budget_keeps_each_initial_canary_measurement_only(
     assert report["snapshot_gate_bytes"] == 456
 
 
-def test_storage_budget_allows_factored_v4_bytes_to_differ_from_v3_reference() -> None:
+def test_storage_budget_accepts_distinct_factored_bytes() -> None:
     case = STORAGE_CANARY_CASES[1]
     v4_logical_bytes = case.base_layout_logical_bytes // 17
     assert v4_logical_bytes != case.base_layout_logical_bytes

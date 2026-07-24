@@ -25,6 +25,35 @@ def _state(state_code: str = "TX") -> pharmacy_license.StateSource:
 
 
 @pytest.mark.asyncio
+async def test_queue_entrypoint_preserves_worker_contract(monkeypatch, capsys):
+    worker_pool = SimpleNamespace(enqueue_job=AsyncMock())
+    monkeypatch.setattr(pharmacy_license, "create_pool", AsyncMock(return_value=worker_pool))
+    monkeypatch.setattr(pharmacy_license, "_normalize_run_id", lambda _value: "run-contract")
+    monkeypatch.setattr(pharmacy_license, "_normalize_import_id", lambda _value: "import-contract")
+
+    run_id = await pharmacy_license.main(test_mode=True, import_id="requested-import")
+
+    assert pharmacy_license.main is pharmacy_license.queue_pharmacy_license_import
+    assert run_id == "run-contract"
+    worker_pool.enqueue_job.assert_awaited_once_with(
+        "pharmacy_license_start",
+        {
+            "run_id": "run-contract",
+            "import_id": "import-contract",
+            "test_mode": True,
+        },
+        _queue_name=pharmacy_license.PHARM_LICENSE_QUEUE_NAME,
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "queued",
+        "run_id": "run-contract",
+        "import_id": "import-contract",
+        "queue_name": pharmacy_license.PHARM_LICENSE_QUEUE_NAME,
+        "test_mode": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_index_builder_creates_primary_filtered_and_method_indexes(monkeypatch):
     class IndexedModel:
         __tablename__ = "sample_table"

@@ -350,11 +350,11 @@ async def test_split_provider_service_chunks_partition_by_npi(monkeypatch):
                 reader = csv.DictReader(handle)
                 for provider_service_row in reader:
                     npi = provider_service_row["Rndrng_NPI"]
-                    existing = chunk_path_by_npi.get(npi)
-                    if existing is None:
-                        chunk_path_by_npi[npi] = chunk["chunk_path"]
-                    else:
-                        assert existing == chunk["chunk_path"]
+                    expected_chunk_path = chunk_path_by_npi.setdefault(
+                        npi,
+                        chunk["chunk_path"],
+                    )
+                    assert expected_chunk_path == chunk["chunk_path"]
 
         assert "1000000001" in chunk_path_by_npi
         assert "1000000002" in chunk_path_by_npi
