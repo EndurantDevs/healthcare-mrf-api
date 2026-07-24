@@ -285,6 +285,139 @@ def _dataset_specs(acs5_year: int, decennial_year: int, cbp_year: int) -> tuple[
     )
 
 
+def _census_query_params_by_name(
+    spec: DatasetSpec,
+    api_key: str | None,
+) -> dict[str, str]:
+    """Build query parameters for one Census dataset request."""
+    query_params_by_name = {
+        "get": ",".join(["NAME", *(variable for _, variable, _ in spec.fields)]),
+        "for": spec.geography,
+    }
+    if api_key:
+        query_params_by_name["key"] = api_key
+    return query_params_by_name
+
+
+async def _request_census_payload(
+    client: aiohttp.ClientSession,
+    spec: DatasetSpec,
+    dataset_url: str,
+    query_params_by_name: dict[str, str],
+    timeout_seconds: int,
+) -> object:
+    """Request and decode one Census API response."""
+    async with client.get(
+        dataset_url,
+        params=query_params_by_name,
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+    ) as response:
+        response_body = await response.text()
+        if response.status >= 400:
+            raise RuntimeError(
+                f"Census API {spec.name} failed status={response.status}: "
+                f"{response_body[:220]}"
+            )
+        return await response.json(content_type=None)
+
+
+async def _fetch_census_payload(
+    client: aiohttp.ClientSession,
+    spec: DatasetSpec,
+    dataset_url: str,
+    query_params_by_name: dict[str, str],
+    timeout_seconds: int,
+    retries: int,
+    retry_delay_seconds: float,
+) -> object:
+    """Retry one Census request using the importer's bounded linear backoff."""
+    last_error: Exception | None = None
+    response_payload = None
+    for attempt in range(1, retries + 1):
+        try:
+            response_payload = await _request_census_payload(
+                client,
+                spec,
+                dataset_url,
+                query_params_by_name,
+                timeout_seconds,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retries:
+                break
+            await asyncio.sleep(min(retry_delay_seconds * attempt, 20.0))
+
+    if response_payload is None:
+        raise RuntimeError(
+            f"Unable to fetch Census dataset {spec.name} from {dataset_url}: {last_error!r}"
+        )
+    return response_payload
+
+
+def _validate_census_payload(
+    spec: DatasetSpec,
+    response_payload: object,
+) -> tuple[list[object], list[object]]:
+    """Return a Census response header and data rows after shape validation."""
+    if not isinstance(response_payload, list) or not response_payload:
+        raise RuntimeError(
+            f"Unexpected Census payload for {spec.name}: {type(response_payload)!r}"
+        )
+    response_header = response_payload[0]
+    if not isinstance(response_header, list):
+        raise RuntimeError(f"Census header malformed for {spec.name}")
+    return response_header, response_payload[1:]
+
+
+def _map_census_header(
+    spec: DatasetSpec,
+    response_header: list[object],
+) -> dict[str, int]:
+    """Map Census column names to their response positions."""
+    column_index_by_name = {
+        str(column_name): column_index
+        for column_index, column_name in enumerate(response_header)
+    }
+    if spec.zip_column not in column_index_by_name:
+        raise RuntimeError(
+            f"Census payload for {spec.name} missing geography column {spec.zip_column!r}"
+        )
+    return column_index_by_name
+
+
+def _convert_census_response_row(
+    spec: DatasetSpec,
+    column_index_by_name: dict[str, int],
+    census_response_row: object,
+) -> tuple[str, dict[str, int | float | None]] | None:
+    """Convert one Census response row to the ZIP-keyed import representation."""
+    if not isinstance(census_response_row, list):
+        return None
+    geography_column_index = column_index_by_name[spec.zip_column]
+    if geography_column_index >= len(census_response_row):
+        raise RuntimeError(
+            f"Census payload row for {spec.name} missing geography value "
+            f"for column {spec.zip_column!r}"
+        )
+    zip_code = _normalize_zip(census_response_row[geography_column_index])
+    if not zip_code:
+        return None
+
+    field_values_by_name: dict[str, int | float | None] = {}
+    for field_name, variable, data_type in spec.fields:
+        variable_index = column_index_by_name.get(variable)
+        raw_field_value = (
+            census_response_row[variable_index]
+            if variable_index is not None and variable_index < len(census_response_row)
+            else None
+        )
+        converter = _to_float if data_type == "float" else _to_int
+        field_values_by_name[field_name] = converter(raw_field_value)
+    return zip_code, field_values_by_name
+
+
 async def _fetch_dataset_rows(
     client: aiohttp.ClientSession,
     spec: DatasetSpec,
@@ -295,77 +428,41 @@ async def _fetch_dataset_rows(
     test_mode: bool,
     test_row_limit: int,
 ) -> dict[str, dict[str, int | float | None]]:
-    """Fetch rows for one Census dataset specification."""
-    params: dict[str, str] = {
-        "get": ",".join(["NAME", *(var for _, var, _ in spec.fields)]),
-        "for": spec.geography,
-    }
-    if api_key:
-        params["key"] = api_key
+    """Fetch and convert rows for one Census dataset specification."""
+    query_params_by_name = _census_query_params_by_name(spec, api_key)
+    dataset_url = f"{CENSUS_API_BASE}/{spec.dataset}"
+    response_payload = await _fetch_census_payload(
+        client,
+        spec,
+        dataset_url,
+        query_params_by_name,
+        timeout_seconds,
+        retries,
+        retry_delay_seconds,
+    )
+    census_response_header, census_response_rows = _validate_census_payload(
+        spec,
+        response_payload,
+    )
+    column_index_by_name = _map_census_header(spec, census_response_header)
 
-    url = f"{CENSUS_API_BASE}/{spec.dataset}"
-    last_error: Exception | None = None
-    payload = None
-    for attempt in range(1, retries + 1):
-        try:
-            async with client.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
-            ) as response:
-                body = await response.text()
-                if response.status >= 400:
-                    raise RuntimeError(
-                        f"Census API {spec.name} failed status={response.status}: {body[:220]}"
-                    )
-                payload = await response.json(content_type=None)
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt >= retries:
-                break
-            await asyncio.sleep(min(retry_delay_seconds * attempt, 20.0))
-
-    if payload is None:
-        raise RuntimeError(
-            f"Unable to fetch Census dataset {spec.name} from {url}: {last_error!r}"
-        )
-
-    if not isinstance(payload, list) or not payload:
-        raise RuntimeError(f"Unexpected Census payload for {spec.name}: {type(payload)!r}")
-
-    header = payload[0]
-    if not isinstance(header, list):
-        raise RuntimeError(f"Census header malformed for {spec.name}")
-    index = {str(col): idx for idx, col in enumerate(header)}
-    if spec.zip_column not in index:
-        raise RuntimeError(
-            f"Census payload for {spec.name} missing geography column {spec.zip_column!r}"
-        )
-
-    rows = payload[1:]
     if test_mode:
-        rows = rows[: max(1, test_row_limit)]
+        census_response_rows = census_response_rows[: max(1, test_row_limit)]
 
-    result: dict[str, dict[str, int | float | None]] = {}
-    for row in rows:
-        if not isinstance(row, list):
+    dataset_rows_by_zip: dict[str, dict[str, int | float | None]] = {}
+    for census_response_row in census_response_rows:
+        converted_census_row = _convert_census_response_row(
+            spec,
+            column_index_by_name,
+            census_response_row,
+        )
+        if converted_census_row is None:
             continue
-        zip_code = _normalize_zip(row[index[spec.zip_column]])
-        if not zip_code:
-            continue
-        values: dict[str, int | float | None] = {}
-        for field_name, variable, data_type in spec.fields:
-            var_index = index.get(variable)
-            raw_value = row[var_index] if var_index is not None and var_index < len(row) else None
-            if data_type == "float":
-                values[field_name] = _to_float(raw_value)
-            else:
-                values[field_name] = _to_int(raw_value)
-        result[zip_code] = values
+        zip_code, field_values_by_name = converted_census_row
+        dataset_rows_by_zip[zip_code] = field_values_by_name
 
-    logger.info("Fetched Census %s rows=%s", spec.name, len(result))
-    return result
+    logger.info("Fetched Census %s rows=%s", spec.name, len(dataset_rows_by_zip))
+    return dataset_rows_by_zip
 
 
 def _build_base_record(zip_code: str) -> dict[str, object]:
@@ -467,8 +564,8 @@ async def _collect_profile_map(test_mode: bool = False) -> Dict[str, Dict[str, o
                     continue
                 profile_map[zip_code].update(row_values)
 
-    for record in profile_map.values():
-        _finalize_profile_record(record)
+    for profile in profile_map.values():
+        _finalize_profile_record(profile)
 
     logger.info("Prepared Census ZIP profiles: rows=%s", len(profile_map))
     return profile_map
@@ -479,14 +576,14 @@ async def _flush_rows(rows: list[dict[str, object]]) -> None:
         return
     table = GeoZipCensusProfile.__table__
     insert_stmt = db.insert(table).values(rows)
-    update_cols = {
+    update_columns_by_name = {
         column.name: getattr(insert_stmt.excluded, column.name)
         for column in table.c
         if not column.primary_key
     }
     insert_stmt = insert_stmt.on_conflict_do_update(
         index_elements=GeoZipCensusProfile.__my_index_elements__,
-        set_=update_cols,
+        set_=update_columns_by_name,
     )
     await insert_stmt.status()
     rows.clear()

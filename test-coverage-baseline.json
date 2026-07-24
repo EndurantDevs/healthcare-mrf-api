@@ -118,6 +118,12 @@
         "process/attributes.py",
         "process/claims_pricing.py",
         "process/clinical_reference.py",
+        "process/clinical_reference_artifacts.py",
+        "process/clinical_reference_parsers.py",
+        "process/clinical_reference_publication.py",
+        "process/clinical_reference_rows.py",
+        "process/clinical_reference_sources.py",
+        "process/clinical_reference_umls_parsers.py",
         "process/cms_doctors.py",
         "process/code_sets.py",
         "process/control_cancel.py",
@@ -141,6 +147,9 @@
         "process/mrf_discovery_checkpoints.py",
         "process/mrf_source_discovery.py",
         "process/ms_drg.py",
+        "process/ms_drg_contracts.py",
+        "process/ms_drg_publication.py",
+        "process/ms_drg_sources.py",
         "process/npi.py",
         "process/nucc.py",
         "process/openaddresses.py",
@@ -359,7 +368,9 @@
         "process/ptg_parts/toc_entries.py",
         "process/ptg_parts/values.py",
         "process/redis_config.py",
+        "process/reference_stage.py",
         "process/serialization.py",
+        "process/terminology_synonym_sources.py",
         "process/terminology_synonyms.py",
         "process/uhc_provider_file_catalog.py",
         "process/uhc_provider_file_catalog_artifacts.py",
@@ -392,12 +403,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 30020,
-          "total": 37740
+          "covered": 30740,
+          "total": 37802
         },
         "lines": {
-          "covered": 97738,
-          "total": 111389
+          "covered": 100408,
+          "total": 112268
         }
       },
       "one_time_floor_reset": {

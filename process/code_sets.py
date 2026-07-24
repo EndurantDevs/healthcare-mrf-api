@@ -97,8 +97,9 @@ def _expand_code_range(raw_code: str, width: int) -> list[str]:
     if range_match:
         start = int(range_match.group(1))
         end = int(range_match.group(2))
-        if start <= end and end - start <= 100:
-            return [str(value).zfill(width) for value in range(start, end + 1)]
+        if start > end or end - start > 100:
+            return []
+        return [str(value).zfill(width) for value in range(start, end + 1)]
     digits = re.sub(r"\D", "", text)
     if not digits:
         return []
@@ -231,14 +232,16 @@ async def _ensure_code_catalog(schema: str) -> None:
         """
     )
 
-async def _upsert_code_rows(schema: str, rows: list[CodeSetRow]) -> int:
-    seen: set[tuple[str, str]] = set()
-    inserted = 0
-    for row in rows:
-        key = (row.code_system, row.code)
-        if key in seen:
+
+
+async def _upsert_code_rows(schema: str, code_rows: list[CodeSetRow]) -> int:
+    seen_code_keys: set[tuple[str, str]] = set()
+    inserted_count = 0
+    for code_row in code_rows:
+        code_key = (code_row.code_system, code_row.code)
+        if code_key in seen_code_keys:
             continue
-        seen.add(key)
+        seen_code_keys.add(code_key)
         await db.status(
             f"""
             INSERT INTO {schema}.{CodeCatalog.__tablename__}
@@ -254,22 +257,32 @@ async def _upsert_code_rows(schema: str, rows: list[CodeSetRow]) -> int:
                 source = excluded.source,
                 updated_at = excluded.updated_at;
             """,
-            code_system=row.code_system,
-            code=row.code,
-            display_name=row.display_name,
-            short_description=row.short_description,
-            long_description=row.long_description,
-            source=row.source,
+            code_system=code_row.code_system,
+            code=code_row.code,
+            display_name=code_row.display_name,
+            short_description=code_row.short_description,
+            long_description=code_row.long_description,
+            source=code_row.source,
         )
-        inserted += 1
-    return inserted
+        inserted_count += 1
+    return inserted_count
+
+
+def _select_test_rows(
+    code_rows: list[CodeSetRow],
+    preferred_codes: set[str],
+) -> list[CodeSetRow]:
+    """Prefer representative codes in test mode, with a bounded source fallback."""
+    preferred_rows = [
+        code_row for code_row in code_rows if code_row.code in preferred_codes
+    ]
+    return preferred_rows or code_rows[:10]
 
 
 async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
     """Fetch, validate, and upsert POS, revenue, and modifier code sets."""
     await ensure_database(test_mode)
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    await _ensure_code_catalog(schema)
 
     pos_url = os.getenv("HLTHPRT_CODE_SETS_POS_URL", DEFAULT_POS_URL)
     rc_url = os.getenv("HLTHPRT_CODE_SETS_RC_URL", DEFAULT_RC_URL)
@@ -280,30 +293,30 @@ async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
     pos_rows = parse_pos_code_rows(pos_html)
     rc_rows = parse_revenue_code_rows(rc_html)
     if test_mode:
-        pos_rows = [row for row in pos_rows if row.code in {"21", "22", "23"}] or pos_rows[:10]
-        rc_rows = [row for row in rc_rows if row.code in {"0450", "0981"}] or rc_rows[:10]
-    modifier_rows = modifier_code_rows()
+        pos_rows = _select_test_rows(pos_rows, {"21", "22", "23"})
+        rc_rows = _select_test_rows(rc_rows, {"0450", "0981"})
     if not pos_rows:
         raise RuntimeError(f"CMS POS source produced no code rows: {pos_url}")
     if not rc_rows:
         raise RuntimeError(f"CMS Blue Button revenue-code source produced no code rows: {rc_url}")
 
+    modifier_rows = modifier_code_rows()
+    await _ensure_code_catalog(schema)
     pos_count = await _upsert_code_rows(schema, pos_rows)
     rc_count = await _upsert_code_rows(schema, rc_rows)
     modifier_count = await _upsert_code_rows(schema, modifier_rows)
-    result = {
+    print(
+        "Code set import done: "
+        f"POS={pos_count:,} RC={rc_count:,} MODIFIER={modifier_count:,} "
+        f"at {datetime.datetime.utcnow().isoformat()}Z"
+    )
+    return {
         "pos_rows": pos_count,
         "rc_rows": rc_count,
         "modifier_rows": modifier_count,
         "pos_url": pos_url,
         "rc_url": rc_url,
     }
-    print(
-        "Code set import done: "
-        f"POS={pos_count:,} RC={rc_count:,} MODIFIER={modifier_count:,} "
-        f"at {datetime.datetime.utcnow().isoformat()}Z"
-    )
-    return result
 
 
 async def main(test_mode: bool = False) -> dict[str, Any]:

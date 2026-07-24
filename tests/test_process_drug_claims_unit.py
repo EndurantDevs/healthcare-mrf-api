@@ -103,6 +103,9 @@ async def test_finish_main_enqueues_finalize(monkeypatch):
     assert enqueue_call.kwargs["_queue_name"] == drug_claims.DRUG_CLAIMS_FINISH_QUEUE_NAME
     assert enqueue_call.kwargs["_job_id"].startswith("drug_claims_finalize_run_a_")
     assert enqueue_call.args[1]["test_mode"] is True
+    assert enqueue_call.args[1]["manifest_path"].endswith(
+        "dev1/run_a/manifest.json"
+    )
 
 
 @pytest.mark.asyncio
@@ -308,12 +311,14 @@ async def test_live_upsert_casts_bind_params_to_varchar(monkeypatch):
         schema="mrf",
         code_catalog_table="code_catalog",
         code_crosswalk_table="code_crosswalk",
-        hp_code="HP123",
-        to_system="RXNORM",
-        to_code="259255",
-        display_name="atorvastatin calcium",
-        confidence=0.9,
-        source="drug_api_live",
+        target=drug_claims.ExternalCrosswalkTarget(
+            hp_code="HP123",
+            code_system="RXNORM",
+            code="259255",
+            display_name="atorvastatin calcium",
+            confidence=0.9,
+            crosswalk_source="drug_api_live",
+        ),
     )
 
     assert inserted == 2

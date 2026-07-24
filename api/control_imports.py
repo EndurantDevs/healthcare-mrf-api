@@ -247,6 +247,8 @@ _CANCELABLE_IMPORTERS = {
     "mrf-source-discovery",
     "provider-directory-fhir",
     "address-archive-v2-migrate",
+    "clinical-reference",
+    "ms-drg",
     "openaddresses",
 }
 _FINISH_IMPORTERS = {

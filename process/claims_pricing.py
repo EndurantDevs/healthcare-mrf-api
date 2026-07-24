@@ -15,7 +15,7 @@ import shutil
 import secrets
 import time
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -286,13 +286,45 @@ async def _get_run_progress(redis, run_id: str, expected_default: int) -> tuple[
     return total_chunks, done_chunks
 
 
-async def _is_finalize_lock_claimed(redis, run_id: str) -> bool:
+async def _is_finalize_lock_claimed(
+    redis,
+    run_id: str,
+    owner_token: str | None = None,
+) -> bool:
     lock_key = _state_key(run_id, "finalize_lock")
-    lock_set = await redis.set(lock_key, "1", ex=CLAIMS_REDIS_TTL_SECONDS, nx=True)
+    lock_set = await redis.set(
+        lock_key,
+        owner_token or secrets.token_hex(16),
+        ex=CLAIMS_REDIS_TTL_SECONDS,
+        nx=True,
+    )
     return bool(lock_set)
 
 
 _claim_finalize_lock = _is_finalize_lock_claimed
+
+
+async def _is_claims_finalize_lock_released(
+    redis: Any,
+    run_id: str,
+    owner_token: str,
+) -> bool:
+    """Release only the finalize lock owned by this worker attempt."""
+
+    if redis is None or not run_id or not owner_token:
+        return False
+    lock_key = _state_key(run_id, "finalize_lock")
+    release_script = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+    released = await redis.eval(
+        release_script,
+        1,
+        lock_key,
+        owner_token,
+    )
+    return bool(released)
 
 
 def _print_row_progress(stage: str, parsed: int, accepted: int, start_time: float, final: bool = False) -> None:
@@ -316,12 +348,27 @@ def _step_end(label: str, started_at: float) -> None:
     _safe_print(f"[step] DONE  {label} in {elapsed:.1f}s", flush=True)
 
 
+def _step_failed(
+    label: str,
+    started_at: float,
+    error: BaseException,
+) -> None:
+    elapsed = max(time.monotonic() - started_at, 0.001)
+    _safe_print(
+        f"[step] FAILED {label} in {elapsed:.1f}s "
+        f"({type(error).__name__})",
+        flush=True,
+    )
+
+
 async def _run_timed_step(label: str, coro) -> None:
     started_at = _step_start(label)
     try:
         await coro
-    finally:
-        _step_end(label, started_at)
+    except BaseException as error:
+        _step_failed(label, started_at, error)
+        raise
+    _step_end(label, started_at)
 
 
 def _normalize_import_id(import_id: str | None) -> str:
@@ -797,28 +844,33 @@ def _resolve_sources(catalog: dict[str, Any], test_mode: bool = False) -> dict[s
     return sources_by_dataset
 
 
+async def _write_bounded_csv_content(response: Any, path: str, max_bytes: int) -> None:
+    downloaded_bytes = 0
+    async with async_open(path, "wb+") as destination:
+        async for response_chunk in response.content.iter_chunked(1024 * 1024):
+            if not response_chunk:
+                break
+            remaining_bytes = max_bytes - downloaded_bytes
+            if remaining_bytes <= 0:
+                break
+            bounded_chunk = response_chunk[:remaining_bytes]
+            await destination.write(bounded_chunk)
+            downloaded_bytes += len(bounded_chunk)
+            if downloaded_bytes >= max_bytes:
+                break
+
+
 async def _download_csv_head(url: str, path: str, max_bytes: int) -> None:
-    # Test mode helper: keep download bounded while still exercising parser and DB pipelines.
+    """Download a bounded CSV prefix after validating the HTTP response."""
+
     client = await get_http_client(use_proxy=CLAIMS_USE_PROXY)
-    downloaded = 0
     async with client:
         async with client.get(
             url,
             timeout=aiohttp.ClientTimeout(total=600, connect=60, sock_read=600),
         ) as response:
             response.raise_for_status()
-            async with async_open(path, "wb+") as afp:
-                async for chunk in response.content.iter_chunked(1024 * 1024):
-                    if not chunk:
-                        break
-                    remaining = max_bytes - downloaded
-                    if remaining <= 0:
-                        break
-                    data = chunk if len(chunk) <= remaining else chunk[:remaining]
-                    await afp.write(data)
-                    downloaded += len(data)
-                    if downloaded >= max_bytes:
-                        break
+            await _write_bounded_csv_content(response, path, max_bytes)
 
 
 async def _download_source_file(
@@ -892,6 +944,75 @@ async def _download_sources(sources: dict[str, dict[str, Any]], temp_dir: str, t
     return {key: path for key, path in results}
 
 
+@dataclass
+class _ProviderChunkBuckets:
+    chunks_dir: Path
+    bucket_count: int
+    writer_by_bucket: dict[int, Any]
+    handle_by_bucket: dict[int, Any]
+    row_count_by_bucket: dict[int, int]
+
+    @classmethod
+    def create(cls, chunks_dir: Path, bucket_count: int) -> "_ProviderChunkBuckets":
+        """Create empty per-bucket writer state for one source file."""
+
+        return cls(
+            chunks_dir=chunks_dir,
+            bucket_count=bucket_count,
+            writer_by_bucket={},
+            handle_by_bucket={},
+            row_count_by_bucket={bucket: 0 for bucket in range(bucket_count)},
+        )
+
+    def write_source_row(self, source_row: dict[str, Any], npi: int) -> None:
+        """Write one source row to the bucket deterministically owned by its NPI."""
+
+        bucket = abs(npi) % self.bucket_count
+        if bucket not in self.writer_by_bucket:
+            chunk_path = self.chunks_dir / f"chunk_{bucket:05d}.csv"
+            chunk_handle = open(chunk_path, "w", encoding="utf-8", newline="")
+            field_names = [field_name for field_name in source_row if field_name is not None]
+            chunk_writer = csv.DictWriter(chunk_handle, fieldnames=field_names, extrasaction="ignore")
+            chunk_writer.writeheader()
+            self.handle_by_bucket[bucket] = chunk_handle
+            self.writer_by_bucket[bucket] = chunk_writer
+        self.writer_by_bucket[bucket].writerow(source_row)
+        self.row_count_by_bucket[bucket] += 1
+
+    def close(self) -> None:
+        """Close every bucket file opened during partitioning."""
+
+        for chunk_handle in self.handle_by_bucket.values():
+            chunk_handle.close()
+
+    def build_chunk_entries(self, parsed_rows: int, accepted_rows: int) -> list[dict[str, Any]]:
+        """Describe non-empty bucket files using the importer chunk contract."""
+
+        chunk_entries: list[dict[str, Any]] = []
+        for bucket in range(self.bucket_count):
+            rows_in_bucket = self.row_count_by_bucket.get(bucket, 0)
+            if rows_in_bucket <= 0:
+                continue
+            chunk_entries.append(
+                {
+                    "dataset_key": "provider_service",
+                    "chunk_id": f"provider_service:{len(chunk_entries)}",
+                    "chunk_index": len(chunk_entries),
+                    "chunk_path": str(self.chunks_dir / f"chunk_{bucket:05d}.csv"),
+                    "parsed_rows": parsed_rows,
+                    "accepted_rows": accepted_rows,
+                    "rows_in_bucket": rows_in_bucket,
+                }
+            )
+        return chunk_entries
+
+
+def _provider_service_bucket_count(source_path: str) -> int:
+    total_size = max(Path(source_path).stat().st_size, 1)
+    estimated_chunks = max(1, math.ceil(total_size / max(CLAIMS_CHUNK_TARGET_BYTES, 1)))
+    return max(1, min(estimated_chunks, CLAIMS_PROVIDER_DRUG_MAX_BUCKETS))
+
+
 async def _split_provider_service_into_chunks(
     source_path: str,
     chunks_dir: Path,
@@ -900,93 +1021,88 @@ async def _split_provider_service_into_chunks(
     """Partition provider-service rows by NPI for parallel loading."""
 
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    total_size = max(Path(source_path).stat().st_size, 1)
-    est_chunks = max(1, int(math.ceil(total_size / max(CLAIMS_CHUNK_TARGET_BYTES, 1))))
-    bucket_count = max(1, min(est_chunks, CLAIMS_PROVIDER_DRUG_MAX_BUCKETS))
+    chunk_buckets = _ProviderChunkBuckets.create(
+        chunks_dir,
+        _provider_service_bucket_count(source_path),
+    )
     row_limit = TEST_PROVIDER_SERVICE_ROW_LIMIT if test_mode else None
-
-    writer_by_bucket: dict[int, Any] = {}
-    handle_by_bucket: dict[int, Any] = {}
-    row_count_by_bucket: dict[int, int] = {
-        idx: 0 for idx in range(bucket_count)
-    }
     parsed_rows = 0
     accepted_rows = 0
-
     try:
         async with async_open(source_path, "r", encoding="utf-8-sig") as source_handle:
-            reader = AsyncDictReader(source_handle)
-            async for source_row in reader:
+            async for source_row in AsyncDictReader(source_handle):
                 parsed_rows += 1
-                if test_mode:
-                    if not _row_allowed_for_test(parsed_rows):
-                        continue
-                    if row_limit is not None and accepted_rows >= row_limit:
-                        break
-
-                npi = _to_npi(
-                    _row_value(
-                        source_row,
-                        "Rndrng_NPI",
-                        "PRSCRBR_NPI",
-                        "Prscrbr_NPI",
-                    )
-                )
+                if test_mode and not _row_allowed_for_test(parsed_rows):
+                    continue
+                if test_mode and row_limit is not None and accepted_rows >= row_limit:
+                    break
+                npi = _to_npi(_row_value(source_row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
                 if npi is None:
                     continue
-                bucket = abs(int(npi)) % bucket_count
-
-                if bucket not in writer_by_bucket:
-                    chunk_path = chunks_dir / f"chunk_{bucket:05d}.csv"
-                    handle = open(chunk_path, "w", encoding="utf-8", newline="")
-                    fieldnames = [
-                        key for key in source_row.keys() if key is not None
-                    ]
-                    writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-                    writer.writeheader()
-                    handle_by_bucket[bucket] = handle
-                    writer_by_bucket[bucket] = writer
-
-                writer_by_bucket[bucket].writerow(source_row)
-                row_count_by_bucket[bucket] += 1
+                chunk_buckets.write_source_row(source_row, npi)
                 accepted_rows += 1
     finally:
-        for handle in handle_by_bucket.values():
-            handle.close()
+        chunk_buckets.close()
 
-    chunks: list[dict[str, Any]] = []
-    chunk_index = 0
-    for bucket in range(bucket_count):
-        rows_in_bucket = row_count_by_bucket.get(bucket, 0)
-        if rows_in_bucket <= 0:
-            continue
-        chunk_path = chunks_dir / f"chunk_{bucket:05d}.csv"
-        chunks.append(
-            {
-                "dataset_key": "provider_service",
-                "chunk_id": f"provider_service:{chunk_index}",
-                "chunk_index": chunk_index,
-                "chunk_path": str(chunk_path),
-                "parsed_rows": parsed_rows,
-                "accepted_rows": accepted_rows,
-                "rows_in_bucket": rows_in_bucket,
-            }
-        )
-        chunk_index += 1
-
-    if not chunks:
+    chunk_entries = chunk_buckets.build_chunk_entries(parsed_rows, accepted_rows)
+    if not chunk_entries:
         _safe_print(
             f"[warn] no chunks generated for provider_service (parsed={parsed_rows:,}, accepted={accepted_rows:,})",
             flush=True,
         )
     else:
         _safe_print(
-            f"[split:provider_service] chunks={len(chunks)} parsed={parsed_rows:,} accepted={accepted_rows:,} "
-            f"bucketed_by=npi buckets={bucket_count}",
+            f"[split:provider_service] chunks={len(chunk_entries)} parsed={parsed_rows:,} "
+            f"accepted={accepted_rows:,} bucketed_by=npi buckets={chunk_buckets.bucket_count}",
             flush=True,
         )
+    return chunk_entries
 
-    return chunks
+
+@dataclass
+class _ByteChunkWriter:
+    dataset_key: str
+    chunks_dir: Path
+    header_line: bytes
+    chunk_entries: list[dict[str, Any]]
+    chunk_handle: Any = None
+    chunk_path: Path | None = None
+    current_size: int = 0
+
+    def _open_chunk(self) -> None:
+        self.chunk_path = self.chunks_dir / f"chunk_{len(self.chunk_entries):05d}.csv"
+        self.chunk_handle = open(self.chunk_path, "wb")
+        self.chunk_handle.write(self.header_line)
+        self.current_size = len(self.header_line)
+
+    def write_line(self, source_line: bytes, parsed_rows: int, accepted_rows: int) -> None:
+        """Append one CSV row and close the chunk once its byte target is reached."""
+
+        if self.chunk_handle is None:
+            self._open_chunk()
+        self.chunk_handle.write(source_line)
+        self.current_size += len(source_line)
+        if self.current_size >= CLAIMS_CHUNK_TARGET_BYTES:
+            self.close_chunk(parsed_rows, accepted_rows)
+
+    def close_chunk(self, parsed_rows: int, accepted_rows: int) -> None:
+        """Close the current file and record its cumulative split counters."""
+
+        if self.chunk_handle is None:
+            return
+        self.chunk_handle.close()
+        self.chunk_entries.append(
+            {
+                "dataset_key": self.dataset_key,
+                "chunk_id": f"{self.dataset_key}:{len(self.chunk_entries)}",
+                "chunk_index": len(self.chunk_entries),
+                "chunk_path": str(self.chunk_path),
+                "parsed_rows": parsed_rows,
+                "accepted_rows": accepted_rows,
+            }
+        )
+        self.chunk_handle = None
+        self.chunk_path = None
 
 
 async def _split_source_into_chunks(
@@ -999,86 +1115,37 @@ async def _split_source_into_chunks(
 
     if dataset_key == "provider_service":
         return await _split_provider_service_into_chunks(source_path, chunks_dir, test_mode)
-
-    dataset_config = DATASET_BY_KEY[dataset_key]
     chunks_dir.mkdir(parents=True, exist_ok=True)
-
-    chunks: list[dict[str, Any]] = []
-    header_line: bytes | None = None
+    chunk_entries: list[dict[str, Any]] = []
+    chunk_writer: _ByteChunkWriter | None = None
     parsed_rows = 0
     accepted_rows = 0
-    chunk_index = 0
-    current_size = 0
-    chunk_handle = None
-    chunk_path: Path | None = None
-    row_limit = dataset_config.row_limit_test if test_mode else None
-
-    def _open_chunk() -> tuple[Any, Path]:
-        nonlocal chunk_index, current_size
-        chunk_path_local = chunks_dir / f"chunk_{chunk_index:05d}.csv"
-        chunk_index += 1
-        handle = open(chunk_path_local, "wb")
-        handle.write(header_line or b"")
-        current_size = len(header_line or b"")
-        return handle, chunk_path_local
-
+    row_limit = DATASET_BY_KEY[dataset_key].row_limit_test if test_mode else None
     try:
         async with async_open(source_path, "rb") as source_handle:
-            async for line in source_handle:
-                if header_line is None:
-                    header_line = line
+            async for source_line in source_handle:
+                if chunk_writer is None:
+                    chunk_writer = _ByteChunkWriter(dataset_key, chunks_dir, source_line, chunk_entries)
                     continue
                 parsed_rows += 1
-                if test_mode:
-                    if not _row_allowed_for_test(parsed_rows):
-                        continue
-                    if row_limit is not None and accepted_rows >= row_limit:
-                        break
-
-                if chunk_handle is None:
-                    chunk_handle, chunk_path = _open_chunk()
-
-                chunk_handle.write(line)
-                current_size += len(line)
+                if test_mode and not _row_allowed_for_test(parsed_rows):
+                    continue
+                if test_mode and row_limit is not None and accepted_rows >= row_limit:
+                    break
                 accepted_rows += 1
-
-                if current_size >= CLAIMS_CHUNK_TARGET_BYTES:
-                    chunk_handle.close()
-                    chunks.append(
-                        {
-                            "dataset_key": dataset_key,
-                            "chunk_id": f"{dataset_key}:{len(chunks)}",
-                            "chunk_index": len(chunks),
-                            "chunk_path": str(chunk_path),
-                            "parsed_rows": parsed_rows,
-                            "accepted_rows": accepted_rows,
-                        }
-                    )
-                    chunk_handle = None
-                    chunk_path = None
+                chunk_writer.write_line(source_line, parsed_rows, accepted_rows)
     finally:
-        if chunk_handle is not None:
-            chunk_handle.close()
-            chunks.append(
-                {
-                    "dataset_key": dataset_key,
-                    "chunk_id": f"{dataset_key}:{len(chunks)}",
-                    "chunk_index": len(chunks),
-                    "chunk_path": str(chunk_path),
-                    "parsed_rows": parsed_rows,
-                    "accepted_rows": accepted_rows,
-                }
-            )
+        if chunk_writer is not None:
+            chunk_writer.close_chunk(parsed_rows, accepted_rows)
 
-    if not chunks:
+    if not chunk_entries:
         _safe_print(f"[warn] no chunks generated for {dataset_key} (parsed={parsed_rows:,}, accepted={accepted_rows:,})")
     else:
         _safe_print(
-            f"[split:{dataset_key}] chunks={len(chunks)} parsed={parsed_rows:,} accepted={accepted_rows:,}",
+            f"[split:{dataset_key}] chunks={len(chunk_entries)} parsed={parsed_rows:,} accepted={accepted_rows:,}",
             flush=True,
         )
-
-    return chunks
+    return chunk_entries
 
 
 async def _split_sources_to_chunks(
@@ -1104,147 +1171,274 @@ async def _split_sources_to_chunks(
     return all_chunks
 
 
+def _provider_row_from_source(
+    source_row: dict[str, Any],
+    year: int,
+) -> tuple[dict[str, Any] | None, bool]:
+    npi = _to_npi(_row_value(source_row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
+    if npi is None:
+        return None, False
+    raw_state = _row_value(source_row, "Rndrng_Prvdr_State_Abrvtn", "Prscrbr_State_Abrvtn")
+    state = _normalize_state(raw_state)
+    if _has_value(raw_state) and state is None:
+        return None, True
+    first_name = _to_str(_row_value(source_row, "Rndrng_Prvdr_First_Name", "Prscrbr_First_Name"))
+    last_org_name = _to_str(_row_value(source_row, "Rndrng_Prvdr_Last_Org_Name", "Prscrbr_Last_Org_Name"))
+    provider_row_by_field = {
+        "provider_key": _provider_key(npi, year),
+        "npi": npi,
+        "year": year,
+        "provider_name": _provider_name(last_org_name, first_name),
+        "first_name": first_name,
+        "last_org_name": last_org_name,
+        "credentials": _to_str(_row_value(source_row, "Rndrng_Prvdr_Crdntls", "Prscrbr_Crdntls")),
+        "provider_type": _to_str(_row_value(source_row, "Rndrng_Prvdr_Type", "Prscrbr_Type")),
+        "city": _to_str(_row_value(source_row, "Rndrng_Prvdr_City", "Prscrbr_City")),
+        "state": state,
+        "zip5": _normalize_zip5(_row_value(source_row, "Rndrng_Prvdr_Zip5", "Prscrbr_zip5")),
+        "country": _to_str(_row_value(source_row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")),
+        "total_services": _to_float(_row_value(source_row, "Tot_Srvcs", "Tot_Clms")),
+        "total_distinct_hcpcs_codes": _to_float(
+            _row_value(source_row, "Tot_HCPCS_Cds", "Tot_30day_Fills")
+        ),
+        "total_allowed_amount": _to_float(_row_value(source_row, "Tot_Mdcr_Alowd_Amt", "Tot_Drug_Cst")),
+        "total_submitted_charges": _to_float(_row_value(source_row, "Tot_Sbmtd_Chrg", "Tot_Day_Suply")),
+        "total_beneficiaries": _to_float(_row_value(source_row, "Tot_Benes")),
+    }
+    return provider_row_by_field, False
+
+
+def _maybe_print_row_progress(
+    stage: str,
+    parsed_rows: int,
+    accepted_rows: int,
+    progress_start: float,
+    progress_last: float,
+) -> float:
+    current_time = time.monotonic()
+    if current_time - progress_last < ROW_PROGRESS_INTERVAL_SECONDS:
+        return progress_last
+    _print_row_progress(stage, parsed_rows, accepted_rows, progress_start)
+    return current_time
+
+
+async def _flush_provider_rows(provider_rows: list[dict[str, Any]], provider_cls: type) -> None:
+    if not provider_rows:
+        return
+    unique_provider_rows = _dedupe_rows(provider_rows, ("provider_key",))
+    await _push_objects_with_retry(unique_provider_rows, provider_cls)
+    provider_rows.clear()
+
+
 async def _load_provider_rows(path: str, provider_cls: type, year: int, test_mode: bool) -> None:
     """Load normalized provider rows from a claims source file."""
 
     provider_rows: list[dict[str, Any]] = []
-    accepted = 0
-    skipped_invalid_state = 0
+    accepted_rows = 0
+    invalid_state_rows = 0
     progress_start = time.monotonic()
     progress_last = progress_start
-    async with async_open(path, "r", encoding="utf-8-sig") as handle:
-        reader = AsyncDictReader(handle)
-        row_number = 0
-        async for source_row in reader:
+    row_number = 0
+    async with async_open(path, "r", encoding="utf-8-sig") as source_handle:
+        async for source_row in AsyncDictReader(source_handle):
             row_number += 1
-            now = time.monotonic()
-            if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
-                _print_row_progress("providers", row_number, accepted, progress_start)
-                progress_last = now
-            npi = _to_npi(
-                _row_value(
-                    source_row,
-                    "Rndrng_NPI",
-                    "PRSCRBR_NPI",
-                    "Prscrbr_NPI",
-                )
+            progress_last = _maybe_print_row_progress(
+                "providers", row_number, accepted_rows, progress_start, progress_last
             )
-            if npi is None:
-                continue
             if test_mode and not _row_allowed_for_test(row_number):
                 continue
-            raw_state = _row_value(
-                source_row,
-                "Rndrng_Prvdr_State_Abrvtn",
-                "Prscrbr_State_Abrvtn",
-            )
-            state = _normalize_state(raw_state)
-            if _has_value(raw_state) and state is None:
-                skipped_invalid_state += 1
+            provider_row_by_field, has_invalid_state = _provider_row_from_source(source_row, year)
+            if provider_row_by_field is None:
+                invalid_state_rows += int(has_invalid_state)
                 continue
-            raw_zip5 = _row_value(
-                source_row,
-                "Rndrng_Prvdr_Zip5",
-                "Prscrbr_zip5",
-            )
-            first_name = _to_str(
-                _row_value(
-                    source_row,
-                    "Rndrng_Prvdr_First_Name",
-                    "Prscrbr_First_Name",
-                )
-            )
-            last_org_name = _to_str(
-                _row_value(
-                    source_row,
-                    "Rndrng_Prvdr_Last_Org_Name",
-                    "Prscrbr_Last_Org_Name",
-                )
-            )
-            provider_row_by_field = {
-                "provider_key": _provider_key(npi, year),
-                "npi": npi,
-                "year": year,
-                "provider_name": _provider_name(last_org_name, first_name),
-                "first_name": first_name,
-                "last_org_name": last_org_name,
-                "credentials": _to_str(
-                    _row_value(
-                        source_row,
-                        "Rndrng_Prvdr_Crdntls",
-                        "Prscrbr_Crdntls",
-                    )
-                ),
-                "provider_type": _to_str(
-                    _row_value(
-                        source_row,
-                        "Rndrng_Prvdr_Type",
-                        "Prscrbr_Type",
-                    )
-                ),
-                "city": _to_str(
-                    _row_value(
-                        source_row,
-                        "Rndrng_Prvdr_City",
-                        "Prscrbr_City",
-                    )
-                ),
-                "state": state,
-                "zip5": _normalize_zip5(raw_zip5),
-                "country": _to_str(
-                    _row_value(
-                        source_row,
-                        "Rndrng_Prvdr_Cntry",
-                        "Prscrbr_Cntry",
-                    )
-                ),
-                "total_services": _to_float(
-                    _row_value(source_row, "Tot_Srvcs", "Tot_Clms")
-                ),
-                "total_distinct_hcpcs_codes": _to_float(
-                    _row_value(source_row, "Tot_HCPCS_Cds", "Tot_30day_Fills")
-                ),
-                "total_allowed_amount": _to_float(
-                    _row_value(
-                        source_row,
-                        "Tot_Mdcr_Alowd_Amt",
-                        "Tot_Drug_Cst",
-                    )
-                ),
-                "total_submitted_charges": _to_float(
-                    _row_value(
-                        source_row,
-                        "Tot_Sbmtd_Chrg",
-                        "Tot_Day_Suply",
-                    )
-                ),
-                "total_beneficiaries": _to_float(
-                    _row_value(source_row, "Tot_Benes")
-                ),
-            }
             provider_rows.append(provider_row_by_field)
-            accepted += 1
+            accepted_rows += 1
             if len(provider_rows) >= IMPORT_BATCH_SIZE:
-                provider_rows = _dedupe_rows(provider_rows, ("provider_key",))
-                await _push_objects_with_retry(provider_rows, provider_cls)
-                provider_rows.clear()
-            if test_mode and accepted >= TEST_PROVIDER_ROW_LIMIT:
+                await _flush_provider_rows(provider_rows, provider_cls)
+            if test_mode and accepted_rows >= TEST_PROVIDER_ROW_LIMIT:
                 break
 
-    if provider_rows:
-        provider_rows = _dedupe_rows(provider_rows, ("provider_key",))
-        await _push_objects_with_retry(provider_rows, provider_cls)
-    _print_row_progress("providers", row_number, accepted, progress_start, final=True)
-    if accepted == 0:
+    await _flush_provider_rows(provider_rows, provider_cls)
+    _print_row_progress("providers", row_number, accepted_rows, progress_start, final=True)
+    if accepted_rows == 0:
         _safe_print(
             "[warn] providers stage accepted 0 rows; verify CSV columns include NPI values.",
             flush=True,
         )
-    if skipped_invalid_state:
+    if invalid_state_rows:
         _safe_print(
-            f"[warn] providers stage skipped {skipped_invalid_state:,} rows due to invalid state values.",
+            f"[warn] providers stage skipped {invalid_state_rows:,} rows due to invalid state values.",
             flush=True,
         )
+
+
+@dataclass(frozen=True)
+class _ProviderServiceCandidate:
+    npi: int
+    year: int
+    procedure_code: int
+    service_description: str | None
+    reported_code: str
+    total_services: float | None
+    total_beneficiary_day_services: float | None
+    total_submitted_charges: float | None
+    total_allowed_amount: float | None
+    total_beneficiaries: float | None
+    city: str | None
+    state: str | None
+    zip5: str | None
+    place_of_service: str | None
+    state_fips: str | None
+    country: str
+
+    @property
+    def procedure_key(self) -> tuple[int, int, int]:
+        """Return the stable aggregation key for provider-procedure claims."""
+
+        return self.npi, self.year, self.procedure_code
+
+    @property
+    def location_key(self) -> int:
+        """Return the stable provider-procedure-location identity."""
+
+        return _location_key(
+            self.npi,
+            self.year,
+            self.procedure_code,
+            self.city,
+            self.state,
+            self.zip5,
+            key_extra=self.place_of_service,
+        )
+
+
+def _weighted_total(average_amount: float | None, total_services: float | None) -> float | None:
+    if average_amount is None:
+        return None
+    if total_services is None:
+        return average_amount
+    return average_amount * total_services
+
+
+def _provider_service_candidate(
+    source_row: dict[str, Any],
+    year: int,
+) -> tuple[_ProviderServiceCandidate | None, bool]:
+    npi = _to_npi(_row_value(source_row, "Rndrng_NPI", "PRSCRBR_NPI", "Prscrbr_NPI"))
+    service_code = _normalize_service_code(_row_value(source_row, "HCPCS_Cd", "HCPCS_CD"))
+    if npi is None or service_code is None:
+        return None, False
+    raw_state = _row_value(source_row, "Rndrng_Prvdr_State_Abrvtn", "Prscrbr_State_Abrvtn")
+    state = _normalize_state(raw_state)
+    if _has_value(raw_state) and state is None:
+        return None, True
+    total_services = _to_float(_row_value(source_row, "Tot_Srvcs", "Tot_Clms"))
+    average_allowed_amount = _to_float(_row_value(source_row, "Avg_Mdcr_Alowd_Amt"))
+    average_submitted_charge = _to_float(_row_value(source_row, "Avg_Sbmtd_Chrg"))
+    return (
+        _ProviderServiceCandidate(
+            npi=npi,
+            year=year,
+            procedure_code=_procedure_code_from_service(_detect_code_system(service_code), service_code),
+            service_description=_to_str(_row_value(source_row, "HCPCS_Desc", "HCPCS_DESC")),
+            reported_code=service_code,
+            total_services=total_services,
+            total_beneficiary_day_services=_to_float(
+                _row_value(source_row, "Tot_Bene_Day_Srvcs", "Tot_30day_Fills")
+            ),
+            total_submitted_charges=_weighted_total(average_submitted_charge, total_services),
+            total_allowed_amount=_weighted_total(average_allowed_amount, total_services),
+            total_beneficiaries=_to_float(_row_value(source_row, "Tot_Benes")),
+            city=_to_str(_row_value(source_row, "Rndrng_Prvdr_City", "Prscrbr_City")),
+            state=state,
+            zip5=_normalize_zip5(_row_value(source_row, "Rndrng_Prvdr_Zip5", "Prscrbr_zip5")),
+            place_of_service=_to_str(_row_value(source_row, "Place_Of_Srvc", "PLACE_OF_SRVC")),
+            state_fips=_normalize_state_fips(
+                _row_value(source_row, "Rndrng_Prvdr_State_FIPS", "Prscrbr_State_FIPS")
+            ),
+            country=_to_str(_row_value(source_row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")) or "US",
+        ),
+        False,
+    )
+
+
+def _provider_procedure_fields(candidate: _ProviderServiceCandidate) -> dict[str, Any]:
+    return {
+        "npi": candidate.npi,
+        "year": candidate.year,
+        "procedure_code": candidate.procedure_code,
+        "service_description": candidate.service_description,
+        "reported_code": candidate.reported_code,
+        "total_services": candidate.total_services,
+        "total_beneficiary_day_services": candidate.total_beneficiary_day_services,
+        "total_submitted_charges": candidate.total_submitted_charges,
+        "total_allowed_amount": candidate.total_allowed_amount,
+        "total_beneficiaries": candidate.total_beneficiaries,
+        "ge65_total_services": None,
+        "ge65_total_allowed_amount": None,
+        "ge65_total_beneficiaries": None,
+    }
+
+
+def _merge_provider_procedure_fields(
+    accumulated_fields: dict[str, Any],
+    candidate_fields: dict[str, Any],
+) -> None:
+    amount_fields = (
+        "total_services",
+        "total_beneficiary_day_services",
+        "total_submitted_charges",
+        "total_allowed_amount",
+        "total_beneficiaries",
+    )
+    for field_name in amount_fields:
+        accumulated_fields[field_name] = _sum_optional(
+            accumulated_fields.get(field_name),
+            candidate_fields.get(field_name),
+        )
+    for descriptive_field in ("service_description", "reported_code"):
+        if not accumulated_fields.get(descriptive_field) and candidate_fields.get(descriptive_field):
+            accumulated_fields[descriptive_field] = candidate_fields[descriptive_field]
+
+
+def _provider_location_fields(candidate: _ProviderServiceCandidate) -> dict[str, Any]:
+    return {
+        "location_key": candidate.location_key,
+        "npi": candidate.npi,
+        "year": candidate.year,
+        "procedure_code": candidate.procedure_code,
+        "place_of_service": candidate.place_of_service,
+        "city": candidate.city,
+        "state": candidate.state,
+        "zip5": candidate.zip5,
+        "state_fips": candidate.state_fips,
+        "country": candidate.country,
+    }
+
+
+async def _flush_location_rows(location_rows: list[dict[str, Any]], location_cls: type) -> None:
+    if not location_rows:
+        return
+    unique_location_rows = _dedupe_rows(location_rows, ("location_key",))
+    unique_location_rows.sort(key=lambda location_fields: location_fields.get("location_key"))
+    await _push_objects_with_retry(unique_location_rows, location_cls)
+    location_rows.clear()
+
+
+async def _flush_provider_procedure_rows(
+    provider_procedure_by_key: dict[tuple[int, int, int], dict[str, Any]],
+    provider_procedure_cls: type,
+) -> None:
+    procedure_rows = list(provider_procedure_by_key.values())
+    procedure_rows.sort(
+        key=lambda procedure_fields: (
+            procedure_fields.get("npi"),
+            procedure_fields.get("year"),
+            procedure_fields.get("procedure_code"),
+        )
+    )
+    for procedure_batch in _chunk_rows(procedure_rows, IMPORT_BATCH_SIZE):
+        await _push_objects_with_retry(procedure_batch, provider_procedure_cls)
 
 
 async def _load_provider_service_rows(
@@ -1256,198 +1450,55 @@ async def _load_provider_service_rows(
 ) -> None:
     """Load provider procedure and location rows from claims data."""
 
-    provider_procedure_map: dict[tuple[int, int, int], dict[str, Any]] = {}
+    provider_procedure_by_key: dict[tuple[int, int, int], dict[str, Any]] = {}
     location_rows: list[dict[str, Any]] = []
     seen_location_keys: set[int] = set()
-    accepted = 0
-    skipped_invalid_state = 0
+    accepted_rows = 0
+    invalid_state_rows = 0
     progress_start = time.monotonic()
     progress_last = progress_start
-
-    async def _flush_location_batches() -> None:
-        nonlocal location_rows
-        if not location_rows:
-            return
-        location_rows = _dedupe_rows(location_rows, ("location_key",))
-        location_rows.sort(key=lambda item: item.get("location_key"))
-        await _push_objects_with_retry(location_rows, location_cls)
-        location_rows.clear()
-
-    async with async_open(path, "r", encoding="utf-8-sig") as handle:
-        reader = AsyncDictReader(handle)
-        row_number = 0
-        async for source_row in reader:
+    row_number = 0
+    async with async_open(path, "r", encoding="utf-8-sig") as source_handle:
+        async for source_row in AsyncDictReader(source_handle):
             row_number += 1
-            now = time.monotonic()
-            if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
-                _print_row_progress("provider_service", row_number, accepted, progress_start)
-                progress_last = now
-            npi = _to_npi(
-                _row_value(
-                    source_row,
-                    "Rndrng_NPI",
-                    "PRSCRBR_NPI",
-                    "Prscrbr_NPI",
-                )
+            progress_last = _maybe_print_row_progress(
+                "provider_service", row_number, accepted_rows, progress_start, progress_last
             )
-            if npi is None:
-                continue
             if test_mode and not _row_allowed_for_test(row_number):
                 continue
-
-            service_code = _normalize_service_code(
-                _row_value(source_row, "HCPCS_Cd", "HCPCS_CD")
-            )
-            if service_code is None:
+            candidate, has_invalid_state = _provider_service_candidate(source_row, year)
+            if candidate is None:
+                invalid_state_rows += int(has_invalid_state)
                 continue
-            code_system = _detect_code_system(service_code)
-            procedure_code = _procedure_code_from_service(code_system, service_code)
-            service_desc = _to_str(
-                _row_value(source_row, "HCPCS_Desc", "HCPCS_DESC")
-            )
-            city = _to_str(
-                _row_value(source_row, "Rndrng_Prvdr_City", "Prscrbr_City")
-            )
-            raw_state = _row_value(
-                source_row,
-                "Rndrng_Prvdr_State_Abrvtn",
-                "Prscrbr_State_Abrvtn",
-            )
-            state = _normalize_state(raw_state)
-            if _has_value(raw_state) and state is None:
-                skipped_invalid_state += 1
-                continue
-            zip5 = _normalize_zip5(
-                _row_value(source_row, "Rndrng_Prvdr_Zip5", "Prscrbr_zip5")
-            )
-            place_of_service = _to_str(
-                _row_value(source_row, "Place_Of_Srvc", "PLACE_OF_SRVC")
-            )
-            avg_allowed_amount = _to_float(
-                _row_value(source_row, "Avg_Mdcr_Alowd_Amt")
-            )
-            avg_submitted_charge = _to_float(
-                _row_value(source_row, "Avg_Sbmtd_Chrg")
-            )
-            total_services = _to_float(
-                _row_value(source_row, "Tot_Srvcs", "Tot_Clms")
-            )
-            total_allowed_amount = None
-            if avg_allowed_amount is not None and total_services is not None:
-                total_allowed_amount = avg_allowed_amount * total_services
-            elif avg_allowed_amount is not None:
-                total_allowed_amount = avg_allowed_amount
-            total_submitted_charge = None
-            if avg_submitted_charge is not None and total_services is not None:
-                total_submitted_charge = avg_submitted_charge * total_services
-            elif avg_submitted_charge is not None:
-                total_submitted_charge = avg_submitted_charge
-
-            provider_row_by_field = {
-                "npi": npi,
-                "year": year,
-                "procedure_code": procedure_code,
-                "service_description": service_desc,
-                "reported_code": service_code,
-                "total_services": total_services,
-                "total_beneficiary_day_services": _to_float(
-                    _row_value(
-                        source_row,
-                        "Tot_Bene_Day_Srvcs",
-                        "Tot_30day_Fills",
-                    )
-                ),
-                "total_submitted_charges": total_submitted_charge,
-                "total_allowed_amount": total_allowed_amount,
-                "total_beneficiaries": _to_float(
-                    _row_value(source_row, "Tot_Benes")
-                ),
-                "ge65_total_services": None,
-                "ge65_total_allowed_amount": None,
-                "ge65_total_beneficiaries": None,
-            }
-            proc_key = (npi, year, procedure_code)
-            existing = provider_procedure_map.get(proc_key)
-            if existing is None:
-                provider_procedure_map[proc_key] = provider_row_by_field
+            candidate_fields = _provider_procedure_fields(candidate)
+            accumulated_fields = provider_procedure_by_key.get(candidate.procedure_key)
+            if accumulated_fields is None:
+                provider_procedure_by_key[candidate.procedure_key] = candidate_fields
             else:
-                existing["total_services"] = _sum_optional(
-                    existing.get("total_services"),
-                    provider_row_by_field.get("total_services"),
-                )
-                existing["total_beneficiary_day_services"] = _sum_optional(
-                    existing.get("total_beneficiary_day_services"),
-                    provider_row_by_field.get("total_beneficiary_day_services"),
-                )
-                existing["total_submitted_charges"] = _sum_optional(
-                    existing.get("total_submitted_charges"),
-                    provider_row_by_field.get("total_submitted_charges"),
-                )
-                existing["total_allowed_amount"] = _sum_optional(
-                    existing.get("total_allowed_amount"),
-                    provider_row_by_field.get("total_allowed_amount"),
-                )
-                existing["total_beneficiaries"] = _sum_optional(
-                    existing.get("total_beneficiaries"),
-                    provider_row_by_field.get("total_beneficiaries"),
-                )
-                if (
-                    not existing.get("service_description")
-                    and provider_row_by_field.get("service_description")
-                ):
-                    existing["service_description"] = provider_row_by_field[
-                        "service_description"
-                    ]
-                if (
-                    not existing.get("reported_code")
-                    and provider_row_by_field.get("reported_code")
-                ):
-                    existing["reported_code"] = provider_row_by_field["reported_code"]
-
-            location_key = _location_key(npi, year, procedure_code, city, state, zip5, key_extra=place_of_service)
-            if location_key not in seen_location_keys:
-                seen_location_keys.add(location_key)
-                location_rows.append(
-                    {
-                        "location_key": location_key,
-                        "npi": npi,
-                        "year": year,
-                        "procedure_code": procedure_code,
-                        "place_of_service": place_of_service,
-                        "city": city,
-                        "state": state,
-                        "zip5": zip5,
-                        "state_fips": _normalize_state_fips(
-                            _row_value(row, "Rndrng_Prvdr_State_FIPS", "Prscrbr_State_FIPS")
-                        ),
-                        "country": _to_str(_row_value(row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")) or "US",
-                    }
-                )
-                if len(location_rows) >= IMPORT_BATCH_SIZE:
-                    await _flush_location_batches()
-
-            accepted += 1
-            if test_mode and accepted >= TEST_PROVIDER_SERVICE_ROW_LIMIT:
+                _merge_provider_procedure_fields(accumulated_fields, candidate_fields)
+            if candidate.location_key not in seen_location_keys:
+                seen_location_keys.add(candidate.location_key)
+                location_rows.append(_provider_location_fields(candidate))
+            if len(location_rows) >= IMPORT_BATCH_SIZE:
+                await _flush_location_rows(location_rows, location_cls)
+            accepted_rows += 1
+            if test_mode and accepted_rows >= TEST_PROVIDER_SERVICE_ROW_LIMIT:
                 break
 
-    if location_rows:
-        await _flush_location_batches()
-
-    if provider_procedure_map:
-        provider_rows = list(provider_procedure_map.values())
-        provider_rows.sort(key=lambda item: (item.get("npi"), item.get("year"), item.get("procedure_code")))
-        for batch in _chunk_rows(provider_rows, IMPORT_BATCH_SIZE):
-            await _push_objects_with_retry(batch, provider_procedure_cls)
-    _print_row_progress("provider_service", row_number, accepted, progress_start, final=True)
-    if skipped_invalid_state:
+    await _flush_location_rows(location_rows, location_cls)
+    await _flush_provider_procedure_rows(provider_procedure_by_key, provider_procedure_cls)
+    _print_row_progress("provider_service", row_number, accepted_rows, progress_start, final=True)
+    if invalid_state_rows:
         _safe_print(
-            f"[warn] provider_service stage skipped {skipped_invalid_state:,} rows due to invalid state values.",
+            f"[warn] provider_service stage skipped {invalid_state_rows:,} rows due to invalid state values.",
             flush=True,
         )
 
 
-def _geo_level_priority(row: dict[str, Any]) -> int:
-    geo_level = str(_row_value(row, "Rndrng_Prvdr_Geo_Lvl", "RNDRNG_PRVDR_GEO_LVL") or "").strip().lower()
+def _geo_level_priority(source_row: dict[str, Any]) -> int:
+    geo_level = str(
+        _row_value(source_row, "Rndrng_Prvdr_Geo_Lvl", "RNDRNG_PRVDR_GEO_LVL") or ""
+    ).strip().lower()
     if geo_level == "national":
         return 3
     if geo_level == "state":
@@ -1457,14 +1508,16 @@ def _geo_level_priority(row: dict[str, Any]) -> int:
     return 0
 
 
-def _geo_scope_value_from_row(row: dict[str, Any]) -> tuple[str, str] | None:
-    geo_level = str(_row_value(row, "Rndrng_Prvdr_Geo_Lvl", "RNDRNG_PRVDR_GEO_LVL") or "").strip().lower()
+def _geo_scope_value_from_row(source_row: dict[str, Any]) -> tuple[str, str] | None:
+    geo_level = str(
+        _row_value(source_row, "Rndrng_Prvdr_Geo_Lvl", "RNDRNG_PRVDR_GEO_LVL") or ""
+    ).strip().lower()
     if geo_level == "national":
         return "national", "US"
     if geo_level == "state":
         state = _normalize_state(
             _row_value(
-                row,
+                source_row,
                 "Rndrng_Prvdr_State_Abrvtn",
                 "RNDRNG_PRVDR_STATE_ABRVTN",
                 "Prscrbr_State_Abrvtn",
@@ -1473,6 +1526,100 @@ def _geo_scope_value_from_row(row: dict[str, Any]) -> tuple[str, str] | None:
         if state:
             return "state", state
     return None
+
+
+@dataclass(frozen=True)
+class _GeoServiceCandidate:
+    procedure_code: int
+    total_services: float
+    procedure_priority: int
+    procedure_row_by_field: dict[str, Any]
+    benchmark_key: tuple[int, int, str, str] | None
+    benchmark_row_by_field: dict[str, Any] | None
+
+
+def _geo_service_candidate(source_row: dict[str, Any], year: int) -> _GeoServiceCandidate | None:
+    service_code = _normalize_service_code(_row_value(source_row, "HCPCS_Cd", "HCPCS_CD"))
+    if service_code is None:
+        return None
+    procedure_code = _procedure_code_from_service(_detect_code_system(service_code), service_code)
+    total_services = _to_float(_row_value(source_row, "Tot_Srvcs", "TOT_SRVCS")) or 0.0
+    average_allowed_amount = _to_float(
+        _row_value(source_row, "Avg_Mdcr_Alowd_Amt", "AVG_MDCR_ALOWD_AMT")
+    )
+    average_payment_amount = _to_float(
+        _row_value(source_row, "Avg_Mdcr_Pymt_Amt", "AVG_MDCR_PYMT_AMT")
+    )
+    average_standardized_amount = _to_float(
+        _row_value(source_row, "Avg_Mdcr_Stdzd_Amt", "AVG_MDCR_STDZD_AMT")
+    )
+    procedure_row_by_field = {
+        "procedure_code": procedure_code,
+        "service_description": _to_str(_row_value(source_row, "HCPCS_Desc", "HCPCS_DESC")),
+        "reported_code": service_code,
+        "avg_submitted_charge": _to_float(_row_value(source_row, "Avg_Sbmtd_Chrg", "AVG_SBMTD_CHRG")),
+        "avg_allowed_amount": average_allowed_amount,
+        "avg_payment_amount": average_payment_amount,
+        "avg_standardized_amount": average_standardized_amount,
+        "total_allowed_amount": _weighted_total(average_allowed_amount, total_services),
+        "total_services": total_services,
+        "total_beneficiaries": _to_float(_row_value(source_row, "Tot_Benes", "TOT_BENES")),
+        "source_year": year,
+    }
+    geography = _geo_scope_value_from_row(source_row)
+    if geography is None:
+        return _GeoServiceCandidate(
+            procedure_code,
+            total_services,
+            _geo_level_priority(source_row),
+            procedure_row_by_field,
+            None,
+            None,
+        )
+    geography_scope, geography_value = geography
+    benchmark_key = (procedure_code, year, geography_scope, geography_value)
+    benchmark_row_by_field = {
+        "procedure_code": procedure_code,
+        "year": year,
+        "geography_scope": geography_scope,
+        "geography_value": geography_value,
+        "total_services": total_services,
+        "avg_submitted_charge": average_allowed_amount,
+        "avg_payment_amount": average_payment_amount,
+        "avg_standardized_amount": average_standardized_amount,
+        "updated_at": datetime.datetime.utcnow(),
+    }
+    return _GeoServiceCandidate(
+        procedure_code,
+        total_services,
+        _geo_level_priority(source_row),
+        procedure_row_by_field,
+        benchmark_key,
+        benchmark_row_by_field,
+    )
+
+
+async def _push_geo_service_candidates(
+    procedure_candidate_by_code: dict[int, tuple[int, float, dict[str, Any]]],
+    benchmark_candidate_by_key: dict[tuple[int, int, str, str], tuple[float, dict[str, Any]]],
+    procedure_cls: type,
+    geo_benchmark_cls: type,
+) -> None:
+    procedure_rows = [procedure_fields for _priority, _total, procedure_fields in procedure_candidate_by_code.values()]
+    if procedure_rows:
+        procedure_rows.sort(key=lambda procedure_fields: procedure_fields.get("procedure_code"))
+        await _push_objects_with_retry(procedure_rows, procedure_cls, rewrite=True, use_copy=False)
+    benchmark_rows = [benchmark_fields for _weight, benchmark_fields in benchmark_candidate_by_key.values()]
+    if benchmark_rows:
+        benchmark_rows.sort(
+            key=lambda benchmark_fields: (
+                benchmark_fields.get("year"),
+                benchmark_fields.get("procedure_code"),
+                benchmark_fields.get("geography_scope"),
+                benchmark_fields.get("geography_value"),
+            )
+        )
+        await _push_objects_with_retry(benchmark_rows, geo_benchmark_cls, rewrite=True, use_copy=False)
 
 
 async def _load_geo_service_rows(
@@ -1484,95 +1631,47 @@ async def _load_geo_service_rows(
 ) -> None:
     """Materialize procedure and geographic benchmark rows from one source."""
 
-    procedure_rows_map: dict[int, tuple[int, float, dict[str, Any]]] = {}
-    geo_benchmark_map: dict[tuple[int, int, str, str], tuple[float, dict[str, Any]]] = {}
-    accepted = 0
+    procedure_candidate_by_code: dict[int, tuple[int, float, dict[str, Any]]] = {}
+    benchmark_candidate_by_key: dict[tuple[int, int, str, str], tuple[float, dict[str, Any]]] = {}
+    accepted_rows = 0
     progress_start = time.monotonic()
     progress_last = progress_start
-
-    async with async_open(path, "r", encoding="utf-8-sig") as handle:
-        reader = AsyncDictReader(handle)
-        row_number = 0
-        async for row in reader:
+    row_number = 0
+    async with async_open(path, "r", encoding="utf-8-sig") as source_handle:
+        async for source_row in AsyncDictReader(source_handle):
             row_number += 1
-            now = time.monotonic()
-            if now - progress_last >= ROW_PROGRESS_INTERVAL_SECONDS:
-                _print_row_progress("geo_service", row_number, accepted, progress_start)
-                progress_last = now
+            progress_last = _maybe_print_row_progress(
+                "geo_service", row_number, accepted_rows, progress_start, progress_last
+            )
             if test_mode and not _row_allowed_for_test(row_number):
                 continue
-
-            service_code = _normalize_service_code(_row_value(row, "HCPCS_Cd", "HCPCS_CD"))
-            if service_code is None:
+            candidate = _geo_service_candidate(source_row, year)
+            if candidate is None:
                 continue
-            code_system = _detect_code_system(service_code)
-            procedure_code = _procedure_code_from_service(code_system, service_code)
-            service_desc = _to_str(_row_value(row, "HCPCS_Desc", "HCPCS_DESC"))
-            total_services = _to_float(_row_value(row, "Tot_Srvcs", "TOT_SRVCS")) or 0.0
-            avg_allowed_amount = _to_float(_row_value(row, "Avg_Mdcr_Alowd_Amt", "AVG_MDCR_ALOWD_AMT"))
-            avg_payment_amount = _to_float(_row_value(row, "Avg_Mdcr_Pymt_Amt", "AVG_MDCR_PYMT_AMT"))
-            avg_standardized_amount = _to_float(_row_value(row, "Avg_Mdcr_Stdzd_Amt", "AVG_MDCR_STDZD_AMT"))
-            total_spending = None
-            if avg_allowed_amount is not None:
-                total_spending = avg_allowed_amount * total_services
-
-            row_payload = {
-                "procedure_code": procedure_code,
-                "service_description": service_desc,
-                "reported_code": service_code,
-                "avg_submitted_charge": _to_float(_row_value(row, "Avg_Sbmtd_Chrg", "AVG_SBMTD_CHRG")),
-                "avg_allowed_amount": avg_allowed_amount,
-                "avg_payment_amount": avg_payment_amount,
-                "avg_standardized_amount": avg_standardized_amount,
-                "total_allowed_amount": total_spending,
-                "total_services": total_services,
-                "total_beneficiaries": _to_float(_row_value(row, "Tot_Benes", "TOT_BENES")),
-                "source_year": year,
-            }
-            rank = (_geo_level_priority(row), total_services)
-            previous = procedure_rows_map.get(procedure_code)
-            if previous is None or rank > (previous[0], previous[1]):
-                procedure_rows_map[procedure_code] = (rank[0], rank[1], row_payload)
-
-            geo_scope_value = _geo_scope_value_from_row(row)
-            if geo_scope_value is not None:
-                geography_scope, geography_value = geo_scope_value
-                geo_key = (procedure_code, year, geography_scope, geography_value)
-                geo_payload = {
-                    "procedure_code": procedure_code,
-                    "year": year,
-                    "geography_scope": geography_scope,
-                    "geography_value": geography_value,
-                    "total_services": total_services,
-                    "avg_submitted_charge": avg_allowed_amount,
-                    "avg_payment_amount": avg_payment_amount,
-                    "avg_standardized_amount": avg_standardized_amount,
-                    "updated_at": datetime.datetime.utcnow(),
-                }
-                geo_previous = geo_benchmark_map.get(geo_key)
-                if geo_previous is None or total_services > geo_previous[0]:
-                    geo_benchmark_map[geo_key] = (total_services, geo_payload)
-
-            accepted += 1
-            if test_mode and accepted >= TEST_GEO_SERVICE_ROW_LIMIT:
+            previous_procedure = procedure_candidate_by_code.get(candidate.procedure_code)
+            candidate_rank = candidate.procedure_priority, candidate.total_services
+            if previous_procedure is None or candidate_rank > previous_procedure[:2]:
+                procedure_candidate_by_code[candidate.procedure_code] = (
+                    *candidate_rank,
+                    candidate.procedure_row_by_field,
+                )
+            if candidate.benchmark_key is not None and candidate.benchmark_row_by_field is not None:
+                previous_benchmark = benchmark_candidate_by_key.get(candidate.benchmark_key)
+                if previous_benchmark is None or candidate.total_services > previous_benchmark[0]:
+                    benchmark_candidate_by_key[candidate.benchmark_key] = (
+                        candidate.total_services,
+                        candidate.benchmark_row_by_field,
+                    )
+            accepted_rows += 1
+            if test_mode and accepted_rows >= TEST_GEO_SERVICE_ROW_LIMIT:
                 break
-
-    rows = [payload for _priority, _total, payload in procedure_rows_map.values()]
-    if rows:
-        rows.sort(key=lambda item: item.get("procedure_code"))
-        await _push_objects_with_retry(rows, procedure_cls, rewrite=True, use_copy=False)
-    geo_rows = [payload for _weight, payload in geo_benchmark_map.values()]
-    if geo_rows:
-        geo_rows.sort(
-            key=lambda item: (
-                item.get("year"),
-                item.get("procedure_code"),
-                item.get("geography_scope"),
-                item.get("geography_value"),
-            )
-        )
-        await _push_objects_with_retry(geo_rows, geo_benchmark_cls, rewrite=True, use_copy=False)
-    _print_row_progress("geo_service", row_number, accepted, progress_start, final=True)
+    await _push_geo_service_candidates(
+        procedure_candidate_by_code,
+        benchmark_candidate_by_key,
+        procedure_cls,
+        geo_benchmark_cls,
+    )
+    _print_row_progress("geo_service", row_number, accepted_rows, progress_start, final=True)
 
 
 async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema: str) -> None:
@@ -2228,40 +2327,49 @@ async def _collect_cost_level_diagnostics(classes: dict[str, type], schema: str)
         """
     )
 
-    profile_scope = [dict(getattr(row, "_mapping", row)) for row in profile_scope_result]
-    peer_scope = [dict(getattr(row, "_mapping", row)) for row in peer_scope_result]
-    coverage = [dict(getattr(row, "_mapping", row)) for row in coverage_result]
+    profile_scope_rows = [
+        dict(getattr(query_row, "_mapping", query_row))
+        for query_row in profile_scope_result
+    ]
+    peer_scope_rows = [
+        dict(getattr(query_row, "_mapping", query_row))
+        for query_row in peer_scope_result
+    ]
+    coverage_rows = [
+        dict(getattr(query_row, "_mapping", query_row))
+        for query_row in coverage_result
+    ]
 
     _safe_print(
         "[diagnostic] cost-level profile scope rows: "
         + ", ".join(
-            f"{item.get('geography_scope')}={int(item.get('rows') or 0)}"
-            for item in profile_scope
+            f"{scope_summary.get('geography_scope')}={int(scope_summary.get('rows') or 0)}"
+            for scope_summary in profile_scope_rows
         ),
         flush=True,
     )
     _safe_print(
         "[diagnostic] cost-level peer scope rows: "
         + ", ".join(
-            f"{item.get('geography_scope')}={int(item.get('rows') or 0)}"
-            for item in peer_scope
+            f"{scope_summary.get('geography_scope')}={int(scope_summary.get('rows') or 0)}"
+            for scope_summary in peer_scope_rows
         ),
         flush=True,
     )
     _safe_print(
         "[diagnostic] cost-level key coverage: "
         + ", ".join(
-            f"{item.get('geography_scope')}={float(item.get('coverage_pct') or 0.0):.2f}%"
-            f" ({int(item.get('peer_keys') or 0)}/{int(item.get('profile_keys') or 0)})"
-            for item in coverage
+            f"{scope_summary.get('geography_scope')}={float(scope_summary.get('coverage_pct') or 0.0):.2f}%"
+            f" ({int(scope_summary.get('peer_keys') or 0)}/{int(scope_summary.get('profile_keys') or 0)})"
+            for scope_summary in coverage_rows
         ),
         flush=True,
     )
 
     return {
-        "profile_scope_rows": profile_scope,
-        "peer_scope_rows": peer_scope,
-        "key_coverage": coverage,
+        "profile_scope_rows": profile_scope_rows,
+        "peer_scope_rows": peer_scope_rows,
+        "key_coverage": coverage_rows,
     }
 
 
@@ -2278,13 +2386,17 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
 
     async with db.transaction():
         for cls in final_classes:
-            obj = classes[cls.__name__]
+            staged_class = classes[cls.__name__]
             table = cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
-            await db.status(f"ALTER TABLE IF EXISTS {schema}.{obj.__tablename__} RENAME TO {table};")
+            await db.status(
+                f"ALTER TABLE {schema}.{staged_class.__tablename__} "
+                f"RENAME TO {table};"
+            )
 
             await db.status(
-                f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
+                f"ALTER INDEX IF EXISTS {schema}.{staged_class.__tablename__}_idx_primary "
+                f"RENAME TO {table}_idx_primary;"
             )
 
             move_indexes = []
@@ -2299,409 +2411,820 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                     continue
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
                 await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_{base_name} RENAME TO {base_name};"
+                    f"ALTER INDEX IF EXISTS {schema}.{staged_class.__tablename__}_{base_name} "
+                    f"RENAME TO {base_name};"
                 )
 
 
-async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Prepare staging, split sources, and enqueue claims-pricing chunks."""
+@dataclass(frozen=True)
+class _ClaimsRunIdentity:
+    test_mode: bool
+    import_id: str
+    run_id: str
+    stage_suffix: str
+    work_dir: Path
 
-    task = task or {}
-    test_mode = bool(task.get("test_mode", False))
-    import_id_val = _normalize_import_id(task.get("import_id"))
-    run_id = _normalize_run_id(task.get("run_id"))
-    stage_suffix = _build_stage_suffix(import_id_val, run_id)
-    redis = ctx.get("redis")
-    if redis is None:
-        raise RuntimeError("ARQ redis context is unavailable for claims pricing start job.")
+    @property
+    def downloads_dir(self) -> Path:
+        """Return the run-owned directory for downloaded source files."""
 
-    total_start = _step_start(
-        "claims-pricing enqueue+split "
-        f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})"
+        return self.work_dir / "downloads"
+
+    @property
+    def chunks_root(self) -> Path:
+        """Return the run-owned root for generated chunk files."""
+
+        return self.work_dir / "chunks"
+
+
+@dataclass(frozen=True)
+class _DownloadedClaimsSource:
+    chunk_entries: list[dict[str, Any]]
+
+
+def _claims_run_identity(task_by_field: dict[str, Any]) -> _ClaimsRunIdentity:
+    test_mode = bool(task_by_field.get("test_mode", False))
+    import_id = _normalize_import_id(task_by_field.get("import_id"))
+    run_id = _normalize_run_id(task_by_field.get("run_id"))
+    return _ClaimsRunIdentity(
+        test_mode=test_mode,
+        import_id=import_id,
+        run_id=run_id,
+        stage_suffix=_build_stage_suffix(import_id, run_id),
+        work_dir=_run_dir(import_id, run_id),
     )
-    await mark_control_run(
-        run_id,
-        status="running",
-        phase_detail="claims-pricing split running",
-        progress_message="splitting source files",
-    )
-    await ensure_database(test_mode)
 
-    step_started_at = _step_start("prepare staging tables")
-    _classes, schema = await _prepare_tables(stage_suffix, test_mode)
-    _step_end("prepare staging tables", step_started_at)
 
-    step_started_at = _step_start("fetch CMS catalog")
-    catalog = await _fetch_catalog()
-    _step_end("fetch CMS catalog", step_started_at)
-
-    step_started_at = _step_start("resolve CMS sources")
-    sources = _resolve_sources(catalog, test_mode=test_mode)
-    _step_end("resolve CMS sources", step_started_at)
-
-    work_dir = _run_dir(import_id_val, run_id)
-    downloads_dir = work_dir / "downloads"
-    chunks_root = work_dir / "chunks"
-    chunks_root.mkdir(parents=True, exist_ok=True)
-    local_paths: dict[str, list[str]] = {}
-    chunks: list[dict[str, Any]] = []
-
-    await _init_run_state(redis, run_id, 0)
-
-    source_count = sum(len(sources.get(dataset.key, [])) for dataset in DATASETS)
-    semaphore = asyncio.Semaphore(min(CLAIMS_DOWNLOAD_CONCURRENCY, max(source_count, 1)))
-
-    async def _download_split_source(
-        dataset_key: str,
-        source: dict[str, Any],
-        source_index: int,
-    ) -> tuple[str, str, list[dict[str, Any]]]:
-        async with semaphore:
-            reporting_year = max(_safe_int(source.get("reporting_year"), 2013), 2013)
-            step = _step_start(f"download+split {dataset_key} year={reporting_year}")
-            try:
-                local_path = await _download_source_file(
-                    dataset_key,
-                    source,
-                    str(downloads_dir),
-                    test_mode,
-                    reporting_year=reporting_year,
-                )
-                split_chunks = await _split_source_into_chunks(
-                    dataset_key=dataset_key,
-                    source_path=local_path,
-                    chunks_dir=chunks_root / dataset_key,
-                    test_mode=test_mode,
-                )
-                for chunk in split_chunks:
-                    chunk["reporting_year"] = reporting_year
-                    chunk["source_index"] = source_index
-                return dataset_key, local_path, split_chunks
-            finally:
-                _step_end(f"download+split {dataset_key} year={reporting_year}", step)
-
-    step_started_at = _step_start("download+split+enqueue chunks (streaming)")
-    dataset_tasks = [
-        asyncio.create_task(_download_split_source(dataset.key, source, idx))
-        for dataset in DATASETS
-        for idx, source in enumerate(sources.get(dataset.key, []))
-    ]
+async def _timed_value(label: str, awaitable: Any) -> Any:
+    step_started_at = _step_start(label)
     try:
-        for completed in asyncio.as_completed(dataset_tasks):
-            dataset_key, local_path, split_chunks = await completed
-            local_paths.setdefault(dataset_key, []).append(local_path)
-            for chunk in split_chunks:
-                reporting_year = max(_safe_int(chunk.get("reporting_year"), 2013), 2013)
-                source_index = max(_safe_int(chunk.get("source_index"), 0), 0)
-                chunk_index = max(_safe_int(chunk.get("chunk_index"), 0), 0)
-                unique_chunk_id = f"{chunk['dataset_key']}:{reporting_year}:{source_index}:{chunk_index}"
-                payload = {
-                    "import_id": import_id_val,
-                    "run_id": run_id,
-                    "stage_suffix": stage_suffix,
-                    "schema": schema,
-                    "test_mode": test_mode,
-                    "dataset_key": chunk["dataset_key"],
-                    "chunk_id": unique_chunk_id,
-                    "chunk_path": chunk["chunk_path"],
-                    "reporting_year": reporting_year,
-                }
-                await redis.enqueue_job(
-                    "claims_pricing_process_chunk",
-                    payload,
-                    _queue_name=CLAIMS_QUEUE_NAME,
-                    _job_id=_chunk_job_id(
-                        run_id,
-                        chunk["dataset_key"],
-                        source_index,
-                        reporting_year,
-                        chunk_index,
-                    ),
-                )
-            if split_chunks:
-                await _increment_total_chunks(redis, run_id, len(split_chunks))
-                chunks.extend(split_chunks)
-    finally:
-        for task_ref in dataset_tasks:
-            if not task_ref.done():
-                task_ref.cancel()
-    _step_end("download+split+enqueue chunks (streaming)", step_started_at)
+        value = await awaitable
+    except BaseException as error:
+        _step_failed(label, step_started_at, error)
+        raise
+    _step_end(label, step_started_at)
+    return value
 
-    manifest = {
-        "import_id": import_id_val,
-        "run_id": run_id,
-        "stage_suffix": stage_suffix,
+
+async def _resolve_sources_async(
+    catalog_by_field: dict[str, Any],
+    test_mode: bool,
+) -> dict[str, list[dict[str, Any]]]:
+    return _resolve_sources(catalog_by_field, test_mode=test_mode)
+
+
+async def _download_split_claims_source(
+    run_identity: _ClaimsRunIdentity,
+    dataset_key: str,
+    source_by_field: dict[str, Any],
+    source_index: int,
+    semaphore: asyncio.Semaphore,
+) -> _DownloadedClaimsSource:
+    reporting_year = max(_safe_int(source_by_field.get("reporting_year"), 2013), 2013)
+    step_label = f"download+split {dataset_key} year={reporting_year}"
+    async with semaphore:
+        step_started_at = _step_start(step_label)
+        try:
+            local_path = await _download_source_file(
+                dataset_key,
+                source_by_field,
+                str(run_identity.downloads_dir),
+                run_identity.test_mode,
+                reporting_year=reporting_year,
+            )
+            chunk_entries = await _split_source_into_chunks(
+                dataset_key,
+                local_path,
+                run_identity.chunks_root
+                / dataset_key
+                / f"{reporting_year}_{source_index:04d}",
+                run_identity.test_mode,
+            )
+            for chunk_by_field in chunk_entries:
+                chunk_by_field["reporting_year"] = reporting_year
+                chunk_by_field["source_index"] = source_index
+            downloaded_source = _DownloadedClaimsSource(chunk_entries)
+        except BaseException as error:
+            _step_failed(step_label, step_started_at, error)
+            raise
+        _step_end(step_label, step_started_at)
+        return downloaded_source
+
+
+async def _enqueue_claim_chunk(
+    redis: Any,
+    run_identity: _ClaimsRunIdentity,
+    schema: str,
+    chunk_by_field: dict[str, Any],
+) -> None:
+    reporting_year = max(_safe_int(chunk_by_field.get("reporting_year"), 2013), 2013)
+    source_index = max(_safe_int(chunk_by_field.get("source_index"), 0), 0)
+    chunk_index = max(_safe_int(chunk_by_field.get("chunk_index"), 0), 0)
+    dataset_key = str(chunk_by_field["dataset_key"])
+    chunk_job_by_field = {
+        "import_id": run_identity.import_id,
+        "run_id": run_identity.run_id,
+        "stage_suffix": run_identity.stage_suffix,
         "schema": schema,
-        "test_mode": test_mode,
-        "sources": sources,
-        "chunks": chunks,
-        "total_chunks": len(chunks),
-        "created_at": datetime.datetime.utcnow().isoformat(),
-        "work_dir": str(work_dir),
+        "test_mode": run_identity.test_mode,
+        "dataset_key": dataset_key,
+        "chunk_id": f"{dataset_key}:{reporting_year}:{source_index}:{chunk_index}",
+        "chunk_path": chunk_by_field["chunk_path"],
+        "reporting_year": reporting_year,
     }
-    manifest_path = _manifest_path(work_dir)
-    _write_manifest(manifest_path, manifest)
+    await redis.enqueue_job(
+        "claims_pricing_process_chunk",
+        chunk_job_by_field,
+        _queue_name=CLAIMS_QUEUE_NAME,
+        _job_id=_chunk_job_id(
+            run_identity.run_id,
+            dataset_key,
+            source_index,
+            reporting_year,
+            chunk_index,
+        ),
+    )
 
+
+async def _stream_claim_chunks(
+    redis: Any,
+    run_identity: _ClaimsRunIdentity,
+    schema: str,
+    sources_by_dataset: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    source_count = sum(len(sources_by_dataset.get(dataset.key, [])) for dataset in DATASETS)
+    semaphore = asyncio.Semaphore(min(CLAIMS_DOWNLOAD_CONCURRENCY, max(source_count, 1)))
+    download_tasks = [
+        asyncio.create_task(
+            _download_split_claims_source(run_identity, dataset.key, source_by_field, source_index, semaphore)
+        )
+        for dataset in DATASETS
+        for source_index, source_by_field in enumerate(sources_by_dataset.get(dataset.key, []))
+    ]
+    chunk_entries: list[dict[str, Any]] = []
+    try:
+        for completed_download in asyncio.as_completed(download_tasks):
+            downloaded_source = await completed_download
+            for chunk_by_field in downloaded_source.chunk_entries:
+                await _enqueue_claim_chunk(redis, run_identity, schema, chunk_by_field)
+            if downloaded_source.chunk_entries:
+                await _increment_total_chunks(
+                    redis,
+                    run_identity.run_id,
+                    len(downloaded_source.chunk_entries),
+                )
+                chunk_entries.extend(downloaded_source.chunk_entries)
+    finally:
+        for download_task in download_tasks:
+            if not download_task.done():
+                download_task.cancel()
+    return chunk_entries
+
+
+def _claims_manifest_by_field(
+    run_identity: _ClaimsRunIdentity,
+    schema: str,
+    sources_by_dataset: dict[str, list[dict[str, Any]]],
+    chunk_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "import_id": run_identity.import_id,
+        "run_id": run_identity.run_id,
+        "stage_suffix": run_identity.stage_suffix,
+        "schema": schema,
+        "test_mode": run_identity.test_mode,
+        "sources": sources_by_dataset,
+        "chunks": chunk_entries,
+        "total_chunks": len(chunk_entries),
+        "created_at": datetime.datetime.utcnow().isoformat(),
+        "work_dir": str(run_identity.work_dir),
+    }
+
+
+async def _enqueue_claims_finalize(
+    redis: Any,
+    run_identity: _ClaimsRunIdentity,
+    schema: str,
+    manifest_path: Path,
+) -> None:
+    finalize_job_by_field = {
+        "import_id": run_identity.import_id,
+        "run_id": run_identity.run_id,
+        "stage_suffix": run_identity.stage_suffix,
+        "schema": schema,
+        "manifest_path": str(manifest_path),
+        "test_mode": run_identity.test_mode,
+    }
     await redis.enqueue_job(
         "claims_pricing_finalize",
-        {
-            "import_id": import_id_val,
-            "run_id": run_id,
-            "stage_suffix": stage_suffix,
-            "schema": schema,
-            "manifest_path": str(manifest_path),
-            "test_mode": test_mode,
-        },
+        finalize_job_by_field,
         _queue_name=CLAIMS_FINISH_QUEUE_NAME,
-        _job_id=f"claims_finalize_{run_id}",
+        _job_id=f"claims_finalize_{run_identity.run_id}",
     )
 
-    _step_end(
-        "claims-pricing enqueue+split "
-        f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})",
-        total_start,
-    )
+
+async def _mark_claim_chunks_queued(
+    run_identity: _ClaimsRunIdentity,
+    total_chunks: int,
+) -> None:
     await mark_control_run(
-        run_id,
+        run_identity.run_id,
         status="running",
         phase_detail="claims-pricing chunks queued",
         progress_message="chunks queued",
-        metrics={"total_chunks": len(chunks), "stage_suffix": stage_suffix},
+        metrics={"total_chunks": total_chunks, "stage_suffix": run_identity.stage_suffix},
         progress={
             "unit": "chunks",
-            "total": len(chunks),
+            "total": total_chunks,
             "done": 0,
             "pct": 0,
             "message": "chunks queued",
             "phase": "claims-pricing chunks queued",
         },
     )
+
+
+def _find_missing_claim_sources(
+    sources_by_dataset: dict[str, list[dict[str, Any]]],
+    chunk_entries: list[dict[str, Any]],
+) -> list[str]:
+    """Identify required source files that produced no processable chunk."""
+
+    observed_source_keys = {
+        (
+            str(chunk_by_field.get("dataset_key") or ""),
+            _safe_int(chunk_by_field.get("source_index"), -1),
+        )
+        for chunk_by_field in chunk_entries
+    }
+    missing_sources = []
+    for dataset in DATASETS:
+        source_descriptors = sources_by_dataset.get(dataset.key) or []
+        if not source_descriptors:
+            missing_sources.append(f"{dataset.key}:no-source")
+            continue
+        for source_index, _source_descriptor in enumerate(source_descriptors):
+            if (dataset.key, source_index) not in observed_source_keys:
+                missing_sources.append(f"{dataset.key}:{source_index}")
+    return missing_sources
+
+
+def _validate_claims_finalize_manifest(
+    manifest_by_field: dict[str, Any],
+    finalize_spec: _ClaimsFinalizeSpec,
+) -> None:
+    """Require a complete durable handoff before live-table publication."""
+
+    chunk_entries = manifest_by_field.get("chunks")
+    sources_by_dataset = manifest_by_field.get("sources")
+    total_chunks = _safe_int(manifest_by_field.get("total_chunks"), -1)
+    if not isinstance(chunk_entries, list) or not chunk_entries:
+        raise RuntimeError(
+            "Claims pricing finalize requires a nonempty chunk manifest."
+        )
+    if total_chunks != len(chunk_entries):
+        raise RuntimeError(
+            "Claims pricing finalize chunk count does not match its manifest."
+        )
+    if not isinstance(sources_by_dataset, dict):
+        raise RuntimeError(
+            "Claims pricing finalize requires source descriptors."
+        )
+    missing_sources = _find_missing_claim_sources(
+        sources_by_dataset,
+        chunk_entries,
+    )
+    if missing_sources:
+        raise RuntimeError(
+            "Claims pricing finalize is missing required source chunks: "
+            f"{', '.join(missing_sources)}"
+        )
+    if (
+        str(manifest_by_field.get("import_id") or "")
+        != finalize_spec.import_id
+        or str(manifest_by_field.get("run_id") or "")
+        != finalize_spec.run_id
+        or str(manifest_by_field.get("stage_suffix") or "")
+        != finalize_spec.stage_suffix
+    ):
+        raise RuntimeError(
+            "Claims pricing finalize identity does not match its manifest."
+        )
+
+
+async def _fail_empty_claim_sources(
+    run_identity: _ClaimsRunIdentity,
+    missing_sources: list[str],
+) -> None:
+    """Record a fail-closed start result before preserving live tables."""
+
+    await mark_control_run(
+        run_identity.run_id,
+        status="failed",
+        phase_detail="claims-pricing source produced no rows",
+        progress_message="source produced no processable rows",
+        metrics={"missing_sources": missing_sources},
+    )
+
+
+async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Prepare staging, split sources, and enqueue claims-pricing chunks."""
+
+    run_identity = _claims_run_identity(task or {})
+    redis = ctx.get("redis")
+    if redis is None:
+        raise RuntimeError("ARQ redis context is unavailable for claims pricing start job.")
+    total_label = (
+        "claims-pricing enqueue+split "
+        f"(test_mode={run_identity.test_mode}, import_id={run_identity.import_id}, "
+        f"run_id={run_identity.run_id}, stage={run_identity.stage_suffix})"
+    )
+    total_started_at = _step_start(total_label)
+    await mark_control_run(
+        run_identity.run_id,
+        status="running",
+        phase_detail="claims-pricing split running",
+        progress_message="splitting source files",
+    )
+    await ensure_database(run_identity.test_mode)
+    _classes_by_name, schema = await _timed_value(
+        "prepare staging tables",
+        _prepare_tables(run_identity.stage_suffix, run_identity.test_mode),
+    )
+    catalog_by_field = await _timed_value("fetch CMS catalog", _fetch_catalog())
+    sources_by_dataset = await _timed_value(
+        "resolve CMS sources",
+        _resolve_sources_async(catalog_by_field, run_identity.test_mode),
+    )
+    run_identity.chunks_root.mkdir(parents=True, exist_ok=True)
+    await _init_run_state(redis, run_identity.run_id, 0)
+    chunk_entries = await _timed_value(
+        "download+split+enqueue chunks (streaming)",
+        _stream_claim_chunks(redis, run_identity, schema, sources_by_dataset),
+    )
+    missing_sources = _find_missing_claim_sources(
+        sources_by_dataset,
+        chunk_entries,
+    )
+    if missing_sources:
+        await _fail_empty_claim_sources(run_identity, missing_sources)
+        raise RuntimeError(
+            "Claims pricing import produced no processable rows for required "
+            f"sources: {', '.join(missing_sources)}"
+        )
+    manifest_by_field = _claims_manifest_by_field(run_identity, schema, sources_by_dataset, chunk_entries)
+    manifest_path = _manifest_path(run_identity.work_dir)
+    _write_manifest(manifest_path, manifest_by_field)
+    await _enqueue_claims_finalize(redis, run_identity, schema, manifest_path)
+    _step_end(total_label, total_started_at)
+    await _mark_claim_chunks_queued(run_identity, len(chunk_entries))
     return {
         "ok": True,
         "queued": True,
-        "import_id": import_id_val,
-        "run_id": run_id,
-        "stage_suffix": stage_suffix,
-        "total_chunks": len(chunks),
+        "import_id": run_identity.import_id,
+        "run_id": run_identity.run_id,
+        "stage_suffix": run_identity.stage_suffix,
+        "total_chunks": len(chunk_entries),
         "manifest_path": str(manifest_path),
     }
+
+
+@dataclass(frozen=True)
+class _ClaimsChunkSpec:
+    dataset_key: str
+    chunk_id: str
+    chunk_path: str
+    run_id: str
+    stage_suffix: str
+    schema: str
+    reporting_year: int
+    test_mode: bool
+
+
+def _claims_chunk_spec(task_by_field: dict[str, Any]) -> _ClaimsChunkSpec:
+    import_id = _normalize_import_id(task_by_field.get("import_id"))
+    run_id = str(task_by_field.get("run_id") or "")
+    test_mode = bool(task_by_field.get("test_mode", False))
+    return _ClaimsChunkSpec(
+        dataset_key=str(task_by_field.get("dataset_key") or ""),
+        chunk_id=str(task_by_field.get("chunk_id") or ""),
+        chunk_path=str(task_by_field.get("chunk_path") or ""),
+        run_id=run_id,
+        stage_suffix=str(
+            task_by_field.get("stage_suffix") or _build_stage_suffix(import_id, run_id)
+        ),
+        schema=str(
+            task_by_field.get("schema")
+            or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+        ),
+        reporting_year=max(_safe_int(task_by_field.get("reporting_year"), 2013), 2013),
+        test_mode=test_mode,
+    )
+
+
+async def _load_claims_chunk(chunk_spec: _ClaimsChunkSpec) -> None:
+    await ensure_database(chunk_spec.test_mode)
+    classes_by_name = _staging_classes(chunk_spec.stage_suffix, chunk_spec.schema)
+    if chunk_spec.dataset_key == "provider":
+        await _load_provider_rows(
+            chunk_spec.chunk_path,
+            classes_by_name["PricingProvider"],
+            chunk_spec.reporting_year,
+            test_mode=False,
+        )
+        return
+    if chunk_spec.dataset_key in {"provider_service", "provider_drug"}:
+        await _load_provider_service_rows(
+            chunk_spec.chunk_path,
+            classes_by_name["PricingProviderProcedure"],
+            classes_by_name["PricingProviderProcedureLocation"],
+            chunk_spec.reporting_year,
+            test_mode=False,
+        )
+        return
+    if chunk_spec.dataset_key in {"geo_service", "drug_spending"}:
+        await _load_geo_service_rows(
+            chunk_spec.chunk_path,
+            classes_by_name["PricingProcedure"],
+            classes_by_name["PricingProcedureGeoBenchmark"],
+            chunk_spec.reporting_year,
+            test_mode=False,
+        )
+        return
+    raise RuntimeError(f"Unsupported dataset_key for chunk processing: {chunk_spec.dataset_key}")
+
+
+async def _record_claims_chunk_complete(redis: Any, chunk_spec: _ClaimsChunkSpec) -> None:
+    await _mark_chunk_done_with_retry(redis, chunk_spec.run_id, chunk_spec.chunk_id)
+    total_chunks, done_chunks = await _get_run_progress(redis, chunk_spec.run_id, 0)
+    enqueue_live_progress(
+        run_id=chunk_spec.run_id,
+        importer="claims-pricing",
+        status="running",
+        phase="claims-pricing chunks running",
+        unit="chunks",
+        done=done_chunks,
+        total=total_chunks,
+        message=f"processed {done_chunks}/{total_chunks} chunks",
+    )
 
 
 async def claims_pricing_process_chunk(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Process one validated claims-pricing chunk and record progress."""
 
-    task = task or {}
-    dataset_key = str(task.get("dataset_key") or "")
-    chunk_id = str(task.get("chunk_id") or "")
-    chunk_path = str(task.get("chunk_path") or "")
-    import_id_val = _normalize_import_id(task.get("import_id"))
-    stage_suffix = str(task.get("stage_suffix") or _build_stage_suffix(import_id_val, str(task.get("run_id") or "")))
-    schema = str(task.get("schema") or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", bool(task.get("test_mode"))))
-    run_id = str(task.get("run_id") or "")
-    test_mode = bool(task.get("test_mode", False))
-
-    if not dataset_key or not chunk_id or not chunk_path:
+    chunk_spec = _claims_chunk_spec(task or {})
+    if not chunk_spec.dataset_key or not chunk_spec.chunk_id or not chunk_spec.chunk_path:
         raise RuntimeError("Chunk payload is missing required fields: dataset_key/chunk_id/chunk_path.")
-
-    if not Path(chunk_path).exists():
-        raise RuntimeError(f"Chunk file does not exist: {chunk_path}")
-
-    await ensure_database(test_mode)
-    classes = _staging_classes(stage_suffix, schema)
-    year = max(_safe_int(task.get("reporting_year"), 2013), 2013)
-
-    if dataset_key == "provider":
-        await _load_provider_rows(chunk_path, classes["PricingProvider"], year, test_mode=False)
-    elif dataset_key in {"provider_service", "provider_drug"}:
-        await _load_provider_service_rows(
-            chunk_path,
-            classes["PricingProviderProcedure"],
-            classes["PricingProviderProcedureLocation"],
-            year,
-            test_mode=False,
-        )
-    elif dataset_key in {"geo_service", "drug_spending"}:
-        await _load_geo_service_rows(
-            chunk_path,
-            classes["PricingProcedure"],
-            classes["PricingProcedureGeoBenchmark"],
-            year,
-            test_mode=False,
-        )
-    else:
-        raise RuntimeError(f"Unsupported dataset_key for chunk processing: {dataset_key}")
-
+    if not Path(chunk_spec.chunk_path).exists():
+        raise RuntimeError(f"Chunk file does not exist: {chunk_spec.chunk_path}")
+    await _load_claims_chunk(chunk_spec)
     redis = ctx.get("redis")
-    if redis is not None and run_id:
-        await _mark_chunk_done_with_retry(redis, run_id, chunk_id)
-        total_chunks, done_chunks = await _get_run_progress(redis, run_id, 0)
+    if redis is not None and chunk_spec.run_id:
+        await _record_claims_chunk_complete(redis, chunk_spec)
+    return {
+        "ok": True,
+        "chunk_id": chunk_spec.chunk_id,
+        "dataset_key": chunk_spec.dataset_key,
+    }
+
+
+@dataclass(frozen=True)
+class _ClaimsFinalizeSpec:
+    import_id: str
+    run_id: str
+    test_mode: bool
+    schema: str
+    stage_suffix: str
+    expected_chunks: int
+    finalize_lock_token: str = field(
+        default_factory=lambda: secrets.token_hex(16),
+        compare=False,
+        repr=False,
+    )
+
+
+def _claims_finalize_spec(
+    task_by_field: dict[str, Any],
+    manifest_by_field: dict[str, Any],
+) -> _ClaimsFinalizeSpec:
+    import_id = _normalize_import_id(task_by_field.get("import_id"))
+    run_id = str(task_by_field.get("run_id") or manifest_by_field.get("run_id") or "")
+    test_mode = bool(task_by_field.get("test_mode", False))
+    schema = str(
+        task_by_field.get("schema")
+        or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    )
+    stage_suffix = str(
+        task_by_field.get("stage_suffix")
+        or manifest_by_field.get("stage_suffix")
+        or _build_stage_suffix(import_id, run_id)
+    )
+    expected_chunks = _safe_int(
+        manifest_by_field.get("total_chunks"),
+        _safe_int(task_by_field.get("total_chunks"), 0),
+    )
+    return _ClaimsFinalizeSpec(
+        import_id,
+        run_id,
+        test_mode,
+        schema,
+        stage_suffix,
+        expected_chunks,
+    )
+
+
+async def _wait_for_claims_finalize_turn(
+    redis: Any,
+    finalize_spec: _ClaimsFinalizeSpec,
+) -> dict[str, Any] | None:
+    if redis is None:
+        raise RuntimeError(
+            "ARQ redis context is unavailable for claims pricing finalize job."
+        )
+    if not finalize_spec.run_id:
+        raise RuntimeError("Claims pricing finalize run_id is required.")
+    finalized_key = _state_key(finalize_spec.run_id, "finalized")
+    if await redis.get(finalized_key):
+        return {
+            "ok": True,
+            "already_finalized": True,
+            "run_id": finalize_spec.run_id,
+            "import_id": finalize_spec.import_id,
+        }
+    total_chunks, done_chunks = await _get_run_progress(
+        redis,
+        finalize_spec.run_id,
+        finalize_spec.expected_chunks,
+    )
+    if done_chunks < total_chunks:
         enqueue_live_progress(
-            run_id=run_id,
+            run_id=finalize_spec.run_id,
             importer="claims-pricing",
             status="running",
             phase="claims-pricing chunks running",
             unit="chunks",
             done=done_chunks,
             total=total_chunks,
-            message=f"processed {done_chunks}/{total_chunks} chunks",
+            message=f"waiting for chunks {done_chunks}/{total_chunks}",
+        )
+        _safe_print(
+            f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} "
+            f"run_id={finalize_spec.run_id}",
+            flush=True,
+        )
+        raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
+    if not await _claim_finalize_lock(
+        redis,
+        finalize_spec.run_id,
+        finalize_spec.finalize_lock_token,
+    ):
+        raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
+    try:
+        await _mark_claims_finalize_started(
+            finalize_spec,
+            total_chunks,
+            done_chunks,
+        )
+    except BaseException:
+        await _release_claims_finalize_lock_safely(redis, finalize_spec)
+        raise
+    return None
+
+
+async def _mark_claims_finalize_started(
+    finalize_spec: _ClaimsFinalizeSpec,
+    total_chunks: int,
+    done_chunks: int,
+) -> None:
+    """Record that one lock-owning worker has begun finalization."""
+
+    await mark_control_run(
+        finalize_spec.run_id,
+        status="finalizing",
+        phase_detail="claims-pricing finalizing",
+        progress_message="finalizing",
+        progress={
+            "unit": "chunks",
+            "total": total_chunks,
+            "done": done_chunks,
+            "pct": 99,
+            "message": "finalizing",
+            "phase": "claims-pricing finalizing",
+        },
+    )
+
+
+async def _materialize_and_publish_claims(
+    classes_by_name: dict[str, type],
+    schema: str,
+) -> dict[str, Any]:
+    await _timed_value("ensure live code tables", _ensure_live_code_tables(schema))
+    await _timed_value(
+        "materialize procedure/code dimensions",
+        _materialize_code_and_crosswalk_rows(classes_by_name, schema),
+    )
+    await _timed_value(
+        "materialize cost-level profile and peer stats",
+        _materialize_cost_level_rows(classes_by_name, schema),
+    )
+    cost_level_diagnostics = await _timed_value(
+        "verify cost-level coverage diagnostics",
+        _collect_cost_level_diagnostics(classes_by_name, schema),
+    )
+    if CLAIMS_DEFER_STAGE_INDEXES:
+        await _timed_value(
+            "build staging indexes",
+            _build_staging_indexes(classes_by_name, schema),
+        )
+    await _timed_value(
+        "publish staging -> final (transactional rename)",
+        _publish_by_table_rename(classes_by_name, schema),
+    )
+    return cost_level_diagnostics
+
+
+async def _record_claims_finalized(redis: Any, finalize_spec: _ClaimsFinalizeSpec) -> None:
+    if redis is None or not finalize_spec.run_id:
+        return
+    finalized_key = _state_key(finalize_spec.run_id, "finalized")
+    await redis.set(finalized_key, "1", ex=CLAIMS_REDIS_TTL_SECONDS)
+    await redis.expire(finalized_key, CLAIMS_REDIS_TTL_SECONDS)
+
+
+async def _release_claims_finalize_lock_safely(
+    redis: Any,
+    finalize_spec: _ClaimsFinalizeSpec,
+) -> None:
+    """Release the owned lock without masking finalize success or failure."""
+
+    try:
+        await _is_claims_finalize_lock_released(
+            redis,
+            finalize_spec.run_id,
+            finalize_spec.finalize_lock_token,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to release claims-pricing finalize lock for run_id=%s: %s",
+            finalize_spec.run_id,
+            exc,
         )
 
-    return {
-        "ok": True,
-        "chunk_id": chunk_id,
-        "dataset_key": dataset_key,
-    }
+
+def _cleanup_claims_work_dir(
+    manifest_by_field: dict[str, Any],
+    finalize_spec: _ClaimsFinalizeSpec,
+) -> None:
+    work_dir_text = str(manifest_by_field.get("work_dir") or "")
+    if not work_dir_text or CLAIMS_KEEP_WORKDIR:
+        return
+    work_dir_root = Path(CLAIMS_WORKDIR).expanduser().resolve()
+    expected_work_dir = (
+        work_dir_root / finalize_spec.import_id / finalize_spec.run_id
+    ).resolve()
+    run_work_dir = Path(work_dir_text).expanduser().resolve()
+    try:
+        expected_work_dir.relative_to(work_dir_root)
+    except ValueError:
+        logger.warning("Refusing unsafe claims-pricing workspace cleanup")
+        return
+    if (
+        not finalize_spec.run_id
+        or work_dir_root == Path(work_dir_root.anchor)
+        or expected_work_dir == work_dir_root
+        or run_work_dir != expected_work_dir
+    ):
+        logger.warning("Refusing mismatched claims-pricing workspace cleanup")
+        return
+    if run_work_dir.exists():
+        shutil.rmtree(run_work_dir, ignore_errors=True)
+
+
+async def _mark_claims_succeeded(finalize_spec: _ClaimsFinalizeSpec) -> None:
+    await mark_control_run(
+        finalize_spec.run_id,
+        status="succeeded",
+        phase_detail="claims-pricing finalized",
+        progress_message="succeeded",
+        metrics={
+            "stage_suffix": finalize_spec.stage_suffix,
+            "schema": finalize_spec.schema,
+        },
+    )
 
 
 async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Wait for all chunks, validate staging, and publish claims pricing."""
 
-    task = task or {}
-    import_id_val = _normalize_import_id(task.get("import_id"))
-    run_id = str(task.get("run_id") or "")
-    test_mode = bool(task.get("test_mode", False))
-    manifest_path = str(task.get("manifest_path") or "")
-    schema = str(task.get("schema") or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode))
-    stage_suffix = str(task.get("stage_suffix") or "")
+    task_by_field = task or {}
     redis = ctx.get("redis")
-
+    task_run_id = str(task_by_field.get("run_id") or "")
+    if (
+        redis is not None
+        and task_run_id
+        and await redis.get(_state_key(task_run_id, "finalized"))
+    ):
+        return {
+            "ok": True,
+            "already_finalized": True,
+            "run_id": task_run_id,
+            "import_id": _normalize_import_id(
+                task_by_field.get("import_id")
+            ),
+        }
+    manifest_path = str(task_by_field.get("manifest_path") or "")
+    test_mode = bool(task_by_field.get("test_mode", False))
     await ensure_database(test_mode)
-
-    manifest = _read_manifest(manifest_path) if manifest_path else {}
-    expected_chunks = _safe_int(manifest.get("total_chunks"), _safe_int(task.get("total_chunks"), 0))
-    if not run_id:
-        run_id = str(manifest.get("run_id") or "")
-    if not stage_suffix:
-        stage_suffix = str(manifest.get("stage_suffix") or _build_stage_suffix(import_id_val, run_id))
-
-    if redis is not None and run_id:
-        finalized_key = _state_key(run_id, "finalized")
-        if await redis.get(finalized_key):
-            return {
-                "ok": True,
-                "already_finalized": True,
-                "run_id": run_id,
-                "import_id": import_id_val,
-            }
-
-        total_chunks, done_chunks = await _get_run_progress(redis, run_id, expected_chunks)
-        if done_chunks < total_chunks:
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="claims-pricing",
-                status="running",
-                phase="claims-pricing chunks running",
-                unit="chunks",
-                done=done_chunks,
-                total=total_chunks,
-                message=f"waiting for chunks {done_chunks}/{total_chunks}",
-            )
-            _safe_print(
-                f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} run_id={run_id}",
-                flush=True,
-            )
-            raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
-
-        if not await _claim_finalize_lock(redis, run_id):
-            raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
-        await mark_control_run(
-            run_id,
-            status="finalizing",
-            phase_detail="claims-pricing finalizing",
-            progress_message="finalizing",
-            progress={
-                "unit": "chunks",
-                "total": total_chunks,
-                "done": done_chunks,
-                "pct": 99,
-                "message": "finalizing",
-                "phase": "claims-pricing finalizing",
-            },
+    manifest_by_field = _read_manifest(manifest_path) if manifest_path else {}
+    finalize_spec = _claims_finalize_spec(task_by_field, manifest_by_field)
+    _validate_claims_finalize_manifest(manifest_by_field, finalize_spec)
+    early_response = await _wait_for_claims_finalize_turn(redis, finalize_spec)
+    if early_response is not None:
+        return early_response
+    try:
+        classes_by_name = _staging_classes(
+            finalize_spec.stage_suffix,
+            finalize_spec.schema,
         )
+        cost_level_diagnostics = await _materialize_and_publish_claims(
+            classes_by_name,
+            finalize_spec.schema,
+        )
+        await _record_claims_finalized(redis, finalize_spec)
+        _cleanup_claims_work_dir(manifest_by_field, finalize_spec)
+        logger.info(
+            "CMS claims pricing import finalized: "
+            "test_mode=%s import_id=%s run_id=%s",
+            finalize_spec.test_mode,
+            finalize_spec.import_id,
+            finalize_spec.run_id,
+        )
+        await _mark_claims_succeeded(finalize_spec)
+        return {
+            "ok": True,
+            "import_id": finalize_spec.import_id,
+            "run_id": finalize_spec.run_id,
+            "stage_suffix": finalize_spec.stage_suffix,
+            "schema": finalize_spec.schema,
+            "cost_level_diagnostics": cost_level_diagnostics,
+        }
+    finally:
+        await _release_claims_finalize_lock_safely(redis, finalize_spec)
 
-    classes = _staging_classes(stage_suffix, schema)
-    step_started_at = _step_start("ensure live code tables")
-    await _ensure_live_code_tables(schema)
-    _step_end("ensure live code tables", step_started_at)
-    step_started_at = _step_start("materialize procedure/code dimensions")
-    await _materialize_code_and_crosswalk_rows(classes, schema)
-    _step_end("materialize procedure/code dimensions", step_started_at)
-    step_started_at = _step_start("materialize cost-level profile and peer stats")
-    await _materialize_cost_level_rows(classes, schema)
-    _step_end("materialize cost-level profile and peer stats", step_started_at)
-    step_started_at = _step_start("verify cost-level coverage diagnostics")
-    cost_level_diagnostics = await _collect_cost_level_diagnostics(classes, schema)
-    _step_end("verify cost-level coverage diagnostics", step_started_at)
-    if CLAIMS_DEFER_STAGE_INDEXES:
-        step_started_at = _step_start("build staging indexes")
-        await _build_staging_indexes(classes, schema)
-        _step_end("build staging indexes", step_started_at)
-    step_started_at = _step_start("publish staging -> final (transactional rename)")
-    await _publish_by_table_rename(classes, schema)
-    _step_end("publish staging -> final (transactional rename)", step_started_at)
 
-    if redis is not None and run_id:
-        await redis.set(_state_key(run_id, "finalized"), "1", ex=CLAIMS_REDIS_TTL_SECONDS)
-        await redis.expire(_state_key(run_id, "finalized"), CLAIMS_REDIS_TTL_SECONDS)
-
-    if manifest:
-        run_work_dir = Path(manifest.get("work_dir", ""))
-        if run_work_dir and run_work_dir.exists() and not CLAIMS_KEEP_WORKDIR:
-            shutil.rmtree(run_work_dir, ignore_errors=True)
-
-    logger.info(
-        "CMS claims pricing import finalized: test_mode=%s import_id=%s run_id=%s",
-        test_mode,
-        import_id_val,
-        run_id,
-    )
-    await mark_control_run(
-        run_id,
-        status="succeeded",
-        phase_detail="claims-pricing finalized",
-        progress_message="succeeded",
-        metrics={"stage_suffix": stage_suffix, "schema": schema},
-    )
+def _queued_claims_run_response(
+    run_id: str,
+    stage_suffix: str,
+    import_id: str,
+    test_mode: bool,
+) -> dict[str, Any]:
     return {
         "ok": True,
-        "import_id": import_id_val,
+        "queued": True,
         "run_id": run_id,
         "stage_suffix": stage_suffix,
-        "schema": schema,
-        "cost_level_diagnostics": cost_level_diagnostics,
+        "import_id": import_id,
+        "test_mode": test_mode,
     }
+
+
+async def _create_claims_pool() -> Any:
+    return await create_pool(
+        build_redis_settings(),
+        job_serializer=serialize_job,
+        job_deserializer=deserialize_job,
+    )
 
 
 async def main(test_mode: bool = False, import_id: str | None = None) -> dict[str, Any]:
     """Queue a new claims-pricing control run and return its identifiers."""
 
-    redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
+    redis = await _create_claims_pool()
     run_id = _normalize_run_id(None)
-    payload = {
+    start_job_by_field = {
         "test_mode": bool(test_mode),
         "import_id": import_id,
         "run_id": run_id,
     }
     await redis.enqueue_job(
         "claims_pricing_start",
-        payload,
+        start_job_by_field,
         _queue_name=CLAIMS_QUEUE_NAME,
         _job_id=f"claims_start_{run_id}",
     )
-    stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
+    normalized_import_id = _normalize_import_id(import_id)
+    stage_suffix = _build_stage_suffix(normalized_import_id, run_id)
     _safe_print(
-        f"Queued claims-pricing run: import_id={_normalize_import_id(import_id)} run_id={run_id} stage={stage_suffix} "
+        f"Queued claims-pricing run: import_id={normalized_import_id} run_id={run_id} stage={stage_suffix} "
         f"test_mode={bool(test_mode)}",
         flush=True,
     )
-    return {
-        "ok": True,
-        "queued": True,
-        "run_id": run_id,
-        "stage_suffix": stage_suffix,
-        "import_id": _normalize_import_id(import_id),
-        "test_mode": bool(test_mode),
-    }
+    return _queued_claims_run_response(
+        run_id,
+        stage_suffix,
+        normalized_import_id,
+        bool(test_mode),
+    )
 
 
 async def finish_main(
@@ -2712,19 +3235,22 @@ async def finish_main(
 ) -> dict[str, Any]:
     """Queue explicit finalization for an existing claims-pricing run."""
 
-    redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
-    stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
-    payload = {
+    redis = await _create_claims_pool()
+    normalized_import_id = _normalize_import_id(import_id)
+    stage_suffix = _build_stage_suffix(normalized_import_id, run_id)
+    resolved_manifest_path = manifest_path or str(
+        _manifest_path(_run_dir(normalized_import_id, run_id))
+    )
+    finalize_job_by_field = {
         "import_id": import_id,
         "run_id": run_id,
         "stage_suffix": stage_suffix,
         "test_mode": bool(test_mode),
+        "manifest_path": resolved_manifest_path,
     }
-    if manifest_path:
-        payload["manifest_path"] = manifest_path
     await redis.enqueue_job(
         "claims_pricing_finalize",
-        payload,
+        finalize_job_by_field,
         _queue_name=CLAIMS_FINISH_QUEUE_NAME,
         _job_id=f"claims_finalize_{run_id}_{secrets.token_hex(4)}",
     )

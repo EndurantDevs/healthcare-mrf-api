@@ -7,37 +7,31 @@ import hashlib
 import json
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from db.connection import init_db
-from db.models import (
-    CodeCatalog,
-    CodeSynonym,
-    NUCCTaxonomy,
-    PricingProvider,
-    PricingProviderPrescription,
-    PricingProviderProcedure,
-    TerminologySynonym,
-    db,
-)
+from db.models import TerminologySynonym, db
 from process.ext.utils import ensure_database, make_class, push_objects
-
-SOURCE_CURATED = "healthporta_curated_terminology_synonyms"
-SOURCE_CODE_CATALOG = "healthporta_code_catalog"
-SOURCE_CODE_SYNONYM = "healthporta_code_synonym"
-SOURCE_PRICING_PROVIDERS = "cms_pricing_provider_observed"
-SOURCE_PRICING_PROCEDURES = "cms_pricing_provider_procedure_observed"
-SOURCE_PRICING_PRESCRIPTIONS = "cms_partd_provider_prescription_observed"
-SOURCE_NUCC = "nucc_taxonomy"
-
-PUBLIC_ATTRIBUTION = (
-    "Derived from public CMS/NUCC/imported HealthPorta reference data and curated "
-    "non-license-restricted search aliases. This importer intentionally does not load "
-    "official proprietary CPT/CDT descriptors or synonym files."
+from process.terminology_synonym_sources import (
+    MEDICATION_CODE_SYSTEMS,
+    PROCEDURE_CODE_SYSTEMS,
+    PUBLIC_ATTRIBUTION,
+    SOURCE_CODE_CATALOG,
+    SOURCE_CODE_SYNONYM,
+    SOURCE_CURATED,
+    SOURCE_NUCC,
+    SOURCE_PRICING_PRESCRIPTIONS,
+    SOURCE_PRICING_PROCEDURES,
+    SOURCE_PRICING_PROVIDERS,
+    _insert_code_catalog_rows,
+    _insert_code_synonym_rows,
+    _insert_nucc_rows,
+    _insert_observed_prescription_rows,
+    _insert_observed_procedure_rows,
+    _insert_observed_provider_rows,
+    _status_count,
 )
-
-PROCEDURE_CODE_SYSTEMS = ("CPT", "HCPCS", "CDT", "HP_PROCEDURE_CODE")
-MEDICATION_CODE_SYSTEMS = ("RXNORM", "NDC", "HP_RX_CODE")
 
 
 def _schema() -> str:
@@ -59,17 +53,6 @@ def _import_id(raw: str | None) -> str:
     if cleaned:
         return cleaned[:32]
     return _now().strftime("%Y%m%d%H%M%S")
-
-
-def _status_count(status: Any) -> int:
-    if status is None:
-        return 0
-    if isinstance(status, int):
-        return status
-    parts = str(status).strip().split()
-    if parts and parts[-1].isdigit():
-        return int(parts[-1])
-    return 0
 
 
 def _row_mapping(row: Any) -> Any:
@@ -96,6 +79,20 @@ async def _create_indexes(stage_cls, schema: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class TerminologyRecordOptions:
+    """Optional display, confidence, provenance, and metadata fields."""
+
+    target_display: str | None = None
+    canonical_term: str | None = None
+    is_broad: bool = False
+    confidence: float = 1.0
+    provenance_source: str = SOURCE_CURATED
+    source_attribution: str = PUBLIC_ATTRIBUTION
+    license_status: str = "public_or_curated"
+    metadata: dict[str, Any] | None = None
+
+
 def _record(
     *,
     domain: str,
@@ -103,15 +100,9 @@ def _record(
     term_type: str,
     target_system: str,
     target_code: str,
-    target_display: str | None = None,
-    canonical_term: str | None = None,
-    is_broad: bool = False,
-    confidence: float = 1.0,
-    source: str = SOURCE_CURATED,
-    source_attribution: str = PUBLIC_ATTRIBUTION,
-    license_status: str = "public_or_curated",
-    metadata: dict[str, Any] | None = None,
+    options: TerminologyRecordOptions | None = None,
 ) -> dict[str, Any] | None:
+    record_options = options or TerminologyRecordOptions()
     term_key = _normalize_term_key(synonym)
     if not (term_key and target_system and target_code):
         return None
@@ -122,14 +113,22 @@ def _record(
         "term_type": term_type,
         "target_system": target_system.upper(),
         "target_code": str(target_code),
-        "target_display": target_display or canonical_term or synonym,
-        "canonical_term": canonical_term or target_display or synonym,
-        "is_broad": bool(is_broad),
-        "confidence": confidence,
-        "source": source,
-        "source_attribution": source_attribution,
-        "license_status": license_status,
-        "metadata_json": json.dumps(metadata or {}, sort_keys=True),
+        "target_display": (
+            record_options.target_display
+            or record_options.canonical_term
+            or synonym
+        ),
+        "canonical_term": (
+            record_options.canonical_term
+            or record_options.target_display
+            or synonym
+        ),
+        "is_broad": bool(record_options.is_broad),
+        "confidence": record_options.confidence,
+        "source": record_options.provenance_source,
+        "source_attribution": record_options.source_attribution,
+        "license_status": record_options.license_status,
+        "metadata_json": json.dumps(record_options.metadata or {}, sort_keys=True),
         "updated_at": _now(),
     }
 
@@ -152,24 +151,26 @@ def _provider_rows() -> list[dict[str, Any]]:
         ("Optometry", "152W00000X", ["optometrist", "eye care"]),
         ("Dentist", "122300000X", ["dental provider", "general dentist"]),
     ]
-    rows: list[dict[str, Any]] = []
+    provider_alias_rows: list[dict[str, Any]] = []
     for provider_type, nucc_code, aliases in seeds:
         terms = [provider_type, nucc_code, *aliases]
         for synonym in terms:
-            row = _record(
+            provider_alias_record = _record(
                 domain="provider_type",
                 synonym=synonym,
                 term_type="curated_provider_alias",
                 target_system="PROVIDER_TYPE",
                 target_code=provider_type,
-                target_display=provider_type,
-                canonical_term=provider_type,
-                confidence=0.96 if synonym != nucc_code else 1.0,
-                metadata={"nucc_code": nucc_code},
+                options=TerminologyRecordOptions(
+                    target_display=provider_type,
+                    canonical_term=provider_type,
+                    confidence=0.96 if synonym != nucc_code else 1.0,
+                    metadata={"nucc_code": nucc_code},
+                ),
             )
-            if row:
-                rows.append(row)
-    return rows
+            if provider_alias_record:
+                provider_alias_rows.append(provider_alias_record)
+    return provider_alias_rows
 
 
 def _procedure_rows() -> list[dict[str, Any]]:
@@ -197,23 +198,25 @@ def _procedure_rows() -> list[dict[str, Any]]:
         ("brain mri", "CPT", ["70551", "70552", "70553"], True),
         ("knee xray", "CPT", ["73560", "73562", "73564"], True),
     ]
-    rows: list[dict[str, Any]] = []
+    procedure_alias_rows: list[dict[str, Any]] = []
     for synonym, system, codes, is_broad in seeds:
         for code in codes:
-            row = _record(
+            procedure_alias_record = _record(
                 domain="procedure",
                 synonym=synonym,
                 term_type="curated_procedure_alias",
                 target_system=system,
                 target_code=code,
-                target_display=synonym,
-                canonical_term=synonym,
-                is_broad=is_broad,
-                confidence=0.90 if is_broad else 0.96,
+                options=TerminologyRecordOptions(
+                    target_display=synonym,
+                    canonical_term=synonym,
+                    is_broad=is_broad,
+                    confidence=0.90 if is_broad else 0.96,
+                ),
             )
-            if row:
-                rows.append(row)
-    return rows
+            if procedure_alias_record:
+                procedure_alias_rows.append(procedure_alias_record)
+    return procedure_alias_rows
 
 
 def _specialty_alias_rows() -> list[dict[str, Any]]:
@@ -227,253 +230,31 @@ def _specialty_alias_rows() -> list[dict[str, Any]]:
     """
     from api.provider_specialty_filters import _SPECIALTY_TAXONOMY_CODE_ALIASES
 
-    rows: list[dict[str, Any]] = []
+    specialty_alias_rows: list[dict[str, Any]] = []
     for alias, taxonomy_codes in _SPECIALTY_TAXONOMY_CODE_ALIASES.items():
         for taxonomy_code in taxonomy_codes:
-            row = _record(
+            specialty_alias_record = _record(
                 domain="provider_type",
                 synonym=alias,
                 term_type="curated_specialty_alias",
                 target_system="NUCC",
                 target_code=taxonomy_code,
-                canonical_term=alias,
-                confidence=0.95,
-                metadata={"nucc_code": taxonomy_code, "alias_bundle": alias},
+                options=TerminologyRecordOptions(
+                    canonical_term=alias,
+                    confidence=0.95,
+                    metadata={
+                        "nucc_code": taxonomy_code,
+                        "alias_bundle": alias,
+                    },
+                ),
             )
-            if row:
-                rows.append(row)
-    return rows
+            if specialty_alias_record:
+                specialty_alias_rows.append(specialty_alias_record)
+    return specialty_alias_rows
 
 
 def _curated_rows() -> list[dict[str, Any]]:
     return _provider_rows() + _specialty_alias_rows() + _procedure_rows()
-
-
-def _norm_sql(expr: str) -> str:
-    return (
-        "LOWER(BTRIM(REGEXP_REPLACE("
-        f"REGEXP_REPLACE(BTRIM({expr}), '[^A-Za-z0-9]+', ' ', 'g'), "
-        "'\\s+', ' ', 'g')))"
-    )
-
-
-def _upsert_columns() -> str:
-    columns = [column.name for column in TerminologySynonym.__table__.columns]
-    return ", ".join(columns)
-
-
-def _insert_sql(stage_table: str, select_sql: str) -> str:
-    columns = _upsert_columns()
-    return f"""
-        INSERT INTO {stage_table} ({columns})
-        {select_sql}
-        ON CONFLICT (domain, term_key, target_system, target_code) DO UPDATE SET
-            synonym = EXCLUDED.synonym,
-            term_type = EXCLUDED.term_type,
-            target_display = EXCLUDED.target_display,
-            canonical_term = EXCLUDED.canonical_term,
-            is_broad = EXCLUDED.is_broad,
-            confidence = EXCLUDED.confidence,
-            source = EXCLUDED.source,
-            source_attribution = EXCLUDED.source_attribution,
-            license_status = EXCLUDED.license_status,
-            metadata_json = EXCLUDED.metadata_json,
-            updated_at = EXCLUDED.updated_at;
-    """
-
-
-async def _insert_code_catalog_rows(schema: str, stage_table: str) -> int:
-    system_list = ", ".join(f"'{value}'" for value in (*PROCEDURE_CODE_SYSTEMS, *MEDICATION_CODE_SYSTEMS))
-    domain_case = (
-        "CASE WHEN UPPER(code_system) IN ('RXNORM', 'NDC', 'HP_RX_CODE') "
-        "THEN 'medication' ELSE 'procedure' END"
-    )
-    term_expr = "COALESCE(NULLIF(display_name, ''), NULLIF(short_description, ''), code)"
-    select_sql = f"""
-        SELECT DISTINCT ON ({domain_case}, {_norm_sql(term_expr)}, UPPER(code_system), code)
-            {domain_case} AS domain,
-            {_norm_sql(term_expr)} AS term_key,
-            {term_expr} AS synonym,
-            'catalog_display' AS term_type,
-            UPPER(code_system) AS target_system,
-            code::varchar AS target_code,
-            COALESCE(NULLIF(display_name, ''), NULLIF(short_description, ''), code) AS target_display,
-            COALESCE(NULLIF(display_name, ''), NULLIF(short_description, ''), code) AS canonical_term,
-            false AS is_broad,
-            0.9400 AS confidence,
-            '{SOURCE_CODE_CATALOG}' AS source,
-            source_attribution,
-            'source_import' AS license_status,
-            jsonb_build_object('catalog_source', source, 'code_type', code_type)::text AS metadata_json,
-            NOW() AT TIME ZONE 'UTC' AS updated_at
-          FROM {schema}.{CodeCatalog.__tablename__}
-         WHERE UPPER(code_system) IN ({system_list})
-           AND COALESCE(NULLIF(display_name, ''), NULLIF(short_description, ''), code) IS NOT NULL
-           AND {_norm_sql(term_expr)} <> ''
-    """
-    return _status_count(await db.status(_insert_sql(stage_table, select_sql)))
-
-
-async def _insert_code_synonym_rows(schema: str, stage_table: str) -> int:
-    system_list = ", ".join(f"'{value}'" for value in (*PROCEDURE_CODE_SYSTEMS, *MEDICATION_CODE_SYSTEMS))
-    domain_case = (
-        "CASE WHEN UPPER(s.code_system) IN ('RXNORM', 'NDC', 'HP_RX_CODE') "
-        "THEN 'medication' ELSE 'procedure' END"
-    )
-    select_sql = f"""
-        SELECT DISTINCT ON ({domain_case}, {_norm_sql('s.synonym')}, UPPER(s.code_system), s.code)
-            {domain_case} AS domain,
-            {_norm_sql('s.synonym')} AS term_key,
-            s.synonym,
-            COALESCE(NULLIF(s.term_type, ''), 'source_synonym') AS term_type,
-            UPPER(s.code_system) AS target_system,
-            s.code::varchar AS target_code,
-            COALESCE(NULLIF(c.display_name, ''), NULLIF(c.short_description, ''), s.synonym) AS target_display,
-            COALESCE(NULLIF(c.display_name, ''), NULLIF(c.short_description, ''), s.synonym) AS canonical_term,
-            false AS is_broad,
-            0.9700 AS confidence,
-            '{SOURCE_CODE_SYNONYM}' AS source,
-            s.source_attribution,
-            'source_import' AS license_status,
-            jsonb_build_object('synonym_source', s.source, 'catalog_source', c.source)::text AS metadata_json,
-            NOW() AT TIME ZONE 'UTC' AS updated_at
-          FROM {schema}.{CodeSynonym.__tablename__} s
-          LEFT JOIN {schema}.{CodeCatalog.__tablename__} c
-            ON UPPER(c.code_system) = UPPER(s.code_system)
-           AND c.code = s.code
-         WHERE UPPER(s.code_system) IN ({system_list})
-           AND s.synonym IS NOT NULL
-           AND {_norm_sql('s.synonym')} <> ''
-    """
-    return _status_count(await db.status(_insert_sql(stage_table, select_sql)))
-
-
-async def _insert_observed_provider_rows(schema: str, stage_table: str) -> int:
-    term_expr = "provider_type"
-    select_sql = f"""
-        SELECT DISTINCT ON ({_norm_sql(term_expr)}, provider_type)
-            'provider_type' AS domain,
-            {_norm_sql(term_expr)} AS term_key,
-            provider_type AS synonym,
-            'observed_provider_type' AS term_type,
-            'PROVIDER_TYPE' AS target_system,
-            provider_type AS target_code,
-            provider_type AS target_display,
-            provider_type AS canonical_term,
-            false AS is_broad,
-            1.0000 AS confidence,
-            '{SOURCE_PRICING_PROVIDERS}' AS source,
-            '{PUBLIC_ATTRIBUTION}' AS source_attribution,
-            'source_import' AS license_status,
-            jsonb_build_object('source_table', '{PricingProvider.__tablename__}')::text AS metadata_json,
-            NOW() AT TIME ZONE 'UTC' AS updated_at
-          FROM {schema}.{PricingProvider.__tablename__}
-         WHERE provider_type IS NOT NULL
-           AND {_norm_sql(term_expr)} <> ''
-    """
-    return _status_count(await db.status(_insert_sql(stage_table, select_sql)))
-
-
-async def _insert_nucc_rows(schema: str, stage_table: str) -> int:
-    select_sql = f"""
-        WITH terms AS (
-            SELECT code,
-                   display_name,
-                   classification,
-                   specialization,
-                   grouping,
-                   unnest(ARRAY[
-                       display_name,
-                       classification,
-                       specialization,
-                       grouping,
-                       code
-                   ]) AS synonym
-              FROM {schema}.{NUCCTaxonomy.__tablename__}
-        )
-        SELECT DISTINCT ON ({_norm_sql('synonym')}, code)
-            'provider_type' AS domain,
-            {_norm_sql('synonym')} AS term_key,
-            synonym,
-            'nucc_term' AS term_type,
-            'NUCC' AS target_system,
-            code AS target_code,
-            COALESCE(NULLIF(display_name, ''), NULLIF(classification, ''), code) AS target_display,
-            COALESCE(NULLIF(classification, ''), NULLIF(display_name, ''), code) AS canonical_term,
-            false AS is_broad,
-            0.9200 AS confidence,
-            '{SOURCE_NUCC}' AS source,
-            '{PUBLIC_ATTRIBUTION}' AS source_attribution,
-            'public_source' AS license_status,
-            jsonb_build_object('grouping', grouping, 'classification', classification, 'specialization', specialization)::text AS metadata_json,
-            NOW() AT TIME ZONE 'UTC' AS updated_at
-          FROM terms
-         WHERE synonym IS NOT NULL
-           AND {_norm_sql('synonym')} <> ''
-    """
-    return _status_count(await db.status(_insert_sql(stage_table, select_sql)))
-
-
-async def _insert_observed_procedure_rows(schema: str, stage_table: str) -> int:
-    select_sql = f"""
-        SELECT DISTINCT ON ({_norm_sql('service_description')}, procedure_code::varchar)
-            'procedure' AS domain,
-            {_norm_sql('service_description')} AS term_key,
-            service_description AS synonym,
-            'observed_claims_service_description' AS term_type,
-            'HP_PROCEDURE_CODE' AS target_system,
-            procedure_code::varchar AS target_code,
-            service_description AS target_display,
-            service_description AS canonical_term,
-            false AS is_broad,
-            0.9300 AS confidence,
-            '{SOURCE_PRICING_PROCEDURES}' AS source,
-            '{PUBLIC_ATTRIBUTION}' AS source_attribution,
-            'source_import' AS license_status,
-            jsonb_build_object('reported_code', reported_code)::text AS metadata_json,
-            NOW() AT TIME ZONE 'UTC' AS updated_at
-          FROM {schema}.{PricingProviderProcedure.__tablename__}
-         WHERE service_description IS NOT NULL
-           AND procedure_code IS NOT NULL
-           AND {_norm_sql('service_description')} <> ''
-    """
-    return _status_count(await db.status(_insert_sql(stage_table, select_sql)))
-
-
-async def _insert_observed_prescription_rows(schema: str, stage_table: str) -> int:
-    term_sql = f"""
-        WITH terms AS (
-            SELECT rx_code_system,
-                   rx_code,
-                   rx_name,
-                   generic_name,
-                   brand_name,
-                   unnest(ARRAY[rx_name, generic_name, brand_name]) AS synonym
-              FROM {schema}.{PricingProviderPrescription.__tablename__}
-             WHERE rx_code_system IS NOT NULL
-               AND rx_code IS NOT NULL
-        )
-        SELECT DISTINCT ON ({_norm_sql('synonym')}, UPPER(rx_code_system), rx_code)
-            'medication' AS domain,
-            {_norm_sql('synonym')} AS term_key,
-            synonym,
-            'observed_prescription_name' AS term_type,
-            UPPER(rx_code_system) AS target_system,
-            rx_code AS target_code,
-            COALESCE(NULLIF(rx_name, ''), NULLIF(generic_name, ''), NULLIF(brand_name, ''), synonym) AS target_display,
-            COALESCE(NULLIF(generic_name, ''), NULLIF(brand_name, ''), NULLIF(rx_name, ''), synonym) AS canonical_term,
-            false AS is_broad,
-            0.9300 AS confidence,
-            '{SOURCE_PRICING_PRESCRIPTIONS}' AS source,
-            '{PUBLIC_ATTRIBUTION}' AS source_attribution,
-            'source_import' AS license_status,
-            jsonb_build_object('rx_name', rx_name, 'generic_name', generic_name, 'brand_name', brand_name)::text AS metadata_json,
-            NOW() AT TIME ZONE 'UTC' AS updated_at
-          FROM terms
-         WHERE synonym IS NOT NULL
-           AND {_norm_sql('synonym')} <> ''
-    """
-    return _status_count(await db.status(_insert_sql(stage_table, term_sql)))
 
 
 async def _publish_stage(schema: str, stage_cls) -> None:
@@ -505,7 +286,7 @@ async def import_terminology_synonyms(
     curated_rows = _curated_rows()
     await push_objects(curated_rows, stage_cls, rewrite=True)
 
-    source_counts = {
+    source_row_count_by_type = {
         "curated_rows": len(curated_rows),
         "code_catalog_rows": await _insert_code_catalog_rows(schema, stage_table),
         "code_synonym_rows": await _insert_code_synonym_rows(schema, stage_table),
@@ -515,19 +296,25 @@ async def import_terminology_synonyms(
         "observed_prescription_rows": await _insert_observed_prescription_rows(schema, stage_table),
     }
     await _create_indexes(stage_cls, schema)
-    rows = await db.all(f"SELECT count(*)::bigint AS row_count FROM {stage_table};")
-    row_count = int(_row_mapping(rows[0])["row_count"]) if rows else 0
+    count_query_rows = await db.all(
+        f"SELECT count(*)::bigint AS row_count FROM {stage_table};"
+    )
+    row_count = (
+        int(_row_mapping(count_query_rows[0])["row_count"])
+        if count_query_rows
+        else 0
+    )
     await _publish_stage(schema, stage_cls)
 
-    result = {
+    import_summary_map = {
         "import_id": suffix,
         "test_mode": bool(test_mode),
         "table": f"{schema}.{TerminologySynonym.__tablename__}",
         "row_count": row_count,
-        "source_counts": source_counts,
+        "source_counts": source_row_count_by_type,
     }
-    print(f"Terminology synonym import done: {result}")
-    return result
+    print(f"Terminology synonym import done: {import_summary_map}")
+    return import_summary_map
 
 
 async def main(
