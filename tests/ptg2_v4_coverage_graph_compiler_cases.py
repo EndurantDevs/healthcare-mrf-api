@@ -391,9 +391,39 @@ def _assert_compiler_progress_events() -> None:
 def _assert_bounded_compiler_files(tmp_path: Path) -> None:
     oversized = tmp_path / "oversized"
     oversized.write_bytes(b"1234")
-    with pytest.raises(RuntimeError, match="exceeds"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"is 4 bytes; maximum is 3 bytes",
+    ):
         compiler._read_bounded(oversized, 3, label="test")
     assert compiler._read_bounded(oversized, 4, label="test") == b"1234"
+    formerly_oversized = tmp_path / "formerly-oversized"
+    formerly_oversized.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+    assert (
+        len(
+            compiler._read_bounded(
+                formerly_oversized,
+                compiler.PTG2_V4_GRAPH_SUMMARY_MAX_BYTES,
+                label="summary",
+            )
+        )
+        == 2 * 1024 * 1024 + 1
+    )
+    over_limit = tmp_path / "over-limit"
+    with over_limit.open("wb") as output:
+        output.truncate(compiler.PTG2_V4_GRAPH_SUMMARY_MAX_BYTES + 1)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"is {compiler.PTG2_V4_GRAPH_SUMMARY_MAX_BYTES + 1} bytes; "
+            rf"maximum is {compiler.PTG2_V4_GRAPH_SUMMARY_MAX_BYTES} bytes"
+        ),
+    ):
+        compiler._read_bounded(
+            over_limit,
+            compiler.PTG2_V4_GRAPH_SUMMARY_MAX_BYTES,
+            label="summary",
+        )
     error_log = tmp_path / "error.log"
     error_log.write_bytes(b"x" * (compiler.PTG2_V4_GRAPH_ERROR_TAIL_BYTES + 5))
     assert len(compiler._read_error_tail(error_log)) == (
