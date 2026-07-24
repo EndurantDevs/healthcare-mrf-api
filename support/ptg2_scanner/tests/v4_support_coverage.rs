@@ -9,13 +9,21 @@ use ptg2_scanner::hashing::{
     price_set_entry_key, provider_entry_component_key, provider_set_component_key,
     provider_set_entry_key,
 };
+use ptg2_scanner::input::open_plain_range_json_reader;
 use ptg2_scanner::manifest::{DenseIdMap, GlobalId128};
 use ptg2_scanner::normalize::{
     int_list, normalize_catalog_code, normalize_money_text, normalized_scalar_from_reader,
     normalized_string_list_from_reader, strict_integer, strict_integer_text, strict_money_number,
 };
+use ptg2_scanner::progress::{
+    emit_progress, ScannerSemanticProgress, ScannerSemanticProgressReporter,
+};
 use serde_json::json;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::{atomic::AtomicU64, Arc};
+use std::time::Instant;
 use struson::reader::JsonStreamReader;
 
 #[test]
@@ -198,4 +206,58 @@ fn v4_normalization_rejects_ambiguous_numeric_and_json_shapes() {
         normalized_string_list_from_reader(&mut scalar_reader).unwrap(),
         vec!["42".to_owned()]
     );
+}
+
+#[test]
+fn semantic_progress_counts_each_scanner_work_family() {
+    let progress = ScannerSemanticProgress::default();
+
+    progress.record_provider_npi_union_visits(3);
+    progress.record_rate_chunk_completed();
+    progress.record_in_network_object_completed();
+
+    let snapshot = progress.snapshot();
+    assert_eq!(snapshot.provider_npi_union_visits, 3);
+    assert_eq!(snapshot.rate_chunks_completed, 1);
+    assert_eq!(snapshot.in_network_objects_completed, 1);
+    assert_eq!(snapshot.semantic_work_completed, 5);
+}
+
+#[test]
+fn scanner_progress_reporters_start_emit_and_stop_cleanly() {
+    let compressed_bytes_read = Arc::new(AtomicU64::new(5));
+    let semantic_progress = Arc::new(ScannerSemanticProgress::default());
+    let reporter = ScannerSemanticProgressReporter::start(
+        Path::new("/tmp/scanner-progress.json.gz"),
+        10,
+        Arc::clone(&compressed_bytes_read),
+        semantic_progress,
+        Instant::now(),
+    )
+    .unwrap();
+
+    emit_progress(
+        Path::new("/tmp/scanner-progress.json.gz"),
+        10,
+        &compressed_bytes_read,
+        &HashMap::from([("in_network".to_owned(), 1)]),
+        Instant::now(),
+        true,
+    );
+    drop(reporter);
+}
+
+#[test]
+fn plain_range_reader_rejects_overflow_before_seeking() {
+    let workspace = tempfile::tempdir().unwrap();
+    let source_path = workspace.path().join("rates.json");
+    fs::write(&source_path, b"{}").unwrap();
+
+    let error =
+        open_plain_range_json_reader(&source_path, u64::MAX, 2, Arc::new(AtomicU64::new(0)))
+            .err()
+            .expect("overflowing range must be rejected");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("overflows u64"));
 }
