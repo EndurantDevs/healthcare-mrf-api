@@ -20,6 +20,7 @@ from db.models import (
 )
 from process.clinical_reference_rows import _build_clinical_area_rows
 from process.ext.utils import make_class, push_objects
+from process.reference_stage import _drop_stage_tables, build_reference_stage_suffix
 
 DEFAULT_BATCH_SIZE = 5000
 CLINICAL_REFERENCE_SOURCES = (
@@ -198,17 +199,31 @@ async def _push(stage_class: Any, row_maps: list[dict[str, Any]]) -> int:
 async def _create_stage_models(
     schema: str,
     import_suffix: str,
+    run_id: str | None = None,
 ) -> ClinicalStageModels:
     shared_models = (CodeCatalog, CodeCrosswalk, CodeSynonym, CodeRelationship)
     area_models = (ClinicalArea, ClinicalAreaCondition, ClinicalAreaTreatment)
+    stage_suffix = build_reference_stage_suffix("cr", import_suffix, run_id)
     stage_by_model = {
-        model_class: make_class(model_class, import_suffix)
+        model_class: make_class(model_class, stage_suffix)
         for model_class in shared_models + area_models
     }
-    for stage_class in stage_by_model.values():
-        await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_class.__tablename__};")
-        await db.create_table(stage_class.__table__, checkfirst=True)
-    return ClinicalStageModels(stage_by_model, shared_models, area_models)
+    stage_models = ClinicalStageModels(stage_by_model, shared_models, area_models)
+    await _drop_stage_models(schema, stage_models)
+    try:
+        for stage_class in stage_by_model.values():
+            await db.create_table(stage_class.__table__, checkfirst=True)
+        return stage_models
+    except BaseException:
+        await _drop_stage_models(schema, stage_models)
+        raise
+
+
+async def _drop_stage_models(
+    schema: str,
+    stage_models: ClinicalStageModels,
+) -> None:
+    await _drop_stage_tables(db, schema, stage_models.stage_by_model.values())
 
 
 async def _stage_reference_rows(

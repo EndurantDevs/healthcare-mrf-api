@@ -63,6 +63,7 @@ from process.clinical_reference_publication import (
     _catalog_stage_count,
     _create_stage_indexes,
     _create_stage_models,
+    _drop_stage_models,
     _ensure_schema_exists,
     _ensure_unified_code_tables,
     _merge_code_catalog_stage,
@@ -415,25 +416,37 @@ async def _execute_clinical_reference_import(
 ) -> dict[str, Any]:
     await _ensure_schema_exists(schema)
     await _ensure_unified_code_tables(schema)
-    stage_models = await _create_stage_models(schema, request.import_suffix)
-    source_rows = await _collect_reference_rows(request)
-    reference_indexes = _index_reference_rows(source_rows)
-    clinical_area_rows = await _stage_reference_rows(
+    stage_models = await _create_stage_models(
         schema,
-        stage_models,
-        reference_indexes,
+        request.import_suffix,
+        request.run_id,
     )
-    concept_count = await _catalog_stage_count(schema, stage_models, request.test_mode)
-    await _publish_reference_stages(schema, stage_models)
-    summary_map = _build_import_summary(
-        request,
-        source_rows,
-        reference_indexes,
-        clinical_area_rows,
-        concept_count,
-    )
-    print(f"Clinical reference import done: {summary_map}")
-    return summary_map
+    try:
+        source_rows = await _collect_reference_rows(request)
+        reference_indexes = _index_reference_rows(source_rows)
+        clinical_area_rows = await _stage_reference_rows(
+            schema,
+            stage_models,
+            reference_indexes,
+        )
+        concept_count = await _catalog_stage_count(
+            schema,
+            stage_models,
+            request.test_mode,
+        )
+        _raise_if_cancelled(request.run_id)
+        await _publish_reference_stages(schema, stage_models)
+        summary_map = _build_import_summary(
+            request,
+            source_rows,
+            reference_indexes,
+            clinical_area_rows,
+            concept_count,
+        )
+        print(f"Clinical reference import done: {summary_map}")
+        return summary_map
+    finally:
+        await _drop_stage_models(schema, stage_models)
 
 
 async def main(

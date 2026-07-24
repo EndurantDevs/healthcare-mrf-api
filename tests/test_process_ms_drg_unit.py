@@ -2,6 +2,7 @@
 
 import importlib
 import threading
+from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -36,6 +37,18 @@ DIAGNOSIS_INDEX_HTML = """
 <tr><td>A850</td><td>01</td><td>097-099</td><td></td><td></td><td></td><td></td></tr>
 </table>
 """
+
+
+class _FakeDb:
+    async def status(self, *_args, **_kwargs):
+        return None
+
+    async def create_table(self, *_args, **_kwargs):
+        return None
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
 
 
 def test_parse_ms_drg_catalog_rows():
@@ -86,13 +99,6 @@ def test_find_latest_manual_toc_url_skips_proposed_links():
 
 @pytest.mark.asyncio
 async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
-    class FakeDb:
-        async def status(self, *_args, **_kwargs):
-            return None
-
-        async def create_table(self, *_args, **_kwargs):
-            return None
-
     class FakeStage:
         __tablename__ = "stage"
         __table__ = object()
@@ -123,7 +129,7 @@ async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
     async def merge_relationship(_stage, _schema, sources):
         calls.append(("relationship", sources))
 
-    monkeypatch.setattr(ms_drg, "db", FakeDb())
+    monkeypatch.setattr(ms_drg, "db", _FakeDb())
     monkeypatch.setattr(ms_drg, "ensure_database", noop)
     monkeypatch.setattr(ms_drg, "_ensure_tables", noop)
     monkeypatch.setattr(ms_drg, "_download_text", lambda url: html_by_url[url])

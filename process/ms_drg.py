@@ -60,6 +60,7 @@ from process.ms_drg_sources import (
     _parse_tables,
     _raise_if_cancelled,
 )
+from process.reference_stage import _drop_stage_tables, build_reference_stage_suffix
 
 DEFAULT_CONCURRENCY = 10
 TEST_INDEX_PAGE_LIMIT = 2
@@ -84,6 +85,10 @@ def _normalize_import_id(raw_import_id: str | None) -> str:
     if cleaned_import_id:
         return cleaned_import_id[:32]
     return _now().strftime("%Y%m%d")
+
+
+def _ms_drg_stage_suffix(import_suffix: str, run_id: str | None = None) -> str:
+    return build_reference_stage_suffix("drg", import_suffix, run_id)
 
 
 def _build_request(
@@ -346,46 +351,56 @@ async def _stage_and_publish(
     request: MsDrgImportRequest,
     import_payloads: MsDrgPayloads,
 ) -> MsDrgPublishCounts:
+    stage_suffix = _ms_drg_stage_suffix(request.import_suffix, request.run_id)
     stage_by_model = {
-        CodeCatalog: make_class(CodeCatalog, request.import_suffix),
-        CodeSynonym: make_class(CodeSynonym, request.import_suffix),
-        CodeRelationship: make_class(CodeRelationship, request.import_suffix),
+        CodeCatalog: make_class(CodeCatalog, stage_suffix),
+        CodeSynonym: make_class(CodeSynonym, stage_suffix),
+        CodeRelationship: make_class(CodeRelationship, stage_suffix),
     }
-    for stage_class in stage_by_model.values():
-        await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_class.__tablename__};")
-        await db.create_table(stage_class.__table__, checkfirst=True)
-    catalog_count = await _push(
-        stage_by_model[CodeCatalog],
-        import_payloads.catalog_payloads,
-    )
-    synonym_count = await _push(
-        stage_by_model[CodeSynonym],
-        import_payloads.synonym_payloads,
-    )
-    relationship_count = 0
-    if request.include_relationships:
-        relationship_count = await _push(
-            stage_by_model[CodeRelationship],
-            import_payloads.relationship_payloads,
+    await _drop_stage_tables(db, schema, stage_by_model.values())
+    try:
+        for stage_class in stage_by_model.values():
+            await db.create_table(stage_class.__table__, checkfirst=True)
+        catalog_count = await _push(
+            stage_by_model[CodeCatalog],
+            import_payloads.catalog_payloads,
         )
-    catalog_sources = SOURCES if request.include_relationships else (SOURCE_MS_DRG,)
-    await _merge_catalog_stage(stage_by_model[CodeCatalog], schema, catalog_sources)
-    await _merge_synonym_stage(
-        stage_by_model[CodeSynonym],
-        schema,
-        (SOURCE_MS_DRG,),
-    )
-    if request.include_relationships:
-        await _merge_relationship_stage(
-            stage_by_model[CodeRelationship],
-            schema,
-            (SOURCE_ICD10CM_INDEX, SOURCE_ICD10PCS_INDEX),
+        synonym_count = await _push(
+            stage_by_model[CodeSynonym],
+            import_payloads.synonym_payloads,
         )
-    return MsDrgPublishCounts(
-        catalog_count,
-        synonym_count,
-        relationship_count,
-    )
+        relationship_count = 0
+        if request.include_relationships:
+            relationship_count = await _push(
+                stage_by_model[CodeRelationship],
+                import_payloads.relationship_payloads,
+            )
+        catalog_sources = SOURCES if request.include_relationships else (SOURCE_MS_DRG,)
+        _raise_if_cancelled(request.run_id)
+        async with db.transaction():
+            await _merge_catalog_stage(
+                stage_by_model[CodeCatalog],
+                schema,
+                catalog_sources,
+            )
+            await _merge_synonym_stage(
+                stage_by_model[CodeSynonym],
+                schema,
+                (SOURCE_MS_DRG,),
+            )
+            if request.include_relationships:
+                await _merge_relationship_stage(
+                    stage_by_model[CodeRelationship],
+                    schema,
+                    (SOURCE_ICD10CM_INDEX, SOURCE_ICD10PCS_INDEX),
+                )
+        return MsDrgPublishCounts(
+            catalog_count,
+            synonym_count,
+            relationship_count,
+        )
+    finally:
+        await _drop_stage_tables(db, schema, stage_by_model.values())
 
 
 def _build_summary(

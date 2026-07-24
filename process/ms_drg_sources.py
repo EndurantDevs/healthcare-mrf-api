@@ -20,7 +20,7 @@ from process.url_security import fetch_max_bytes, urlopen_safe
 
 try:
     import redis
-except ImportError:  # pragma: no cover - redis is present in normal importer runtime
+except ImportError:
     redis = None
 
 MS_DRG_DEFAULT_MAX_BYTES = 64 * 1024 * 1024

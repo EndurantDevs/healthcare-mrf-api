@@ -5,13 +5,15 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import fcntl
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,15 @@ from process.clinical_reference_rows import (
     _concept_row,
     _relationship_row,
     _synonym_row,
+)
+from process.clinical_reference_artifacts import (
+    _create_publication_rollback,
+    _discard_partial_download,
+    _manifest_path,
+    _recover_interrupted_publication,
+    _restore_publication,
+    _sha256_file,
+    _write_manifest_temporary,
 )
 from process.control_cancel import ImportCancelledError
 from process.redis_config import build_redis_settings
@@ -40,14 +51,6 @@ def _now_isoformat() -> str:
     import datetime
 
     return datetime.datetime.utcnow().isoformat() + "Z"
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source_stream:
-        for artifact_chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
-            digest.update(artifact_chunk)
-    return digest.hexdigest()
 
 
 def _is_cancel_requested(run_id: str | None) -> bool:
@@ -93,11 +96,88 @@ def _redact_sensitive_url(value: str) -> str:
     return re.sub(r"(?i)(apiKey=)[^\s&]+", r"\1<redacted>", str(value))
 
 
-def _discard_partial_download(temporary_path: Path) -> None:
+def _stream_url_to_file(
+    request: urllib.request.Request,
+    output_stream: Any,
+    run_id: str | None,
+) -> None:
+    with urllib.request.urlopen(request, timeout=3600) as response:
+        while True:
+            _raise_if_cancelled(run_id)
+            artifact_chunk = response.read(1024 * 1024)
+            if not artifact_chunk:
+                break
+            output_stream.write(artifact_chunk)
+
+
+@contextmanager
+def _destination_write_lock(path: Path):
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+b") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def _discard_stale_download_temporaries(path: Path) -> None:
+    for temporary_path in path.parent.glob(f".{path.name}.*.tmp"):
+        _discard_partial_download(temporary_path)
+
+
+def _download_url_locked(
+    url: str,
+    path: Path,
+    request: urllib.request.Request,
+    force: bool,
+    run_id: str | None,
+) -> Path:
+    _raise_if_cancelled(run_id)
+    _recover_interrupted_publication(path)
+    _discard_stale_download_temporaries(path)
+    if path.exists() and path.stat().st_size > 0 and not force:
+        return path
+    artifact_mode = path.stat().st_mode & 0o777 if path.exists() else None
+    temporary_path = None
+    temporary_manifest_path = None
     try:
-        temporary_path.unlink(missing_ok=True)
-    except OSError:
-        return
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output_stream:
+            temporary_path = Path(output_stream.name)
+            _stream_url_to_file(request, output_stream, run_id)
+        if artifact_mode is not None:
+            os.chmod(temporary_path, artifact_mode)
+        _raise_if_cancelled(run_id)
+        manifest_map = {
+            "source_url": url,
+            "downloaded_at": _now_isoformat(),
+            "byte_count": temporary_path.stat().st_size,
+            "sha256": _sha256_file(temporary_path),
+        }
+        manifest_path = _manifest_path(path)
+        temporary_manifest_path = _write_manifest_temporary(path, manifest_map)
+        rollback_path, had_artifact = _create_publication_rollback(path)
+        try:
+            os.replace(temporary_path, path)
+            temporary_path = None
+            os.replace(temporary_manifest_path, manifest_path)
+            temporary_manifest_path = None
+        except BaseException:
+            _restore_publication(path, rollback_path, had_artifact)
+            raise
+        _discard_partial_download(rollback_path)
+        return path
+    finally:
+        if temporary_path is not None:
+            _discard_partial_download(temporary_path)
+        if temporary_manifest_path is not None:
+            _discard_partial_download(temporary_manifest_path)
 
 
 def _download_url(
@@ -108,47 +188,22 @@ def _download_url(
     force: bool = False,
     run_id: str | None = None,
 ) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.stat().st_size > 0 and not force:
-        return path
     _raise_if_cancelled(run_id)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
     request_url = _umls_download_url(url, api_key) if api_key else url
     request = urllib.request.Request(
         request_url,
         headers={"User-Agent": "HealthPorta terminology importer"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=3600) as response, temporary_path.open(
-            "wb"
-        ) as output_stream:
-            while True:
-                _raise_if_cancelled(run_id)
-                artifact_chunk = response.read(1024 * 1024)
-                if not artifact_chunk:
-                    break
-                output_stream.write(artifact_chunk)
-        _raise_if_cancelled(run_id)
-        temporary_path.replace(path)
+        with _destination_write_lock(path):
+            return _download_url_locked(url, path, request, force, run_id)
     except ImportCancelledError:
-        _discard_partial_download(temporary_path)
         raise
     except Exception as exc:
-        _discard_partial_download(temporary_path)
         redacted_url = _redact_sensitive_url(request_url)
         redacted_error = _redact_sensitive_url(str(exc))
         raise RuntimeError(f"download failed for {redacted_url}: {redacted_error}") from exc
-    manifest_map = {
-        "source_url": url,
-        "downloaded_at": _now_isoformat(),
-        "byte_count": path.stat().st_size,
-        "sha256": _sha256_file(path),
-    }
-    path.with_suffix(path.suffix + ".manifest.json").write_text(
-        json.dumps(manifest_map, indent=2),
-        encoding="utf-8",
-    )
-    return path
 
 
 def _release_current(release_type: str) -> dict[str, Any]:

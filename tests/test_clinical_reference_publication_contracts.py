@@ -438,7 +438,7 @@ async def test_import_publishes_summary_contract(monkeypatch, tmp_path):
     async def ensure_tables(schema):
         lifecycle_events.append(("tables", schema))
 
-    async def create_stages(schema, suffix):
+    async def create_stages(schema, suffix, run_id):
         lifecycle_events.append(("stages", suffix))
         return publication.ClinicalStageModels({}, (), ())
 

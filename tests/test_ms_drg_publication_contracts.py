@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -95,6 +96,10 @@ class _RecordingDb:
 
     async def disconnect(self):
         self.disconnected = True
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
 
 
 def _manual_source(toc_html="<p>toc</p>", catalog_rows=None):

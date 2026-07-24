@@ -7,6 +7,7 @@ import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -145,9 +146,126 @@ def test_download_publishes_manifest_and_reuses_cache(monkeypatch, tmp_path):
     assert opened_requests == [("https://example.test/artifact.zip", 3600)]
 
 
+def test_cached_download_checks_cancellation_before_network_access(
+    monkeypatch,
+    tmp_path,
+):
+    artifact_path = tmp_path / "artifact.zip"
+    artifact_path.write_bytes(b"cached")
+    open_response = Mock()
+    cancel_import = Mock(side_effect=ImportCancelledError("cancelled cached run"))
+    monkeypatch.setattr(sources.urllib.request, "urlopen", open_response)
+    monkeypatch.setattr(sources, "_raise_if_cancelled", cancel_import)
+
+    with pytest.raises(ImportCancelledError, match="cached run"):
+        sources._download_url(
+            "https://example.test/artifact.zip",
+            artifact_path,
+            run_id="run-cached",
+        )
+
+    cancel_import.assert_called_once_with("run-cached")
+    open_response.assert_not_called()
+
+
+def test_download_uses_unique_owned_temporary_paths(monkeypatch, tmp_path):
+    artifact_path = tmp_path / "artifact.zip"
+    replace_sources = []
+    replace_file = sources.os.replace
+
+    def record_replace(source_path, destination_path):
+        if Path(destination_path) == artifact_path:
+            replace_sources.append(Path(source_path))
+        replace_file(source_path, destination_path)
+
+    monkeypatch.setattr(sources.os, "replace", record_replace)
+    monkeypatch.setattr(
+        sources.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _ByteResponse([b"complete", b""]),
+    )
+
+    sources._download_url(
+        "https://example.test/artifact.zip",
+        artifact_path,
+        force=True,
+    )
+    new_artifact_mode = artifact_path.stat().st_mode & 0o777
+    artifact_path.chmod(0o640)
+    sources._download_url(
+        "https://example.test/artifact.zip",
+        artifact_path,
+        force=True,
+    )
+
+    assert len(set(replace_sources)) == 2
+    assert all(temporary_path.parent == tmp_path for temporary_path in replace_sources)
+    assert all(
+        temporary_path.name.startswith(".artifact.zip.")
+        for temporary_path in replace_sources
+    )
+    assert new_artifact_mode == 0o600
+    assert artifact_path.stat().st_mode & 0o777 == 0o640
+
+
+def test_download_releases_temporary_ownership_after_replace(
+    monkeypatch,
+    tmp_path,
+):
+    artifact_path = tmp_path / "artifact.zip"
+    reused_temporary_paths = []
+    replace_file = sources.os.replace
+
+    def replace_and_reuse_path(source_path, destination_path):
+        replace_file(source_path, destination_path)
+        reused_path = Path(source_path)
+        reused_path.write_bytes(b"owned by another process")
+        reused_temporary_paths.append(reused_path)
+
+    monkeypatch.setattr(sources.os, "replace", replace_and_reuse_path)
+    monkeypatch.setattr(
+        sources.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _ByteResponse([b"complete", b""]),
+    )
+
+    sources._download_url(
+        "https://example.test/artifact.zip",
+        artifact_path,
+    )
+
+    assert artifact_path.read_bytes() == b"complete"
+    assert reused_temporary_paths[0].read_bytes() == b"owned by another process"
+
+
+def test_download_scavenges_only_stale_owned_temporaries(monkeypatch, tmp_path):
+    artifact_path = tmp_path / "artifact.zip"
+    stale_paths = [
+        tmp_path / ".artifact.zip.orphan.tmp",
+        tmp_path / ".artifact.zip.manifest.orphan.tmp",
+    ]
+    for stale_path in stale_paths:
+        stale_path.write_bytes(b"orphaned partial")
+    monkeypatch.setattr(
+        sources.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _ByteResponse([b"complete", b""]),
+    )
+
+    sources._download_url(
+        "https://example.test/artifact.zip",
+        artifact_path,
+    )
+
+    assert all(not stale_path.exists() for stale_path in stale_paths)
+    assert artifact_path.read_bytes() == b"complete"
+
+
 def test_download_failure_redacts_and_discards_partial(monkeypatch, tmp_path):
     """Failed and cancelled downloads never expose credentials or retain partial bytes."""
     artifact_path = tmp_path / "restricted.zip"
+    unrelated_temporary_path = artifact_path.with_suffix(".zip.tmp")
+    unrelated_temporary_path.write_bytes(b"owned by another downloader")
     monkeypatch.setattr(
         sources.urllib.request,
         "urlopen",
@@ -165,7 +283,8 @@ def test_download_failure_redacts_and_discards_partial(monkeypatch, tmp_path):
 
     assert "visible-secret" not in str(failure.value)
     assert "apiKey=<redacted>" in str(failure.value)
-    assert not artifact_path.with_suffix(".zip.tmp").exists()
+    assert unrelated_temporary_path.read_bytes() == b"owned by another downloader"
+    assert list(tmp_path.glob(".restricted.zip.*.tmp")) == []
     assert not artifact_path.exists()
 
     cancel_checks = iter((None, ImportCancelledError("cancelled")))
@@ -187,7 +306,8 @@ def test_download_failure_redacts_and_discards_partial(monkeypatch, tmp_path):
             artifact_path,
             run_id="run-3",
         )
-    assert not artifact_path.with_suffix(".zip.tmp").exists()
+    assert unrelated_temporary_path.read_bytes() == b"owned by another downloader"
+    assert list(tmp_path.glob(".restricted.zip.*.tmp")) == []
 
 
 @pytest.mark.parametrize(
