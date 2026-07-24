@@ -171,7 +171,9 @@ def _lease_deadline(*, sealed: bool = False) -> datetime:
     return _utcnow() + timedelta(seconds=_env_non_negative_seconds(name, default))
 
 
-def _advisory_lock_key(digest: bytes) -> int:
+def v4_layout_advisory_lock_key(digest: bytes) -> int:
+    """Return the transaction-lock key for one persisted V4 fingerprint."""
+
     if len(digest) != 32:
         raise ValueError("PTG V4 layout fingerprint must contain 32 bytes")
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
@@ -2209,7 +2211,7 @@ async def reserve_v4_shared_layout(
     fingerprint = v4_layout_fingerprint(semantic_fingerprint)
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:lock_key)"),
-        {"lock_key": _advisory_lock_key(fingerprint)},
+        {"lock_key": v4_layout_advisory_lock_key(fingerprint)},
     )
     existing = await _load_v4_layout_reservation(
         session,
@@ -3619,7 +3621,7 @@ async def seal_v4_shared_layout(
     )
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:lock_key)"),
-        {"lock_key": _advisory_lock_key(observed_summary.map_digest)},
+        {"lock_key": v4_layout_advisory_lock_key(observed_summary.map_digest)},
     )
     reusable_result = await session.execute(
         text(
@@ -3890,6 +3892,7 @@ __all__ = [
     "summarize_persisted_v4_snapshot_metadata",
     "summarize_v4_snapshot_map_packs",
     "v4_layout_fingerprint",
+    "v4_layout_advisory_lock_key",
     "v4_map_pack_target_hashes",
     "touch_v4_shared_layout_build",
 ]

@@ -8847,6 +8847,38 @@ def test_failed_shared_layout_abandonment_retries_transient_database_errors(monk
     }
 
 
+def test_failed_v4_layout_abandonment_uses_exact_owned_gc_path(monkeypatch):
+    abandonment = AsyncMock(
+        return_value=SimpleNamespace(logical_layout_count=1)
+    )
+    legacy_abandonment = AsyncMock()
+    monkeypatch.setattr(
+        process_ptg,
+        "abandon_owned_v4_layout",
+        abandonment,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "is_shared_layout_build_abandoned",
+        legacy_abandonment,
+    )
+
+    is_abandoned = asyncio.run(
+        process_ptg._is_failed_shared_layout_abandoned(
+            SimpleNamespace(snapshot_key=491, reused=False),
+            build_token="owned-v4-attempt",
+            expected_generation=process_ptg.PTG2_V4_SHARED_GENERATION,
+        )
+    )
+
+    assert is_abandoned is True
+    abandonment.assert_awaited_once_with(
+        snapshot_key=491,
+        build_token="owned-v4-attempt",
+    )
+    legacy_abandonment.assert_not_awaited()
+
+
 def _manifest_push_mock(pushed_list):
     async def fake_push(rows, cls, **_kwargs):
         pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)

@@ -7,6 +7,7 @@
         "api/control.py",
         "api/control_auth.py",
         "api/control_imports.py",
+        "api/control_ptg_v4_recovery.py",
         "api/control_snapshot_rollback.py",
         "api/control_workers.py",
         "api/endpoint/__init__.py",
@@ -306,6 +307,10 @@
         "process/ptg_parts/ptg2_source_witness_store.py",
         "process/ptg_parts/ptg2_source_witness_streaming_encode.py",
         "process/ptg_parts/ptg2_v4_audit.py",
+        "process/ptg_parts/ptg2_v4_failed_layout_marker.py",
+        "process/ptg_parts/ptg2_v4_failed_layout_recovery.py",
+        "process/ptg_parts/ptg2_v4_failed_layout_request.py",
+        "process/ptg_parts/ptg2_v4_failed_layout_state.py",
         "process/ptg_parts/ptg2_v4_graph_compiler.py",
         "process/ptg_parts/ptg2_v4_snapshot_maps.py",
         "process/ptg_parts/row_helpers.py",
@@ -363,12 +368,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 29062,
-          "total": 37286
+          "covered": 29223,
+          "total": 37354
         },
         "lines": {
-          "covered": 94870,
-          "total": 109512
+          "covered": 95412,
+          "total": 109881
         }
       },
       "one_time_floor_reset": {

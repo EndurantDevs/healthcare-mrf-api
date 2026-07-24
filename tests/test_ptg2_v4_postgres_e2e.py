@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 import hashlib
 import importlib.util
 import json
@@ -22,11 +23,18 @@ from api import ptg2_v4_graph as graph
 from db.connection import Database
 from process.ptg_parts import ptg2_shared_publish, ptg2_v4_audit
 from process.ptg_parts import ptg2_shared_snapshot_publish as snapshot_publish
+from process.ptg_parts import ptg2_v4_failed_layout_recovery as recovery
+from process.ptg_parts.ptg2_shared_blocks import SharedBlock
+from process.ptg_parts.ptg2_shared_gc import (
+    PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
+    abandon_owned_v4_layout,
+)
 from process.ptg_parts.ptg2_v4_graph_compiler import (
     compile_provider_graph_v4_rust,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_SHARED_GENERATION,
+    publish_v4_snapshot_maps,
     reserve_v4_shared_layout,
     seal_v4_shared_layout,
 )
@@ -361,6 +369,434 @@ async def _create_v4_test_schema(
         await database.execute_ddl(statement)
 
 
+async def _complete_shared_gc_test_schema(
+    database: Database,
+    *,
+    schema_name: str,
+) -> None:
+    """Add minimal unused V3 relations required by strict GC ownership checks."""
+
+    schema = _quoted(schema_name)
+    existing_rows = await database.all(
+        """
+        SELECT table_name
+          FROM information_schema.tables
+         WHERE table_schema = :schema_name
+        """,
+        schema_name=schema_name,
+    )
+    existing_names = {
+        str(table_record._mapping["table_name"])
+        for table_record in existing_rows
+    }
+    columns_by_table = {
+        "ptg2_v3_snapshot_binding": (
+            "snapshot_id varchar(96), snapshot_key bigint"
+        ),
+        "ptg2_v3_snapshot_scope": (
+            "snapshot_id varchar(96), snapshot_key bigint"
+        ),
+        "ptg2_v3_snapshot_source": (
+            "snapshot_id varchar(96), snapshot_key bigint"
+        ),
+        "ptg2_v3_candidate_audit_attestation": (
+            "snapshot_id varchar(96), snapshot_key bigint"
+        ),
+    }
+    for table_name, column_sql in columns_by_table.items():
+        if table_name in existing_names:
+            continue
+        await database.execute_ddl(
+            f"CREATE TABLE {schema}.{_quoted(table_name)} ({column_sql})"
+        )
+        existing_names.add(table_name)
+    for table_name in PTG2_V3_MIGRATION_OWNED_TABLE_NAMES:
+        if table_name in existing_names:
+            continue
+        await database.execute_ddl(
+            f"CREATE TABLE {schema}.{_quoted(table_name)} "
+            "(snapshot_key bigint)"
+        )
+
+
+async def _create_failed_recovery_control_schema(
+    database: Database,
+    *,
+    schema_name: str,
+) -> None:
+    """Create the minimal logical-owner tables read by exact recovery."""
+
+    schema = _quoted(schema_name)
+    for statement in (
+        f"""
+        CREATE TABLE {schema}.ptg2_snapshot (
+            snapshot_id varchar(96) PRIMARY KEY,
+            import_run_id varchar(96) NOT NULL,
+            status varchar(16) NOT NULL,
+            published_at timestamptz
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_import_run (
+            import_run_id varchar(96) PRIMARY KEY,
+            status varchar(16) NOT NULL,
+            report jsonb NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_current_snapshot (
+            snapshot_id varchar(96),
+            previous_snapshot_id varchar(96)
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_current_source_snapshot (
+            snapshot_id varchar(96),
+            previous_snapshot_id varchar(96)
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_current_plan_source (
+            snapshot_id varchar(96),
+            previous_snapshot_id varchar(96)
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_snapshot_pin (
+            snapshot_id varchar(96)
+        )
+        """,
+    ):
+        await database.execute_ddl(statement)
+
+
+@dataclass(frozen=True)
+class _FailedRecoverySeed:
+    schema_name: str
+    schema: str
+    semantic_fingerprint: bytes
+    build_token: str
+    snapshot_id: str
+    import_run_id: str
+    snapshot_key: int
+
+
+def _recovery_block(object_kind: str, payload: bytes) -> SharedBlock:
+    return SharedBlock(
+        object_kind, 0, 0, 1, "none", len(payload), payload
+    )
+
+
+async def _insert_recovery_blocks(
+    session,
+    *,
+    schema: str,
+    snapshot_key: int,
+    mapped_block: SharedBlock,
+    target_block: SharedBlock,
+) -> None:
+    for physical_block in (mapped_block, target_block):
+        await session.execute(
+            sa.text(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_block
+                    (block_hash, format_version, object_kind, codec,
+                     entry_count, raw_byte_count, stored_byte_count, payload)
+                VALUES
+                    (:block_hash, 2, :object_kind, 'none', 1, 6, 6, :payload)
+                """
+            ),
+            {
+                "block_hash": physical_block.block_hash,
+                "object_kind": physical_block.object_kind,
+                "payload": physical_block.payload,
+            },
+        )
+    await session.execute(
+        sa.text(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_snapshot_block
+                (snapshot_key, object_kind, block_key, fragment_no,
+                 entry_count, block_hash)
+            VALUES (:snapshot_key, :object_kind, 0, 0, 1, :block_hash)
+            """
+        ),
+        {
+            "snapshot_key": snapshot_key,
+            "object_kind": mapped_block.object_kind,
+            "block_hash": mapped_block.block_hash,
+        },
+    )
+
+
+async def _insert_failed_recovery_owner(
+    session,
+    *,
+    schema: str,
+    snapshot_id: str,
+    import_run_id: str,
+    snapshot_key: int,
+    semantic_fingerprint: bytes,
+) -> None:
+    await session.execute(
+        sa.text(
+            f"""
+            INSERT INTO {schema}.ptg2_snapshot
+                (snapshot_id, import_run_id, status)
+            VALUES (:snapshot_id, :import_run_id, 'failed')
+            """
+        ),
+        {"snapshot_id": snapshot_id, "import_run_id": import_run_id},
+    )
+    report_by_field = {
+        "shared_snapshot_key": snapshot_key,
+        "shared_semantic_fingerprint": semantic_fingerprint.hex(),
+        "shared_layout_abandoned": False,
+        "shared_layout_abandonment_deferred": True,
+    }
+    await session.execute(
+        sa.text(
+            f"""
+            INSERT INTO {schema}.ptg2_import_run
+                (import_run_id, status, report)
+            VALUES (:import_run_id, 'failed', CAST(:report AS jsonb))
+            """
+        ),
+        {
+            "import_run_id": import_run_id,
+            "report": json.dumps(report_by_field),
+        },
+    )
+
+
+async def _seed_failed_recovery(
+    database: Database,
+    *,
+    schema_name: str,
+) -> _FailedRecoverySeed:
+    """Seed one failed logical owner with an active-lease packed V4 layout."""
+
+    schema = _quoted(schema_name)
+    semantic_fingerprint = hashlib.sha256(b"owned-v4-layout").digest()
+    build_token = f"owned-v4-{uuid.uuid4().hex}"
+    snapshot_id = "ptg2:202607:failed-recovery"
+    import_run_id = "ptg2:failed-recovery-run"
+    mapped_block = _recovery_block("owned_v4_mapped_v1", b"mapped")
+    target_block = _recovery_block("owned_v4_target_v1", b"target")
+    async with database.transaction() as session:
+        reservation = await reserve_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            semantic_fingerprint=semantic_fingerprint,
+            build_token=build_token,
+        )
+        await _insert_recovery_blocks(
+            session,
+            schema=schema,
+            snapshot_key=reservation.snapshot_key,
+            mapped_block=mapped_block,
+            target_block=target_block,
+        )
+        await _insert_provider_set_rows(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            provider_sets_by_key={1: _global(1, 1)},
+        )
+        await publish_v4_snapshot_maps(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            build_token=build_token,
+            representation="direct_v1",
+            references=(target_block.reference(),),
+            max_coordinates_per_pack=1,
+        )
+        await _insert_failed_recovery_owner(
+            session,
+            schema=schema,
+            snapshot_id=snapshot_id,
+            import_run_id=import_run_id,
+            snapshot_key=reservation.snapshot_key,
+            semantic_fingerprint=semantic_fingerprint,
+        )
+    return _FailedRecoverySeed(
+        schema_name=schema_name,
+        schema=schema,
+        semantic_fingerprint=semantic_fingerprint,
+        build_token=build_token,
+        snapshot_id=snapshot_id,
+        import_run_id=import_run_id,
+        snapshot_key=reservation.snapshot_key,
+    )
+
+
+async def _assert_cross_key_binding_rejected(
+    database: Database,
+    seed: _FailedRecoverySeed,
+) -> None:
+    """Prove a binding on another key still fences the logical snapshot."""
+
+    await database.status(
+        f"""
+        INSERT INTO {seed.schema}.ptg2_v3_snapshot_binding
+            (snapshot_id, snapshot_key)
+        VALUES (:snapshot_id, :snapshot_key)
+        """,
+        snapshot_id=seed.snapshot_id,
+        snapshot_key=seed.snapshot_key + 10_000,
+    )
+    with pytest.raises(
+        recovery.PTG2V4RecoveryConflict,
+        match="recovery gates did not pass",
+    ):
+        await recovery.plan_ptg2_v4_recovery(
+            schema_name=seed.schema_name,
+            snapshot_id=seed.snapshot_id,
+            import_run_id=seed.import_run_id,
+            snapshot_key=seed.snapshot_key,
+        )
+    await database.status(
+        f"""
+        DELETE FROM {seed.schema}.ptg2_v3_snapshot_binding
+         WHERE snapshot_id = :snapshot_id
+        """,
+        snapshot_id=seed.snapshot_id,
+    )
+
+
+async def _assert_recovery_replay(
+    seed: _FailedRecoverySeed,
+    *,
+    plan_digest: str,
+) -> None:
+    """Prove response loss can replay the durable result exactly."""
+
+    replay_plan_by_field = await recovery.plan_ptg2_v4_recovery(
+        schema_name=seed.schema_name,
+        snapshot_id=seed.snapshot_id,
+        import_run_id=seed.import_run_id,
+        snapshot_key=seed.snapshot_key,
+    )
+    assert replay_plan_by_field["executed"] is True
+    assert replay_plan_by_field["idempotent"] is True
+    assert replay_plan_by_field["plan_digest"] == plan_digest
+    replay_by_field = await recovery.recover_ptg2_v4_layout(
+        schema_name=seed.schema_name,
+        snapshot_id=seed.snapshot_id,
+        import_run_id=seed.import_run_id,
+        snapshot_key=seed.snapshot_key,
+        expected_plan_digest=plan_digest,
+    )
+    assert replay_by_field["executed"] is True
+    assert replay_by_field["idempotent"] is True
+    with pytest.raises(
+        recovery.PTG2V4RecoveryConflict,
+        match="recovery plan changed",
+    ):
+        await recovery.recover_ptg2_v4_layout(
+            schema_name=seed.schema_name,
+            snapshot_id=seed.snapshot_id,
+            import_run_id=seed.import_run_id,
+            snapshot_key=seed.snapshot_key,
+            expected_plan_digest="f" * 64,
+        )
+
+
+async def _recover_failed_seed(
+    database: Database,
+    seed: _FailedRecoverySeed,
+) -> int:
+    """Recover one active-lease seed and prove every exact fence."""
+
+    cas_count_before = int(
+        await database.scalar(
+            f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_block"
+        )
+        or 0
+    )
+    assert await database.scalar(
+        f"""
+        SELECT lease_until > transaction_timestamp()
+          FROM {seed.schema}.ptg2_v3_snapshot_layout
+         WHERE snapshot_key = :snapshot_key
+        """,
+        snapshot_key=seed.snapshot_key,
+    )
+    async with database.acquire() as connection:
+        wrong_owner = await abandon_owned_v4_layout(
+            schema_name=seed.schema_name,
+            snapshot_key=seed.snapshot_key,
+            build_token="another-owner",
+            executor=connection,
+        )
+    assert wrong_owner.logical_layout_count == 0
+    await _assert_cross_key_binding_rejected(database, seed)
+    plan_by_field = await recovery.plan_ptg2_v4_recovery(
+        schema_name=seed.schema_name,
+        snapshot_id=seed.snapshot_id,
+        import_run_id=seed.import_run_id,
+        snapshot_key=seed.snapshot_key,
+    )
+    assert seed.build_token not in json.dumps(plan_by_field, default=str)
+    assert plan_by_field["candidate_hash_count"] == 3
+    recovery_by_field = await recovery.recover_ptg2_v4_layout(
+        schema_name=seed.schema_name,
+        snapshot_id=seed.snapshot_id,
+        import_run_id=seed.import_run_id,
+        snapshot_key=seed.snapshot_key,
+        expected_plan_digest=str(plan_by_field["plan_digest"]),
+    )
+    assert recovery_by_field["executed"] is True
+    assert recovery_by_field["released_layouts"] == 1
+    assert recovery_by_field["queued_candidate_hashes"] == 3
+    await _assert_recovery_replay(
+        seed,
+        plan_digest=str(plan_by_field["plan_digest"]),
+    )
+    return cas_count_before
+
+
+async def _assert_recovered_seed(
+    database: Database,
+    seed: _FailedRecoverySeed,
+    cas_count_before: int,
+) -> None:
+    assert await database.scalar(
+        f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_block"
+    ) == cas_count_before
+    assert await database.scalar(
+        f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_gc_candidate"
+    ) == 3
+    assert await database.scalar(
+        f"""
+        SELECT bool_and(eligible_at > transaction_timestamp())
+          FROM {seed.schema}.ptg2_v3_gc_candidate
+        """
+    )
+    for table_name in (
+        "ptg2_v3_snapshot_layout",
+        "ptg2_v3_layout_fingerprint",
+        "ptg2_v3_snapshot_block",
+        "ptg2_v3_provider_set",
+        "ptg2_v4_snapshot_map_root",
+        "ptg2_v4_snapshot_map_pack",
+    ):
+        assert await database.scalar(
+            f'SELECT COUNT(*) FROM {seed.schema}."{table_name}" '
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=seed.snapshot_key,
+        ) == 0
+    async with database.transaction() as session:
+        replacement = await reserve_v4_shared_layout(
+            session,
+            schema_name=seed.schema_name,
+            semantic_fingerprint=seed.semantic_fingerprint,
+            build_token="replacement-owner",
+        )
+    assert replacement.snapshot_key != seed.snapshot_key
+
+
 def _base_layout_manifest() -> dict[str, object]:
     return {
         "serving_index": {
@@ -666,6 +1102,48 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
         assert physical_bytes > 0
     finally:
         compilation.cleanup()
+        try:
+            await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_build_abandons_before_lease_without_deleting_cas(
+    monkeypatch,
+) -> None:
+    """Prove exact failed-build recovery retains payloads and unlocks reuse."""
+
+    if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
+
+    monkeypatch.delenv("HLTHPRT_PTG2_V3_BLOCK_GC_GRACE_SECONDS", raising=False)
+    schema_name = f"ptg2_v4_abandon_{uuid.uuid4().hex}"
+    schema = _quoted(schema_name)
+    database = Database()
+    await database.connect()
+    try:
+        await _create_v4_test_schema(
+            database,
+            schema_name=schema_name,
+            monkeypatch=monkeypatch,
+        )
+        await _complete_shared_gc_test_schema(
+            database,
+            schema_name=schema_name,
+        )
+        await _create_failed_recovery_control_schema(
+            database,
+            schema_name=schema_name,
+        )
+        monkeypatch.setattr(recovery, "db", database)
+        seed = await _seed_failed_recovery(
+            database,
+            schema_name=schema_name,
+        )
+        cas_count_before = await _recover_failed_seed(database, seed)
+        await _assert_recovered_seed(database, seed, cas_count_before)
+    finally:
         try:
             await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         finally:

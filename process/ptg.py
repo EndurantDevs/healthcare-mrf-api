@@ -181,6 +181,9 @@ from process.ptg_parts.ptg2_shared_finalize import (
     attach_v3_dictionary_contract,
     attach_v3_source_run_contract,
 )
+from process.ptg_parts.ptg2_shared_gc import (
+    abandon_owned_v4_layout,
+)
 from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
     logical_plan_fields_for_job,
@@ -2637,13 +2640,14 @@ async def _is_failed_shared_layout_abandoned(
     """Abandon an owned unpublished layout, or defer interrupted cleanup to GC."""
     if shared_layout_reservation is None or shared_layout_reservation.reused:
         return None
-    if expected_generation == PTG2_V4_SHARED_GENERATION:
-        # V4 graph reachability lives inside authenticated map packs.  Leave an
-        # interrupted building root to the generation-aware recurring GC so it
-        # can queue both map blocks and decoded target hashes before deletion.
-        return None
     for attempt in range(3):
         try:
+            if expected_generation == PTG2_V4_SHARED_GENERATION:
+                abandonment = await abandon_owned_v4_layout(
+                    snapshot_key=shared_layout_reservation.snapshot_key,
+                    build_token=build_token,
+                )
+                return abandonment.logical_layout_count == 1
             async with db.transaction() as session:
                 return await is_shared_layout_build_abandoned(
                     session,

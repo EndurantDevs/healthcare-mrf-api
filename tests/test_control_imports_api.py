@@ -19,6 +19,7 @@ from sanic.exceptions import BadRequest, NotFound
 from db.models import ImportRun
 
 from api import control
+from api import control_ptg_v4_recovery as v4_recovery_control
 from api import metrics as api_metrics
 from api.control import _require_control_auth
 from api import control_imports
@@ -3653,6 +3654,168 @@ async def test_control_ptg_source_snapshot_remove_endpoint(monkeypatch):
     assert response.status == 200
     assert payload["executed"] is True
     assert calls == [{"snapshot_id": "snap_old", "source_key": "source_a"}]
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_v4_failed_layout_recovery_plan_endpoint(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    calls = []
+
+    async def fake_plan(**kwargs):
+        calls.append(kwargs)
+        return {
+            "snapshot_key": kwargs["snapshot_key"],
+            "plan_digest": "a" * 64,
+            "executable": True,
+        }
+
+    monkeypatch.setattr(
+        v4_recovery_control,
+        "plan_ptg2_v4_recovery",
+        fake_plan,
+    )
+    response = await v4_recovery_control.control_v4_recovery_plan(
+        authed_request(
+            json={
+                "snapshot_id": "ptg2:202607:test",
+                "import_run_id": "ptg2:test-run",
+                "snapshot_key": 491,
+            }
+        )
+    )
+    response_by_field = json.loads(response.body)
+
+    assert response.status == 200
+    assert response_by_field["executable"] is True
+    assert calls == [
+        {
+            "snapshot_id": "ptg2:202607:test",
+            "import_run_id": "ptg2:test-run",
+            "snapshot_key": 491,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_v4_failed_layout_recover_endpoint(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    calls = []
+
+    async def fake_recover(**kwargs):
+        calls.append(kwargs)
+        return {
+            "snapshot_key": kwargs["snapshot_key"],
+            "executed": True,
+        }
+
+    monkeypatch.setattr(
+        v4_recovery_control,
+        "recover_ptg2_v4_layout",
+        fake_recover,
+    )
+    response = await v4_recovery_control.control_v4_recover(
+        authed_request(
+            json={
+                "snapshot_id": "ptg2:202607:test",
+                "import_run_id": "ptg2:test-run",
+                "snapshot_key": 491,
+                "expected_plan_digest": "a" * 64,
+            }
+        )
+    )
+    response_by_field = json.loads(response.body)
+
+    assert response.status == 200
+    assert response_by_field["executed"] is True
+    assert calls == [
+        {
+            "snapshot_id": "ptg2:202607:test",
+            "import_run_id": "ptg2:test-run",
+            "snapshot_key": 491,
+            "expected_plan_digest": "a" * 64,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_v4_failed_layout_recovery_maps_conflict(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+
+    async def fake_plan(**_kwargs):
+        raise v4_recovery_control.PTG2V4RecoveryConflict("ownership changed")
+
+    monkeypatch.setattr(
+        v4_recovery_control,
+        "plan_ptg2_v4_recovery",
+        fake_plan,
+    )
+
+    with pytest.raises(control.SanicException) as exc_info:
+        await v4_recovery_control.control_v4_recovery_plan(
+            authed_request(
+                json={
+                    "snapshot_id": "ptg2:202607:test",
+                    "import_run_id": "ptg2:test-run",
+                    "snapshot_key": 491,
+                }
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_v4_recovery_plan_maps_bad_request(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+
+    async def fake_plan(**_kwargs):
+        raise ValueError("invalid target")
+
+    monkeypatch.setattr(
+        v4_recovery_control,
+        "plan_ptg2_v4_recovery",
+        fake_plan,
+    )
+
+    with pytest.raises(BadRequest, match="invalid target"):
+        await v4_recovery_control.control_v4_recovery_plan(
+            authed_request(json={"snapshot_key": 0})
+        )
+
+
+@pytest.mark.parametrize(
+    ("raised_error", "expected_status"),
+    (
+        (
+            v4_recovery_control.PTG2V4RecoveryConflict("ownership changed"),
+            409,
+        ),
+        (ValueError("invalid digest"), 400),
+    ),
+)
+@pytest.mark.asyncio
+async def test_control_ptg_v4_recover_maps_failures(
+    monkeypatch,
+    raised_error: Exception,
+    expected_status: int,
+) -> None:
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+
+    async def fake_recover(**_kwargs):
+        raise raised_error
+
+    monkeypatch.setattr(
+        v4_recovery_control,
+        "recover_ptg2_v4_layout",
+        fake_recover,
+    )
+
+    with pytest.raises(control.SanicException) as exc_info:
+        await v4_recovery_control.control_v4_recover(
+            authed_request(json={"expected_plan_digest": "bad"})
+        )
+
+    assert exc_info.value.status_code == expected_status
 
 
 @pytest.mark.asyncio
