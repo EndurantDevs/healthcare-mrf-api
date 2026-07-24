@@ -144,6 +144,53 @@ class PTGFileProgressCoordinator:
             or scanner_observation.get("phase")
             or "processing"
         )
+        is_indeterminate = (
+            file_index not in self._completed_indices
+            and _is_progress_denominator_indeterminate(scanner_observation)
+        )
+        if is_indeterminate:
+            semantic_work_done = scanner_observation.get("work_done")
+            if semantic_work_done is None:
+                semantic_work_done = scanner_observation.get("done")
+            progress_position_by_field = {
+                "stage_pct": None,
+                "phase_pct": None,
+                "unit": (
+                    scanner_observation.get("unit")
+                    or scanner_observation.get("basis")
+                    or "items"
+                ),
+                "basis": (
+                    scanner_observation.get("basis")
+                    or scanner_observation.get("unit")
+                    or "items"
+                ),
+                "denominator_state": "unknown",
+                "done": scanner_observation.get("done"),
+                "total": None,
+                "work_done": semantic_work_done,
+                "work_total": None,
+                "pct": None,
+                "weighted_compressed_input_bytes_lower_bound": int(
+                    weighted_done
+                ),
+                "stage_pct_lower_bound": stage_fraction * 100.0,
+                "pct_lower_bound": min(run_pct, self._stage_end_pct),
+                "eta_seconds": None,
+            }
+        else:
+            progress_position_by_field = {
+                "stage_pct": stage_fraction * 100.0,
+                "phase_pct": scanner_observation.get("phase_pct"),
+                "unit": "compressed_input_bytes",
+                "basis": "weighted_compressed_input_bytes",
+                "denominator_state": "known",
+                "done": int(weighted_done),
+                "total": self._total_weight,
+                "work_done": int(weighted_done),
+                "work_total": self._total_weight,
+                "pct": min(run_pct, self._stage_end_pct),
+            }
         weight_label = f"{file_weight_pct:.1f}% of compressed input"
         if file_index == self._dominant_index:
             weight_label += "; largest file"
@@ -151,15 +198,7 @@ class PTGFileProgressCoordinator:
             **dict(scanner_observation),
             "stage_id": self._stage_id,
             "stage_ordinal": self._stage_ordinal,
-            "stage_pct": stage_fraction * 100.0,
-            "unit": "compressed_input_bytes",
-            "basis": "weighted_compressed_input_bytes",
-            "denominator_state": "known",
-            "done": int(weighted_done),
-            "total": self._total_weight,
-            "work_done": int(weighted_done),
-            "work_total": self._total_weight,
-            "pct": min(run_pct, self._stage_end_pct),
+            **progress_position_by_field,
             "file_index": file_index + 1,
             "file_count": len(self._weights),
             "file_name": self._labels[file_index],
@@ -180,6 +219,8 @@ class PTGFileProgressCoordinator:
 
 
 def _file_progress_fraction(payload: Mapping[str, Any]) -> float | None:
+    if _is_progress_denominator_indeterminate(payload):
+        return None
     for field_name in ("phase_pct", "stage_pct"):
         try:
             value = float(payload.get(field_name))
@@ -195,6 +236,21 @@ def _file_progress_fraction(payload: Mapping[str, Any]) -> float | None:
     if total <= 0 or done != done or total != total:
         return None
     return max(0.0, min(done / total, 1.0))
+
+
+def _is_progress_denominator_indeterminate(payload: Mapping[str, Any]) -> bool:
+    """Return whether a progress payload exposes only lower-bound work."""
+
+    progress_basis = str(
+        payload.get("basis") or payload.get("unit") or ""
+    ).strip().lower()
+    denominator_state = str(
+        payload.get("denominator_state") or ""
+    ).strip().lower()
+    return (
+        progress_basis == "semantic_work"
+        and denominator_state in {"unknown", "lower_bound"}
+    )
 
 
 def _merge_file_progress_counters(

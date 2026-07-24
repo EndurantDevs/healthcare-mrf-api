@@ -72,6 +72,8 @@ _RICH_PROGRESS_FIELDS = (
     "stage_ordinal",
     "stage_pct",
     "phase_pct",
+    "stage_pct_lower_bound",
+    "pct_lower_bound",
     "basis",
     "denominator_state",
     "file_index",
@@ -85,6 +87,7 @@ _RICH_PROGRESS_FIELDS = (
     "file_weight",
     "file_weight_pct",
     "dominant_file",
+    "weighted_compressed_input_bytes_lower_bound",
     "observed_at",
     "progressed_at",
 )
@@ -322,6 +325,8 @@ def _merged_live_progress_candidate(
         "dead_letter",
     }
     has_succeeded = status == "succeeded"
+    if not is_terminal:
+        _clear_indeterminate_semantic_progress_fields(candidate_by_field)
     _normalize_progress_fields(candidate_by_field, succeeded=has_succeeded)
     _normalize_estimate_fields(
         candidate_by_field,
@@ -339,6 +344,36 @@ def _merged_live_progress_candidate(
             str(candidate_by_field["label"])
         )
     return candidate_by_field
+
+
+def _clear_indeterminate_semantic_progress_fields(
+    candidate_by_field: dict[str, Any],
+) -> None:
+    """Prevent stale bounded fields from masking current lower-bound work."""
+
+    progress_basis = str(
+        candidate_by_field.get("basis")
+        or candidate_by_field.get("unit")
+        or ""
+    ).strip().lower()
+    denominator_state = str(
+        candidate_by_field.get("denominator_state") or ""
+    ).strip().lower()
+    if (
+        progress_basis != "semantic_work"
+        or denominator_state not in {"unknown", "lower_bound"}
+    ):
+        return
+    for field_name in (
+        "pct",
+        "stage_pct",
+        "phase_pct",
+        "total",
+        "work_total",
+        "eta_seconds",
+        "estimated_finish_at",
+    ):
+        candidate_by_field.pop(field_name, None)
 
 
 def _new_live_progress_candidate_by_field(
@@ -776,16 +811,19 @@ def _movement_signature(progress: dict[str, Any]) -> str:
             "stage_id",
             "stage_ordinal",
             "stage_pct",
+            "stage_pct_lower_bound",
             "phase_pct",
             "unit",
             "done",
             "total",
             "pct",
+            "pct_lower_bound",
             "basis",
             "file_index",
             "file_count",
             "file_name",
             "counters",
+            "weighted_compressed_input_bytes_lower_bound",
         )
         if progress.get(key) is not None
     }
