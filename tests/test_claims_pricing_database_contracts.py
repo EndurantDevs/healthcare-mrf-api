@@ -169,7 +169,8 @@ async def test_publish_renames_tables_and_owned_indexes(monkeypatch):
     await claims_pricing._publish_by_table_rename(classes_by_name, "mrf")
     sql_text = "\n".join(status_call.args[0] for status_call in status.await_args_list)
     assert "DROP TABLE IF EXISTS" in sql_text
-    assert "RENAME TO" in sql_text
+    assert "ALTER TABLE mrf." in sql_text
+    assert "ALTER TABLE IF EXISTS" not in sql_text
     assert "state_idx" in sql_text
 
 

@@ -142,6 +142,22 @@ class RecordingRedis:
 
         return self.values_by_key.get(key)
 
+    async def eval(
+        self,
+        _script: str,
+        key_count: int,
+        key: str,
+        owner_token: str,
+    ) -> int:
+        """Apply the owner-token compare-and-delete lock contract."""
+
+        assert key_count == 1
+        if self.values_by_key.get(key) != owner_token:
+            return 0
+        self.values_by_key.pop(key, None)
+        self.deleted_keys.append(key)
+        return 1
+
     async def expire(self, key: str, seconds: int) -> None:
         """Record TTL refreshes."""
 

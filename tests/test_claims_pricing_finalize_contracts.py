@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import importlib
 import json
 from pathlib import Path
@@ -13,12 +14,31 @@ from tests.claims_pricing_contract_fakes import RecordingRedis
 claims_pricing = importlib.import_module("process.claims_pricing")
 
 
+def _finalize_spec() -> object:
+    return claims_pricing._ClaimsFinalizeSpec(
+        "import_a",
+        "run-a",
+        False,
+        "mrf",
+        "stage-a",
+        0,
+    )
+
+
 def test_cleanup_requires_explicit_existing_work_dir(monkeypatch, tmp_path):
     remove_tree = Mock()
     monkeypatch.setattr(claims_pricing.shutil, "rmtree", remove_tree)
     monkeypatch.setattr(claims_pricing, "CLAIMS_KEEP_WORKDIR", False)
-    claims_pricing._cleanup_claims_work_dir({})
-    claims_pricing._cleanup_claims_work_dir({"work_dir": str(tmp_path / "missing")})
+    monkeypatch.setattr(
+        claims_pricing,
+        "CLAIMS_WORKDIR",
+        str(tmp_path / "claims"),
+    )
+    claims_pricing._cleanup_claims_work_dir({}, _finalize_spec())
+    claims_pricing._cleanup_claims_work_dir(
+        {"work_dir": str(tmp_path / "missing")},
+        _finalize_spec(),
+    )
     remove_tree.assert_not_called()
 
 
@@ -26,18 +46,65 @@ def test_cleanup_honors_retention_flag(monkeypatch, tmp_path):
     remove_tree = Mock()
     monkeypatch.setattr(claims_pricing.shutil, "rmtree", remove_tree)
     monkeypatch.setattr(claims_pricing, "CLAIMS_KEEP_WORKDIR", True)
-    claims_pricing._cleanup_claims_work_dir({"work_dir": str(tmp_path)})
+    claims_pricing._cleanup_claims_work_dir(
+        {"work_dir": str(tmp_path)},
+        _finalize_spec(),
+    )
     remove_tree.assert_not_called()
 
 
 def test_cleanup_removes_only_manifest_work_dir(monkeypatch, tmp_path):
-    run_work_dir = tmp_path / "run"
-    run_work_dir.mkdir()
+    work_dir_root = tmp_path / "claims"
+    run_work_dir = work_dir_root / "import_a" / "run-a"
+    run_work_dir.mkdir(parents=True)
     remove_tree = Mock()
     monkeypatch.setattr(claims_pricing.shutil, "rmtree", remove_tree)
     monkeypatch.setattr(claims_pricing, "CLAIMS_KEEP_WORKDIR", False)
-    claims_pricing._cleanup_claims_work_dir({"work_dir": str(run_work_dir)})
-    remove_tree.assert_called_once_with(run_work_dir, ignore_errors=True)
+    monkeypatch.setattr(
+        claims_pricing,
+        "CLAIMS_WORKDIR",
+        str(work_dir_root),
+    )
+    claims_pricing._cleanup_claims_work_dir(
+        {"work_dir": str(run_work_dir)},
+        _finalize_spec(),
+    )
+    remove_tree.assert_called_once_with(
+        run_work_dir.resolve(),
+        ignore_errors=True,
+    )
+
+
+def test_cleanup_rejects_outside_and_symlinked_work_dirs(
+    monkeypatch,
+    tmp_path,
+):
+    work_dir_root = tmp_path / "claims"
+    expected_work_dir = work_dir_root / "import_a" / "run-a"
+    outside_work_dir = tmp_path / "outside"
+    outside_work_dir.mkdir()
+    expected_work_dir.parent.mkdir(parents=True)
+    expected_work_dir.symlink_to(outside_work_dir, target_is_directory=True)
+    remove_tree = Mock()
+    monkeypatch.setattr(claims_pricing.shutil, "rmtree", remove_tree)
+    monkeypatch.setattr(claims_pricing, "CLAIMS_KEEP_WORKDIR", False)
+    monkeypatch.setattr(
+        claims_pricing,
+        "CLAIMS_WORKDIR",
+        str(work_dir_root),
+    )
+
+    claims_pricing._cleanup_claims_work_dir(
+        {"work_dir": str(outside_work_dir)},
+        _finalize_spec(),
+    )
+    claims_pricing._cleanup_claims_work_dir(
+        {"work_dir": str(expected_work_dir)},
+        _finalize_spec(),
+    )
+
+    remove_tree.assert_not_called()
+    assert outside_work_dir.is_dir()
 
 
 @pytest.mark.asyncio
@@ -78,8 +145,9 @@ async def test_finalize_returns_idempotent_response(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_finalize_publishes_diagnostics_and_cleans_manifest(monkeypatch, tmp_path):
-    run_work_dir = tmp_path / "run"
-    run_work_dir.mkdir()
+    work_dir_root = tmp_path / "claims"
+    run_work_dir = work_dir_root / "import_a" / "run-a"
+    run_work_dir.mkdir(parents=True)
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
         json.dumps(
@@ -104,6 +172,7 @@ async def test_finalize_publishes_diagnostics_and_cleans_manifest(monkeypatch, t
         AsyncMock(return_value=diagnostics_by_field),
     )
     monkeypatch.setattr(claims_pricing, "mark_control_run", AsyncMock())
+    monkeypatch.setattr(claims_pricing, "CLAIMS_WORKDIR", str(work_dir_root))
     monkeypatch.setattr(claims_pricing, "CLAIMS_KEEP_WORKDIR", False)
     response_by_field = await claims_pricing.claims_pricing_finalize(
         {},
@@ -136,6 +205,64 @@ async def test_finalize_with_redis_records_terminal_state(monkeypatch):
     monkeypatch.setattr(claims_pricing, "_mark_claims_succeeded", AsyncMock())
     await claims_pricing.claims_pricing_finalize({"redis": redis}, {})
     assert redis.values_by_key["claims_pricing:r:finalized"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finalize_failure",
+    [
+        RuntimeError("publish failed"),
+        asyncio.CancelledError("publish cancelled"),
+    ],
+)
+async def test_finalize_releases_lock_after_failure_or_cancellation(
+    monkeypatch,
+    finalize_failure,
+):
+    redis = RecordingRedis()
+    finalize_spec = claims_pricing._ClaimsFinalizeSpec(
+        "i",
+        "r",
+        False,
+        "mrf",
+        "s",
+        0,
+    )
+    release_lock = AsyncMock()
+    monkeypatch.setattr(
+        claims_pricing,
+        "_claims_finalize_spec",
+        lambda *_args: finalize_spec,
+    )
+    monkeypatch.setattr(claims_pricing, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        claims_pricing,
+        "_wait_for_claims_finalize_turn",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "_staging_classes",
+        lambda *_args: {},
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "_materialize_and_publish_claims",
+        AsyncMock(side_effect=finalize_failure),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "_release_claims_finalize_lock_safely",
+        release_lock,
+    )
+
+    with pytest.raises(type(finalize_failure)):
+        await claims_pricing.claims_pricing_finalize(
+            {"redis": redis},
+            {},
+        )
+
+    release_lock.assert_awaited_once_with(redis, finalize_spec)
 
 
 @pytest.mark.asyncio
@@ -180,6 +307,28 @@ async def test_run_timed_step_reports_completion(monkeypatch):
     await claims_pricing._run_timed_step("synthetic", operation())
     assert completed_steps == ["operation"]
     step_end.assert_called_once_with("synthetic", 5.0)
+
+
+@pytest.mark.asyncio
+async def test_run_timed_step_reports_failure_without_completion(monkeypatch):
+    step_end = Mock()
+    step_failed = Mock()
+    failure = RuntimeError("synthetic failure")
+    monkeypatch.setattr(claims_pricing, "_step_start", lambda _label: 5.0)
+    monkeypatch.setattr(claims_pricing, "_step_end", step_end)
+    monkeypatch.setattr(claims_pricing, "_step_failed", step_failed)
+
+    async def failed_operation():
+        raise failure
+
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        await claims_pricing._run_timed_step(
+            "synthetic",
+            failed_operation(),
+        )
+
+    step_end.assert_not_called()
+    step_failed.assert_called_once_with("synthetic", 5.0, failure)
 
 
 @pytest.mark.asyncio

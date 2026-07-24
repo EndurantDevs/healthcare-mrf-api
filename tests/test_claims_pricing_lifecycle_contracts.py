@@ -24,8 +24,26 @@ async def test_run_state_tracks_totals_members_and_lock():
     await claims_pricing._mark_chunk_done(redis, "run-a", "provider:0")
     total_chunks, done_chunks = await claims_pricing._get_run_progress(redis, "run-a", 99)
     assert (total_chunks, done_chunks) == (5, 1)
-    assert await claims_pricing._is_finalize_lock_claimed(redis, "run-a") is True
-    assert await claims_pricing._is_finalize_lock_claimed(redis, "run-a") is False
+    assert await claims_pricing._is_finalize_lock_claimed(
+        redis,
+        "run-a",
+        "owner-one",
+    ) is True
+    assert await claims_pricing._is_finalize_lock_claimed(
+        redis,
+        "run-a",
+        "owner-two",
+    ) is False
+    assert not await claims_pricing._release_claims_finalize_lock(
+        redis,
+        "run-a",
+        "owner-two",
+    )
+    assert await claims_pricing._release_claims_finalize_lock(
+        redis,
+        "run-a",
+        "owner-one",
+    )
     assert set(redis.deleted_keys) == {
         "claims_pricing:run-a:total_chunks",
         "claims_pricing:run-a:done_chunks",
@@ -66,17 +84,26 @@ async def test_mark_done_propagates_terminal_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_timed_value_closes_step_on_failure(monkeypatch):
+async def test_timed_value_reports_failure_without_logging_completion(
+    monkeypatch,
+):
     step_end = Mock()
+    step_failed = Mock()
     monkeypatch.setattr(claims_pricing, "_step_start", lambda _label: 10.0)
     monkeypatch.setattr(claims_pricing, "_step_end", step_end)
+    monkeypatch.setattr(claims_pricing, "_step_failed", step_failed)
 
     async def fail_step():
         raise RuntimeError("failed step")
 
-    with pytest.raises(RuntimeError, match="failed step"):
+    with pytest.raises(RuntimeError, match="failed step") as raised:
         await claims_pricing._timed_value("synthetic", fail_step())
-    step_end.assert_called_once_with("synthetic", 10.0)
+    step_end.assert_not_called()
+    step_failed.assert_called_once_with(
+        "synthetic",
+        10.0,
+        raised.value,
+    )
 
 
 @pytest.mark.asyncio
@@ -99,6 +126,9 @@ async def test_download_split_source_annotates_chunk_contract(monkeypatch, tmp_p
             }
         ]
     )
+    step_end = Mock()
+    monkeypatch.setattr(claims_pricing, "_step_start", lambda _label: 2.0)
+    monkeypatch.setattr(claims_pricing, "_step_end", step_end)
     monkeypatch.setattr(claims_pricing, "_download_source_file", download_source)
     monkeypatch.setattr(claims_pricing, "_split_source_into_chunks", split_source)
     downloaded = await claims_pricing._download_split_claims_source(
@@ -111,16 +141,25 @@ async def test_download_split_source_annotates_chunk_contract(monkeypatch, tmp_p
     assert downloaded.chunk_entries[0]["reporting_year"] == 2023
     assert downloaded.chunk_entries[0]["source_index"] == 2
     assert download_source.await_args.kwargs["reporting_year"] == 2023
+    assert split_source.await_args.args[2] == (
+        tmp_path / "chunks" / "provider" / "2023_0002"
+    )
+    step_end.assert_called_once_with(
+        "download+split provider year=2023",
+        2.0,
+    )
 
 
 @pytest.mark.asyncio
 async def test_download_split_source_closes_timing_on_failure(monkeypatch, tmp_path):
     run_identity = claims_pricing._ClaimsRunIdentity(False, "i", "r", "s", tmp_path)
     step_end = Mock()
+    step_failed = Mock()
     monkeypatch.setattr(claims_pricing, "_step_start", lambda _label: 3.0)
     monkeypatch.setattr(claims_pricing, "_step_end", step_end)
+    monkeypatch.setattr(claims_pricing, "_step_failed", step_failed)
     monkeypatch.setattr(claims_pricing, "_download_source_file", AsyncMock(side_effect=OSError("offline")))
-    with pytest.raises(OSError, match="offline"):
+    with pytest.raises(OSError, match="offline") as raised:
         await claims_pricing._download_split_claims_source(
             run_identity,
             "provider",
@@ -128,7 +167,12 @@ async def test_download_split_source_closes_timing_on_failure(monkeypatch, tmp_p
             0,
             asyncio.Semaphore(1),
         )
-    step_end.assert_called_once()
+    step_end.assert_not_called()
+    step_failed.assert_called_once_with(
+        "download+split provider year=2013",
+        3.0,
+        raised.value,
+    )
 
 
 @pytest.mark.asyncio
@@ -237,13 +281,27 @@ async def test_start_persists_manifest_before_finalize(monkeypatch, tmp_path):
             "dataset_key": "provider",
             "chunk_index": 0,
             "chunk_path": str(tmp_path / "chunk.csv"),
+            "source_index": 0,
         }
     ]
+    monkeypatch.setattr(
+        claims_pricing,
+        "DATASETS",
+        (claims_pricing.DatasetConfig("provider", "landing", 10),),
+    )
     monkeypatch.setattr(claims_pricing, "CLAIMS_WORKDIR", str(tmp_path))
     monkeypatch.setattr(claims_pricing, "ensure_database", AsyncMock())
     monkeypatch.setattr(claims_pricing, "_prepare_tables", AsyncMock(return_value=({}, "mrf")))
     monkeypatch.setattr(claims_pricing, "_fetch_catalog", AsyncMock(return_value={"dataset": []}))
-    monkeypatch.setattr(claims_pricing, "_resolve_sources_async", AsyncMock(return_value={"provider": []}))
+    monkeypatch.setattr(
+        claims_pricing,
+        "_resolve_sources_async",
+        AsyncMock(
+            return_value={
+                "provider": [{"url": "https://example.test/provider.csv"}]
+            }
+        ),
+    )
     monkeypatch.setattr(claims_pricing, "_stream_claim_chunks", AsyncMock(return_value=chunk_entries))
     monkeypatch.setattr(claims_pricing, "mark_control_run", AsyncMock())
     response_by_field = await claims_pricing.claims_pricing_start(
@@ -253,10 +311,83 @@ async def test_start_persists_manifest_before_finalize(monkeypatch, tmp_path):
     manifest_by_field = json.loads(Path(response_by_field["manifest_path"]).read_text())
     assert response_by_field["total_chunks"] == 1
     assert manifest_by_field["chunks"] == chunk_entries
-    assert manifest_by_field["sources"] == {"provider": []}
+    assert manifest_by_field["sources"] == {
+        "provider": [{"url": "https://example.test/provider.csv"}]
+    }
     assert manifest_by_field["work_dir"].endswith("import_a/run-a")
     assert redis.jobs[-1]["function"] == "claims_pricing_finalize"
     assert redis.jobs[-1]["task"]["manifest_path"] == response_by_field["manifest_path"]
+
+
+@pytest.mark.asyncio
+async def test_start_refuses_finalize_when_a_required_source_has_no_rows(
+    monkeypatch,
+    tmp_path,
+):
+    redis = RecordingRedis()
+    chunk_entries = [
+        {
+            "dataset_key": "provider",
+            "chunk_index": 0,
+            "chunk_path": str(tmp_path / "provider-chunk.csv"),
+            "source_index": 0,
+        }
+    ]
+    sources_by_dataset = {
+        "provider": [{"url": "https://example.test/provider.csv"}],
+        "geo_service": [{"url": "https://example.test/geo.csv"}],
+    }
+    mark_control = AsyncMock()
+    monkeypatch.setattr(
+        claims_pricing,
+        "DATASETS",
+        (
+            claims_pricing.DatasetConfig("provider", "provider", 10),
+            claims_pricing.DatasetConfig("geo_service", "geo", 10),
+        ),
+    )
+    monkeypatch.setattr(claims_pricing, "CLAIMS_WORKDIR", str(tmp_path))
+    monkeypatch.setattr(claims_pricing, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        claims_pricing,
+        "_prepare_tables",
+        AsyncMock(return_value=({}, "mrf")),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "_fetch_catalog",
+        AsyncMock(return_value={"dataset": []}),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "_resolve_sources_async",
+        AsyncMock(return_value=sources_by_dataset),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "_stream_claim_chunks",
+        AsyncMock(return_value=chunk_entries),
+    )
+    monkeypatch.setattr(claims_pricing, "mark_control_run", mark_control)
+
+    with pytest.raises(RuntimeError, match="geo_service:0"):
+        await claims_pricing.claims_pricing_start(
+            {"redis": redis},
+            {
+                "test_mode": True,
+                "import_id": "import-a",
+                "run_id": "run-a",
+            },
+        )
+
+    assert all(
+        queued_job["function"] != "claims_pricing_finalize"
+        for queued_job in redis.jobs
+    )
+    assert mark_control.await_args.kwargs["status"] == "failed"
+    assert mark_control.await_args.kwargs["metrics"] == {
+        "missing_sources": ["geo_service:0"]
+    }
 
 
 @pytest.mark.asyncio
@@ -450,6 +581,50 @@ async def test_finalize_wait_claims_lock_and_marks_phase(monkeypatch):
     assert await claims_pricing._wait_for_claims_finalize_turn(RecordingRedis(), finalize_spec) is None
     assert mark_control.await_args.kwargs["status"] == "finalizing"
     assert mark_control.await_args.kwargs["progress"]["pct"] == 99
+
+
+@pytest.mark.asyncio
+async def test_finalize_wait_releases_lock_when_status_update_fails(
+    monkeypatch,
+):
+    redis = RecordingRedis()
+    finalize_spec = claims_pricing._ClaimsFinalizeSpec(
+        "i",
+        "r",
+        False,
+        "mrf",
+        "s",
+        1,
+    )
+    release_lock = AsyncMock()
+    monkeypatch.setattr(
+        claims_pricing,
+        "_get_run_progress",
+        AsyncMock(return_value=(1, 1)),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "_claim_finalize_lock",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "mark_control_run",
+        AsyncMock(side_effect=RuntimeError("status unavailable")),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "_release_claims_finalize_lock_safely",
+        release_lock,
+    )
+
+    with pytest.raises(RuntimeError, match="status unavailable"):
+        await claims_pricing._wait_for_claims_finalize_turn(
+            redis,
+            finalize_spec,
+        )
+
+    release_lock.assert_awaited_once_with(redis, finalize_spec)
 
 
 @pytest.mark.asyncio

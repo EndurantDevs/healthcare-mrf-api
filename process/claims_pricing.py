@@ -15,7 +15,7 @@ import shutil
 import secrets
 import time
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -286,13 +286,45 @@ async def _get_run_progress(redis, run_id: str, expected_default: int) -> tuple[
     return total_chunks, done_chunks
 
 
-async def _is_finalize_lock_claimed(redis, run_id: str) -> bool:
+async def _is_finalize_lock_claimed(
+    redis,
+    run_id: str,
+    owner_token: str | None = None,
+) -> bool:
     lock_key = _state_key(run_id, "finalize_lock")
-    lock_set = await redis.set(lock_key, "1", ex=CLAIMS_REDIS_TTL_SECONDS, nx=True)
+    lock_set = await redis.set(
+        lock_key,
+        owner_token or secrets.token_hex(16),
+        ex=CLAIMS_REDIS_TTL_SECONDS,
+        nx=True,
+    )
     return bool(lock_set)
 
 
 _claim_finalize_lock = _is_finalize_lock_claimed
+
+
+async def _release_claims_finalize_lock(
+    redis: Any,
+    run_id: str,
+    owner_token: str,
+) -> bool:
+    """Release only the finalize lock owned by this worker attempt."""
+
+    if redis is None or not run_id or not owner_token:
+        return False
+    lock_key = _state_key(run_id, "finalize_lock")
+    release_script = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+    released = await redis.eval(
+        release_script,
+        1,
+        lock_key,
+        owner_token,
+    )
+    return bool(released)
 
 
 def _print_row_progress(stage: str, parsed: int, accepted: int, start_time: float, final: bool = False) -> None:
@@ -316,12 +348,27 @@ def _step_end(label: str, started_at: float) -> None:
     _safe_print(f"[step] DONE  {label} in {elapsed:.1f}s", flush=True)
 
 
+def _step_failed(
+    label: str,
+    started_at: float,
+    error: BaseException,
+) -> None:
+    elapsed = max(time.monotonic() - started_at, 0.001)
+    _safe_print(
+        f"[step] FAILED {label} in {elapsed:.1f}s "
+        f"({type(error).__name__})",
+        flush=True,
+    )
+
+
 async def _run_timed_step(label: str, coro) -> None:
     started_at = _step_start(label)
     try:
         await coro
-    finally:
-        _step_end(label, started_at)
+    except BaseException as error:
+        _step_failed(label, started_at, error)
+        raise
+    _step_end(label, started_at)
 
 
 def _normalize_import_id(import_id: str | None) -> str:
@@ -2343,7 +2390,8 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
             table = cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
             await db.status(
-                f"ALTER TABLE IF EXISTS {schema}.{staged_class.__tablename__} RENAME TO {table};"
+                f"ALTER TABLE {schema}.{staged_class.__tablename__} "
+                f"RENAME TO {table};"
             )
 
             await db.status(
@@ -2410,9 +2458,12 @@ def _claims_run_identity(task_by_field: dict[str, Any]) -> _ClaimsRunIdentity:
 async def _timed_value(label: str, awaitable: Any) -> Any:
     step_started_at = _step_start(label)
     try:
-        return await awaitable
-    finally:
-        _step_end(label, step_started_at)
+        value = await awaitable
+    except BaseException as error:
+        _step_failed(label, step_started_at, error)
+        raise
+    _step_end(label, step_started_at)
+    return value
 
 
 async def _resolve_sources_async(
@@ -2444,15 +2495,20 @@ async def _download_split_claims_source(
             chunk_entries = await _split_source_into_chunks(
                 dataset_key,
                 local_path,
-                run_identity.chunks_root / dataset_key,
+                run_identity.chunks_root
+                / dataset_key
+                / f"{reporting_year}_{source_index:04d}",
                 run_identity.test_mode,
             )
             for chunk_by_field in chunk_entries:
                 chunk_by_field["reporting_year"] = reporting_year
                 chunk_by_field["source_index"] = source_index
-            return _DownloadedClaimsSource(chunk_entries)
-        finally:
-            _step_end(step_label, step_started_at)
+            downloaded_source = _DownloadedClaimsSource(chunk_entries)
+        except BaseException as error:
+            _step_failed(step_label, step_started_at, error)
+            raise
+        _step_end(step_label, step_started_at)
+        return downloaded_source
 
 
 async def _enqueue_claim_chunk(
@@ -2588,6 +2644,46 @@ async def _mark_claim_chunks_queued(
     )
 
 
+def _find_missing_claim_sources(
+    sources_by_dataset: dict[str, list[dict[str, Any]]],
+    chunk_entries: list[dict[str, Any]],
+) -> list[str]:
+    """Identify required source files that produced no processable chunk."""
+
+    observed_source_keys = {
+        (
+            str(chunk_by_field.get("dataset_key") or ""),
+            _safe_int(chunk_by_field.get("source_index"), -1),
+        )
+        for chunk_by_field in chunk_entries
+    }
+    missing_sources = []
+    for dataset in DATASETS:
+        source_descriptors = sources_by_dataset.get(dataset.key) or []
+        if not source_descriptors:
+            missing_sources.append(f"{dataset.key}:no-source")
+            continue
+        for source_index, _source_descriptor in enumerate(source_descriptors):
+            if (dataset.key, source_index) not in observed_source_keys:
+                missing_sources.append(f"{dataset.key}:{source_index}")
+    return missing_sources
+
+
+async def _fail_empty_claim_sources(
+    run_identity: _ClaimsRunIdentity,
+    missing_sources: list[str],
+) -> None:
+    """Record a fail-closed start result before preserving live tables."""
+
+    await mark_control_run(
+        run_identity.run_id,
+        status="failed",
+        phase_detail="claims-pricing source produced no rows",
+        progress_message="source produced no processable rows",
+        metrics={"missing_sources": missing_sources},
+    )
+
+
 async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Prepare staging, split sources, and enqueue claims-pricing chunks."""
 
@@ -2623,6 +2719,16 @@ async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[
         "download+split+enqueue chunks (streaming)",
         _stream_claim_chunks(redis, run_identity, schema, sources_by_dataset),
     )
+    missing_sources = _find_missing_claim_sources(
+        sources_by_dataset,
+        chunk_entries,
+    )
+    if missing_sources:
+        await _fail_empty_claim_sources(run_identity, missing_sources)
+        raise RuntimeError(
+            "Claims pricing import produced no processable rows for required "
+            f"sources: {', '.join(missing_sources)}"
+        )
     manifest_by_field = _claims_manifest_by_field(run_identity, schema, sources_by_dataset, chunk_entries)
     manifest_path = _manifest_path(run_identity.work_dir)
     _write_manifest(manifest_path, manifest_by_field)
@@ -2747,6 +2853,11 @@ class _ClaimsFinalizeSpec:
     schema: str
     stage_suffix: str
     expected_chunks: int
+    finalize_lock_token: str = field(
+        default_factory=lambda: secrets.token_hex(16),
+        compare=False,
+        repr=False,
+    )
 
 
 def _claims_finalize_spec(
@@ -2815,22 +2926,30 @@ async def _wait_for_claims_finalize_turn(
             flush=True,
         )
         raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
-    if not await _claim_finalize_lock(redis, finalize_spec.run_id):
-        raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
-    await mark_control_run(
+    if not await _claim_finalize_lock(
+        redis,
         finalize_spec.run_id,
-        status="finalizing",
-        phase_detail="claims-pricing finalizing",
-        progress_message="finalizing",
-        progress={
-            "unit": "chunks",
-            "total": total_chunks,
-            "done": done_chunks,
-            "pct": 99,
-            "message": "finalizing",
-            "phase": "claims-pricing finalizing",
-        },
-    )
+        finalize_spec.finalize_lock_token,
+    ):
+        raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
+    try:
+        await mark_control_run(
+            finalize_spec.run_id,
+            status="finalizing",
+            phase_detail="claims-pricing finalizing",
+            progress_message="finalizing",
+            progress={
+                "unit": "chunks",
+                "total": total_chunks,
+                "done": done_chunks,
+                "pct": 99,
+                "message": "finalizing",
+                "phase": "claims-pricing finalizing",
+            },
+        )
+    except BaseException:
+        await _release_claims_finalize_lock_safely(redis, finalize_spec)
+        raise
     return None
 
 
@@ -2871,11 +2990,51 @@ async def _record_claims_finalized(redis: Any, finalize_spec: _ClaimsFinalizeSpe
     await redis.expire(finalized_key, CLAIMS_REDIS_TTL_SECONDS)
 
 
-def _cleanup_claims_work_dir(manifest_by_field: dict[str, Any]) -> None:
+async def _release_claims_finalize_lock_safely(
+    redis: Any,
+    finalize_spec: _ClaimsFinalizeSpec,
+) -> None:
+    """Release the owned lock without masking finalize success or failure."""
+
+    try:
+        await _release_claims_finalize_lock(
+            redis,
+            finalize_spec.run_id,
+            finalize_spec.finalize_lock_token,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to release claims-pricing finalize lock for run_id=%s: %s",
+            finalize_spec.run_id,
+            exc,
+        )
+
+
+def _cleanup_claims_work_dir(
+    manifest_by_field: dict[str, Any],
+    finalize_spec: _ClaimsFinalizeSpec,
+) -> None:
     work_dir_text = str(manifest_by_field.get("work_dir") or "")
     if not work_dir_text or CLAIMS_KEEP_WORKDIR:
         return
-    run_work_dir = Path(work_dir_text)
+    work_dir_root = Path(CLAIMS_WORKDIR).expanduser().resolve()
+    expected_work_dir = (
+        work_dir_root / finalize_spec.import_id / finalize_spec.run_id
+    ).resolve()
+    run_work_dir = Path(work_dir_text).expanduser().resolve()
+    try:
+        expected_work_dir.relative_to(work_dir_root)
+    except ValueError:
+        logger.warning("Refusing unsafe claims-pricing workspace cleanup")
+        return
+    if (
+        not finalize_spec.run_id
+        or work_dir_root == Path(work_dir_root.anchor)
+        or expected_work_dir == work_dir_root
+        or run_work_dir != expected_work_dir
+    ):
+        logger.warning("Refusing mismatched claims-pricing workspace cleanup")
+        return
     if run_work_dir.exists():
         shutil.rmtree(run_work_dir, ignore_errors=True)
 
@@ -2906,28 +3065,35 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
     early_response = await _wait_for_claims_finalize_turn(redis, finalize_spec)
     if early_response is not None:
         return early_response
-    classes_by_name = _staging_classes(finalize_spec.stage_suffix, finalize_spec.schema)
-    cost_level_diagnostics = await _materialize_and_publish_claims(
-        classes_by_name,
-        finalize_spec.schema,
-    )
-    await _record_claims_finalized(redis, finalize_spec)
-    _cleanup_claims_work_dir(manifest_by_field)
-    logger.info(
-        "CMS claims pricing import finalized: test_mode=%s import_id=%s run_id=%s",
-        finalize_spec.test_mode,
-        finalize_spec.import_id,
-        finalize_spec.run_id,
-    )
-    await _mark_claims_succeeded(finalize_spec)
-    return {
-        "ok": True,
-        "import_id": finalize_spec.import_id,
-        "run_id": finalize_spec.run_id,
-        "stage_suffix": finalize_spec.stage_suffix,
-        "schema": finalize_spec.schema,
-        "cost_level_diagnostics": cost_level_diagnostics,
-    }
+    try:
+        classes_by_name = _staging_classes(
+            finalize_spec.stage_suffix,
+            finalize_spec.schema,
+        )
+        cost_level_diagnostics = await _materialize_and_publish_claims(
+            classes_by_name,
+            finalize_spec.schema,
+        )
+        await _record_claims_finalized(redis, finalize_spec)
+        _cleanup_claims_work_dir(manifest_by_field, finalize_spec)
+        logger.info(
+            "CMS claims pricing import finalized: "
+            "test_mode=%s import_id=%s run_id=%s",
+            finalize_spec.test_mode,
+            finalize_spec.import_id,
+            finalize_spec.run_id,
+        )
+        await _mark_claims_succeeded(finalize_spec)
+        return {
+            "ok": True,
+            "import_id": finalize_spec.import_id,
+            "run_id": finalize_spec.run_id,
+            "stage_suffix": finalize_spec.stage_suffix,
+            "schema": finalize_spec.schema,
+            "cost_level_diagnostics": cost_level_diagnostics,
+        }
+    finally:
+        await _release_claims_finalize_lock_safely(redis, finalize_spec)
 
 
 def _queued_claims_run_response(
