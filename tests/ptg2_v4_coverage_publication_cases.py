@@ -391,7 +391,12 @@ def _configure_audit_publication(monkeypatch):
     return SimpleNamespace(selected_layout="pattern")
 
 
-async def _assert_audit_publication(compilation) -> None:
+async def _assert_audit_publication(
+    compilation,
+    *,
+    expected_representation: str,
+    expected_verification: str,
+) -> None:
     publication = await audit.publish_v4_audit_sample(
         schema_name="mrf",
         build_ownership=SharedLayoutBuildOwnership(17, "token"),
@@ -404,7 +409,11 @@ async def _assert_audit_publication(compilation) -> None:
         graph_compilation=compilation,
     )
     assert publication.row_count == 1
-    assert publication.metadata["provider_graph_representation"] == "pattern_v1"
+    assert (
+        publication.metadata["provider_graph_representation"]
+        == expected_representation
+    )
+    assert publication.metadata["provider_graph_verification"] == expected_verification
     assert len(publication.support_digest) == 32
 
 
@@ -416,6 +425,30 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             logical_snapshot_id="snapshot",
             finalizer_summary={"source_count": 1},
             mapping_digest=b"short",
+            core_support_digest=b"s" * 32,
+            atom_key_bits=16,
+            price_membership_block_span=256,
+            graph_compilation=compilation,
+        )
+    with pytest.raises(ValueError, match="core support digest"):
+        await audit.publish_v4_audit_sample(
+            schema_name="mrf",
+            build_ownership=SharedLayoutBuildOwnership(17, "token"),
+            logical_snapshot_id="snapshot",
+            finalizer_summary={"source_count": 1},
+            mapping_digest=b"m" * 32,
+            core_support_digest=b"short",
+            atom_key_bits=16,
+            price_membership_block_span=256,
+            graph_compilation=compilation,
+        )
+    with pytest.raises(RuntimeError, match="negative source_count"):
+        await audit.publish_v4_audit_sample(
+            schema_name="mrf",
+            build_ownership=SharedLayoutBuildOwnership(17, "token"),
+            logical_snapshot_id="snapshot",
+            finalizer_summary={"source_count": -1},
+            mapping_digest=b"m" * 32,
             core_support_digest=b"s" * 32,
             atom_key_bits=16,
             price_membership_block_span=256,
@@ -439,5 +472,14 @@ async def _assert_audit_publication_rejections(compilation) -> None:
 async def test_audit_publish_orchestration(monkeypatch) -> None:
     """Orchestrate audit publication and reject incomplete derived outputs."""
     compilation = _configure_audit_publication(monkeypatch)
-    await _assert_audit_publication(compilation)
+    await _assert_audit_publication(
+        compilation,
+        expected_representation="pattern_v1",
+        expected_verification="set_patterns_pattern_groups_group_npis_exact_v1",
+    )
+    await _assert_audit_publication(
+        SimpleNamespace(selected_layout="direct"),
+        expected_representation="direct_v1",
+        expected_verification="set_groups_direct_group_npis_exact_v1",
+    )
     await _assert_audit_publication_rejections(compilation)
