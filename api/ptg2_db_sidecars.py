@@ -25,6 +25,7 @@ from api.ptg2_candidate_audit_maps import (
     INTEGER_SET_MEMBERSHIP_BYTES as _AUDIT_INTEGER_SET_MEMBERSHIP_BYTES,
 )
 from api.ptg2_shared_blocks import (
+    PTG2_SHARED_PROJECTION_GENERATIONS,
     PTG2SharedBlockError,
     SharedGraphReadLimitError,
     claim_shared_block_processing,
@@ -43,7 +44,6 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
     ManifestReadLimitError,
 )
-from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
 
 
 _ProviderCodeRequests = Mapping[int, tuple[int, ...]]
@@ -486,7 +486,9 @@ async def _discover_forward_shard_keys(
               JOIN {schema}.ptg2_v3_snapshot_layout layout
                 ON layout.snapshot_key = :snapshot_key
                AND layout.state = 'sealed'
-               AND layout.generation = :generation
+               AND layout.generation = ANY(
+                   CAST(:shared_projection_generations AS text[])
+               )
               JOIN {schema}.ptg2_v3_snapshot_block mapping
                 ON mapping.snapshot_key = layout.snapshot_key
                AND mapping.object_kind = :object_kind
@@ -499,7 +501,7 @@ async def _discover_forward_shard_keys(
     )
     params_by_name = {
         "snapshot_key": _required_shared_snapshot_key(shared_snapshot_key),
-        "generation": PTG2_V3_SHARED_GENERATION,
+        "shared_projection_generations": PTG2_SHARED_PROJECTION_GENERATIONS,
         "object_kind": _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
         "code_keys": normalized_code_keys,
         "code_block_span": _SERVING_BINARY_BY_CODE_BLOCK_SPAN,
@@ -2044,7 +2046,9 @@ async def has_serving_binary_code_block(
                     ON mapping.snapshot_key = layout.snapshot_key
                  WHERE layout.snapshot_key = :snapshot_key
                    AND layout.state = 'sealed'
-                   AND layout.generation = :generation
+                   AND layout.generation = ANY(
+                       CAST(:shared_projection_generations AS text[])
+                   )
                    AND mapping.object_kind = :object_kind
                    AND mapping.block_key >= :lower_bound
                    AND mapping.block_key < :upper_bound
@@ -2056,7 +2060,7 @@ async def has_serving_binary_code_block(
             "snapshot_key": _required_shared_snapshot_key(
                 shared_snapshot_key
             ),
-            "generation": PTG2_V3_SHARED_GENERATION,
+            "shared_projection_generations": PTG2_SHARED_PROJECTION_GENERATIONS,
             "object_kind": _SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
             "lower_bound": lower_bound,
             "upper_bound": upper_bound,
@@ -4606,7 +4610,9 @@ async def has_shared_provider_pages_in_db(
                     ON mapping.snapshot_key = layout.snapshot_key
                  WHERE layout.snapshot_key = :snapshot_key
                    AND layout.state = 'sealed'
-                   AND layout.generation = 'shared_blocks_v3'
+                   AND layout.generation = ANY(
+                       CAST(:shared_projection_generations AS text[])
+                   )
                    AND mapping.object_kind = :object_kind
                  LIMIT 1
             )
@@ -4615,6 +4621,7 @@ async def has_shared_provider_pages_in_db(
         {
             "snapshot_key": _required_shared_snapshot_key(shared_snapshot_key),
             "object_kind": PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND,
+            "shared_projection_generations": PTG2_SHARED_PROJECTION_GENERATIONS,
         },
     )
     return bool(query_result.scalar())
