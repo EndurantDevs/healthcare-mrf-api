@@ -61,7 +61,7 @@ async def process_data(ctx, task=None):
             total=len(selected_files),
             message=f"{len(selected_files)} source files discovered",
         )
-    for file_index, p in enumerate(selected_files):
+    for file_index, source_file in enumerate(selected_files):
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -72,22 +72,30 @@ async def process_data(ctx, task=None):
                 done=file_index,
                 total=len(selected_files),
                 message=f"downloading file {file_index + 1}/{len(selected_files)}",
-                label=p,
+                label=source_file,
             )
         with tempfile.TemporaryDirectory() as tmpdirname:
-            print(f"Found: {p}")
-            file_name = p.split('/')[-1]
+            print(f"Found: {source_file}")
+            file_name = source_file.split('/')[-1]
             tmp_filename = str(PurePath(str(tmpdirname), file_name))
-            await download_it_and_save(os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + p, tmp_filename,
-                                       chunk_size=10 * 1024 * 1024, cache_dir='/tmp')
-            print(f"Downloaded: {p}")
+            await download_it_and_save(
+                os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + source_file,
+                tmp_filename,
+                chunk_size=10 * 1024 * 1024,
+                cache_dir='/tmp',
+            )
+            print(f"Downloaded: {source_file}")
             csv_map, csv_map_reverse = ({}, {})
             async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    for key in row:
-                        t = re.sub(r"\(.*\)", r"", key.lower()).strip().replace(' ', '_')
-                        csv_map[key] = t
-                        csv_map_reverse[t] = key
+                async for header_row in AsyncDictReader(afp, delimiter=","):
+                    for key in header_row:
+                        normalized_column_name = (
+                            re.sub(r"\(.*\)", r"", key.lower())
+                            .strip()
+                            .replace(' ', '_')
+                        )
+                        csv_map[key] = normalized_column_name
+                        csv_map_reverse[normalized_column_name] = key
                     break
 
             count = 0
@@ -96,8 +104,8 @@ async def process_data(ctx, task=None):
             row_list = []
             nucc_taxonomy_cls = make_class(NUCCTaxonomy, import_date)
             async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
-                async for row in AsyncDictReader(afp, delimiter=","):
-                    if not row['Code']:
+                async for taxonomy_row in AsyncDictReader(afp, delimiter=","):
+                    if not taxonomy_row['Code']:
                         continue
                     count += 1
                     if test_mode and count > TEST_NUCC_ROWS:
@@ -115,17 +123,19 @@ async def process_data(ctx, task=None):
                             done=count,
                             total=TEST_NUCC_ROWS if test_mode else None,
                             message=f"parsed {count} rows",
-                            label=p,
+                            label=source_file,
                         )
-                    obj = {}
+                    taxonomy_dict = {}
                     for key, mapped_key in csv_map.items():
-                        t = row[key]
-                        if not t:
-                            obj[mapped_key] = None
+                        cell_value = taxonomy_row[key]
+                        if not cell_value:
+                            taxonomy_dict[mapped_key] = None
                             continue
-                        obj[mapped_key] = t
-                    obj['int_code'] = return_checksum([obj['code'],], crc=32)
-                    row_list.append(obj)
+                        taxonomy_dict[mapped_key] = cell_value
+                    taxonomy_dict['int_code'] = return_checksum(
+                        [taxonomy_dict['code']], crc=32
+                    )
+                    row_list.append(taxonomy_dict)
                     if count % 9999 == 0:
                         await raise_if_cancelled(ctx, task)
                         await push_objects(row_list, nucc_taxonomy_cls)
@@ -147,7 +157,7 @@ async def process_data(ctx, task=None):
                     done=file_index + 1,
                     total=len(selected_files),
                     message=f"processed file {file_index + 1}/{len(selected_files)}",
-                    label=p,
+                    label=source_file,
                 )
         return 1
 
@@ -165,17 +175,22 @@ async def startup(ctx):
     import_date = ctx['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 
-    tables = {}  # for the future complex usage
+    tables_by_name = {}  # for future multi-table imports
 
     for cls in (NUCCTaxonomy,):
-        tables[cls.__main_table__] = make_class(cls, import_date)
-        obj = tables[cls.__main_table__]
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
-        await db.create_table(obj.__table__, checkfirst=True)
-        if hasattr(obj, "__my_index_elements__"):
+        tables_by_name[cls.__main_table__] = make_class(cls, import_date)
+        table_model = tables_by_name[cls.__main_table__]
+        await db.status(
+            f"DROP TABLE IF EXISTS "
+            f"{db_schema}.{table_model.__main_table__}_{import_date};"
+        )
+        await db.create_table(table_model.__table__, checkfirst=True)
+        if hasattr(table_model, "__my_index_elements__"):
             await db.status(
-                f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
-                f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
+                f"CREATE UNIQUE INDEX {table_model.__tablename__}_idx_primary ON "
+                f"{db_schema}.{table_model.__tablename__} "
+                f"({', '.join(table_model.__my_index_elements__)});"
+            )
 
     print("Preparing done")
 
@@ -187,25 +202,34 @@ async def shutdown(ctx):
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     await ensure_database(bool(context.get("test_mode")))
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
-    tables = {}
+    tables_by_name = {}
     stage_rows = 0
     async with db.transaction():
         for cls in (NUCCTaxonomy, ):
-            tables[cls.__main_table__] = make_class(cls, import_date)
-            obj = tables[cls.__main_table__]
-            table = obj.__main_table__
+            tables_by_name[cls.__main_table__] = make_class(cls, import_date)
+            table_model = tables_by_name[cls.__main_table__]
+            table = table_model.__main_table__
             if run_id:
-                stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{obj.__tablename__};") or 0)
+                stage_rows = int(
+                    await db.scalar(
+                        f"SELECT COUNT(*) FROM "
+                        f"{db_schema}.{table_model.__tablename__};"
+                    )
+                    or 0
+                )
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{table_model.__tablename__} "
+                f"RENAME TO {table};"
+            )
 
             await db.status(f"ALTER INDEX IF EXISTS "
                             f"{db_schema}.{table}_idx_primary RENAME TO "
                             f"{table}_idx_primary_old;")
 
             await db.status(f"ALTER INDEX IF EXISTS "
-                            f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
+                            f"{db_schema}.{table_model.__tablename__}_idx_primary RENAME TO "
                             f"{table}_idx_primary;")
 
     await mark_control_run(

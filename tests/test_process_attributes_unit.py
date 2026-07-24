@@ -402,7 +402,9 @@ async def test_safe_unzip_uses_native_and_fallback_extractors(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_prepare_attribute_tables_is_idempotent(monkeypatch):
-    monkeypatch.setattr(process_attributes, "_TABLES_PREPARED", False)
+    monkeypatch.setitem(
+        process_attributes._TABLE_STATE_BY_KEY, "is_prepared", False
+    )
     monkeypatch.setattr(process_attributes, "ensure_database", AsyncMock())
     monkeypatch.setattr(
         process_attributes,

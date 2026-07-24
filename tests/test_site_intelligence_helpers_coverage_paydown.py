@@ -14,10 +14,8 @@ from api.endpoint import site_intelligence
 @pytest.fixture(autouse=True)
 def _reset_site_intelligence_caches():
     site_intelligence._TABLE_EXISTS_CACHE.clear()
-    site_intelligence._ZCTA_OVERLAP_AVAILABLE_CACHE = None
     yield
     site_intelligence._TABLE_EXISTS_CACHE.clear()
-    site_intelligence._ZCTA_OVERLAP_AVAILABLE_CACHE = None
 
 
 class _Result:
@@ -168,34 +166,34 @@ async def test_table_cache_and_zcta_availability_boundaries(monkeypatch):
     assert await site_intelligence._is_table_cached(object(), site_intelligence.GeoZipLookup)
     assert calls == [site_intelligence.GeoZipLookup, site_intelligence.GeoZipLookup]
 
-    site_intelligence._ZCTA_OVERLAP_AVAILABLE_CACHE = None
+    site_intelligence._TABLE_EXISTS_CACHE.clear()
     no_bind = SimpleNamespace(execute=lambda *_args: None)
-    assert await site_intelligence._zcta_overlap_available(no_bind) is False
-    assert await site_intelligence._zcta_overlap_available(no_bind) is False
+    assert await site_intelligence._is_zcta_overlap_available(no_bind) is False
+    assert await site_intelligence._is_zcta_overlap_available(no_bind) is False
 
-    site_intelligence._ZCTA_OVERLAP_AVAILABLE_CACHE = None
+    site_intelligence._TABLE_EXISTS_CACHE.clear()
     available_row = SimpleNamespace(has_zcta5=True, has_geom=True, has_postgis=True)
-    assert await site_intelligence._zcta_overlap_available(
+    assert await site_intelligence._is_zcta_overlap_available(
         _Session(_Result([available_row]))
     ) is True
 
-    site_intelligence._ZCTA_OVERLAP_AVAILABLE_CACHE = None
+    site_intelligence._TABLE_EXISTS_CACHE.clear()
     incomplete_row = SimpleNamespace(has_zcta5=True, has_geom=False, has_postgis=True)
-    assert await site_intelligence._zcta_overlap_available(
+    assert await site_intelligence._is_zcta_overlap_available(
         _Session(_Result([incomplete_row]))
     ) is False
 
-    site_intelligence._ZCTA_OVERLAP_AVAILABLE_CACHE = None
+    site_intelligence._TABLE_EXISTS_CACHE.clear()
     failed = _Session(failure=RuntimeError("probe failed"))
-    assert await site_intelligence._zcta_overlap_available(failed) is False
+    assert await site_intelligence._is_zcta_overlap_available(failed) is False
     assert failed.rollback_count == 1
 
-    site_intelligence._ZCTA_OVERLAP_AVAILABLE_CACHE = None
+    site_intelligence._TABLE_EXISTS_CACHE.clear()
     rollback_failed = _Session(
         failure=RuntimeError("probe failed"),
         rollback_failure=RuntimeError("rollback failed"),
     )
-    assert await site_intelligence._zcta_overlap_available(rollback_failed) is False
+    assert await site_intelligence._is_zcta_overlap_available(rollback_failed) is False
 
 
 @pytest.mark.asyncio
@@ -208,7 +206,7 @@ async def test_radius_zip_weights_success_fallback_and_validation(monkeypatch):
     async def is_overlap_unavailable(_session):
         return False
 
-    monkeypatch.setattr(site_intelligence, "_zcta_overlap_available", is_overlap_unavailable)
+    monkeypatch.setattr(site_intelligence, "_is_zcta_overlap_available", is_overlap_unavailable)
     assert await site_intelligence._radius_zip_weights(object(), 41.0, -87.0, 3) == (
         {},
         "zip_centroid",
@@ -217,7 +215,7 @@ async def test_radius_zip_weights_success_fallback_and_validation(monkeypatch):
     async def is_overlap_available(_session):
         return True
 
-    monkeypatch.setattr(site_intelligence, "_zcta_overlap_available", is_overlap_available)
+    monkeypatch.setattr(site_intelligence, "_is_zcta_overlap_available", is_overlap_available)
     overlap_rows = [
         SimpleNamespace(zip_code="60654", overlap_weight=0.25),
         SimpleNamespace(zip_code="60654-extra", overlap_weight=0.75),
@@ -226,11 +224,11 @@ async def test_radius_zip_weights_success_fallback_and_validation(monkeypatch):
         SimpleNamespace(zip_code="60655", overlap_weight=0),
         SimpleNamespace(zip_code="60656", overlap_weight=2.0),
     ]
-    weights, method = await site_intelligence._radius_zip_weights(
+    weights_by_zip, method = await site_intelligence._radius_zip_weights(
         _Session(_Result(overlap_rows)), 41.0, -87.0, 3
     )
     assert method == "zcta_polygon_overlap"
-    assert weights == {"60654": 0.75, "60656": 1.0}
+    assert weights_by_zip == {"60654": 0.75, "60656": 1.0}
 
     failed = _Session(failure=RuntimeError("spatial query failed"))
     assert await site_intelligence._radius_zip_weights(failed, 41.0, -87.0, 3) == (

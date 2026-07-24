@@ -88,10 +88,10 @@ def _parse_float(value: Optional[str], param_name: str) -> Optional[float]:
         raise InvalidUsage(f"Parameter '{param_name}' must be numeric") from exc
 
 
-def _append_filter(applied_filters: Dict[str, Any], key: str, value: Any):
+def _append_filter(filters_by_name: Dict[str, Any], key: str, value: Any):
     if value is None or value == "":
         return
-    applied_filters[key] = value
+    filters_by_name[key] = value
 
 
 def _get_session(request):
@@ -158,7 +158,7 @@ def _plan_level_plan_id_column(table):
 
 
 def _collect_price_bounds(result):
-    bounds = {}
+    bounds_by_plan = {}
     for row in _result_rows(result):
         row_dict = _row_to_dict(row)
         plan_id = row_dict.get("plan_id")
@@ -179,10 +179,10 @@ def _collect_price_bounds(result):
             continue
         min_val = min(values)
         max_val = max(values)
-        entry = bounds.setdefault(key, {"min": min_val, "max": max_val})
-        entry["min"] = min(entry["min"], min_val)
-        entry["max"] = max(entry["max"], max_val)
-    return bounds
+        plan_bounds = bounds_by_plan.setdefault(key, {"min": min_val, "max": max_val})
+        plan_bounds["min"] = min(plan_bounds["min"], min_val)
+        plan_bounds["max"] = max(plan_bounds["max"], max_val)
+    return bounds_by_plan
 
 
 def _default_boolean_facets():
@@ -259,21 +259,21 @@ async def _compute_facets(session, filtered_plans):
 
 
 def _normalize_attribute_map(attribute_map):
-    cleaned = {}
+    attributes_by_name = {}
     if not attribute_map:
-        return cleaned
+        return attributes_by_name
     for name, value in attribute_map.items():
-        entry = {}
+        attribute_dict = {}
         if isinstance(value, dict):
-            entry.update(value)
+            attribute_dict.update(value)
         else:
-            entry["attr_value"] = value
-        if "attr_value" not in entry:
-            entry["attr_value"] = None
-        if name in attributes_labels and "human_attr_name" not in entry:
-            entry["human_attr_name"] = attributes_labels[name]
-        cleaned[name] = entry
-    return cleaned
+            attribute_dict["attr_value"] = value
+        if "attr_value" not in attribute_dict:
+            attribute_dict["attr_value"] = None
+        if name in attributes_labels and "human_attr_name" not in attribute_dict:
+            attribute_dict["human_attr_name"] = attributes_labels[name]
+        attributes_by_name[name] = attribute_dict
+    return attributes_by_name
 
 
 def _get_list_param(args, name):
@@ -314,15 +314,15 @@ def _summary_attributes_to_dict(payload):
             return {}
     if not isinstance(data, list):
         return {}
-    mapping = {}
-    for entry in data:
-        if not isinstance(entry, dict):
+    attributes_by_name = {}
+    for attribute_entry in data:
+        if not isinstance(attribute_entry, dict):
             continue
-        name = entry.get("attr_name")
+        name = attribute_entry.get("attr_name")
         if not name:
             continue
-        mapping[name] = {"attr_value": entry.get("attr_value")}
-    return mapping
+        attributes_by_name[name] = {"attr_value": attribute_entry.get("attr_value")}
+    return attributes_by_name
 
 
 def _summary_benefits_to_dict(payload):
@@ -336,17 +336,17 @@ def _summary_benefits_to_dict(payload):
             return {}
     if not isinstance(data, list):
         return {}
-    mapping = {}
-    for entry in data:
-        if not isinstance(entry, dict):
+    benefits_by_name = {}
+    for benefit_entry in data:
+        if not isinstance(benefit_entry, dict):
             continue
-        name = entry.get("benefit_name")
+        name = benefit_entry.get("benefit_name")
         if not name:
             continue
-        mapping[name] = dict(entry)
+        benefits_by_name[name] = dict(benefit_entry)
         if name in benefits_labels:
-            mapping[name]["human_attr_name"] = benefits_labels[name]
-    return mapping
+            benefits_by_name[name]["human_attr_name"] = benefits_labels[name]
+    return benefits_by_name
 
 
 def _distinct_state_codes(query_result) -> list[str]:
@@ -558,16 +558,16 @@ async def get_network_batch_by_checksums(request, checksums):
     session = _get_session(request)
     values = [value.strip() for value in checksums.split(",") if value.strip()]
     payload = []
-    seen = set()
+    seen_checksums = set()
 
     for value in values:
         try:
             checksum = int(value)
         except ValueError:
             continue
-        if checksum in seen:
+        if checksum in seen_checksums:
             continue
-        seen.add(checksum)
+        seen_checksums.add(checksum)
         entry = await _fetch_network_entry(session, checksum)
         if entry:
             payload.append(entry)
@@ -657,7 +657,7 @@ async def find_a_plan(request):
     query_text = (args.get("q") or "").strip()
     state = (args.get("state") or "").strip().upper()
 
-    bool_filter_inputs = {
+    boolean_filter_by_name = {
         "has_adult_dental": _parse_bool(args.get("has_adult_dental"), "has_adult_dental"),
         "has_child_dental": _parse_bool(args.get("has_child_dental"), "has_child_dental"),
         "has_adult_vision": _parse_bool(args.get("has_adult_vision"), "has_adult_vision"),
@@ -676,7 +676,9 @@ async def find_a_plan(request):
     moop_max = _parse_float(args.get("moop_max"), "moop_max")
     premium_min = _parse_float(args.get("premium_min"), "premium_min")
     premium_max = _parse_float(args.get("premium_max"), "premium_max")
-    plan_types = [value.upper() for value in _get_list_param(args, "plan_types")]
+    plan_types = [
+        plan_type.upper() for plan_type in _get_list_param(args, "plan_types")
+    ]
     metal_levels = _get_list_param(args, "metal_levels")
     csr_variations = _get_list_param(args, "csr_variations")
 
@@ -720,10 +722,10 @@ async def find_a_plan(request):
         except ValueError as exc:
             raise sanic.exceptions.BadRequest from exc
 
-    issuer_ids_param = []
-    for value in _get_list_param(args, "issuer_ids"):
+    requested_issuer_ids = []
+    for issuer_id_value in _get_list_param(args, "issuer_ids"):
         try:
-            issuer_ids_param.append(int(value))
+            requested_issuer_ids.append(int(issuer_id_value))
         except ValueError as exc:
             raise sanic.exceptions.BadRequest("issuer_ids must be integers") from exc
 
@@ -732,43 +734,43 @@ async def find_a_plan(request):
 
     session = _get_session(request)
 
-    applied_filters: Dict[str, Any] = {}
+    filters_by_name: Dict[str, Any] = {}
     warnings: List[Dict[str, str]] = []
-    facets = _empty_facets() if include_facets else {}
+    facets_by_category = _empty_facets() if include_facets else {}
 
     plan_filters = []
     summary_filters = []
 
     if state:
         plan_filters.append(plan_table.c.state == state)
-        _append_filter(applied_filters, "state", state)
+        _append_filter(filters_by_name, "state", state)
 
     if year is not None:
         plan_filters.append(plan_table.c.year == year)
-        _append_filter(applied_filters, "year", year)
+        _append_filter(filters_by_name, "year", year)
 
     issuer_filters = []
     if issuer_id is not None:
         issuer_filters.append(issuer_id)
-    issuer_filters.extend(issuer_ids_param)
+    issuer_filters.extend(requested_issuer_ids)
     issuer_filters = sorted(set(issuer_filters))
     if issuer_filters:
         plan_filters.append(plan_table.c.issuer_id.in_(issuer_filters))
         if len(issuer_filters) == 1:
-            _append_filter(applied_filters, "issuer_id", issuer_filters[0])
+            _append_filter(filters_by_name, "issuer_id", issuer_filters[0])
         else:
-            _append_filter(applied_filters, "issuer_ids", issuer_filters)
+            _append_filter(filters_by_name, "issuer_ids", issuer_filters)
 
     if plan_id_filter:
         plan_filters.append(plan_table.c.plan_id.ilike(f"%{plan_id_filter}%"))
-        _append_filter(applied_filters, "plan_id", plan_id_filter)
+        _append_filter(filters_by_name, "plan_id", plan_id_filter)
 
     if query_text:
         plan_filters.append(plan_table.c.marketing_name.ilike(f"%{query_text}%"))
-        _append_filter(applied_filters, "q", query_text)
+        _append_filter(filters_by_name, "q", query_text)
 
     if zip_code:
-        _append_filter(applied_filters, "zip_code", zip_code)
+        _append_filter(filters_by_name, "zip_code", zip_code)
         zip_states = await _states_for_zip(session, zip_code)
         if not zip_states:
             warnings.append(
@@ -782,8 +784,8 @@ async def find_a_plan(request):
                     "offset": offset,
                     "results": [],
                     "issuers": [],
-                    "facets": facets,
-                    "applied_filters": applied_filters,
+                    "facets": facets_by_category,
+                    "applied_filters": filters_by_name,
                     "warnings": warnings,
                 },
                 default=str,
@@ -791,15 +793,15 @@ async def find_a_plan(request):
         plan_filters.append(plan_table.c.state.in_(zip_states))
 
     if rating_area:
-        _append_filter(applied_filters, "rating_area", rating_area)
+        _append_filter(filters_by_name, "rating_area", rating_area)
     if age is not None:
-        _append_filter(applied_filters, "age", age)
-    _append_filter(applied_filters, "limit", limit)
-    _append_filter(applied_filters, "page", page)
-    _append_filter(applied_filters, "offset", offset)
-    _append_filter(applied_filters, "include_facets", include_facets)
-    _append_filter(applied_filters, "order", order)
-    _append_filter(applied_filters, "order_by", order_by)
+        _append_filter(filters_by_name, "age", age)
+    _append_filter(filters_by_name, "limit", limit)
+    _append_filter(filters_by_name, "page", page)
+    _append_filter(filters_by_name, "offset", offset)
+    _append_filter(filters_by_name, "include_facets", include_facets)
+    _append_filter(filters_by_name, "order", order)
+    _append_filter(filters_by_name, "order_by", order_by)
 
     price_filter_required = bool(age is not None or rating_area)
     if price_filter_required:
@@ -815,44 +817,52 @@ async def find_a_plan(request):
         price_subquery = select(plan_prices_table.c.plan_id).where(and_(*price_conditions))
         plan_filters.append(price_subquery.exists())
 
-    for key, value in bool_filter_inputs.items():
-        if value is None:
+    for key, filter_value in boolean_filter_by_name.items():
+        if filter_value is None:
             continue
         column = SUMMARY_BOOLEAN_COLUMNS.get(key)
         if column is None:
             continue
-        summary_filters.append(column.is_(True) if value else column.is_(False))
-        _append_filter(applied_filters, key, value)
+        summary_filters.append(
+            column.is_(True) if filter_value else column.is_(False)
+        )
+        _append_filter(filters_by_name, key, filter_value)
 
     if deductible_min is not None:
         summary_filters.append(plan_search_summary_table.c.deductible_inn_individual >= deductible_min)
-        _append_filter(applied_filters, "deductible_min", deductible_min)
+        _append_filter(filters_by_name, "deductible_min", deductible_min)
     if deductible_max is not None:
         summary_filters.append(plan_search_summary_table.c.deductible_inn_individual <= deductible_max)
-        _append_filter(applied_filters, "deductible_max", deductible_max)
+        _append_filter(filters_by_name, "deductible_max", deductible_max)
     if moop_min is not None:
         summary_filters.append(plan_search_summary_table.c.moop_inn_individual >= moop_min)
-        _append_filter(applied_filters, "moop_min", moop_min)
+        _append_filter(filters_by_name, "moop_min", moop_min)
     if moop_max is not None:
         summary_filters.append(plan_search_summary_table.c.moop_inn_individual <= moop_max)
-        _append_filter(applied_filters, "moop_max", moop_max)
+        _append_filter(filters_by_name, "moop_max", moop_max)
     if premium_min is not None:
         summary_filters.append(plan_search_summary_table.c.premium_min >= premium_min)
-        _append_filter(applied_filters, "premium_min", premium_min)
+        _append_filter(filters_by_name, "premium_min", premium_min)
     if premium_max is not None:
         summary_filters.append(plan_search_summary_table.c.premium_max <= premium_max)
-        _append_filter(applied_filters, "premium_max", premium_max)
+        _append_filter(filters_by_name, "premium_max", premium_max)
     if plan_types:
         summary_filters.append(plan_search_summary_table.c.plan_type.in_(plan_types))
-        _append_filter(applied_filters, "plan_types", plan_types)
+        _append_filter(filters_by_name, "plan_types", plan_types)
     if metal_levels:
-        lowered_levels = [value.lower() for value in metal_levels]
+        lowered_levels = [metal_level.lower() for metal_level in metal_levels]
         summary_filters.append(func.lower(plan_search_summary_table.c.metal_level).in_(lowered_levels))
-        _append_filter(applied_filters, "metal_levels", metal_levels)
+        _append_filter(filters_by_name, "metal_levels", metal_levels)
     if csr_variations:
-        lowered_csr = [value.lower() for value in csr_variations]
-        summary_filters.append(func.lower(plan_search_summary_table.c.csr_variation).in_(lowered_csr))
-        _append_filter(applied_filters, "csr_variations", csr_variations)
+        normalized_csr_values = [
+            csr_variation.lower() for csr_variation in csr_variations
+        ]
+        summary_filters.append(
+            func.lower(plan_search_summary_table.c.csr_variation).in_(
+                normalized_csr_values
+            )
+        )
+        _append_filter(filters_by_name, "csr_variations", csr_variations)
 
     join_condition = and_(
         plan_table.c.plan_id == plan_search_summary_table.c.plan_id,
@@ -871,9 +881,9 @@ async def find_a_plan(request):
     total_result = await session.execute(select(func.count()).select_from(filtered_plans))
     total = _result_scalar(total_result) or 0
     if include_facets and total > 0:
-        facets = await _compute_facets(session, filtered_plans)
+        facets_by_category = await _compute_facets(session, filtered_plans)
     elif not include_facets:
-        facets = {}
+        facets_by_category = {}
 
     order_map = {
         "plan_id": plan_table.c.plan_id,
@@ -931,18 +941,22 @@ async def find_a_plan(request):
     data_result = await session.execute(data_stmt)
     plans_rows = _result_rows(data_result)
 
-    results = []
+    plan_results = []
     plan_keys = []
     result_lookup = {}
-    for row in plans_rows:
-        row_dict = _row_to_dict(row)
+    for plan_row in plans_rows:
+        row_dict = _row_to_dict(plan_row)
         plan_id = row_dict.get("plan_id")
         plan_year = row_dict.get("year")
         if not plan_id or plan_year is None:
             continue
         plan_key = (plan_id, plan_year)
-        entry = {key: value for key, value in row_dict.items() if key not in {"attributes", "plan_benefits"}}
-        entry.update({
+        plan_dict = {
+            key: field_value
+            for key, field_value in row_dict.items()
+            if key not in {"attributes", "plan_benefits"}
+        }
+        plan_dict.update({
             "price_range": {"min": None, "max": None},
             "has_adult_dental": row_dict.get("has_adult_dental"),
             "has_child_dental": row_dict.get("has_child_dental"),
@@ -963,13 +977,17 @@ async def find_a_plan(request):
             "metal_level": row_dict.get("metal_level"),
             "csr_variation": row_dict.get("csr_variation"),
         })
-        entry["attributes"] = _normalize_attribute_map(_summary_attributes_to_dict(row_dict.get("attributes")))
-        entry["plan_benefits"] = _summary_benefits_to_dict(row_dict.get("plan_benefits"))
-        results.append(entry)
-        result_lookup[plan_key] = entry
+        plan_dict["attributes"] = _normalize_attribute_map(
+            _summary_attributes_to_dict(row_dict.get("attributes"))
+        )
+        plan_dict["plan_benefits"] = _summary_benefits_to_dict(
+            row_dict.get("plan_benefits")
+        )
+        plan_results.append(plan_dict)
+        result_lookup[plan_key] = plan_dict
         plan_keys.append(plan_key)
 
-    if not results:
+    if not plan_results:
         return response.json(
             {
                 "total": int(total),
@@ -978,8 +996,8 @@ async def find_a_plan(request):
                 "offset": offset,
                 "results": [],
                 "issuers": [],
-                "facets": facets,
-                "applied_filters": applied_filters,
+                "facets": facets_by_category,
+                "applied_filters": filters_by_name,
                 "warnings": warnings,
             },
             default=str,
@@ -988,7 +1006,7 @@ async def find_a_plan(request):
     plan_ids = sorted({key[0] for key in plan_keys})
     plan_years = sorted({key[1] for key in plan_keys})
 
-    price_bounds = {}
+    price_bounds_by_plan = {}
     if plan_ids:
         price_stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id.in_(plan_ids))
         if plan_years:
@@ -1002,12 +1020,12 @@ async def find_a_plan(request):
         if state:
             price_stmt = price_stmt.where(plan_prices_table.c.state == state)
         price_result = await session.execute(price_stmt)
-        price_bounds = _collect_price_bounds(price_result)
+        price_bounds_by_plan = _collect_price_bounds(price_result)
 
-    for key, entry in result_lookup.items():
-        price_info = price_bounds.get(key)
+    for key, plan_dict in result_lookup.items():
+        price_info = price_bounds_by_plan.get(key)
         if price_info:
-            entry["price_range"] = {
+            plan_dict["price_range"] = {
                 "min": price_info["min"],
                 "max": price_info["max"],
             }
@@ -1032,8 +1050,8 @@ async def find_a_plan(request):
     )
     issuer_result = await session.execute(issuer_stmt)
     issuers = []
-    for row in _result_rows(issuer_result):
-        row_dict = _row_to_dict(row)
+    for issuer_row in _result_rows(issuer_result):
+        row_dict = _row_to_dict(issuer_row)
         issuers.append(
             {
                 "issuer_id": row_dict.get("issuer_id"),
@@ -1048,10 +1066,10 @@ async def find_a_plan(request):
             "page": page,
             "limit": limit,
             "offset": offset,
-            "results": results,
+            "results": plan_results,
             "issuers": issuers,
-            "facets": facets,
-            "applied_filters": applied_filters,
+            "facets": facets_by_category,
+            "applied_filters": filters_by_name,
             "warnings": warnings,
         },
         default=str,
@@ -1242,7 +1260,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
 
     def _unique(values):
         seen_values = set()
-        ordered = []
+        ordered_values = []
         for value in values:
             if value is None:
                 continue
@@ -1266,8 +1284,8 @@ async def get_plan(request, plan_id, year=None, variant=None):
             normalized = str(value).strip()
             if normalized and normalized not in seen_values:
                 seen_values.add(normalized)
-                ordered.append(normalized)
-        return ordered
+                ordered_values.append(normalized)
+        return ordered_values
 
     variants = _unique(
         [
@@ -1302,10 +1320,10 @@ async def get_plan(request, plan_id, year=None, variant=None):
             variants.append(full_id)
         name = row_dict.get("attr_name")
         if name:
-            entry = {"attr_value": row_dict.get("attr_value")}
+            attribute_dict = {"attr_value": row_dict.get("attr_value")}
             if name in attributes_labels:
-                entry["human_attr_name"] = attributes_labels[name]
-            plan_data["attributes"][name] = entry
+                attribute_dict["human_attr_name"] = attributes_labels[name]
+            plan_data["attributes"][name] = attribute_dict
 
     plan_benefit_stmt = select(plan_benefits_table).where(
         and_(
@@ -1360,7 +1378,14 @@ async def get_plan(request, plan_id, year=None, variant=None):
             )
         ).order_by(plan_attributes_table.c.full_plan_id.asc())
         fallback_result = await session.execute(fallback_stmt)
-        variants = _unique([row[0] if isinstance(row, (list, tuple)) else row for row in _result_rows(fallback_result)])
+        variants = _unique(
+            [
+                fallback_row[0]
+                if isinstance(fallback_row, (list, tuple))
+                else fallback_row
+                for fallback_row in _result_rows(fallback_result)
+            ]
+        )
 
     variants = _unique(variants)
     plan_data["variants"] = variants
@@ -1381,15 +1406,15 @@ async def get_plan(request, plan_id, year=None, variant=None):
             )
         )
         attr_result = await session.execute(attr_stmt)
-        for row in _result_rows(attr_result):
-            row_dict = _row_to_dict(row)
+        for attribute_row in _result_rows(attr_result):
+            row_dict = _row_to_dict(attribute_row)
             name = row_dict.get("attr_name")
-            entry = {"attr_value": row_dict.get("attr_value")}
+            attribute_dict = {"attr_value": row_dict.get("attr_value")}
             if name in attributes_labels:
-                entry["human_attr_name"] = attributes_labels[name]
-            plan_data["variant_attributes"][name] = entry
+                attribute_dict["human_attr_name"] = attributes_labels[name]
+            plan_data["variant_attributes"][name] = attribute_dict
             if name not in plan_data["attributes"]:
-                plan_data["attributes"][name] = entry
+                plan_data["attributes"][name] = attribute_dict
 
         benefit_stmt = select(plan_benefits_table).where(
             and_(
@@ -1398,8 +1423,8 @@ async def get_plan(request, plan_id, year=None, variant=None):
             )
         )
         benefit_result = await session.execute(benefit_stmt)
-        for row in _result_rows(benefit_result):
-            row_dict = _row_to_dict(row)
+        for benefit_row in _result_rows(benefit_result):
+            row_dict = _row_to_dict(benefit_row)
             name = row_dict.get("benefit_name")
             benefit_entry = row_dict.copy()
             for key in ("full_plan_id", "year", "plan_id"):
@@ -1422,9 +1447,15 @@ async def get_plan(request, plan_id, year=None, variant=None):
             if name not in plan_data["plan_benefits"]:
                 plan_data["plan_benefits"][name] = benefit_entry
     if active_variant and not plan_data["variant_attributes"] and plan_data["attributes"]:
-        plan_data["variant_attributes"] = {k: dict(v) for k, v in plan_data["attributes"].items()}
+        plan_data["variant_attributes"] = {
+            attribute_name: dict(attribute_values)
+            for attribute_name, attribute_values in plan_data["attributes"].items()
+        }
     if active_variant and not plan_data["variant_benefits"] and plan_data["plan_benefits"]:
-        plan_data["variant_benefits"] = {k: dict(v) for k, v in plan_data["plan_benefits"].items()}
+        plan_data["variant_benefits"] = {
+            benefit_name: dict(benefit_values)
+            for benefit_name, benefit_values in plan_data["plan_benefits"].items()
+        }
 
     plan_data["attributes"] = _normalize_attribute_map(plan_data.get("attributes"))
     plan_data["variant_attributes"] = _normalize_attribute_map(plan_data.get("variant_attributes"))

@@ -33,7 +33,7 @@ from process.serialization import deserialize_job, serialize_job
 latin_pattern = re.compile(r"[^\x00-\x7f]")
 ATTRIBUTES_QUEUE_NAME = "arq:Attributes"
 
-_TABLES_PREPARED = False
+_TABLE_STATE_BY_KEY = {"is_prepared": False}
 _TABLES_LOCK = asyncio.Lock()
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TEST_FILE_LIMIT = 1
@@ -64,12 +64,11 @@ async def _is_table_available(schema: str, table_name: str) -> bool:
 
 
 async def _prepare_attribute_tables(ctx):
-    global _TABLES_PREPARED
-    if _TABLES_PREPARED:
+    if _TABLE_STATE_BY_KEY["is_prepared"]:
         return
 
     async with _TABLES_LOCK:
-        if _TABLES_PREPARED:
+        if _TABLE_STATE_BY_KEY["is_prepared"]:
             return
 
         context = ctx.setdefault("context", {})
@@ -88,23 +87,24 @@ async def _prepare_attribute_tables(ctx):
             PlanRatingAreas,
             PlanBenefits,
         ):
-            obj = make_class(cls, import_date, schema_override=db_schema)
+            table_model = make_class(cls, import_date, schema_override=db_schema)
             await db.status(
-                f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};"
+                f"DROP TABLE IF EXISTS {db_schema}.{table_model.__main_table__}_{import_date};"
             )
             try:
-                await db.create_table(obj.__table__, checkfirst=True)
+                await db.create_table(table_model.__table__, checkfirst=True)
             except IntegrityError as exc:  # pragma: no cover - rare race; ignore if table/type already exists
                 if "pg_type_typname_nsp_index" not in str(exc):
                     raise
-            if hasattr(obj, "__my_index_elements__"):
+            if hasattr(table_model, "__my_index_elements__"):
                 await db.status(
-                    f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
-                    f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});"
+                    f"CREATE UNIQUE INDEX {table_model.__tablename__}_idx_primary ON "
+                    f"{db_schema}.{table_model.__tablename__} "
+                    f"({', '.join(table_model.__my_index_elements__)});"
                 )
 
         context["tables_prepared"] = True
-        _TABLES_PREPARED = True
+        _TABLE_STATE_BY_KEY["is_prepared"] = True
         print("Preparing done")
 
 
@@ -163,14 +163,14 @@ async def startup(ctx):
     await init_db(db, loop)
 
 
-async def shutdown(ctx):
+async def finalize_attribute_tables(ctx):
     """Finalize staged attribute tables after worker shutdown."""
 
     import_date = ctx["import_date"]
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
-    tables = {}
+    tables_by_name = {}
 
     processing_classes_array = (
         PlanAttributes,
@@ -180,11 +180,13 @@ async def shutdown(ctx):
     )
 
     for cls in processing_classes_array:
-        tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
-        obj = tables[cls.__main_table__]
-        table_name = f"{db_schema}.{obj.__tablename__}"
+        tables_by_name[cls.__main_table__] = make_class(
+            cls, import_date, schema_override=db_schema
+        )
+        table_model = tables_by_name[cls.__main_table__]
+        table_name = f"{db_schema}.{table_model.__tablename__}"
 
-        if not await _is_table_available(db_schema, obj.__tablename__):
+        if not await _is_table_available(db_schema, table_model.__tablename__):
             print(f"Skipping post-processing for missing table {table_name}")
             continue
 
@@ -192,8 +194,8 @@ async def shutdown(ctx):
             for index in cls.__my_additional_indexes__:
                 index_name = index.get("name", "_".join(index.get("index_elements")))
                 using = ""
-                if t := index.get("using"):
-                    using = f"USING {t} "
+                if index_method := index.get("using"):
+                    using = f"USING {index_method} "
 
                 unique = ' '
                 if index.get('unique'):
@@ -202,8 +204,9 @@ async def shutdown(ctx):
                 if index.get('where'):
                     where = f' WHERE {index.get("where")} '
                 create_index_sql = (
-                    f"CREATE{unique}INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
-                    f"ON {db_schema}.{obj.__tablename__}  {using}"
+                    f"CREATE{unique}INDEX IF NOT EXISTS "
+                    f"{table_model.__tablename__}_idx_{index_name} "
+                    f"ON {db_schema}.{table_model.__tablename__}  {using}"
                     f"({', '.join(index.get('index_elements'))}){where};"
                 )
                 print(create_index_sql)
@@ -214,21 +217,23 @@ async def shutdown(ctx):
 
     async with db.transaction():
         for cls in processing_classes_array:
-            tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
-            obj = tables[cls.__main_table__]
-            table_name = f"{db_schema}.{obj.__tablename__}"
+            tables_by_name[cls.__main_table__] = make_class(
+                cls, import_date, schema_override=db_schema
+            )
+            table_model = tables_by_name[cls.__main_table__]
+            table_name = f"{db_schema}.{table_model.__tablename__}"
 
-            if not await _is_table_available(db_schema, obj.__tablename__):
+            if not await _is_table_available(db_schema, table_model.__tablename__):
                 print(f"Skipping swap for missing table {table_name}")
                 continue
 
-            table = obj.__main_table__
+            table = table_model.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(
                 f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;"
             )
             await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};"
+                f"ALTER TABLE IF EXISTS {db_schema}.{table_model.__tablename__} RENAME TO {table};"
             )
 
             await db.status(
@@ -239,15 +244,15 @@ async def shutdown(ctx):
 
             await db.status(
                 f"ALTER INDEX IF EXISTS "
-                f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
+                f"{db_schema}.{table_model.__tablename__}_idx_primary RENAME TO "
                 f"{table}_idx_primary;"
             )
 
             if (
                 hasattr(cls, "__my_additional_indexes__")
-                and obj.__my_additional_indexes__
+                and table_model.__my_additional_indexes__
             ):
-                for index in obj.__my_additional_indexes__:
+                for index in table_model.__my_additional_indexes__:
                     index_name = index.get(
                         "name", "_".join(index.get("index_elements"))
                     )
@@ -258,11 +263,14 @@ async def shutdown(ctx):
                     )
                     await db.status(
                         f"ALTER INDEX IF EXISTS "
-                        f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
+                        f"{db_schema}.{table_model.__tablename__}_idx_{index_name} RENAME TO "
                         f"{table}_idx_{index_name};"
                     )
 
     print_time_info(ctx["context"]["start"])
+
+
+shutdown = finalize_attribute_tables
 
 
 async def save_attributes(ctx, task):
@@ -301,8 +309,8 @@ async def process_attributes(ctx, task):
     test_row_limit = _test_row_limit()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = "attr.csv"
-        tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+        archive_basename = "attr.csv"
+        tmp_filename = str(PurePath(str(tmpdirname), archive_basename + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
         await _safe_unzip(tmp_filename, tmpdirname)
 
@@ -312,26 +320,28 @@ async def process_attributes(ctx, task):
 
         count = 0
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
-            async for row in AsyncDictReader(afp, delimiter=","):
+            async for attribute_row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(
-                    row.get("StandardComponentId"), row.get("PlanId")
+                    attribute_row.get("StandardComponentId"),
+                    attribute_row.get("PlanId"),
                 )
                 if not plan_id or not full_plan_id:
                     continue
                 count += 1
-                for key in row:
+                for key in attribute_row:
                     if not (
-                        (key in ("StandardComponentId",)) and (row[key] is None)
-                    ) and (t := str(row[key]).strip()):
-                        obj = {
+                        (key in ("StandardComponentId",))
+                        and (attribute_row[key] is None)
+                    ) and (text_value := str(attribute_row[key]).strip()):
+                        attribute_dict = {
                             "plan_id": plan_id,
                             "full_plan_id": full_plan_id,
                             "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
                             "attr_name": re.sub(latin_pattern, r"", key),
-                            "attr_value": t,
+                            "attr_value": text_value,
                         }
 
-                        attr_obj_list.append(obj)
+                        attr_obj_list.append(attribute_dict)
 
                 if count > 10000:
                     # int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
@@ -371,8 +381,8 @@ async def process_benefits(ctx, task):
     test_row_limit = _test_row_limit()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = "benefits.csv"
-        tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+        archive_basename = "benefits.csv"
+        tmp_filename = str(PurePath(str(tmpdirname), archive_basename + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
         await _safe_unzip(tmp_filename, tmpdirname)
 
@@ -382,65 +392,75 @@ async def process_benefits(ctx, task):
 
         count = 0
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
-            async for row in AsyncDictReader(afp, delimiter=","):
+            async for benefit_row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(
-                    row.get("StandardComponentId"), row.get("PlanId")
+                    benefit_row.get("StandardComponentId"), benefit_row.get("PlanId")
                 )
                 if not plan_id or not full_plan_id:
                     continue
 
-                obj = {
+                benefit_dict = {
                     "year": None,
                     "plan_id": plan_id,
                     "full_plan_id": full_plan_id,
-                    "benefit_name": row["BenefitName"],
-                    "copay_inn_tier1": row["CopayInnTier1"],
-                    "copay_inn_tier2": row["CopayInnTier2"],
-                    "copay_outof_net": row["CopayOutofNet"],
-                    "coins_inn_tier1": row["CoinsInnTier1"],
-                    "coins_inn_tier2": row["CoinsInnTier2"],
-                    "coins_outof_net": row["CoinsOutofNet"],
+                    "benefit_name": benefit_row["BenefitName"],
+                    "copay_inn_tier1": benefit_row["CopayInnTier1"],
+                    "copay_inn_tier2": benefit_row["CopayInnTier2"],
+                    "copay_outof_net": benefit_row["CopayOutofNet"],
+                    "coins_inn_tier1": benefit_row["CoinsInnTier1"],
+                    "coins_inn_tier2": benefit_row["CoinsInnTier2"],
+                    "coins_outof_net": benefit_row["CoinsOutofNet"],
                     "is_ehb": None,
                     "is_covered": None,
                     "quant_limit_on_svc": None,
                     "limit_qty": None,
-                    "limit_unit": row["LimitUnit"],
-                    "exclusions": row["Exclusions"],
-                    "explanation": row["Explanation"],
-                    "ehb_var_reason": row["EHBVarReason"],
+                    "limit_unit": benefit_row["LimitUnit"],
+                    "exclusions": benefit_row["Exclusions"],
+                    "explanation": benefit_row["Explanation"],
+                    "ehb_var_reason": benefit_row["EHBVarReason"],
                     "is_excl_from_inn_mo": None,
                     "is_excl_from_oon_mo": None,
                 }
 
-                obj["is_ehb"] = _parse_flag(row.get("IsEHB"), ("yes", "y"), ("no", "n"))
-                obj["is_covered"] = _parse_flag(row.get("IsCovered"), ("covered",), ("not covered",))
-                obj["quant_limit_on_svc"] = _parse_flag(
-                    row.get("QuantLimitOnSvc"), ("yes", "y"), ("no", "n")
+                benefit_dict["is_ehb"] = _parse_flag(
+                    benefit_row.get("IsEHB"), ("yes", "y"), ("no", "n")
                 )
-                obj["is_excl_from_inn_mo"] = _parse_flag(
-                    row.get("IsExclFromInnMOOP"), ("yes", "y"), ("no", "n")
+                benefit_dict["is_covered"] = _parse_flag(
+                    benefit_row.get("IsCovered"), ("covered",), ("not covered",)
                 )
-                obj["is_excl_from_oon_mo"] = _parse_flag(
-                    row.get("IsExclFromOonMOOP"), ("yes", "y"), ("no", "n")
+                benefit_dict["quant_limit_on_svc"] = _parse_flag(
+                    benefit_row.get("QuantLimitOnSvc"),
+                    ("yes", "y"),
+                    ("no", "n"),
+                )
+                benefit_dict["is_excl_from_inn_mo"] = _parse_flag(
+                    benefit_row.get("IsExclFromInnMOOP"),
+                    ("yes", "y"),
+                    ("no", "n"),
+                )
+                benefit_dict["is_excl_from_oon_mo"] = _parse_flag(
+                    benefit_row.get("IsExclFromOonMOOP"),
+                    ("yes", "y"),
+                    ("no", "n"),
                 )
 
-                if row["LimitQty"]:
+                if benefit_row["LimitQty"]:
                     try:
-                        obj["limit_qty"] = float(row["LimitQty"])
+                        benefit_dict["limit_qty"] = float(benefit_row["LimitQty"])
                     except ValueError:
-                        obj["limit_qty"] = None
+                        benefit_dict["limit_qty"] = None
 
                 try:
-                    if row["BusinessYear"]:
+                    if benefit_row["BusinessYear"]:
                         try:
-                            obj["year"] = int(row["BusinessYear"])
+                            benefit_dict["year"] = int(benefit_row["BusinessYear"])
                         except ValueError:
                             continue
                 except KeyError:
-                    print(row)
+                    print(benefit_row)
                     sys.exit(1)
 
-                attr_obj_list.append(obj)
+                attr_obj_list.append(benefit_dict)
 
                 if count > 50000:
                     total_count += count
@@ -479,14 +499,14 @@ async def process_rating_areas(ctx):
         rating_areas_path = _PROJECT_ROOT / "restore" / "data" / "rating_areas.csv"
     async with async_open(rating_areas_path, "r", encoding='utf-8-sig') as afp:
         async for row in AsyncDictReader(afp, delimiter=";"):
-            obj = {
+            rating_area_dict = {
                 "state": row["STATE CODE"].upper(),
                 "county": row["COUNTY"],
                 "zip3": row["ZIP3"],
                 "rating_area_id": row["RATING AREA ID"],
                 "market": row["MARKET"],
             }
-            attr_obj_list.append(obj)
+            attr_obj_list.append(rating_area_dict)
 
     if attr_obj_list:
         await push_objects(attr_obj_list, myplanrating)
@@ -509,8 +529,8 @@ async def process_prices(ctx, task):
     test_row_limit = _test_row_limit()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = "rate.csv"
-        tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+        archive_basename = "rate.csv"
+        tmp_filename = str(PurePath(str(tmpdirname), archive_basename + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
         await _safe_unzip(tmp_filename, tmpdirname)
 
@@ -524,87 +544,93 @@ async def process_prices(ctx, task):
         int_more_regex = re.compile(r"^(\d+) and over$")
         clean_int = re.compile(r"^(\d+)$")
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
-            async for row in AsyncDictReader(afp, delimiter=","):
-                if not row["PlanId"]:
+            async for price_row in AsyncDictReader(afp, delimiter=","):
+                if not price_row["PlanId"]:
                     continue
                 count += 1
 
-                obj = {
-                    "plan_id": row["PlanId"],
-                    "state": row["StateCode"].upper(),
+                price_dict = {
+                    "plan_id": price_row["PlanId"],
+                    "state": price_row["StateCode"].upper(),
                     "year": int(task["year"]),
                     "rate_effective_date": pytz.utc.localize(
-                        parse_date(row["RateEffectiveDate"], fuzzy=True)
+                        parse_date(price_row["RateEffectiveDate"], fuzzy=True)
                     )
-                    if row["RateEffectiveDate"]
+                    if price_row["RateEffectiveDate"]
                     else None,
                     "rate_expiration_date": pytz.utc.localize(
-                        parse_date(row["RateExpirationDate"], fuzzy=True)
+                        parse_date(price_row["RateExpirationDate"], fuzzy=True)
                     )
-                    if row["RateExpirationDate"]
+                    if price_row["RateExpirationDate"]
                     else None,
-                    "rating_area_id": row["RatingAreaId"],
-                    "tobacco": row["Tobacco"],
+                    "rating_area_id": price_row["RatingAreaId"],
+                    "tobacco": price_row["Tobacco"],
                     "min_age": 0,
                     "max_age": 125,
-                    "individual_rate": float(row["IndividualRate"])
-                    if row["IndividualRate"]
+                    "individual_rate": float(price_row["IndividualRate"])
+                    if price_row["IndividualRate"]
                     else None,
-                    "individual_tobacco_rate": float(row["IndividualTobaccoRate"])
-                    if row["IndividualTobaccoRate"]
+                    "individual_tobacco_rate": float(price_row["IndividualTobaccoRate"])
+                    if price_row["IndividualTobaccoRate"]
                     else None,
-                    "couple": float(row["Couple"]) if row["Couple"] else None,
+                    "couple": float(price_row["Couple"])
+                    if price_row["Couple"]
+                    else None,
                     "primary_subscriber_and_one_dependent": float(
-                        row["PrimarySubscriberAndOneDependent"]
+                        price_row["PrimarySubscriberAndOneDependent"]
                     )
-                    if row["PrimarySubscriberAndOneDependent"]
+                    if price_row["PrimarySubscriberAndOneDependent"]
                     else None,
                     "primary_subscriber_and_two_dependents": float(
-                        row["PrimarySubscriberAndTwoDependents"]
+                        price_row["PrimarySubscriberAndTwoDependents"]
                     )
-                    if row["PrimarySubscriberAndTwoDependents"]
+                    if price_row["PrimarySubscriberAndTwoDependents"]
                     else None,
                     "primary_subscriber_and_three_or_more_dependents": float(
-                        row["PrimarySubscriberAndThreeOrMoreDependents"]
+                        price_row["PrimarySubscriberAndThreeOrMoreDependents"]
                     )
-                    if row["PrimarySubscriberAndThreeOrMoreDependents"]
+                    if price_row["PrimarySubscriberAndThreeOrMoreDependents"]
                     else None,
-                    "couple_and_one_dependent": float(row["CoupleAndOneDependent"])
-                    if row["CoupleAndOneDependent"]
+                    "couple_and_one_dependent": float(
+                        price_row["CoupleAndOneDependent"]
+                    )
+                    if price_row["CoupleAndOneDependent"]
                     else None,
-                    "couple_and_two_dependents": float(row["CoupleAndTwoDependents"])
-                    if row["CoupleAndTwoDependents"]
+                    "couple_and_two_dependents": float(
+                        price_row["CoupleAndTwoDependents"]
+                    )
+                    if price_row["CoupleAndTwoDependents"]
                     else None,
                     "couple_and_three_or_more_dependents": float(
-                        row["CoupleAndThreeOrMoreDependents"]
+                        price_row["CoupleAndThreeOrMoreDependents"]
                     )
-                    if row["CoupleAndThreeOrMoreDependents"]
+                    if price_row["CoupleAndThreeOrMoreDependents"]
                     else None,
                 }
 
-                match row["Age"].strip():
-                    case x if t := clean_int.search(x):
-                        obj["min_age"] = int(t.group(1))
-                        obj["max_age"] = obj["min_age"]
-                    case x if t := range_regex.search(x):
-                        obj["min_age"] = int(t.group(1))
-                        obj["max_age"] = int(t.group(2))
-                    case x if t := int_more_regex.search(x):
-                        obj["min_age"] = int(t.group(1))
+                match price_row["Age"].strip():
+                    case age_text if regex_match := clean_int.search(age_text):
+                        price_dict["min_age"] = int(regex_match.group(1))
+                        price_dict["max_age"] = price_dict["min_age"]
+                    case age_text if regex_match := range_regex.search(age_text):
+                        price_dict["min_age"] = int(regex_match.group(1))
+                        price_dict["max_age"] = int(regex_match.group(2))
+                    case age_text if regex_match := int_more_regex.search(age_text):
+                        price_dict["min_age"] = int(regex_match.group(1))
 
-                obj["checksum"] = return_checksum(
+                price_dict["checksum"] = return_checksum(
                     [
-                        obj["plan_id"],
-                        obj["year"],
-                        obj["rate_effective_date"],
-                        obj["rate_expiration_date"],
-                        obj["rating_area_id"],
-                        obj["min_age"],
-                        obj["max_age"],
+                        price_dict["plan_id"],
+                        price_dict["year"],
+                        price_dict["rate_effective_date"],
+                        price_dict["rate_expiration_date"],
+                        price_dict["rating_area_id"],
+                        price_dict["min_age"],
+                        price_dict["max_age"],
                     ]
                 )
 
-                attr_obj_list.append(obj)
+                attr_obj_list.append(price_dict)
 
                 if count > 1000000:
                     total_count += count
@@ -740,8 +766,8 @@ async def process_state_attributes(ctx, task):
     test_row_limit = _test_row_limit()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = "attr.csv"
-        tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+        archive_basename = "attr.csv"
+        tmp_filename = str(PurePath(str(tmpdirname), archive_basename + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
         await _safe_unzip(tmp_filename, tmpdirname)
 
@@ -751,28 +777,30 @@ async def process_state_attributes(ctx, task):
 
         count = 0
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
-            async for row in AsyncDictReader(afp, delimiter=","):
+            async for attribute_row in AsyncDictReader(afp, delimiter=","):
                 plan_id, full_plan_id = _normalize_plan_ids(
-                    row.get("STANDARD COMPONENT ID"), row.get("PLAN ID")
+                    attribute_row.get("STANDARD COMPONENT ID"),
+                    attribute_row.get("PLAN ID"),
                 )
                 if not plan_id or not full_plan_id:
                     continue
                 count += 1
-                for key in row:
+                for key in attribute_row:
                     if not (
-                        (key in ("StandardComponentId",)) and (row[key] is None)
-                    ) and (t := str(row[key]).strip()):
-                        obj = {
+                        (key in ("StandardComponentId",))
+                        and (attribute_row[key] is None)
+                    ) and (text_value := str(attribute_row[key]).strip()):
+                        attribute_dict = {
                             "plan_id": plan_id,
                             "full_plan_id": full_plan_id,
                             "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
                             "attr_name": re.sub(
                                 latin_pattern, r"", plan_attributes_labels_to_key[key]
                             ),
-                            "attr_value": t,
+                            "attr_value": text_value,
                         }
 
-                        attr_obj_list.append(obj)
+                        attr_obj_list.append(attribute_dict)
 
                 if count > 10000:
                     # int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
@@ -796,7 +824,7 @@ async def process_state_attributes(ctx, task):
                 await push_objects(attr_obj_list, myplanattributes)
 
 
-async def main(test_mode: bool = False):
+async def enqueue_attribute_sources(test_mode: bool = False):
     """Queue all configured plan attribute, benefit, and pricing sources."""
 
     redis = await create_pool(
@@ -862,6 +890,9 @@ async def main(test_mode: bool = False):
             },
             _queue_name=ATTRIBUTES_QUEUE_NAME,
         )
+
+
+main = enqueue_attribute_sources
 
 
 def _attribute_source_groups():
