@@ -48,19 +48,54 @@ def _write_geo_csv(
         writer.writerows(source_rows)
 
 
+class _TransactionSpy:
+    def __init__(self):
+        self.active = False
+        self.enter_count = 0
+        self.exit_count = 0
+        self.exit_exception_type = None
+
+    async def __aenter__(self):
+        assert not self.active
+        self.active = True
+        self.enter_count += 1
+        return self
+
+    async def __aexit__(self, exc_type, _exc, _traceback):
+        assert self.active
+        self.active = False
+        self.exit_count += 1
+        self.exit_exception_type = exc_type
+        return False
+
+
 @pytest.fixture
 def database_mocks(monkeypatch):
     ensure_database_mock = AsyncMock()
     create_table_mock = AsyncMock()
     status_mock = AsyncMock()
+    transaction_spy = _TransactionSpy()
     monkeypatch.setattr(geo_import, "ensure_database", ensure_database_mock)
     monkeypatch.setattr(geo_import.db, "create_table", create_table_mock)
     monkeypatch.setattr(geo_import.db, "status", status_mock)
+    monkeypatch.setattr(
+        geo_import.db,
+        "transaction",
+        lambda: transaction_spy,
+    )
     return SimpleNamespace(
         ensure_database=ensure_database_mock,
         create_table=create_table_mock,
         status=status_mock,
+        transaction=transaction_spy,
     )
+
+
+def _assert_database_not_reached(database_mocks) -> None:
+    database_mocks.ensure_database.assert_not_awaited()
+    database_mocks.create_table.assert_not_awaited()
+    database_mocks.status.assert_not_awaited()
+    assert database_mocks.transaction.enter_count == 0
 
 
 class _InsertStatementSpy:
@@ -223,7 +258,7 @@ async def test_load_parses_bom_semicolon_and_skips_missing_keys(
     )
     captured_geo_rows = []
 
-    async def capture_flush(pending_geo_rows):
+    async def capture_flush(pending_geo_rows, *, target_table):
         captured_geo_rows.extend(pending_geo_rows)
         pending_geo_rows.clear()
 
@@ -238,7 +273,8 @@ async def test_load_parses_bom_semicolon_and_skips_missing_keys(
         checkfirst=True,
     )
     database_mocks.status.assert_awaited_once_with(
-        "TRUNCATE TABLE geo_test.geo_zip_lookup;"
+        f"TRUNCATE TABLE "
+        f"{geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
     )
     assert captured_geo_rows == [
         {
@@ -271,7 +307,9 @@ async def test_load_flushes_two_thousand_rows_then_remainder(
     _write_geo_csv(csv_path, source_rows)
     batch_sizes = []
 
-    async def capture_batch_size(pending_geo_rows):
+    async def capture_batch_size(pending_geo_rows, *, target_table):
+        assert target_table is geo_import.GeoZipLookup.__table__
+        assert database_mocks.transaction.active
         batch_sizes.append(len(pending_geo_rows))
         pending_geo_rows.clear()
 
@@ -281,12 +319,13 @@ async def test_load_flushes_two_thousand_rows_then_remainder(
 
     assert batch_sizes == [geo_import.IMPORT_BATCH_SIZE, 1]
     database_mocks.status.assert_awaited_once_with(
-        "TRUNCATE TABLE mrf.geo_zip_lookup;"
+        f"TRUNCATE TABLE "
+        f"{geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
     )
 
 
 @pytest.mark.asyncio
-async def test_load_uses_default_source_and_schema_fallback(
+async def test_load_uses_default_source_and_model_schema(
     tmp_path,
     monkeypatch,
     database_mocks,
@@ -295,19 +334,20 @@ async def test_load_uses_default_source_and_schema_fallback(
     _write_geo_csv(csv_path, [_csv_fields_by_name()])
     flushed_geo_rows = []
 
-    async def capture_flush(pending_geo_rows):
+    async def capture_flush(pending_geo_rows, *, target_table):
+        assert target_table is geo_import.GeoZipLookup.__table__
         flushed_geo_rows.extend(pending_geo_rows)
         pending_geo_rows.clear()
 
     monkeypatch.setattr(geo_import, "DEFAULT_SOURCE", csv_path)
     monkeypatch.setattr(geo_import, "_flush_rows", capture_flush)
-    monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
 
     await geo_import.load_geo_lookup()
 
     assert [geo_values["zip_code"] for geo_values in flushed_geo_rows] == ["60654"]
     database_mocks.status.assert_awaited_once_with(
-        "TRUNCATE TABLE mrf.geo_zip_lookup;"
+        f"TRUNCATE TABLE "
+        f"{geo_import._qualified_geo_zip_table(geo_import.GeoZipLookup.__table__)};"
     )
 
 
@@ -321,9 +361,7 @@ async def test_missing_source_fails_before_database_mutation(
     with pytest.raises(FileNotFoundError, match=str(missing_path)):
         await geo_import.load_geo_lookup(missing_path)
 
-    database_mocks.ensure_database.assert_not_awaited()
-    database_mocks.create_table.assert_not_awaited()
-    database_mocks.status.assert_not_awaited()
+    _assert_database_not_reached(database_mocks)
 
 
 @pytest.mark.asyncio
@@ -342,7 +380,10 @@ async def test_main_reports_the_delegated_source(
     response = await geo_import.main(test_mode=test_mode, file_path=file_path)
 
     expected_source = Path(file_path) if file_path else None
-    load_mock.assert_awaited_once_with(source_file=expected_source)
+    load_mock.assert_awaited_once_with(
+        source_file=expected_source,
+        test_mode=bool(test_mode),
+    )
     assert response == {
         "test_mode": bool(test_mode),
         "source_file": str(expected_source or geo_import.DEFAULT_SOURCE),
