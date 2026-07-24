@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from sqlalchemy import func, or_, select
 
@@ -94,17 +94,7 @@ async def _load_synonym_entries(session, key_variants: SpecialtyKeyVariants) -> 
         synonym = str(synonym_mapping.get("synonym") or "").strip()
         if not synonym:
             continue
-        target_system = str(synonym_mapping.get("target_system") or "").strip().upper()
-        code = ""
-        if target_system == "NUCC":
-            code = str(synonym_mapping.get("target_code") or "").strip().upper()
-        else:
-            metadata_raw = synonym_mapping.get("metadata_json")
-            if metadata_raw:
-                try:
-                    code = str((json.loads(metadata_raw) or {}).get("nucc_code") or "").strip().upper()
-                except (TypeError, ValueError):
-                    code = ""
+        code = _synonym_code(synonym_mapping)
         if code:
             for variant in key_variants(synonym):
                 codes_by_synonym_variant.setdefault(variant, []).append(code)
@@ -150,12 +140,112 @@ def _synonym_code(mapping) -> str:
         return ""
     try:
         return str((json.loads(metadata_raw) or {}).get("nucc_code") or "").strip().upper()
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return ""
 
 
 def _sorted_codes(codes: list[str]) -> tuple[str, ...]:
     return tuple(sorted({code for code in codes if code}))
+
+
+async def _load_synonym_codes(
+    session,
+    variants: tuple[str, ...],
+) -> tuple[str, ...]:
+    synonym_table = TerminologySynonym.__table__
+    synonym_result = await session.execute(
+        select(
+            synonym_table.c.target_system,
+            synonym_table.c.target_code,
+            synonym_table.c.metadata_json,
+        ).where(
+            synonym_table.c.domain == "provider_type",
+            synonym_table.c.term_key.in_(variants),
+        )
+    )
+    return _sorted_codes([
+        _synonym_code(synonym_mapping)
+        for synonym_mapping in synonym_result.mappings()
+    ])
+
+
+async def _load_matching_nucc_mappings(
+    session,
+    variants: tuple[str, ...],
+) -> list[Mapping[str, object]]:
+    nucc_table = NUCCTaxonomy.__table__
+    classification_key = _normalized_term_sql(nucc_table.c.classification)
+    specialization_key = _normalized_term_sql(nucc_table.c.specialization)
+    display_key = _normalized_term_sql(nucc_table.c.display_name)
+    nucc_result = await session.execute(
+        select(
+            nucc_table.c.code,
+            nucc_table.c.classification,
+            nucc_table.c.specialization,
+            nucc_table.c.display_name,
+        ).where(
+            or_(
+                classification_key.in_(variants),
+                specialization_key.in_(variants),
+                display_key.in_(variants),
+            )
+        )
+    )
+    return list(nucc_result.mappings())
+
+
+def _matching_nucc_mappings(
+    nucc_mappings: list[Mapping[str, object]],
+    field_name: str,
+    variant_set: set[str],
+) -> list[Mapping[str, object]]:
+    return [
+        nucc_mapping
+        for nucc_mapping in nucc_mappings
+        if _normalized_term_value(nucc_mapping.get(field_name)) in variant_set
+    ]
+
+
+def _codes_from_nucc_mappings(
+    nucc_mappings: list[Mapping[str, object]],
+) -> tuple[str, ...]:
+    return _sorted_codes([
+        str(nucc_mapping.get("code") or "").strip().upper()
+        for nucc_mapping in nucc_mappings
+    ])
+
+
+def _resolve_nucc_entry(
+    nucc_mappings: list[Mapping[str, object]],
+    variants: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    variant_set = set(variants)
+    classification_mappings = _matching_nucc_mappings(
+        nucc_mappings,
+        "classification",
+        variant_set,
+    )
+    if classification_mappings:
+        all_codes = _codes_from_nucc_mappings(classification_mappings)
+        base_codes = _codes_from_nucc_mappings([
+            nucc_mapping
+            for nucc_mapping in classification_mappings
+            if not str(nucc_mapping.get("specialization") or "").strip()
+        ])
+        return all_codes, base_codes or all_codes
+
+    specialization_mappings = _matching_nucc_mappings(
+        nucc_mappings,
+        "specialization",
+        variant_set,
+    )
+    matching_mappings = specialization_mappings or _matching_nucc_mappings(
+        nucc_mappings,
+        "display_name",
+        variant_set,
+    )
+    codes = _codes_from_nucc_mappings(matching_mappings)
+    return (codes, codes) if codes else None
 
 
 async def load_dynamic_specialty_entry(
@@ -175,76 +265,14 @@ async def load_dynamic_specialty_entry(
     if not variants:
         return None
 
-    synonym_table = TerminologySynonym.__table__
-    synonym_result = await session.execute(
-        select(
-            synonym_table.c.target_system,
-            synonym_table.c.target_code,
-            synonym_table.c.metadata_json,
-        ).where(
-            synonym_table.c.domain == "provider_type",
-            synonym_table.c.term_key.in_(variants),
-        )
-    )
-    synonym_codes = _sorted_codes([
-        _synonym_code(mapping)
-        for mapping in synonym_result.mappings()
-    ])
+    synonym_codes = await _load_synonym_codes(session, variants)
     if synonym_codes:
         return synonym_codes, synonym_codes
 
-    nucc_table = NUCCTaxonomy.__table__
-    classification_key = _normalized_term_sql(nucc_table.c.classification)
-    specialization_key = _normalized_term_sql(nucc_table.c.specialization)
-    display_key = _normalized_term_sql(nucc_table.c.display_name)
-    nucc_result = await session.execute(
-        select(
-            nucc_table.c.code,
-            nucc_table.c.classification,
-            nucc_table.c.specialization,
-            nucc_table.c.display_name,
-        ).where(
-            or_(
-                classification_key.in_(variants),
-                specialization_key.in_(variants),
-                display_key.in_(variants),
-            )
-        )
-    )
-    rows = list(nucc_result.mappings())
-    if not rows:
+    nucc_mappings = await _load_matching_nucc_mappings(session, variants)
+    if not nucc_mappings:
         return None
-
-    variant_set = set(variants)
-    classification_rows = [
-        row for row in rows
-        if _normalized_term_value(row.get("classification")) in variant_set
-    ]
-    if classification_rows:
-        all_codes = _sorted_codes([
-            str(row.get("code") or "").strip().upper()
-            for row in classification_rows
-        ])
-        base_codes = _sorted_codes([
-            str(row.get("code") or "").strip().upper()
-            for row in classification_rows
-            if not str(row.get("specialization") or "").strip()
-        ])
-        return all_codes, base_codes or all_codes
-
-    specialization_rows = [
-        row for row in rows
-        if _normalized_term_value(row.get("specialization")) in variant_set
-    ]
-    matching_rows = specialization_rows or [
-        row for row in rows
-        if _normalized_term_value(row.get("display_name")) in variant_set
-    ]
-    codes = _sorted_codes([
-        str(row.get("code") or "").strip().upper()
-        for row in matching_rows
-    ])
-    return (codes, codes) if codes else None
+    return _resolve_nucc_entry(nucc_mappings, variants)
 
 
 def _normalized_term_value(value: object) -> str:

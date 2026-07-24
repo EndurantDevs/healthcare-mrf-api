@@ -1,7 +1,7 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 38,
-    "ambiguous_variable_names": 163,
+    "ambiguous_variable_names": 161,
     "boolean_name_mismatch": 114,
     "builtin_shadowing": 0,
     "class_name_shape": 2,
@@ -13,7 +13,7 @@
     "global_state_usage": 12,
     "inline_suppressions": 4,
     "long_files": 178,
-    "long_functions": 870,
+    "long_functions": 869,
     "missing_contract_docstrings": 3,
     "pass_placeholders": 0,
     "single_letter_names": 25,
@@ -116,8 +116,6 @@
       "ambiguous_variable_name:api/endpoint/site_intelligence.py:get_site_score:row",
       "ambiguous_variable_name:api/endpoint/site_intelligence.py:get_site_score:value",
       "ambiguous_variable_name:api/endpoint/site_intelligence.py:get_site_score:values",
-      "ambiguous_variable_name:api/provider_specialty_cache_entries.py:load_dynamic_specialty_entry:row",
-      "ambiguous_variable_name:api/provider_specialty_cache_entries.py:load_dynamic_specialty_entry:rows",
       "ambiguous_variable_name:api/tier_utils.py:normalize_drug_tier_slug:value",
       "ambiguous_variable_name:process/address_archive_migration.py:main:payload",
       "ambiguous_variable_name:process/address_archive_migration.py:process_data:payload",
@@ -963,7 +961,6 @@
       "long_function:api/endpoint/reports.py:list_pharmacy_access_rankings",
       "long_function:api/endpoint/reports.py:list_pharmacy_markets",
       "long_function:api/endpoint/site_intelligence.py:get_site_score",
-      "long_function:api/provider_specialty_cache_entries.py:load_dynamic_specialty_entry",
       "long_function:api/ptg2_audit_occurrences.py:_audit_page_sql",
       "long_function:api/ptg2_audit_occurrences.py:audit_occurrences_payload",
       "long_function:api/ptg2_code_context.py:_resolve_ptg2_code_search_context",
@@ -2049,12 +2046,6 @@
       "too_many_parameters:tests/test_ptg2_scanner_v3_runs.py:_run_scanner",
       "too_many_parameters:tests/test_ptg2_v3_source_api_audit.py:_api_page_document"
     ]
-  },
-  "one_time_debt_reset": {
-    "maximum_increase_basis_points": 200,
-    "reason": "PTG V4 adaptive graph representation migration",
-    "reference_baseline_sha256": "3ed17d26f634e6b231a7283bf20b9c4a34cd2f698aa6533aae667c7329316c2f",
-    "reference_total": 2075
   },
   "rules": {
     "readability": {
