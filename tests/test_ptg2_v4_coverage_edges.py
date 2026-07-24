@@ -45,7 +45,9 @@ from tests.ptg2_v4_coverage_graph_compiler_cases import (
     test_compiler_progress_and_file_validation_branch_matrix,
 )
 from tests.ptg2_v4_coverage_prefix_diagnostics import (
+    test_compiler_accepts_risk_ranked_owner_below_group_maximum,
     test_compiler_prefix_owner_diagnostics_fail_closed,
+    test_compiler_rejects_unavailable_factor_artifact,
 )
 from tests.ptg2_v4_coverage_summary_mutations import (
     test_compiler_progress_rejects_post_terminal_and_backward_events,

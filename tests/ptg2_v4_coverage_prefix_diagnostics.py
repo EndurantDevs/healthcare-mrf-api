@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -221,3 +222,60 @@ def test_compiler_prefix_owner_diagnostics_fail_closed() -> None:
     )
     _assert_online_owner_fail_closed(option_by_name, active_context)
     _assert_pattern_memo_fail_closed()
+
+
+def test_compiler_accepts_risk_ranked_owner_below_group_maximum() -> None:
+    option_by_name = {
+        "npi_prefix_target": 10,
+        "max_online_group_keys_per_set": 10,
+    }
+    context = compiler._PrefixDiagnosticContext(
+        provider_set_count=2,
+        simulated_set_count=2,
+        override_owner_count=0,
+        groups_to_target_percentiles=(1, 3, 5, 5),
+        source_maxima_by_dimension={
+            "owner": 0,
+            "member": 0,
+            "page": 0,
+            "byte": 512,
+        },
+        source_limits_by_dimension={
+            "owner": 1,
+            "member": 1,
+            "page": 1,
+            "byte": 512,
+        },
+        group_npi_maxima_by_dimension={
+            "member": 0,
+            "locator_page": 0,
+            "member_page": 0,
+            "byte": 0,
+            "batch": 0,
+        },
+        group_npi_limits_by_dimension={
+            "member": 0,
+            "locator_page": 0,
+            "member_page": 0,
+            "byte": 0,
+            "batch": 0,
+        },
+    )
+    observe = _worst_owner_observe(
+        key=7,
+        groups_to_target=4,
+        member_count=10,
+        digest="ab" * 32,
+    )
+    observe["npi_prefix_worst_source_byte_work"] = 512
+
+    assert compiler._validate_worst_prefix_owner(
+        observe,
+        option_by_name,
+        context,
+    ) == (7, False)
+
+
+def test_compiler_rejects_unavailable_factor_artifact(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="factor artifact is unavailable"):
+        compiler._artifact_manifest({"path": str(tmp_path / "missing.bin")})

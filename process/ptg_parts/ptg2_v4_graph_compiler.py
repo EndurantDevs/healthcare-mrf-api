@@ -661,7 +661,10 @@ def _validate_worst_prefix_owner(
     ):
         raise RuntimeError("V4 graph worst provider-set key is invalid")
     elif (
-        worst_owner.groups_to_target != context.groups_to_target_percentiles[-1]
+        # Rust ranks this canary across the full online-owner risk tuple. Group
+        # count is only one dimension, so the winner may be below the
+        # population maximum while still being the highest-risk owner.
+        worst_owner.groups_to_target > context.groups_to_target_percentiles[-1]
         or worst_owner.member_count > int(options["npi_prefix_target"])
         or not isinstance(worst_owner.member_digest, str)
         or _has_work_overflow(
