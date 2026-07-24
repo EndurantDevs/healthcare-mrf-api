@@ -25,6 +25,7 @@ from process.ptg_parts.ptg2_shared_audit import (
     SharedAuditPublication,
     _BuildingBlockReader,
     _CORE_LAYOUT_DOMAIN,
+    _HydrationWork,
     _ReadBudget,
     _insert_occurrences,
     _integer,
@@ -1466,9 +1467,22 @@ async def publish_v4_audit_sample(
             snapshot_key=snapshot_key,
             audit_occurrences=audit_occurrences,
         )
+    hydration_work = _HydrationWork(
+        price_candidate_count=len(candidates),
+        provider_candidate_count=len(candidates),
+        represented_source_count=len(
+            {candidate.source_key for candidate in candidates}
+        ),
+        provider_selection_budget=len(candidates),
+        provider_selection_count=sum(
+            len(provider_npis_for_candidate)
+            for provider_npis_for_candidate in provider_npis.values()
+        ),
+    )
     metadata = _publication_metadata(
         audit_occurrences=audit_occurrences,
         candidates=candidates,
+        hydration_work=hydration_work,
         candidate_summary=candidate_summary,
         source_count=source_count,
         core_layout_id=core_layout_id,

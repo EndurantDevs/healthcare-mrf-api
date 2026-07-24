@@ -378,11 +378,16 @@ def _configure_audit_publication(monkeypatch):
         lambda **_kwargs: (occurrence,),
     )
     monkeypatch.setattr(audit, "_insert_occurrences", no_op)
-    monkeypatch.setattr(
-        audit,
-        "_publication_metadata",
-        lambda **_kwargs: {"sample_count": 1},
-    )
+    def fake_publication_metadata(**kwargs):
+        hydration_work = kwargs["hydration_work"]
+        assert hydration_work.price_candidate_count == 1
+        assert hydration_work.provider_candidate_count == 1
+        assert hydration_work.represented_source_count == 1
+        assert hydration_work.provider_selection_budget == 1
+        assert hydration_work.provider_selection_count == 1
+        return {"sample_count": 1}
+
+    monkeypatch.setattr(audit, "_publication_metadata", fake_publication_metadata)
     return SimpleNamespace(selected_layout="pattern")
 
 
