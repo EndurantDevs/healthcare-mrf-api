@@ -89,13 +89,23 @@ def _provider_set_metadata_entries(tmp_path, *, row_count: int = 1):
 @pytest.mark.asyncio
 async def test_strict_v3_stage_creates_only_price_inputs(monkeypatch):
     status = AsyncMock()
+    register_stages = AsyncMock()
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
     monkeypatch.setattr(ptg2_manifest_publish.db, "status", status)
-
-    stage_table = await ptg2_manifest_publish._create_serving_stage_table(
-        "strict-run"
+    monkeypatch.setattr(
+        ptg2_manifest_publish,
+        "register_attempt_stage_tables",
+        register_stages,
     )
 
+    stage_table = await ptg2_manifest_publish._create_serving_stage_table(
+        "strict-run",
+        snapshot_id="strict-v3-snapshot",
+        internal_run_id="strict-v3-run",
+        storage_generation="shared_blocks_v3",
+    )
+
+    register_stages.assert_not_awaited()
     statements = "\n".join(call.args[0] for call in status.await_args_list)
     assert stage_table == "ptg2_manifest_stage_serving_strict_run"
     assert "ptg2_manifest_stage_price_atom_strict_run" in statements
@@ -110,6 +120,39 @@ async def test_strict_v3_stage_creates_only_price_inputs(monkeypatch):
     ):
         assert retired_kind not in statements
     assert "CREATE UNLOGGED TABLE \"mrf\".\"ptg2_manifest_stage_serving_strict_run\"" not in statements
+
+
+@pytest.mark.asyncio
+async def test_v4_stage_registers_all_physical_tables(monkeypatch):
+    status = AsyncMock()
+    register_stages = AsyncMock()
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
+    monkeypatch.setattr(ptg2_manifest_publish.db, "status", status)
+    monkeypatch.setattr(
+        ptg2_manifest_publish,
+        "register_attempt_stage_tables",
+        register_stages,
+    )
+
+    stage_table = await ptg2_manifest_publish._create_serving_stage_table(
+        "v4-run",
+        snapshot_id="v4-snapshot",
+        internal_run_id="v4-run",
+        storage_generation="shared_blocks_v4",
+    )
+
+    register_stages.assert_awaited_once_with(
+        ptg2_manifest_publish.db,
+        schema_name="mrf",
+        snapshot_id="v4-snapshot",
+        internal_run_id="v4-run",
+        table_names=[
+            stage_table,
+            "ptg2_manifest_stage_price_atom_v4_run",
+            "ptg2_manifest_stage_price_set_atom_v4_run",
+            "ptg2_manifest_stage_price_set_summary_v4_run",
+        ],
+    )
 
 
 @pytest.mark.asyncio

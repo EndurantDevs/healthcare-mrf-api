@@ -12,9 +12,12 @@ from db.connection import db
 from process.ptg_parts.ptg2_shared_gc import (
     _is_owned_v4_layout_locked,
     _v4_reachable_hashes,
-    abandon_owned_v4_layout,
     require_migration_owned_tables,
     resolve_ptg2_schema,
+)
+from process.ptg_parts.ptg2_v4_failed_layout_fence import (
+    PTG2V4RecoveryConflict,
+    abandon_writable_v4_layout,
 )
 from process.ptg_parts.ptg2_v4_failed_layout_state import (
     json_mapping,
@@ -38,12 +41,6 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_SHARED_GENERATION,
     v4_layout_fingerprint,
 )
-
-
-class PTG2V4RecoveryConflict(RuntimeError):
-    """Raised when exact failed-layout recovery safety gates do not hold."""
-
-
 @dataclass(frozen=True)
 class _RecoveryContext:
     snapshot_id: str
@@ -401,11 +398,10 @@ async def _release_recovery_context(
     schema_name: str,
     context: _RecoveryContext,
 ) -> dict[str, Any]:
-    abandonment = await abandon_owned_v4_layout(
-        schema_name=schema_name,
-        snapshot_key=context.snapshot_key,
-        build_token=context.build_token,
-        executor=connection,
+    abandonment = await abandon_writable_v4_layout(
+        connection, schema_name=schema_name,
+        snapshot_id=context.snapshot_id, import_run_id=context.import_run_id,
+        snapshot_key=context.snapshot_key, build_token=context.build_token,
     )
     if abandonment.logical_layout_count != 1:
         raise PTG2V4RecoveryConflict(

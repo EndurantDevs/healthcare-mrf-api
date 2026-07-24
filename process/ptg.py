@@ -63,6 +63,18 @@ from process.ptg_parts.artifacts import (PTG2ArtifactStore,
                                          resolve_ptg2_artifact_dir,
                                          sha256_file)
 from process.ptg_parts.ptg2_artifact_blobs import delete_ptg2_artifacts_for_snapshot
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    StaleMetadataFenceError,
+    guard_attempt_rows,
+    has_stale_metadata_marker,
+    is_stale_metadata_fence_error,
+    lock_writable_snapshot,
+    raise_stale_metadata_fence,
+)
+from process.ptg_parts.ptg2_v4_stale_metadata_types import (
+    PTG2_V4_STALE_METADATA_MARKER,
+)
 from process.ptg_parts.canonical import (_canonical_key, _canonical_sort_key,
                                          _canonicalize_for_json,
                                          canonical_json_dumps,
@@ -548,8 +560,59 @@ def _ptg2_snapshot_conflict_update_values(
     return update_values_by_column
 
 
+def _has_stale_metadata_marker(json_column: Any) -> Any:
+    """Build the SQL predicate protecting a reconciled metadata row."""
+
+    empty_jsonb = cast(literal("{}"), JSONB)
+    envelope = func.coalesce(cast(json_column, JSONB), empty_jsonb)
+    return envelope.op("?")(PTG2_V4_STALE_METADATA_MARKER)
+
+
+async def _store_fenced_snapshot_state(
+    session: Any,
+    statement: Any,
+    table: Any,
+    snapshot_attributes: dict[str, Any],
+    *,
+    is_snapshot_claim: bool,
+) -> dict[str, Any]:
+    """Store one snapshot state while its exact attempt remains writable."""
+
+    schema_name = resolve_ptg2_schema()
+    await guard_attempt_rows(
+        session,
+        db,
+        schema_name=schema_name,
+        table_name=PTG2Snapshot.__tablename__,
+        attempt_rows=[snapshot_attributes],
+    )
+    stored_row = await statement.first()
+    await guard_attempt_rows(
+        session,
+        db,
+        schema_name=schema_name,
+        table_name=PTG2Snapshot.__tablename__,
+        attempt_rows=[snapshot_attributes],
+    )
+    has_snapshot_claim = stored_row is not None
+    if stored_row is None:
+        stored_row = await (
+            db.select(*table.c)
+            .where(table.c.snapshot_id == snapshot_attributes["snapshot_id"])
+            .first()
+        )
+    snapshot_state = _row_mapping(stored_row)
+    if is_snapshot_claim:
+        snapshot_state["snapshot_claim_status"] = (
+            "acquired" if has_snapshot_claim else "existing"
+        )
+    return snapshot_state
+
+
 async def _push_ptg2_snapshot_preserving_publication(
     snapshot_attributes: dict[str, Any],
+    *,
+    initial_import_run_by_field: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     table = PTG2Snapshot.__table__
     statement = db.insert(table).values(snapshot_attributes)
@@ -564,70 +627,227 @@ async def _push_ptg2_snapshot_preserving_publication(
         if is_snapshot_claim
         else table.c.status.is_distinct_from(PTG2_STATUS_PUBLISHED)
     )
+    conflict_where = conflict_where & ~_has_stale_metadata_marker(
+        table.c.manifest
+    )
     statement = statement.on_conflict_do_update(
         index_elements=["snapshot_id"],
         set_=update_values_by_column,
         where=conflict_where,
     ).returning(*table.c)
 
-    async def execute_snapshot_state_write() -> dict[str, Any]:
-        """Store one snapshot state and report whether a building claim won."""
-
-        stored_row = await statement.first()
-        has_snapshot_claim = stored_row is not None
-        if stored_row is None:
-            stored_row = await (
-                db.select(*table.c)
-                .where(table.c.snapshot_id == snapshot_attributes["snapshot_id"])
-                .first()
-            )
-        snapshot_state = _row_mapping(stored_row)
+    async with db.transaction() as session:
         if is_snapshot_claim:
-            snapshot_state["snapshot_claim_status"] = (
-                "acquired" if has_snapshot_claim else "existing"
+            await _acquire_source_pointer_gc_lock(session)
+        snapshot_state = await _store_fenced_snapshot_state(
+            session,
+            statement,
+            table,
+            snapshot_attributes,
+            is_snapshot_claim=is_snapshot_claim,
+        )
+        should_initialize_attempt = (
+            initial_import_run_by_field is not None
+            and (
+                snapshot_state.get("snapshot_claim_status") == "acquired"
+                or _is_exact_building_attempt_retry(
+                    snapshot_state,
+                    initial_import_run_by_field,
+                )
             )
+        )
+        if should_initialize_attempt:
+            await _push_fenced_import_run(initial_import_run_by_field)
         return snapshot_state
 
-    if not is_snapshot_claim:
-        return await execute_snapshot_state_write()
+
+def _is_exact_building_attempt_retry(
+    snapshot_state: Mapping[str, Any],
+    import_run_attributes: Mapping[str, Any],
+) -> bool:
+    """Recognize the deterministic attempt while its source lock is held."""
+
+    return (
+        snapshot_state.get("snapshot_claim_status") == "existing"
+        and snapshot_state.get("status") == PTG2_STATUS_BUILDING
+        and snapshot_state.get("import_run_id")
+        == import_run_attributes.get("import_run_id")
+    )
+
+
+async def _push_fenced_import_run(
+    import_run_attributes: dict[str, Any],
+) -> dict[str, Any]:
+    """Upsert one run unless metadata reconciliation fenced the attempt."""
+
+    table = PTG2ImportRun.__table__
+    statement = db.insert(table).values(import_run_attributes)
+    update_values_by_column = {
+        column.name: getattr(statement.excluded, column.name)
+        for column in table.c
+        if column.name != "import_run_id"
+    }
+    statement = statement.on_conflict_do_update(
+        index_elements=["import_run_id"],
+        set_=update_values_by_column,
+        where=~_has_stale_metadata_marker(table.c.report),
+    ).returning(*table.c)
     async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(session)
-        return await execute_snapshot_state_write()
+        await guard_attempt_rows(
+            session,
+            db,
+            schema_name=resolve_ptg2_schema(),
+            table_name=PTG2ImportRun.__tablename__,
+            attempt_rows=[import_run_attributes],
+        )
+        stored_row = await statement.first()
+        if stored_row is not None:
+            return _row_mapping(stored_row)
+        existing_row = await (
+            db.select(*table.c)
+            .where(
+                table.c.import_run_id
+                == import_run_attributes["import_run_id"]
+            )
+            .first()
+        )
+        existing_state = _row_mapping(existing_row)
+        if has_stale_metadata_marker(existing_state.get("report")):
+            raise StaleMetadataFenceError(
+                "PTG import run was metadata-reconciled"
+            )
+        return existing_state
+
+
+async def _push_fenced_ptg2_plan_months(
+    plan_month_entries: list[dict[str, Any]],
+) -> None:
+    """Upsert plan-month rows while holding every snapshot fence row."""
+
+    table = PTG2PlanMonth.__table__
+    statement = db.insert(table).values(plan_month_entries)
+    update_values_by_column = {
+        column.name: getattr(statement.excluded, column.name)
+        for column in table.c
+        if column.name not in set(PTG2PlanMonth.__my_index_elements__)
+    }
+    statement = statement.on_conflict_do_update(
+        index_elements=list(PTG2PlanMonth.__my_index_elements__),
+        set_=update_values_by_column,
+    )
+    schema_name = resolve_ptg2_schema()
+    snapshot_ids = sorted(
+        {
+            str(entry.get("snapshot_id") or "")
+            for entry in plan_month_entries
+            if entry.get("snapshot_id")
+        }
+    )
+    async with db.transaction() as session:
+        for snapshot_id in snapshot_ids:
+            await lock_writable_snapshot(
+                session,
+                db,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+            )
+        await session.execute(statement)
+
+
+def _ptg2_model_schema_name(cls: Any) -> str:
+    return (
+        getattr(getattr(cls, "__table__", None), "schema", None)
+        or resolve_ptg2_schema()
+    )
+
+
+async def _push_fenced_ptg2_objects_direct(
+    object_entries: list[dict[str, Any]],
+    cls: Any,
+    *,
+    rewrite: bool,
+) -> None:
+    """Use the ordinary writer only while the exact attempt is writable."""
+
+    async with db.transaction() as session:
+        await guard_attempt_rows(
+            session,
+            db,
+            schema_name=_ptg2_model_schema_name(cls),
+            table_name=cls.__tablename__,
+            attempt_rows=object_entries,
+        )
+        try:
+            await push_objects(
+                object_entries,
+                cls,
+                rewrite=rewrite,
+                use_copy=False,
+            )
+        except TypeError as exc:
+            if "use_copy" not in str(exc):
+                raise
+            await push_objects(object_entries, cls, rewrite=rewrite)
 
 
 async def _push_ptg2_objects(
     object_entries: list[dict[str, Any]],
     cls,
     rewrite: bool = True,
+    initial_import_run_by_field: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    """Route PTG writes through their lifecycle-fenced storage path."""
+
     if object_entries and cls is PTG2Snapshot and rewrite:
         if len(object_entries) != 1:
             raise ValueError("PTG snapshot state writes must contain exactly one row")
-        return await _push_ptg2_snapshot_preserving_publication(object_entries[0])
+        initial_run_kwargs = (
+            {
+                "initial_import_run_by_field": (
+                    initial_import_run_by_field
+                )
+            }
+            if initial_import_run_by_field is not None
+            else {}
+        )
+        return await _push_ptg2_snapshot_preserving_publication(
+            object_entries[0],
+            **initial_run_kwargs,
+        )
+    if object_entries and cls is PTG2ImportRun and rewrite:
+        if len(object_entries) != 1:
+            raise ValueError("PTG import-run writes must contain exactly one row")
+        return await _push_fenced_import_run(object_entries[0])
+    if object_entries and cls is PTG2PlanMonth and rewrite:
+        await _push_fenced_ptg2_plan_months(object_entries)
+        return None
     if object_entries and cls is PTG2PriceSet and _env_bool(PTG2_STREAMING_DEDUPE_ENV, False):
         try:
             await _copy_ignore_ptg2_objects(object_entries, cls)
             return
         except Exception as exc:
+            if is_stale_metadata_fence_error(exc):
+                raise_stale_metadata_fence(exc)
             logger.warning("PTG2 copy/ignore fallback for %s: %s", cls.__tablename__, exc)
     if object_entries and cls is PTG2ServingRate and _env_bool(PTG2_DIRECT_COPY_SERVING_RATE_ENV, False):
         try:
             await _copy_insert_ptg2_objects(object_entries, cls)
             return
         except Exception as exc:
+            if is_stale_metadata_fence_error(exc):
+                raise_stale_metadata_fence(exc)
             logger.warning("PTG2 direct COPY fallback for %s: %s", cls.__tablename__, exc)
     if object_entries and rewrite and len(object_entries) >= max(_env_int(PTG2_COPY_UPSERT_ROWS_ENV, 250), 1):
         try:
             await _copy_upsert_ptg2_objects(object_entries, cls)
             return
         except Exception as exc:
+            if is_stale_metadata_fence_error(exc):
+                raise_stale_metadata_fence(exc)
             logger.warning("PTG2 copy/upsert fallback for %s: %s", cls.__tablename__, exc)
-    try:
-        await push_objects(object_entries, cls, rewrite=rewrite, use_copy=False)
-    except TypeError as exc:
-        if "use_copy" not in str(exc):
-            raise
-        await push_objects(object_entries, cls, rewrite=rewrite)
+    await _push_fenced_ptg2_objects_direct(
+        object_entries, cls, rewrite=rewrite
+    )
 
 def _ptg2_copy_file_row_count(path: Path) -> int:
     if not path.exists() or path.stat().st_size <= 0:
@@ -2410,6 +2630,8 @@ async def _process_in_network_file(
 async def _persist_completed_ptg2_import_run(
     *,
     import_run_id: str,
+    snapshot_id: str | None = None,
+    manifest_stage_table: str | None = None,
     import_month: datetime.date,
     started_at: datetime.datetime,
     options: Mapping[str, Any],
@@ -2419,7 +2641,12 @@ async def _persist_completed_ptg2_import_run(
     post_publish_started_monotonic: float,
     post_publish_stage_timer: _StageTimer,
 ) -> datetime.datetime:
-    """Persist completion only after every required import stage has finished."""
+    """Atomically persist completion and release owned manifest stages."""
+
+    if bool(snapshot_id) != bool(manifest_stage_table):
+        raise ValueError(
+            "completion stage release requires both snapshot and stage identifiers"
+        )
 
     provisional_finished_at = _utcnow()
     provisional_report_by_field = {
@@ -2430,58 +2657,187 @@ async def _persist_completed_ptg2_import_run(
             "completion_metrics_pending": True,
         },
     }
-    await _push_ptg2_objects(
-        [
-            {
-                "import_run_id": import_run_id,
-                "import_month": import_month,
-                "status": PTG2_STATUS_VALIDATED,
-                "started_at": started_at,
-                "finished_at": provisional_finished_at,
-                "heartbeat_at": provisional_finished_at,
-                "options": dict(options),
-                "report": provisional_report_by_field,
-                "error": None,
-            }
-        ],
-        PTG2ImportRun,
-        rewrite=True,
-    )
-    post_publish_stage_timer.mark("run_state_persistence")
+    async with db.transaction():
+        await _push_ptg2_objects(
+            [
+                {
+                    "import_run_id": import_run_id,
+                    "import_month": import_month,
+                    "status": PTG2_STATUS_VALIDATED,
+                    "started_at": started_at,
+                    "finished_at": provisional_finished_at,
+                    "heartbeat_at": provisional_finished_at,
+                    "options": dict(options),
+                    "report": provisional_report_by_field,
+                    "error": None,
+                }
+            ],
+            PTG2ImportRun,
+            rewrite=True,
+        )
+        post_publish_stage_timer.mark("run_state_persistence")
+        if manifest_stage_table is not None:
+            assert snapshot_id is not None
+            await _drop_ptg2_snapshot_table_names(
+                _ptg2_manifest_stage_table_names(manifest_stage_table),
+                snapshot_id=snapshot_id,
+                internal_run_id=import_run_id,
+            )
+            post_publish_stage_timer.mark("manifest_stage_release")
 
-    completed_monotonic = _ptg2_monotonic()
-    for key, stage_seconds in post_publish_stage_timer.durations_by_stage.items():
-        timing_payload[f"post_publish_{key}_seconds"] = stage_seconds
-    timing_payload["post_publish_seconds"] = (
-        completed_monotonic - post_publish_started_monotonic
-    )
-    timing_payload["total_seconds"] = completed_monotonic - import_started_monotonic
-    report_payload["timings"] = timing_payload
-    report_payload["timing_contract"] = {
-        "version": 2,
-        "total_boundary": "after_required_run_state_persistence",
-        "completion_metrics_write_excluded": True,
-    }
+        completed_monotonic = _ptg2_monotonic()
+        for key, stage_seconds in post_publish_stage_timer.durations_by_stage.items():
+            timing_payload[f"post_publish_{key}_seconds"] = stage_seconds
+        timing_payload["post_publish_seconds"] = (
+            completed_monotonic - post_publish_started_monotonic
+        )
+        timing_payload["total_seconds"] = (
+            completed_monotonic - import_started_monotonic
+        )
+        report_payload["timings"] = timing_payload
+        report_payload["timing_contract"] = {
+            "version": 2,
+            "total_boundary": "after_required_run_state_persistence",
+            "completion_metrics_write_excluded": True,
+        }
 
-    completed_at = _utcnow()
-    await _push_ptg2_objects(
-        [
-            {
-                "import_run_id": import_run_id,
-                "import_month": import_month,
-                "status": PTG2_STATUS_VALIDATED,
-                "started_at": started_at,
-                "finished_at": completed_at,
-                "heartbeat_at": completed_at,
-                "options": dict(options),
-                "report": report_payload,
-                "error": None,
-            }
-        ],
-        PTG2ImportRun,
-        rewrite=True,
-    )
+        completed_at = _utcnow()
+        await _push_ptg2_objects(
+            [
+                {
+                    "import_run_id": import_run_id,
+                    "import_month": import_month,
+                    "status": PTG2_STATUS_VALIDATED,
+                    "started_at": started_at,
+                    "finished_at": completed_at,
+                    "heartbeat_at": completed_at,
+                    "options": dict(options),
+                    "report": report_payload,
+                    "error": None,
+                }
+            ],
+            PTG2ImportRun,
+            rewrite=True,
+        )
     return completed_at
+
+
+def _terminal_retry_update_statement(schema: str) -> Any:
+    return db.text(
+        f"""
+        UPDATE {schema}.ptg2_import_run AS internal_run
+           SET status = CAST(:terminal_run_status AS varchar(32)),
+               finished_at = CASE
+                   WHEN internal_run.status = CAST(
+                       :terminal_run_status AS varchar(32)
+                   )
+                    AND internal_run.finished_at IS NOT NULL
+                   THEN internal_run.finished_at
+                   ELSE statement_timestamp()
+               END,
+               heartbeat_at = CASE
+                   WHEN internal_run.status = CAST(
+                       :terminal_run_status AS varchar(32)
+                   )
+                   THEN COALESCE(
+                       internal_run.heartbeat_at,
+                       internal_run.finished_at,
+                       statement_timestamp()
+                   )
+                   ELSE statement_timestamp()
+               END,
+               report = CASE
+                   WHEN internal_run.status = CAST(
+                       :terminal_run_status AS varchar(32)
+                   )
+                    AND COALESCE(
+                       internal_run.report::jsonb,
+                       '{{}}'::jsonb
+                   ) <> '{{}}'::jsonb
+                   THEN internal_run.report
+                   ELSE snapshot.manifest
+               END,
+               error = NULL
+          FROM {schema}.ptg2_snapshot AS snapshot
+         WHERE internal_run.import_run_id = :internal_run_id
+           AND snapshot.snapshot_id = :snapshot_id
+           AND snapshot.import_run_id = internal_run.import_run_id
+           AND snapshot.status IN (:validated_status, :published_status)
+        RETURNING internal_run.import_run_id
+        """
+    )
+
+
+async def _registered_terminal_stage_names(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_id: str,
+    internal_run_id: str,
+) -> list[str]:
+    stage_result = await session.execute(
+        db.text(
+            f"""
+            SELECT table_name
+              FROM {schema}.ptg2_v4_attempt_stage
+             WHERE snapshot_id = :snapshot_id
+               AND internal_run_id = :internal_run_id
+             ORDER BY table_name
+            """
+        ),
+        {
+            "snapshot_id": snapshot_id,
+            "internal_run_id": internal_run_id,
+        },
+    )
+    return [str(stage_record[0]) for stage_record in stage_result.all()]
+
+
+async def _finalize_resumed_terminal_attempt(
+    snapshot_attributes: Mapping[str, Any],
+    *,
+    internal_run_id: str,
+) -> None:
+    """Finish an exact terminal retry and remove any retained V4 stages."""
+
+    snapshot_id = str(snapshot_attributes.get("snapshot_id") or "")
+    snapshot_run_id = str(snapshot_attributes.get("import_run_id") or "")
+    if not snapshot_id or snapshot_run_id != internal_run_id:
+        raise RuntimeError("terminal snapshot retry changed its attempt pair")
+    schema_name = resolve_ptg2_schema()
+    schema = _quote_ident(schema_name)
+    async with db.transaction() as session:
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
+        )
+        terminal_result = await session.execute(
+            _terminal_retry_update_statement(schema),
+            {
+                "terminal_run_status": PTG2_STATUS_VALIDATED,
+                "internal_run_id": internal_run_id,
+                "snapshot_id": snapshot_id,
+                "validated_status": PTG2_STATUS_VALIDATED,
+                "published_status": PTG2_STATUS_PUBLISHED,
+            },
+        )
+        if terminal_result.first() is None:
+            raise RuntimeError("terminal snapshot retry is not finalizable")
+        registered_stage_names = await _registered_terminal_stage_names(
+            session,
+            schema=schema,
+            snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
+        )
+        if registered_stage_names:
+            await _drop_ptg2_snapshot_table_names(
+                registered_stage_names,
+                snapshot_id=snapshot_id,
+                internal_run_id=internal_run_id,
+            )
 
 
 async def _heartbeat_ptg2_import_run(import_run_id: str) -> None:
@@ -2491,20 +2847,36 @@ async def _heartbeat_ptg2_import_run(import_run_id: str) -> None:
         float(os.getenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "15")),
         1.0,
     )
-    schema = _quote_ident(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    schema_name = resolve_ptg2_schema()
+    schema = _quote_ident(schema_name)
     while True:
         await asyncio.sleep(interval)
         try:
-            await db.status(
-                f"""
-                UPDATE {schema}.ptg2_import_run
-                   SET heartbeat_at = timezone('UTC', statement_timestamp())
-                 WHERE import_run_id = :import_run_id
-                   AND status IN ('pending', 'running', 'building')
-                """,
-                import_run_id=import_run_id,
-            )
-        except Exception:
+            async with db.transaction() as session:
+                await lock_writable_snapshot(
+                    session,
+                    db,
+                    schema_name=schema_name,
+                    snapshot_id="",
+                    internal_run_id=import_run_id,
+                )
+                await session.execute(
+                    db.text(
+                        f"""
+                        UPDATE {schema}.ptg2_import_run
+                           SET heartbeat_at = timezone(
+                               'UTC',
+                               statement_timestamp()
+                           )
+                         WHERE import_run_id = :import_run_id
+                           AND status IN ('pending', 'running', 'building')
+                        """
+                    ),
+                    {"import_run_id": import_run_id},
+                )
+        except Exception as exc:
+            if is_stale_metadata_fence_error(exc):
+                raise_stale_metadata_fence(exc)
             logger.warning(
                 "Failed to persist PTG2 import heartbeat for %s",
                 import_run_id,
@@ -2513,7 +2885,12 @@ async def _heartbeat_ptg2_import_run(import_run_id: str) -> None:
 
 
 async def _stop_ptg2_import_heartbeat(task: asyncio.Task[Any] | None) -> None:
-    if task is None or task.done():
+    if task is None:
+        return
+    if task.done():
+        if task.cancelled():
+            return
+        task.result()
         return
     task.cancel()
     try:
@@ -2531,6 +2908,7 @@ async def _mark_ptg2_import_failed(
     report: dict[str, Any] | None = None,
     options: dict[str, Any] | None = None,
     *,
+    manifest_stage_table: str | None = None,
     should_preserve_published_snapshot: bool = False,
     import_started_monotonic: float | None = None,
     failure_handling_started_monotonic: float | None = None,
@@ -2545,69 +2923,28 @@ async def _mark_ptg2_import_failed(
     report_by_field["timings"] = timing_by_metric
     persistence_started_monotonic = _ptg2_monotonic()
     try:
-        if not should_preserve_published_snapshot:
-            await _push_ptg2_objects(
-                [
-                    {
-                        "snapshot_id": snapshot_id,
-                        "import_run_id": import_run_id,
-                        "import_month": import_month,
-                        "status": PTG2_STATUS_FAILED,
-                        "created_at": started_at,
-                        "validated_at": None,
-                        "published_at": None,
-                        "previous_snapshot_id": None,
-                        "manifest": {
-                            **report_by_field,
-                            "error": error_text,
-                        },
-                    }
-                ],
-                PTG2Snapshot,
-                rewrite=True,
-            )
-        await _push_ptg2_objects(
-            [
-                {
-                    "import_run_id": import_run_id,
-                    "import_month": import_month,
-                    "status": PTG2_STATUS_FAILED,
-                    "started_at": started_at,
-                    "finished_at": finished,
-                    "heartbeat_at": finished,
-                    "options": dict(options or {}),
-                    "report": {
-                        **report_by_field,
-                        "timing_contract": {
-                            "version": 2,
-                            "completion_metrics_pending": True,
-                        },
-                    },
-                    "error": error_text,
-                }
-            ],
-            PTG2ImportRun,
-            rewrite=True,
-        )
-        persisted_monotonic = _ptg2_monotonic()
-        if import_started_monotonic is not None:
-            timing_by_metric["failure_state_persistence_seconds"] = (
-                persisted_monotonic - persistence_started_monotonic
-            )
-            if failure_handling_started_monotonic is not None:
-                timing_by_metric["failure_handling_seconds"] = (
-                    persisted_monotonic - failure_handling_started_monotonic
+        async with db.transaction():
+            if not should_preserve_published_snapshot:
+                await _push_ptg2_objects(
+                    [
+                        {
+                            "snapshot_id": snapshot_id,
+                            "import_run_id": import_run_id,
+                            "import_month": import_month,
+                            "status": PTG2_STATUS_FAILED,
+                            "created_at": started_at,
+                            "validated_at": None,
+                            "published_at": None,
+                            "previous_snapshot_id": None,
+                            "manifest": {
+                                **report_by_field,
+                                "error": error_text,
+                            },
+                        }
+                    ],
+                    PTG2Snapshot,
+                    rewrite=True,
                 )
-            timing_by_metric["total_seconds"] = (
-                persisted_monotonic - import_started_monotonic
-            )
-            report_by_field["timings"] = timing_by_metric
-            report_by_field["timing_contract"] = {
-                "version": 2,
-                "total_boundary": "after_required_failure_state_persistence",
-                "completion_metrics_write_excluded": True,
-            }
-            finished = _utcnow()
             await _push_ptg2_objects(
                 [
                     {
@@ -2618,15 +2955,70 @@ async def _mark_ptg2_import_failed(
                         "finished_at": finished,
                         "heartbeat_at": finished,
                         "options": dict(options or {}),
-                        "report": report_by_field,
+                        "report": {
+                            **report_by_field,
+                            "timing_contract": {
+                                "version": 2,
+                                "completion_metrics_pending": True,
+                            },
+                        },
                         "error": error_text,
                     }
                 ],
                 PTG2ImportRun,
                 rewrite=True,
             )
+            if manifest_stage_table is not None:
+                await _drop_ptg2_snapshot_table_names(
+                    _ptg2_manifest_stage_table_names(
+                        manifest_stage_table
+                    ),
+                    snapshot_id=snapshot_id,
+                    internal_run_id=import_run_id,
+                )
+            persisted_monotonic = _ptg2_monotonic()
+            if import_started_monotonic is not None:
+                timing_by_metric["failure_state_persistence_seconds"] = (
+                    persisted_monotonic - persistence_started_monotonic
+                )
+                if failure_handling_started_monotonic is not None:
+                    timing_by_metric["failure_handling_seconds"] = (
+                        persisted_monotonic
+                        - failure_handling_started_monotonic
+                    )
+                timing_by_metric["total_seconds"] = (
+                    persisted_monotonic - import_started_monotonic
+                )
+                report_by_field["timings"] = timing_by_metric
+                report_by_field["timing_contract"] = {
+                    "version": 2,
+                    "total_boundary": (
+                        "after_required_failure_state_persistence"
+                    ),
+                    "completion_metrics_write_excluded": True,
+                }
+                finished = _utcnow()
+                await _push_ptg2_objects(
+                    [
+                        {
+                            "import_run_id": import_run_id,
+                            "import_month": import_month,
+                            "status": PTG2_STATUS_FAILED,
+                            "started_at": started_at,
+                            "finished_at": finished,
+                            "heartbeat_at": finished,
+                            "options": dict(options or {}),
+                            "report": report_by_field,
+                            "error": error_text,
+                        }
+                    ],
+                    PTG2ImportRun,
+                    rewrite=True,
+                )
         return report_by_field
     except Exception as mark_exc:
+        if is_stale_metadata_fence_error(mark_exc):
+            raise_stale_metadata_fence(mark_exc)
         logger.error("Failed to mark PTG2 import %s as failed: %s", import_run_id, mark_exc)
         return None
 
@@ -2651,7 +3043,7 @@ async def _is_failed_shared_layout_abandoned(
             async with db.transaction() as session:
                 return await is_shared_layout_build_abandoned(
                     session,
-                    schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                    schema_name=resolve_ptg2_schema(),
                     snapshot_key=shared_layout_reservation.snapshot_key,
                     build_token=build_token,
                 )
@@ -2670,38 +3062,49 @@ async def _is_failed_shared_layout_abandoned(
 async def _cleanup_failed_ptg2_source_state(
     *,
     serving_index: dict[str, Any] | None,
-    manifest_stage_table: str | None,
     snapshot_id: str,
+    internal_run_id: str,
 ) -> None:
     """Remove unpublished relational, artifact, and source-dictionary state."""
     try:
         await _drop_ptg2_snapshot_tables_for_manifest(serving_index)
-        if manifest_stage_table:
-            await _drop_ptg2_snapshot_table_names(
-                _ptg2_manifest_stage_table_names(manifest_stage_table)
-            )
-    except Exception:
+    except Exception as exc:
+        if is_stale_metadata_fence_error(exc):
+            raise_stale_metadata_fence(exc)
         logger.debug(
             "Failed to clean PTG2 source-scoped tables for failed import",
             exc_info=True,
         )
     try:
-        await delete_ptg2_artifacts_for_snapshot(snapshot_id)
-    except Exception:
+        await delete_ptg2_artifacts_for_snapshot(
+            snapshot_id,
+            import_run_id=internal_run_id,
+        )
+    except Exception as exc:
+        if is_stale_metadata_fence_error(exc):
+            raise_stale_metadata_fence(exc)
         logger.debug("Failed to clean PTG2 artifacts for failed import", exc_info=True)
     try:
         await delete_unpublished_snapshot_sources(
-            schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            schema_name=resolve_ptg2_schema(),
             snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
         )
-    except Exception:
+    except Exception as exc:
+        if is_stale_metadata_fence_error(exc):
+            raise_stale_metadata_fence(exc)
         logger.debug(
             "Failed to clean PTG2 shared source metadata for failed import",
             exc_info=True,
         )
     try:
-        await _delete_allowed_snapshot_rows(snapshot_id)
-    except Exception:
+        await _delete_allowed_snapshot_rows(
+            snapshot_id,
+            internal_run_id=internal_run_id,
+        )
+    except Exception as exc:
+        if is_stale_metadata_fence_error(exc):
+            raise_stale_metadata_fence(exc)
         logger.debug(
             "Failed to clean PTG2 allowed-amount rows for failed import",
             exc_info=True,
@@ -2806,11 +3209,23 @@ def _allowed_amount_metrics_from_results(
     return metrics_by_name
 
 
-async def _delete_allowed_snapshot_rows(snapshot_id: str) -> None:
+async def _delete_allowed_snapshot_rows(
+    snapshot_id: str,
+    *,
+    internal_run_id: str | None = None,
+) -> None:
     """Delete all unpublished allowed-amount rows owned by one snapshot."""
 
-    schema_name = _quote_ident(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    resolved_schema_name = resolve_ptg2_schema()
+    schema_name = _quote_ident(resolved_schema_name)
     async with db.transaction() as session:
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=resolved_schema_name,
+            snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
+        )
         for table_name in PTG2_ALLOWED_AMOUNT_TABLE_NAMES:
             await session.execute(
                 db.text(
@@ -2829,7 +3244,7 @@ def _allowed_amount_index_manifest(
     source_key: str,
     previous_snapshot_id: str | None,
 ) -> dict[str, Any]:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     return {
         "contract": PTG2_ALLOWED_AMOUNT_CONTRACT,
         "arch_version": "postgres_binary_v3",
@@ -3057,7 +3472,7 @@ async def _reconcile_serving_snapshot_pointer(
             "snapshot_id": snapshot_id,
             "current_snapshot_id": current_snapshot_id,
         }
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
         missing_tables, missing_artifacts = (
@@ -3096,7 +3511,7 @@ async def _publish_allowed_current_pointer(
     """Advance the isolated allowed-evidence current pointer."""
 
     pointer_source_key = _allowed_source_pointer_key(source_key)
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
         await _compare_and_swap_source_pointer(
@@ -3127,7 +3542,7 @@ async def _publish_mixed_candidate_current_pointers(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Atomically activate negotiated and allowed pointers for one candidate."""
 
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
         negotiated_pointer_result = (
@@ -3218,7 +3633,7 @@ async def _resume_validated_candidate(
     serving_index = manifest.get("serving_index")
     if not isinstance(serving_index, dict):
         raise RuntimeError(f"PTG snapshot {snapshot_id} candidate has no serving index")
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     missing_tables, missing_artifacts = await _missing_snapshot_serving_resources(
         schema_name,
         snapshot_id,
@@ -3803,7 +4218,7 @@ async def _publish_shared_v3_source_dictionary(
         rewrite=True,
     )
     published_source_records = await publish_shared_v3_snapshot_sources(
-        schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+        schema_name=resolve_ptg2_schema(),
         snapshot_id=snapshot_id,
         plan_scopes=shared_input_identity.logical_plans,
         coverage_scope_id=shared_input_identity.coverage_scope_id,
@@ -4171,7 +4586,7 @@ async def _publish_reused_shared_v3_snapshot(
     )
     serving_index["source_set"] = source_set
     await validate_reused_snapshot_sources(
-        schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+        schema_name=resolve_ptg2_schema(),
         snapshot_key=int(shared_snapshot_key),
         logical_snapshot_id=snapshot_id,
         expected_generation=expected_generation,
@@ -4294,10 +4709,6 @@ async def _publish_reused_shared_v3_snapshot(
         activation_status = "deferred"
     release_current_artifact_lease()
     post_publish_stage_timer.mark("logical_candidate_and_optional_pointer_cutover")
-    if manifest_stage_table:
-        await _drop_ptg2_snapshot_table_names(
-            _ptg2_manifest_stage_table_names(manifest_stage_table)
-        )
     post_publish_stage_timer.mark("scratch_cleanup")
     if auto_activate:
         await _cleanup_old_ptg2_source_tables(
@@ -4323,6 +4734,8 @@ async def _publish_reused_shared_v3_snapshot(
     publish_report_map["activation_status"] = activation_status
     await _persist_completed_ptg2_import_run(
         import_run_id=import_run_id,
+        snapshot_id=snapshot_id,
+        manifest_stage_table=manifest_stage_table,
         import_month=import_month,
         started_at=started_at,
         options=options,
@@ -5043,6 +5456,17 @@ async def _main_with_artifact_lease(
         reset_live_progress_context(live_token)
         raise
     now = _utcnow()
+    initial_import_run_by_field = {
+        "import_run_id": import_run_id,
+        "import_month": import_month_value,
+        "status": PTG2_STATUS_RUNNING,
+        "started_at": now,
+        "finished_at": None,
+        "heartbeat_at": now,
+        "options": options_by_name,
+        "report": {},
+        "error": None,
+    }
     try:
         snapshot_state = await _push_ptg2_objects(
             [
@@ -5060,6 +5484,7 @@ async def _main_with_artifact_lease(
             ],
             PTG2Snapshot,
             rewrite=True,
+            initial_import_run_by_field=initial_import_run_by_field,
         )
     except BaseException:
         await source_import_lock.__aexit__(None, None, None)
@@ -5096,6 +5521,10 @@ async def _main_with_artifact_lease(
                 source_key=source_key_val,
                 import_month=import_month_value,
                 pointer_reconciliation=pointer_reconciliation,
+            )
+            await _finalize_resumed_terminal_attempt(
+                snapshot_state,
+                internal_run_id=import_run_id,
             )
             write_live_progress(
                 status="succeeded",
@@ -5155,6 +5584,10 @@ async def _main_with_artifact_lease(
                         test_mode=test_mode,
                     )
                 )
+            await _finalize_resumed_terminal_attempt(
+                snapshot_state,
+                internal_run_id=import_run_id,
+            )
             write_live_progress(
                 status="succeeded",
                 phase="succeeded",
@@ -5170,7 +5603,18 @@ async def _main_with_artifact_lease(
         finally:
             await source_import_lock.__aexit__(None, None, None)
             reset_live_progress_context(live_token)
-    if snapshot_state and snapshot_state.get("snapshot_claim_status") == "existing":
+    is_exact_building_retry = bool(
+        snapshot_state
+        and _is_exact_building_attempt_retry(
+            snapshot_state,
+            initial_import_run_by_field,
+        )
+    )
+    if (
+        snapshot_state
+        and snapshot_state.get("snapshot_claim_status") == "existing"
+        and not is_exact_building_retry
+    ):
         await source_import_lock.__aexit__(None, None, None)
         reset_live_progress_context(live_token)
         existing_status = snapshot_state.get("status") or "<unknown>"
@@ -5249,8 +5693,8 @@ async def _main_with_artifact_lease(
         if not should_preserve_candidate_tables:
             await _cleanup_failed_ptg2_source_state(
                 serving_index=(serving_index if isinstance(serving_index, dict) else None),
-                manifest_stage_table=ptg2_manifest_stage_table,
                 snapshot_id=snapshot_id,
+                internal_run_id=import_run_id,
             )
             abandoned_layout = await _is_failed_shared_layout_abandoned(
                 shared_layout_reservation,
@@ -5266,7 +5710,7 @@ async def _main_with_artifact_lease(
         _cleanup_strict_v3_graph_artifacts(pending_strict_v3.graph_artifacts_map)
         pending_strict_v3.copy_entries_by_kind = {}
         pending_strict_v3.graph_artifacts_map = {}
-        await _mark_ptg2_import_failed(
+        persisted_failure_report = await _mark_ptg2_import_failed(
             import_run_id,
             snapshot_id,
             import_month_value,
@@ -5274,6 +5718,7 @@ async def _main_with_artifact_lease(
             error_text,
             report=failure_report_by_field,
             options=options_by_name,
+            manifest_stage_table=ptg2_manifest_stage_table,
             should_preserve_published_snapshot=(
                 is_snapshot_known_published
                 or candidate_stage_flags_by_name["staged"]
@@ -5281,6 +5726,17 @@ async def _main_with_artifact_lease(
             import_started_monotonic=import_started_monotonic,
             failure_handling_started_monotonic=failure_handling_started_monotonic,
         )
+        if persisted_failure_report is None:
+            write_live_progress(
+                status="failed",
+                phase="failure_persistence_incomplete",
+                eta_seconds=0,
+                message=(
+                    "PTG import failed before terminal state committed; "
+                    "the exact attempt can be retried"
+                ),
+            )
+            return
         write_live_progress(
             status="failed",
             phase="failed",
@@ -5289,23 +5745,6 @@ async def _main_with_artifact_lease(
         )
 
     try:
-        await _push_ptg2_objects(
-            [
-                {
-                    "import_run_id": import_run_id,
-                    "import_month": import_month_value,
-                    "status": PTG2_STATUS_RUNNING,
-                    "started_at": now,
-                    "finished_at": None,
-                    "heartbeat_at": now,
-                    "options": options_by_name,
-                    "report": {},
-                    "error": None,
-                }
-            ],
-            PTG2ImportRun,
-            rewrite=True,
-        )
         ptg2_import_heartbeat_task = asyncio.create_task(
             _heartbeat_ptg2_import_run(import_run_id),
             name=f"ptg2-import-heartbeat:{import_run_id}",
@@ -5552,7 +5991,12 @@ async def _main_with_artifact_lease(
         ptg2_manifest_stage_table = _ptg2_manifest_stage_table_name(
             stage_token
         )
-        await _create_serving_stage_table(stage_token)
+        await _create_serving_stage_table(
+            stage_token,
+            snapshot_id=snapshot_id,
+            internal_run_id=import_run_id,
+            storage_generation=shared_storage_generation,
+        )
         setup_stage_timer.mark("manifest_stage_table")
         processed_file_count_map = {"done": 0}
         attempted_files = len(selected_jobs)
@@ -5799,7 +6243,7 @@ async def _main_with_artifact_lease(
                 )
                 shared_layout_reservation = await reserve_layout(
                     session,
-                    schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                    schema_name=resolve_ptg2_schema(),
                     semantic_fingerprint=shared_input_identity.semantic_fingerprint,
                     build_token=shared_layout_build_token,
                 )
@@ -6179,7 +6623,7 @@ async def _main_with_artifact_lease(
 
             try:
                 shared_publication = await publish_strict_shared_v3_layout(
-                    schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                    schema_name=resolve_ptg2_schema(),
                     manifest_stage_table=ptg2_manifest_stage_table,
                     reserved_snapshot_key=shared_layout_reservation.snapshot_key,
                     build_token=shared_layout_build_token,
@@ -6303,10 +6747,6 @@ async def _main_with_artifact_lease(
                 finalizer_block_copy=serving_index.get("finalizer_block_copy"),
             )
             failure_report_by_field.update(full_rebuild_metrics)
-            await _drop_ptg2_snapshot_table_names(
-                _ptg2_manifest_stage_table_names(ptg2_manifest_stage_table)
-            )
-            ptg2_manifest_stage_table = None
             failure_report_by_field["serving_index"] = serving_index
             _emit_ptg2_publish_progress(
                 "snapshot tables published",
@@ -6495,6 +6935,8 @@ async def _main_with_artifact_lease(
         report_by_field["activation_status"] = activation_status
         await _persist_completed_ptg2_import_run(
             import_run_id=import_run_id,
+            snapshot_id=snapshot_id,
+            manifest_stage_table=ptg2_manifest_stage_table,
             import_month=import_month_value,
             started_at=now,
             options=options_by_name,
@@ -6504,6 +6946,7 @@ async def _main_with_artifact_lease(
             post_publish_started_monotonic=post_publish_started_monotonic,
             post_publish_stage_timer=post_publish_stage_timer,
         )
+        ptg2_manifest_stage_table = None
         _emit_ptg2_publish_progress(
             "validated",
             completed_steps=8,
@@ -6569,6 +7012,14 @@ async def _main_with_artifact_lease(
             **full_rebuild_metrics,
             "timings": timing_by_metric,
         }
+    except StaleMetadataFenceError:
+        write_live_progress(
+            status="failed",
+            phase="fenced",
+            eta_seconds=0,
+            message="PTG import stopped: attempt was reconciled",
+        )
+        raise
     except asyncio.CancelledError as exc:
         await mark_import_failed(
             "worker task was cancelled",
@@ -6600,18 +7051,38 @@ async def _main_with_artifact_lease(
         )
         raise freshness_error from exc
     except Exception as exc:
+        if is_stale_metadata_fence_error(exc):
+            write_live_progress(
+                status="failed",
+                phase="fenced",
+                eta_seconds=0,
+                message="PTG import stopped: attempt was reconciled",
+            )
+            raise_stale_metadata_fence(exc)
         await mark_import_failed(exc)
         _attach_full_rebuild_failure_metrics(exc, failure_report_by_field)
         raise
     finally:
-        await _stop_ptg2_import_heartbeat(ptg2_import_heartbeat_task)
-        _cleanup_manifest_copy_entries(pending_strict_v3.copy_entries_by_kind)
-        _cleanup_strict_v3_graph_artifacts(pending_strict_v3.graph_artifacts_map)
         try:
-            await source_import_lock.__aexit__(None, None, None)
-        except Exception:
-            logger.warning("Failed to release PTG2 source import lock", exc_info=True)
-        reset_live_progress_context(live_token)
+            await _stop_ptg2_import_heartbeat(ptg2_import_heartbeat_task)
+        finally:
+            try:
+                _cleanup_manifest_copy_entries(
+                    pending_strict_v3.copy_entries_by_kind
+                )
+                _cleanup_strict_v3_graph_artifacts(
+                    pending_strict_v3.graph_artifacts_map
+                )
+            finally:
+                try:
+                    await source_import_lock.__aexit__(None, None, None)
+                except Exception:
+                    logger.warning(
+                        "Failed to release PTG2 source import lock",
+                        exc_info=True,
+                    )
+                finally:
+                    reset_live_progress_context(live_token)
 
 
 async def main(

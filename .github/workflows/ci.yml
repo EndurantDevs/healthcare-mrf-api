@@ -562,6 +562,18 @@ jobs:
           tests/test_ptg2_v4_migration_postgres.py
           tests/test_ptg2_v4_snapshot_maps.py
           tests/test_ptg2_v4_postgres_e2e.py
+          tests/test_ptg2_v4_stale_metadata_reconcile_postgres.py
+          tests/test_ptg2_v4_attempt_registry_postgres.py
+          tests/test_ptg2_v4_attempt_stage_regression_postgres.py
+          tests/test_ptg2_v4_attempt_entry_atomicity_postgres.py
+          tests/test_ptg2_v4_terminal_stage_atomicity_postgres.py
+          tests/test_ptg2_v4_stale_metadata_plan_drift_postgres.py
+          tests/test_ptg2_v4_stale_metadata_json_postgres.py
+          tests/test_ptg2_v4_stale_metadata_fence_postgres.py
+          tests/test_ptg2_v4_import_job_postgres.py
+          tests/test_ptg2_v4_attempt_migration_adoption_postgres.py
+          tests/test_ptg2_v4_attempt_migration_downgrade_postgres.py
+          tests/test_ptg2_v4_attempt_model_autogenerate_postgres.py
       - name: Run strict shared PTG PostgreSQL GC and removal tests
         env:
           HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST: "1"

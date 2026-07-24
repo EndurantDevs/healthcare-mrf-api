@@ -195,7 +195,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260723100000_ptg2_v4_snapshot_map_pack"
+        "20260724110000_ptg2_v4_attempt_fence_hardening"
     ]
 
 

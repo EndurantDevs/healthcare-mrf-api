@@ -93,6 +93,10 @@ MIGRATION_PATHS = (
     / "alembic"
     / "versions"
     / "20260721150000_ptg2_source_witness_parts.py",
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260724100000_ptg2_v4_attempt_fence.py",
 )
 SCANNER_TEST_PATH = Path(__file__).with_name("test_ptg2_scanner_v3_runs.py")
 SERVING_RECORD = struct.Struct(">16s16s16sI")
@@ -1317,6 +1321,7 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         },
     )
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    monkeypatch.setenv("DB_SCHEMA", schema_name)
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
     monkeypatch.setenv(
         "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",

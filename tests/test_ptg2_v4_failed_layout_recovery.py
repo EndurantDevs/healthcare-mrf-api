@@ -383,7 +383,7 @@ async def test_release_context_rejects_changed_physical_state(
 ) -> None:
     monkeypatch.setattr(
         recovery,
-        "abandon_owned_v4_layout",
+        "abandon_writable_v4_layout",
         AsyncMock(
             return_value=SimpleNamespace(
                 logical_layout_count=released_layouts,
@@ -397,7 +397,6 @@ async def test_release_context_rejects_changed_physical_state(
         "load_recovery_postconditions",
         AsyncMock(return_value=postcondition_by_name),
     )
-
     with pytest.raises(RuntimeError, match=message):
         await recovery._release_recovery_context(
             object(),

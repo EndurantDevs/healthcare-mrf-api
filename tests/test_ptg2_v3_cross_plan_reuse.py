@@ -25,6 +25,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
 )
 from process.ptg_parts.ptg2_shared_reuse import shared_physical_input_identity
 from process.ptg_parts.source_pointers import _bind_snapshot_coverage_scope
+from tests.ptg2_v4_migration_catalog_support import (
+    attempt_guard_prerequisite_ddl,
+)
 
 
 POSTGRES_TEST_ENV = "HLTHPRT_PTG2_CROSS_PLAN_POSTGRES_TEST"
@@ -91,6 +94,7 @@ async def _create_test_schema(connection, schema_name: str) -> None:
 
     schema = f'"{schema_name}"'
     await connection.status(f"CREATE SCHEMA {schema}")
+    await connection.status(attempt_guard_prerequisite_ddl(schema))
     for ddl in (
         f"""
         CREATE TABLE {schema}.ptg2_v3_snapshot_layout (

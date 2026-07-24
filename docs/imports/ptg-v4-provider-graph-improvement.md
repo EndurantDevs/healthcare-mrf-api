@@ -213,10 +213,51 @@ declared allowed-amount pointers in one lifecycle-locked transaction. It
 validates the retained snapshot's sealed scope and activated audit attestation
 before changing any pointer, and an exact retry performs no writes.
 
-The V3 oracle is a separately deployed, scale-to-zero candidate pinned to its
-reviewed image. Reference capture first attests the singular ready Deployment
-and Pod, immutable image digest, V3-only ConfigMaps, and exact Service target.
-The V3 oracle is scaled back to zero after capture.
+The V3 oracle is pinned to its reviewed image. Reference capture first attests
+the singular ready Deployment and Pod, immutable image digest, V3-only
+ConfigMaps, and exact Service target. In the current dev topology that same
+Deployment also serves candidate-audit traffic, so it remains at one replica
+through both canary passes. It may become scale-to-zero only after those roles
+are separated in source control and the canary attests the dedicated oracle.
+
+## Metadata-only stale-build reconciliation
+
+An interrupted V4 attempt can leave only its internal import-run row and an
+empty-manifest `building` snapshot. Operators repair that exact pair through
+two authenticated capabilities:
+
+- `POST /control/v1/ptg/v4/stale-metadata/reconcile-plan` accepts
+  `snapshot_id` and `internal_run_id` and returns a redacted plan digest.
+- `POST /control/v1/ptg/v4/stale-metadata/reconcile` accepts the same exact
+  coordinates plus `expected_plan_digest`.
+
+The stale interval is server-owned through
+`HLTHPRT_PTG2_V4_METADATA_STALE_SECONDS` and cannot be shortened in a request.
+Execution holds the shared lifecycle lock, a pair-qualified advisory lock, and
+the snapshot row, run row, and durable exact-pair attempt fence before
+rechecking the plan. It is eligible only for a V4 internal run, an exact
+snapshot/run association, an empty snapshot manifest, and no row in the
+authoritative attempt-attachment registry. That registry covers layout
+bindings, logical scope, artifacts, allowed amounts, rates, source metadata,
+pointers, plan months, child jobs, and deterministic manifest-stage tables.
+The plan digest also binds the canonical complete import-run report. Any
+physical-layout or failed-layout recovery field makes metadata reconciliation
+ineligible and leaves the target for exact physical recovery. That recovery
+must prove the same attempt fence is still active and writable immediately
+before releasing physical ownership.
+
+Every registered application writer guards the same fence in the transaction
+that performs its write. Low-volume relations also have database triggers as a
+backstop; bulk/COPY paths guard once per transaction to avoid a per-row trigger
+cost. After reconciliation, the immutable fence rejects resumed heartbeats,
+writes, cleanup, attachment, and storage-generation changes.
+
+The operation changes only the snapshot and run metadata rows to `failed` and
+seals the fence with their identical audit-safe marker, plan digest, target
+digest, marker digest, and reconciliation timestamp. It never deletes rows,
+releases a layout, queues or sweeps a block, starts GC, removes an artifact, or
+changes a pointer. An exact retry requires the two row markers and the fence
+audit to agree, then performs no writes.
 
 ## Deferred work
 
@@ -227,6 +268,13 @@ evidence justify a separate release.
 
 Source-component-only serving is not a global layout. It is an exact bounded
 fallback for manifest-listed pattern-overflow owners.
+
+The first release keeps the fail-closed transaction-scoped lifecycle lock for
+all guarded bulk writes. Serial canaries retain database wait samples beside
+the existing import-stage timings. A V3-specific bulk fast path is deferred
+until those measurements justify it; that path must validate and row-lock the
+V3 snapshot and run without weakening the global-first fence for V4, unknown,
+or reconciled attempts.
 
 V3 retirement, documentation consolidation, and retained-snapshot cleanup are
 explicitly deferred for one to two months and require a separate approval.

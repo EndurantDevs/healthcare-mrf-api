@@ -42,6 +42,10 @@ from process.ptg_parts.ptg2_shared_finalize import (
 )
 from process.ptg_parts.ptg2_shared_graph import SharedGraphConversionResult
 from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    lock_writable_snapshot,
+)
 from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine,
 )
@@ -702,6 +706,13 @@ async def publish_shared_v3_snapshot_sources(
     primary_plan = normalized_plan_scopes[0]
     schema = _quote_ident(schema_name)
     async with db.transaction() as session:
+        await acquire_ptg2_lifecycle_lock(session)
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=schema_name,
+            snapshot_id=str(snapshot_id),
+        )
         await session.execute(
             db.text(
                 f"""
@@ -831,16 +842,52 @@ async def publish_shared_v3_snapshot_sources(
     return tuple(source_records)
 
 
+async def _delete_unbound_snapshot_source_metadata(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_id: str,
+) -> None:
+    """Delete the two logical-source relations while no binding exists."""
+
+    for table_name in (
+        "ptg2_v3_snapshot_source",
+        "ptg2_v3_snapshot_scope",
+    ):
+        await session.execute(
+            db.text(
+                f"""
+                DELETE FROM {schema}.{table_name} AS owned
+                 WHERE owned.snapshot_id = :snapshot_id
+                   AND NOT EXISTS (
+                        SELECT 1
+                          FROM {schema}.ptg2_v3_snapshot_binding AS binding
+                         WHERE binding.snapshot_id = owned.snapshot_id
+                   )
+                """
+            ),
+            {"snapshot_id": str(snapshot_id)},
+        )
+
+
 async def delete_unpublished_snapshot_sources(
     *,
     schema_name: str,
     snapshot_id: str,
+    internal_run_id: str | None = None,
 ) -> None:
     """Remove failed logical metadata without releasing or changing shared layouts."""
 
     schema = _quote_ident(schema_name)
     async with db.transaction() as session:
         await acquire_ptg2_lifecycle_lock(session)
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
+        )
         snapshot_result = await session.execute(
             db.text(
                 f"""
@@ -860,33 +907,10 @@ async def delete_unpublished_snapshot_sources(
         snapshot_row = snapshot_result.first()
         if not _can_delete_unpublished_sources(snapshot_row):
             return
-        await session.execute(
-            db.text(
-                f"""
-                DELETE FROM {schema}.ptg2_v3_snapshot_source AS source
-                 WHERE source.snapshot_id = :snapshot_id
-                   AND NOT EXISTS (
-                        SELECT 1
-                          FROM {schema}.ptg2_v3_snapshot_binding AS binding
-                         WHERE binding.snapshot_id = source.snapshot_id
-                   )
-                """
-            ),
-            {"snapshot_id": str(snapshot_id)},
-        )
-        await session.execute(
-            db.text(
-                f"""
-                DELETE FROM {schema}.ptg2_v3_snapshot_scope AS scope
-                 WHERE scope.snapshot_id = :snapshot_id
-                   AND NOT EXISTS (
-                        SELECT 1
-                          FROM {schema}.ptg2_v3_snapshot_binding AS binding
-                         WHERE binding.snapshot_id = scope.snapshot_id
-                   )
-                """
-            ),
-            {"snapshot_id": str(snapshot_id)},
+        await _delete_unbound_snapshot_source_metadata(
+            session,
+            schema=schema,
+            snapshot_id=snapshot_id,
         )
 
 
@@ -2388,7 +2412,7 @@ async def _publish_prepared_shared_layout(
         raise RuntimeError(
             "PTG V4 publication requires authenticated resource evidence"
         )
-    configured_schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip()
+    configured_schema = resolve_ptg2_schema()
     if str(schema_name).strip() != configured_schema:
         raise RuntimeError(
             "strict shared publication must use the configured PostgreSQL schema"
@@ -3084,7 +3108,7 @@ async def publish_strict_shared_v3_layout(
                 "PTG V4 compressed acquisition bytes must be positive"
             )
     publication_started_at = time.monotonic()
-    configured_schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip()
+    configured_schema = resolve_ptg2_schema()
     if str(schema_name).strip() != configured_schema:
         raise RuntimeError(
             "strict V3 publication must use the configured PostgreSQL schema"

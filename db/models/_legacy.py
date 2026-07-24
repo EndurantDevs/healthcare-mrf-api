@@ -24,6 +24,7 @@ from sqlalchemy import (
     Numeric,
     PrimaryKeyConstraint,
     String,
+    Table,
     UniqueConstraint,
     text,
 )
@@ -32,6 +33,13 @@ from sqlalchemy.orm import declared_attr
 
 from db.connection import Base, db
 from db.json_mixin import JSONOutputMixin
+from db.ptg2_v4_attempt_schema import (
+    ATTEMPT_FENCE_TABLE,
+    ATTEMPT_STAGE_RUN_INDEX,
+    ATTEMPT_STAGE_TABLE,
+    fence_table_elements,
+    stage_table_elements,
+)
 
 
 def _resolve_ptg2_database_schema() -> str:
@@ -1805,12 +1813,17 @@ class PTG2Snapshot(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("snapshot_id"),
+        Index("ptg2_snapshot_attempt_run_idx", "import_run_id"),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["snapshot_id"]
     __my_additional_indexes__ = [
         {"index_elements": ("status",), "name": "ptg2_snapshot_status_idx"},
         {"index_elements": ("import_month",), "name": "ptg2_snapshot_month_idx"},
+        {
+            "index_elements": ("import_run_id",),
+            "name": "ptg2_snapshot_attempt_run_idx",
+        },
     ]
 
     snapshot_id = Column(String(96))
@@ -1822,6 +1835,43 @@ class PTG2Snapshot(Base, JSONOutputMixin):
     published_at = Column(DateTime)
     previous_snapshot_id = Column(String(96))
     manifest = Column(JSON)
+
+
+class PTG2V4AttemptFence(Base, JSONOutputMixin):
+    """Immutable authority for one PTG V4 snapshot/import-run attempt."""
+
+    __tablename__ = ATTEMPT_FENCE_TABLE
+    __main_table__ = __tablename__
+    __table__ = Table(
+        __tablename__,
+        Base.metadata,
+        *fence_table_elements(_PTG2_DATABASE_SCHEMA),
+        schema=_PTG2_DATABASE_SCHEMA,
+        extend_existing=True,
+    )
+    __my_index_elements__ = ["snapshot_id"]
+
+
+class PTG2V4AttemptStage(Base, JSONOutputMixin):
+    """Exact registry of stage tables owned by one fenced attempt."""
+
+    __tablename__ = ATTEMPT_STAGE_TABLE
+    __main_table__ = __tablename__
+    __table__ = Table(
+        __tablename__,
+        Base.metadata,
+        *stage_table_elements(_PTG2_DATABASE_SCHEMA),
+        Index(ATTEMPT_STAGE_RUN_INDEX, "internal_run_id"),
+        schema=_PTG2_DATABASE_SCHEMA,
+        extend_existing=True,
+    )
+    __my_index_elements__ = ["snapshot_id", "table_name"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("internal_run_id",),
+            "name": ATTEMPT_STAGE_RUN_INDEX,
+        },
+    ]
 
 
 class PlanReleaseServingRevision(Base, JSONOutputMixin):
@@ -2117,9 +2167,19 @@ class PTG2CurrentSnapshot(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("slot"),
+        Index(
+            "ptg2_current_snapshot_attempt_previous_idx",
+            "previous_snapshot_id",
+        ),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["slot"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("previous_snapshot_id",),
+            "name": "ptg2_current_snapshot_attempt_previous_idx",
+        },
+    ]
 
     slot = Column(String(32))
     snapshot_id = Column(String(96))
@@ -2132,12 +2192,20 @@ class PTG2CurrentSourceSnapshot(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("source_key"),
+        Index(
+            "ptg2_current_source_attempt_previous_idx",
+            "previous_snapshot_id",
+        ),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["source_key"]
     __my_additional_indexes__ = [
         {"index_elements": ("snapshot_id",), "name": "ptg2_current_source_snapshot_idx"},
         {"index_elements": ("import_month",), "name": "ptg2_current_source_month_idx"},
+        {
+            "index_elements": ("previous_snapshot_id",),
+            "name": "ptg2_current_source_attempt_previous_idx",
+        },
     ]
 
     source_key = Column(String(96))
@@ -2152,6 +2220,10 @@ class PTG2CurrentPlanSource(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("plan_source_key"),
+        Index(
+            "ptg2_current_plan_attempt_previous_idx",
+            "previous_snapshot_id",
+        ),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["plan_source_key"]
@@ -2160,6 +2232,10 @@ class PTG2CurrentPlanSource(Base, JSONOutputMixin):
         {"index_elements": ("plan_id", "plan_market_type", "import_month"), "name": "ptg2_current_plan_source_lookup_idx"},
         {"index_elements": ("source_key",), "name": "ptg2_current_plan_source_source_idx"},
         {"index_elements": ("snapshot_id",), "name": "ptg2_current_plan_source_snapshot_idx"},
+        {
+            "index_elements": ("previous_snapshot_id",),
+            "name": "ptg2_current_plan_attempt_previous_idx",
+        },
     ]
 
     plan_source_key = Column(String(96))
@@ -2177,6 +2253,7 @@ class PTG2SourceCatalog(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("source_catalog_id"),
+        Index("ptg2_source_catalog_attempt_run_idx", "import_run_id"),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["source_catalog_id"]
@@ -2184,6 +2261,10 @@ class PTG2SourceCatalog(Base, JSONOutputMixin):
         {"index_elements": ("canonical_url",), "name": "ptg2_source_catalog_url_idx"},
         {"index_elements": ("source_type",), "name": "ptg2_source_catalog_type_idx"},
         {"index_elements": ("plan_id",), "name": "ptg2_source_catalog_plan_idx"},
+        {
+            "index_elements": ("import_run_id",),
+            "name": "ptg2_source_catalog_attempt_run_idx",
+        },
     ]
 
     source_catalog_id = Column(String(96))
@@ -2284,7 +2365,13 @@ class PTG2ImportJob(Base, JSONOutputMixin):
     __tablename__ = "ptg2_import_job"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint("import_job_id"),
+        PrimaryKeyConstraint(
+            "import_job_id",
+            name="ptg2_import_job_pkey",
+        ),
+        Index("ptg2_import_job_run_idx", "import_run_id"),
+        Index("ptg2_import_job_status_idx", "status"),
+        Index("ptg2_import_job_type_idx", "source_type"),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["import_job_id"]
@@ -2314,6 +2401,7 @@ class PTG2ArtifactManifest(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("artifact_id"),
+        Index("ptg2_artifact_manifest_attempt_run_idx", "import_run_id"),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["artifact_id"]
@@ -2321,6 +2409,10 @@ class PTG2ArtifactManifest(Base, JSONOutputMixin):
         {"index_elements": ("artifact_kind",), "name": "ptg2_artifact_kind_idx"},
         {"index_elements": ("snapshot_id",), "name": "ptg2_artifact_snapshot_idx"},
         {"index_elements": ("sha256",), "name": "ptg2_artifact_sha_idx"},
+        {
+            "index_elements": ("import_run_id",),
+            "name": "ptg2_artifact_manifest_attempt_run_idx",
+        },
     ]
 
     artifact_id = Column(String(96))

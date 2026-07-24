@@ -57,6 +57,7 @@ def test_deterministic_rerun_returns_already_published_without_table_work(monkey
     calls = []
     create_stage = AsyncMock()
     cleanup = AsyncMock()
+    finalize_terminal_retry = AsyncMock()
     publish_pointers = AsyncMock(
         return_value={"status": "promoted", "global_pointer": "reconciled"}
     )
@@ -104,6 +105,11 @@ def test_deterministic_rerun_returns_already_published_without_table_work(monkey
         "_drop_ptg2_snapshot_tables_for_manifest",
         cleanup,
     )
+    monkeypatch.setattr(
+        process_ptg,
+        "_finalize_resumed_terminal_attempt",
+        finalize_terminal_retry,
+    )
 
     rerun_result = _run_source_import()
 
@@ -116,6 +122,11 @@ def test_deterministic_rerun_returns_already_published_without_table_work(monkey
     assert calls[0][1]["status"] == process_ptg.PTG2_STATUS_BUILDING
     create_stage.assert_not_awaited()
     cleanup.assert_not_awaited()
+    finalize_terminal_retry.assert_awaited_once()
+    assert (
+        finalize_terminal_retry.await_args.kwargs["internal_run_id"]
+        == "ptg2:publish_race_candidate"
+    )
     assert publish_pointers.await_args.kwargs["previous_snapshot_id"] == "snap_previous"
     assert publish_pointers.await_args.kwargs["snapshot_attributes"]["status"] == "published"
 
@@ -130,6 +141,7 @@ def test_building_snapshot_collision_fails_closed(monkeypatch):
         assert cls is process_ptg.PTG2Snapshot
         return {
             **object_entries[0],
+            "import_run_id": "ptg2:another-delivery",
             "status": process_ptg.PTG2_STATUS_BUILDING,
             "snapshot_claim_status": "existing",
         }
@@ -162,6 +174,58 @@ def test_building_snapshot_collision_fails_closed(monkeypatch):
     assert len(calls) == 1
     create_stage.assert_not_awaited()
     cleanup.assert_not_awaited()
+
+
+def test_exact_retry_reenters_main_after_terminal_commit_rollback(
+    monkeypatch,
+):
+    """Resume the same building pair instead of reporting a collision."""
+
+    prepare_tables = AsyncMock(
+        side_effect=RuntimeError("exact retry reached import pipeline")
+    )
+    persist_failure = AsyncMock(return_value={})
+
+    async def existing_exact_claim(object_entries, cls, **_kwargs):
+        assert cls is process_ptg.PTG2Snapshot
+        return {
+            **object_entries[0],
+            "status": process_ptg.PTG2_STATUS_BUILDING,
+            "snapshot_claim_status": "existing",
+        }
+
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg,
+        "_current_source_snapshot_id",
+        AsyncMock(return_value="snap_previous"),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_push_ptg2_objects",
+        existing_exact_claim,
+    )
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", prepare_tables)
+    monkeypatch.setattr(
+        process_ptg,
+        "_cleanup_failed_ptg2_source_state",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_mark_ptg2_import_failed",
+        persist_failure,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="exact retry reached import pipeline",
+    ):
+        _run_source_import()
+
+    prepare_tables.assert_awaited_once()
+    persist_failure.assert_awaited_once()
 
 
 def test_source_pointer_read_failure_leaves_no_building_claim(monkeypatch):
@@ -214,15 +278,16 @@ def test_source_pointer_compare_and_swap_rejects_stale_candidate(monkeypatch):
                 import_month=datetime.date(2026, 7, 1),
                 updated_at=datetime.datetime(2026, 7, 10),
             )
-        )
+    )
 
     assert transaction.entered == 1
-    assert len(executed_statements) == 3
+    assert len(executed_statements) == 4
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
     assert executed_statements[0][1] == {
         "publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
     }
-    assert "FOR UPDATE OF snapshot" in executed_statements[1][0]
-    assert executed_statements[1][1] == {"snapshot_id": "snap_stale"}
-    assert "IS NOT DISTINCT FROM :previous_snapshot_id" in executed_statements[2][0]
-    assert "DELETE FROM" not in executed_statements[2][0]
+    assert "guard_ptg2_v4_attempt" in executed_statements[1][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[2][0]
+    assert executed_statements[2][1] == {"snapshot_id": "snap_stale"}
+    assert "IS NOT DISTINCT FROM :previous_snapshot_id" in executed_statements[3][0]
+    assert "DELETE FROM" not in executed_statements[3][0]

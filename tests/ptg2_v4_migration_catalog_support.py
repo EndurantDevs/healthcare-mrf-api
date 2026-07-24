@@ -29,6 +29,25 @@ V4_TABLES = frozenset(
 )
 
 
+def attempt_guard_prerequisite_ddl(schema: str) -> str:
+    """Return the no-op guard required by isolated non-fence test schemas."""
+
+    return f"""
+        CREATE OR REPLACE FUNCTION {schema}.guard_ptg2_v4_attempt(
+            requested_snapshot_id text,
+            requested_internal_run_id text,
+            allow_reconciled boolean DEFAULT false
+        )
+        RETURNS void
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            RETURN;
+        END;
+        $$;
+        """
+
+
 def v3_provider_set_prerequisite_ddl(schema: str) -> str:
     """Return the real V3 provider-set shape referenced by the V4 migration."""
 

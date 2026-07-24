@@ -119,9 +119,10 @@ async def test_delete_artifacts_ignores_blank_snapshot_and_deletes_in_order(monk
         schema_name="custom",
     )
     assert ensure_table.await_args.args == ("custom",)
-    assert len(fake_db.session.calls) == 2
-    assert "ptg2_artifact_blob_chunk" in fake_db.session.calls[0][0]
-    assert "ptg2_artifact_manifest" in fake_db.session.calls[1][0]
+    assert len(fake_db.session.calls) == 3
+    assert "guard_ptg2_v4_attempt" in fake_db.session.calls[0][0]
+    assert "ptg2_artifact_blob_chunk" in fake_db.session.calls[1][0]
+    assert "ptg2_artifact_manifest" in fake_db.session.calls[2][0]
 
 
 def test_artifact_cache_paths_and_validation(monkeypatch, tmp_path):

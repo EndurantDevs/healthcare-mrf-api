@@ -26,6 +26,14 @@ from process.ptg_parts.ptg2_artifact_blobs import (
     ptg2_artifact_db_store_enabled,
     store_ptg2_artifact_file_in_db,
 )
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_shared_blocks import PTG2_V4_SHARED_GENERATION
+from process.ptg_parts.ptg2_v4_attempt_registry import (
+    manifest_stage_name_for_kind,
+)
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    register_attempt_stage_tables,
+)
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
                                          _has_rows_in_table, _table_exists)
 from process.ptg_parts.live_progress import write_live_progress
@@ -393,8 +401,7 @@ def _is_provider_rate_scope_enabled() -> bool:
 
 
 def _ptg2_manifest_stage_table_name(token: str) -> str:
-    safe_token = "".join(ch if ch.isalnum() else "_" for ch in token.lower()).strip("_")
-    return f"ptg2_manifest_stage_serving_{safe_token}"[:63]
+    return manifest_stage_name_for_kind("serving", token)
 
 
 def _ptg2_manifest_stage_suffix(serving_stage_table: str) -> str:
@@ -403,16 +410,48 @@ def _ptg2_manifest_stage_suffix(serving_stage_table: str) -> str:
 
 
 def _ptg2_manifest_support_stage_table(serving_stage_table: str, kind: str) -> str:
-    return f"ptg2_manifest_stage_{kind}_{_ptg2_manifest_stage_suffix(serving_stage_table)}"[:63]
+    return manifest_stage_name_for_kind(
+        kind,
+        _ptg2_manifest_stage_suffix(serving_stage_table),
+    )
 
 
-async def _create_serving_stage_table(token: str) -> str:
-    """Create the PostgreSQL stages consumed by strict V3 publish."""
+async def _create_serving_stage_table(
+    token: str,
+    *,
+    snapshot_id: str | None = None,
+    internal_run_id: str | None = None,
+    storage_generation: str | None = None,
+) -> str:
+    """Create strict stages and register only V4-owned physical state."""
 
     if _ptg2_manifest_snapshot_arch() != PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3:
         raise RuntimeError("only postgres_binary_v3 staging is supported")
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     stage_table = _ptg2_manifest_stage_table_name(token)
+    stage_table_names = [
+        stage_table,
+        *(
+            _ptg2_manifest_support_stage_table(stage_table, kind)
+            for kind in (
+                "price_atom",
+                "price_set_atom",
+                "price_set_summary",
+            )
+        ),
+    ]
+    if storage_generation == PTG2_V4_SHARED_GENERATION:
+        if snapshot_id is None or internal_run_id is None:
+            raise RuntimeError(
+                "V4 serving stages require snapshot and internal-run coordinates"
+            )
+        await register_attempt_stage_tables(
+            db,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
+            table_names=stage_table_names,
+        )
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
     await _create_price_atom_stage_table(stage_table)
     await _create_price_atom_member_stage_table(stage_table)
@@ -421,7 +460,7 @@ async def _create_serving_stage_table(token: str) -> str:
 
 
 async def _create_price_atom_stage_table(serving_stage_table: str) -> str:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "price_atom")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
@@ -445,7 +484,7 @@ async def _create_price_atom_stage_table(serving_stage_table: str) -> str:
 
 
 async def _create_price_atom_member_stage_table(serving_stage_table: str) -> str:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "price_set_atom")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
@@ -462,7 +501,7 @@ async def _create_price_atom_member_stage_table(serving_stage_table: str) -> str
 
 
 async def _create_price_set_summary_stage_table(serving_stage_table: str) -> str:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     stage_table = _ptg2_manifest_support_stage_table(
         serving_stage_table,
         "price_set_summary",
@@ -484,7 +523,7 @@ async def _create_price_set_summary_stage_table(serving_stage_table: str) -> str
 
 
 async def _create_provider_group_member_stage(serving_stage_table: str) -> str:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "provider_group_member")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
@@ -501,7 +540,7 @@ async def _create_provider_group_member_stage(serving_stage_table: str) -> str:
 
 
 async def _create_provider_npi_scope_stage(serving_stage_table: str) -> str:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "provider_npi_scope")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
     await db.status(
@@ -515,7 +554,7 @@ async def _create_provider_npi_scope_stage(serving_stage_table: str) -> str:
 
 
 async def _create_code_count_stage_table(serving_stage_table: str) -> str:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "code_count")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
@@ -533,7 +572,7 @@ async def _create_code_count_stage_table(serving_stage_table: str) -> str:
 
 
 async def _create_provider_set_dictionary_stage(serving_stage_table: str) -> str:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "provider_set_dictionary")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
@@ -758,7 +797,7 @@ async def _copy_ptg2_manifest_file(
     file_status = copy_path.stat()
     if file_status.st_size <= 0 and not stat.S_ISFIFO(file_status.st_mode):
         return
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
