@@ -216,8 +216,57 @@ def test_build_ptg2_source_snapshot_remove_plan_rejects_legacy_manifest(monkeypa
     )
 
     assert plan["removable"] is False
-    assert plan["reason"] == "only postgres_binary_v3/shared_blocks_v3 snapshots can be removed"
+    assert plan["reason"] == (
+        "only postgres_binary_v3/shared_blocks_v3 or "
+        "postgres_binary_v3/shared_blocks_v4 snapshots can be removed"
+    )
     assert plan["tables"] == []
+
+
+def test_build_ptg2_source_snapshot_remove_plan_accepts_v4_manifest(monkeypatch):
+    """V4 uses the same logical ownership with a different physical generation."""
+
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_snapshot_row",
+        AsyncMock(
+            return_value={
+                "snapshot_id": "snap_v4",
+                "status": "published",
+                "import_month": "2026-07-01",
+                "manifest": {
+                    "serving_index": {
+                        "source_key": "source_a",
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v4",
+                        "shared_snapshot_key": 41,
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_current_references",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_artifact_manifest_ids",
+        AsyncMock(return_value=["artifact_v4"]),
+    )
+
+    plan = asyncio.run(
+        source_snapshot_control.build_ptg2_source_snapshot_remove_plan(
+            snapshot_id="snap_v4",
+            source_key="source_a",
+        )
+    )
+
+    assert plan["removable"] is True
+    assert plan["storage_generation"] == "shared_blocks_v4"
+    assert plan["shared_snapshot_key"] == 41
+    assert plan["artifact_manifest_ids"] == ["artifact_v4"]
 
 
 def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
@@ -243,12 +292,20 @@ def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
             "tables": [],
             "artifact_manifest_ids": ["artifact_1"],
             "current_references": {},
+            "storage_generation": "shared_blocks_v3",
+            "shared_snapshot_key": 17,
         }
 
+    bound_layout_keys = AsyncMock(return_value=())
     monkeypatch.setattr(
         source_snapshot_control,
         "build_ptg2_source_snapshot_remove_plan",
         fake_remove_plan,
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "bound_shared_layout_keys",
+        bound_layout_keys,
     )
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
@@ -265,6 +322,8 @@ def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
     assert cleanup_summary["deleted_artifact_manifests"] == 1
     assert cleanup_summary["deleted_snapshots"] == 1
     assert cleanup_summary["released_shared_layouts"] == 0
+    assert cleanup_summary["physical_cleanup"] == "not_applicable"
+    bound_layout_keys.assert_awaited_once()
     assert transaction_statements == [
         (
             "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
@@ -288,7 +347,14 @@ def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
     assert scope_delete_index < binding_delete_index < snapshot_delete_index
 
 
-def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(monkeypatch):
+@pytest.mark.parametrize(
+    "storage_generation",
+    ["shared_blocks_v3", "shared_blocks_v4"],
+)
+def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(
+    monkeypatch,
+    storage_generation,
+):
     """Verify retire ptg2 source snapshot deletes current source and plan pointers."""
     status_calls = []
     reference_calls = []
@@ -316,7 +382,7 @@ def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(mo
             "manifest": {"serving_index": {
                 "source_key": "source_a",
                 "arch_version": "postgres_binary_v3",
-                "storage_generation": "shared_blocks_v3",
+                "storage_generation": storage_generation,
             }},
         }
 
