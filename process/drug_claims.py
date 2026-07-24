@@ -264,7 +264,9 @@ class DrugClaimsFinalizeRequest:
     manifest: dict[str, Any]
     expected_chunks: int
     finalize_lock_token: str = field(
-        default_factory=lambda: secrets.token_hex(16)
+        default_factory=lambda: secrets.token_hex(16),
+        compare=False,
+        repr=False,
     )
 
 
