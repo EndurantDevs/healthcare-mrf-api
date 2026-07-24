@@ -137,6 +137,45 @@ async def test_building_v4_root_rejects_an_unowned_or_completed_build() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_building_v4_root_rejects_missing_identity_before_io() -> None:
+    with pytest.raises(PTG2SharedBlockError, match="identity is unavailable"):
+        await graph._load_building_v4_graph_root(
+            object(),
+            0,
+            schema_name="mrf",
+            build_token="build-17",
+        )
+
+
+@pytest.mark.asyncio
+async def test_building_v4_root_accepts_authenticated_building_layout() -> None:
+    root_by_field = {
+        "snapshot_key": 17,
+        "representation": "pattern_v1",
+        "format_version": graph.PTG2_V4_MAP_FORMAT_VERSION,
+        "map_format": graph.PTG2_V4_MAP_FORMAT,
+        "projection_id_scope": graph.PTG2_V4_PROJECTION_ID_SCOPE,
+        "build_token": "build-17",
+        "layout_state": "building",
+    }
+
+    class Session:
+        async def execute(self, _statement, parameters):
+            assert parameters == {
+                "snapshot_key": 17,
+                "build_token": "build-17",
+            }
+            return SimpleNamespace(first=lambda: root_by_field)
+
+    assert await graph._load_building_v4_graph_root(
+        Session(),
+        17,
+        schema_name="mrf",
+        build_token="build-17",
+    ) == graph.V4GraphRoot(17, "pattern_v1", b"\0" * 32)
+
+
 def test_taxonomy_projection_scope_seals_independent_physical_dimensions() -> None:
     with graph.v4_graph_taxonomy_projection_scope(
         maximum_members=5,
@@ -164,6 +203,54 @@ def test_taxonomy_projection_scope_seals_independent_physical_dimensions() -> No
         )
         with pytest.raises(PTG2SharedBlockError, match="taxonomy graph work"):
             graph._charge_v4_taxonomy_projection_work(batch_count=1)
+
+
+@pytest.mark.parametrize(
+    ("charge", "dimension"),
+    (
+        ({"member_count": 1}, "graph_members"),
+        ({"byte_count": 1}, "graph_bytes"),
+    ),
+)
+def test_taxonomy_projection_scope_reports_exact_exceeded_dimension(
+    charge,
+    dimension,
+) -> None:
+    with graph.v4_graph_taxonomy_projection_scope(
+        maximum_members=0,
+        maximum_pages=0,
+        maximum_bytes=0,
+        maximum_batches=0,
+    ):
+        with pytest.raises(graph.PTG2OnlineWorkBudgetExceeded) as exc_info:
+            graph._charge_v4_taxonomy_projection_work(**charge)
+
+    assert exc_info.value.dimension == dimension
+
+
+def test_taxonomy_projection_scope_reuses_outer_scope_and_rejects_negatives() -> None:
+    with graph.v4_graph_taxonomy_projection_scope(
+        maximum_members=1,
+        maximum_pages=1,
+        maximum_bytes=1,
+        maximum_batches=1,
+    ) as outer:
+        with graph.v4_graph_taxonomy_projection_scope(
+            maximum_members=0,
+            maximum_pages=0,
+            maximum_bytes=0,
+            maximum_batches=0,
+        ) as nested:
+            assert nested is outer
+
+    with pytest.raises(PTG2SharedBlockError, match="limit is negative"):
+        with graph.v4_graph_taxonomy_projection_scope(
+            maximum_members=-1,
+            maximum_pages=0,
+            maximum_bytes=0,
+            maximum_batches=0,
+        ):
+            pytest.fail("negative limits must fail before yielding")
 
 
 def test_v4_heavy_bitmap_decoder_is_exact_and_rejects_padding_bits() -> None:
@@ -196,6 +283,55 @@ def test_v4_heavy_bitmap_decoder_is_exact_and_rejects_padding_bits() -> None:
             header + bytes((0b00000101, 0b10000010)),
             heavy_owner=owner,
             allowed_member_keys=(102,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_match"),
+    (
+        (b"", "invalid size"),
+        (b"WRONGMAG" + struct.pack("<IIII", 7, 100, 10, 3) + b"\0\0", "invalid magic"),
+        (
+            b"PTG2V4BM" + struct.pack("<IIII", 8, 100, 10, 3) + b"\x07\0",
+            "conflicts with its manifest",
+        ),
+        (
+            b"PTG2V4BM" + struct.pack("<IIII", 7, 100, 10, 3) + b"\x05\0",
+            "member count changed",
+        ),
+    ),
+)
+def test_v4_heavy_bitmap_rejects_manifest_and_count_drift(
+    payload,
+    error_match,
+) -> None:
+    owner = graph.V4HeavyOwner(
+        relation="npi_groups_exact",
+        owner_key=7,
+        object_kind="v4_npi_groups_exact_heavy_bitmap_v1",
+        member_count=3,
+        member_base=100,
+        member_span=10,
+        fragment_count=1,
+    )
+
+    with pytest.raises(PTG2SharedBlockError, match=error_match):
+        graph._decode_heavy_bitmap(payload, heavy_owner=owner)
+
+
+def test_v4_empty_member_page_has_an_exact_empty_value() -> None:
+    assert graph._decode_member_page(b"", entry_count=0) == ()
+
+
+@pytest.mark.asyncio
+async def test_v4_map_coordinates_reject_negative_identity_before_io() -> None:
+    with pytest.raises(PTG2SharedBlockError, match="coordinate is negative"):
+        await graph._load_map_coordinate_pairs(
+            object(),
+            schema_name="mrf",
+            snapshot_key=17,
+            object_kind="v4_test",
+            coordinate_pairs=((-1, 0),),
         )
 
 

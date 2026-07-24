@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
+from api.ptg2_shared_blocks import PTG2SharedBlockError
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts import ptg2_v4_taxonomy_candidates as taxonomy
 from process.ptg_parts.ptg2_manifest_artifacts import (
@@ -704,3 +705,383 @@ def test_filtered_reverse_rate_scope_cannot_escape_graph_matches() -> None:
             [_rate_row(3)],
             (1, 2),
         )
+
+
+def _projection_rule(
+    projection_manifest: dict[str, object],
+) -> taxonomy.V4InferredTaxonomyProjectionRule:
+    resolved = serving._v4_inferred_taxonomy_projection_rule(
+        _tables(projection_manifest),
+        {"code_system": "CPT", "code": "70553"},
+    )
+    assert resolved is not None
+    return resolved[1]
+
+
+def test_inferred_taxonomy_v4_rule_loss_fails_closed(monkeypatch) -> None:
+    projection_manifest, _candidates = _projection_fixture()
+    monkeypatch.setattr(
+        serving,
+        "_is_inferred_taxonomy_only_provider_filter",
+        lambda _args: True,
+    )
+    monkeypatch.setattr(serving, "_inferred_provider_taxonomy_rule", lambda _args: None)
+
+    with pytest.raises(PTG2ManifestArtifactError, match="lost its rule"):
+        serving._v4_inferred_taxonomy_projection_rule(
+            _tables(projection_manifest),
+            {"code_system": "CPT", "code": "70553"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("serving_rows", "error_match"),
+    (
+        ([{**_rate_row(1), "_ptg_provider_set_key": True}], "invalid provider set"),
+        (
+            [{**_rate_row(1), "provider_set_global_id_128": None}],
+            "invalid provider set",
+        ),
+        (
+            [
+                _rate_row(1),
+                {
+                    **_rate_row(1),
+                    "provider_set_global_id_128": _provider_set_id(2),
+                },
+            ],
+            "disagree on provider-set identity",
+        ),
+    ),
+)
+def test_filtered_reverse_rate_scope_rejects_invalid_identity(
+    serving_rows,
+    error_match,
+) -> None:
+    with pytest.raises(PTG2ManifestArtifactError, match=error_match):
+        serving._v4_filtered_reverse_provider_set_ids(serving_rows, None)
+
+
+def test_inferred_taxonomy_v4_candidate_budgets_are_typed() -> None:
+    direct_manifest, direct_candidates = _projection_fixture()
+    direct_rule = replace(
+        _projection_rule(direct_manifest),
+        max_online_inferred_taxonomy_candidates=direct_candidates.member_count - 1,
+    )
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as direct_error:
+        serving._validate_v4_inferred_taxonomy_candidates(
+            direct_candidates,
+            direct_rule,
+        )
+    assert direct_error.value.dimension == "candidate_members"
+
+    pattern_manifest, pattern_candidates = _projection_fixture_for(
+        (1, 2),
+        {7: (1, 2)},
+    )
+    pattern_rule = replace(
+        _projection_rule(pattern_manifest),
+        max_online_candidate_pattern_projection_members=1,
+    )
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as pattern_error:
+        serving._validate_v4_inferred_taxonomy_candidates(
+            pattern_candidates,
+            pattern_rule,
+        )
+    assert pattern_error.value.dimension == "candidate_pattern_projection_members"
+
+
+def test_inferred_taxonomy_v4_pattern_shape_drift_fails_closed() -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1, 2),
+        {7: (1, 2)},
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="pattern projection changed"):
+        serving._validate_v4_inferred_taxonomy_candidates(
+            replace(candidates, npi_keys_by_pattern={7: (1,)}),
+            _projection_rule(projection_manifest),
+        )
+
+
+def test_pattern_candidate_prefix_deduplicates_shared_postings() -> None:
+    selected, exhausted = serving._v4_pattern_candidate_prefix(
+        [_rate_row(1), _rate_row(2), _rate_row(3)],
+        {1: (7, 8), 2: (7,), 3: (9,)},
+        {7: (1, 3), 8: (1, 2), 9: (1, 4)},
+        target_count=99,
+    )
+
+    assert selected == ((0, 1), (0, 2), (0, 3), (2, 4))
+    assert exhausted is True
+
+
+@pytest.mark.parametrize(
+    ("max_members", "npi_keys_by_pattern", "error_match"),
+    (
+        (-1, {7: (1,)}, "retained-membership cap is invalid"),
+        (1, {}, "lost its exact provider-set membership"),
+    ),
+)
+def test_pattern_membership_completion_fails_closed(
+    max_members,
+    npi_keys_by_pattern,
+    error_match,
+) -> None:
+    with pytest.raises(PTG2ManifestArtifactError, match=error_match):
+        serving._v4_selected_pattern_memberships(
+            (1,),
+            npi_keys_by_pattern,
+            {10: (7,)},
+            {10: _provider_set_id(10)},
+            max_members=max_members,
+        )
+
+
+async def _select_pattern_fixture(
+    projection_manifest,
+    candidates,
+    projection_rule,
+):
+    """Run the pattern selector with the shared synthetic request."""
+    return await serving._select_v4_pattern_taxonomy_expansion(
+        object(),
+        _tables(projection_manifest),
+        code_rows=[{"code_key": 4, "rate_count": 1}],
+        args={"code_system": "CPT", "code": "70553"},
+        snapshot_id="snapshot",
+        source_trace_set_hash=None,
+        network_names=[],
+        target_count=1,
+        descending=False,
+        projection_rule=projection_rule,
+        candidates=candidates,
+    )
+
+
+async def _select_direct_fixture(
+    projection_manifest,
+    projection_rule,
+):
+    """Run the direct selector with the shared synthetic request."""
+    return await serving._select_v4_taxonomy_expansion(
+        object(),
+        _tables(projection_manifest),
+        code_rows=[{"code_key": 4, "rate_count": 1}],
+        args={"code_system": "CPT", "code": "70553"},
+        snapshot_id="snapshot",
+        source_trace_set_hash=None,
+        network_names=[],
+        target_count=1,
+        descending=False,
+        projection_manifest=projection_manifest,
+        projection_rule=projection_rule,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "error_type", "error_match", "expected_dimension"),
+    (
+        ("missing_rows", PTG2ManifestArtifactError, "rate rows are unavailable", None),
+        ("occurrence_budget", serving.PTG2OnlineWorkBudgetExceeded, None, "code_occurrences"),
+        ("set_budget", serving.PTG2OnlineWorkBudgetExceeded, None, "code_sets"),
+        ("missing_projection", PTG2ManifestArtifactError, "projection is incomplete", None),
+        ("missing_npi", PTG2ManifestArtifactError, "NPI dictionary is incomplete", None),
+        ("duplicate_rank", PTG2ManifestArtifactError, "ranking is not unique", None),
+        ("missing_enrichment", PTG2ManifestArtifactError, "enrichment is unavailable", None),
+    ),
+)
+async def test_pattern_selector_rejects_broken_sealed_boundaries(
+    monkeypatch,
+    failure,
+    error_type,
+    error_match,
+    expected_dimension,
+) -> None:
+    """Reject every corrupted or over-budget pattern selection boundary."""
+    projection_manifest, candidates = _projection_fixture_for((1,), {7: (1,)})
+    projection_rule = _projection_rule(projection_manifest)
+    serving_rows = None if failure == "missing_rows" else [_rate_row(1)]
+    pattern_keys_by_set = {} if failure == "missing_projection" else {1: (7,)}
+    npi_by_key = {} if failure == "missing_npi" else {1: 1_000_000_001}
+    providers_by_set = None if failure == "missing_enrichment" else {}
+    if failure == "occurrence_budget":
+        projection_rule = replace(
+            projection_rule,
+            max_online_filtered_reverse_code_occurrences=0,
+        )
+    if failure == "set_budget":
+        projection_rule = replace(
+            projection_rule,
+            max_online_filtered_reverse_code_sets=0,
+        )
+    if failure == "duplicate_rank":
+        monkeypatch.setattr(
+            serving,
+            "_v4_pattern_candidate_prefix",
+            lambda *_args, **_kwargs: (((0, 1), (0, 1)), False),
+        )
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(return_value=serving_rows),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        AsyncMock(return_value=pattern_keys_by_set),
+    )
+    monkeypatch.setattr(
+        serving,
+        "v4_npi_values_for_keys",
+        AsyncMock(return_value=npi_by_key),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_selected_provider_rows_by_set",
+        AsyncMock(return_value=providers_by_set),
+    )
+
+    with pytest.raises(error_type, match=error_match) as exc_info:
+        await _select_pattern_fixture(
+            projection_manifest,
+            candidates,
+            projection_rule,
+        )
+    if expected_dimension is not None:
+        assert exc_info.value.dimension == expected_dimension
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_stage", ("rate_scope", "candidate_scope"))
+async def test_pattern_selector_returns_exact_empty_selection(
+    monkeypatch,
+    empty_stage,
+) -> None:
+    projection_manifest, candidates = _projection_fixture_for((1,), {7: (1,)})
+    serving_rows = [] if empty_stage == "rate_scope" else [_rate_row(1)]
+    pattern_keys_by_set = {1: ()}
+    intersection_lookup = AsyncMock(return_value=pattern_keys_by_set)
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(return_value=serving_rows),
+    )
+    monkeypatch.setattr(serving, "lookup_v4_relation_intersections", intersection_lookup)
+
+    selection = await _select_pattern_fixture(
+        projection_manifest,
+        candidates,
+        _projection_rule(projection_manifest),
+    )
+
+    assert selection.row_data == []
+    assert selection.exhausted is True
+    assert intersection_lookup.await_count == (0 if empty_stage == "rate_scope" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "error_type", "error_match", "expected_dimension"),
+    (
+        ("missing_npi", PTG2ManifestArtifactError, "NPI dictionary is incomplete", None),
+        ("missing_rows", PTG2ManifestArtifactError, "rate rows are unavailable", None),
+        ("member_budget", serving.PTG2OnlineWorkBudgetExceeded, None, "retained_memberships"),
+        ("graph_error", PTG2SharedBlockError, "different graph error", None),
+        ("escaped_scope", PTG2ManifestArtifactError, "escaped its exact code scope", None),
+        ("missing_enrichment", PTG2ManifestArtifactError, "enrichment is unavailable", None),
+    ),
+)
+async def test_direct_selector_rejects_broken_sealed_boundaries(
+    monkeypatch,
+    failure,
+    error_type,
+    error_match,
+    expected_dimension,
+) -> None:
+    """Reject every corrupted or over-budget direct selection boundary."""
+    projection_manifest, candidates = _projection_fixture_for((1,), {})
+    npi = 1_000_000_001
+    npi_by_key = {} if failure == "missing_npi" else {1: npi}
+    serving_rows = None if failure == "missing_rows" else [_rate_row(1)]
+    provider_set_keys_by_npi = {
+        npi: (2,) if failure == "escaped_scope" else (1,)
+    }
+    graph_error = None
+    if failure == "member_budget":
+        graph_error = PTG2SharedBlockError(
+            "PTG V4 graph selection exceeds max_members"
+        )
+    if failure == "graph_error":
+        graph_error = PTG2SharedBlockError("different graph error")
+    graph_lookup = AsyncMock(
+        side_effect=graph_error,
+        return_value=provider_set_keys_by_npi,
+    )
+    monkeypatch.setattr(
+        serving,
+        "load_v4_inferred_taxonomy_candidates",
+        AsyncMock(return_value=candidates),
+    )
+    monkeypatch.setattr(
+        serving,
+        "v4_npi_values_for_keys",
+        AsyncMock(return_value=npi_by_key),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(return_value=serving_rows),
+    )
+    monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
+    monkeypatch.setattr(
+        serving,
+        "_selected_provider_rows_by_set",
+        AsyncMock(return_value=None if failure == "missing_enrichment" else {}),
+    )
+
+    with pytest.raises(error_type, match=error_match) as exc_info:
+        await _select_direct_fixture(
+            projection_manifest,
+            _projection_rule(projection_manifest),
+        )
+    if expected_dimension is not None:
+        assert exc_info.value.dimension == expected_dimension
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_stage", ("rate_scope", "graph_scope"))
+async def test_direct_selector_returns_exact_empty_selection(
+    monkeypatch,
+    empty_stage,
+) -> None:
+    projection_manifest, candidates = _projection_fixture_for((1,), {})
+    npi = 1_000_000_001
+    serving_rows = [] if empty_stage == "rate_scope" else [_rate_row(1)]
+    graph_lookup = AsyncMock(return_value={npi: ()})
+    monkeypatch.setattr(
+        serving,
+        "load_v4_inferred_taxonomy_candidates",
+        AsyncMock(return_value=candidates),
+    )
+    monkeypatch.setattr(
+        serving,
+        "v4_npi_values_for_keys",
+        AsyncMock(return_value={1: npi}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(return_value=serving_rows),
+    )
+    monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
+
+    selection = await _select_direct_fixture(
+        projection_manifest,
+        _projection_rule(projection_manifest),
+    )
+
+    assert selection.row_data == []
+    assert selection.exhausted is True
+    assert graph_lookup.await_count == (0 if empty_stage == "rate_scope" else 1)
