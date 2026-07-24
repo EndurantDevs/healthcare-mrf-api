@@ -7,7 +7,6 @@ import csv
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List
 
 import click
 
@@ -18,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 SUPPORT_ZIP_DIR = Path(__file__).resolve().parents[1] / "support" / "zip"
 DEFAULT_SOURCE = SUPPORT_ZIP_DIR / "geo_city_public.csv"
+IMPORT_BATCH_SIZE = 2000
 
 
 def _parse_float(value):
@@ -54,22 +54,48 @@ def _normalize_county_code(value):
     return digits[-5:].rjust(5, "0")
 
 
-async def _flush_rows(rows: List[Dict]):
-    if not rows:
+def _geo_zip_values_from_csv_fields(
+    csv_fields: dict[str, str | None],
+) -> dict[str, object] | None:
+    zip_code = (csv_fields.get("Zip Code") or "").strip()
+    city = (csv_fields.get("Official USPS city name") or "").strip()
+    if not zip_code or not city:
+        return None
+
+    latitude, longitude = _parse_geo_point(csv_fields.get("Geo Point"))
+    return {
+        "zip_code": zip_code.rjust(5, "0"),
+        "city": city,
+        "city_lower": city.lower(),
+        "state": (csv_fields.get("Official USPS State Code") or "").strip().upper(),
+        "state_name": (csv_fields.get("Official State Name") or "").strip(),
+        "county_name": (csv_fields.get("Primary Official County Name") or "").strip(),
+        "county_code": _normalize_county_code(
+            csv_fields.get("Primary Official County Code")
+        ),
+        "latitude": latitude,
+        "longitude": longitude,
+        "timezone": (csv_fields.get("Timezone") or "").strip(),
+        "population": _parse_population(csv_fields.get("Population")),
+    }
+
+
+async def _flush_rows(pending_geo_rows: list[dict[str, object]]) -> None:
+    if not pending_geo_rows:
         return
     table = GeoZipLookup.__table__
-    insert_stmt = db.insert(table).values(rows)
-    update_cols = {
+    insert_stmt = db.insert(table).values(pending_geo_rows)
+    column_update_map = {
         column.name: getattr(insert_stmt.excluded, column.name)
         for column in table.c
         if not column.primary_key
     }
     insert_stmt = insert_stmt.on_conflict_do_update(
         index_elements=GeoZipLookup.__my_index_elements__,
-        set_=update_cols,
+        set_=column_update_map,
     )
     await insert_stmt.status()
-    rows.clear()
+    pending_geo_rows.clear()
 
 
 async def load_geo_lookup(source_file: Path | None = None):
@@ -83,42 +109,20 @@ async def load_geo_lookup(source_file: Path | None = None):
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     await db.status(f"TRUNCATE TABLE {schema}.{GeoZipLookup.__tablename__};")
 
-    rows: List[Dict] = []
+    pending_geo_rows: list[dict[str, object]] = []
     processed = 0
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle, delimiter=";")
-        for row in reader:
-            zip_code = (row.get("Zip Code") or "").strip()
-            city = (row.get("Official USPS city name") or "").strip()
-            if not zip_code or not city:
+        for csv_fields in reader:
+            geo_zip_values = _geo_zip_values_from_csv_fields(csv_fields)
+            if geo_zip_values is None:
                 continue
-            state = (row.get("Official USPS State Code") or "").strip().upper()
-            state_name = (row.get("Official State Name") or "").strip()
-            county_name = (row.get("Primary Official County Name") or "").strip()
-            county_code = _normalize_county_code(row.get("Primary Official County Code"))
-            timezone = (row.get("Timezone") or "").strip()
-            population = _parse_population(row.get("Population"))
-            lat, lon = _parse_geo_point(row.get("Geo Point"))
-
-            record = {
-                "zip_code": zip_code.rjust(5, "0"),
-                "city": city,
-                "city_lower": city.lower(),
-                "state": state,
-                "state_name": state_name,
-                "county_name": county_name,
-                "county_code": county_code,
-                "latitude": lat,
-                "longitude": lon,
-                "timezone": timezone,
-                "population": population,
-            }
-            rows.append(record)
+            pending_geo_rows.append(geo_zip_values)
             processed += 1
-            if len(rows) >= 2000:
-                await _flush_rows(rows)
+            if len(pending_geo_rows) >= IMPORT_BATCH_SIZE:
+                await _flush_rows(pending_geo_rows)
 
-    await _flush_rows(rows)
+    await _flush_rows(pending_geo_rows)
     logger.info("Loaded %s geo zip rows from %s", processed, csv_path)
 
 
