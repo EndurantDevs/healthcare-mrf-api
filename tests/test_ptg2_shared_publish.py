@@ -725,6 +725,21 @@ async def _session_transaction(session):
     yield session
 
 
+def test_shared_block_publish_batch_is_bounded_for_dense_stages():
+    synthetic_dense_stage_rows = 8_192_000
+
+    assert ptg2_shared_publish._SHARED_BLOCK_PUBLISH_BATCH_ROWS == 4_096
+    assert (
+        ptg2_shared_publish._SHARED_BLOCK_PUBLISH_BATCH_ROWS
+        <= ptg2_shared_publish._SHARED_BLOCK_EXISTENCE_BATCH_ROWS
+    )
+    assert (
+        synthetic_dense_stage_rows
+        // ptg2_shared_publish._SHARED_BLOCK_PUBLISH_BATCH_ROWS
+        == 2_000
+    )
+
+
 def _assert_slow_shared_block_publication(publication, progress_events, session):
     assert publication.mapping_count == 4_103
     assert publication.unique_block_count == 4_101
