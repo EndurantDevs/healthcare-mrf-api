@@ -50,8 +50,8 @@ ANCHOR_COUNT_RADIUS_MILES = 3.0
 MAX_ANCHOR_LIST_ITEMS = 25
 TABLE_EXISTS_CACHE_TTL_SECONDS = 300.0
 _TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
-_ZCTA_OVERLAP_AVAILABLE_CACHE: tuple[float, bool] | None = None
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
+_ZCTA_OVERLAP_CACHE_KEY = "tiger.zcta5:overlap_available"
 
 
 def _get_session(request):
@@ -82,16 +82,16 @@ async def _is_table_cached(session, model) -> bool:
     return exists
 
 
-async def _zcta_overlap_available(session) -> bool:
-    global _ZCTA_OVERLAP_AVAILABLE_CACHE
+async def _is_zcta_overlap_available(session) -> bool:
     now = time.monotonic()
-    if _ZCTA_OVERLAP_AVAILABLE_CACHE and (
-        now - _ZCTA_OVERLAP_AVAILABLE_CACHE[0]
+    availability_cache_entry = _TABLE_EXISTS_CACHE.get(_ZCTA_OVERLAP_CACHE_KEY)
+    if availability_cache_entry and (
+        now - availability_cache_entry[0]
     ) < TABLE_EXISTS_CACHE_TTL_SECONDS:
-        return _ZCTA_OVERLAP_AVAILABLE_CACHE[1]
+        return availability_cache_entry[1]
     # Test/session doubles don't support this optional path; keep deterministic behavior.
     if not hasattr(session, "get_bind"):
-        _ZCTA_OVERLAP_AVAILABLE_CACHE = (now, False)
+        _TABLE_EXISTS_CACHE[_ZCTA_OVERLAP_CACHE_KEY] = (now, False)
         return False
     try:
         probe = await session.execute(
@@ -111,9 +111,12 @@ async def _zcta_overlap_available(session) -> bool:
                 """
             )
         )
-        row = probe.first()
-        available = bool(
-            row and bool(row.has_zcta5) and bool(row.has_geom) and bool(row.has_postgis)
+        availability_row = probe.first()
+        is_available = bool(
+            availability_row
+            and bool(availability_row.has_zcta5)
+            and bool(availability_row.has_geom)
+            and bool(availability_row.has_postgis)
         )
     except Exception:
         if hasattr(session, "rollback"):
@@ -121,9 +124,9 @@ async def _zcta_overlap_available(session) -> bool:
                 await session.rollback()
             except Exception as rollback_exc:
                 logger.debug("failed to rollback ZCTA availability probe: %s", rollback_exc)
-        available = False
-    _ZCTA_OVERLAP_AVAILABLE_CACHE = (now, available)
-    return available
+        is_available = False
+    _TABLE_EXISTS_CACHE[_ZCTA_OVERLAP_CACHE_KEY] = (now, is_available)
+    return is_available
 
 
 async def _radius_zip_weights(
@@ -134,7 +137,7 @@ async def _radius_zip_weights(
 ) -> tuple[dict[str, float], str]:
     if radius_miles <= 0:
         return {}, "none"
-    if not await _zcta_overlap_available(session):
+    if not await _is_zcta_overlap_available(session):
         return {}, "zip_centroid"
 
     radius_meters = radius_miles * MILES_TO_METERS
@@ -163,7 +166,12 @@ async def _radius_zip_weights(
         """
     )
     try:
-        rows = (await session.execute(sql, {"lat": lat, "lng": lng, "radius_meters": radius_meters})).all()
+        zip_overlap_rows = (
+            await session.execute(
+                sql,
+                {"lat": lat, "lng": lng, "radius_meters": radius_meters},
+            )
+        ).all()
     except Exception:
         if hasattr(session, "rollback"):
             try:
@@ -172,19 +180,23 @@ async def _radius_zip_weights(
                 logger.debug("failed to rollback radius ZIP overlap query: %s", rollback_exc)
         return {}, "zip_centroid"
 
-    weights: dict[str, float] = {}
-    for row in rows:
-        zip_code = str(row.zip_code or "").strip()
-        weight = _safe_float(row.overlap_weight, default=0.0) or 0.0
+    weights_by_zip: dict[str, float] = {}
+    for zip_overlap_row in zip_overlap_rows:
+        zip_code = str(zip_overlap_row.zip_code or "").strip()
+        weight = _safe_float(zip_overlap_row.overlap_weight, default=0.0) or 0.0
         if not zip_code or weight <= 0:
             continue
         # Keep only 5-digit ZIP for consistent joins.
         zip_code = zip_code[:5]
         if len(zip_code) != 5:
             continue
-        weights[zip_code] = max(weights.get(zip_code, 0.0), min(weight, 1.0))
+        weights_by_zip[zip_code] = max(
+            weights_by_zip.get(zip_code, 0.0), min(weight, 1.0)
+        )
 
-    return weights, ("zcta_polygon_overlap" if weights else "zip_centroid")
+    return weights_by_zip, (
+        "zcta_polygon_overlap" if weights_by_zip else "zip_centroid"
+    )
 
 
 def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -382,25 +394,25 @@ async def _nearest_anchor(
             )
         )
     )
-    rows = (await session.execute(stmt)).all()
-    if not rows:
+    anchor_rows = (await session.execute(stmt)).all()
+    if not anchor_rows:
         return None
 
-    nearest = None
-    for row in rows:
-        row_lat = _safe_float(row.latitude)
-        row_lng = _safe_float(row.longitude)
+    nearest_anchor_by_field = None
+    for anchor_row in anchor_rows:
+        row_lat = _safe_float(anchor_row.latitude)
+        row_lng = _safe_float(anchor_row.longitude)
         if row_lat is None or row_lng is None:
             continue
         miles = _haversine_miles(lat, lng, row_lat, row_lng)
-        if nearest is None or miles < nearest["miles"]:
-            nearest = {
-                "name": str(row.name or facility_type),
+        if nearest_anchor_by_field is None or miles < nearest_anchor_by_field["miles"]:
+            nearest_anchor_by_field = {
+                "name": str(anchor_row.name or facility_type),
                 "lat": row_lat,
                 "lng": row_lng,
                 "miles": miles,
             }
-    return nearest
+    return nearest_anchor_by_field
 
 
 async def _anchors_within_radius(
@@ -431,29 +443,29 @@ async def _anchors_within_radius(
             )
         )
     )
-    rows = (await session.execute(stmt)).all()
-    if not rows:
+    anchor_rows = (await session.execute(stmt)).all()
+    if not anchor_rows:
         return []
 
-    items: list[dict] = []
-    for row in rows:
-        row_lat = _safe_float(row.latitude)
-        row_lng = _safe_float(row.longitude)
+    nearby_anchors: list[dict] = []
+    for anchor_row in anchor_rows:
+        row_lat = _safe_float(anchor_row.latitude)
+        row_lng = _safe_float(anchor_row.longitude)
         if row_lat is None or row_lng is None:
             continue
         miles = _haversine_miles(lat, lng, row_lat, row_lng)
         if miles > search_miles:
             continue
-        items.append(
+        nearby_anchors.append(
             {
-                "name": str(row.name or facility_type),
+                "name": str(anchor_row.name or facility_type),
                 "lat": row_lat,
                 "lng": row_lng,
                 "miles": round(float(miles), 2),
             }
         )
-    items.sort(key=lambda item: float(item.get("miles", 999999)))
-    return items[: max(1, int(limit))]
+    nearby_anchors.sort(key=lambda anchor: float(anchor.get("miles", 999999)))
+    return nearby_anchors[: max(1, int(limit))]
 
 
 async def _load_anchor_candidates(
@@ -487,17 +499,17 @@ async def _load_anchor_candidates(
             )
         )
     )
-    rows = (await session.execute(stmt)).all()
+    anchor_rows = (await session.execute(stmt)).all()
     by_type: dict[str, list[dict]] = {"Hospital": [], "FQHC": []}
-    for row in rows:
-        row_lat = _safe_float(row.latitude)
-        row_lng = _safe_float(row.longitude)
+    for anchor_row in anchor_rows:
+        row_lat = _safe_float(anchor_row.latitude)
+        row_lng = _safe_float(anchor_row.longitude)
         if row_lat is None or row_lng is None:
             continue
         miles = _haversine_miles(lat, lng, row_lat, row_lng)
-        by_type.setdefault(str(row.facility_type or ""), []).append(
+        by_type.setdefault(str(anchor_row.facility_type or ""), []).append(
             {
-                "name": str(row.name or ""),
+                "name": str(anchor_row.name or ""),
                 "lat": row_lat,
                 "lng": row_lng,
                 "miles": miles,
@@ -558,7 +570,7 @@ async def get_site_score(request):
     )
 
     session = _get_session(request)
-    table_exists = {
+    table_availability_by_name = {
         "geo_zip": await _is_table_cached(session, GeoZipLookup),
         "medicare": await _is_table_cached(session, MedicareEnrollmentStats),
         "lodes": await _is_table_cached(session, LODESWorkplaceAggregate),
@@ -571,7 +583,7 @@ async def get_site_score(request):
         "facility_anchor": await _is_table_cached(session, FacilityAnchor),
         "economics": await _is_table_cached(session, PharmacyEconomicsSummary),
     }
-    if not table_exists["geo_zip"]:
+    if not table_availability_by_name["geo_zip"]:
         confidence = _confidence_percent(
             has_trade_area=False,
             has_demand=False,
@@ -639,7 +651,7 @@ async def get_site_score(request):
                 "trade_areas": {},
                 "methodology": {
                     "trade_area_minutes": list(TRADE_AREA_MINUTES),
-                    "datasets_available": table_exists,
+                    "datasets_available": table_availability_by_name,
                 },
             }
         )
@@ -662,15 +674,17 @@ async def get_site_score(request):
     )
     zip_rows = (await session.execute(zip_stmt)).all()
 
-    trade_area_zips: dict[int, set[str]] = {minutes: set() for minutes in TRADE_AREA_MINUTES}
+    zip_codes_by_minutes: dict[int, set[str]] = {
+        minutes: set() for minutes in TRADE_AREA_MINUTES
+    }
     nearest_state = None
     nearest_zip_distance = None
     zip_distance_map: dict[str, float] = {}
 
-    for row in zip_rows:
-        zip_code = str(row.zip_code or "").strip()
-        row_lat = _safe_float(row.latitude)
-        row_lng = _safe_float(row.longitude)
+    for zip_row in zip_rows:
+        zip_code = str(zip_row.zip_code or "").strip()
+        row_lat = _safe_float(zip_row.latitude)
+        row_lng = _safe_float(zip_row.longitude)
         if not zip_code or row_lat is None or row_lng is None:
             continue
         distance = _haversine_miles(lat, lng, row_lat, row_lng)
@@ -679,10 +693,10 @@ async def get_site_score(request):
         zip_distance_map[zip_code] = distance
         if nearest_zip_distance is None or distance < nearest_zip_distance:
             nearest_zip_distance = distance
-            nearest_state = row.state
+            nearest_state = zip_row.state
         for minutes, radius_miles in radius_by_minutes.items():
             if distance <= radius_miles:
-                trade_area_zips[minutes].add(zip_code)
+                zip_codes_by_minutes[minutes].add(zip_code)
 
     all_zip_codes = sorted(zip_distance_map.keys())
     if not all_zip_codes:
@@ -752,7 +766,7 @@ async def get_site_score(request):
         )
 
     medicare_rows = []
-    if table_exists["medicare"]:
+    if table_availability_by_name["medicare"]:
         medicare_rows = (
             await session.execute(
                 select(
@@ -776,7 +790,7 @@ async def get_site_score(request):
             }
 
     lodes_rows = []
-    if table_exists["lodes"]:
+    if table_availability_by_name["lodes"]:
         lodes_rows = (
             await session.execute(
                 select(
@@ -800,7 +814,7 @@ async def get_site_score(request):
             }
 
     places_rows = []
-    if table_exists["places"]:
+    if table_availability_by_name["places"]:
         places_rows = (
             await session.execute(
                 select(
@@ -820,31 +834,33 @@ async def get_site_score(request):
         ).all()
     latest_places_by_key: dict[tuple[str, str], tuple[int, float]] = {}
     chronic_measure_name_by_key: dict[str, str] = {}
-    for row in places_rows:
-        zip_code = str(row.zcta)
-        measure_id = str(row.measure_id or "").strip()
-        if not _is_chronic_measure(measure_id, row.measure_name):
+    for place_row in places_rows:
+        zip_code = str(place_row.zcta)
+        measure_id = str(place_row.measure_id or "").strip()
+        if not _is_chronic_measure(measure_id, place_row.measure_name):
             continue
-        year = _safe_int(row.year)
-        value = _safe_float(row.data_value)
-        if value is None:
+        year = _safe_int(place_row.year)
+        chronic_rate = _safe_float(place_row.data_value)
+        if chronic_rate is None:
             continue
-        measure_key = measure_id or str(row.measure_name or "unknown")
+        measure_key = measure_id or str(place_row.measure_name or "unknown")
         key = (zip_code, measure_key)
         current = latest_places_by_key.get(key)
         if not current or year > current[0]:
-            latest_places_by_key[key] = (year, value)
+            latest_places_by_key[key] = (year, chronic_rate)
         if measure_key not in chronic_measure_name_by_key:
-            chronic_measure_name_by_key[measure_key] = str(row.measure_name or measure_key)
+            chronic_measure_name_by_key[measure_key] = str(
+                place_row.measure_name or measure_key
+            )
     chronic_by_zip: dict[str, list[float]] = defaultdict(list)
-    for (zip_code, _), (_year, value) in latest_places_by_key.items():
-        chronic_by_zip[zip_code].append(value)
+    for (zip_code, _), (_year, chronic_rate) in latest_places_by_key.items():
+        chronic_by_zip[zip_code].append(chronic_rate)
 
     all_providers_by_zip: dict[str, set[int]] = defaultdict(set)
     np_pa_by_zip: dict[str, set[int]] = defaultdict(set)
 
     provider_zip_rows = []
-    if table_exists["doctors"]:
+    if table_availability_by_name["doctors"]:
         provider_zip_rows = (
             await session.execute(
                 select(
@@ -866,7 +882,7 @@ async def get_site_score(request):
 
     active_pharmacy_rows = []
     partd_pharmacy_rows = []
-    if table_exists["partd_pharmacy"]:
+    if table_availability_by_name["partd_pharmacy"]:
         partd_pharmacy_rows = (
             await session.execute(
                 select(
@@ -895,9 +911,11 @@ async def get_site_score(request):
     pharmacy_rows = []
     use_unified_addresses = (
         _address_serving_source() == ADDRESS_SERVING_SOURCE_UNIFIED
-        and table_exists["entity_address"]
+        and table_availability_by_name["entity_address"]
     )
-    if table_exists["npi_taxonomy"] and (use_unified_addresses or table_exists["npi_address"]):
+    if table_availability_by_name["npi_taxonomy"] and (
+        use_unified_addresses or table_availability_by_name["npi_address"]
+    ):
         pharmacy_rows = (
             await session.execute(
                 _pharmacy_geo_stmt(
@@ -924,50 +942,54 @@ async def get_site_score(request):
             pharmacy_distance_map[npi] = distance
 
     pharmacy_radius_value = pharmacy_radius_miles or radius_by_minutes[15]
-    radius_zip_weights, selected_radius_method = await _radius_zip_weights(
+    zip_weight_by_code, selected_radius_method = await _radius_zip_weights(
         session,
         lat,
         lng,
         pharmacy_radius_value,
     )
     # Fallback to centroid inclusion when polygon overlap is unavailable.
-    if not radius_zip_weights:
-        radius_zip_weights = {
-            z: 1.0 for z, d in zip_distance_map.items() if d <= pharmacy_radius_value
+    if not zip_weight_by_code:
+        zip_weight_by_code = {
+            zip_code: 1.0
+            for zip_code, distance in zip_distance_map.items()
+            if distance <= pharmacy_radius_value
         }
-        if not radius_zip_weights and zip_distance_map:
+        if not zip_weight_by_code and zip_distance_map:
             nearest_zip = min(zip_distance_map.items(), key=lambda item: item[1])[0]
-            radius_zip_weights = {nearest_zip: 1.0}
+            zip_weight_by_code = {nearest_zip: 1.0}
             selected_radius_method = "address_zip_fallback"
-    radius_zip_codes = list(radius_zip_weights.keys())
+    radius_zip_codes = list(zip_weight_by_code.keys())
 
     seniors_radius = int(
         round(
             sum(
-                medicare_by_zip.get(z, {}).get("total_beneficiaries", 0) * radius_zip_weights.get(z, 0.0)
-                for z in radius_zip_codes
+                medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0)
+                * zip_weight_by_code.get(zip_code, 0.0)
+                for zip_code in radius_zip_codes
             )
         )
     )
     workers_radius = int(
         round(
             sum(
-                workers_by_zip.get(z, {}).get("total_workers", 0) * radius_zip_weights.get(z, 0.0)
-                for z in radius_zip_codes
+                workers_by_zip.get(zip_code, {}).get("total_workers", 0)
+                * zip_weight_by_code.get(zip_code, 0.0)
+                for zip_code in radius_zip_codes
             )
         )
     )
 
     chronic_weighted_sum = 0.0
     chronic_weighted_den = 0.0
-    for z in radius_zip_codes:
-        values = chronic_by_zip.get(z, [])
-        if not values:
+    for zip_code in radius_zip_codes:
+        chronic_rates = chronic_by_zip.get(zip_code, [])
+        if not chronic_rates:
             continue
-        weight = radius_zip_weights.get(z, 0.0)
+        weight = zip_weight_by_code.get(zip_code, 0.0)
         if weight <= 0:
             continue
-        zip_avg = sum(values) / len(values)
+        zip_avg = sum(chronic_rates) / len(chronic_rates)
         chronic_weighted_sum += zip_avg * weight
         chronic_weighted_den += weight
     chronic_avg_radius = (
@@ -977,13 +999,13 @@ async def get_site_score(request):
     chronic_measure_values_radius: dict[str, tuple[float, float, int]] = defaultdict(
         lambda: (0.0, 0.0, 0)
     )
-    for (zip_code, measure_key), (_year, value) in latest_places_by_key.items():
-        weight = radius_zip_weights.get(zip_code, 0.0)
+    for (zip_code, measure_key), (_year, chronic_rate) in latest_places_by_key.items():
+        weight = zip_weight_by_code.get(zip_code, 0.0)
         if weight <= 0:
             continue
         sum_v, sum_w, samples = chronic_measure_values_radius[measure_key]
         chronic_measure_values_radius[measure_key] = (
-            sum_v + (value * weight),
+            sum_v + (chronic_rate * weight),
             sum_w + weight,
             samples + 1,
         )
@@ -1003,11 +1025,21 @@ async def get_site_score(request):
     # Weighted ZIP approximation for selected-radius provider and pharmacy availability.
     provider_count_radius = int(
         round(
-            sum(len(all_providers_by_zip.get(z, set())) * radius_zip_weights.get(z, 0.0) for z in radius_zip_codes)
+            sum(
+                len(all_providers_by_zip.get(zip_code, set()))
+                * zip_weight_by_code.get(zip_code, 0.0)
+                for zip_code in radius_zip_codes
+            )
         )
     )
     np_pa_count_radius = int(
-        round(sum(len(np_pa_by_zip.get(z, set())) * radius_zip_weights.get(z, 0.0) for z in radius_zip_codes))
+        round(
+            sum(
+                len(np_pa_by_zip.get(zip_code, set()))
+                * zip_weight_by_code.get(zip_code, 0.0)
+                for zip_code in radius_zip_codes
+            )
+        )
     )
     if pharmacy_distance_map:
         pharmacy_count_radius = sum(
@@ -1017,16 +1049,18 @@ async def get_site_score(request):
         pharmacy_count_radius = int(
             round(
                 sum(
-                    len(partd_pharmacies_by_zip.get(z, set())) * radius_zip_weights.get(z, 0.0)
-                    for z in radius_zip_codes
+                    len(partd_pharmacies_by_zip.get(zip_code, set()))
+                    * zip_weight_by_code.get(zip_code, 0.0)
+                    for zip_code in radius_zip_codes
                 )
             )
         )
     active_pharmacy_count_radius = int(
         round(
             sum(
-                len(active_pharmacies_by_zip.get(z, set())) * radius_zip_weights.get(z, 0.0)
-                for z in radius_zip_codes
+                len(active_pharmacies_by_zip.get(zip_code, set()))
+                * zip_weight_by_code.get(zip_code, 0.0)
+                for zip_code in radius_zip_codes
             )
         )
     )
@@ -1036,22 +1070,24 @@ async def get_site_score(request):
         lat,
         lng,
         search_miles=40.0,
-        facility_table_available=table_exists["facility_anchor"],
+        facility_table_available=table_availability_by_name["facility_anchor"],
     )
 
     def _nearest_from_candidates(items: list[dict]) -> dict | None:
         if not items:
             return None
-        nearest = min(items, key=lambda item: float(item.get("miles", 999999)))
+        nearest_anchor_by_field = min(
+            items, key=lambda item: float(item.get("miles", 999999))
+        )
         return {
-            "name": str(nearest.get("name") or ""),
-            "lat": nearest.get("lat"),
-            "lng": nearest.get("lng"),
-            "miles": float(nearest.get("miles") or 0.0),
+            "name": str(nearest_anchor_by_field.get("name") or ""),
+            "lat": nearest_anchor_by_field.get("lat"),
+            "lng": nearest_anchor_by_field.get("lng"),
+            "miles": float(nearest_anchor_by_field.get("miles") or 0.0),
         }
 
     def _within_radius_from_candidates(items: list[dict], search_miles: float) -> list[dict]:
-        selected = [
+        selected_anchors = [
             {
                 "name": str(item.get("name") or ""),
                 "lat": item.get("lat"),
@@ -1061,8 +1097,8 @@ async def get_site_score(request):
             for item in items
             if float(item.get("miles") or 0.0) <= search_miles
         ]
-        selected.sort(key=lambda item: float(item.get("miles", 999999)))
-        return selected[:MAX_ANCHOR_LIST_ITEMS]
+        selected_anchors.sort(key=lambda item: float(item.get("miles", 999999)))
+        return selected_anchors[:MAX_ANCHOR_LIST_ITEMS]
 
     nearest_hospital = _nearest_from_candidates(anchor_candidates.get("Hospital", []))
     nearest_fqhc = _nearest_from_candidates(anchor_candidates.get("FQHC", []))
@@ -1074,7 +1110,7 @@ async def get_site_score(request):
     )
 
     economics_rows = []
-    if nearest_state and table_exists["economics"]:
+    if nearest_state and table_availability_by_name["economics"]:
         economics_rows = (
             await session.execute(
                 select(
@@ -1108,22 +1144,59 @@ async def get_site_score(request):
         else 0.0
     )
 
-    trade_area_payload = {}
+    trade_area_by_minutes = {}
     for minutes in TRADE_AREA_MINUTES:
-        zips = sorted(trade_area_zips[minutes])
-        seniors = sum(medicare_by_zip.get(z, {}).get("total_beneficiaries", 0) for z in zips)
-        workers = sum(workers_by_zip.get(z, {}).get("total_workers", 0) for z in zips)
-        provider_count = len(set().union(*(all_providers_by_zip.get(z, set()) for z in zips))) if zips else 0
-        np_pa_count = len(set().union(*(np_pa_by_zip.get(z, set()) for z in zips))) if zips else 0
-        active_pharmacy_count = (
-            len(set().union(*(active_pharmacies_by_zip.get(z, set()) for z in zips))) if zips else 0
+        zip_codes = sorted(zip_codes_by_minutes[minutes])
+        seniors = sum(
+            medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0)
+            for zip_code in zip_codes
         )
-        chronic_values = [v for z in zips for v in chronic_by_zip.get(z, [])]
-        chronic_avg = (sum(chronic_values) / len(chronic_values)) if chronic_values else None
+        workers = sum(
+            workers_by_zip.get(zip_code, {}).get("total_workers", 0)
+            for zip_code in zip_codes
+        )
+        provider_count = (
+            len(
+                set().union(
+                    *(all_providers_by_zip.get(zip_code, set()) for zip_code in zip_codes)
+                )
+            )
+            if zip_codes
+            else 0
+        )
+        np_pa_count = (
+            len(
+                set().union(
+                    *(np_pa_by_zip.get(zip_code, set()) for zip_code in zip_codes)
+                )
+            )
+            if zip_codes
+            else 0
+        )
+        active_pharmacy_count = (
+            len(
+                set().union(
+                    *(
+                        active_pharmacies_by_zip.get(zip_code, set())
+                        for zip_code in zip_codes
+                    )
+                )
+            )
+            if zip_codes
+            else 0
+        )
+        chronic_rates = [
+            chronic_rate
+            for zip_code in zip_codes
+            for chronic_rate in chronic_by_zip.get(zip_code, [])
+        ]
+        chronic_avg = (
+            (sum(chronic_rates) / len(chronic_rates)) if chronic_rates else None
+        )
 
-        trade_area_payload[str(minutes)] = {
+        trade_area_by_minutes[str(minutes)] = {
             "radius_miles": round(radius_by_minutes[minutes], 2),
-            "zip_count": len(zips),
+            "zip_count": len(zip_codes),
             "metrics": {
                 "total_seniors": seniors,
                 "daytime_workers": workers,
@@ -1134,9 +1207,15 @@ async def get_site_score(request):
             },
         }
 
-    zips_15 = sorted(trade_area_zips[15])
-    seniors_15 = sum(medicare_by_zip.get(z, {}).get("total_beneficiaries", 0) for z in zips_15)
-    workers_15 = sum(workers_by_zip.get(z, {}).get("total_workers", 0) for z in zips_15)
+    zips_15 = sorted(zip_codes_by_minutes[15])
+    seniors_15 = sum(
+        medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0)
+        for zip_code in zips_15
+    )
+    workers_15 = sum(
+        workers_by_zip.get(zip_code, {}).get("total_workers", 0)
+        for zip_code in zips_15
+    )
     provider_count_15 = (
         len(set().union(*(all_providers_by_zip.get(z, set()) for z in zips_15))) if zips_15 else 0
     )
@@ -1152,22 +1231,30 @@ async def get_site_score(request):
     active_pharmacy_count_15 = (
         len(set().union(*(active_pharmacies_by_zip.get(z, set()) for z in zips_15))) if zips_15 else 0
     )
-    chronic_values_15 = [v for z in zips_15 for v in chronic_by_zip.get(z, [])]
-    chronic_avg_15 = (sum(chronic_values_15) / len(chronic_values_15)) if chronic_values_15 else None
+    chronic_rates_15 = [
+        chronic_rate
+        for zip_code in zips_15
+        for chronic_rate in chronic_by_zip.get(zip_code, [])
+    ]
+    chronic_avg_15 = (
+        (sum(chronic_rates_15) / len(chronic_rates_15))
+        if chronic_rates_15
+        else None
+    )
     chronic_measure_values_15: dict[str, list[float]] = defaultdict(list)
-    for (zip_code, measure_key), (_year, value) in latest_places_by_key.items():
+    for (zip_code, measure_key), (_year, chronic_rate) in latest_places_by_key.items():
         if zip_code in zips_15:
-            chronic_measure_values_15[measure_key].append(value)
-    chronic_breakdown_15 = []
-    for measure_key, values in sorted(chronic_measure_values_15.items()):
-        if not values:
+            chronic_measure_values_15[measure_key].append(chronic_rate)
+    chronic_breakdown_rows_15 = []
+    for measure_key, chronic_rates in sorted(chronic_measure_values_15.items()):
+        if not chronic_rates:
             continue
-        chronic_breakdown_15.append(
+        chronic_breakdown_rows_15.append(
             {
                 "measure_id": measure_key,
                 "measure_name": chronic_measure_name_by_key.get(measure_key, measure_key),
-                "avg_rate": round(sum(values) / len(values), 2),
-                "zip_samples": len(values),
+                "avg_rate": round(sum(chronic_rates) / len(chronic_rates), 2),
+                "zip_samples": len(chronic_rates),
             }
         )
 
@@ -1241,7 +1328,7 @@ async def get_site_score(request):
         nearest_hospital_miles=nearest_hospital_miles,
         nearest_fqhc_miles=nearest_fqhc_miles,
     )
-    target_met = expected_volume["daily"] >= target_scripts_per_day
+    is_target_met = expected_volume["daily"] >= target_scripts_per_day
     target_gap = max(0, target_scripts_per_day - expected_volume["daily"])
     target_ratio = (
         round(expected_volume["daily"] / target_scripts_per_day, 4)
@@ -1250,12 +1337,12 @@ async def get_site_score(request):
     )
     base_decision, base_rationale = _base_recommendation_for_score(score)
     final_decision = base_decision
-    target_adjusted = False
-    if not target_met and base_decision == "Recommend":
+    is_target_adjusted = False
+    if not is_target_met and base_decision == "Recommend":
         final_decision = "Conditional"
-        target_adjusted = True
+        is_target_adjusted = True
     recommendation_rationale = base_rationale
-    if not target_met:
+    if not is_target_met:
         recommendation_rationale = (
             f"{base_rationale} Expected daily scripts ({expected_volume['daily']}) are below "
             f"the configured target ({target_scripts_per_day})."
@@ -1296,7 +1383,9 @@ async def get_site_score(request):
     )
 
     base_score_band = _score_band(score)
-    effective_score_band = _effective_score_band(final_decision, target_adjusted)
+    effective_score_band = _effective_score_band(
+        final_decision, is_target_adjusted
+    )
 
     return response.json(
         {
@@ -1391,7 +1480,7 @@ async def get_site_score(request):
             },
             "target_assessment": {
                 "target_daily": target_scripts_per_day,
-                "target_met": target_met,
+                "target_met": is_target_met,
                 "gap_daily": target_gap,
                 "coverage_ratio": target_ratio,
             },
@@ -1399,9 +1488,9 @@ async def get_site_score(request):
                 "base_decision": base_decision,
                 "final_decision": final_decision,
                 "rationale": recommendation_rationale,
-                "target_adjusted": target_adjusted,
+                "target_adjusted": is_target_adjusted,
             },
-            "trade_areas": trade_area_payload,
+            "trade_areas": trade_area_by_minutes,
             "methodology": {
                 "trade_area_minutes": list(TRADE_AREA_MINUTES),
                 "drive_speed_mph": float(
@@ -1420,7 +1509,7 @@ async def get_site_score(request):
                     "zcta_polygon_overlap": "selected_radius_zcta_polygon_overlap",
                     "address_zip_fallback": "selected_radius_address_zip_fallback",
                 }.get(selected_radius_method, "selected_radius_zip_centroid"),
-                "datasets_available": table_exists,
+                "datasets_available": table_availability_by_name,
             },
         }
     )

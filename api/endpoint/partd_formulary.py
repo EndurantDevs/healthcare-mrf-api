@@ -106,7 +106,7 @@ async def _is_table_available(session, table) -> bool:
 
 async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) -> dict[str, Any]:
     table = PharmacyLicenseRecord.__table__
-    empty = {
+    empty_summary_dict = {
         "has_active_state_license": False,
         "active_license_count": 0,
         "active_states": [],
@@ -114,10 +114,10 @@ async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) 
         "license_checked_at": None,
     }
     if not await _is_table_available(session, table):
-        return empty
+        return empty_summary_dict
 
     table_name = _qualified_table_name(table)
-    row = (
+    license_summary_row = (
         await session.execute(
             text(
                 f"""
@@ -148,16 +148,26 @@ async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) 
         )
     ).mappings().first()
 
-    if not row:
-        return empty
+    if not license_summary_row:
+        return empty_summary_dict
 
-    active_states = sorted({str(state).upper() for state in (row.get("active_states") or []) if state})
-    latest_verified = row.get("latest_verified_at")
+    active_states = sorted(
+        {
+            str(state).upper()
+            for state in (license_summary_row.get("active_states") or [])
+            if state
+        }
+    )
+    latest_verified = license_summary_row.get("latest_verified_at")
     return {
-        "has_active_state_license": bool(row.get("active_count") or 0),
-        "active_license_count": int(row.get("active_count") or 0),
+        "has_active_state_license": bool(
+            license_summary_row.get("active_count") or 0
+        ),
+        "active_license_count": int(license_summary_row.get("active_count") or 0),
         "active_states": active_states,
-        "disciplinary_flag_any": bool(row.get("disciplinary_flag_any")),
+        "disciplinary_flag_any": bool(
+            license_summary_row.get("disciplinary_flag_any")
+        ),
         "license_checked_at": latest_verified.isoformat() if latest_verified else None,
     }
 
@@ -178,7 +188,7 @@ async def get_partd_import_status(request):
     if run_row is None:
         raise NotFound("No Part D imports found")
 
-    run_data = dict(run_row._mapping)
+    run_dict = dict(run_row._mapping)
     snapshot_table = PartDFormularySnapshot.__table__
     run_snapshots = (
         await session.execute(
@@ -186,20 +196,24 @@ async def get_partd_import_status(request):
                 func.count().label("snapshot_count"),
                 func.coalesce(func.sum(snapshot_table.c.row_count_activity), 0).label("activity_rows"),
                 func.coalesce(func.sum(snapshot_table.c.row_count_pricing), 0).label("pricing_rows"),
-            ).where(snapshot_table.c.run_id == run_data["run_id"])
+            ).where(snapshot_table.c.run_id == run_dict["run_id"])
         )
     ).first()
     snapshot_map = run_snapshots._mapping if run_snapshots else {}
 
     return response.json(
         {
-            "run_id": run_data.get("run_id"),
-            "import_id": run_data.get("import_id"),
-            "status": run_data.get("status"),
-            "started_at": run_data.get("started_at").isoformat() if run_data.get("started_at") else None,
-            "finished_at": run_data.get("finished_at").isoformat() if run_data.get("finished_at") else None,
-            "source_summary": run_data.get("source_summary") or {},
-            "error_text": run_data.get("error_text"),
+            "run_id": run_dict.get("run_id"),
+            "import_id": run_dict.get("import_id"),
+            "status": run_dict.get("status"),
+            "started_at": run_dict.get("started_at").isoformat()
+            if run_dict.get("started_at")
+            else None,
+            "finished_at": run_dict.get("finished_at").isoformat()
+            if run_dict.get("finished_at")
+            else None,
+            "source_summary": run_dict.get("source_summary") or {},
+            "error_text": run_dict.get("error_text"),
             "snapshots": {
                 "count": int(snapshot_map.get("snapshot_count") or 0),
                 "activity_rows": int(snapshot_map.get("activity_rows") or 0),
@@ -250,11 +264,11 @@ async def list_partd_snapshots(request):
         snapshot_table.c.snapshot_id.desc(),
     ).offset(pagination.offset).limit(pagination.limit)
 
-    rows = (await session.execute(data_stmt)).all()
-    items = []
-    for row in rows:
-        mapping = row._mapping
-        items.append(
+    snapshot_rows = (await session.execute(data_stmt)).all()
+    snapshot_items = []
+    for snapshot_row in snapshot_rows:
+        mapping = snapshot_row._mapping
+        snapshot_items.append(
             {
                 "snapshot_id": mapping.get("snapshot_id"),
                 "run_id": mapping.get("run_id"),
@@ -278,7 +292,7 @@ async def list_partd_snapshots(request):
             "limit": pagination.limit,
             "offset": pagination.offset,
             "total": total,
-            "items": items,
+            "items": snapshot_items,
         }
     )
 
@@ -295,7 +309,7 @@ async def get_pharmacy_partd_activity(request, npi):
 
     activity_table = PartDPharmacyActivity.__table__
     activity_table_name = _qualified_table_name(activity_table)
-    rows = (
+    activity_rows = (
         await session.execute(
             text(
                 f"""
@@ -335,7 +349,7 @@ async def get_pharmacy_partd_activity(request, npi):
         )
     ).mappings().all()
 
-    if not rows:
+    if not activity_rows:
         return response.json(
             {
                 "npi": parsed_npi,
@@ -349,15 +363,15 @@ async def get_pharmacy_partd_activity(request, npi):
             }
         )
 
-    items = []
-    active = False
+    activity_items = []
+    is_medicare_active = False
     source_type = None
-    for mapping in rows:
+    for mapping in activity_rows:
         if source_type is None and mapping.get("source_type"):
             source_type = mapping.get("source_type")
         item_active = bool(mapping.get("medicare_active"))
-        active = active or item_active
-        items.append(
+        is_medicare_active = is_medicare_active or item_active
+        activity_items.append(
             {
                 "snapshot_id": mapping.get("snapshot_id"),
                 "plan_id": mapping.get("plan_id"),
@@ -383,16 +397,24 @@ async def get_pharmacy_partd_activity(request, npi):
             }
         )
 
-    plan_ids = sorted({item["plan_id"] for item in items if item.get("plan_id")})
+    plan_ids = sorted(
+        {
+            activity_item["plan_id"]
+            for activity_item in activity_items
+            if activity_item.get("plan_id")
+        }
+    )
     return response.json(
         {
             "npi": parsed_npi,
             "as_of": as_of.isoformat(),
-            "medicare_active": active,
-            "medicare_active_as_of": as_of.isoformat() if active else None,
+            "medicare_active": is_medicare_active,
+            "medicare_active_as_of": as_of.isoformat()
+            if is_medicare_active
+            else None,
             "source_type": source_type,
             "plan_ids": plan_ids,
-            "items": items,
+            "items": activity_items,
             "state_license_summary": state_license_summary,
         }
     )
@@ -446,11 +468,17 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
                 {"npi": parsed_npi, "as_of": as_of},
             )
         ).mappings().all()
-        effective_plan_ids = sorted({row.get("plan_id") for row in plan_rows if row.get("plan_id")})
+        effective_plan_ids = sorted(
+            {
+                plan_row.get("plan_id")
+                for plan_row in plan_rows
+                if plan_row.get("plan_id")
+            }
+        )
 
     cost_table = PartDMedicationCost.__table__
     cost_table_name = _qualified_table_name(cost_table)
-    query_params: dict[str, Any] = {
+    query_parameter_map: dict[str, Any] = {
         "normalized_code": normalized_code,
     }
     where_parts: list[str] = []
@@ -481,9 +509,9 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
         ).all()
         crosswalk_ndcs = sorted(
             {
-                _NON_DIGIT.sub("", str(row[0] or "").strip())
-                for row in (direct_ndc_rows + reverse_ndc_rows)
-                if _NON_DIGIT.sub("", str(row[0] or "").strip())
+                _NON_DIGIT.sub("", str(crosswalk_row[0] or "").strip())
+                for crosswalk_row in (direct_ndc_rows + reverse_ndc_rows)
+                if _NON_DIGIT.sub("", str(crosswalk_row[0] or "").strip())
             }
         )
         code_clauses = [
@@ -491,7 +519,9 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
             "c.rxnorm_id = :normalized_code",
         ]
         if crosswalk_ndcs:
-            ndc_in = _bind_in_clause("crosswalk_ndc", crosswalk_ndcs, query_params)
+            ndc_in = _bind_in_clause(
+                "crosswalk_ndc", crosswalk_ndcs, query_parameter_map
+            )
             code_clauses.append(f"c.ndc11 IN ({ndc_in})")
         where_parts.append(f"({' OR '.join(code_clauses)})")
     else:
@@ -526,14 +556,14 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
             }
         )
 
-    plan_in = _bind_in_clause("plan_id", effective_plan_ids, query_params)
+    plan_in = _bind_in_clause("plan_id", effective_plan_ids, query_parameter_map)
     where_parts.append(f"c.plan_ids && ARRAY[{plan_in}]::varchar[]")
     where_parts.append(f"p.plan_id IN ({plan_in})")
     if year is not None:
-        query_params["year"] = year
+        query_parameter_map["year"] = year
         where_parts.append("c.year = :year")
     if month_date is not None:
-        query_params["month_date"] = month_date
+        query_parameter_map["month_date"] = month_date
         where_parts.append("c.effective_from <= :month_date")
         where_parts.append("(c.effective_to IS NULL OR c.effective_to >= :month_date)")
 
@@ -548,13 +578,13 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
                 WHERE {' AND '.join(where_parts)};
                 """
             ),
-            query_params,
+            query_parameter_map,
         )
     ).scalar() or 0
 
-    data_params = dict(query_params)
-    data_params["offset"] = pagination.offset
-    data_params["limit"] = pagination.limit
+    data_parameter_map = dict(query_parameter_map)
+    data_parameter_map["offset"] = pagination.offset
+    data_parameter_map["limit"] = pagination.limit
     data_rows = (
         await session.execute(
             text(
@@ -590,14 +620,14 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
                 LIMIT :limit;
                 """
             ),
-            data_params,
+            data_parameter_map,
         )
     ).mappings().all()
 
-    items = []
+    cost_items = []
     normalized_match_strategy = "plan_level_ndc" if normalized_system == "NDC" else "plan_level_rxnorm"
     for mapping in data_rows:
-        items.append(
+        cost_items.append(
             {
                 "snapshot_id": mapping.get("snapshot_id"),
                 "plan_id": mapping.get("plan_id"),
@@ -646,6 +676,6 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
             "limit": pagination.limit,
             "offset": pagination.offset,
             "total": total,
-            "items": items,
+            "items": cost_items,
         }
     )
