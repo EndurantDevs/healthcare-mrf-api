@@ -213,10 +213,12 @@ declared allowed-amount pointers in one lifecycle-locked transaction. It
 validates the retained snapshot's sealed scope and activated audit attestation
 before changing any pointer, and an exact retry performs no writes.
 
-The V3 oracle is a separately deployed, scale-to-zero candidate pinned to its
-reviewed image. Reference capture first attests the singular ready Deployment
-and Pod, immutable image digest, V3-only ConfigMaps, and exact Service target.
-The V3 oracle is scaled back to zero after capture.
+The V3 oracle is pinned to its reviewed image. Reference capture first attests
+the singular ready Deployment and Pod, immutable image digest, V3-only
+ConfigMaps, and exact Service target. In the current dev topology that same
+Deployment also serves candidate-audit traffic, so it remains at one replica
+through both canary passes. It may become scale-to-zero only after those roles
+are separated in source control and the canary attests the dedicated oracle.
 
 ## Metadata-only stale-build reconciliation
 
