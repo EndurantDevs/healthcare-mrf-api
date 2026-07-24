@@ -215,7 +215,7 @@ async def control_ptg_source_snapshot_promote(request):
         raise SanicException(str(exc), status_code=409) from exc
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
-    if _ptg_source_snapshot_refresh_requested(payload):
+    if _is_ptg_snapshot_refresh_requested(payload):
         try:
             refresh_payload = _ptg_source_snapshot_refresh_payload(
                 payload,
@@ -416,16 +416,16 @@ def _ptg_import_file_payload(payload: dict) -> dict:
     }
 
 
-def _request_bool(value) -> bool:
+def _is_request_enabled(value) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _ptg_source_snapshot_refresh_requested(payload: dict) -> bool:
+def _is_ptg_snapshot_refresh_requested(payload: dict) -> bool:
     refresh = payload.get("address_refresh") if isinstance(payload.get("address_refresh"), dict) else {}
     return any(
-        _request_bool(value)
+        _is_request_enabled(value)
         for value in (
             payload.get("refresh_addresses"),
             payload.get("enqueue_address_refresh"),
@@ -435,8 +435,8 @@ def _ptg_source_snapshot_refresh_requested(payload: dict) -> bool:
     )
 
 
-def _ptg_source_snapshot_refresh_payload(payload: dict, *, source_key: str, snapshot_id: str) -> dict:
-    raw_refresh = payload.get("address_refresh")
+def _ptg_source_snapshot_refresh_payload(request_payload: dict, *, source_key: str, snapshot_id: str) -> dict:
+    raw_refresh = request_payload.get("address_refresh")
     if raw_refresh is not None and not isinstance(raw_refresh, dict):
         raise ValueError("address_refresh must be an object")
     refresh = raw_refresh or {}
@@ -450,24 +450,24 @@ def _ptg_source_snapshot_refresh_payload(payload: dict, *, source_key: str, snap
     ):
         if key in refresh and key not in params:
             params[key] = refresh[key]
-        elif key in payload and key not in params:
-            params[key] = payload[key]
+        elif key in request_payload and key not in params:
+            params[key] = request_payload[key]
     params.setdefault("refresh_mode", "full")
     params["trigger_source_key"] = source_key
     params["trigger_snapshot_id"] = snapshot_id
     return {
-        "run_id": refresh.get("run_id") or payload.get("refresh_run_id"),
+        "run_id": refresh.get("run_id") or request_payload.get("refresh_run_id"),
         "importer": "entity-address-unified",
         "params": params,
         "idempotency_key": (
             refresh.get("idempotency_key")
-            or payload.get("refresh_idempotency_key")
+            or request_payload.get("refresh_idempotency_key")
             or f"entity-address-unified:{source_key}:{snapshot_id}"
         ),
-        "triggered_by": refresh.get("triggered_by") or payload.get("triggered_by") or "ptg_source_snapshot_promote",
-        "schedule_id": refresh.get("schedule_id") or payload.get("schedule_id"),
-        "subscription_id": refresh.get("subscription_id") or payload.get("subscription_id"),
-        "import_id": refresh.get("import_id") or payload.get("refresh_import_id"),
+        "triggered_by": refresh.get("triggered_by") or request_payload.get("triggered_by") or "ptg_source_snapshot_promote",
+        "schedule_id": refresh.get("schedule_id") or request_payload.get("schedule_id"),
+        "subscription_id": refresh.get("subscription_id") or request_payload.get("subscription_id"),
+        "import_id": refresh.get("import_id") or request_payload.get("refresh_import_id"),
     }
 
 

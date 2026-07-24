@@ -197,7 +197,7 @@ async def test_direct_lean_dictionaries_use_stage_or_serving_source(
     status = AsyncMock()
     table_exists = AsyncMock(side_effect=(True, False, True, False))
     monkeypatch.setattr(manifest.db, "status", status)
-    monkeypatch.setattr(manifest, "_table_exists", table_exists)
+    monkeypatch.setattr(manifest, "_is_table_available", table_exists)
     for stage_table in ("code_stage", "code_stage"):
         await manifest._build_direct_lean_code_counts(
             schema_name="mrf",

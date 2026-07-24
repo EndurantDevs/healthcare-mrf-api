@@ -20,7 +20,7 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
     return max(value, minimum)
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _is_environment_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -67,7 +67,7 @@ def build_redis_settings() -> RedisSettings:
             settings.max_connections if settings.max_connections is not None else 100,
             minimum=1,
         )
-    settings.retry_on_timeout = _env_bool("HLTHPRT_REDIS_RETRY_ON_TIMEOUT", default=True)
+    settings.retry_on_timeout = _is_environment_enabled("HLTHPRT_REDIS_RETRY_ON_TIMEOUT", default=True)
     return settings
 
 

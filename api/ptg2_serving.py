@@ -4179,6 +4179,63 @@ class _V4GraphReadBounds:
     max_members: int | None
 
 
+@dataclass(frozen=True)
+class _V4NpiProjection:
+    npi_key_by_value: Mapping[int, int]
+    representation: str
+    second_relation: str
+    first_members_by_npi_key: Mapping[int, tuple[int, ...]]
+    first_member_keys: tuple[int, ...]
+
+
+async def _load_v4_npi_projection(
+    session,
+    snapshot_key: int,
+    normalized_npis: tuple[int, ...],
+    read_bounds: _V4GraphReadBounds,
+) -> _V4NpiProjection:
+    """Load the first V4 NPI projection and its selected representation."""
+
+    npi_key_by_value = await v4_npi_keys_for_values(
+        session,
+        snapshot_key=snapshot_key,
+        npis=normalized_npis,
+        schema_name=read_bounds.schema_name,
+    )
+    root = await load_v4_graph_root(
+        session,
+        snapshot_key,
+        schema_name=read_bounds.schema_name,
+    )
+    first_relation, second_relation, _ = _v4_npi_projection_relations(
+        root.representation
+    )
+    first_members_by_npi_key = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation=first_relation,
+        owner_keys=npi_key_by_value.values(),
+        schema_name=read_bounds.schema_name,
+        max_members=read_bounds.max_members,
+    )
+    first_member_keys = tuple(
+        sorted(
+            {
+                int(first_member_key)
+                for members in first_members_by_npi_key.values()
+                for first_member_key in members
+            }
+        )
+    )
+    return _V4NpiProjection(
+        npi_key_by_value=npi_key_by_value,
+        representation=root.representation,
+        second_relation=second_relation,
+        first_members_by_npi_key=first_members_by_npi_key,
+        first_member_keys=first_member_keys,
+    )
+
+
 async def _v4_pattern_members_for_sets(
     session,
     *,
@@ -4190,12 +4247,6 @@ async def _v4_pattern_members_for_sets(
 ) -> Mapping[int, tuple[int, ...]] | None:
     """Read a bounded set-to-pattern projection or select the forward path."""
 
-    if (
-        read_bounds.max_members is not None
-        and len(allowed_provider_sets) * (maximum_pattern_degree + 1)
-        > int(read_bounds.max_members)
-    ):
-        return None
     bounded_patterns = await lookup_v4_relation_member_prefixes(
         session,
         snapshot_key=snapshot_key,
@@ -4203,6 +4254,7 @@ async def _v4_pattern_members_for_sets(
         owner_keys=allowed_provider_sets,
         schema_name=read_bounds.schema_name,
         limit_per_owner=maximum_pattern_degree + 1,
+        max_members=read_bounds.max_members,
     )
     if set(bounded_patterns) != set(allowed_provider_sets):
         raise PTG2ManifestArtifactError(
@@ -4270,6 +4322,43 @@ async def _v4_reverse_members_for_sets(
     )
 
 
+async def _v4_scoped_reverse_sets(
+    session,
+    serving_tables: PTG2ServingTables,
+    snapshot_key: int,
+    normalized_npis: tuple[int, ...],
+    projection: _V4NpiProjection,
+    allowed_provider_sets: tuple[int, ...] | None,
+    read_bounds: _V4GraphReadBounds,
+) -> dict[int, tuple[int, ...]] | None:
+    """Resolve a code-scoped reverse result when that direction is cheaper."""
+
+    if allowed_provider_sets is None:
+        return None
+    first_members_by_allowed_set = await _v4_reverse_members_for_sets(
+        session,
+        snapshot_key=snapshot_key,
+        representation=projection.representation,
+        first_member_count=len(projection.first_member_keys),
+        allowed_provider_sets=allowed_provider_sets,
+        forward_relation=projection.second_relation,
+        maximum_pattern_degree=(
+            _v4_hot_prefix_limits(serving_tables).maximum_patterns_per_set
+        ),
+        read_bounds=read_bounds,
+    )
+    if first_members_by_allowed_set is None:
+        return None
+    return _v4_sets_by_npi_reverse(
+        normalized_npis=normalized_npis,
+        npi_key_by_value=projection.npi_key_by_value,
+        first_members_by_npi_key=projection.first_members_by_npi_key,
+        first_members_by_allowed_set=first_members_by_allowed_set,
+        allowed_provider_sets=allowed_provider_sets,
+        max_members=read_bounds.max_members,
+    )
+
+
 def _v4_sets_from_first_members(
     normalized_npis: tuple[int, ...],
     npi_key_by_value: Mapping[int, int],
@@ -4318,6 +4407,14 @@ def _v4_sets_from_first_members(
     return provider_set_keys_by_npi
 
 
+def _normalized_optional_integer_keys(
+    values: Iterable[int] | None,
+) -> tuple[int, ...] | None:
+    if values is None:
+        return None
+    return tuple(sorted({int(value) for value in values}))
+
+
 async def _v4_sets_by_npi(
     session,
     serving_tables: PTG2ServingTables,
@@ -4328,92 +4425,46 @@ async def _v4_sets_by_npi(
     max_members: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Resolve hot NPI-to-set membership through the selected V4 representation."""
-
     normalized_npis = tuple(sorted({int(npi) for npi in npis}))
     if not normalized_npis:
         return {}
-    allowed_provider_sets = (
-        tuple(
-            sorted(int(provider_set_key) for provider_set_key in allowed_provider_set_keys)
-        )
-        if allowed_provider_set_keys is not None
-        else None
+    allowed_provider_sets = _normalized_optional_integer_keys(
+        allowed_provider_set_keys
     )
     snapshot_key = _required_shared_snapshot_key(serving_tables)
-    read_bounds = _V4GraphReadBounds(
-        schema_name=schema_name,
-        max_members=max_members,
-    )
+    read_bounds = _V4GraphReadBounds(schema_name, max_members)
     with v4_graph_request_scope():
-        npi_key_by_value = await v4_npi_keys_for_values(
-            session,
-            snapshot_key=snapshot_key,
-            npis=normalized_npis,
-            schema_name=schema_name,
-        )
-        root = await load_v4_graph_root(
+        projection = await _load_v4_npi_projection(
             session,
             snapshot_key,
-            schema_name=schema_name,
+            normalized_npis,
+            read_bounds,
         )
-        first_relation, second_relation, _ = _v4_npi_projection_relations(
-            root.representation
-        )
-        first_members_by_npi_key = await lookup_v4_relation_members(
-            session,
-            snapshot_key=snapshot_key,
-            relation=first_relation,
-            owner_keys=npi_key_by_value.values(),
-            schema_name=schema_name,
-            max_members=max_members,
-        )
-        first_member_keys = tuple(
-            sorted(
-                {
-                    int(first_member_key)
-                    for members in first_members_by_npi_key.values()
-                    for first_member_key in members
-                }
-            )
-        )
-        if not first_member_keys:
+        if not projection.first_member_keys:
             return {npi: () for npi in normalized_npis}
-        if allowed_provider_sets is not None:
-            first_members_by_allowed_set = await _v4_reverse_members_for_sets(
-                session,
-                snapshot_key=snapshot_key,
-                representation=root.representation,
-                first_member_count=len(first_member_keys),
-                allowed_provider_sets=allowed_provider_sets,
-                forward_relation=second_relation,
-                maximum_pattern_degree=(
-                    _v4_hot_prefix_limits(
-                        serving_tables
-                    ).maximum_patterns_per_set
-                ),
-                read_bounds=read_bounds,
-            )
-            if first_members_by_allowed_set is not None:
-                return _v4_sets_by_npi_reverse(
-                    normalized_npis=normalized_npis,
-                    npi_key_by_value=npi_key_by_value,
-                    first_members_by_npi_key=first_members_by_npi_key,
-                    first_members_by_allowed_set=first_members_by_allowed_set,
-                    allowed_provider_sets=allowed_provider_sets,
-                    max_members=max_members,
-                )
+        reverse_sets = await _v4_scoped_reverse_sets(
+            session,
+            serving_tables,
+            snapshot_key,
+            normalized_npis,
+            projection,
+            allowed_provider_sets,
+            read_bounds,
+        )
+        if reverse_sets is not None:
+            return reverse_sets
         provider_sets_by_first_member = await lookup_v4_relation_members(
             session,
             snapshot_key=snapshot_key,
-            relation=second_relation,
-            owner_keys=first_member_keys,
+            relation=projection.second_relation,
+            owner_keys=projection.first_member_keys,
             schema_name=schema_name,
             max_members=max_members,
         )
     return _v4_sets_from_first_members(
         normalized_npis,
-        npi_key_by_value,
-        first_members_by_npi_key,
+        projection.npi_key_by_value,
+        projection.first_members_by_npi_key,
         provider_sets_by_first_member,
         allowed_provider_sets,
         max_members=max_members,

@@ -57,13 +57,13 @@ def _parse_int_param(value: str | None, param_name: str) -> int | None:
         raise InvalidUsage(f"Parameter '{param_name}' must be an integer") from exc
 
 
-def _parse_bool_param(value: str | None, default: bool = False) -> bool:
+def _is_boolean_parameter_enabled(value: str | None, default: bool = False) -> bool:
     if value in (None, "", "null"):
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-async def _table_exists(session, table_name: str, schema: str = "mrf") -> bool:
+async def _is_table_available(session, table_name: str, schema: str = "mrf") -> bool:
     result = await session.execute(
         text("SELECT to_regclass(:name)"),
         {"name": f"{schema}.{table_name}"},
@@ -76,7 +76,7 @@ async def _table_exists(session, table_name: str, schema: str = "mrf") -> bool:
 async def get_pharmacy_license_import_status(request):
     """Return the latest or requested pharmacy-license import status."""
     session = _get_session(request)
-    if not await _table_exists(session, PharmacyLicenseImportRun.__tablename__):
+    if not await _is_table_available(session, PharmacyLicenseImportRun.__tablename__):
         raise NotFound("No pharmacy-license imports found")
 
     run_id = request.args.get("run_id")
@@ -130,7 +130,7 @@ async def get_pharmacy_license_import_status(request):
 async def get_pharmacy_license_coverage(request):
     """Return pharmacy-license source coverage by state."""
     session = _get_session(request)
-    if not await _table_exists(session, PharmacyLicenseStateCoverage.__tablename__):
+    if not await _is_table_available(session, PharmacyLicenseStateCoverage.__tablename__):
         return response.json(
             {
                 "total_states": 0,
@@ -190,11 +190,11 @@ async def get_pharmacy_license_by_npi(request, npi):
     session = _get_session(request)
     parsed_npi = _parse_npi(npi)
     as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()
-    include_history = _parse_bool_param(request.args.get("include_history"), default=True)
+    include_history = _is_boolean_parameter_enabled(request.args.get("include_history"), default=True)
     history_limit = _parse_int_param(request.args.get("history_limit"), "history_limit") or 50
     history_limit = max(1, min(history_limit, MAX_HISTORY_LIMIT))
 
-    if not await _table_exists(session, PharmacyLicenseRecord.__tablename__):
+    if not await _is_table_available(session, PharmacyLicenseRecord.__tablename__):
         return response.json(
             {
                 "npi": parsed_npi,
@@ -284,7 +284,7 @@ async def get_pharmacy_license_by_npi(request, npi):
         )
 
     history: list[dict[str, Any]] = []
-    if include_history and await _table_exists(session, PharmacyLicenseRecordHistory.__tablename__):
+    if include_history and await _is_table_available(session, PharmacyLicenseRecordHistory.__tablename__):
         hist_table = PharmacyLicenseRecordHistory.__table__
         hist_rows = (
             await session.execute(

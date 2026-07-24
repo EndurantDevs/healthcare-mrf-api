@@ -54,6 +54,7 @@ async def test_v4_owner_prefix_reads_only_intersecting_vector_pages(
         owner_keys=(0,),
         schema_name="mrf",
         limit_per_owner=5,
+        max_members=5,
     ) == {0: (1, 2, 3, 4, 5)}
     assert harness.requested_pages == [
         ("v4_pattern_groups_locators_v1", (0,)),
@@ -168,6 +169,7 @@ async def test_v4_heavy_owner_prefix_does_not_fetch_tail_fragments(
         owner_keys=(0,),
         schema_name="mrf",
         limit_per_owner=3,
+        max_members=3,
     ) == {0: (10, 11, 18)}
     assert harness.requested_coordinate_pairs == [(0, 0), (0, 1)]
     assert harness.requested_block_hashes == [b"a" * 32, b"b" * 32]

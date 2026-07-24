@@ -98,7 +98,7 @@ def _bind_in_clause(prefix: str, values: list[str], params: dict[str, Any]) -> s
     return ", ".join(placeholders)
 
 
-async def _table_exists(session, table) -> bool:
+async def _is_table_available(session, table) -> bool:
     qualified = _qualified_table_name(table)
     result = await session.execute(text("SELECT to_regclass(:name)"), {"name": qualified})
     return bool(result.scalar())
@@ -113,7 +113,7 @@ async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) 
         "disciplinary_flag_any": False,
         "license_checked_at": None,
     }
-    if not await _table_exists(session, table):
+    if not await _is_table_available(session, table):
         return empty
 
     table_name = _qualified_table_name(table)

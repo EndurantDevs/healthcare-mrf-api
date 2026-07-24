@@ -19,7 +19,6 @@ from process.ptg_parts.domain import (
     PTG2_STATUS_VALIDATED,
 )
 from process.ptg_parts.ptg2_candidate_layout_identity import (
-    PTG2_CANDIDATE_SUPPORTED_GENERATIONS,
     PTG2_CANDIDATE_V3_GENERATION,
     PTG2_CANDIDATE_V4_GENERATION,
     normalize_candidate_storage_generation,
@@ -865,7 +864,7 @@ _CANDIDATE_ACTIVATION_ROW_SQL = """
         ON v4_root.snapshot_key = layout.snapshot_key
      WHERE snapshot.snapshot_id = :snapshot_id
        AND layout.state = 'sealed'
-       AND layout.generation = ANY(CAST(:storage_generations AS text[]))
+       AND layout.generation IN (:v3_generation, :v4_generation)
        AND (
             layout.generation = :v3_generation
             OR (
@@ -891,9 +890,6 @@ async def _locked_candidate_activation_row(
         db.text(_CANDIDATE_ACTIVATION_ROW_SQL.format(schema=schema)),
         {
             "snapshot_id": snapshot_id,
-            "storage_generations": sorted(
-                PTG2_CANDIDATE_SUPPORTED_GENERATIONS
-            ),
             "v3_generation": PTG2_CANDIDATE_V3_GENERATION,
             "v4_generation": PTG2_CANDIDATE_V4_GENERATION,
         },
@@ -921,19 +917,25 @@ def _candidate_storage_generation(
     """Cross-check the locked layout generation against sealed metadata."""
 
     serving_index = _manifest_mapping(manifest.get("serving_index"))
-    storage_generation = normalize_candidate_storage_generation(
+    layout_generation = normalize_candidate_storage_generation(
         candidate.get("storage_generation")
-        or serving_index.get("storage_generation")
         or PTG2_CANDIDATE_V3_GENERATION
     )
+    manifest_generation = serving_index.get("storage_generation")
+    if manifest_generation is None:
+        if layout_generation != PTG2_CANDIDATE_V3_GENERATION:
+            raise ValueError(
+                "snapshot storage generation is missing from its sealed manifest"
+            )
+        return layout_generation
     if (
-        serving_index.get("storage_generation", storage_generation)
-        != storage_generation
+        normalize_candidate_storage_generation(manifest_generation)
+        != layout_generation
     ):
         raise ValueError(
             "snapshot storage generation does not match its sealed layout"
         )
-    return storage_generation
+    return layout_generation
 
 
 def _validated_activation_identity(
@@ -953,7 +955,7 @@ def _validated_activation_identity(
         activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
         or activation.get("state") != "validated"
     ):
-        raise ValueError("snapshot is missing its strict V3 activation contract")
+        raise ValueError("snapshot is missing its strict activation contract")
     normalized_source_key = str(source_key or "").strip().lower()
     if str(activation.get("source_key") or "").strip().lower() != normalized_source_key:
         raise ValueError("snapshot source_key does not match requested source_key")

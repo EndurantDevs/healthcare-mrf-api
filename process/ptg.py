@@ -105,7 +105,7 @@ from process.ptg_parts.copy_load import (_copy_ignore_ptg2_objects,
                                          _copy_upsert_ptg2_objects)
 from process.ptg_parts.db_tables import (_estimated_table_rows,
                                          _exact_table_rows, _quote_ident,
-                                         _has_rows_in_table, _table_exists)
+                                         _has_rows_in_table, _is_table_available)
 from process.ptg_parts.domain import (PTG2_ARTIFACT_RAW,
                                       PTG2_CANDIDATE_ACTIVATION_CONTRACT,
                                       PTG2_CONFIDENCE_NPPES_MAILING_LOCATION,
@@ -4760,12 +4760,7 @@ async def _publish_reused_shared_v3_snapshot(
         "publish_status": "shared_layout_reused",
         "already_published": False,
         "shared_layout_reused": True,
-        "storage_generation": str(
-            options.get(
-                "storage_generation",
-                PTG2_V3_SHARED_GENERATION,
-            )
-        ),
+        "storage_generation": str(expected_generation),
         "activation_status": activation_status,
         "snapshot_status": (
             PTG2_STATUS_PUBLISHED if auto_activate else PTG2_STATUS_VALIDATED

@@ -120,7 +120,7 @@ async def test_resolve_npi_filter_capabilities_uses_model_columns_without_schema
     )
     monkeypatch.setattr(
         npi_module,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(side_effect=[True, False]),
     )
 
@@ -150,7 +150,7 @@ async def test_fetch_provider_enrichment_detail_moves_chain_flags_to_visibility(
         }
 
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_summary_map)
-    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(npi_module, "_is_table_available", AsyncMock(return_value=False))
     monkeypatch.setattr(npi_module.db, "session", lambda: FakeSessionContext())
 
     response_payload = await npi_module._fetch_provider_enrichment_detail(1518379601)

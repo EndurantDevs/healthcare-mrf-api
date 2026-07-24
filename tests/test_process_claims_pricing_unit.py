@@ -29,7 +29,7 @@ _normalize_service_code = claims_pricing._normalize_service_code
 _detect_code_system = claims_pricing._detect_code_system
 _provider_key = claims_pricing._provider_key
 _location_key = claims_pricing._location_key
-_env_bool = claims_pricing._env_bool
+_is_environment_enabled = claims_pricing._is_environment_enabled
 _select_csv_distribution = claims_pricing._select_csv_distribution
 _download_sources = claims_pricing._download_sources
 _download_source_file = claims_pricing._download_source_file
@@ -201,11 +201,11 @@ def test_provider_key_uses_bigint_safe_hash():
 
 def test_env_bool_parsing(monkeypatch):
     monkeypatch.delenv("HLTHPRT_FAKE_BOOL", raising=False)
-    assert _env_bool("HLTHPRT_FAKE_BOOL", default=True) is True
+    assert _is_environment_enabled("HLTHPRT_FAKE_BOOL", default=True) is True
     monkeypatch.setenv("HLTHPRT_FAKE_BOOL", "false")
-    assert _env_bool("HLTHPRT_FAKE_BOOL", default=True) is False
+    assert _is_environment_enabled("HLTHPRT_FAKE_BOOL", default=True) is False
     monkeypatch.setenv("HLTHPRT_FAKE_BOOL", "YES")
-    assert _env_bool("HLTHPRT_FAKE_BOOL", default=False) is True
+    assert _is_environment_enabled("HLTHPRT_FAKE_BOOL", default=False) is True
 
 
 @pytest.mark.asyncio

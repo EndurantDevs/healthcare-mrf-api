@@ -206,7 +206,7 @@ def test_model_helper_split_keeps_facade_helpers_stable():
 def test_table_helper_split_keeps_facade_helpers_stable():
     assert provider_quality._ensure_indexes is provider_quality_table_helpers._ensure_indexes
     assert provider_quality._build_staging_indexes is provider_quality_table_helpers._build_staging_indexes
-    assert provider_quality._table_exists is provider_quality_table_helpers._table_exists
+    assert provider_quality._is_table_available is provider_quality_table_helpers._is_table_available
     assert provider_quality._table_columns is provider_quality_table_helpers._table_columns
 
 
@@ -473,7 +473,7 @@ async def test_materialize_query_contains_state_benchmark_and_extra_measures(mon
     async def is_table_existing(_schema: str, _table: str) -> bool:
         return False
 
-    monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
+    monkeypatch.setattr(provider_quality, "_is_table_available", is_table_existing)
     monkeypatch.setattr(provider_quality.db, "status", _fake_status)
 
     staging_classes_by_name = {
@@ -514,7 +514,7 @@ async def test_materialize_cohort_query_contains_lsh_and_fallback_rules(monkeypa
         return False
 
     monkeypatch.setattr(provider_quality.db, "status", _fake_status)
-    monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
+    monkeypatch.setattr(provider_quality, "_is_table_available", is_table_existing)
 
     classes = provider_quality._staging_classes("stage_test", "mrf")
     await provider_quality._materialize_quality_rows_cohort(classes, "mrf", "run_test")
@@ -548,7 +548,7 @@ async def test_shard_queries_delete_partition_before_insert(monkeypatch):
     async def is_table_existing(_schema: str, _table: str) -> bool:
         return False
 
-    monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
+    monkeypatch.setattr(provider_quality, "_is_table_available", is_table_existing)
     classes = provider_quality._staging_classes("stage_test", "mrf")
     ctx = await provider_quality._build_cohort_materialization_context(classes, "mrf")
 
@@ -802,7 +802,7 @@ async def test_ensure_provider_quality_rx_agg_table_builds_once(monkeypatch):
         scalar_calls_by_metric["total"] += 1
         return 0
 
-    monkeypatch.setattr(provider_quality, "_table_exists", is_table_existing)
+    monkeypatch.setattr(provider_quality, "_is_table_available", is_table_existing)
     monkeypatch.setattr(provider_quality.db, "status", _capture_status)
     monkeypatch.setattr(provider_quality.db, "scalar", _capture_scalar)
 

@@ -272,7 +272,7 @@ _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES: dict[str, str] = {
 }
 
 
-def _normalize_bool(value: Any) -> bool:
+def _is_normalized_boolean(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -355,10 +355,10 @@ def _resolve_provider_specialty_filter(
     specialty = str(args.get("specialty") or "").strip()
     classification = str(args.get("classification") or "").strip()
     taxonomy_codes = _normalize_taxonomy_codes(args.get("taxonomy_codes"))
-    include_subspecialties = _normalize_bool(args.get("include_subspecialties"))
+    include_subspecialties = _is_normalized_boolean(args.get("include_subspecialties"))
     primary_only = True
     if args.get("primary_only") not in (None, ""):
-        primary_only = _normalize_bool(args.get("primary_only"))
+        primary_only = _is_normalized_boolean(args.get("primary_only"))
 
     key = _normalize_specialty_key(specialty)
     if not taxonomy_codes and specialty:

@@ -61,7 +61,7 @@ def _get_session(request):
     return session
 
 
-async def _table_exists(session, model) -> bool:
+async def _is_table_available(session, model) -> bool:
     table = model.__table__
     schema = table.schema or "mrf"
     qualified = f"{schema}.{table.name}"
@@ -69,7 +69,7 @@ async def _table_exists(session, model) -> bool:
     return bool(result.scalar())
 
 
-async def _table_exists_cached(session, model) -> bool:
+async def _is_table_cached(session, model) -> bool:
     table = model.__table__
     schema = table.schema or "mrf"
     cache_key = f"{schema}.{table.name}"
@@ -77,7 +77,7 @@ async def _table_exists_cached(session, model) -> bool:
     cached = _TABLE_EXISTS_CACHE.get(cache_key)
     if cached and (now - cached[0]) < TABLE_EXISTS_CACHE_TTL_SECONDS:
         return cached[1]
-    exists = await _table_exists(session, model)
+    exists = await _is_table_available(session, model)
     _TABLE_EXISTS_CACHE[cache_key] = (now, exists)
     return exists
 
@@ -559,17 +559,17 @@ async def get_site_score(request):
 
     session = _get_session(request)
     table_exists = {
-        "geo_zip": await _table_exists_cached(session, GeoZipLookup),
-        "medicare": await _table_exists_cached(session, MedicareEnrollmentStats),
-        "lodes": await _table_exists_cached(session, LODESWorkplaceAggregate),
-        "places": await _table_exists_cached(session, PricingPlacesZcta),
-        "doctors": await _table_exists_cached(session, DoctorClinicianAddress),
-        "entity_address": await _table_exists_cached(session, EntityAddressUnified),
-        "npi_address": await _table_exists_cached(session, NPIAddress),
-        "npi_taxonomy": await _table_exists_cached(session, NPIDataTaxonomy),
-        "partd_pharmacy": await _table_exists_cached(session, PartDPharmacyActivity),
-        "facility_anchor": await _table_exists_cached(session, FacilityAnchor),
-        "economics": await _table_exists_cached(session, PharmacyEconomicsSummary),
+        "geo_zip": await _is_table_cached(session, GeoZipLookup),
+        "medicare": await _is_table_cached(session, MedicareEnrollmentStats),
+        "lodes": await _is_table_cached(session, LODESWorkplaceAggregate),
+        "places": await _is_table_cached(session, PricingPlacesZcta),
+        "doctors": await _is_table_cached(session, DoctorClinicianAddress),
+        "entity_address": await _is_table_cached(session, EntityAddressUnified),
+        "npi_address": await _is_table_cached(session, NPIAddress),
+        "npi_taxonomy": await _is_table_cached(session, NPIDataTaxonomy),
+        "partd_pharmacy": await _is_table_cached(session, PartDPharmacyActivity),
+        "facility_anchor": await _is_table_cached(session, FacilityAnchor),
+        "economics": await _is_table_cached(session, PharmacyEconomicsSummary),
     }
     if not table_exists["geo_zip"]:
         confidence = _confidence_percent(

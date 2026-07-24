@@ -72,7 +72,7 @@ def _env_positive_int(name: str, default: int) -> int:
         return default
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _is_environment_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
         return default
@@ -99,8 +99,8 @@ def _index_requires_postgis(index: dict) -> bool:
 def _npi_requires_nucc(context: dict | None = None) -> bool:
     context = context or {}
     if context.get("test_mode"):
-        return _env_bool("HLTHPRT_NPI_REQUIRE_NUCC_IN_TEST", False)
-    return _env_bool("HLTHPRT_NPI_REQUIRE_NUCC", True)
+        return _is_environment_enabled("HLTHPRT_NPI_REQUIRE_NUCC_IN_TEST", False)
+    return _is_environment_enabled("HLTHPRT_NPI_REQUIRE_NUCC", True)
 
 
 async def _assert_nucc_ready(schema: str) -> None:
@@ -1349,7 +1349,7 @@ async def shutdown(ctx):  # pragma: no cover
             "canonical_address_resolve",
             _canonical_address_resolve(),
         )
-        if _env_bool("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False):
+        if _is_environment_enabled("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False):
             oa_stats = await timed_shutdown_phase(
                 "openaddresses_archive_backfill",
                 refresh_archive_geocodes_from_openaddresses_sharded(schema=db_schema, run_id=run_id or None),
@@ -1471,7 +1471,7 @@ async def shutdown(ctx):  # pragma: no cover
                     )
 
                 preferred_archive = archive_table_name()
-                use_canonical_archive = _env_bool("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
+                use_canonical_archive = _is_environment_enabled("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
                 archive_source = (
                     preferred_archive
                     if use_canonical_archive and await table_exists(preferred_archive)
@@ -1659,7 +1659,7 @@ WHERE
             "npi_address_rows": int(npi_address_count or 0),
             "npi_shutdown_phase_timings": shutdown_phase_timings,
             **({"address_resolve": address_stats.__dict__} if address_stats else {}),
-            "openaddresses_backfill_enabled": _env_bool("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False),
+            "openaddresses_backfill_enabled": _is_environment_enabled("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False),
         },
     )
     print_time_info(ctx['context']['start'])

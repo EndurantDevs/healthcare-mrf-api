@@ -155,10 +155,13 @@ async def _ensure_schema_exists(db_schema: str) -> None:
         raise
 
 
-async def _table_exists(db_schema: str, table_name: str) -> bool:
+async def _is_table_available(db_schema: str, table_name: str) -> bool:
     db_schema = _validate_schema_name(db_schema)
     qualified_name = f"{db_schema}.{table_name}"
     return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=qualified_name))
+
+
+_table_exists = _is_table_available
 
 
 async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:

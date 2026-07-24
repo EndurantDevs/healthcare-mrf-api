@@ -99,7 +99,7 @@ def catalog_code_lookup_values(code_system: Any, raw_code: Any) -> tuple[str, ..
     return tuple(values)
 
 
-def restricted_terminology_public_enabled() -> bool:
+def is_restricted_terminology_public_enabled() -> bool:
     """Return whether public responses may expose restricted terminology."""
 
     return str(os.getenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES") or "").strip().lower() in {"1", "true", "yes"}

@@ -110,10 +110,10 @@ def _is_env_enabled(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-_env_bool = _is_env_enabled
+_is_environment_enabled = _is_env_enabled
 
 
-CLAIMS_PARALLEL_LOAD = _env_bool("HLTHPRT_CLAIMS_PARALLEL_LOAD", default=True)
+CLAIMS_PARALLEL_LOAD = _is_environment_enabled("HLTHPRT_CLAIMS_PARALLEL_LOAD", default=True)
 CLAIMS_QUEUE_NAME = "arq:ClaimsPricing"
 CLAIMS_FINISH_QUEUE_NAME = "arq:ClaimsPricing_finish"
 CLAIMS_CHUNK_TARGET_MB = max(int(os.getenv("HLTHPRT_CLAIMS_CHUNK_TARGET_MB", "128")), 4)
@@ -121,9 +121,9 @@ CLAIMS_CHUNK_TARGET_BYTES = CLAIMS_CHUNK_TARGET_MB * 1024 * 1024
 CLAIMS_FINISH_RETRY_SECONDS = max(int(os.getenv("HLTHPRT_CLAIMS_FINISH_RETRY_SECONDS", "15")), 1)
 CLAIMS_REDIS_TTL_SECONDS = max(int(os.getenv("HLTHPRT_CLAIMS_REDIS_TTL_SECONDS", "172800")), 3600)
 CLAIMS_WORKDIR = os.getenv("HLTHPRT_CLAIMS_WORKDIR", "/tmp/healthporta_claims")
-CLAIMS_KEEP_WORKDIR = _env_bool("HLTHPRT_CLAIMS_KEEP_WORKDIR", default=False)
+CLAIMS_KEEP_WORKDIR = _is_environment_enabled("HLTHPRT_CLAIMS_KEEP_WORKDIR", default=False)
 CLAIMS_DOWNLOAD_CONCURRENCY = max(int(os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_CONCURRENCY", "3")), 1)
-CLAIMS_DEFER_STAGE_INDEXES = _env_bool("HLTHPRT_CLAIMS_DEFER_STAGE_INDEXES", default=True)
+CLAIMS_DEFER_STAGE_INDEXES = _is_environment_enabled("HLTHPRT_CLAIMS_DEFER_STAGE_INDEXES", default=True)
 CLAIMS_DB_DEADLOCK_RETRIES = max(int(os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_RETRIES", "6")), 1)
 CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS = max(
     float(os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS", "0.25")), 0.05

@@ -172,7 +172,7 @@ async def test_get_pharmacy_market_context_returns_market(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_pharmacy_context_uses_legacy_address_table_by_default(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=False))
 
     class Session:
         def __init__(self):
@@ -217,7 +217,7 @@ async def test_fetch_pharmacy_context_uses_unified_address_table_by_default_when
     async def is_table_present(_session, table):
         return table is reports.EntityAddressUnified.__table__
 
-    monkeypatch.setattr(reports, "_table_exists", is_table_present)
+    monkeypatch.setattr(reports, "_is_table_available", is_table_present)
 
     class Session:
         def __init__(self):
@@ -258,7 +258,7 @@ async def test_fetch_pharmacy_context_uses_unified_address_table_by_default_when
 
 @pytest.mark.asyncio
 async def test_query_market_summaries_avoids_count_query_when_data_present(monkeypatch):
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=False))
     monkeypatch.setattr(reports, "_build_market_sql", lambda **_: ("SELECT count", "SELECT data", {}))
 
     market_summary_by_field = {
@@ -311,7 +311,7 @@ async def test_query_market_summaries_avoids_count_query_when_data_present(monke
 
 @pytest.mark.asyncio
 async def test_query_market_summaries_uses_count_fallback_for_empty_offset_page(monkeypatch):
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=False))
     monkeypatch.setattr(reports, "_build_market_sql", lambda **_: ("SELECT count", "SELECT data", {}))
 
     class Session:
@@ -399,7 +399,7 @@ async def test_get_pharmacy_state_stats_returns_payload(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_query_pharmacy_state_stats_normalizes_and_zero_fills_states(monkeypatch):
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=False))
     pharmacy_rows = [
         {
             "state": "California",
@@ -456,7 +456,7 @@ async def test_query_pharmacy_state_stats_normalizes_and_zero_fills_states(monke
 
 @pytest.mark.asyncio
 async def test_query_chain_summary_uses_helper_table_when_available(monkeypatch):
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=True))
 
     query_by_field = {}
 
@@ -490,7 +490,7 @@ async def test_query_chain_summary_uses_helper_table_when_available(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_query_chain_summary_falls_back_when_helper_missing(monkeypatch):
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=False))
 
     query_by_field = {}
 
@@ -590,7 +590,7 @@ def test_build_market_sql_can_force_legacy_address_table(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_query_chain_summary_optimizes_match_all_wildcard(monkeypatch):
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=True))
 
     query_by_field = {}
 
@@ -623,7 +623,7 @@ async def test_query_chain_summary_optimizes_match_all_wildcard(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_query_pharmacy_state_stats_uses_helper_table(monkeypatch):
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=True))
 
     query_by_field = {}
 
@@ -655,7 +655,7 @@ async def test_query_pharmacy_state_stats_uses_helper_table(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_query_pharmacy_state_stats_coerces_numeric_fields(monkeypatch):
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=True))
 
     class Session:
         async def execute(self, stmt, _params=None):

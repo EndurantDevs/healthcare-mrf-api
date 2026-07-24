@@ -142,7 +142,7 @@ def test_volume_chronic_distance_and_drive_radius_helpers(monkeypatch):
 async def test_table_cache_and_zcta_availability_boundaries(monkeypatch):
     site_intelligence._TABLE_EXISTS_CACHE.clear()
     exists_session = _Session(_Result(scalar="mrf.geo_zip_lookup"))
-    assert await site_intelligence._table_exists(
+    assert await site_intelligence._is_table_available(
         exists_session, site_intelligence.GeoZipLookup
     ) is True
 
@@ -152,10 +152,10 @@ async def test_table_cache_and_zcta_availability_boundaries(monkeypatch):
         calls.append(model)
         return True
 
-    monkeypatch.setattr(site_intelligence, "_table_exists", is_table_present)
+    monkeypatch.setattr(site_intelligence, "_is_table_available", is_table_present)
     site_intelligence._TABLE_EXISTS_CACHE.clear()
-    assert await site_intelligence._table_exists_cached(object(), site_intelligence.GeoZipLookup)
-    assert await site_intelligence._table_exists_cached(object(), site_intelligence.GeoZipLookup)
+    assert await site_intelligence._is_table_cached(object(), site_intelligence.GeoZipLookup)
+    assert await site_intelligence._is_table_cached(object(), site_intelligence.GeoZipLookup)
     assert calls == [site_intelligence.GeoZipLookup]
     table = site_intelligence.GeoZipLookup.__table__
     cache_key = f"{table.schema or 'mrf'}.{table.name}"
@@ -165,7 +165,7 @@ async def test_table_cache_and_zcta_availability_boundaries(monkeypatch):
         - 1,
         True,
     )
-    assert await site_intelligence._table_exists_cached(object(), site_intelligence.GeoZipLookup)
+    assert await site_intelligence._is_table_cached(object(), site_intelligence.GeoZipLookup)
     assert calls == [site_intelligence.GeoZipLookup, site_intelligence.GeoZipLookup]
 
     site_intelligence._ZCTA_OVERLAP_AVAILABLE_CACHE = None

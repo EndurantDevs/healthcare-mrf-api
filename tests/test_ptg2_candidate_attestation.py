@@ -1471,7 +1471,6 @@ def test_candidate_metadata_is_reread_from_postgres_under_row_lock():
     assert "v4_root.state = 'complete'" in sql
     assert params == {
         "snapshot_id": "snap_new",
-        "storage_generations": ["shared_blocks_v3", "shared_blocks_v4"],
         "v3_generation": "shared_blocks_v3",
         "v4_generation": "shared_blocks_v4",
     }
@@ -1522,6 +1521,32 @@ def test_v4_candidate_rejects_manifest_generation_mismatch():
                     "serving_index": {
                         "storage_generation": "shared_blocks_v3",
                     },
+                },
+                "storage_generation": "shared_blocks_v4",
+                "snapshot_key": 17,
+                "plan_id": "12-3456789",
+                "plan_market_type": "group",
+                "coverage_scope_id": b"c" * 32,
+            },
+            source_key="source_a",
+            expected_current_snapshot_id="snap_old",
+        )
+
+
+def test_v4_candidate_requires_manifest_generation():
+    with pytest.raises(ValueError, match="missing from its sealed manifest"):
+        source_pointers._validated_activation_identity(
+            {
+                "status": "validated",
+                "previous_snapshot_id": "snap_old",
+                "manifest": {
+                    "activation": {
+                        "contract": "ptg2_candidate_activation_v1",
+                        "state": "validated",
+                        "source_key": "source_a",
+                        "expected_previous_snapshot_id": "snap_old",
+                    },
+                    "serving_index": {},
                 },
                 "storage_generation": "shared_blocks_v4",
                 "snapshot_key": 17,

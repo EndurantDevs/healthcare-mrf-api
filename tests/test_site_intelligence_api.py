@@ -172,7 +172,7 @@ async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_in
     monkeypatch.setattr(site_intel_module, "_get_session", lambda _request: session)
     monkeypatch.setattr(
         site_intel_module,
-        "_table_exists_cached",
+        "_is_table_cached",
         _is_always_present,
     )
     request = SimpleNamespace(args={"lat": "41.892", "lng": "-87.635"}, ctx=SimpleNamespace())
@@ -284,7 +284,7 @@ async def test_site_intelligence_target_scripts_gates_recommendation(monkeypatch
     monkeypatch.setattr(site_intel_module, "_get_session", lambda _request: session)
     monkeypatch.setattr(
         site_intel_module,
-        "_table_exists_cached",
+        "_is_table_cached",
         _is_always_present,
     )
 

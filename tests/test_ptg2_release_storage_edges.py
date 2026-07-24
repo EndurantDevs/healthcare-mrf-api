@@ -97,7 +97,7 @@ async def test_snapshot_db_artifact_availability_requires_complete_rows(
 
     monkeypatch.setattr(
         snapshot_cleanup,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=False),
     )
     assert await snapshot_cleanup._available_snapshot_db_artifact_ids(
@@ -106,7 +106,7 @@ async def test_snapshot_db_artifact_availability_requires_complete_rows(
 
     monkeypatch.setattr(
         snapshot_cleanup,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(side_effect=(True, True)),
     )
     monkeypatch.setattr(

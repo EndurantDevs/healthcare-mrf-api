@@ -601,7 +601,7 @@ def _setting_value(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _is_environment_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -882,7 +882,7 @@ async def _try_materialize_keyed_with_rust(
     keyed_table_name: str,
     raw_copy_sql: str,
 ) -> bool:
-    if not _env_bool(ADDRESS_CANON_RUST_MATERIALIZE_ENV, default=True):
+    if not _is_environment_enabled(ADDRESS_CANON_RUST_MATERIALIZE_ENV, default=True):
         return False
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -1435,7 +1435,7 @@ async def restore_missing_zip_from_tiger_zcta(
     present, avoiding silent archive identity rewrites.
     """
 
-    if not _env_bool(ADDRESS_ZIP_RESTORE_ENABLED_ENV, default=True):
+    if not _is_environment_enabled(ADDRESS_ZIP_RESTORE_ENABLED_ENV, default=True):
         return 0
     if not hasattr(db, "transaction"):
         return 0
@@ -1479,7 +1479,7 @@ async def restore_missing_zip_from_tiger_zcta(
 
     if not dependencies_available:
         message = "TIGER ZCTA or geo_zip_lookup is unavailable for address ZIP restore"
-        if _env_bool(ADDRESS_ZIP_RESTORE_REQUIRED_ENV, default=False):
+        if _is_environment_enabled(ADDRESS_ZIP_RESTORE_REQUIRED_ENV, default=False):
             raise RuntimeError(message)
         logger.info("%s; skipping %s.%s", message, schema, staging_table)
         return 0

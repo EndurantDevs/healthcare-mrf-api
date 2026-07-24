@@ -1557,9 +1557,9 @@ async def _enrich_provider_service_cost_indices(
     """Populate provider service rows with peer-derived cost indices when profile tables exist."""
     if not provider_service_rows or not internal_codes:
         return
-    if not await _table_exists(session, provider_procedure_cost_profile_table.name):
+    if not await _is_table_available(session, provider_procedure_cost_profile_table.name):
         return
-    if not await _table_exists(session, procedure_peer_stats_table.name):
+    if not await _is_table_available(session, procedure_peer_stats_table.name):
         return
 
     geography_candidates_by_npi: dict[int, list[tuple[str, str]]] = {}
@@ -1817,7 +1817,7 @@ async def _resolve_year(session, table, requested_year: int | None) -> tuple[int
     return await _default_year(session, table), "data_max"
 
 
-async def _table_exists(session, table_name: str) -> bool:
+async def _is_table_available(session, table_name: str) -> bool:
     qualified_name = table_name if "." in table_name else f"{PRICING_SCHEMA}.{table_name}"
     if ENABLE_PRICING_SCHEMA_CACHE:
         cached = _PRICING_TABLE_EXISTS_CACHE.get(qualified_name)
@@ -1878,7 +1878,7 @@ async def _group_plan_provider_address_source(session) -> tuple[str, bool, bool,
         return legacy_table, False, False, False
 
     coverage_supported = {"group_plan_array", "ptg_plan_array"}.issubset(columns)
-    plan_bridge_supported = "location_key" in columns and await _table_exists(session, "entity_address_plan_bridge")
+    plan_bridge_supported = "location_key" in columns and await _is_table_available(session, "entity_address_plan_bridge")
     return unified_table, True, coverage_supported, plan_bridge_supported
 
 
@@ -1948,7 +1948,7 @@ def _terminology_item(row: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _is_terminology_available(session) -> bool:
-    return await _table_exists(session, terminology_synonym_table.name)
+    return await _is_table_available(session, terminology_synonym_table.name)
 
 
 async def _query_terminology(
@@ -3087,12 +3087,12 @@ async def _load_provider_quality_profile(
     doctor_state_expr = _state_code_sql("d.state")
     unified_state_expr = _state_code_sql("e.state_name")
     npi_state_expr = _state_code_sql("a.state_name")
-    taxonomy_table_exists = await _table_exists(session, NPIDataTaxonomy.__tablename__)
-    nucc_table_exists = await _table_exists(session, NUCCTaxonomy.__tablename__)
-    provider_enrichment_exists = await _table_exists(session, ProviderEnrichmentSummary.__tablename__)
-    doctor_clinician_exists = await _table_exists(session, DoctorClinicianAddress.__tablename__)
-    unified_address_exists = await _table_exists(session, EntityAddressUnified.__tablename__)
-    npi_address_exists = await _table_exists(session, NPIAddress.__tablename__)
+    taxonomy_table_exists = await _is_table_available(session, NPIDataTaxonomy.__tablename__)
+    nucc_table_exists = await _is_table_available(session, NUCCTaxonomy.__tablename__)
+    provider_enrichment_exists = await _is_table_available(session, ProviderEnrichmentSummary.__tablename__)
+    doctor_clinician_exists = await _is_table_available(session, DoctorClinicianAddress.__tablename__)
+    unified_address_exists = await _is_table_available(session, EntityAddressUnified.__tablename__)
+    npi_address_exists = await _is_table_available(session, NPIAddress.__tablename__)
     unified_address_columns = (
         await _table_columns(session, EntityAddressUnified.__tablename__)
         if unified_address_exists
@@ -4666,7 +4666,7 @@ async def _load_procedure_taxonomy_evidence(
     if cached_evidence_items is not None:
         return cached_evidence_items
 
-    quality_feature_exists = await _table_exists(session, QUALITY_FEATURE_TABLE_NAME)
+    quality_feature_exists = await _is_table_available(session, QUALITY_FEATURE_TABLE_NAME)
     if quality_feature_exists:
         quality_evidence_items = await _load_quality_procedure_taxonomy_evidence(
             session,
@@ -7775,7 +7775,7 @@ async def list_pricing_providers(request):
     order_by = str(args.get("order_by") or "total_allowed_amount")
     benchmark_mode_used = benchmark_mode
     benchmark_mode_source = "request" if benchmark_mode else None
-    if order_by == "tier_relevance" and await _table_exists(session, QUALITY_SCORE_TABLE_NAME):
+    if order_by == "tier_relevance" and await _is_table_available(session, QUALITY_SCORE_TABLE_NAME):
         benchmark_mode_used, benchmark_mode_source = await _resolve_quality_benchmark_mode(
             session,
             year,
@@ -8176,9 +8176,9 @@ async def get_pricing_provider_score(request, npi: str):
             )
         )
 
-    if not await _table_exists(session, QUALITY_SCORE_TABLE_NAME):
+    if not await _is_table_available(session, QUALITY_SCORE_TABLE_NAME):
         raise sanic.exceptions.NotFound("Provider quality score table not found")
-    if not await _table_exists(session, QUALITY_DOMAIN_TABLE_NAME):
+    if not await _is_table_available(session, QUALITY_DOMAIN_TABLE_NAME):
         raise sanic.exceptions.NotFound("Provider quality domain table not found")
 
     year, year_source = await _resolve_quality_year(session, year)
@@ -8646,9 +8646,9 @@ async def _provider_procedure_cost_level(
     if provider_npi is None:
         raise InvalidUsage("Path parameter 'npi' must be provided")
 
-    if not await _table_exists(session, provider_procedure_cost_profile_table.name):
+    if not await _is_table_available(session, provider_procedure_cost_profile_table.name):
         raise sanic.exceptions.NotFound("Cost profile data is not available; run claims-pricing import.")
-    if not await _table_exists(session, procedure_peer_stats_table.name):
+    if not await _is_table_available(session, procedure_peer_stats_table.name):
         raise sanic.exceptions.NotFound("Peer stats data is not available; run claims-pricing import.")
 
     year = _parse_int(args.get("year"), "year", minimum=2013)
@@ -9444,7 +9444,7 @@ async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
     year = _parse_int(args.get("year"), "year", minimum=2013)
     state = str(args.get("state", "")).strip().upper()
 
-    if not await _table_exists(session, procedure_geo_benchmark_table.name):
+    if not await _is_table_available(session, procedure_geo_benchmark_table.name):
         return response.json(
             {
                 "query": {
@@ -10342,7 +10342,7 @@ async def autocomplete_prescriptions(request):
     search_query = _normalize_query_text(args.get("q"), "q", min_len=2)
     year = _parse_int(args.get("year"), "year", minimum=2013)
 
-    if not await _table_exists(session, provider_prescription_table.name):
+    if not await _is_table_available(session, provider_prescription_table.name):
         return response.json(
             {
                 "items": [],
@@ -11440,7 +11440,7 @@ async def list_providers_by_prescription(request):
     if not query_text and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
 
-    if not await _table_exists(session, provider_prescription_table.name):
+    if not await _is_table_available(session, provider_prescription_table.name):
         return response.json(
             {
                 "items": [],
@@ -11635,7 +11635,7 @@ async def list_provider_prescriptions(request, npi: str):
     rx_name = str(args.get("rx_name", "")).strip().lower()
     code = str(args.get("code", "")).strip()
 
-    if not await _table_exists(session, provider_prescription_table.name):
+    if not await _is_table_available(session, provider_prescription_table.name):
         return response.json(
             {
                 "items": [],
@@ -11777,7 +11777,7 @@ async def _provider_prescription_detail(
     year = _parse_int(args.get("year"), "year", minimum=2013)
     if provider_npi is None:
         raise InvalidUsage("Path parameter 'npi' must be provided")
-    if not await _table_exists(session, provider_prescription_table.name):
+    if not await _is_table_available(session, provider_prescription_table.name):
         raise sanic.exceptions.NotFound("Prescription data is not available; run drug-claims import.")
 
     year, year_source = await _resolve_year(session, provider_prescription_table, year)
@@ -11860,7 +11860,7 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
     specialty = str(args.get("specialty", "")).strip().lower()
     search_query = str(args.get("q", "")).strip().lower()
 
-    if not await _table_exists(session, provider_prescription_table.name):
+    if not await _is_table_available(session, provider_prescription_table.name):
         return response.json(
             {
                 "items": [],
@@ -12016,7 +12016,7 @@ async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str
     state = str(args.get("state", "")).strip().upper()
     city = str(args.get("city", "")).strip().lower()
 
-    if not await _table_exists(session, provider_prescription_table.name):
+    if not await _is_table_available(session, provider_prescription_table.name):
         return response.json(
             {
                 "query": {

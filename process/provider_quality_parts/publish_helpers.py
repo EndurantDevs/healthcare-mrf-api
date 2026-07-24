@@ -21,7 +21,7 @@ from process.provider_quality_parts.execution_helpers import _push_objects_with_
 from process.provider_quality_parts.lifecycle import _archived_identifier
 from process.provider_quality_parts.model_helpers import _cohort_model_classes
 from process.provider_quality_parts.state import _safe_int
-from process.provider_quality_parts.table_helpers import _table_exists
+from process.provider_quality_parts.table_helpers import _is_table_available
 
 
 async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> None:
@@ -43,7 +43,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
 
     for cls in final_classes:
         obj = classes[cls.__name__]
-        stage_exists = await _table_exists(schema, obj.__tablename__)
+        stage_exists = await _is_table_available(schema, obj.__tablename__)
         if not stage_exists:
             raise RuntimeError(
                 f"Staging table missing for publish: {schema}.{obj.__tablename__}. "

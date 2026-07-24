@@ -53,7 +53,7 @@ async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
         await _ensure_indexes(model, schema)
 
 
-async def _table_exists(schema: str, table: str) -> bool:
+async def _is_table_available(schema: str, table: str) -> bool:
     table_ref = f"{schema}.{table}"
     result = await db.scalar("SELECT to_regclass(:table_ref)", table_ref=table_ref)
     return result is not None

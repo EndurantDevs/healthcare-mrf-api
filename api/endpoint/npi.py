@@ -226,7 +226,7 @@ def _redact_internal_address_fields(value: Any) -> Any:
     return value
 
 
-def _env_flag(*names: str, default: bool = False) -> bool:
+def _is_environment_flag_enabled(*names: str, default: bool = False) -> bool:
     for name in names:
         raw = os.getenv(name)
         if raw is None:
@@ -331,7 +331,7 @@ def _provider_display_name_from_mapping(mapping: Mapping[str, Any]) -> str:
     return fallback or "Unknown"
 
 
-ENABLE_NPI_SCHEMA_CACHE = _env_flag(
+ENABLE_NPI_SCHEMA_CACHE = _is_environment_flag_enabled(
     "HLTHPRT_ENABLE_NPI_SCHEMA_CACHE",
     "HLTHPRT_ENABLE_SCHEMA_CACHE",
 )
@@ -3458,7 +3458,7 @@ async def _fetch_provider_directory_source_detail_map(
     ]
     if not unique_ids:
         return {}
-    if not await _table_exists(ProviderDirectorySource.__tablename__, session=session):
+    if not await _is_table_available(ProviderDirectorySource.__tablename__, session=session):
         return {}
     stmt = _provider_directory_source_detail_statement(unique_ids)
     result = await _execute_stmt(stmt, session=session)
@@ -3965,7 +3965,7 @@ async def _fetch_ffs_summary_overrides(
     if not all_enrollment_ids:
         return summary_overrides_by_npi
 
-    if await _table_exists(ProviderEnrollmentFFSAdditionalNPI.__tablename__, session=session):
+    if await _is_table_available(ProviderEnrollmentFFSAdditionalNPI.__tablename__, session=session):
         stmt = (
             select(
                 ProviderEnrollmentFFSAdditionalNPI.enrollment_id,
@@ -3995,7 +3995,7 @@ async def _fetch_ffs_summary_overrides(
                 "ffs_related_npi_count"
             ] = len(unique_related_npis)
 
-    if await _table_exists(ProviderEnrollmentFFSAddress.__tablename__, session=session):
+    if await _is_table_available(ProviderEnrollmentFFSAddress.__tablename__, session=session):
         stmt = (
             select(
                 ProviderEnrollmentFFSAddress.enrollment_id,
@@ -4036,7 +4036,7 @@ async def _fetch_ffs_summary_overrides(
                 "ffs_practice_states"
             ] = _unique_non_empty(states_by_npi.get(npi_value, []))
 
-    if await _table_exists(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
+    if await _is_table_available(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
         stmt = (
             select(
                 ProviderEnrollmentFFSSecondarySpecialty.enrollment_id,
@@ -4072,7 +4072,7 @@ async def _fetch_ffs_summary_overrides(
                 texts_by_npi.get(npi_value, [])
             )
 
-    if await _table_exists(ProviderEnrollmentFFSReassignment.__tablename__, session=session):
+    if await _is_table_available(ProviderEnrollmentFFSReassignment.__tablename__, session=session):
         stmt = (
             select(
                 ProviderEnrollmentFFSReassignment.reassigning_enrollment_id,
@@ -4651,7 +4651,7 @@ def _parse_optional_year(raw: Optional[str], param_name: str = "year") -> Option
     return year
 
 
-async def _table_exists(table_name: str, *, session: Any = None) -> bool:
+async def _is_table_available(table_name: str, *, session: Any = None) -> bool:
     cache_key = _schema_cache_key(table_name)
     cached = _cache_get(_TABLE_EXISTS_CACHE, cache_key)
     if cached is not None:
@@ -4714,13 +4714,13 @@ async def _resolve_npi_filter_capabilities(*, session: Any = None) -> dict[str, 
                 "npi_medications_array_available"
             ] = "medications_array" in model_columns
 
-    capability_map["pricing_provider_procedure_available"] = await _table_exists(
+    capability_map["pricing_provider_procedure_available"] = await _is_table_available(
         "pricing_provider_procedure",
         session=session,
     )
     capability_map[
         "pricing_provider_prescription_available"
-    ] = await _table_exists(
+    ] = await _is_table_available(
         "pricing_provider_prescription",
         session=session,
     )
@@ -5161,7 +5161,7 @@ async def _fetch_provider_enrichment_summary_map(
     unique_npis = sorted({int(npi) for npi in npis if npi is not None})
     if not unique_npis:
         return {}
-    if not await _table_exists(ProviderEnrichmentSummary.__tablename__, session=session):
+    if not await _is_table_available(ProviderEnrichmentSummary.__tablename__, session=session):
         return {}
 
     requested_columns = [
@@ -5260,7 +5260,7 @@ async def _fetch_provider_enrichment_summary_map(
             "ffs_chain_enrollment_ids": [],
         }
 
-    if not summary_map or not await _table_exists(ProviderEnrollmentFFS.__tablename__, session=session):
+    if not summary_map or not await _is_table_available(ProviderEnrollmentFFS.__tablename__, session=session):
         return summary_map
 
     stmt = (
@@ -5479,7 +5479,7 @@ async def _fetch_provider_enrichment_detail(
     for key, model in table_model_pairs:
         if summary and not summary.get(enrollment_flag_map[key], False):
             continue
-        if not await _table_exists(model.__tablename__, session=session):
+        if not await _is_table_available(model.__tablename__, session=session):
             continue
         stmt = (
             select(model)
@@ -5513,7 +5513,7 @@ async def _fetch_provider_enrichment_detail(
         else:
             enrichment_detail_map["enrollments"][key] = enrollment_rows
 
-    if not await _table_exists(ProviderEnrollmentFFS.__tablename__, session=session):
+    if not await _is_table_available(ProviderEnrollmentFFS.__tablename__, session=session):
         return enrichment_detail_map
 
     ffs_rows = enrichment_detail_map["enrollments"]["ffs_public"]
@@ -5525,7 +5525,7 @@ async def _fetch_provider_enrichment_detail(
     if not enrollment_ids:
         return enrichment_detail_map
 
-    if await _table_exists(ProviderEnrollmentFFSAdditionalNPI.__tablename__, session=session):
+    if await _is_table_available(ProviderEnrollmentFFSAdditionalNPI.__tablename__, session=session):
         stmt = (
             select(ProviderEnrollmentFFSAdditionalNPI)
             .where(ProviderEnrollmentFFSAdditionalNPI.enrollment_id.in_(enrollment_ids))
@@ -5541,7 +5541,7 @@ async def _fetch_provider_enrichment_detail(
             for enrollment_record in enrollment_query_result.scalars()
         ]
 
-    if await _table_exists(ProviderEnrollmentFFSAddress.__tablename__, session=session):
+    if await _is_table_available(ProviderEnrollmentFFSAddress.__tablename__, session=session):
         stmt = (
             select(ProviderEnrollmentFFSAddress)
             .where(ProviderEnrollmentFFSAddress.enrollment_id.in_(enrollment_ids))
@@ -5559,7 +5559,7 @@ async def _fetch_provider_enrichment_detail(
             for enrollment_record in enrollment_query_result.scalars()
         ]
 
-    if await _table_exists(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
+    if await _is_table_available(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
         stmt = (
             select(ProviderEnrollmentFFSSecondarySpecialty)
             .where(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(enrollment_ids))
@@ -5575,7 +5575,7 @@ async def _fetch_provider_enrichment_detail(
             for enrollment_record in enrollment_query_result.scalars()
         ]
 
-    if await _table_exists(ProviderEnrollmentFFSReassignment.__tablename__, session=session):
+    if await _is_table_available(ProviderEnrollmentFFSReassignment.__tablename__, session=session):
         out_rows = await _execute_stmt(
             text(
                 f"""
@@ -5702,9 +5702,9 @@ async def _resolve_filter_year(
         return _parse_optional_year(env_raw, "HLTHPRT_NPI_FILTER_DEFAULT_YEAR"), "env"
 
     sources: list[str] = []
-    if include_procedures and await _table_exists("pricing_provider_procedure", session=session):
+    if include_procedures and await _is_table_available("pricing_provider_procedure", session=session):
         sources.append("SELECT MAX(year)::INTEGER AS y FROM mrf.pricing_provider_procedure")
-    if include_medications and await _table_exists("pricing_provider_prescription", session=session):
+    if include_medications and await _is_table_available("pricing_provider_prescription", session=session):
         sources.append("SELECT MAX(year)::INTEGER AS y FROM mrf.pricing_provider_prescription")
     if not sources:
         return None, "none"
@@ -5730,7 +5730,7 @@ async def _resolve_internal_filter_codes(
     if input_system == target_system:
         return _to_int_codes(codes, param_name), "direct"
 
-    if not await _table_exists("code_crosswalk", session=session):
+    if not await _is_table_available("code_crosswalk", session=session):
         return [], "none"
 
     sql = text(
@@ -8864,7 +8864,7 @@ async def get_facility_connected_providers(request):
         raise sanic.exceptions.InvalidUsage("At least one facility locator is required: ccn or organization_name")
 
     table_name = enrollment_model.__tablename__
-    if not await _table_exists(table_name, session=request_session):
+    if not await _is_table_available(table_name, session=request_session):
         response_map: dict[str, Any] = {
             "query": {
                 "facility_type": facility_type,
@@ -9758,11 +9758,11 @@ async def get_npi(request, npi):
     include_extra_info = _parse_bool_arg(request.args.get("extra_info"), default=False)
     sync_geocode = _parse_bool_arg(
         request.args.get("sync_geocode"),
-        default=_env_flag("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True),
+        default=_is_environment_flag_enabled("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True),
     )
     lookup_stored_geocode = _parse_bool_arg(
         request.args.get("lookup_stored_geocode"),
-        default=_env_flag(
+        default=_is_environment_flag_enabled(
             "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
             "HLTHPRT_NPI_API_LOOKUP_STORED_GEOCODE",
             default=True,
@@ -9838,15 +9838,17 @@ async def get_npi(request, npi):
         if cached_body is not None:
             return response.raw(cached_body, content_type="application/json")
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    address_archive_cutover = _env_flag("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
+    is_address_archive_cutover = _is_environment_flag_enabled(
+        "HLTHPRT_ADDRESS_ARCHIVE_CUTOVER"
+    )
     v2_archive_table_cache = SimpleNamespace(resolved=False, table_name=None)
     v2_archive_table_lock = asyncio.Lock()
 
-    async def _table_exists(table_name: str) -> bool:
+    async def _is_table_available(table_name: str) -> bool:
         value = await db.scalar("SELECT to_regclass(:table_name);", table_name=f"{db_schema}.{table_name}")
         return isinstance(value, str) and bool(value)
 
-    async def _table_has_column(table_name: str, column_name: str) -> bool:
+    async def _has_table_column(table_name: str, column_name: str) -> bool:
         return bool(await db.scalar(
             """
             SELECT EXISTS (
@@ -9875,13 +9877,13 @@ async def get_npi(request, npi):
         async with v2_archive_table_lock:
             if v2_archive_table_cache.resolved:
                 return v2_archive_table_cache.table_name
-            if address_archive_cutover and hasattr(db, "first"):
+            if is_address_archive_cutover and hasattr(db, "first"):
                 preferred = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
                 for table_name in (preferred,):
                     if (
-                        await _table_exists(table_name)
-                        and await _table_has_column(table_name, "address_key")
-                        and await _table_has_column(table_name, "geo_source")
+                        await _is_table_available(table_name)
+                        and await _has_table_column(table_name, "address_key")
+                        and await _has_table_column(table_name, "geo_source")
                         and await _has_address_key_functions()
                     ):
                         v2_archive_table_cache.table_name = table_name
@@ -9937,7 +9939,7 @@ async def get_npi(request, npi):
         if request_session is None and not hasattr(db, "first"):
             return None
         params = lookup_params_from_address(address)
-        if not params or not await _table_exists("openaddresses_geocode"):
+        if not params or not await _is_table_available("openaddresses_geocode"):
             return None
         for query in (exact_lookup_sql(db_schema), fuzzy_lookup_sql(db_schema), relaxed_lookup_sql(db_schema)):
             if request_session is not None:
@@ -10759,10 +10761,10 @@ async def _fetch_provider_directory_address_overlay(
     session: Any = None,
 ) -> list[dict[str, Any]]:
     """Fetch FHIR address evidence with endpoint-aware confirmation counts."""
-    if not await _table_exists(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
+    if not await _is_table_available(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
         return []
     visibility_table_states = [
-        await _table_exists(table_name, session=session)
+        await _is_table_available(table_name, session=session)
         for table_name in PROVIDER_DIRECTORY_VISIBILITY_TABLES
     ]
     if not all(visibility_table_states):

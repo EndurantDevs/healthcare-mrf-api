@@ -135,7 +135,7 @@ async def test_get_facility_connected_providers_returns_providers_and_specialty_
         ]
     )
 
-    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(npi_module, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(npi_module.db, "session", lambda: FakeSessionContext(fake_session))
 
     request = types.SimpleNamespace(

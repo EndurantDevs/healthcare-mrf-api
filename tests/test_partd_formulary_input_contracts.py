@@ -131,7 +131,7 @@ async def test_table_presence_uses_database_regclass(database_value, expected):
     session = _Session(_ScalarResult(database_value))
     table = SimpleNamespace(schema="mrf", name="pharmacy_license_record")
 
-    assert await partd_formulary._table_exists(session, table) is expected
+    assert await partd_formulary._is_table_available(session, table) is expected
     assert session.calls[0][0][1] == {"name": "mrf.pharmacy_license_record"}
 
 
@@ -139,7 +139,7 @@ async def test_table_presence_uses_database_regclass(database_value, expected):
 async def test_missing_license_table_returns_an_explicit_empty_summary(monkeypatch):
     monkeypatch.setattr(
         partd_formulary,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=False),
     )
 
@@ -162,7 +162,7 @@ async def test_missing_license_table_returns_an_explicit_empty_summary(monkeypat
 async def test_license_summary_normalizes_states_and_verification_time(monkeypatch):
     monkeypatch.setattr(
         partd_formulary,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
     verified_at = datetime.datetime(2026, 7, 24, 10, 30, tzinfo=datetime.timezone.utc)

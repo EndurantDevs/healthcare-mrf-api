@@ -1701,7 +1701,7 @@ async def test_load_provider_quality_profile_sql_has_no_trailing_cte_comma(monke
                 ]
             )
 
-    monkeypatch.setattr(pricing_module, "_table_exists", _is_table_present)
+    monkeypatch.setattr(pricing_module, "_is_table_available", _is_table_present)
     monkeypatch.setattr(pricing_module, "_table_columns", _table_columns)
 
     profile = await pricing_module._load_provider_quality_profile(
@@ -2588,7 +2588,7 @@ async def test_load_procedure_taxonomy_evidence_uses_cache(monkeypatch):
         return [dict(evidence_rows[0])]
 
     pricing_module._PROCEDURE_TAXONOMY_EVIDENCE_CACHE.clear()
-    monkeypatch.setattr(pricing_module, "_table_exists", has_fake_table)
+    monkeypatch.setattr(pricing_module, "_is_table_available", has_fake_table)
     monkeypatch.setattr(pricing_module, "_load_quality_procedure_taxonomy_evidence", fake_load_quality)
 
     first_items = await pricing_module._load_procedure_taxonomy_evidence(

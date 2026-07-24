@@ -10,7 +10,7 @@ def _quote_ident(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
 
-async def _table_exists(schema_name: str, table_name: str) -> bool:
+async def _is_table_available(schema_name: str, table_name: str) -> bool:
     rows = await db.all(
         """
         SELECT EXISTS (

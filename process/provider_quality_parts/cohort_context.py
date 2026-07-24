@@ -27,14 +27,14 @@ from process.provider_quality_parts.model_helpers import (
     _model_columns,
     _optional_column_pairs,
 )
-from process.provider_quality_parts.table_helpers import _table_columns, _table_exists
+from process.provider_quality_parts.table_helpers import _table_columns, _is_table_available
 
 
 async def _build_cohort_materialization_context(
     classes: dict[str, type],
     schema: str,
     *,
-    table_exists: Callable[[str, str], Awaitable[bool]] = _table_exists,
+    table_exists: Callable[[str, str], Awaitable[bool]] = _is_table_available,
     table_columns: Callable[[str, str], Awaitable[set[str]]] = _table_columns,
 ) -> dict[str, Any]:
     """Build table and column context for cohort materialization."""
