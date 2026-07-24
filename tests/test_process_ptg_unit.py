@@ -697,6 +697,130 @@ def test_weighted_file_progress_zero_weight_duplicate_does_not_add_work(
     assert events[-1]["counters"]["files_completed"] == 1
 
 
+def test_weighted_file_progress_rejects_invalid_shapes_and_indexes(monkeypatch):
+    """Reject unusable progress plans and keep observer indexes bounded."""
+
+    constructor_arguments_by_name = {
+        "stage_start_pct": 20,
+        "stage_end_pct": 90,
+    }
+    with pytest.raises(ValueError, match="matching nonempty"):
+        ptg_progress.PTGFileProgressCoordinator(
+            [],
+            [],
+            **constructor_arguments_by_name,
+        )
+    with pytest.raises(ValueError, match="positive aggregate"):
+        ptg_progress.PTGFileProgressCoordinator(
+            [0],
+            ["zero.json.gz"],
+            **constructor_arguments_by_name,
+        )
+    with pytest.raises(ValueError, match="greater than its start"):
+        ptg_progress.PTGFileProgressCoordinator(
+            [1],
+            ["source.json.gz"],
+            stage_start_pct=20,
+            stage_end_pct=20,
+        )
+
+    coordinator, events = _weighted_progress_fixture(monkeypatch)
+    with pytest.raises(IndexError, match="out of range"):
+        coordinator.observe(-1, {})
+
+    observer = coordinator.observer(1)
+    observer(
+        {
+            "basis": "semantic_work",
+            "denominator_state": "lower_bound",
+            "done": 17,
+        }
+    )
+    assert events[-1]["work_done"] == 17
+    assert events[-1]["work_total"] is None
+
+
+def test_file_progress_fraction_and_counter_aggregation_edges():
+    """Normalize fallback fractions and aggregate mixed counter types."""
+
+    assert ptg_progress._file_progress_fraction(
+        {"phase_pct": float("nan"), "stage_pct": 25}
+    ) == pytest.approx(0.25)
+    assert ptg_progress._file_progress_fraction(
+        {"phase_pct": None, "stage_pct": None, "done": "invalid", "total": 4}
+    ) is None
+    assert ptg_progress._file_progress_fraction({"done": 1, "total": 0}) is None
+    assert ptg_progress._file_progress_fraction({"done": 3, "total": 4}) == pytest.approx(
+        0.75
+    )
+
+    counters = ptg_progress._aggregate_file_progress_counters(
+        [
+            {"complete": False, "rows": 2, "source": "first"},
+            {
+                "complete": True,
+                "rows": 3,
+                "source": "ignored duplicate",
+                "format": "json",
+            },
+        ]
+    )
+    assert counters == {
+        "complete": True,
+        "rows": 5,
+        "source": "first",
+        "format": "json",
+    }
+
+
+def test_live_progress_attempt_fences_older_and_ambiguous_updates(monkeypatch):
+    """Reject stale retry callbacks even when their fallback attempt IDs match."""
+
+    previous_by_field = {
+        "run_id": "run-fenced",
+        "attempt_id": "run-fenced",
+        "attempt_started_at": "2026-07-23T10:00:00Z",
+        "progress_seq": 2,
+    }
+    assert (
+        live_progress._attempt_disposition(
+            {
+                "run_id": "run-fenced",
+                "attempt_id": "run-fenced",
+                "attempt_started_at": "2026-07-23T09:00:00Z",
+            },
+            previous_by_field,
+        )
+        == live_progress._ATTEMPT_REJECT
+    )
+    assert (
+        live_progress._attempt_disposition(
+            {
+                "run_id": "run-fenced",
+                "attempt_id": "run-fenced",
+                "attempt_started_at": "",
+            },
+            previous_by_field,
+        )
+        == live_progress._ATTEMPT_REJECT
+    )
+    assert live_progress._is_incoming_progress_older(
+        {"progress_seq": 1},
+        previous_by_field,
+    )
+
+    now = datetime.datetime(2026, 7, 23, 10, 0, 5)
+    monkeypatch.setattr(live_progress, "_utc_now", lambda: now)
+    monkeypatch.setattr(
+        live_progress,
+        "_read_live_progress_payload",
+        lambda _run_id: {"updated_at": "2026-07-23T10:00:04Z"},
+    )
+    assert live_progress.read_live_progress("run-fenced") == {
+        "updated_at": "2026-07-23T10:00:04Z"
+    }
+
+
 def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch):
     writes = []
     events = []
