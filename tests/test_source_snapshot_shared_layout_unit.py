@@ -99,6 +99,19 @@ async def test_returns_empty_when_snapshot_has_no_shared_binding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rejects_v4_snapshot_without_shared_binding() -> None:
+    session = _Session([])
+
+    with pytest.raises(
+        ValueError,
+        match="missing its shared layout binding",
+    ):
+        await _bound_keys(session)
+
+    assert session.calls[0][1] == {"snapshot_id": "snapshot-a"}
+
+
+@pytest.mark.asyncio
 async def test_rejects_multiple_shared_layout_bindings() -> None:
     session = _Session([_layout(), _layout(snapshot_key=12)])
 
@@ -136,7 +149,19 @@ async def test_rejects_unsealed_shared_layout() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "manifest_snapshot_key",
-    [None, "not-a-number", 0, -1],
+    [
+        None,
+        "not-a-number",
+        0,
+        -1,
+        True,
+        False,
+        11.0,
+        11.9,
+        "011",
+        " 11 ",
+        "+11",
+    ],
 )
 async def test_rejects_missing_or_nonpositive_v4_manifest_key(
     manifest_snapshot_key: Any,
@@ -152,7 +177,7 @@ async def test_rejects_missing_or_nonpositive_v4_manifest_key(
             snapshot_key=manifest_snapshot_key,
         )
 
-    assert len(session.calls) == 1
+    assert session.calls == []
 
 
 @pytest.mark.asyncio

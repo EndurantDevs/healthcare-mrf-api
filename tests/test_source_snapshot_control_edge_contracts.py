@@ -127,6 +127,11 @@ async def test_snapshot_control_requires_nonempty_identifiers() -> None:
         )
 
     with pytest.raises(ValueError, match="snapshot_id is required"):
+        await source_snapshot_control.remove_ptg2_source_snapshot(
+            snapshot_id=" ",
+        )
+
+    with pytest.raises(ValueError, match="snapshot_id is required"):
         await source_snapshot_control.retire_ptg2_source_snapshot(
             snapshot_id=" ",
         )
@@ -219,8 +224,8 @@ async def test_remove_missing_snapshot_is_an_executed_noop(
 
     cleanup_summary = (
         await source_snapshot_control.remove_ptg2_source_snapshot(
-            snapshot_id="snapshot-missing",
-            source_key="source-a",
+            snapshot_id=" snapshot-missing ",
+            source_key=" source-a ",
         )
     )
 
@@ -228,6 +233,11 @@ async def test_remove_missing_snapshot_is_an_executed_noop(
     assert cleanup_summary["deleted_snapshots"] == 0
     assert cleanup_summary["released_shared_layouts"] == 0
     assert cleanup_summary["physical_cleanup"] == "not_applicable"
+    (
+        source_snapshot_control.build_ptg2_source_snapshot_remove_plan
+    ).assert_awaited_once_with(
+        snapshot_id="snapshot-missing", source_key="source-a"
+    )
 
 
 @pytest.mark.asyncio

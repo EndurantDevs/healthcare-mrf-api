@@ -251,8 +251,8 @@ async def test_targeted_v4_removal_releases_only_the_last_bound_layout(monkeypat
         stored_bytes = await _install_v4_layout_fixture(database, schema_name)
 
         first = await source_snapshot_control.remove_ptg2_source_snapshot(
-            snapshot_id="shared-a",
-            source_key="source_a",
+            snapshot_id=" shared-a ",
+            source_key=" source_a ",
         )
 
         assert first["storage_generation"] == PTG2_V4_SHARED_GENERATION
@@ -278,6 +278,65 @@ async def test_targeted_v4_removal_releases_only_the_last_bound_layout(monkeypat
         assert await _count(database, schema_name, "ptg2_v4_snapshot_map_root") == 0
         assert await _count(database, schema_name, "ptg2_v4_snapshot_map_pack") == 0
         assert await _count(database, schema_name, "ptg2_v3_gc_candidate") == 2
+        assert await _count(database, schema_name, "ptg2_v3_block") == 2
+    finally:
+        try:
+            async with database.acquire() as connection:
+                await connection.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_targeted_v4_removal_rejects_missing_binding_before_delete(
+    monkeypatch,
+):
+    """A corrupt V4 binding cannot turn targeted removal into metadata deletion."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
+        pytest.skip(
+            "set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 "
+            "for the isolated PostgreSQL test"
+        )
+
+    database = Database()
+    schema_name = f"ptg2_v4_snapshot_binding_guard_{uuid.uuid4().hex}"
+    schema = _quoted(schema_name)
+    await database.connect()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    monkeypatch.setattr(source_snapshot_control, "db", database)
+    try:
+        await _create_production_shaped_schema(database, schema_name)
+        await _install_v4_layout_fixture(database, schema_name)
+        async with database.acquire() as connection:
+            await connection.status(
+                f"""
+                DELETE FROM {schema}.ptg2_v3_snapshot_binding
+                 WHERE snapshot_id = 'shared-a'
+                """
+            )
+
+        with pytest.raises(
+            ValueError,
+            match="missing its shared layout binding",
+        ):
+            await source_snapshot_control.remove_ptg2_source_snapshot(
+                snapshot_id="shared-a",
+                source_key="source_a",
+            )
+
+        async with database.acquire() as connection:
+            retained_snapshot = await connection.first(
+                f"""
+                SELECT snapshot_id
+                  FROM {schema}.ptg2_snapshot
+                 WHERE snapshot_id = 'shared-a'
+                """
+            )
+        assert retained_snapshot is not None
+        assert await _count(database, schema_name, "ptg2_snapshot") == 2
+        assert await _count(database, schema_name, "ptg2_v3_snapshot_layout") == 1
+        assert await _count(database, schema_name, "ptg2_v4_snapshot_map_root") == 1
         assert await _count(database, schema_name, "ptg2_v3_block") == 2
     finally:
         try:

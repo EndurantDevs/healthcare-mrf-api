@@ -167,6 +167,10 @@ async def remove_ptg2_source_snapshot(
     source_key: str | None = None,
 ) -> dict[str, Any]:
     """Remove an unreferenced source snapshot after validating its removal plan."""
+    snapshot_id = str(snapshot_id or "").strip()
+    source_key = str(source_key or "").strip() or None
+    if not snapshot_id:
+        raise ValueError("snapshot_id is required")
     schema = _schema_name()
     async with db.transaction() as session:
         await _lock_source_pointer_gc(session)

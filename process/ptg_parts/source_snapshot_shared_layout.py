@@ -52,12 +52,23 @@ async def _lock_snapshot_layout(
 def _v4_manifest_snapshot_key(expected_snapshot_key: Any) -> int:
     """Return the required positive V4 layout coordinate from the manifest."""
 
-    try:
-        snapshot_key = int(expected_snapshot_key)
-    except (TypeError, ValueError) as exc:
+    if isinstance(expected_snapshot_key, bool):
         raise ValueError(
             "PTG V4 snapshot manifest is missing its shared snapshot key"
-        ) from exc
+        )
+    if isinstance(expected_snapshot_key, int):
+        snapshot_key = expected_snapshot_key
+    elif (
+        isinstance(expected_snapshot_key, str)
+        and expected_snapshot_key.isascii()
+        and expected_snapshot_key.isdecimal()
+        and not expected_snapshot_key.startswith("0")
+    ):
+        snapshot_key = int(expected_snapshot_key)
+    else:
+        raise ValueError(
+            "PTG V4 snapshot manifest is missing its shared snapshot key"
+        )
     if snapshot_key <= 0:
         raise ValueError(
             "PTG V4 snapshot manifest is missing its shared snapshot key"
@@ -111,12 +122,21 @@ async def bound_shared_layout_keys(
     }
     if expected_generation not in supported_generations:
         raise ValueError("snapshot removal plan has an unsupported storage generation")
+    expected_v4_snapshot_key = (
+        _v4_manifest_snapshot_key(expected_snapshot_key)
+        if expected_generation == PTG2_V4_SHARED_GENERATION
+        else None
+    )
     layout_by_field = await _lock_snapshot_layout(
         session,
         schema=schema,
         snapshot_id=snapshot_id,
     )
     if not layout_by_field:
+        if expected_generation == PTG2_V4_SHARED_GENERATION:
+            raise ValueError(
+                "PTG V4 snapshot is missing its shared layout binding"
+            )
         return ()
     snapshot_key = int(layout_by_field.get("snapshot_key"))
     layout_generation = str(
@@ -127,7 +147,7 @@ async def bound_shared_layout_keys(
     if str(layout_by_field.get("state") or "").strip().lower() != "sealed":
         raise ValueError("snapshot binding does not reference a sealed shared layout")
     if expected_generation == PTG2_V4_SHARED_GENERATION:
-        if _v4_manifest_snapshot_key(expected_snapshot_key) != snapshot_key:
+        if expected_v4_snapshot_key != snapshot_key:
             raise ValueError(
                 "PTG V4 snapshot manifest does not match its shared layout binding"
             )
