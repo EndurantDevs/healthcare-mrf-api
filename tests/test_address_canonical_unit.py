@@ -396,8 +396,8 @@ def test_address_fast_python_fallback_matches_reference(monkeypatch):
 def test_rust_canon_version_match_requires_ruleset_version():
     current = address_canon.current_canon_version()
 
-    assert address_canon._canon_version_matches(current)
-    assert not address_canon._canon_version_matches(
+    assert address_canon._is_canon_version_match(current)
+    assert not address_canon._is_canon_version_match(
         {
             **current,
             "ruleset_version": current["ruleset_version"] - 1,
@@ -410,7 +410,7 @@ async def test_rust_materialize_default_on_falls_back_when_binary_missing(monkey
     monkeypatch.delenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, raising=False)
     monkeypatch.setattr(address_canon, "_ptg2_rust_scanner_binary", lambda: None)
 
-    assert await address_canon._try_materialize_keyed_with_rust(
+    assert await address_canon._has_rust_materialized_keys(
         None,
         keyed_table='"address_archive_resolve_keyed"',
         keyed_table_name="address_archive_resolve_keyed",
@@ -427,11 +427,11 @@ async def test_rust_materialize_falls_back_on_version_mismatch(monkeypatch, tmp_
     monkeypatch.setattr(address_canon, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
     monkeypatch.setattr(
         address_canon,
-        "_rust_canon_version_is_current",
+        "_is_rust_canon_version_current",
         _is_not_current,
     )
 
-    assert await address_canon._try_materialize_keyed_with_rust(
+    assert await address_canon._has_rust_materialized_keys(
         None,
         keyed_table='"address_archive_resolve_keyed"',
         keyed_table_name="address_archive_resolve_keyed",
@@ -1055,23 +1055,23 @@ def test_entity_address_unified_defaults_to_production_sized_publish_gate():
 
 def test_entity_address_unified_inline_source_evidence_guard_defaults_off(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE", raising=False)
-    assert entity_address_unified._require_inline_source_evidence() is False
+    assert entity_address_unified._should_require_inline_evidence() is False
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE", "true")
-    assert entity_address_unified._require_inline_source_evidence() is True
+    assert entity_address_unified._should_require_inline_evidence() is True
 
 
 def test_entity_address_unified_publish_decision_defaults_to_stage_only_for_test(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", raising=False)
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", raising=False)
 
-    assert entity_address_unified._publish_requested({}, test_mode=True) is False
-    assert entity_address_unified._publish_requested({}, test_mode=False) is True
-    assert entity_address_unified._publish_requested(
+    assert entity_address_unified._is_publish_requested({}, test_mode=True) is False
+    assert entity_address_unified._is_publish_requested({}, test_mode=False) is True
+    assert entity_address_unified._is_publish_requested(
         {"publish": True},
         test_mode=True,
     ) is True
-    assert entity_address_unified._publish_requested(
+    assert entity_address_unified._is_publish_requested(
         {"skip_publish": True},
         test_mode=False,
     ) is False
@@ -1081,12 +1081,12 @@ def test_entity_address_unified_publish_decision_allows_env_override(monkeypatch
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", "true")
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", raising=False)
 
-    assert entity_address_unified._publish_requested({}, test_mode=True) is True
+    assert entity_address_unified._is_publish_requested({}, test_mode=True) is True
 
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", raising=False)
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", "true")
 
-    assert entity_address_unified._publish_requested({}, test_mode=False) is False
+    assert entity_address_unified._is_publish_requested({}, test_mode=False) is False
 
 
 def test_entity_address_unified_refresh_mode_aliases_obsolete_ptg_to_full(monkeypatch):
@@ -1129,7 +1129,7 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
         },
     )
 
-    sql = entity_address_unified._prepare_provider_directory_partial_affected_groups_sql(
+    sql = entity_address_unified._prepare_partial_affected_groups_sql(
         "mrf",
         "entity_address_unified_pd_groups",
         source_selects,
@@ -1155,7 +1155,7 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
     ) in sql
     assert "src.entity_id::varchar AS entity_id" in sql
     assert "END AS entity_npi" in sql
-    index_sql = entity_address_unified._index_provider_directory_partial_affected_groups_sql(
+    index_sql = entity_address_unified._index_partial_affected_groups_sql(
         "mrf",
         "entity_address_unified_pd_groups",
     )
@@ -1187,7 +1187,7 @@ def test_provider_directory_organization_address_sql_can_skip_address_key_withou
             "npi_address": False,
             "address_archive_v2": False,
         },
-        address_canon_available=False,
+        is_address_canon_available=False,
     )
 
     sql = "\n".join(source_selects)
@@ -1214,7 +1214,7 @@ def test_provider_directory_partial_sql_can_scope_live_groups_by_source_id():
         provider_directory_run_id="run_123",
     )
 
-    sql = entity_address_unified._prepare_provider_directory_partial_affected_groups_sql(
+    sql = entity_address_unified._prepare_partial_affected_groups_sql(
         "mrf",
         "entity_address_unified_pd_groups",
         source_selects,
@@ -1271,7 +1271,7 @@ async def test_latest_provider_directory_partial_scope_returns_scope_sources(mon
     )
     monkeypatch.setattr(
         entity_address_unified,
-        "_is_table_available",
+        "_has_table",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(entity_address_unified.db, "first", first_mock)
@@ -2597,7 +2597,7 @@ def _provider_directory_replacement_sql_parts():
         "_provider_directory_replacement_stage_table_name"
     )("entity_address_unified_20260614")
     affected_location_table = _entity_address_unified_private(
-        "_provider_directory_affected_live_location_table_name"
+        "_affected_live_location_table"
     )(
         "entity_address_unified_20260614"
     )
@@ -2609,7 +2609,7 @@ def _provider_directory_replacement_sql_parts():
         stage_table="entity_address_unified_20260614",
     )
     prepare_affected_sql = _entity_address_unified_private(
-        "_prepare_provider_directory_affected_live_locations_sql"
+        "_prepare_affected_live_locations_sql"
     )(
         "mrf",
         live_table="entity_address_unified",
@@ -2618,13 +2618,13 @@ def _provider_directory_replacement_sql_parts():
         affected_location_table=affected_location_table,
     )
     index_affected_sql = _entity_address_unified_private(
-        "_index_provider_directory_affected_live_locations_sql"
+        "_index_affected_live_locations_sql"
     )(
         "mrf",
         affected_location_table,
     )
     copy_live_sql = _entity_address_unified_private(
-        "_copy_unaffected_live_entity_rows_by_location_sql"
+        "_copy_unaffected_rows_by_location_sql"
     )(
         "mrf",
         live_table="entity_address_unified",
@@ -2754,7 +2754,7 @@ async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeyp
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "none")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
-    monkeypatch.setattr(entity_address_unified, "_is_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(entity_address_unified, "_has_table", AsyncMock(return_value=True))
     monkeypatch.setattr(
         entity_address_unified,
         "_inherit_archive_coordinates",
@@ -2865,7 +2865,7 @@ def test_facility_anchor_npi_candidate_stage_keeps_indexed_nppes_default(monkeyp
 
 
 def test_entity_address_unified_promotes_approved_facility_anchor_candidates_sql():
-    sql = entity_address_unified._promote_approved_facility_anchor_npi_candidates_sql("mrf")
+    sql = entity_address_unified._promote_facility_npi_candidates_sql("mrf")
 
     assert "INSERT INTO mrf.facility_anchor_npi_override" in sql
     assert "FROM mrf.facility_anchor_npi_candidate AS c" in sql
@@ -3383,7 +3383,7 @@ async def test_ensure_entity_address_unified_live_columns_adds_missing_stale_col
     monkeypatch.setattr(entity_address_unified.db, "status", status_mock)
     monkeypatch.setattr(
         entity_address_unified,
-        "_is_table_available",
+        "_has_table",
         AsyncMock(return_value=True),
     )
 
@@ -3474,7 +3474,7 @@ def test_entity_address_unified_fallback_summary_counts_prefer_replacement_rows(
 def test_entity_address_unified_final_summary_counts_can_be_disabled(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS", "false")
 
-    assert entity_address_unified._final_summary_counts() is False
+    assert entity_address_unified._should_compute_final_summary_counts() is False
 
 
 def test_entity_address_unified_publish_validation_tolerates_coordinate_roundoff():
@@ -3629,10 +3629,10 @@ def test_provider_directory_partial_keeps_scope_for_all_post_build_mutations():
 
 def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE", raising=False)
-    assert entity_address_unified._keep_raw_stage() is False
+    assert entity_address_unified._should_keep_raw_stage() is False
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE", "true")
-    assert entity_address_unified._keep_raw_stage() is True
+    assert entity_address_unified._should_keep_raw_stage() is True
 
 
 def test_entity_address_unified_indexes_cover_primary_serving_queries():

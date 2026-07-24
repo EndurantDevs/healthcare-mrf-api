@@ -84,7 +84,7 @@ def _fast_module() -> Any | None:
     except Exception as exc:
         logger.warning("Rust/PyO3 address canonicalizer version check failed; using Python fallback: %s", exc)
         return None
-    if not address_canon._canon_version_matches(version):
+    if not address_canon._is_canon_version_match(version):
         logger.warning(
             "Rust/PyO3 address canonicalizer version mismatch; using Python fallback "
             "(rust=%s python=%s)",

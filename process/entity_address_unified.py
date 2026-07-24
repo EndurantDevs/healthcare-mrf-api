@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -321,14 +320,14 @@ def _validate_schema_name(schema: str) -> str:
     return cleaned
 
 
-def _env_bool(name: str, default: bool) -> bool:
+def _is_env_enabled(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _coerce_bool(value) -> bool:
+def _is_truthy(value) -> bool:
     if isinstance(value, bool):
         return value
     if value is None:
@@ -350,15 +349,15 @@ def _coerce_str_list(value) -> list[str]:
         candidates = list(value)
     else:
         candidates = [value]
-    cleaned: list[str] = []
-    seen: set[str] = set()
+    cleaned_values: list[str] = []
+    seen_values: set[str] = set()
     for item in candidates:
         text = _clean_optional(item)
-        if not text or text in seen:
+        if not text or text in seen_values:
             continue
-        seen.add(text)
-        cleaned.append(text)
-    return cleaned
+        seen_values.add(text)
+        cleaned_values.append(text)
+    return cleaned_values
 
 
 def _entity_address_refresh_mode(task: dict) -> str:
@@ -369,19 +368,19 @@ def _entity_address_refresh_mode(task: dict) -> str:
         or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE")
         or ""
     )
-    value = str(raw).strip().lower().replace("_", "-")
-    if not value:
+    normalized_mode = str(raw).strip().lower().replace("_", "-")
+    if not normalized_mode:
         return ENTITY_ADDRESS_REFRESH_MODE_FULL
-    if value in {"full", "rebuild", "full-rebuild"}:
+    if normalized_mode in {"full", "rebuild", "full-rebuild"}:
         return ENTITY_ADDRESS_REFRESH_MODE_FULL
-    if value in {"ptg-partial", "partial-ptg", "ptg", "ptg-source", "ptg-source-refresh"}:
+    if normalized_mode in {"ptg-partial", "partial-ptg", "ptg", "ptg-source", "ptg-source-refresh"}:
         logger.warning(
             "entity-address-unified refresh_mode=%s is obsolete because PTG no longer "
             "publishes address rows; running a full unified-address refresh instead.",
             raw,
         )
         return ENTITY_ADDRESS_REFRESH_MODE_FULL
-    if value in {
+    if normalized_mode in {
         "provider-directory-partial",
         "partial-provider-directory",
         "provider-directory",
@@ -412,7 +411,7 @@ def _entity_address_provider_directory_run_id(task: dict) -> str | None:
     )
 
 
-def _entity_address_provider_directory_source_batch_size(task: dict) -> int:
+def _provider_directory_source_batch_size(task: dict) -> int:
     raw = (
         task.get("provider_directory_source_batch_size")
         or task.get("provider_directory_batch_size")
@@ -451,7 +450,7 @@ def _entity_address_provider_directory_partial_scope(task: dict) -> str:
     )
 
 
-def _publish_requested(task: dict, *, test_mode: bool) -> bool:
+def _is_publish_requested(task: dict, *, test_mode: bool) -> bool:
     """Return whether this run should publish staged entity-address tables.
 
     Bounded/test pilots are stage-only by default so they can prove runtime
@@ -459,22 +458,22 @@ def _publish_requested(task: dict, *, test_mode: bool) -> bool:
     """
 
     if task.get("skip_publish") not in (None, ""):
-        return not _coerce_bool(task.get("skip_publish"))
+        return not _is_truthy(task.get("skip_publish"))
     if task.get("publish") not in (None, ""):
-        return _coerce_bool(task.get("publish"))
+        return _is_truthy(task.get("publish"))
     env_publish = os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH")
     if env_publish not in (None, ""):
-        return _coerce_bool(env_publish)
+        return _is_truthy(env_publish)
     env_skip = os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH")
     if env_skip not in (None, ""):
-        return not _coerce_bool(env_skip)
+        return not _is_truthy(env_skip)
     return not test_mode
 
 
-def _task_bool_or_env(task: dict, key: str, env_name: str, default: bool) -> bool:
+def _is_task_or_env_enabled(task: dict, key: str, env_name: str, default: bool) -> bool:
     if task.get(key) not in (None, ""):
-        return _coerce_bool(task.get(key))
-    return _env_bool(env_name, default)
+        return _is_truthy(task.get(key))
+    return _is_env_enabled(env_name, default)
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -556,9 +555,9 @@ def _entity_address_sql_settings() -> list[tuple[str, str]]:
         ),
     )
     return [
-        (setting, value)
+        (setting, setting_value)
         for setting, env_name, default in candidates
-        if (value := _env_sql_setting(env_name, default)) is not None
+        if (setting_value := _env_sql_setting(env_name, default)) is not None
     ]
 
 
@@ -878,7 +877,7 @@ def _is_support_code_location_index(stage_cls, index: dict) -> bool:
 
 
 def _stage_index_profile() -> str:
-    if _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES", False):
+    if _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES", False):
         return "none"
     raw = (os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE") or DEFAULT_STAGE_INDEX_PROFILE).strip().lower()
     if raw in STAGE_INDEX_PROFILES:
@@ -906,22 +905,22 @@ def _post_publish_index_profile() -> str:
     return DEFAULT_POST_PUBLISH_INDEX_PROFILE
 
 
-def _post_publish_index_concurrently() -> bool:
-    return _env_bool(
+def _should_build_post_publish_concurrently() -> bool:
+    return _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENTLY",
         DEFAULT_POST_PUBLISH_INDEX_CONCURRENTLY,
     )
 
 
-def _defer_publish_validation() -> bool:
-    return _env_bool(
+def _should_defer_publish_validation() -> bool:
+    return _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_PUBLISH_VALIDATION",
         DEFAULT_DEFER_PUBLISH_VALIDATION,
     )
 
 
 def _should_aggregate_source_record_ids() -> bool:
-    return _env_bool(
+    return _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SOURCE_RECORD_IDS",
         DEFAULT_AGGREGATE_SOURCE_RECORD_IDS,
     )
@@ -941,22 +940,22 @@ def _source_record_ids_select_sql() -> str:
     )
 
 
-def _require_inline_source_evidence() -> bool:
-    return _env_bool(
+def _should_require_inline_evidence() -> bool:
+    return _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE",
         DEFAULT_REQUIRE_INLINE_SOURCE_EVIDENCE,
     )
 
 
-def _final_summary_counts() -> bool:
-    return _env_bool(
+def _should_compute_final_summary_counts() -> bool:
+    return _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS",
         DEFAULT_FINAL_SUMMARY_COUNTS,
     )
 
 
-def _keep_raw_stage() -> bool:
-    return _env_bool(
+def _should_keep_raw_stage() -> bool:
+    return _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE",
         DEFAULT_KEEP_RAW_STAGE,
     )
@@ -977,7 +976,7 @@ def _raw_group_index_profile() -> str:
     return DEFAULT_RAW_GROUP_INDEX_PROFILE
 
 
-def _main_index_enabled_for_profile(index_name: str, profile: str) -> bool:
+def _is_main_index_enabled(index_name: str, profile: str) -> bool:
     if profile == "all":
         return True
     if profile == "none":
@@ -998,7 +997,7 @@ def _post_publish_index_plan(
     skipped_indexes: list[str] = []
     for index in getattr(EntityAddressUnified, "__my_additional_indexes__", []) or []:
         index_name = index.get("name", "_".join(index.get("index_elements") or ()))
-        if not _main_index_enabled_for_profile(index_name, profile):
+        if not _is_main_index_enabled(index_name, profile):
             skipped_indexes.append(f"{table_name}.{index_name}")
             continue
         using = f"USING {index.get('using')} " if index.get("using") else ""
@@ -1021,14 +1020,14 @@ def _post_publish_index_plan(
 
 def _is_stage_index_enabled(stage_cls, index: dict) -> bool:
     if _is_support_code_location_index(stage_cls, index):
-        return _env_bool(
+        return _is_env_enabled(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES",
             DEFAULT_SUPPORT_CODE_LOCATION_INDEXES,
         )
     if getattr(stage_cls, "__main_table__", "") != EntityAddressUnified.__main_table__:
         return True
     index_name = index.get("name", "_".join(index.get("index_elements") or ()))
-    return _main_index_enabled_for_profile(index_name, _stage_index_profile())
+    return _is_main_index_enabled(index_name, _stage_index_profile())
 
 
 def _support_stage_classes(import_date: str) -> dict[type, type]:
@@ -1064,7 +1063,7 @@ async def _compact_hot_row_source_record_ids(
 ) -> int:
     """Compact source-record identifiers while preserving stage row identity."""
     phase_context = context if context is not None else {}
-    if not _env_bool(
+    if not _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE",
         DEFAULT_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE,
     ):
@@ -1252,13 +1251,13 @@ async def _create_stage_indexes(
         async with semaphore:
             await _build_index(index_name, stmt)
 
-    results = await asyncio.gather(
+    index_results = await asyncio.gather(
         *(_guarded(index_name, stmt) for index_name, stmt in statements),
         return_exceptions=True,
     )
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
+    for index_result in index_results:
+        if isinstance(index_result, BaseException):
+            raise index_result
 
 
 async def _create_post_publish_indexes(
@@ -1270,8 +1269,8 @@ async def _create_post_publish_indexes(
     phase_context = context if context is not None else {}
     profile = _post_publish_index_profile()
     phase_context["post_publish_index_profile"] = profile
-    build_concurrently = _post_publish_index_concurrently()
-    phase_context["post_publish_index_concurrently"] = build_concurrently
+    should_build_concurrently = _should_build_post_publish_concurrently()
+    phase_context["post_publish_index_concurrently"] = should_build_concurrently
     if profile == "none":
         phase_context["post_publish_index_pending"] = False
         phase_context["post_publish_index_total"] = 0
@@ -1282,14 +1281,14 @@ async def _create_post_publish_indexes(
     statements, skipped_indexes = _post_publish_index_plan(
         db_schema,
         profile,
-        build_concurrently=build_concurrently,
+        build_concurrently=should_build_concurrently,
     )
     phase_context["post_publish_skipped_indexes"] = skipped_indexes
 
     async def _analyze_live_table() -> None:
         statement = f"ANALYZE {db_schema}.{table_name};"
         started_at = time.time()
-        if build_concurrently and hasattr(db, "execute_ddl"):
+        if should_build_concurrently and hasattr(db, "execute_ddl"):
             await db.execute_ddl(statement)
         else:
             await _run_sql_phase(
@@ -1318,7 +1317,7 @@ async def _create_post_publish_indexes(
         # here instead of failing the whole post-publish index pass on a
         # freshly provisioned database.
         ensure_extension = "CREATE EXTENSION IF NOT EXISTS btree_gin"
-        if build_concurrently and hasattr(db, "execute_ddl"):
+        if should_build_concurrently and hasattr(db, "execute_ddl"):
             await db.execute_ddl(ensure_extension)
         else:
             await _run_sql_phase(
@@ -1336,10 +1335,10 @@ async def _create_post_publish_indexes(
         ),
         minimum=1,
     )
-    index_concurrency = 1 if build_concurrently else min(configured_index_concurrency, len(statements))
+    index_concurrency = 1 if should_build_concurrently else min(configured_index_concurrency, len(statements))
     phase_context["post_publish_index_concurrency"] = index_concurrency
 
-    async def _post_publish_index_invalid(live_index_name: str) -> bool:
+    async def _is_post_publish_index_invalid(live_index_name: str) -> bool:
         invalid = await db.scalar(
             f"""
             SELECT 1
@@ -1357,10 +1356,10 @@ async def _create_post_publish_indexes(
         return bool(invalid)
 
     async def _drop_invalid_index(live_index_name: str) -> None:
-        if not await _post_publish_index_invalid(live_index_name):
+        if not await _is_post_publish_index_invalid(live_index_name):
             return
-        drop_stmt = f"DROP INDEX {'CONCURRENTLY ' if build_concurrently else ''}IF EXISTS {db_schema}.{live_index_name};"
-        if build_concurrently and hasattr(db, "execute_ddl"):
+        drop_stmt = f"DROP INDEX {'CONCURRENTLY ' if should_build_concurrently else ''}IF EXISTS {db_schema}.{live_index_name};"
+        if should_build_concurrently and hasattr(db, "execute_ddl"):
             await db.execute_ddl(drop_stmt)
         else:
             await _run_sql_phase(
@@ -1375,7 +1374,7 @@ async def _create_post_publish_indexes(
         is_completed = False
         try:
             await _drop_invalid_index(live_index_name)
-            if build_concurrently and hasattr(db, "execute_ddl"):
+            if should_build_concurrently and hasattr(db, "execute_ddl"):
                 await db.execute_ddl(stmt)
                 _record_phase_timing(
                     phase_context,
@@ -1433,13 +1432,13 @@ async def _create_post_publish_indexes(
         async with semaphore:
             await _build_index(index_name, stmt)
 
-    results = await asyncio.gather(
+    index_results = await asyncio.gather(
         *(_guarded(index_name, stmt) for index_name, stmt in statements),
         return_exceptions=True,
     )
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
+    for index_result in index_results:
+        if isinstance(index_result, BaseException):
+            raise index_result
     await _analyze_live_table()
 
 
@@ -1621,14 +1620,14 @@ async def _ensure_stage_primary_key(
 
 async def _prepare_support_stage_tables(db_schema: str, import_date: str) -> dict[type, type]:
     stage_classes = _support_stage_classes(import_date)
-    heap_load = _env_bool(
+    should_use_heap_load = _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_HEAP_LOAD",
         DEFAULT_SUPPORT_HEAP_LOAD,
     )
     for stage_cls in stage_classes.values():
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
         await db.create_table(stage_cls.__table__, checkfirst=True)
-        if heap_load:
+        if should_use_heap_load:
             await db.status(_drop_stage_primary_key_sql(db_schema, stage_cls.__tablename__))
     return stage_classes
 
@@ -1642,8 +1641,8 @@ async def _create_support_stage_indexes(
 ) -> None:
     """Build support-table primary keys and indexes with bounded concurrency."""
     phase_context = context if context is not None else {}
-    stage_tables = list(stage_classes.values())
-    if not stage_tables:
+    stage_table_classes = list(stage_classes.values())
+    if not stage_table_classes:
         return
     index_concurrency = min(
         _env_int(
@@ -1651,12 +1650,12 @@ async def _create_support_stage_indexes(
             DEFAULT_SUPPORT_INDEX_CONCURRENCY,
             minimum=1,
         ),
-        len(stage_tables),
+        len(stage_table_classes),
     )
     phase_context["support_stage_index_concurrency"] = index_concurrency
     progress_lock = asyncio.Lock()
     completed_counts = [0]
-    total = len(stage_tables)
+    total = len(stage_table_classes)
 
     async def _index_stage_table(index: int, stage_cls) -> None:
         table_name = stage_cls.__tablename__
@@ -1694,8 +1693,8 @@ async def _create_support_stage_indexes(
                     message=f"indexed support table {index}/{total}: {table_name}",
                 )
 
-    if index_concurrency <= 1 or len(stage_tables) == 1:
-        for index, stage_cls in enumerate(stage_tables, start=1):
+    if index_concurrency <= 1 or len(stage_table_classes) == 1:
+        for index, stage_cls in enumerate(stage_table_classes, start=1):
             await _index_stage_table(index, stage_cls)
         return
 
@@ -1705,13 +1704,16 @@ async def _create_support_stage_indexes(
         async with semaphore:
             await _index_stage_table(index, stage_cls)
 
-    results = await asyncio.gather(
-        *(_guarded(index, stage_cls) for index, stage_cls in enumerate(stage_tables, start=1)),
+    index_results = await asyncio.gather(
+        *(
+            _guarded(index, stage_cls)
+            for index, stage_cls in enumerate(stage_table_classes, start=1)
+        ),
         return_exceptions=True,
     )
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
+    for index_result in index_results:
+        if isinstance(index_result, BaseException):
+            raise index_result
 
 
 async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
@@ -1773,7 +1775,7 @@ async def _ensure_promoted_stage_logged(db_schema: str, table_name: str) -> None
 
 def _cutover_relation_sets(
     swaps: list[_StageTableSwap],
-    support_stage_classes: dict[type, type],
+    support_stage_class_map: dict[type, type],
     *,
     partial_support_patch: bool,
     affected_group_table: str,
@@ -1786,7 +1788,7 @@ def _cutover_relation_sets(
         relation_names.update((live_table, f"{live_table}_old", stage_table))
         required_names.add(stage_table)
     if partial_support_patch:
-        for live_cls, stage_cls in support_stage_classes.items():
+        for live_cls, stage_cls in support_stage_class_map.items():
             relation_names.update((live_cls.__main_table__, stage_cls.__tablename__))
             required_names.add(stage_cls.__tablename__)
         if affected_group_table:
@@ -1896,7 +1898,7 @@ async def _run_entity_address_cutover(
 def _entity_address_cutover_plan(
     db_schema: str,
     stage_cls,
-    support_stage_classes: dict[type, type],
+    support_stage_class_map: dict[type, type],
     *,
     partial_support_patch: bool,
     affected_group_table: str,
@@ -1907,7 +1909,7 @@ def _entity_address_cutover_plan(
     if partial_support_patch:
         patch_statements = _partial_support_patch_sql(
             db_schema,
-            support_stage_classes,
+            support_stage_class_map,
             old_entity_table=f"{EntityAddressUnified.__main_table__}_old",
             affected_group_table=affected_group_table,
             build_network_bridge=bool(
@@ -1917,11 +1919,11 @@ def _entity_address_cutover_plan(
     else:
         swaps.extend(
             _StageTableSwap(live_cls, support_stage_cls)
-            for live_cls, support_stage_cls in support_stage_classes.items()
+            for live_cls, support_stage_cls in support_stage_class_map.items()
         )
     relation_names, required_names = _cutover_relation_sets(
         swaps,
-        support_stage_classes,
+        support_stage_class_map,
         partial_support_patch=partial_support_patch,
         affected_group_table=affected_group_table,
     )
@@ -1949,7 +1951,7 @@ def _cutover_retry_settings() -> tuple[int, int, int]:
 async def _publish_staged_entity_address_tables(
     db_schema: str,
     stage_cls,
-    support_stage_classes: dict[type, type],
+    support_stage_class_map: dict[type, type],
     *,
     partial_support_patch: bool,
     affected_group_table: str,
@@ -1958,7 +1960,7 @@ async def _publish_staged_entity_address_tables(
     swaps, patch_statements, relation_names, required_names = _entity_address_cutover_plan(
         db_schema,
         stage_cls,
-        support_stage_classes,
+        support_stage_class_map,
         partial_support_patch=partial_support_patch,
         affected_group_table=affected_group_table,
         context=context,
@@ -1995,23 +1997,23 @@ async def _publish_staged_entity_address_tables(
 async def _drop_stage_artifacts(
     db_schema: str,
     stage_cls,
-    support_stage_classes: dict[type, type],
+    support_stage_class_map: dict[type, type],
     *,
     extra_tables: Iterable[str] = (),
 ) -> None:
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
-    for stage_model in support_stage_classes.values():
+    for stage_model in support_stage_class_map.values():
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_model.__tablename__};")
     for table_name in extra_tables:
         if table_name:
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table_name};")
 
 
-async def _is_table_available(db_schema: str, table_name: str) -> bool:
+async def _has_table(db_schema: str, table_name: str) -> bool:
     return bool(await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}') IS NOT NULL;"))
 
 
-async def _table_column_exists(db_schema: str, table_name: str, column_name: str) -> bool:
+async def _has_table_column(db_schema: str, table_name: str, column_name: str) -> bool:
     return bool(
         await db.scalar(
             """
@@ -2034,7 +2036,7 @@ async def _ensure_entity_address_unified_live_columns(
     db_schema: str,
     table_name: str = EntityAddressUnified.__main_table__,
 ) -> None:
-    if not await _is_table_available(db_schema, table_name):
+    if not await _has_table(db_schema, table_name):
         return
     existing_rows = await db.all(
         """
@@ -2046,13 +2048,13 @@ async def _ensure_entity_address_unified_live_columns(
         db_schema=db_schema,
         table_name=table_name,
     )
-    existing = {
+    existing_columns = {
         str((row._mapping if hasattr(row, "_mapping") else row).get("column_name"))
         for row in existing_rows
     }
     dialect = postgresql.dialect()
     for column in EntityAddressUnified.__table__.columns:
-        if column.name in existing:
+        if column.name in existing_columns:
             continue
         column_ddl = str(CreateColumn(column).compile(dialect=dialect)).strip()
         await db.status(
@@ -2060,11 +2062,7 @@ async def _ensure_entity_address_unified_live_columns(
         )
 
 
-async def _is_support_bridge_reuse_available(
-    db_schema: str,
-    *,
-    build_network_bridge: bool,
-) -> bool:
+async def _is_support_bridge_reuse_available(db_schema: str, *, build_network_bridge: bool) -> bool:
     bridge_models: list[type] = [
         EntityAddressPlanBridge,
         EntityAddressProcedureBridge,
@@ -2073,12 +2071,12 @@ async def _is_support_bridge_reuse_available(
     if build_network_bridge:
         bridge_models.append(EntityAddressNetworkBridge)
     for model in bridge_models:
-        if not await _is_table_available(db_schema, model.__main_table__):
+        if not await _has_table(db_schema, model.__main_table__):
             return False
     return True
 
 
-def _promote_approved_facility_anchor_npi_candidates_sql(db_schema: str) -> str:
+def _promote_facility_npi_candidates_sql(db_schema: str) -> str:
     return f"""
     INSERT INTO {db_schema}.facility_anchor_npi_override (
         facility_anchor_id,
@@ -2129,17 +2127,17 @@ def _promote_approved_facility_anchor_npi_candidates_sql(db_schema: str) -> str:
 
 async def _promote_approved_facility_anchor_npi_candidates(db_schema: str) -> int:
     if not (
-        await _is_table_available(db_schema, "facility_anchor_npi_candidate")
-        and await _is_table_available(db_schema, "facility_anchor_npi_override")
+        await _has_table(db_schema, "facility_anchor_npi_candidate")
+        and await _has_table(db_schema, "facility_anchor_npi_override")
     ):
         return 0
     return int(
-        await db.status(_promote_approved_facility_anchor_npi_candidates_sql(db_schema))
+        await db.status(_promote_facility_npi_candidates_sql(db_schema))
         or 0
     )
 
 
-async def _address_canon_available(db_schema: str) -> bool:
+async def _is_address_canon_available(db_schema: str) -> bool:
     value = await db.scalar(
         "SELECT to_regprocedure(:signature);",
         signature=f"{db_schema}.addr_key_v1(text,text,text,text,text,text)",
@@ -2652,7 +2650,7 @@ def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
 
 
 async def _latest_provider_directory_partial_scope(db_schema: str) -> tuple[str | None, list[str], list[str]]:
-    if not await _is_table_available(db_schema, "provider_directory_source"):
+    if not await _has_table(db_schema, "provider_directory_source"):
         return None, [], []
     row = await db.first(_latest_provider_directory_partial_scope_sql(db_schema))
     if not row:
@@ -2798,7 +2796,7 @@ def _source_selects(
     test_limit_per_source: int | None = None,
     provider_directory_source_ids: list[str] | tuple[str, ...] | None = None,
     provider_directory_run_id: str | None = None,
-    address_canon_available: bool = True,
+    is_address_canon_available: bool = True,
 ) -> list[str]:
     """Build normalized source queries for unified address materialization."""
     selects: list[str] = []
@@ -2876,7 +2874,7 @@ def _source_selects(
         "pd.first_line, pd.second_line, pd.city_name, "
         "pd.state_name, pd.postal_code, pd.country_code"
         ")"
-        if address_canon_available
+        if is_address_canon_available
         else "NULL::uuid"
     )
     provider_directory_role_scope_filter = _provider_directory_scope_filter_sql(
@@ -3951,11 +3949,11 @@ def _entity_address_row_npi_expr(row_alias: str) -> str:
     )
 
 
-def _provider_directory_partial_affected_group_table_name(stage_table: str) -> str:
+def _partial_affected_group_table(stage_table: str) -> str:
     return _archived_identifier(stage_table, "_pd_groups")
 
 
-def _provider_directory_affected_live_location_table_name(stage_table: str) -> str:
+def _affected_live_location_table(stage_table: str) -> str:
     return _archived_identifier(stage_table, "_pd_live_locations")
 
 
@@ -3997,7 +3995,7 @@ def _provider_directory_current_group_select_sql(source_select: str) -> str:
     """
 
 
-def _prepare_provider_directory_partial_affected_groups_sql(
+def _prepare_partial_affected_groups_sql(
     db_schema: str,
     group_table: str,
     source_selects: list[str],
@@ -4066,7 +4064,7 @@ def _index_affected_groups_sql(db_schema: str, group_table: str) -> str:
     """
 
 
-def _index_provider_directory_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
+def _index_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
     return _index_affected_groups_sql(db_schema, group_table)
 
 
@@ -4176,19 +4174,19 @@ def _provider_directory_partial_source_selects(
     *,
     affected_group_table: str,
 ) -> list[str]:
-    filtered: list[str] = []
+    filtered_selects: list[str] = []
     provider_selects = 0
     for source_select in source_selects:
         if _is_provider_directory_source_select(db_schema, source_select):
-            filtered.append(source_select)
+            filtered_selects.append(source_select)
             provider_selects += 1
         else:
-            filtered.append(
+            filtered_selects.append(
                 _affected_npi_source_select_sql(db_schema, source_select, affected_group_table)
             )
     if not provider_selects:
         return []
-    return filtered
+    return filtered_selects
 
 
 def _provider_directory_partial_replacement_source_selects(
@@ -4278,7 +4276,7 @@ def _copy_unaffected_live_entity_rows_sql(
     """
 
 
-def _prepare_provider_directory_affected_live_locations_sql(
+def _prepare_affected_live_locations_sql(
     db_schema: str,
     *,
     live_table: str,
@@ -4330,7 +4328,7 @@ def _prepare_provider_directory_affected_live_locations_sql(
     """
 
 
-def _index_provider_directory_affected_live_locations_sql(
+def _index_affected_live_locations_sql(
     db_schema: str,
     affected_location_table: str,
 ) -> str:
@@ -4341,7 +4339,7 @@ def _index_provider_directory_affected_live_locations_sql(
     """
 
 
-def _copy_unaffected_live_entity_rows_by_location_sql(
+def _copy_unaffected_rows_by_location_sql(
     db_schema: str,
     *,
     live_table: str,
@@ -4421,7 +4419,7 @@ def _shard_source_selects(
     mrf_address_ranges = mrf_address_ranges or []
     doctor_clinician_address_ranges = doctor_clinician_address_ranges or []
     provider_enrollment_ffs_ranges = provider_enrollment_ffs_ranges or []
-    sharded: list[str] = []
+    sharded_selects: list[str] = []
     shard_specs = [
         (
             f"FROM {db_schema}.npi_address AS a",
@@ -4471,12 +4469,12 @@ def _shard_source_selects(
                 alias = candidate_alias
                 break
         if not ranges or not where_marker or where_marker not in select_sql:
-            sharded.append(select_sql)
+            sharded_selects.append(select_sql)
             continue
         for low, high in ranges:
             predicate = f"{where_marker}\n               AND {alias}.npi >= {low}\n               AND {alias}.npi < {high}"
-            sharded.append(select_sql.replace(where_marker, predicate, 1))
-    return sharded
+            sharded_selects.append(select_sql.replace(where_marker, predicate, 1))
+    return sharded_selects
 
 
 async def _npi_table_ranges(db_schema: str, table_name: str, shards: int) -> list[tuple[int, int]]:
@@ -4597,7 +4595,7 @@ def _enrich_raw_stage_sql(
     raw_table: str,
     *,
     archive_available: bool = True,
-    address_canon_available: bool = True,
+    is_address_canon_available: bool = True,
     checksum_min: int | None = None,
     checksum_max: int | None = None,
     evidence_shards: int | None = None,
@@ -4608,15 +4606,15 @@ def _enrich_raw_stage_sql(
     if archive_available:
         computed_address_key = _address_key_expr(
             db_schema,
-            address_canon_available,
+            is_address_canon_available,
             address_source="r.address_source",
             table_alias="r",
         )
-        trust_source_key = _env_bool(
+        should_trust_source_key = _is_env_enabled(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY",
             DEFAULT_TRUST_SOURCE_ADDRESS_KEY,
         )
-        if trust_source_key:
+        if should_trust_source_key:
             archive_fields = (
                 "COALESCE(a_direct.address_key, a_fallback.address_key) AS archive_address_key, "
                 "COALESCE(a_direct.premise_key, a_fallback.premise_key) AS premise_key, "
@@ -4800,11 +4798,11 @@ def _enrich_raw_stage_sql(
     """
 
 
-def _key_v2_enabled() -> bool:
-    return _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2", False)
+def _is_key_v2_enabled() -> bool:
+    return _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2", False)
 
 
-def _dedupe_key_expr(address_canon_available: bool) -> str:
+def _dedupe_key_expr(is_address_canon_available: bool) -> str:
     return "location_key"
 
 
@@ -4818,10 +4816,10 @@ def _raw_aggregate_group_index_sql(
     raw_table: str,
     *,
     aggregate_shards: int,
-    address_canon_available: bool = True,
+    is_address_canon_available: bool = True,
     inline_source_evidence: bool = False,
 ) -> str:
-    dedupe_key_expr = _dedupe_key_expr(address_canon_available)
+    dedupe_key_expr = _dedupe_key_expr(is_address_canon_available)
     if aggregate_shards > 1:
         profile = _raw_group_index_profile()
         shard_expr = (
@@ -5267,7 +5265,7 @@ def _backfill_same_provider_address_fields_sql(
     """
 
 
-async def _location_key_primary_key_validated(db_schema: str, table_name: str) -> bool:
+async def _is_location_primary_key_validated(db_schema: str, table_name: str) -> bool:
     """A valid PK on location_key proves both non-null and uniqueness."""
     return bool(
         await db.scalar(
@@ -5299,7 +5297,7 @@ async def _location_key_primary_key_validated(db_schema: str, table_name: str) -
 async def _validate_publish_integrity(
     db_schema: str,
     stage_table: str,
-    support_stage_classes: dict[type, type],
+    support_stage_class_map: dict[type, type],
     *,
     test_mode: bool,
 ) -> dict[str, int | dict[str, int]]:
@@ -5308,10 +5306,10 @@ async def _validate_publish_integrity(
         return {}
 
     failures: list[str] = []
-    metrics: dict[str, int | dict[str, int]] = {}
+    integrity_metric_map: dict[str, int | dict[str, int]] = {}
 
-    location_key_constraint_validated = await _location_key_primary_key_validated(db_schema, stage_table)
-    metrics["location_key_constraint_validated"] = location_key_constraint_validated
+    location_key_constraint_validated = await _is_location_primary_key_validated(db_schema, stage_table)
+    integrity_metric_map["location_key_constraint_validated"] = location_key_constraint_validated
     if location_key_constraint_validated:
         null_location_keys = 0
         duplicate_location_keys = 0
@@ -5337,8 +5335,8 @@ async def _validate_publish_integrity(
             )
             or 0
         )
-    metrics["null_location_keys"] = null_location_keys
-    metrics["duplicate_location_keys"] = duplicate_location_keys
+    integrity_metric_map["null_location_keys"] = null_location_keys
+    integrity_metric_map["duplicate_location_keys"] = duplicate_location_keys
     if duplicate_location_keys:
         failures.append(f"{duplicate_location_keys} duplicate staged location_key values")
 
@@ -5347,7 +5345,7 @@ async def _validate_publish_integrity(
     archive_coordinate_mismatch_rows = 0
     archive_missing_coordinate_rows = 0
     archive_identity_mismatch_rows = 0
-    if await _is_table_available(db_schema, "address_archive_v2"):
+    if await _has_table(db_schema, "address_archive_v2"):
         (
             unresolved_merged_into_rows,
             archive_coordinate_mismatch_rows,
@@ -5355,8 +5353,8 @@ async def _validate_publish_integrity(
             missing_archive_address_key_rows,
             archive_identity_mismatch_rows,
         ) = (
-            int(value or 0)
-            for value in await asyncio.gather(
+            int(metric_value or 0)
+            for metric_value in await asyncio.gather(
                 db.scalar(
                     f"""
                 SELECT COUNT(*)
@@ -5423,19 +5421,19 @@ async def _validate_publish_integrity(
                 ),
             )
         )
-    metrics["unresolved_merged_into_rows"] = unresolved_merged_into_rows
+    integrity_metric_map["unresolved_merged_into_rows"] = unresolved_merged_into_rows
     if unresolved_merged_into_rows:
         failures.append(
             f"{unresolved_merged_into_rows} staged rows point to address_archive_v2.merged_into redirects"
         )
-    metrics["missing_archive_address_key_rows"] = missing_archive_address_key_rows
+    integrity_metric_map["missing_archive_address_key_rows"] = missing_archive_address_key_rows
     if missing_archive_address_key_rows:
         failures.append(
             f"{missing_archive_address_key_rows} staged rows have address_key values missing from address_archive_v2"
         )
-    metrics["archive_coordinate_mismatch_rows"] = archive_coordinate_mismatch_rows
-    metrics["archive_missing_coordinate_rows"] = archive_missing_coordinate_rows
-    if archive_missing_coordinate_rows and _env_bool(
+    integrity_metric_map["archive_coordinate_mismatch_rows"] = archive_coordinate_mismatch_rows
+    integrity_metric_map["archive_missing_coordinate_rows"] = archive_missing_coordinate_rows
+    if archive_missing_coordinate_rows and _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES",
         False,
     ):
@@ -5480,37 +5478,37 @@ async def _validate_publish_integrity(
         _invalid_coordinate_count(db_schema, stage_table),
     )
     practice_null_address_key_rows = int(practice_null_address_key_rows_raw or 0)
-    metrics["practice_null_address_key_rows"] = practice_null_address_key_rows
-    metrics["practice_null_address_key_by_source"] = {
-        str(row._mapping["source"]): int(row._mapping["rows"] or 0)
-        for row in practice_null_address_key_by_source_rows
+    integrity_metric_map["practice_null_address_key_rows"] = practice_null_address_key_rows
+    integrity_metric_map["practice_null_address_key_by_source"] = {
+        str(count_row._mapping["source"]): int(count_row._mapping["rows"] or 0)
+        for count_row in practice_null_address_key_by_source_rows
     }
 
-    metrics["archive_identity_mismatch_rows"] = archive_identity_mismatch_rows
+    integrity_metric_map["archive_identity_mismatch_rows"] = archive_identity_mismatch_rows
     if archive_identity_mismatch_rows:
         failures.append(
             f"{archive_identity_mismatch_rows} staged rows do not match address_archive_v2 identity_version"
         )
 
     fallback_archive_identity_mismatch_rows = int(fallback_archive_identity_mismatch_rows_raw or 0)
-    metrics["fallback_archive_identity_mismatch_rows"] = fallback_archive_identity_mismatch_rows
+    integrity_metric_map["fallback_archive_identity_mismatch_rows"] = fallback_archive_identity_mismatch_rows
     if fallback_archive_identity_mismatch_rows:
         failures.append(
             f"{fallback_archive_identity_mismatch_rows} staged rows without address_key use a non-current archive_identity_version"
         )
 
-    metrics["invalid_coordinate_rows"] = invalid_coordinate_rows
+    integrity_metric_map["invalid_coordinate_rows"] = invalid_coordinate_rows
     if invalid_coordinate_rows:
         failures.append(f"{invalid_coordinate_rows} staged rows have invalid latitude/longitude values")
 
-    bridge_orphans: dict[str, int] = {}
-    for model, support_stage_cls in support_stage_classes.items():
+    bridge_orphan_count_map: dict[str, int] = {}
+    for model, support_stage_cls in support_stage_class_map.items():
         if model is EntityAddressEvidence:
             continue
         bridge_table = support_stage_cls.__tablename__
-        if not await _is_table_available(db_schema, bridge_table):
+        if not await _has_table(db_schema, bridge_table):
             failures.append(f"support stage table {bridge_table} is missing")
-            bridge_orphans[bridge_table] = -1
+            bridge_orphan_count_map[bridge_table] = -1
             continue
         orphan_count = int(
             await db.scalar(
@@ -5526,14 +5524,14 @@ async def _validate_publish_integrity(
             )
             or 0
         )
-        bridge_orphans[bridge_table] = orphan_count
+        bridge_orphan_count_map[bridge_table] = orphan_count
         if orphan_count:
             failures.append(f"{orphan_count} rows in {bridge_table} reference missing staged location_key")
-    metrics["bridge_orphans"] = bridge_orphans
+    integrity_metric_map["bridge_orphans"] = bridge_orphan_count_map
 
     if failures:
         raise RuntimeError("EntityAddressUnified publish integrity validation failed: " + "; ".join(failures))
-    return metrics
+    return integrity_metric_map
 
 
 def _insert_raw_from_source_sql(
@@ -5541,7 +5539,7 @@ def _insert_raw_from_source_sql(
     raw_table: str,
     source_select: str,
     *,
-    address_canon_available: bool = True,
+    is_address_canon_available: bool = True,
 ) -> str:
     """Build SQL that normalizes one source query into the raw stage."""
     return f"""
@@ -5745,13 +5743,13 @@ def _materialize_from_raw_sql(
     *,
     checksum_modulo: int | None = None,
     checksum_remainder: int | None = None,
-    address_canon_available: bool = True,
+    is_address_canon_available: bool = True,
     inline_source_evidence: bool = False,
 ) -> str:
     """Build SQL that deduplicates raw evidence into unified locations."""
-    dedupe_key_expr = _dedupe_key_expr(address_canon_available)
+    dedupe_key_expr = _dedupe_key_expr(is_address_canon_available)
     source_record_ids_select = _source_record_ids_select_sql()
-    split_array_aggregates = _env_bool(
+    should_split_array_aggregates = _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES",
         DEFAULT_SPLIT_ARRAY_AGGREGATES,
     )
@@ -5763,7 +5761,7 @@ def _materialize_from_raw_sql(
             else _aggregate_shard_expr(dedupe_key_expr, int(checksum_modulo))
         )
         shard_filter = f" WHERE {shard_expr} = {int(checksum_remainder)}"
-    if split_array_aggregates:
+    if should_split_array_aggregates:
         array_filter_clauses = []
         if shard_filter:
             array_filter_clauses.append(shard_filter.replace(" WHERE ", "", 1))
@@ -6064,11 +6062,11 @@ def _materialize_sql(
     stage_table: str,
     source_selects: Iterable[str],
     *,
-    address_canon_available: bool = True,
+    is_address_canon_available: bool = True,
 ) -> str:
     """Build direct source-to-stage materialization SQL."""
     selects_sql = "\nUNION ALL\n".join(select.strip() for select in source_selects)
-    dedupe_key_expr = _dedupe_key_expr(address_canon_available)
+    dedupe_key_expr = _dedupe_key_expr(is_address_canon_available)
     source_record_ids_select = _source_record_ids_select_sql()
     return f"""
     INSERT INTO {db_schema}.{stage_table} (
@@ -6723,7 +6721,7 @@ def _model_column_names(model: type) -> list[str]:
     return [column.name for column in model.__table__.columns]
 
 
-def _delete_live_support_for_affected_groups_sql(
+def _delete_affected_group_support_sql(
     db_schema: str,
     live_support_table: str,
     old_entity_table: str,
@@ -6798,7 +6796,7 @@ def _partial_support_patch_sql(
         statements.append(
             (
                 f"delete affected {label}",
-                _delete_live_support_for_affected_groups_sql(
+                _delete_affected_group_support_sql(
                     db_schema,
                     model.__main_table__,
                     old_entity_table,
@@ -8035,21 +8033,23 @@ def _support_stage_statements(
 ) -> list[_SupportStageStatement]:
     """Build the ordered support-table population plan."""
     available = available or {}
-    stage_tables = {model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()}
+    stage_table_map = {
+        model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()
+    }
     partial_bridge_reuse = bool(affected_group_table)
     partial_support_patch = partial_bridge_reuse and not copy_unaffected_bridges
-    build_code_bridges = _env_bool(
+    should_build_code_bridges = _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES",
         DEFAULT_BUILD_CODE_BRIDGES,
     )
-    build_facility_candidates = _env_bool(
+    should_build_facility_candidates = _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES",
         DEFAULT_BUILD_FACILITY_CANDIDATES,
     )
     evidence_sql = (
         _evidence_from_raw_sql(
             db_schema,
-            stage_tables[EntityAddressEvidence],
+            stage_table_map[EntityAddressEvidence],
             raw_table,
             source_run_id=source_run_id,
             node_id=node_id,
@@ -8057,7 +8057,7 @@ def _support_stage_statements(
         if raw_table
         else _evidence_from_stage_sql(
             db_schema,
-            stage_tables[EntityAddressEvidence],
+            stage_table_map[EntityAddressEvidence],
             stage_table,
             source_run_id=source_run_id,
             node_id=node_id,
@@ -8067,7 +8067,7 @@ def _support_stage_statements(
     statements = [
         _SupportStageStatement(
             "support tables",
-            _truncate_support_stage_sql(db_schema, stage_tables),
+            _truncate_support_stage_sql(db_schema, stage_table_map),
             parallel=False,
         ),
         _SupportStageStatement("evidence", evidence_sql),
@@ -8100,20 +8100,20 @@ def _support_stage_statements(
             1,
         ),
     ]
-    if build_code_bridges or partial_bridge_reuse:
+    if should_build_code_bridges or partial_bridge_reuse:
         bridge_specs.extend(code_bridge_specs)
     if (
-        build_facility_candidates
+        should_build_facility_candidates
         and not partial_support_patch
-        and FacilityAnchorNPICandidate in stage_tables
+        and FacilityAnchorNPICandidate in stage_table_map
         and available.get("facility_anchor", False)
         and available.get("facility_anchor.medicare_ccn", available.get("facility_anchor", False))
     ):
-        include_nppes_candidates = _env_bool(
+        include_nppes_candidates = _is_env_enabled(
             "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES",
             False,
         )
-        include_other_identifier_candidates = _env_bool(
+        include_other_identifier_candidates = _is_env_enabled(
             "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_OTHER_IDENTIFIER",
             False,
         )
@@ -8122,7 +8122,7 @@ def _support_stage_statements(
             DEFAULT_FACILITY_CANDIDATE_SHARDS,
             minimum=1,
         )
-        facility_candidate_kwargs = dict(
+        facility_candidate_option_map = dict(
             source_run_id=source_run_id,
             include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
             include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
@@ -8157,11 +8157,11 @@ def _support_stage_statements(
                     label,
                     _facility_anchor_npi_candidate_sql(
                         db_schema,
-                        stage_tables[FacilityAnchorNPICandidate],
+                        stage_table_map[FacilityAnchorNPICandidate],
                         stage_table,
                         candidate_shards=facility_candidate_shards,
                         candidate_shard=shard,
-                        **facility_candidate_kwargs,
+                        **facility_candidate_option_map,
                     ),
                 )
             )
@@ -8185,7 +8185,7 @@ def _support_stage_statements(
                     _copy_unaffected_bridge_rows_sql(
                         db_schema,
                         model.__main_table__,
-                        stage_tables[model],
+                        stage_table_map[model],
                         columns,
                         affected_group_table,
                     ),
@@ -8200,19 +8200,21 @@ def _support_stage_statements(
             statement_label = label
             if bridge_shards > 1:
                 statement_label = f"{label} shard {shard + 1}/{bridge_shards}"
-            kwargs = {
+            statement_option_map = {
                 "affected_group_table": affected_group_table if partial_bridge_reuse else None,
             }
             if shard_env:
-                kwargs.update({"bridge_shards": bridge_shards, "bridge_shard": shard})
+                statement_option_map.update(
+                    {"bridge_shards": bridge_shards, "bridge_shard": shard}
+                )
             statements.append(
                 _SupportStageStatement(
                     statement_label,
                     builder(
                         db_schema,
-                        stage_tables[model],
+                        stage_table_map[model],
                         stage_table,
-                        **kwargs,
+                        **statement_option_map,
                     ),
                 )
             )
@@ -8233,8 +8235,8 @@ def _support_stage_sql(
     copy_unaffected_bridges: bool = True,
 ) -> list[str]:
     return [
-        item.statement
-        for item in _support_stage_statements(
+        stage_statement.statement
+        for stage_statement in _support_stage_statements(
             db_schema,
             stage_table,
             stage_classes,
@@ -8284,14 +8286,14 @@ async def _populate_support_stage_tables(
             DEFAULT_SUPPORT_STAGE_CONCURRENCY,
             minimum=1,
         ),
-        max(1, sum(1 for item in statements if item.parallel)),
+        max(1, sum(1 for stage_statement in statements if stage_statement.parallel)),
     )
     phase_context["support_stage_concurrency"] = support_concurrency
     total_steps = len(statements)
     step_progress_map = {"completed_steps": 0}
     progress_lock = asyncio.Lock()
 
-    async def _run_item(index: int, item: _SupportStageStatement) -> None:
+    async def _run_item(index: int, stage_statement: _SupportStageStatement) -> None:
         # Progress is held in step_progress_map to avoid nonlocal state.
         if run_id:
             async with progress_lock:
@@ -8300,25 +8302,25 @@ async def _populate_support_stage_tables(
                     run_id=run_id,
                     importer="entity-address-unified",
                     status="running",
-                    phase=f"entity-address-unified building {item.label}",
+                    phase=f"entity-address-unified building {stage_statement.label}",
                     unit="steps",
                     done=current_done,
                     total=total_steps,
                     pct=95 + (current_done / max(total_steps, 1)) * 4,
                     message=(
-                        f"building support table {index}/{total_steps}: {item.label} "
+                        f"building support table {index}/{total_steps}: {stage_statement.label} "
                         f"(concurrency {support_concurrency})"
                     ),
                 )
         await _run_sql_phase(
-            item.statement,
+            stage_statement.statement,
             context=phase_context,
-            phase=f"entity-address-unified building {item.label}",
+            phase=f"entity-address-unified building {stage_statement.label}",
         )
 
-    async def _finish_item(index: int, item: _SupportStageStatement) -> None:
+    async def _finish_item(index: int, stage_statement: _SupportStageStatement) -> None:
         # Progress is held in step_progress_map to avoid nonlocal state.
-        await _run_item(index, item)
+        await _run_item(index, stage_statement)
         async with progress_lock:
             step_progress_map["completed_steps"] += 1
             if run_id:
@@ -8326,29 +8328,35 @@ async def _populate_support_stage_tables(
                     run_id=run_id,
                     importer="entity-address-unified",
                     status="running",
-                    phase=f"entity-address-unified built {item.label}",
+                    phase=f"entity-address-unified built {stage_statement.label}",
                     unit="steps",
                     done=step_progress_map["completed_steps"],
                     total=total_steps,
                     pct=95 + (step_progress_map["completed_steps"] / max(total_steps, 1)) * 4,
-                    message=f"built support table {index}/{total_steps}: {item.label}",
+                    message=(
+                        f"built support table {index}/{total_steps}: "
+                        f"{stage_statement.label}"
+                    ),
                 )
 
     async def _run_parallel_batch(batch: list[tuple[int, _SupportStageStatement]]) -> None:
         if not batch:
             return
         if support_concurrency <= 1 or len(batch) in {1}:
-            for index, item in batch:
-                await _finish_item(index, item)
+            for index, stage_statement in batch:
+                await _finish_item(index, stage_statement)
             return
         semaphore = asyncio.Semaphore(support_concurrency)
 
-        async def _guarded(index: int, item: _SupportStageStatement) -> None:
+        async def _guarded(index: int, stage_statement: _SupportStageStatement) -> None:
             async with semaphore:
-                await _finish_item(index, item)
+                await _finish_item(index, stage_statement)
 
         results = await asyncio.gather(
-            *(_guarded(index, item) for index, item in batch),
+            *(
+                _guarded(index, stage_statement)
+                for index, stage_statement in batch
+            ),
             return_exceptions=True,
         )
         for result in results:
@@ -8356,21 +8364,21 @@ async def _populate_support_stage_tables(
                 raise result
 
     parallel_batches: list[tuple[int, _SupportStageStatement]] = []
-    for index, item in enumerate(statements, start=1):
-        if item.parallel:
-            parallel_batches.append((index, item))
+    for index, stage_statement in enumerate(statements, start=1):
+        if stage_statement.parallel:
+            parallel_batches.append((index, stage_statement))
             continue
         await _run_parallel_batch(parallel_batches)
         parallel_batches = []
-        await _finish_item(index, item)
+        await _finish_item(index, stage_statement)
     await _run_parallel_batch(parallel_batches)
-    counts: dict[str, int] = {}
+    row_count_map: dict[str, int] = {}
     for model, stage_cls in stage_classes.items():
-        counts[model.__tablename__] = int(
+        row_count_map[model.__tablename__] = int(
             await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};")
             or 0
         )
-    return counts
+    return row_count_map
 
 
 def _support_stage_progress_label(statement: str) -> str:
@@ -9005,7 +9013,7 @@ def _inference_sql(
         """Build an optional NPPES address-type predicate."""
         return f"           AND a.type = '{address_type}'\n" if address_type else ""
 
-    def build_fqhc_parent_nppes_exact_candidates_sql(address_type: str | None) -> str:
+    def build_parent_exact_candidates_sql(address_type: str | None) -> str:
         """Build exact FQHC parent candidates from NPPES names and addresses."""
         if not include_nppes_name_inference:
             return empty_inference_candidates_sql
@@ -9044,7 +9052,7 @@ def _inference_sql(
          GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
         """
 
-    def build_fqhc_parent_nppes_name_state_candidates_sql(address_type: str | None) -> str:
+    def build_parent_name_state_candidates_sql(address_type: str | None) -> str:
         """Build FQHC parent candidates from NPPES names and states."""
         if not include_nppes_name_inference:
             return empty_inference_candidates_sql
@@ -9080,7 +9088,7 @@ def _inference_sql(
          GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
         """
 
-    def build_fqhc_parent_nppes_address_candidates_sql(address_type: str | None) -> str:
+    def build_parent_address_candidates_sql(address_type: str | None) -> str:
         """Build FQHC parent candidates from NPPES addresses."""
         if not include_nppes_name_inference:
             return empty_inference_candidates_sql
@@ -9113,12 +9121,12 @@ def _inference_sql(
          GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
         """
 
-    fqhc_parent_nppes_exact_primary_candidates_sql = build_fqhc_parent_nppes_exact_candidates_sql("primary")
-    fqhc_parent_nppes_exact_all_candidates_sql = build_fqhc_parent_nppes_exact_candidates_sql(None)
-    fqhc_parent_nppes_name_state_primary_candidates_sql = build_fqhc_parent_nppes_name_state_candidates_sql("primary")
-    fqhc_parent_nppes_name_state_all_candidates_sql = build_fqhc_parent_nppes_name_state_candidates_sql(None)
-    fqhc_parent_nppes_address_primary_candidates_sql = build_fqhc_parent_nppes_address_candidates_sql("primary")
-    fqhc_parent_nppes_address_all_candidates_sql = build_fqhc_parent_nppes_address_candidates_sql(None)
+    fqhc_parent_nppes_exact_primary_candidates_sql = build_parent_exact_candidates_sql("primary")
+    fqhc_parent_nppes_exact_all_candidates_sql = build_parent_exact_candidates_sql(None)
+    fqhc_parent_nppes_name_state_primary_candidates_sql = build_parent_name_state_candidates_sql("primary")
+    fqhc_parent_nppes_name_state_all_candidates_sql = build_parent_name_state_candidates_sql(None)
+    fqhc_parent_nppes_address_primary_candidates_sql = build_parent_address_candidates_sql("primary")
+    fqhc_parent_nppes_address_all_candidates_sql = build_parent_address_candidates_sql(None)
 
     npi_fqhc_exact_address_candidates_sql = (
         f"""
@@ -10279,41 +10287,41 @@ async def process_data(ctx, task=None):
     if "test_mode" in task:
         context["test_mode"] = bool(task.get("test_mode"))
     test_mode = bool(context.get("test_mode", False))
-    context["publish_requested"] = _publish_requested(task, test_mode=test_mode)
+    context["publish_requested"] = _is_publish_requested(task, test_mode=test_mode)
     refresh_mode = _entity_address_refresh_mode(task)
-    partial_provider_directory_refresh = (
+    is_partial_provider_directory_refresh = (
         refresh_mode == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
     )
-    partial_source_refresh = partial_provider_directory_refresh
+    partial_source_refresh = is_partial_provider_directory_refresh
     provider_directory_partial_scope = (
         _entity_address_provider_directory_partial_scope(task)
-        if partial_provider_directory_refresh
+        if is_partial_provider_directory_refresh
         else None
     )
     provider_directory_source_ids = (
         _entity_address_provider_directory_source_ids(task)
-        if partial_provider_directory_refresh
+        if is_partial_provider_directory_refresh
         else []
     )
     provider_directory_run_id = (
         _entity_address_provider_directory_run_id(task)
-        if partial_provider_directory_refresh
+        if is_partial_provider_directory_refresh
         else None
     )
     provider_directory_source_batch_size = (
-        _entity_address_provider_directory_source_batch_size(task)
-        if partial_provider_directory_refresh
+        _provider_directory_source_batch_size(task)
+        if is_partial_provider_directory_refresh
         else 0
     )
     provider_directory_scope_sources: list[str] = []
     context["refresh_mode"] = refresh_mode
-    context["partial_provider_directory_refresh"] = partial_provider_directory_refresh
+    context["partial_provider_directory_refresh"] = is_partial_provider_directory_refresh
     context["partial_provider_directory_scope"] = provider_directory_partial_scope
     should_aggregate_source_record_ids = _should_aggregate_source_record_ids()
     context["aggregate_source_record_ids"] = should_aggregate_source_record_ids
-    serving_only_refresh = partial_provider_directory_refresh or (
+    serving_only_refresh = is_partial_provider_directory_refresh or (
         not partial_source_refresh
-        and _task_bool_or_env(
+        and _is_task_or_env_enabled(
             task,
             "serving_only_refresh",
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY",
@@ -10329,8 +10337,8 @@ async def process_data(ctx, task=None):
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(EntityAddressUnified, import_date)
     stage_table = stage_cls.__tablename__
-    reuse_stage = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE", False)
-    if partial_source_refresh and reuse_stage:
+    should_reuse_stage = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE", False)
+    if partial_source_refresh and should_reuse_stage:
         raise RuntimeError(
             f"entity-address-unified {refresh_mode} refresh cannot be combined with "
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE."
@@ -10338,16 +10346,16 @@ async def process_data(ctx, task=None):
 
     if not ctx["context"].get("stage_prepared"):
         await _ensure_schema_exists(db_schema)
-        unlogged_stage = (
-            not reuse_stage
-            and _env_bool(
+        should_use_unlogged_stage = (
+            not should_reuse_stage
+            and _is_env_enabled(
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE",
                 DEFAULT_UNLOGGED_STAGE,
             )
         )
-        context["unlogged_stage"] = unlogged_stage
-        if reuse_stage:
-            if not await _is_table_available(db_schema, stage_table):
+        context["unlogged_stage"] = should_use_unlogged_stage
+        if should_reuse_stage:
+            if not await _has_table(db_schema, stage_table):
                 raise RuntimeError(
                     f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE requested, "
                     f"but {db_schema}.{stage_table} does not exist"
@@ -10356,7 +10364,7 @@ async def process_data(ctx, task=None):
         else:
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_table};")
             await db.create_table(stage_cls.__table__, checkfirst=True)
-            if unlogged_stage:
+            if should_use_unlogged_stage:
                 await db.status(_set_unlogged_table_sql(db_schema, stage_table))
             await db.status(_disable_autovacuum_sql(db_schema, stage_table))
         ctx["context"]["stage_prepared"] = True
@@ -10397,7 +10405,7 @@ async def process_data(ctx, task=None):
         "provider_directory_dataset_resource",
         "address_archive_v2",
     ]
-    available = {table: await _is_table_available(db_schema, table) for table in required_checks}
+    available_relation_map = {table: await _has_table(db_schema, table) for table in required_checks}
     for table_name in (
         "npi_address",
         "doctor_clinician_address",
@@ -10406,18 +10414,18 @@ async def process_data(ctx, task=None):
         "mrf_address",
         "provider_directory_location",
     ):
-        available[f"{table_name}.address_key"] = (
-            await _table_column_exists(db_schema, table_name, "address_key")
-            if available.get(table_name)
+        available_relation_map[f"{table_name}.address_key"] = (
+            await _has_table_column(db_schema, table_name, "address_key")
+            if available_relation_map.get(table_name)
             else False
         )
-    available["facility_anchor.medicare_ccn"] = (
-        await _table_column_exists(db_schema, "facility_anchor", "medicare_ccn")
-        if available.get("facility_anchor")
+    available_relation_map["facility_anchor.medicare_ccn"] = (
+        await _has_table_column(db_schema, "facility_anchor", "medicare_ccn")
+        if available_relation_map.get("facility_anchor")
         else False
     )
     approved_candidate_promotions = 0
-    if available.get("facility_anchor_npi_candidate") and available.get("facility_anchor_npi_override"):
+    if available_relation_map.get("facility_anchor_npi_candidate") and available_relation_map.get("facility_anchor_npi_override"):
         approved_candidate_promotions = await _promote_approved_facility_anchor_npi_candidates(db_schema)
         context["facility_anchor_npi_candidate_promotions"] = approved_candidate_promotions
         if run_id and approved_candidate_promotions:
@@ -10449,24 +10457,24 @@ async def process_data(ctx, task=None):
             )
         )
     context["limit_per_source"] = test_limit_per_source
-    missing_fence_relations = _missing_provider_directory_fence_relations(available)
+    missing_fence_relations = _missing_provider_directory_fence_relations(available_relation_map)
     has_compatibility_data = False
     if missing_fence_relations:
-        if partial_provider_directory_refresh:
+        if is_partial_provider_directory_refresh:
             _validate_provider_directory_fence(
-                available,
+                available_relation_map,
                 has_compatibility_data=False,
                 partial_refresh=True,
             )
         else:
             has_compatibility_data = await _has_provider_directory_compatibility_data(
                 db_schema,
-                available,
+                available_relation_map,
             )
-    if partial_provider_directory_refresh:
+    if is_partial_provider_directory_refresh:
         await _preflight_provider_directory_partial_scope_index(db_schema)
     if (
-        partial_provider_directory_refresh
+        is_partial_provider_directory_refresh
         and provider_directory_partial_scope == "latest-run"
         and not provider_directory_source_ids
         and not provider_directory_run_id
@@ -10478,7 +10486,7 @@ async def process_data(ctx, task=None):
         ) = (
             await _latest_provider_directory_partial_scope(db_schema)
         )
-    if partial_provider_directory_refresh and provider_directory_partial_scope == "latest-run":
+    if is_partial_provider_directory_refresh and provider_directory_partial_scope == "latest-run":
         if not provider_directory_source_ids and not provider_directory_run_id:
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial refresh could not "
@@ -10495,41 +10503,41 @@ async def process_data(ctx, task=None):
             provider_directory_source_ids,
             provider_directory_source_batch_size,
         )
-        if partial_provider_directory_refresh
+        if is_partial_provider_directory_refresh
         else [provider_directory_source_ids]
     )
     context["partial_provider_directory_source_batch_size"] = provider_directory_source_batch_size
     context["partial_provider_directory_source_batches"] = len(provider_directory_source_batches)
-    address_canon_available = await _address_canon_available(db_schema)
+    is_address_canon_available = await _is_address_canon_available(db_schema)
     base_source_selects = _source_selects(
         db_schema,
-        available,
+        available_relation_map,
         test_limit_per_source=test_limit_per_source,
-        address_canon_available=address_canon_available,
+        is_address_canon_available=is_address_canon_available,
     )
     source_selects = _current_provider_directory_source_selects(
         db_schema,
-        available,
+        available_relation_map,
         base_source_selects,
-        source_ids=(provider_directory_source_ids if partial_provider_directory_refresh else None),
-        run_id=(provider_directory_run_id if partial_provider_directory_refresh else None),
+        source_ids=(provider_directory_source_ids if is_partial_provider_directory_refresh else None),
+        run_id=(provider_directory_run_id if is_partial_provider_directory_refresh else None),
         test_limit_per_source=test_limit_per_source,
         has_compatibility_data=has_compatibility_data,
-        partial_refresh=partial_provider_directory_refresh,
+        partial_refresh=is_partial_provider_directory_refresh,
     )
     affected_group_table: str | None = None
-    if partial_provider_directory_refresh:
-        if not await _is_table_available(db_schema, EntityAddressUnified.__main_table__):
+    if is_partial_provider_directory_refresh:
+        if not await _has_table(db_schema, EntityAddressUnified.__main_table__):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial refresh requested, but the live "
                 "entity_address_unified table does not exist; run refresh_mode=full first."
             )
-        affected_group_table = _provider_directory_partial_affected_group_table_name(stage_table)
+        affected_group_table = _partial_affected_group_table(stage_table)
         context["partial_provider_directory_affected_group_table"] = affected_group_table
         context["partial_affected_group_table"] = affected_group_table
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
         await _run_sql_phase(
-            _prepare_provider_directory_partial_affected_groups_sql(
+            _prepare_partial_affected_groups_sql(
                 db_schema,
                 affected_group_table,
                 source_selects,
@@ -10546,7 +10554,7 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
         await _run_sql_phase(
-            _index_provider_directory_partial_affected_groups_sql(db_schema, affected_group_table),
+            _index_partial_affected_groups_sql(db_schema, affected_group_table),
             context=context,
             run_id=run_id,
             phase="entity-address-unified indexing affected Provider Directory groups",
@@ -10575,7 +10583,7 @@ async def process_data(ctx, task=None):
         context["partial_provider_directory_affected_groups"] = affected_group_rows
         source_selects = _provider_directory_partial_replacement_source_selects(
             db_schema,
-            available,
+            available_relation_map,
             base_source_selects,
             affected_group_table=affected_group_table,
             test_limit_per_source=test_limit_per_source,
@@ -10602,27 +10610,27 @@ async def process_data(ctx, task=None):
             source_selects,
             npi_address_ranges=(
                 await _npi_table_ranges(db_schema, "npi_address", source_table_shards)
-                if available.get("npi_address", False)
+                if available_relation_map.get("npi_address", False)
                 else []
             ),
             mrf_address_ranges=(
                 await _npi_table_ranges(db_schema, "mrf_address", source_table_shards)
-                if available.get("mrf_address", False)
+                if available_relation_map.get("mrf_address", False)
                 else []
             ),
             doctor_clinician_address_ranges=(
                 await _npi_table_ranges(db_schema, "doctor_clinician_address", source_table_shards)
-                if available.get("doctor_clinician_address", False)
+                if available_relation_map.get("doctor_clinician_address", False)
                 else []
             ),
             provider_enrollment_ffs_ranges=(
                 await _npi_table_ranges(db_schema, "provider_enrollment_ffs", source_table_shards)
-                if available.get("provider_enrollment_ffs", False)
+                if available_relation_map.get("provider_enrollment_ffs", False)
                 else []
             ),
         )
     context["source_select_count"] = len(source_selects)
-    if not address_canon_available:
+    if not is_address_canon_available:
         message = (
             "canonical address SQL functions are not available; "
             "entity_address_unified will publish with NULL address_key values"
@@ -10648,21 +10656,21 @@ async def process_data(ctx, task=None):
         raise RuntimeError("No source tables are available for entity_address_unified materialization.")
 
     if serving_only_refresh:
-        support_stage_classes = {}
+        support_stage_class_map = {}
         ctx["context"]["support_stage_prepared"] = False
         ctx["context"]["support_stage_indexes_prepared"] = True
     elif not ctx["context"].get("support_stage_prepared"):
-        support_stage_classes = await _prepare_support_stage_tables(db_schema, import_date)
+        support_stage_class_map = await _prepare_support_stage_tables(db_schema, import_date)
         ctx["context"]["support_stage_prepared"] = True
         ctx["context"]["support_stage_indexes_prepared"] = False
     else:
-        support_stage_classes = _support_stage_classes(import_date)
+        support_stage_class_map = _support_stage_classes(import_date)
 
-    build_network_bridge = _env_bool(
+    should_build_network_bridge = _is_env_enabled(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE",
         DEFAULT_BUILD_NETWORK_BRIDGE,
     )
-    context["build_network_bridge"] = build_network_bridge
+    context["build_network_bridge"] = should_build_network_bridge
     context.setdefault("partial_support_patch_publish", False)
     context.setdefault("partial_main_patch_publish", False)
 
@@ -10678,15 +10686,15 @@ async def process_data(ctx, task=None):
             message=f"{len(source_selects)} sources discovered",
         )
 
-    chunked_load = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD", True)
-    if partial_source_refresh and not chunked_load:
+    should_use_chunked_load = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD", True)
+    if partial_source_refresh and not should_use_chunked_load:
         raise RuntimeError(
             f"entity-address-unified {refresh_mode} refresh requires "
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD=true."
         )
     raw_table: str | None = None
-    inline_source_evidence = False
-    if chunked_load and not reuse_stage:
+    include_inline_source_evidence = False
+    if should_use_chunked_load and not should_reuse_stage:
         source_concurrency = _env_int(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SOURCE_CONCURRENCY",
             DEFAULT_SOURCE_CONCURRENCY,
@@ -10709,25 +10717,25 @@ async def process_data(ctx, task=None):
             aggregate_shards,
         )
         context["aggregate_concurrency"] = aggregate_concurrency
-        inline_source_evidence = (
-            _env_bool(
+        include_inline_source_evidence = (
+            _is_env_enabled(
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_INLINE_SOURCE_EVIDENCE",
                 DEFAULT_INLINE_SOURCE_EVIDENCE,
             )
         )
-        context["inline_source_evidence"] = inline_source_evidence
-        if _require_inline_source_evidence() and not inline_source_evidence:
+        context["inline_source_evidence"] = include_inline_source_evidence
+        if _should_require_inline_evidence() and not include_inline_source_evidence:
             raise RuntimeError(
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE requested, "
                 "but inline source evidence is inactive "
-                f"(partial_source_refresh={partial_source_refresh}, reuse_stage={reuse_stage}, "
-                f"chunked_load={chunked_load})."
+                f"(partial_source_refresh={partial_source_refresh}, reuse_stage={should_reuse_stage}, "
+                f"chunked_load={should_use_chunked_load})."
             )
-        split_array_aggregates = _env_bool(
+        should_split_array_aggregates = _is_env_enabled(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES",
             DEFAULT_SPLIT_ARRAY_AGGREGATES,
         )
-        context["split_array_aggregates"] = split_array_aggregates
+        context["split_array_aggregates"] = should_split_array_aggregates
         enrich_shards = _env_int(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_SHARDS",
             DEFAULT_ENRICH_SHARDS,
@@ -10744,11 +10752,11 @@ async def process_data(ctx, task=None):
         )
         context["enrich_concurrency"] = enrich_concurrency
         raw_table = _raw_stage_table_name(stage_table)
-        use_unlogged_raw = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_RAW_STAGE", True)
-        reuse_raw_stage = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE", False)
+        use_unlogged_raw = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_RAW_STAGE", True)
+        should_reuse_raw_stage = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE", False)
 
-        if reuse_raw_stage:
-            if not await _is_table_available(db_schema, raw_table):
+        if should_reuse_raw_stage:
+            if not await _has_table(db_schema, raw_table):
                 raise RuntimeError(
                     f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE requested, "
                     f"but {db_schema}.{raw_table} does not exist"
@@ -10789,7 +10797,7 @@ async def process_data(ctx, task=None):
                             db_schema,
                             raw_table,
                             select_sql,
-                            address_canon_available=address_canon_available,
+                            is_address_canon_available=is_address_canon_available,
                         ),
                         context=context,
                         run_id=run_id,
@@ -10869,13 +10877,13 @@ async def process_data(ctx, task=None):
                             _enrich_raw_stage_sql(
                                 db_schema,
                                 raw_table,
-                                archive_available=available.get("address_archive_v2", False),
-                                address_canon_available=address_canon_available,
+                                archive_available=available_relation_map.get("address_archive_v2", False),
+                                is_address_canon_available=is_address_canon_available,
                                 checksum_min=checksum_min,
                                 checksum_max=checksum_max,
                                 evidence_shards=(
                                     aggregate_shards
-                                    if inline_source_evidence and aggregate_shards > 1
+                                    if include_inline_source_evidence and aggregate_shards > 1
                                     else None
                                 ),
                             ),
@@ -10908,11 +10916,11 @@ async def process_data(ctx, task=None):
                     _enrich_raw_stage_sql(
                         db_schema,
                         raw_table,
-                        archive_available=available.get("address_archive_v2", False),
-                        address_canon_available=address_canon_available,
+                        archive_available=available_relation_map.get("address_archive_v2", False),
+                        is_address_canon_available=is_address_canon_available,
                         evidence_shards=(
                             aggregate_shards
-                            if inline_source_evidence and aggregate_shards > 1
+                            if include_inline_source_evidence and aggregate_shards > 1
                             else None
                         ),
                     ),
@@ -10951,8 +10959,8 @@ async def process_data(ctx, task=None):
                 db_schema,
                 raw_table,
                 aggregate_shards=aggregate_shards,
-                address_canon_available=address_canon_available,
-                inline_source_evidence=inline_source_evidence,
+                is_address_canon_available=is_address_canon_available,
+                inline_source_evidence=include_inline_source_evidence,
             ),
             context=context,
             run_id=run_id,
@@ -11017,8 +11025,8 @@ async def process_data(ctx, task=None):
                     raw_table,
                     checksum_modulo=aggregate_shards,
                     checksum_remainder=remainder,
-                    address_canon_available=address_canon_available,
-                    inline_source_evidence=inline_source_evidence,
+                    is_address_canon_available=is_address_canon_available,
+                    inline_source_evidence=include_inline_source_evidence,
                 ),
                 context=context,
                 run_id=run_id,
@@ -11057,8 +11065,8 @@ async def process_data(ctx, task=None):
                     db_schema,
                     stage_table,
                     raw_table,
-                    address_canon_available=address_canon_available,
-                    inline_source_evidence=inline_source_evidence,
+                    is_address_canon_available=is_address_canon_available,
+                    inline_source_evidence=include_inline_source_evidence,
                 ),
                 context=context,
                 run_id=run_id,
@@ -11071,10 +11079,10 @@ async def process_data(ctx, task=None):
                 emit_done=True,
             )
 
-    elif chunked_load:
+    elif should_use_chunked_load:
         raw_table = _raw_stage_table_name(stage_table)
         context["stage_reused"] = True
-        if not await _is_table_available(db_schema, raw_table):
+        if not await _has_table(db_schema, raw_table):
             raw_table = None
         if run_id:
             stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
@@ -11107,7 +11115,7 @@ async def process_data(ctx, task=None):
                 db_schema,
                 stage_table,
                 source_selects,
-                address_canon_available=address_canon_available,
+                is_address_canon_available=is_address_canon_available,
             ),
             context=context,
             run_id=run_id,
@@ -11141,13 +11149,13 @@ async def process_data(ctx, task=None):
 
     if (
         should_enable_inference
-        and available.get("npi", False)
-        and available.get("npi_address", False)
-        and available.get("npi_taxonomy", False)
-        and available.get("nucc_taxonomy", False)
+        and available_relation_map.get("npi", False)
+        and available_relation_map.get("npi_address", False)
+        and available_relation_map.get("npi_taxonomy", False)
+        and available_relation_map.get("nucc_taxonomy", False)
     ):
         include_facility_override = False
-        if available.get("facility_anchor_npi_override", False):
+        if available_relation_map.get("facility_anchor_npi_override", False):
             include_facility_override = bool(
                 await db.scalar(
                     f"""
@@ -11163,8 +11171,8 @@ async def process_data(ctx, task=None):
             )
         context["facility_anchor_npi_override_inference_enabled"] = include_facility_override
         include_npi_other_identifier = (
-            available.get("npi_other_identifier", False)
-            and _env_bool(
+            available_relation_map.get("npi_other_identifier", False)
+            and _is_env_enabled(
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPI_OTHER_IDENTIFIER_INFERENCE",
                 False,
             )
@@ -11177,19 +11185,19 @@ async def process_data(ctx, task=None):
             _inference_sql(
                 db_schema,
                 stage_table,
-                include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
-                include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
+                include_hospital_enrollment=available_relation_map.get("provider_enrollment_hospital", False),
+                include_fqhc_enrollment=available_relation_map.get("provider_enrollment_fqhc", False),
                 include_facility_override=include_facility_override,
                 include_npi_other_identifier=include_npi_other_identifier,
-                include_name_fallback=_env_bool(
+                include_name_fallback=_is_env_enabled(
                     "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE",
                     False,
                 ),
-                include_nppes_name_inference=_env_bool(
+                include_nppes_name_inference=_is_env_enabled(
                     "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_NAME_INFERENCE",
                     False,
                 ),
-                include_nppes_broad_inference=_env_bool(
+                include_nppes_broad_inference=_is_env_enabled(
                     "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_BROAD_INFERENCE",
                     False,
                 ),
@@ -11205,10 +11213,10 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
 
-    if inline_source_evidence:
+    if include_inline_source_evidence:
         context["source_evidence_inlined"] = True
     else:
-        if _require_inline_source_evidence():
+        if _should_require_inline_evidence():
             raise RuntimeError(
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE requested, "
                 "but the import reached the separate source-evidence work-table path."
@@ -11226,7 +11234,7 @@ async def process_data(ctx, task=None):
             ),
             evidence_shards,
         )
-        use_unlogged_evidence = _env_bool(
+        use_unlogged_evidence = _is_env_enabled(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_EVIDENCE_STAGE",
             True,
         )
@@ -11266,7 +11274,7 @@ async def process_data(ctx, task=None):
                 evidence_table,
                 evidence_shards=evidence_shards,
                 affected_group_table=affected_group_table,
-                affected_scope="npi" if partial_provider_directory_refresh else "group",
+                affected_scope="npi" if is_partial_provider_directory_refresh else "group",
             ),
             context=context,
             run_id=run_id,
@@ -11441,29 +11449,30 @@ async def process_data(ctx, task=None):
         context["support_counts"] = support_counts_by_kind
     elif context.get("support_stage_populated") and isinstance(cached_support_counts, dict):
         support_counts_by_kind = {
-            str(key): int(value) for key, value in cached_support_counts.items()
+            str(key): int(cached_count)
+            for key, cached_count in cached_support_counts.items()
         }
     else:
         support_raw_table = None if partial_source_refresh else raw_table
         support_affected_group_table = None
-        copy_unaffected_support_bridges = True
+        should_copy_unaffected_support_bridges = True
         support_counts_by_kind = await _populate_support_stage_tables(
             db_schema,
             stage_table,
-            support_stage_classes,
+            support_stage_class_map,
             source_run_id=import_date,
             node_id=node_id,
             raw_table=support_raw_table,
-            build_network_bridge=build_network_bridge,
-            available=available,
+            build_network_bridge=should_build_network_bridge,
+            available=available_relation_map,
             run_id=run_id,
             context=context,
             affected_group_table=support_affected_group_table,
-            copy_unaffected_bridges=copy_unaffected_support_bridges,
+            copy_unaffected_bridges=should_copy_unaffected_support_bridges,
         )
         context["support_stage_populated"] = True
         context["support_counts"] = support_counts_by_kind
-    if raw_table and _keep_raw_stage():
+    if raw_table and _should_keep_raw_stage():
         context["raw_stage_kept"] = True
         context["raw_stage_table"] = raw_table
     elif raw_table:
@@ -11477,7 +11486,7 @@ async def process_data(ctx, task=None):
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
 
     if (
-        _env_bool(
+        _is_env_enabled(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS",
             DEFAULT_COMPACT_SOURCE_RECORD_IDS,
         )
@@ -11516,13 +11525,13 @@ async def process_data(ctx, task=None):
                 message=f"compacted {compacted_rows:,} hot rows",
             )
 
-    if partial_provider_directory_refresh and context.get("partial_provider_directory_replacement_publish"):
-        if not affected_group_table or not await _is_table_available(db_schema, affected_group_table):
+    if is_partial_provider_directory_refresh and context.get("partial_provider_directory_replacement_publish"):
+        if not affected_group_table or not await _has_table(db_schema, affected_group_table):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
                 "the affected group table while composing the replacement stage."
             )
-        if not await _is_table_available(db_schema, EntityAddressUnified.__main_table__):
+        if not await _has_table(db_schema, EntityAddressUnified.__main_table__):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
                 "the live entity_address_unified table to exist."
@@ -11559,7 +11568,7 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
         await db.status(_disable_autovacuum_sql(db_schema, replacement_stage_table))
-        affected_live_location_table = _provider_directory_affected_live_location_table_name(stage_table)
+        affected_live_location_table = _affected_live_location_table(stage_table)
         context["partial_provider_directory_affected_live_location_table"] = affected_live_location_table
         await _run_sql_phase(
             f"DROP TABLE IF EXISTS {db_schema}.{affected_live_location_table};",
@@ -11574,7 +11583,7 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
         await _run_sql_phase(
-            _prepare_provider_directory_affected_live_locations_sql(
+            _prepare_affected_live_locations_sql(
                 db_schema,
                 live_table=EntityAddressUnified.__main_table__,
                 affected_group_table=affected_group_table,
@@ -11593,7 +11602,7 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
         await _run_sql_phase(
-            _index_provider_directory_affected_live_locations_sql(
+            _index_affected_live_locations_sql(
                 db_schema,
                 affected_live_location_table,
             ),
@@ -11627,7 +11636,7 @@ async def process_data(ctx, task=None):
         context["partial_provider_directory_affected_live_locations"] = affected_live_locations
         context["partial_provider_directory_coordinate_scope_table"] = affected_live_location_table
         copied_rows = await _run_sql_phase(
-            _copy_unaffected_live_entity_rows_by_location_sql(
+            _copy_unaffected_rows_by_location_sql(
                 db_schema,
                 live_table=EntityAddressUnified.__main_table__,
                 target_stage_table=replacement_stage_table,
@@ -11729,17 +11738,17 @@ async def process_data(ctx, task=None):
         and not serving_only_refresh
     ):
         await _create_support_stage_indexes(
-            support_stage_classes,
+            support_stage_class_map,
             db_schema,
             context=context,
             run_id=run_id,
         )
         context["support_stage_indexes_prepared"] = True
 
-    final_summary_counts = _final_summary_counts()
-    context["final_summary_counts"] = final_summary_counts
+    should_compute_final_summary_counts = _should_compute_final_summary_counts()
+    context["final_summary_counts"] = should_compute_final_summary_counts
     summary_counts = None
-    if not final_summary_counts:
+    if not should_compute_final_summary_counts:
         summary_counts = _fallback_summary_counts(context)
     if summary_counts is None:
         summary_counts = await _stage_summary_counts(db_schema, stage_table)
@@ -11811,7 +11820,7 @@ async def shutdown(ctx):
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(EntityAddressUnified, import_date)
     serving_only_refresh = bool(context.get("serving_only_refresh"))
-    support_stage_classes = {} if serving_only_refresh else _support_stage_classes(import_date)
+    support_stage_class_map = {} if serving_only_refresh else _support_stage_classes(import_date)
     affected_group_table = str(
         context.get("partial_affected_group_table")
         or context.get("partial_provider_directory_affected_group_table")
@@ -11846,7 +11855,7 @@ async def shutdown(ctx):
     if is_partial_provider_directory_refresh and context.get(
         "partial_provider_directory_replacement_publish"
     ):
-        if not coordinate_scope_table or not await _is_table_available(db_schema, coordinate_scope_table):
+        if not coordinate_scope_table or not await _has_table(db_schema, coordinate_scope_table):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
                 "the affected location scope through staged coordinate backfill."
@@ -11861,7 +11870,7 @@ async def shutdown(ctx):
         os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", str(DEFAULT_MIN_ROWS))
     )
     previous_rows = 0
-    live_table_exists = await _is_table_available(db_schema, EntityAddressUnified.__main_table__)
+    live_table_exists = await _has_table(db_schema, EntityAddressUnified.__main_table__)
     if live_table_exists:
         previous_rows = int(
             await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{EntityAddressUnified.__main_table__};")
@@ -11876,7 +11885,7 @@ async def shutdown(ctx):
         await _drop_stage_artifacts(
             db_schema,
             stage_cls,
-            support_stage_classes,
+            support_stage_class_map,
             extra_tables=[affected_group_table, affected_live_location_table],
         )
         await mark_control_run(
@@ -11939,9 +11948,9 @@ async def shutdown(ctx):
         serving_only_refresh
         and not partial_support_patch
         and not is_partial_provider_directory_refresh
-        and _defer_publish_validation()
+        and _should_defer_publish_validation()
     )
-    if await _is_table_available(db_schema, "address_archive_v2"):
+    if await _has_table(db_schema, "address_archive_v2"):
         archive_coordinate_same_key_backfill_rows = await _run_sql_phase(
             _backfill_archive_coordinates_sql(
                 db_schema,
@@ -12050,13 +12059,13 @@ async def shutdown(ctx):
         publish_validation = await _validate_publish_integrity(
             db_schema,
             stage_cls.__tablename__,
-            support_stage_classes,
+            support_stage_class_map,
             test_mode=bool(context.get("test_mode")),
         )
         context["publish_validation"] = publish_validation
 
     if partial_support_patch and (
-        not affected_group_table or not await _is_table_available(db_schema, affected_group_table)
+        not affected_group_table or not await _has_table(db_schema, affected_group_table)
     ):
         raise RuntimeError(
             "entity-address-unified support patch publish requires "
@@ -12065,7 +12074,7 @@ async def shutdown(ctx):
     await _publish_staged_entity_address_tables(
         db_schema,
         stage_cls,
-        support_stage_classes,
+        support_stage_class_map,
         partial_support_patch=partial_support_patch,
         affected_group_table=affected_group_table,
         context=context,
@@ -12075,7 +12084,7 @@ async def shutdown(ctx):
         await _drop_stage_artifacts(
             db_schema,
             stage_cls,
-            support_stage_classes,
+            support_stage_class_map,
             extra_tables=[affected_group_table, affected_live_location_table],
         )
 
@@ -12089,9 +12098,9 @@ async def shutdown(ctx):
     post_publish_profile = (
         "none" if is_partial_provider_directory_refresh else _post_publish_index_profile()
     )
-    post_publish_concurrently = _post_publish_index_concurrently()
+    should_build_post_publish_concurrently = _should_build_post_publish_concurrently()
     context["post_publish_index_profile"] = post_publish_profile
-    context["post_publish_index_concurrently"] = post_publish_concurrently
+    context["post_publish_index_concurrently"] = should_build_post_publish_concurrently
     context["post_publish_index_completed"] = int(context.get("post_publish_index_completed") or 0)
     context["post_publish_index_total"] = int(context.get("post_publish_index_total") or 0)
     context["post_publish_skipped_indexes"] = list(context.get("post_publish_skipped_indexes") or [])
@@ -12099,7 +12108,7 @@ async def shutdown(ctx):
         planned_statements, skipped_indexes = _post_publish_index_plan(
             db_schema,
             post_publish_profile,
-            build_concurrently=post_publish_concurrently,
+            build_concurrently=should_build_post_publish_concurrently,
         )
         context["post_publish_index_total"] = len(planned_statements)
         context["post_publish_index_completed"] = 0
@@ -12314,22 +12323,28 @@ async def main(
         job_serializer=serialize_job,
         job_deserializer=deserialize_job,
     )
-    payload = {"test_mode": bool(test_mode)}
+    task_payload_map = {"test_mode": bool(test_mode)}
     if limit_per_source is not None:
-        payload["limit_per_source"] = max(int(limit_per_source), 0)
+        task_payload_map["limit_per_source"] = max(int(limit_per_source), 0)
     if publish is not None:
-        payload["publish"] = bool(publish)
+        task_payload_map["publish"] = bool(publish)
     if refresh_mode:
-        payload["refresh_mode"] = refresh_mode
+        task_payload_map["refresh_mode"] = refresh_mode
     if serving_only_refresh is not None:
-        payload["serving_only_refresh"] = bool(serving_only_refresh)
+        task_payload_map["serving_only_refresh"] = bool(serving_only_refresh)
     if provider_directory_run_id:
-        payload["provider_directory_run_id"] = provider_directory_run_id
+        task_payload_map["provider_directory_run_id"] = provider_directory_run_id
     source_ids = _coerce_str_list(provider_directory_source_ids)
     if source_ids:
-        payload["provider_directory_source_ids"] = source_ids
+        task_payload_map["provider_directory_source_ids"] = source_ids
     if provider_directory_partial_scope:
-        payload["provider_directory_partial_scope"] = provider_directory_partial_scope
+        task_payload_map["provider_directory_partial_scope"] = provider_directory_partial_scope
     if provider_directory_source_batch_size is not None:
-        payload["provider_directory_source_batch_size"] = max(int(provider_directory_source_batch_size), 0)
-    await redis.enqueue_job("process_data", payload, _queue_name=ENTITY_ADDRESS_UNIFIED_QUEUE_NAME)
+        task_payload_map["provider_directory_source_batch_size"] = max(
+            int(provider_directory_source_batch_size), 0
+        )
+    await redis.enqueue_job(
+        "process_data",
+        task_payload_map,
+        _queue_name=ENTITY_ADDRESS_UNIFIED_QUEUE_NAME,
+    )

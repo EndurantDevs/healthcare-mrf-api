@@ -421,12 +421,12 @@ def test_provider_directory_source_id_batches_are_bounded():
 def test_provider_directory_source_batch_size_accepts_task_and_env(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE", raising=False)
     assert (
-        entity_address_unified._entity_address_provider_directory_source_batch_size({})  # pylint: disable=protected-access
+        entity_address_unified._provider_directory_source_batch_size({})
         == 100
     )
 
     assert (
-        entity_address_unified._entity_address_provider_directory_source_batch_size(
+        entity_address_unified._provider_directory_source_batch_size(
             {"provider_directory_source_batch_size": 4}
         )
         == 4
@@ -434,7 +434,7 @@ def test_provider_directory_source_batch_size_accepts_task_and_env(monkeypatch):
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE", "5")
     assert (
-        entity_address_unified._entity_address_provider_directory_source_batch_size({})
+        entity_address_unified._provider_directory_source_batch_size({})
         == 5
     )
 
@@ -455,7 +455,7 @@ def test_serving_only_refresh_task_bool_overrides_env(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY", "false")
 
     assert (
-        entity_address_unified._task_bool_or_env(
+        entity_address_unified._is_task_or_env_enabled(
             {"serving_only_refresh": True},
             "serving_only_refresh",
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY",
@@ -464,7 +464,7 @@ def test_serving_only_refresh_task_bool_overrides_env(monkeypatch):
         is True
     )
     assert (
-        entity_address_unified._task_bool_or_env(
+        entity_address_unified._is_task_or_env_enabled(
             {},
             "serving_only_refresh",
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY",
