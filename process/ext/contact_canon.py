@@ -8,14 +8,13 @@ import importlib
 import logging
 import re
 from collections.abc import Iterable, Sequence
+from functools import lru_cache
 from typing import Any
 
 
 logger = logging.getLogger(__name__)
 
 ContactRow = tuple[Any, Any, Any]
-_FAST_MODULE: Any | None = None
-_FAST_MODULE_CHECKED = False
 _DEFAULT_US_COUNTRIES = {
     "",
     "US",
@@ -93,24 +92,24 @@ def _python_canonicalize_number(raw: str | None, country_code: str | None) -> di
         return _empty_contact()
 
     country = (country_code or "").strip().upper()
-    explicit_international = main_text.lstrip().startswith("+")
-    default_us = country in _DEFAULT_US_COUNTRIES
+    is_explicit_international = main_text.lstrip().startswith("+")
+    is_default_us_country = country in _DEFAULT_US_COUNTRIES
 
-    if len(digits) == 10 and default_us:
+    if len(digits) == 10 and is_default_us_country:
         return {
             "number": digits,
             "extension": extension,
             "is_international": False,
             "valid_for_fallback": True,
         }
-    if len(digits) == 11 and digits.startswith("1") and default_us:
+    if len(digits) == 11 and digits.startswith("1") and is_default_us_country:
         return {
             "number": digits[1:],
             "extension": extension,
             "is_international": False,
             "valid_for_fallback": True,
         }
-    if explicit_international and 8 <= len(digits) <= 15:
+    if is_explicit_international and 8 <= len(digits) <= 15:
         return {
             "number": digits,
             "extension": extension,
@@ -137,32 +136,31 @@ def _python_canonicalize(row: ContactRow) -> dict[str, str | bool | None]:
     }
 
 
+@lru_cache(maxsize=1)
 def _fast_module() -> Any | None:
-    global _FAST_MODULE, _FAST_MODULE_CHECKED
-    if _FAST_MODULE_CHECKED:
-        return _FAST_MODULE
-    _FAST_MODULE_CHECKED = True
     try:
         module = importlib.import_module("ptg2_address_canon")
     except ImportError:
         return None
+    except Exception as exc:
+        logger.warning("Rust/PyO3 contact canonicalizer could not be loaded; using Python fallback: %s", exc)
+        return None
     if not hasattr(module, "canonicalize_contact_batch"):
         return None
-    _FAST_MODULE = module
-    return _FAST_MODULE
+    return module
 
 
 def canonicalize_batch(rows: Iterable[Sequence[Any]]) -> list[dict[str, str | bool | None]]:
     """Canonicalize phone and fax rows with a compatible optional fast path."""
 
-    prepared = [_row_tuple(row) for row in rows]
+    prepared_rows = [_row_tuple(row) for row in rows]
     module = _fast_module()
     if module is not None:
         try:
-            return list(module.canonicalize_contact_batch(prepared))
+            return list(module.canonicalize_contact_batch(prepared_rows))
         except Exception as exc:
             logger.warning("Rust/PyO3 contact canonicalizer failed; using Python fallback: %s", exc)
-    return [_python_canonicalize(row) for row in prepared]
+    return [_python_canonicalize(row) for row in prepared_rows]
 
 
 def canonicalize_one(row: Sequence[Any]) -> dict[str, str | bool | None]:
