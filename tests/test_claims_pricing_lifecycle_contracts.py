@@ -534,10 +534,18 @@ def test_finalize_spec_uses_manifest_fallback(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_finalize_wait_accepts_runs_without_redis():
+async def test_finalize_wait_requires_redis_and_run_identity():
     finalize_spec = claims_pricing._ClaimsFinalizeSpec("i", "", False, "mrf", "s", 0)
-    assert await claims_pricing._wait_for_claims_finalize_turn(None, finalize_spec) is None
-    assert await claims_pricing._wait_for_claims_finalize_turn(RecordingRedis(), finalize_spec) is None
+    with pytest.raises(RuntimeError, match="redis context"):
+        await claims_pricing._wait_for_claims_finalize_turn(
+            None,
+            finalize_spec,
+        )
+    with pytest.raises(RuntimeError, match="run_id"):
+        await claims_pricing._wait_for_claims_finalize_turn(
+            RecordingRedis(),
+            finalize_spec,
+        )
 
 
 @pytest.mark.asyncio

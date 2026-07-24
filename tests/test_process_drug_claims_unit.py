@@ -103,6 +103,9 @@ async def test_finish_main_enqueues_finalize(monkeypatch):
     assert enqueue_call.kwargs["_queue_name"] == drug_claims.DRUG_CLAIMS_FINISH_QUEUE_NAME
     assert enqueue_call.kwargs["_job_id"].startswith("drug_claims_finalize_run_a_")
     assert enqueue_call.args[1]["test_mode"] is True
+    assert enqueue_call.args[1]["manifest_path"].endswith(
+        "dev1/run_a/manifest.json"
+    )
 
 
 @pytest.mark.asyncio

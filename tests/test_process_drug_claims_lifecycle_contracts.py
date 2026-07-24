@@ -469,6 +469,50 @@ def test_finalize_request_uses_manifest_fallbacks(tmp_path, monkeypatch):
     assert request.expected_chunks == 4
 
 
+def test_finalize_manifest_rejects_empty_and_partial_source_handoffs(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        drug_claims,
+        "DATASETS",
+        (
+            drug_claims.DatasetConfig("provider_drug", "provider", 1),
+            drug_claims.DatasetConfig("drug_spending", "spending", 1),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="nonempty chunk manifest"):
+        drug_claims._validate_drug_claims_finalize_manifest(
+            _finalize_request()
+        )
+
+    partial_request = _finalize_request(
+        manifest={
+            "import_id": "import-one",
+            "run_id": "run-one",
+            "stage_suffix": "stage-one",
+            "total_chunks": 1,
+            "sources": {
+                "provider_drug": [
+                    {"url": "https://files.invalid/provider.csv"}
+                ],
+                "drug_spending": [
+                    {"url": "https://files.invalid/spending.csv"}
+                ],
+            },
+            "chunks": [
+                {
+                    "dataset_key": "provider_drug",
+                    "source_index": 0,
+                }
+            ],
+        }
+    )
+    with pytest.raises(RuntimeError, match="drug_spending:0"):
+        drug_claims._validate_drug_claims_finalize_manifest(
+            partial_request
+        )
+
+
 @pytest.mark.asyncio
 async def test_finalize_permission_retry_and_idempotency(monkeypatch):
     already_redis = SimpleNamespace(get=AsyncMock(return_value=b"1"))
@@ -480,9 +524,10 @@ async def test_finalize_permission_retry_and_idempotency(monkeypatch):
         "run_id": "run-one",
         "import_id": "import-one",
     }
-    assert await drug_claims._await_drug_claims_finalize_permission(
-        _finalize_request(None)
-    ) is None
+    with pytest.raises(RuntimeError, match="redis context"):
+        await drug_claims._await_drug_claims_finalize_permission(
+            _finalize_request(None)
+        )
 
     waiting_redis = SimpleNamespace(get=AsyncMock(return_value=None))
     monkeypatch.setattr(drug_claims, "_get_run_progress", AsyncMock(return_value=(2, 1)))
@@ -561,6 +606,11 @@ async def test_finalize_success_cleans_workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(drug_claims, "_drug_claims_finalize_request", lambda *args: request)
     monkeypatch.setattr(
         drug_claims,
+        "_validate_drug_claims_finalize_manifest",
+        lambda _request: None,
+    )
+    monkeypatch.setattr(
+        drug_claims,
         "_await_drug_claims_finalize_permission",
         AsyncMock(return_value=None),
     )
@@ -610,6 +660,11 @@ async def test_finalize_releases_lock_after_failure_or_cancellation(
     )
     monkeypatch.setattr(
         drug_claims,
+        "_validate_drug_claims_finalize_manifest",
+        lambda _request: None,
+    )
+    monkeypatch.setattr(
+        drug_claims,
         "_await_drug_claims_finalize_permission",
         AsyncMock(return_value=None),
     )
@@ -632,17 +687,20 @@ async def test_finalize_releases_lock_after_failure_or_cancellation(
 
 @pytest.mark.asyncio
 async def test_finalize_returns_existing_result_without_publish(monkeypatch):
-    request = _finalize_request()
-    existing_result_by_field = {"ok": True, "already_finalized": True}
+    redis = SimpleNamespace(get=AsyncMock(return_value=b"1"))
     publish = AsyncMock()
-    monkeypatch.setattr(drug_claims, "ensure_database", AsyncMock())
-    monkeypatch.setattr(drug_claims, "_drug_claims_finalize_request", lambda *args: request)
-    monkeypatch.setattr(
-        drug_claims,
-        "_await_drug_claims_finalize_permission",
-        AsyncMock(return_value=existing_result_by_field),
-    )
+    ensure_database = AsyncMock()
+    monkeypatch.setattr(drug_claims, "ensure_database", ensure_database)
     monkeypatch.setattr(drug_claims, "_materialize_and_publish_drug_claims", publish)
 
-    assert await drug_claims.drug_claims_finalize({}, {}) == existing_result_by_field
+    assert await drug_claims.drug_claims_finalize(
+        {"redis": redis},
+        {"import_id": "import-one", "run_id": "run-one"},
+    ) == {
+        "ok": True,
+        "already_finalized": True,
+        "run_id": "run-one",
+        "import_id": "import_one",
+    }
+    ensure_database.assert_not_awaited()
     publish.assert_not_awaited()

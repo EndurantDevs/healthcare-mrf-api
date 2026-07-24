@@ -2908,6 +2908,46 @@ def _find_missing_drug_claim_sources(
     return missing_sources
 
 
+def _validate_drug_claims_finalize_manifest(
+    request: DrugClaimsFinalizeRequest,
+) -> None:
+    """Require a complete durable handoff before live-table publication."""
+
+    chunk_manifests = request.manifest.get("chunks")
+    source_descriptors_by_dataset = request.manifest.get("sources")
+    total_chunks = _safe_int(request.manifest.get("total_chunks"), -1)
+    if not isinstance(chunk_manifests, list) or not chunk_manifests:
+        raise RuntimeError(
+            "Drug claims finalize requires a nonempty chunk manifest."
+        )
+    if total_chunks != len(chunk_manifests):
+        raise RuntimeError(
+            "Drug claims finalize chunk count does not match its manifest."
+        )
+    if not isinstance(source_descriptors_by_dataset, dict):
+        raise RuntimeError(
+            "Drug claims finalize requires source descriptors."
+        )
+    missing_sources = _find_missing_drug_claim_sources(
+        source_descriptors_by_dataset,
+        chunk_manifests,
+    )
+    if missing_sources:
+        raise RuntimeError(
+            "Drug claims finalize is missing required source chunks: "
+            f"{', '.join(missing_sources)}"
+        )
+    if (
+        str(request.manifest.get("import_id") or "") != request.import_id
+        or str(request.manifest.get("run_id") or "") != request.run_id
+        or str(request.manifest.get("stage_suffix") or "")
+        != request.stage_suffix
+    ):
+        raise RuntimeError(
+            "Drug claims finalize identity does not match its manifest."
+        )
+
+
 async def _fail_empty_drug_claims_sources(
     request: DrugClaimsStartRequest,
     missing_sources: list[str],
@@ -3087,8 +3127,12 @@ async def _await_drug_claims_finalize_permission(
 ) -> dict[str, Any] | None:
     """Wait for all chunks and acquire the single-publisher lock."""
 
-    if request.redis is None or not request.run_id:
-        return None
+    if request.redis is None:
+        raise RuntimeError(
+            "ARQ redis context is unavailable for drug claims finalize job."
+        )
+    if not request.run_id:
+        raise RuntimeError("Drug claims finalize run_id is required.")
     finalized_key = _state_key(request.run_id, "finalized")
     if await request.redis.get(finalized_key):
         return {
@@ -3215,9 +3259,25 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
     """Wait for all chunks, validate staging, and publish drug claims."""
 
     finalize_task = task or {}
+    redis = ctx.get("redis")
+    task_run_id = str(finalize_task.get("run_id") or "")
+    if (
+        redis is not None
+        and task_run_id
+        and await redis.get(_state_key(task_run_id, "finalized"))
+    ):
+        return {
+            "ok": True,
+            "already_finalized": True,
+            "run_id": task_run_id,
+            "import_id": _normalize_import_id(
+                finalize_task.get("import_id")
+            ),
+        }
     test_mode = bool(finalize_task.get("test_mode", False))
     await ensure_database(test_mode)
     request = _drug_claims_finalize_request(ctx, finalize_task, test_mode)
+    _validate_drug_claims_finalize_manifest(request)
     already_finalized_result = await _await_drug_claims_finalize_permission(request)
     if already_finalized_result is not None:
         return already_finalized_result
@@ -3297,15 +3357,18 @@ async def finish_main(
     """Queue explicit finalization for an existing drug-claims run."""
 
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
-    stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
+    normalized_import_id = _normalize_import_id(import_id)
+    stage_suffix = _build_stage_suffix(normalized_import_id, run_id)
+    resolved_manifest_path = manifest_path or str(
+        _manifest_path(_run_dir(normalized_import_id, run_id))
+    )
     finalize_job_by_field = {
         "import_id": import_id,
         "run_id": run_id,
         "stage_suffix": stage_suffix,
         "test_mode": bool(test_mode),
+        "manifest_path": resolved_manifest_path,
     }
-    if manifest_path:
-        finalize_job_by_field["manifest_path"] = manifest_path
     await redis.enqueue_job(
         "drug_claims_finalize",
         finalize_job_by_field,

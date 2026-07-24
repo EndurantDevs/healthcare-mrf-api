@@ -2669,6 +2669,49 @@ def _find_missing_claim_sources(
     return missing_sources
 
 
+def _validate_claims_finalize_manifest(
+    manifest_by_field: dict[str, Any],
+    finalize_spec: _ClaimsFinalizeSpec,
+) -> None:
+    """Require a complete durable handoff before live-table publication."""
+
+    chunk_entries = manifest_by_field.get("chunks")
+    sources_by_dataset = manifest_by_field.get("sources")
+    total_chunks = _safe_int(manifest_by_field.get("total_chunks"), -1)
+    if not isinstance(chunk_entries, list) or not chunk_entries:
+        raise RuntimeError(
+            "Claims pricing finalize requires a nonempty chunk manifest."
+        )
+    if total_chunks != len(chunk_entries):
+        raise RuntimeError(
+            "Claims pricing finalize chunk count does not match its manifest."
+        )
+    if not isinstance(sources_by_dataset, dict):
+        raise RuntimeError(
+            "Claims pricing finalize requires source descriptors."
+        )
+    missing_sources = _find_missing_claim_sources(
+        sources_by_dataset,
+        chunk_entries,
+    )
+    if missing_sources:
+        raise RuntimeError(
+            "Claims pricing finalize is missing required source chunks: "
+            f"{', '.join(missing_sources)}"
+        )
+    if (
+        str(manifest_by_field.get("import_id") or "")
+        != finalize_spec.import_id
+        or str(manifest_by_field.get("run_id") or "")
+        != finalize_spec.run_id
+        or str(manifest_by_field.get("stage_suffix") or "")
+        != finalize_spec.stage_suffix
+    ):
+        raise RuntimeError(
+            "Claims pricing finalize identity does not match its manifest."
+        )
+
+
 async def _fail_empty_claim_sources(
     run_identity: _ClaimsRunIdentity,
     missing_sources: list[str],
@@ -2894,8 +2937,12 @@ async def _wait_for_claims_finalize_turn(
     redis: Any,
     finalize_spec: _ClaimsFinalizeSpec,
 ) -> dict[str, Any] | None:
-    if redis is None or not finalize_spec.run_id:
-        return None
+    if redis is None:
+        raise RuntimeError(
+            "ARQ redis context is unavailable for claims pricing finalize job."
+        )
+    if not finalize_spec.run_id:
+        raise RuntimeError("Claims pricing finalize run_id is required.")
     finalized_key = _state_key(finalize_spec.run_id, "finalized")
     if await redis.get(finalized_key):
         return {
@@ -3056,12 +3103,27 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
     """Wait for all chunks, validate staging, and publish claims pricing."""
 
     task_by_field = task or {}
+    redis = ctx.get("redis")
+    task_run_id = str(task_by_field.get("run_id") or "")
+    if (
+        redis is not None
+        and task_run_id
+        and await redis.get(_state_key(task_run_id, "finalized"))
+    ):
+        return {
+            "ok": True,
+            "already_finalized": True,
+            "run_id": task_run_id,
+            "import_id": _normalize_import_id(
+                task_by_field.get("import_id")
+            ),
+        }
     manifest_path = str(task_by_field.get("manifest_path") or "")
     test_mode = bool(task_by_field.get("test_mode", False))
     await ensure_database(test_mode)
     manifest_by_field = _read_manifest(manifest_path) if manifest_path else {}
     finalize_spec = _claims_finalize_spec(task_by_field, manifest_by_field)
-    redis = ctx.get("redis")
+    _validate_claims_finalize_manifest(manifest_by_field, finalize_spec)
     early_response = await _wait_for_claims_finalize_turn(redis, finalize_spec)
     if early_response is not None:
         return early_response
@@ -3160,15 +3222,18 @@ async def finish_main(
     """Queue explicit finalization for an existing claims-pricing run."""
 
     redis = await _create_claims_pool()
-    stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
+    normalized_import_id = _normalize_import_id(import_id)
+    stage_suffix = _build_stage_suffix(normalized_import_id, run_id)
+    resolved_manifest_path = manifest_path or str(
+        _manifest_path(_run_dir(normalized_import_id, run_id))
+    )
     finalize_job_by_field = {
         "import_id": import_id,
         "run_id": run_id,
         "stage_suffix": stage_suffix,
         "test_mode": bool(test_mode),
+        "manifest_path": resolved_manifest_path,
     }
-    if manifest_path:
-        finalize_job_by_field["manifest_path"] = manifest_path
     await redis.enqueue_job(
         "claims_pricing_finalize",
         finalize_job_by_field,

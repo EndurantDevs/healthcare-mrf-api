@@ -107,6 +107,48 @@ def test_cleanup_rejects_outside_and_symlinked_work_dirs(
     assert outside_work_dir.is_dir()
 
 
+def test_finalize_manifest_rejects_empty_and_partial_source_handoffs(
+    monkeypatch,
+):
+    finalize_spec = _finalize_spec()
+    monkeypatch.setattr(
+        claims_pricing,
+        "DATASETS",
+        (
+            claims_pricing.DatasetConfig("provider", "provider", 1),
+            claims_pricing.DatasetConfig("geo_service", "geo", 1),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="nonempty chunk manifest"):
+        claims_pricing._validate_claims_finalize_manifest(
+            {},
+            finalize_spec,
+        )
+
+    partial_manifest_by_field = {
+        "import_id": "import_a",
+        "run_id": "run-a",
+        "stage_suffix": "stage-a",
+        "total_chunks": 1,
+        "sources": {
+            "provider": [{"url": "https://example.test/provider.csv"}],
+            "geo_service": [{"url": "https://example.test/geo.csv"}],
+        },
+        "chunks": [
+            {
+                "dataset_key": "provider",
+                "source_index": 0,
+            }
+        ],
+    }
+    with pytest.raises(RuntimeError, match="geo_service:0"):
+        claims_pricing._validate_claims_finalize_manifest(
+            partial_manifest_by_field,
+            finalize_spec,
+        )
+
+
 @pytest.mark.asyncio
 async def test_record_finalized_skips_missing_runtime_identity():
     redis = RecordingRedis()
@@ -152,9 +194,21 @@ async def test_finalize_publishes_diagnostics_and_cleans_manifest(monkeypatch, t
     manifest_path.write_text(
         json.dumps(
             {
+                "import_id": "import_a",
                 "run_id": "run-a",
                 "stage_suffix": "stage-a",
-                "total_chunks": 0,
+                "sources": {
+                    "provider": [
+                        {"url": "https://example.test/provider.csv"}
+                    ]
+                },
+                "chunks": [
+                    {
+                        "dataset_key": "provider",
+                        "source_index": 0,
+                    }
+                ],
+                "total_chunks": 1,
                 "work_dir": str(run_work_dir),
             }
         )
@@ -164,7 +218,18 @@ async def test_finalize_publishes_diagnostics_and_cleans_manifest(monkeypatch, t
         "peer_scope_rows": [{"geography_scope": "national", "rows": 1}],
         "key_coverage": [{"geography_scope": "national", "coverage_pct": 50.0}],
     }
+    redis = RecordingRedis()
+    monkeypatch.setattr(
+        claims_pricing,
+        "DATASETS",
+        (claims_pricing.DatasetConfig("provider", "provider", 1),),
+    )
     monkeypatch.setattr(claims_pricing, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        claims_pricing,
+        "_wait_for_claims_finalize_turn",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(claims_pricing, "_staging_classes", lambda *_args: {"stage": object()})
     monkeypatch.setattr(
         claims_pricing,
@@ -175,7 +240,7 @@ async def test_finalize_publishes_diagnostics_and_cleans_manifest(monkeypatch, t
     monkeypatch.setattr(claims_pricing, "CLAIMS_WORKDIR", str(work_dir_root))
     monkeypatch.setattr(claims_pricing, "CLAIMS_KEEP_WORKDIR", False)
     response_by_field = await claims_pricing.claims_pricing_finalize(
-        {},
+        {"redis": redis},
         {"import_id": "import-a", "manifest_path": str(manifest_path), "schema": "mrf"},
     )
     assert response_by_field == {
@@ -199,6 +264,11 @@ async def test_finalize_with_redis_records_terminal_state(monkeypatch):
         lambda *_args: finalize_spec,
     )
     monkeypatch.setattr(claims_pricing, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        claims_pricing,
+        "_validate_claims_finalize_manifest",
+        Mock(),
+    )
     monkeypatch.setattr(claims_pricing, "_wait_for_claims_finalize_turn", AsyncMock(return_value=None))
     monkeypatch.setattr(claims_pricing, "_staging_classes", lambda *_args: {})
     monkeypatch.setattr(claims_pricing, "_materialize_and_publish_claims", AsyncMock(return_value={}))
@@ -235,6 +305,11 @@ async def test_finalize_releases_lock_after_failure_or_cancellation(
         lambda *_args: finalize_spec,
     )
     monkeypatch.setattr(claims_pricing, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        claims_pricing,
+        "_validate_claims_finalize_manifest",
+        Mock(),
+    )
     monkeypatch.setattr(
         claims_pricing,
         "_wait_for_claims_finalize_turn",
@@ -343,6 +418,31 @@ async def test_finish_main_includes_explicit_manifest(monkeypatch):
     )
     assert response_by_field["import_id"] == "import_a"
     assert redis.jobs[0]["task"]["manifest_path"] == "/tmp/manifest.json"
+
+
+@pytest.mark.asyncio
+async def test_finish_main_derives_canonical_manifest(monkeypatch, tmp_path):
+    redis = RecordingRedis()
+    monkeypatch.setattr(
+        claims_pricing,
+        "_create_claims_pool",
+        AsyncMock(return_value=redis),
+    )
+    monkeypatch.setattr(
+        claims_pricing,
+        "CLAIMS_WORKDIR",
+        str(tmp_path),
+    )
+
+    await claims_pricing.finish_main(
+        "import-a",
+        "run-a",
+        test_mode=True,
+    )
+
+    assert redis.jobs[0]["task"]["manifest_path"] == str(
+        tmp_path / "import_a" / "run-a" / "manifest.json"
+    )
 
 
 def test_staging_classes_use_schema_override(monkeypatch):
