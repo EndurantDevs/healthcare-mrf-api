@@ -18,6 +18,12 @@ from process.ptg_parts.domain import (
     PTG2_STATUS_PUBLISHED,
     PTG2_STATUS_VALIDATED,
 )
+from process.ptg_parts.ptg2_candidate_layout_identity import (
+    PTG2_CANDIDATE_SUPPORTED_GENERATIONS,
+    PTG2_CANDIDATE_V3_GENERATION,
+    PTG2_CANDIDATE_V4_GENERATION,
+    normalize_candidate_storage_generation,
+)
 from process.ptg_parts.ptg2_shared_blocks import bind_snapshot_to_shared_layout
 from process.ptg_parts.ptg2_candidate_attestation import (
     consume_candidate_audit_attestation_in_transaction,
@@ -833,42 +839,64 @@ def _needs_audited_candidate_activation(snapshot: dict[str, Any]) -> bool:
     )
 
 
+_CANDIDATE_ACTIVATION_ROW_SQL = """
+    SELECT snapshot.snapshot_id,
+           snapshot.import_run_id,
+           snapshot.import_month,
+           snapshot.status,
+           snapshot.created_at,
+           snapshot.validated_at,
+           snapshot.published_at,
+           snapshot.previous_snapshot_id,
+           snapshot.manifest,
+           binding.snapshot_key,
+           scope.plan_id,
+           scope.plan_market_type,
+           scope.coverage_scope_id,
+           layout.generation AS storage_generation
+      FROM {schema}.ptg2_snapshot AS snapshot
+      JOIN {schema}.ptg2_v3_snapshot_binding AS binding
+        ON binding.snapshot_id = snapshot.snapshot_id
+      JOIN {schema}.ptg2_v3_snapshot_scope AS scope
+        ON scope.snapshot_id = snapshot.snapshot_id
+      JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+        ON layout.snapshot_key = binding.snapshot_key
+      LEFT JOIN {schema}.ptg2_v4_snapshot_map_root AS v4_root
+        ON v4_root.snapshot_key = layout.snapshot_key
+     WHERE snapshot.snapshot_id = :snapshot_id
+       AND layout.state = 'sealed'
+       AND layout.generation = ANY(CAST(:storage_generations AS text[]))
+       AND (
+            layout.generation = :v3_generation
+            OR (
+                layout.generation = :v4_generation
+                AND v4_root.state = 'complete'
+                AND v4_root.map_digest = layout.mapping_digest
+            )
+       )
+     FOR UPDATE OF snapshot
+"""
+
+
 async def _locked_candidate_activation_row(
     session: Any,
     *,
     schema_name: str,
     snapshot_id: str,
 ) -> dict[str, Any]:
+    """Lock one sealed V3/V4 candidate with a complete selected layout."""
+
+    schema = _quote_ident(schema_name)
     activation_query = await session.execute(
-        db.text(
-            f"""
-            SELECT snapshot.snapshot_id,
-                   snapshot.import_run_id,
-                   snapshot.import_month,
-                   snapshot.status,
-                   snapshot.created_at,
-                   snapshot.validated_at,
-                   snapshot.published_at,
-                   snapshot.previous_snapshot_id,
-                   snapshot.manifest,
-                   binding.snapshot_key,
-                   scope.plan_id,
-                   scope.plan_market_type,
-                   scope.coverage_scope_id
-              FROM {_quote_ident(schema_name)}.ptg2_snapshot AS snapshot
-              JOIN {_quote_ident(schema_name)}.ptg2_v3_snapshot_binding AS binding
-                ON binding.snapshot_id = snapshot.snapshot_id
-              JOIN {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope AS scope
-                ON scope.snapshot_id = snapshot.snapshot_id
-              JOIN {_quote_ident(schema_name)}.ptg2_v3_snapshot_layout AS layout
-                ON layout.snapshot_key = binding.snapshot_key
-             WHERE snapshot.snapshot_id = :snapshot_id
-               AND layout.state = 'sealed'
-               AND layout.generation = 'shared_blocks_v3'
-             FOR UPDATE OF snapshot
-            """
-        ),
-        {"snapshot_id": snapshot_id},
+        db.text(_CANDIDATE_ACTIVATION_ROW_SQL.format(schema=schema)),
+        {
+            "snapshot_id": snapshot_id,
+            "storage_generations": sorted(
+                PTG2_CANDIDATE_SUPPORTED_GENERATIONS
+            ),
+            "v3_generation": PTG2_CANDIDATE_V3_GENERATION,
+            "v4_generation": PTG2_CANDIDATE_V4_GENERATION,
+        },
     )
     activation_record = activation_query.one_or_none()
     if activation_record is None:
@@ -886,16 +914,41 @@ async def _database_utc_timestamp(session: Any) -> datetime.datetime:
     return timestamp.replace(tzinfo=None)
 
 
+def _candidate_storage_generation(
+    candidate: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> str:
+    """Cross-check the locked layout generation against sealed metadata."""
+
+    serving_index = _manifest_mapping(manifest.get("serving_index"))
+    storage_generation = normalize_candidate_storage_generation(
+        candidate.get("storage_generation")
+        or serving_index.get("storage_generation")
+        or PTG2_CANDIDATE_V3_GENERATION
+    )
+    if (
+        serving_index.get("storage_generation", storage_generation)
+        != storage_generation
+    ):
+        raise ValueError(
+            "snapshot storage generation does not match its sealed layout"
+        )
+    return storage_generation
+
+
 def _validated_activation_identity(
     candidate: dict[str, Any],
     *,
     source_key: str,
     expected_current_snapshot_id: str | None,
 ) -> dict[str, Any]:
+    """Validate immutable candidate identity before pointer activation."""
+
     if str(candidate.get("status") or "").strip().lower() != PTG2_STATUS_VALIDATED:
         raise ValueError("snapshot is not a validated candidate")
     manifest = _manifest_mapping(candidate.get("manifest"))
     activation = _manifest_mapping(manifest.get("activation"))
+    storage_generation = _candidate_storage_generation(candidate, manifest)
     if (
         activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
         or activation.get("state") != "validated"
@@ -932,6 +985,7 @@ def _validated_activation_identity(
         "plan_market_type": plan_market_type,
         "coverage_scope_id": coverage_scope_id,
         "snapshot_key": int(candidate["snapshot_key"]),
+        "storage_generation": storage_generation,
     }
 
 
@@ -1243,6 +1297,9 @@ def _candidate_activation_result(
         "status": "promoted",
         "source_key": source_key,
         "snapshot_id": snapshot_id,
+        "storage_generation": activation_context.activation_by_field[
+            "storage_generation"
+        ],
         "previous_snapshot_id": activation_context.activation_by_field[
             "previous_snapshot_id"
         ],

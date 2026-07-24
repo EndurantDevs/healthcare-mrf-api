@@ -869,6 +869,7 @@ def _success_result(
     )
     audit_metrics_by_name = {
         "arch_version": ARCH_VERSION,
+        "storage_generation": candidate_audit_target.storage_generation,
         "snapshot_status": "published",
         "activation_status": "activated",
         "snapshot_id": active_snapshot_id,

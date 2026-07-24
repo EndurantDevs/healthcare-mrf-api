@@ -1466,7 +1466,72 @@ def test_candidate_metadata_is_reread_from_postgres_under_row_lock():
     assert "snapshot.manifest" in sql
     assert "binding.snapshot_key" in sql
     assert "scope.coverage_scope_id" in sql
-    assert params == {"snapshot_id": "snap_new"}
+    assert "layout.generation AS storage_generation" in sql
+    assert "ptg2_v4_snapshot_map_root" in sql
+    assert "v4_root.state = 'complete'" in sql
+    assert params == {
+        "snapshot_id": "snap_new",
+        "storage_generations": ["shared_blocks_v3", "shared_blocks_v4"],
+        "v3_generation": "shared_blocks_v3",
+        "v4_generation": "shared_blocks_v4",
+    }
+
+
+def test_v4_candidate_has_valid_activation_identity():
+    identity = source_pointers._validated_activation_identity(
+        {
+            "status": "validated",
+            "previous_snapshot_id": "snap_old",
+            "manifest": {
+                "activation": {
+                    "contract": "ptg2_candidate_activation_v1",
+                    "state": "validated",
+                    "source_key": "source_a",
+                    "expected_previous_snapshot_id": "snap_old",
+                },
+                "serving_index": {
+                    "storage_generation": "shared_blocks_v4",
+                },
+            },
+            "storage_generation": "shared_blocks_v4",
+            "snapshot_key": 17,
+            "plan_id": "12-3456789",
+            "plan_market_type": "group",
+            "coverage_scope_id": b"c" * 32,
+        },
+        source_key="source_a",
+        expected_current_snapshot_id="snap_old",
+    )
+
+    assert identity["storage_generation"] == "shared_blocks_v4"
+
+
+def test_v4_candidate_rejects_manifest_generation_mismatch():
+    with pytest.raises(ValueError, match="does not match its sealed layout"):
+        source_pointers._validated_activation_identity(
+            {
+                "status": "validated",
+                "previous_snapshot_id": "snap_old",
+                "manifest": {
+                    "activation": {
+                        "contract": "ptg2_candidate_activation_v1",
+                        "state": "validated",
+                        "source_key": "source_a",
+                        "expected_previous_snapshot_id": "snap_old",
+                    },
+                    "serving_index": {
+                        "storage_generation": "shared_blocks_v3",
+                    },
+                },
+                "storage_generation": "shared_blocks_v4",
+                "snapshot_key": 17,
+                "plan_id": "12-3456789",
+                "plan_market_type": "group",
+                "coverage_scope_id": b"c" * 32,
+            },
+            source_key="source_a",
+            expected_current_snapshot_id="snap_old",
+        )
 
 
 def test_candidate_plan_pointer_entries_load_all_logical_plan_mappings():
@@ -1633,6 +1698,7 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
 
     assert activation_result["status"] == "promoted"
     assert activation_result["plan_source_count"] == 1
+    assert activation_result["storage_generation"] == "shared_blocks_v3"
     assert events == [
         "lock",
         "candidate",

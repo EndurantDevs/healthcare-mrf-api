@@ -3447,7 +3447,18 @@ async def test_control_ptg_parse_toc_preview_endpoint(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
+@pytest.mark.parametrize(
+    ("request_generation", "expected_generation"),
+    (
+        (None, "shared_blocks_v3"),
+        ("shared_blocks_v4", "shared_blocks_v4"),
+    ),
+)
+async def test_control_ptg_source_snapshot_attest_endpoint(
+    monkeypatch,
+    request_generation,
+    expected_generation,
+):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
     calls = []
 
@@ -3461,16 +3472,17 @@ async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
 
     monkeypatch.setattr(control, "record_candidate_audit_attestation", fake_attest)
     audit_report_map = {"schema_version": 2, "status": "pass"}
+    request_by_field = {
+        "snapshot_id": "snap_new",
+        "source_key": "source_a",
+        "plan_id": "12-3456789",
+        "plan_market_type": "group",
+        "report": audit_report_map,
+    }
+    if request_generation is not None:
+        request_by_field["storage_generation"] = request_generation
     response = await control.control_ptg_source_snapshot_attest(
-        authed_request(
-            json={
-                "snapshot_id": "snap_new",
-                "source_key": "source_a",
-                "plan_id": "12-3456789",
-                "plan_market_type": "group",
-                "report": audit_report_map,
-            }
-        )
+        authed_request(json=request_by_field)
     )
     response_by_field = json.loads(response.body)
 
@@ -3482,6 +3494,7 @@ async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
             "source_key": "source_a",
             "plan_id": "12-3456789",
             "plan_market_type": "group",
+            "storage_generation": expected_generation,
             "report": audit_report_map,
         }
     ]

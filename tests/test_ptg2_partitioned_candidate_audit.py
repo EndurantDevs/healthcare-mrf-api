@@ -279,7 +279,18 @@ async def test_execute_rejects_deadline_outside_release_bound(deadline_seconds):
 
 @pytest.mark.parametrize(
     ("status", "body", "message"),
-    [(400, b"{}", "rejected_400"), (200, b"not-json", "response_invalid")],
+    [
+        (400, b"{}", "rejected_400"),
+        (
+            400,
+            (
+                b'{"message":"PTG2 candidate persisted audit provider is '
+                b'missing from its NPI graph"}'
+            ),
+            "rejected_400_persisted_provider_graph_membership_missing",
+        ),
+        (200, b"not-json", "response_invalid"),
+    ],
 )
 @pytest.mark.asyncio
 async def test_partition_response_rejects_status_or_invalid_json(

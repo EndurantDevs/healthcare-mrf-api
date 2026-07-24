@@ -4760,6 +4760,12 @@ async def _publish_reused_shared_v3_snapshot(
         "publish_status": "shared_layout_reused",
         "already_published": False,
         "shared_layout_reused": True,
+        "storage_generation": str(
+            options.get(
+                "storage_generation",
+                PTG2_V3_SHARED_GENERATION,
+            )
+        ),
         "activation_status": activation_status,
         "snapshot_status": (
             PTG2_STATUS_PUBLISHED if auto_activate else PTG2_STATUS_VALIDATED
@@ -6990,6 +6996,7 @@ async def _main_with_artifact_lease(
         return {
             "status": "succeeded",
             "arch_version": "postgres_binary_v3",
+            "storage_generation": shared_storage_generation,
             "activation_status": activation_status,
             "snapshot_status": snapshot_status,
             "import_run_id": import_run_id,

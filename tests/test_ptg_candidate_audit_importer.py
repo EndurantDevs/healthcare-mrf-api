@@ -1578,6 +1578,7 @@ def test_scheduler_result_is_redacted():
     )
     encoded = json.dumps(scheduler_result_map, sort_keys=True)
 
+    assert scheduler_result_map["storage_generation"] == "shared_blocks_v3"
     assert "must-not-leak" not in encoded
     assert "derived-source" not in encoded
     assert "12-3456789" not in encoded
@@ -1586,6 +1587,7 @@ def test_scheduler_result_is_redacted():
     assert "response" not in encoded
     assert set(scheduler_result_map) == {
         "arch_version",
+        "storage_generation",
         "snapshot_status",
         "activation_status",
         "snapshot_id",
