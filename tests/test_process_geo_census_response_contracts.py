@@ -134,8 +134,8 @@ async def test_fetch_dataset_rows_retries_with_bounded_backoff_then_converts(
     monkeypatch,
 ):
     census_payload_rows = [
-        ["zip code tabulation area", "COUNT", "RATE"],
-        ["ZCTA5 01234", "1,234", "4.5"],
+        ["NAME", "COUNT", "RATE", "zip code tabulation area"],
+        ["ZCTA5 01234", "1,234", "4.5", "01234"],
     ]
     client = _ScriptedClient(
         _FakeResponse(None, status=503, response_body="please retry"),
@@ -263,6 +263,23 @@ async def test_fetch_dataset_rows_rejects_malformed_response_shapes(
         await _fetch_synthetic_rows(client, retries=1)
 
     assert expected_message in str(failure_info.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_dataset_rows_rejects_short_row_missing_geography_value():
+    census_payload_rows = [
+        ["NAME", "COUNT", "RATE", "zip code tabulation area"],
+        ["ZCTA5 01234", "1", "2.0"],
+    ]
+    client = _ScriptedClient(_FakeResponse(census_payload_rows))
+
+    with pytest.raises(RuntimeError) as failure_info:
+        await _fetch_synthetic_rows(client, retries=1)
+
+    failure_message = str(failure_info.value)
+    assert "synthetic_dataset" in failure_message
+    assert "missing geography value" in failure_message
+    assert "'zip code tabulation area'" in failure_message
 
 
 @pytest.mark.asyncio

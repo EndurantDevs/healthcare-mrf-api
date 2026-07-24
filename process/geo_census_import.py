@@ -395,9 +395,13 @@ def _convert_census_response_row(
     """Convert one Census response row to the ZIP-keyed import representation."""
     if not isinstance(census_response_row, list):
         return None
-    zip_code = _normalize_zip(
-        census_response_row[column_index_by_name[spec.zip_column]]
-    )
+    geography_column_index = column_index_by_name[spec.zip_column]
+    if geography_column_index >= len(census_response_row):
+        raise RuntimeError(
+            f"Census payload row for {spec.name} missing geography value "
+            f"for column {spec.zip_column!r}"
+        )
+    zip_code = _normalize_zip(census_response_row[geography_column_index])
     if not zip_code:
         return None
 
