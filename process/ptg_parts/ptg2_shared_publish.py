@@ -50,7 +50,10 @@ _SHARED_BLOCK_STAGE_COLUMNS = (
     "payload",
 )
 _SHARED_BLOCK_EXISTENCE_BATCH_ROWS = 8_192
-_SHARED_BLOCK_PUBLISH_BATCH_ROWS = 32
+# CTIDs are the only values materialized in Python.  This keeps every SQL
+# operation bounded while avoiding hundreds of thousands of round trips for a
+# dense block stage.
+_SHARED_BLOCK_PUBLISH_BATCH_ROWS = 4_096
 _BATCH_INSERT_BLOCK_SQL = """
 INSERT INTO {schema}.ptg2_v3_block
     (block_hash, format_version, object_kind, codec, entry_count,
