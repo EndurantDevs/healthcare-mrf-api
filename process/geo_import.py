@@ -170,6 +170,20 @@ def _preflight_geo_source(csv_path: Path) -> int:
     return valid_geo_row_count
 
 
+def _validate_stable_source_row_count(
+    processed_geo_row_count: int,
+    expected_geo_row_count: int,
+) -> None:
+    """Reject a source whose valid-row count changed after preflight."""
+    if processed_geo_row_count == expected_geo_row_count:
+        return
+    raise GeoSourceValidationError(
+        "Geo source changed after preflight: "
+        f"expected {expected_geo_row_count} valid rows, "
+        f"read {processed_geo_row_count}"
+    )
+
+
 async def _flush_rows(
     pending_geo_rows: list[dict[str, object]],
     *,
@@ -226,11 +240,10 @@ async def load_geo_lookup(
             pending_geo_rows,
             target_table=target_table,
         )
-        if processed != expected_geo_row_count:
-            raise GeoSourceValidationError(
-                "Geo source changed after preflight: "
-                f"expected {expected_geo_row_count} valid rows, read {processed}"
-            )
+        _validate_stable_source_row_count(
+            processed,
+            expected_geo_row_count,
+        )
 
     logger.info("Loaded %s geo zip rows from %s", processed, csv_path)
 
