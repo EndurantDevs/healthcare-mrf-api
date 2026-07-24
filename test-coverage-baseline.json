@@ -326,6 +326,7 @@
         "process/ptg_parts/ptg2_v4_failed_layout_state.py",
         "process/ptg_parts/ptg2_v4_graph_compiler.py",
         "process/ptg_parts/ptg2_v4_snapshot_maps.py",
+        "process/ptg_parts/ptg2_v4_stale_metadata_attachments.py",
         "process/ptg_parts/ptg2_v4_stale_metadata_authority.py",
         "process/ptg_parts/ptg2_v4_stale_metadata_fence.py",
         "process/ptg_parts/ptg2_v4_stale_metadata_json.py",
@@ -389,11 +390,11 @@
       },
       "metrics": {
         "branches": {
-          "covered": 29768,
+          "covered": 29778,
           "total": 37692
         },
         "lines": {
-          "covered": 97130,
+          "covered": 97146,
           "total": 111181
         }
       },
