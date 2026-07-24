@@ -271,6 +271,7 @@
         "process/ptg_parts/ptg2_candidate_audit_contract.py",
         "process/ptg_parts/ptg2_candidate_audit_evidence.py",
         "process/ptg_parts/ptg2_candidate_audit_plan_store.py",
+        "process/ptg_parts/ptg2_candidate_layout_identity.py",
         "process/ptg_parts/ptg2_fast_candidate_audit.py",
         "process/ptg_parts/ptg2_fast_candidate_audit_report.py",
         "process/ptg_parts/ptg2_input_artifact_gc.py",
@@ -390,12 +391,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 29831,
-          "total": 37686
+          "covered": 29900,
+          "total": 37718
         },
         "lines": {
-          "covered": 97256,
-          "total": 111177
+          "covered": 97377,
+          "total": 111263
         }
       },
       "one_time_floor_reset": {
