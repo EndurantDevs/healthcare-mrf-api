@@ -289,7 +289,7 @@ async def _resolve_state_year(
             async with client.head(url, timeout=30, allow_redirects=True) as resp:
                 if resp.status == 200:
                     return year
-                if resp.status in (404, 403):
+                if resp.status == 404:
                     continue
         except Exception as exc:
             logger.debug("LODES HEAD probe failed for %s: %s", url, exc)
