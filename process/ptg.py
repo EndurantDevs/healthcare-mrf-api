@@ -751,7 +751,7 @@ async def _push_fenced_ptg2_plan_months(
                 schema_name=schema_name,
                 snapshot_id=snapshot_id,
             )
-        await session.execute(statement)
+        await statement.status()
 
 
 def _ptg2_model_schema_name(cls: Any) -> str:
