@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
@@ -35,8 +36,8 @@ class _Session:
         self.rows = iter(rows)
         self.calls: list[tuple[str, dict]] = []
 
-    async def execute(self, statement, parameters):
-        self.calls.append((str(statement), dict(parameters)))
+    async def execute(self, statement, parameters=None):
+        self.calls.append((str(statement), dict(parameters or {})))
         return _Result(next(self.rows))
 
 
@@ -138,3 +139,43 @@ async def test_attachment_counts_probe_before_building_count_query():
     assert "to_regclass" in session.calls[0][0]
     assert '"ptg2_price_set_stage"' in session.calls[1][0]
     assert '"ptg2_serving_rate_stage"' not in session.calls[1][0]
+
+
+@pytest.mark.asyncio
+async def test_store_timestamp_and_cas_conflicts():
+    with pytest.raises(RuntimeError, match="reconciliation timestamp"):
+        await store._database_timestamp(
+            _Session({"observed_at": "not-a-timestamp"}),
+            _Database(),
+        )
+
+    stale_write = store.PTG2V4StaleMetadataWrite(
+        schema_name="synthetic_ptg",
+        snapshot_id="snapshot",
+        internal_run_id="run",
+        context=store.PTG2V4StaleMetadataContext(
+            observed_at=dt.datetime(2026, 7, 24),
+            snapshot_by_field={},
+            internal_run_by_field={},
+            attempt_fence_by_field={},
+            attachment_count_by_name={},
+        ),
+        marker_by_field={
+            "target_digest": "0" * 64,
+            "plan_digest": "1" * 64,
+        },
+        v4_storage_generation="shared_blocks_v4",
+        stale_after_seconds=300,
+    )
+    for apply_update in (
+        store._apply_stale_snapshot_row,
+        store._apply_stale_internal_run,
+        store._seal_attempt_fence,
+    ):
+        with pytest.raises(store.PTG2V4StaleMetadataConflict):
+            await apply_update(
+                _Session(None),
+                _Database(),
+                stale_write=stale_write,
+                marker_json="{}",
+            )
