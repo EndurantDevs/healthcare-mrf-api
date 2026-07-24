@@ -413,7 +413,7 @@ async def _has_claimed_finalize_lock(
     return bool(lock_set)
 
 
-async def _release_finalize_lock(
+async def _is_finalize_lock_released(
     redis,
     run_id: str,
     owner_token: str,
@@ -442,7 +442,7 @@ async def _release_finalize_lock_safely(
     """Release the owned lock without masking finalize success or failure."""
 
     try:
-        await _release_finalize_lock(
+        await _is_finalize_lock_released(
             request.redis,
             request.run_id,
             request.finalize_lock_token,
@@ -3170,24 +3170,38 @@ async def _await_drug_claims_finalize_permission(
     ):
         raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
     try:
-        await mark_control_run(
-            request.run_id,
-            status="finalizing",
-            phase_detail="drug-claims finalizing",
-            progress_message="finalizing",
-            progress={
-                "unit": "chunks",
-                "total": total_chunks,
-                "done": done_chunks,
-                "pct": 99,
-                "message": "finalizing",
-                "phase": "drug-claims finalizing",
-            },
+        await _mark_drug_claims_finalize_started(
+            request,
+            total_chunks,
+            done_chunks,
         )
     except BaseException:
         await _release_finalize_lock_safely(request)
         raise
     return None
+
+
+async def _mark_drug_claims_finalize_started(
+    request: DrugClaimsFinalizeRequest,
+    total_chunks: int,
+    done_chunks: int,
+) -> None:
+    """Record that one lock-owning worker has begun finalization."""
+
+    await mark_control_run(
+        request.run_id,
+        status="finalizing",
+        phase_detail="drug-claims finalizing",
+        progress_message="finalizing",
+        progress={
+            "unit": "chunks",
+            "total": total_chunks,
+            "done": done_chunks,
+            "pct": 99,
+            "message": "finalizing",
+            "phase": "drug-claims finalizing",
+        },
+    )
 
 
 async def _materialize_and_publish_drug_claims(

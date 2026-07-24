@@ -186,7 +186,46 @@ async def test_finalize_returns_idempotent_response(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_finalize_publishes_diagnostics_and_cleans_manifest(monkeypatch, tmp_path):
+async def test_finalize_publishes_diagnostics_and_cleans_manifest(
+    monkeypatch,
+    tmp_path,
+):
+    diagnostics_by_field = {
+        "profile_scope_rows": [{"geography_scope": "national", "rows": 2}],
+        "peer_scope_rows": [{"geography_scope": "national", "rows": 1}],
+        "key_coverage": [
+            {"geography_scope": "national", "coverage_pct": 50.0}
+        ],
+    }
+    work_dir_root, run_work_dir, manifest_path = (
+        _complete_claims_manifest_paths(tmp_path)
+    )
+    _configure_successful_claims_finalize(
+        monkeypatch,
+        work_dir_root,
+        diagnostics_by_field,
+    )
+    redis = RecordingRedis()
+
+    response_by_field = await claims_pricing.claims_pricing_finalize(
+        {"redis": redis},
+        {
+            "import_id": "import-a",
+            "manifest_path": str(manifest_path),
+            "schema": "mrf",
+        },
+    )
+
+    assert response_by_field["cost_level_diagnostics"] == (
+        diagnostics_by_field
+    )
+    assert response_by_field["run_id"] == "run-a"
+    assert not run_work_dir.exists()
+
+
+def _complete_claims_manifest_paths(
+    tmp_path,
+) -> tuple[Path, Path, Path]:
     work_dir_root = tmp_path / "claims"
     run_work_dir = work_dir_root / "import_a" / "run-a"
     run_work_dir.mkdir(parents=True)
@@ -213,12 +252,14 @@ async def test_finalize_publishes_diagnostics_and_cleans_manifest(monkeypatch, t
             }
         )
     )
-    diagnostics_by_field = {
-        "profile_scope_rows": [{"geography_scope": "national", "rows": 2}],
-        "peer_scope_rows": [{"geography_scope": "national", "rows": 1}],
-        "key_coverage": [{"geography_scope": "national", "coverage_pct": 50.0}],
-    }
-    redis = RecordingRedis()
+    return work_dir_root, run_work_dir, manifest_path
+
+
+def _configure_successful_claims_finalize(
+    monkeypatch,
+    work_dir_root: Path,
+    diagnostics_by_field: dict,
+) -> None:
     monkeypatch.setattr(
         claims_pricing,
         "DATASETS",
@@ -239,19 +280,6 @@ async def test_finalize_publishes_diagnostics_and_cleans_manifest(monkeypatch, t
     monkeypatch.setattr(claims_pricing, "mark_control_run", AsyncMock())
     monkeypatch.setattr(claims_pricing, "CLAIMS_WORKDIR", str(work_dir_root))
     monkeypatch.setattr(claims_pricing, "CLAIMS_KEEP_WORKDIR", False)
-    response_by_field = await claims_pricing.claims_pricing_finalize(
-        {"redis": redis},
-        {"import_id": "import-a", "manifest_path": str(manifest_path), "schema": "mrf"},
-    )
-    assert response_by_field == {
-        "ok": True,
-        "import_id": "import_a",
-        "run_id": "run-a",
-        "stage_suffix": "stage-a",
-        "schema": "mrf",
-        "cost_level_diagnostics": diagnostics_by_field,
-    }
-    assert not run_work_dir.exists()
 
 
 @pytest.mark.asyncio

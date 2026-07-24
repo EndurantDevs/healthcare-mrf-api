@@ -304,7 +304,7 @@ async def _is_finalize_lock_claimed(
 _claim_finalize_lock = _is_finalize_lock_claimed
 
 
-async def _release_claims_finalize_lock(
+async def _is_claims_finalize_lock_released(
     redis: Any,
     run_id: str,
     owner_token: str,
@@ -2980,24 +2980,38 @@ async def _wait_for_claims_finalize_turn(
     ):
         raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
     try:
-        await mark_control_run(
-            finalize_spec.run_id,
-            status="finalizing",
-            phase_detail="claims-pricing finalizing",
-            progress_message="finalizing",
-            progress={
-                "unit": "chunks",
-                "total": total_chunks,
-                "done": done_chunks,
-                "pct": 99,
-                "message": "finalizing",
-                "phase": "claims-pricing finalizing",
-            },
+        await _mark_claims_finalize_started(
+            finalize_spec,
+            total_chunks,
+            done_chunks,
         )
     except BaseException:
         await _release_claims_finalize_lock_safely(redis, finalize_spec)
         raise
     return None
+
+
+async def _mark_claims_finalize_started(
+    finalize_spec: _ClaimsFinalizeSpec,
+    total_chunks: int,
+    done_chunks: int,
+) -> None:
+    """Record that one lock-owning worker has begun finalization."""
+
+    await mark_control_run(
+        finalize_spec.run_id,
+        status="finalizing",
+        phase_detail="claims-pricing finalizing",
+        progress_message="finalizing",
+        progress={
+            "unit": "chunks",
+            "total": total_chunks,
+            "done": done_chunks,
+            "pct": 99,
+            "message": "finalizing",
+            "phase": "claims-pricing finalizing",
+        },
+    )
 
 
 async def _materialize_and_publish_claims(
@@ -3044,7 +3058,7 @@ async def _release_claims_finalize_lock_safely(
     """Release the owned lock without masking finalize success or failure."""
 
     try:
-        await _release_claims_finalize_lock(
+        await _is_claims_finalize_lock_released(
             redis,
             finalize_spec.run_id,
             finalize_spec.finalize_lock_token,

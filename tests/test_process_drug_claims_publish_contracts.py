@@ -1,6 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import dataclasses
 import sys
 from contextlib import asynccontextmanager
 from importlib.util import module_from_spec, spec_from_file_location
@@ -139,20 +138,24 @@ async def test_finalize_materialization_orders_publish_steps(
     assert calls == expected_calls
 
 
-def test_cleanup_requires_explicit_work_directory_and_respects_retention(
-    tmp_path,
-    monkeypatch,
-):
-    empty_request = drug_claims.DrugClaimsFinalizeRequest(
+def _drug_cleanup_request(manifest=None):
+    return drug_claims.DrugClaimsFinalizeRequest(
         False,
         "import-one",
         "run-one",
         "stage-one",
         "mrf",
         None,
-        {},
+        manifest or {},
         0,
     )
+
+
+def test_cleanup_requires_explicit_owned_work_directory(
+    tmp_path,
+    monkeypatch,
+):
+    empty_request = _drug_cleanup_request()
     drug_claims._cleanup_drug_claims_workdir(empty_request)
 
     work_dir_root = tmp_path / "drug-claims"
@@ -163,41 +166,55 @@ def test_cleanup_requires_explicit_work_directory_and_respects_retention(
     )
     remove_tree = Mock(wraps=drug_claims.shutil.rmtree)
     monkeypatch.setattr(drug_claims.shutil, "rmtree", remove_tree)
-    incomplete_request = dataclasses.replace(
-        empty_request,
-        manifest={"status": "ready"},
+    drug_claims._cleanup_drug_claims_workdir(
+        _drug_cleanup_request({"status": "ready"})
     )
-    drug_claims._cleanup_drug_claims_workdir(incomplete_request)
     remove_tree.assert_not_called()
 
     outside_directory = tmp_path / "outside"
     outside_directory.mkdir()
-    outside_request = dataclasses.replace(
-        empty_request,
-        manifest={"work_dir": str(outside_directory)},
+    drug_claims._cleanup_drug_claims_workdir(
+        _drug_cleanup_request({"work_dir": str(outside_directory)})
     )
-    drug_claims._cleanup_drug_claims_workdir(outside_request)
     assert outside_directory.is_dir()
     remove_tree.assert_not_called()
 
+
+def test_cleanup_removes_completed_owned_work_directory(
+    tmp_path,
+    monkeypatch,
+):
+    work_dir_root = tmp_path / "drug-claims"
     completed_directory = work_dir_root / "import-one" / "run-one"
     completed_directory.mkdir(parents=True)
-    completed_request = dataclasses.replace(
-        empty_request,
-        manifest={"work_dir": str(completed_directory)},
+    monkeypatch.setattr(
+        drug_claims,
+        "DRUG_CLAIMS_WORKDIR",
+        str(work_dir_root),
     )
     monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_KEEP_WORKDIR", False)
-    drug_claims._cleanup_drug_claims_workdir(completed_request)
+    drug_claims._cleanup_drug_claims_workdir(
+        _drug_cleanup_request({"work_dir": str(completed_directory)})
+    )
     assert not completed_directory.exists()
 
+
+def test_cleanup_preserves_owned_work_directory_when_retained(
+    tmp_path,
+    monkeypatch,
+):
+    work_dir_root = tmp_path / "drug-claims"
     run_directory = work_dir_root / "import-one" / "run-one"
     run_directory.mkdir(parents=True)
-    retained_request = dataclasses.replace(
-        empty_request,
-        manifest={"work_dir": str(run_directory)},
+    monkeypatch.setattr(
+        drug_claims,
+        "DRUG_CLAIMS_WORKDIR",
+        str(work_dir_root),
     )
     monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_KEEP_WORKDIR", True)
-    drug_claims._cleanup_drug_claims_workdir(retained_request)
+    drug_claims._cleanup_drug_claims_workdir(
+        _drug_cleanup_request({"work_dir": str(run_directory)})
+    )
     assert run_directory.is_dir()
 
 

@@ -23,9 +23,9 @@ class _FinalizeLockRedis:
     async def set(self, key, value, *, ex, nx):
         assert ex > 0
         if nx and key in self.values_by_key:
-            return False
+            return 0
         self.values_by_key[key] = value
-        return True
+        return 1
 
     async def eval(self, _script, key_count, key, owner_token):
         assert key_count == 1
@@ -129,13 +129,13 @@ async def test_finalize_lock_release_requires_the_owner_token(monkeypatch):
         "run-one",
         "owner-two",
     )
-    assert not await drug_claims._release_finalize_lock(
+    assert not await drug_claims._is_finalize_lock_released(
         redis,
         "run-one",
         "owner-two",
     )
     assert redis.values_by_key[lock_key] == "owner-one"
-    assert await drug_claims._release_finalize_lock(
+    assert await drug_claims._is_finalize_lock_released(
         redis,
         "run-one",
         "owner-one",
