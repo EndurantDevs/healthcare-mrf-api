@@ -1,6 +1,8 @@
 use ptg2_scanner::manifest::{write_dense_member_sidecar, GlobalId128, SidecarEntry};
+use ptg2_scanner::provider_graph_v4::ProviderGraphV4Error;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::error::Error;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -330,6 +332,16 @@ fn run(arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .expect("run V4 graph compiler")
+}
+
+#[test]
+fn compiler_errors_preserve_typed_sources() {
+    let io_error = ProviderGraphV4Error::from(std::io::Error::other("fixture"));
+    assert!(io_error.source().is_some());
+    let json_error = ProviderGraphV4Error::from(serde_json::from_str::<Value>("{").unwrap_err());
+    assert!(json_error.source().is_some());
+    let invalid_error = ProviderGraphV4Error::InvalidData("fixture".into());
+    assert!(invalid_error.source().is_none());
 }
 
 #[test]
