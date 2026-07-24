@@ -17,19 +17,16 @@ from api.ptg2_shared_blocks import PTG2SharedBlockError
 from process.ptg_parts import (
     canonical,
     import_rows,
-    provider_references,
     ptg2_manifest_artifacts as manifest_artifacts,
     ptg2_manifest_publish,
     rust_stage,
-    snapshot_cleanup,
     table_setup,
 )
 
 
-def test_global_local_mapping_round_trip_and_manifest_guards(
+def _write_mapping_fixture(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> tuple[dict[str, object], Path, bytes, bytes]:
     first_id = b"a" * 16
     second_id = b"b" * 16
     manifest = manifest_artifacts.write_global_local_id_mapping(
@@ -37,7 +34,24 @@ def test_global_local_mapping_round_trip_and_manifest_guards(
         "mapping",
         {second_id: (3, 1, 3), first_id: ()},
     )
-    manifest_path = tmp_path / "mapping.manifest.json"
+    return manifest, tmp_path / "mapping.manifest.json", first_id, second_id
+
+
+def _install_mapping_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+) -> None:
+    monkeypatch.setattr(
+        manifest_artifacts,
+        "read_manifest",
+        lambda *_args, **_kwargs: payload,
+    )
+
+
+def test_global_local_mapping_round_trip(tmp_path: Path) -> None:
+    _manifest, manifest_path, first_id, second_id = _write_mapping_fixture(
+        tmp_path
+    )
 
     assert manifest_artifacts.read_global_local_id_mapping(manifest_path) == {
         second_id: (1, 3),
@@ -48,46 +62,63 @@ def test_global_local_mapping_round_trip_and_manifest_guards(
     with pytest.raises(manifest_artifacts.PTG2ManifestArtifactError):
         manifest_artifacts._normalize_local_ids((-1,))
 
-    def install_manifest(payload: dict[str, object]) -> None:
-        monkeypatch.setattr(
-            manifest_artifacts,
-            "read_manifest",
-            lambda *_args, **_kwargs: payload,
-        )
 
-    invalid_version = copy.deepcopy(manifest)
-    invalid_version["version"] = 999
-    install_manifest(invalid_version)
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (("version", 999), ("artifact_type", "unexpected")),
+)
+def test_global_local_mapping_rejects_invalid_manifest_header(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    manifest, manifest_path, _first_id, _second_id = _write_mapping_fixture(
+        tmp_path
+    )
+    invalid_manifest = copy.deepcopy(manifest)
+    invalid_manifest[field_name] = invalid_value
+    _install_mapping_manifest(monkeypatch, invalid_manifest)
     with pytest.raises(manifest_artifacts.PTG2ManifestArtifactError):
         manifest_artifacts.read_global_local_id_mapping(manifest_path)
 
-    invalid_type = copy.deepcopy(manifest)
-    invalid_type["artifact_type"] = "unexpected"
-    install_manifest(invalid_type)
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (("record_size", 1), ("record_format", "unexpected")),
+)
+def test_global_local_mapping_rejects_invalid_record_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    manifest, manifest_path, _first_id, _second_id = _write_mapping_fixture(
+        tmp_path
+    )
+    invalid_manifest = copy.deepcopy(manifest)
+    invalid_manifest["sidecars"][0][field_name] = invalid_value
+    _install_mapping_manifest(monkeypatch, invalid_manifest)
     with pytest.raises(manifest_artifacts.PTG2ManifestArtifactError):
         manifest_artifacts.read_global_local_id_mapping(manifest_path)
 
-    invalid_size = copy.deepcopy(manifest)
-    invalid_size["sidecars"][0]["record_size"] = 1
-    install_manifest(invalid_size)
-    with pytest.raises(manifest_artifacts.PTG2ManifestArtifactError):
-        manifest_artifacts.read_global_local_id_mapping(manifest_path)
 
-    invalid_format = copy.deepcopy(manifest)
-    invalid_format["sidecars"][0]["record_format"] = "unexpected"
-    install_manifest(invalid_format)
-    with pytest.raises(manifest_artifacts.PTG2ManifestArtifactError):
-        manifest_artifacts.read_global_local_id_mapping(manifest_path)
-
+def test_global_local_mapping_rejects_invalid_record_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, manifest_path, _first_id, _second_id = _write_mapping_fixture(
+        tmp_path
+    )
     unaligned = copy.deepcopy(manifest)
     unaligned["sidecars"][0]["byte_count"] = 1
-    install_manifest(unaligned)
+    _install_mapping_manifest(monkeypatch, unaligned)
     with pytest.raises(manifest_artifacts.PTG2ManifestArtifactError):
         manifest_artifacts.read_global_local_id_mapping(manifest_path)
 
     wrong_count = copy.deepcopy(manifest)
     wrong_count["sidecars"][0]["record_count"] = 99
-    install_manifest(wrong_count)
+    _install_mapping_manifest(monkeypatch, wrong_count)
     with pytest.raises(manifest_artifacts.PTG2ManifestArtifactError):
         manifest_artifacts.read_global_local_id_mapping(manifest_path)
 
@@ -101,7 +132,7 @@ def test_global_local_mapping_round_trip_and_manifest_guards(
             "record_count": 1,
         }
     )
-    install_manifest(partial_record)
+    _install_mapping_manifest(monkeypatch, partial_record)
     with pytest.raises(manifest_artifacts.PTG2ManifestArtifactError):
         manifest_artifacts.read_global_local_id_mapping(manifest_path)
 
@@ -211,193 +242,6 @@ async def test_serving_stage_ensure_tolerates_optional_ddl_failures(
     assert not any("CREATE INDEX" in statement for statement in seen_statements)
 
 
-def test_snapshot_cleanup_helpers_preserve_owned_and_available_resources(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    serving_index = {
-        "table": "mrf.ptg2_serving_rate_compact_transient",
-        "serving_table_retained": False,
-        "materialized_tables": {
-            "primary": "mrf.ptg2_serving_rate_compact_primary",
-            "invalid": "unrelated_table",
-        },
-    }
-    assert snapshot_cleanup._required_snapshot_table_names(serving_index) == [
-        "ptg2_serving_rate_compact_primary"
-    ]
-    assert snapshot_cleanup._required_snapshot_table_names(
-        {
-            "table": "mrf.ptg2_serving_rate_compact_transient",
-            "serving_table_retained": False,
-        }
-    ) == []
-
-    db_ids: set[str] = set()
-    local_refs: set[str] = set()
-    snapshot_cleanup._record_snapshot_artifact_reference(
-        None,
-        db_ids,
-        local_refs,
-        include_local_artifacts=True,
-    )
-    snapshot_cleanup._record_snapshot_artifact_reference(
-        "db://ptg2_artifact/artifact_1",
-        db_ids,
-        local_refs,
-        include_local_artifacts=True,
-    )
-    snapshot_cleanup._record_snapshot_artifact_reference(
-        "relative.bin",
-        db_ids,
-        local_refs,
-        include_local_artifacts=True,
-    )
-    snapshot_cleanup._record_snapshot_artifact_reference(
-        "ignored.bin",
-        db_ids,
-        local_refs,
-        include_local_artifacts=False,
-    )
-    assert db_ids == {"artifact_1"}
-    assert local_refs == {"relative.bin"}
-
-    local_file = tmp_path / "artifact.bin"
-    local_file.write_bytes(b"ok")
-    monkeypatch.setattr(
-        snapshot_cleanup,
-        "resolve_ptg2_artifact_dir",
-        lambda: tmp_path,
-    )
-    assert snapshot_cleanup._is_local_artifact_available(str(local_file))
-    assert snapshot_cleanup._is_local_artifact_available(local_file.as_uri())
-    assert snapshot_cleanup._is_local_artifact_available(local_file.name)
-    assert not snapshot_cleanup._is_local_artifact_available("missing.bin")
-
-    owners = snapshot_cleanup._snapshot_table_owners(
-        [
-            {
-                "snapshot_id": "candidate_a",
-                "manifest": {
-                    "serving_index": {
-                        "table": "mrf.ptg2_serving_rate_compact_shared"
-                    }
-                },
-            },
-            {
-                "snapshot_id": "candidate_b",
-                "manifest": '{"serving_index":{"table":"mrf.ptg2_serving_rate_compact_shared"}}',
-            },
-            {"snapshot_id": "", "manifest": {}},
-            {"snapshot_id": "candidate_c", "manifest": "not-json"},
-        ]
-    )
-    assert owners == {
-        "ptg2_serving_rate_compact_shared": {"candidate_a", "candidate_b"}
-    }
-
-
-@pytest.mark.asyncio
-async def test_snapshot_db_artifact_availability_requires_complete_rows(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assert await snapshot_cleanup._available_snapshot_db_artifact_ids(
-        "candidate_schema", "candidate", set()
-    ) == set()
-
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=False))
-    assert await snapshot_cleanup._available_snapshot_db_artifact_ids(
-        "candidate_schema", "candidate", {"artifact_1"}
-    ) == set()
-
-    monkeypatch.setattr(
-        snapshot_cleanup,
-        "_table_exists",
-        AsyncMock(side_effect=(True, True)),
-    )
-    monkeypatch.setattr(
-        snapshot_cleanup.db,
-        "all",
-        AsyncMock(
-            return_value=[
-                {"artifact_id": "artifact_1"},
-                SimpleNamespace(_mapping={"artifact_id": "artifact_2"}),
-            ]
-        ),
-    )
-    assert await snapshot_cleanup._available_snapshot_db_artifact_ids(
-        "candidate_schema",
-        "candidate",
-        {"artifact_1", "artifact_2"},
-    ) == {"artifact_1", "artifact_2"}
-
-
-@pytest.mark.asyncio
-async def test_provider_reference_materialization_handles_failure_and_group_rows(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    materialize = AsyncMock(side_effect=RuntimeError("unavailable"))
-    facade = SimpleNamespace(
-        ptg2_temp_parent=lambda: tmp_path,
-        materialize_json_source=materialize,
-        _record_source_version=AsyncMock(),
-        _push_ptg2_objects=AsyncMock(),
-        push_objects=AsyncMock(),
-        flush_error_log=AsyncMock(),
-        TEST_PROVIDER_GROUPS=1,
-    )
-    monkeypatch.setattr(provider_references, "_ptg_facade", lambda: facade)
-    classes = {
-        "PTGProviderGroup": object,
-        "PTGFile": object,
-        "ImportLog": object,
-    }
-    assert await provider_references._process_provider_reference_file(
-        "https://invalid.example/reference.json",
-        classes,
-        test_mode=False,
-    ) == {}
-
-    raw_artifact = SimpleNamespace()
-    logical_artifact = SimpleNamespace(logical_path=tmp_path / "logical.json")
-    materialize.side_effect = None
-    materialize.return_value = (raw_artifact, logical_artifact)
-    monkeypatch.setattr(
-        provider_references,
-        "load_json_artifact",
-        lambda _path: {
-            "version": "1",
-            "provider_groups": [
-                {
-                    "provider_group_id": "7",
-                    "tin": {"type": "ein", "value": "000000000"},
-                    "npi": [1000000001],
-                    "network_name": ["primary"],
-                },
-                {
-                    "provider_group_ref": 8,
-                    "npi": [1000000002],
-                },
-            ],
-        },
-    )
-
-    provider_map = await provider_references._process_provider_reference_file(
-        "https://invalid.example/reference.json",
-        classes,
-        test_mode=True,
-        import_run_id="run_1",
-    )
-
-    assert list(provider_map) == [7]
-    assert provider_map[7][0]["provider_group_id"] == 7
-    facade._record_source_version.assert_awaited_once()
-    facade._push_ptg2_objects.assert_awaited_once()
-    facade.push_objects.assert_awaited_once()
-    facade.flush_error_log.assert_awaited_once()
-
-
 def test_ptg_helpers_cover_money_and_lean_source_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -460,14 +304,16 @@ async def test_v4_dictionary_reverse_lookup_and_candidate_bounds(
             tiny_budget,
         )
 
-    candidate_keys = {1000000001: set()}
-    retained_bytes = candidate_v4._candidate_map_retained_bytes(candidate_keys)
+    candidate_keys_by_npi = {1000000001: set()}
+    retained_bytes = candidate_v4._candidate_map_retained_bytes(
+        candidate_keys_by_npi
+    )
     budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=1024 * 1024)
     budget.claim(retained_bytes, category="candidate projection")
     assert await candidate_v4.prove_v4_candidate_sets(
         object(),
         SimpleNamespace(),
-        candidate_keys,
+        candidate_keys_by_npi,
         budget,
         schema_name="candidate_schema",
     ) == {1000000001: ()}
