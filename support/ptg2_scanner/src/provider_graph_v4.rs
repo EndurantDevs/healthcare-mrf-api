@@ -55,8 +55,8 @@ const DEFAULT_MAX_ONLINE_PROVIDER_EXPANSION_RATE_ROWS: usize = 256;
 const DEFAULT_MAX_ONLINE_PROVIDER_EXPANSION_PROVIDER_SETS: usize = 64;
 const DEFAULT_MAX_ONLINE_PROVIDER_EXPANSION_GRAPH_BATCHES: usize = 64;
 const DEFAULT_NPI_PREFIX_TARGET: usize = 201;
-const DEFAULT_MAX_NPI_PREFIX_OVERRIDE_OWNERS: usize = 50_000;
-const DEFAULT_MAX_NPI_PREFIX_OVERRIDE_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_NPI_PREFIX_OVERRIDE_OWNERS: usize = 250_000;
+const DEFAULT_MAX_NPI_PREFIX_OVERRIDE_BYTES: u64 = 256 * 1024 * 1024;
 const REFERENCE_ENCODE_BUFFER_BYTES: u64 = 4 * 1024;
 const REFERENCE_SPOOL_WRITER_BYTES: u64 = 8 * 1024;
 const MAX_REFERENCE_OBJECT_KINDS: usize = 32;
@@ -5769,12 +5769,14 @@ mod tests {
         .unwrap();
         let groups = (0..10u32).collect::<Vec<_>>();
         let group_npis = (0..10u32).map(|npi_key| vec![npi_key]).collect::<Vec<_>>();
+        let owner_count = 50_001usize;
+        let owner_factors = vec![vec![0]; owner_count];
         let plan = derive_npi_prefix_overrides(
             NpiPrefixInputs {
                 set_base: 0,
-                set_components: &[vec![0]],
+                set_components: &owner_factors,
                 component_groups: std::slice::from_ref(&groups),
-                set_patterns: &[vec![0]],
+                set_patterns: &owner_factors,
                 pattern_groups: std::slice::from_ref(&groups),
                 group_npis: &group_npis,
             },
@@ -5783,11 +5785,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.group_unsafe_set_count, 0);
-        assert_eq!(plan.physical_unsafe_set_count, 1);
-        assert_eq!(plan.groups_to_target, vec![3]);
+        assert_eq!(plan.physical_unsafe_set_count, owner_count as u64);
+        assert!(plan.groups_to_target.iter().all(|count| *count == 3));
         assert_eq!(plan.lists[0], vec![0, 1, 2]);
-        assert_eq!(plan.metadata.len(), 1);
+        assert_eq!(plan.metadata.len(), owner_count);
         assert!(plan.maximum_source_member_work > 1);
+        assert_eq!(
+            pages_for_owner_prefixes(&[0, 1], &group_npis, &[0, 1, 2], 1, 1),
+            2
+        );
     }
 
     #[test]

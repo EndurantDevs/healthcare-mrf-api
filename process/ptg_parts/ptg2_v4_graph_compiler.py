@@ -892,11 +892,11 @@ def _hot_prefix_option_defaults() -> dict[str, int]:
             PTG2_V4_GRAPH_NPI_PREFIX_TARGET_ENV, 201
         ),
         "max_npi_prefix_override_owners": _positive_env_int(
-            PTG2_V4_GRAPH_MAX_NPI_PREFIX_OVERRIDE_OWNERS_ENV, 50_000
+            PTG2_V4_GRAPH_MAX_NPI_PREFIX_OVERRIDE_OWNERS_ENV, 250_000
         ),
         "max_npi_prefix_override_bytes": _positive_env_int(
             PTG2_V4_GRAPH_MAX_NPI_PREFIX_OVERRIDE_BYTES_ENV,
-            64 * 1024 * 1024,
+            256 * 1024 * 1024,
         ),
     }
 

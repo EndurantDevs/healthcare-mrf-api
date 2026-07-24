@@ -149,10 +149,9 @@ fn write_direct_manifest(root: &Path) -> PathBuf {
         shard_id,
         sets.iter()
             .copied()
-            .zip(components)
-            .map(|(owner, member)| SidecarEntry {
+            .map(|owner| SidecarEntry {
                 owner,
-                members: vec![member],
+                members: components.to_vec(),
             })
             .collect(),
     );
