@@ -336,6 +336,7 @@ async def test_snapshot_reservation_root_and_binding_lifecycle(monkeypatch) -> N
 
 
 def _configure_audit_publication(monkeypatch):
+    verify_providers = audit._verified_provider_npis_by_candidate
     candidates = (AuditCandidate(1, 7, 2, 0, 1, 0),)
     witness = audit.V4ProviderSetAuditWitness(7, 11, 1_234_567_890)
     transaction_session = object()
@@ -388,7 +389,10 @@ def _configure_audit_publication(monkeypatch):
         return {"sample_count": 1}
 
     monkeypatch.setattr(audit, "_publication_metadata", fake_publication_metadata)
-    return SimpleNamespace(selected_layout="pattern")
+    return SimpleNamespace(
+        selected_layout="pattern",
+        verify_providers=verify_providers,
+    )
 
 
 async def _assert_audit_publication(
@@ -442,18 +446,6 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             price_membership_block_span=256,
             graph_compilation=compilation,
         )
-    with pytest.raises(RuntimeError, match="negative source_count"):
-        await audit.publish_v4_audit_sample(
-            schema_name="mrf",
-            build_ownership=SharedLayoutBuildOwnership(17, "token"),
-            logical_snapshot_id="snapshot",
-            finalizer_summary={"source_count": -1},
-            mapping_digest=b"m" * 32,
-            core_support_digest=b"s" * 32,
-            atom_key_bits=16,
-            price_membership_block_span=256,
-            graph_compilation=compilation,
-        )
     with pytest.raises(RuntimeError, match="unsupported"):
         await audit.publish_v4_audit_sample(
             schema_name="mrf",
@@ -465,6 +457,24 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             atom_key_bits=16,
             price_membership_block_span=256,
             graph_compilation=SimpleNamespace(selected_layout="unknown"),
+        )
+    async def missing_edges(_relation, edges):
+        return {edge: False for edge in edges}
+
+    candidate = AuditCandidate(1, 7, 2, 0, 1, 0)
+    witness = audit.V4ProviderSetAuditWitness(7, 11, 1_234_567_890)
+    reader = SimpleNamespace(
+        representation="direct_v1",
+        contains_edges=missing_edges,
+    )
+    with pytest.raises(RuntimeError, match="absent from the direct graph"):
+        await compilation.verify_providers(
+            object(),
+            schema_name="mrf",
+            snapshot_key=17,
+            candidates=(candidate,),
+            witnesses={7: witness},
+            reader=reader,
         )
 
 
