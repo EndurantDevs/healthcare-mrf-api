@@ -336,6 +336,7 @@ async def test_snapshot_reservation_root_and_binding_lifecycle(monkeypatch) -> N
 
 
 def _configure_audit_publication(monkeypatch):
+    verify_providers = audit._verified_provider_npis_by_candidate
     candidates = (AuditCandidate(1, 7, 2, 0, 1, 0),)
     witness = audit.V4ProviderSetAuditWitness(7, 11, 1_234_567_890)
     transaction_session = object()
@@ -378,15 +379,28 @@ def _configure_audit_publication(monkeypatch):
         lambda **_kwargs: (occurrence,),
     )
     monkeypatch.setattr(audit, "_insert_occurrences", no_op)
-    monkeypatch.setattr(
-        audit,
-        "_publication_metadata",
-        lambda **_kwargs: {"sample_count": 1},
+    def fake_publication_metadata(**kwargs):
+        hydration_work = kwargs["hydration_work"]
+        assert hydration_work.price_candidate_count == 1
+        assert hydration_work.provider_candidate_count == 1
+        assert hydration_work.represented_source_count == 1
+        assert hydration_work.provider_selection_budget == 1
+        assert hydration_work.provider_selection_count == 1
+        return {"sample_count": 1}
+
+    monkeypatch.setattr(audit, "_publication_metadata", fake_publication_metadata)
+    return SimpleNamespace(
+        selected_layout="pattern",
+        verify_providers=verify_providers,
     )
-    return SimpleNamespace(selected_layout="pattern")
 
 
-async def _assert_audit_publication(compilation) -> None:
+async def _assert_audit_publication(
+    compilation,
+    *,
+    expected_representation: str,
+    expected_verification: str,
+) -> None:
     publication = await audit.publish_v4_audit_sample(
         schema_name="mrf",
         build_ownership=SharedLayoutBuildOwnership(17, "token"),
@@ -399,7 +413,11 @@ async def _assert_audit_publication(compilation) -> None:
         graph_compilation=compilation,
     )
     assert publication.row_count == 1
-    assert publication.metadata["provider_graph_representation"] == "pattern_v1"
+    assert (
+        publication.metadata["provider_graph_representation"]
+        == expected_representation
+    )
+    assert publication.metadata["provider_graph_verification"] == expected_verification
     assert len(publication.support_digest) == 32
 
 
@@ -416,6 +434,18 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             price_membership_block_span=256,
             graph_compilation=compilation,
         )
+    with pytest.raises(ValueError, match="core support digest"):
+        await audit.publish_v4_audit_sample(
+            schema_name="mrf",
+            build_ownership=SharedLayoutBuildOwnership(17, "token"),
+            logical_snapshot_id="snapshot",
+            finalizer_summary={"source_count": 1},
+            mapping_digest=b"m" * 32,
+            core_support_digest=b"short",
+            atom_key_bits=16,
+            price_membership_block_span=256,
+            graph_compilation=compilation,
+        )
     with pytest.raises(RuntimeError, match="unsupported"):
         await audit.publish_v4_audit_sample(
             schema_name="mrf",
@@ -428,11 +458,38 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             price_membership_block_span=256,
             graph_compilation=SimpleNamespace(selected_layout="unknown"),
         )
+    async def missing_edges(_relation, edges):
+        return {edge: False for edge in edges}
+
+    candidate = AuditCandidate(1, 7, 2, 0, 1, 0)
+    witness = audit.V4ProviderSetAuditWitness(7, 11, 1_234_567_890)
+    reader = SimpleNamespace(
+        representation="direct_v1",
+        contains_edges=missing_edges,
+    )
+    with pytest.raises(RuntimeError, match="absent from the direct graph"):
+        await compilation.verify_providers(
+            object(),
+            schema_name="mrf",
+            snapshot_key=17,
+            candidates=(candidate,),
+            witnesses={7: witness},
+            reader=reader,
+        )
 
 
 @pytest.mark.asyncio
 async def test_audit_publish_orchestration(monkeypatch) -> None:
     """Orchestrate audit publication and reject incomplete derived outputs."""
     compilation = _configure_audit_publication(monkeypatch)
-    await _assert_audit_publication(compilation)
+    await _assert_audit_publication(
+        compilation,
+        expected_representation="pattern_v1",
+        expected_verification="set_patterns_pattern_groups_group_npis_exact_v1",
+    )
+    await _assert_audit_publication(
+        SimpleNamespace(selected_layout="direct"),
+        expected_representation="direct_v1",
+        expected_verification="set_groups_direct_group_npis_exact_v1",
+    )
     await _assert_audit_publication_rejections(compilation)
