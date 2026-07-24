@@ -347,4 +347,3 @@ async def test_state_processing_returns_zero_for_unusable_source(response):
         )
         == 0
     )
-
