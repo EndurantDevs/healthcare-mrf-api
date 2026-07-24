@@ -28,7 +28,7 @@ from process.ptg_parts.ptg2_shared_gc import (
     resolve_ptg2_schema,
 )
 from process.ptg_parts.snapshot_cleanup import (
-    is_strict_ptg2_v3_shared_blocks_manifest,
+    is_shared_snapshot_control_manifest,
 )
 
 
@@ -251,20 +251,9 @@ def _serving_index(row: dict[str, Any]) -> dict[str, Any]:
 def _is_gc_shared_manifest(
     serving_index: dict[str, Any] | None,
 ) -> bool:
-    """Admit V4 without changing the established strict V3 predicate."""
+    """Use the same explicit V3/V4 generation gate as targeted control."""
 
-    if is_strict_ptg2_v3_shared_blocks_manifest(serving_index):
-        return True
-    if not isinstance(serving_index, dict):
-        return False
-    return (
-        str(serving_index.get("arch_version") or "").strip().lower()
-        == "postgres_binary_v3"
-        and str(
-            serving_index.get("storage_generation") or ""
-        ).strip().lower()
-        == PTG2_V4_SHARED_GENERATION
-    )
+    return is_shared_snapshot_control_manifest(serving_index)
 
 
 def _is_allowed_amount_snapshot(row: dict[str, Any]) -> bool:

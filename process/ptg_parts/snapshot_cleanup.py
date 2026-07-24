@@ -31,6 +31,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_GENERATION,
+    PTG2_V4_SHARED_GENERATION,
 )
 from process.ptg_parts.ptg2_shared_gc import (
     release_unbound_ptg2_shared_layouts,
@@ -136,6 +137,21 @@ def is_strict_ptg2_v3_shared_blocks_manifest(
         == PTG2_V3_ARCH_VERSION
         and str(serving_index.get("storage_generation") or "").strip().lower()
         == PTG2_V3_SHARED_GENERATION
+    )
+
+
+def is_shared_snapshot_control_manifest(
+    serving_index: dict[str, Any] | None,
+) -> bool:
+    """Admit only shared V3/V4 layouts to generation-aware snapshot control."""
+
+    if not isinstance(serving_index, dict):
+        return False
+    return (
+        str(serving_index.get("arch_version") or "").strip().lower()
+        == PTG2_V3_ARCH_VERSION
+        and str(serving_index.get("storage_generation") or "").strip().lower()
+        in {PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION}
     )
 
 

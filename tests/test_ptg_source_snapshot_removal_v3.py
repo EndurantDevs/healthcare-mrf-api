@@ -50,6 +50,8 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
             "tables": [],
             "artifact_manifest_ids": [],
             "current_references": {},
+            "storage_generation": "shared_blocks_v3",
+            "shared_snapshot_key": 11,
         }
 
     async def fake_status(statement, **params):
@@ -69,17 +71,27 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
             return 1
         raise AssertionError(statement)
 
-    async def fake_release(*, schema_name, executor, require_shared):
+    async def fake_release(*, schema_name, executor, require_shared, layout_keys):
         assert transaction.active
         assert schema_name == "mrf"
         assert require_shared is True
         assert executor._session is transaction
+        assert layout_keys == (11,)
         events.append("layout-release")
-        return SimpleNamespace(logical_layout_count=1)
+        return SimpleNamespace(
+            logical_layout_count=1,
+            candidate_hash_count=2,
+            stored_bytes=4096,
+        )
 
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
     monkeypatch.setattr(source_snapshot_control, "build_ptg2_source_snapshot_remove_plan", fake_plan)
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "bound_shared_layout_keys",
+        AsyncMock(return_value=(11,)),
+    )
     monkeypatch.setattr(source_snapshot_control, "release_unbound_ptg2_shared_layouts", fake_release)
 
     removal_result = await source_snapshot_control.remove_ptg2_source_snapshot(
@@ -98,6 +110,9 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
     assert removal_result["deleted_v3_snapshot_bindings"] == 1
     assert removal_result["deleted_snapshots"] == 1
     assert removal_result["released_shared_layouts"] == 1
+    assert removal_result["queued_shared_block_candidates"] == 2
+    assert removal_result["queued_shared_block_bytes"] == 4096
+    assert removal_result["physical_cleanup"] == "released"
 
 
 async def _create_production_shaped_schema(database, schema_name):

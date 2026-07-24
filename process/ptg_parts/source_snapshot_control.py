@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import datetime
-import json
 import os
 from typing import Any
 
@@ -12,9 +10,15 @@ from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 from process.ptg_parts.ptg2_shared_gc import release_unbound_ptg2_shared_layouts
-from process.ptg_parts.snapshot_cleanup import (
-    _is_ptg2_snapshot_in_flight,
-    is_strict_ptg2_v3_shared_blocks_manifest,
+from process.ptg_parts.snapshot_cleanup import is_shared_snapshot_control_manifest
+from process.ptg_parts.source_snapshot_control_policy import (
+    SUPPORTED_SHARED_SNAPSHOT_CONTROL_MESSAGE,
+    manifest_dict,
+    retirement_manifest_source_key,
+    snapshot_remove_reasons,
+)
+from process.ptg_parts.source_snapshot_shared_layout import (
+    bound_shared_layout_keys,
 )
 from process.ptg_parts.source_pointers import (
     PTG2_SOURCE_POINTER_GC_LOCK_KEY,
@@ -25,16 +29,6 @@ from process.ptg_parts.source_pointers import (
 
 class SourceSnapshotConflict(ValueError):
     """Raised when a source snapshot pointer changed between plan and execute."""
-
-
-def _is_remove_blocked(snapshot_status: Any) -> bool:
-    """Allow explicit cleanup of validated candidates while builds stay protected."""
-
-    normalized_status = str(snapshot_status or "").strip().lower()
-    return (
-        _is_ptg2_snapshot_in_flight(normalized_status)
-        and normalized_status != "validated"
-    )
 
 
 class _TransactionExecutor:
@@ -70,76 +64,6 @@ def _row_mapping(row: Any) -> dict[str, Any]:
     if isinstance(row, dict):
         return row
     return dict(getattr(row, "_mapping", row))
-
-
-def _manifest_dict(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
-def _snapshot_remove_reasons(
-    *,
-    source_key: str | None,
-    manifest_source_key: str | None,
-    snapshot_status: str,
-    references: dict[str, list[str]],
-) -> list[str]:
-    """Describe every current or rollback reference that prevents removal."""
-
-    reasons: list[str] = []
-    if source_key and manifest_source_key and source_key != manifest_source_key:
-        reasons.append("snapshot source_key does not match requested source_key")
-    if _is_remove_blocked(snapshot_status):
-        reasons.append(f"snapshot is in-flight (status: {snapshot_status})")
-    label_by_reference_name = {
-        "global_slots": "current global",
-        "source_keys": "current source",
-        "plan_source_keys": "current plan",
-        "previous_global_slots": "previous global",
-        "previous_source_keys": "previous source",
-        "previous_plan_source_keys": "previous plan",
-        "plan_release_pins": "plan release pin",
-    }
-    reasons.extend(
-        f"snapshot is referenced by {label} pointer"
-        for reference_name, label in label_by_reference_name.items()
-        if references.get(reference_name)
-    )
-    return reasons
-
-
-def _retirement_manifest_source_key(
-    snapshot: dict[str, Any],
-    requested_source_key: str | None,
-) -> str | None:
-    """Validate a snapshot's immutable identity before retiring its pointers."""
-
-    if not snapshot:
-        return None
-    manifest_map = _manifest_dict(snapshot.get("manifest"))
-    serving_index_map = (
-        manifest_map.get("serving_index")
-        if isinstance(manifest_map.get("serving_index"), dict)
-        else {}
-    )
-    manifest_source_key = str(serving_index_map.get("source_key") or "").strip() or None
-    if not is_strict_ptg2_v3_shared_blocks_manifest(serving_index_map):
-        raise ValueError(
-            "only postgres_binary_v3/shared_blocks_v3 snapshots can be retired"
-        )
-    snapshot_status = str(snapshot.get("status") or "").strip().lower()
-    if _is_ptg2_snapshot_in_flight(snapshot_status):
-        raise ValueError(f"snapshot is in-flight (status: {snapshot_status})")
-    if requested_source_key and manifest_source_key and requested_source_key != manifest_source_key:
-        raise ValueError("snapshot source_key does not match requested source_key")
-    return manifest_source_key
 
 
 async def promote_ptg2_source_snapshot(
@@ -188,19 +112,25 @@ async def build_ptg2_source_snapshot_remove_plan(
             "artifact_manifest_ids": [],
             "current_references": {},
         }
-    manifest = _manifest_dict(snapshot.get("manifest"))
+    manifest = manifest_dict(snapshot.get("manifest"))
     serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
-    if not is_strict_ptg2_v3_shared_blocks_manifest(serving_index):
+    storage_generation = str(
+        serving_index.get("storage_generation") or ""
+    ).strip().lower()
+    if not is_shared_snapshot_control_manifest(serving_index):
         return {
             "snapshot_id": snapshot_id,
             "source_key": source_key,
             "exists": True,
             "removable": False,
-            "reason": "only postgres_binary_v3/shared_blocks_v3 snapshots can be removed",
+            "reason": (
+                f"{SUPPORTED_SHARED_SNAPSHOT_CONTROL_MESSAGE} can be removed"
+            ),
             "metadata_only": True,
             "tables": [],
             "artifact_manifest_ids": [],
             "current_references": {},
+            "storage_generation": storage_generation or None,
             "status": snapshot.get("status"),
             "import_month": str(snapshot.get("import_month") or ""),
         }
@@ -208,7 +138,7 @@ async def build_ptg2_source_snapshot_remove_plan(
     references = await _current_references(schema, snapshot_id)
     artifact_ids = await _artifact_manifest_ids(schema, snapshot_id)
     snapshot_status = str(snapshot.get("status") or "").strip().lower()
-    reasons = _snapshot_remove_reasons(
+    reasons = snapshot_remove_reasons(
         source_key=source_key,
         manifest_source_key=manifest_source_key,
         snapshot_status=snapshot_status,
@@ -224,6 +154,8 @@ async def build_ptg2_source_snapshot_remove_plan(
         "tables": [],
         "artifact_manifest_ids": artifact_ids,
         "current_references": references,
+        "storage_generation": storage_generation,
+        "shared_snapshot_key": serving_index.get("shared_snapshot_key"),
         "status": snapshot.get("status"),
         "import_month": str(snapshot.get("import_month") or ""),
     }
@@ -251,7 +183,20 @@ async def remove_ptg2_source_snapshot(
                 "deleted_artifact_manifests": 0,
                 "deleted_snapshots": 0,
                 "released_shared_layouts": 0,
+                "queued_shared_block_candidates": 0,
+                "queued_shared_block_bytes": 0,
+                "physical_cleanup": "not_applicable",
             }
+        storage_generation = str(
+            plan.get("storage_generation") or ""
+        ).strip().lower()
+        layout_keys = await bound_shared_layout_keys(
+            session,
+            schema=schema,
+            snapshot_id=snapshot_id,
+            expected_generation=storage_generation,
+            expected_snapshot_key=plan.get("shared_snapshot_key"),
+        )
         tables: list[str] = []
         deleted_v3_snapshot_scopes = await db.status(
             f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_scope WHERE snapshot_id = :snapshot_id",
@@ -281,12 +226,22 @@ async def remove_ptg2_source_snapshot(
             snapshot_id=snapshot_id,
         )
         shared_layout_release = None
-        if int(deleted_v3_snapshot_bindings or 0) > 0:
+        if int(deleted_v3_snapshot_bindings or 0) > 0 and layout_keys:
             shared_layout_release = await release_unbound_ptg2_shared_layouts(
                 schema_name=schema,
                 executor=_TransactionExecutor(session),
                 require_shared=True,
+                layout_keys=layout_keys,
             )
+        released_shared_layouts = int(
+            getattr(shared_layout_release, "logical_layout_count", 0) or 0
+        )
+        queued_shared_block_candidates = int(
+            getattr(shared_layout_release, "candidate_hash_count", 0) or 0
+        )
+        queued_shared_block_bytes = int(
+            getattr(shared_layout_release, "stored_bytes", 0) or 0
+        )
     return {
         **plan,
         "executed": True,
@@ -296,8 +251,13 @@ async def remove_ptg2_source_snapshot(
         "deleted_artifact_chunks": int(deleted_artifact_chunks or 0),
         "deleted_artifact_manifests": int(deleted_artifacts or 0),
         "deleted_snapshots": int(deleted_snapshots or 0),
-        "released_shared_layouts": int(
-            getattr(shared_layout_release, "logical_layout_count", 0) or 0
+        "released_shared_layouts": released_shared_layouts,
+        "queued_shared_block_candidates": queued_shared_block_candidates,
+        "queued_shared_block_bytes": queued_shared_block_bytes,
+        "physical_cleanup": (
+            "released"
+            if released_shared_layouts
+            else ("deferred" if layout_keys else "not_applicable")
         ),
     }
 
@@ -316,7 +276,7 @@ async def retire_ptg2_source_snapshot(
     async with db.transaction() as session:
         await _lock_source_pointer_gc(session)
         snapshot = await _snapshot_row(schema, snapshot_id)
-        manifest_source_key = _retirement_manifest_source_key(snapshot, source_key)
+        manifest_source_key = retirement_manifest_source_key(snapshot, source_key)
         before = await _current_references(schema, snapshot_id)
         if before.get("global_slots"):
             raise ValueError("snapshot is referenced by current global pointer")
