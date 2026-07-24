@@ -17,13 +17,14 @@ use ptg2_scanner::normalize::{
 };
 use ptg2_scanner::progress::{
     emit_progress, ScannerSemanticProgress, ScannerSemanticProgressReporter,
+    SEMANTIC_PROGRESS_INTERVAL,
 };
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{atomic::AtomicU64, Arc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use struson::reader::JsonStreamReader;
 
 #[test]
@@ -224,9 +225,10 @@ fn semantic_progress_counts_each_scanner_work_family() {
 }
 
 #[test]
-fn scanner_progress_reporters_start_emit_and_stop_cleanly() {
+fn scanner_progress_reporters_emit_interval_frame_and_stop_cleanly() {
     let compressed_bytes_read = Arc::new(AtomicU64::new(5));
     let semantic_progress = Arc::new(ScannerSemanticProgress::default());
+    semantic_progress.record_rate_chunk_completed();
     let reporter = ScannerSemanticProgressReporter::start(
         Path::new("/tmp/scanner-progress.json.gz"),
         10,
@@ -236,6 +238,7 @@ fn scanner_progress_reporters_start_emit_and_stop_cleanly() {
     )
     .unwrap();
 
+    std::thread::sleep(SEMANTIC_PROGRESS_INTERVAL + Duration::from_secs(1));
     emit_progress(
         Path::new("/tmp/scanner-progress.json.gz"),
         10,
