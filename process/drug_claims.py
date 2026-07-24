@@ -200,6 +200,71 @@ class DatasetConfig:
     row_limit_test: int
 
 
+@dataclass(frozen=True)
+class SnapshotSourceLayout:
+    schema: str
+    product_table: str
+    package_table: str
+    rxnorm_join_sql: str
+    rxnorm_source_sql: str
+    package_join_sql: str
+    ndc_source_sql: str
+
+
+@dataclass(frozen=True)
+class SnapshotStageTables:
+    hp_rx_codes: str
+    snapshot_codes: str
+    crosswalk_candidates: str
+
+    def drop_order(self) -> tuple[str, str, str]:
+        """Return child-first stage-table cleanup order."""
+
+        return (
+            self.crosswalk_candidates,
+            self.snapshot_codes,
+            self.hp_rx_codes,
+        )
+
+
+@dataclass(frozen=True)
+class ExternalCrosswalkTarget:
+    hp_code: str
+    code_system: str
+    code: str
+    display_name: str | None
+    confidence: float
+    crosswalk_source: str
+
+
+@dataclass(frozen=True)
+class DrugClaimsStartRequest:
+    test_mode: bool
+    import_id: str
+    run_id: str
+    stage_suffix: str
+    redis: Any
+
+
+@dataclass(frozen=True)
+class DrugClaimsWorkspace:
+    work_dir: Path
+    downloads_dir: Path
+    chunks_root: Path
+
+
+@dataclass(frozen=True)
+class DrugClaimsFinalizeRequest:
+    test_mode: bool
+    import_id: str
+    run_id: str
+    stage_suffix: str
+    schema: str
+    redis: Any
+    manifest: dict[str, Any]
+    expected_chunks: int
+
+
 DATASETS = (
     DatasetConfig("provider_drug", PROVIDER_DRUG_LANDING_PAGE, TEST_PROVIDER_DRUG_ROW_LIMIT),
     DatasetConfig("drug_spending", DRUG_SPENDING_LANDING_PAGE, TEST_DRUG_SPENDING_ROW_LIMIT),
@@ -858,13 +923,38 @@ async def _split_provider_drug_into_chunks(
     chunks_dir.mkdir(parents=True, exist_ok=True)
     bucket_count = _provider_drug_bucket_count(source_path)
     row_limit = TEST_PROVIDER_DRUG_ROW_LIMIT if test_mode else None
+    row_count_by_bucket, parsed_rows, accepted_rows = await _partition_provider_drug_rows(
+        source_path,
+        chunks_dir,
+        bucket_count,
+        row_limit,
+        test_mode,
+    )
+    chunks = _provider_drug_chunk_manifests(
+        chunks_dir,
+        bucket_count,
+        row_count_by_bucket,
+        parsed_rows,
+        accepted_rows,
+    )
+    _report_provider_drug_split(chunks, parsed_rows, accepted_rows, bucket_count)
+    return chunks
+
+
+async def _partition_provider_drug_rows(
+    source_path: str,
+    chunks_dir: Path,
+    bucket_count: int,
+    row_limit: int | None,
+    test_mode: bool,
+) -> tuple[dict[int, int], int, int]:
+    """Write valid provider rows into deterministic NPI buckets."""
 
     writers_by_bucket: dict[int, Any] = {}
     handles_by_bucket: dict[int, Any] = {}
     row_count_by_bucket: dict[int, int] = {idx: 0 for idx in range(bucket_count)}
     parsed_rows = 0
     accepted_rows = 0
-
     try:
         async with async_open(source_path, "r", encoding="utf-8-sig") as source_handle:
             reader = AsyncDictReader(source_handle)
@@ -895,9 +985,19 @@ async def _split_provider_drug_into_chunks(
     finally:
         for handle in handles_by_bucket.values():
             handle.close()
+    return row_count_by_bucket, parsed_rows, accepted_rows
+
+
+def _provider_drug_chunk_manifests(
+    chunks_dir: Path,
+    bucket_count: int,
+    row_count_by_bucket: dict[int, int],
+    parsed_rows: int,
+    accepted_rows: int,
+) -> list[dict[str, Any]]:
+    """Describe each non-empty provider bucket for downstream workers."""
 
     chunks: list[dict[str, Any]] = []
-    chunk_index = 0
     for bucket in range(bucket_count):
         rows_in_bucket = row_count_by_bucket.get(bucket, 0)
         if rows_in_bucket <= 0:
@@ -906,15 +1006,24 @@ async def _split_provider_drug_into_chunks(
         chunks.append(
             {
                 "dataset_key": "provider_drug",
-                "chunk_id": f"provider_drug:{chunk_index}",
-                "chunk_index": chunk_index,
+                "chunk_id": f"provider_drug:{len(chunks)}",
+                "chunk_index": len(chunks),
                 "chunk_path": str(chunk_path),
                 "parsed_rows": parsed_rows,
                 "accepted_rows": accepted_rows,
                 "rows_in_bucket": rows_in_bucket,
             }
         )
-        chunk_index += 1
+    return chunks
+
+
+def _report_provider_drug_split(
+    chunks: list[dict[str, Any]],
+    parsed_rows: int,
+    accepted_rows: int,
+    bucket_count: int,
+) -> None:
+    """Report the provider split outcome without changing its manifest."""
 
     if not chunks:
         print(
@@ -927,8 +1036,6 @@ async def _split_provider_drug_into_chunks(
             f"bucketed_by=npi buckets={bucket_count}",
             flush=True,
         )
-
-    return chunks
 
 
 def _open_binary_chunk(chunks_dir: Path, chunk_index: int, header_line: bytes | None) -> tuple[Any, Path, int]:
@@ -952,17 +1059,73 @@ async def _split_source_into_chunks(
 
     dataset_config = DATASET_BY_KEY[dataset_key]
     chunks_dir.mkdir(parents=True, exist_ok=True)
+    row_limit = dataset_config.row_limit_test if test_mode else None
+    chunks, parsed_rows, accepted_rows = await _partition_binary_source_rows(
+        dataset_key,
+        source_path,
+        chunks_dir,
+        row_limit,
+        test_mode,
+    )
+    _report_binary_source_split(dataset_key, chunks, parsed_rows, accepted_rows)
+    return chunks
+
+
+def _binary_chunk_manifest(
+    dataset_key: str,
+    chunk_path: Path | None,
+    chunk_index: int,
+    parsed_rows: int,
+    accepted_rows: int,
+) -> dict[str, Any]:
+    """Build the stable worker manifest for one binary CSV chunk."""
+
+    return {
+        "dataset_key": dataset_key,
+        "chunk_id": f"{dataset_key}:{chunk_index}",
+        "chunk_index": chunk_index,
+        "chunk_path": str(chunk_path),
+        "parsed_rows": parsed_rows,
+        "accepted_rows": accepted_rows,
+    }
+
+
+def _close_binary_chunk(
+    chunk_handle: Any,
+    chunks: list[dict[str, Any]],
+    dataset_key: str,
+    chunk_path: Path | None,
+    parsed_rows: int,
+    accepted_rows: int,
+) -> None:
+    """Close one chunk and append its final worker manifest."""
+
+    chunk_handle.close()
+    chunks.append(
+        _binary_chunk_manifest(
+            dataset_key,
+            chunk_path,
+            len(chunks),
+            parsed_rows,
+            accepted_rows,
+        )
+    )
+
+
+async def _partition_binary_source_rows(
+    dataset_key: str,
+    source_path: str,
+    chunks_dir: Path,
+    row_limit: int | None,
+    test_mode: bool,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Write a non-provider CSV into bounded byte-sized chunks."""
 
     chunks: list[dict[str, Any]] = []
     header_line: bytes | None = None
-    parsed_rows = 0
-    accepted_rows = 0
-    chunk_index = 0
-    current_size = 0
+    parsed_rows = accepted_rows = chunk_index = current_size = 0
     chunk_handle = None
     chunk_path: Path | None = None
-    row_limit = dataset_config.row_limit_test if test_mode else None
-
     try:
         async with async_open(source_path, "rb") as source_handle:
             async for line in source_handle:
@@ -988,32 +1151,36 @@ async def _split_source_into_chunks(
                 accepted_rows += 1
 
                 if current_size >= DRUG_CLAIMS_CHUNK_TARGET_BYTES:
-                    chunk_handle.close()
-                    chunks.append(
-                        {
-                            "dataset_key": dataset_key,
-                            "chunk_id": f"{dataset_key}:{len(chunks)}",
-                            "chunk_index": len(chunks),
-                            "chunk_path": str(chunk_path),
-                            "parsed_rows": parsed_rows,
-                            "accepted_rows": accepted_rows,
-                        }
+                    _close_binary_chunk(
+                        chunk_handle,
+                        chunks,
+                        dataset_key,
+                        chunk_path,
+                        parsed_rows,
+                        accepted_rows,
                     )
                     chunk_handle = None
                     chunk_path = None
     finally:
         if chunk_handle is not None:
-            chunk_handle.close()
-            chunks.append(
-                {
-                    "dataset_key": dataset_key,
-                    "chunk_id": f"{dataset_key}:{len(chunks)}",
-                    "chunk_index": len(chunks),
-                    "chunk_path": str(chunk_path),
-                    "parsed_rows": parsed_rows,
-                    "accepted_rows": accepted_rows,
-                }
+            _close_binary_chunk(
+                chunk_handle,
+                chunks,
+                dataset_key,
+                chunk_path,
+                parsed_rows,
+                accepted_rows,
             )
+    return chunks, parsed_rows, accepted_rows
+
+
+def _report_binary_source_split(
+    dataset_key: str,
+    chunks: list[dict[str, Any]],
+    parsed_rows: int,
+    accepted_rows: int,
+) -> None:
+    """Report bounded CSV chunking for operator visibility."""
 
     if not chunks:
         print(f"[warn] no chunks generated for {dataset_key} (parsed={parsed_rows:,}, accepted={accepted_rows:,})")
@@ -1022,7 +1189,6 @@ async def _split_source_into_chunks(
             f"[split:{dataset_key}] chunks={len(chunks)} parsed={parsed_rows:,} accepted={accepted_rows:,}",
             flush=True,
         )
-    return chunks
 
 
 async def _load_provider_drug_rows(
@@ -1033,11 +1199,139 @@ async def _load_provider_drug_rows(
 ) -> None:
     """Aggregate provider prescription rows into a staging table."""
 
+    provider_rx_map, row_number, accepted, progress_start = await _read_provider_drug_rows(
+        path,
+        year,
+        test_mode,
+    )
+    if provider_rx_map:
+        provider_prescriptions = sorted(
+            provider_rx_map.values(),
+            key=lambda prescription: (
+                prescription.get("npi"),
+                prescription.get("year"),
+                prescription.get("rx_code_system"),
+                prescription.get("rx_code"),
+            ),
+        )
+        for prescription_batch in _chunk_rows(provider_prescriptions, IMPORT_BATCH_SIZE):
+            await _push_objects_with_retry(prescription_batch, provider_prescription_cls)
+    _print_row_progress("provider_drug", row_number, accepted, progress_start, final=True)
+
+
+def _provider_prescription_from_row(
+    claim_row: dict[str, Any],
+    npi: int,
+    year: int,
+) -> dict[str, Any] | None:
+    """Normalize one provider CSV row into the staging contract."""
+
+    generic_name = _to_str(_row_value(claim_row, "Gnrc_Name", "GNRC_NAME", "generic_name"))
+    brand_name = _to_str(_row_value(claim_row, "Brnd_Name", "BRND_NAME", "brand_name"))
+    rx_name = generic_name or brand_name
+    if not rx_name:
+        return None
+    return {
+        "npi": npi,
+        "year": year,
+        "rx_code_system": RX_INTERNAL_CODE_SYSTEM,
+        "rx_code": _rx_code_from_names(generic_name, brand_name),
+        "rx_name": rx_name,
+        "generic_name": generic_name,
+        "brand_name": brand_name,
+        "provider_name": _provider_name(
+            _to_str(_row_value(claim_row, "Rndrng_Prvdr_Last_Org_Name", "Prscrbr_Last_Org_Name")),
+            _to_str(_row_value(claim_row, "Rndrng_Prvdr_First_Name", "Prscrbr_First_Name")),
+        ),
+        "provider_type": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Type", "Prscrbr_Type")),
+        "city": _to_str(_row_value(claim_row, "Rndrng_Prvdr_City", "Prscrbr_City")),
+        "state": _to_str(_row_value(claim_row, "Rndrng_Prvdr_State_Abrvtn", "Prscrbr_State_Abrvtn")),
+        "zip5": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Zip5", "Prscrbr_Zip5", "Prscrbr_zip5")),
+        "country": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")) or "US",
+        "total_claims": _to_float(_row_value(claim_row, "Tot_Clms", "TOT_CLAIMS")),
+        "total_30day_fills": _to_float(_row_value(claim_row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
+        "total_day_supply": _to_float(_row_value(claim_row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
+        "total_drug_cost": _to_float(_row_value(claim_row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Drug_Cost")),
+        "total_benes": _to_float(_row_value(claim_row, "Tot_Benes", "TOT_BENES")),
+        "ge65_total_claims": _to_float(_row_value(claim_row, "GE65_Tot_Clms", "GE65_TOT_CLAIMS")),
+        "ge65_total_30day_fills": _to_float(_row_value(claim_row, "GE65_Tot_30day_Fills", "GE65_TOT_30DAY_FILLS")),
+        "ge65_total_day_supply": _to_float(_row_value(claim_row, "GE65_Tot_Day_Suply", "GE65_TOT_DAY_SUPLY")),
+        "ge65_total_drug_cost": _to_float(_row_value(claim_row, "GE65_Tot_Drug_Cst", "GE65_TOT_DRUG_CST")),
+        "ge65_total_benes": _to_float(_row_value(claim_row, "GE65_Tot_Benes", "GE65_TOT_BENES")),
+    }
+
+
+def _merge_prescription_metrics(
+    existing_prescription: dict[str, Any],
+    new_prescription: dict[str, Any],
+    metric_fields: tuple[str, ...],
+) -> None:
+    """Accumulate nullable numeric metrics without inventing zero values."""
+
+    for metric_field in metric_fields:
+        existing_prescription[metric_field] = _sum_optional(
+            existing_prescription.get(metric_field),
+            new_prescription.get(metric_field),
+        )
+
+
+def _merge_prescription_names(
+    existing_prescription: dict[str, Any],
+    new_prescription: dict[str, Any],
+) -> None:
+    """Fill missing prescription names from a duplicate source row."""
+
+    for name_field in ("rx_name", "generic_name", "brand_name"):
+        if not existing_prescription.get(name_field) and new_prescription.get(name_field):
+            existing_prescription[name_field] = new_prescription[name_field]
+
+
+def _merge_provider_prescription(
+    provider_rx_map: dict[tuple[int, int, str, str], dict[str, Any]],
+    prescription_values_by_field: dict[str, Any],
+) -> None:
+    """Merge one normalized provider record by its durable prescription key."""
+
+    prescription_key = (
+        prescription_values_by_field["npi"],
+        prescription_values_by_field["year"],
+        prescription_values_by_field["rx_code_system"],
+        prescription_values_by_field["rx_code"],
+    )
+    existing_prescription = provider_rx_map.get(prescription_key)
+    if existing_prescription is None:
+        provider_rx_map[prescription_key] = prescription_values_by_field
+        return
+    _merge_prescription_metrics(
+        existing_prescription,
+        prescription_values_by_field,
+        (
+            "total_claims",
+            "total_30day_fills",
+            "total_day_supply",
+            "total_drug_cost",
+            "total_benes",
+            "ge65_total_claims",
+            "ge65_total_30day_fills",
+            "ge65_total_day_supply",
+            "ge65_total_drug_cost",
+            "ge65_total_benes",
+        ),
+    )
+    _merge_prescription_names(existing_prescription, prescription_values_by_field)
+
+
+async def _read_provider_drug_rows(
+    path: str,
+    year: int,
+    test_mode: bool,
+) -> tuple[dict[tuple[int, int, str, str], dict[str, Any]], int, int, float]:
+    """Read, validate, and aggregate one provider-drug CSV chunk."""
+
     provider_rx_map: dict[tuple[int, int, str, str], dict[str, Any]] = {}
     accepted = 0
     progress_start = time.monotonic()
     progress_last = progress_start
-
     async with async_open(path, "r", encoding="utf-8-sig") as handle:
         reader = AsyncDictReader(handle)
         row_number = 0
@@ -1053,84 +1347,14 @@ async def _load_provider_drug_rows(
                 continue
             if test_mode and not _is_row_allowed_for_test(row_number):
                 continue
-
-            generic_name = _to_str(_row_value(claim_row, "Gnrc_Name", "GNRC_NAME", "generic_name"))
-            brand_name = _to_str(_row_value(claim_row, "Brnd_Name", "BRND_NAME", "brand_name"))
-            rx_name = generic_name or brand_name
-            if not rx_name:
+            prescription_values_by_field = _provider_prescription_from_row(claim_row, npi, year)
+            if prescription_values_by_field is None:
                 continue
-
-            rx_code = _rx_code_from_names(generic_name, brand_name)
-            key = (npi, year, RX_INTERNAL_CODE_SYSTEM, rx_code)
-
-            prescription_values_by_field = {
-                "npi": npi,
-                "year": year,
-                "rx_code_system": RX_INTERNAL_CODE_SYSTEM,
-                "rx_code": rx_code,
-                "rx_name": rx_name,
-                "generic_name": generic_name,
-                "brand_name": brand_name,
-                "provider_name": _provider_name(
-                    _to_str(_row_value(claim_row, "Rndrng_Prvdr_Last_Org_Name", "Prscrbr_Last_Org_Name")),
-                    _to_str(_row_value(claim_row, "Rndrng_Prvdr_First_Name", "Prscrbr_First_Name")),
-                ),
-                "provider_type": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Type", "Prscrbr_Type")),
-                "city": _to_str(_row_value(claim_row, "Rndrng_Prvdr_City", "Prscrbr_City")),
-                "state": _to_str(_row_value(claim_row, "Rndrng_Prvdr_State_Abrvtn", "Prscrbr_State_Abrvtn")),
-                "zip5": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Zip5", "Prscrbr_Zip5", "Prscrbr_zip5")),
-                "country": _to_str(_row_value(claim_row, "Rndrng_Prvdr_Cntry", "Prscrbr_Cntry")) or "US",
-                "total_claims": _to_float(_row_value(claim_row, "Tot_Clms", "TOT_CLAIMS")),
-                "total_30day_fills": _to_float(_row_value(claim_row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
-                "total_day_supply": _to_float(_row_value(claim_row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
-                "total_drug_cost": _to_float(_row_value(claim_row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Drug_Cost")),
-                "total_benes": _to_float(_row_value(claim_row, "Tot_Benes", "TOT_BENES")),
-                "ge65_total_claims": _to_float(_row_value(claim_row, "GE65_Tot_Clms", "GE65_TOT_CLAIMS")),
-                "ge65_total_30day_fills": _to_float(_row_value(claim_row, "GE65_Tot_30day_Fills", "GE65_TOT_30DAY_FILLS")),
-                "ge65_total_day_supply": _to_float(_row_value(claim_row, "GE65_Tot_Day_Suply", "GE65_TOT_DAY_SUPLY")),
-                "ge65_total_drug_cost": _to_float(_row_value(claim_row, "GE65_Tot_Drug_Cst", "GE65_TOT_DRUG_CST")),
-                "ge65_total_benes": _to_float(_row_value(claim_row, "GE65_Tot_Benes", "GE65_TOT_BENES")),
-            }
-
-            existing = provider_rx_map.get(key)
-            if existing is None:
-                provider_rx_map[key] = prescription_values_by_field
-            else:
-                for metric_key in (
-                    "total_claims",
-                    "total_30day_fills",
-                    "total_day_supply",
-                    "total_drug_cost",
-                    "total_benes",
-                    "ge65_total_claims",
-                    "ge65_total_30day_fills",
-                    "ge65_total_day_supply",
-                    "ge65_total_drug_cost",
-                    "ge65_total_benes",
-                ):
-                    existing[metric_key] = _sum_optional(
-                        existing.get(metric_key),
-                        prescription_values_by_field.get(metric_key),
-                    )
-                if not existing.get("rx_name") and prescription_values_by_field.get("rx_name"):
-                    existing["rx_name"] = prescription_values_by_field["rx_name"]
-                if not existing.get("generic_name") and prescription_values_by_field.get("generic_name"):
-                    existing["generic_name"] = prescription_values_by_field["generic_name"]
-                if not existing.get("brand_name") and prescription_values_by_field.get("brand_name"):
-                    existing["brand_name"] = prescription_values_by_field["brand_name"]
-
+            _merge_provider_prescription(provider_rx_map, prescription_values_by_field)
             accepted += 1
             if test_mode and accepted >= TEST_PROVIDER_DRUG_ROW_LIMIT:
                 break
-
-    if provider_rx_map:
-        provider_prescriptions = list(provider_rx_map.values())
-        provider_prescriptions.sort(
-            key=lambda item: (item.get("npi"), item.get("year"), item.get("rx_code_system"), item.get("rx_code"))
-        )
-        for batch in _chunk_rows(provider_prescriptions, IMPORT_BATCH_SIZE):
-            await _push_objects_with_retry(batch, provider_prescription_cls)
-    _print_row_progress("provider_drug", row_number, accepted, progress_start, final=True)
+    return provider_rx_map, row_number, accepted, progress_start
 
 
 async def _load_drug_spending_rows(
@@ -1141,11 +1365,99 @@ async def _load_drug_spending_rows(
 ) -> None:
     """Aggregate drug spending rows into prescription staging records."""
 
+    prescription_map, row_number, accepted, progress_start = await _read_drug_spending_rows(
+        path,
+        year,
+        test_mode,
+    )
+    if prescription_map:
+        prescriptions = sorted(
+            prescription_map.values(),
+            key=lambda prescription: (
+                prescription.get("rx_code_system"),
+                prescription.get("rx_code"),
+            ),
+        )
+        for prescription_batch in _chunk_rows(prescriptions, IMPORT_BATCH_SIZE):
+            await _push_objects_with_retry(
+                prescription_batch,
+                prescription_cls,
+                rewrite=True,
+                use_copy=False,
+            )
+    _print_row_progress("drug_spending", row_number, accepted, progress_start, final=True)
+
+
+def _spending_prescription_from_row(
+    spending_row: dict[str, Any],
+    year: int,
+) -> dict[str, Any] | None:
+    """Normalize one spending CSV row into the prescription contract."""
+
+    generic_name = _to_str(_row_value(spending_row, "Gnrc_Name", "GNRC_NAME", "generic_name"))
+    brand_name = _to_str(_row_value(spending_row, "Brnd_Name", "BRND_NAME", "brand_name"))
+    rx_name = generic_name or brand_name
+    if not rx_name:
+        return None
+    return {
+        "rx_code_system": RX_INTERNAL_CODE_SYSTEM,
+        "rx_code": _rx_code_from_names(generic_name, brand_name),
+        "rx_name": rx_name,
+        "generic_name": generic_name,
+        "brand_name": brand_name,
+        "total_claims": _to_float(_row_value(spending_row, "Tot_Clms", "TOT_CLAIMS", "Tot_Rx")),
+        "total_30day_fills": _to_float(_row_value(spending_row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
+        "total_day_supply": _to_float(_row_value(spending_row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
+        "total_drug_cost": _to_float(_row_value(spending_row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Spndng", "TOT_SPNDG")),
+        "total_benes": _to_float(_row_value(spending_row, "Tot_Benes", "TOT_BENES", "Bene_Cnt", "BENE_CNT")),
+        "source_year": year,
+    }
+
+
+def _merge_spending_prescription(
+    prescription_map: dict[tuple[str, str], dict[str, Any]],
+    prescription_values_by_field: dict[str, Any],
+    year: int,
+) -> None:
+    """Merge one normalized spending row by its internal code key."""
+
+    prescription_key = (
+        prescription_values_by_field["rx_code_system"],
+        prescription_values_by_field["rx_code"],
+    )
+    existing_prescription = prescription_map.get(prescription_key)
+    if existing_prescription is None:
+        prescription_map[prescription_key] = prescription_values_by_field
+        return
+    _merge_prescription_metrics(
+        existing_prescription,
+        prescription_values_by_field,
+        (
+            "total_claims",
+            "total_30day_fills",
+            "total_day_supply",
+            "total_drug_cost",
+            "total_benes",
+        ),
+    )
+    _merge_prescription_names(existing_prescription, prescription_values_by_field)
+    existing_prescription["source_year"] = max(
+        _safe_int(existing_prescription.get("source_year"), year),
+        year,
+    )
+
+
+async def _read_drug_spending_rows(
+    path: str,
+    year: int,
+    test_mode: bool,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], int, int, float]:
+    """Read, validate, and aggregate one spending CSV chunk."""
+
     prescription_map: dict[tuple[str, str], dict[str, Any]] = {}
     accepted = 0
     progress_start = time.monotonic()
     progress_last = progress_start
-
     async with async_open(path, "r", encoding="utf-8-sig") as handle:
         reader = AsyncDictReader(handle)
         row_number = 0
@@ -1157,56 +1469,14 @@ async def _load_drug_spending_rows(
                 progress_last = now
             if test_mode and not _is_row_allowed_for_test(row_number):
                 continue
-
-            generic_name = _to_str(_row_value(spending_row, "Gnrc_Name", "GNRC_NAME", "generic_name"))
-            brand_name = _to_str(_row_value(spending_row, "Brnd_Name", "BRND_NAME", "brand_name"))
-            rx_name = generic_name or brand_name
-            if not rx_name:
+            prescription_values_by_field = _spending_prescription_from_row(spending_row, year)
+            if prescription_values_by_field is None:
                 continue
-
-            rx_code = _rx_code_from_names(generic_name, brand_name)
-            key = (RX_INTERNAL_CODE_SYSTEM, rx_code)
-            prescription_values_by_field = {
-                "rx_code_system": RX_INTERNAL_CODE_SYSTEM,
-                "rx_code": rx_code,
-                "rx_name": rx_name,
-                "generic_name": generic_name,
-                "brand_name": brand_name,
-                "total_claims": _to_float(_row_value(spending_row, "Tot_Clms", "TOT_CLAIMS", "Tot_Rx")),
-                "total_30day_fills": _to_float(_row_value(spending_row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
-                "total_day_supply": _to_float(_row_value(spending_row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
-                "total_drug_cost": _to_float(_row_value(spending_row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Spndng", "TOT_SPNDG")),
-                "total_benes": _to_float(_row_value(spending_row, "Tot_Benes", "TOT_BENES", "Bene_Cnt", "BENE_CNT")),
-                "source_year": year,
-            }
-
-            existing = prescription_map.get(key)
-            if existing is None:
-                prescription_map[key] = prescription_values_by_field
-            else:
-                for metric_key in ("total_claims", "total_30day_fills", "total_day_supply", "total_drug_cost", "total_benes"):
-                    existing[metric_key] = _sum_optional(
-                        existing.get(metric_key),
-                        prescription_values_by_field.get(metric_key),
-                    )
-                if not existing.get("rx_name") and prescription_values_by_field.get("rx_name"):
-                    existing["rx_name"] = prescription_values_by_field["rx_name"]
-                if not existing.get("generic_name") and prescription_values_by_field.get("generic_name"):
-                    existing["generic_name"] = prescription_values_by_field["generic_name"]
-                if not existing.get("brand_name") and prescription_values_by_field.get("brand_name"):
-                    existing["brand_name"] = prescription_values_by_field["brand_name"]
-                existing["source_year"] = max(_safe_int(existing.get("source_year"), year), year)
-
+            _merge_spending_prescription(prescription_map, prescription_values_by_field, year)
             accepted += 1
             if test_mode and accepted >= TEST_DRUG_SPENDING_ROW_LIMIT:
                 break
-
-    if prescription_map:
-        prescriptions = list(prescription_map.values())
-        prescriptions.sort(key=lambda item: (item.get("rx_code_system"), item.get("rx_code")))
-        for batch in _chunk_rows(prescriptions, IMPORT_BATCH_SIZE):
-            await _push_objects_with_retry(batch, prescription_cls, rewrite=True, use_copy=False)
-    _print_row_progress("drug_spending", row_number, accepted, progress_start, final=True)
+    return prescription_map, row_number, accepted, progress_start
 
 
 async def _materialize_prescription_and_code_rows(classes: dict[str, type], schema: str) -> None:
@@ -1216,6 +1486,27 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
     provider_prescription_table = classes["PricingProviderPrescription"].__tablename__
     code_catalog_table = CodeCatalog.__tablename__
     code_crosswalk_table = CodeCrosswalk.__tablename__
+    await _materialize_prescription_rollup(
+        schema,
+        prescription_table,
+        provider_prescription_table,
+    )
+    await _materialize_internal_code_catalog(schema, prescription_table, code_catalog_table)
+    await _materialize_identity_crosswalk(schema, prescription_table, code_crosswalk_table)
+    await _enrich_external_rx_crosswalk(
+        schema=schema,
+        prescription_table=prescription_table,
+        code_catalog_table=code_catalog_table,
+        code_crosswalk_table=code_crosswalk_table,
+    )
+
+
+async def _materialize_prescription_rollup(
+    schema: str,
+    prescription_table: str,
+    provider_prescription_table: str,
+) -> None:
+    """Roll provider rows into the prescription dimension."""
 
     await db.status(
         f"""
@@ -1265,6 +1556,14 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
         """
     )
 
+
+async def _materialize_internal_code_catalog(
+    schema: str,
+    prescription_table: str,
+    code_catalog_table: str,
+) -> None:
+    """Publish internal prescription codes into the shared catalog."""
+
     await db.status(
         f"""
         INSERT INTO {schema}.{code_catalog_table}
@@ -1288,6 +1587,14 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
             updated_at = excluded.updated_at;
         """
     )
+
+
+async def _materialize_identity_crosswalk(
+    schema: str,
+    prescription_table: str,
+    code_crosswalk_table: str,
+) -> None:
+    """Publish exact identity edges for every internal prescription code."""
 
     await db.status(
         f"""
@@ -1319,13 +1626,6 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
             source = excluded.source,
             updated_at = excluded.updated_at;
         """
-    )
-
-    await _enrich_external_rx_crosswalk(
-        schema=schema,
-        prescription_table=prescription_table,
-        code_catalog_table=code_catalog_table,
-        code_crosswalk_table=code_crosswalk_table,
     )
 
 
@@ -1382,19 +1682,70 @@ async def _enrich_external_rx_crosswalk(
     )
 
 
-async def _enrich_rx_crosswalk_from_snapshot(
-    *,
-    schema: str,
-    prescription_table: str,
-    code_catalog_table: str,
-    code_crosswalk_table: str,
-) -> dict[str, int]:
-    """Add normalized NDC and RxNorm edges from maintained snapshot tables."""
+async def _snapshot_rxnorm_fragments(
+    snapshot_schema: str,
+    product_table: str,
+) -> tuple[str, str]:
+    """Select the supported array or scalar RxNorm snapshot representation."""
+
+    if await _is_column_present(snapshot_schema, product_table, "rxnorm_ids"):
+        return (
+            "LEFT JOIN LATERAL unnest(COALESCE(p.rxnorm_ids, ARRAY[]::varchar[])) "
+            "AS rx(rxnorm_id) ON TRUE",
+            "COALESCE(BTRIM(rx.rxnorm_id), '')",
+        )
+    for candidate_column in ("rxnorm_id", "rxnorm", "rxcui"):
+        if await _is_column_present(snapshot_schema, product_table, candidate_column):
+            logger.info(
+                "Snapshot RX crosswalk: using scalar %s.%s.%s as RXNORM source",
+                snapshot_schema,
+                product_table,
+                candidate_column,
+            )
+            return "", f"COALESCE(BTRIM(p.{candidate_column}::varchar), '')"
+    logger.warning(
+        "Snapshot RX crosswalk: no rxnorm_ids/rxnorm_id-like column on %s.%s; snapshot RXNORM mapping disabled",
+        snapshot_schema,
+        product_table,
+    )
+    return "", "''"
+
+
+async def _snapshot_ndc_fragments(
+    snapshot_schema: str,
+    package_table: str,
+) -> tuple[str, str]:
+    """Select available package NDC columns without requiring optional fields."""
+
+    has_product_ndc = await _is_column_present(snapshot_schema, package_table, "product_ndc")
+    has_ndc11 = await _is_column_present(snapshot_schema, package_table, "ndc11")
+    has_package_ndc = await _is_column_present(snapshot_schema, package_table, "package_ndc")
+    ndc_sources: list[str] = ["p.product_ndc"]
+    if has_product_ndc and (has_ndc11 or has_package_ndc):
+        package_join_sql = (
+            f"LEFT JOIN {snapshot_schema}.{package_table} pkg "
+            "ON pkg.product_ndc = p.product_ndc"
+        )
+        if has_ndc11:
+            ndc_sources.insert(0, "pkg.ndc11")
+        if has_package_ndc:
+            ndc_sources.insert(1 if has_ndc11 else 0, "pkg.package_ndc")
+        return package_join_sql, f"COALESCE({', '.join(ndc_sources)}, '')"
+    if not has_product_ndc:
+        logger.warning(
+            "Snapshot RX crosswalk: %s.%s is missing product_ndc; package NDC fields are skipped",
+            snapshot_schema,
+            package_table,
+        )
+    return "", f"COALESCE({', '.join(ndc_sources)}, '')"
+
+
+async def _resolve_snapshot_source_layout() -> SnapshotSourceLayout | None:
+    """Validate snapshot tables and describe their optional columns."""
 
     snapshot_schema = RX_CROSSWALK_SNAPSHOT_SCHEMA
     product_table = RX_CROSSWALK_SNAPSHOT_PRODUCT_TABLE
     package_table = RX_CROSSWALK_SNAPSHOT_PACKAGE_TABLE
-
     product_exists = await _is_table_present(snapshot_schema, product_table)
     package_exists = await _is_table_present(snapshot_schema, package_table)
     if not (product_exists and package_exists):
@@ -1405,377 +1756,398 @@ async def _enrich_rx_crosswalk_from_snapshot(
             snapshot_schema,
             package_table,
         )
-        return {"mapped_codes": 0, "edges": 0}
-
-    product_has_rxnorm_ids = await _is_column_present(
-        snapshot_schema, product_table, "rxnorm_ids"
+        return None
+    rxnorm_join_sql, rxnorm_source_sql = await _snapshot_rxnorm_fragments(
+        snapshot_schema,
+        product_table,
     )
-    product_rxnorm_scalar_column = ""
-    if not product_has_rxnorm_ids:
-        for candidate in ("rxnorm_id", "rxnorm", "rxcui"):
-            if await _is_column_present(snapshot_schema, product_table, candidate):
-                product_rxnorm_scalar_column = candidate
-                break
-
-    package_has_product_ndc = await _is_column_present(
-        snapshot_schema, package_table, "product_ndc"
+    package_join_sql, ndc_source_sql = await _snapshot_ndc_fragments(
+        snapshot_schema,
+        package_table,
     )
-    package_has_ndc11 = await _is_column_present(
-        snapshot_schema, package_table, "ndc11"
-    )
-    package_has_package_ndc = await _is_column_present(
-        snapshot_schema, package_table, "package_ndc"
+    return SnapshotSourceLayout(
+        schema=snapshot_schema,
+        product_table=product_table,
+        package_table=package_table,
+        rxnorm_join_sql=rxnorm_join_sql,
+        rxnorm_source_sql=rxnorm_source_sql,
+        package_join_sql=package_join_sql,
+        ndc_source_sql=ndc_source_sql,
     )
 
-    if product_has_rxnorm_ids:
-        rxnorm_join_sql = "LEFT JOIN LATERAL unnest(COALESCE(p.rxnorm_ids, ARRAY[]::varchar[])) AS rx(rxnorm_id) ON TRUE"
-        rxnorm_source_sql = "COALESCE(BTRIM(rx.rxnorm_id), '')"
-    elif product_rxnorm_scalar_column:
-        rxnorm_join_sql = ""
-        rxnorm_source_sql = f"COALESCE(BTRIM(p.{product_rxnorm_scalar_column}::varchar), '')"
-        logger.info(
-            "Snapshot RX crosswalk: using scalar %s.%s.%s as RXNORM source",
-            snapshot_schema,
-            product_table,
-            product_rxnorm_scalar_column,
-        )
-    else:
-        rxnorm_join_sql = ""
-        rxnorm_source_sql = "''"
-        logger.warning(
-            "Snapshot RX crosswalk: no rxnorm_ids/rxnorm_id-like column on %s.%s; snapshot RXNORM mapping disabled",
-            snapshot_schema,
-            product_table,
-        )
 
-    ndc_sources: list[str] = ["p.product_ndc"]
-    if package_has_product_ndc and (package_has_ndc11 or package_has_package_ndc):
-        package_join_sql = f"LEFT JOIN {snapshot_schema}.{package_table} pkg ON pkg.product_ndc = p.product_ndc"
-        if package_has_ndc11:
-            ndc_sources.insert(0, "pkg.ndc11")
-        if package_has_package_ndc:
-            ndc_sources.insert(1 if package_has_ndc11 else 0, "pkg.package_ndc")
-    else:
-        package_join_sql = ""
-        if not package_has_product_ndc:
-            logger.warning(
-                "Snapshot RX crosswalk: %s.%s is missing product_ndc; package NDC fields are skipped",
-                snapshot_schema,
-                package_table,
-            )
-    ndc_source_sql = f"COALESCE({', '.join(ndc_sources)}, '')"
+def _snapshot_stage_tables(schema: str) -> SnapshotStageTables:
+    """Create collision-resistant names for durable snapshot work tables."""
 
     stage_token = secrets.token_hex(6)
-    tmp_hp_rx_codes = f"{schema}.tmp_hp_rx_codes_{stage_token}"
-    tmp_rx_snapshot_codes = f"{schema}.tmp_rx_snapshot_codes_{stage_token}"
-    tmp_rx_crosswalk_candidates = f"{schema}.tmp_rx_crosswalk_candidates_{stage_token}"
-    stage_tables = (
-        tmp_rx_crosswalk_candidates,
-        tmp_rx_snapshot_codes,
-        tmp_hp_rx_codes,
+    return SnapshotStageTables(
+        hp_rx_codes=f"{schema}.tmp_hp_rx_codes_{stage_token}",
+        snapshot_codes=f"{schema}.tmp_rx_snapshot_codes_{stage_token}",
+        crosswalk_candidates=f"{schema}.tmp_rx_crosswalk_candidates_{stage_token}",
     )
 
-    async def _drop_stage_tables() -> None:
-        for table_name in stage_tables:
-            try:
-                await db.status(f"DROP TABLE IF EXISTS {table_name};")
-            except Exception as exc:
-                logger.warning("Failed to drop staging table %s: %r", table_name, exc)
 
-    await _drop_stage_tables()
-    try:
-        await db.status(
-            f"""
-            CREATE UNLOGGED TABLE {tmp_hp_rx_codes} AS
-            SELECT
-                rx_code,
-                COALESCE(total_claims, 0)::double precision AS total_claims,
-                NULLIF(UPPER(REGEXP_REPLACE(COALESCE(generic_name, ''), '[^A-Za-z0-9]+', '', 'g')), '') AS generic_key,
-                NULLIF(UPPER(REGEXP_REPLACE(COALESCE(brand_name, ''), '[^A-Za-z0-9]+', '', 'g')), '') AS brand_key,
-                NULLIF(BTRIM(generic_name), '') AS generic_name,
-                NULLIF(BTRIM(brand_name), '') AS brand_name,
-                NULLIF(BTRIM(rx_name), '') AS rx_name
-            FROM {schema}.{prescription_table}
-            WHERE UPPER(COALESCE(rx_code_system, '')) = '{RX_INTERNAL_CODE_SYSTEM}'
-              AND (COALESCE(BTRIM(generic_name), '') <> '' OR COALESCE(BTRIM(brand_name), '') <> '');
-            """
+async def _drop_snapshot_stage_tables(stage_tables: SnapshotStageTables) -> None:
+    """Best-effort cleanup for durable snapshot work tables."""
+
+    for table_name in stage_tables.drop_order():
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {table_name};")
+        except Exception as exc:
+            logger.warning("Failed to drop staging table %s: %r", table_name, exc)
+
+
+_SNAPSHOT_CANDIDATES_SQL = """
+CREATE UNLOGGED TABLE {crosswalk_candidates} AS
+WITH generic_matches AS (
+    SELECT
+        hp.rx_code,
+        hp.generic_name AS hp_generic_name,
+        hp.brand_name AS hp_brand_name,
+        hp.rx_name AS hp_rx_name,
+        snapshot.generic_name AS ext_generic_name,
+        snapshot.brand_name AS ext_brand_name,
+        snapshot.rxnorm_code,
+        snapshot.ndc_code,
+        CASE
+            WHEN hp.generic_key IS NOT NULL
+                 AND snapshot.generic_key IS NOT NULL
+                 AND hp.generic_key = snapshot.generic_key
+                 AND hp.brand_key IS NOT NULL
+                 AND snapshot.brand_key IS NOT NULL
+                 AND hp.brand_key = snapshot.brand_key
+                THEN 'exact'
+            ELSE 'normalized'
+        END AS match_type,
+        CASE
+            WHEN hp.generic_key IS NOT NULL
+                 AND snapshot.generic_key IS NOT NULL
+                 AND hp.generic_key = snapshot.generic_key
+                 AND hp.brand_key IS NOT NULL
+                 AND snapshot.brand_key IS NOT NULL
+                 AND hp.brand_key = snapshot.brand_key
+                THEN 1.0
+            ELSE 0.95
+        END AS confidence
+    FROM {hp_rx_codes} hp
+    INNER JOIN {snapshot_codes} snapshot
+        ON hp.generic_key IS NOT NULL
+       AND snapshot.generic_key = hp.generic_key
+),
+brand_matches AS (
+    SELECT
+        hp.rx_code,
+        hp.generic_name AS hp_generic_name,
+        hp.brand_name AS hp_brand_name,
+        hp.rx_name AS hp_rx_name,
+        snapshot.generic_name AS ext_generic_name,
+        snapshot.brand_name AS ext_brand_name,
+        snapshot.rxnorm_code,
+        snapshot.ndc_code,
+        CASE
+            WHEN hp.generic_key IS NOT NULL
+                 AND snapshot.generic_key IS NOT NULL
+                 AND hp.generic_key = snapshot.generic_key
+                 AND hp.brand_key IS NOT NULL
+                 AND snapshot.brand_key IS NOT NULL
+                 AND hp.brand_key = snapshot.brand_key
+                THEN 'exact'
+            ELSE 'normalized'
+        END AS match_type,
+        CASE
+            WHEN hp.generic_key IS NOT NULL
+                 AND snapshot.generic_key IS NOT NULL
+                 AND hp.generic_key = snapshot.generic_key
+                 AND hp.brand_key IS NOT NULL
+                 AND snapshot.brand_key IS NOT NULL
+                 AND hp.brand_key = snapshot.brand_key
+                THEN 1.0
+            ELSE 0.90
+        END AS confidence
+    FROM {hp_rx_codes} hp
+    INNER JOIN {snapshot_codes} snapshot
+        ON hp.brand_key IS NOT NULL
+       AND snapshot.brand_key = hp.brand_key
+),
+combined AS (
+    SELECT * FROM generic_matches
+    UNION ALL
+    SELECT * FROM brand_matches
+),
+normalized AS (
+    SELECT
+        rx_code,
+        'RXNORM'::varchar AS to_system,
+        rxnorm_code AS to_code,
+        match_type,
+        confidence,
+        COALESCE(hp_generic_name, ext_generic_name, hp_brand_name, ext_brand_name, hp_rx_name) AS display_name,
+        COALESCE(hp_generic_name, ext_generic_name) AS generic_name,
+        COALESCE(hp_brand_name, ext_brand_name) AS brand_name
+    FROM combined
+    WHERE rxnorm_code ~ '^[0-9]+$'
+    UNION ALL
+    SELECT
+        rx_code,
+        'NDC'::varchar AS to_system,
+        ndc_code AS to_code,
+        match_type,
+        confidence,
+        COALESCE(hp_generic_name, ext_generic_name, hp_brand_name, ext_brand_name, hp_rx_name) AS display_name,
+        COALESCE(hp_generic_name, ext_generic_name) AS generic_name,
+        COALESCE(hp_brand_name, ext_brand_name) AS brand_name
+    FROM combined
+    WHERE ndc_code ~ '^[0-9]{{11}}$'
+),
+dedup AS (
+    SELECT
+        rx_code,
+        to_system,
+        to_code,
+        CASE WHEN bool_or(match_type = 'exact') THEN 'exact' ELSE 'normalized' END AS match_type,
+        MAX(confidence) AS confidence,
+        MAX(display_name) AS display_name,
+        MAX(generic_name) AS generic_name,
+        MAX(brand_name) AS brand_name
+    FROM normalized
+    GROUP BY rx_code, to_system, to_code
+),
+ranked AS (
+    SELECT
+        dedup.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY dedup.rx_code, dedup.to_system
+            ORDER BY
+                dedup.confidence DESC,
+                CASE WHEN dedup.match_type = 'exact' THEN 1 ELSE 0 END DESC,
+                dedup.to_code ASC
+        ) AS rank_in_system
+    FROM dedup
+    WHERE dedup.confidence >= :confidence_min
+)
+SELECT
+    rx_code,
+    to_system,
+    to_code,
+    match_type,
+    confidence,
+    display_name,
+    generic_name,
+    brand_name
+FROM ranked
+WHERE (to_system = 'NDC' AND rank_in_system <= :max_ndc_per_code)
+   OR (to_system = 'RXNORM' AND rank_in_system <= :max_rxnorm_per_code);
+"""
+
+
+async def _create_snapshot_candidate_stage(stage_tables: SnapshotStageTables) -> None:
+    """Rank bounded NDC and RxNorm candidates for every internal code."""
+
+    await db.status(
+        _SNAPSHOT_CANDIDATES_SQL.format(
+            crosswalk_candidates=stage_tables.crosswalk_candidates,
+            hp_rx_codes=stage_tables.hp_rx_codes,
+            snapshot_codes=stage_tables.snapshot_codes,
+        ),
+        confidence_min=RX_CROSSWALK_CONFIDENCE_MIN,
+        max_ndc_per_code=RX_CROSSWALK_MAX_NDC_PER_CODE,
+        max_rxnorm_per_code=RX_CROSSWALK_MAX_RXNORM_PER_CODE,
+    )
+    await db.status(f"CREATE INDEX ON {stage_tables.crosswalk_candidates} (rx_code);")
+    await db.status(
+        f"CREATE INDEX ON {stage_tables.crosswalk_candidates} (to_system, to_code);"
+    )
+
+
+async def _prepare_snapshot_candidate_tables(
+    schema: str,
+    prescription_table: str,
+    source_layout: SnapshotSourceLayout,
+    stage_tables: SnapshotStageTables,
+) -> None:
+    """Materialize indexed internal, snapshot, and candidate work tables."""
+
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {stage_tables.hp_rx_codes} AS
+        SELECT
+            rx_code,
+            COALESCE(total_claims, 0)::double precision AS total_claims,
+            NULLIF(UPPER(REGEXP_REPLACE(COALESCE(generic_name, ''), '[^A-Za-z0-9]+', '', 'g')), '') AS generic_key,
+            NULLIF(UPPER(REGEXP_REPLACE(COALESCE(brand_name, ''), '[^A-Za-z0-9]+', '', 'g')), '') AS brand_key,
+            NULLIF(BTRIM(generic_name), '') AS generic_name,
+            NULLIF(BTRIM(brand_name), '') AS brand_name,
+            NULLIF(BTRIM(rx_name), '') AS rx_name
+        FROM {schema}.{prescription_table}
+        WHERE UPPER(COALESCE(rx_code_system, '')) = '{RX_INTERNAL_CODE_SYSTEM}'
+          AND (COALESCE(BTRIM(generic_name), '') <> '' OR COALESCE(BTRIM(brand_name), '') <> '');
+        """
+    )
+    await db.status(f"CREATE INDEX ON {stage_tables.hp_rx_codes} (generic_key);")
+    await db.status(f"CREATE INDEX ON {stage_tables.hp_rx_codes} (brand_key);")
+    await db.status(f"CREATE INDEX ON {stage_tables.hp_rx_codes} (rx_code);")
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {stage_tables.snapshot_codes} AS
+        SELECT
+            NULLIF(UPPER(REGEXP_REPLACE(COALESCE(p.generic_name, ''), '[^A-Za-z0-9]+', '', 'g')), '') AS generic_key,
+            NULLIF(UPPER(REGEXP_REPLACE(COALESCE(p.brand_name, ''), '[^A-Za-z0-9]+', '', 'g')), '') AS brand_key,
+            NULLIF(BTRIM(p.generic_name), '') AS generic_name,
+            NULLIF(BTRIM(p.brand_name), '') AS brand_name,
+            NULLIF(REGEXP_REPLACE({source_layout.rxnorm_source_sql}, '[^0-9]+', '', 'g'), '') AS rxnorm_code,
+            NULLIF(REGEXP_REPLACE({source_layout.ndc_source_sql}, '[^0-9]+', '', 'g'), '') AS ndc_code
+        FROM {source_layout.schema}.{source_layout.product_table} p
+        {source_layout.rxnorm_join_sql}
+        {source_layout.package_join_sql}
+        WHERE COALESCE(BTRIM(p.generic_name), '') <> '' OR COALESCE(BTRIM(p.brand_name), '') <> '';
+        """
+    )
+    for indexed_column in ("generic_key", "brand_key", "rxnorm_code", "ndc_code"):
+        await db.status(f"CREATE INDEX ON {stage_tables.snapshot_codes} ({indexed_column});")
+    await _create_snapshot_candidate_stage(stage_tables)
+
+
+async def _publish_snapshot_code_catalog(
+    schema: str,
+    code_catalog_table: str,
+    candidate_table: str,
+) -> None:
+    """Publish the best snapshot description for each external code."""
+
+    await db.status(
+        f"""
+        WITH dedup_catalog AS (
+            SELECT DISTINCT ON (to_system, to_code)
+                to_system,
+                to_code,
+                display_name,
+                generic_name,
+                brand_name,
+                confidence,
+                match_type,
+                rx_code
+            FROM {candidate_table}
+            ORDER BY
+                to_system,
+                to_code,
+                confidence DESC,
+                CASE WHEN match_type = 'exact' THEN 1 ELSE 0 END DESC,
+                rx_code ASC
         )
-        await db.status(f"CREATE INDEX ON {tmp_hp_rx_codes} (generic_key);")
-        await db.status(f"CREATE INDEX ON {tmp_hp_rx_codes} (brand_key);")
-        await db.status(f"CREATE INDEX ON {tmp_hp_rx_codes} (rx_code);")
+        INSERT INTO {schema}.{code_catalog_table}
+            (code_system, code, display_name, short_description, long_description, is_active, source, updated_at)
+        SELECT
+            to_system,
+            to_code,
+            COALESCE(NULLIF(BTRIM(display_name), ''), to_code),
+            NULLIF(BTRIM(COALESCE(generic_name, brand_name)), ''),
+            NULL,
+            TRUE,
+            'drug_api_snapshot',
+            NOW()
+        FROM dedup_catalog
+        ON CONFLICT (code_system, code) DO UPDATE
+        SET
+            display_name = excluded.display_name,
+            short_description = excluded.short_description,
+            is_active = excluded.is_active,
+            source = excluded.source,
+            updated_at = excluded.updated_at;
+        """
+    )
 
-        await db.status(
-            f"""
-            CREATE UNLOGGED TABLE {tmp_rx_snapshot_codes} AS
-            SELECT
-                NULLIF(UPPER(REGEXP_REPLACE(COALESCE(p.generic_name, ''), '[^A-Za-z0-9]+', '', 'g')), '') AS generic_key,
-                NULLIF(UPPER(REGEXP_REPLACE(COALESCE(p.brand_name, ''), '[^A-Za-z0-9]+', '', 'g')), '') AS brand_key,
-                NULLIF(BTRIM(p.generic_name), '') AS generic_name,
-                NULLIF(BTRIM(p.brand_name), '') AS brand_name,
-                NULLIF(REGEXP_REPLACE({rxnorm_source_sql}, '[^0-9]+', '', 'g'), '') AS rxnorm_code,
-                NULLIF(REGEXP_REPLACE({ndc_source_sql}, '[^0-9]+', '', 'g'), '') AS ndc_code
-            FROM {snapshot_schema}.{product_table} p
-            {rxnorm_join_sql}
-            {package_join_sql}
-            WHERE COALESCE(BTRIM(p.generic_name), '') <> '' OR COALESCE(BTRIM(p.brand_name), '') <> '';
-            """
-        )
-        await db.status(f"CREATE INDEX ON {tmp_rx_snapshot_codes} (generic_key);")
-        await db.status(f"CREATE INDEX ON {tmp_rx_snapshot_codes} (brand_key);")
-        await db.status(f"CREATE INDEX ON {tmp_rx_snapshot_codes} (rxnorm_code);")
-        await db.status(f"CREATE INDEX ON {tmp_rx_snapshot_codes} (ndc_code);")
 
-        await db.status(
-            f"""
-            CREATE UNLOGGED TABLE {tmp_rx_crosswalk_candidates} AS
-            WITH generic_matches AS (
-                SELECT
-                    hp.rx_code,
-                    hp.generic_name AS hp_generic_name,
-                    hp.brand_name AS hp_brand_name,
-                    hp.rx_name AS hp_rx_name,
-                    snapshot.generic_name AS ext_generic_name,
-                    snapshot.brand_name AS ext_brand_name,
-                    snapshot.rxnorm_code,
-                    snapshot.ndc_code,
-                    CASE
-                        WHEN hp.generic_key IS NOT NULL
-                             AND snapshot.generic_key IS NOT NULL
-                             AND hp.generic_key = snapshot.generic_key
-                             AND hp.brand_key IS NOT NULL
-                             AND snapshot.brand_key IS NOT NULL
-                             AND hp.brand_key = snapshot.brand_key
-                            THEN 'exact'
-                        ELSE 'normalized'
-                    END AS match_type,
-                    CASE
-                        WHEN hp.generic_key IS NOT NULL
-                             AND snapshot.generic_key IS NOT NULL
-                             AND hp.generic_key = snapshot.generic_key
-                             AND hp.brand_key IS NOT NULL
-                             AND snapshot.brand_key IS NOT NULL
-                             AND hp.brand_key = snapshot.brand_key
-                            THEN 1.0
-                        ELSE 0.95
-                    END AS confidence
-                FROM {tmp_hp_rx_codes} hp
-                INNER JOIN {tmp_rx_snapshot_codes} snapshot
-                    ON hp.generic_key IS NOT NULL
-                   AND snapshot.generic_key = hp.generic_key
-            ),
-            brand_matches AS (
-                SELECT
-                    hp.rx_code,
-                    hp.generic_name AS hp_generic_name,
-                    hp.brand_name AS hp_brand_name,
-                    hp.rx_name AS hp_rx_name,
-                    snapshot.generic_name AS ext_generic_name,
-                    snapshot.brand_name AS ext_brand_name,
-                    snapshot.rxnorm_code,
-                    snapshot.ndc_code,
-                    CASE
-                        WHEN hp.generic_key IS NOT NULL
-                             AND snapshot.generic_key IS NOT NULL
-                             AND hp.generic_key = snapshot.generic_key
-                             AND hp.brand_key IS NOT NULL
-                             AND snapshot.brand_key IS NOT NULL
-                             AND hp.brand_key = snapshot.brand_key
-                            THEN 'exact'
-                        ELSE 'normalized'
-                    END AS match_type,
-                    CASE
-                        WHEN hp.generic_key IS NOT NULL
-                             AND snapshot.generic_key IS NOT NULL
-                             AND hp.generic_key = snapshot.generic_key
-                             AND hp.brand_key IS NOT NULL
-                             AND snapshot.brand_key IS NOT NULL
-                             AND hp.brand_key = snapshot.brand_key
-                            THEN 1.0
-                        ELSE 0.90
-                    END AS confidence
-                FROM {tmp_hp_rx_codes} hp
-                INNER JOIN {tmp_rx_snapshot_codes} snapshot
-                    ON hp.brand_key IS NOT NULL
-                   AND snapshot.brand_key = hp.brand_key
-            ),
-            combined AS (
-                SELECT * FROM generic_matches
-                UNION ALL
-                SELECT * FROM brand_matches
-            ),
-            normalized AS (
-                SELECT
-                    rx_code,
-                    'RXNORM'::varchar AS to_system,
-                    rxnorm_code AS to_code,
-                    match_type,
-                    confidence,
-                    COALESCE(hp_generic_name, ext_generic_name, hp_brand_name, ext_brand_name, hp_rx_name) AS display_name,
-                    COALESCE(hp_generic_name, ext_generic_name) AS generic_name,
-                    COALESCE(hp_brand_name, ext_brand_name) AS brand_name
-                FROM combined
-                WHERE rxnorm_code ~ '^[0-9]+$'
-                UNION ALL
-                SELECT
-                    rx_code,
-                    'NDC'::varchar AS to_system,
-                    ndc_code AS to_code,
-                    match_type,
-                    confidence,
-                    COALESCE(hp_generic_name, ext_generic_name, hp_brand_name, ext_brand_name, hp_rx_name) AS display_name,
-                    COALESCE(hp_generic_name, ext_generic_name) AS generic_name,
-                    COALESCE(hp_brand_name, ext_brand_name) AS brand_name
-                FROM combined
-                WHERE ndc_code ~ '^[0-9]{11}$'
-            ),
-            dedup AS (
-                SELECT
-                    rx_code,
-                    to_system,
-                    to_code,
-                    CASE WHEN bool_or(match_type = 'exact') THEN 'exact' ELSE 'normalized' END AS match_type,
-                    MAX(confidence) AS confidence,
-                    MAX(display_name) AS display_name,
-                    MAX(generic_name) AS generic_name,
-                    MAX(brand_name) AS brand_name
-                FROM normalized
-                GROUP BY rx_code, to_system, to_code
-            ),
-            ranked AS (
-                SELECT
-                    dedup.*,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY dedup.rx_code, dedup.to_system
-                        ORDER BY
-                            dedup.confidence DESC,
-                            CASE WHEN dedup.match_type = 'exact' THEN 1 ELSE 0 END DESC,
-                            dedup.to_code ASC
-                    ) AS rank_in_system
-                FROM dedup
-                WHERE dedup.confidence >= :confidence_min
-            )
+async def _publish_snapshot_crosswalk_edges(
+    schema: str,
+    code_crosswalk_table: str,
+    candidate_table: str,
+) -> int:
+    """Publish symmetric crosswalk edges from ranked snapshot candidates."""
+
+    edge_rows = await db.status(
+        f"""
+        WITH edges AS (
             SELECT
-                rx_code,
+                '{RX_INTERNAL_CODE_SYSTEM}'::varchar AS from_system,
+                rx_code AS from_code,
                 to_system,
                 to_code,
                 match_type,
-                confidence,
-                display_name,
-                generic_name,
-                brand_name
-            FROM ranked
-            WHERE (to_system = 'NDC' AND rank_in_system <= :max_ndc_per_code)
-               OR (to_system = 'RXNORM' AND rank_in_system <= :max_rxnorm_per_code);
-            """,
-            confidence_min=RX_CROSSWALK_CONFIDENCE_MIN,
-            max_ndc_per_code=RX_CROSSWALK_MAX_NDC_PER_CODE,
-            max_rxnorm_per_code=RX_CROSSWALK_MAX_RXNORM_PER_CODE,
+                confidence
+            FROM {candidate_table}
+            UNION ALL
+            SELECT
+                to_system AS from_system,
+                to_code AS from_code,
+                '{RX_INTERNAL_CODE_SYSTEM}'::varchar AS to_system,
+                rx_code AS to_code,
+                match_type,
+                confidence
+            FROM {candidate_table}
         )
-        await db.status(f"CREATE INDEX ON {tmp_rx_crosswalk_candidates} (rx_code);")
-        await db.status(f"CREATE INDEX ON {tmp_rx_crosswalk_candidates} (to_system, to_code);")
+        INSERT INTO {schema}.{code_crosswalk_table}
+            (from_system, from_code, to_system, to_code, match_type, confidence, source, updated_at)
+        SELECT
+            edges.from_system,
+            edges.from_code,
+            edges.to_system,
+            edges.to_code,
+            edges.match_type,
+            edges.confidence,
+            'drug_api_snapshot',
+            NOW()
+        FROM edges
+        ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE
+        SET
+            match_type = excluded.match_type,
+            confidence = excluded.confidence,
+            source = excluded.source,
+            updated_at = excluded.updated_at;
+        """
+    )
+    return _safe_int(edge_rows, 0)
 
+
+async def _enrich_rx_crosswalk_from_snapshot(
+    *,
+    schema: str,
+    prescription_table: str,
+    code_catalog_table: str,
+    code_crosswalk_table: str,
+) -> dict[str, int]:
+    """Add normalized NDC and RxNorm edges from maintained snapshot tables."""
+
+    source_layout = await _resolve_snapshot_source_layout()
+    if source_layout is None:
+        return {"mapped_codes": 0, "edges": 0}
+    stage_tables = _snapshot_stage_tables(schema)
+    await _drop_snapshot_stage_tables(stage_tables)
+    try:
+        await _prepare_snapshot_candidate_tables(
+            schema,
+            prescription_table,
+            source_layout,
+            stage_tables,
+        )
         mapped_codes = _safe_int(
-            await db.scalar(f"SELECT COUNT(DISTINCT rx_code) FROM {tmp_rx_crosswalk_candidates};"),
+            await db.scalar(f"SELECT COUNT(DISTINCT rx_code) FROM {stage_tables.crosswalk_candidates};"),
             0,
         )
         if mapped_codes <= 0:
             return {"mapped_codes": 0, "edges": 0}
-
-        await db.status(
-            f"""
-            WITH dedup_catalog AS (
-                SELECT DISTINCT ON (to_system, to_code)
-                    to_system,
-                    to_code,
-                    display_name,
-                    generic_name,
-                    brand_name,
-                    confidence,
-                    match_type,
-                    rx_code
-                FROM {tmp_rx_crosswalk_candidates}
-                ORDER BY
-                    to_system,
-                    to_code,
-                    confidence DESC,
-                    CASE WHEN match_type = 'exact' THEN 1 ELSE 0 END DESC,
-                    rx_code ASC
-            )
-            INSERT INTO {schema}.{code_catalog_table}
-                (code_system, code, display_name, short_description, long_description, is_active, source, updated_at)
-            SELECT
-                to_system,
-                to_code,
-                COALESCE(NULLIF(BTRIM(display_name), ''), to_code),
-                NULLIF(BTRIM(COALESCE(generic_name, brand_name)), ''),
-                NULL,
-                TRUE,
-                'drug_api_snapshot',
-                NOW()
-            FROM dedup_catalog
-            ON CONFLICT (code_system, code) DO UPDATE
-            SET
-                display_name = excluded.display_name,
-                short_description = excluded.short_description,
-                is_active = excluded.is_active,
-                source = excluded.source,
-                updated_at = excluded.updated_at;
-            """
+        await _publish_snapshot_code_catalog(
+            schema,
+            code_catalog_table,
+            stage_tables.crosswalk_candidates,
         )
-
-        edge_rows = await db.status(
-            f"""
-            WITH edges AS (
-                SELECT
-                    '{RX_INTERNAL_CODE_SYSTEM}'::varchar AS from_system,
-                    rx_code AS from_code,
-                    to_system,
-                    to_code,
-                    match_type,
-                    confidence
-                FROM {tmp_rx_crosswalk_candidates}
-                UNION ALL
-                SELECT
-                    to_system AS from_system,
-                    to_code AS from_code,
-                    '{RX_INTERNAL_CODE_SYSTEM}'::varchar AS to_system,
-                    rx_code AS to_code,
-                    match_type,
-                    confidence
-                FROM {tmp_rx_crosswalk_candidates}
-            )
-            INSERT INTO {schema}.{code_crosswalk_table}
-                (
-                    from_system,
-                    from_code,
-                    to_system,
-                    to_code,
-                    match_type,
-                    confidence,
-                    source,
-                    updated_at
-                )
-            SELECT
-                edges.from_system,
-                edges.from_code,
-                edges.to_system,
-                edges.to_code,
-                edges.match_type,
-                edges.confidence,
-                'drug_api_snapshot',
-                NOW()
-            FROM edges
-            ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE
-            SET
-                match_type = excluded.match_type,
-                confidence = excluded.confidence,
-                source = excluded.source,
-                updated_at = excluded.updated_at;
-            """
+        edge_rows = await _publish_snapshot_crosswalk_edges(
+            schema,
+            code_crosswalk_table,
+            stage_tables.crosswalk_candidates,
         )
-        return {"mapped_codes": mapped_codes, "edges": _safe_int(edge_rows, 0)}
+        return {"mapped_codes": mapped_codes, "edges": edge_rows}
     finally:
-        await _drop_stage_tables()
+        await _drop_snapshot_stage_tables(stage_tables)
 
 
 async def _collect_unresolved_hp_rx_codes(
@@ -1920,22 +2292,12 @@ async def _resolve_live_external_codes_for_entry(
     }
 
 
-async def _upsert_external_code_and_edges(
-    *,
+async def _upsert_external_catalog_code(
     schema: str,
     code_catalog_table: str,
-    code_crosswalk_table: str,
-    hp_code: str,
-    to_system: str,
-    to_code: str,
-    display_name: str | None,
-    confidence: float,
-    source: str,
-) -> int:
-    """Upsert one external code and symmetric normalized crosswalk edges."""
-
-    if not hp_code or not to_system or not to_code:
-        return 0
+    crosswalk_target: ExternalCrosswalkTarget,
+) -> None:
+    """Upsert the external code referenced by a resolved crosswalk."""
 
     await db.status(
         f"""
@@ -1956,15 +2318,34 @@ async def _upsert_external_code_and_edges(
             display_name = excluded.display_name,
             is_active = excluded.is_active,
             source = excluded.source,
-            updated_at = excluded.updated_at;
+        updated_at = excluded.updated_at;
         """,
-        code_system=to_system,
-        code=to_code,
-        display_name=display_name or to_code,
-        source=source,
+        code_system=crosswalk_target.code_system,
+        code=crosswalk_target.code,
+        display_name=crosswalk_target.display_name or crosswalk_target.code,
+        source=crosswalk_target.crosswalk_source,
     )
 
-    rowcount = await db.status(
+
+async def _upsert_external_crosswalk_edge(
+    schema: str,
+    code_crosswalk_table: str,
+    crosswalk_target: ExternalCrosswalkTarget,
+    is_reverse: bool,
+) -> int:
+    """Upsert one direction of a normalized external-code edge."""
+
+    if is_reverse:
+        from_system = crosswalk_target.code_system
+        from_code = crosswalk_target.code
+        to_system = RX_INTERNAL_CODE_SYSTEM
+        to_code = crosswalk_target.hp_code
+    else:
+        from_system = RX_INTERNAL_CODE_SYSTEM
+        from_code = crosswalk_target.hp_code
+        to_system = crosswalk_target.code_system
+        to_code = crosswalk_target.code
+    edge_rows = await db.status(
         f"""
         INSERT INTO {schema}.{code_crosswalk_table}
             (
@@ -1992,56 +2373,44 @@ async def _upsert_external_code_and_edges(
             match_type = excluded.match_type,
             confidence = excluded.confidence,
             source = excluded.source,
-            updated_at = excluded.updated_at;
+        updated_at = excluded.updated_at;
         """,
-        from_system=RX_INTERNAL_CODE_SYSTEM,
-        from_code=hp_code,
+        from_system=from_system,
+        from_code=from_code,
         to_system=to_system,
         to_code=to_code,
         match_type="normalized",
-        confidence=confidence,
-        source=source,
+        confidence=crosswalk_target.confidence,
+        source=crosswalk_target.crosswalk_source,
     )
+    return _safe_int(edge_rows, 0)
 
-    reverse_rowcount = await db.status(
-        f"""
-        INSERT INTO {schema}.{code_crosswalk_table}
-            (
-                from_system,
-                from_code,
-                to_system,
-                to_code,
-                match_type,
-                confidence,
-                source,
-                updated_at
-            )
-        VALUES (
-            CAST(:from_system AS varchar),
-            CAST(:from_code AS varchar),
-            CAST(:to_system AS varchar),
-            CAST(:to_code AS varchar),
-            :match_type,
-            :confidence,
-            :source,
-            NOW()
-        )
-        ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE
-        SET
-            match_type = excluded.match_type,
-            confidence = excluded.confidence,
-            source = excluded.source,
-            updated_at = excluded.updated_at;
-        """,
-        from_system=to_system,
-        from_code=to_code,
-        to_system=RX_INTERNAL_CODE_SYSTEM,
-        to_code=hp_code,
-        match_type="normalized",
-        confidence=confidence,
-        source=source,
+
+async def _upsert_external_code_and_edges(
+    *,
+    schema: str,
+    code_catalog_table: str,
+    code_crosswalk_table: str,
+    target: ExternalCrosswalkTarget,
+) -> int:
+    """Upsert one external code and symmetric normalized crosswalk edges."""
+
+    if not target.hp_code or not target.code_system or not target.code:
+        return 0
+    await _upsert_external_catalog_code(schema, code_catalog_table, target)
+    forward_rows = await _upsert_external_crosswalk_edge(
+        schema,
+        code_crosswalk_table,
+        target,
+        is_reverse=False,
     )
-    return _safe_int(rowcount, 0) + _safe_int(reverse_rowcount, 0)
+    reverse_rows = await _upsert_external_crosswalk_edge(
+        schema,
+        code_crosswalk_table,
+        target,
+        is_reverse=True,
+    )
+    return forward_rows + reverse_rows
 
 
 async def _upsert_live_resolution(
@@ -2069,12 +2438,14 @@ async def _upsert_live_resolution(
             schema=schema,
             code_catalog_table=code_catalog_table,
             code_crosswalk_table=code_crosswalk_table,
-            hp_code=hp_code,
-            to_system="RXNORM",
-            to_code=normalized_rxnorm,
-            display_name=display_name,
-            confidence=default_confidence,
-            source=crosswalk_source,
+            target=ExternalCrosswalkTarget(
+                hp_code=hp_code,
+                code_system="RXNORM",
+                code=normalized_rxnorm,
+                display_name=display_name,
+                confidence=default_confidence,
+                crosswalk_source=crosswalk_source,
+            ),
         )
 
     for ndc_code in ndc_codes:
@@ -2085,12 +2456,14 @@ async def _upsert_live_resolution(
             schema=schema,
             code_catalog_table=code_catalog_table,
             code_crosswalk_table=code_crosswalk_table,
-            hp_code=hp_code,
-            to_system="NDC",
-            to_code=normalized_ndc,
-            display_name=display_name,
-            confidence=default_confidence,
-            source=crosswalk_source,
+            target=ExternalCrosswalkTarget(
+                hp_code=hp_code,
+                code_system="NDC",
+                code=normalized_ndc,
+                display_name=display_name,
+                confidence=default_confidence,
+                crosswalk_source=crosswalk_source,
+            ),
         )
 
     return 1, inserted_edges
@@ -2210,185 +2583,294 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 )
 
 
-async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Prepare staging, split sources, and enqueue drug-claims chunks."""
+def _drug_claims_start_request(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+) -> DrugClaimsStartRequest:
+    """Validate and normalize the durable start-job identity."""
 
-    task = task or {}
-    test_mode = bool(task.get("test_mode", False))
-    import_id_val = _normalize_import_id(task.get("import_id"))
-    run_id = _normalize_run_id(task.get("run_id"))
-    stage_suffix = _build_stage_suffix(import_id_val, run_id)
     redis = ctx.get("redis")
     if redis is None:
         raise RuntimeError("ARQ redis context is unavailable for drug claims start job.")
-
-    total_start = _step_start(
-        "drug-claims enqueue+split "
-        f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})"
+    import_id = _normalize_import_id(task.get("import_id"))
+    run_id = _normalize_run_id(task.get("run_id"))
+    return DrugClaimsStartRequest(
+        test_mode=bool(task.get("test_mode", False)),
+        import_id=import_id,
+        run_id=run_id,
+        stage_suffix=_build_stage_suffix(import_id, run_id),
+        redis=redis,
     )
-    await mark_control_run(
-        run_id,
-        status="running",
-        phase_detail="drug-claims split running",
-        progress_message="splitting source files",
-    )
-    await ensure_database(test_mode)
 
+
+async def _prepare_drug_claims_sources(
+    request: DrugClaimsStartRequest,
+) -> tuple[str, dict[str, list[dict[str, Any]]], DrugClaimsWorkspace]:
+    """Prepare staging and resolve the complete CMS source contract."""
+
+    await ensure_database(request.test_mode)
     staging_started_at = _step_start("prepare staging tables")
-    _classes, schema = await _prepare_tables(stage_suffix, test_mode)
+    _, schema = await _prepare_tables(request.stage_suffix, request.test_mode)
     _step_end("prepare staging tables", staging_started_at)
-
     catalog_started_at = _step_start("fetch CMS catalog")
     catalog = await _fetch_catalog()
     _step_end("fetch CMS catalog", catalog_started_at)
-
     source_resolution_started_at = _step_start("resolve CMS sources")
-    source_descriptors_by_dataset = _resolve_sources(catalog, test_mode=test_mode)
+    source_descriptors_by_dataset = _resolve_sources(catalog, test_mode=request.test_mode)
     _step_end("resolve CMS sources", source_resolution_started_at)
+    work_dir = _run_dir(request.import_id, request.run_id)
+    workspace = DrugClaimsWorkspace(
+        work_dir=work_dir,
+        downloads_dir=work_dir / "downloads",
+        chunks_root=work_dir / "chunks",
+    )
+    workspace.chunks_root.mkdir(parents=True, exist_ok=True)
+    await _init_run_state(request.redis, request.run_id, 0)
+    return schema, source_descriptors_by_dataset, workspace
 
-    work_dir = _run_dir(import_id_val, run_id)
-    downloads_dir = work_dir / "downloads"
-    chunks_root = work_dir / "chunks"
-    chunks_root.mkdir(parents=True, exist_ok=True)
-    download_paths_by_dataset: dict[str, list[str]] = {}
-    chunks: list[dict[str, Any]] = []
 
-    await _init_run_state(redis, run_id, 0)
+async def _download_split_drug_claims_source(
+    request: DrugClaimsStartRequest,
+    workspace: DrugClaimsWorkspace,
+    dataset_key: str,
+    source_descriptor: dict[str, Any],
+    source_index: int,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Download and split one year of one CMS dataset."""
 
-    source_count = sum(len(source_descriptors_by_dataset.get(dataset.key, [])) for dataset in DATASETS)
-    semaphore = asyncio.Semaphore(min(DRUG_CLAIMS_DOWNLOAD_CONCURRENCY, max(source_count, 1)))
+    async with semaphore:
+        reporting_year = max(_safe_int(source_descriptor.get("reporting_year"), 2013), 2013)
+        step_started_at = _step_start(f"download+split {dataset_key} year={reporting_year}")
+        try:
+            local_path = await _download_source_file(
+                dataset_key,
+                source_descriptor,
+                str(workspace.downloads_dir),
+                request.test_mode,
+                reporting_year=reporting_year,
+            )
+            split_chunks = await _split_source_into_chunks(
+                dataset_key=dataset_key,
+                source_path=local_path,
+                chunks_dir=workspace.chunks_root / dataset_key,
+                test_mode=request.test_mode,
+            )
+            for chunk_manifest in split_chunks:
+                chunk_manifest["reporting_year"] = reporting_year
+                chunk_manifest["source_index"] = source_index
+            return dataset_key, split_chunks
+        finally:
+            _step_end(f"download+split {dataset_key} year={reporting_year}", step_started_at)
 
-    async def _download_split_source(
-        dataset_key: str,
-        source_descriptor: dict[str, Any],
-        source_index: int,
-    ) -> tuple[str, str, list[dict[str, Any]]]:
-        async with semaphore:
-            reporting_year = max(_safe_int(source_descriptor.get("reporting_year"), 2013), 2013)
-            step = _step_start(f"download+split {dataset_key} year={reporting_year}")
-            try:
-                local_path = await _download_source_file(
-                    dataset_key,
-                    source_descriptor,
-                    str(downloads_dir),
-                    test_mode,
-                    reporting_year=reporting_year,
-                )
-                split_chunks = await _split_source_into_chunks(
-                    dataset_key=dataset_key,
-                    source_path=local_path,
-                    chunks_dir=chunks_root / dataset_key,
-                    test_mode=test_mode,
-                )
-                for chunk in split_chunks:
-                    chunk["reporting_year"] = reporting_year
-                    chunk["source_index"] = source_index
-                return dataset_key, local_path, split_chunks
-            finally:
-                _step_end(f"download+split {dataset_key} year={reporting_year}", step)
 
-    chunk_enqueue_started_at = _step_start("download+split+enqueue chunks (streaming)")
-    dataset_tasks = [
-        asyncio.create_task(_download_split_source(dataset.key, source_descriptor, idx))
+async def _enqueue_drug_claims_chunk(
+    request: DrugClaimsStartRequest,
+    schema: str,
+    chunk_manifest: dict[str, Any],
+) -> None:
+    """Queue one split chunk with a deterministic id and normalized year."""
+
+    reporting_year = max(_safe_int(chunk_manifest.get("reporting_year"), 2013), 2013)
+    source_index = max(_safe_int(chunk_manifest.get("source_index"), 0), 0)
+    chunk_index = max(_safe_int(chunk_manifest.get("chunk_index"), 0), 0)
+    unique_chunk_id = (
+        f"{chunk_manifest['dataset_key']}:{reporting_year}:{source_index}:{chunk_index}"
+    )
+    chunk_job_by_field = {
+        "import_id": request.import_id,
+        "run_id": request.run_id,
+        "stage_suffix": request.stage_suffix,
+        "schema": schema,
+        "test_mode": request.test_mode,
+        "dataset_key": chunk_manifest["dataset_key"],
+        "chunk_id": unique_chunk_id,
+        "chunk_path": chunk_manifest["chunk_path"],
+        "reporting_year": reporting_year,
+    }
+    await request.redis.enqueue_job(
+        "drug_claims_process_chunk",
+        chunk_job_by_field,
+        _queue_name=DRUG_CLAIMS_QUEUE_NAME,
+        _job_id=_chunk_job_id(
+            request.run_id,
+            chunk_manifest["dataset_key"],
+            source_index,
+            reporting_year,
+            chunk_index,
+        ),
+    )
+
+
+async def _collect_and_enqueue_source_chunks(
+    request: DrugClaimsStartRequest,
+    schema: str,
+    source_descriptors_by_dataset: dict[str, list[dict[str, Any]]],
+    workspace: DrugClaimsWorkspace,
+) -> list[dict[str, Any]]:
+    """Run bounded source work and enqueue chunks as each source completes."""
+
+    source_count = sum(
+        len(source_descriptors_by_dataset.get(dataset.key, []))
         for dataset in DATASETS
-        for idx, source_descriptor in enumerate(source_descriptors_by_dataset.get(dataset.key, []))
+    )
+    semaphore = asyncio.Semaphore(
+        min(DRUG_CLAIMS_DOWNLOAD_CONCURRENCY, max(source_count, 1))
+    )
+    source_tasks = [
+        asyncio.create_task(
+            _download_split_drug_claims_source(
+                request,
+                workspace,
+                dataset.key,
+                source_descriptor,
+                source_index,
+                semaphore,
+            )
+        )
+        for dataset in DATASETS
+        for source_index, source_descriptor in enumerate(
+            source_descriptors_by_dataset.get(dataset.key, [])
+        )
     ]
+    all_chunks: list[dict[str, Any]] = []
     try:
-        for completed in asyncio.as_completed(dataset_tasks):
-            dataset_key, local_path, split_chunks = await completed
-            download_paths_by_dataset.setdefault(dataset_key, []).append(local_path)
-            for chunk in split_chunks:
-                reporting_year = max(_safe_int(chunk.get("reporting_year"), 2013), 2013)
-                source_index = max(_safe_int(chunk.get("source_index"), 0), 0)
-                chunk_index = max(_safe_int(chunk.get("chunk_index"), 0), 0)
-                unique_chunk_id = f"{chunk['dataset_key']}:{reporting_year}:{source_index}:{chunk_index}"
-                chunk_job_by_field = {
-                    "import_id": import_id_val,
-                    "run_id": run_id,
-                    "stage_suffix": stage_suffix,
-                    "schema": schema,
-                    "test_mode": test_mode,
-                    "dataset_key": chunk["dataset_key"],
-                    "chunk_id": unique_chunk_id,
-                    "chunk_path": chunk["chunk_path"],
-                    "reporting_year": reporting_year,
-                }
-                await redis.enqueue_job(
-                    "drug_claims_process_chunk",
-                    chunk_job_by_field,
-                    _queue_name=DRUG_CLAIMS_QUEUE_NAME,
-                    _job_id=_chunk_job_id(
-                        run_id,
-                        chunk["dataset_key"],
-                        source_index,
-                        reporting_year,
-                        chunk_index,
-                    ),
-                )
+        for completed_source in asyncio.as_completed(source_tasks):
+            _, split_chunks = await completed_source
+            for chunk_manifest in split_chunks:
+                await _enqueue_drug_claims_chunk(request, schema, chunk_manifest)
             if split_chunks:
-                await _increment_total_chunks(redis, run_id, len(split_chunks))
-                chunks.extend(split_chunks)
+                await _increment_total_chunks(
+                    request.redis,
+                    request.run_id,
+                    len(split_chunks),
+                )
+                all_chunks.extend(split_chunks)
     finally:
-        for task_ref in dataset_tasks:
-            if not task_ref.done():
-                task_ref.cancel()
-    _step_end("download+split+enqueue chunks (streaming)", chunk_enqueue_started_at)
+        for source_task in source_tasks:
+            if not source_task.done():
+                source_task.cancel()
+    return all_chunks
+
+
+def _persist_drug_claims_manifest(
+    request: DrugClaimsStartRequest,
+    schema: str,
+    workspace: DrugClaimsWorkspace,
+    source_descriptors_by_dataset: dict[str, list[dict[str, Any]]],
+    chunks: list[dict[str, Any]],
+) -> Path:
+    """Write the exact finalize handoff consumed by retryable workers."""
 
     run_manifest_by_field = {
-        "import_id": import_id_val,
-        "run_id": run_id,
-        "stage_suffix": stage_suffix,
+        "import_id": request.import_id,
+        "run_id": request.run_id,
+        "stage_suffix": request.stage_suffix,
         "schema": schema,
-        "test_mode": test_mode,
+        "test_mode": request.test_mode,
         "sources": source_descriptors_by_dataset,
         "chunks": chunks,
         "total_chunks": len(chunks),
         "created_at": datetime.datetime.utcnow().isoformat(),
-        "work_dir": str(work_dir),
+        "work_dir": str(workspace.work_dir),
     }
-    manifest_path = _manifest_path(work_dir)
+    manifest_path = _manifest_path(workspace.work_dir)
     _write_manifest(manifest_path, run_manifest_by_field)
+    return manifest_path
 
-    await redis.enqueue_job(
+
+async def _enqueue_drug_claims_finalize(
+    request: DrugClaimsStartRequest,
+    schema: str,
+    manifest_path: Path,
+) -> None:
+    """Queue finalization after the complete manifest is durable."""
+
+    await request.redis.enqueue_job(
         "drug_claims_finalize",
         {
-            "import_id": import_id_val,
-            "run_id": run_id,
-            "stage_suffix": stage_suffix,
+            "import_id": request.import_id,
+            "run_id": request.run_id,
+            "stage_suffix": request.stage_suffix,
             "schema": schema,
             "manifest_path": str(manifest_path),
-            "test_mode": test_mode,
+            "test_mode": request.test_mode,
         },
         _queue_name=DRUG_CLAIMS_FINISH_QUEUE_NAME,
-        _job_id=f"drug_claims_finalize_{run_id}",
+        _job_id=f"drug_claims_finalize_{request.run_id}",
     )
 
-    _step_end(
-        "drug-claims enqueue+split "
-        f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})",
-        total_start,
-    )
+
+async def _mark_drug_claims_chunks_queued(
+    request: DrugClaimsStartRequest,
+    total_chunks: int,
+) -> None:
+    """Publish the control-plane result of successful split and enqueue."""
+
     await mark_control_run(
-        run_id,
+        request.run_id,
         status="running",
         phase_detail="drug-claims chunks queued",
         progress_message="chunks queued",
-        metrics={"total_chunks": len(chunks), "stage_suffix": stage_suffix},
+        metrics={"total_chunks": total_chunks, "stage_suffix": request.stage_suffix},
         progress={
             "unit": "chunks",
-            "total": len(chunks),
+            "total": total_chunks,
             "done": 0,
             "pct": 0,
             "message": "chunks queued",
             "phase": "drug-claims chunks queued",
         },
     )
+
+
+async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Prepare staging, split sources, and enqueue drug-claims chunks."""
+
+    request = _drug_claims_start_request(ctx, task or {})
+    total_start = _step_start(
+        "drug-claims enqueue+split "
+        f"(test_mode={request.test_mode}, import_id={request.import_id}, "
+        f"run_id={request.run_id}, stage={request.stage_suffix})"
+    )
+    await mark_control_run(
+        request.run_id,
+        status="running",
+        phase_detail="drug-claims split running",
+        progress_message="splitting source files",
+    )
+    schema, source_descriptors_by_dataset, workspace = await _prepare_drug_claims_sources(
+        request
+    )
+    chunk_enqueue_started_at = _step_start("download+split+enqueue chunks (streaming)")
+    chunks = await _collect_and_enqueue_source_chunks(
+        request,
+        schema,
+        source_descriptors_by_dataset,
+        workspace,
+    )
+    _step_end("download+split+enqueue chunks (streaming)", chunk_enqueue_started_at)
+    manifest_path = _persist_drug_claims_manifest(
+        request,
+        schema,
+        workspace,
+        source_descriptors_by_dataset,
+        chunks,
+    )
+    await _enqueue_drug_claims_finalize(request, schema, manifest_path)
+    _step_end(
+        "drug-claims enqueue+split "
+        f"(test_mode={request.test_mode}, import_id={request.import_id}, "
+        f"run_id={request.run_id}, stage={request.stage_suffix})",
+        total_start,
+    )
+    await _mark_drug_claims_chunks_queued(request, len(chunks))
     return {
         "ok": True,
         "queued": True,
-        "import_id": import_id_val,
-        "run_id": run_id,
-        "stage_suffix": stage_suffix,
+        "import_id": request.import_id,
+        "run_id": request.run_id,
+        "stage_suffix": request.stage_suffix,
         "total_chunks": len(chunks),
         "manifest_path": str(manifest_path),
     }
@@ -2455,117 +2937,175 @@ async def drug_claims_process_chunk(ctx, task: dict[str, Any] | None = None) -> 
     }
 
 
+def _drug_claims_finalize_request(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    test_mode: bool,
+) -> DrugClaimsFinalizeRequest:
+    """Resolve retry-stable finalize identity from task and manifest."""
+
+    import_id = _normalize_import_id(task.get("import_id"))
+    manifest_path = str(task.get("manifest_path") or "")
+    manifest = _read_manifest(manifest_path) if manifest_path else {}
+    run_id = str(task.get("run_id") or manifest.get("run_id") or "")
+    stage_suffix = str(
+        task.get("stage_suffix")
+        or manifest.get("stage_suffix")
+        or _build_stage_suffix(import_id, run_id)
+    )
+    schema = str(
+        task.get("schema")
+        or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    )
+    expected_chunks = _safe_int(
+        manifest.get("total_chunks"),
+        _safe_int(task.get("total_chunks"), 0),
+    )
+    return DrugClaimsFinalizeRequest(
+        test_mode=test_mode,
+        import_id=import_id,
+        run_id=run_id,
+        stage_suffix=stage_suffix,
+        schema=schema,
+        redis=ctx.get("redis"),
+        manifest=manifest,
+        expected_chunks=expected_chunks,
+    )
+
+
+async def _await_drug_claims_finalize_permission(
+    request: DrugClaimsFinalizeRequest,
+) -> dict[str, Any] | None:
+    """Wait for all chunks and acquire the single-publisher lock."""
+
+    if request.redis is None or not request.run_id:
+        return None
+    finalized_key = _state_key(request.run_id, "finalized")
+    if await request.redis.get(finalized_key):
+        return {
+            "ok": True,
+            "already_finalized": True,
+            "run_id": request.run_id,
+            "import_id": request.import_id,
+        }
+    total_chunks, done_chunks = await _get_run_progress(
+        request.redis,
+        request.run_id,
+        request.expected_chunks,
+    )
+    if done_chunks < total_chunks:
+        enqueue_live_progress(
+            run_id=request.run_id,
+            importer="drug-claims",
+            status="running",
+            phase="drug-claims chunks running",
+            unit="chunks",
+            done=done_chunks,
+            total=total_chunks,
+            message=f"waiting for chunks {done_chunks}/{total_chunks}",
+        )
+        print(
+            f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} "
+            f"run_id={request.run_id}",
+            flush=True,
+        )
+        raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
+    if not await _has_claimed_finalize_lock(request.redis, request.run_id):
+        raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
+    await mark_control_run(
+        request.run_id,
+        status="finalizing",
+        phase_detail="drug-claims finalizing",
+        progress_message="finalizing",
+        progress={
+            "unit": "chunks",
+            "total": total_chunks,
+            "done": done_chunks,
+            "pct": 99,
+            "message": "finalizing",
+            "phase": "drug-claims finalizing",
+        },
+    )
+    return None
+
+
+async def _materialize_and_publish_drug_claims(
+    request: DrugClaimsFinalizeRequest,
+) -> None:
+    """Materialize dimensions, build deferred indexes, and publish atomically."""
+
+    classes = _staging_classes(request.stage_suffix, request.schema)
+    live_tables_started_at = _step_start("ensure live code tables")
+    await _ensure_live_code_tables(request.schema)
+    _step_end("ensure live code tables", live_tables_started_at)
+    materialization_started_at = _step_start("materialize prescription/code dimensions")
+    await _materialize_prescription_and_code_rows(classes, request.schema)
+    _step_end("materialize prescription/code dimensions", materialization_started_at)
+    if DRUG_CLAIMS_DEFER_STAGE_INDEXES:
+        index_build_started_at = _step_start("build staging indexes")
+        await _build_staging_indexes(classes, request.schema)
+        _step_end("build staging indexes", index_build_started_at)
+    publish_started_at = _step_start("publish staging -> final (transactional rename)")
+    await _publish_by_table_rename(classes, request.schema)
+    _step_end("publish staging -> final (transactional rename)", publish_started_at)
+
+
+async def _mark_drug_claims_finalized(request: DrugClaimsFinalizeRequest) -> None:
+    """Persist the finalize fence after successful publication."""
+
+    if request.redis is None or not request.run_id:
+        return
+    finalized_key = _state_key(request.run_id, "finalized")
+    await request.redis.set(
+        finalized_key,
+        "1",
+        ex=DRUG_CLAIMS_REDIS_TTL_SECONDS,
+    )
+    await request.redis.expire(finalized_key, DRUG_CLAIMS_REDIS_TTL_SECONDS)
+
+
+def _cleanup_drug_claims_workdir(request: DrugClaimsFinalizeRequest) -> None:
+    """Remove a completed run workspace unless retention was requested."""
+
+    if not request.manifest:
+        return
+    run_work_dir = Path(request.manifest.get("work_dir", ""))
+    if run_work_dir and run_work_dir.exists() and not DRUG_CLAIMS_KEEP_WORKDIR:
+        shutil.rmtree(run_work_dir, ignore_errors=True)
+
+
 async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Wait for all chunks, validate staging, and publish drug claims."""
 
-    task = task or {}
-    import_id_val = _normalize_import_id(task.get("import_id"))
-    run_id = str(task.get("run_id") or "")
-    test_mode = bool(task.get("test_mode", False))
-    manifest_path = str(task.get("manifest_path") or "")
-    schema = str(task.get("schema") or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode))
-    stage_suffix = str(task.get("stage_suffix") or "")
-    redis = ctx.get("redis")
-
+    finalize_task = task or {}
+    test_mode = bool(finalize_task.get("test_mode", False))
     await ensure_database(test_mode)
-
-    manifest = _read_manifest(manifest_path) if manifest_path else {}
-    expected_chunks = _safe_int(manifest.get("total_chunks"), _safe_int(task.get("total_chunks"), 0))
-    if not run_id:
-        run_id = str(manifest.get("run_id") or "")
-    if not stage_suffix:
-        stage_suffix = str(manifest.get("stage_suffix") or _build_stage_suffix(import_id_val, run_id))
-
-    if redis is not None and run_id:
-        finalized_key = _state_key(run_id, "finalized")
-        if await redis.get(finalized_key):
-            return {
-                "ok": True,
-                "already_finalized": True,
-                "run_id": run_id,
-                "import_id": import_id_val,
-            }
-
-        total_chunks, done_chunks = await _get_run_progress(redis, run_id, expected_chunks)
-        if done_chunks < total_chunks:
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="drug-claims",
-                status="running",
-                phase="drug-claims chunks running",
-                unit="chunks",
-                done=done_chunks,
-                total=total_chunks,
-                message=f"waiting for chunks {done_chunks}/{total_chunks}",
-            )
-            print(
-                f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} run_id={run_id}",
-                flush=True,
-            )
-            raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
-
-        if not await _has_claimed_finalize_lock(redis, run_id):
-            raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
-        await mark_control_run(
-            run_id,
-            status="finalizing",
-            phase_detail="drug-claims finalizing",
-            progress_message="finalizing",
-            progress={
-                "unit": "chunks",
-                "total": total_chunks,
-                "done": done_chunks,
-                "pct": 99,
-                "message": "finalizing",
-                "phase": "drug-claims finalizing",
-            },
-        )
-
-    classes = _staging_classes(stage_suffix, schema)
-    live_tables_started_at = _step_start("ensure live code tables")
-    await _ensure_live_code_tables(schema)
-    _step_end("ensure live code tables", live_tables_started_at)
-    materialization_started_at = _step_start("materialize prescription/code dimensions")
-    await _materialize_prescription_and_code_rows(classes, schema)
-    _step_end("materialize prescription/code dimensions", materialization_started_at)
-
-    if DRUG_CLAIMS_DEFER_STAGE_INDEXES:
-        index_build_started_at = _step_start("build staging indexes")
-        await _build_staging_indexes(classes, schema)
-        _step_end("build staging indexes", index_build_started_at)
-
-    publish_started_at = _step_start("publish staging -> final (transactional rename)")
-    await _publish_by_table_rename(classes, schema)
-    _step_end("publish staging -> final (transactional rename)", publish_started_at)
-
-    if redis is not None and run_id:
-        await redis.set(_state_key(run_id, "finalized"), "1", ex=DRUG_CLAIMS_REDIS_TTL_SECONDS)
-        await redis.expire(_state_key(run_id, "finalized"), DRUG_CLAIMS_REDIS_TTL_SECONDS)
-
-    if manifest:
-        run_work_dir = Path(manifest.get("work_dir", ""))
-        if run_work_dir and run_work_dir.exists() and not DRUG_CLAIMS_KEEP_WORKDIR:
-            shutil.rmtree(run_work_dir, ignore_errors=True)
-
+    request = _drug_claims_finalize_request(ctx, finalize_task, test_mode)
+    already_finalized_result = await _await_drug_claims_finalize_permission(request)
+    if already_finalized_result is not None:
+        return already_finalized_result
+    await _materialize_and_publish_drug_claims(request)
+    await _mark_drug_claims_finalized(request)
+    _cleanup_drug_claims_workdir(request)
     logger.info(
         "CMS drug claims import finalized: test_mode=%s import_id=%s run_id=%s",
-        test_mode,
-        import_id_val,
-        run_id,
+        request.test_mode,
+        request.import_id,
+        request.run_id,
     )
     await mark_control_run(
-        run_id,
+        request.run_id,
         status="succeeded",
         phase_detail="drug-claims finalized",
         progress_message="succeeded",
-        metrics={"stage_suffix": stage_suffix, "schema": schema},
+        metrics={"stage_suffix": request.stage_suffix, "schema": request.schema},
     )
     return {
         "ok": True,
-        "import_id": import_id_val,
-        "run_id": run_id,
-        "stage_suffix": stage_suffix,
-        "schema": schema,
+        "import_id": request.import_id,
+        "run_id": request.run_id,
+        "stage_suffix": request.stage_suffix,
+        "schema": request.schema,
     }
 
 

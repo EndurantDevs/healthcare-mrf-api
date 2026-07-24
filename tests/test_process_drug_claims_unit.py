@@ -308,12 +308,14 @@ async def test_live_upsert_casts_bind_params_to_varchar(monkeypatch):
         schema="mrf",
         code_catalog_table="code_catalog",
         code_crosswalk_table="code_crosswalk",
-        hp_code="HP123",
-        to_system="RXNORM",
-        to_code="259255",
-        display_name="atorvastatin calcium",
-        confidence=0.9,
-        source="drug_api_live",
+        target=drug_claims.ExternalCrosswalkTarget(
+            hp_code="HP123",
+            code_system="RXNORM",
+            code="259255",
+            display_name="atorvastatin calcium",
+            confidence=0.9,
+            crosswalk_source="drug_api_live",
+        ),
     )
 
     assert inserted == 2
