@@ -740,6 +740,44 @@ def test_shared_block_publish_batch_is_bounded_for_dense_stages():
     )
 
 
+@pytest.mark.parametrize(
+    ("flag_index", "message"),
+    (
+        (4, "incompatible format version"),
+        (5, "stored content metadata"),
+        (6, "mapping conflicts"),
+    ),
+)
+def test_batched_stage_summary_rejects_invalid_batch_proof(flag_index, message):
+    aggregate_values = [1, 10, 7, ["serving"], False, False, False]
+    aggregate_values[flag_index] = True
+    summary = ptg2_shared_publish._BatchedBlockStageSummary()
+
+    with pytest.raises(RuntimeError, match=message):
+        summary.add(
+            aggregate_values,
+            unique_blocks=1,
+            unique_coordinates=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag_index", "message"),
+    (
+        (5, "incompatible format version"),
+        (6, "no payload"),
+        (7, "stored content metadata"),
+    ),
+)
+def test_batched_v4_summary_rejects_invalid_batch_proof(flag_index, message):
+    aggregate_values = [1, 2, 10, 7, ["v4_graph"], False, False, False]
+    aggregate_values[flag_index] = True
+    summary = ptg2_shared_publish._BatchedV4CASStageSummary()
+
+    with pytest.raises(RuntimeError, match=message):
+        summary.add(aggregate_values, [1, 10, 7])
+
+
 def _assert_slow_shared_block_publication(publication, progress_events, session):
     assert publication.mapping_count == 4_103
     assert publication.unique_block_count == 4_101
