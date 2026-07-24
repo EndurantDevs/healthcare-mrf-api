@@ -1552,6 +1552,11 @@ async def test_fetch_shared_blocks_uses_one_stable_query_without_process_cache()
     assert second == first
     assert len(session.calls) == 2
     assert all("ptg2_v3_snapshot_block" in sql and "ptg2_v3_block" in sql for sql, _ in session.calls)
+    assert all(
+        params["shared_projection_generations"]
+        == ("shared_blocks_v3", "shared_blocks_v4")
+        for _sql, params in session.calls
+    )
 
 
 @pytest.mark.asyncio
@@ -2774,6 +2779,10 @@ async def test_fetch_shared_blocks_filters_exact_fragments():
     sql, params = session.calls[0]
     assert "mapping.fragment_no = ANY" in sql
     assert params["fragment_nos"] == (7080,)
+    assert params["shared_projection_generations"] == (
+        "shared_blocks_v3",
+        "shared_blocks_v4",
+    )
 
 
 @pytest.mark.asyncio

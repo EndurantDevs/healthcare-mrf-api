@@ -403,12 +403,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 30740,
+          "covered": 30833,
           "total": 37802
         },
         "lines": {
-          "covered": 100408,
-          "total": 112268
+          "covered": 100564,
+          "total": 112194
         }
       },
       "one_time_floor_reset": {

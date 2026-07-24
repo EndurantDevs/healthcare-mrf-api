@@ -378,6 +378,11 @@ async def test_provider_page_existence_uses_shared_layout_query():
 
     assert await sidecars.has_shared_provider_pages_in_db(session, 1) is True
     session.execute.assert_awaited_once()
+    _statement, params = session.execute.await_args.args
+    assert params["shared_projection_generations"] == (
+        "shared_blocks_v3",
+        "shared_blocks_v4",
+    )
 
 
 @pytest.mark.asyncio

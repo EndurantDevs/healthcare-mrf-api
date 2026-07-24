@@ -24,6 +24,7 @@ from process.ptg_parts.ptg2_shared_reuse import shared_source_set_metadata
 from process.ptg_parts.ptg2_shared_source_set import (
     ordered_source_ordinal_digest,
 )
+from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_SHARED_GENERATION
 
 
 PTG2_V3_GRAPH_CHUNK_BYTES = 64 * 1024
@@ -40,6 +41,10 @@ _GRAPH_KIND_AND_WIDTH = {
     PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP: ("graph_provider_set_groups_v1", 4),
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PTG2_SHARED_PROJECTION_GENERATIONS = (
+    PTG2_V3_SHARED_GENERATION,
+    PTG2_V4_SHARED_GENERATION,
+)
 
 
 class PTG2SharedBlockError(RuntimeError):
@@ -427,7 +432,9 @@ async def _stream_shared_mapping_records(
                 ON mapping.snapshot_key = layout.snapshot_key
              WHERE layout.snapshot_key = :snapshot_key
                AND layout.state = 'sealed'
-               AND layout.generation = :generation
+               AND layout.generation = ANY(
+                   CAST(:shared_projection_generations AS text[])
+               )
                AND mapping.object_kind = :object_kind
                AND mapping.block_key = ANY(CAST(:block_keys AS bigint[]))
                {fragment_filter}
@@ -437,7 +444,7 @@ async def _stream_shared_mapping_records(
     )
     params_by_name = {
         "snapshot_key": request.snapshot_key,
-        "generation": PTG2_V3_SHARED_GENERATION,
+        "shared_projection_generations": PTG2_SHARED_PROJECTION_GENERATIONS,
         "object_kind": request.object_kind,
         "block_keys": request.block_keys,
         "fragment_nos": request.fragment_nos,
@@ -1223,7 +1230,9 @@ async def _shared_direct_query_result(
                 ON block.block_hash = mapping.block_hash
              WHERE layout.snapshot_key = :snapshot_key
                AND layout.state = 'sealed'
-               AND layout.generation = :generation
+               AND layout.generation = ANY(
+                   CAST(:shared_projection_generations AS text[])
+               )
                AND mapping.object_kind = :object_kind
                AND mapping.block_key = ANY(CAST(:block_keys AS bigint[]))
                {fragment_filter}
@@ -1232,7 +1241,7 @@ async def _shared_direct_query_result(
     )
     query_params_by_name = {
         "snapshot_key": request.snapshot_key,
-        "generation": PTG2_V3_SHARED_GENERATION,
+        "shared_projection_generations": PTG2_SHARED_PROJECTION_GENERATIONS,
         "object_kind": request.object_kind,
         "block_keys": request.block_keys,
         "fragment_nos": request.fragment_nos,

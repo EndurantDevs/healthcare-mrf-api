@@ -21,6 +21,7 @@ from api.ptg2_candidate_audit import (
     PTG2CandidateAuditAccess,
 )
 from api.ptg2_candidate_audit_batch import CandidateAuditBatchResult
+from api.ptg2_db_sidecars import lookup_forward_price_index_from_db
 from api.ptg2_shared_blocks import shared_block_read_once_scope
 from api.ptg2_types import PTG2ServingTables
 from db.connection import db
@@ -244,6 +245,60 @@ async def test_real_postgres_candidate_batch_reads_and_processes_each_block_once
         SNAPSHOT_ID,
         candidate_audit_access=candidate_case.access,
     )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_v4_layout_reads_compatibility_forward_projections(
+) -> None:
+    """Prove a V4 layout reads its retained forward projections exactly."""
+
+    if os.getenv("HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST=1")
+    candidate_case = _candidate_batch_case()
+    schema = quote_identifier(candidate_case.schema_name)
+    await db.disconnect()
+    await db.connect()
+    try:
+        await create_candidate_schema(candidate_case.schema_name)
+        await seed_candidate(
+            candidate_case.schema_name,
+            candidate_case.witness_payload,
+            candidate_case.witness_metadata,
+            candidate_case.persisted_audit_rows,
+        )
+        await db.status(
+            f"""
+            UPDATE {schema}.ptg2_v3_snapshot_layout
+               SET generation = 'shared_blocks_v4'
+             WHERE snapshot_key = :snapshot_key
+            """,
+            snapshot_key=SNAPSHOT_KEY,
+        )
+        async with db.session() as session:
+            with shared_block_read_once_scope(
+                max_retained_raw_bytes=1024 * 1024,
+            ) as read_once_scope:
+                price_keys_by_occurrence = await lookup_forward_price_index_from_db(
+                    session,
+                    (7, 8),
+                    source_keys_by_code={7: (0,), 8: (0,)},
+                    shared_snapshot_key=SNAPSHOT_KEY,
+                    source_count=1,
+                    price_dictionary_item_count=16,
+                    price_dictionary_block_bytes=65_536,
+                    provider_shard_span=1_024,
+                    schema_name=candidate_case.schema_name,
+                )
+                read_once_scope.assert_processed_once()
+        assert price_keys_by_occurrence == {
+            (7, 5, 0): (8,),
+            (8, 5, 0): (8,),
+        }
+    finally:
+        try:
+            await db.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            await db.disconnect()
 
 
 async def _load_postgres_partition_plan(

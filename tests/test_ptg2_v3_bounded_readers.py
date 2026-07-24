@@ -1733,6 +1733,10 @@ async def test_code_shard_discovery_uses_exact_mapping_ranges():
     assert params["object_kind"] == "by_code_provider_shard_v1"
     assert params["code_keys"] == (7, 9)
     assert params["code_block_span"] == 1 << 31
+    assert params["shared_projection_generations"] == (
+        "shared_blocks_v3",
+        "shared_blocks_v4",
+    )
 
 
 @pytest.mark.asyncio
@@ -1768,6 +1772,10 @@ async def test_code_existence_uses_provider_shard_range():
     assert params["object_kind"] == "by_code_provider_shard_v1"
     assert params["lower_bound"] == 7 << 31
     assert params["upper_bound"] == 8 << 31
+    assert params["shared_projection_generations"] == (
+        "shared_blocks_v3",
+        "shared_blocks_v4",
+    )
 
 
 class _AsyncRows:
