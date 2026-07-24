@@ -15,6 +15,7 @@ from process.ptg_parts.ptg2_shared_blocks import PTG2_V4_SHARED_GENERATION
 from tests.ptg2_v4_stale_metadata_postgres_support import (
     INTERNAL_RUN_ID,
     SNAPSHOT_ID,
+    configure_test_schema,
     create_stale_schema,
     database_for_dsn,
     drop_stale_schema,
@@ -78,7 +79,7 @@ async def test_attempt_entry_crash_rolls_back_and_exact_retry_recovers(
     original_run_push = process_ptg._push_fenced_import_run
     try:
         await create_stale_schema(connection, schema_name)
-        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+        configure_test_schema(monkeypatch, schema_name)
         monkeypatch.setattr(process_ptg, "db", test_database)
         monkeypatch.setattr(
             process_ptg.PTG2Snapshot.__table__, "schema", schema_name

@@ -4380,6 +4380,50 @@ def test_ptg2_ensure_tables_requires_v3_migration_before_runtime_ddl(monkeypatch
     assert created_list == []
 
 
+@pytest.mark.parametrize(
+    "missing_table_name",
+    (
+        "ptg2_v4_attempt_fence",
+        "ptg2_v4_attempt_stage",
+        "ptg2_import_job",
+    ),
+)
+def test_ptg2_ensure_tables_cannot_recreate_v4_migration_tables(
+    monkeypatch,
+    missing_table_name,
+):
+    created_list = []
+
+    async def fake_status(_statement):
+        return None
+
+    async def fake_all(_statement, **params):
+        return [
+            {"table_name": table_name}
+            for table_name in params["table_names"]
+            if table_name != missing_table_name
+        ]
+
+    async def fake_create_table(table, **_kwargs):
+        created_list.append(table.name)
+
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
+    monkeypatch.setattr(
+        process_ptg.db,
+        "create_table",
+        fake_create_table,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"{missing_table_name}.*alembic upgrade head",
+    ):
+        asyncio.run(process_ptg.ensure_ptg2_tables())
+
+    assert created_list == []
+
+
 def test_ptg2_ensure_tables_requires_allowed_amount_migration(monkeypatch):
     created_list = []
 

@@ -12,9 +12,12 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from db.ptg2_v4_attempt_schema import (
     ATTEMPT_FENCE_TABLE,
+    ATTEMPT_IMPORT_JOB_INDEXES,
+    ATTEMPT_IMPORT_JOB_TABLE,
     ATTEMPT_STAGE_RUN_INDEX,
     ATTEMPT_STAGE_TABLE,
     fence_table_elements,
+    import_job_table_elements,
     stage_table_elements,
 )
 from tests.ptg2_v4_attempt_migration_postgres_support import (
@@ -26,7 +29,11 @@ from tests.ptg2_v4_attempt_migration_postgres_support import (
 from tests.ptg2_v4_stale_metadata_postgres_support import quoted
 
 
-_TARGET_TABLES = {ATTEMPT_FENCE_TABLE, ATTEMPT_STAGE_TABLE}
+_TARGET_TABLES = {
+    ATTEMPT_FENCE_TABLE,
+    ATTEMPT_IMPORT_JOB_TABLE,
+    ATTEMPT_STAGE_TABLE,
+}
 
 
 def _target_metadata(schema_name: str) -> sa.MetaData:
@@ -54,6 +61,16 @@ def _target_metadata(schema_name: str) -> sa.MetaData:
         metadata,
         *stage_table_elements(schema_name),
         sa.Index(ATTEMPT_STAGE_RUN_INDEX, "internal_run_id"),
+        schema=schema_name,
+    )
+    sa.Table(
+        ATTEMPT_IMPORT_JOB_TABLE,
+        metadata,
+        *import_job_table_elements(),
+        *(
+            sa.Index(index_name, column_name)
+            for index_name, column_name in ATTEMPT_IMPORT_JOB_INDEXES
+        ),
         schema=schema_name,
     )
     return metadata

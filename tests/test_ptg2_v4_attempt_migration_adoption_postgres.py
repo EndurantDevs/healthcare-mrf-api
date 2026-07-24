@@ -7,6 +7,9 @@ import pytest
 from sqlalchemy.exc import DBAPIError
 
 from db.ptg2_v4_attempt_schema import (
+    ATTEMPT_IMPORT_JOB_COLUMNS,
+    ATTEMPT_IMPORT_JOB_INDEXES,
+    ATTEMPT_IMPORT_JOB_PRIMARY_KEY,
     FENCE_FINAL_COLUMNS,
     FENCE_FINAL_CONSTRAINTS,
     LIFECYCLE_GUARDED_TABLES,
@@ -94,6 +97,62 @@ async def _assert_final_catalog(connection, schema_name: str) -> None:
     assert all(stage_constraints.values())
 
 
+async def _assert_import_job_catalog(
+    connection,
+    schema_name: str,
+) -> None:
+    assert await _column_names(
+        connection,
+        schema_name,
+        "ptg2_import_job",
+    ) == ATTEMPT_IMPORT_JOB_COLUMNS
+    constraints = await _constraint_catalog(
+        connection,
+        schema_name,
+        "ptg2_import_job",
+    )
+    assert constraints == {ATTEMPT_IMPORT_JOB_PRIMARY_KEY: True}
+    indexes = await connection.fetch(
+        """
+        SELECT index_record.relname
+          FROM pg_index AS index_membership
+          JOIN pg_class AS relation_record
+            ON relation_record.oid = index_membership.indrelid
+          JOIN pg_namespace AS namespace_record
+            ON namespace_record.oid = relation_record.relnamespace
+          JOIN pg_class AS index_record
+            ON index_record.oid = index_membership.indexrelid
+         WHERE namespace_record.nspname = $1
+           AND relation_record.relname = 'ptg2_import_job'
+        """,
+        schema_name,
+    )
+    assert {str(index_record["relname"]) for index_record in indexes} == {
+        ATTEMPT_IMPORT_JOB_PRIMARY_KEY,
+        *(index_name for index_name, _column in ATTEMPT_IMPORT_JOB_INDEXES),
+    }
+    triggers = await connection.fetch(
+        """
+        SELECT trigger_record.tgname
+          FROM pg_trigger AS trigger_record
+          JOIN pg_class AS relation_record
+            ON relation_record.oid = trigger_record.tgrelid
+          JOIN pg_namespace AS namespace_record
+            ON namespace_record.oid = relation_record.relnamespace
+         WHERE namespace_record.nspname = $1
+           AND relation_record.relname = 'ptg2_import_job'
+           AND NOT trigger_record.tgisinternal
+        """,
+        schema_name,
+    )
+    assert {str(trigger_record["tgname"]) for trigger_record in triggers} == {
+        "ptg2_import_job_attempt_lifecycle_lock",
+        "ptg2_import_job_attempt_insert_guard",
+        "ptg2_import_job_attempt_update_guard",
+        "ptg2_import_job_attempt_delete_guard",
+    }
+
+
 @pytest.mark.asyncio
 async def test_fresh_upgrade_installs_exact_final_attempt_catalog(
     monkeypatch,
@@ -103,6 +162,10 @@ async def test_fresh_upgrade_installs_exact_final_attempt_catalog(
         schema_name,
         connection,
     ):
+        schema = quoted(schema_name)
+        await connection.execute(
+            f"DROP TABLE {schema}.ptg2_import_job"
+        )
         await run_migration_action(
             dsn,
             migration(FENCE_MIGRATION),
@@ -110,6 +173,7 @@ async def test_fresh_upgrade_installs_exact_final_attempt_catalog(
         )
 
         await _assert_final_catalog(connection, schema_name)
+        await _assert_import_job_catalog(connection, schema_name)
         trigger_body = await connection.fetchval(
             """
             SELECT function_record.prosrc
@@ -128,6 +192,105 @@ async def test_fresh_upgrade_installs_exact_final_attempt_catalog(
             schema_name,
         )
         assert "OLD.fence_nonce IS DISTINCT FROM NEW.fence_nonce" in trigger_body
+
+
+@pytest.mark.asyncio
+async def test_exact_import_job_is_adopted_without_replacing_rows(
+    monkeypatch,
+):
+    async with attempt_migration_database(monkeypatch) as (
+        dsn,
+        schema_name,
+        connection,
+    ):
+        schema = quoted(schema_name)
+        await connection.execute(
+            f"""
+            INSERT INTO {schema}.ptg2_import_job
+                (import_job_id, import_run_id, status, payload)
+            VALUES (
+                'existing-job',
+                'existing-run',
+                'pending',
+                '{{"evidence":"preserved"}}'::json
+            )
+            """
+        )
+        before_oid = await connection.fetchval(
+            "SELECT to_regclass($1)::oid",
+            f"{schema_name}.ptg2_import_job",
+        )
+        before_row = await connection.fetchrow(
+            f"SELECT * FROM {schema}.ptg2_import_job"
+        )
+
+        await run_migration_action(
+            dsn,
+            migration(FENCE_MIGRATION),
+            "upgrade",
+        )
+
+        assert await connection.fetchval(
+            "SELECT to_regclass($1)::oid",
+            f"{schema_name}.ptg2_import_job",
+        ) == before_oid
+        assert tuple(
+            await connection.fetchrow(
+                f"SELECT * FROM {schema}.ptg2_import_job"
+            )
+        ) == tuple(before_row)
+        await _assert_import_job_catalog(connection, schema_name)
+
+
+@pytest.mark.asyncio
+async def test_legacy_import_job_indexes_are_added_without_replacing_rows(
+    monkeypatch,
+):
+    async with attempt_migration_database(monkeypatch) as (
+        dsn,
+        schema_name,
+        connection,
+    ):
+        schema = quoted(schema_name)
+        for index_name, _column_name in ATTEMPT_IMPORT_JOB_INDEXES:
+            await connection.execute(
+                f"DROP INDEX {schema}.\"{index_name}\""
+            )
+        await connection.execute(
+            f"""
+            INSERT INTO {schema}.ptg2_import_job
+                (import_job_id, status, payload)
+            VALUES (
+                'legacy-job',
+                'pending',
+                '{{"evidence":"preserved"}}'::json
+            )
+            """
+        )
+        before_oid = await connection.fetchval(
+            "SELECT to_regclass($1)::oid",
+            f"{schema_name}.ptg2_import_job",
+        )
+        before_row = await connection.fetchrow(
+            f"SELECT * FROM {schema}.ptg2_import_job"
+        )
+
+        await run_migration_action(
+            dsn,
+            migration(FENCE_MIGRATION),
+            "upgrade",
+        )
+
+        assert await connection.fetchval(
+            "SELECT to_regclass($1)::oid",
+            f"{schema_name}.ptg2_import_job",
+        ) == before_oid
+        assert tuple(
+            await connection.fetchrow(
+                f"SELECT * FROM {schema}.ptg2_import_job"
+            )
+        ) == tuple(before_row)
+        await _assert_import_job_catalog(connection, schema_name)
 
 
 @pytest.mark.asyncio
@@ -171,6 +334,7 @@ async def test_known_legacy_shape_is_adopted_in_place(
 
         assert await table_oids(connection, schema_name) == before_oids
         await _assert_final_catalog(connection, schema_name)
+        await _assert_import_job_catalog(connection, schema_name)
         adopted_row = await connection.fetchrow(
             f"""
             SELECT snapshot_id, internal_run_id, fence_nonce, state
@@ -317,3 +481,4 @@ async def test_hardening_only_repairs_legacy_lifecycle_layer(
             schema_name,
         )
         assert lifecycle_trigger_count == len(LIFECYCLE_GUARDED_TABLES)
+        await _assert_import_job_catalog(connection, schema_name)

@@ -2365,7 +2365,13 @@ class PTG2ImportJob(Base, JSONOutputMixin):
     __tablename__ = "ptg2_import_job"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint("import_job_id"),
+        PrimaryKeyConstraint(
+            "import_job_id",
+            name="ptg2_import_job_pkey",
+        ),
+        Index("ptg2_import_job_run_idx", "import_run_id"),
+        Index("ptg2_import_job_status_idx", "status"),
+        Index("ptg2_import_job_type_idx", "source_type"),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["import_job_id"]

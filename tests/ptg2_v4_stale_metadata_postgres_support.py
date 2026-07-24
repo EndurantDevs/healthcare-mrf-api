@@ -19,196 +19,11 @@ from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     StaleMetadataFenceError,
     guard_attempt_rows,
 )
+from tests.ptg2_v4_stale_metadata_postgres_schema import SCHEMA_DDL
 
 
 SNAPSHOT_ID = "ptg2:202607:synthetic-stale"
 INTERNAL_RUN_ID = "ptg2:synthetic-stale-run"
-
-_SCHEMA_DDL = (
-    """
-    CREATE TABLE {schema}.ptg2_snapshot (
-        snapshot_id varchar(96) PRIMARY KEY,
-        import_run_id varchar(96),
-        import_month date,
-        status varchar(32),
-        created_at timestamp without time zone,
-        validated_at timestamp without time zone,
-        published_at timestamp without time zone,
-        previous_snapshot_id varchar(96),
-        manifest json
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_import_run (
-        import_run_id varchar(96) PRIMARY KEY,
-        import_month date,
-        status varchar(32),
-        started_at timestamp without time zone,
-        finished_at timestamp without time zone,
-        heartbeat_at timestamp without time zone,
-        options json,
-        report json,
-        error text
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
-        snapshot_id varchar(96),
-        snapshot_key bigint
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_snapshot_scope (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_snapshot_plan_scope (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_snapshot_source (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_candidate_audit_attestation (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_snapshot_pin (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.plan_release_snapshot_binding (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_plan_month (
-        plan_month_id varchar(96) PRIMARY KEY,
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_artifact_manifest (
-        artifact_id varchar(96) PRIMARY KEY,
-        snapshot_id varchar(96),
-        import_run_id varchar(96),
-        artifact_kind varchar(64),
-        storage_uri text,
-        sha256 varchar(64),
-        byte_count bigint,
-        payload json,
-        created_at timestamp without time zone
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_allowed_amount_plan (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_allowed_amount_item (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_allowed_amount_payment (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_allowed_amount_provider_payment (
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_current_snapshot (
-        slot varchar(32),
-        snapshot_id varchar(96),
-        previous_snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_current_source_snapshot (
-        source_key varchar(96),
-        snapshot_id varchar(96),
-        previous_snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_current_plan_source (
-        plan_source_key varchar(96),
-        snapshot_id varchar(96),
-        previous_snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_import_job (
-        import_job_id varchar(96),
-        import_run_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_source_catalog (
-        source_catalog_id varchar(96),
-        import_run_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_serving_rate (
-        serving_rate_id varchar(96),
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_serving_rate_compact (
-        serving_rate_id varchar(96),
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_price_set_stage (
-        snapshot_id varchar(96),
-        price_set_hash varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_serving_rate_stage (
-        serving_rate_id varchar(96),
-        snapshot_id varchar(96)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
-        snapshot_key bigint PRIMARY KEY,
-        state varchar(16)
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_block (
-        block_hash bytea PRIMARY KEY,
-        payload bytea
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_snapshot_block (
-        snapshot_key bigint,
-        block_hash bytea
-    )
-    """,
-    """
-    CREATE TABLE {schema}.ptg2_v3_gc_candidate (
-        block_hash bytea PRIMARY KEY,
-        eligible_at timestamptz
-    )
-    """,
-)
-
 
 class _OperationRecorder:
     """Capture Alembic SQL so a synthetic schema can run the real migration."""
@@ -335,6 +150,13 @@ def database_for_dsn(dsn: str) -> Database:
     )
 
 
+def configure_test_schema(monkeypatch, schema_name: str) -> None:
+    """Keep both supported schema aliases aligned for isolated tests."""
+
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    monkeypatch.setenv("DB_SCHEMA", schema_name)
+
+
 async def create_unmigrated_stale_schema(
     connection,
     schema_name: str,
@@ -343,7 +165,7 @@ async def create_unmigrated_stale_schema(
 
     quoted_schema = quoted(schema_name)
     await connection.execute(f"CREATE SCHEMA {quoted_schema}")
-    for statement in _SCHEMA_DDL:
+    for statement in SCHEMA_DDL:
         await connection.execute(statement.format(schema=quoted_schema))
 
 

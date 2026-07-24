@@ -163,11 +163,17 @@ def install_attempt_audit_guard(operations: Any, schema: str) -> None:
         LANGUAGE plpgsql
         AS $$
         {_FINAL_AUDIT_BODY}
-        $$;
-        DROP TRIGGER IF EXISTS {_q(_AUDIT_TRIGGER)} ON {quoted_fence};
+        $$
+        """
+    )
+    operations.execute(
+        f"DROP TRIGGER IF EXISTS {_q(_AUDIT_TRIGGER)} ON {quoted_fence}"
+    )
+    operations.execute(
+        f"""
         CREATE TRIGGER {_q(_AUDIT_TRIGGER)}
         BEFORE UPDATE OR DELETE ON {quoted_fence}
-        FOR EACH ROW EXECUTE FUNCTION {qualified_function}();
+        FOR EACH ROW EXECUTE FUNCTION {qualified_function}()
         """
     )
 

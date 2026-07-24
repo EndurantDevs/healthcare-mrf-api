@@ -23,6 +23,7 @@ from tests.ptg2_v4_stale_metadata_postgres_support import (
     INTERNAL_RUN_ID,
     SNAPSHOT_ID,
     apply_attempt_migrations,
+    configure_test_schema,
     create_stale_schema,
     create_unmigrated_stale_schema,
     database_for_dsn,
@@ -266,7 +267,7 @@ async def test_every_registry_attachment_is_an_eligibility_blocker(
     try:
         await create_stale_schema(setup_connection, schema_name)
         await seed_ready_pair(setup_connection, schema_name)
-        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+        configure_test_schema(monkeypatch, schema_name)
         monkeypatch.setenv(
             reconcile.PTG2_V4_STALE_METADATA_SECONDS_ENV,
             "3600",
@@ -321,7 +322,7 @@ async def test_raw_high_volume_attachment_invalidates_idempotent_retry(
     try:
         await create_stale_schema(setup_connection, schema_name)
         await seed_ready_pair(setup_connection, schema_name)
-        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+        configure_test_schema(monkeypatch, schema_name)
         monkeypatch.setenv(
             reconcile.PTG2_V4_STALE_METADATA_SECONDS_ENV,
             "3600",

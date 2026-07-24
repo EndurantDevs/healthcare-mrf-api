@@ -120,6 +120,34 @@ async def test_empty_authority_downgrades_and_reupgrades_cleanly(
 
 
 @pytest.mark.asyncio
+async def test_missing_registered_table_downgrades_without_relation_error(
+    monkeypatch,
+):
+    async with attempt_migration_database(monkeypatch) as (
+        dsn,
+        schema_name,
+        connection,
+    ):
+        fence_migration = migration(FENCE_MIGRATION)
+        await run_migration_action(dsn, fence_migration, "upgrade")
+        schema = quoted(schema_name)
+        await connection.execute(
+            f"DROP TABLE {schema}.ptg2_import_job"
+        )
+
+        await run_migration_action(dsn, fence_migration, "downgrade")
+
+        assert await connection.fetchval(
+            "SELECT to_regclass($1)",
+            f"{schema_name}.ptg2_v4_attempt_fence",
+        ) is None
+        assert await connection.fetchval(
+            "SELECT to_regclass($1)",
+            f"{schema_name}.ptg2_import_job",
+        ) is None
+
+
+@pytest.mark.asyncio
 async def test_lock_order_downgrade_restores_predecessor_lifecycle_layer(
     monkeypatch,
 ):

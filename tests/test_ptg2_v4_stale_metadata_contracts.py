@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import pytest
 
+from db.migration_ptg2_v4_import_job import (
+    _has_import_job_table_under_lock,
+)
 from process.ptg_parts.ptg2_v4_attempt_registry import (
     ATTEMPT_ATTACHMENTS,
     ATTEMPT_STATE_TABLES,
@@ -13,6 +16,7 @@ from process.ptg_parts.ptg2_v4_stale_metadata_json import (
     database_json_digest,
 )
 from tests.ptg2_v4_stale_metadata_postgres_support import (
+    _attempt_migration_sql,
     _load_attempt_migration,
     _migration_sql,
     load_attempt_fence_migration,
@@ -34,6 +38,85 @@ def _attachment_signatures(attachments) -> tuple:
         )
         for attachment in attachments
     )
+
+
+def _top_level_sql_statement_count(sql: str) -> int:
+    """Count statements while treating quoted function bodies as opaque."""
+
+    statements = 0
+    has_content = False
+    index = 0
+    quote: str | None = None
+    while index < len(sql):
+        if quote is not None:
+            if (
+                quote in {"'", '"'}
+                and sql.startswith(quote * 2, index)
+            ):
+                index += 2
+            elif sql.startswith(quote, index):
+                index += len(quote)
+                quote = None
+            else:
+                index += 1
+            continue
+        character = sql[index]
+        if character in {"'", '"'}:
+            quote = character
+            has_content = True
+            index += 1
+            continue
+        if character == "$":
+            tag_end = sql.find("$", index + 1)
+            if tag_end >= 0:
+                tag = sql[index:tag_end + 1]
+                if tag == "$$" or tag[1:-1].replace("_", "a").isalnum():
+                    quote = tag
+                    has_content = True
+                    index = tag_end + 1
+                    continue
+        if character == ";":
+            if has_content:
+                statements += 1
+                has_content = False
+        elif not character.isspace():
+            has_content = True
+        index += 1
+    return statements + int(has_content)
+
+
+class _ScalarResult:
+    def scalar_one(self):
+        return 1
+
+
+class _LockOrderConnection:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def execute(self, statement, _parameters):
+        self.events.append(str(statement))
+        return _ScalarResult()
+
+    def exec_driver_sql(self, statement):
+        self.events.append(str(statement))
+        return _ScalarResult()
+
+
+def test_import_job_existence_is_decided_after_parent_locks():
+    connection = _LockOrderConnection()
+
+    assert _has_import_job_table_under_lock(
+        connection,
+        "synthetic_ptg",
+    )
+
+    assert "pg_advisory_xact_lock" in connection.events[0]
+    assert "LOCK TABLE" in connection.events[1]
+    assert '"ptg2_snapshot"' in connection.events[1]
+    assert '"ptg2_import_run"' in connection.events[1]
+    assert "to_regclass" in connection.events[2]
+    assert '"ptg2_import_job"' in connection.events[3]
 
 
 def test_runtime_registry_matches_the_frozen_migration_catalog():
@@ -95,11 +178,27 @@ def test_hardening_revision_refuses_unverifiable_offline_adoption():
         "20260724110000_ptg2_v4_attempt_fence_hardening.py"
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="hardening_requires_online_catalog",
-    ):
-        _migration_sql(hardening_migration, "synthetic_ptg")
+    statements = _migration_sql(hardening_migration, "synthetic_ptg")
+
+    assert len(statements) == 1
+    assert "hardening_requires_online_catalog" in statements[0]
+    assert "ERRCODE = '55000'" in statements[0]
+
+
+def test_attempt_migrations_emit_one_statement_per_execute():
+    hardening_migration = _load_attempt_migration(
+        "20260724110000_ptg2_v4_attempt_fence_hardening.py"
+    )
+    statements = (
+        *_attempt_migration_sql("synthetic_ptg"),
+        *_migration_sql(hardening_migration, "synthetic_ptg"),
+    )
+
+    assert statements
+    assert all(
+        _top_level_sql_statement_count(statement) == 1
+        for statement in statements
+    )
 
 
 @pytest.mark.parametrize(

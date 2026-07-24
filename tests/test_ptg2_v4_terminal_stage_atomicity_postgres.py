@@ -22,6 +22,7 @@ from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
 from tests.ptg2_v4_stale_metadata_postgres_support import (
     INTERNAL_RUN_ID,
     SNAPSHOT_ID,
+    configure_test_schema,
     create_stale_schema,
     database_for_dsn,
     drop_stale_schema,
@@ -273,7 +274,7 @@ async def test_terminal_retry_release_is_atomic_and_recoverable(monkeypatch):
             schema_name,
             stage_table,
         )
-        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+        configure_test_schema(monkeypatch, schema_name)
         monkeypatch.setattr(process_ptg, "db", test_database)
         await _crash_terminal_retry(monkeypatch, test_database)
         await _assert_terminal_pair_state(
@@ -426,7 +427,7 @@ async def test_failed_terminal_commit_rolls_back_then_retry_recovers(
             schema_name,
             stage_table,
         )
-        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+        configure_test_schema(monkeypatch, schema_name)
         monkeypatch.setattr(process_ptg, "db", test_database)
         monkeypatch.setattr(
             process_ptg.PTG2Snapshot.__table__, "schema", schema_name

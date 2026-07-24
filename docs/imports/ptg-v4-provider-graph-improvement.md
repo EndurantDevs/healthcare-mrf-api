@@ -267,5 +267,12 @@ evidence justify a separate release.
 Source-component-only serving is not a global layout. It is an exact bounded
 fallback for manifest-listed pattern-overflow owners.
 
+The first release keeps the fail-closed transaction-scoped lifecycle lock for
+all guarded bulk writes. Serial canaries retain database wait samples beside
+the existing import-stage timings. A V3-specific bulk fast path is deferred
+until those measurements justify it; that path must validate and row-lock the
+V3 snapshot and run without weakening the global-first fence for V4, unknown,
+or reconciled attempts.
+
 V3 retirement, documentation consolidation, and retained-snapshot cleanup are
 explicitly deferred for one to two months and require a separate approval.

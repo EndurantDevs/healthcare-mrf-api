@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 
 from alembic import op
+import sqlalchemy as sa
 from db.migration_index_adoption import has_matching_index
 
 
@@ -57,6 +58,25 @@ def _create_index_sql(
     )
 
 
+def _online_table_exists(
+    operations,
+    schema: str,
+    table_name: str,
+) -> bool:
+    """Treat offline recorders as complete and inspect real online catalogs."""
+
+    get_bind = getattr(operations, "get_bind", None)
+    connection = get_bind() if callable(get_bind) else None
+    if not isinstance(connection, sa.engine.Connection):
+        return True
+    return bool(
+        connection.execute(
+            sa.text("SELECT to_regclass(:qualified_name) IS NOT NULL"),
+            {"qualified_name": f"{schema}.{table_name}"},
+        ).scalar_one()
+    )
+
+
 def upgrade() -> None:
     """Adopt exact indexes or build them without blocking table writers."""
 
@@ -88,6 +108,8 @@ def upgrade() -> None:
                 )
         return
     for index_name, table_name, column_name in _ATTEMPT_INDEXES:
+        if not _online_table_exists(op, schema, table_name):
+            continue
         if has_matching_index(
             op,
             index_name,

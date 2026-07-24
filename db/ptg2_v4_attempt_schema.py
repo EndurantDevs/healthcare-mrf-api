@@ -8,6 +8,13 @@ from sqlalchemy.dialects import postgresql
 
 
 ATTEMPT_FENCE_TABLE = "ptg2_v4_attempt_fence"
+ATTEMPT_IMPORT_JOB_TABLE = "ptg2_import_job"
+ATTEMPT_IMPORT_JOB_PRIMARY_KEY = "ptg2_import_job_pkey"
+ATTEMPT_IMPORT_JOB_INDEXES = (
+    ("ptg2_import_job_run_idx", "import_run_id"),
+    ("ptg2_import_job_status_idx", "status"),
+    ("ptg2_import_job_type_idx", "source_type"),
+)
 ATTEMPT_STAGE_TABLE = "ptg2_v4_attempt_stage"
 ATTEMPT_STAGE_RUN_INDEX = "ptg2_v4_attempt_stage_run_idx"
 LIFECYCLE_GUARDED_TABLES = (
@@ -73,6 +80,23 @@ FENCE_LEGACY_COLUMNS = frozenset(
         "marker",
         "created_at",
         "reconciled_at",
+    }
+)
+ATTEMPT_IMPORT_JOB_COLUMNS = frozenset(
+    {
+        "import_job_id",
+        "import_run_id",
+        "source_catalog_id",
+        "source_type",
+        "status",
+        "attempts",
+        "lease_owner",
+        "lease_expires_at",
+        "heartbeat_at",
+        "error",
+        "payload",
+        "created_at",
+        "updated_at",
     }
 )
 FENCE_FINAL_COLUMNS = FENCE_LEGACY_COLUMNS | {"fence_nonce"}
@@ -229,6 +253,30 @@ def fence_table_elements(
     )
 
 
+def import_job_table_elements() -> tuple:
+    """Return fresh SQLAlchemy objects for the migration-owned job table."""
+
+    return (
+        sa.Column("import_job_id", sa.String(96), nullable=False),
+        sa.Column("import_run_id", sa.String(96)),
+        sa.Column("source_catalog_id", sa.String(96)),
+        sa.Column("source_type", sa.String(64)),
+        sa.Column("status", sa.String(32)),
+        sa.Column("attempts", sa.Integer()),
+        sa.Column("lease_owner", sa.String()),
+        sa.Column("lease_expires_at", sa.DateTime()),
+        sa.Column("heartbeat_at", sa.DateTime()),
+        sa.Column("error", sa.Text()),
+        sa.Column("payload", postgresql.JSON()),
+        sa.Column("created_at", sa.DateTime()),
+        sa.Column("updated_at", sa.DateTime()),
+        sa.PrimaryKeyConstraint(
+            "import_job_id",
+            name=ATTEMPT_IMPORT_JOB_PRIMARY_KEY,
+        ),
+    )
+
+
 def stage_table_elements(schema_name: str) -> tuple:
     """Return fresh SQLAlchemy objects for the exact stage registry."""
 
@@ -261,6 +309,10 @@ def stage_table_elements(schema_name: str) -> tuple:
 
 __all__ = [
     "ATTEMPT_FENCE_TABLE",
+    "ATTEMPT_IMPORT_JOB_COLUMNS",
+    "ATTEMPT_IMPORT_JOB_INDEXES",
+    "ATTEMPT_IMPORT_JOB_PRIMARY_KEY",
+    "ATTEMPT_IMPORT_JOB_TABLE",
     "ATTEMPT_STAGE_RUN_INDEX",
     "ATTEMPT_STAGE_TABLE",
     "FENCE_AUDIT_CONSTRAINT",
@@ -277,5 +329,6 @@ __all__ = [
     "STAGE_FINAL_COLUMNS",
     "STAGE_FINAL_CONSTRAINTS",
     "fence_table_elements",
+    "import_job_table_elements",
     "stage_table_elements",
 ]

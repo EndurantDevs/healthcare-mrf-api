@@ -31,14 +31,12 @@ def _configure_publication_spies(monkeypatch):
         batches.append(("npi", tuple(row["npi_key"] for row in npi_rows)))
 
     async def fake_component_batch(_session, *, component_rows, **_kwargs):
-        batches.append(
-            ("component", tuple(row["component_key"] for row in component_rows))
-        )
+        keys = tuple(row["component_key"] for row in component_rows)
+        batches.append(("component", keys))
 
     async def fake_pattern_batch(_session, *, pattern_rows, **_kwargs):
-        batches.append(
-            ("pattern", tuple(row["pattern_key"] for row in pattern_rows))
-        )
+        keys = tuple(row["pattern_key"] for row in pattern_rows)
+        batches.append(("pattern", keys))
 
     async def fake_dense(_session, *, expected_count: int, **_kwargs):
         return expected_count
@@ -323,9 +321,9 @@ async def _assert_snapshot_binding() -> None:
         await snapshot_maps.bind_snapshot_to_v4_layout(
             _ScriptedSession(
                 _Result(),
-                _Result(scalar=None),
-                _Result(scalar=18),
-            ),
+            _Result(scalar=None),
+            _Result(scalar=18),
+        ),
             schema_name="mrf",
             snapshot_id="snapshot",
             snapshot_key=17,
@@ -340,7 +338,6 @@ async def test_snapshot_reservation_root_and_binding_lifecycle(monkeypatch) -> N
     await _assert_layout_write_lock()
     await _assert_snapshot_map_root()
     await _assert_snapshot_binding()
-
 
 
 def _configure_audit_publication(monkeypatch):

@@ -11,6 +11,7 @@ from db.models import (
     PTG2CurrentPlanSource,
     PTG2CurrentSnapshot,
     PTG2CurrentSourceSnapshot,
+    PTG2ImportJob,
     PTG2Snapshot,
     PTG2SourceCatalog,
     PTG2V4AttemptFence,
@@ -18,9 +19,12 @@ from db.models import (
 )
 from db.ptg2_v4_attempt_schema import (
     ATTEMPT_FENCE_TABLE,
+    ATTEMPT_IMPORT_JOB_INDEXES,
+    ATTEMPT_IMPORT_JOB_TABLE,
     ATTEMPT_STAGE_RUN_INDEX,
     ATTEMPT_STAGE_TABLE,
     fence_table_elements,
+    import_job_table_elements,
     stage_table_elements,
 )
 from process.ptg_parts.table_setup import PTG2_MODEL_CLASSES
@@ -28,6 +32,10 @@ from process.ptg_parts.table_setup import PTG2_MODEL_CLASSES
 
 SCHEMA = PTG2V4AttemptFence.__table__.schema
 ATTEMPT_INDEX_OWNERS = (
+    *(
+        (PTG2ImportJob, index_name, column_name)
+        for index_name, column_name in ATTEMPT_IMPORT_JOB_INDEXES
+    ),
     (PTG2Snapshot, "ptg2_snapshot_attempt_run_idx", "import_run_id"),
     (
         PTG2SourceCatalog,
@@ -131,12 +139,25 @@ def test_attempt_models_match_the_canonical_schema_metadata() -> None:
         sa.Index(ATTEMPT_STAGE_RUN_INDEX, "internal_run_id"),
         schema=SCHEMA,
     )
+    expected_import_job = sa.Table(
+        ATTEMPT_IMPORT_JOB_TABLE,
+        expected_metadata,
+        *import_job_table_elements(),
+        *(
+            sa.Index(index_name, column_name)
+            for index_name, column_name in ATTEMPT_IMPORT_JOB_INDEXES
+        ),
+        schema=SCHEMA,
+    )
 
     assert _table_signature(PTG2V4AttemptFence.__table__) == (
         _table_signature(expected_fence)
     )
     assert _table_signature(PTG2V4AttemptStage.__table__) == (
         _table_signature(expected_stage)
+    )
+    assert _table_signature(PTG2ImportJob.__table__) == (
+        _table_signature(expected_import_job)
     )
 
 
@@ -157,3 +178,4 @@ def test_attempt_indexes_are_owned_by_orm_metadata_and_runtime_ensures() -> None
 def test_migration_owned_attempt_models_are_not_runtime_created() -> None:
     assert PTG2V4AttemptFence not in PTG2_MODEL_CLASSES
     assert PTG2V4AttemptStage not in PTG2_MODEL_CLASSES
+    assert PTG2ImportJob not in PTG2_MODEL_CLASSES

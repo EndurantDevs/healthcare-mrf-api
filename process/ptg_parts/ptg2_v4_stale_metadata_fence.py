@@ -80,7 +80,7 @@ async def lock_writable_snapshot(
     """Lock one snapshot/run pair and reject a reconciled writer."""
 
     schema = _quote_ident(schema_name)
-    statement = database.text if database is not None else text
+    statement = getattr(database, "text", text)
     try:
         await _execute_statement(
             session,

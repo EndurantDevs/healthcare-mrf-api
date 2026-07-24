@@ -17,7 +17,18 @@ from db.migration_ptg2_v4_attempt_catalog import (
 )
 from db.migration_ptg2_v4_attempt_fence import (
     assert_attempt_downgrade_safe,
+    execute_when_table_exists,
     install_lifecycle_lock_layer,
+    validate_lifecycle_lock_layer,
+)
+from db.migration_ptg2_v4_import_job import (
+    adopt_or_create_import_job,
+    install_import_job_attempt_guards,
+    validate_import_job_attempt_guards,
+    validate_import_job_catalog,
+)
+from db.ptg2_v4_attempt_schema import (
+    ATTEMPT_IMPORT_JOB_TABLE,
 )
 
 
@@ -186,15 +197,23 @@ def _create_attachment_triggers(
         ("delete", "REFERENCING OLD TABLE AS attempt_old_rows"),
     ):
         trigger_name = f"{attachment.table_name}_attempt_{operation}_guard"
-        op.execute(
+        execute_when_table_exists(
+            op,
+            schema,
+            attachment.table_name,
+            f"DROP TRIGGER IF EXISTS {_q(trigger_name)} ON {table}",
+        )
+        execute_when_table_exists(
+            op,
+            schema,
+            attachment.table_name,
             f"""
-            DROP TRIGGER IF EXISTS {_q(trigger_name)} ON {table};
             CREATE TRIGGER {_q(trigger_name)}
             AFTER {operation.upper()} ON {table}
             {transition}
             FOR EACH STATEMENT
-            EXECUTE FUNCTION {_function(schema, function_name)}();
-            """
+            EXECUTE FUNCTION {_function(schema, function_name)}()
+            """,
         )
 
 
@@ -205,8 +224,11 @@ def _drop_attachment_triggers(
     table = _qt(schema, attachment.table_name)
     for operation in ("insert", "update", "delete"):
         trigger_name = f"{attachment.table_name}_attempt_{operation}_guard"
-        op.execute(
-            f"DROP TRIGGER IF EXISTS {_q(trigger_name)} ON {table}"
+        execute_when_table_exists(
+            op,
+            schema,
+            attachment.table_name,
+            f"DROP TRIGGER IF EXISTS {_q(trigger_name)} ON {table}",
         )
     op.execute(
         f"DROP FUNCTION IF EXISTS "
@@ -270,8 +292,11 @@ def _create_fence_tables(schema: str) -> None:
                         AND reconciled_at IS NOT NULL
                     )
                 )
-        );
-
+        )
+        """
+    )
+    op.execute(
+        f"""
         CREATE TABLE {stage} (
             snapshot_id varchar(96) NOT NULL,
             internal_run_id varchar(96) NOT NULL,
@@ -283,7 +308,7 @@ def _create_fence_tables(schema: str) -> None:
                 FOREIGN KEY (snapshot_id, internal_run_id)
                 REFERENCES {fence}(snapshot_id, internal_run_id)
                 ON DELETE CASCADE
-        );
+        )
         """
     )
 
@@ -309,9 +334,12 @@ def _create_lifecycle_lock_layer(schema: str) -> None:
 def _drop_lifecycle_lock_layer(schema: str) -> None:
     for table_name in reversed(_lifecycle_guarded_tables()):
         trigger_name = f"{table_name}_attempt_lifecycle_lock"
-        op.execute(
+        execute_when_table_exists(
+            op,
+            schema,
+            table_name,
             f"DROP TRIGGER IF EXISTS {_q(trigger_name)} "
-            f"ON {_qt(schema, table_name)}"
+            f"ON {_qt(schema, table_name)}",
         )
     op.execute(
         f"DROP FUNCTION IF EXISTS "
@@ -498,6 +526,7 @@ def upgrade() -> None:
     """Install the V4 attempt fence, registry triggers, and immutable audit."""
 
     schema = _schema()
+    import_job_status = adopt_or_create_import_job(op, schema)
     adoption_status = adopt_or_validate_attempt_tables(op, schema)
     _assert_one_snapshot_per_v4_run(schema)
     if adoption_status in {"absent", "offline"}:
@@ -521,8 +550,20 @@ def upgrade() -> None:
     _create_guard_function(schema)
     _create_audit_guard(schema)
     for attachment in (*ATTEMPT_STATE_TABLES, *ATTEMPT_ATTACHMENTS):
-        if attachment.statement_trigger:
+        if (
+            attachment.statement_trigger
+            and attachment.table_name != ATTEMPT_IMPORT_JOB_TABLE
+        ):
             _create_attachment_triggers(schema, attachment)
+    install_import_job_attempt_guards(op, schema)
+    if adoption_status != "offline" and import_job_status != "offline":
+        validate_import_job_catalog(op, schema)
+        validate_lifecycle_lock_layer(
+            op,
+            schema,
+            _lifecycle_guarded_tables(),
+        )
+        validate_import_job_attempt_guards(op, schema)
 
 
 def downgrade() -> None:
@@ -537,9 +578,12 @@ def downgrade() -> None:
             _drop_attachment_triggers(schema, attachment)
     _drop_lifecycle_lock_layer(schema)
     fence = _qt(schema, "ptg2_v4_attempt_fence")
-    op.execute(
+    execute_when_table_exists(
+        op,
+        schema,
+        "ptg2_v4_attempt_fence",
         f"DROP TRIGGER IF EXISTS "
-        f"{_q('ptg2_v4_attempt_fence_audit_guard')} ON {fence}"
+        f"{_q('ptg2_v4_attempt_fence_audit_guard')} ON {fence}",
     )
     op.execute(
         f"DROP FUNCTION IF EXISTS "

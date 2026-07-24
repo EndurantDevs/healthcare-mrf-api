@@ -15,6 +15,7 @@ from process.ptg_parts.ptg2_v4_attempt_registry import (
 from tests.ptg2_v4_stale_metadata_postgres_support import (
     INTERNAL_RUN_ID,
     SNAPSHOT_ID,
+    configure_test_schema,
     create_stale_schema,
     database_for_dsn,
     drop_stale_schema,
@@ -25,7 +26,7 @@ from tests.ptg2_v4_stale_metadata_postgres_support import (
 
 
 def _configure_reconciler(monkeypatch, schema_name, test_database) -> None:
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    configure_test_schema(monkeypatch, schema_name)
     monkeypatch.setenv(
         reconcile.PTG2_V4_STALE_METADATA_SECONDS_ENV,
         "3600",
@@ -390,4 +391,3 @@ async def test_publication_evidence_is_ineligible_in_postgres(
         await setup_connection.close()
         await test_database.disconnect()
         await drop_stale_schema(dsn, schema_name)
-

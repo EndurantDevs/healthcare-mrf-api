@@ -27,7 +27,6 @@ from db.models import (
     PTG2CurrentSourceSnapshot,
     PTG2FactChunk,
     PTG2GCCandidate,
-    PTG2ImportJob,
     PTG2ImportRun,
     PTG2LocationSet,
     PTG2LocationSetMember,
@@ -80,6 +79,11 @@ from process.ptg_parts.ptg2_shared_gc import (
     require_migration_owned_tables,
     resolve_ptg2_schema,
 )
+from db.ptg2_v4_attempt_schema import (
+    ATTEMPT_FENCE_TABLE,
+    ATTEMPT_IMPORT_JOB_TABLE,
+    ATTEMPT_STAGE_TABLE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +98,6 @@ PTG2_MODEL_CLASSES = (
     PTG2SourceIdentity,
     PTG2SourceFileVersion,
     PTG2ContentIdentity,
-    PTG2ImportJob,
     PTG2ArtifactManifest,
     PTG2ArtifactBlobChunk,
     PTG2Plan,
@@ -111,6 +114,11 @@ PTG2_ALLOWED_AMOUNT_MIGRATION_TABLE_NAMES = (
     PTG2AllowedAmountItem.__tablename__,
     PTG2AllowedAmountPayment.__tablename__,
     PTG2AllowedAmountProviderPayment.__tablename__,
+)
+PTG2_V4_ATTEMPT_MIGRATION_TABLE_NAMES = (
+    ATTEMPT_FENCE_TABLE,
+    ATTEMPT_STAGE_TABLE,
+    ATTEMPT_IMPORT_JOB_TABLE,
 )
 
 
@@ -138,6 +146,40 @@ async def _require_allowed_amount_migration_tables(db_schema: str) -> None:
     if missing_table_names:
         raise RuntimeError(
             "PTG allowed-amount migration-owned tables are missing from "
+            f"schema {db_schema}: {', '.join(missing_table_names)}; "
+            "run alembic upgrade head"
+        )
+
+
+async def _require_v4_attempt_migration_tables(db_schema: str) -> None:
+    table_records = await db.all(
+        """
+        SELECT table_name
+          FROM information_schema.tables
+         WHERE table_schema = :schema_name
+           AND table_name = ANY(CAST(:table_names AS text[]))
+        """,
+        schema_name=db_schema,
+        table_names=list(PTG2_V4_ATTEMPT_MIGRATION_TABLE_NAMES),
+    )
+    present_table_names = {
+        str(table_by_field["table_name"])
+        for table_record in table_records
+        if (
+            table_by_field := getattr(
+                table_record,
+                "_mapping",
+                table_record,
+            )
+        ).get("table_name")
+    }
+    missing_table_names = sorted(
+        set(PTG2_V4_ATTEMPT_MIGRATION_TABLE_NAMES)
+        - present_table_names
+    )
+    if missing_table_names:
+        raise RuntimeError(
+            "PTG V4 attempt migration-owned tables are missing from "
             f"schema {db_schema}: {', '.join(missing_table_names)}; "
             "run alembic upgrade head"
         )
@@ -463,6 +505,7 @@ async def ensure_ptg2_tables() -> None:
     """Create PTG2 tables and apply their required schema migrations."""
     db_schema = resolve_ptg2_schema()
     await require_migration_owned_tables(db, db_schema)
+    await _require_v4_attempt_migration_tables(db_schema)
     await _require_allowed_amount_migration_tables(db_schema)
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")

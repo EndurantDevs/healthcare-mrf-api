@@ -36,6 +36,32 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def execute_when_table_exists(
+    operations: Any,
+    schema: str,
+    table_name: str,
+    statement: str,
+) -> None:
+    """Execute one DDL statement only when its runtime-owned table exists."""
+
+    qualified_table = _qt(schema, table_name)
+    operations.execute(
+        f"""
+        DO $guard$
+        BEGIN
+            IF to_regclass({_sql_literal(qualified_table)}) IS NOT NULL THEN
+                EXECUTE {_sql_literal(statement.strip())};
+            END IF;
+        END;
+        $guard$
+        """
+    )
+
+
 def install_lifecycle_lock_layer(
     operations: Any,
     schema: str,
@@ -57,13 +83,21 @@ def install_lifecycle_lock_layer(
     for table_name in guarded_tables:
         trigger_name = f"{table_name}_attempt_lifecycle_lock"
         qualified_table = _qt(schema, table_name)
-        operations.execute(
+        execute_when_table_exists(
+            operations,
+            schema,
+            table_name,
+            f"DROP TRIGGER IF EXISTS {_q(trigger_name)} ON {qualified_table}",
+        )
+        execute_when_table_exists(
+            operations,
+            schema,
+            table_name,
             f"""
-            DROP TRIGGER IF EXISTS {_q(trigger_name)} ON {qualified_table};
             CREATE TRIGGER {_q(trigger_name)}
             BEFORE INSERT OR UPDATE OR DELETE ON {qualified_table}
-            FOR EACH STATEMENT EXECUTE FUNCTION {lifecycle_function}();
-            """
+            FOR EACH STATEMENT EXECUTE FUNCTION {lifecycle_function}()
+            """,
         )
 
 
@@ -157,6 +191,14 @@ def validate_lifecycle_lock_layer(
     connection = get_bind() if callable(get_bind) else None
     if not isinstance(connection, sa.engine.Connection):
         raise RuntimeError("ptg2_v4_lifecycle_validation_requires_online")
+    existing_tables = {
+        table_name
+        for table_name in guarded_tables
+        if connection.execute(
+            sa.text("SELECT to_regclass(:qualified_name) IS NOT NULL"),
+            {"qualified_name": f"{schema}.{table_name}"},
+        ).scalar_one()
+    }
     expected_by_trigger = {
         f"{table_name}_attempt_lifecycle_lock": (
             table_name,
@@ -165,7 +207,7 @@ def validate_lifecycle_lock_layer(
             _LIFECYCLE_FUNCTION,
             schema,
         )
-        for table_name in guarded_tables
+        for table_name in existing_tables
     }
     actual_by_trigger = _lifecycle_trigger_catalog(connection, schema)
     if not _is_exact_lifecycle_function(connection, schema):
@@ -183,20 +225,35 @@ def validate_lifecycle_lock_layer(
 def _lock_downgrade_catalog(operations: Any, schema: str) -> None:
     """Hold every decision relation before checking downgrade eligibility."""
 
+    get_bind = getattr(operations, "get_bind", None)
+    connection = get_bind() if callable(get_bind) else None
+
+    def execute_lock(statement: str) -> None:
+        """Execute one lock through the online or offline operation path."""
+
+        if isinstance(connection, sa.engine.Connection):
+            connection.exec_driver_sql(statement)
+        else:
+            operations.execute(statement)
+
     snapshot = _qt(schema, "ptg2_snapshot")
     internal_run = _qt(schema, "ptg2_import_run")
     layout = _qt(schema, "ptg2_v3_snapshot_layout")
     root = _qt(schema, "ptg2_v4_snapshot_map_root")
     fence = _qt(schema, ATTEMPT_FENCE_TABLE)
     stage = _qt(schema, ATTEMPT_STAGE_TABLE)
-    operations.execute(
+    execute_lock(
         f"SELECT pg_advisory_xact_lock(hashtext('{_LIFECYCLE_LOCK_KEY}'));"
     )
-    operations.execute(
+    execute_lock(
         f"""
         LOCK TABLE {snapshot}, {internal_run}, {layout}, {root}
-            IN SHARE ROW EXCLUSIVE MODE;
-        LOCK TABLE {fence}, {stage} IN ACCESS EXCLUSIVE MODE;
+            IN SHARE ROW EXCLUSIVE MODE
+        """
+    )
+    execute_lock(
+        f"""
+        LOCK TABLE {fence}, {stage} IN ACCESS EXCLUSIVE MODE
         """
     )
 
@@ -265,6 +322,7 @@ def assert_attempt_downgrade_safe(operations: Any, schema: str) -> None:
 
 __all__ = [
     "assert_attempt_downgrade_safe",
+    "execute_when_table_exists",
     "install_lifecycle_lock_layer",
     "validate_lifecycle_lock_layer",
 ]
