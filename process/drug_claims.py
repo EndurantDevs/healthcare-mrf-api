@@ -3069,8 +3069,11 @@ def _cleanup_drug_claims_workdir(request: DrugClaimsFinalizeRequest) -> None:
 
     if not request.manifest:
         return
-    run_work_dir = Path(request.manifest.get("work_dir", ""))
-    if run_work_dir and run_work_dir.exists() and not DRUG_CLAIMS_KEEP_WORKDIR:
+    work_dir_text = str(request.manifest.get("work_dir") or "").strip()
+    if not work_dir_text or DRUG_CLAIMS_KEEP_WORKDIR:
+        return
+    run_work_dir = Path(work_dir_text)
+    if run_work_dir.exists():
         shutil.rmtree(run_work_dir, ignore_errors=True)
 
 

@@ -1,11 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import dataclasses
 import sys
 from contextlib import asynccontextmanager
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -134,7 +135,10 @@ async def test_finalize_materialization_orders_publish_steps(
     assert calls == expected_calls
 
 
-def test_cleanup_respects_manifest_and_retention(tmp_path, monkeypatch):
+def test_cleanup_requires_explicit_work_directory_and_respects_retention(
+    tmp_path,
+    monkeypatch,
+):
     empty_request = drug_claims.DrugClaimsFinalizeRequest(
         False,
         "import-one",
@@ -147,17 +151,30 @@ def test_cleanup_respects_manifest_and_retention(tmp_path, monkeypatch):
     )
     drug_claims._cleanup_drug_claims_workdir(empty_request)
 
+    remove_tree = Mock(wraps=drug_claims.shutil.rmtree)
+    monkeypatch.setattr(drug_claims.shutil, "rmtree", remove_tree)
+    incomplete_request = dataclasses.replace(
+        empty_request,
+        manifest={"status": "ready"},
+    )
+    drug_claims._cleanup_drug_claims_workdir(incomplete_request)
+    remove_tree.assert_not_called()
+
+    completed_directory = tmp_path / "completed"
+    completed_directory.mkdir()
+    completed_request = dataclasses.replace(
+        empty_request,
+        manifest={"work_dir": str(completed_directory)},
+    )
+    monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_KEEP_WORKDIR", False)
+    drug_claims._cleanup_drug_claims_workdir(completed_request)
+    assert not completed_directory.exists()
+
     run_directory = tmp_path / "retained"
     run_directory.mkdir()
-    retained_request = drug_claims.DrugClaimsFinalizeRequest(
-        False,
-        "import-one",
-        "run-one",
-        "stage-one",
-        "mrf",
-        None,
-        {"work_dir": str(run_directory)},
-        0,
+    retained_request = dataclasses.replace(
+        empty_request,
+        manifest={"work_dir": str(run_directory)},
     )
     monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_KEEP_WORKDIR", True)
     drug_claims._cleanup_drug_claims_workdir(retained_request)
