@@ -9,10 +9,11 @@ import json
 from typing import Any, Mapping
 
 from process.ptg_parts.db_tables import _quote_ident
-from process.ptg_parts.ptg2_v4_attempt_registry import (
-    ATTEMPT_ATTACHMENTS,
-    MANIFEST_STAGE_KINDS,
-    manifest_stage_table_names,
+from process.ptg_parts.ptg2_v4_attempt_registry import manifest_stage_table_names
+from process.ptg_parts.ptg2_v4_stale_metadata_attachments import (
+    attachment_count_query,
+    optional_attachment_probe,
+    present_optional_attachment_names,
 )
 from process.ptg_parts.ptg2_v4_stale_metadata_json import json_mapping
 from process.ptg_parts.ptg2_v4_stale_metadata_types import (
@@ -64,51 +65,6 @@ def _internal_run_query(
          WHERE import_run_id = :internal_run_id
         {lock_clause}
     """
-
-
-def _attachment_presence_sql(schema_name: str) -> list[str]:
-    schema = _quote_ident(schema_name)
-    presence_sql_parts: list[str] = []
-    for attachment in ATTEMPT_ATTACHMENTS:
-        conditions = [
-            f"{_quote_ident(column)} = :snapshot_id"
-            for column in attachment.snapshot_columns
-        ]
-        conditions.extend(
-            f"{_quote_ident(column)} = :internal_run_id"
-            for column in attachment.run_columns
-        )
-        where_sql = " OR ".join(conditions)
-        presence_sql_parts.append(
-            "CASE WHEN EXISTS ("
-            f"SELECT 1 FROM {schema}.{_quote_ident(attachment.table_name)} "
-            f"WHERE {where_sql}"
-            ") THEN 1 ELSE 0 END::bigint "
-            f"AS {_quote_ident(attachment.name)}"
-        )
-    return presence_sql_parts
-
-
-def _attachment_count_query(
-    schema_name: str,
-    *,
-    stage_table_count: int,
-) -> str:
-    fields = _attachment_presence_sql(schema_name)
-    fields.extend(
-        "CASE WHEN to_regclass("
-        f":manifest_stage_{stage_index}) IS NULL "
-        "THEN 0 ELSE 1 END::bigint "
-        f"AS {_quote_ident(f'manifest_stage_{stage_kind}')}"
-        for stage_index, stage_kind in enumerate(
-            MANIFEST_STAGE_KINDS[:stage_table_count]
-        )
-    )
-    fields.append(
-        "CAST(:manifest_stage_identity_missing AS bigint) "
-        "AS manifest_stage_identity_missing"
-    )
-    return "SELECT\n" + ",\n".join(fields)
 
 
 def _stage_parameters(
@@ -190,13 +146,29 @@ async def _attachment_counts(
     parameter_by_name: Mapping[str, Any],
     stage_table_count: int,
 ) -> dict[str, int]:
+    optional_query, optional_parameter_by_name = optional_attachment_probe(
+        schema_name
+    )
+    optional_presence_by_name = (
+        await _first_record(
+            session,
+            database,
+            optional_query,
+            optional_parameter_by_name,
+        )
+        or {}
+    )
+    present_optional_names = present_optional_attachment_names(
+        optional_presence_by_name
+    )
     count_by_name = (
         await _first_record(
             session,
             database,
-            _attachment_count_query(
+            attachment_count_query(
                 schema_name,
                 stage_table_count=stage_table_count,
+                present_optional_names=present_optional_names,
             ),
             parameter_by_name,
         )

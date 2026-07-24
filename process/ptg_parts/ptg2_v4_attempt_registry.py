@@ -17,6 +17,7 @@ class AttemptAttachment:
     snapshot_columns: tuple[str, ...] = ()
     run_columns: tuple[str, ...] = ()
     statement_trigger: bool = True
+    optional_relation: bool = False
 
 
 ATTEMPT_ATTACHMENTS = (
@@ -128,14 +129,16 @@ ATTEMPT_ATTACHMENTS = (
         "ptg2_price_set_stage",
         ("snapshot_id",),
         (),
-        False,
+        statement_trigger=False,
+        optional_relation=True,
     ),
     AttemptAttachment(
         "serving_rate_stage",
         "ptg2_serving_rate_stage",
         ("snapshot_id",),
         (),
-        False,
+        statement_trigger=False,
+        optional_relation=True,
     ),
     AttemptAttachment(
         "manifest_stage_registration",

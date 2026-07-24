@@ -660,6 +660,126 @@ def test_v4_graph_request_scope_records_provider_expansion_work() -> None:
     )
 
 
+def test_v4_runtime_cache_bounds(monkeypatch) -> None:
+    """Keep portable limit and cache edge behavior explicit."""
+
+    environment_name = "PTG2_V4_TEST_POSITIVE_INT"
+    monkeypatch.setenv(environment_name, "invalid")
+    assert graph._env_positive_int(environment_name, 11) == 11
+    monkeypatch.setenv(environment_name, "0")
+    assert graph._env_positive_int(environment_name, 11) == 11
+    monkeypatch.setenv(environment_name, "7")
+    assert graph._env_positive_int(environment_name, 11) == 7
+
+    cache = graph._ByteLRU(3)
+    cache.put("first", "old", 2)
+    cache.put("first", "new", 1)
+    cache.put("oversized", "ignored", 4)
+    cache.put("second", "retained", 3)
+    assert cache.get("first") is None
+    assert cache.get("oversized") is None
+    assert cache.get("second") == "retained"
+
+    graph.record_v4_hot_prefix_request()
+    graph.record_v4_cold_exact_request()
+    graph.record_v4_prefix_override_sets(2)
+    assert graph._row_mapping(None) == {}
+    bounded_cache = OrderedDict()
+    monkeypatch.setattr(graph, "_ROOT_CACHE_MAX_ENTRIES", 1)
+    graph._cache_bounded(bounded_cache, "first", 1)
+    graph._cache_bounded(bounded_cache, "second", 2)
+    assert bounded_cache == OrderedDict((("second", 2),))
+    with pytest.raises(PTG2SharedBlockError, match="invalid entry_count"):
+        graph._strict_manifest_int({"entry_count": True}, "entry_count")
+
+    with graph.v4_graph_request_scope() as request_io:
+        graph.record_v4_hot_prefix_request()
+        graph.record_v4_cold_exact_request()
+        graph.record_v4_prefix_override_sets(2)
+        assert request_io.hot_prefix_requests == 1
+        assert request_io.cold_exact_requests == 1
+        assert request_io.npi_prefix_override_sets == 2
+
+
+def test_v4_source_scope_bounds() -> None:
+    with graph.v4_graph_hot_source_scope(
+        maximum_owners=1,
+        maximum_members=1,
+        maximum_pages=1,
+        maximum_bytes=1,
+    ) as source_work:
+        with graph.v4_graph_hot_source_scope(
+            maximum_owners=0,
+            maximum_members=0,
+            maximum_pages=0,
+            maximum_bytes=0,
+        ) as nested_source_work:
+            assert nested_source_work is source_work
+        graph._charge_v4_hot_source_work(
+            "set_patterns",
+            owner_count=1,
+            member_count=1,
+            page_count=1,
+            byte_count=1,
+        )
+        with pytest.raises(PTG2SharedBlockError, match="sealed limit"):
+            graph._charge_v4_hot_source_work(
+                "set_patterns",
+                owner_count=1,
+                member_count=0,
+                page_count=0,
+                byte_count=0,
+            )
+
+    with pytest.raises(PTG2SharedBlockError, match="limit is negative"):
+        with graph.v4_graph_hot_source_scope(
+            maximum_owners=-1,
+            maximum_members=0,
+            maximum_pages=0,
+            maximum_bytes=0,
+        ):
+            raise AssertionError("negative source scope unexpectedly entered")
+
+
+def test_v4_npi_scope_bounds() -> None:
+    with graph.v4_graph_hot_npi_scope(
+        maximum_members=1,
+        maximum_locator_pages=1,
+        maximum_member_pages=1,
+        maximum_bytes=1,
+        maximum_batches=1,
+    ) as npi_work:
+        with graph.v4_graph_hot_npi_scope(
+            maximum_members=0,
+            maximum_locator_pages=0,
+            maximum_member_pages=0,
+            maximum_bytes=0,
+            maximum_batches=0,
+        ) as nested_npi_work:
+            assert nested_npi_work is npi_work
+
+    with pytest.raises(PTG2SharedBlockError, match="limit is negative"):
+        with graph.v4_graph_hot_npi_scope(
+            maximum_members=-1,
+            maximum_locator_pages=0,
+            maximum_member_pages=0,
+            maximum_bytes=0,
+            maximum_batches=0,
+        ):
+            raise AssertionError("negative NPI scope unexpectedly entered")
+
+
+@pytest.mark.asyncio
+async def test_v4_empty_heavy_owners() -> None:
+    assert await graph.load_v4_heavy_owners(
+        object(),
+        snapshot_key=1,
+        relation="npi_groups_exact",
+        owner_keys=(),
+        schema_name="mrf",
+    ) == {}
+
+
 def test_hot_npi_scope_enforces_sealed_second_hop_work() -> None:
     before = graph.v4_graph_metrics_snapshot()
     with graph.v4_graph_request_scope():

@@ -19,6 +19,7 @@ use ptg2_scanner::progress::{
     emit_progress, ScannerSemanticProgress, ScannerSemanticProgressReporter,
     SEMANTIC_PROGRESS_INTERVAL,
 };
+use ptg2_scanner::v3_dense::DenseIdentityMap;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
@@ -180,6 +181,11 @@ fn v4_normalization_rejects_ambiguous_numeric_and_json_shapes() {
     assert!(int_list(Some(&json!("bad"))).is_empty());
     assert!(strict_integer_text(&json!("1"), "field").is_err());
     assert!(strict_integer_text(&json!(1.5), "field").is_err());
+    assert_eq!(strict_integer_text(&json!(7), "field").unwrap(), "7");
+    assert_eq!(
+        strict_integer_text(&json!(u64::MAX), "field").unwrap(),
+        u64::MAX.to_string()
+    );
     assert!(strict_integer(&json!(u64::MAX), "field").is_err());
     assert!(strict_integer(&json!(1.5), "field").is_err());
     assert_eq!(
@@ -263,4 +269,24 @@ fn plain_range_reader_rejects_overflow_before_seeking() {
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("overflows u64"));
+
+    let gzip_path = workspace.path().join("rates.json.gz");
+    fs::write(&gzip_path, b"not decoded").unwrap();
+    let error = open_plain_range_json_reader(&gzip_path, 0, 1, Arc::new(AtomicU64::new(0)))
+        .err()
+        .expect("gzip range must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+
+    let error = open_plain_range_json_reader(&source_path, 1, 2, Arc::new(AtomicU64::new(0)))
+        .err()
+        .expect("past-end range must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    assert_eq!(
+        DenseIdentityMap::estimated_memory_bytes(usize::MAX)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert!(DenseIdentityMap::with_capacity(0).unwrap().is_empty());
 }

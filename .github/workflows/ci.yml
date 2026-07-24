@@ -563,6 +563,7 @@ jobs:
           tests/test_ptg2_v4_snapshot_maps.py
           tests/test_ptg2_v4_postgres_e2e.py
           tests/test_ptg2_v4_stale_metadata_reconcile_postgres.py
+          tests/test_ptg2_v4_stale_metadata_optional_postgres.py
           tests/test_ptg2_v4_attempt_registry_postgres.py
           tests/test_ptg2_v4_attempt_stage_regression_postgres.py
           tests/test_ptg2_v4_attempt_entry_atomicity_postgres.py
