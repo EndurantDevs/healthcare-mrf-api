@@ -21,7 +21,8 @@ from process.ptg_parts.live_progress import current_live_progress_context, write
 
 PTG2_V4_GRAPH_COMPILER_BIN_ENV = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4_BIN"
 PTG2_V4_GRAPH_SUMMARY_FORMAT = "ptg2_provider_graph_v4_factor_adaptive_v1"
-PTG2_V4_GRAPH_SUMMARY_MAX_BYTES = 2 * 1024 * 1024
+# Dense-owner metadata is bounded separately from the multi-gigabyte graph model.
+PTG2_V4_GRAPH_SUMMARY_MAX_BYTES = 256 * 1024 * 1024
 PTG2_V4_GRAPH_ERROR_TAIL_BYTES = 8 * 1024
 PTG2_V4_SHARED_FORMAT_VERSION = 2
 PTG2_V4_GRAPH_CHECKPOINT_FORMAT = "ptg2_provider_graph_v4_checkpoint_v1"
@@ -1340,7 +1341,10 @@ def _resolve_v4_graph_compiler_binary() -> Path | None:
 def _read_bounded(path: Path, maximum_bytes: int, *, label: str) -> bytes:
     byte_count = path.stat().st_size
     if byte_count > maximum_bytes:
-        raise RuntimeError(f"V4 graph compiler {label} exceeds {maximum_bytes} bytes")
+        raise RuntimeError(
+            f"V4 graph compiler {label} is {byte_count} bytes; "
+            f"maximum is {maximum_bytes} bytes"
+        )
     return path.read_bytes()
 
 
@@ -2236,6 +2240,10 @@ async def compile_provider_graph_v4_rust(
             ),
             label="stdout summary",
         )
+        stdout_summary_sha256 = hashlib.sha256(
+            _canonical_json_bytes(stdout_summary)
+        ).digest()
+        del stdout_summary
         summary_path = output / "v4-summary.json"
         if not summary_path.is_file() or summary_path.is_symlink():
             raise RuntimeError("V4 graph compiler did not publish its summary")
@@ -2247,7 +2255,9 @@ async def compile_provider_graph_v4_rust(
             ),
             label="summary file",
         )
-        if stdout_summary != file_summary:
+        if stdout_summary_sha256 != hashlib.sha256(
+            _canonical_json_bytes(file_summary)
+        ).digest():
             raise RuntimeError("V4 graph compiler stdout and summary file disagree")
         compilation_result = _validate_compiler_summary(
             file_summary,
