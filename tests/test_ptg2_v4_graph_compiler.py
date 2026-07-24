@@ -278,6 +278,15 @@ async def test_wrapper_surfaces_typed_resource_admission_failure(tmp_path: Path)
         )
     assert not output.exists()
 
+    with pytest.raises(RuntimeError, match="unknown option"):
+        await compile_provider_graph_v4_rust(
+            graph_artifact_entries=artifacts,
+            provider_set_key_map_path=provider_map,
+            output_directory=output,
+            binary_path=_binary(),
+            options={"max_npi_prefix_override_owner": 250_001},
+        )
+
 
 @pytest.mark.asyncio
 async def test_progress_consumer_accepts_monotonic_events_and_logs_malformed_lines(

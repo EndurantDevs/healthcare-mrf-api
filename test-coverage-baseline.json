@@ -368,11 +368,11 @@
       },
       "metrics": {
         "branches": {
-          "covered": 29254,
+          "covered": 29255,
           "total": 37368
         },
         "lines": {
-          "covered": 95461,
+          "covered": 95462,
           "total": 109913
         }
       },
@@ -478,16 +478,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 2989,
-          "total": 3521
+          "covered": 2994,
+          "total": 3524
         },
         "lines": {
-          "covered": 45189,
-          "total": 53344
+          "covered": 45217,
+          "total": 53351
         },
         "regions": {
-          "covered": 67162,
-          "total": 78996
+          "covered": 67206,
+          "total": 79013
         }
       },
       "one_time_floor_reset": {

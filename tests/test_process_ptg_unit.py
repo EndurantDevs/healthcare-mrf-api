@@ -8028,8 +8028,8 @@ def _expected_v4_graph_encoding_policy() -> dict[str, int]:
         "max_online_provider_expansion_provider_sets": 64,
         "max_online_provider_expansion_graph_batches": 64,
         "npi_prefix_target": 201,
-        "max_npi_prefix_override_owners": 50_000,
-        "max_npi_prefix_override_bytes": 64 * 1024 * 1024,
+        "max_npi_prefix_override_owners": 250_000,
+        "max_npi_prefix_override_bytes": 256 * 1024 * 1024,
     }
 
 
@@ -8049,11 +8049,20 @@ def test_v4_physical_identity_binds_encoding_policy_but_not_admission_caps(
 
     baseline = _v4_identity_fingerprint(downloaded)
     monkeypatch.setenv(
-        "HLTHPRT_PTG2_V4_GRAPH_MEMBER_PAGE_BYTES",
-        "32768",
+        "HLTHPRT_PTG2_V4_GRAPH_MAX_NPI_PREFIX_OVERRIDE_OWNERS",
+        "250001",
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_V4_GRAPH_MAX_NPI_PREFIX_OVERRIDE_BYTES",
+        str(256 * 1024 * 1024 + 1),
     )
     changed_encoding = _v4_identity_fingerprint(downloaded)
-    monkeypatch.delenv("HLTHPRT_PTG2_V4_GRAPH_MEMBER_PAGE_BYTES")
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_V4_GRAPH_MAX_NPI_PREFIX_OVERRIDE_OWNERS"
+    )
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_V4_GRAPH_MAX_NPI_PREFIX_OVERRIDE_BYTES"
+    )
     monkeypatch.setenv(
         "HLTHPRT_PTG2_V4_GRAPH_MAX_ESTIMATED_MODEL_BYTES",
         "777777777",
