@@ -1078,6 +1078,7 @@ async def test_v3_lifecycle_fails_closed(
             "status": "promoted",
             "source_key": SOURCE_A,
             "snapshot_id": snapshot_a,
+            "storage_generation": "shared_blocks_v3",
             "previous_snapshot_id": None,
             "plan_source_count": 1,
             "global_pointer": "reconciled",

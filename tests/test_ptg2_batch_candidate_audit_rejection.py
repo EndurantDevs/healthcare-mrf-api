@@ -36,6 +36,10 @@ ALLOWLISTED_REJECTION_REASONS = (
         "PTG2 provider-code intersections exceed their retention limit",
         "provider_code_intersections_limit_exceeded",
     ),
+    (
+        "PTG2 candidate persisted audit provider is missing from its NPI graph",
+        "persisted_provider_graph_membership_missing",
+    ),
 )
 
 

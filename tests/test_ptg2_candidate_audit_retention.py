@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from api import ptg2_candidate_audit_capacity as capacity
 from api import ptg2_candidate_audit_graph as candidate_graph
 from api import ptg2_candidate_audit_reverse as reverse_scope
+from api import ptg2_candidate_audit_v4 as v4_scope
 from api import ptg2_db_sidecars as sidecars
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
@@ -285,6 +288,60 @@ def test_reverse_projection_preserves_source_scope_and_persisted_proof():
         second.npi: {6},
         persisted.npi: {persisted.provider_set_key},
     }
+
+
+@pytest.mark.asyncio
+async def test_v4_candidate_graph_fails_before_unbounded_projection(
+    monkeypatch,
+):
+    npi = 1_234_567_890
+    candidate_keys_by_npi = {npi: {7}}
+    candidate_source_bytes = (
+        v4_scope._NPI_PROVIDER_MAP_BYTES
+        + v4_scope._NPI_PROVIDER_MAP_ENTRY_BYTES
+        + v4_scope._NPI_PROVIDER_BUCKET_BYTES
+        + v4_scope._NPI_PROVIDER_MEMBERSHIP_BYTES
+    )
+    allowed_set_bytes = (
+        capacity.INTEGER_KEY_SET_BYTES
+        + capacity.INTEGER_KEY_SET_MEMBERSHIP_BYTES
+    )
+    final_fixed_bytes = (
+        v4_scope._V4_RESULT_MAP_BYTES
+        + v4_scope._V4_RESULT_BUCKET_BYTES
+    )
+    transient_fixed_bytes = (
+        v4_scope._V4_GRAPH_TRANSIENT_MAP_BYTES
+        + 5 * v4_scope._V4_GRAPH_TRANSIENT_OWNER_BYTES
+    )
+    budget = CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=(
+            candidate_source_bytes
+            + allowed_set_bytes
+            + final_fixed_bytes
+            + transient_fixed_bytes
+            + v4_scope._V4_GRAPH_PEAK_MEMBER_BYTES
+            - 1
+        )
+    )
+    budget.claim(candidate_source_bytes, category="the candidate source map")
+    graph_lookup = AsyncMock()
+    monkeypatch.setattr(v4_scope, "_v4_sets_by_npi", graph_lookup)
+
+    with pytest.raises(
+        CandidateAuditDecodedRetentionError,
+        match="bounded V4 candidate graph projection",
+    ):
+        await v4_scope.prove_v4_candidate_sets(
+            object(),
+            object(),
+            candidate_keys_by_npi,
+            budget,
+            schema_name="candidate_schema",
+        )
+
+    graph_lookup.assert_not_awaited()
+    assert budget.retained_bytes == candidate_source_bytes
 
 
 @pytest.mark.parametrize("maximum_bytes", (0, -1, True))

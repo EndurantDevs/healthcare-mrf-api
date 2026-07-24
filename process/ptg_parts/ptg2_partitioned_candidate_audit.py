@@ -16,6 +16,7 @@ from process.ptg_parts.ptg2_batch_candidate_audit import (
     BatchCandidateAuditContractError,
     BatchCandidateAuditTransportError,
     PTG2_BATCH_AUDIT_MAX_RESPONSE_BYTES,
+    _batch_rejection_reason,
 )
 from process.ptg_parts.ptg2_batch_candidate_audit_report import (
     BatchAuditReportTarget,
@@ -259,7 +260,7 @@ async def _post_partition(
                     )
                 if response.status != 200:
                     raise BatchCandidateAuditContractError(
-                        f"batch_endpoint_rejected_{response.status}"
+                        _batch_rejection_reason(response.status, body)
                     )
             try:
                 raw_result = json.loads(body)

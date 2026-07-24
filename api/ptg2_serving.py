@@ -4086,6 +4086,34 @@ def _is_v4_reverse_scope_cheaper(
     return reverse_score <= forward_score
 
 
+def _v4_single_npi_reverse_sets(
+    npi: int,
+    npi_key_by_value: Mapping[int, int],
+    first_members_by_npi_key: Mapping[int, tuple[int, ...]],
+    first_members_by_allowed_set: Mapping[int, tuple[int, ...]],
+    allowed_provider_sets: tuple[int, ...],
+    max_members: int | None,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve one NPI through the code-scoped reverse relation."""
+
+    npi_key = npi_key_by_value.get(npi)
+    if npi_key is None:
+        return {npi: ()}
+    first_member_set = frozenset(first_members_by_npi_key.get(npi_key, ()))
+    provider_set_keys: list[int] = []
+    for provider_set_key in allowed_provider_sets:
+        if first_member_set.isdisjoint(
+            first_members_by_allowed_set.get(provider_set_key, ())
+        ):
+            continue
+        provider_set_keys.append(provider_set_key)
+        if max_members is not None and len(provider_set_keys) > int(max_members):
+            raise PTG2SharedBlockError(
+                "PTG V4 graph selection exceeds max_members"
+            )
+    return {npi: tuple(provider_set_keys)}
+
+
 def _v4_sets_by_npi_reverse(
     *,
     normalized_npis: tuple[int, ...],
@@ -4093,26 +4121,19 @@ def _v4_sets_by_npi_reverse(
     first_members_by_npi_key: Mapping[int, tuple[int, ...]],
     first_members_by_allowed_set: Mapping[int, tuple[int, ...]],
     allowed_provider_sets: tuple[int, ...],
+    max_members: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Invert only the code-scoped set edges, never the whole snapshot graph."""
 
     if len(normalized_npis) == 1:
-        npi = normalized_npis[0]
-        npi_key = npi_key_by_value.get(npi)
-        if npi_key is None:
-            return {npi: ()}
-        first_member_set = frozenset(
-            first_members_by_npi_key.get(npi_key, ())
+        return _v4_single_npi_reverse_sets(
+            normalized_npis[0],
+            npi_key_by_value,
+            first_members_by_npi_key,
+            first_members_by_allowed_set,
+            allowed_provider_sets,
+            max_members,
         )
-        return {
-            npi: tuple(
-                provider_set_key
-                for provider_set_key in allowed_provider_sets
-                if not first_member_set.isdisjoint(
-                    first_members_by_allowed_set.get(provider_set_key, ())
-                )
-            )
-        }
     npis_by_first_member: dict[int, list[int]] = defaultdict(list)
     for npi in normalized_npis:
         npi_key = npi_key_by_value.get(npi)
@@ -4123,12 +4144,21 @@ def _v4_sets_by_npi_reverse(
     matches_by_npi: dict[int, list[int]] = {
         npi: [] for npi in normalized_npis
     }
+    retained_member_count = 0
     for provider_set_key in allowed_provider_sets:
         matched_npis: set[int] = set()
         for first_member in first_members_by_allowed_set.get(provider_set_key, ()):
             matched_npis.update(npis_by_first_member.get(int(first_member), ()))
         for npi in matched_npis:
             matches_by_npi[npi].append(provider_set_key)
+            retained_member_count += 1
+            if (
+                max_members is not None
+                and retained_member_count > int(max_members)
+            ):
+                raise PTG2SharedBlockError(
+                    "PTG V4 graph selection exceeds max_members"
+                )
     return {
         npi: tuple(provider_set_keys)
         for npi, provider_set_keys in matches_by_npi.items()
@@ -4143,6 +4173,49 @@ def _v4_npi_projection_relations(
     return "npi_groups_exact", "group_sets_direct", "set_groups_direct"
 
 
+@dataclass(frozen=True)
+class _V4GraphReadBounds:
+    schema_name: str
+    max_members: int | None
+
+
+async def _v4_pattern_members_for_sets(
+    session,
+    *,
+    snapshot_key: int,
+    reverse_relation: str,
+    allowed_provider_sets: tuple[int, ...],
+    maximum_pattern_degree: int,
+    read_bounds: _V4GraphReadBounds,
+) -> Mapping[int, tuple[int, ...]] | None:
+    """Read a bounded set-to-pattern projection or select the forward path."""
+
+    if (
+        read_bounds.max_members is not None
+        and len(allowed_provider_sets) * (maximum_pattern_degree + 1)
+        > int(read_bounds.max_members)
+    ):
+        return None
+    bounded_patterns = await lookup_v4_relation_member_prefixes(
+        session,
+        snapshot_key=snapshot_key,
+        relation=reverse_relation,
+        owner_keys=allowed_provider_sets,
+        schema_name=read_bounds.schema_name,
+        limit_per_owner=maximum_pattern_degree + 1,
+    )
+    if set(bounded_patterns) != set(allowed_provider_sets):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 set-pattern relation is incomplete"
+        )
+    if any(
+        len(pattern_keys) > maximum_pattern_degree
+        for pattern_keys in bounded_patterns.values()
+    ):
+        return None
+    return bounded_patterns
+
+
 async def _v4_reverse_members_for_sets(
     session,
     *,
@@ -4152,19 +4225,22 @@ async def _v4_reverse_members_for_sets(
     allowed_provider_sets: tuple[int, ...],
     forward_relation: str,
     maximum_pattern_degree: int,
+    read_bounds: _V4GraphReadBounds,
 ) -> Mapping[int, tuple[int, ...]] | None:
+    """Choose a bounded reverse projection when its manifest cost is lower."""
+
     _, _, reverse_relation = _v4_npi_projection_relations(representation)
     forward_manifest = await load_v4_relation_manifest(
         session,
         snapshot_key=snapshot_key,
         relation=forward_relation,
-        schema_name=PTG2_SCHEMA,
+        schema_name=read_bounds.schema_name,
     )
     reverse_manifest = await load_v4_relation_manifest(
         session,
         snapshot_key=snapshot_key,
         relation=reverse_relation,
-        schema_name=PTG2_SCHEMA,
+        schema_name=read_bounds.schema_name,
     )
     if not _is_v4_reverse_scope_cheaper(
         first_member_count=first_member_count,
@@ -4181,26 +4257,17 @@ async def _v4_reverse_members_for_sets(
             snapshot_key=snapshot_key,
             relation=reverse_relation,
             owner_keys=allowed_provider_sets,
-            schema_name=PTG2_SCHEMA,
+            schema_name=read_bounds.schema_name,
+            max_members=read_bounds.max_members,
         )
-    bounded_patterns = await lookup_v4_relation_member_prefixes(
+    return await _v4_pattern_members_for_sets(
         session,
         snapshot_key=snapshot_key,
-        relation=reverse_relation,
-        owner_keys=allowed_provider_sets,
-        schema_name=PTG2_SCHEMA,
-        limit_per_owner=maximum_pattern_degree + 1,
+        reverse_relation=reverse_relation,
+        allowed_provider_sets=allowed_provider_sets,
+        maximum_pattern_degree=maximum_pattern_degree,
+        read_bounds=read_bounds,
     )
-    if set(bounded_patterns) != set(allowed_provider_sets):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 set-pattern relation is incomplete"
-        )
-    if any(
-        len(pattern_keys) > maximum_pattern_degree
-        for pattern_keys in bounded_patterns.values()
-    ):
-        return None
-    return bounded_patterns
 
 
 def _v4_sets_from_first_members(
@@ -4209,8 +4276,11 @@ def _v4_sets_from_first_members(
     first_members_by_npi_key: Mapping[int, tuple[int, ...]],
     provider_sets_by_first_member: Mapping[int, tuple[int, ...]],
     allowed_provider_sets: tuple[int, ...] | None,
+    *,
+    max_members: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     provider_set_keys_by_npi: dict[int, tuple[int, ...]] = {}
+    retained_member_count = 0
     allowed_provider_set_key_set = (
         None if allowed_provider_sets is None else frozenset(allowed_provider_sets)
     )
@@ -4236,6 +4306,14 @@ def _v4_sets_from_first_members(
             provider_set_keys = intersect_sorted_u32(
                 provider_set_keys, allowed_provider_sets
             )
+        retained_member_count += len(provider_set_keys)
+        if (
+            max_members is not None
+            and retained_member_count > int(max_members)
+        ):
+            raise PTG2SharedBlockError(
+                "PTG V4 graph selection exceeds max_members"
+            )
         provider_set_keys_by_npi[npi] = provider_set_keys
     return provider_set_keys_by_npi
 
@@ -4245,7 +4323,9 @@ async def _v4_sets_by_npi(
     serving_tables: PTG2ServingTables,
     npis: Iterable[int],
     *,
-    allowed_provider_set_keys: frozenset[int] | None = None,
+    allowed_provider_set_keys: Iterable[int] | None = None,
+    schema_name: str = PTG2_SCHEMA,
+    max_members: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Resolve hot NPI-to-set membership through the selected V4 representation."""
 
@@ -4260,17 +4340,21 @@ async def _v4_sets_by_npi(
         else None
     )
     snapshot_key = _required_shared_snapshot_key(serving_tables)
+    read_bounds = _V4GraphReadBounds(
+        schema_name=schema_name,
+        max_members=max_members,
+    )
     with v4_graph_request_scope():
         npi_key_by_value = await v4_npi_keys_for_values(
             session,
             snapshot_key=snapshot_key,
             npis=normalized_npis,
-            schema_name=PTG2_SCHEMA,
+            schema_name=schema_name,
         )
         root = await load_v4_graph_root(
             session,
             snapshot_key,
-            schema_name=PTG2_SCHEMA,
+            schema_name=schema_name,
         )
         first_relation, second_relation, _ = _v4_npi_projection_relations(
             root.representation
@@ -4280,7 +4364,8 @@ async def _v4_sets_by_npi(
             snapshot_key=snapshot_key,
             relation=first_relation,
             owner_keys=npi_key_by_value.values(),
-            schema_name=PTG2_SCHEMA,
+            schema_name=schema_name,
+            max_members=max_members,
         )
         first_member_keys = tuple(
             sorted(
@@ -4306,6 +4391,7 @@ async def _v4_sets_by_npi(
                         serving_tables
                     ).maximum_patterns_per_set
                 ),
+                read_bounds=read_bounds,
             )
             if first_members_by_allowed_set is not None:
                 return _v4_sets_by_npi_reverse(
@@ -4314,13 +4400,15 @@ async def _v4_sets_by_npi(
                     first_members_by_npi_key=first_members_by_npi_key,
                     first_members_by_allowed_set=first_members_by_allowed_set,
                     allowed_provider_sets=allowed_provider_sets,
+                    max_members=max_members,
                 )
         provider_sets_by_first_member = await lookup_v4_relation_members(
             session,
             snapshot_key=snapshot_key,
             relation=second_relation,
             owner_keys=first_member_keys,
-            schema_name=PTG2_SCHEMA,
+            schema_name=schema_name,
+            max_members=max_members,
         )
     return _v4_sets_from_first_members(
         normalized_npis,
@@ -4328,6 +4416,7 @@ async def _v4_sets_by_npi(
         first_members_by_npi_key,
         provider_sets_by_first_member,
         allowed_provider_sets,
+        max_members=max_members,
     )
 
 

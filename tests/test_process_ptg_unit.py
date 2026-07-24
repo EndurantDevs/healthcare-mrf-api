@@ -8970,6 +8970,7 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
     )
 
     assert import_result["arch_version"] == "postgres_binary_v3"
+    assert import_result["storage_generation"] == "shared_blocks_v3"
     assert import_result["activation_status"] == "deferred"
     assert import_result["snapshot_status"] == process_ptg.PTG2_STATUS_VALIDATED
     candidate_stage.assert_awaited_once()

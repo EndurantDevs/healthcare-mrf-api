@@ -233,7 +233,6 @@ async def control_ptg_source_snapshot_promote(request):
 @blueprint.post("/ptg/source-snapshots/attest")
 async def control_ptg_source_snapshot_attest(request):
     """Bind one passing release audit report to an exact validated candidate."""
-
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     report = payload.get("report")
@@ -245,6 +244,7 @@ async def control_ptg_source_snapshot_attest(request):
             source_key=str(payload.get("source_key") or ""),
             plan_id=str(payload.get("plan_id") or ""),
             plan_market_type=str(payload.get("plan_market_type") or ""),
+            storage_generation=str(payload.get("storage_generation") or "shared_blocks_v3"),
             report=report,
         )
     except ValueError as exc:

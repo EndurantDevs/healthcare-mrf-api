@@ -69,6 +69,7 @@
         "api/ptg2_candidate_audit_provider_requests.py",
         "api/ptg2_candidate_audit_reverse.py",
         "api/ptg2_candidate_audit_selection.py",
+        "api/ptg2_candidate_audit_v4.py",
         "api/ptg2_capacity_evidence.py",
         "api/ptg2_code_context.py",
         "api/ptg2_code_details.py",
@@ -391,12 +392,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 29900,
-          "total": 37718
+          "covered": 30020,
+          "total": 37740
         },
         "lines": {
-          "covered": 97377,
-          "total": 111263
+          "covered": 97738,
+          "total": 111389
         }
       },
       "one_time_floor_reset": {

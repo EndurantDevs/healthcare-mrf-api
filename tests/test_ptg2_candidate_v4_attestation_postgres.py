@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 
 from db.connection import db
-from process.ptg_parts import ptg2_candidate_attestation
+from process.ptg_parts import ptg2_candidate_attestation, source_pointers
 from process.ptg_parts.ptg2_shared_source_set import (
     ordered_source_ordinal_digest,
     shared_source_set_metadata,
@@ -96,7 +96,14 @@ def _v4_identity_and_manifests():
 async def _create_v4_candidate_tables(quoted_schema: str) -> None:
     table_definitions = (
         f"""CREATE TABLE {quoted_schema}.ptg2_snapshot (
-            snapshot_id text PRIMARY KEY, status text NOT NULL,
+            snapshot_id text PRIMARY KEY,
+            import_run_id text NOT NULL DEFAULT 'run-1',
+            import_month date NOT NULL DEFAULT DATE '2026-07-01',
+            status text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+            validated_at timestamptz,
+            published_at timestamptz,
+            previous_snapshot_id text,
             manifest jsonb NOT NULL)""",
         f"""CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_binding (
             snapshot_id text PRIMARY KEY, snapshot_key bigint NOT NULL)""",
@@ -126,6 +133,7 @@ async def _seed_v4_candidate(
 ) -> None:
     await db.status(
         f"""INSERT INTO {quoted_schema}.ptg2_snapshot
+            (snapshot_id, status, manifest)
             VALUES ('candidate-v4', 'validated', CAST(:manifest AS jsonb))""",
         manifest=json.dumps(snapshot_manifest_by_field),
     )
@@ -155,6 +163,16 @@ async def _seed_v4_candidate(
             VALUES ('candidate-v4', 'source-a', :raw_digest)""",
         raw_digest=RAW_CONTAINER_DIGEST,
     )
+
+
+async def _locked_v4_activation_generation(schema_name: str) -> str:
+    async with db.transaction() as session:
+        activation_row = await source_pointers._locked_candidate_activation_row(
+            session,
+            schema_name=schema_name,
+            snapshot_id="candidate-v4",
+        )
+    return str(activation_row["storage_generation"])
 
 
 def _v4_report_and_evidence(identity_by_field):
@@ -229,6 +247,9 @@ async def test_real_postgres_v4_candidate_attestation_locks_complete_root(
             quoted_schema,
             snapshot_manifest_by_field,
             layout_manifest_by_field,
+        )
+        assert await _locked_v4_activation_generation(schema_name) == (
+            "shared_blocks_v4"
         )
         attestation_result = await (
             ptg2_candidate_attestation.record_candidate_audit_attestation(
