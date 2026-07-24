@@ -16,6 +16,25 @@ sys.modules["drug_claims_state_contracts"] = drug_claims
 MODULE_SPEC.loader.exec_module(drug_claims)
 
 
+class _FinalizeLockRedis:
+    def __init__(self):
+        self.values_by_key = {}
+
+    async def set(self, key, value, *, ex, nx):
+        assert ex > 0
+        if nx and key in self.values_by_key:
+            return False
+        self.values_by_key[key] = value
+        return True
+
+    async def eval(self, _script, key_count, key, owner_token):
+        assert key_count == 1
+        if self.values_by_key.get(key) != owner_token:
+            return 0
+        del self.values_by_key[key]
+        return 1
+
+
 @pytest.mark.parametrize(
     ("environment_value", "default_value", "is_enabled"),
     [
@@ -92,6 +111,36 @@ async def test_redis_run_state_contract(monkeypatch):
             call("drug_claims:run-one:done_chunks", "chunk-one"),
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_finalize_lock_release_requires_the_owner_token(monkeypatch):
+    redis = _FinalizeLockRedis()
+    monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_REDIS_TTL_SECONDS", 99)
+    lock_key = drug_claims._state_key("run-one", "finalize_lock")
+
+    assert await drug_claims._has_claimed_finalize_lock(
+        redis,
+        "run-one",
+        "owner-one",
+    )
+    assert not await drug_claims._has_claimed_finalize_lock(
+        redis,
+        "run-one",
+        "owner-two",
+    )
+    assert not await drug_claims._release_finalize_lock(
+        redis,
+        "run-one",
+        "owner-two",
+    )
+    assert redis.values_by_key[lock_key] == "owner-one"
+    assert await drug_claims._release_finalize_lock(
+        redis,
+        "run-one",
+        "owner-one",
+    )
+    assert lock_key not in redis.values_by_key
 
 
 @pytest.mark.asyncio

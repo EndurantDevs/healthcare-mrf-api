@@ -15,7 +15,7 @@ import secrets
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -263,6 +263,9 @@ class DrugClaimsFinalizeRequest:
     redis: Any
     manifest: dict[str, Any]
     expected_chunks: int
+    finalize_lock_token: str = field(
+        default_factory=lambda: secrets.token_hex(16)
+    )
 
 
 DATASETS = (
@@ -393,10 +396,61 @@ async def _get_run_progress(redis, run_id: str, expected_default: int) -> tuple[
     return total_chunks, done_chunks
 
 
-async def _has_claimed_finalize_lock(redis, run_id: str) -> bool:
+async def _has_claimed_finalize_lock(
+    redis,
+    run_id: str,
+    owner_token: str | None = None,
+) -> bool:
     lock_key = _state_key(run_id, "finalize_lock")
-    lock_set = await redis.set(lock_key, "1", ex=DRUG_CLAIMS_REDIS_TTL_SECONDS, nx=True)
+    lock_set = await redis.set(
+        lock_key,
+        owner_token or secrets.token_hex(16),
+        ex=DRUG_CLAIMS_REDIS_TTL_SECONDS,
+        nx=True,
+    )
     return bool(lock_set)
+
+
+async def _release_finalize_lock(
+    redis,
+    run_id: str,
+    owner_token: str,
+) -> bool:
+    """Release only the finalize lock owned by this worker attempt."""
+
+    if redis is None or not run_id or not owner_token:
+        return False
+    lock_key = _state_key(run_id, "finalize_lock")
+    release_script = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+    released = await redis.eval(
+        release_script,
+        1,
+        lock_key,
+        owner_token,
+    )
+    return bool(released)
+
+
+async def _release_finalize_lock_safely(
+    request: DrugClaimsFinalizeRequest,
+) -> None:
+    """Release the owned lock without masking finalize success or failure."""
+
+    try:
+        await _release_finalize_lock(
+            request.redis,
+            request.run_id,
+            request.finalize_lock_token,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to release drug claims finalize lock for run_id=%s: %s",
+            request.run_id,
+            exc,
+        )
 
 
 def _print_row_progress(stage: str, parsed: int, accepted: int, start_time: float, final: bool = False) -> None:
@@ -2560,7 +2614,10 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
             staging_class = classes[cls.__name__]
             table = cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
-            await db.status(f"ALTER TABLE IF EXISTS {schema}.{staging_class.__tablename__} RENAME TO {table};")
+            await db.status(
+                f"ALTER TABLE {schema}.{staging_class.__tablename__} "
+                f"RENAME TO {table};"
+            )
 
             await db.status(
                 f"ALTER INDEX IF EXISTS {schema}.{staging_class.__tablename__}_idx_primary "
@@ -2824,6 +2881,46 @@ async def _mark_drug_claims_chunks_queued(
     )
 
 
+def _find_missing_drug_claim_sources(
+    source_descriptors_by_dataset: dict[str, list[dict[str, Any]]],
+    chunks: list[dict[str, Any]],
+) -> list[str]:
+    """Identify required source files that produced no processable chunk."""
+
+    observed_source_keys = {
+        (
+            str(chunk_manifest.get("dataset_key") or ""),
+            _safe_int(chunk_manifest.get("source_index"), -1),
+        )
+        for chunk_manifest in chunks
+    }
+    missing_sources = []
+    for dataset in DATASETS:
+        source_descriptors = source_descriptors_by_dataset.get(dataset.key) or []
+        if not source_descriptors:
+            missing_sources.append(f"{dataset.key}:no-source")
+            continue
+        for source_index, _source_descriptor in enumerate(source_descriptors):
+            if (dataset.key, source_index) not in observed_source_keys:
+                missing_sources.append(f"{dataset.key}:{source_index}")
+    return missing_sources
+
+
+async def _fail_empty_drug_claims_sources(
+    request: DrugClaimsStartRequest,
+    missing_sources: list[str],
+) -> None:
+    """Record a fail-closed start result before preserving live tables."""
+
+    await mark_control_run(
+        request.run_id,
+        status="failed",
+        phase_detail="drug-claims source produced no rows",
+        progress_message="source produced no processable rows",
+        metrics={"missing_sources": missing_sources},
+    )
+
+
 async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Prepare staging, split sources, and enqueue drug-claims chunks."""
 
@@ -2850,6 +2947,16 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
         workspace,
     )
     _step_end("download+split+enqueue chunks (streaming)", chunk_enqueue_started_at)
+    missing_sources = _find_missing_drug_claim_sources(
+        source_descriptors_by_dataset,
+        chunks,
+    )
+    if missing_sources:
+        await _fail_empty_drug_claims_sources(request, missing_sources)
+        raise RuntimeError(
+            "Drug claims import produced no processable rows for required "
+            f"sources: {', '.join(missing_sources)}"
+        )
     manifest_path = _persist_drug_claims_manifest(
         request,
         schema,
@@ -3010,22 +3117,30 @@ async def _await_drug_claims_finalize_permission(
             flush=True,
         )
         raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
-    if not await _has_claimed_finalize_lock(request.redis, request.run_id):
-        raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
-    await mark_control_run(
+    if not await _has_claimed_finalize_lock(
+        request.redis,
         request.run_id,
-        status="finalizing",
-        phase_detail="drug-claims finalizing",
-        progress_message="finalizing",
-        progress={
-            "unit": "chunks",
-            "total": total_chunks,
-            "done": done_chunks,
-            "pct": 99,
-            "message": "finalizing",
-            "phase": "drug-claims finalizing",
-        },
-    )
+        request.finalize_lock_token,
+    ):
+        raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
+    try:
+        await mark_control_run(
+            request.run_id,
+            status="finalizing",
+            phase_detail="drug-claims finalizing",
+            progress_message="finalizing",
+            progress={
+                "unit": "chunks",
+                "total": total_chunks,
+                "done": done_chunks,
+                "pct": 99,
+                "message": "finalizing",
+                "phase": "drug-claims finalizing",
+            },
+        )
+    except BaseException:
+        await _release_finalize_lock_safely(request)
+        raise
     return None
 
 
@@ -3072,7 +3187,24 @@ def _cleanup_drug_claims_workdir(request: DrugClaimsFinalizeRequest) -> None:
     work_dir_text = str(request.manifest.get("work_dir") or "").strip()
     if not work_dir_text or DRUG_CLAIMS_KEEP_WORKDIR:
         return
-    run_work_dir = Path(work_dir_text)
+    work_dir_root = Path(DRUG_CLAIMS_WORKDIR).expanduser().resolve()
+    expected_work_dir = (
+        work_dir_root / request.import_id / request.run_id
+    ).resolve()
+    run_work_dir = Path(work_dir_text).expanduser().resolve()
+    try:
+        expected_work_dir.relative_to(work_dir_root)
+    except ValueError:
+        logger.warning("Refusing unsafe drug claims workspace cleanup")
+        return
+    if (
+        not request.run_id
+        or work_dir_root == Path(work_dir_root.anchor)
+        or expected_work_dir == work_dir_root
+        or run_work_dir != expected_work_dir
+    ):
+        logger.warning("Refusing mismatched drug claims workspace cleanup")
+        return
     if run_work_dir.exists():
         shutil.rmtree(run_work_dir, ignore_errors=True)
 
@@ -3087,29 +3219,35 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
     already_finalized_result = await _await_drug_claims_finalize_permission(request)
     if already_finalized_result is not None:
         return already_finalized_result
-    await _materialize_and_publish_drug_claims(request)
-    await _mark_drug_claims_finalized(request)
-    _cleanup_drug_claims_workdir(request)
-    logger.info(
-        "CMS drug claims import finalized: test_mode=%s import_id=%s run_id=%s",
-        request.test_mode,
-        request.import_id,
-        request.run_id,
-    )
-    await mark_control_run(
-        request.run_id,
-        status="succeeded",
-        phase_detail="drug-claims finalized",
-        progress_message="succeeded",
-        metrics={"stage_suffix": request.stage_suffix, "schema": request.schema},
-    )
-    return {
-        "ok": True,
-        "import_id": request.import_id,
-        "run_id": request.run_id,
-        "stage_suffix": request.stage_suffix,
-        "schema": request.schema,
-    }
+    try:
+        await _materialize_and_publish_drug_claims(request)
+        await _mark_drug_claims_finalized(request)
+        _cleanup_drug_claims_workdir(request)
+        logger.info(
+            "CMS drug claims import finalized: test_mode=%s import_id=%s run_id=%s",
+            request.test_mode,
+            request.import_id,
+            request.run_id,
+        )
+        await mark_control_run(
+            request.run_id,
+            status="succeeded",
+            phase_detail="drug-claims finalized",
+            progress_message="succeeded",
+            metrics={
+                "stage_suffix": request.stage_suffix,
+                "schema": request.schema,
+            },
+        )
+        return {
+            "ok": True,
+            "import_id": request.import_id,
+            "run_id": request.run_id,
+            "stage_suffix": request.stage_suffix,
+            "schema": request.schema,
+        }
+    finally:
+        await _release_finalize_lock_safely(request)
 
 
 async def _enqueue_start_job(redis: Any, start_job_by_field: dict[str, Any], run_id: str) -> None:

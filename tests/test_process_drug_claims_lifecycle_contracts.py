@@ -251,14 +251,21 @@ async def test_start_writes_manifest_before_finalize(tmp_path, monkeypatch):
     workspace = _workspace(tmp_path)
     sources_by_dataset = {
         "provider_drug": [{"url": "https://files.invalid/provider.csv"}],
-        "drug_spending": [],
+        "drug_spending": [{"url": "https://files.invalid/spending.csv"}],
     }
     chunk_manifests = [
         {
             "dataset_key": "provider_drug",
             "chunk_index": 0,
             "chunk_path": str(tmp_path / "chunk.csv"),
-        }
+            "source_index": 0,
+        },
+        {
+            "dataset_key": "drug_spending",
+            "chunk_index": 0,
+            "chunk_path": str(tmp_path / "spending-chunk.csv"),
+            "source_index": 0,
+        },
     ]
     enqueue_finalize = AsyncMock()
     monkeypatch.setattr(drug_claims, "_drug_claims_start_request", lambda ctx, task: request)
@@ -280,7 +287,7 @@ async def test_start_writes_manifest_before_finalize(tmp_path, monkeypatch):
 
     start_result = await drug_claims.drug_claims_start({"redis": redis}, {})
     manifest_fields = drug_claims._read_manifest(start_result["manifest_path"])
-    assert start_result["total_chunks"] == 1
+    assert start_result["total_chunks"] == 2
     assert manifest_fields["sources"] == sources_by_dataset
     assert manifest_fields["chunks"] == chunk_manifests
     assert manifest_fields["work_dir"] == str(tmp_path)
@@ -289,6 +296,73 @@ async def test_start_writes_manifest_before_finalize(tmp_path, monkeypatch):
         "mrf",
         Path(start_result["manifest_path"]),
     )
+
+
+@pytest.mark.asyncio
+async def test_start_refuses_finalize_when_a_required_source_has_no_rows(
+    tmp_path,
+    monkeypatch,
+):
+    redis = SimpleNamespace(enqueue_job=AsyncMock())
+    request = _start_request(redis)
+    workspace = _workspace(tmp_path)
+    sources_by_dataset = {
+        "provider_drug": [{"url": "https://files.invalid/provider.csv"}],
+        "drug_spending": [{"url": "https://files.invalid/spending.csv"}],
+    }
+    provider_chunks = [
+        {
+            "dataset_key": "provider_drug",
+            "chunk_index": 0,
+            "chunk_path": str(tmp_path / "provider-chunk.csv"),
+            "source_index": 0,
+        }
+    ]
+    persist_manifest = AsyncMock()
+    enqueue_finalize = AsyncMock()
+    mark_control = AsyncMock()
+    monkeypatch.setattr(
+        drug_claims,
+        "_drug_claims_start_request",
+        lambda _ctx, _task: request,
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_prepare_drug_claims_sources",
+        AsyncMock(return_value=("mrf", sources_by_dataset, workspace)),
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_collect_and_enqueue_source_chunks",
+        AsyncMock(return_value=provider_chunks),
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_persist_drug_claims_manifest",
+        persist_manifest,
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_enqueue_drug_claims_finalize",
+        enqueue_finalize,
+    )
+    monkeypatch.setattr(drug_claims, "mark_control_run", mark_control)
+    monkeypatch.setattr(drug_claims, "_step_start", lambda _label: 0.0)
+    monkeypatch.setattr(
+        drug_claims,
+        "_step_end",
+        lambda _label, _started_at: None,
+    )
+
+    with pytest.raises(RuntimeError, match="drug_spending:0"):
+        await drug_claims.drug_claims_start({"redis": redis}, {})
+
+    persist_manifest.assert_not_awaited()
+    enqueue_finalize.assert_not_awaited()
+    assert mark_control.await_args.kwargs["status"] == "failed"
+    assert mark_control.await_args.kwargs["metrics"] == {
+        "missing_sources": ["drug_spending:0"]
+    }
 
 
 @pytest.mark.asyncio
@@ -440,9 +514,45 @@ async def test_finalize_permission_marks_finalizing(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_finalize_permission_releases_lock_when_status_update_fails(
+    monkeypatch,
+):
+    request = _finalize_request(
+        SimpleNamespace(get=AsyncMock(return_value=None))
+    )
+    release_lock = AsyncMock()
+    monkeypatch.setattr(
+        drug_claims,
+        "_get_run_progress",
+        AsyncMock(return_value=(2, 2)),
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_has_claimed_finalize_lock",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "mark_control_run",
+        AsyncMock(side_effect=RuntimeError("status unavailable")),
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_release_finalize_lock_safely",
+        release_lock,
+    )
+
+    with pytest.raises(RuntimeError, match="status unavailable"):
+        await drug_claims._await_drug_claims_finalize_permission(request)
+
+    release_lock.assert_awaited_once_with(request)
+
+
+@pytest.mark.asyncio
 async def test_finalize_success_cleans_workspace(tmp_path, monkeypatch):
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
+    work_dir_root = tmp_path / "drug-claims"
+    run_directory = work_dir_root / "import-one" / "run-one"
+    run_directory.mkdir(parents=True)
     request = _finalize_request(
         SimpleNamespace(set=AsyncMock(), expire=AsyncMock()),
         {"work_dir": str(run_directory)},
@@ -456,7 +566,14 @@ async def test_finalize_success_cleans_workspace(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(drug_claims, "_materialize_and_publish_drug_claims", AsyncMock())
     monkeypatch.setattr(drug_claims, "mark_control_run", AsyncMock())
+    monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_WORKDIR", str(work_dir_root))
     monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_KEEP_WORKDIR", False)
+    release_lock = AsyncMock()
+    monkeypatch.setattr(
+        drug_claims,
+        "_release_finalize_lock_safely",
+        release_lock,
+    )
 
     finalize_result = await drug_claims.drug_claims_finalize({}, {"test_mode": True})
     assert finalize_result == {
@@ -468,6 +585,49 @@ async def test_finalize_success_cleans_workspace(tmp_path, monkeypatch):
     }
     assert not run_directory.exists()
     request.redis.set.assert_awaited_once()
+    release_lock.assert_awaited_once_with(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finalize_failure",
+    [
+        RuntimeError("publish failed"),
+        asyncio.CancelledError("publish cancelled"),
+    ],
+)
+async def test_finalize_releases_lock_after_failure_or_cancellation(
+    monkeypatch,
+    finalize_failure,
+):
+    request = _finalize_request()
+    release_lock = AsyncMock()
+    monkeypatch.setattr(drug_claims, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        drug_claims,
+        "_drug_claims_finalize_request",
+        lambda *_args: request,
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_await_drug_claims_finalize_permission",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_materialize_and_publish_drug_claims",
+        AsyncMock(side_effect=finalize_failure),
+    )
+    monkeypatch.setattr(
+        drug_claims,
+        "_release_finalize_lock_safely",
+        release_lock,
+    )
+
+    with pytest.raises(type(finalize_failure)):
+        await drug_claims.drug_claims_finalize({}, {"test_mode": True})
+
+    release_lock.assert_awaited_once_with(request)
 
 
 @pytest.mark.asyncio

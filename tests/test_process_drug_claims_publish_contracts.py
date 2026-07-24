@@ -71,7 +71,11 @@ async def test_publish_renames_tables_and_declared_indexes(monkeypatch):
     sql_statements = "\n".join(publish_database.statements)
     assert publish_database.transaction_entries == 1
     assert "DROP TABLE IF EXISTS mrf.pricing_prescription" in sql_statements
-    assert "prescription_stage RENAME TO pricing_prescription" in sql_statements
+    assert (
+        "ALTER TABLE mrf.prescription_stage "
+        "RENAME TO pricing_prescription"
+    ) in sql_statements
+    assert "ALTER TABLE IF EXISTS mrf.prescription_stage" not in sql_statements
     assert "prescription_stage_pricing_prescription_rx_code_idx" in sql_statements
     assert "prescription_stage_year_idx RENAME TO year_idx" in sql_statements
     assert "provider_stage RENAME TO pricing_provider_prescription" in sql_statements
@@ -151,6 +155,12 @@ def test_cleanup_requires_explicit_work_directory_and_respects_retention(
     )
     drug_claims._cleanup_drug_claims_workdir(empty_request)
 
+    work_dir_root = tmp_path / "drug-claims"
+    monkeypatch.setattr(
+        drug_claims,
+        "DRUG_CLAIMS_WORKDIR",
+        str(work_dir_root),
+    )
     remove_tree = Mock(wraps=drug_claims.shutil.rmtree)
     monkeypatch.setattr(drug_claims.shutil, "rmtree", remove_tree)
     incomplete_request = dataclasses.replace(
@@ -160,8 +170,18 @@ def test_cleanup_requires_explicit_work_directory_and_respects_retention(
     drug_claims._cleanup_drug_claims_workdir(incomplete_request)
     remove_tree.assert_not_called()
 
-    completed_directory = tmp_path / "completed"
-    completed_directory.mkdir()
+    outside_directory = tmp_path / "outside"
+    outside_directory.mkdir()
+    outside_request = dataclasses.replace(
+        empty_request,
+        manifest={"work_dir": str(outside_directory)},
+    )
+    drug_claims._cleanup_drug_claims_workdir(outside_request)
+    assert outside_directory.is_dir()
+    remove_tree.assert_not_called()
+
+    completed_directory = work_dir_root / "import-one" / "run-one"
+    completed_directory.mkdir(parents=True)
     completed_request = dataclasses.replace(
         empty_request,
         manifest={"work_dir": str(completed_directory)},
@@ -170,8 +190,8 @@ def test_cleanup_requires_explicit_work_directory_and_respects_retention(
     drug_claims._cleanup_drug_claims_workdir(completed_request)
     assert not completed_directory.exists()
 
-    run_directory = tmp_path / "retained"
-    run_directory.mkdir()
+    run_directory = work_dir_root / "import-one" / "run-one"
+    run_directory.mkdir(parents=True)
     retained_request = dataclasses.replace(
         empty_request,
         manifest={"work_dir": str(run_directory)},
