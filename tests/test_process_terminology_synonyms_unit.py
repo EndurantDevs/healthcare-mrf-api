@@ -97,23 +97,25 @@ def test_record_rejects_incomplete_identity_and_applies_display_fallbacks():
         is None
     )
 
-    row = terminology_synonyms._record(
+    terminology_record = terminology_synonyms._record(
         domain="procedure",
         synonym="Brain MRI",
         term_type="curated",
         target_system="cpt",
         target_code=70553,
-        canonical_term="MRI of the brain",
-        metadata={"contrast": True},
+        options=terminology_synonyms.TerminologyRecordOptions(
+            canonical_term="MRI of the brain",
+            metadata={"contrast": True},
+        ),
     )
 
-    assert row is not None
-    assert row["term_key"] == "brain mri"
-    assert row["target_system"] == "CPT"
-    assert row["target_code"] == "70553"
-    assert row["target_display"] == "MRI of the brain"
-    assert row["canonical_term"] == "MRI of the brain"
-    assert row["metadata_json"] == '{"contrast": true}'
+    assert terminology_record is not None
+    assert terminology_record["term_key"] == "brain mri"
+    assert terminology_record["target_system"] == "CPT"
+    assert terminology_record["target_code"] == "70553"
+    assert terminology_record["target_display"] == "MRI of the brain"
+    assert terminology_record["canonical_term"] == "MRI of the brain"
+    assert terminology_record["metadata_json"] == '{"contrast": true}'
 
 
 def test_curated_builders_skip_records_rejected_by_validation(monkeypatch):
