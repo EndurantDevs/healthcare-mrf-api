@@ -121,6 +121,59 @@ def test_progress_allows_done_reset_only_across_phase_context() -> None:
     assert report["passed"] is True
 
 
+def test_progress_accepts_advancing_indeterminate_semantic_counters() -> None:
+    samples = _successful_progress_samples()
+    for rate_chunks, sample in enumerate(samples[:2], start=1):
+        sample["progress"].update(
+            {
+                "pct": None,
+                "done": 0,
+                "total": None,
+                "unit": "semantic_work",
+                "basis": "semantic_work",
+                "denominator_state": "unknown",
+                "counters": {"rate_chunks_completed": rate_chunks},
+            }
+        )
+
+    report = evaluate_progress_timeline(
+        _timeline(samples),
+        budget=_elapsed_budget(),
+        maximum_update_gap_seconds=5,
+    )
+
+    assert report["passed"] is True
+    assert report["distinct_progress_update_count"] == 2
+    assert report["intermediate_update_count"] == 2
+
+
+def test_progress_rejects_frozen_percent_for_indeterminate_semantic_work() -> None:
+    samples = _successful_progress_samples()
+    for completed, sample in zip((65_536, 131_072), samples[:2], strict=True):
+        sample["progress"].update(
+            {
+                "pct": 30,
+                "done": completed,
+                "total": None,
+                "unit": "semantic_work",
+                "basis": "semantic_work",
+                "denominator_state": "unknown",
+            }
+        )
+
+    report = evaluate_progress_timeline(
+        _timeline(samples),
+        budget=_elapsed_budget(),
+        maximum_update_gap_seconds=5,
+    )
+
+    assert report["passed"] is False
+    assert (
+        "indeterminate progress falsely reports a determinate percent"
+        in report["failures"]
+    )
+
+
 def test_progress_rejects_heartbeat_only_stall() -> None:
     first_sample = _successful_progress_samples()[0]
     repeated_sample_by_field = {

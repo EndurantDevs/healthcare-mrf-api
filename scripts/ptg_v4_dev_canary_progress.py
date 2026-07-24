@@ -91,7 +91,7 @@ def _progress_report(
         "distinct_progress_update_count": len(movement_samples),
         "heartbeat_update_count": len(heartbeat_samples),
         "intermediate_update_count": sum(
-            1 for sample in movement_samples if float(sample["pct"]) < 100
+            1 for sample in movement_samples if _is_intermediate_progress(sample)
         ),
         "maximum_observed_update_gap_seconds": _maximum_update_gap(
             movement_samples
@@ -148,6 +148,9 @@ def _progress_updates(raw_samples: Any, failures: list[str]) -> list[dict[str, A
             "stage_ordinal": _optional_int(progress.get("stage_ordinal")),
             "compiler_phase": progress.get("compiler_phase") or progress.get("phase"),
             "unit": progress.get("unit"),
+            "basis": progress.get("basis") or progress.get("scanner_progress_basis"),
+            "denominator_state": progress.get("denominator_state"),
+            "counters": _mapping(progress.get("counters")),
             "event_seq": _optional_int(progress.get("event_seq")),
             "progress_seq": _optional_int(progress.get("progress_seq")),
         }
@@ -211,9 +214,6 @@ def _validate_progress_updates(
         failures.append("progress timeline has too few distinct updates")
         return
     required_fields = (
-        "pct",
-        "done",
-        "total",
         "stage_ordinal",
         "event_seq",
         "progress_seq",
@@ -225,8 +225,12 @@ def _validate_progress_updates(
     ):
         failures.append("progress timeline contains incomplete numeric evidence")
         return
-    intermediate_count = sum(1 for sample in samples if float(sample["pct"]) < 100)
-    if intermediate_count < minimum_intermediate_updates:
+    for sample in samples:
+        _validate_progress_shape(sample, failures)
+    if (
+        sum(1 for sample in samples if _is_intermediate_progress(sample))
+        < minimum_intermediate_updates
+    ):
         failures.append("progress timeline lacks two intermediate updates")
     _validate_boundary_gap(
         started_at,
@@ -272,13 +276,49 @@ def _validate_progress_pair(
     maximum_gap_seconds: float,
     failures: list[str],
 ) -> None:
-    for field_name in ("pct", "stage_ordinal", "event_seq", "progress_seq"):
+    for field_name in ("stage_ordinal", "event_seq", "progress_seq"):
         if float(current[field_name]) < float(previous[field_name]):
             failures.append(f"progress timeline {field_name} moved backward")
-    if _work_counter_context(previous) == _work_counter_context(current) and (
-        int(current["done"]) < int(previous["done"])
+    previous_pct = _optional_float(previous.get("pct"))
+    current_pct = _optional_float(current.get("pct"))
+    if (
+        previous_pct is not None
+        and current_pct is not None
+        and current_pct < previous_pct
+    ):
+        failures.append("progress timeline pct moved backward")
+    is_same_work_context = _work_counter_context(previous) == _work_counter_context(
+        current
+    )
+    previous_done = _optional_int(previous.get("done"))
+    current_done = _optional_int(current.get("done"))
+    if (
+        is_same_work_context
+        and previous_done is not None
+        and current_done is not None
+        and current_done < previous_done
     ):
         failures.append("progress timeline done moved backward within one phase")
+    are_both_indeterminate = (
+        is_same_work_context
+        and _is_progress_indeterminate(previous)
+        and _is_progress_indeterminate(current)
+    )
+    has_counter_advanced = (
+        _has_counter_advanced(previous, current, failures)
+        if are_both_indeterminate
+        else False
+    )
+    if (
+        are_both_indeterminate
+        and not has_counter_advanced
+        and not (
+            previous_done is not None
+            and current_done is not None
+            and current_done > previous_done
+        )
+    ):
+        failures.append("indeterminate progress counters did not advance")
     gap_seconds = _timestamp_gap(
         previous.get("progressed_at"),
         current.get("progressed_at"),
@@ -287,6 +327,72 @@ def _validate_progress_pair(
         failures.append("progressed_at timestamps are invalid or non-increasing")
     elif gap_seconds > maximum_gap_seconds:
         failures.append("progress movement gap exceeds the configured maximum")
+
+
+def _validate_progress_shape(sample: Mapping[str, Any], failures: list[str]) -> None:
+    """Require either exact bounded work or truthful indeterminate work."""
+
+    if _is_progress_indeterminate(sample):
+        if _optional_float(sample.get("pct")) is not None:
+            failures.append(
+                "indeterminate progress falsely reports a determinate percent"
+            )
+        if _optional_int(sample.get("total")) is not None:
+            failures.append("indeterminate progress falsely reports a known total")
+        if (
+            _optional_int(sample.get("done")) is None
+            and not _numeric_counters(sample)
+        ):
+            failures.append("indeterminate progress lacks advancing work counters")
+        return
+    if any(
+        _optional_float(sample.get(field_name)) is None
+        for field_name in ("pct", "done", "total")
+    ):
+        failures.append("progress timeline contains incomplete numeric evidence")
+        return
+    if float(sample["total"]) <= 0:
+        failures.append("determinate progress total is not positive")
+
+
+def _is_intermediate_progress(sample: Mapping[str, Any]) -> bool:
+    progress_pct = _optional_float(sample.get("pct"))
+    return progress_pct is None or progress_pct < 100
+
+
+def _is_progress_indeterminate(sample: Mapping[str, Any]) -> bool:
+    denominator_state = str(sample.get("denominator_state") or "").strip().lower()
+    return (
+        denominator_state in {"unknown", "lower_bound"}
+        or _optional_int(sample.get("total")) is None
+    )
+
+
+def _numeric_counters(sample: Mapping[str, Any]) -> dict[str, float]:
+    return {
+        str(name): float(value)
+        for name, value in _mapping(sample.get("counters")).items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+
+
+def _has_counter_advanced(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+    failures: list[str],
+) -> bool:
+    previous_counters = _numeric_counters(previous)
+    current_counters = _numeric_counters(current)
+    has_advanced = False
+    for name, previous_value in previous_counters.items():
+        current_value = current_counters.get(name)
+        if current_value is None:
+            continue
+        if current_value < previous_value:
+            failures.append(f"progress timeline counter {name} moved backward")
+        elif current_value > previous_value:
+            has_advanced = True
+    return has_advanced
 
 
 def _validate_heartbeat_updates(

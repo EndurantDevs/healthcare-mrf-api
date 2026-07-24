@@ -1599,7 +1599,16 @@ def _emit_scanner_live_progress(
         and progress.work_done > 0
         and progress.work_total is None
     )
-    phase_pct = None if use_unbounded_object_progress else progress.percent
+    use_indeterminate_semantic_progress = bool(
+        not progress.is_done
+        and progress.progress_basis == "semantic_work"
+        and progress.work_total is None
+    )
+    phase_pct = (
+        None
+        if use_unbounded_object_progress or use_indeterminate_semantic_progress
+        else progress.percent
+    )
     if (
         phase_pct is None
         and progress.work_done is not None
@@ -1613,6 +1622,7 @@ def _emit_scanner_live_progress(
         progress_context_map.get("overall_progress_end_pct"),
     )
     pct = overall_pct if overall_pct is not None else phase_pct
+    pct_lower_bound = None
     object_rate = None
     if use_unbounded_object_progress:
         pct = _coerce_progress_float(
@@ -1629,6 +1639,15 @@ def _emit_scanner_live_progress(
         progress_done = progress.object_count
         progress_total = None
         progress_eta = None
+    elif use_indeterminate_semantic_progress:
+        pct_lower_bound = _coerce_progress_float(
+            progress_context_map.get("overall_progress_start_pct")
+        )
+        message, object_rate = _scanner_bounded_progress_message(phase, progress)
+        progress_unit = progress.progress_basis
+        progress_done = progress.work_done
+        progress_total = None
+        progress_eta = None
     else:
         message, object_rate = _scanner_bounded_progress_message(phase, progress)
         progress_unit = progress.progress_basis
@@ -1642,6 +1661,7 @@ def _emit_scanner_live_progress(
         "done": progress_done,
         "total": progress_total,
         "pct": pct,
+        "pct_lower_bound": pct_lower_bound,
         "phase_pct": phase_pct,
         "stage_id": phase,
         "stage_pct": phase_pct,

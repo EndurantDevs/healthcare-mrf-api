@@ -279,11 +279,6 @@ fn semantic_progress_line(
     let bytes_read = compressed_bytes_read
         .load(Ordering::Relaxed)
         .min(total_bytes);
-    let percent = if total_bytes > 0 {
-        (bytes_read as f64 / total_bytes as f64) * 100.0
-    } else {
-        0.0
-    };
     let elapsed_seconds = started_at.elapsed().as_secs_f64();
     let compressed_mib_s = if elapsed_seconds > 0.0 {
         (bytes_read as f64 / (1024.0 * 1024.0)) / elapsed_seconds
@@ -299,13 +294,12 @@ fn semantic_progress_line(
         "scan"
     };
     format!(
-        "PTG2_SCANNER_PROGRESS\tpath={}\tphase={}\tprogress_basis=semantic_work\tsemantic_work_completed={}\tcompressed_bytes={}\ttotal_bytes={}\tpercent={:.2}\tcompressed_mib_s={:.2}\telapsed_seconds={:.0}\teta_seconds=unknown\tobjects={}\tnegotiated_rates={}\tnegotiated_rates_parsed={}\tnegotiated_rates_transform_started={}\tprovider_group_union_visits={}\tprovider_npi_union_visits={}\trate_chunks_completed={}\tin_network={}\tscan_finalize_jobs_started={}\tscan_finalize_jobs_completed={}\tscan_finalize_bytes_processed={}\tscan_finalize_pairs_processed={}\tscan_finalize_chunks_sorted={}\tscan_finalize_chunks_merged={}\tscan_finalize_sort_comparisons={}\tdone=false",
+        "PTG2_SCANNER_PROGRESS\tpath={}\tphase={}\tprogress_basis=semantic_work\tsemantic_work_completed={}\tcompressed_bytes={}\ttotal_bytes={}\tpercent=unknown\tcompressed_mib_s={:.2}\telapsed_seconds={:.0}\teta_seconds=unknown\tobjects={}\tnegotiated_rates={}\tnegotiated_rates_parsed={}\tnegotiated_rates_transform_started={}\tprovider_group_union_visits={}\tprovider_npi_union_visits={}\trate_chunks_completed={}\tin_network={}\tscan_finalize_jobs_started={}\tscan_finalize_jobs_completed={}\tscan_finalize_bytes_processed={}\tscan_finalize_pairs_processed={}\tscan_finalize_chunks_sorted={}\tscan_finalize_chunks_merged={}\tscan_finalize_sort_comparisons={}\tdone=false",
         path.display(),
         phase,
         snapshot.semantic_work_completed,
         bytes_read,
         total_bytes,
-        percent,
         compressed_mib_s,
         elapsed_seconds,
         negotiated_rates,
@@ -437,6 +431,7 @@ mod tests {
         assert!(line.contains("progress_basis=semantic_work"));
         assert!(line.contains("semantic_work_completed=7"));
         assert!(line.contains("provider_group_union_visits=4"));
+        assert!(line.contains("\tpercent=unknown\t"));
         assert!(line.ends_with("done=false"));
     }
 
@@ -537,7 +532,7 @@ mod tests {
         );
 
         assert!(line.contains("\tphase=scan\t"));
-        assert!(line.contains("\tpercent=0.00\t"));
+        assert!(line.contains("\tpercent=unknown\t"));
         assert!(line.contains("\tcompressed_mib_s=0.00\t"));
     }
 }

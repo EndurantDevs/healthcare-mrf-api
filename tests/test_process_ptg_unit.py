@@ -634,6 +634,47 @@ def test_weighted_file_progress_does_not_regress(monkeypatch):
     assert events[-1]["counters"]["indexed_rates_completed"] == 900
 
 
+def test_weighted_file_progress_preserves_indeterminate_semantic_work(monkeypatch):
+    """Do not turn an unfinished semantic counter into known compressed work."""
+
+    coordinator, events = _weighted_progress_fixture(monkeypatch)
+    for completed, chunks in ((65_536, 1), (131_072, 2)):
+        coordinator.observe(
+            1,
+            {
+                "phase": "compact-serving scanner",
+                "phase_pct": 99,
+                "pct": 99,
+                "unit": "semantic_work",
+                "basis": "semantic_work",
+                "denominator_state": "unknown",
+                "done": completed,
+                "total": None,
+                "work_done": completed,
+                "work_total": None,
+                "eta_seconds": 900,
+                "counters": {"rate_chunks_completed": chunks},
+            },
+        )
+
+    first, second = events
+    assert [first["done"], second["done"]] == [65_536, 131_072]
+    assert all(event["total"] is None for event in events)
+    assert all(event["pct"] is None for event in events)
+    assert all(event["phase_pct"] is None for event in events)
+    assert all(event["stage_pct"] is None for event in events)
+    assert all(event["unit"] == "semantic_work" for event in events)
+    assert all(event["basis"] == "semantic_work" for event in events)
+    assert all(event["denominator_state"] == "unknown" for event in events)
+    assert all(event["eta_seconds"] is None for event in events)
+    assert all(
+        event["weighted_compressed_input_bytes_lower_bound"] == 0
+        for event in events
+    )
+    assert all(event["pct_lower_bound"] == 20 for event in events)
+    assert second["counters"]["rate_chunks_completed"] == 2
+
+
 def test_weighted_file_progress_zero_weight_duplicate_does_not_add_work(
     monkeypatch,
 ):
@@ -654,6 +695,130 @@ def test_weighted_file_progress_zero_weight_duplicate_does_not_add_work(
     assert events[-1]["pct"] == 30
     assert events[-1]["total"] == 100
     assert events[-1]["counters"]["files_completed"] == 1
+
+
+def test_weighted_file_progress_rejects_invalid_shapes_and_indexes(monkeypatch):
+    """Reject unusable progress plans and keep observer indexes bounded."""
+
+    constructor_arguments_by_name = {
+        "stage_start_pct": 20,
+        "stage_end_pct": 90,
+    }
+    with pytest.raises(ValueError, match="matching nonempty"):
+        ptg_progress.PTGFileProgressCoordinator(
+            [],
+            [],
+            **constructor_arguments_by_name,
+        )
+    with pytest.raises(ValueError, match="positive aggregate"):
+        ptg_progress.PTGFileProgressCoordinator(
+            [0],
+            ["zero.json.gz"],
+            **constructor_arguments_by_name,
+        )
+    with pytest.raises(ValueError, match="greater than its start"):
+        ptg_progress.PTGFileProgressCoordinator(
+            [1],
+            ["source.json.gz"],
+            stage_start_pct=20,
+            stage_end_pct=20,
+        )
+
+    coordinator, events = _weighted_progress_fixture(monkeypatch)
+    with pytest.raises(IndexError, match="out of range"):
+        coordinator.observe(-1, {})
+
+    observer = coordinator.observer(1)
+    observer(
+        {
+            "basis": "semantic_work",
+            "denominator_state": "lower_bound",
+            "done": 17,
+        }
+    )
+    assert events[-1]["work_done"] == 17
+    assert events[-1]["work_total"] is None
+
+
+def test_file_progress_fraction_and_counter_aggregation_edges():
+    """Normalize fallback fractions and aggregate mixed counter types."""
+
+    assert ptg_progress._file_progress_fraction(
+        {"phase_pct": float("nan"), "stage_pct": 25}
+    ) == pytest.approx(0.25)
+    assert ptg_progress._file_progress_fraction(
+        {"phase_pct": None, "stage_pct": None, "done": "invalid", "total": 4}
+    ) is None
+    assert ptg_progress._file_progress_fraction({"done": 1, "total": 0}) is None
+    assert ptg_progress._file_progress_fraction({"done": 3, "total": 4}) == pytest.approx(
+        0.75
+    )
+
+    counters = ptg_progress._aggregate_file_progress_counters(
+        [
+            {"complete": False, "rows": 2, "source": "first"},
+            {
+                "complete": True,
+                "rows": 3,
+                "source": "ignored duplicate",
+                "format": "json",
+            },
+        ]
+    )
+    assert counters == {
+        "complete": True,
+        "rows": 5,
+        "source": "first",
+        "format": "json",
+    }
+
+
+def test_live_progress_attempt_fences_older_and_ambiguous_updates(monkeypatch):
+    """Reject stale retry callbacks even when their fallback attempt IDs match."""
+
+    previous_by_field = {
+        "run_id": "run-fenced",
+        "attempt_id": "run-fenced",
+        "attempt_started_at": "2026-07-23T10:00:00Z",
+        "progress_seq": 2,
+    }
+    assert (
+        live_progress._attempt_disposition(
+            {
+                "run_id": "run-fenced",
+                "attempt_id": "run-fenced",
+                "attempt_started_at": "2026-07-23T09:00:00Z",
+            },
+            previous_by_field,
+        )
+        == live_progress._ATTEMPT_REJECT
+    )
+    assert (
+        live_progress._attempt_disposition(
+            {
+                "run_id": "run-fenced",
+                "attempt_id": "run-fenced",
+                "attempt_started_at": "",
+            },
+            previous_by_field,
+        )
+        == live_progress._ATTEMPT_REJECT
+    )
+    assert live_progress._is_incoming_progress_older(
+        {"progress_seq": 1},
+        previous_by_field,
+    )
+
+    now = datetime.datetime(2026, 7, 23, 10, 0, 5)
+    monkeypatch.setattr(live_progress, "_utc_now", lambda: now)
+    monkeypatch.setattr(
+        live_progress,
+        "_read_live_progress_payload",
+        lambda _run_id: {"updated_at": "2026-07-23T10:00:04Z"},
+    )
+    assert live_progress.read_live_progress("run-fenced") == {
+        "updated_at": "2026-07-23T10:00:04Z"
+    }
 
 
 def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch):
@@ -681,6 +846,84 @@ def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch)
     assert events[0]["estimate"]["eta_seconds"] == 60
     assert process_ptg._format_duration is ptg_progress._format_duration
     assert process_ptg._maybe_log_artifact_progress is ptg_progress._maybe_log_artifact_progress
+
+
+def _bounded_progress_snapshot(
+    run_id: str,
+    attempt_started_at: str,
+) -> dict[str, object]:
+    """Return the determinate predecessor for the transition regression."""
+
+    return {
+        "run_id": run_id,
+        "attempt_id": run_id,
+        "attempt_started_at": attempt_started_at,
+        "started_at": attempt_started_at,
+        "status": "running",
+        "source": "ptg-live-progress",
+        "confidence": "live",
+        "unit": "compressed_input_bytes",
+        "basis": "weighted_compressed_input_bytes",
+        "denominator_state": "known",
+        "done": 50,
+        "total": 100,
+        "work_done": 50,
+        "work_total": 100,
+        "pct": 55,
+        "stage_pct": 50,
+        "phase_pct": 50,
+        "eta_seconds": 60,
+        "estimated_finish_at": "2026-07-23T10:01:00Z",
+        "event_seq": 1,
+        "progress_seq": 1,
+    }
+
+
+def test_live_progress_clears_stale_bounded_fields_for_semantic_work():
+    """An indeterminate update must not inherit an older numeric percent."""
+
+    run_id = "run-indeterminate-progress-fields"
+    attempt_started_at = "2026-07-23T10:00:00Z"
+    candidate = live_progress._merged_live_progress_candidate(
+        run_id=run_id,
+        context={
+            "attempt_id": run_id,
+            "attempt_started_at": attempt_started_at,
+        },
+        progress_by_field={
+            "status": "running",
+            "unit": "semantic_work",
+            "basis": "semantic_work",
+            "denominator_state": "unknown",
+            "done": 65_536,
+            "work_done": 65_536,
+            "pct_lower_bound": 20,
+            "stage_pct_lower_bound": 0,
+            "weighted_compressed_input_bytes_lower_bound": 0,
+            "counters": {"rate_chunks_completed": 1},
+        },
+        observed_at="2026-07-23T10:00:04Z",
+        now=datetime.datetime(2026, 7, 23, 10, 0, 4),
+        previous=_bounded_progress_snapshot(run_id, attempt_started_at),
+    )
+
+    assert candidate is not None
+    for field_name in (
+        "pct",
+        "stage_pct",
+        "phase_pct",
+        "total",
+        "work_total",
+        "eta_seconds",
+        "estimated_finish_at",
+    ):
+        assert field_name not in candidate
+    assert candidate["done"] == 65_536
+    assert candidate["denominator_state"] == "unknown"
+    projected = live_progress.progress_payload_from_live(candidate)
+    assert projected["pct_lower_bound"] == 20
+    assert projected["stage_pct_lower_bound"] == 0
+    assert projected["weighted_compressed_input_bytes_lower_bound"] == 0
 
 
 def test_live_progress_preserves_earliest_started_at(monkeypatch):
@@ -1643,11 +1886,21 @@ def test_rust_scanner_semantic_progress_advances_during_one_long_item(monkeypatc
             "elapsed_seconds=8\teta_seconds=unknown\tobjects=1\t"
             f"rate_chunks_completed={chunks}\tin_network=0\tdone=false",
             phase="compact-serving scanner",
-            live_progress_context={"run_id": "run-semantic-long-item"},
+            live_progress_context={
+                "run_id": "run-semantic-long-item",
+                "overall_progress_start_pct": 20,
+                "overall_progress_end_pct": 90,
+            },
         )
 
     assert [event["done"] for event in events] == [65_536, 131_072]
     assert all(event["total"] is None for event in events)
+    assert all(event["pct"] is None for event in events)
+    assert all(event["phase_pct"] is None for event in events)
+    assert all(event["stage_pct"] is None for event in events)
+    assert all(event["pct_lower_bound"] == 20 for event in events)
+    assert all(event["denominator_state"] == "unknown" for event in events)
+    assert all(event["eta_seconds"] is None for event in events)
     assert all(event["basis"] == "semantic_work" for event in events)
     assert [event["counters"]["rate_chunks_completed"] for event in events] == [1, 2]
     assert all(event["counters"]["in_network"] == 0 for event in events)
