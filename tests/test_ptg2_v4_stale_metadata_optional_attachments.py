@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from process.ptg_parts import ptg2_v4_stale_metadata_store as store
@@ -42,6 +44,12 @@ class _Database:
     @staticmethod
     def text(statement):
         return statement
+
+
+def test_row_mapping_branches():
+    assert store._row_mapping(None) is None
+    mapped_row = SimpleNamespace(_mapping={"attachment": 0})
+    assert store._row_mapping(mapped_row) == {"attachment": 0}
 
 
 def test_only_dynamic_stage_relations_are_optional():
