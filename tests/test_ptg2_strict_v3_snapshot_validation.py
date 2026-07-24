@@ -144,7 +144,7 @@ async def test_strict_v3_snapshot_validation_accepts_one_sealed_complete_binding
     monkeypatch,
 ):
     serving_index = _serving_index()
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     query = _layout_query([_layout_row(serving_index)])
     monkeypatch.setattr(snapshot_cleanup.db, "all", query)
 
@@ -177,7 +177,7 @@ async def test_strict_v3_snapshot_validation_rejects_legacy_manifest_before_quer
 ):
     table_exists = AsyncMock(return_value=True)
     query = AsyncMock()
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", table_exists)
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", table_exists)
     monkeypatch.setattr(snapshot_cleanup.db, "all", query)
 
     missing_tables, contract_errors = (
@@ -217,7 +217,7 @@ async def test_strict_v3_snapshot_validation_detects_incomplete_physical_layout(
             },
         }
     )
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", _layout_query([layout_row]))
 
     _missing_tables, contract_errors = (
@@ -242,7 +242,7 @@ async def test_strict_v3_snapshot_validation_allows_zero_npi_layout(
     serving_index = _serving_index(npi_count=0)
     row = _layout_row(serving_index)
     row["has_npi_scope"] = False
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", _layout_query([row]))
 
     _missing_tables, contract_errors = (
@@ -263,7 +263,7 @@ async def test_strict_v3_snapshot_validation_rejects_missing_or_wrong_scope_bind
     serving_index = _serving_index()
     row = _layout_row(serving_index)
     row.update({"scope_count": 2, "matching_scope_count": 0})
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", _layout_query([row]))
 
     _missing_tables, contract_errors = (
@@ -289,7 +289,7 @@ async def test_strict_v3_snapshot_validation_requires_canonical_manifest_scope(
     serving_index = _serving_index()
     serving_index["coverage_scope_id"] = coverage_scope_id
     query = AsyncMock()
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", query)
 
     _missing_tables, contract_errors = (
@@ -306,7 +306,7 @@ async def test_strict_v3_snapshot_validation_requires_canonical_manifest_scope(
 
 @pytest.mark.asyncio
 async def test_strict_v3_snapshot_validation_rejects_missing_binding(monkeypatch):
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", AsyncMock(return_value=[]))
 
     _missing_tables, contract_errors = (
@@ -360,7 +360,7 @@ async def test_strict_v3_snapshot_validation_rejects_broken_code_scope_chain(
     serving_index = _serving_index()
     row = _layout_row(serving_index)
     row.update(updates)
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", _layout_query([row]))
 
     _missing_tables, contract_errors = (
@@ -383,7 +383,7 @@ async def test_strict_v3_snapshot_validation_rejects_layout_manifest_scope_misma
     row["layout_manifest"] = {
         "serving_index": {**serving_index, "coverage_scope_id": "d" * 64}
     }
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", _layout_query([row]))
 
     _missing_tables, contract_errors = (
@@ -410,7 +410,7 @@ async def test_strict_v3_snapshot_validation_allows_empty_code_layout(monkeypatc
             "matching_code_scope_count": 0,
         }
     )
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", _layout_query([row]))
 
     _missing_tables, contract_errors = (
@@ -439,7 +439,7 @@ async def test_strict_v3_snapshot_validation_checks_audit_rows(
 ):
     serving_index = _serving_index()
     query = AsyncMock(side_effect=[[_layout_row(serving_index)], audit_rows])
-    monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(snapshot_cleanup, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(snapshot_cleanup.db, "all", query)
 
     _missing_tables, contract_errors = (

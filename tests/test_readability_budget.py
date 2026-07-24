@@ -464,6 +464,8 @@ def _baseline_with_readability_reset(snapshot, reference):
 
 
 def test_readability_reset_is_two_percent_base_anchored_and_non_repeatable(tmp_path):
+    """Reject stale, repeated, or incorrectly sized readability resets."""
+
     reference_snapshot = _synthetic_readability_snapshot(50)
     reference_baseline = readability_cli._baseline_snapshot(reference_snapshot)
     reference_path = tmp_path / "readability-base.json"

@@ -112,7 +112,7 @@ from process.provider_quality_parts.config import (
     SVI_CSV_URL_TEMPLATE,
     TEST_MAX_DOWNLOAD_BYTES,
     _benchmark_modes_for_materialization,
-    _env_bool,
+    _is_environment_enabled,
 )
 from process.provider_quality_parts.cohort_sql import (
     _cohort_sql_phase_1_build_features,
@@ -219,7 +219,7 @@ from process.provider_quality_parts.table_helpers import (
     _ensure_indexes,
     _index_name_for_table,
     _table_columns,
-    _table_exists,
+    _is_table_available,
 )
 
 logger = logging.getLogger(__name__)
@@ -283,7 +283,7 @@ def _provider_quality_rx_agg_table(classes: dict[str, type]) -> str:
 async def _ensure_provider_quality_rx_agg_table(classes: dict[str, type], schema: str, years: tuple[int, ...]) -> None:
     if not years:
         return
-    if not await _table_exists(schema, PricingProviderPrescription.__tablename__):
+    if not await _is_table_available(schema, PricingProviderPrescription.__tablename__):
         return
     table = _provider_quality_rx_agg_table(classes)
     year_values = ", ".join(str(int(year)) for year in years)
@@ -779,7 +779,7 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
     return await _build_cohort_materialization_context_impl(
         classes,
         schema,
-        table_exists=_table_exists,
+        table_exists=_is_table_available,
         table_columns=_table_columns,
     )
 
@@ -836,8 +836,8 @@ async def _materialize_quality_rows(classes: dict[str, type], schema: str, run_i
     measure_table = classes["PricingProviderQualityMeasure"].__tablename__
     domain_table = classes["PricingProviderQualityDomain"].__tablename__
     score_table = classes["PricingProviderQualityScore"].__tablename__
-    rx_table_exists = await _table_exists(schema, rx_table)
-    geo_zip_table_exists = await _table_exists(schema, geo_zip_table)
+    rx_table_exists = await _is_table_available(schema, rx_table)
+    geo_zip_table_exists = await _is_table_available(schema, geo_zip_table)
     if rx_table_exists:
         provider_rx_cte = f"""
         provider_rx AS (

@@ -141,6 +141,8 @@ async def _validate_json(session: aiohttp.ClientSession, url: str, *, max_bytes:
 
 
 async def _discover(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Discover bounded health-benefit group candidates from ASR inputs."""
+
     groups = _candidate_groups(args.start, args.end)
     timeout = aiohttp.ClientTimeout(total=None, connect=args.connect_timeout, sock_read=args.read_timeout)
     connector = aiohttp.TCPConnector(limit=args.concurrency, ttl_dns_cache=300)

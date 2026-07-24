@@ -191,7 +191,7 @@ def _install_shutdown_database_fakes(monkeypatch):
     )
     monkeypatch.setattr(
         process_attributes,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
     status_mock = AsyncMock()

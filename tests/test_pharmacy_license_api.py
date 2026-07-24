@@ -98,13 +98,13 @@ def test_pharmacy_license_parameter_helpers_cover_invalid_and_explicit_values():
         pharmacy_license._parse_date_param("2026-02-30", "as_of")
     with pytest.raises(InvalidUsage, match="must be an integer"):
         pharmacy_license._parse_int_param("many", "limit")
-    assert pharmacy_license._parse_bool_param(" YES ") is True
+    assert pharmacy_license._is_boolean_parameter_enabled(" YES ") is True
 
 
 @pytest.mark.asyncio
 async def test_pharmacy_license_table_exists_uses_qualified_relation():
     session = FakeSession([FakeResult(scalar="mrf.pharmacy_license_record")])
-    assert await pharmacy_license._table_exists(
+    assert await pharmacy_license._is_table_available(
         session,
         "pharmacy_license_record",
     ) is True
@@ -118,7 +118,7 @@ async def test_pharmacy_license_missing_tables_and_runs_fail_closed(monkeypatch)
 
     monkeypatch.setattr(
         pharmacy_license,
-        "_table_exists",
+        "_is_table_available",
         is_fake_table_missing,
     )
     with pytest.raises(NotFound, match="No pharmacy-license imports found"):
@@ -148,7 +148,7 @@ async def test_import_status_requested_run_missing(monkeypatch):
 
     monkeypatch.setattr(
         pharmacy_license,
-        "_table_exists",
+        "_is_table_available",
         is_fake_table_present,
     )
     with pytest.raises(NotFound, match="No pharmacy-license imports found"):
@@ -163,7 +163,7 @@ async def test_get_import_status_returns_aggregates(monkeypatch):
         del schema
         return True
 
-    monkeypatch.setattr(pharmacy_license, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(pharmacy_license, "_is_table_available", is_fake_table_present)
 
     request = make_request(
         [
@@ -208,7 +208,7 @@ async def test_get_coverage_returns_items(monkeypatch):
         del schema
         return True
 
-    monkeypatch.setattr(pharmacy_license, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(pharmacy_license, "_is_table_available", is_fake_table_present)
 
     request = make_request(
         [
@@ -266,7 +266,7 @@ async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypat
         del schema
         return True
 
-    monkeypatch.setattr(pharmacy_license, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(pharmacy_license, "_is_table_available", is_fake_table_present)
 
     request = make_request(
         [
@@ -342,7 +342,7 @@ async def test_pharmacy_license_inactive_disciplinary_summary_without_history(
         del schema
         return True
 
-    monkeypatch.setattr(pharmacy_license, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(pharmacy_license, "_is_table_available", is_fake_table_present)
     verified_at = datetime(2026, 7, 20, 12, 0)
     api_request = make_request(
         [

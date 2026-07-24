@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlsplit
 
 from db.connection import db
 from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir
-from process.ptg_parts.db_tables import _quote_ident, _table_exists
+from process.ptg_parts.db_tables import _quote_ident, _is_table_available
 from process.ptg_parts.domain import (
     PTG2_STATUS_BUILDING,
     PTG2_STATUS_PENDING,
@@ -307,9 +307,9 @@ async def _available_snapshot_db_artifact_ids(
 ) -> set[str]:
     if not artifact_ids:
         return set()
-    artifact_tables_are_available = await _table_exists(
+    artifact_tables_are_available = await _is_table_available(
         schema_name, "ptg2_artifact_manifest"
-    ) and await _table_exists(schema_name, "ptg2_artifact_blob_chunk")
+    ) and await _is_table_available(schema_name, "ptg2_artifact_blob_chunk")
     if not artifact_tables_are_available:
         return set()
     artifact_rows = await db.all(
@@ -420,7 +420,7 @@ async def _missing_snapshot_serving_resources(
     missing_table_names = [
         table_name
         for table_name in _STRICT_V3_SHARED_TABLE_NAMES
-        if not await _table_exists(schema_name, table_name)
+        if not await _is_table_available(schema_name, table_name)
     ]
     if missing_table_names or contract_errors:
         return missing_table_names, contract_errors

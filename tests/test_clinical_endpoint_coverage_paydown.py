@@ -63,7 +63,7 @@ def test_clinical_value_and_restriction_helpers(monkeypatch):
     assert clinical._normalize_code(" abc-1 ") == "ABC-1"
     assert clinical._decode_path_value("mesh%3AC14") == "mesh:C14"
 
-    monkeypatch.setattr(clinical, "restricted_terminology_public_enabled", lambda: False)
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: False)
     assert clinical._restricted_public_filter(clinical.code_table.c.code_system) is not None
     assert len(
         clinical._restricted_pair_filters(
@@ -75,7 +75,7 @@ def test_clinical_value_and_restriction_helpers(monkeypatch):
         clinical._raise_if_restricted_public("SNOMEDCT_US")
     clinical._raise_if_restricted_public("RXNORM")
 
-    monkeypatch.setattr(clinical, "restricted_terminology_public_enabled", lambda: True)
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: True)
     assert clinical._restricted_public_filter(clinical.code_table.c.code_system) is None
     assert clinical._restricted_pair_filters(
         clinical.crosswalk_table.c.from_system,
@@ -160,7 +160,7 @@ async def test_list_codes_filters_and_clinical_area_delegation(monkeypatch):
     assert listing_payload["query"]["system"] == "ICD10CM"
     assert [concept["code"] for concept in listing_payload["items"]] == ["I10", "I11"]
 
-    monkeypatch.setattr(clinical, "restricted_terminology_public_enabled", lambda: True)
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: True)
     empty = await clinical._list_codes(_request(_Session(_Result(scalar=None), _Result())), "condition")
     assert _payload(empty)["pagination"]["total"] == 0
 
@@ -225,7 +225,7 @@ async def test_clinical_area_concept_list_boundaries(monkeypatch):
     assert listed_payload["pagination"]["total"] == 1
     assert listed_payload["items"][0]["area_mapping_source"] == "mesh"
 
-    monkeypatch.setattr(clinical, "restricted_terminology_public_enabled", lambda: True)
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: True)
     unfiltered = await clinical._list_area_concepts_response(
         _request(_Session(_Result(scalar=0), _Result())),
         clinical_area_id="mesh:C14",
@@ -252,7 +252,7 @@ async def test_concept_listing_detail_and_not_found(monkeypatch):
         "q": "drug",
     }
 
-    monkeypatch.setattr(clinical, "restricted_terminology_public_enabled", lambda: True)
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: True)
     all_concepts = await clinical.list_concepts(_request(_Session(_Result(scalar=0), _Result())))
     assert _payload(all_concepts)["query"] == {"system": None, "code_type": None, "q": None}
 
@@ -314,7 +314,7 @@ async def test_relationship_and_crosswalk_filtered_and_unfiltered(monkeypatch):
     assert relationship_payload["pagination"]["total"] == 1
     assert relationship_payload["query"]["from_code"] == "I10"
 
-    monkeypatch.setattr(clinical, "restricted_terminology_public_enabled", lambda: True)
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: True)
     unfiltered_relationships = await clinical.list_relationships(
         _request(_Session(_Result(scalar=0), _Result()))
     )
@@ -352,7 +352,7 @@ async def test_clinical_area_routes_and_code_route_wrappers(monkeypatch):
     assert areas["items"][0]["condition_count"] == 2
     assert areas["items"][0]["treatment_count"] == 3
 
-    monkeypatch.setattr(clinical, "restricted_terminology_public_enabled", lambda: True)
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: True)
     no_areas = await clinical.list_clinical_areas(_request(_Session(_Result(scalar=0), _Result())))
     assert _payload(no_areas)["items"] == []
 

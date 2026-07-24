@@ -261,7 +261,7 @@ async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
     database = _PublishDatabase()
     _patch_publish_models(monkeypatch, live_classes)
     monkeypatch.setattr(publish_helpers, "db", database)
-    monkeypatch.setattr(publish_helpers, "_table_exists", lambda *_args: _async(True))
+    monkeypatch.setattr(publish_helpers, "_is_table_available", lambda *_args: _async(True))
     monkeypatch.setattr(
         publish_helpers,
         "_archived_identifier",
@@ -284,7 +284,7 @@ async def test_publish_refuses_a_missing_stage(monkeypatch) -> None:
     live_classes, stage_classes_by_name = _publish_classes()
     _patch_publish_models(monkeypatch, live_classes)
     monkeypatch.setattr(publish_helpers, "db", _PublishDatabase())
-    monkeypatch.setattr(publish_helpers, "_table_exists", lambda *_args: _async(False))
+    monkeypatch.setattr(publish_helpers, "_is_table_available", lambda *_args: _async(False))
     with pytest.raises(RuntimeError, match="Staging table missing"):
         await publish_helpers._publish_by_table_rename(stage_classes_by_name, "mrf")
 

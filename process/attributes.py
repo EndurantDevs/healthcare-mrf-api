@@ -55,7 +55,7 @@ class _InlineAttributeRedis:
         return type("InlineJob", (), {"job_id": f"inline_save_attributes_{self.count}"})()
 
 
-async def _table_exists(schema: str, table_name: str) -> bool:
+async def _is_table_available(schema: str, table_name: str) -> bool:
     exists = await db.scalar(
         "SELECT to_regclass(:qualified_name) IS NOT NULL",
         qualified_name=f"{schema}.{table_name}",
@@ -184,7 +184,7 @@ async def shutdown(ctx):
         obj = tables[cls.__main_table__]
         table_name = f"{db_schema}.{obj.__tablename__}"
 
-        if not await _table_exists(db_schema, obj.__tablename__):
+        if not await _is_table_available(db_schema, obj.__tablename__):
             print(f"Skipping post-processing for missing table {table_name}")
             continue
 
@@ -218,7 +218,7 @@ async def shutdown(ctx):
             obj = tables[cls.__main_table__]
             table_name = f"{db_schema}.{obj.__tablename__}"
 
-            if not await _table_exists(db_schema, obj.__tablename__):
+            if not await _is_table_available(db_schema, obj.__tablename__):
                 print(f"Skipping swap for missing table {table_name}")
                 continue
 

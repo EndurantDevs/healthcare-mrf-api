@@ -166,7 +166,7 @@ def _parse_lat_lng(row: dict) -> tuple[float | None, float | None]:
     return lat, lng
 
 
-async def _table_has_column(db_schema: str, table_name: str, column_name: str) -> bool:
+async def _has_table_column(db_schema: str, table_name: str, column_name: str) -> bool:
     return bool(
         await db.scalar(
             f"""
@@ -185,8 +185,8 @@ async def _table_has_column(db_schema: str, table_name: str, column_name: str) -
 async def _canonical_archive_table(db_schema: str) -> str | None:
     requested = archive_table_name()
     if (
-        await _table_has_column(db_schema, requested, "address_key")
-        and await _table_has_column(db_schema, requested, "geo_source")
+        await _has_table_column(db_schema, requested, "address_key")
+        and await _has_table_column(db_schema, requested, "geo_source")
     ):
         return requested
     return None
@@ -233,7 +233,7 @@ async def _backfill_hospital_coordinates_from_existing_live(stage_table: str, db
     db_schema = _validate_schema_name(db_schema)
     if stage_table == FacilityAnchor.__main_table__:
         return 0
-    if not await _table_has_column(db_schema, FacilityAnchor.__main_table__, "latitude"):
+    if not await _has_table_column(db_schema, FacilityAnchor.__main_table__, "latitude"):
         return 0
 
     return int(

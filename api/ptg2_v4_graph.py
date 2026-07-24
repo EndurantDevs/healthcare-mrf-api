@@ -1744,6 +1744,35 @@ async def _lookup_v4_heavy_member_prefixes(
     return prefixes_by_owner
 
 
+async def _lookup_v4_selected_heavy_members(
+    session: Any,
+    *,
+    snapshot_key: int,
+    schema_name: str,
+    relation_manifest: V4RelationManifest,
+    heavy_owners: Mapping[int, V4HeavyOwner],
+    per_owner_limit: int | None,
+) -> dict[int, tuple[int, ...]]:
+    """Read full heavy vectors or only their authenticated prefixes."""
+
+    if per_owner_limit is None:
+        return await _lookup_v4_heavy_members(
+            session,
+            snapshot_key=int(snapshot_key),
+            schema_name=schema_name,
+            relation_manifest=relation_manifest,
+            heavy_owners=heavy_owners,
+        )
+    return await _lookup_v4_heavy_member_prefixes(
+        session,
+        snapshot_key=int(snapshot_key),
+        schema_name=schema_name,
+        relation_manifest=relation_manifest,
+        heavy_owners=heavy_owners,
+        limit_per_owner=per_owner_limit,
+    )
+
+
 def _common_heavy_object_kind(
     heavy_owners: Mapping[int, V4HeavyOwner],
 ) -> str:
@@ -1776,10 +1805,6 @@ async def _lookup_v4_relation_members_scoped(
     ):
         raise PTG2SharedBlockError(
             "PTG V4 prefix_members_per_owner cannot be negative"
-        )
-    if max_members is not None and prefix_members_per_owner is not None:
-        raise PTG2SharedBlockError(
-            "PTG V4 aggregate and per-owner member limits are mutually exclusive"
         )
     per_owner_limit = (
         None
@@ -1839,28 +1864,22 @@ async def _lookup_v4_relation_members_scoped(
         if owner_key not in selected_heavy_owners
     )
     total_members = sum(
-        owner.member_count for owner in selected_heavy_owners.values()
+        owner.member_count
+        if per_owner_limit is None
+        else min(owner.member_count, per_owner_limit)
+        for owner in selected_heavy_owners.values()
     )
     if max_members is not None and total_members > int(max_members):
         raise PTG2SharedBlockError("PTG V4 graph selection exceeds max_members")
-    if per_owner_limit is None:
-        heavy_members = await _lookup_v4_heavy_members(
-            session,
-            snapshot_key=int(snapshot_key),
-            schema_name=schema_name,
-            relation_manifest=relation_manifest,
-            heavy_owners=selected_heavy_owners,
-        )
-    else:
-        heavy_members = await _lookup_v4_heavy_member_prefixes(
-            session,
-            snapshot_key=int(snapshot_key),
-            schema_name=schema_name,
-            relation_manifest=relation_manifest,
-            heavy_owners=selected_heavy_owners,
-            limit_per_owner=per_owner_limit,
-        )
     if not regular_owner_keys:
+        heavy_members = await _lookup_v4_selected_heavy_members(
+            session,
+            snapshot_key=int(snapshot_key),
+            schema_name=schema_name,
+            relation_manifest=relation_manifest,
+            heavy_owners=selected_heavy_owners,
+            per_owner_limit=per_owner_limit,
+        )
         return {
             owner_key: heavy_members[owner_key]
             for owner_key in normalized_owner_keys
@@ -1911,9 +1930,18 @@ async def _lookup_v4_relation_members_scoped(
             else min(member_count, per_owner_limit)
         )
         locator_by_owner[owner_key] = (member_offset, selected_member_count)
-        total_members += member_count
+        total_members += selected_member_count
         if max_members is not None and total_members > int(max_members):
             raise PTG2SharedBlockError("PTG V4 graph selection exceeds max_members")
+
+    heavy_members = await _lookup_v4_selected_heavy_members(
+        session,
+        snapshot_key=int(snapshot_key),
+        schema_name=schema_name,
+        relation_manifest=relation_manifest,
+        heavy_owners=selected_heavy_owners,
+        per_owner_limit=per_owner_limit,
+    )
 
     members_per_page = relation_manifest.members_per_page
     member_page_keys: set[int] = set()
@@ -2063,6 +2091,7 @@ async def lookup_v4_relation_member_prefixes(
     owner_keys: Iterable[int],
     schema_name: str,
     limit_per_owner: int,
+    max_members: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Resolve authenticated owner prefixes without reading complete vectors."""
 
@@ -2073,7 +2102,7 @@ async def lookup_v4_relation_member_prefixes(
             relation=relation,
             owner_keys=owner_keys,
             schema_name=schema_name,
-            max_members=None,
+            max_members=max_members,
             prefix_members_per_owner=limit_per_owner,
         )
     with v4_graph_request_scope():
@@ -2083,7 +2112,7 @@ async def lookup_v4_relation_member_prefixes(
             relation=relation,
             owner_keys=owner_keys,
             schema_name=schema_name,
-            max_members=None,
+            max_members=max_members,
             prefix_members_per_owner=limit_per_owner,
         )
 

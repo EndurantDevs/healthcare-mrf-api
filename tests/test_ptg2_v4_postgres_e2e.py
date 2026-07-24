@@ -19,7 +19,12 @@ import asyncpg
 import pytest
 import sqlalchemy as sa
 
+from api import ptg2_candidate_audit_v4 as candidate_v4
 from api import ptg2_v4_graph as graph
+from api.ptg2_candidate_audit_capacity import (
+    CandidateAuditDecodedRetentionBudget,
+)
+from api.ptg2_types import PTG2ServingTables
 from db.connection import Database
 from process.ptg_parts import ptg2_shared_publish, ptg2_v4_audit
 from process.ptg_parts import ptg2_shared_snapshot_publish as snapshot_publish
@@ -43,6 +48,7 @@ from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
 )
+from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -815,6 +821,39 @@ def _base_layout_manifest() -> dict[str, object]:
     }
 
 
+async def _prove_candidates_in_postgres(
+    database: Database,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    candidate_keys_by_npi: dict[int, set[int]],
+) -> dict[int, tuple[int, ...]]:
+    """Execute the bounded candidate graph proof against durable V4 rows."""
+
+    serving_tables = PTG2ServingTables(
+        arch_version="postgres_binary_v3",
+        shared_snapshot_key=snapshot_key,
+        storage_generation="shared_blocks_v4",
+        cold_lookup_contract="ptg_v3_cold_v2",
+        shared_block_layout="packed_snapshot_maps_v4",
+        source_count=1,
+        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(),
+    )
+    retention_budget = CandidateAuditDecodedRetentionBudget()
+    retention_budget.claim(
+        candidate_v4._candidate_map_retained_bytes(candidate_keys_by_npi),
+        category="the candidate provider map",
+    )
+    async with database.transaction() as session:
+        return await candidate_v4.prove_v4_candidate_sets(
+            session,
+            serving_tables,
+            candidate_keys_by_npi,
+            retention_budget,
+            schema_name=schema_name,
+        )
+
+
 @pytest.mark.asyncio
 async def test_v4_storage_relation_lookup_accepts_bound_identifiers_on_postgres() -> None:
     """Prove the canary storage catalog lookup against real PostgreSQL."""
@@ -1037,6 +1076,13 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
             provider_set_key: (0,)
             for provider_set_key in range(1, _SET_COUNT + 1)
         }
+        candidate_sets = await _prove_candidates_in_postgres(
+            database,
+            schema_name=schema_name,
+            snapshot_key=sealed.snapshot_key,
+            candidate_keys_by_npi={_NPI: {1, _SET_COUNT}},
+        )
+        assert candidate_sets == {_NPI: (1, _SET_COUNT)}
         assert set().union(*(set(groups) for groups in pattern_groups.values())) == set(
             expected_groups
         )
@@ -1270,6 +1316,19 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
             (0, 1): True,
             (1, 0): True,
             (1, 1): False,
+        }
+        candidate_sets = await _prove_candidates_in_postgres(
+            database,
+            schema_name=schema_name,
+            snapshot_key=sealed.snapshot_key,
+            candidate_keys_by_npi={
+                1_111_111_111: {0, 1},
+                2_222_222_222: {0, 1},
+            },
+        )
+        assert candidate_sets == {
+            1_111_111_111: (1,),
+            2_222_222_222: (0,),
         }
 
         persisted_relations = {

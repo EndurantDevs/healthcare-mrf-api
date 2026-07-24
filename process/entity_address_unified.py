@@ -920,7 +920,7 @@ def _defer_publish_validation() -> bool:
     )
 
 
-def _aggregate_source_record_ids() -> bool:
+def _should_aggregate_source_record_ids() -> bool:
     return _env_bool(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SOURCE_RECORD_IDS",
         DEFAULT_AGGREGATE_SOURCE_RECORD_IDS,
@@ -928,7 +928,7 @@ def _aggregate_source_record_ids() -> bool:
 
 
 def _source_record_ids_select_sql() -> str:
-    if _aggregate_source_record_ids():
+    if _should_aggregate_source_record_ids():
         return (
             "ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)"
             "::varchar[] AS source_record_ids"
@@ -1019,7 +1019,7 @@ def _post_publish_index_plan(
     return statements, skipped_indexes
 
 
-def _stage_index_enabled(stage_cls, index: dict) -> bool:
+def _is_stage_index_enabled(stage_cls, index: dict) -> bool:
     if _is_support_code_location_index(stage_cls, index):
         return _env_bool(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES",
@@ -1179,7 +1179,7 @@ async def _create_stage_indexes(
     statements: list[tuple[str, str]] = []
     for index in indexes:
         index_name = index.get("name", "_".join(index.get("index_elements")))
-        if not _stage_index_enabled(stage_cls, index):
+        if not _is_stage_index_enabled(stage_cls, index):
             skipped_indexes = phase_context.setdefault("skipped_stage_indexes", [])
             skipped_indexes.append(f"{stage_cls.__tablename__}.{index_name}")
             continue
@@ -2007,7 +2007,7 @@ async def _drop_stage_artifacts(
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table_name};")
 
 
-async def _table_exists(db_schema: str, table_name: str) -> bool:
+async def _is_table_available(db_schema: str, table_name: str) -> bool:
     return bool(await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}') IS NOT NULL;"))
 
 
@@ -2034,7 +2034,7 @@ async def _ensure_entity_address_unified_live_columns(
     db_schema: str,
     table_name: str = EntityAddressUnified.__main_table__,
 ) -> None:
-    if not await _table_exists(db_schema, table_name):
+    if not await _is_table_available(db_schema, table_name):
         return
     existing_rows = await db.all(
         """
@@ -2060,7 +2060,11 @@ async def _ensure_entity_address_unified_live_columns(
         )
 
 
-async def _support_bridge_reuse_available(db_schema: str, *, build_network_bridge: bool) -> bool:
+async def _is_support_bridge_reuse_available(
+    db_schema: str,
+    *,
+    build_network_bridge: bool,
+) -> bool:
     bridge_models: list[type] = [
         EntityAddressPlanBridge,
         EntityAddressProcedureBridge,
@@ -2069,7 +2073,7 @@ async def _support_bridge_reuse_available(db_schema: str, *, build_network_bridg
     if build_network_bridge:
         bridge_models.append(EntityAddressNetworkBridge)
     for model in bridge_models:
-        if not await _table_exists(db_schema, model.__main_table__):
+        if not await _is_table_available(db_schema, model.__main_table__):
             return False
     return True
 
@@ -2125,8 +2129,8 @@ def _promote_approved_facility_anchor_npi_candidates_sql(db_schema: str) -> str:
 
 async def _promote_approved_facility_anchor_npi_candidates(db_schema: str) -> int:
     if not (
-        await _table_exists(db_schema, "facility_anchor_npi_candidate")
-        and await _table_exists(db_schema, "facility_anchor_npi_override")
+        await _is_table_available(db_schema, "facility_anchor_npi_candidate")
+        and await _is_table_available(db_schema, "facility_anchor_npi_override")
     ):
         return 0
     return int(
@@ -2648,7 +2652,7 @@ def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
 
 
 async def _latest_provider_directory_partial_scope(db_schema: str) -> tuple[str | None, list[str], list[str]]:
-    if not await _table_exists(db_schema, "provider_directory_source"):
+    if not await _is_table_available(db_schema, "provider_directory_source"):
         return None, [], []
     row = await db.first(_latest_provider_directory_partial_scope_sql(db_schema))
     if not row:
@@ -5343,7 +5347,7 @@ async def _validate_publish_integrity(
     archive_coordinate_mismatch_rows = 0
     archive_missing_coordinate_rows = 0
     archive_identity_mismatch_rows = 0
-    if await _table_exists(db_schema, "address_archive_v2"):
+    if await _is_table_available(db_schema, "address_archive_v2"):
         (
             unresolved_merged_into_rows,
             archive_coordinate_mismatch_rows,
@@ -5504,7 +5508,7 @@ async def _validate_publish_integrity(
         if model is EntityAddressEvidence:
             continue
         bridge_table = support_stage_cls.__tablename__
-        if not await _table_exists(db_schema, bridge_table):
+        if not await _is_table_available(db_schema, bridge_table):
             failures.append(f"support stage table {bridge_table} is missing")
             bridge_orphans[bridge_table] = -1
             continue
@@ -10305,8 +10309,8 @@ async def process_data(ctx, task=None):
     context["refresh_mode"] = refresh_mode
     context["partial_provider_directory_refresh"] = partial_provider_directory_refresh
     context["partial_provider_directory_scope"] = provider_directory_partial_scope
-    aggregate_source_record_ids = _aggregate_source_record_ids()
-    context["aggregate_source_record_ids"] = aggregate_source_record_ids
+    should_aggregate_source_record_ids = _should_aggregate_source_record_ids()
+    context["aggregate_source_record_ids"] = should_aggregate_source_record_ids
     serving_only_refresh = partial_provider_directory_refresh or (
         not partial_source_refresh
         and _task_bool_or_env(
@@ -10343,7 +10347,7 @@ async def process_data(ctx, task=None):
         )
         context["unlogged_stage"] = unlogged_stage
         if reuse_stage:
-            if not await _table_exists(db_schema, stage_table):
+            if not await _is_table_available(db_schema, stage_table):
                 raise RuntimeError(
                     f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE requested, "
                     f"but {db_schema}.{stage_table} does not exist"
@@ -10393,7 +10397,7 @@ async def process_data(ctx, task=None):
         "provider_directory_dataset_resource",
         "address_archive_v2",
     ]
-    available = {table: await _table_exists(db_schema, table) for table in required_checks}
+    available = {table: await _is_table_available(db_schema, table) for table in required_checks}
     for table_name in (
         "npi_address",
         "doctor_clinician_address",
@@ -10515,7 +10519,7 @@ async def process_data(ctx, task=None):
     )
     affected_group_table: str | None = None
     if partial_provider_directory_refresh:
-        if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
+        if not await _is_table_available(db_schema, EntityAddressUnified.__main_table__):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial refresh requested, but the live "
                 "entity_address_unified table does not exist; run refresh_mode=full first."
@@ -10744,7 +10748,7 @@ async def process_data(ctx, task=None):
         reuse_raw_stage = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE", False)
 
         if reuse_raw_stage:
-            if not await _table_exists(db_schema, raw_table):
+            if not await _is_table_available(db_schema, raw_table):
                 raise RuntimeError(
                     f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE requested, "
                     f"but {db_schema}.{raw_table} does not exist"
@@ -11070,7 +11074,7 @@ async def process_data(ctx, task=None):
     elif chunked_load:
         raw_table = _raw_stage_table_name(stage_table)
         context["stage_reused"] = True
-        if not await _table_exists(db_schema, raw_table):
+        if not await _is_table_available(db_schema, raw_table):
             raw_table = None
         if run_id:
             stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
@@ -11477,7 +11481,7 @@ async def process_data(ctx, task=None):
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS",
             DEFAULT_COMPACT_SOURCE_RECORD_IDS,
         )
-        and aggregate_source_record_ids
+        and should_aggregate_source_record_ids
         and not context.get("hot_row_source_record_ids_compacted")
     ):
         if run_id:
@@ -11513,12 +11517,12 @@ async def process_data(ctx, task=None):
             )
 
     if partial_provider_directory_refresh and context.get("partial_provider_directory_replacement_publish"):
-        if not affected_group_table or not await _table_exists(db_schema, affected_group_table):
+        if not affected_group_table or not await _is_table_available(db_schema, affected_group_table):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
                 "the affected group table while composing the replacement stage."
             )
-        if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
+        if not await _is_table_available(db_schema, EntityAddressUnified.__main_table__):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
                 "the live entity_address_unified table to exist."
@@ -11842,7 +11846,7 @@ async def shutdown(ctx):
     if is_partial_provider_directory_refresh and context.get(
         "partial_provider_directory_replacement_publish"
     ):
-        if not coordinate_scope_table or not await _table_exists(db_schema, coordinate_scope_table):
+        if not coordinate_scope_table or not await _is_table_available(db_schema, coordinate_scope_table):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
                 "the affected location scope through staged coordinate backfill."
@@ -11857,7 +11861,7 @@ async def shutdown(ctx):
         os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", str(DEFAULT_MIN_ROWS))
     )
     previous_rows = 0
-    live_table_exists = await _table_exists(db_schema, EntityAddressUnified.__main_table__)
+    live_table_exists = await _is_table_available(db_schema, EntityAddressUnified.__main_table__)
     if live_table_exists:
         previous_rows = int(
             await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{EntityAddressUnified.__main_table__};")
@@ -11937,7 +11941,7 @@ async def shutdown(ctx):
         and not is_partial_provider_directory_refresh
         and _defer_publish_validation()
     )
-    if await _table_exists(db_schema, "address_archive_v2"):
+    if await _is_table_available(db_schema, "address_archive_v2"):
         archive_coordinate_same_key_backfill_rows = await _run_sql_phase(
             _backfill_archive_coordinates_sql(
                 db_schema,
@@ -12052,7 +12056,7 @@ async def shutdown(ctx):
         context["publish_validation"] = publish_validation
 
     if partial_support_patch and (
-        not affected_group_table or not await _table_exists(db_schema, affected_group_table)
+        not affected_group_table or not await _is_table_available(db_schema, affected_group_table)
     ):
         raise RuntimeError(
             "entity-address-unified support patch publish requires "

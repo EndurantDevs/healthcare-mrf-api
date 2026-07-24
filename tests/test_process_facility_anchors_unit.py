@@ -105,7 +105,7 @@ async def test_backfill_hospital_coordinates_uses_existing_live_table(monkeypatc
             calls.append(("status", sql))
             return 7
 
-    monkeypatch.setattr(anchors_module, "_table_has_column", has_table_column)
+    monkeypatch.setattr(anchors_module, "_has_table_column", has_table_column)
     monkeypatch.setattr(anchors_module, "db", FakeDb())
 
     updated = await anchors_module._backfill_hospital_coordinates_from_existing_live(

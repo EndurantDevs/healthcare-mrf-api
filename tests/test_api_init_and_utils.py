@@ -11,13 +11,13 @@ from api.utils import square_poly
 
 
 def test_init_api_registers_group(monkeypatch):
+    """Register the grouped public API blueprint once."""
     calls_by_name = {}
 
     fake_db = types.SimpleNamespace(init_app=lambda app: calls_by_name.setdefault("init", True))
     api_module = importlib.import_module("api.__init__")
     monkeypatch.setattr(api_module, "db", fake_db)
     monkeypatch.setitem(init_api.__globals__, "db", fake_db)
-
     class FakeApp:
         def __init__(self):
             self.config = {}

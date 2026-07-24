@@ -176,7 +176,7 @@ async def test_shutdown_aborts_when_stage_rows_below_min(monkeypatch, places_mod
             __tablename__=f"{cls.__tablename__}_{suffix}",
         ),
     )
-    monkeypatch.setattr(places_module, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(places_module, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(places_module.db, "scalar", AsyncMock(return_value=12))
     monkeypatch.setenv("HLTHPRT_PLACES_ZCTA_MIN_ROWS", "500")
 

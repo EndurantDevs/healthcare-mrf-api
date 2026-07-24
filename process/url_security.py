@@ -28,7 +28,7 @@ class UnsafeUrlError(ValueError):
     """Raised when a caller-supplied URL is not safe to fetch server-side."""
 
 
-def _allow_local() -> bool:
+def _is_local_allowed() -> bool:
     return str(os.getenv(FETCH_ALLOW_LOCAL_ENV, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -48,7 +48,7 @@ def fetch_max_bytes(default: int) -> int:
 def assert_public_ip(ip: ipaddress._BaseAddress) -> None:
     """Reject loopback and private destination addresses."""
     if ip.is_loopback or ip.is_private:
-        if _allow_local():
+        if _is_local_allowed():
             return
         raise UnsafeUrlError(f"non-public IP address is not allowed: {ip}")
     # not is_global also catches ranges the flag checks miss, e.g. CGNAT 100.64.0.0/10
@@ -63,7 +63,7 @@ def _validate_scheme_and_host(url: str) -> tuple[str, int]:
     if not parsed.hostname:
         raise UnsafeUrlError("URL host is required")
     hostname = parsed.hostname.strip().lower()
-    if not _allow_local() and (hostname in {"localhost", "0.0.0.0"} or hostname.endswith(".local")):
+    if not _is_local_allowed() and (hostname in {"localhost", "0.0.0.0"} or hostname.endswith(".local")):
         raise UnsafeUrlError("local hosts are not allowed")
     return hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
 

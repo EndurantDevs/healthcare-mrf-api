@@ -181,9 +181,9 @@ async def test_quality_table_introspection_handles_present_and_missing_values(
     quality_database = _QualityDatabase()
     monkeypatch.setattr(table_helpers, "db", quality_database)
     quality_database.scalar_result = object()
-    assert await table_helpers._table_exists("mrf", "quality")
+    assert await table_helpers._is_table_available("mrf", "quality")
     quality_database.scalar_result = None
-    assert not await table_helpers._table_exists("mrf", "missing")
+    assert not await table_helpers._is_table_available("mrf", "missing")
     quality_database.column_rows = [
         SimpleNamespace(column_name=" score "),
         SimpleNamespace(column_name=None),

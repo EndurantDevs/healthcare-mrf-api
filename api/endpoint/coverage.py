@@ -41,7 +41,7 @@ def _qualified_table_name(table) -> str:
     return f"{schema}.{table.name}"
 
 
-async def _table_exists(session, table) -> bool:
+async def _is_table_available(session, table) -> bool:
     result = await session.execute(
         text("SELECT to_regclass(:name)"),
         {"name": _qualified_table_name(table)},
@@ -90,7 +90,7 @@ async def coverage_statistics(request):
     ]
     table_exists: dict[str, bool] = {}
     for table in tracked_tables:
-        table_exists[table.name] = await _table_exists(session, table)
+        table_exists[table.name] = await _is_table_available(session, table)
 
     payload = {
         "marketplace_plans": 0,

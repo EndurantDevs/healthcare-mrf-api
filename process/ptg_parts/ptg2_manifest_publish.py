@@ -35,7 +35,7 @@ from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     register_attempt_stage_tables,
 )
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
-                                         _has_rows_in_table, _table_exists)
+                                         _has_rows_in_table, _is_table_available)
 from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
@@ -1828,7 +1828,7 @@ async def _build_manifest_provider_group_location_table(
     provider_group_location_table: str,
 ) -> str | None:
     """Materialize provider-group locations from unified addresses for manifest serving."""
-    if not await _table_exists(schema_name, provider_group_member_table):
+    if not await _is_table_available(schema_name, provider_group_member_table):
         return None
     await _create_provider_group_location_table(
         schema_name=schema_name,
@@ -1905,14 +1905,14 @@ async def _materialize_manifest_provider_group_rate_scope(
 ) -> str | None:
     """Persist plan/code/provider-group membership for location filtering."""
 
-    if not await _table_exists(schema_name, provider_set_component_table):
+    if not await _is_table_available(schema_name, provider_set_component_table):
         return None
-    if not await _table_exists(schema_name, serving_table):
+    if not await _is_table_available(schema_name, serving_table):
         return None
     if lean_provider_key_layout and (
         not provider_set_dictionary_table
-        or not await _table_exists(schema_name, provider_set_dictionary_table)
-        or not await _table_exists(schema_name, code_count_table)
+        or not await _is_table_available(schema_name, provider_set_dictionary_table)
+        or not await _is_table_available(schema_name, code_count_table)
     ):
         return None
 
@@ -2156,7 +2156,7 @@ async def _rewrite_price_atom_lean_dictionary(
     price_atom_dictionary_table: str,
 ) -> dict[str, Any] | None:
     """Rewrite an existing price-atom table to a lean keyed layout."""
-    if not await _table_exists(schema_name, price_atom_table):
+    if not await _is_table_available(schema_name, price_atom_table):
         return None
 
     temporary_storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
@@ -2706,7 +2706,7 @@ async def _build_direct_lean_code_counts(
     code_count_stage_table: str | None = None,
 ) -> None:
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} CASCADE;")
-    if code_count_stage_table and await _table_exists(schema_name, code_count_stage_table):
+    if code_count_stage_table and await _is_table_available(schema_name, code_count_stage_table):
         await db.status(
             f"""
             CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} AS
@@ -2750,7 +2750,7 @@ async def _build_direct_lean_provider_sets(
     await db.status(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} CASCADE;"
     )
-    if provider_set_dictionary_stage_table and await _table_exists(schema_name, provider_set_dictionary_stage_table):
+    if provider_set_dictionary_stage_table and await _is_table_available(schema_name, provider_set_dictionary_stage_table):
         await db.status(
             f"""
             CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} AS

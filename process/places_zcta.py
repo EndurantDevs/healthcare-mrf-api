@@ -269,7 +269,7 @@ async def startup(ctx):  # pragma: no cover
     )
 
 
-async def _table_exists(schema: str, table_name: str) -> bool:
+async def _is_table_available(schema: str, table_name: str) -> bool:
     exists = await db.scalar(f"SELECT to_regclass('{schema}.{table_name}');")
     return bool(exists)
 
@@ -288,7 +288,7 @@ async def shutdown(ctx):  # pragma: no cover
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(PricingPlacesZcta, import_date)
 
-    if not await _table_exists(db_schema, stage_cls.__tablename__):
+    if not await _is_table_available(db_schema, stage_cls.__tablename__):
         raise RuntimeError(
             f"Staging table {db_schema}.{stage_cls.__tablename__} is missing; cannot finalize PLACES publish."
         )

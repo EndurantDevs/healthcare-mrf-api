@@ -292,7 +292,7 @@ async def test_provider_directory_source_fetch_keeps_endpoint_identity(monkeypat
             ]
 
     execute_source_query = AsyncMock(return_value=SourceDetailResult())
-    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(npi_module, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_source_query)
 
     source_details = await npi_module._fetch_provider_directory_source_detail_map(
@@ -320,7 +320,7 @@ async def test_provider_directory_overlay_fetch_projects_coordinates(monkeypatch
         captured_sql_statements.append(str(stmt))
         return FakeResult()
 
-    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(npi_module, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(npi_module, "_table_columns", AsyncMock(return_value={"lat", "long"}))
     monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
 
@@ -350,7 +350,7 @@ async def test_provider_directory_overlay_fails_closed_without_visibility_tables
         captured_sql_statements.append(str(stmt))
         return FakeResult()
 
-    monkeypatch.setattr(npi_module, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(npi_module, "_is_table_available", is_fake_table_present)
     monkeypatch.setattr(npi_module, "_table_columns", AsyncMock(return_value=set()))
     monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
 
@@ -372,7 +372,7 @@ async def test_provider_directory_overlay_fetch_tolerates_old_overlay_schema(mon
         captured_sql_statements.append(str(stmt))
         return FakeResult()
 
-    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(npi_module, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(npi_module, "_table_columns", AsyncMock(return_value=set()))
     monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
 

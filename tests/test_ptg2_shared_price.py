@@ -233,7 +233,7 @@ async def test_lean_price_atom_skips_missing_stage(monkeypatch):
     monkeypatch.setattr(manifest_publish.db, "status", status)
     monkeypatch.setattr(
         manifest_publish,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=False),
     )
 
@@ -256,7 +256,7 @@ async def test_lean_price_atom_does_not_repeat_numeric_rate_conversion(monkeypat
     monkeypatch.setattr(manifest_publish.db, "all", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         manifest_publish,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
 
@@ -307,7 +307,7 @@ async def test_lean_price_atom_respects_logged_stage_override(monkeypatch):
     monkeypatch.setattr(manifest_publish.db, "all", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         manifest_publish,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
 
@@ -332,7 +332,7 @@ async def test_lean_price_atom_rejects_dictionary_hash_collisions(monkeypatch):
     monkeypatch.setattr(manifest_publish.db, "all", all_rows)
     monkeypatch.setattr(
         manifest_publish,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
 
@@ -362,7 +362,7 @@ async def test_lean_price_atom_v1_keeps_and_indexes_dictionary(monkeypatch):
     monkeypatch.setattr(manifest_publish.db, "all", all_rows)
     monkeypatch.setattr(
         manifest_publish,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
@@ -398,7 +398,7 @@ async def test_lean_price_atom_v2_drops_all_constant_dictionary(monkeypatch):
     )
     monkeypatch.setattr(
         manifest_publish,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
 

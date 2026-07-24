@@ -448,7 +448,7 @@ FFS_RESOURCE_BUNDLE_SPECS = tuple(spec for spec in ENROLLMENT_DATASET_SPECS if s
 PROCESSING_CLASSES = tuple(spec["model"] for spec in ENROLLMENT_DATASET_SPECS) + (ProviderEnrichmentSummary,)
 
 
-async def _table_exists(schema: str, table: str) -> bool:
+async def _is_table_available(schema: str, table: str) -> bool:
     exists = await db.scalar(f"SELECT to_regclass('{schema}.{table}');")
     return bool(exists)
 
@@ -1435,7 +1435,7 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
                NULL::int AS medicare_claim_rows
          WHERE FALSE
     """
-    if await _table_exists(db_schema, PricingProvider.__tablename__):
+    if await _is_table_available(db_schema, PricingProvider.__tablename__):
         pricing_cte = f"""
             SELECT
                 npi::bigint AS npi,
@@ -1671,7 +1671,7 @@ async def shutdown(ctx):  # pragma: no cover
     for cls in processing_classes:
         stage_obj = make_class(cls, import_date)
         staging_table_by_name[cls.__main_table__] = stage_obj
-        if not await _table_exists(db_schema, stage_obj.__tablename__):
+        if not await _is_table_available(db_schema, stage_obj.__tablename__):
             raise RuntimeError(
                 f"Staging table {db_schema}.{stage_obj.__tablename__} is missing; "
                 "cannot finalize provider-enrichment publish."

@@ -151,18 +151,18 @@ def _pharmacy_address_table_sql(source: str | None = None) -> str:
     return "mrf.npi_address"
 
 
-def _pharmacy_address_is_unified(address_table_sql: str) -> bool:
+def _is_pharmacy_address_unified(address_table_sql: str) -> bool:
     return address_table_sql.endswith(".entity_address_unified")
 
 
 def _pharmacy_address_zip5_expr(alias: str, address_table_sql: str) -> str:
-    if _pharmacy_address_is_unified(address_table_sql):
+    if _is_pharmacy_address_unified(address_table_sql):
         return f"{alias}.zip5"
     return f"LEFT(COALESCE({alias}.postal_code, ''), 5)"
 
 
 def _pharmacy_address_order_expr(alias: str, address_table_sql: str) -> str:
-    if _pharmacy_address_is_unified(address_table_sql):
+    if _is_pharmacy_address_unified(address_table_sql):
         return (
             f"{alias}.npi, ({alias}.telephone_number IS NOT NULL) DESC, "
             f"({alias}.address_precision = 'street') DESC, {alias}.source_count DESC NULLS LAST, "
@@ -171,7 +171,7 @@ def _pharmacy_address_order_expr(alias: str, address_table_sql: str) -> str:
     return f"{alias}.npi, ({alias}.telephone_number IS NOT NULL) DESC, {alias}.checksum ASC"
 
 
-async def _table_exists(session, table) -> bool:
+async def _is_table_available(session, table) -> bool:
     qualified = _qualified_table_name(table)
     now = time.monotonic()
     cached = _TABLE_EXISTS_CACHE.get(qualified)
@@ -190,7 +190,7 @@ async def _resolve_pharmacy_address_table_sql(session) -> str:
     source = _address_serving_source()
     if source != ADDRESS_SERVING_SOURCE_UNIFIED:
         return _pharmacy_address_table_sql(ADDRESS_SERVING_SOURCE_LEGACY)
-    if await _table_exists(session, EntityAddressUnified.__table__):
+    if await _is_table_available(session, EntityAddressUnified.__table__):
         return _pharmacy_address_table_sql(ADDRESS_SERVING_SOURCE_UNIFIED)
     return _pharmacy_address_table_sql(ADDRESS_SERVING_SOURCE_LEGACY)
 
@@ -253,7 +253,7 @@ def _parse_order(value: str | None, *, default: str) -> str:
     return order
 
 
-def _parse_bool_param(value: str | None, *, default: bool = False) -> bool:
+def _is_boolean_parameter_enabled(value: str | None, *, default: bool = False) -> bool:
     if value in (None, "", "null"):
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
@@ -699,7 +699,7 @@ async def _query_chain_summary(
     names: list[str],
     include_states: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], bool]:
-    has_staffing_helper = await _table_exists(session, NPIPhoneStaffing.__table__)
+    has_staffing_helper = await _is_table_available(session, NPIPhoneStaffing.__table__)
     address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     sql, params = _build_chain_summary_sql(
         names=names,
@@ -947,7 +947,7 @@ def _pharmacy_state_stats_methodology(*, staffing_helper_available: bool) -> dic
     }
 
 async def _query_pharmacy_state_stats(session) -> tuple[list[dict[str, Any]], bool]:
-    has_staffing_helper = await _table_exists(session, NPIPhoneStaffing.__table__)
+    has_staffing_helper = await _is_table_available(session, NPIPhoneStaffing.__table__)
     address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     sql = _build_pharmacy_state_stats_sql(
         has_staffing_helper=has_staffing_helper,
@@ -1513,9 +1513,9 @@ async def _query_market_summaries(
     market_id: str | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Query market summaries."""
-    has_partd = await _table_exists(session, PartDPharmacyActivity.__table__)
-    has_license = await _table_exists(session, PharmacyLicenseRecord.__table__)
-    has_other_id = await _table_exists(session, NPIDataOtherIdentifier.__table__)
+    has_partd = await _is_table_available(session, PartDPharmacyActivity.__table__)
+    has_license = await _is_table_available(session, PharmacyLicenseRecord.__table__)
+    has_other_id = await _is_table_available(session, NPIDataOtherIdentifier.__table__)
     address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     count_sql, data_sql, params = _build_market_sql(
         scope=scope,
@@ -1614,9 +1614,9 @@ async def _query_market_summaries(
 
 async def _fetch_pharmacy_context(session, *, npi: int, as_of: datetime.date) -> dict[str, Any] | None:
     """Fetch pharmacy context."""
-    has_partd = await _table_exists(session, PartDPharmacyActivity.__table__)
-    has_license = await _table_exists(session, PharmacyLicenseRecord.__table__)
-    has_other_id = await _table_exists(session, NPIDataOtherIdentifier.__table__)
+    has_partd = await _is_table_available(session, PartDPharmacyActivity.__table__)
+    has_license = await _is_table_available(session, PharmacyLicenseRecord.__table__)
+    has_other_id = await _is_table_available(session, NPIDataOtherIdentifier.__table__)
     partd_table = _qualified_table_name(PartDPharmacyActivity.__table__)
     license_table = _qualified_table_name(PharmacyLicenseRecord.__table__)
     other_id_table = _qualified_table_name(NPIDataOtherIdentifier.__table__)
@@ -1830,7 +1830,7 @@ async def list_pharmacy_markets(request):
     sort = _parse_sort(args.get("sort"), default="access_score")
     order = _parse_order(args.get("order"), default="desc")
     as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _parse_bool_param(args.get("include_staffing"), default=False)
+    include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
     chain = _canonical_chain(args.get("chain"))
 
     total, items = await _query_market_summaries(
@@ -1883,7 +1883,7 @@ async def get_pharmacy_market_by_id(request, market_id):
     if scope not in _ALLOWED_SCOPES:
         raise InvalidUsage("Unsupported market_id scope")
     as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _parse_bool_param(request.args.get("include_staffing"), default=False)
+    include_staffing = _is_boolean_parameter_enabled(request.args.get("include_staffing"), default=False)
     total, items = await _query_market_summaries(
         session,
         scope=scope,
@@ -1939,7 +1939,7 @@ async def list_pharmacy_access_rankings(request):
 
     scope = _parse_scope(args.get("scope"), default=default_scope)
     as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _parse_bool_param(args.get("include_staffing"), default=False)
+    include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
     chain = _canonical_chain(args.get("chain"))
     total, items = await _query_market_summaries(
         session,
@@ -1984,7 +1984,7 @@ async def get_pharmacy_chain_summary(request):
     names = _extract_name_like_filters(request.args)
     if not names:
         raise InvalidUsage("At least one name_like value is required")
-    include_states = _parse_bool_param(request.args.get("include_states"), default=True)
+    include_states = _is_boolean_parameter_enabled(request.args.get("include_states"), default=True)
     summary, histogram, states, staffing_helper_available = await _query_chain_summary(
         session,
         names=names,
@@ -2047,7 +2047,7 @@ async def get_pharmacy_market_context(request, npi):
     session = _get_session(request)
     parsed_npi = _parse_npi(npi)
     as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _parse_bool_param(request.args.get("include_staffing"), default=False)
+    include_staffing = _is_boolean_parameter_enabled(request.args.get("include_staffing"), default=False)
 
     pharmacy = await _fetch_pharmacy_context(session, npi=parsed_npi, as_of=as_of)
     if not pharmacy:

@@ -1271,7 +1271,7 @@ async def test_latest_provider_directory_partial_scope_returns_scope_sources(mon
     )
     monkeypatch.setattr(
         entity_address_unified,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(entity_address_unified.db, "first", first_mock)
@@ -2754,7 +2754,7 @@ async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeyp
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "none")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
-    monkeypatch.setattr(entity_address_unified, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(entity_address_unified, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(
         entity_address_unified,
         "_inherit_archive_coordinates",
@@ -3383,7 +3383,7 @@ async def test_ensure_entity_address_unified_live_columns_adds_missing_stale_col
     monkeypatch.setattr(entity_address_unified.db, "status", status_mock)
     monkeypatch.setattr(
         entity_address_unified,
-        "_table_exists",
+        "_is_table_available",
         AsyncMock(return_value=True),
     )
 

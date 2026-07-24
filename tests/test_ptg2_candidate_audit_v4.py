@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -189,3 +190,97 @@ async def test_v4_candidate_scope_uses_bounded_code_first_graph(
     ]
     assert all(call["schema_name"] == "candidate_schema" for call in graph_calls)
     assert all(int(call["max_members"]) > 0 for call in graph_calls)
+
+
+@pytest.mark.asyncio
+async def test_v4_empty_candidate_scope_retains_exact_empty_result(monkeypatch):
+    npi = 1_234_567_890
+    candidate_keys_by_npi = {npi: set()}
+    retention_budget = v4_scope.CandidateAuditDecodedRetentionBudget()
+    retention_budget.claim(
+        v4_scope._candidate_map_retained_bytes(candidate_keys_by_npi),
+        category="the candidate provider map",
+    )
+    graph_lookup = AsyncMock()
+    monkeypatch.setattr(v4_scope, "_v4_sets_by_npi", graph_lookup)
+
+    observed = await v4_scope.prove_v4_candidate_sets(
+        object(),
+        _v4_serving_tables(),
+        candidate_keys_by_npi,
+        retention_budget,
+        schema_name="candidate_schema",
+    )
+
+    assert observed == {npi: ()}
+    assert retention_budget.retained_bytes == (
+        v4_scope._V4_RESULT_MAP_BYTES
+        + v4_scope._V4_RESULT_BUCKET_BYTES
+    )
+    graph_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_v4_graph_failure_releases_transient_reservation(monkeypatch):
+    npi = 1_234_567_890
+    candidate_keys_by_npi = {npi: {7}}
+    candidate_source_bytes = v4_scope._candidate_map_retained_bytes(
+        candidate_keys_by_npi
+    )
+    retention_budget = v4_scope.CandidateAuditDecodedRetentionBudget()
+    retention_budget.claim(
+        candidate_source_bytes,
+        category="the candidate provider map",
+    )
+    monkeypatch.setattr(
+        v4_scope,
+        "_v4_sets_by_npi",
+        AsyncMock(side_effect=RuntimeError("graph read failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="graph read failed"):
+        await v4_scope.prove_v4_candidate_sets(
+            object(),
+            _v4_serving_tables(),
+            candidate_keys_by_npi,
+            retention_budget,
+            schema_name="candidate_schema",
+        )
+
+    assert retention_budget.retained_bytes == candidate_source_bytes
+
+
+@pytest.mark.asyncio
+async def test_v4_scope_creates_default_retention_budget(monkeypatch):
+    expected_price_index = {(7, 5, 0): (10,)}
+    monkeypatch.setattr(
+        v4_scope,
+        "lookup_forward_price_index_from_db",
+        AsyncMock(return_value=expected_price_index),
+    )
+    candidate_proof = AsyncMock(return_value={1_234_567_890: (5,)})
+    monkeypatch.setattr(v4_scope, "prove_v4_candidate_sets", candidate_proof)
+    builders = v4_scope.V4CandidateBuilders(
+        source_keys=lambda *_args: SimpleNamespace(
+            source_keys_by_code={7: (0,)},
+            retained_bytes=0,
+        ),
+        provider_candidates=lambda *_args: {1_234_567_890: {5}},
+    )
+
+    observed = await v4_scope.load_v4_candidate_scope(
+        object(),
+        _v4_serving_tables(),
+        (_challenge(),),
+        (_persisted_occurrence(),),
+        _code_index(),
+        builders=builders,
+        schema_name="candidate_schema",
+    )
+
+    assert observed.price_keys_by_occurrence is expected_price_index
+    retention_budget = candidate_proof.await_args.args[3]
+    assert isinstance(
+        retention_budget,
+        v4_scope.CandidateAuditDecodedRetentionBudget,
+    )

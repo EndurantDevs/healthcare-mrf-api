@@ -16,7 +16,7 @@ from api.code_systems import (
     is_restricted_terminology_system,
     normalize_code,
     normalize_code_system,
-    restricted_terminology_public_enabled,
+    is_restricted_terminology_public_enabled,
 )
 from api.endpoint.pagination import parse_pagination
 from db.models import (
@@ -62,13 +62,13 @@ def _decode_path_value(raw: Any) -> str:
 
 
 def _restricted_public_filter(column):
-    if restricted_terminology_public_enabled():
+    if is_restricted_terminology_public_enabled():
         return None
     return func.upper(column).notin_(("SNOMEDCT_US",))
 
 
 def _restricted_pair_filters(from_column, to_column):
-    if restricted_terminology_public_enabled():
+    if is_restricted_terminology_public_enabled():
         return []
     return [
         func.upper(from_column).notin_(("SNOMEDCT_US",)),
@@ -77,7 +77,7 @@ def _restricted_pair_filters(from_column, to_column):
 
 
 def _raise_if_restricted_public(system: str) -> None:
-    if is_restricted_terminology_system(system) and not restricted_terminology_public_enabled():
+    if is_restricted_terminology_system(system) and not is_restricted_terminology_public_enabled():
         raise sanic.exceptions.NotFound
 
 

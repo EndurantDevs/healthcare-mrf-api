@@ -54,7 +54,7 @@ async def test_coverage_statistics_success(monkeypatch):
     async def _is_every_table_present(_session, _table):
         return True
 
-    monkeypatch.setattr(coverage_module, "_table_exists", _is_every_table_present)
+    monkeypatch.setattr(coverage_module, "_is_table_available", _is_every_table_present)
 
     request = make_request(
         [
@@ -103,7 +103,7 @@ async def test_coverage_statistics_missing_tables_return_zero(monkeypatch):
     async def _is_every_table_missing(_session, _table):
         return False
 
-    monkeypatch.setattr(coverage_module, "_table_exists", _is_every_table_missing)
+    monkeypatch.setattr(coverage_module, "_is_table_available", _is_every_table_missing)
 
     request = make_request([])
     response = await coverage_statistics(request)
@@ -148,7 +148,7 @@ async def test_coverage_statistics_uses_snapshot_and_procedure_fallbacks(
 
     monkeypatch.setattr(
         coverage_module,
-        "_table_exists",
+        "_is_table_available",
         _is_selected_table_present,
     )
     request = make_request(

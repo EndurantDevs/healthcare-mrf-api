@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import struct
 
 import pytest
@@ -862,6 +864,154 @@ def _v4_serving_tables(*, patterns: int = 1024) -> PTG2ServingTables:
             "max_online_provider_expansion_graph_batches": 64,
         },
     )
+
+
+def test_single_reverse_budget_is_enforced() -> None:
+    with pytest.raises(PTG2SharedBlockError, match="exceeds max_members"):
+        ptg2_serving._v4_sets_by_npi_reverse(
+            normalized_npis=(1_234_567_890,),
+            npi_key_by_value={1_234_567_890: 4},
+            first_members_by_npi_key={4: (2,)},
+            first_members_by_allowed_set={7: (2,), 8: (2,)},
+            allowed_provider_sets=(7, 8),
+            max_members=1,
+        )
+
+
+def test_single_reverse_missing_npi_is_empty() -> None:
+    assert ptg2_serving._v4_sets_by_npi_reverse(
+        normalized_npis=(1_234_567_890,),
+        npi_key_by_value={},
+        first_members_by_npi_key={},
+        first_members_by_allowed_set={7: (2,)},
+        allowed_provider_sets=(7,),
+        max_members=1,
+    ) == {1_234_567_890: ()}
+
+
+def test_multi_reverse_budget_is_enforced() -> None:
+    with pytest.raises(PTG2SharedBlockError, match="exceeds max_members"):
+        ptg2_serving._v4_sets_by_npi_reverse(
+            normalized_npis=(1_234_567_890, 2_234_567_890),
+            npi_key_by_value={1_234_567_890: 4, 2_234_567_890: 6},
+            first_members_by_npi_key={4: (2,), 6: (3,)},
+            first_members_by_allowed_set={7: (2,), 8: (3,)},
+            allowed_provider_sets=(7, 8),
+            max_members=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pattern_reverse_passes_aggregate_budget(monkeypatch) -> None:
+    prefix_lookup = AsyncMock(return_value={7: (2,), 8: (3,)})
+    session = object()
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_v4_relation_member_prefixes",
+        prefix_lookup,
+    )
+
+    observed = await ptg2_serving._v4_pattern_members_for_sets(
+        session,
+        snapshot_key=17,
+        reverse_relation="set_patterns",
+        allowed_provider_sets=(7, 8),
+        maximum_pattern_degree=2,
+        read_bounds=ptg2_serving._V4GraphReadBounds("candidate_schema", 5),
+    )
+
+    assert observed == {7: (2,), 8: (3,)}
+    prefix_lookup.assert_awaited_once_with(
+        session,
+        snapshot_key=17,
+        relation="set_patterns",
+        owner_keys=(7, 8),
+        schema_name="candidate_schema",
+        limit_per_owner=3,
+        max_members=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pattern_reverse_requires_all_sets(monkeypatch) -> None:
+    async def incomplete_prefixes(*_args, **_kwargs):
+        return {7: (2,)}
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_v4_relation_member_prefixes",
+        incomplete_prefixes,
+    )
+
+    with pytest.raises(
+        ptg2_serving.PTG2ManifestArtifactError,
+        match="set-pattern relation is incomplete",
+    ):
+        await ptg2_serving._v4_pattern_members_for_sets(
+            object(),
+            snapshot_key=17,
+            reverse_relation="set_patterns",
+            allowed_provider_sets=(7, 8),
+            maximum_pattern_degree=2,
+            read_bounds=ptg2_serving._V4GraphReadBounds(
+                "candidate_schema",
+                100,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_direct_reverse_preserves_member_budget(monkeypatch) -> None:
+    async def manifest_lookup(*_args, **kwargs):
+        is_forward = kwargs["relation"] == "group_sets_direct"
+        return SimpleNamespace(
+            owner_count=1 if is_forward else 2,
+            logical_member_count=100 if is_forward else 2,
+        )
+
+    lookup_calls: list[dict[str, object]] = []
+
+    async def relation_lookup(*_args, **kwargs):
+        lookup_calls.append(kwargs)
+        return {7: (2,), 8: (3,)}
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "load_v4_relation_manifest",
+        manifest_lookup,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_v4_relation_members",
+        relation_lookup,
+    )
+
+    observed = await ptg2_serving._v4_reverse_members_for_sets(
+        object(),
+        snapshot_key=17,
+        representation="direct_v1",
+        first_member_count=1,
+        allowed_provider_sets=(7, 8),
+        forward_relation="group_sets_direct",
+        maximum_pattern_degree=2,
+        read_bounds=ptg2_serving._V4GraphReadBounds("candidate_schema", 2),
+    )
+
+    assert observed == {7: (2,), 8: (3,)}
+    assert lookup_calls[0]["relation"] == "set_groups_direct"
+    assert lookup_calls[0]["max_members"] == 2
+
+
+def test_forward_projection_budget_is_enforced() -> None:
+    with pytest.raises(PTG2SharedBlockError, match="exceeds max_members"):
+        ptg2_serving._v4_sets_from_first_members(
+            (1_234_567_890, 2_234_567_890),
+            {1_234_567_890: 4, 2_234_567_890: 6},
+            {4: (2,), 6: (3,)},
+            {2: (7,), 3: (8,)},
+            None,
+            max_members=1,
+        )
 
 
 @pytest.mark.asyncio

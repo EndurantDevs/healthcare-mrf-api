@@ -1060,7 +1060,7 @@ def test_artifact_stream_split_keeps_facade_helpers_stable():
 
 def test_db_table_split_keeps_facade_helpers_stable():
     assert process_ptg._quote_ident is ptg_db_tables._quote_ident
-    assert process_ptg._table_exists is ptg_db_tables._table_exists
+    assert process_ptg._is_table_available is ptg_db_tables._is_table_available
     assert process_ptg._has_rows_in_table is ptg_db_tables._has_rows_in_table
     assert process_ptg._estimated_table_rows is ptg_db_tables._estimated_table_rows
     assert process_ptg._exact_table_rows is ptg_db_tables._exact_table_rows
@@ -6976,7 +6976,7 @@ def test_manifest_publish_materializes_lean_provider_group_rate_scope(monkeypatc
         return table == "ptg2_provider_group_rate_scope_snap"
 
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
-    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(ptg_manifest_publish, "_is_table_available", is_fake_table_present)
     monkeypatch.setattr(
         ptg_manifest_publish,
         "_has_rows_in_table",
