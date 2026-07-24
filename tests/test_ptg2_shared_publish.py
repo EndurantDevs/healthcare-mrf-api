@@ -622,8 +622,8 @@ class _FirstBatchProgress:
 
 
 class _SlowSharedBlockSQLDriver:
-    batch_sizes = (32, 7)
-    new_hash_counts = (32, 5)
+    batch_sizes = (4_096, 7)
+    new_hash_counts = (4_096, 5)
 
     def __init__(self):
         self.fetch_index = 0
@@ -672,8 +672,8 @@ class _SlowSharedBlockSQLDriver:
 
 
 class _SlowV4CASSQLDriver:
-    batch_sizes = (32, 4)
-    unique_counts = (30, 3)
+    batch_sizes = (4_096, 4)
+    unique_counts = (4_094, 3)
 
     def __init__(self):
         self.fetch_index = 0
@@ -725,13 +725,66 @@ async def _session_transaction(session):
     yield session
 
 
+def test_shared_block_publish_batch_is_bounded_for_dense_stages():
+    synthetic_dense_stage_rows = 8_192_000
+
+    assert ptg2_shared_publish._SHARED_BLOCK_PUBLISH_BATCH_ROWS == 4_096
+    assert (
+        ptg2_shared_publish._SHARED_BLOCK_PUBLISH_BATCH_ROWS
+        <= ptg2_shared_publish._SHARED_BLOCK_EXISTENCE_BATCH_ROWS
+    )
+    assert (
+        synthetic_dense_stage_rows
+        // ptg2_shared_publish._SHARED_BLOCK_PUBLISH_BATCH_ROWS
+        == 2_000
+    )
+
+
+@pytest.mark.parametrize(
+    ("flag_index", "message"),
+    (
+        (4, "incompatible format version"),
+        (5, "stored content metadata"),
+        (6, "mapping conflicts"),
+    ),
+)
+def test_batched_stage_summary_rejects_invalid_batch_proof(flag_index, message):
+    aggregate_values = [1, 10, 7, ["serving"], False, False, False]
+    aggregate_values[flag_index] = True
+    summary = ptg2_shared_publish._BatchedBlockStageSummary()
+
+    with pytest.raises(RuntimeError, match=message):
+        summary.add(
+            aggregate_values,
+            unique_blocks=1,
+            unique_coordinates=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag_index", "message"),
+    (
+        (5, "incompatible format version"),
+        (6, "no payload"),
+        (7, "stored content metadata"),
+    ),
+)
+def test_batched_v4_summary_rejects_invalid_batch_proof(flag_index, message):
+    aggregate_values = [1, 2, 10, 7, ["v4_graph"], False, False, False]
+    aggregate_values[flag_index] = True
+    summary = ptg2_shared_publish._BatchedV4CASStageSummary()
+
+    with pytest.raises(RuntimeError, match=message):
+        summary.add(aggregate_values, [1, 10, 7])
+
+
 def _assert_slow_shared_block_publication(publication, progress_events, session):
-    assert publication.mapping_count == 39
-    assert publication.unique_block_count == 37
-    assert publication.logical_byte_count == 390
-    assert publication.stored_byte_count == 273
+    assert publication.mapping_count == 4_103
+    assert publication.unique_block_count == 4_101
+    assert publication.logical_byte_count == 41_030
+    assert publication.stored_byte_count == 28_721
     assert progress_events == [
-        ("sql_stage_rows", 32),
+        ("sql_stage_rows", 4_096),
         ("publish_batches", 1),
         ("sql_stage_rows", 7),
         ("publish_batches", 1),
@@ -739,18 +792,18 @@ def _assert_slow_shared_block_publication(publication, progress_events, session)
     statements = "\n".join(
         str(call.args[0]) for call in session.execute.await_args_list
     )
-    assert "FETCH FORWARD 32" in statements
+    assert "FETCH FORWARD 4096" in statements
     assert "JOIN \"ptg2_publish_batch_" in statements
 
 
 def _assert_slow_v4_cas_publication(publication, progress_events):
-    assert publication.staged_row_count == 36
-    assert publication.staged_entry_count == 72
-    assert publication.unique_block_count == 33
-    assert publication.logical_byte_count == 360
-    assert publication.stored_byte_count == 252
-    assert publication.unique_logical_byte_count == 330
-    assert publication.unique_stored_byte_count == 231
+    assert publication.staged_row_count == 4_100
+    assert publication.staged_entry_count == 8_200
+    assert publication.unique_block_count == 4_097
+    assert publication.logical_byte_count == 41_000
+    assert publication.stored_byte_count == 28_700
+    assert publication.unique_logical_byte_count == 40_970
+    assert publication.unique_stored_byte_count == 28_679
     assert progress_events[-2:] == [
         ("sql_stage_rows", 4),
         ("publish_batches", 1),
@@ -1111,7 +1164,7 @@ async def test_slow_sql_stage_reports_exact_bounded_rows_before_completion(
 
     assert not publish_task.done()
     assert progress_capture.events == [
-        ("sql_stage_rows", 32),
+        ("sql_stage_rows", 4_096),
         ("publish_batches", 1),
     ]
     sql_driver.release_second_batch.set()
@@ -1238,7 +1291,7 @@ async def test_slow_v4_cas_sql_reports_exact_batches_before_completion(
 
     assert not publish_task.done()
     assert progress_capture.events == [
-        ("sql_stage_rows", 32),
+        ("sql_stage_rows", 4_096),
         ("publish_batches", 1),
     ]
     sql_driver.release_second_batch.set()
