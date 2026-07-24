@@ -482,11 +482,11 @@
           "total": 3521
         },
         "lines": {
-          "covered": 45193,
+          "covered": 45189,
           "total": 53344
         },
         "regions": {
-          "covered": 67169,
+          "covered": 67162,
           "total": 78996
         }
       },
