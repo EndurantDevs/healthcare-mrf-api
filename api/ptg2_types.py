@@ -69,6 +69,7 @@ class PTG2ServingTables:
     source_set: dict[str, Any] | None = None
     database_evidence: dict[str, Any] | None = None
     provider_graph_v4_hot_prefix: dict[str, Any] | None = None
+    provider_graph_v4_inferred_taxonomy_candidates: dict[str, Any] | None = None
 
     @property
     def uses_shared_blocks(self) -> bool:

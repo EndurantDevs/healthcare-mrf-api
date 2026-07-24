@@ -29,6 +29,42 @@ def test_snapshot_publish_rejects_missing_summary_mapping():
         shared_snapshot_publish._mapping(None, "blocks")
 
 
+@pytest.mark.asyncio
+async def test_v4_taxonomy_sidecar_threads_building_root_identity(
+    monkeypatch,
+) -> None:
+    publication = object()
+    publish_mock = AsyncMock(return_value=publication)
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "publish_v4_inferred_taxonomy_candidates",
+        publish_mock,
+    )
+    session = object()
+
+    observed = await shared_snapshot_publish._publish_v4_taxonomy_sidecar(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+        build_token="exact-build-token",
+        npi_count=154_184,
+        representation="pattern_v1",
+        pattern_count=45,
+    )
+
+    assert observed is publication
+    assert publish_mock.await_args.kwargs == {
+        "schema_name": "mrf",
+        "snapshot_key": 41,
+        "build_token": "exact-build-token",
+        "rules": shared_snapshot_publish.INFERRED_PROVIDER_TAXONOMY_RULES,
+        "npi_count": 154_184,
+        "representation": "pattern_v1",
+        "pattern_count": 45,
+    }
+    assert publish_mock.await_args.args == (session,)
+
+
 class _SlowProgressDriver:
     def __init__(self, elapsed_seconds):
         self.elapsed_seconds = elapsed_seconds
@@ -340,7 +376,14 @@ def _patch_v4_graph_publication(
     map_summary,
 ):
     publish_cas_mock = AsyncMock(return_value=cas_publication)
-    publish_maps_mock = AsyncMock(return_value=map_summary)
+    taxonomy_publication = SimpleNamespace(
+        packed_byte_count=12,
+        pattern_member_bytes=40,
+        manifest={},
+    )
+    publish_maps_mock = AsyncMock(
+        return_value=(map_summary, taxonomy_publication)
+    )
     replacements_by_name = {
         "create_shared_block_stage": AsyncMock(),
         "copy_shared_block_binary_file": AsyncMock(),
@@ -382,7 +425,8 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
         empty_npi_tin_only_normalization_count=2,
     )
 
-    assert publication.stored_byte_count == 76
+    assert publication.logical_byte_count == 64
+    assert publication.stored_byte_count == 128
     assert publish_cas_mock.await_args.kwargs == {
         "schema_name": "mrf",
         "stage_table": publish_cas_mock.await_args.kwargs["stage_table"],

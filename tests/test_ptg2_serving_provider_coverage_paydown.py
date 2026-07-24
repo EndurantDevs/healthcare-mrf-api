@@ -244,7 +244,12 @@ async def test_enriched_provider_rows_executes_available_address_query(
     )
     overlay = AsyncMock(return_value=[{"npi": 11, "overlaid": True}])
     monkeypatch.setattr(serving, "_overlay_provider_directory_corroboration", overlay)
-    session = FakeSession([FakeResult([{"npi": 11, "provider_name": "Eleven"}])])
+    session = FakeSession(
+        [
+            FakeResult(),
+            FakeResult([{"npi": 11, "provider_name": "Eleven"}]),
+        ]
+    )
 
     provider_rows = await serving._enriched_provider_rows_for_npis(
         session,
@@ -256,7 +261,8 @@ async def test_enriched_provider_rows_executes_available_address_query(
     )
 
     assert provider_rows == [{"npi": 11, "overlaid": True}]
-    statement = str(session.calls[0][0][0])
+    assert str(session.calls[0][0][0]) == "SET LOCAL jit = off"
+    statement = str(session.calls[1][0][0])
     if unified:
         assert "fallback_addresses AS MATERIALIZED" in statement
         assert "na.telephone_number" in statement

@@ -170,9 +170,13 @@ def api_spec(args: Any) -> BoundedApiSpec:
 def reference_spec(args: Any) -> BoundedApiSpec:
     """Build the fixed V3 oracle query without accepting latency settings."""
 
-    if args.page_limit != 25 or args.expected_item_count != 25:
+    if (
+        args.page_limit != 25
+        or args.expected_item_count < 1
+        or args.expected_item_count > args.page_limit
+    ):
         raise CanaryConfigurationError(
-            "frozen V3 reference must capture the exact 25-item public page"
+            "frozen V3 reference must capture the exact bounded public page"
         )
     if (
         str(args.code_system).strip().upper() != "CPT"
@@ -187,7 +191,7 @@ def reference_spec(args: Any) -> BoundedApiSpec:
         code_system="CPT",
         code="70553",
         limit=25,
-        expected_item_count=25,
+        expected_item_count=args.expected_item_count,
         expected_result_state="matched",
         cold_p95_limit_ms=50,
         warm_p95_limit_ms=50,

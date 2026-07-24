@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -112,6 +113,42 @@ def test_reference_is_derived_without_persisting_provider_payload() -> None:
     assert reference["semantic_key_count"] == 25
     assert "items" not in reference
     assert "provider_name" not in str(reference)
+
+
+def test_reference_accepts_an_exact_exhausted_page_below_the_limit() -> None:
+    spec = replace(_spec("v3-snapshot"), expected_item_count=21)
+    document = _document("v3-snapshot", "shared_blocks_v3")
+    document["items"] = document["items"][:21]
+    document["pagination"] = {
+        "limit": 25,
+        "offset": 0,
+        "has_more": False,
+        "total": 21,
+        "total_is_exact": True,
+    }
+
+    reference = build_v3_reference_evidence(
+        document,
+        spec,
+        runtime_evidence=_reference()["reference_runtime"],
+    )
+
+    assert reference["item_count"] == 21
+    assert validate_reference_evidence(reference, expected_spec=spec) == []
+
+    reference["pagination"]["total_is_exact"] = False
+    assert "public V3 reference short page is not exact and exhausted" in (
+        validate_reference_evidence(reference, expected_spec=spec)
+    )
+
+
+def test_reference_rejects_a_mode_that_disables_default_inference() -> None:
+    reference = _reference()
+    reference["query"]["mode"] = "exact_source"
+
+    failures = validate_reference_evidence(reference)
+
+    assert "public V3 reference does not use the fixed CPT 70553 query" in failures
 
 
 def test_v4_exact_page_accepts_numeric_encoding_and_directory_changes() -> None:

@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from sqlalchemy import text
 
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_BUILD_LEASE_SECONDS_DEFAULT,
@@ -31,6 +32,11 @@ from process.ptg_parts.ptg2_shared_blocks import (
 )
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     lock_writable_snapshot,
+)
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_TABLE,
+    summarize_v4_inferred_taxonomy_candidates,
+    validate_v4_inferred_taxonomy_projection_manifest,
 )
 
 
@@ -131,7 +137,7 @@ _MAP_MAGIC = b"PTG4MAP1"
 _MAP_HEADER = struct.Struct(">8sHHI64s")
 _MAP_RECORD = struct.Struct(">QIQ32s")
 _MAP_DIGEST_DOMAIN = b"PTG2V4COORDINATEMAP\x01"
-_LAYOUT_FINGERPRINT_DOMAIN = b"PTG2V4PHYSICALLAYOUT\x01"
+_LAYOUT_FINGERPRINT_DOMAIN = b"PTG2V4PHYSICALLAYOUT\x02"
 _V4_SEAL_PROGRESS_CALLBACK: contextvars.ContextVar[
     Callable[[str, int], None] | None
 ] = contextvars.ContextVar("ptg2_v4_seal_progress_callback", default=None)
@@ -307,6 +313,9 @@ class V4SnapshotMetadataSummary:
     heavy_owner_count: int
     provider_graph_diagnostics: Mapping[str, Any] = field(default_factory=dict)
     provider_graph_resources: Mapping[str, int] = field(default_factory=dict)
+    inferred_taxonomy_candidates: Mapping[str, Any] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -697,6 +706,15 @@ def _provider_graph_v4_map(
         or resources_by_field["empty_npi_tin_only_normalization_count"] < 0
     ):
         raise ValueError("PTG V4 graph resource admission is invalid")
+    inferred_taxonomy_candidates = dict(
+        metadata.inferred_taxonomy_candidates
+    )
+    if inferred_taxonomy_candidates:
+        inferred_taxonomy_candidates = (
+            validate_v4_inferred_taxonomy_projection_manifest(
+                inferred_taxonomy_candidates
+            )
+        )
     return {
         "contract": PTG2_V4_PROVIDER_GRAPH_CONTRACT,
         "representation": str(representation),
@@ -712,6 +730,10 @@ def _provider_graph_v4_map(
         "heavy_owner_table": PTG2_V4_HEAVY_OWNER_TABLE,
         "npi_prefix_table": PTG2_V4_NPI_PREFIX_TABLE,
         "diagnostic_table": PTG2_V4_GRAPH_DIAGNOSTIC_TABLE,
+        "inferred_taxonomy_candidate_table": (
+            PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_TABLE
+        ),
+        "inferred_taxonomy_candidates": inferred_taxonomy_candidates,
         "hot_prefix": dict(metadata.provider_graph_diagnostics),
         "resource_admission": resources_by_field,
     }
@@ -1966,6 +1988,16 @@ async def summarize_persisted_v4_snapshot_metadata(
         schema=schema,
         snapshot_key=int(snapshot_key),
     )
+    inferred_taxonomy_candidates = (
+        await summarize_v4_inferred_taxonomy_candidates(
+            session,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            npi_count=counts.npi_count,
+            pattern_count=counts.pattern_count,
+            rules=INFERRED_PROVIDER_TAXONOMY_RULES,
+        )
+    )
     return V4SnapshotMetadataSummary(
         npi_count=counts.npi_count,
         component_count=counts.component_count,
@@ -1974,6 +2006,7 @@ async def summarize_persisted_v4_snapshot_metadata(
         heavy_owner_count=heavy_owner_count,
         provider_graph_diagnostics=provider_graph_diagnostics,
         provider_graph_resources=provider_graph_resources,
+        inferred_taxonomy_candidates=inferred_taxonomy_candidates,
     )
 
 
@@ -2066,6 +2099,11 @@ def _sealed_root_summaries(
         else {},
         provider_graph_resources=dict(
             provider_graph.get("resource_admission") or {}
+        )
+        if isinstance(provider_graph, Mapping)
+        else {},
+        inferred_taxonomy_candidates=dict(
+            provider_graph.get("inferred_taxonomy_candidates") or {}
         )
         if isinstance(provider_graph, Mapping)
         else {},

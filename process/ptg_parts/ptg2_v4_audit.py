@@ -1381,6 +1381,7 @@ async def publish_v4_audit_sample(
     atom_key_bits: int,
     price_membership_block_span: int,
     graph_compilation: V4GraphCompilationResult,
+    inferred_taxonomy_candidates: Mapping[str, Any],
 ) -> SharedAuditPublication:
     """Persist a V3-compatible occurrence sample proved through packed V4 CAS."""
 
@@ -1495,6 +1496,9 @@ async def publish_v4_audit_sample(
         "set_patterns_pattern_groups_group_npis_exact_v1"
         if representation == "pattern_v1"
         else "set_groups_direct_group_npis_exact_v1"
+    )
+    metadata["inferred_taxonomy_candidates"] = dict(
+        inferred_taxonomy_candidates
     )
     return SharedAuditPublication(
         metadata=metadata,

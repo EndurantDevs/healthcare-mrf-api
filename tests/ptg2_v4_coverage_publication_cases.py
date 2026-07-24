@@ -416,6 +416,7 @@ async def _assert_audit_publication(
         atom_key_bits=16,
         price_membership_block_span=256,
         graph_compilation=compilation,
+        inferred_taxonomy_candidates={"contract": "test_projection"},
     )
     assert publication.row_count == 1
     assert (
@@ -423,6 +424,9 @@ async def _assert_audit_publication(
         == expected_representation
     )
     assert publication.metadata["provider_graph_verification"] == expected_verification
+    assert publication.metadata["inferred_taxonomy_candidates"] == {
+        "contract": "test_projection"
+    }
     assert len(publication.support_digest) == 32
 
 
@@ -438,6 +442,7 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             atom_key_bits=16,
             price_membership_block_span=256,
             graph_compilation=compilation,
+            inferred_taxonomy_candidates={"contract": "test_projection"},
         )
     with pytest.raises(ValueError, match="core support digest"):
         await audit.publish_v4_audit_sample(
@@ -450,6 +455,7 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             atom_key_bits=16,
             price_membership_block_span=256,
             graph_compilation=compilation,
+            inferred_taxonomy_candidates={"contract": "test_projection"},
         )
     with pytest.raises(RuntimeError, match="unsupported"):
         await audit.publish_v4_audit_sample(
@@ -462,6 +468,7 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             atom_key_bits=16,
             price_membership_block_span=256,
             graph_compilation=SimpleNamespace(selected_layout="unknown"),
+            inferred_taxonomy_candidates={"contract": "test_projection"},
         )
     async def missing_edges(_relation, edges):
         return {edge: False for edge in edges}

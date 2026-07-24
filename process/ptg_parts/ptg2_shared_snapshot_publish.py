@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from db.connection import db
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_COLD_LOOKUP_CONTRACT,
@@ -102,6 +103,10 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     publish_v4_snapshot_maps,
     seal_v4_shared_layout,
     touch_v4_shared_layout_build,
+)
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    V4InferredTaxonomyPublication,
+    publish_v4_inferred_taxonomy_candidates,
 )
 
 
@@ -274,6 +279,7 @@ class _V4GraphPublication:
     map_summary: V4SnapshotMapSummary
     representation: str
     compiler_summary: Mapping[str, Any]
+    inferred_taxonomy_candidates: Mapping[str, Any]
     audit_witness_path: Path
 
 
@@ -1491,6 +1497,30 @@ async def _publish_v4_sparse_dictionary_stage_ranges(
         raise RuntimeError("PTG V4 persisted dictionary rows changed")
 
 
+async def _publish_v4_taxonomy_sidecar(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+    npi_count: int,
+    representation: str,
+    pattern_count: int,
+) -> V4InferredTaxonomyPublication:
+    """Publish taxonomy evidence against the exact building-root identity."""
+
+    return await publish_v4_inferred_taxonomy_candidates(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        build_token=build_token,
+        rules=INFERRED_PROVIDER_TAXONOMY_RULES,
+        npi_count=int(npi_count),
+        representation=representation,
+        pattern_count=int(pattern_count),
+    )
+
+
 async def _publish_v4_dictionaries_and_maps(
     compilation: V4GraphCompilationResult,
     *,
@@ -1500,7 +1530,7 @@ async def _publish_v4_dictionaries_and_maps(
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
     progress_callback: Callable[[str, int], None] | None = None,
-) -> V4SnapshotMapSummary:
+) -> tuple[V4SnapshotMapSummary, V4InferredTaxonomyPublication]:
     """Bulk-copy dense dictionaries, then publish exact metadata and packed maps."""
 
     if int(compressed_acquisition_bytes) <= 0:
@@ -1519,6 +1549,11 @@ async def _publish_v4_dictionaries_and_maps(
     )
     expected_npi_count = int(compilation.observe.get("npi_count") or 0)
     expected_pattern_count = int(compilation.observe.get("pattern_count") or 0)
+    root_representation = (
+        "pattern_v1"
+        if compilation.selected_layout == "pattern"
+        else "direct_v1"
+    )
     expected_prefix_owner_count = int(
         compilation.observe.get("npi_prefix_override_owner_count") or 0
     )
@@ -1683,11 +1718,7 @@ async def _publish_v4_dictionaries_and_maps(
                 schema_name=schema_name,
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
-                representation=(
-                    "pattern_v1"
-                    if compilation.selected_layout == "pattern"
-                    else "direct_v1"
-                ),
+                representation=root_representation,
                 references=_iter_v4_block_references(
                     compilation.reference_manifest_path
                 ),
@@ -2063,7 +2094,29 @@ async def _publish_v4_dictionaries_and_maps(
                     )
                 ),
             )
-            return map_summary
+
+            # Candidate keys are snapshot-local NPI coordinates. Publish this
+            # immutable sidecar only after the dense dictionary and complete
+            # authenticated building graph are available in this transaction.
+            taxonomy_publication = (
+                await _publish_v4_taxonomy_sidecar(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_key=int(snapshot_key),
+                    build_token=build_token,
+                    npi_count=expected_npi_count,
+                    representation=root_representation,
+                    pattern_count=expected_pattern_count,
+                )
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    "published_dictionary_rows",
+                    int(taxonomy_publication.rule_count)
+                    + int(taxonomy_publication.observe_only_rule_count),
+                )
+                progress_callback("publish_batches", 1)
+            return map_summary, taxonomy_publication
     finally:
         await db.status(
             "DROP TABLE IF EXISTS "
@@ -2104,16 +2157,20 @@ async def _publish_v4_graph(
             build_token=build_token,
             **_progress_callback_kwargs(progress_callback),
         )
-        map_summary = await _publish_v4_dictionaries_and_maps(
-            compilation,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-            build_token=build_token,
-            compressed_acquisition_bytes=int(compressed_acquisition_bytes),
-            empty_npi_tin_only_normalization_count=int(
-                empty_npi_tin_only_normalization_count
-            ),
-            **_progress_callback_kwargs(progress_callback),
+        map_summary, taxonomy_publication = (
+            await _publish_v4_dictionaries_and_maps(
+                compilation,
+                schema_name=schema_name,
+                snapshot_key=int(snapshot_key),
+                build_token=build_token,
+                compressed_acquisition_bytes=int(
+                    compressed_acquisition_bytes
+                ),
+                empty_npi_tin_only_normalization_count=int(
+                    empty_npi_tin_only_normalization_count
+                ),
+                **_progress_callback_kwargs(progress_callback),
+            )
         )
     except BaseException:
         await _queue_failed_v4_graph_blocks(
@@ -2145,6 +2202,9 @@ async def _publish_v4_graph(
             "artifacts": artifact_contracts,
             "relation_summaries": tuple(compilation.relation_summaries),
             "heavy_bitmaps": tuple(compilation.heavy_bitmaps),
+            "inferred_taxonomy_candidates": dict(
+                taxonomy_publication.manifest
+            ),
             "observe": dict(compilation.observe),
             "resource_admission": {
                 "compressed_acquisition_bytes": int(
@@ -2169,16 +2229,23 @@ async def _publish_v4_graph(
         provider_group_count=int(compilation.observe.get("group_count") or 0),
         npi_count=int(compilation.observe.get("npi_count") or 0),
         support_digest=support_digest,
-        logical_byte_count=int(cas_publication.logical_byte_count),
+        logical_byte_count=(
+            int(cas_publication.logical_byte_count)
+            + int(taxonomy_publication.packed_byte_count)
+            + int(taxonomy_publication.pattern_member_bytes)
+        ),
         stored_byte_count=(
             int(cas_publication.stored_byte_count)
             + int(map_summary.stored_map_byte_count)
+            + int(taxonomy_publication.packed_byte_count)
+            + int(taxonomy_publication.pattern_member_bytes)
         ),
         map_summary=map_summary,
         representation=(
             "pattern_v1" if compilation.selected_layout == "pattern" else "direct_v1"
         ),
         compiler_summary=dict(compilation.summary),
+        inferred_taxonomy_candidates=dict(taxonomy_publication.manifest),
         audit_witness_path=compilation.provider_set_audit_npi_copy_path,
     )
 
@@ -2302,6 +2369,13 @@ def _physical_serving_index(
             "provider_group_count": int(graph_publication.provider_group_count),
             "npi_count": int(graph_publication.npi_count),
             "block_count": int(graph_publication.block_count),
+            "inferred_taxonomy_candidates": dict(
+                getattr(
+                    graph_publication,
+                    "inferred_taxonomy_candidates",
+                    {},
+                )
+            ),
         },
         "provider_identifier_quarantine": quarantine,
         "finalizer_block_copy": dict(finalizer_block_copy),
@@ -2874,6 +2948,9 @@ async def _publish_prepared_shared_layout(
                     atom_key_bits=int(price_publication.atom_key_bits),
                     price_membership_block_span=price_membership_block_span,
                     graph_compilation=graph_conversion,
+                    inferred_taxonomy_candidates=(
+                        graph_publication.inferred_taxonomy_candidates
+                    ),
                 )
             finally:
                 graph_conversion.cleanup()

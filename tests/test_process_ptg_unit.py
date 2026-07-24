@@ -675,6 +675,110 @@ def test_weighted_file_progress_preserves_indeterminate_semantic_work(monkeypatc
     assert second["counters"]["rate_chunks_completed"] == 2
 
 
+def test_single_fragmented_file_persists_measured_lower_bound_progress(
+    monkeypatch,
+):
+    """A long provider-heavy item advances work and timestamps without fake pct."""
+
+    elapsed_seconds = [0.0]
+    progress_writes = _install_timed_progress_capture(monkeypatch, elapsed_seconds)
+    coordinator = ptg_progress.PTGFileProgressCoordinator(
+        [8_000_000_000],
+        ["reference-extreme-rates.json.gz"],
+        stage_start_pct=20,
+        stage_end_pct=90,
+    )
+    token = ptg_live_progress.set_live_progress_context(
+        run_id="run-single-fragmented-file",
+        attempt_id="attempt-1",
+        attempt_started_at="2026-07-23T10:00:00Z",
+    )
+    try:
+        for elapsed, completed, groups in (
+            (4.0, 65_536, 1_000_000),
+            (8.0, 131_072, 2_000_000),
+            (12.0, 196_608, 3_000_000),
+        ):
+            elapsed_seconds[0] = elapsed
+            coordinator.observe(
+                0,
+                {
+                    "phase": "fragmented provider graph scan",
+                    "basis": "semantic_work",
+                    "denominator_state": "unknown",
+                    "done": completed,
+                    "work_done": completed,
+                    "counters": {
+                        "rate_chunks_completed": completed // 65_536,
+                        "raw_provider_group_attempts": groups,
+                    },
+                },
+            )
+    finally:
+        ptg_live_progress.reset_live_progress_context(token)
+
+    snapshots = [snapshot for _elapsed, snapshot in progress_writes]
+    assert [snapshot["done"] for snapshot in snapshots] == [
+        65_536,
+        131_072,
+        196_608,
+    ]
+    assert all(snapshot.get("pct") is None for snapshot in snapshots)
+    assert all(snapshot["pct_lower_bound"] == 20 for snapshot in snapshots)
+    assert [snapshot["progress_seq"] for snapshot in snapshots] == [1, 2, 3]
+    assert len({snapshot["observed_at"] for snapshot in snapshots}) == 3
+    assert snapshots[-1]["counters"]["raw_provider_group_attempts"] == 3_000_000
+
+
+def test_v4_publication_progress_preserves_compiler_window(monkeypatch):
+    """Precompile work stays below 92 and postcompile work starts at 95."""
+
+    events = []
+    monkeypatch.setattr(
+        process_ptg,
+        "write_live_progress",
+        lambda **payload: events.append(payload),
+    )
+    process_ptg._emit_ptg2_publish_progress(
+        "publishing snapshot tables",
+        completed_steps=5,
+        total_steps=8,
+        stage_start_pct=90,
+        stage_end_pct=92,
+        stage_id="ptg2_v4_precompile",
+        stage_ordinal=4,
+    )
+    [outer_precompile] = events
+    assert outer_precompile["pct"] == pytest.approx(91.25)
+    assert outer_precompile["stage_ordinal"] == 4
+    events.clear()
+    progress = process_ptg._PTG2V4PublicationProgress()
+    progress.observe("finalizer", {"copied_bytes": 4_096})
+    progress.observe("dictionary publication", {"published_rows": 20_000})
+    progress.observe("provider set key export", {"exported_rows": 6_448})
+    progress.observe("provider graph conversion", {"converted_blocks": 400})
+    progress.observe(
+        "provider graph publication",
+        {"copy_bytes": 1_000_000, "published_dictionary_rows": 37_000},
+    )
+    progress.observe("snapshot seal", {"sealed_rows": 1_000})
+
+    assert [event["stage_ordinal"] for event in events[:3]] == [4, 4, 4]
+    assert [event["pct_lower_bound"] for event in events[:3]] == [
+        91.25,
+        91.5,
+        91.75,
+    ]
+    assert all(event["pct"] is None for event in events)
+    assert [event["stage_ordinal"] for event in events[3:]] == [6, 6, 6]
+    assert [event["pct_lower_bound"] for event in events[3:]] == [
+        95.0,
+        95.25,
+        97.0,
+    ]
+    assert events[-1]["counters"]["published_dictionary_rows"] == 37_000
+
+
 def test_weighted_file_progress_zero_weight_duplicate_does_not_add_work(
     monkeypatch,
 ):
@@ -8114,6 +8218,31 @@ def test_scanner_fingerprint_isolates_v4_sources_when_disabled(
     assert v4_after_v4_change["publisher_source_bytes"] > (
         v4_baseline["publisher_source_bytes"]
     )
+
+
+def test_v4_scanner_identity_binds_inferred_taxonomy_rule_set(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_v4_identity_binaries(tmp_path, monkeypatch)
+    baseline = process_ptg._shared_v3_scanner_identity()
+    first_rule, *remaining_rules = process_ptg.INFERRED_PROVIDER_TAXONOMY_RULES
+    changed_first_rule = type(first_rule)(
+        ranges=((first_rule.ranges[0][0] + 1, first_rule.ranges[0][1]),),
+        taxonomy_codes=first_rule.taxonomy_codes,
+        display_terms=first_rule.display_terms,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "INFERRED_PROVIDER_TAXONOMY_RULES",
+        (changed_first_rule, *remaining_rules),
+    )
+
+    changed = process_ptg._shared_v3_scanner_identity()
+
+    assert changed["inferred_taxonomy_rule_set_sha256"] != baseline[
+        "inferred_taxonomy_rule_set_sha256"
+    ]
 
 
 def _strict_v3_downloaded_job(job):

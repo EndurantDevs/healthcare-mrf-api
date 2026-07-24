@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2ManifestArtifactError,
+)
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    PTG2_V4_INFERRED_TAXONOMY_DIRECT_REPRESENTATION,
+    PTG2_V4_INFERRED_TAXONOMY_PATTERN_REPRESENTATION,
+    validate_v4_inferred_taxonomy_projection_manifest,
+)
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
     PTG2_V4_GRAPH_RESOURCE_FIELDS,
@@ -31,6 +39,7 @@ REQUIRED_PHYSICAL_RELATIONS = frozenset(
         "ptg2_v4_heavy_owner",
         "ptg2_v4_provider_set_npi_prefix",
         "ptg2_v4_provider_graph_diagnostic",
+        "ptg2_v4_inferred_taxonomy_candidate",
     }
 )
 WHOLE_SNAPSHOT_PHYSICAL_RELATIONS = frozenset(
@@ -77,6 +86,9 @@ def evaluate_v4_evidence(
     provider_graph_diagnostic = _mapping(
         evidence_by_field.get("provider_graph_diagnostic")
     )
+    inferred_taxonomy_candidates = _mapping(
+        evidence_by_field.get("inferred_taxonomy_candidates")
+    )
     physical_storage = _mapping(evidence_by_field.get("physical_storage"))
     _validate_v4_state(
         snapshot,
@@ -98,10 +110,18 @@ def evaluate_v4_evidence(
         expected_relation_counts,
         failures,
     )
+    inferred_taxonomy_summary = _validate_inferred_taxonomy_candidates(
+        snapshot,
+        inferred_taxonomy_candidates,
+        exact_counts,
+        failures,
+        expected_representation=storage_budget.case.expected_representation,
+    )
     manifest_summary = _manifest_summary(
         snapshot,
         root,
         provider_graph_diagnostic,
+        inferred_taxonomy_summary,
         failures,
     )
     _validate_physical_storage(
@@ -118,6 +138,7 @@ def evaluate_v4_evidence(
         "relations": relations,
         "heavy_owner_diagnostics": evidence_by_field.get("heavy_owners", []),
         "provider_graph_diagnostic": provider_graph_diagnostic,
+        "inferred_taxonomy_candidates": inferred_taxonomy_candidates,
         "manifest": manifest_summary,
         "physical_storage": physical_storage,
         "storage_budget": storage_budget.report(
@@ -323,6 +344,7 @@ def _manifest_summary(
     snapshot: Mapping[str, Any],
     root: Mapping[str, Any],
     diagnostic_evidence: Mapping[str, Any],
+    inferred_taxonomy_summary: Mapping[str, Any],
     failures: list[str],
 ) -> dict[str, Any]:
     layout_manifest = _mapping(snapshot.get("layout_manifest"))
@@ -357,11 +379,167 @@ def _manifest_summary(
         "representation": representation,
         "hot_prefix": hot_prefix,
         "resource_admission": resource_admission,
+        "inferred_taxonomy_candidates": dict(inferred_taxonomy_summary),
         "manifest_storage_bytes_informational": _optional_int(
             serving_index.get("storage_bytes")
         ),
         "layout_logical_byte_count_informational": _optional_int(
             snapshot.get("layout_logical_byte_count")
+        ),
+    }
+
+
+def _validate_inferred_taxonomy_candidates(
+    snapshot: Mapping[str, Any],
+    projection_evidence: Mapping[str, Any],
+    exact_counts: Mapping[str, Any],
+    failures: list[str],
+    *,
+    expected_representation: str | None = None,
+) -> dict[str, Any]:
+    """Bind an advertised projection to exact authenticated database rows."""
+
+    layout_manifest = _mapping(snapshot.get("layout_manifest"))
+    serving_index = _mapping(layout_manifest.get("serving_index"))
+    serving_binary = _mapping(serving_index.get("serving_binary"))
+    provider_graph = _mapping(serving_binary.get("provider_graph_v4"))
+    manifest_advertises_projection = (
+        "inferred_taxonomy_candidates" in provider_graph
+    )
+    advertised_projection_value = provider_graph.get(
+        "inferred_taxonomy_candidates"
+    )
+    exact_by_manifest_field = {
+        "rule_count": _optional_int(
+            exact_counts.get("inferred_taxonomy_rule_count")
+        ),
+        "observe_only_rule_count": _optional_int(
+            exact_counts.get(
+                "inferred_taxonomy_observe_only_rule_count"
+            )
+        ),
+        "member_count": _optional_int(
+            exact_counts.get("inferred_taxonomy_member_count")
+        ),
+        "packed_byte_count": _optional_int(
+            exact_counts.get("inferred_taxonomy_packed_byte_count")
+        ),
+        "pattern_count": _optional_int(
+            exact_counts.get("inferred_taxonomy_pattern_count")
+        ),
+        "pattern_member_count": _optional_int(
+            exact_counts.get("inferred_taxonomy_pattern_member_count")
+        ),
+        "pattern_member_bytes": _optional_int(
+            exact_counts.get(
+                "inferred_taxonomy_pattern_payload_byte_count"
+            )
+        ),
+    }
+    exact_counts_are_complete = all(
+        count is not None for count in exact_by_manifest_field.values()
+    )
+
+    if not manifest_advertises_projection:
+        if not exact_counts_are_complete or any(
+            count != 0 for count in exact_by_manifest_field.values()
+        ):
+            failures.append(
+                "inferred-taxonomy rows exist without a serving manifest"
+            )
+        if projection_evidence:
+            failures.append(
+                "inferred-taxonomy database evidence exists without rows"
+            )
+        return {"advertised": False}
+
+    if not isinstance(advertised_projection_value, Mapping):
+        failures.append("inferred-taxonomy serving manifest is malformed")
+        canonical_advertised: dict[str, Any] = {}
+    else:
+        try:
+            canonical_advertised = (
+                validate_v4_inferred_taxonomy_projection_manifest(
+                    advertised_projection_value
+                )
+            )
+        except PTG2ManifestArtifactError:
+            failures.append(
+                "inferred-taxonomy serving manifest is invalid"
+            )
+            canonical_advertised = {}
+
+    try:
+        canonical_evidence = (
+            validate_v4_inferred_taxonomy_projection_manifest(
+                projection_evidence
+            )
+        )
+    except PTG2ManifestArtifactError:
+        failures.append("inferred-taxonomy database projection is invalid")
+        canonical_evidence = {}
+
+    if (
+        not exact_counts_are_complete
+        or not canonical_evidence
+        or any(
+            exact_by_manifest_field[field_name]
+            != _optional_int(canonical_evidence.get(field_name))
+            for field_name in exact_by_manifest_field
+        )
+    ):
+        failures.append(
+            "inferred-taxonomy projection counts differ from exact snapshot rows"
+        )
+
+    if (
+        canonical_advertised
+        and canonical_evidence
+        and canonical_advertised != canonical_evidence
+    ):
+        failures.append(
+            "inferred-taxonomy serving manifest differs from database projection"
+        )
+
+    expected_rule_representation = (
+        str(expected_representation or provider_graph.get("representation") or "")
+    )
+    nonempty_rules = tuple(
+        rule
+        for rule in canonical_evidence.get("rules", ())
+        if _optional_int(rule.get("member_count")) not in (None, 0)
+    )
+    if expected_rule_representation in {
+        PTG2_V4_INFERRED_TAXONOMY_DIRECT_REPRESENTATION,
+        PTG2_V4_INFERRED_TAXONOMY_PATTERN_REPRESENTATION,
+    } and any(
+        rule.get("representation") != expected_rule_representation
+        for rule in nonempty_rules
+    ):
+        failures.append(
+            "inferred-taxonomy nonempty rules do not use the selected graph representation"
+        )
+    if expected_rule_representation == (
+        PTG2_V4_INFERRED_TAXONOMY_PATTERN_REPRESENTATION
+    ) and any(
+        _optional_int(rule.get(field_name)) in (None, 0)
+        for rule in nonempty_rules
+        for field_name in (
+            "pattern_count",
+            "pattern_member_count",
+            "pattern_member_bytes",
+        )
+    ):
+        failures.append(
+            "inferred-taxonomy pattern layout lacks a positive pattern projection"
+        )
+
+    return {
+        "advertised": True,
+        **(
+            canonical_evidence
+            if canonical_evidence
+            else dict(projection_evidence)
         ),
     }
 

@@ -1228,8 +1228,10 @@ async def _emit_compile_progress(**payload: Any) -> None:
     progress_by_field = {
         **context,
         "phase": "publishing: provider graph compile",
-        "stage_id": "publishing: provider graph compile",
+        "stage_id": "ptg2_v4_provider_graph_compile",
+        "stage_ordinal": 5,
         "unit": "factor_edges",
+        "denominator_state": "known",
         "source": "ptg2-v4-provider-graph-compile",
         "confidence": "live",
         **payload,

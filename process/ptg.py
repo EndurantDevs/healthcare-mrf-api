@@ -25,6 +25,7 @@ import ijson
 from sqlalchemy import cast, func, literal
 from sqlalchemy.dialects.postgresql import JSONB
 
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from db.connection import db
 from db.models import (ImportLog, PTG2CurrentPlanSource,
                        PTG2CurrentSourceSnapshot, PTG2FactChunk,
@@ -221,6 +222,9 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
 from process.ptg_parts.ptg2_v4_graph_compiler import (
     _resolve_v4_graph_compiler_binary,
     v4_graph_encoding_policy,
+)
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    inferred_provider_taxonomy_rule_set_digest,
 )
 from process.ptg_parts.ptg2_source_witness_contract import (
     validate_source_witness_manifest,
@@ -974,6 +978,132 @@ def _emit_ptg2_publish_progress(
         write_live_progress(**progress_payload_dict)
     except Exception:
         logger.debug("Failed to write PTG2 publish live progress", exc_info=True)
+
+
+class _PTG2V4PublicationProgress:
+    """Expose measured V4 publication work without hiding compiler progress."""
+
+    _PCT_LOWER_BOUND_BY_STAGE = {
+        "price preparation and publication": 91.25,
+        "finalizer": 91.25,
+        "price key map export": 91.5,
+        "dictionary publication": 91.5,
+        "provider set key export": 91.75,
+        "provider graph conversion": 95.0,
+        "serving block publication": 95.25,
+        "provider graph publication": 95.25,
+        "price publication": 95.25,
+        "source witness publication": 95.25,
+        "mapping summary": 96.0,
+        "audit publication": 96.5,
+        "snapshot seal": 97.0,
+    }
+    _POST_COMPILE_STAGES = frozenset(
+        stage_name
+        for stage_name, pct_lower_bound in _PCT_LOWER_BOUND_BY_STAGE.items()
+        if pct_lower_bound >= 95.0
+    )
+
+    def __init__(self) -> None:
+        self._event_count = 0
+        self._pct_lower_bound = 91.25
+        self._post_compile = False
+        self._counters_by_stage: dict[str, dict[str, int]] = {}
+
+    def _retain_counters(
+        self,
+        stage_name: str,
+        counters_by_name: Mapping[str, int],
+    ) -> dict[str, int]:
+        retained_by_name = self._counters_by_stage.setdefault(stage_name, {})
+        for raw_name, raw_counter in counters_by_name.items():
+            counter_value = int(raw_counter)
+            if counter_value >= 0:
+                counter_name = str(raw_name)
+                retained_by_name[counter_name] = max(
+                    retained_by_name.get(counter_name, 0),
+                    counter_value,
+                )
+        aggregate_by_name: dict[str, int] = {}
+        for stage_counters in self._counters_by_stage.values():
+            for counter_name, counter_value in stage_counters.items():
+                aggregate_by_name[counter_name] = (
+                    aggregate_by_name.get(counter_name, 0) + counter_value
+                )
+        return aggregate_by_name
+
+    def observe(
+        self,
+        stage_name: str,
+        counters_by_name: Mapping[str, int],
+    ) -> None:
+        """Persist one exact publication observation under the proper stage fence."""
+
+        normalized_stage_name = str(stage_name or "publication").strip()
+        normalized_stage_name = normalized_stage_name or "publication"
+        aggregate_by_name = self._retain_counters(
+            normalized_stage_name,
+            counters_by_name,
+        )
+        self._event_count += 1
+        self._post_compile = (
+            self._post_compile
+            or normalized_stage_name in self._POST_COMPILE_STAGES
+        )
+        self._pct_lower_bound = max(
+            self._pct_lower_bound,
+            self._PCT_LOWER_BOUND_BY_STAGE.get(
+                normalized_stage_name,
+                self._pct_lower_bound,
+            ),
+        )
+        aggregate_by_name["publication_progress_events"] = self._event_count
+        self._write_progress(normalized_stage_name, aggregate_by_name)
+
+    def _write_progress(
+        self,
+        stage_name: str,
+        counters_by_name: Mapping[str, int],
+    ) -> None:
+        """Write the current measured lower bound without inventing a total."""
+
+        progress_message = (
+            f"publishing PTG snapshot: {stage_name}; "
+            f"measured events={self._event_count}"
+        )
+        try:
+            write_live_progress(
+                phase=f"publishing: snapshot {stage_name}"[:128],
+                stage_id=(
+                    "ptg2_v4_publication"
+                    if self._post_compile
+                    else "ptg2_v4_precompile"
+                ),
+                stage_ordinal=6 if self._post_compile else 4,
+                unit="publication_events",
+                basis="semantic_work",
+                denominator_state="lower_bound",
+                done=self._event_count,
+                total=None,
+                work_done=self._event_count,
+                work_total=None,
+                pct=None,
+                pct_lower_bound=self._pct_lower_bound,
+                phase_pct=None,
+                stage_pct=None,
+                eta_seconds=None,
+                message=progress_message,
+                detail=progress_message,
+                source="ptg2-v4-publication-progress",
+                confidence="measured",
+                publication_stage=stage_name,
+                counters=dict(counters_by_name),
+            )
+        except Exception:
+            logger.debug(
+                "Failed to write measured PTG V4 publication progress",
+                exc_info=True,
+            )
 
 
 def _copy_file_row_count(copy_file_entry: dict[str, Any]) -> int:
@@ -4432,15 +4562,21 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
     )
     if provider_graph_v4_enabled:
         publisher_sources += (
+            source_root.parent / "api" / "ptg2_code_filters.py",
             source_root / "ptg_parts" / "ptg2_v4_audit.py",
             source_root / "ptg_parts" / "ptg2_v4_graph_compiler.py",
             source_root / "ptg_parts" / "ptg2_v4_snapshot_maps.py",
+            source_root / "ptg_parts" / "ptg2_v4_taxonomy_candidates.py",
         )
     publisher_digest = hashlib.sha256()
     publisher_byte_count = 0
     for source_path in publisher_sources:
         source_bytes = source_path.read_bytes()
-        relative_name = source_path.relative_to(source_root).as_posix().encode("utf-8")
+        try:
+            identity_path = source_path.relative_to(source_root)
+        except ValueError:
+            identity_path = source_path.relative_to(source_root.parent)
+        relative_name = identity_path.as_posix().encode("utf-8")
         publisher_digest.update(len(relative_name).to_bytes(4, "big"))
         publisher_digest.update(relative_name)
         publisher_digest.update(len(source_bytes).to_bytes(8, "big"))
@@ -4465,6 +4601,11 @@ def _shared_v3_scanner_identity() -> dict[str, Any]:
                 "provider_graph_compiler_sha256": compiler_digest,
                 "provider_graph_compiler_bytes": int(compiler_bytes),
                 "provider_graph_encoding_policy": v4_graph_encoding_policy(),
+                "inferred_taxonomy_rule_set_sha256": (
+                    inferred_provider_taxonomy_rule_set_digest(
+                        INFERRED_PROVIDER_TAXONOMY_RULES
+                    ).hex()
+                ),
             }
         )
     return scanner_identity_by_field
@@ -6523,13 +6664,28 @@ async def _main_with_artifact_lease(
         await flush_error_log(classes["ImportLog"])
         data_seconds = _ptg2_monotonic() - data_started_monotonic
         publish_started_monotonic = _ptg2_monotonic()
-        write_live_progress(phase="publishing", pct=92, message="publishing PTG snapshot")
+        write_live_progress(
+            phase="publishing",
+            pct=90 if provider_graph_v4_enabled else 92,
+            message="publishing PTG snapshot",
+        )
         publish_progress_total = 8
+        precompile_progress_options = (
+            {
+                "stage_start_pct": 90.0,
+                "stage_end_pct": 92.0,
+                "stage_id": "ptg2_v4_precompile",
+                "stage_ordinal": 4,
+            }
+            if provider_graph_v4_enabled
+            else {}
+        )
         _emit_ptg2_publish_progress(
             "starting",
             completed_steps=0,
             total_steps=publish_progress_total,
             message_text="starting PTG snapshot publish",
+            **precompile_progress_options,
         )
         manifest_merge_metrics_by_name: dict[str, Any] = {"enabled": False}
         manifest_precopy_merge_seconds = 0.0
@@ -6548,6 +6704,7 @@ async def _main_with_artifact_lease(
                 completed_steps=0,
                 total_steps=publish_progress_total,
                 message_text="merging manifest copy files before publish",
+                **precompile_progress_options,
             )
             manifest_precopy_merge_started_monotonic = _ptg2_monotonic()
             manifest_merge_metrics_by_name = await _merge_and_copy_ptg2_manifest_files(
@@ -6565,6 +6722,7 @@ async def _main_with_artifact_lease(
                 message_text="manifest copy files loaded into staging tables",
                 serving_rows=manifest_merge_metrics_by_name.get("serving_rows"),
                 streamed_to_copy=manifest_merge_metrics_by_name.get("streamed_to_copy"),
+                **precompile_progress_options,
             )
             for file_summary in successful_files:
                 summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
@@ -6584,6 +6742,7 @@ async def _main_with_artifact_lease(
                 completed_steps=5,
                 total_steps=publish_progress_total,
                 message_text="publishing PTG manifest snapshot tables",
+                **precompile_progress_options,
             )
             if shared_layout_reservation is None or shared_input_identity is None:
                 raise RuntimeError("strict V3 publish is missing its physical input reservation")
@@ -6597,7 +6756,7 @@ async def _main_with_artifact_lease(
             source_audit_witness_entries = strict_v3_copy_entries.get(
                 "source_audit_witness"
             ) or []
-            publication_progress_by_field = {"event_count": 0}
+            v4_publication_progress = _PTG2V4PublicationProgress()
 
             def report_snapshot_publication_progress(
                 stage_name: str,
@@ -6605,22 +6764,7 @@ async def _main_with_artifact_lease(
             ) -> None:
                 """Expose exact V4 publication work without advancing fake time."""
 
-                publication_progress_by_field["event_count"] += 1
-                normalized_counters_by_name = {
-                    str(counter_name): int(counter_value)
-                    for counter_name, counter_value in counters_by_name.items()
-                }
-                normalized_counters_by_name["publication_progress_events"] = (
-                    publication_progress_by_field["event_count"]
-                )
-                _emit_ptg2_publish_progress(
-                    f"snapshot {stage_name}",
-                    completed_steps=5,
-                    total_steps=publish_progress_total,
-                    message_text=f"publishing PTG snapshot: {stage_name}",
-                    publication_stage=stage_name,
-                    counters=normalized_counters_by_name,
-                )
+                v4_publication_progress.observe(stage_name, counters_by_name)
 
             try:
                 shared_publication = await publish_strict_shared_v3_layout(
@@ -6756,6 +6900,14 @@ async def _main_with_artifact_lease(
                 message_text="PTG manifest snapshot tables published",
                 serving_rates=serving_index.get("serving_rates") if isinstance(serving_index, dict) else None,
                 rate_count=serving_index.get("rate_count") if isinstance(serving_index, dict) else None,
+                **(
+                    {
+                        "stage_id": "ptg2_v4_publication",
+                        "stage_ordinal": 6,
+                    }
+                    if provider_graph_v4_enabled
+                    else {}
+                ),
             )
         publish_seconds = _ptg2_monotonic() - publish_started_monotonic
         post_publish_started_monotonic = _ptg2_monotonic()
