@@ -24,7 +24,7 @@ def _assert_snapshot_environment(monkeypatch) -> None:
     assert snapshot_maps._env_non_negative_seconds("PTG_TEST_SECONDS", 9) == 9
 
     with pytest.raises(ValueError, match="32 bytes"):
-        snapshot_maps._advisory_lock_key(b"short")
+        snapshot_maps.v4_layout_advisory_lock_key(b"short")
     with pytest.raises(ValueError, match="semantic fingerprint"):
         snapshot_maps.v4_layout_fingerprint(b"short")
     assert len(snapshot_maps.v4_layout_fingerprint(b"s" * 32)) == 32

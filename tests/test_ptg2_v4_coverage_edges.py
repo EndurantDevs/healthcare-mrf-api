@@ -5,6 +5,8 @@ import pytest
 pytest.register_assert_rewrite(
     "tests.ptg2_v4_coverage_graph_audit_cases",
     "tests.ptg2_v4_coverage_graph_compiler_cases",
+    "tests.ptg2_v4_coverage_prefix_diagnostics",
+    "tests.ptg2_v4_coverage_summary_mutations",
     "tests.ptg2_v4_coverage_publication_cases",
     "tests.ptg2_v4_coverage_snapshot_map_cases",
     "tests.ptg2_v4_coverage_snapshot_seal_cases",
@@ -41,4 +43,11 @@ from tests.ptg2_v4_coverage_graph_audit_cases import (
 )
 from tests.ptg2_v4_coverage_graph_compiler_cases import (
     test_compiler_progress_and_file_validation_branch_matrix,
+)
+from tests.ptg2_v4_coverage_prefix_diagnostics import (
+    test_compiler_prefix_owner_diagnostics_fail_closed,
+)
+from tests.ptg2_v4_coverage_summary_mutations import (
+    test_compiler_progress_rejects_post_terminal_and_backward_events,
+    test_compiler_summary_authentication_branch_matrix,
 )

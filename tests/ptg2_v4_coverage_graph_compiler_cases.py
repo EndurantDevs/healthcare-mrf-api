@@ -63,6 +63,64 @@ def _assert_artifact_manifest(tmp_path: Path) -> None:
         compiler._artifact_manifest({**artifact_entry_by_field, "name": 7})
 
 
+def _copy_structure_error_cases():
+    return (
+        (compiler._PG_COPY_HEADER, "truncates COPY rows", 1, False),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">h", -1) + b"x",
+            "trailing COPY bytes",
+            1,
+            False,
+        ),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">h", 2),
+            "wrong COPY width",
+            1,
+            False,
+        ),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">h", 1) + b"\0",
+            "truncates COPY field",
+            1,
+            False,
+        ),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">hi", 1, -1),
+            "NULL COPY field",
+            1,
+            False,
+        ),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">hi", 1, 8) + b"x",
+            "truncates COPY field",
+            1,
+            False,
+        ),
+    )
+
+
+def _copy_version_error_cases():
+    return (
+        (
+            compiler._PG_COPY_HEADER
+            + struct.pack(">hi", 2, 0)
+            + struct.pack(">i", 1)
+            + b"\1",
+            "invalid format-version width",
+            2,
+            True,
+        ),
+        (
+            compiler._PG_COPY_HEADER
+            + struct.pack(">hi", 2, 0)
+            + struct.pack(">ih", 2, compiler.PTG2_V4_SHARED_FORMAT_VERSION + 1),
+            "changed the shared CAS wire version",
+            2,
+            True,
+        ),
+    )
+
+
 def _assert_copy_file_validation(tmp_path: Path) -> None:
     copy_path = tmp_path / "rows.copy"
     copy_path.write_bytes(
@@ -79,20 +137,108 @@ def _assert_copy_file_validation(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="invalid COPY header"):
         compiler._count_pg_binary_rows(copy_path, expected_field_count=1)
 
+    malformed_cases = _copy_structure_error_cases() + _copy_version_error_cases()
+    for copy_payload, message, field_count, validate_shared_version in malformed_cases:
+        copy_path.write_bytes(copy_payload)
+        with pytest.raises(RuntimeError, match=message):
+            compiler._count_pg_binary_rows(
+                copy_path,
+                expected_field_count=field_count,
+                validate_shared_version=validate_shared_version,
+            )
+
+    copy_path.write_bytes(
+        compiler._PG_COPY_HEADER
+        + struct.pack(">hi", 2, 0)
+        + struct.pack(">ih", 2, compiler.PTG2_V4_SHARED_FORMAT_VERSION)
+        + struct.pack(">h", -1)
+    )
+    assert (
+        compiler._count_pg_binary_rows(
+            copy_path,
+            expected_field_count=2,
+            validate_shared_version=True,
+        )
+        == 1
+    )
+
+
+def _prefix_metadata_payload(
+    *rows: tuple[int, int, bytes],
+    trailing: bytes = b"",
+) -> bytes:
+    prefix_payload = bytearray(compiler._PG_COPY_HEADER)
+    for provider_set_key, member_count, digest in rows:
+        prefix_payload.extend(struct.pack(">h", 3))
+        for field in (
+            struct.pack(">i", provider_set_key),
+            struct.pack(">i", member_count),
+            digest,
+        ):
+            prefix_payload.extend(struct.pack(">i", len(field)))
+            prefix_payload.extend(field)
+    prefix_payload.extend(struct.pack(">h", -1))
+    prefix_payload.extend(trailing)
+    return bytes(prefix_payload)
+
+
+def _assert_prefix_metadata_validation(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "prefix-metadata.copy"
+    digest = b"d" * 32
+    metadata_path.write_bytes(_prefix_metadata_payload((1, 2, digest)))
+    assert compiler._read_prefix_override_metadata(
+        metadata_path,
+        prefix_target=2,
+    ) == {1: (2, digest)}
+
+    malformed_by_message = (
+        (b"bad", "invalid COPY header"),
+        (compiler._PG_COPY_HEADER, "truncates COPY rows"),
+        (_prefix_metadata_payload(trailing=b"x"), "trailing bytes"),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">h", 2),
+            "invalid row width",
+        ),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">h", 3) + b"\0",
+            "truncates field width",
+        ),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">hi", 3, 3),
+            "invalid field width",
+        ),
+        (
+            compiler._PG_COPY_HEADER + struct.pack(">hi", 3, 4) + b"\0",
+            "truncates field",
+        ),
+        (_prefix_metadata_payload((-1, 0, digest)), "not canonical"),
+        (_prefix_metadata_payload((1, -1, digest)), "not canonical"),
+        (_prefix_metadata_payload((1, 3, digest)), "not canonical"),
+        (
+            _prefix_metadata_payload((1, 1, digest), (1, 1, digest)),
+            "not canonical",
+        ),
+    )
+    for prefix_payload, message in malformed_by_message:
+        metadata_path.write_bytes(prefix_payload)
+        with pytest.raises(RuntimeError, match=message):
+            compiler._read_prefix_override_metadata(
+                metadata_path,
+                prefix_target=2,
+            )
+
 
 def _assert_reference_manifest(tmp_path: Path) -> None:
     references = tmp_path / "references.jsonl"
+    valid_record_by_field = {
+        "object_kind": "v4_members_v1",
+        "block_key": 0,
+        "fragment_no": 0,
+        "hash": "ab" * 32,
+        "codec": "none",
+    }
     references.write_text(
-        json.dumps(
-            {
-                "object_kind": "v4_members_v1",
-                "block_key": 0,
-                "fragment_no": 0,
-                "hash": "ab" * 32,
-                "codec": "none",
-            }
-        )
-        + "\n",
+        json.dumps(valid_record_by_field) + "\n",
         encoding="ascii",
     )
     compiler._validate_reference_manifest(references, 1)
@@ -114,6 +260,67 @@ def _assert_reference_manifest(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="object_kind"):
         compiler._validate_reference_manifest(references, 1)
 
+    references.write_bytes(b"x" * (64 * 1024 + 1) + b"\n")
+    with pytest.raises(RuntimeError, match="exceeds 64 KiB"):
+        compiler._validate_reference_manifest(references, 1)
+    references.write_text("[]\n", encoding="ascii")
+    with pytest.raises(RuntimeError, match="not an object"):
+        compiler._validate_reference_manifest(references, 1)
+    references.write_text(
+        "\n".join(
+            (
+                json.dumps(valid_record_by_field),
+                json.dumps(valid_record_by_field),
+            )
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    with pytest.raises(RuntimeError, match="strict coordinate order"):
+        compiler._validate_reference_manifest(references, 2)
+    references.write_text(
+        json.dumps({**valid_record_by_field, "codec": "gzip"}) + "\n",
+        encoding="ascii",
+    )
+    with pytest.raises(RuntimeError, match="unexpectedly compressed"):
+        compiler._validate_reference_manifest(references, 1)
+
+
+def _assert_observe_counter_validation() -> None:
+    assert compiler._normalized_observe_value(
+        "npi_prefix_worst_provider_set_key",
+        None,
+    ) is None
+    assert compiler._normalized_observe_value(
+        "npi_prefix_worst_member_digest",
+        None,
+    ) is None
+    assert compiler._normalized_observe_value(
+        "npi_prefix_worst_online_member_digest",
+        "ab" * 32,
+    ) == "ab" * 32
+    assert compiler._normalized_observe_value(
+        "npi_prefix_worst_provider_set_uses_override",
+        True,
+    ) is True
+    with pytest.raises(RuntimeError, match="invalid observe"):
+        compiler._normalized_observe_value(
+            "npi_prefix_worst_provider_set_uses_override",
+            1,
+        )
+    assert compiler._normalized_observe_value("ordinary_counter", 3) == 3
+    with pytest.raises(RuntimeError, match="invalid observe counters"):
+        compiler._normalize_observe_counters(())
+    assert compiler._normalize_observe_counters(
+        {
+            "npi_prefix_worst_online_provider_set_key": None,
+            "ordinary_counter": 4,
+        }
+    ) == {
+        "npi_prefix_worst_online_provider_set_key": None,
+        "ordinary_counter": 4,
+    }
+
 
 def _assert_sorted_intersection() -> None:
     assert intersection.intersect_sorted_u32((1, 3, 5), (0, 1, 5, 9)) == (
@@ -131,7 +338,9 @@ def test_compiler_and_intersection_validation_edges(tmp_path: Path, monkeypatch)
     _assert_compiler_scalar_validation(monkeypatch)
     _assert_artifact_manifest(tmp_path)
     _assert_copy_file_validation(tmp_path)
+    _assert_prefix_metadata_validation(tmp_path)
     _assert_reference_manifest(tmp_path)
+    _assert_observe_counter_validation()
     _assert_sorted_intersection()
 
 
@@ -220,6 +429,14 @@ def _assert_summary_path_validation(tmp_path: Path, executable: Path) -> None:
             {"path": str((tmp_path / "missing").resolve())},
             "path",
             tmp_path / "missing",
+        )
+    symlink = tmp_path / "compiler-symlink"
+    symlink.symlink_to(executable)
+    with pytest.raises(RuntimeError, match="unexpected path"):
+        compiler._summary_path(
+            {"path": str(symlink.resolve(strict=False).parent / symlink.name)},
+            "path",
+            executable,
         )
 
 

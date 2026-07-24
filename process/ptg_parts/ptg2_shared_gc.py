@@ -22,6 +22,7 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_MAP_BLOCK_KIND,
     PTG2_V4_SHARED_GENERATION,
     decode_v4_snapshot_map_pack,
+    v4_layout_advisory_lock_key,
 )
 
 
@@ -551,6 +552,105 @@ async def _v4_reachable_hashes(
     return reachable_hashes
 
 
+async def _owned_v4_layout_fingerprint(
+    executor: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+) -> bytes | None:
+    """Load the unique fingerprint that serializes one V4 reservation."""
+
+    schema = _quote_ident(schema_name)
+    fingerprint_rows = await executor.all(
+        f"""
+        SELECT semantic_fingerprint
+          FROM {schema}.ptg2_v3_layout_fingerprint
+         WHERE snapshot_key = :snapshot_key
+         ORDER BY semantic_fingerprint
+         LIMIT 2
+        """,
+        snapshot_key=int(snapshot_key),
+    )
+    if not fingerprint_rows:
+        return None
+    if len(fingerprint_rows) != 1:
+        raise RuntimeError("owned PTG V4 layout has multiple fingerprints")
+    fingerprint = bytes(
+        _row_mapping(fingerprint_rows[0]).get("semantic_fingerprint") or b""
+    )
+    if len(fingerprint) != 32:
+        raise RuntimeError("owned PTG V4 layout fingerprint is invalid")
+    return fingerprint
+
+
+def _owned_v4_layout_lock_sql(schema: str) -> str:
+    return f"""
+        SELECT layout.snapshot_key,
+               (
+                   SELECT root.state
+                     FROM {schema}.ptg2_v4_snapshot_map_root AS root
+                    WHERE root.snapshot_key = layout.snapshot_key
+               ) AS root_state,
+               EXISTS (
+                   SELECT 1
+                     FROM {schema}.ptg2_v3_snapshot_binding AS binding
+                    WHERE binding.snapshot_key = layout.snapshot_key
+               ) AS is_bound
+          FROM {schema}.ptg2_v3_snapshot_layout AS layout
+          JOIN {schema}.ptg2_v3_layout_fingerprint AS fingerprint
+            ON fingerprint.snapshot_key = layout.snapshot_key
+           AND fingerprint.semantic_fingerprint = :semantic_fingerprint
+         WHERE layout.snapshot_key = :snapshot_key
+           AND layout.generation = :generation
+           AND layout.state = 'building'
+           AND layout.build_token = :build_token
+           AND (
+                SELECT COUNT(*)
+                  FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint_count
+                 WHERE fingerprint_count.snapshot_key = layout.snapshot_key
+           ) = 1
+         FOR UPDATE OF layout
+    """
+
+
+async def _is_owned_v4_layout_locked(
+    executor: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+) -> bool:
+    """Fence an exact unpublished V4 build against reservation and publication."""
+
+    fingerprint = await _owned_v4_layout_fingerprint(
+        executor,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+    )
+    if fingerprint is None:
+        return False
+    await executor.status(
+        "SELECT pg_advisory_xact_lock(:lock_key)",
+        lock_key=v4_layout_advisory_lock_key(fingerprint),
+    )
+    schema = _quote_ident(schema_name)
+    owner_rows = await executor.all(
+        _owned_v4_layout_lock_sql(schema),
+        semantic_fingerprint=fingerprint,
+        snapshot_key=int(snapshot_key),
+        generation=PTG2_V4_SHARED_GENERATION,
+        build_token=str(build_token),
+    )
+    if not owner_rows:
+        return False
+    owner = _row_mapping(owner_rows[0])
+    if bool(owner.get("is_bound")):
+        raise RuntimeError("refusing to abandon a bound PTG V4 layout")
+    if owner.get("root_state") not in (None, "building"):
+        raise RuntimeError("refusing to abandon a completed PTG V4 map root")
+    return True
+
+
 async def _additional_v4_layout_stats(
     executor: Any,
     *,
@@ -793,10 +893,13 @@ def _lock_layouts_sql(schema_name: str) -> str:
     """
 
 
-def _release_layouts_sql(schema_name: str) -> str:
-    """Build guarded SQL that queues block GC and deletes unbound layouts."""
+def _dense_layout_delete_fragments(
+    schema: str,
+    *,
+    selected_layout_cte: str = "layout_batch",
+) -> tuple[str, str]:
+    """Return CTEs and dependencies for every unconstrained dense layout table."""
 
-    schema = _quote_ident(schema_name)
     dense_delete_ctes: list[str] = []
     dense_delete_dependencies: list[str] = []
     for table_name in PTG2_V3_DENSE_LAYOUT_TABLES:
@@ -804,8 +907,8 @@ def _release_layouts_sql(schema_name: str) -> str:
         dense_delete_ctes.append(
             f"""
         {cte_name} AS (
-            DELETE FROM {schema}.{_quote_ident(table_name)} AS payload
-             USING layout_batch AS selected
+             DELETE FROM {schema}.{_quote_ident(table_name)} AS payload
+             USING {selected_layout_cte} AS selected
              WHERE payload.snapshot_key = selected.snapshot_key
             RETURNING payload.snapshot_key
         ),"""
@@ -813,8 +916,19 @@ def _release_layouts_sql(schema_name: str) -> str:
         dense_delete_dependencies.append(
             f"AND (SELECT COUNT(*) FROM {cte_name}) >= 0"
         )
-    dense_delete_sql = "\n".join(dense_delete_ctes)
-    dense_dependency_sql = "\n               ".join(dense_delete_dependencies)
+    return (
+        "\n".join(dense_delete_ctes),
+        "\n               ".join(dense_delete_dependencies),
+    )
+
+
+def _release_layouts_sql(schema_name: str) -> str:
+    """Build guarded SQL that queues block GC and deletes unbound layouts."""
+
+    schema = _quote_ident(schema_name)
+    dense_delete_sql, dense_dependency_sql = _dense_layout_delete_fragments(
+        schema
+    )
     return f"""
         WITH layout_batch AS MATERIALIZED (
             SELECT layout.snapshot_key
@@ -890,6 +1004,162 @@ def _release_layouts_sql(schema_name: str) -> str:
                        ON block.block_hash = mapped.block_hash
                ), 0) AS stored_bytes
     """
+
+
+def _owned_v4_candidate_ctes(schema: str) -> str:
+    return f"""
+        owned_layout AS MATERIALIZED (
+            SELECT layout.snapshot_key
+              FROM {schema}.ptg2_v3_snapshot_layout AS layout
+             WHERE layout.snapshot_key = :snapshot_key
+               AND layout.generation = :generation
+               AND layout.state = 'building'
+               AND layout.build_token = :build_token
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {schema}.ptg2_v3_snapshot_binding AS binding
+                     WHERE binding.snapshot_key = layout.snapshot_key
+               )
+        ),
+        mapped_blocks AS MATERIALIZED (
+            SELECT DISTINCT mapping.block_hash
+              FROM {schema}.ptg2_v3_snapshot_block AS mapping
+              JOIN owned_layout AS layout
+                ON layout.snapshot_key = mapping.snapshot_key
+            UNION
+            SELECT DISTINCT v4_hash.block_hash
+              FROM unnest(CAST(:v4_block_hashes AS bytea[]))
+                       AS v4_hash(block_hash)
+        ),
+        queued_candidates AS (
+            INSERT INTO {schema}.ptg2_v3_gc_candidate AS candidate
+                (block_hash, eligible_at, queued_at)
+            SELECT mapped.block_hash,
+                   transaction_timestamp()
+                       + (:grace_seconds * INTERVAL '1 second'),
+                   transaction_timestamp()
+              FROM mapped_blocks AS mapped
+            ON CONFLICT (block_hash) DO UPDATE
+                SET eligible_at = GREATEST(
+                    candidate.eligible_at,
+                    EXCLUDED.eligible_at
+                )
+            RETURNING block_hash
+        ),"""
+
+
+def _abandon_owned_v4_layout_sql(schema_name: str) -> str:
+    """Queue exact V4 reachability and remove one token-owned building layout."""
+
+    schema = _quote_ident(schema_name)
+    candidate_ctes = _owned_v4_candidate_ctes(schema)
+    dense_delete_sql, dense_dependency_sql = _dense_layout_delete_fragments(
+        schema,
+        selected_layout_cte="owned_layout",
+    )
+    return f"""
+        WITH {candidate_ctes}
+        {dense_delete_sql}
+        deleted_layout AS (
+            DELETE FROM {schema}.ptg2_v3_snapshot_layout AS layout
+             USING owned_layout AS selected
+             WHERE layout.snapshot_key = selected.snapshot_key
+               AND layout.generation = :generation
+               AND layout.state = 'building'
+               AND layout.build_token = :build_token
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {schema}.ptg2_v3_snapshot_binding AS binding
+                     WHERE binding.snapshot_key = layout.snapshot_key
+               )
+               AND (SELECT COUNT(*) FROM queued_candidates) >= 0
+               {dense_dependency_sql}
+            RETURNING layout.snapshot_key
+        )
+        SELECT (SELECT COUNT(*) FROM deleted_layout) AS logical_layout_count,
+               (SELECT COUNT(*) FROM mapped_blocks) AS candidate_hash_count,
+               COALESCE((
+                   SELECT SUM(block.stored_byte_count)
+                     FROM mapped_blocks AS mapped
+                     JOIN {schema}.ptg2_v3_block AS block
+                       ON block.block_hash = mapped.block_hash
+               ), 0) AS stored_bytes
+    """
+
+
+async def _abandon_owned_v4_layout_ready(
+    executor: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+    grace_seconds: int,
+) -> PTG2SharedLayoutGCStats:
+    if not await _is_owned_v4_layout_locked(
+        executor,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        build_token=str(build_token),
+    ):
+        return PTG2SharedLayoutGCStats()
+    v4_block_hashes = await _v4_reachable_hashes(
+        executor,
+        schema_name=schema_name,
+        snapshot_keys=(int(snapshot_key),),
+    )
+    aggregate_rows = await executor.all(
+        _abandon_owned_v4_layout_sql(schema_name),
+        snapshot_key=int(snapshot_key),
+        generation=PTG2_V4_SHARED_GENERATION,
+        build_token=str(build_token),
+        grace_seconds=int(grace_seconds),
+        v4_block_hashes=sorted(v4_block_hashes),
+    )
+    aggregate = _row_mapping(aggregate_rows[0]) if aggregate_rows else {}
+    stats = PTG2SharedLayoutGCStats(
+        logical_layout_count=int(aggregate.get("logical_layout_count") or 0),
+        candidate_hash_count=int(aggregate.get("candidate_hash_count") or 0),
+        stored_bytes=int(aggregate.get("stored_bytes") or 0),
+    )
+    if stats.logical_layout_count != 1:
+        raise RuntimeError("owned PTG V4 layout changed during abandonment")
+    return stats
+
+
+async def abandon_owned_v4_layout(
+    *,
+    schema_name: str | None = None,
+    snapshot_key: int,
+    build_token: str,
+    executor: Any | None = None,
+    grace_seconds: int | None = None,
+) -> PTG2SharedLayoutGCStats:
+    """Remove one exact failed V4 build while retaining every CAS payload."""
+
+    schema_name = resolve_ptg2_schema(schema_name)
+    grace = _block_gc_grace_seconds(grace_seconds)
+
+    async def _run(connection: Any) -> PTG2SharedLayoutGCStats:
+        if not await _has_shared_tables(
+            connection,
+            schema_name,
+            require_shared=True,
+        ):
+            raise RuntimeError("owned PTG V4 abandonment requires shared tables")
+        if not await _has_v4_map_tables(connection, schema_name):
+            raise RuntimeError("owned PTG V4 abandonment requires V4 map tables")
+        return await _abandon_owned_v4_layout_ready(
+            connection,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=str(build_token),
+            grace_seconds=grace,
+        )
+
+    if executor is not None:
+        return await _run(executor)
+    async with db.acquire() as connection:
+        return await _run(connection)
 
 
 async def _release_layouts_ready(
