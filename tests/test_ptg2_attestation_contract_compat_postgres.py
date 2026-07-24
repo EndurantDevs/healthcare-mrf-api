@@ -19,35 +19,12 @@ from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
 )
 from tests.ptg2_attestation_compat_test_support import (
+    create_writer_attestation_table as _create_writer_attestation_table,
     quoted_identifier as _quoted,
     writer_evidence_by_field as _writer_evidence,
     writer_identity_by_field as _writer_identity,
     writer_report_by_field as _writer_report,
 )
-
-
-async def _create_writer_attestation_table(quoted_schema: str) -> None:
-    await db.execute_ddl(
-        f"""CREATE TABLE {quoted_schema}.ptg2_v3_candidate_audit_attestation (
-            snapshot_id text PRIMARY KEY,
-            snapshot_key bigint NOT NULL,
-            source_key text NOT NULL,
-            plan_id text NOT NULL,
-            plan_market_type text NOT NULL,
-            coverage_scope_id bytea NOT NULL,
-            source_set_digest bytea NOT NULL,
-            audit_sample_digest bytea NOT NULL,
-            source_witness_digest bytea NOT NULL,
-            contract text NOT NULL,
-            tool_name text NOT NULL,
-            tool_version text NOT NULL,
-            report_digest bytea NOT NULL,
-            report jsonb NOT NULL,
-            attested_at timestamptz NOT NULL,
-            expires_at timestamptz NOT NULL,
-            activated_at timestamptz
-        )"""
-    )
 
 
 async def _seed_writer_v3_attestation(quoted_schema: str) -> None:

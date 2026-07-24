@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 
+from db.connection import db
 from process.ptg_parts import ptg2_candidate_attestation
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
@@ -16,6 +17,32 @@ def quoted_identifier(identifier: str) -> str:
     """Quote one generated PostgreSQL identifier."""
 
     return '"' + identifier.replace('"', '""') + '"'
+
+
+async def create_writer_attestation_table(quoted_schema: str) -> None:
+    """Create the durable attestation table used by isolated PostgreSQL proofs."""
+
+    await db.execute_ddl(
+        f"""CREATE TABLE {quoted_schema}.ptg2_v3_candidate_audit_attestation (
+            snapshot_id text PRIMARY KEY,
+            snapshot_key bigint NOT NULL,
+            source_key text NOT NULL,
+            plan_id text NOT NULL,
+            plan_market_type text NOT NULL,
+            coverage_scope_id bytea NOT NULL,
+            source_set_digest bytea NOT NULL,
+            audit_sample_digest bytea NOT NULL,
+            source_witness_digest bytea NOT NULL,
+            contract text NOT NULL,
+            tool_name text NOT NULL,
+            tool_version text NOT NULL,
+            report_digest bytea NOT NULL,
+            report jsonb NOT NULL,
+            attested_at timestamptz NOT NULL,
+            expires_at timestamptz NOT NULL,
+            activated_at timestamptz
+        )"""
+    )
 
 
 def writer_source_witness_by_field(
@@ -77,6 +104,7 @@ def writer_identity_by_field() -> dict[str, object]:
 
     identity_by_field = {
         "snapshot_key": 17,
+        "storage_generation": "shared_blocks_v3",
         "source_key": "source-a",
         "plan_id": "12-3456789",
         "plan_market_type": "group",
@@ -155,6 +183,7 @@ def writer_evidence_by_field(
             if is_v4
             else ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
         ),
+        "storage_generation": identity_by_field["storage_generation"],
         "tool_name": (
             ptg2_candidate_attestation.PTG2_BATCH_AUDIT_TOOL
             if is_v4
@@ -194,6 +223,7 @@ def writer_evidence_by_field(
 
 
 __all__ = [
+    "create_writer_attestation_table",
     "quoted_identifier",
     "writer_evidence_by_field",
     "writer_identity_by_field",

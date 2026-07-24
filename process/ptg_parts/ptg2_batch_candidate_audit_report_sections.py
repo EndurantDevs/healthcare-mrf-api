@@ -33,6 +33,9 @@ from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
 from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_DEADLINE_SECONDS,
 )
+from process.ptg_parts.ptg2_candidate_layout_identity import (
+    PTG2_CANDIDATE_V3_GENERATION,
+)
 from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
     PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
@@ -56,6 +59,7 @@ class CandidateReportCoordinates:
     source_key: str
     plan_id: str
     plan_market_type: str
+    storage_generation: str = PTG2_CANDIDATE_V3_GENERATION
 
 
 @dataclass(frozen=True)
@@ -224,7 +228,7 @@ def validate_report_target(
     )
     expected_by_field = {
         "expected_architecture": "postgres_binary_v3",
-        "expected_storage_generation": "shared_blocks_v3",
+        "expected_storage_generation": coordinates.storage_generation,
         "expected_database_backend": "postgresql",
         "expected_snapshot_lifecycle": "validated",
         "architecture_assertion": "required_postgresql_session_evidence",

@@ -78,10 +78,43 @@ def _audit_sample_by_field() -> dict[str, object]:
     }
 
 
+def _candidate_serving_index(
+    storage_generation: str,
+    provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+) -> dict[str, object]:
+    serving_index_by_field = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": storage_generation,
+        "source_set": {
+            "contract": "sorted_raw_container_sha256_bytes_v1",
+            "source_count": 1,
+            "raw_container_sha256_digest": SOURCE_SET_DIGEST,
+        },
+        "source_witness": _source_witness_by_field(),
+        "audit_sample": _audit_sample_by_field(),
+        "provider_identifier_quarantine": provider_identifier_quarantine,
+    }
+    if storage_generation == "shared_blocks_v4":
+        serving_index_by_field.update(
+            {
+                "type": "ptg2_shared_blocks_v4",
+                "provider_scope_strategy": "postgres_packed_graph_v4",
+                "shared_block_layout": "packed_snapshot_maps_v4",
+                "shared_snapshot_key": 17,
+                "snapshot_map": {
+                    "contract": "ptg_v4_packed_snapshot_map_v1",
+                    "map_digest": ("ab" * 32),
+                },
+            }
+        )
+    return serving_index_by_field
+
+
 def _candidate_row(
     *,
     activated: bool = False,
     provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+    storage_generation: str = "shared_blocks_v3",
 ) -> dict[str, object]:
     """Build one sealed candidate database row fixture."""
 
@@ -94,18 +127,10 @@ def _candidate_row(
     }
     if activated:
         activation_map["mode"] = "audited_control"
-    serving_index_by_field = {
-        "arch_version": "postgres_binary_v3",
-        "storage_generation": "shared_blocks_v3",
-        "source_set": {
-            "contract": "sorted_raw_container_sha256_bytes_v1",
-            "source_count": 1,
-            "raw_container_sha256_digest": SOURCE_SET_DIGEST,
-        },
-        "source_witness": _source_witness_by_field(),
-        "audit_sample": _audit_sample_by_field(),
-        "provider_identifier_quarantine": provider_identifier_quarantine,
-    }
+    serving_index_by_field = _candidate_serving_index(
+        storage_generation,
+        provider_identifier_quarantine,
+    )
     return {
         "snapshot_id": snapshot_id,
         "import_run_id": "ptg2:derived-import",
@@ -119,8 +144,21 @@ def _candidate_row(
         "plan_id": "12-3456789",
         "plan_market_type": "group",
         "layout_state": "sealed",
-        "layout_generation": "shared_blocks_v3",
+        "layout_generation": storage_generation,
+        "layout_mapping_digest": (
+            bytes.fromhex("ab" * 32)
+            if storage_generation == "shared_blocks_v4"
+            else None
+        ),
         "layout_manifest": {"serving_index": serving_index_by_field},
+        "v4_root_state": (
+            "complete" if storage_generation == "shared_blocks_v4" else None
+        ),
+        "v4_root_map_digest": (
+            bytes.fromhex("ab" * 32)
+            if storage_generation == "shared_blocks_v4"
+            else None
+        ),
         "current_snapshot_id": snapshot_id if activated else "previous-snapshot",
         "audit_report_digest": bytes.fromhex("cd" * 32) if activated else None,
         "audit_report": (
@@ -355,6 +393,31 @@ async def test_candidate_scope_is_derived_and_corroboration_cannot_spoof(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_candidate_scope_accepts_complete_v4_packed_layout(monkeypatch):
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(
+            return_value=[
+                _candidate_row(storage_generation="shared_blocks_v4")
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id="ptg2:derived-import",
+    )
+
+    assert target.storage_generation == "shared_blocks_v4"
+    assert target.snapshot_key == 17
+
+
+@pytest.mark.asyncio
 async def test_controlled_rebuild_run_identity_keeps_audit_targets_unambiguous(
     monkeypatch,
 ):
@@ -428,6 +491,8 @@ async def test_candidate_target_query_ignores_unsupported_attestations(monkeypat
     assert " attestation.contract = ANY(" in query
     assert "current_attestation.contract = ANY(" in query
     assert query.count(":supported_contracts") == 2
+    assert "ptg2_v4_snapshot_map_root AS v4_root" in query
+    assert "ptg2_v4_snapshot_map_root AS current_v4_root" in query
     assert query_parameters["supported_contracts"] == list(
         ptg_candidate_audit.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
     )
@@ -951,8 +1016,12 @@ async def test_release_audit_loads_once_and_uses_partitioned_http_configuration(
     monkeypatch.setattr(ptg_candidate_audit, "run_partitioned_candidate_audit", runner)
 
     progress_callback = AsyncMock()
-    report = await ptg_candidate_audit.run_batch_release_audit(
+    candidate_target = replace(
         _target(),
+        storage_generation="shared_blocks_v4",
+    )
+    report = await ptg_candidate_audit.run_batch_release_audit(
+        candidate_target,
         progress_callback=progress_callback,
     )
 
@@ -960,6 +1029,7 @@ async def test_release_audit_loads_once_and_uses_partitioned_http_configuration(
     kwargs = runner.await_args.kwargs
     assert kwargs["audit_target"].snapshot_id == "candidate-snapshot"
     assert kwargs["audit_target"].raw_container_sha256 == (RAW_DIGEST,)
+    assert kwargs["audit_target"].storage_generation == "shared_blocks_v4"
     assert kwargs["audit_target"].source_witness["payload_sha256"] == (
         SOURCE_WITNESS_DIGEST
     )
@@ -1162,6 +1232,21 @@ async def test_partition_progress_reports_exact_counters_within_audit_band(
 
 
 @pytest.mark.asyncio
+async def test_partition_progress_without_control_run_is_a_noop(monkeypatch):
+    mark_control_run = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "mark_control_run", mark_control_run)
+
+    await ptg_candidate_audit._partition_progress(
+        None,
+        snapshot_id="candidate-snapshot",
+        completed=0,
+        total=0,
+    )
+
+    mark_control_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rolling_v3_writer_path_loads_witness_once(monkeypatch):
     witness = Mock(occurrence_records=(object(), object()))
     report = _passing_report()
@@ -1223,6 +1308,7 @@ async def test_default_v4_audit_attests_then_activates(
         events.append("attest")
         assert kwargs["plan_id"] == "12-3456789"
         assert kwargs["source_key"] == "derived-source"
+        assert kwargs["storage_generation"] == "shared_blocks_v3"
         assert kwargs["report"] is report
         return {"report_digest": "ef" * 32}
 
