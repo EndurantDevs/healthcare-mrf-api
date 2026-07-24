@@ -161,6 +161,9 @@ async def _is_table_available(db_schema: str, table_name: str) -> bool:
     return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=qualified_name))
 
 
+_table_exists = _is_table_available
+
+
 async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
     """Download HUD USPS crosswalk to map Census Tract → ZIP code.
 
@@ -387,7 +390,7 @@ async def process_data(ctx, task=None):
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(LODESWorkplaceAggregate, import_date)
     await _ensure_schema_exists(db_schema)
-    if not await _is_table_available(db_schema, stage_cls.__tablename__):
+    if not await _table_exists(db_schema, stage_cls.__tablename__):
         await db.create_table(stage_cls.__table__, checkfirst=True)
         if hasattr(stage_cls, "__my_index_elements__") and stage_cls.__my_index_elements__:
             await db.status(
@@ -489,7 +492,7 @@ async def shutdown(ctx):
 
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(LODESWorkplaceAggregate, import_date)
-    if not await _is_table_available(db_schema, stage_cls.__tablename__):
+    if not await _table_exists(db_schema, stage_cls.__tablename__):
         if context.get("test_mode"):
             logger.info(
                 "LODES test mode: stage table %s.%s is missing; skipping publish.",
@@ -515,7 +518,7 @@ async def shutdown(ctx):
     distinct_zctas = int(await db.scalar(
         f"SELECT COUNT(DISTINCT zcta_code) FROM {db_schema}.{stage_cls.__tablename__};"
     ) or 0)
-    if await _is_table_available(db_schema, "geo_zip_lookup"):
+    if await _table_exists(db_schema, "geo_zip_lookup"):
         matched_zctas = int(await db.scalar(
             f"""
             SELECT COUNT(DISTINCT s.zcta_code)
