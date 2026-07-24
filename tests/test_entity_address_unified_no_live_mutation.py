@@ -45,7 +45,7 @@ def _mock_shutdown_dependencies(monkeypatch, events: list[tuple[str, str]]) -> N
         events.append(("ddl", "post-publish indexes"))
 
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
-    monkeypatch.setattr(entity_address_unified, "_is_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(entity_address_unified, "_has_table", AsyncMock(return_value=True))
     monkeypatch.setattr(entity_address_unified.db, "scalar", AsyncMock(return_value=100))
     monkeypatch.setattr(entity_address_unified, "_run_sql_phase", run_sql)
     monkeypatch.setattr(
@@ -120,10 +120,10 @@ async def test_archive_coordinate_mismatches_are_informational_but_invalid_coord
 ):
     monkeypatch.setattr(
         entity_address_unified,
-        "_location_key_primary_key_validated",
+        "_is_location_primary_key_validated",
         AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(entity_address_unified, "_is_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(entity_address_unified, "_has_table", AsyncMock(return_value=True))
     monkeypatch.setattr(entity_address_unified.db, "all", AsyncMock(return_value=[]))
 
     scalar = AsyncMock(side_effect=[0, 1233, 0, 0, 0, 0, 0])

@@ -1480,7 +1480,7 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
             schema,
             stage_table,
             source_selects,
-            address_canon_available=True,
+            is_address_canon_available=True,
         )
     )
 

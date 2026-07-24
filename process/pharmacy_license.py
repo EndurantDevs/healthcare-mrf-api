@@ -720,40 +720,40 @@ def _iter_name_variants_for_match(value: Any) -> list[str]:
         if compacted:
             variants.append(compacted)
 
-    deduped: list[str] = []
-    seen: set[str] = set()
+    deduped_variants: list[str] = []
+    seen_variants: set[str] = set()
     for item in variants:
         normalized = " ".join(item.split())
         if not normalized:
             continue
         dedupe_key = normalized.lower()
-        if dedupe_key in seen:
+        if dedupe_key in seen_variants:
             continue
-        seen.add(dedupe_key)
-        deduped.append(normalized)
-    return deduped
+        seen_variants.add(dedupe_key)
+        deduped_variants.append(normalized)
+    return deduped_variants
 
 
 def _name_candidates_for_match(entity_name: Any, dba_name: Any) -> list[str]:
     candidates: list[str] = []
-    seen: set[str] = set()
+    seen_candidates: set[str] = set()
     for value in (entity_name, dba_name):
         for variant in _iter_name_variants_for_match(value):
             for loose in (False, True):
                 key = _normalize_name_for_match(variant, loose=loose)
-                if not key or key in seen:
+                if not key or key in seen_candidates:
                     continue
-                seen.add(key)
+                seen_candidates.add(key)
                 candidates.append(key)
     return candidates
 
 
 def _unique_mapping(raw_map: dict[Any, set[int]]) -> dict[Any, int]:
-    resolved: dict[Any, int] = {}
+    unique_value_map: dict[Any, int] = {}
     for key, values in raw_map.items():
         if len(values) == 1:
-            resolved[key] = next(iter(values))
-    return resolved
+            unique_value_map[key] = next(iter(values))
+    return unique_value_map
 
 
 def _is_license_like_identifier_issuer(value: Any) -> bool:
@@ -764,12 +764,15 @@ def _is_license_like_identifier_issuer(value: Any) -> bool:
     return any(token in issuer for token in _LICENSE_LIKE_ISSUER_TOKENS)
 
 
-def _partd_name_fallback_quality_ok(*, total_rows: int, named_rows: int, city_rows: int, zip_rows: int) -> bool:
+def _is_partd_name_fallback_acceptable(*, total_rows: int, named_rows: int, city_rows: int, zip_rows: int) -> bool:
     if total_rows < PHARM_LICENSE_PARTD_MIN_ROWS_FOR_FALLBACK:
         return False
     if named_rows <= 0:
         return False
     return city_rows > 0 or zip_rows > 0
+
+
+_partd_name_fallback_quality_ok = _is_partd_name_fallback_acceptable
 
 
 def _to_date(value: Any) -> datetime.date | None:
@@ -909,16 +912,16 @@ def _parse_fda_state_sources(html: str) -> list[StateSource]:
 
 
 def _extract_hidden_fields(page_html: str) -> dict[str, str]:
-    fields: dict[str, str] = {}
+    hidden_field_map: dict[str, str] = {}
     for input_tag in _INPUT_TAG_PATTERN.findall(page_html):
-        attrs = {key.lower(): html.unescape(value) for key, value in _TAG_ATTR_PATTERN.findall(input_tag)}
-        if attrs.get("type", "").lower() != "hidden":
+        attribute_map = {key.lower(): html.unescape(value) for key, value in _TAG_ATTR_PATTERN.findall(input_tag)}
+        if attribute_map.get("type", "").lower() != "hidden":
             continue
-        name = attrs.get("name")
+        name = attribute_map.get("name")
         if not name or not name.startswith("__"):
             continue
-        fields[name] = attrs.get("value", "")
-    return fields
+        hidden_field_map[name] = attribute_map.get("value", "")
+    return hidden_field_map
 
 
 def _extract_lookup_field_names(page_html: str) -> set[str]:
@@ -969,7 +972,7 @@ def _pick_pharmacy_option(options: list[tuple[str, str]], *, prefer_facility: bo
         candidate = (text or value).strip().lower()
         if candidate == "pharmacy":
             return value
-    filtered: list[str] = []
+    filtered_options: list[str] = []
     for value, text in options:
         candidate = (text or value).strip().lower()
         if "pharm" not in candidate:
@@ -978,9 +981,9 @@ def _pick_pharmacy_option(options: list[tuple[str, str]], *, prefer_facility: bo
             continue
         if prefer_facility and any(token in candidate for token in ("pharmacist", "graduate pharmacist")):
             continue
-        filtered.append(value)
-    if filtered:
-        return filtered[0]
+        filtered_options.append(value)
+    if filtered_options:
+        return filtered_options[0]
     for value, text in options:
         candidate = (text or value).strip().lower()
         if "pharm" in candidate:
@@ -1011,7 +1014,7 @@ def _extract_form_action(page_html: str, base_url: str) -> str:
 
 def _extract_postback_targets(page_html: str) -> dict[int, str]:
     decoded = html.unescape(page_html)
-    targets: dict[int, str] = {}
+    postback_target_map: dict[int, str] = {}
     for raw_args, body in _ASP_DATAGRID_POSTBACK_PATTERN.findall(decoded):
         arg_match = re.search(r"'([^']+)'\s*,\s*'([^']*)'", raw_args)
         if not arg_match:
@@ -1019,8 +1022,8 @@ def _extract_postback_targets(page_html: str) -> dict[int, str]:
         label = _strip_html_tags(body)
         if not label.isdigit():
             continue
-        targets[int(label)] = arg_match.group(1)
-    return targets
+        postback_target_map[int(label)] = arg_match.group(1)
+    return postback_target_map
 
 
 def _parse_datagrid_rows(page_html: str) -> list[dict[str, str]]:
@@ -1040,31 +1043,31 @@ def _parse_datagrid_rows(page_html: str) -> list[dict[str, str]]:
             continue
         if len(raw_row) != normalized_count:
             continue
-        row: dict[str, str] = {}
+        parsed_row_map: dict[str, str] = {}
         for idx, header in enumerate(normalized_headers):
-            row[header] = _strip_html_tags(raw_row[idx])
+            parsed_row_map[header] = _strip_html_tags(raw_row[idx])
         # pager rows carry only page numbers in first cell
-        if normalized_count > 1 and all(not row[header].strip() for header in normalized_headers[1:]):
-            if re.fullmatch(r"[0-9 ]+", row[normalized_headers[0]] or ""):
+        if normalized_count > 1 and all(not parsed_row_map[header].strip() for header in normalized_headers[1:]):
+            if re.fullmatch(r"[0-9 ]+", parsed_row_map[normalized_headers[0]] or ""):
                 continue
-        parsed_rows.append(row)
+        parsed_rows.append(parsed_row_map)
     return parsed_rows
 
 
 def _hydrate_row_with_address_parts(row: dict[str, str]) -> dict[str, str]:
-    hydrated = dict(row)
-    address = _safe_text(hydrated.get("Address")) or _safe_text(hydrated.get("address"))
+    hydrated_field_map = dict(row)
+    address = _safe_text(hydrated_field_map.get("Address")) or _safe_text(hydrated_field_map.get("address"))
     if not address:
-        return hydrated
-    if hydrated.get("City") and hydrated.get("State"):
-        return hydrated
+        return hydrated_field_map
+    if hydrated_field_map.get("City") and hydrated_field_map.get("State"):
+        return hydrated_field_map
     match = _CITY_STATE_ZIP_PATTERN.match(address)
     if not match:
-        return hydrated
-    hydrated.setdefault("City", match.group("city").strip())
-    hydrated.setdefault("State", match.group("state").strip())
-    hydrated.setdefault("Zip", match.group("zip").strip())
-    return hydrated
+        return hydrated_field_map
+    hydrated_field_map.setdefault("City", match.group("city").strip())
+    hydrated_field_map.setdefault("State", match.group("state").strip())
+    hydrated_field_map.setdefault("Zip", match.group("zip").strip())
+    return hydrated_field_map
 
 
 def _is_captcha_page(page_html: str) -> bool:
@@ -1250,7 +1253,7 @@ async def _build_state_npi_resolver(state_code: str) -> StateNpiResolver | None:
                     by_name_city.setdefault((name_key, city_key), set()).add(npi)
                 if zip_key:
                     by_name_zip.setdefault((name_key, zip_key), set()).add(npi)
-        quality_ok = _partd_name_fallback_quality_ok(
+        is_quality_acceptable = _is_partd_name_fallback_acceptable(
             total_rows=len(partd_records),
             named_rows=named_rows,
             city_rows=city_rows,
@@ -1261,9 +1264,9 @@ async def _build_state_npi_resolver(state_code: str) -> StateNpiResolver | None:
             "named_rows": named_rows,
             "city_rows": city_rows,
             "zip_rows": zip_rows,
-            "quality_ok": quality_ok,
+            "quality_ok": is_quality_acceptable,
         }
-        if quality_ok:
+        if is_quality_acceptable:
             resolver.by_name = _unique_mapping(by_name)
             resolver.by_name_city = _unique_mapping(by_name_city)
             resolver.by_name_zip = _unique_mapping(by_name_zip)
@@ -1320,7 +1323,7 @@ def _extract_city_state_zip_from_freeform(address: Any) -> tuple[str | None, str
     return None, state, zip_code
 
 
-def _ma_license_type_is_pharmacy_facility(license_type: Any) -> bool:
+def _is_ma_pharmacy_facility_license(license_type: Any) -> bool:
     license_text = str(license_type or "").strip().lower()
     if not license_text:
         return False
@@ -1342,6 +1345,9 @@ def _ma_license_type_is_pharmacy_facility(license_type: Any) -> bool:
         "drug manufacturer",
     )
     return any(marker in license_text for marker in included_markers)
+
+
+_ma_license_type_is_pharmacy_facility = _is_ma_pharmacy_facility_license
 
 
 def _map_tx_csv_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -1727,7 +1733,7 @@ async def _load_rows_from_ma_export_source(
         if not isinstance(license_record, dict):
             continue
         mapped = _map_ma_export_row(license_record)
-        if not _ma_license_type_is_pharmacy_facility(mapped.get("License Type")):
+        if not _is_ma_pharmacy_facility_license(mapped.get("License Type")):
             continue
         mapped_rows.append(mapped)
         if len(mapped_rows) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
@@ -1951,10 +1957,10 @@ async def _load_rows_from_aspnet_search_state(
 
 
 def _row_index(row: dict[str, Any]) -> dict[str, Any]:
-    indexed: dict[str, Any] = {}
+    normalized_field_map: dict[str, Any] = {}
     for key, value in row.items():
-        indexed[_normalize_key(key)] = value
-    return indexed
+        normalized_field_map[_normalize_key(key)] = value
+    return normalized_field_map
 
 
 def _pick_by_aliases(indexed: dict[str, Any], aliases: tuple[str, ...]) -> Any:
@@ -2618,7 +2624,7 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
     history_table = f"{schema}.{PharmacyLicenseRecordHistory.__tablename__}"
 
     if source_enabled("pharmacy_license"):
-        address_fields = {
+        address_field_map = {
             "first_line": "address_line1",
             "second_line": "address_line2",
             "city": "city",
@@ -2629,12 +2635,12 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
         try:
             await stamp_address_keys(
                 PharmacyLicenseRecordStage.__tablename__,
-                address_fields,
+                address_field_map,
                 schema=schema,
             )
             stats = await resolve_into_archive(
                 PharmacyLicenseRecordStage.__tablename__,
-                address_fields,
+                address_field_map,
                 source_bit=32,
                 priority=6,
                 schema=schema,
@@ -3035,11 +3041,11 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
         snapshot_id=snapshot_id,
     )
 
-    result = await db.all(
+    count_result_rows = await db.all(
         f"SELECT COUNT(*)::int FROM {stage_table} WHERE snapshot_id = :snapshot_id",
         snapshot_id=snapshot_id,
     )
-    stage_rows = int(result[0][0]) if result and result[0] and result[0][0] is not None else 0
+    stage_rows = int(count_result_rows[0][0]) if count_result_rows and count_result_rows[0] and count_result_rows[0][0] is not None else 0
 
     await db.status(
         f"DELETE FROM {stage_table} WHERE snapshot_id = :snapshot_id",
@@ -3122,18 +3128,18 @@ async def pharmacy_license_start(ctx, task=None):
                     "test_mode": test_mode,
                     "states": [
                         {
-                            "state_code": source.state_code,
-                            "state_name": source.state_name,
-                            "board_url": source.board_url,
+                            "state_code": state_source.state_code,
+                            "state_name": state_source.state_name,
+                            "board_url": state_source.board_url,
                         }
-                        for source in state_sources
+                        for state_source in state_sources
                     ],
                 },
                 "error_text": None,
             }
         )
 
-        summary_totals = {
+        summary_total_map = {
             "states": len(state_sources),
             "supported_states": 0,
             "unsupported_states": 0,
@@ -3150,8 +3156,8 @@ async def pharmacy_license_start(ctx, task=None):
             connector=connector,
             headers={"User-Agent": PHARM_LICENSE_HTTP_USER_AGENT},
         ) as session:
-            for state_index, source in enumerate(state_sources, start=1):
-                snapshot_id = _hash_snapshot_id(run_id, source.state_code, source.board_url)
+            for state_index, state_source in enumerate(state_sources, start=1):
+                snapshot_id = _hash_snapshot_id(run_id, state_source.state_code, state_source.board_url)
                 enqueue_live_progress(
                     run_id=run_id,
                     importer="pharmacy-license",
@@ -3160,15 +3166,15 @@ async def pharmacy_license_start(ctx, task=None):
                     unit="states",
                     done=state_index - 1,
                     total=len(state_sources),
-                    message=f"importing {source.state_code} ({state_index}/{len(state_sources)})",
+                    message=f"importing {state_source.state_code} ({state_index}/{len(state_sources)})",
                 )
                 await _upsert_snapshot(
                     {
                         "snapshot_id": snapshot_id,
                         "run_id": run_id,
-                        "state_code": source.state_code,
-                        "state_name": source.state_name,
-                        "board_url": source.board_url,
+                        "state_code": state_source.state_code,
+                        "state_name": state_source.state_name,
+                        "board_url": state_source.board_url,
                         "source_url": None,
                         "status": "running",
                         "row_count_parsed": 0,
@@ -3184,7 +3190,7 @@ async def pharmacy_license_start(ctx, task=None):
                 try:
                     stats = await _import_state_source(
                         session,
-                        source,
+                        state_source,
                         run_id=run_id,
                         snapshot_id=snapshot_id,
                         test_mode=test_mode,
@@ -3197,9 +3203,9 @@ async def pharmacy_license_start(ctx, task=None):
                         {
                             "snapshot_id": snapshot_id,
                             "run_id": run_id,
-                            "state_code": source.state_code,
-                            "state_name": source.state_name,
-                            "board_url": source.board_url,
+                            "state_code": state_source.state_code,
+                            "state_name": state_source.state_name,
+                            "board_url": state_source.board_url,
                             "source_url": stats.source_url,
                             "status": stats.status,
                             "row_count_parsed": stats.row_count_parsed,
@@ -3214,9 +3220,9 @@ async def pharmacy_license_start(ctx, task=None):
 
                     await _upsert_coverage(
                         {
-                            "state_code": source.state_code,
-                            "state_name": source.state_name,
-                            "board_url": source.board_url,
+                            "state_code": state_source.state_code,
+                            "state_name": state_source.state_name,
+                            "board_url": state_source.board_url,
                             "source_url": stats.source_url,
                             "supported": bool(stats.supported),
                             "unsupported_reason": stats.unsupported_reason,
@@ -3234,14 +3240,14 @@ async def pharmacy_license_start(ctx, task=None):
                         }
                     )
 
-                    summary_totals["parsed_rows"] += stats.row_count_parsed
-                    summary_totals["matched_rows"] += stats.row_count_matched
-                    summary_totals["dropped_rows"] += stats.row_count_dropped
-                    summary_totals["inserted_rows"] += inserted_rows
+                    summary_total_map["parsed_rows"] += stats.row_count_parsed
+                    summary_total_map["matched_rows"] += stats.row_count_matched
+                    summary_total_map["dropped_rows"] += stats.row_count_dropped
+                    summary_total_map["inserted_rows"] += inserted_rows
                     if stats.supported:
-                        summary_totals["supported_states"] += 1
+                        summary_total_map["supported_states"] += 1
                     else:
-                        summary_totals["unsupported_states"] += 1
+                        summary_total_map["unsupported_states"] += 1
                     enqueue_live_progress(
                         run_id=run_id,
                         importer="pharmacy-license",
@@ -3252,7 +3258,7 @@ async def pharmacy_license_start(ctx, task=None):
                         total=len(state_sources),
                         message=(
                             f"imported {state_index}/{len(state_sources)} state(s); "
-                            f"inserted_rows={summary_totals['inserted_rows']}"
+                            f"inserted_rows={summary_total_map['inserted_rows']}"
                         ),
                     )
 
@@ -3261,9 +3267,9 @@ async def pharmacy_license_start(ctx, task=None):
                         {
                             "snapshot_id": snapshot_id,
                             "run_id": run_id,
-                            "state_code": source.state_code,
-                            "state_name": source.state_name,
-                            "board_url": source.board_url,
+                            "state_code": state_source.state_code,
+                            "state_name": state_source.state_name,
+                            "board_url": state_source.board_url,
                             "source_url": None,
                             "status": "failed",
                             "row_count_parsed": 0,
@@ -3277,9 +3283,9 @@ async def pharmacy_license_start(ctx, task=None):
                     )
                     await _upsert_coverage(
                         {
-                            "state_code": source.state_code,
-                            "state_name": source.state_name,
-                            "board_url": source.board_url,
+                            "state_code": state_source.state_code,
+                            "state_name": state_source.state_name,
+                            "board_url": state_source.board_url,
                             "source_url": None,
                             "supported": False,
                             "unsupported_reason": "state_import_failed",
@@ -3294,7 +3300,7 @@ async def pharmacy_license_start(ctx, task=None):
                             "updated_at": datetime.datetime.utcnow(),
                         }
                     )
-                    summary_totals["unsupported_states"] += 1
+                    summary_total_map["unsupported_states"] += 1
                     enqueue_live_progress(
                         run_id=run_id,
                         importer="pharmacy-license",
@@ -3304,9 +3310,9 @@ async def pharmacy_license_start(ctx, task=None):
                         done=state_index,
                         total=len(state_sources),
                         message=(
-                            f"failed {source.state_code}; aborting"
+                            f"failed {state_source.state_code}; aborting"
                             if isinstance(exc, PharmacyLicenseCanonicalAddressError)
-                            else f"failed {source.state_code}; continuing"
+                            else f"failed {state_source.state_code}; continuing"
                         ),
                     )
                     if isinstance(exc, PharmacyLicenseCanonicalAddressError):
@@ -3337,15 +3343,15 @@ async def pharmacy_license_start(ctx, task=None):
                 "finished_at": datetime.datetime.utcnow(),
                 "source_summary": {
                     "test_mode": test_mode,
-                    **summary_totals,
+                    **summary_total_map,
                 },
                 "error_text": None,
             }
         )
         print(
             f"pharmacy_license import completed run_id={run_id} "
-            f"states={summary_totals['states']} matched={summary_totals['matched_rows']} "
-            f"inserted={summary_totals['inserted_rows']}",
+            f"states={summary_total_map['states']} matched={summary_total_map['matched_rows']} "
+            f"inserted={summary_total_map['inserted_rows']}",
             flush=True,
         )
         await mark_control_run(
@@ -3353,7 +3359,7 @@ async def pharmacy_license_start(ctx, task=None):
             status="succeeded",
             phase_detail="pharmacy-license completed",
             progress_message="succeeded",
-            metrics=summary_totals,
+            metrics=summary_total_map,
         )
     except Exception as exc:
         await _truncate_stage_table(schema)
@@ -3403,7 +3409,10 @@ async def pharmacy_license_finalize(_ctx, task=None):  # pragma: no cover
     )
 
 
-async def main(test_mode: bool = False, import_id: str | None = None):  # pragma: no cover
+async def queue_pharmacy_license_import(
+    test_mode: bool = False,
+    import_id: str | None = None,
+):
     """Queue a pharmacy-license import and return its generated run ID."""
     run_id = _normalize_run_id(None)
     normalized_import_id = _normalize_import_id(import_id)
@@ -3434,6 +3443,9 @@ async def main(test_mode: bool = False, import_id: str | None = None):  # pragma
         )
     )
     return run_id
+
+
+main = queue_pharmacy_license_import
 
 
 async def finish_main(

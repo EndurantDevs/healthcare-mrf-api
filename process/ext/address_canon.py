@@ -181,7 +181,7 @@ def _unit_prefix(value: str | None) -> str | None:
     return PUB28_UNIT_DESIGNATOR_MAP.get(cleaned)
 
 
-def _valid_unit_value(value: str | None, prefix: str | None = None) -> bool:
+def _is_valid_unit_value(value: str | None, prefix: str | None = None) -> bool:
     cleaned = re.sub(r"[^a-z0-9]", "", (value or "").lower())
     if cleaned and prefix in EXPLICIT_SINGLE_LETTER_UNIT_PREFIXES and re.match(r"^[a-z]$", cleaned):
         return True
@@ -203,7 +203,7 @@ def _unit_from_match(
         return ""
     cleaned = re.sub(r"[^a-z0-9]", "", f"{unit_value}{suffix or ''}".lower())
     if cleaned:
-        if not _valid_unit_value(cleaned, prefix):
+        if not _is_valid_unit_value(cleaned, prefix):
             return ""
         return f"{prefix}{cleaned}"
     if prefix in PUB28_UNIT_NO_RANGE:
@@ -322,12 +322,12 @@ def _street_token_norm(value: str) -> str:
     return PUB28_DIRECTIONAL_MAP.get(mapped) or PUB28_STREET_SUFFIX_MAP.get(mapped) or mapped
 
 
-def _street_token_is_suffix(value: str | None) -> bool:
+def _is_street_suffix_token(value: str | None) -> bool:
     token = re.sub(r"[^a-z0-9]", "", (value or "").lower())
     return token in STREET_SUFFIX_TOKENS
 
 
-def _street_token_is_directional(value: str | None) -> bool:
+def _is_directional_street_token(value: str | None) -> bool:
     token = re.sub(r"[^a-z0-9]", "", (value or "").lower())
     return token in DIRECTIONAL_TOKENS
 
@@ -337,7 +337,7 @@ def _street_token_norm_context(token: str, index: int, tokens: list[str]) -> str
     if not cleaned:
         return ""
     next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
-    if _street_token_is_suffix(next_token):
+    if _is_street_suffix_token(next_token):
         if cleaned in ORDINAL_WORD_MAP:
             return ORDINAL_WORD_MAP[cleaned]
         ordinal_typo = ORDINAL_H_TYPO_RE.match(cleaned)
@@ -361,15 +361,15 @@ def _normalized_street_tokens(tokens: list[str]) -> list[str]:
 
 
 def _edge_direction_index(tokens: list[str]) -> int | None:
-    if tokens and _street_token_is_directional(tokens[0]):
+    if tokens and _is_directional_street_token(tokens[0]):
         return 0
     if (
         len(tokens) >= 2
         and re.match(r"^[0-9]+[a-z]?$", re.sub(r"[^a-z0-9]", "", tokens[0].lower()))
-        and _street_token_is_directional(tokens[1])
+        and _is_directional_street_token(tokens[1])
     ):
         return 1
-    if tokens and _street_token_is_directional(tokens[-1]):
+    if tokens and _is_directional_street_token(tokens[-1]):
         return len(tokens) - 1
     return None
 
@@ -427,7 +427,7 @@ def street_norm(line1: str | None, line2: str | None) -> str | None:
 def street_suffix_token(line1: str | None, line2: str | None) -> str | None:
     """Return the canonical terminal street suffix when one is present."""
     tokens = _street_tokens(line1, line2)
-    if len(tokens) < 2 or not _street_token_is_suffix(tokens[-1]):
+    if len(tokens) < 2 or not _is_street_suffix_token(tokens[-1]):
         return None
     return _street_token_norm(tokens[-1])
 
@@ -436,7 +436,7 @@ def street_suffixless_norm(line1: str | None, line2: str | None) -> str | None:
     """Normalize a street after removing a recognized terminal suffix."""
     tokens = _street_tokens(line1, line2)
     stop = len(tokens)
-    if len(tokens) >= 2 and _street_token_is_suffix(tokens[-1]):
+    if len(tokens) >= 2 and _is_street_suffix_token(tokens[-1]):
         stop -= 1
     cleaned = "".join(
         _street_token_norm_context(token, index, tokens)
@@ -458,14 +458,14 @@ def street_directionless_norm(line1: str | None, line2: str | None) -> str | Non
     """Normalize a street after removing its recognized edge direction."""
     tokens = _street_tokens(line1, line2)
     direction_index = _edge_direction_index(tokens)
-    retained = [
+    retained_tokens = [
         token
         for index, token in enumerate(tokens)
         if index != direction_index
     ]
     cleaned = "".join(
-        _street_token_norm_context(token, index, retained)
-        for index, token in enumerate(retained)
+        _street_token_norm_context(token, index, retained_tokens)
+        for index, token in enumerate(retained_tokens)
     )
     return cleaned or None
 
@@ -476,7 +476,7 @@ def street_completion_norm(line1: str | None, line2: str | None) -> str | None:
     direction_index = _edge_direction_index(tokens)
     drop_indexes = {direction_index} if direction_index is not None else set()
     retained_indexes = [index for index in range(len(tokens)) if index not in drop_indexes]
-    if len(retained_indexes) >= 2 and _street_token_is_suffix(tokens[retained_indexes[-1]]):
+    if len(retained_indexes) >= 2 and _is_street_suffix_token(tokens[retained_indexes[-1]]):
         drop_indexes.add(retained_indexes[-1])
     normalized = _normalized_street_tokens(tokens)
     cleaned = "".join(token for index, token in enumerate(normalized) if index not in drop_indexes)
@@ -566,13 +566,16 @@ def address_key_v1(
     return key_from_identity(identity_key_v1(first_line, second_line, city, state, zip_code, country))
 
 
-def source_enabled(source_name: str) -> bool:
+def is_source_enabled(source_name: str) -> bool:
     """Report whether canonicalization is enabled for a named source."""
     raw = os.getenv("HLTHPRT_ADDRESS_CANON_SOURCES", "").strip()
     if not raw:
         return False
-    enabled = {part.strip().lower() for part in raw.split(",") if part.strip()}
-    return "all" in enabled or source_name.lower() in enabled
+    enabled_sources = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    return "all" in enabled_sources or source_name.lower() in enabled_sources
+
+
+source_enabled = is_source_enabled
 
 
 def archive_table_name() -> str:
@@ -601,7 +604,7 @@ def _setting_value(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _is_environment_enabled(name: str, default: bool = False) -> bool:
+def _is_env_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -797,7 +800,7 @@ def _keyed_raw_copy_sql(
     """
 
 
-def _canon_version_matches(payload: Mapping[str, Any]) -> bool:
+def _is_canon_version_match(payload: Mapping[str, Any]) -> bool:
     expected = current_canon_version()
     return (
         int(payload.get("identity_version") or 0) == expected["identity_version"]
@@ -805,6 +808,9 @@ def _canon_version_matches(payload: Mapping[str, Any]) -> bool:
         and int(payload.get("ruleset_version") or 0) == expected["ruleset_version"]
         and str(payload.get("pub28_sha256") or "") == expected["pub28_sha256"]
     )
+
+
+_canon_version_matches = _is_canon_version_match
 
 
 async def _rust_canon_version(binary: Path) -> dict[str, Any]:
@@ -825,7 +831,7 @@ async def _rust_canon_version(binary: Path) -> dict[str, Any]:
     return json.loads(stdout.decode("utf-8"))
 
 
-async def _rust_canon_version_is_current(binary: Path) -> bool:
+async def _is_rust_canon_version_current(binary: Path) -> bool:
     cache_key = str(binary.resolve())
     cached = _RUST_CANON_VERSION_CACHE.get(cache_key)
     if cached is not None:
@@ -836,16 +842,19 @@ async def _rust_canon_version_is_current(binary: Path) -> bool:
         logger.warning("Rust address canonicalizer version check failed; falling back to SQL: %s", exc)
         _RUST_CANON_VERSION_CACHE[cache_key] = False
         return False
-    ok = _canon_version_matches(payload)
-    if not ok:
+    is_version_current = _is_canon_version_match(payload)
+    if not is_version_current:
         logger.warning(
             "Rust address canonicalizer version mismatch; falling back to SQL "
             "(rust=%s python=%s)",
             payload,
             current_canon_version(),
         )
-    _RUST_CANON_VERSION_CACHE[cache_key] = ok
-    return ok
+    _RUST_CANON_VERSION_CACHE[cache_key] = is_version_current
+    return is_version_current
+
+
+_rust_canon_version_is_current = _is_rust_canon_version_current
 
 
 async def _run_rust_address_canonicalizer(
@@ -875,14 +884,14 @@ async def _run_rust_address_canonicalizer(
         )
 
 
-async def _try_materialize_keyed_with_rust(
+async def _has_rust_materialized_keys(
     session: Any,
     *,
     keyed_table: str,
     keyed_table_name: str,
     raw_copy_sql: str,
 ) -> bool:
-    if not _is_environment_enabled(ADDRESS_CANON_RUST_MATERIALIZE_ENV, default=True):
+    if not _is_env_enabled(ADDRESS_CANON_RUST_MATERIALIZE_ENV, default=True):
         return False
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -891,7 +900,7 @@ async def _try_materialize_keyed_with_rust(
             ADDRESS_CANON_RUST_MATERIALIZE_ENV,
         )
         return False
-    if not await _rust_canon_version_is_current(binary):
+    if not await _is_rust_canon_version_current(binary):
         return False
 
     connection = await session.connection()
@@ -930,6 +939,9 @@ async def _try_materialize_keyed_with_rust(
                 null="\\N",
             )
     return True
+
+
+_try_materialize_keyed_with_rust = _has_rust_materialized_keys
 
 
 def _emit_progress(**payload: Any) -> None:
@@ -1188,7 +1200,7 @@ async def propagate_child_address_keys(
                     "AND mod(abs(hashtext(child.ctid::text)::bigint), :shards) = :shard"
                 )
             pending_table = _quote_ident("address_key_propagation_pending")
-            params = {"shards": shards, "shard": shard}
+            parameter_map = {"shards": shards, "shard": shard}
             async with db.transaction() as session:
                 await session.execute(text(f"DROP TABLE IF EXISTS pg_temp.{pending_table};"))
                 await session.execute(
@@ -1224,7 +1236,7 @@ async def propagate_child_address_keys(
                          {shard_filter};
                         """
                     ),
-                    params,
+                    parameter_map,
                 )
                 await session.execute(text(f"CREATE INDEX ON {pending_table} (child_ctid);"))
                 cleared = (
@@ -1281,7 +1293,7 @@ async def propagate_child_address_keys(
     return progress_by_metric["updated"]
 
 
-async def _table_exists_in_session(session: Any, schema: str, table: str) -> bool:
+async def _has_session_table(session: Any, schema: str, table: str) -> bool:
     value = (
         await session.execute(
             text("SELECT to_regclass(:table_name);"),
@@ -1291,7 +1303,7 @@ async def _table_exists_in_session(session: Any, schema: str, table: str) -> boo
     return bool(value)
 
 
-async def _table_has_column_in_session(session: Any, schema: str, table: str, column: str) -> bool:
+async def _has_session_table_column(session: Any, schema: str, table: str, column: str) -> bool:
     return bool(
         (
             await session.execute(
@@ -1319,14 +1331,14 @@ async def _first_existing_column_in_session(
     candidates: tuple[str, ...],
 ) -> str | None:
     for column in candidates:
-        if await _table_has_column_in_session(session, schema, table, column):
+        if await _has_session_table_column(session, schema, table, column):
             return column
     return None
 
 
-async def _zip_restore_dependencies_available(session: Any, schema: str) -> bool:
-    tiger_zcta = await _table_exists_in_session(session, "tiger", "zcta5")
-    geo_zip_lookup = await _table_exists_in_session(session, schema, "geo_zip_lookup")
+async def _has_zip_restore_dependencies(session: Any, schema: str) -> bool:
+    tiger_zcta = await _has_session_table(session, "tiger", "zcta5")
+    geo_zip_lookup = await _has_session_table(session, schema, "geo_zip_lookup")
     return tiger_zcta and geo_zip_lookup
 
 
@@ -1435,7 +1447,7 @@ async def restore_missing_zip_from_tiger_zcta(
     present, avoiding silent archive identity rewrites.
     """
 
-    if not _is_environment_enabled(ADDRESS_ZIP_RESTORE_ENABLED_ENV, default=True):
+    if not _is_env_enabled(ADDRESS_ZIP_RESTORE_ENABLED_ENV, default=True):
         return 0
     if not hasattr(db, "transaction"):
         return 0
@@ -1456,9 +1468,9 @@ async def restore_missing_zip_from_tiger_zcta(
     concurrency = min(max(int(concurrency or 1), 1), shards)
 
     async with db.transaction() as session:
-        if not await _table_exists_in_session(session, schema, staging_table):
+        if not await _has_session_table(session, schema, staging_table):
             return 0
-        if not await _table_has_column_in_session(session, schema, staging_table, zip_column):
+        if not await _has_session_table_column(session, schema, staging_table, zip_column):
             return 0
         latitude_column = await _first_existing_column_in_session(
             session,
@@ -1474,12 +1486,12 @@ async def restore_missing_zip_from_tiger_zcta(
         )
         if latitude_column is None or longitude_column is None:
             return 0
-        has_address_key = await _table_has_column_in_session(session, schema, staging_table, "address_key")
-        dependencies_available = await _zip_restore_dependencies_available(session, schema)
+        has_address_key = await _has_session_table_column(session, schema, staging_table, "address_key")
+        dependencies_available = await _has_zip_restore_dependencies(session, schema)
 
     if not dependencies_available:
         message = "TIGER ZCTA or geo_zip_lookup is unavailable for address ZIP restore"
-        if _is_environment_enabled(ADDRESS_ZIP_RESTORE_REQUIRED_ENV, default=False):
+        if _is_env_enabled(ADDRESS_ZIP_RESTORE_REQUIRED_ENV, default=False):
             raise RuntimeError(message)
         logger.info("%s; skipping %s.%s", message, schema, staging_table)
         return 0
@@ -1539,7 +1551,7 @@ async def restore_missing_zip_from_tiger_zcta(
 
 async def _select_canonical_archive_table(schema: str, requested: str) -> str:
     async with db.transaction() as session:
-        if await _table_exists_in_session(session, schema, requested) and await _table_has_column_in_session(
+        if await _has_session_table(session, schema, requested) and await _has_session_table_column(
             session, schema, requested, "address_key"
         ):
             return requested
@@ -2015,7 +2027,7 @@ async def resolve_into_archive(
             await cancel_check()
 
         await session.execute(text(f"DROP TABLE IF EXISTS {keyed_temp_table};"))
-        rust_materialized = await _try_materialize_keyed_with_rust(
+        rust_materialized = await _has_rust_materialized_keys(
             session,
             keyed_table=keyed_table,
             keyed_table_name=keyed_table_name,
@@ -2157,11 +2169,11 @@ async def resolve_into_archive(
         ).scalar() or 0)
         raw_coverage = (await session.execute(text(coverage_sql))).scalar() or {}
         if isinstance(raw_coverage, str):
-            coverage = json.loads(raw_coverage)
+            coverage_map = json.loads(raw_coverage)
         else:
-            coverage = dict(raw_coverage)
-        eligible_key_rows = int(coverage.get("eligible_key_rows") or 0)
-        eligible_null_key_rows = int(coverage.get("eligible_null_key_rows") or 0)
+            coverage_map = dict(raw_coverage)
+        eligible_key_rows = int(coverage_map.get("eligible_key_rows") or 0)
+        eligible_null_key_rows = int(coverage_map.get("eligible_null_key_rows") or 0)
         _emit_progress(
             phase="address archive resolve",
             unit="phase",
@@ -2176,12 +2188,12 @@ async def resolve_into_archive(
         else:
             reason_buckets_by_reason = dict(raw_reason_buckets)
         reason_buckets_by_reason = {
-            str(key): int(value or 0)
-            for key, value in reason_buckets_by_reason.items()
+            str(key): int(metric_value or 0)
+            for key, metric_value in reason_buckets_by_reason.items()
         }
         reason_buckets_by_reason.update({
-            str(key): int(value or 0)
-            for key, value in alias_stats_by_kind.items()
+            str(key): int(metric_value or 0)
+            for key, metric_value in alias_stats_by_kind.items()
         })
         distinct_keys = int((
             await session.execute(text(f"SELECT count(*) FROM ({dedup_cte}) d;"))
@@ -2379,7 +2391,7 @@ async def resolve_into_archive(
                 ORDER BY last_seen_at DESC, address_key
                 LIMIT :limit;
             """), {"source_bit": source_bit, "limit": gate_sample_limit})
-            gate_sample_rows = [dict(row._mapping) for row in sample_rows_result]
+            gate_sample_rows = [dict(archive_row._mapping) for archive_row in sample_rows_result]
         else:
             gate_sample_rows = []
         gate_violations = _resolve_gate_violations(
@@ -2585,19 +2597,19 @@ async def migrate_legacy_archive_to_v2(
             if not raw_rows:
                 break
             keyed_rows: list[dict[str, Any]] = []
-            for row in raw_rows:
-                data = row._mapping
-                first_line = data.get("first_line")
-                second_line = data.get("second_line")
-                city_name = data.get("city_name")
-                state_name = data.get("state_name")
-                postal_code = data.get("postal_code")
-                country = data.get("country_code") or "US"
+            for archive_row in raw_rows:
+                migration_payload = archive_row._mapping
+                first_line = migration_payload.get("first_line")
+                second_line = migration_payload.get("second_line")
+                city_name = migration_payload.get("city_name")
+                state_name = migration_payload.get("state_name")
+                postal_code = migration_payload.get("postal_code")
+                country = migration_payload.get("country_code") or "US"
                 identity_key = identity_key_v1(first_line, second_line, city_name, state_name, postal_code, country)
                 premise_identity = premise_identity_key_v1(first_line, second_line, city_name, state_name, postal_code, country)
                 postal_digits = re.sub(r"[^0-9]", "", str(postal_code or ""))
                 keyed_rows.append({
-                    "checksum": data.get("checksum"),
+                    "checksum": migration_payload.get("checksum"),
                     "address_key": str(key_from_identity(identity_key)) if identity_key else None,
                     "identity_key": identity_key,
                     "premise_key": str(key_from_identity(premise_identity)) if premise_identity else None,
@@ -2613,24 +2625,24 @@ async def migrate_legacy_archive_to_v2(
                     "city_name": str(city_name).strip() if city_name is not None and str(city_name).strip() else None,
                     "state_name": str(state_name).strip() if state_name is not None and str(state_name).strip() else None,
                     "postal_code": str(postal_code).strip() if postal_code is not None and str(postal_code).strip() else None,
-                    "telephone_number": str(data.get("telephone_number")).strip()
-                    if data.get("telephone_number") is not None and str(data.get("telephone_number")).strip()
+                    "telephone_number": str(migration_payload.get("telephone_number")).strip()
+                    if migration_payload.get("telephone_number") is not None and str(migration_payload.get("telephone_number")).strip()
                     else None,
-                    "fax_number": str(data.get("fax_number")).strip()
-                    if data.get("fax_number") is not None and str(data.get("fax_number")).strip()
+                    "fax_number": str(migration_payload.get("fax_number")).strip()
+                    if migration_payload.get("fax_number") is not None and str(migration_payload.get("fax_number")).strip()
                     else None,
-                    "formatted_address": str(data.get("formatted_address")).strip()
-                    if data.get("formatted_address") is not None and str(data.get("formatted_address")).strip()
+                    "formatted_address": str(migration_payload.get("formatted_address")).strip()
+                    if migration_payload.get("formatted_address") is not None and str(migration_payload.get("formatted_address")).strip()
                     else None,
-                    "lat": data.get("lat"),
-                    "long": data.get("long"),
-                    "place_id": str(data.get("place_id")).strip()
-                    if data.get("place_id") is not None and str(data.get("place_id")).strip()
+                    "lat": migration_payload.get("lat"),
+                    "long": migration_payload.get("long"),
+                    "place_id": str(migration_payload.get("place_id")).strip()
+                    if migration_payload.get("place_id") is not None and str(migration_payload.get("place_id")).strip()
                     else None,
                     "geo_source": "google"
-                    if data.get("place_id") is not None and str(data.get("place_id")).strip()
+                    if migration_payload.get("place_id") is not None and str(migration_payload.get("place_id")).strip()
                     else None,
-                    "date_added": data.get("date_added"),
+                    "date_added": migration_payload.get("date_added"),
                 })
             await session.execute(insert_sql, keyed_rows)
             last_rn = int(raw_rows[-1]._mapping["rn"])
@@ -2908,7 +2920,7 @@ async def migrate_legacy_archive_to_v2(
                 ORDER BY (place_id IS NOT NULL) DESC, date_added DESC NULLS LAST, address_key
                 LIMIT :limit;
             """), {"limit": sample_limit})
-            sample_rows = [dict(row._mapping) for row in sample_result]
+            sample_rows = [dict(archive_row._mapping) for archive_row in sample_result]
         else:
             sample_rows = []
 
@@ -2969,15 +2981,15 @@ async def swap_archive_v2_to_current(
         await session.execute(text(f"SET LOCAL statement_timeout = '{_setting_value(timeout)}';"))
 
         for table_name in (current_table, archive_table, checksum_map_table, checksum_collision_table):
-            if not await _table_exists_in_session(session, schema, table_name):
+            if not await _has_session_table(session, schema, table_name):
                 raise RuntimeError(f"required table is missing: {schema}.{table_name}")
-        if await _table_has_column_in_session(session, schema, current_table, "address_key"):
+        if await _has_session_table_column(session, schema, current_table, "address_key"):
             raise RuntimeError(f"{schema}.{current_table} already appears to be canonical")
-        if not await _table_has_column_in_session(session, schema, current_table, "checksum"):
+        if not await _has_session_table_column(session, schema, current_table, "checksum"):
             raise RuntimeError(f"{schema}.{current_table} is not the legacy checksum archive")
-        if not await _table_has_column_in_session(session, schema, archive_table, "address_key"):
+        if not await _has_session_table_column(session, schema, archive_table, "address_key"):
             raise RuntimeError(f"{schema}.{archive_table} is not the canonical archive")
-        backup_exists = await _table_exists_in_session(session, schema, backup_table)
+        backup_exists = await _has_session_table(session, schema, backup_table)
         if backup_exists and not allow_replace_backup:
             raise RuntimeError(f"backup table already exists: {schema}.{backup_table}")
 
