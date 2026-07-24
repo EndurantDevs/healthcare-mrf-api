@@ -12,7 +12,7 @@
     "function_name_shape": 43,
     "global_state_usage": 12,
     "inline_suppressions": 4,
-    "long_files": 179,
+    "long_files": 178,
     "long_functions": 871,
     "missing_contract_docstrings": 3,
     "pass_placeholders": 0,
@@ -870,7 +870,6 @@
       "long_file:tests/test_ptg2_v4_postgres_e2e.py",
       "long_file:tests/test_ptg2_v4_snapshot_maps.py",
       "long_file:tests/test_ptg_candidate_audit_importer.py",
-      "long_file:tests/test_ptg_v4_import_orchestration_coverage.py",
       "long_file:tests/test_readability_budget.py",
       "long_file:tests/test_reports_api.py"
     ],
