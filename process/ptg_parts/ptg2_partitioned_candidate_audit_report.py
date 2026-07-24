@@ -114,7 +114,7 @@ def _target_section(report_input: PartitionedAuditReportInput) -> dict[str, Any]
     audit_target = report_input.audit_target
     return {
         "expected_architecture": "postgres_binary_v3",
-        "expected_storage_generation": "shared_blocks_v3",
+        "expected_storage_generation": audit_target.storage_generation,
         "expected_database_backend": "postgresql",
         "expected_snapshot_lifecycle": "validated",
         "architecture_assertion": "required_postgresql_session_evidence",

@@ -56,13 +56,17 @@ from process.ptg_parts.ptg2_source_witness import (
     source_set_digest,
 )
 from process.ptg_parts.ptg2_source_witness_store import load_shared_source_witness
+from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_SHARED_DENSE_WRITE_GENERATIONS,
+    PTG2_V3_SHARED_GENERATION,
+)
 from process.ptg_parts.source_snapshot_control import promote_ptg2_source_snapshot
 from scripts.validation import ptg2_v3_source_api_audit
 
 
 IMPORTER_NAME = "ptg-candidate-audit"
 ARCH_VERSION = "postgres_binary_v3"
-STORAGE_GENERATION = "shared_blocks_v3"
+SUPPORTED_STORAGE_GENERATIONS = PTG2_SHARED_DENSE_WRITE_GENERATIONS
 PTG2_BATCH_AUDIT_WRITER_ENABLED = (
     PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
     == PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
@@ -156,6 +160,7 @@ class CandidateAuditTarget:
     equivalent_current_import_run_id: str | None = None
     equivalent_audit_report: Mapping[str, Any] | None = None
     equivalent_audit_report_digest: str | None = None
+    storage_generation: str = PTG2_V3_SHARED_GENERATION
 
 
 class CandidateAuditReleaseGateError(RuntimeError):
@@ -291,6 +296,9 @@ def _candidate_target_from_row(
     )
     audit_sample = _mapping(serving_index.get("audit_sample"))
     layout_audit_sample = _mapping(layout_serving_index.get("audit_sample"))
+    storage_generation = str(
+        serving_index.get("storage_generation") or ""
+    ).strip()
     try:
         provider_identifier_quarantine = (
             validate_provider_identifier_quarantine(
@@ -328,11 +336,13 @@ def _candidate_target_from_row(
     if (
         not snapshot_id
         or serving_index.get("arch_version") != ARCH_VERSION
-        or serving_index.get("storage_generation") != STORAGE_GENERATION
+        or storage_generation not in SUPPORTED_STORAGE_GENERATIONS
         or layout_serving_index.get("arch_version") != ARCH_VERSION
-        or layout_serving_index.get("storage_generation") != STORAGE_GENERATION
+        or layout_serving_index.get("storage_generation")
+        != storage_generation
         or str(candidate_row.get("layout_state") or "") != "sealed"
-        or str(candidate_row.get("layout_generation") or "") != STORAGE_GENERATION
+        or str(candidate_row.get("layout_generation") or "")
+        != storage_generation
         or activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
     ):
         raise ValueError("candidate is not an exact strict postgres_binary_v3 snapshot")
@@ -396,6 +406,7 @@ def _candidate_target_from_row(
         activated=is_activated,
         audit_report=report,
         audit_report_digest=report_digest,
+        storage_generation=storage_generation,
     )
 
 
@@ -727,6 +738,7 @@ async def run_batch_release_audit(
                 provider_identifier_quarantine=(
                     candidate_target.provider_identifier_quarantine
                 ),
+                storage_generation=candidate_target.storage_generation,
             ),
             witness=witness,
             persisted_sample=persisted_sample,
@@ -843,6 +855,7 @@ def _success_result(
     )
     audit_metrics_by_name = {
         "arch_version": ARCH_VERSION,
+        "storage_generation": candidate_audit_target.storage_generation,
         "snapshot_status": "published",
         "activation_status": "activated",
         "snapshot_id": active_snapshot_id,
@@ -1041,6 +1054,7 @@ async def _audit_and_activate(
         source_key=candidate_target.source_key,
         plan_id=candidate_target.plan_id,
         plan_market_type=candidate_target.plan_market_type,
+        storage_generation=candidate_target.storage_generation,
         report=report,
     )
     await _progress(

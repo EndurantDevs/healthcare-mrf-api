@@ -3468,6 +3468,7 @@ async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
                 "source_key": "source_a",
                 "plan_id": "12-3456789",
                 "plan_market_type": "group",
+                "storage_generation": "shared_blocks_v4",
                 "report": audit_report_map,
             }
         )
@@ -3482,6 +3483,7 @@ async def test_control_ptg_source_snapshot_attest_endpoint(monkeypatch):
             "source_key": "source_a",
             "plan_id": "12-3456789",
             "plan_market_type": "group",
+            "storage_generation": "shared_blocks_v4",
             "report": audit_report_map,
         }
     ]

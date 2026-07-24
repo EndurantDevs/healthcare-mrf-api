@@ -82,6 +82,7 @@ def _candidate_row(
     *,
     activated: bool = False,
     provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+    storage_generation: str = "shared_blocks_v3",
 ) -> dict[str, object]:
     """Build one sealed candidate database row fixture."""
 
@@ -96,7 +97,7 @@ def _candidate_row(
         activation_map["mode"] = "audited_control"
     serving_index_by_field = {
         "arch_version": "postgres_binary_v3",
-        "storage_generation": "shared_blocks_v3",
+        "storage_generation": storage_generation,
         "source_set": {
             "contract": "sorted_raw_container_sha256_bytes_v1",
             "source_count": 1,
@@ -119,7 +120,7 @@ def _candidate_row(
         "plan_id": "12-3456789",
         "plan_market_type": "group",
         "layout_state": "sealed",
-        "layout_generation": "shared_blocks_v3",
+        "layout_generation": storage_generation,
         "layout_manifest": {"serving_index": serving_index_by_field},
         "current_snapshot_id": snapshot_id if activated else "previous-snapshot",
         "audit_report_digest": bytes.fromhex("cd" * 32) if activated else None,
@@ -228,6 +229,7 @@ def _target(
     *,
     activated: bool = False,
     provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+    storage_generation: str = "shared_blocks_v3",
 ) -> ptg_candidate_audit.CandidateAuditTarget:
     return ptg_candidate_audit.CandidateAuditTarget(
         candidate_run_id="ptg2:derived-import",
@@ -256,6 +258,16 @@ def _target(
             else None
         ),
         audit_report_digest="cd" * 32 if activated else None,
+        storage_generation=storage_generation,
+    )
+
+
+def _current_generation_target() -> ptg_candidate_audit.CandidateAuditTarget:
+    return _target(
+        provider_identifier_quarantine=(
+            NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+        ),
+        storage_generation="shared_blocks_v4",
     )
 
 
@@ -459,6 +471,33 @@ async def test_equivalent_current_snapshot_reuses_existing_attestation(monkeypat
     assert target.equivalent_audit_report_digest == "cd" * 32
     assert raw_sources.await_args_list[0].args == ("candidate-snapshot",)
     assert raw_sources.await_args_list[1].args == ("active-snapshot",)
+
+
+@pytest.mark.asyncio
+async def test_shared_blocks_v4_candidate_resolves_exact_audit_target(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(
+            return_value=[
+                _candidate_row(storage_generation="shared_blocks_v4")
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id="ptg2:derived-import",
+    )
+
+    assert target.storage_generation == "shared_blocks_v4"
+    assert target.snapshot_status == "validated"
 
 
 @pytest.mark.asyncio
@@ -1210,9 +1249,12 @@ async def test_default_v4_audit_attests_then_activates(
         witness_loader,
     )
 
+    candidate_target = _current_generation_target()
+
     async def audit(target, *, http_config, progress_callback):
         events.append("audit")
         assert target.snapshot_key == 17
+        assert target.storage_generation == "shared_blocks_v4"
         assert http_config is None
         assert progress_callback is not None
         return report
@@ -1223,6 +1265,7 @@ async def test_default_v4_audit_attests_then_activates(
         events.append("attest")
         assert kwargs["plan_id"] == "12-3456789"
         assert kwargs["source_key"] == "derived-source"
+        assert kwargs["storage_generation"] == "shared_blocks_v4"
         assert kwargs["report"] is report
         return {"report_digest": "ef" * 32}
 
@@ -1235,16 +1278,13 @@ async def test_default_v4_audit_attests_then_activates(
     monkeypatch.setattr(ptg_candidate_audit, "promote_ptg2_source_snapshot", promote)
 
     activation_response = await ptg_candidate_audit._audit_and_activate(
-        _target(
-            provider_identifier_quarantine=(
-                NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
-            )
-        ),
+        candidate_target,
         control_run_id="control-run",
     )
 
     assert events == ["audit", "attest", "promote"]
     assert activation_response["arch_version"] == "postgres_binary_v3"
+    assert activation_response["storage_generation"] == "shared_blocks_v4"
     assert activation_response["snapshot_status"] == "published"
     assert activation_response["activation_status"] == "activated"
     assert activation_response["audit_report_digest"] == "ef" * 32
@@ -1500,6 +1540,7 @@ def test_scheduler_result_is_redacted():
     assert "response" not in encoded
     assert set(scheduler_result_map) == {
         "arch_version",
+        "storage_generation",
         "snapshot_status",
         "activation_status",
         "snapshot_id",

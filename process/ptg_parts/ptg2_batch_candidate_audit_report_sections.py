@@ -42,6 +42,10 @@ from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
 from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine_evidence,
 )
+from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_SHARED_DENSE_WRITE_GENERATIONS,
+    PTG2_V3_SHARED_GENERATION,
+)
 from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_SOURCE_WITNESS_MANIFEST_FIELDS,
     source_witness_manifest_projection,
@@ -56,6 +60,7 @@ class CandidateReportCoordinates:
     source_key: str
     plan_id: str
     plan_market_type: str
+    storage_generation: str = PTG2_V3_SHARED_GENERATION
 
 
 @dataclass(frozen=True)
@@ -211,6 +216,8 @@ def validate_report_target(
 ) -> None:
     """Validate target hashes and the authenticated transport contract."""
 
+    if coordinates.storage_generation not in PTG2_SHARED_DENSE_WRITE_GENERATIONS:
+        raise ValueError("candidate storage generation is unsupported")
     target_by_field = strict_report_mapping(
         report_by_field.get("target"),
         field_name="target",
@@ -224,7 +231,7 @@ def validate_report_target(
     )
     expected_by_field = {
         "expected_architecture": "postgres_binary_v3",
-        "expected_storage_generation": "shared_blocks_v3",
+        "expected_storage_generation": coordinates.storage_generation,
         "expected_database_backend": "postgresql",
         "expected_snapshot_lifecycle": "validated",
         "architecture_assertion": "required_postgresql_session_evidence",

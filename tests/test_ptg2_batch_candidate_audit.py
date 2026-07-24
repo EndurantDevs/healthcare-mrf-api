@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 from aiohttp import web
@@ -307,8 +308,15 @@ def _v4_report(
     )
 
 
-def test_v4_report_validates_one_request_and_once_only_ledgers():
-    report = _v4_report()
+@pytest.mark.parametrize(
+    "storage_generation",
+    ("shared_blocks_v3", "shared_blocks_v4"),
+)
+def test_v4_report_validates_one_request_and_once_only_ledgers(
+    storage_generation,
+):
+    target = replace(_target(), storage_generation=storage_generation)
+    report = _v4_report(target)
 
     evidence = validate_batch_candidate_release_audit_report(
         report,
@@ -316,8 +324,10 @@ def test_v4_report_validates_one_request_and_once_only_ledgers():
         source_key="derived-source",
         plan_id="12-3456789",
         plan_market_type="group",
+        storage_generation=storage_generation,
     )
 
+    assert report["target"]["expected_storage_generation"] == storage_generation
     assert evidence["contract"] == PTG2_BATCH_AUDIT_ATTESTATION_CONTRACT
     assert evidence["batch_api_actual_http_requests"] == 1
     assert evidence["checks"]["batch_requests_executed"] == 1
@@ -327,8 +337,6 @@ def test_v4_report_validates_one_request_and_once_only_ledgers():
         _request().ordered_source_ordinal_digest
     )
     assert _RAW_DIGEST not in json.dumps(report, sort_keys=True)
-
-
 def test_v4_report_rejects_forged_request_and_matched_digests():
     report = deepcopy(_v4_report())
     forged_request_digest = "0" * 64

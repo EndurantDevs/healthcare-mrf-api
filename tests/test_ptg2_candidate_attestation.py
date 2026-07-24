@@ -14,6 +14,10 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_CONTRACT,
     PTG2_FAST_AUDIT_TOOL_VERSION,
 )
+from process.ptg_parts.ptg2_batch_candidate_audit_report_sections import (
+    CandidateReportCoordinates,
+    validate_report_target,
+)
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
 )
@@ -229,6 +233,54 @@ def test_release_report_validation_is_exact_and_deterministic():
     assert first["standard_api_actual_http_requests"] == 10_001
 
 
+def test_legacy_release_report_rejects_current_storage_generation():
+    with pytest.raises(
+        ValueError,
+        match="legacy candidate audit reports require shared_blocks_v3",
+    ):
+        ptg2_candidate_attestation.validate_candidate_release_audit_report(
+            _release_report(),
+            snapshot_id="snap_new",
+            source_key="source_a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            storage_generation="shared_blocks_v4",
+        )
+
+
+@pytest.mark.asyncio
+async def test_attestation_rejects_unknown_storage_generation_before_database():
+    with pytest.raises(
+        ValueError,
+        match="candidate storage generation is unsupported",
+    ):
+        await ptg2_candidate_attestation.record_candidate_audit_attestation(
+            snapshot_id="snap_new",
+            source_key="source_a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            storage_generation="shared_blocks_future",
+            report={},
+        )
+
+
+def test_batch_report_target_rejects_unknown_storage_generation():
+    with pytest.raises(
+        ValueError,
+        match="candidate storage generation is unsupported",
+    ):
+        validate_report_target(
+            {},
+            CandidateReportCoordinates(
+                snapshot_id="snap_new",
+                source_key="source_a",
+                plan_id="12-3456789",
+                plan_market_type="group",
+                storage_generation="shared_blocks_future",
+            ),
+        )
+
+
 def test_release_report_rejects_non_uvloop_or_non_aiohttp_runtime():
     report = _release_report()
     report["runtime"] = {"http_client": "httpx", "event_loop": "asyncio"}
@@ -316,6 +368,152 @@ def test_attestation_row_mapping_edges():
     assert ptg2_candidate_attestation._row_mapping((("value", 4),)) == {
         "value": 4
     }
+
+
+def test_source_pointer_mapping_helpers_cover_serialized_and_driver_rows():
+    driver_row = Mock()
+    driver_row._mapping = {"value": 3}
+
+    assert source_pointers._manifest_mapping('{"value": 1}') == {"value": 1}
+    assert source_pointers._manifest_mapping("[]") == {}
+    assert source_pointers._manifest_mapping("{") == {}
+    assert source_pointers._manifest_mapping(None) == {}
+    assert source_pointers._row_mapping(None) == {}
+    assert source_pointers._row_mapping(driver_row) == {"value": 3}
+
+
+def test_source_pointer_keys_fail_closed_and_bind_optional_source(monkeypatch):
+    with pytest.raises(ValueError, match="requires a source key"):
+        source_pointers._allowed_source_pointer_key("")
+
+    normalizer = Mock(side_effect=["source_a", None])
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(
+            source_pointers,
+            "_normalize_source_key",
+            normalizer,
+        )
+        with pytest.raises(RuntimeError, match="normalization failed"):
+            source_pointers._allowed_source_pointer_key("source_a")
+
+    import_month = datetime.date(2026, 7, 1)
+    without_source = source_pointers._ptg2_plan_source_key(
+        "12-3456789",
+        "group",
+        import_month,
+    )
+    with_source = source_pointers._ptg2_plan_source_key(
+        "12-3456789",
+        "group",
+        import_month,
+        "source_a",
+    )
+    assert without_source != with_source
+
+
+@pytest.mark.asyncio
+async def test_source_pointer_lookup_distinguishes_missing_and_empty_rows(
+    monkeypatch,
+):
+    first = AsyncMock(side_effect=[None, (None,), ("snap_current",)])
+    monkeypatch.setattr(source_pointers.db, "first", first)
+
+    assert await source_pointers._current_source_snapshot_id("source_a") is None
+    assert await source_pointers._current_source_snapshot_id("source_a") is None
+    assert (
+        await source_pointers._current_source_snapshot_id("source_a")
+        == "snap_current"
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_plan_rows_ignore_empty_plan_identity(monkeypatch):
+    monkeypatch.setattr(
+        source_pointers.db,
+        "all",
+        AsyncMock(
+            return_value=[
+                {"plan_id": "", "plan_market_type": "group"},
+            ]
+        ),
+    )
+
+    assert await source_pointers._source_plan_rows(
+        snapshot_id="snap_new",
+        source_key="source_a",
+        import_month=datetime.date(2026, 7, 1),
+        previous_snapshot_id="snap_old",
+        updated_at=datetime.datetime.now(datetime.timezone.utc),
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_staging_rejects_non_candidate_state():
+    with pytest.raises(ValueError, match="requires a validated snapshot"):
+        await source_pointers._stage_snapshot_in_pointer_transaction(
+            AsyncMock(),
+            schema_name="ptg",
+            snapshot_attributes={"status": "published"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_publication_allows_absent_optional_metadata():
+    session = AsyncMock()
+
+    await source_pointers._publish_snapshot_in_pointer_transaction(
+        session,
+        schema_name="ptg",
+        snapshot_attributes=None,
+    )
+
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_candidate_activation_requires_logical_plan_mappings():
+    session = AsyncMock()
+    session.execute.return_value = []
+
+    with pytest.raises(ValueError, match="no logical plan mappings"):
+        await source_pointers._candidate_plan_pointer_entries(
+            session,
+            schema_name="ptg",
+            source_key="source_a",
+            snapshot_id="snap_new",
+            previous_snapshot_id="snap_old",
+            import_month=datetime.date(2026, 7, 1),
+            activated_at=datetime.datetime.now(datetime.timezone.utc),
+        )
+
+
+@pytest.mark.parametrize(
+    ("plan_id", "plan_market_type"),
+    (("", "group"), ("12-3456789", "")),
+)
+def test_plan_pointer_entry_rejects_incomplete_plan_identity(
+    plan_id,
+    plan_market_type,
+):
+    with pytest.raises(ValueError, match="plan identity is incomplete"):
+        source_pointers._plan_pointer_entry(
+            plan_id=plan_id,
+            plan_market_type=plan_market_type,
+            import_month=datetime.date(2026, 7, 1),
+            source_key="source_a",
+            snapshot_id="snap_new",
+            previous_snapshot_id="snap_old",
+            updated_at=datetime.datetime.now(datetime.timezone.utc),
+        )
+
+
+def test_activated_snapshot_requires_candidate_contract():
+    with pytest.raises(ValueError, match="candidate activation contract"):
+        source_pointers.activated_snapshot_attributes(
+            {"manifest": {}},
+            activated_at=datetime.datetime.now(datetime.timezone.utc),
+            activation_mode="audited",
+        )
 
 
 @pytest.mark.parametrize(
@@ -504,7 +702,13 @@ def test_record_candidate_attestation_rechecks_freshness_after_lock(monkeypatch)
     assert session.calls == []
 
 
-def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
+@pytest.mark.parametrize(
+    "storage_generation",
+    ("shared_blocks_v3", "shared_blocks_v4"),
+)
+def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample(
+    storage_generation,
+):
     raw_container_digest = b"x" * 32
     source_set = ptg2_candidate_attestation.shared_source_set_metadata(
         [raw_container_digest.hex()]
@@ -512,6 +716,7 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
     audit_sample_digest = "ab" * 32
     coverage_scope_id = b"c" * 32
     serving_index = {
+        "storage_generation": storage_generation,
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": _audit_sample(audit_sample_digest),
@@ -519,6 +724,7 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
     layout_serving_index = {
+        "storage_generation": storage_generation,
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_count": 1,
         "audit_sample": _audit_sample(audit_sample_digest),
@@ -539,6 +745,7 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
             },
             "layout_manifest": {"serving_index": layout_serving_index},
             "snapshot_key": 17,
+            "storage_generation": storage_generation,
             "plan_id": "12-3456789",
             "plan_market_type": "group",
             "coverage_scope_id": coverage_scope_id,
@@ -549,6 +756,7 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
     assert identity["source_set_digest"] == bytes.fromhex(
         source_set["raw_container_sha256_digest"]
     )
+    assert identity["storage_generation"] == storage_generation
     assert identity["audit_sample_digest"] == bytes.fromhex(audit_sample_digest)
     assert identity["ordered_source_ordinal_digest"] == (
         ptg2_candidate_attestation.ordered_source_ordinal_digest(
@@ -1372,7 +1580,116 @@ def test_candidate_metadata_is_reread_from_postgres_under_row_lock():
     assert "snapshot.manifest" in sql
     assert "binding.snapshot_key" in sql
     assert "scope.coverage_scope_id" in sql
-    assert params == {"snapshot_id": "snap_new"}
+    assert params == {
+        "snapshot_id": "snap_new",
+        "storage_generations": [
+            "shared_blocks_v3",
+            "shared_blocks_v4",
+        ],
+    }
+
+
+def _activation_candidate(**overrides):
+    candidate_fields_by_name = {
+        "status": "validated",
+        "contract": "ptg2_candidate_activation_v1",
+        "activation_state": "validated",
+        "source_key": "source_a",
+        "previous_snapshot_id": "snap_old",
+        "expected_previous_snapshot_id": "snap_old",
+        "storage_generation": "shared_blocks_v4",
+        "serving_storage_generation": "shared_blocks_v4",
+        "plan_id": "12-3456789",
+        "plan_market_type": "group",
+        "coverage_scope_id": b"c" * 32,
+    }
+    candidate_fields_by_name.update(overrides)
+    return {
+        "status": candidate_fields_by_name["status"],
+        "previous_snapshot_id": candidate_fields_by_name[
+            "previous_snapshot_id"
+        ],
+        "manifest": {
+            "activation": {
+                "contract": candidate_fields_by_name["contract"],
+                "state": candidate_fields_by_name["activation_state"],
+                "source_key": candidate_fields_by_name["source_key"],
+                "expected_previous_snapshot_id": candidate_fields_by_name[
+                    "expected_previous_snapshot_id"
+                ],
+            },
+            "serving_index": {
+                "storage_generation": candidate_fields_by_name[
+                    "serving_storage_generation"
+                ],
+            },
+        },
+        "storage_generation": candidate_fields_by_name["storage_generation"],
+        "snapshot_key": 17,
+        "plan_id": candidate_fields_by_name["plan_id"],
+        "plan_market_type": candidate_fields_by_name["plan_market_type"],
+        "coverage_scope_id": candidate_fields_by_name[
+            "coverage_scope_id"
+        ],
+    }
+
+
+def test_shared_blocks_v4_candidate_has_valid_activation_identity():
+    identity = source_pointers._validated_activation_identity(
+        _activation_candidate(),
+        source_key="source_a",
+        expected_current_snapshot_id="snap_old",
+    )
+
+    assert identity["snapshot_key"] == 17
+    assert identity["previous_snapshot_id"] == "snap_old"
+
+
+@pytest.mark.parametrize(
+    ("candidate_kwargs", "expected_current_snapshot_id", "error_pattern"),
+    (
+        ({"status": "published"}, "snap_old", "not a validated candidate"),
+        ({"contract": "invalid"}, "snap_old", "activation contract"),
+        ({"activation_state": "invalid"}, "snap_old", "activation contract"),
+        (
+            {
+                "storage_generation": "shared_blocks_future",
+                "serving_storage_generation": "shared_blocks_future",
+            },
+            "snap_old",
+            "sealed layout",
+        ),
+        (
+            {"serving_storage_generation": "shared_blocks_v3"},
+            "snap_old",
+            "sealed layout",
+        ),
+        ({"source_key": "source_b"}, "snap_old", "source_key"),
+        (
+            {"previous_snapshot_id": "snap_other"},
+            "snap_old",
+            "predecessor disagrees",
+        ),
+        ({}, "snap_other", "requested predecessor"),
+        ({"plan_id": ""}, "snap_old", "incomplete immutable scope"),
+        ({"plan_market_type": ""}, "snap_old", "incomplete immutable scope"),
+        ({"coverage_scope_id": b"short"}, "snap_old", "incomplete immutable scope"),
+    ),
+)
+def test_candidate_activation_identity_rejects_mismatched_bindings(
+    candidate_kwargs,
+    expected_current_snapshot_id,
+    error_pattern,
+):
+    with pytest.raises(
+        (ValueError, source_pointers.PTG2SourcePointerConflict),
+        match=error_pattern,
+    ):
+        source_pointers._validated_activation_identity(
+            _activation_candidate(**candidate_kwargs),
+            source_key="source_a",
+            expected_current_snapshot_id=expected_current_snapshot_id,
+        )
 
 
 def test_candidate_plan_pointer_entries_load_all_logical_plan_mappings():

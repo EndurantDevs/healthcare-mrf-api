@@ -32,6 +32,10 @@ from process.ptg_parts.ptg2_shared_reuse import (
     PTG2_V3_SOURCE_SET_CONTRACT,
     shared_source_set_metadata,
 )
+from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_SHARED_DENSE_WRITE_GENERATIONS,
+    PTG2_V3_SHARED_GENERATION,
+)
 from process.ptg_parts.ptg2_shared_source_set import (
     ordered_source_ordinal_digest,
 )
@@ -611,6 +615,7 @@ def validate_candidate_release_audit_report(
     source_key: str,
     plan_id: str,
     plan_market_type: str,
+    storage_generation: str = PTG2_V3_SHARED_GENERATION,
     evaluated_at: datetime.datetime | None = None,
 ) -> dict[str, Any]:
     """Dispatch strict V3 and V4 release reports without rewriting history."""
@@ -622,7 +627,12 @@ def validate_candidate_release_audit_report(
             source_key=source_key,
             plan_id=plan_id,
             plan_market_type=plan_market_type,
+            storage_generation=storage_generation,
             evaluated_at=evaluated_at,
+        )
+    if storage_generation != PTG2_V3_SHARED_GENERATION:
+        raise ValueError(
+            "legacy candidate audit reports require shared_blocks_v3"
         )
     return _validate_v3_release_report(
         report,
@@ -819,6 +829,28 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
     layout_serving_index_by_field = _mapping(
         layout_manifest_by_field.get("serving_index")
     )
+    storage_generation = str(
+        database_row.get("storage_generation")
+        or serving_index_by_field.get("storage_generation")
+        or layout_serving_index_by_field.get("storage_generation")
+        or PTG2_V3_SHARED_GENERATION
+    ).strip()
+    if (
+        storage_generation not in PTG2_SHARED_DENSE_WRITE_GENERATIONS
+        or serving_index_by_field.get(
+            "storage_generation",
+            storage_generation,
+        )
+        != storage_generation
+        or layout_serving_index_by_field.get(
+            "storage_generation",
+            storage_generation,
+        )
+        != storage_generation
+    ):
+        raise ValueError(
+            "candidate storage generation changed after layout sealing"
+        )
     physical_identity = _validated_candidate_physical_identity(
         database_row,
         serving_index_by_field,
@@ -851,6 +883,7 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
         "plan_id": str(database_row.get("plan_id") or "").strip(),
         "plan_market_type": str(database_row.get("plan_market_type") or "").strip().lower(),
         "coverage_scope_id": physical_identity.coverage_scope_id,
+        "storage_generation": storage_generation,
         "source_set_digest": physical_identity.source_set_digest,
         "ordered_source_ordinal_digest": ordered_source_ordinal_digest(
             physical_identity.raw_container_hashes
@@ -881,6 +914,7 @@ async def _locked_candidate_identity(
                    scope.plan_id,
                    scope.plan_market_type,
                    scope.coverage_scope_id,
+                   layout.generation AS storage_generation,
                    layout.layout_manifest,
                    ARRAY(
                        SELECT source.raw_container_sha256
@@ -897,11 +931,18 @@ async def _locked_candidate_identity(
                 ON layout.snapshot_key = binding.snapshot_key
              WHERE snapshot.snapshot_id = :snapshot_id
                AND layout.state = 'sealed'
-               AND layout.generation = 'shared_blocks_v3'
+               AND layout.generation = ANY(
+                   CAST(:storage_generations AS text[])
+               )
              FOR UPDATE OF snapshot
             """
         ),
-        {"snapshot_id": snapshot_id},
+        {
+            "snapshot_id": snapshot_id,
+            "storage_generations": sorted(
+                PTG2_SHARED_DENSE_WRITE_GENERATIONS
+            ),
+        },
     )
     candidate_row = query_result.one_or_none()
     if candidate_row is None:
@@ -925,6 +966,7 @@ async def record_candidate_audit_attestation(
     source_key: str,
     plan_id: str,
     plan_market_type: str,
+    storage_generation: str = PTG2_V3_SHARED_GENERATION,
     report: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Persist a passing release report against the candidate's immutable identity."""
@@ -933,6 +975,9 @@ async def record_candidate_audit_attestation(
     normalized_source_key = str(source_key or "").strip().lower()
     normalized_plan_id = str(plan_id or "").strip()
     normalized_market_type = str(plan_market_type or "").strip().lower()
+    normalized_storage_generation = str(
+        storage_generation or ""
+    ).strip().lower()
     if not all(
         (
             normalized_snapshot_id,
@@ -942,6 +987,11 @@ async def record_candidate_audit_attestation(
         )
     ):
         raise ValueError("snapshot, source, plan, and market are required")
+    if (
+        normalized_storage_generation
+        not in PTG2_SHARED_DENSE_WRITE_GENERATIONS
+    ):
+        raise ValueError("candidate storage generation is unsupported")
     preflight_now = datetime.datetime.now(datetime.timezone.utc)
     evidence = validate_candidate_release_audit_report(
         report,
@@ -949,6 +999,7 @@ async def record_candidate_audit_attestation(
         source_key=normalized_source_key,
         plan_id=normalized_plan_id,
         plan_market_type=normalized_market_type,
+        storage_generation=normalized_storage_generation,
         evaluated_at=preflight_now,
     )
     _require_current_candidate_attestation_writer(evidence)
@@ -962,6 +1013,7 @@ async def record_candidate_audit_attestation(
             source_key=normalized_source_key,
             plan_id=normalized_plan_id,
             plan_market_type=normalized_market_type,
+            storage_generation=normalized_storage_generation,
             evaluated_at=now,
         )
         _require_current_candidate_attestation_writer(evidence)
@@ -980,6 +1032,11 @@ async def record_candidate_audit_attestation(
             identity["source_key"] != normalized_source_key
             or identity["plan_id"] != normalized_plan_id
             or identity["plan_market_type"] != normalized_market_type
+            or identity.get(
+                "storage_generation",
+                PTG2_V3_SHARED_GENERATION,
+            )
+            != normalized_storage_generation
         ):
             raise ValueError("audit target does not match the candidate bindings")
         if evidence["audit_sample_digest"] != identity["audit_sample_digest"]:

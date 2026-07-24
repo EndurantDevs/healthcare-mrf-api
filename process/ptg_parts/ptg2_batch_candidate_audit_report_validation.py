@@ -48,6 +48,7 @@ from process.ptg_parts.ptg2_partitioned_candidate_audit_report_validation import
     validate_partitioned_batch_binding,
     validate_partitioned_http_metrics,
 )
+from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
 from process.ptg_parts.ptg2_candidate_audit_contract import (
     validated_public_audit_sample_projection,
 )
@@ -467,6 +468,7 @@ def validate_batch_candidate_release_audit_report(
     source_key: str,
     plan_id: str,
     plan_market_type: str,
+    storage_generation: str = PTG2_V3_SHARED_GENERATION,
     evaluated_at: datetime.datetime | None = None,
 ) -> dict[str, Any]:
     """Validate and digest one strict V4 bounded release report."""
@@ -482,6 +484,7 @@ def validate_batch_candidate_release_audit_report(
         source_key=source_key,
         plan_id=plan_id,
         plan_market_type=plan_market_type,
+        storage_generation=storage_generation,
     )
     parts = _validated_report_parts(report_by_field, coordinates, evaluation_time)
     return _attestation_evidence(report_by_field, parts)

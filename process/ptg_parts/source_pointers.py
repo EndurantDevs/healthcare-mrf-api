@@ -18,7 +18,11 @@ from process.ptg_parts.domain import (
     PTG2_STATUS_PUBLISHED,
     PTG2_STATUS_VALIDATED,
 )
-from process.ptg_parts.ptg2_shared_blocks import bind_snapshot_to_shared_layout
+from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_SHARED_DENSE_WRITE_GENERATIONS,
+    PTG2_V3_SHARED_GENERATION,
+    bind_snapshot_to_shared_layout,
+)
 from process.ptg_parts.ptg2_candidate_attestation import (
     consume_candidate_audit_attestation_in_transaction,
     verify_candidate_audit_attestation_in_transaction,
@@ -86,9 +90,14 @@ class PTG2SourcePointerConflict(RuntimeError):
 def _allowed_source_pointer_key(source_key: str) -> str:
     """Return the current-source key reserved for allowed evidence."""
 
-    pointer_key = _normalize_source_key(f"{source_key}_allowed_amounts")
-    if not pointer_key:
+    normalized_source_key = _normalize_source_key(source_key)
+    if not normalized_source_key:
         raise ValueError("allowed-amount source pointer requires a source key")
+    pointer_key = _normalize_source_key(
+        f"{normalized_source_key}_allowed_amounts"
+    )
+    if not pointer_key:
+        raise RuntimeError("allowed-amount source pointer normalization failed")
     return pointer_key
 
 
@@ -854,7 +863,8 @@ async def _locked_candidate_activation_row(
                    binding.snapshot_key,
                    scope.plan_id,
                    scope.plan_market_type,
-                   scope.coverage_scope_id
+                   scope.coverage_scope_id,
+                   layout.generation AS storage_generation
               FROM {_quote_ident(schema_name)}.ptg2_snapshot AS snapshot
               JOIN {_quote_ident(schema_name)}.ptg2_v3_snapshot_binding AS binding
                 ON binding.snapshot_id = snapshot.snapshot_id
@@ -864,11 +874,18 @@ async def _locked_candidate_activation_row(
                 ON layout.snapshot_key = binding.snapshot_key
              WHERE snapshot.snapshot_id = :snapshot_id
                AND layout.state = 'sealed'
-               AND layout.generation = 'shared_blocks_v3'
+               AND layout.generation = ANY(
+                   CAST(:storage_generations AS text[])
+               )
              FOR UPDATE OF snapshot
             """
         ),
-        {"snapshot_id": snapshot_id},
+        {
+            "snapshot_id": snapshot_id,
+            "storage_generations": sorted(
+                PTG2_SHARED_DENSE_WRITE_GENERATIONS
+            ),
+        },
     )
     activation_record = activation_query.one_or_none()
     if activation_record is None:
@@ -886,16 +903,45 @@ async def _database_utc_timestamp(session: Any) -> datetime.datetime:
     return timestamp.replace(tzinfo=None)
 
 
+def _validated_candidate_storage_generation(
+    candidate: dict[str, Any],
+    serving_index: dict[str, Any],
+) -> str:
+    """Bind activation to the generation recorded in the sealed layout."""
+
+    storage_generation = str(
+        candidate.get("storage_generation")
+        or serving_index.get("storage_generation")
+        or PTG2_V3_SHARED_GENERATION
+    ).strip()
+    if (
+        storage_generation not in PTG2_SHARED_DENSE_WRITE_GENERATIONS
+        or serving_index.get(
+            "storage_generation",
+            storage_generation,
+        )
+        != storage_generation
+    ):
+        raise ValueError(
+            "snapshot storage generation does not match its sealed layout"
+        )
+    return storage_generation
+
+
 def _validated_activation_identity(
     candidate: dict[str, Any],
     *,
     source_key: str,
     expected_current_snapshot_id: str | None,
 ) -> dict[str, Any]:
+    """Validate immutable candidate identity before pointer activation."""
+
     if str(candidate.get("status") or "").strip().lower() != PTG2_STATUS_VALIDATED:
         raise ValueError("snapshot is not a validated candidate")
     manifest = _manifest_mapping(candidate.get("manifest"))
     activation = _manifest_mapping(manifest.get("activation"))
+    serving_index = _manifest_mapping(manifest.get("serving_index"))
+    _validated_candidate_storage_generation(candidate, serving_index)
     if (
         activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
         or activation.get("state") != "validated"

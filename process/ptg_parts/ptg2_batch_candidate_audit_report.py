@@ -31,6 +31,7 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_evidence,
 )
+from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
 from process.ptg_parts.ptg2_source_witness import source_set_digest
 from process.ptg_parts.ptg2_source_witness_contract import (
     source_witness_manifest_projection,
@@ -48,6 +49,7 @@ class BatchAuditReportTarget:
     source_witness: Mapping[str, Any]
     audit_sample: Mapping[str, Any]
     provider_identifier_quarantine: Mapping[str, Any]
+    storage_generation: str = PTG2_V3_SHARED_GENERATION
 
 
 @dataclass(frozen=True)
@@ -70,7 +72,7 @@ def _target_section(report_input: BatchAuditReportInput) -> dict[str, Any]:
     api_origin = f"{parsed_origin.scheme}://{parsed_origin.netloc}"
     return {
         "expected_architecture": "postgres_binary_v3",
-        "expected_storage_generation": "shared_blocks_v3",
+        "expected_storage_generation": target.storage_generation,
         "expected_database_backend": "postgresql",
         "expected_snapshot_lifecycle": "validated",
         "architecture_assertion": "required_postgresql_session_evidence",
@@ -240,6 +242,7 @@ def validate_batch_candidate_release_audit_report(
     source_key: str,
     plan_id: str,
     plan_market_type: str,
+    storage_generation: str = PTG2_V3_SHARED_GENERATION,
     evaluated_at: datetime.datetime | None = None,
 ) -> dict[str, Any]:
     """Validate one V4 report through the bounded companion validator."""
@@ -254,6 +257,7 @@ def validate_batch_candidate_release_audit_report(
         source_key=source_key,
         plan_id=plan_id,
         plan_market_type=plan_market_type,
+        storage_generation=storage_generation,
         evaluated_at=evaluated_at,
     )
 
