@@ -58,6 +58,12 @@ MIGRATION_PATH = (
     / "versions"
     / "20260723100000_ptg2_v4_snapshot_map_pack.py"
 )
+TAXONOMY_MIGRATION_PATH = (
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260724120000_ptg2_v4_taxonomy_candidates.py"
+)
 _STANDARD_FORMAT = (
     "magic8:uint32_le_version:uint64_le_entry_count:"
     "index(owner16:uint64_le_offset:uint32_le_count):members16"
@@ -79,6 +85,17 @@ def _load_v4_migration():
     spec = importlib.util.spec_from_file_location(
         "ptg2_v4_postgres_e2e_migration",
         MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_v4_taxonomy_migration():
+    spec = importlib.util.spec_from_file_location(
+        "ptg2_v4_postgres_e2e_taxonomy_migration",
+        TAXONOMY_MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -331,6 +348,20 @@ async def _create_v4_test_schema(
         )
         """,
         f"""
+        CREATE TABLE {schema}.npi (
+            npi bigint PRIMARY KEY,
+            entity_type_code integer
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.npi_taxonomy (
+            npi bigint NOT NULL,
+            checksum integer NOT NULL,
+            healthcare_provider_taxonomy_code varchar,
+            PRIMARY KEY (npi, checksum)
+        )
+        """,
+        f"""
         CREATE TABLE {schema}.ptg2_v3_block (
             block_hash bytea PRIMARY KEY,
             format_version smallint NOT NULL,
@@ -373,6 +404,10 @@ async def _create_v4_test_schema(
     monkeypatch.setattr(migration, "op", recorder)
     monkeypatch.setattr(migration, "_schema", lambda: schema_name)
     migration.upgrade()
+    taxonomy_migration = _load_v4_taxonomy_migration()
+    monkeypatch.setattr(taxonomy_migration, "op", recorder)
+    monkeypatch.setattr(taxonomy_migration, "_schema", lambda: schema_name)
+    taxonomy_migration.upgrade()
     for statement in recorder.executed:
         await database.execute_ddl(statement)
 
@@ -971,6 +1006,16 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
                 (metric, int(amount))
             ),
         )
+        taxonomy_manifest = publication.inferred_taxonomy_candidates
+        assert taxonomy_manifest["rule_count"] > 0
+        assert taxonomy_manifest["observe_only_rule_count"] == 0
+        assert taxonomy_manifest["member_count"] == 0
+        assert await database.scalar(
+            f"SELECT COUNT(*) FROM "
+            f"{schema}.ptg2_v4_inferred_taxonomy_candidate "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=reservation.snapshot_key,
+        ) == taxonomy_manifest["rule_count"]
         async with database.transaction() as session:
             sealed = await seal_v4_shared_layout(
                 session,
@@ -1218,6 +1263,7 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
         binary_path=binary_path,
     )
     assert compilation.selected_layout == "direct"
+    assert compilation.observe["pattern_count"] == 2
     relation_names = {
         str(relation["relation"])
         for relation in compilation.relation_summaries
@@ -1272,9 +1318,28 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
                 expected_summary=publication.map_summary,
                 support_digest=publication.support_digest,
                 layout_manifest=_base_layout_manifest(),
-            )
+        )
 
         assert publication.representation == "direct_v1"
+        assert publication.inferred_taxonomy_candidates["rule_count"] > 0
+        assert (
+            publication.inferred_taxonomy_candidates[
+                "observe_only_rule_count"
+            ]
+            == 0
+        )
+        assert publication.inferred_taxonomy_candidates["member_count"] == 0
+        assert publication.inferred_taxonomy_candidates["pattern_count"] == 0
+        assert await database.scalar(
+            f"SELECT representation FROM {schema}.ptg2_v4_snapshot_map_root "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=sealed.snapshot_key,
+        ) == "direct_v1"
+        assert await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_pattern "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=sealed.snapshot_key,
+        ) == 0
         async with database.transaction() as session:
             set_groups = await graph.lookup_v4_relation_members(
                 session,

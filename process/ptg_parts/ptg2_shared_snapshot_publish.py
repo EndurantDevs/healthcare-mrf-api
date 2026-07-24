@@ -1548,11 +1548,15 @@ async def _publish_v4_dictionaries_and_maps(
         compilation.observe.get("component_count") or 0
     )
     expected_npi_count = int(compilation.observe.get("npi_count") or 0)
-    expected_pattern_count = int(compilation.observe.get("pattern_count") or 0)
     root_representation = (
         "pattern_v1"
         if compilation.selected_layout == "pattern"
         else "direct_v1"
+    )
+    root_pattern_count = (
+        int(compilation.observe.get("pattern_count") or 0)
+        if root_representation == "pattern_v1"
+        else 0
     )
     expected_prefix_owner_count = int(
         compilation.observe.get("npi_prefix_override_owner_count") or 0
@@ -1686,7 +1690,7 @@ async def _publish_v4_dictionaries_and_maps(
                 _V4DenseDictionaryStage(
                     stage_table=pattern_stage,
                     key_name="pattern_key",
-                    expected_count=expected_pattern_count,
+                    expected_count=root_pattern_count,
                     target_table="ptg2_v4_pattern",
                     columns=("pattern_key", "pattern_digest", "set_count"),
                     value_predicate=(
@@ -2106,7 +2110,7 @@ async def _publish_v4_dictionaries_and_maps(
                     build_token=build_token,
                     npi_count=expected_npi_count,
                     representation=root_representation,
-                    pattern_count=expected_pattern_count,
+                    pattern_count=root_pattern_count,
                 )
             )
             if progress_callback is not None:
