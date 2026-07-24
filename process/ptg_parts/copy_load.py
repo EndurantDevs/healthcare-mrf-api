@@ -16,7 +16,11 @@ from process.ext.utils import push_objects
 from process.ptg_parts.canonical import normalize_money
 from process.ptg_parts.config import _uses_ptg2_stage_copy_dedupe
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.rust_stage import _ptg2_dictionary_select_columns
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    guard_attempt_rows,
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -80,6 +84,28 @@ def _ptg2_copy_record(row: dict[str, Any], columns: list[str], json_columns: set
     return tuple(values)
 
 
+async def _guard_copy_attempt(
+    connection: Any,
+    schema_name: str,
+    table_name: str,
+    attempt_rows: list[dict[str, Any]],
+) -> None:
+    """Fence the attempt on the same connection used by COPY."""
+
+    await guard_attempt_rows(
+        connection,
+        db,
+        schema_name=schema_name,
+        table_name=table_name,
+        attempt_rows=attempt_rows,
+    )
+
+
+def _copy_driver_connection(connection: Any) -> Any:
+    raw_connection = connection.raw_connection
+    return getattr(raw_connection, "driver_connection", raw_connection)
+
+
 async def _copy_upsert_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> None:
     if not object_rows:
         return
@@ -99,7 +125,7 @@ async def _copy_upsert_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> N
         ] = object_row
     object_rows = list(deduped_row_by_conflict.values())
     json_columns = _ptg2_json_columns(cls)
-    schema_name = cls.__table__.schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(cls.__table__.schema)
     table_name = cls.__tablename__
     temp_table = f"ptg2_stage_{table_name}_{os.getpid()}_{time.time_ns()}"
     quoted_temp = _quote_ident(temp_table)
@@ -119,11 +145,11 @@ async def _copy_upsert_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> N
         for object_row in object_rows
     ]
     async with db.acquire() as conn:
+        await _guard_copy_attempt(conn, schema_name, table_name, object_rows)
         await conn.status(
             f"CREATE TEMP TABLE {quoted_temp} (LIKE {quoted_target} INCLUDING DEFAULTS) ON COMMIT DROP;"
         )
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        driver_conn = _copy_driver_connection(conn)
         await driver_conn.copy_records_to_table(
             temp_table,
             columns=columns,
@@ -144,11 +170,11 @@ async def _copy_insert_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
         return
     columns = list(rows[0].keys())
     json_columns = _ptg2_json_columns(cls)
-    schema_name = cls.__table__.schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(cls.__table__.schema)
     records = [_ptg2_copy_record(row, columns, json_columns) for row in rows]
     async with db.acquire() as conn:
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        await _guard_copy_attempt(conn, schema_name, cls.__tablename__, rows)
+        driver_conn = _copy_driver_connection(conn)
         await driver_conn.copy_records_to_table(
             cls.__tablename__,
             schema_name=schema_name,
@@ -166,7 +192,7 @@ async def _copy_ignore_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> N
         return
     columns = list(object_rows[0].keys())
     json_columns = _ptg2_json_columns(cls)
-    schema_name = cls.__table__.schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema(cls.__table__.schema)
     table_name = cls.__tablename__
     temp_table = f"ptg2_stage_{table_name}_{os.getpid()}_{time.time_ns()}"
     quoted_temp = _quote_ident(temp_table)
@@ -178,11 +204,11 @@ async def _copy_ignore_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> N
         for object_row in object_rows
     ]
     async with db.acquire() as conn:
+        await _guard_copy_attempt(conn, schema_name, table_name, object_rows)
         await conn.status(
             f"CREATE TEMP TABLE {quoted_temp} (LIKE {quoted_target} INCLUDING DEFAULTS) ON COMMIT DROP;"
         )
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        driver_conn = _copy_driver_connection(conn)
         await driver_conn.copy_records_to_table(
             temp_table,
             columns=columns,
@@ -198,32 +224,43 @@ async def _copy_ignore_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> N
         )
 
 
-async def _copy_stage_price_set_rows(rows: list[dict[str, Any]], snapshot_id: str) -> None:
-    if not rows:
+async def _copy_stage_price_set_rows(
+    price_set_entries: list[dict[str, Any]],
+    snapshot_id: str,
+) -> None:
+    if not price_set_entries:
         return
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     columns = [
         "snapshot_id",
         "price_set_hash",
         "created_at",
     ]
-    records = [
+    copy_records = [
         (
             snapshot_id,
-            row.get("price_set_hash"),
-            row.get("created_at"),
+            price_set_entry.get("price_set_hash"),
+            price_set_entry.get("created_at"),
         )
-        for row in rows
+        for price_set_entry in price_set_entries
     ]
-    records = [_copy_record_values(record) for record in records]
+    copy_records = [
+        _copy_record_values(copy_record)
+        for copy_record in copy_records
+    ]
     async with db.acquire() as conn:
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        await _guard_copy_attempt(
+            conn,
+            schema_name,
+            "ptg2_price_set_stage",
+            [{"snapshot_id": snapshot_id}],
+        )
+        driver_conn = _copy_driver_connection(conn)
         await driver_conn.copy_records_to_table(
             "ptg2_price_set_stage",
             schema_name=schema_name,
             columns=columns,
-            records=records,
+            records=copy_records,
         )
 
 
@@ -233,7 +270,7 @@ async def _copy_stage_serving_rate_rows(
     """Bulk-copy serving-rate rows into the snapshot staging table."""
     if not serving_rate_rows:
         return
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     columns = [
         "serving_rate_id",
         "snapshot_id",
@@ -310,8 +347,13 @@ async def _copy_stage_serving_rate_rows(
         for serving_rate_record in serving_rate_records
     ]
     async with db.acquire() as conn:
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        await _guard_copy_attempt(
+            conn,
+            schema_name,
+            "ptg2_serving_rate_stage",
+            [{"snapshot_id": snapshot_id}],
+        )
+        driver_conn = _copy_driver_connection(conn)
         await driver_conn.copy_records_to_table(
             "ptg2_serving_rate_stage",
             schema_name=schema_name,
@@ -325,7 +367,7 @@ async def _copy_compact_serving_rate_rows(
 ) -> None:
     if not serving_rate_rows:
         return
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     columns = [
         "serving_rate_id",
         "snapshot_id",
@@ -364,8 +406,13 @@ async def _copy_compact_serving_rate_rows(
         for serving_rate_record in serving_rate_records
     ]
     async with db.acquire() as conn:
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        await _guard_copy_attempt(
+            conn,
+            schema_name,
+            "ptg2_serving_rate_compact",
+            [{"snapshot_id": snapshot_id}],
+        )
+        driver_conn = _copy_driver_connection(conn)
         await driver_conn.copy_records_to_table(
             "ptg2_serving_rate_compact",
             schema_name=schema_name,
@@ -374,16 +421,30 @@ async def _copy_compact_serving_rate_rows(
         )
 
 
-async def _copy_compact_serving_rate_file(copy_path: Path, *, target_table: str = "ptg2_serving_rate_compact") -> None:
+async def _copy_compact_serving_rate_file(
+    copy_path: Path,
+    *,
+    snapshot_id: str | None = None,
+    target_table: str = "ptg2_serving_rate_compact",
+) -> None:
     if not copy_path.exists() or copy_path.stat().st_size <= 0:
         return
-    await _copy_compact_serving_rate_source(copy_path.open("rb"), target_table=target_table)
+    await _copy_compact_serving_rate_source(
+        copy_path.open("rb"),
+        snapshot_id=snapshot_id,
+        target_table=target_table,
+    )
 
 
 async def _copy_compact_serving_rate_source(
-    copy_source, *, target_table: str = "ptg2_serving_rate_compact"
+    copy_source,
+    *,
+    snapshot_id: str | None = None,
+    target_table: str = "ptg2_serving_rate_compact",
 ) -> None:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    if target_table == "ptg2_serving_rate_compact" and not snapshot_id:
+        raise ValueError("compact serving-rate COPY requires snapshot_id")
+    schema_name = resolve_ptg2_schema()
     columns = [
         "serving_rate_id",
         "snapshot_id",
@@ -399,8 +460,14 @@ async def _copy_compact_serving_rate_source(
         "network_names",
     ]
     async with db.acquire() as conn:
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        if snapshot_id:
+            await _guard_copy_attempt(
+                conn,
+                schema_name,
+                target_table,
+                [{"snapshot_id": snapshot_id}],
+            )
+        driver_conn = _copy_driver_connection(conn)
         copy_to_table = getattr(driver_conn, "copy_to_table", None)
         if copy_to_table is None:
             raise NotImplementedError("Active database driver does not expose copy_to_table")
@@ -485,7 +552,7 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
     if kind not in copy_spec_by_kind:
         raise ValueError(f"Unsupported PTG2 dictionary copy kind: {kind}")
     table_name, columns, conflict_targets = copy_spec_by_kind[kind]
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     if target_table is not None:
         should_dedupe_stage_copy = _uses_ptg2_stage_copy_dedupe(kind)
         async with db.acquire() as conn:

@@ -3060,7 +3060,13 @@ async def test_reservation_resumes_only_the_same_build_token():
 
 @pytest.mark.asyncio
 async def test_snapshot_binding_retry_is_idempotent_only_for_same_layout():
-    session = _ScriptedSession([_Result(scalar_value=None), _Result(scalar_value=31)])
+    session = _ScriptedSession(
+        [
+            _Result(rows=[{"import_run_id": "run-31", "manifest": {}}]),
+            _Result(scalar_value=None),
+            _Result(scalar_value=31),
+        ]
+    )
 
     await bind_snapshot_to_shared_layout(
         session,
@@ -3069,14 +3075,18 @@ async def test_snapshot_binding_retry_is_idempotent_only_for_same_layout():
         snapshot_key=31,
     )
 
-    assert len(session.calls) == 2
-    assert "ON CONFLICT (snapshot_id) DO NOTHING" in session.calls[0][0]
+    assert len(session.calls) == 3
+    assert "guard_ptg2_v4_attempt" in session.calls[0][0]
+    assert "ON CONFLICT (snapshot_id) DO NOTHING" in session.calls[1][0]
 
 
 @pytest.mark.asyncio
 async def test_snapshot_binding_accepts_only_complete_v4_map_root():
     session = _ScriptedSession(
         [
+            _Result(
+                rows=[{"import_run_id": "run-v4", "manifest": {}}]
+            ),
             _Result(scalar_value=None),
             _Result(scalar_value=None),
             _Result(scalar_value=b"m" * 32),
@@ -3091,10 +3101,10 @@ async def test_snapshot_binding_accepts_only_complete_v4_map_root():
         snapshot_key=44,
     )
 
-    assert len(session.calls) == 4
-    assert "ptg2_v4_snapshot_map_root" in session.calls[2][0]
-    assert "root.state = 'complete'" in session.calls[2][0]
-    assert session.calls[2][1]["generation"] == "shared_blocks_v4"
+    assert len(session.calls) == 5
+    assert "ptg2_v4_snapshot_map_root" in session.calls[3][0]
+    assert "root.state = 'complete'" in session.calls[3][0]
+    assert session.calls[3][1]["generation"] == "shared_blocks_v4"
 
 
 @pytest.mark.asyncio

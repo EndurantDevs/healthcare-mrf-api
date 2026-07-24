@@ -35,6 +35,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_shared_gc import (
     release_unbound_ptg2_shared_layouts,
 )
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    drop_attempt_stage_tables,
+)
 from process.ptg_parts.source_pointers import PTG2_SOURCE_POINTER_GC_LOCK_KEY
 
 
@@ -609,11 +613,28 @@ async def _drop_ptg2_snapshot_table_names(
     table_names: list[str],
     *,
     executor: Any | None = None,
+    snapshot_id: str | None = None,
+    internal_run_id: str | None = None,
+    retain_attempt_registration: bool = False,
 ) -> None:
     if not table_names:
         return
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     executor = executor or db
+    if snapshot_id or internal_run_id:
+        if not snapshot_id or not internal_run_id:
+            raise ValueError(
+                "attempt stage cleanup requires snapshot and run identifiers"
+            )
+        await drop_attempt_stage_tables(
+            executor,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
+            table_names=table_names,
+            retain_registration=retain_attempt_registration,
+        )
+        return
     for table_name in table_names:
         await executor.status(
             f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)};"
@@ -748,7 +769,7 @@ async def _cleanup_source_tables(
     source_key: str,
     keep_snapshot_ids: set[str],
 ) -> None:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     all_snapshot_rows = await _all_snapshot_manifest_rows(
         executor,
         schema_name=schema_name,
@@ -784,7 +805,7 @@ async def _cleanup_old_ptg2_source_tables(
         )
         return
 
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     async with db.acquire() as connection:
         await connection.status(
             "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",

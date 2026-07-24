@@ -14,6 +14,9 @@ from typing import Any, Iterable, Mapping, Sequence
 from sqlalchemy import text
 
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    lock_writable_snapshot,
+)
 
 
 PTG2_V3_SHARED_GENERATION = "shared_blocks_v3"
@@ -1353,6 +1356,12 @@ async def bind_snapshot_to_shared_layout(
 ) -> None:
     """Bind one logical snapshot to a sealed V3 or complete-map V4 layout."""
 
+    await lock_writable_snapshot(
+        session,
+        None,
+        schema_name=schema_name,
+        snapshot_id=str(snapshot_id),
+    )
     schema = _quote_ident(schema_name)
     v3_binding_result = await session.execute(
         text(

@@ -29,6 +29,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
     delete_shared_layout_dense_rows,
     shared_block_hash,
 )
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    lock_writable_snapshot,
+)
 
 
 PTG2_V4_SHARED_GENERATION = "shared_blocks_v4"
@@ -3802,6 +3805,12 @@ async def bind_snapshot_to_v4_layout(
 ) -> None:
     """Bind one logical snapshot only to a sealed, complete V4 map root."""
 
+    await lock_writable_snapshot(
+        session,
+        None,
+        schema_name=schema_name,
+        snapshot_id=str(snapshot_id),
+    )
     schema = _quote_ident(schema_name)
     binding_result = await session.execute(
         text(

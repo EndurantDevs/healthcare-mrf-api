@@ -304,20 +304,28 @@ async def _assert_snapshot_map_root() -> None:
 
 async def _assert_snapshot_binding() -> None:
     await snapshot_maps.bind_snapshot_to_v4_layout(
-        _ScriptedSession(_Result(scalar="snapshot")),
+        _ScriptedSession(_Result(), _Result(scalar="snapshot")),
         schema_name="mrf",
         snapshot_id="snapshot",
         snapshot_key=17,
     )
     await snapshot_maps.bind_snapshot_to_v4_layout(
-        _ScriptedSession(_Result(scalar=None), _Result(scalar=17)),
+        _ScriptedSession(
+            _Result(),
+            _Result(scalar=None),
+            _Result(scalar=17),
+        ),
         schema_name="mrf",
         snapshot_id="snapshot",
         snapshot_key=17,
     )
     with pytest.raises(RuntimeError, match="not bindable"):
         await snapshot_maps.bind_snapshot_to_v4_layout(
-            _ScriptedSession(_Result(scalar=None), _Result(scalar=18)),
+            _ScriptedSession(
+                _Result(),
+                _Result(scalar=None),
+                _Result(scalar=18),
+            ),
             schema_name="mrf",
             snapshot_id="snapshot",
             snapshot_key=17,

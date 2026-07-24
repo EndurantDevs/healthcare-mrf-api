@@ -56,6 +56,7 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     touch_v4_shared_layout_build,
 )
 from tests.ptg2_v4_migration_catalog_support import (
+    attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
 )
 
@@ -491,6 +492,7 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             )
             """
         )
+        await database.execute_ddl(attempt_guard_prerequisite_ddl(schema))
         await database.execute_ddl(
             f"""
             CREATE TABLE {schema}.ptg2_v3_snapshot_binding (

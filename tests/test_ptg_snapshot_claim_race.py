@@ -59,6 +59,22 @@ class _ExistingSnapshotQuery:
         }
 
 
+class _ExistingReconciledRunQuery:
+    def where(self, *_args):
+        return self
+
+    async def first(self):
+        return {
+            "import_run_id": "run-reconciled",
+            "status": process_ptg.PTG2_STATUS_FAILED,
+            "report": {
+                process_ptg.PTG2_V4_STALE_METADATA_MARKER: {
+                    "status": "reconciled"
+                }
+            },
+        }
+
+
 class _ClaimSession:
     def __init__(self, executed_statements):
         self.executed_statements = executed_statements
@@ -94,10 +110,61 @@ def test_building_snapshot_claim_only_reclaims_failed_candidate(monkeypatch):
         )
     )
 
-    assert conflict_options_by_name["where"].right.value == process_ptg.PTG2_STATUS_FAILED
+    status_clause = tuple(conflict_options_by_name["where"].clauses)[0]
+    assert status_clause.right.value == process_ptg.PTG2_STATUS_FAILED
+    assert process_ptg.PTG2_V4_STALE_METADATA_MARKER in (
+        conflict_options_by_name["where"].compile().params.values()
+    )
     assert snapshot_state["snapshot_claim_status"] == "existing"
-    assert len(executed_statements) == 1
+    assert len(executed_statements) == 3
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
+    assert all(
+        "guard_ptg2_v4_attempt" in statement
+        for statement, _parameters in executed_statements[1:]
+    )
+
+
+def test_import_run_upsert_cannot_overwrite_reconciliation_marker(
+    monkeypatch,
+):
+    """Fence a paused worker when its completion upsert resumes."""
+
+    conflict_options_by_name = {}
+    monkeypatch.setattr(
+        process_ptg.db,
+        "insert",
+        lambda *_args: _InsertStatement(conflict_options_by_name),
+    )
+    monkeypatch.setattr(
+        process_ptg.db,
+        "select",
+        lambda *_args: _ExistingReconciledRunQuery(),
+    )
+    executed_statements = []
+    monkeypatch.setattr(
+        process_ptg.db,
+        "transaction",
+        lambda: _Transaction(_ClaimSession(executed_statements)),
+    )
+
+    with pytest.raises(
+        process_ptg.StaleMetadataFenceError,
+        match="metadata-reconciled",
+    ):
+        asyncio.run(
+            process_ptg._push_fenced_import_run(
+                {
+                    "import_run_id": "run-reconciled",
+                    "status": process_ptg.PTG2_STATUS_VALIDATED,
+                }
+            )
+        )
+
+    assert process_ptg.PTG2_V4_STALE_METADATA_MARKER in (
+        conflict_options_by_name["where"].compile().params.values()
+    )
+    assert len(executed_statements) == 1
+    assert "guard_ptg2_v4_attempt" in executed_statements[0][0]
 
 
 def test_published_reconciliation_rejects_cleaned_resources_under_lock(monkeypatch):

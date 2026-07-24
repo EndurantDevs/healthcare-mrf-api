@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -27,6 +26,10 @@ from process.ptg_parts.ptg2_candidate_attestation import (
 from process.ptg_parts.ptg2_lifecycle_lock import (
     PTG2_SOURCE_POINTER_GC_LOCK_KEY,
     acquire_ptg2_lifecycle_lock,
+)
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    lock_writable_snapshot,
 )
 from process.ptg_parts.snapshot_tables import _normalize_source_key
 
@@ -226,7 +229,7 @@ def _plan_pointer_entry(
 
 
 async def _current_source_snapshot_id(source_key: str) -> str | None:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     row = await db.first(
         f"""
         SELECT snapshot_id
@@ -250,7 +253,7 @@ async def _source_plan_rows(
     updated_at: datetime.datetime,
 ) -> list[dict[str, Any]]:
     """Build pointer rows from public snapshot scope and retained plan metadata."""
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     plan_scope_records = await db.all(
         f"""
         SELECT DISTINCT plans.plan_id, plans.plan_market_type
@@ -731,7 +734,7 @@ async def _stage_ptg2_source_candidate(
 ) -> dict[str, Any]:
     """Bind a sealed V3 layout without changing any live serving pointer."""
 
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     candidate_attributes = candidate_snapshot_attributes(
         snapshot_attributes,
         source_key=source_key,
@@ -997,9 +1000,15 @@ async def activate_ptg2_source_candidate(
     normalized_snapshot_id = str(snapshot_id or "").strip()
     if not normalized_source_key or not normalized_snapshot_id:
         raise ValueError("source_key and snapshot_id are required")
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=schema_name,
+            snapshot_id=normalized_snapshot_id,
+        )
         return await _activate_ptg2_source_candidate_in_transaction(
             session,
             schema_name=schema_name,
@@ -1314,9 +1323,15 @@ async def _publish_ptg2_source_pointers(
         != normalized_snapshot_id
     ):
         raise ValueError("snapshot attributes do not match the requested snapshot")
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=schema_name,
+            snapshot_id=normalized_snapshot_id,
+        )
         authoritative_snapshot = await _locked_snapshot_publication_row(
             session,
             schema_name=schema_name,
@@ -1407,12 +1422,18 @@ async def _publish_ptg2_global_snapshot_pointer(
     updated_at: datetime.datetime,
     shared_snapshot_key: int | None = None,
 ) -> dict[str, Any]:
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema_name = resolve_ptg2_schema()
     snapshot_id = str(snapshot_attributes.get("snapshot_id") or "").strip()
     if not snapshot_id:
         raise ValueError("Global snapshot-pointer promotion requires a snapshot id")
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+        )
         authoritative_snapshot = await _locked_snapshot_publication_row(
             session,
             schema_name=schema_name,

@@ -23,7 +23,7 @@ from api.control_imports import (
 from api.control_workers import ensure_worker, worker_registry
 from api.control_auth import require_control_auth as _require_control_auth
 from api.control_snapshot_rollback import register_source_snapshot_rollback_route
-from api.control_ptg_v4_recovery import register_v4_recovery_routes
+from api.control_ptg_v4 import register_v4_control_routes
 from api.provider_directory_sources import provider_directory_source_catalog
 from api.provider_directory_source_outcomes import (
     enrich_provider_directory_source_catalog,
@@ -52,7 +52,7 @@ from process.ptg_parts.source_snapshot_control import (
 
 blueprint = Blueprint("control", url_prefix="/control/v1")
 register_source_snapshot_rollback_route(blueprint)
-register_v4_recovery_routes(blueprint)
+register_v4_control_routes(blueprint)
 register_uhc_provider_file_catalog_routes(blueprint)
 register_profile_selection_route(blueprint)
 logger = logging.getLogger(__name__)

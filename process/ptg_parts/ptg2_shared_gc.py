@@ -18,6 +18,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     shared_block_hash,
 )
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_MAP_BLOCK_KIND,
     PTG2_V4_SHARED_GENERATION,
@@ -132,20 +133,6 @@ def _row_mapping(row: Any) -> dict[str, Any]:
     if isinstance(row, dict):
         return row
     return dict(getattr(row, "_mapping", row))
-
-
-def resolve_ptg2_schema(schema_name: str | None = None) -> str:
-    """Resolve the PTG schema with the same conflict rules as Alembic."""
-
-    if schema_name:
-        return str(schema_name)
-    runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
-    legacy_schema = os.getenv("DB_SCHEMA")
-    if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
-        raise RuntimeError(
-            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
-        )
-    return runtime_schema or legacy_schema or "mrf"
 
 
 async def missing_migration_owned_tables(

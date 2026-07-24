@@ -37,6 +37,17 @@ MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payloa
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_attempt_fence(monkeypatch):
+    """Keep candidate-contract tests focused on their existing boundary."""
+
+    monkeypatch.setattr(
+        source_pointers,
+        "lock_writable_snapshot",
+        AsyncMock(),
+    )
+
+
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 

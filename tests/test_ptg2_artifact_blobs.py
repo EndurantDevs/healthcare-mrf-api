@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from sqlalchemy import text as sql_text
 
 from process.ptg_parts import ptg2_artifact_blobs as artifact_blobs
 
@@ -25,6 +26,8 @@ class FakeTransaction:
 
 
 class FakeDB:
+    text = staticmethod(sql_text)
+
     def __init__(self):
         self.session = FakeSession()
 

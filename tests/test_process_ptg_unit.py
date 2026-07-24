@@ -1016,12 +1016,22 @@ def test_internal_ptg_import_heartbeat_updates_only_active_run(monkeypatch):
     async def immediate_sleep(_seconds):
         return None
 
-    async def stop_after_update(statement, **params):
-        calls.append((statement, params))
-        raise asyncio.CancelledError
+    class HeartbeatSession:
+        async def execute(self, statement, params=None):
+            calls.append((str(statement), params or {}))
+            raise asyncio.CancelledError
+
+    @asynccontextmanager
+    async def transaction():
+        yield HeartbeatSession()
 
     monkeypatch.setattr(process_ptg.asyncio, "sleep", immediate_sleep)
-    monkeypatch.setattr(process_ptg.db, "status", stop_after_update)
+    monkeypatch.setattr(process_ptg.db, "transaction", transaction)
+    monkeypatch.setattr(
+        process_ptg,
+        "lock_writable_snapshot",
+        AsyncMock(),
+    )
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(process_ptg._heartbeat_ptg2_import_run("ptg2:test-run"))
@@ -1177,6 +1187,34 @@ def test_push_ptg2_objects_falls_back_to_legacy_push_signature(monkeypatch):
     ]
 
 
+def test_price_set_copy_fence_never_falls_back_to_generic_write(monkeypatch):
+    generic_push = AsyncMock()
+    monkeypatch.setattr(process_ptg, "_env_bool", lambda *_args: True)
+    monkeypatch.setattr(
+        process_ptg,
+        "_copy_ignore_ptg2_objects",
+        AsyncMock(
+            side_effect=process_ptg.StaleMetadataFenceError(
+                "attempt is metadata-reconciled"
+            )
+        ),
+    )
+    monkeypatch.setattr(process_ptg, "push_objects", generic_push)
+
+    with pytest.raises(
+        process_ptg.StaleMetadataFenceError,
+        match="durably fenced",
+    ):
+        asyncio.run(
+            process_ptg._push_ptg2_objects(
+                [{"price_set_hash": "price-set"}],
+                process_ptg.PTG2PriceSet,
+            )
+        )
+
+    generic_push.assert_not_awaited()
+
+
 def test_push_ptg2_objects_falls_back_after_direct_copy_failure(monkeypatch):
     push_objects = AsyncMock()
     monkeypatch.setattr(process_ptg, "_env_bool", lambda *_args: True)
@@ -1186,9 +1224,19 @@ def test_push_ptg2_objects_falls_back_after_direct_copy_failure(monkeypatch):
         "_copy_insert_ptg2_objects",
         AsyncMock(side_effect=RuntimeError("COPY unavailable")),
     )
+    monkeypatch.setattr(
+        process_ptg,
+        "guard_attempt_rows",
+        AsyncMock(),
+    )
     monkeypatch.setattr(process_ptg, "push_objects", push_objects)
 
-    object_entries = [{"serving_rate_hash": "serving-rate"}]
+    object_entries = [
+        {
+            "serving_rate_hash": "serving-rate",
+            "snapshot_id": "snapshot-copy-fallback",
+        }
+    ]
     asyncio.run(
         process_ptg._push_ptg2_objects(
             object_entries,
@@ -4765,7 +4813,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     assert import_run_rows[-1]["report"]["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
 
 
-def test_ptg2_main_marks_claim_failed_when_import_run_start_fails(monkeypatch):
+def test_ptg2_main_rolls_back_claim_when_import_run_start_fails(monkeypatch):
     pushed_entries = []
     final_table_cleanup = AsyncMock()
     create_stage = AsyncMock()
@@ -4774,8 +4822,6 @@ def test_ptg2_main_marks_claim_failed_when_import_run_start_fails(monkeypatch):
         pushed_entries.extend((cls, entry) for entry in object_entries)
         entry = object_entries[0]
         if cls is process_ptg.PTG2Snapshot and entry["status"] == process_ptg.PTG2_STATUS_BUILDING:
-            return {**entry, "snapshot_claim_status": "acquired"}
-        if cls is process_ptg.PTG2ImportRun and entry["status"] == process_ptg.PTG2_STATUS_RUNNING:
             raise RuntimeError("import run write failed")
         return None
 
@@ -4802,10 +4848,80 @@ def test_ptg2_main_marks_claim_failed_when_import_run_start_fails(monkeypatch):
     ]
     assert [entry["status"] for entry in snapshot_entries] == [
         process_ptg.PTG2_STATUS_BUILDING,
-        process_ptg.PTG2_STATUS_FAILED,
     ]
-    final_table_cleanup.assert_awaited_once_with(None)
+    final_table_cleanup.assert_not_awaited()
     create_stage.assert_not_awaited()
+
+
+def _install_fenced_import_start(monkeypatch, pushed_entries):
+    """Configure an import-run start that loses to metadata reconciliation."""
+
+    source_cleanup = AsyncMock()
+    table_cleanup = AsyncMock()
+
+    async def push(object_entries, cls, **_kwargs):
+        pushed_entries.extend((cls, entry) for entry in object_entries)
+        entry = object_entries[0]
+        if (
+            cls is process_ptg.PTG2Snapshot
+            and entry["status"] == process_ptg.PTG2_STATUS_BUILDING
+        ):
+            raise process_ptg.StaleMetadataFenceError(
+                "attempt is metadata-reconciled"
+            )
+        return None
+
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg,
+        "_current_source_snapshot_id",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
+    monkeypatch.setattr(
+        process_ptg,
+        "_cleanup_failed_ptg2_source_state",
+        source_cleanup,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_drop_ptg2_snapshot_tables_for_manifest",
+        table_cleanup,
+    )
+    return source_cleanup, table_cleanup
+
+
+def test_ptg2_main_exits_fenced_without_failure_cleanup(monkeypatch):
+    """A reconciled paused worker must not overwrite or clean its attempt."""
+
+    pushed_entries = []
+    source_cleanup, table_cleanup = _install_fenced_import_start(
+        monkeypatch,
+        pushed_entries,
+    )
+
+    with pytest.raises(
+        process_ptg.StaleMetadataFenceError,
+        match="metadata-reconciled",
+    ):
+        asyncio.run(
+            process_ptg.main(
+                in_network_url="https://example.test/rates.json.gz",
+                import_month="2026-07",
+                import_id="fenced_import_run_start",
+                source_key="source_a",
+            )
+        )
+
+    snapshot_statuses = [
+        entry["status"]
+        for cls, entry in pushed_entries
+        if cls is process_ptg.PTG2Snapshot
+    ]
+    assert snapshot_statuses == [process_ptg.PTG2_STATUS_BUILDING]
+    source_cleanup.assert_not_awaited()
+    table_cleanup.assert_not_awaited()
 
 
 def test_failed_snapshot_upsert_merges_existing_strict_v3_manifest():
@@ -4853,7 +4969,7 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", AsyncMock())
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", stage_cleanup)
 
-    async def create_partial_stage(stage_token):
+    async def create_partial_stage(stage_token, **_coordinates):
         partially_created_tables.append(
             process_ptg._ptg2_manifest_stage_table_name(stage_token)
         )
@@ -7438,8 +7554,9 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
     assert "incumbent.published_at >=" in joined
     assert "DELETE FROM \"mrf\".ptg2_current_plan_source WHERE source_key = :source_key" in joined
     assert "INSERT INTO \"mrf\".ptg2_current_plan_source" in joined
-    assert len(executed_list) == 7
-    assert "FOR UPDATE OF snapshot" in executed_list[1][0]
+    assert len(executed_list) == 8
+    assert "guard_ptg2_v4_attempt" in executed_list[1][0]
+    assert "FOR UPDATE OF snapshot" in executed_list[2][0]
 
 
 def test_pointer_stays_on_plan_failure(monkeypatch):
@@ -7487,7 +7604,7 @@ def test_pointer_stays_on_plan_failure(monkeypatch):
         )
 
     assert transaction_started_map["value"] is True
-    assert len(executed_statements) == 2
+    assert len(executed_statements) == 3
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
     assert executed_statements[0][1] == {
         "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
@@ -7530,11 +7647,12 @@ def test_ptg2_global_publish_is_atomic(monkeypatch):
         "snapshot_id": "snap",
         "global_pointer": "reconciled",
     }
-    assert len(executed_statements) == 4
+    assert len(executed_statements) == 5
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
-    assert "FOR UPDATE OF snapshot" in executed_statements[1][0]
-    assert "UPDATE \"mrf\".ptg2_snapshot" in executed_statements[2][0]
-    assert "INSERT INTO \"mrf\".ptg2_current_snapshot" in executed_statements[3][0]
+    assert "guard_ptg2_v4_attempt" in executed_statements[1][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[2][0]
+    assert "UPDATE \"mrf\".ptg2_snapshot" in executed_statements[3][0]
+    assert "INSERT INTO \"mrf\".ptg2_current_snapshot" in executed_statements[4][0]
     assert executed_statements[0][1] == {
         "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
     }
@@ -7573,9 +7691,10 @@ def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(mo
             )
         )
 
-    assert len(executed_statements) == 2
+    assert len(executed_statements) == 3
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
-    assert "FOR UPDATE OF snapshot" in executed_statements[1][0]
+    assert "guard_ptg2_v4_attempt" in executed_statements[1][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[2][0]
 
 
 def test_manifest_allowlists_location_tables():
@@ -8754,13 +8873,11 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(
-        process_ptg,
-        "_prepare_ptg_tables",
+        process_ptg, "_prepare_ptg_tables",
         AsyncMock(return_value={"ImportLog": "log"}),
     )
     monkeypatch.setattr(
-        process_ptg,
-        "_create_serving_stage_table",
+        process_ptg, "_create_serving_stage_table",
         AsyncMock(return_value="manifest_stage"),
     )
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
@@ -8983,11 +9100,50 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
     assert done_events[0][1] == pytest.approx(60.0)
 
 
+def _publish_failure_cleanup_mocks(failure_events):
+    async def is_layout_abandoned(*_args, **_kwargs):
+        failure_events.append("layout_abandoned")
+        return True
+
+    async def clean_stage_tables(*_args, **kwargs):
+        failure_events.append(
+            "stage_storage_dropped"
+            if kwargs.get("retain_attempt_registration")
+            else "stage_attachment_released"
+        )
+
+    return (
+        AsyncMock(side_effect=is_layout_abandoned),
+        AsyncMock(side_effect=clean_stage_tables),
+    )
+
+
+def _install_failure_cleanup_targets(monkeypatch, abandon, stage_cleanup):
+    cleanup_target_by_name = {
+        "is_shared_layout_build_abandoned": abandon,
+        "_current_source_snapshot_id": AsyncMock(return_value=None),
+        "_drop_ptg2_snapshot_tables_for_manifest": AsyncMock(),
+        "_drop_ptg2_snapshot_table_names": stage_cleanup,
+        "delete_ptg2_artifacts_for_snapshot": AsyncMock(),
+        "delete_unpublished_snapshot_sources": AsyncMock(),
+    }
+    for target_name, target_value in cleanup_target_by_name.items():
+        monkeypatch.setattr(process_ptg, target_name, target_value)
+
+
 def _install_ptg2_publish_failure_mocks(monkeypatch):
+    """Install one failed-publish path with ordered cleanup observations."""
+
     pushed_rows = []
+    failure_events = []
 
     async def fake_push(rows, cls, **_kwargs):
         pushed_rows.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
+        if (
+            getattr(cls, "__name__", "") == "PTG2ImportRun"
+            and rows[0].get("status") == process_ptg.PTG2_STATUS_FAILED
+        ):
+            failure_events.append("failure_report_persisted")
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -9028,22 +9184,19 @@ def _install_ptg2_publish_failure_mocks(monkeypatch):
     monkeypatch.setattr(process_ptg, "_publish_shared_v3_source_dictionary", AsyncMock())
     publish = _install_strict_v3_publish_mocks(monkeypatch, serving_rates=1)
     publish.side_effect = RuntimeError("binary publish failed")
-    abandon = AsyncMock(return_value=True)
-    monkeypatch.setattr(process_ptg, "is_shared_layout_build_abandoned", abandon)
-    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
-    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", AsyncMock())
-    monkeypatch.setattr(process_ptg, "delete_ptg2_artifacts_for_snapshot", AsyncMock())
-    monkeypatch.setattr(
-        process_ptg,
-        "delete_unpublished_snapshot_sources",
-        AsyncMock(),
-    )
-    return pushed_rows, abandon
+    abandon, stage_cleanup = _publish_failure_cleanup_mocks(failure_events)
+    _install_failure_cleanup_targets(monkeypatch, abandon, stage_cleanup)
+    return pushed_rows, abandon, stage_cleanup, failure_events
 
 
 def test_ptg2_publish_failure_abandons_owned_shared_layout(monkeypatch):
     """A failed publisher removes only the physical layout owned by its token."""
-    pushed_rows, abandon = _install_ptg2_publish_failure_mocks(monkeypatch)
+    (
+        pushed_rows,
+        abandon,
+        stage_cleanup,
+        failure_events,
+    ) = _install_ptg2_publish_failure_mocks(monkeypatch)
 
     with pytest.raises(RuntimeError, match="binary publish failed"):
         asyncio.run(
@@ -9072,6 +9225,13 @@ def test_ptg2_publish_failure_abandons_owned_shared_layout(monkeypatch):
     assert failed_report["timings"]["total_seconds"] >= 0
     assert failed_report["timings"]["failure_handling_seconds"] >= 0
     assert failed_report["timings"]["failure_state_persistence_seconds"] >= 0
+    stage_cleanup.assert_awaited_once()
+    assert failure_events == [
+        "layout_abandoned",
+        "failure_report_persisted",
+        "stage_attachment_released",
+        "failure_report_persisted",
+    ]
 
 
 def test_failed_shared_layout_abandonment_retries_transient_database_errors(monkeypatch):
@@ -9280,6 +9440,7 @@ def _run_manifest_import_case(
     return SimpleNamespace(
         import_result=import_result,
         import_run=import_run_rows[-1],
+        create_stage_mock=create_stage_mock,
         publish_mock=publish_mock,
         download_options_by_name=download_options_by_name,
     )
@@ -9294,6 +9455,10 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
     assert "full_rebuild_scope_digest" not in run.import_run["options"]
     assert run.import_run["options"]["snapshot_arch"] == "postgres_binary_v3"
     assert run.import_run["options"]["storage_generation"] == "shared_blocks_v3"
+    assert (
+        run.create_stage_mock.await_args.kwargs["storage_generation"]
+        == "shared_blocks_v3"
+    )
     assert run.import_run["options"]["test_mode"] is True
     assert run.import_run["report"]["serving_rates"] == 222
     assert "full_rebuild" not in run.import_result

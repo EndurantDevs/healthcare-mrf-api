@@ -40,6 +40,7 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
 )
 from scripts.ptg_v4_dev_canary_storage import relation_size_rows
 from tests.ptg2_v4_migration_catalog_support import (
+    attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
 )
 
@@ -359,6 +360,7 @@ async def _create_v4_test_schema(
         """,
     ):
         await database.execute_ddl(statement)
+    await database.execute_ddl(attempt_guard_prerequisite_ddl(schema))
 
     migration = _load_v4_migration()
     recorder = _OpRecorder()

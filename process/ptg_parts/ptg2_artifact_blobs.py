@@ -21,6 +21,10 @@ from db.connection import db
 from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir, sha256_file
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
+from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
+    lock_writable_snapshot,
+)
 
 PTG2_ARTIFACT_DB_URI_PREFIX = "db://ptg2_artifact/"
 PTG2_ARTIFACT_DB_STORE_ENV = "HLTHPRT_PTG2_ARTIFACT_DB_STORE"
@@ -105,7 +109,7 @@ def _row_mapping(row: Any) -> dict[str, Any]:
 
 async def ensure_ptg2_artifact_blob_table(schema_name: str | None = None) -> None:
     """Create the PTG2 artifact chunk table and lookup index when absent."""
-    schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema = resolve_ptg2_schema(schema_name)
     qualified_table = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
     await db.status(
         f"""
@@ -133,17 +137,25 @@ async def delete_ptg2_artifacts_for_snapshot(
     snapshot_id: str,
     *,
     schema_name: str | None = None,
+    import_run_id: str | None = None,
 ) -> None:
     """Delete PostgreSQL-owned artifacts for one unpublished snapshot."""
 
     snapshot_id = str(snapshot_id or "").strip()
     if not snapshot_id:
         return
-    schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema = resolve_ptg2_schema(schema_name)
     qualified_chunks = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
     qualified_manifest = f"{_quote_ident(schema)}.ptg2_artifact_manifest"
-    await ensure_ptg2_artifact_blob_table(schema)
     async with db.transaction() as session:
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=schema,
+            snapshot_id=snapshot_id,
+            internal_run_id=import_run_id,
+        )
+        await ensure_ptg2_artifact_blob_table(schema)
         await session.execute(
             text(
                 f"""
@@ -221,7 +233,7 @@ async def store_ptg2_artifact_file(
         artifact_entry_map.pop("path", None)
         artifact_entry_map.pop("cache_path", None)
 
-    schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema = resolve_ptg2_schema(schema_name)
     artifact_name = str(artifact_entry_map.get("name") or name or artifact_kind)
     artifact_id = _artifact_id_for(
         snapshot_id=snapshot_id,
@@ -250,8 +262,16 @@ async def store_ptg2_artifact_file(
         "compression_level": compression_level,
     }
 
-    await ensure_ptg2_artifact_blob_table(schema)
     async with db.transaction() as session:
+        if snapshot_id or import_run_id:
+            await lock_writable_snapshot(
+                session,
+                db,
+                schema_name=schema,
+                snapshot_id=snapshot_id or "",
+                internal_run_id=import_run_id,
+            )
+        await ensure_ptg2_artifact_blob_table(schema)
         await session.execute(
             text(f"DELETE FROM {qualified_chunks} WHERE artifact_id = :artifact_id"),
             {"artifact_id": artifact_id},
@@ -390,7 +410,7 @@ async def materialize_ptg2_artifact_from_db(
     if _is_cached_file_valid(cache_path, metadata):
         return cache_path
 
-    schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema = resolve_ptg2_schema(schema_name)
     qualified_chunks = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}")
