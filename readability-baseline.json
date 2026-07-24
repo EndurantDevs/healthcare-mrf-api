@@ -2047,6 +2047,12 @@
       "too_many_parameters:tests/test_ptg2_v3_source_api_audit.py:_api_page_document"
     ]
   },
+  "one_time_debt_reset": {
+    "maximum_increase_basis_points": 200,
+    "reason": "PTG V4 adaptive graph representation migration",
+    "reference_baseline_sha256": "3ed17d26f634e6b231a7283bf20b9c4a34cd2f698aa6533aae667c7329316c2f",
+    "reference_total": 2075
+  },
   "rules": {
     "readability": {
       "allowed_short_names": [
