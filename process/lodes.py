@@ -41,12 +41,12 @@ def _resolve_test_states() -> list[str]:
     raw = (os.getenv("HLTHPRT_LODES_TEST_STATES") or "").strip()
     if not raw:
         return list(DEFAULT_TEST_STATES)
-    parsed = []
+    parsed_states = []
     for token in raw.split(","):
         state = token.strip().lower()
         if len(state) == 2 and state in ALL_STATES:
-            parsed.append(state)
-    return parsed or list(DEFAULT_TEST_STATES)
+            parsed_states.append(state)
+    return parsed_states or list(DEFAULT_TEST_STATES)
 
 
 TEST_STATES = _resolve_test_states()
@@ -124,13 +124,16 @@ def _is_tract_geoid(value: str) -> bool:
     return len(cleaned) == 11 and cleaned.isdigit()
 
 
-def _add_tract_zip_mapping(crosswalk: dict[str, str], tract: str, zip_code: str) -> bool:
+def _has_added_tract_zip_mapping(crosswalk: dict[str, str], tract: str, zip_code: str) -> bool:
     tract = (tract or "").strip()
     zip_code = (zip_code or "").strip()
     if not _is_tract_geoid(tract) or len(zip_code) < 5:
         return False
     crosswalk[tract] = zip_code[:5]
     return True
+
+
+_add_tract_zip_mapping = _has_added_tract_zip_mapping
 
 
 def _is_usable_tract_crosswalk(crosswalk: dict[str, str]) -> bool:
@@ -169,7 +172,7 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
 
     Returns an empty mapping when no usable crosswalk is available.
     """
-    crosswalk: dict[str, str] = {}
+    zip_by_tract_geoid: dict[str, str] = {}
 
     # The HUD crosswalk API requires a token; fall back to the publicly
     # available crosswalk CSV when the env var is set.
@@ -181,39 +184,43 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
         logger.info("Loading local crosswalk file: %s", crosswalk_file)
         with open(crosswalk_file, "r", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
-            for row in reader:
-                tract = row.get("TRACT") or row.get("tract") or ""
-                zip_code = row.get("ZIP") or row.get("zip") or ""
-                _add_tract_zip_mapping(crosswalk, tract, zip_code)
-        if _is_usable_tract_crosswalk(crosswalk):
-            logger.info("Loaded %d tract→zip mappings from file", len(crosswalk))
-            return crosswalk
+            for local_crosswalk_row in reader:
+                tract = local_crosswalk_row.get("TRACT") or local_crosswalk_row.get("tract") or ""
+                zip_code = local_crosswalk_row.get("ZIP") or local_crosswalk_row.get("zip") or ""
+                _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zip_code)
+        if _is_usable_tract_crosswalk(zip_by_tract_geoid):
+            logger.info("Loaded %d tract→zip mappings from file", len(zip_by_tract_geoid))
+            return zip_by_tract_geoid
         logger.warning(
             "Local LODES crosswalk file produced only %d valid 11-digit tract mappings; "
             "trying network fallbacks",
-            len(crosswalk),
+            len(zip_by_tract_geoid),
         )
-        crosswalk.clear()
+        zip_by_tract_geoid.clear()
 
     if hud_token:
         try:
-            headers = {"Authorization": f"Bearer {hud_token}"}
-            async with client.get(HUD_CROSSWALK_URL, headers=headers, timeout=120) as resp:
+            request_headers_by_name = {"Authorization": f"Bearer {hud_token}"}
+            async with client.get(HUD_CROSSWALK_URL, headers=request_headers_by_name, timeout=120) as resp:
                 if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    for item in data.get("data", {}).get("results", data if isinstance(data, list) else []):
-                        tract = str(item.get("geoid", ""))
-                        zip_code = str(item.get("zip", ""))
-                        _add_tract_zip_mapping(crosswalk, tract, zip_code)
-                    if _is_usable_tract_crosswalk(crosswalk):
-                        logger.info("Loaded %d tract→zip mappings from HUD API", len(crosswalk))
-                        return crosswalk
+                    hud_payload = await resp.json(content_type=None)
+                    hud_results = hud_payload.get("data", {}).get(
+                        "results",
+                        hud_payload if isinstance(hud_payload, list) else [],
+                    )
+                    for hud_result in hud_results:
+                        tract = str(hud_result.get("geoid", ""))
+                        zip_code = str(hud_result.get("zip", ""))
+                        _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zip_code)
+                    if _is_usable_tract_crosswalk(zip_by_tract_geoid):
+                        logger.info("Loaded %d tract→zip mappings from HUD API", len(zip_by_tract_geoid))
+                        return zip_by_tract_geoid
                     logger.warning(
                         "HUD crosswalk API produced only %d valid 11-digit tract mappings; "
                         "trying Census fallback",
-                        len(crosswalk),
+                        len(zip_by_tract_geoid),
                     )
-                    crosswalk.clear()
+                    zip_by_tract_geoid.clear()
         except Exception as e:
             logger.warning("HUD crosswalk API failed (%s); trying Census fallback", e)
 
@@ -225,29 +232,29 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
                 content = (await resp.read()).decode("utf-8-sig", errors="replace")
                 reader = csv.DictReader(content.splitlines(), delimiter="|")
                 best_by_tract: dict[str, tuple[int, str]] = {}
-                for row in reader:
-                    tract = (row.get("GEOID_TRACT_20") or "").strip()
-                    zcta = (row.get("GEOID_ZCTA5_20") or "").strip()
+                for relationship_row in reader:
+                    tract = (relationship_row.get("GEOID_TRACT_20") or "").strip()
+                    zcta = (relationship_row.get("GEOID_ZCTA5_20") or "").strip()
                     if not tract or not zcta or len(zcta) != 5:
                         continue
                     try:
-                        area = int(float((row.get("AREALAND_PART") or "0").strip() or "0"))
+                        area = int(float((relationship_row.get("AREALAND_PART") or "0").strip() or "0"))
                     except ValueError:
                         area = 0
                     prev = best_by_tract.get(tract)
                     if prev is None or area > prev[0]:
                         best_by_tract[tract] = (area, zcta)
                 for tract, (_area, zcta) in best_by_tract.items():
-                    _add_tract_zip_mapping(crosswalk, tract, zcta)
-                if _is_usable_tract_crosswalk(crosswalk):
+                    _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zcta)
+                if _is_usable_tract_crosswalk(zip_by_tract_geoid):
                     logger.info(
                         "Loaded %d tract→zip mappings from Census tract/ZCTA relationship file",
-                        len(crosswalk),
+                        len(zip_by_tract_geoid),
                     )
-                    return crosswalk
+                    return zip_by_tract_geoid
                 logger.warning(
                     "Census tract/ZCTA fallback produced only %d valid 11-digit tract mappings",
-                    len(crosswalk),
+                    len(zip_by_tract_geoid),
                 )
             else:
                 logger.warning(
@@ -261,7 +268,7 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
         "No tract→ZIP crosswalk available (set HLTHPRT_HUD_API_TOKEN or "
         "HLTHPRT_LODES_CROSSWALK_FILE)."
     )
-    return crosswalk
+    return zip_by_tract_geoid
 
 
 def _block_to_zcta(block_geocode: str, crosswalk: dict[str, str]) -> str | None:
@@ -336,10 +343,10 @@ async def _process_lodes_state(
             reader = csv.DictReader(decompressed.splitlines())
             zcta_totals: dict[str, int] = defaultdict(int)
 
-            for row in reader:
-                block_id = row.get("w_geocode", "")
+            for workplace_row in reader:
+                block_id = workplace_row.get("w_geocode", "")
                 try:
-                    c000 = int(float(row.get("C000") or 0))
+                    c000 = int(float(workplace_row.get("C000") or 0))
                 except (TypeError, ValueError):
                     c000 = 0
 
@@ -352,20 +359,20 @@ async def _process_lodes_state(
                     zcta_totals[zcta] += c000
 
             now = datetime.datetime.utcnow()
-            flush_batch = []
+            pending_workplace_rows = []
             for zcta_code, total_workers in zcta_totals.items():
-                flush_batch.append({
+                pending_workplace_rows.append({
                     "zcta_code": zcta_code[:5],
                     "total_workers": total_workers,
                     "year": year,
                     "updated_at": now,
                 })
-                if len(flush_batch) >= batch_size:
-                    await push_objects(flush_batch, stage_cls)
-                    flush_batch.clear()
+                if len(pending_workplace_rows) >= batch_size:
+                    await push_objects(pending_workplace_rows, stage_cls)
+                    pending_workplace_rows.clear()
 
-            if flush_batch:
-                await push_objects(flush_batch, stage_cls)
+            if pending_workplace_rows:
+                await push_objects(pending_workplace_rows, stage_cls)
 
             logger.info("LODES %s: %d ZCTAs aggregated", state, len(zcta_totals))
             return len(zcta_totals)
@@ -404,10 +411,10 @@ async def process_data(ctx, task=None):
     client = aiohttp.ClientSession()
     try:
         crosswalk = await _load_tract_to_zip_crosswalk(client)
-        require_crosswalk = str(
+        needs_crosswalk = str(
             os.getenv("HLTHPRT_LODES_REQUIRE_CROSSWALK", "true")
         ).strip().lower() not in {"0", "false", "no"}
-        if require_crosswalk and not crosswalk:
+        if needs_crosswalk and not crosswalk:
             raise RuntimeError(
                 "LODES crosswalk is required but unavailable. "
                 "Set HLTHPRT_HUD_API_TOKEN or HLTHPRT_LODES_CROSSWALK_FILE."
@@ -415,7 +422,7 @@ async def process_data(ctx, task=None):
 
         states = TEST_STATES if test_mode else ALL_STATES
         total_zctas = 0
-        processed_states: dict[str, int] = {}
+        year_by_processed_state: dict[str, int] = {}
         skipped_states: list[str] = []
 
         for state in states:
@@ -430,7 +437,7 @@ async def process_data(ctx, task=None):
                 )
                 continue
 
-            processed_states[state] = resolved_year
+            year_by_processed_state[state] = resolved_year
             total_zctas += await _process_lodes_state(
                 client=client,
                 state=state,
@@ -443,7 +450,7 @@ async def process_data(ctx, task=None):
         await client.close()
 
     ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
-    ctx["context"]["processed_states"] = processed_states
+    ctx["context"]["processed_states"] = year_by_processed_state
     ctx["context"]["skipped_states"] = skipped_states
     logger.info("LODES import done: %d total ZCTA rows", total_zctas)
 

@@ -7169,17 +7169,23 @@ def _is_ptg2_provider_filter_requested(args: dict[str, Any]) -> bool:
     return _inferred_provider_taxonomy_rule(args) is not None
 
 
-def _inferred_taxonomy_is_only_provider_filter(
+def _is_inferred_taxonomy_only_provider_filter(
     args: Mapping[str, Any],
 ) -> bool:
     """Select the exact V4 projection only for the default inferred rule."""
 
-    normalized_args = dict(args)
+    filter_args_by_name = dict(args)
     return (
-        _inferred_provider_taxonomy_rule(normalized_args) is not None
-        and normalized_args.get("provider_sex_code") in (None, "", "null")
-        and not resolve_provider_specialty_filter(normalized_args).active
+        _inferred_provider_taxonomy_rule(filter_args_by_name) is not None
+        and filter_args_by_name.get("provider_sex_code")
+        in (None, "", "null")
+        and not resolve_provider_specialty_filter(filter_args_by_name).active
     )
+
+
+_inferred_taxonomy_is_only_provider_filter = (
+    _is_inferred_taxonomy_only_provider_filter
+)
 
 
 _PTG2_COST_ORDER_FIELDS = frozenset(
@@ -10651,7 +10657,7 @@ def _v4_inferred_taxonomy_projection_rule(
 
     if not bool(getattr(serving_tables, "uses_v4_graph", False)):
         return None
-    if not _inferred_taxonomy_is_only_provider_filter(args):
+    if not _is_inferred_taxonomy_only_provider_filter(args):
         return None
     projection_manifest = getattr(
         serving_tables,
@@ -10676,7 +10682,7 @@ def _v4_inferred_taxonomy_projection_rule(
     return projection_manifest, rule_manifest
 
 
-def _v4_filtered_reverse_provider_set_ids(
+def _v4_rate_scope_set_ids(
     serving_rows: Iterable[Mapping[str, Any]],
     expected_provider_set_keys: tuple[int, ...] | None,
 ) -> dict[int, str]:
@@ -10718,13 +10724,16 @@ def _v4_filtered_reverse_provider_set_ids(
     return provider_set_id_by_key
 
 
+_v4_filtered_reverse_provider_set_ids = _v4_rate_scope_set_ids
+
+
 def _validate_v4_inferred_taxonomy_candidates(
     candidates: Any,
     projection_rule: V4InferredTaxonomyProjectionRule,
 ) -> None:
     """Recheck the loaded candidate projection against its sealed rule."""
 
-    common_identity_changed = (
+    has_projection_identity_changed = (
         candidates.rule_digest != projection_rule.rule_digest
         or candidates.catalog_digest != projection_rule.catalog_digest
         or candidates.member_digest != projection_rule.member_digest
@@ -10739,7 +10748,7 @@ def _validate_v4_inferred_taxonomy_candidates(
         or candidates.pattern_member_digest
         != projection_rule.pattern_member_digest
     )
-    if common_identity_changed:
+    if has_projection_identity_changed:
         raise PTG2ManifestArtifactError(
             "PTG2 V4 inferred-taxonomy candidates changed from their seal"
         )
@@ -10885,7 +10894,7 @@ def _v4_selected_pattern_memberships(
     return provider_set_ids_by_npi_key
 
 
-async def _select_v4_pattern_inferred_taxonomy_provider_expansion(
+async def _select_v4_pattern_taxonomy_expansion(
     session,
     serving_tables: PTG2ServingTables,
     *,
@@ -10922,7 +10931,7 @@ async def _select_v4_pattern_inferred_taxonomy_provider_expansion(
         )
     if len(serving_rows) > maximum_occurrences:
         raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
-    provider_set_id_by_key = _v4_filtered_reverse_provider_set_ids(
+    provider_set_id_by_key = _v4_rate_scope_set_ids(
         serving_rows,
         None,
     )
@@ -11051,7 +11060,12 @@ async def _select_v4_pattern_inferred_taxonomy_provider_expansion(
     )
 
 
-async def _select_v4_inferred_taxonomy_provider_expansion(
+_select_v4_pattern_inferred_taxonomy_provider_expansion = (
+    _select_v4_pattern_taxonomy_expansion
+)
+
+
+async def _select_v4_taxonomy_expansion(
     session,
     serving_tables: PTG2ServingTables,
     *,
@@ -11081,7 +11095,7 @@ async def _select_v4_inferred_taxonomy_provider_expansion(
     )
     _validate_v4_inferred_taxonomy_candidates(candidates, projection_rule)
     if candidates.representation == "pattern_v1":
-        return await _select_v4_pattern_inferred_taxonomy_provider_expansion(
+        return await _select_v4_pattern_taxonomy_expansion(
             session,
             serving_tables,
             code_rows=code_rows,
@@ -11128,7 +11142,7 @@ async def _select_v4_inferred_taxonomy_provider_expansion(
         )
     if len(serving_rows) > maximum_occurrences:
         raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
-    provider_set_id_by_key = _v4_filtered_reverse_provider_set_ids(
+    provider_set_id_by_key = _v4_rate_scope_set_ids(
         serving_rows,
         None,
     )
@@ -11237,7 +11251,7 @@ async def _select_v4_inferred_taxonomy_provider_expansion(
             target_count=normalized_target_count,
         )
     )
-    selected_memberships = {
+    selected_provider_set_ids_by_npi = {
         npi: provider_set_ids_by_npi[npi]
         for npi in selected_npis
     }
@@ -11245,7 +11259,7 @@ async def _select_v4_inferred_taxonomy_provider_expansion(
         session,
         serving_tables,
         npis=selected_npis,
-        provider_set_ids_by_npi=selected_memberships,
+        provider_set_ids_by_npi=selected_provider_set_ids_by_npi,
         args=args,
         snapshot_id=snapshot_id,
     )
@@ -11259,6 +11273,9 @@ async def _select_v4_inferred_taxonomy_provider_expansion(
         rank_by_key=rank_by_key,
         exhausted=len(rank_by_key) < normalized_target_count,
     )
+
+
+_select_v4_inferred_taxonomy_provider_expansion = _select_v4_taxonomy_expansion
 
 
 async def _strict_cost_provider_expansion_selection(
@@ -11307,7 +11324,7 @@ async def _strict_cost_provider_expansion_selection(
     if inferred_taxonomy_projection is not None:
         projection_manifest, projection_rule = inferred_taxonomy_projection
         exact_inferred_selection = (
-            await _select_v4_inferred_taxonomy_provider_expansion(
+            await _select_v4_taxonomy_expansion(
                 session,
                 serving_tables,
                 code_rows=code_rows,

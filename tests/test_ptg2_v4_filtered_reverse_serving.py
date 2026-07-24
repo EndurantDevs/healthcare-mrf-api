@@ -31,6 +31,8 @@ def _projection_fixture_for(
     dict[str, object],
     taxonomy.V4InferredTaxonomyCandidates,
 ]:
+    """Build matching sealed candidate and manifest fixtures for one layout."""
+
     rule = serving._inferred_provider_taxonomy_rule(
         {"code_system": "CPT", "code": "70553"}
     )

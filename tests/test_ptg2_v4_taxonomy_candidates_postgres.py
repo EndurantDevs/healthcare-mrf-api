@@ -90,6 +90,8 @@ async def _create_prerequisites(
     engine: AsyncEngine,
     schema_name: str,
 ) -> None:
+    """Create the minimal V4 root and NPI catalog for this lifecycle."""
+
     schema = _quoted(schema_name)
     statements = (
         f"CREATE SCHEMA {schema}",

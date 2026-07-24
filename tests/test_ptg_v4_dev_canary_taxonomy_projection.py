@@ -34,18 +34,18 @@ def _candidate_row(
 ) -> dict[str, Any]:
     rule_digest = bytes([rule_byte]) * 32
     member_keys = pack_inferred_taxonomy_npi_keys(npi_keys)
-    pattern_postings = dict(npi_keys_by_pattern or {})
+    postings_by_pattern = dict(npi_keys_by_pattern or {})
     representation = (
         PTG2_V4_INFERRED_TAXONOMY_PATTERN_REPRESENTATION
-        if pattern_postings
+        if postings_by_pattern
         else PTG2_V4_INFERRED_TAXONOMY_DIRECT_REPRESENTATION
     )
     pattern_payload = pack_inferred_taxonomy_pattern_npi_keys(
-        pattern_postings
+        postings_by_pattern
     )
     pattern_member_count = sum(
         len(pattern_npi_keys)
-        for pattern_npi_keys in pattern_postings.values()
+        for pattern_npi_keys in postings_by_pattern.values()
     )
     return {
         "rule_digest": rule_digest,
@@ -60,13 +60,13 @@ def _candidate_row(
         ),
         "member_keys": member_keys,
         "representation": representation,
-        "pattern_count": len(pattern_postings),
+        "pattern_count": len(postings_by_pattern),
         "pattern_member_count": pattern_member_count,
         "pattern_member_bytes": len(pattern_payload),
         "pattern_member_digest": inferred_taxonomy_pattern_member_digest(
             rule_digest,
             representation=representation,
-            pattern_count=len(pattern_postings),
+            pattern_count=len(postings_by_pattern),
             pattern_member_count=pattern_member_count,
             payload=pattern_payload,
         ),
@@ -138,14 +138,16 @@ def _snapshot(
     advertised: bool = True,
     representation: str = PTG2_V4_INFERRED_TAXONOMY_PATTERN_REPRESENTATION,
 ) -> dict[str, Any]:
-    provider_graph: dict[str, object] = {"representation": representation}
+    provider_graph_map: dict[str, object] = {
+        "representation": representation
+    }
     if advertised:
-        provider_graph["inferred_taxonomy_candidates"] = projection
+        provider_graph_map["inferred_taxonomy_candidates"] = projection
     return {
         "layout_manifest": {
             "serving_index": {
                 "serving_binary": {
-                    "provider_graph_v4": provider_graph,
+                    "provider_graph_v4": provider_graph_map,
                 }
             }
         }
@@ -291,21 +293,23 @@ def test_database_row_shaper_rejects_pattern_metadata_or_payload_tamper(
     tamper_field: str,
 ) -> None:
     row = _candidate_row(1, (2, 5), npi_keys_by_pattern={7: (2, 5)})
-    tampered = dict(row)
+    tampered_candidate_map = dict(row)
     if tamper_field == "representation":
-        tampered[tamper_field] = (
+        tampered_candidate_map[tamper_field] = (
             PTG2_V4_INFERRED_TAXONOMY_DIRECT_REPRESENTATION
         )
     elif tamper_field == "pattern_member_count":
-        tampered[tamper_field] = int(tampered[tamper_field]) + 1
+        tampered_candidate_map[tamper_field] = (
+            int(tampered_candidate_map[tamper_field]) + 1
+        )
     else:
-        payload = bytearray(tampered[tamper_field])
-        payload[-1] ^= 1
-        tampered[tamper_field] = bytes(payload)
+        tampered_payload = bytearray(tampered_candidate_map[tamper_field])
+        tampered_payload[-1] ^= 1
+        tampered_candidate_map[tamper_field] = bytes(tampered_payload)
 
     with pytest.raises(RuntimeError):
         canary_db._shape_inferred_taxonomy_candidates(
-            (tampered,),
+            (tampered_candidate_map,),
             npi_count=6,
             pattern_count=8,
         )

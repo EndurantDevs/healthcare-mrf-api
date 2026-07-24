@@ -331,7 +331,7 @@ def pack_inferred_taxonomy_pattern_npi_keys(
     if len(normalized_patterns) > 0xFFFFFFFF:
         raise ValueError("PTG V4 inferred-taxonomy pattern count is invalid")
     normalized_patterns.sort(key=lambda item: item[0])
-    payload = bytearray(
+    packed_pattern_members = bytearray(
         _PATTERN_PAYLOAD_HEADER.pack(
             _PATTERN_PAYLOAD_MAGIC,
             _PATTERN_PAYLOAD_VERSION,
@@ -340,10 +340,12 @@ def pack_inferred_taxonomy_pattern_npi_keys(
         )
     )
     for pattern_key, npi_keys in normalized_patterns:
-        payload.extend(_PATTERN_PAYLOAD_RECORD.pack(pattern_key, len(npi_keys)))
+        packed_pattern_members.extend(
+            _PATTERN_PAYLOAD_RECORD.pack(pattern_key, len(npi_keys))
+        )
         for npi_key in npi_keys:
-            payload.extend(struct.pack("<I", npi_key))
-    return bytes(payload)
+            packed_pattern_members.extend(struct.pack("<I", npi_key))
+    return bytes(packed_pattern_members)
 
 
 def unpack_inferred_taxonomy_pattern_npi_keys(
@@ -390,7 +392,7 @@ def unpack_inferred_taxonomy_pattern_npi_keys(
     offset = _PATTERN_PAYLOAD_HEADER.size
     previous_pattern_key = -1
     observed_members = 0
-    postings: dict[int, tuple[int, ...]] = {}
+    npi_keys_by_pattern: dict[int, tuple[int, ...]] = {}
     for _index in range(normalized_pattern_count):
         record_end = offset + _PATTERN_PAYLOAD_RECORD.size
         if record_end > len(normalized_payload):
@@ -424,7 +426,7 @@ def unpack_inferred_taxonomy_pattern_npi_keys(
             raise PTG2ManifestArtifactError(
                 "PTG V4 inferred-taxonomy pattern NPI keys are not strict"
             )
-        postings[pattern_key] = npi_keys
+        npi_keys_by_pattern[pattern_key] = npi_keys
         previous_pattern_key = pattern_key
         observed_members += member_count
         offset = member_end
@@ -432,7 +434,7 @@ def unpack_inferred_taxonomy_pattern_npi_keys(
         raise PTG2ManifestArtifactError(
             "PTG V4 inferred-taxonomy pattern payload has trailing data"
         )
-    return postings
+    return npi_keys_by_pattern
 
 
 def inferred_taxonomy_member_digest(
@@ -546,7 +548,7 @@ def _catalog_digest(
 def _normalized_rules(
     rules: Iterable[InferredProviderTaxonomyRule],
 ) -> tuple[tuple[bytes, InferredProviderTaxonomyRule, frozenset[str]], ...]:
-    normalized: list[
+    normalized_rules: list[
         tuple[bytes, InferredProviderTaxonomyRule, frozenset[str]]
     ] = []
     seen_digests: set[bytes] = set()
@@ -555,7 +557,7 @@ def _normalized_rules(
         if rule_digest in seen_digests:
             raise ValueError("inferred taxonomy rule digest is duplicated")
         seen_digests.add(rule_digest)
-        normalized.append(
+        normalized_rules.append(
             (
                 rule_digest,
                 rule,
@@ -564,9 +566,9 @@ def _normalized_rules(
                 ),
             )
         )
-    if not normalized:
+    if not normalized_rules:
         raise ValueError("inferred taxonomy candidate publication needs rules")
-    return tuple(sorted(normalized, key=lambda item: item[0]))
+    return tuple(sorted(normalized_rules, key=lambda item: item[0]))
 
 
 def inferred_provider_taxonomy_rule_set_digest(
@@ -655,7 +657,7 @@ def _update_projection_observe_rule_digest(
     digest.update(bytes.fromhex(str(rule_manifest["pattern_member_digest"])))
 
 
-def shape_v4_inferred_taxonomy_projection_manifest(
+def _shape_projection_manifest(
     rows: Sequence[Mapping[str, Any]],
     *,
     npi_count: int,
@@ -663,7 +665,7 @@ def shape_v4_inferred_taxonomy_projection_manifest(
 ) -> dict[str, Any]:
     """Shape persisted V3 candidate and observe rows under root bounds."""
 
-    caps = _projection_cap_values()
+    caps_by_name = _projection_cap_values()
     if isinstance(npi_count, bool) or isinstance(pattern_count, bool):
         raise RuntimeError(
             "PTG V4 inferred-taxonomy dictionary bounds are invalid"
@@ -693,7 +695,7 @@ def shape_v4_inferred_taxonomy_projection_manifest(
         catalog_digest = bytes(raw_row["catalog_digest"])
         member_digest = bytes(raw_row["member_digest"])
         member_count = int(raw_row["member_count"])
-        payload = bytes(raw_row["member_keys"])
+        packed_candidate_keys = bytes(raw_row["member_keys"])
         representation = str(raw_row["representation"])
         observe_reason = raw_row.get("observe_reason")
         raw_observe_count = raw_row.get("observe_count_lower_bound")
@@ -717,7 +719,7 @@ def shape_v4_inferred_taxonomy_projection_manifest(
             or len(member_digest) != 32
             or len(pattern_member_digest) != 32
             or member_count < 0
-            or len(payload) != member_count * 4
+            or len(packed_candidate_keys) != member_count * 4
             or row_pattern_count < 0
             or pattern_member_count < 0
             or pattern_member_bytes != len(pattern_payload)
@@ -731,10 +733,10 @@ def shape_v4_inferred_taxonomy_projection_manifest(
             )
         try:
             candidate_members = unpack_inferred_taxonomy_npi_keys(
-                payload,
+                packed_candidate_keys,
                 member_count=member_count,
             )
-            pattern_postings = unpack_inferred_taxonomy_pattern_npi_keys(
+            npi_keys_by_pattern = unpack_inferred_taxonomy_pattern_npi_keys(
                 pattern_payload,
                 pattern_count=row_pattern_count,
                 pattern_member_count=pattern_member_count,
@@ -753,7 +755,7 @@ def shape_v4_inferred_taxonomy_projection_manifest(
         candidate_member_set = frozenset(candidate_members)
         posting_member_set = frozenset(
             npi_key
-            for npi_keys in pattern_postings.values()
+            for npi_keys in npi_keys_by_pattern.values()
             for npi_key in npi_keys
         )
         is_pattern_projection = representation == (
@@ -774,34 +776,39 @@ def shape_v4_inferred_taxonomy_projection_manifest(
                 "PTG V4 inferred-taxonomy projection representation is invalid"
             )
         if is_observe_projection:
-            candidate_cap_observe = observe_reason == (
+            is_candidate_cap_observe = observe_reason == (
                 PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_CAP_REASON
             )
-            pattern_cap_observe = observe_reason == (
+            is_pattern_cap_observe = observe_reason == (
                 PTG2_V4_INFERRED_TAXONOMY_PATTERN_CAP_REASON
             )
             if (
-                not (candidate_cap_observe or pattern_cap_observe)
+                not (is_candidate_cap_observe or is_pattern_cap_observe)
                 or observe_count_lower_bound is None
                 or (
-                    candidate_cap_observe
+                    is_candidate_cap_observe
                     and (
                         member_count
-                        != caps["max_online_inferred_taxonomy_candidates"] + 1
+                        != caps_by_name[
+                            "max_online_inferred_taxonomy_candidates"
+                        ]
+                        + 1
                         or observe_count_lower_bound
-                        != caps[
+                        != caps_by_name[
                             "max_online_inferred_taxonomy_candidates"
                         ]
                         + 1
                     )
                 )
                 or (
-                    pattern_cap_observe
+                    is_pattern_cap_observe
                     and (
                         member_count
-                        > caps["max_online_inferred_taxonomy_candidates"]
+                        > caps_by_name[
+                            "max_online_inferred_taxonomy_candidates"
+                        ]
                         or observe_count_lower_bound
-                        != caps[
+                        != caps_by_name[
                             "max_online_candidate_pattern_projection_members"
                         ]
                         + 1
@@ -819,9 +826,9 @@ def shape_v4_inferred_taxonomy_projection_manifest(
             or observe_count_lower_bound is not None
             or
             member_count
-            > caps["max_online_inferred_taxonomy_candidates"]
+            > caps_by_name["max_online_inferred_taxonomy_candidates"]
             or pattern_member_count
-            > caps[
+            > caps_by_name[
                 "max_online_candidate_pattern_projection_members"
             ]
         ):
@@ -836,7 +843,7 @@ def shape_v4_inferred_taxonomy_projection_manifest(
             )
         if any(
             pattern_key >= normalized_pattern_count
-            for pattern_key in pattern_postings
+            for pattern_key in npi_keys_by_pattern
         ):
             raise RuntimeError(
                 "PTG V4 inferred-taxonomy pattern exceeds its pattern root"
@@ -865,7 +872,7 @@ def shape_v4_inferred_taxonomy_projection_manifest(
             or inferred_taxonomy_member_digest(
                 rule_digest,
                 member_count=member_count,
-                payload=payload,
+                payload=packed_candidate_keys,
             )
             != member_digest
             or expected_pattern_digest != pattern_member_digest
@@ -874,37 +881,37 @@ def shape_v4_inferred_taxonomy_projection_manifest(
                 "PTG V4 inferred-taxonomy candidate manifest changed"
             )
         if is_observe_projection:
-            rule_manifest = {
+            rule_manifest_by_field = {
                 "rule_digest": rule_digest.hex(),
                 "catalog_digest": catalog_digest.hex(),
                 "member_digest": member_digest.hex(),
                 "member_count": member_count,
                 "observed_count_lower_bound": observe_count_lower_bound,
-                "packed_byte_count": len(payload),
+                "packed_byte_count": len(packed_candidate_keys),
                 "status": PTG2_V4_INFERRED_TAXONOMY_OBSERVE_STATUS,
                 "reason": observe_reason,
                 "representation": representation,
                 "pattern_member_digest": pattern_member_digest.hex(),
             }
-            observe_only_rule_manifests.append(rule_manifest)
-            digest_entries.append((rule_digest, True, rule_manifest))
+            observe_only_rule_manifests.append(rule_manifest_by_field)
+            digest_entries.append((rule_digest, True, rule_manifest_by_field))
         else:
-            rule_manifest = {
+            rule_manifest_by_field = {
                 "rule_digest": rule_digest.hex(),
                 "catalog_digest": catalog_digest.hex(),
                 "member_digest": member_digest.hex(),
                 "member_count": member_count,
-                "packed_byte_count": len(payload),
+                "packed_byte_count": len(packed_candidate_keys),
                 "representation": representation,
                 "pattern_count": row_pattern_count,
                 "pattern_member_count": pattern_member_count,
                 "pattern_member_bytes": pattern_member_bytes,
                 "pattern_member_digest": pattern_member_digest.hex(),
             }
-            rule_manifests.append(rule_manifest)
-            digest_entries.append((rule_digest, False, rule_manifest))
+            rule_manifests.append(rule_manifest_by_field)
+            digest_entries.append((rule_digest, False, rule_manifest_by_field))
         total_members += member_count
-        total_packed_bytes += len(payload)
+        total_packed_bytes += len(packed_candidate_keys)
         total_patterns += row_pattern_count
         total_pattern_members += pattern_member_count
         total_pattern_bytes += pattern_member_bytes
@@ -918,20 +925,23 @@ def shape_v4_inferred_taxonomy_projection_manifest(
     )
     digest = hashlib.sha256()
     digest.update(_PROJECTION_DIGEST_DOMAIN)
-    _update_projection_cap_digest(digest, caps)
+    _update_projection_cap_digest(digest, caps_by_name)
     digest.update(rule_set_digest)
-    for _rule_digest, is_observe, rule_manifest in digest_entries:
+    for _rule_digest, is_observe, rule_manifest_by_field in digest_entries:
         if is_observe:
-            _update_projection_observe_rule_digest(digest, rule_manifest)
+            _update_projection_observe_rule_digest(
+                digest,
+                rule_manifest_by_field,
+            )
         else:
-            _update_projection_rule_digest(digest, rule_manifest)
+            _update_projection_rule_digest(digest, rule_manifest_by_field)
     projection_digest = digest.digest()
     return {
         "contract": PTG2_V4_INFERRED_TAXONOMY_PROJECTION_CONTRACT,
         "catalog_contract": PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT,
         "vector_format": PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT,
         "pattern_format": PTG2_V4_INFERRED_TAXONOMY_PATTERN_FORMAT,
-        **caps,
+        **caps_by_name,
         "rule_count": len(rule_manifests),
         "observe_only_rule_count": len(observe_only_rule_manifests),
         "member_count": total_members,
@@ -944,6 +954,9 @@ def shape_v4_inferred_taxonomy_projection_manifest(
         "rules": rule_manifests,
         "observe_only_rules": observe_only_rule_manifests,
     }
+
+
+shape_v4_inferred_taxonomy_projection_manifest = _shape_projection_manifest
 
 
 def _candidate_projection_manifest(
@@ -968,14 +981,14 @@ def _candidate_projection_manifest(
             maximum_npi_key = max(maximum_npi_key, candidate_members[-1])
         if pattern_postings:
             maximum_pattern_key = max(maximum_pattern_key, *pattern_postings)
-    return shape_v4_inferred_taxonomy_projection_manifest(
+    return _shape_projection_manifest(
         materialized_rows,
         npi_count=maximum_npi_key + 1,
         pattern_count=maximum_pattern_key + 1,
     )
 
 
-def validate_v4_inferred_taxonomy_projection_manifest(
+def _validate_projection_manifest(
     manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Validate and canonicalize one optional sealed projection descriptor."""
@@ -1025,7 +1038,7 @@ def validate_v4_inferred_taxonomy_projection_manifest(
         )
     integer_fields = (*cap_fields, *aggregate_fields)
     try:
-        integers = {
+        integer_by_field = {
             field_name: int(manifest[field_name])
             for field_name in integer_fields
             if not isinstance(manifest[field_name], bool)
@@ -1034,17 +1047,19 @@ def validate_v4_inferred_taxonomy_projection_manifest(
         raise PTG2ManifestArtifactError(
             "PTG V4 inferred-taxonomy projection counts are invalid"
         ) from exc
-    if len(integers) != len(integer_fields):
+    if len(integer_by_field) != len(integer_fields):
         raise PTG2ManifestArtifactError(
             "PTG V4 inferred-taxonomy projection counts are invalid"
         )
     if (
-        any(integers[field_name] <= 0 for field_name in cap_fields)
+        any(integer_by_field[field_name] <= 0 for field_name in cap_fields)
         or any(
-            integers[field_name] < 0
+            integer_by_field[field_name] < 0
             for field_name in aggregate_fields
         )
-        or integers["rule_count"] + integers["observe_only_rule_count"] <= 0
+        or integer_by_field["rule_count"]
+        + integer_by_field["observe_only_rule_count"]
+        <= 0
     ):
         raise PTG2ManifestArtifactError(
             "PTG V4 inferred-taxonomy projection bounds are invalid"
@@ -1058,7 +1073,9 @@ def validate_v4_inferred_taxonomy_projection_manifest(
         raise PTG2ManifestArtifactError(
             "PTG V4 inferred-taxonomy projection rules are invalid"
         )
-    caps = {field_name: integers[field_name] for field_name in cap_fields}
+    caps_by_name = {
+        field_name: integer_by_field[field_name] for field_name in cap_fields
+    }
     canonical_rules: list[dict[str, Any]] = []
     canonical_observe_rules: list[dict[str, Any]] = []
     digest_entries: list[tuple[bytes, bool, dict[str, Any]]] = []
@@ -1109,10 +1126,10 @@ def validate_v4_inferred_taxonomy_projection_manifest(
             "pattern_member_count",
             "pattern_member_bytes",
         )
-        direct_projection = representation == (
+        is_direct_projection = representation == (
             PTG2_V4_INFERRED_TAXONOMY_DIRECT_REPRESENTATION
         )
-        pattern_projection = representation == (
+        is_pattern_projection = representation == (
             PTG2_V4_INFERRED_TAXONOMY_PATTERN_REPRESENTATION
         )
         pattern_size = (
@@ -1128,30 +1145,30 @@ def validate_v4_inferred_taxonomy_projection_manifest(
             or len(pattern_member_digest) != 32
             or member_count < 0
             or packed_byte_count != member_count * 4
-            or member_count > integers[
+            or member_count > integer_by_field[
                 "max_online_inferred_taxonomy_candidates"
             ]
             or pattern_count < 0
             or pattern_member_count < 0
-            or pattern_member_count > integers[
+            or pattern_member_count > integer_by_field[
                 "max_online_candidate_pattern_projection_members"
             ]
             or pattern_member_bytes < 0
             or (
-                direct_projection
+                is_direct_projection
                 and any(
                     (pattern_count, pattern_member_count, pattern_member_bytes)
                 )
             )
             or (
-                pattern_projection
+                is_pattern_projection
                 and (
                     pattern_count <= 0
                     or pattern_member_count < pattern_count
                     or pattern_member_bytes != pattern_size
                 )
             )
-            or not (direct_projection or pattern_projection)
+            or not (is_direct_projection or is_pattern_projection)
             or (
                 previous_rule_digest is not None
                 and rule_digest <= previous_rule_digest
@@ -1160,7 +1177,7 @@ def validate_v4_inferred_taxonomy_projection_manifest(
             raise PTG2ManifestArtifactError(
                 "PTG V4 inferred-taxonomy projection rule is invalid"
             )
-        canonical_rule = {
+        canonical_rule_by_field = {
             "rule_digest": rule_digest.hex(),
             "catalog_digest": catalog_digest.hex(),
             "member_digest": member_digest.hex(),
@@ -1172,8 +1189,8 @@ def validate_v4_inferred_taxonomy_projection_manifest(
             "pattern_member_bytes": pattern_member_bytes,
             "pattern_member_digest": pattern_member_digest.hex(),
         }
-        canonical_rules.append(canonical_rule)
-        digest_entries.append((rule_digest, False, canonical_rule))
+        canonical_rules.append(canonical_rule_by_field)
+        digest_entries.append((rule_digest, False, canonical_rule_by_field))
         total_members += member_count
         total_packed_bytes += packed_byte_count
         total_patterns += pattern_count
@@ -1244,19 +1261,25 @@ def validate_v4_inferred_taxonomy_projection_manifest(
                     raw_rule.get("reason")
                     == PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_CAP_REASON
                     and member_count
-                    == integers["max_online_inferred_taxonomy_candidates"]
+                    == integer_by_field[
+                        "max_online_inferred_taxonomy_candidates"
+                    ]
                     + 1
                     and observed_count_lower_bound
-                    == integers["max_online_inferred_taxonomy_candidates"]
+                    == integer_by_field[
+                        "max_online_inferred_taxonomy_candidates"
+                    ]
                     + 1
                 )
                 or (
                     raw_rule.get("reason")
                     == PTG2_V4_INFERRED_TAXONOMY_PATTERN_CAP_REASON
                     and member_count
-                    <= integers["max_online_inferred_taxonomy_candidates"]
+                    <= integer_by_field[
+                        "max_online_inferred_taxonomy_candidates"
+                    ]
                     and observed_count_lower_bound
-                    == integers[
+                    == integer_by_field[
                         "max_online_candidate_pattern_projection_members"
                     ]
                     + 1
@@ -1273,7 +1296,7 @@ def validate_v4_inferred_taxonomy_projection_manifest(
             raise PTG2ManifestArtifactError(
                 "PTG V4 inferred-taxonomy observe rule is invalid"
             )
-        canonical_rule = {
+        canonical_rule_by_field = {
             "rule_digest": rule_digest.hex(),
             "catalog_digest": catalog_digest.hex(),
             "member_digest": member_digest.hex(),
@@ -1287,8 +1310,8 @@ def validate_v4_inferred_taxonomy_projection_manifest(
             ),
             "pattern_member_digest": pattern_member_digest.hex(),
         }
-        canonical_observe_rules.append(canonical_rule)
-        digest_entries.append((rule_digest, True, canonical_rule))
+        canonical_observe_rules.append(canonical_rule_by_field)
+        digest_entries.append((rule_digest, True, canonical_rule_by_field))
         total_members += member_count
         total_packed_bytes += packed_byte_count
         previous_observe_rule_digest = rule_digest
@@ -1326,13 +1349,18 @@ def validate_v4_inferred_taxonomy_projection_manifest(
         ) from exc
     digest = hashlib.sha256()
     digest.update(_PROJECTION_DIGEST_DOMAIN)
-    _update_projection_cap_digest(digest, caps)
+    _update_projection_cap_digest(digest, caps_by_name)
     digest.update(rule_set_digest)
-    for _rule_digest, is_observe, canonical_rule in ordered_digest_entries:
+    for _rule_digest, is_observe, canonical_rule_by_field in (
+        ordered_digest_entries
+    ):
         if is_observe:
-            _update_projection_observe_rule_digest(digest, canonical_rule)
+            _update_projection_observe_rule_digest(
+                digest,
+                canonical_rule_by_field,
+            )
         else:
-            _update_projection_rule_digest(digest, canonical_rule)
+            _update_projection_rule_digest(digest, canonical_rule_by_field)
     try:
         raw_projection_digest = bytes.fromhex(
             str(manifest.get("projection_digest") or "")
@@ -1346,14 +1374,14 @@ def validate_v4_inferred_taxonomy_projection_manifest(
         label="inferred-taxonomy projection digest",
     )
     if (
-        len(canonical_rules) != integers["rule_count"]
+        len(canonical_rules) != integer_by_field["rule_count"]
         or len(canonical_observe_rules)
-        != integers["observe_only_rule_count"]
-        or total_members != integers["member_count"]
-        or total_packed_bytes != integers["packed_byte_count"]
-        or total_patterns != integers["pattern_count"]
-        or total_pattern_members != integers["pattern_member_count"]
-        or total_pattern_bytes != integers["pattern_member_bytes"]
+        != integer_by_field["observe_only_rule_count"]
+        or total_members != integer_by_field["member_count"]
+        or total_packed_bytes != integer_by_field["packed_byte_count"]
+        or total_patterns != integer_by_field["pattern_count"]
+        or total_pattern_members != integer_by_field["pattern_member_count"]
+        or total_pattern_bytes != integer_by_field["pattern_member_bytes"]
         or rule_set_digest != expected_rule_set_digest
         or digest.digest() != projection_digest
     ):
@@ -1365,7 +1393,7 @@ def validate_v4_inferred_taxonomy_projection_manifest(
         "catalog_contract": PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT,
         "vector_format": PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT,
         "pattern_format": PTG2_V4_INFERRED_TAXONOMY_PATTERN_FORMAT,
-        **caps,
+        **caps_by_name,
         "rule_count": len(canonical_rules),
         "observe_only_rule_count": len(canonical_observe_rules),
         "member_count": total_members,
@@ -1380,15 +1408,16 @@ def validate_v4_inferred_taxonomy_projection_manifest(
     }
 
 
+validate_v4_inferred_taxonomy_projection_manifest = _validate_projection_manifest
+
+
 def resolve_inferred_taxonomy_projection_rule_manifest(
     manifest: Mapping[str, Any],
     rule_digest: bytes,
 ) -> V4InferredTaxonomyProjectionRule | None:
     """Resolve an online rule or one explicit observe-only fallback."""
 
-    canonical_manifest = validate_v4_inferred_taxonomy_projection_manifest(
-        manifest
-    )
+    canonical_manifest = _validate_projection_manifest(manifest)
     normalized_rule_digest = _digest_bytes(rule_digest, label="rule digest")
     for raw_rule in canonical_manifest["rules"]:
         if raw_rule["rule_digest"] == normalized_rule_digest.hex():
@@ -1652,7 +1681,10 @@ async def publish_v4_inferred_taxonomy_candidates(
                 ),
             },
         )
-        catalog_rows = tuple(_row_mapping(row) for row in catalog_result)
+        catalog_rows = tuple(
+            _row_mapping(catalog_result_row)
+            for catalog_result_row in catalog_result
+        )
         for catalog_row in catalog_rows:
             npi_key = int(catalog_row["npi_key"])
             npi = int(catalog_row["npi"])
@@ -1686,23 +1718,25 @@ async def publish_v4_inferred_taxonomy_candidates(
     expected_rows: list[dict[str, Any]] = []
     for rule_digest, _rule, _rule_codes in normalized_rules:
         evidence_rows = tuple(evidence_by_rule_digest[rule_digest])
-        npi_keys = tuple(row.npi_key for row in evidence_rows)
-        candidate_cap_exceeded = (
+        npi_keys = tuple(
+            evidence_row.npi_key for evidence_row in evidence_rows
+        )
+        is_candidate_cap_exceeded = (
             len(npi_keys)
             > PTG2_V4_MAX_ONLINE_INFERRED_TAXONOMY_CANDIDATES
         )
         observe_reason = (
             PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_CAP_REASON
-            if candidate_cap_exceeded
+            if is_candidate_cap_exceeded
             else None
         )
         observe_count_lower_bound = (
             PTG2_V4_MAX_ONLINE_INFERRED_TAXONOMY_CANDIDATES + 1
-            if candidate_cap_exceeded
+            if is_candidate_cap_exceeded
             else None
         )
-        payload = pack_inferred_taxonomy_npi_keys(npi_keys)
-        pattern_postings: dict[int, tuple[int, ...]] = {}
+        packed_candidate_keys = pack_inferred_taxonomy_npi_keys(npi_keys)
+        npi_keys_by_pattern: dict[int, tuple[int, ...]] = {}
         if (
             observe_reason is None
             and root_representation
@@ -1710,7 +1744,7 @@ async def publish_v4_inferred_taxonomy_candidates(
             and npi_keys
         ):
             try:
-                pattern_postings = await _candidate_pattern_postings_for_rule(
+                npi_keys_by_pattern = await _candidate_pattern_postings_for_rule(
                     session,
                     schema_name=schema_name,
                     snapshot_key=int(snapshot_key),
@@ -1728,7 +1762,7 @@ async def publish_v4_inferred_taxonomy_candidates(
                 )
         observed_pattern_members = sum(
             len(pattern_npi_keys)
-            for pattern_npi_keys in pattern_postings.values()
+            for pattern_npi_keys in npi_keys_by_pattern.values()
         )
         if (
             observe_reason is None
@@ -1739,13 +1773,13 @@ async def publish_v4_inferred_taxonomy_candidates(
             observe_count_lower_bound = (
                 PTG2_V4_MAX_ONLINE_CANDIDATE_PATTERN_PROJECTION_MEMBERS + 1
             )
-        observe_only = observe_reason is not None
-        if observe_only:
-            pattern_postings = {}
+        is_observe_only = observe_reason is not None
+        if is_observe_only:
+            npi_keys_by_pattern = {}
         pattern_payload = pack_inferred_taxonomy_pattern_npi_keys(
-            pattern_postings
+            npi_keys_by_pattern
         )
-        if observe_only:
+        if is_observe_only:
             representation = (
                 PTG2_V4_INFERRED_TAXONOMY_OBSERVE_REPRESENTATION
             )
@@ -1755,8 +1789,8 @@ async def publish_v4_inferred_taxonomy_candidates(
             representation = (
                 PTG2_V4_INFERRED_TAXONOMY_PATTERN_REPRESENTATION
             )
-            pattern_count = len(pattern_postings)
-            pattern_postings = unpack_inferred_taxonomy_pattern_npi_keys(
+            pattern_count = len(npi_keys_by_pattern)
+            npi_keys_by_pattern = unpack_inferred_taxonomy_pattern_npi_keys(
                 pattern_payload,
                 pattern_count=pattern_count,
                 pattern_member_count=observed_pattern_members,
@@ -1768,11 +1802,11 @@ async def publish_v4_inferred_taxonomy_candidates(
             )
             pattern_count = 0
             pattern_member_count = 0
-            pattern_postings = {}
+            npi_keys_by_pattern = {}
         candidate_member_set = frozenset(npi_keys)
         if any(
             npi_key not in candidate_member_set
-            for pattern_npi_keys in pattern_postings.values()
+            for pattern_npi_keys in npi_keys_by_pattern.values()
             for npi_key in pattern_npi_keys
         ):
             raise ValueError(
@@ -1799,9 +1833,9 @@ async def publish_v4_inferred_taxonomy_candidates(
                 "member_digest": inferred_taxonomy_member_digest(
                     rule_digest,
                     member_count=len(npi_keys),
-                    payload=payload,
+                    payload=packed_candidate_keys,
                 ),
-                "member_keys": payload,
+                "member_keys": packed_candidate_keys,
                 "representation": representation,
                 "observe_reason": observe_reason,
                 "observe_count_lower_bound": observe_count_lower_bound,
@@ -1881,7 +1915,10 @@ async def publish_v4_inferred_taxonomy_candidates(
         ),
         {"snapshot_key": int(snapshot_key)},
     )
-    stored_rows = tuple(_row_mapping(row) for row in stored_result)
+    stored_rows = tuple(
+        _row_mapping(stored_result_row)
+        for stored_result_row in stored_result
+    )
     comparable_fields = (
         "rule_digest",
         "catalog_contract",
@@ -1902,27 +1939,27 @@ async def publish_v4_inferred_taxonomy_candidates(
     normalized_stored_rows = tuple(
         {
             field_name: (
-                bytes(row[field_name])
+                bytes(persisted_candidate_row[field_name])
                 if field_name.endswith("digest")
                 or field_name in {"member_keys", "pattern_member_payload"}
-                else row[field_name]
+                else persisted_candidate_row[field_name]
             )
             for field_name in comparable_fields
         }
-        for row in stored_rows
+        for persisted_candidate_row in stored_rows
     )
     normalized_expected_rows = tuple(
         {
-            field_name: row[field_name]
+            field_name: expected_candidate_row[field_name]
             for field_name in comparable_fields
         }
-        for row in expected_rows
+        for expected_candidate_row in expected_rows
     )
     if normalized_stored_rows != normalized_expected_rows:
         raise RuntimeError(
             "PTG V4 inferred-taxonomy candidate publication changed"
         )
-    manifest = shape_v4_inferred_taxonomy_projection_manifest(
+    manifest = _shape_projection_manifest(
         normalized_stored_rows,
         npi_count=normalized_npi_count,
         pattern_count=root_pattern_count,
@@ -1952,10 +1989,13 @@ async def summarize_v4_inferred_taxonomy_candidates(
     """Re-authenticate all rule vectors immediately before V4 seal."""
 
     normalized_rules = _normalized_rules(rules)
-    expected_rule_digests = tuple(item[0] for item in normalized_rules)
+    expected_rule_digests = tuple(
+        configured_rule_entry[0]
+        for configured_rule_entry in normalized_rules
+    )
     schema = _quote_ident(schema_name)
     table = _quote_ident(PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_TABLE)
-    result = await session.execute(
+    candidate_query_result = await session.execute(
         text(
             f"""
             SELECT rule_digest,
@@ -1980,14 +2020,20 @@ async def summarize_v4_inferred_taxonomy_candidates(
         ),
         {"snapshot_key": int(snapshot_key)},
     )
-    rows = tuple(_row_mapping(row) for row in result)
-    observed_rule_digests = tuple(bytes(row["rule_digest"]) for row in rows)
+    candidate_summary_rows = tuple(
+        _row_mapping(candidate_summary_row)
+        for candidate_summary_row in candidate_query_result
+    )
+    observed_rule_digests = tuple(
+        bytes(candidate_summary_row["rule_digest"])
+        for candidate_summary_row in candidate_summary_rows
+    )
     if observed_rule_digests != expected_rule_digests:
         raise RuntimeError(
             "PTG V4 inferred-taxonomy candidate rules are incomplete"
         )
-    return shape_v4_inferred_taxonomy_projection_manifest(
-        rows,
+    return _shape_projection_manifest(
+        candidate_summary_rows,
         npi_count=npi_count,
         pattern_count=pattern_count,
     )
@@ -2052,7 +2098,10 @@ async def load_v4_inferred_taxonomy_candidates(
             "rule_digest": normalized_rule_digest,
         },
     )
-    metadata_rows = tuple(_row_mapping(row) for row in metadata_result)
+    metadata_rows = tuple(
+        _row_mapping(candidate_metadata_row)
+        for candidate_metadata_row in metadata_result
+    )
     if len(metadata_rows) != 1:
         raise PTG2ManifestArtifactError(
             "PTG V4 inferred-taxonomy candidate vector is unavailable"
@@ -2117,12 +2166,12 @@ async def load_v4_inferred_taxonomy_candidates(
         raise PTG2ManifestArtifactError(
             "PTG V4 inferred-taxonomy candidate metadata changed from its seal"
         )
-    payload = bytes(metadata.get("member_keys") or b"")
+    packed_candidate_keys = bytes(metadata.get("member_keys") or b"")
     try:
         observed_member_digest = inferred_taxonomy_member_digest(
             normalized_rule_digest,
             member_count=member_count,
-            payload=payload,
+            payload=packed_candidate_keys,
         )
     except ValueError as exc:
         raise PTG2ManifestArtifactError(
@@ -2133,7 +2182,7 @@ async def load_v4_inferred_taxonomy_candidates(
             "PTG V4 inferred-taxonomy candidate digest changed"
         )
     npi_keys = unpack_inferred_taxonomy_npi_keys(
-        payload,
+        packed_candidate_keys,
         member_count=member_count,
     )
     pattern_payload = bytes(metadata.get("pattern_member_payload") or b"")
@@ -2161,7 +2210,7 @@ async def load_v4_inferred_taxonomy_candidates(
         pattern_member_count=pattern_member_count,
     )
     try:
-        shape_v4_inferred_taxonomy_projection_manifest(
+        _shape_projection_manifest(
             (
                 {
                     "rule_digest": normalized_rule_digest,
@@ -2170,7 +2219,7 @@ async def load_v4_inferred_taxonomy_candidates(
                     "vector_format": metadata["vector_format"],
                     "member_count": member_count,
                     "member_digest": member_digest,
-                    "member_keys": payload,
+                    "member_keys": packed_candidate_keys,
                     "representation": representation,
                     "pattern_count": pattern_count,
                     "pattern_member_count": pattern_member_count,

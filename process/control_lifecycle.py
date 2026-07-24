@@ -48,19 +48,27 @@ async def control_single_job_start(
     **_arq_metadata: Any,
 ) -> dict[str, Any]:
     """Run a single-job importer while updating the unified import_run registry."""
-    payload = task if isinstance(task, dict) else {}
+    control_task_by_field = task if isinstance(task, dict) else {}
     bind_status_event_loop()
-    run_id = str(payload.get("run_id") or "").strip()
-    importer = str(payload.get("importer") or payload.get("target_function") or "unknown").strip()
-    target_module = str(payload.get("target_module") or "").strip()
-    target_function = str(payload.get("target_function") or "").strip()
-    call_style = str(payload.get("call_style") or "ctx_task").strip()
-    run_shutdown = bool(payload.get("run_shutdown"))
-    target_task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+    run_id = str(control_task_by_field.get("run_id") or "").strip()
+    importer = str(
+        control_task_by_field.get("importer")
+        or control_task_by_field.get("target_function")
+        or "unknown"
+    ).strip()
+    target_module = str(control_task_by_field.get("target_module") or "").strip()
+    target_function = str(control_task_by_field.get("target_function") or "").strip()
+    call_style = str(control_task_by_field.get("call_style") or "ctx_task").strip()
+    run_shutdown = bool(control_task_by_field.get("run_shutdown"))
+    target_task_by_field = (
+        control_task_by_field.get("task")
+        if isinstance(control_task_by_field.get("task"), dict)
+        else {}
+    )
     ctx = _isolated_control_job_context(ctx, run_id)
 
     if run_id:
-        target_task = {**target_task, "run_id": run_id}
+        target_task_by_field = {**target_task_by_field, "run_id": run_id}
 
     started_at = dt.datetime.now(dt.UTC).isoformat(timespec="microseconds")
     attempt_id = f"{run_id}:{uuid.uuid4().hex}" if run_id else None
@@ -136,7 +144,7 @@ async def control_single_job_start(
             target_function=target_function,
             call_style=call_style,
             control_context=ctx,
-            target_task_by_field=target_task,
+            target_task_by_field=target_task_by_field,
         )
         if run_shutdown:
             shutdown = getattr(module, "shutdown", None)
@@ -337,7 +345,7 @@ def _control_run_heartbeat_update_values(
 ) -> dict[str, Any]:
     fallback_phase = f"{target_function} running"
     if live:
-        progress_payload = progress_payload_from_live(live) or {
+        progress_by_field = progress_payload_from_live(live) or {
             "unit": "run",
             "done": 0,
             "total": 1,
@@ -345,10 +353,10 @@ def _control_run_heartbeat_update_values(
             "message": "running",
             "phase": fallback_phase,
         }
-        phase_detail = str(live.get("phase") or progress_payload.get("phase") or fallback_phase)[:128]
+        phase_detail = str(live.get("phase") or progress_by_field.get("phase") or fallback_phase)[:128]
     else:
         phase_detail = fallback_phase
-        progress_payload = {
+        progress_by_field = {
             "unit": "run",
             "done": 0,
             "total": 1,
@@ -356,15 +364,15 @@ def _control_run_heartbeat_update_values(
             "message": "running",
             "phase": fallback_phase,
         }
-    progress_payload = dict(progress_payload)
+    progress_by_field = dict(progress_by_field)
     if attempt_id and attempt_started_at:
-        progress_payload["attempt_id"] = attempt_id
-        progress_payload["attempt_started_at"] = attempt_started_at
+        progress_by_field["attempt_id"] = attempt_id
+        progress_by_field["attempt_started_at"] = attempt_started_at
     return {
         "status": "running",
         "phase_detail": phase_detail,
         "heartbeat_at": now,
-        "progress": progress_payload,
+        "progress": progress_by_field,
         "finished_at": None,
     }
 
@@ -377,17 +385,17 @@ async def _stop_live_progress_heartbeat(task: asyncio.Task | None) -> None:
         await task
 
 
-def _terminal_progress_from_result(target_function: str, result: Any) -> dict[str, Any] | None:
-    if isinstance(result, int):
+def _terminal_progress_from_result(target_function: str, terminal_result: Any) -> dict[str, Any] | None:
+    if isinstance(terminal_result, int):
         return {
             "unit": "items",
-            "done": result,
-            "total": result,
+            "done": terminal_result,
+            "total": terminal_result,
             "pct": 100,
             "message": "succeeded",
             "phase": f"{target_function} succeeded",
         }
-    if not isinstance(result, dict):
+    if not isinstance(terminal_result, dict):
         return None
     count_keys = (
         "rows",
@@ -401,7 +409,15 @@ def _terminal_progress_from_result(target_function: str, result: Any) -> dict[st
         "clinical_area_rows",
     )
     count_value = next(
-        (value for key in count_keys if isinstance((value := result.get(key)), int) and value >= 0),
+        (
+            candidate_count
+            for key in count_keys
+            if isinstance(
+                (candidate_count := terminal_result.get(key)),
+                int,
+            )
+            and candidate_count >= 0
+        ),
         None,
     )
     if count_value is None:
@@ -471,11 +487,11 @@ def _terminal_metrics_from_context(context: Any) -> dict[str, Any] | None:
         "phase_timings",
         "audit", "skipped_stage_indexes",
     )
-    metrics = {key: context[key] for key in keys if key in context}
-    staged_rows = metrics.get("staged_rows")
-    if "rows" not in metrics and isinstance(staged_rows, int):
-        metrics["rows"] = staged_rows
-    return metrics or None
+    metrics_by_name = {key: context[key] for key in keys if key in context}
+    staged_rows = metrics_by_name.get("staged_rows")
+    if "rows" not in metrics_by_name and isinstance(staged_rows, int):
+        metrics_by_name["rows"] = staged_rows
+    return metrics_by_name or None
 
 
 async def _flush_terminal_status_events() -> None:
@@ -561,7 +577,7 @@ async def mark_control_run(
         progress_by_field["attempt_started_at"] = attempt_started_at
     live_started_at = (attempt_started_at or now) if status == "running" else None
     live_finished_at = now if is_terminal and not preserve_finished_at else None
-    values: dict[str, Any] = {
+    update_values_by_field: dict[str, Any] = {
         "status": status,
         "phase_detail": phase_detail,
         "heartbeat_at": now,
@@ -569,14 +585,14 @@ async def mark_control_run(
         "error": error,
     }
     if metrics is not None:
-        values["metrics"] = metrics
+        update_values_by_field["metrics"] = metrics
     if snapshot_id:
-        values["snapshot_id"] = snapshot_id
+        update_values_by_field["snapshot_id"] = snapshot_id
     if status == "running":
-        values["started_at"] = func.coalesce(ImportRun.started_at, now)
-        values["finished_at"] = None
+        update_values_by_field["started_at"] = func.coalesce(ImportRun.started_at, now)
+        update_values_by_field["finished_at"] = None
     if is_terminal and not preserve_finished_at:
-        values["finished_at"] = now
+        update_values_by_field["finished_at"] = now
     should_update_database = bool(
         status == "running" and attempt_id and attempt_started_at
     ) or await _should_update_control_run_db(
@@ -615,11 +631,11 @@ async def mark_control_run(
                 attempt_started_at=attempt_started_at,
             )
         affected_rows = await _execute_control_run_update(
-            stmt.values(**values).returning(ImportRun.run_id)
+            stmt.values(**update_values_by_field).returning(ImportRun.run_id)
         )
         if affected_rows != 1:
             return _CONTROL_RUN_NOT_MARKED
-    live_payload = {
+    live_update_by_field = {
         **progress_by_field,
         "run_id": run_id,
         "status": status,
@@ -648,7 +664,7 @@ async def mark_control_run(
     }
     await asyncio.to_thread(
         write_live_progress,
-        **live_payload,
+        **live_update_by_field,
         status_event_payload=status_event_by_field,
     )
     return _CONTROL_RUN_MARKED
@@ -707,11 +723,14 @@ def _control_run_db_update_slot_key(*, run_id: str, status: str, phase_detail: s
     return f"hp:control-run-db-update:{digest}"
 
 
-def _claim_control_run_db_update_slot(slot_key: str, throttle_seconds: float) -> bool:
+def _is_db_update_slot_claimed(slot_key: str, throttle_seconds: float) -> bool:
     try:
         return bool(_control_run_db_throttle_client().set(slot_key, "1", nx=True, px=max(int(throttle_seconds * 1000), 1)))
     except Exception:
         return True
+
+
+_claim_control_run_db_update_slot = _is_db_update_slot_claimed
 
 
 @lru_cache(maxsize=1)
@@ -825,11 +844,11 @@ def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str,
 def _control_failure_error(exc: Exception) -> dict[str, Any]:
     """Preserve stable retry semantics exposed by importer-specific errors."""
 
-    error = {
+    error_by_field = {
         "code": str(getattr(exc, "control_error_code", "import_failed")),
         "message": str(exc).strip() or type(exc).__name__,
     }
     retryable = getattr(exc, "retryable", None)
     if isinstance(retryable, bool):
-        error["retryable"] = retryable
-    return error
+        error_by_field["retryable"] = retryable
+    return error_by_field

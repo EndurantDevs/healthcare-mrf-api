@@ -83,10 +83,10 @@ async def test_building_v4_relation_read_is_bound_to_its_build_token(
 ) -> None:
     root = graph.V4GraphRoot(17, "pattern_v1", b"\0" * 32)
     root_loader = AsyncMock(return_value=root)
-    observed: dict[str, object] = {}
+    observed_by_argument: dict[str, object] = {}
 
     async def fake_lookup(*_args, **kwargs):
-        observed.update(kwargs)
+        observed_by_argument.update(kwargs)
         return {3: (5, 7)}
 
     monkeypatch.setattr(graph, "_load_building_v4_graph_root", root_loader)
@@ -109,8 +109,8 @@ async def test_building_v4_relation_read_is_bound_to_its_build_token(
         "schema_name": "mrf",
         "build_token": "build-17",
     }
-    assert observed["authenticated_root"] == root
-    assert observed["max_members"] == 11
+    assert observed_by_argument["authenticated_root"] == root
+    assert observed_by_argument["max_members"] == 11
 
 
 @pytest.mark.asyncio
@@ -706,7 +706,7 @@ async def test_v4_regular_relation_intersection_retains_only_allowed_members(
             self.block_hash = block_hash
             self.entry_count = entries
 
-    member_payload = [struct.pack("<III", 5, 7, 9)]
+    member_payloads = [struct.pack("<III", 5, 7, 9)]
 
     async def fake_root(*_args, **_kwargs):
         return graph.V4GraphRoot(17, "direct_v1", b"r" * 32)
@@ -743,7 +743,7 @@ async def test_v4_regular_relation_intersection_retains_only_allowed_members(
             }
         return {
             b"m" * 32: graph._CachedPhysicalBlock(
-                b"m" * 32, kind, 3, member_payload[0]
+                b"m" * 32, kind, 3, member_payloads[0]
             )
         }
 
@@ -774,7 +774,7 @@ async def test_v4_regular_relation_intersection_retains_only_allowed_members(
             max_members=1,
         )
 
-    member_payload[0] = struct.pack("<III", 7, 5, 9)
+    member_payloads[0] = struct.pack("<III", 7, 5, 9)
     with pytest.raises(PTG2SharedBlockError, match="unique and ordered"):
         await graph.lookup_v4_relation_intersections(
             object(),

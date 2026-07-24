@@ -706,13 +706,13 @@ def _provider_graph_v4_map(
         or resources_by_field["empty_npi_tin_only_normalization_count"] < 0
     ):
         raise ValueError("PTG V4 graph resource admission is invalid")
-    inferred_taxonomy_candidates = dict(
+    inferred_taxonomy_manifest_map = dict(
         metadata.inferred_taxonomy_candidates
     )
-    if inferred_taxonomy_candidates:
-        inferred_taxonomy_candidates = (
+    if inferred_taxonomy_manifest_map:
+        inferred_taxonomy_manifest_map = (
             validate_v4_inferred_taxonomy_projection_manifest(
-                inferred_taxonomy_candidates
+                inferred_taxonomy_manifest_map
             )
         )
     return {
@@ -733,7 +733,7 @@ def _provider_graph_v4_map(
         "inferred_taxonomy_candidate_table": (
             PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_TABLE
         ),
-        "inferred_taxonomy_candidates": inferred_taxonomy_candidates,
+        "inferred_taxonomy_candidates": inferred_taxonomy_manifest_map,
         "hot_prefix": dict(metadata.provider_graph_diagnostics),
         "resource_admission": resources_by_field,
     }
@@ -2050,6 +2050,8 @@ async def _load_v4_layout_reservation(
 def _sealed_root_summaries(
     existing: Mapping[str, Any],
 ) -> tuple[Mapping[str, Any], V4SnapshotMapSummary, V4SnapshotMetadataSummary]:
+    """Reconstruct sealed manifest and V4 summaries from one reuse row."""
+
     manifest = existing.get("layout_manifest") or {}
     serving_index = (
         manifest.get("serving_index") if isinstance(manifest, Mapping) else None

@@ -103,6 +103,8 @@ async def _assert_persisted_metadata_summary(
     expected_summary,
     no_op,
 ) -> None:
+    """Assert persisted graph metadata is summarized without identity drift."""
+
     async def fake_aggregate(*_args, **_kwargs):
         return {
             "npi_count": 1,

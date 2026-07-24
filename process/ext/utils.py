@@ -194,19 +194,19 @@ async def _determine_request_timeout(
 async def _head_download_info(
     client: aiohttp.ClientSession, url: str
 ) -> tuple[int | None, bool]:
-    range_disabled = _parallel_download_disabled_for_url(url)
+    is_range_download_disabled = _is_parallel_download_disabled_for_url(url)
 
     async def _probe_total_via_range() -> int | None:
-        if range_disabled:
+        if is_range_download_disabled:
             return None
         try:
-            probe_headers = {
+            probe_headers_by_name = {
                 "Range": "bytes=0-0",
                 "Accept-Encoding": "identity",
             }
             async with client.get(
                 url,
-                headers=probe_headers,
+                headers=probe_headers_by_name,
                 allow_redirects=True,
                 timeout=aiohttp.ClientTimeout(total=HEAD_TIMEOUT_SECONDS),
             ) as probe_response:
@@ -233,7 +233,7 @@ async def _head_download_info(
                     size_bytes = int(content_length)
                 except ValueError:
                     size_bytes = None
-            if range_disabled:
+            if is_range_download_disabled:
                 return size_bytes, False
             supports_ranges = "bytes" in accept_ranges
             if supports_ranges and (not size_bytes or size_bytes < 1024):
@@ -246,7 +246,7 @@ async def _head_download_info(
         return probed_total, bool(probed_total)
 
 
-def _parallel_download_disabled_for_url(url: str) -> bool:
+def _is_parallel_download_disabled_for_url(url: str) -> bool:
     raw_hosts = os.getenv(
         "HLTHPRT_PARALLEL_DOWNLOAD_DISABLED_HOSTS",
         DEFAULT_PARALLEL_DOWNLOAD_DISABLED_HOSTS,
@@ -262,6 +262,9 @@ def _parallel_download_disabled_for_url(url: str) -> bool:
         or (disabled.startswith(".") and hostname.endswith(disabled))
         for disabled in disabled_hosts
     )
+
+
+_parallel_download_disabled_for_url = _is_parallel_download_disabled_for_url
 
 
 async def _download_parallel_by_ranges(
@@ -297,14 +300,14 @@ async def _download_parallel_by_ranges(
 
     file_fd = os.open(filepath, os.O_RDWR)
 
-    def _write_range(fd: int, offset: int, payload: bytes) -> None:
+    def _write_range(fd: int, offset: int, range_bytes: bytes) -> None:
         # pwrite avoids fd seek contention across parallel workers.
-        os.pwrite(fd, payload, offset)
+        os.pwrite(fd, range_bytes, offset)
 
     async def _download_range(start_byte: int, end_byte: int) -> None:
         """Download and persist one inclusive byte range."""
         nonlocal downloaded_bytes, last_progress_time
-        headers_local = {
+        range_headers_by_name = {
             "Range": f"bytes={start_byte}-{end_byte}",
             # Range math requires identity representation for deterministic byte offsets.
             "Accept-Encoding": "identity",
@@ -328,23 +331,23 @@ async def _download_parallel_by_ranges(
                 )
                 try:
                     async with client.get(
-                        url, headers=headers_local, timeout=attempt_timeout
+                        url, headers=range_headers_by_name, timeout=attempt_timeout
                     ) as response:
                         if response.status not in (206,):
                             raise RuntimeError(
                                 f"Range request not honored (status={response.status})"
                             )
-                        payload = await response.read()
+                        range_bytes = await response.read()
                         expected = end_byte - start_byte + 1
-                        if len(payload) != expected:
+                        if len(range_bytes) != expected:
                             raise RuntimeError(
-                                f"Range payload mismatch for {url}: got {len(payload)} bytes, expected {expected}"
+                                f"Range payload mismatch for {url}: got {len(range_bytes)} bytes, expected {expected}"
                             )
                         await asyncio.to_thread(
-                            _write_range, file_fd, start_byte, payload
+                            _write_range, file_fd, start_byte, range_bytes
                         )
                         async with progress_lock:
-                            downloaded_bytes += len(payload)
+                            downloaded_bytes += len(range_bytes)
                             now = time.monotonic()
                             if (
                                 now - last_progress_time >= PROGRESS_INTERVAL_SECONDS
@@ -372,7 +375,12 @@ async def _download_parallel_by_ranges(
             )
 
     try:
-        await asyncio.gather(*(_download_range(s, e) for s, e in ranges))
+        await asyncio.gather(
+            *(
+                _download_range(range_start, range_end)
+                for range_start, range_end in ranges
+            )
+        )
     finally:
         os.close(file_fd)
 
@@ -562,7 +570,7 @@ async def download_it_and_save(
                 existing_size = (
                     os.path.getsize(filepath) if os.path.exists(filepath) else 0
                 )
-                resume_done = False
+                is_resume_complete = False
                 can_resume_stream = (
                     bool(existing_size)
                     and bool(accept_ranges)
@@ -570,12 +578,12 @@ async def download_it_and_save(
                 )
                 if can_resume_stream and size_bytes and existing_size < size_bytes:
                     print(f"Resuming stream from {existing_size} / {size_bytes} bytes")
-                    resume_headers = {
+                    resume_headers_by_name = {
                         "Range": f"bytes={existing_size}-",
                         "Accept-Encoding": "identity",
                     }
                     async with client.get(
-                        url, timeout=request_timeout, headers=resume_headers
+                        url, timeout=request_timeout, headers=resume_headers_by_name
                     ) as response:
                         if response.status == 206:
                             encoding = (
@@ -587,7 +595,7 @@ async def download_it_and_save(
                             await _stream_response_to_file(
                                 response, "ab", start_offset=existing_size
                             )
-                            resume_done = True
+                            is_resume_complete = True
                         else:
                             print(
                                 f"[warn] resume not supported for {url} (status={response.status}), restarting"
@@ -603,7 +611,7 @@ async def download_it_and_save(
                     )
                     return
 
-                if not resume_done:
+                if not is_resume_complete:
                     async with client.get(url, timeout=request_timeout) as response:
                         try:
                             encoding = (
@@ -694,13 +702,13 @@ def make_class(model_cls, table_suffix, schema_override=None):
         if schema_override is not None:
             new_table.schema = schema_override
 
-    mapper_args = dict(getattr(model_cls, "__mapper_args__", {}))
-    mapper_args["concrete"] = True
+    mapper_options_by_name = dict(getattr(model_cls, "__mapper_args__", {}))
+    mapper_options_by_name["concrete"] = True
 
-    attrs = {
+    class_attributes_by_name = {
         "__tablename__": new_table_name,
         "__table__": new_table,
-        "__mapper_args__": mapper_args,
+        "__mapper_args__": mapper_options_by_name,
         "__module__": model_cls.__module__,
     }
 
@@ -710,14 +718,14 @@ def make_class(model_cls, table_suffix, schema_override=None):
         "__main_table__",
     ):
         if hasattr(model_cls, attr_name):
-            attrs[attr_name] = getattr(model_cls, attr_name)
+            class_attributes_by_name[attr_name] = getattr(model_cls, attr_name)
 
     bases = tuple(base for base in model_cls.__bases__ if base is not object)
     if not bases:
         bases = (model_cls,)
 
     dynamic_name = f"{model_cls.__name__}_{table_suffix}"
-    dynamic_cls = type(dynamic_name, bases, attrs)
+    dynamic_cls = type(dynamic_name, bases, class_attributes_by_name)
     _DYNAMIC_CLASS_CACHE[cache_key] = dynamic_cls
     return dynamic_cls
 
@@ -853,11 +861,11 @@ def get_import_schema(env_var: str, default: str, test_mode: bool) -> str:
 
 def deduplicate_dicts(dict_list, key_fields):
     """Keep the last dictionary for each composite key."""
-    seen = {}
+    latest_by_composite_key = {}
     for dict_entry in dict_list:
-        key = tuple(dict_entry.get(field) for field in key_fields)
-        seen[key] = dict_entry  # keep the last occurrence
-    return list(seen.values())
+        composite_key_parts = tuple(dict_entry.get(field) for field in key_fields)
+        latest_by_composite_key[composite_key_parts] = dict_entry  # keep the last occurrence
+    return list(latest_by_composite_key.values())
 
 
 def order_dicts_by_fields(dict_list, key_fields):
@@ -901,14 +909,14 @@ async def push_objects(
             if _is_deadlock_error(err):
                 return "deadlock"
 
-            checked: list[BaseException] = []
-            pending = [err]
-            while pending:
-                current = pending.pop(0)
-                if current is None or any(current is seen for seen in checked):
+            checked_errors: list[BaseException] = []
+            pending_errors = [err]
+            while pending_errors:
+                current = pending_errors.pop(0)
+                if current is None or any(current is seen for seen in checked_errors):
                     continue
-                checked.append(current)
-                pending.extend(
+                checked_errors.append(current)
+                pending_errors.extend(
                     candidate
                     for candidate in (
                         getattr(current, "orig", None),
@@ -918,7 +926,7 @@ async def push_objects(
                     if candidate is not None
                 )
 
-            for current in checked:
+            for current in checked_errors:
                 current_type = type(current).__name__.lower()
                 current_text = str(current).lower()
                 if "connectiondoesnotexisterror" in current_type:
@@ -1037,10 +1045,10 @@ async def push_objects(
                 yield sequence[start : start + chunk_size]
 
         if rewrite:
-            targets = _conflict_targets()
-            if targets:
-                obj_list = deduplicate_dicts(obj_list, targets)
-                obj_list = order_dicts_by_fields(obj_list, targets)
+            rewrite_conflict_targets = _conflict_targets()
+            if rewrite_conflict_targets:
+                obj_list = deduplicate_dicts(obj_list, rewrite_conflict_targets)
+                obj_list = order_dicts_by_fields(obj_list, rewrite_conflict_targets)
 
             if use_copy:
                 try:
@@ -1080,20 +1088,22 @@ async def push_objects(
 
             for chunk in _chunk_records(obj_list):
                 stmt = db.insert(cls.__table__).values(chunk)
-                if targets:
+                if rewrite_conflict_targets:
                     update_cols = [
-                        c.name
-                        for c in cls.__table__.c
-                        if c.name not in targets and not c.primary_key
+                        column.name
+                        for column in cls.__table__.c
+                        if column.name not in rewrite_conflict_targets and not column.primary_key
                     ]
                     set_dict = {col: getattr(stmt.excluded, col) for col in update_cols}
                     if set_dict:
                         stmt = stmt.on_conflict_do_update(
-                            index_elements=targets,
+                            index_elements=rewrite_conflict_targets,
                             set_=set_dict,
                         )
                     else:
-                        stmt = stmt.on_conflict_do_nothing(index_elements=targets)
+                        stmt = stmt.on_conflict_do_nothing(
+                            index_elements=rewrite_conflict_targets
+                        )
                 try:
                     await _status_with_deadlock_retry(stmt)
                 except (UndefinedTableError, SQLAlchemyError, InterfaceError) as err:
@@ -1120,9 +1130,9 @@ async def push_objects(
                 if conflict_targets:
                     if rewrite:
                         update_cols = [
-                            c.name
-                            for c in cls.__table__.c
-                            if c.name not in conflict_targets and not c.primary_key
+                            column.name
+                            for column in cls.__table__.c
+                            if column.name not in conflict_targets and not column.primary_key
                         ]
                         set_dict = {
                             col: getattr(stmt.excluded, col) for col in update_cols
@@ -1193,9 +1203,9 @@ async def push_objects(
                     if _is_missing_table_error(chunk_err):
                         return await _retry_after_missing_table(chunk_err)
                     print(f"Batch insert failed ({chunk_err}); retrying one-by-one")
-                    for obj in chunk:
+                    for record_by_field in chunk:
                         try:
-                            single_stmt = db.insert(cls.__table__).values(obj)
+                            single_stmt = db.insert(cls.__table__).values(record_by_field)
                             if conflict_targets:
                                 single_stmt = single_stmt.on_conflict_do_nothing(
                                     index_elements=conflict_targets
@@ -1217,13 +1227,13 @@ import logging
 from sqlalchemy import or_
 
 
-def _coerce_datetime(value):
-    if isinstance(value, datetime.datetime):
-        return value
-    if isinstance(value, dict):
-        type_tag = value.get("__type__")
+def _coerce_datetime(raw_datetime):
+    if isinstance(raw_datetime, datetime.datetime):
+        return raw_datetime
+    if isinstance(raw_datetime, dict):
+        type_tag = raw_datetime.get("__type__")
         if type_tag == "datetime":
-            iso_value = value.get("value")
+            iso_value = raw_datetime.get("value")
             if isinstance(iso_value, str):
                 try:
                     return datetime.datetime.fromisoformat(iso_value)
@@ -1233,17 +1243,17 @@ def _coerce_datetime(value):
                     except (ValueError, TypeError):
                         return None
         if type_tag == "repr":
-            return _coerce_datetime(value.get("repr"))
+            return _coerce_datetime(raw_datetime.get("repr"))
         # silently ignore other tagged dicts
-        if "__type__" not in value:
-            return _coerce_datetime(value.get("value"))
+        if "__type__" not in raw_datetime:
+            return _coerce_datetime(raw_datetime.get("value"))
         return None
-    if isinstance(value, str):
+    if isinstance(raw_datetime, str):
         try:
-            return datetime.datetime.fromisoformat(value)
+            return datetime.datetime.fromisoformat(raw_datetime)
         except ValueError:
             try:
-                return parse_date(value)
+                return parse_date(raw_datetime)
             except (ValueError, TypeError):
                 return None
     return None

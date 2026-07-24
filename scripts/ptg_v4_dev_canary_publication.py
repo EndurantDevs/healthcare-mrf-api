@@ -403,7 +403,7 @@ def _validate_inferred_taxonomy_candidates(
     serving_index = _mapping(layout_manifest.get("serving_index"))
     serving_binary = _mapping(serving_index.get("serving_binary"))
     provider_graph = _mapping(serving_binary.get("provider_graph_v4"))
-    manifest_advertises_projection = (
+    has_advertised_projection = (
         "inferred_taxonomy_candidates" in provider_graph
     )
     advertised_projection_value = provider_graph.get(
@@ -440,7 +440,7 @@ def _validate_inferred_taxonomy_candidates(
         count is not None for count in exact_by_manifest_field.values()
     )
 
-    if not manifest_advertises_projection:
+    if not has_advertised_projection:
         if not exact_counts_are_complete or any(
             count != 0 for count in exact_by_manifest_field.values()
         ):
@@ -455,10 +455,10 @@ def _validate_inferred_taxonomy_candidates(
 
     if not isinstance(advertised_projection_value, Mapping):
         failures.append("inferred-taxonomy serving manifest is malformed")
-        canonical_advertised: dict[str, Any] = {}
+        advertised_projection_map: dict[str, Any] = {}
     else:
         try:
-            canonical_advertised = (
+            advertised_projection_map = (
                 validate_v4_inferred_taxonomy_projection_manifest(
                     advertised_projection_value
                 )
@@ -467,24 +467,24 @@ def _validate_inferred_taxonomy_candidates(
             failures.append(
                 "inferred-taxonomy serving manifest is invalid"
             )
-            canonical_advertised = {}
+            advertised_projection_map = {}
 
     try:
-        canonical_evidence = (
+        evidence_projection_map = (
             validate_v4_inferred_taxonomy_projection_manifest(
                 projection_evidence
             )
         )
     except PTG2ManifestArtifactError:
         failures.append("inferred-taxonomy database projection is invalid")
-        canonical_evidence = {}
+        evidence_projection_map = {}
 
     if (
         not exact_counts_are_complete
-        or not canonical_evidence
+        or not evidence_projection_map
         or any(
             exact_by_manifest_field[field_name]
-            != _optional_int(canonical_evidence.get(field_name))
+            != _optional_int(evidence_projection_map.get(field_name))
             for field_name in exact_by_manifest_field
         )
     ):
@@ -493,9 +493,9 @@ def _validate_inferred_taxonomy_candidates(
         )
 
     if (
-        canonical_advertised
-        and canonical_evidence
-        and canonical_advertised != canonical_evidence
+        advertised_projection_map
+        and evidence_projection_map
+        and advertised_projection_map != evidence_projection_map
     ):
         failures.append(
             "inferred-taxonomy serving manifest differs from database projection"
@@ -506,7 +506,7 @@ def _validate_inferred_taxonomy_candidates(
     )
     nonempty_rules = tuple(
         rule
-        for rule in canonical_evidence.get("rules", ())
+        for rule in evidence_projection_map.get("rules", ())
         if _optional_int(rule.get("member_count")) not in (None, 0)
     )
     if expected_rule_representation in {
@@ -537,8 +537,8 @@ def _validate_inferred_taxonomy_candidates(
     return {
         "advertised": True,
         **(
-            canonical_evidence
-            if canonical_evidence
+            evidence_projection_map
+            if evidence_projection_map
             else dict(projection_evidence)
         ),
     }

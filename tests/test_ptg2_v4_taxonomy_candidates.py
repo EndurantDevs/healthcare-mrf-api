@@ -55,40 +55,43 @@ class _PublicationSession:
         self.stored_rows: list[dict[str, Any]] = []
         self.catalog_rows_by_codes = catalog_rows_by_codes
 
+    def _execute_catalog_query(self, sql, parameters):
+        self.catalog_sql = sql
+        parameters_by_name = dict(parameters)
+        self.catalog_calls.append(parameters_by_name)
+        taxonomy_codes = tuple(parameters_by_name["taxonomy_codes"])
+        default_rows_by_codes = {
+            ("AAA",): (
+                {
+                    "npi_key": 0,
+                    "npi": 1_234_567_890,
+                    "matched_taxonomy_codes": ["AAA"],
+                },
+                {
+                    "npi_key": 2,
+                    "npi": 1_234_567_892,
+                    "matched_taxonomy_codes": ["AAA"],
+                },
+            ),
+            ("BBB",): (
+                {
+                    "npi_key": 2,
+                    "npi": 1_234_567_892,
+                    "matched_taxonomy_codes": ["BBB"],
+                },
+            ),
+        }
+        rows_by_codes = self.catalog_rows_by_codes or default_rows_by_codes
+        return _Result(rows_by_codes.get(taxonomy_codes, ()))
+
     async def execute(self, statement, parameters=None):
         sql = str(statement)
         if "ARRAY_AGG" in sql:
-            self.catalog_sql = sql
-            normalized_parameters = dict(parameters)
-            self.catalog_calls.append(normalized_parameters)
-            taxonomy_codes = tuple(normalized_parameters["taxonomy_codes"])
-            default_rows = {
-                ("AAA",): (
-                    {
-                        "npi_key": 0,
-                        "npi": 1_234_567_890,
-                        "matched_taxonomy_codes": ["AAA"],
-                    },
-                    {
-                        "npi_key": 2,
-                        "npi": 1_234_567_892,
-                        "matched_taxonomy_codes": ["AAA"],
-                    },
-                ),
-                ("BBB",): (
-                    {
-                        "npi_key": 2,
-                        "npi": 1_234_567_892,
-                        "matched_taxonomy_codes": ["BBB"],
-                    },
-                ),
-            }
-            rows_by_codes = self.catalog_rows_by_codes or default_rows
-            return _Result(
-                rows_by_codes.get(taxonomy_codes, ())
-            )
+            return self._execute_catalog_query(sql, parameters)
         if "INSERT INTO" in sql:
-            self.stored_rows = [dict(row) for row in parameters]
+            self.stored_rows = [
+                dict(stored_row) for stored_row in parameters
+            ]
             return _Result()
         if "SELECT rule_digest" in sql:
             return _Result(self.stored_rows)
@@ -116,7 +119,7 @@ def _projection_row(
     npi_keys_by_pattern: dict[int, tuple[int, ...]] | None = None,
 ) -> dict[str, Any]:
     rule_digest = candidates.inferred_provider_taxonomy_rule_digest(rule)
-    payload = candidates.pack_inferred_taxonomy_npi_keys(npi_keys)
+    member_payload = candidates.pack_inferred_taxonomy_npi_keys(npi_keys)
     pattern_members = npi_keys_by_pattern or {}
     pattern_payload = candidates.pack_inferred_taxonomy_pattern_npi_keys(
         pattern_members
@@ -141,9 +144,9 @@ def _projection_row(
         "member_digest": candidates.inferred_taxonomy_member_digest(
             rule_digest,
             member_count=len(npi_keys),
-            payload=payload,
+            payload=member_payload,
         ),
-        "member_keys": payload,
+        "member_keys": member_payload,
         "representation": representation,
         "pattern_count": len(pattern_members),
         "pattern_member_count": pattern_member_count,
@@ -166,7 +169,7 @@ def _observe_projection_row(
     npi_keys: tuple[int, ...],
 ) -> dict[str, Any]:
     rule_digest = candidates.inferred_provider_taxonomy_rule_digest(rule)
-    payload = candidates.pack_inferred_taxonomy_npi_keys(npi_keys)
+    member_payload = candidates.pack_inferred_taxonomy_npi_keys(npi_keys)
     representation = (
         candidates.PTG2_V4_INFERRED_TAXONOMY_OBSERVE_REPRESENTATION
     )
@@ -181,9 +184,9 @@ def _observe_projection_row(
         "member_digest": candidates.inferred_taxonomy_member_digest(
             rule_digest,
             member_count=len(npi_keys),
-            payload=payload,
+            payload=member_payload,
         ),
-        "member_keys": payload,
+        "member_keys": member_payload,
         "representation": representation,
         "observe_reason": (
             candidates.PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_CAP_REASON
@@ -206,37 +209,41 @@ def _observe_projection_row(
 
 
 def _reader_row(
-    row: dict[str, Any],
+    projection_row: dict[str, Any],
     *,
     member_keys: bytes | None = None,
     pattern_member_payload: bytes | None = None,
     root_pattern_count: int | None = None,
 ) -> dict[str, Any]:
-    candidate_payload = row["member_keys"] if member_keys is None else member_keys
+    candidate_payload = (
+        projection_row["member_keys"]
+        if member_keys is None
+        else member_keys
+    )
     pattern_payload = (
-        row["pattern_member_payload"]
+        projection_row["pattern_member_payload"]
         if pattern_member_payload is None
         else pattern_member_payload
     )
     if root_pattern_count is None:
         root_pattern_count = (
-            max(row.get("pattern_count", 0), 10)
-            if row.get("representation") == "pattern_v1"
+            max(projection_row.get("pattern_count", 0), 10)
+            if projection_row.get("representation") == "pattern_v1"
             else 0
         )
     return {
-        "catalog_contract": row["catalog_contract"],
-        "catalog_digest": row["catalog_digest"],
-        "vector_format": row["vector_format"],
-        "member_count": row["member_count"],
-        "member_digest": row["member_digest"],
+        "catalog_contract": projection_row["catalog_contract"],
+        "catalog_digest": projection_row["catalog_digest"],
+        "vector_format": projection_row["vector_format"],
+        "member_count": projection_row["member_count"],
+        "member_digest": projection_row["member_digest"],
         "member_keys": candidate_payload,
         "member_bytes": len(candidate_payload),
-        "representation": row["representation"],
-        "pattern_count": row["pattern_count"],
-        "pattern_member_count": row["pattern_member_count"],
-        "pattern_member_bytes": row["pattern_member_bytes"],
-        "pattern_member_digest": row["pattern_member_digest"],
+        "representation": projection_row["representation"],
+        "pattern_count": projection_row["pattern_count"],
+        "pattern_member_count": projection_row["pattern_member_count"],
+        "pattern_member_bytes": projection_row["pattern_member_bytes"],
+        "pattern_member_digest": projection_row["pattern_member_digest"],
         "pattern_member_payload": pattern_payload,
         "pattern_payload_bytes": len(pattern_payload),
         "root_state": "complete",
@@ -249,6 +256,8 @@ def _reader_row(
 async def test_publication_is_individual_only_packed_and_rule_stable(
     monkeypatch,
 ) -> None:
+    """Publish stable individual candidates and authenticate their rule set."""
+
     async def no_op_lock(*_args, **_kwargs):
         return None
 
@@ -311,7 +320,7 @@ async def test_publication_is_individual_only_packed_and_rule_stable(
     assert publication.manifest["pattern_member_count"] == 0
     assert publication.manifest["pattern_member_bytes"] == 0
     assert {
-        row["representation"] for row in session.stored_rows
+        stored_row["representation"] for stored_row in session.stored_rows
     } == {"direct_v1"}
 
     first_rule = _rules()[0]
@@ -334,6 +343,8 @@ async def test_publication_is_individual_only_packed_and_rule_stable(
 async def test_publication_accepts_rule_scoped_pattern_projection(
     monkeypatch,
 ) -> None:
+    """Publish exact rule-scoped pattern postings under the sealed root."""
+
     async def no_op_lock(*_args, **_kwargs):
         return None
 
@@ -372,7 +383,8 @@ async def test_publication_accepts_rule_scoped_pattern_projection(
     )
 
     row_by_rule_digest = {
-        row["rule_digest"]: row for row in session.stored_rows
+        stored_row["rule_digest"]: stored_row
+        for stored_row in session.stored_rows
     }
     factored = row_by_rule_digest[first_rule_digest]
     assert factored["representation"] == "pattern_v1"
@@ -386,7 +398,7 @@ async def test_publication_accepts_rule_scoped_pattern_projection(
     assert publication.pattern_count == 3
     assert publication.pattern_member_count == 4
     assert {
-        row["representation"] for row in session.stored_rows
+        stored_row["representation"] for stored_row in session.stored_rows
     } == {"pattern_v1"}
     assert len(graph_calls) == 2
     assert all(call["relation"] == "npi_patterns" for call in graph_calls)
@@ -433,7 +445,7 @@ async def test_publication_bounds_rule_catalog_before_materialization(
     assert publication.rule_count == 1
     assert publication.observe_only_rule_count == 1
     assert {
-        row["representation"] for row in session.stored_rows
+        stored_row["representation"] for stored_row in session.stored_rows
     } == {"direct_v1", "observe_v1"}
     assert publication.manifest["observe_only_rules"][0]["status"] == (
         "observe_only"
@@ -457,6 +469,8 @@ async def test_publication_bounds_rule_catalog_before_materialization(
 
 @pytest.mark.asyncio
 async def test_publication_can_seal_an_all_observe_rule_set(monkeypatch) -> None:
+    """Seal a rule set whose every member vector exceeds the online cap."""
+
     async def no_op_lock(*_args, **_kwargs):
         return None
 
@@ -514,7 +528,7 @@ async def test_publication_can_seal_an_all_observe_rule_set(monkeypatch) -> None
     assert publication.manifest["rules"] == []
     assert len(publication.manifest["observe_only_rules"]) == 2
     assert {
-        row["representation"] for row in session.stored_rows
+        stored_row["representation"] for stored_row in session.stored_rows
     } == {"observe_v1"}
     assert candidates.validate_v4_inferred_taxonomy_projection_manifest(
         publication.manifest
@@ -525,6 +539,8 @@ async def test_publication_can_seal_an_all_observe_rule_set(monkeypatch) -> None
 async def test_pattern_publication_rejects_root_and_projection_drift(
     monkeypatch,
 ) -> None:
+    """Reject pattern evidence that changes its root or candidate coverage."""
+
     async def no_op_lock(*_args, **_kwargs):
         return None
 
@@ -642,21 +658,22 @@ async def test_pattern_publication_empty_evidence_is_explicit(
     assert publication.member_count == 0
     assert publication.pattern_member_count == 0
     assert {
-        row["representation"] for row in empty_session.stored_rows
+        stored_row["representation"]
+        for stored_row in empty_session.stored_rows
     } == {"direct_v1"}
 
 
 def test_pattern_posting_codec_is_compact_strict_and_deterministic() -> None:
-    payload = candidates.pack_inferred_taxonomy_pattern_npi_keys(
+    packed_pattern_payload = candidates.pack_inferred_taxonomy_pattern_npi_keys(
         {9: (2, 5), 2: (0, 2)}
     )
-    assert len(payload) == 24 + 2 * 8 + 4 * 4
+    assert len(packed_pattern_payload) == 24 + 2 * 8 + 4 * 4
     assert candidates.unpack_inferred_taxonomy_pattern_npi_keys(
-        payload,
+        packed_pattern_payload,
         pattern_count=2,
         pattern_member_count=4,
     ) == {2: (0, 2), 9: (2, 5)}
-    assert payload == candidates.pack_inferred_taxonomy_pattern_npi_keys(
+    assert packed_pattern_payload == candidates.pack_inferred_taxonomy_pattern_npi_keys(
         {2: (0, 2), 9: (2, 5)}
     )
 
@@ -664,13 +681,13 @@ def test_pattern_posting_codec_is_compact_strict_and_deterministic() -> None:
         candidates.pack_inferred_taxonomy_pattern_npi_keys({2: (2, 2)})
     with pytest.raises(PTG2ManifestArtifactError, match="trailing data"):
         candidates.unpack_inferred_taxonomy_pattern_npi_keys(
-            payload + b"\x00",
+            packed_pattern_payload + b"\x00",
             pattern_count=2,
             pattern_member_count=4,
         )
     with pytest.raises(PTG2ManifestArtifactError, match="truncated"):
         candidates.unpack_inferred_taxonomy_pattern_npi_keys(
-            payload[:-1],
+            packed_pattern_payload[:-1],
             pattern_count=2,
             pattern_member_count=4,
         )
@@ -790,11 +807,11 @@ def test_observe_rule_is_explicit_fallback_and_status_is_authenticated(
 
 @pytest.mark.asyncio
 async def test_persisted_summary_enforces_global_pattern_bound() -> None:
-    row = _projection_row(
+    projection_row = _projection_row(
         _rules()[0],
         npi_keys_by_pattern={9: (0, 2)},
     )
-    session = _ScriptedSession(_Result((row,)))
+    session = _ScriptedSession(_Result((projection_row,)))
 
     with pytest.raises(RuntimeError, match="exceeds its pattern root"):
         await candidates.summarize_v4_inferred_taxonomy_candidates(
@@ -809,17 +826,17 @@ async def test_persisted_summary_enforces_global_pattern_bound() -> None:
 
 @pytest.mark.asyncio
 async def test_reader_uses_one_bounded_authenticated_round_trip() -> None:
-    row = _projection_row(
+    projection_row = _projection_row(
         _rules()[0],
         npi_keys_by_pattern={9: (0, 2)},
     )
-    manifest = candidates._candidate_projection_manifest((row,))
-    session = _ScriptedSession(_Result((_reader_row(row),)))
+    manifest = candidates._candidate_projection_manifest((projection_row,))
+    session = _ScriptedSession(_Result((_reader_row(projection_row),)))
 
     loaded = await candidates.load_v4_inferred_taxonomy_candidates(
         session,
         snapshot_key=41,
-        rule_digest=row["rule_digest"],
+        rule_digest=projection_row["rule_digest"],
         schema_name="mrf",
         projection_manifest=manifest,
     )
@@ -834,8 +851,10 @@ async def test_reader_uses_one_bounded_authenticated_round_trip() -> None:
 
 @pytest.mark.asyncio
 async def test_reader_rejects_manifest_payload_and_cap_tamper() -> None:
-    row = _projection_row(_rules()[0])
-    manifest = candidates._candidate_projection_manifest((row,))
+    """Reject sealed manifest, payload, root, and cap drift before serving."""
+
+    projection_row = _projection_row(_rules()[0])
+    manifest = candidates._candidate_projection_manifest((projection_row,))
     tampered_manifest = deepcopy(manifest)
     tampered_manifest["projection_digest"] = "0" * 64
     no_query_session = _ScriptedSession()
@@ -843,22 +862,29 @@ async def test_reader_rejects_manifest_payload_and_cap_tamper() -> None:
         await candidates.load_v4_inferred_taxonomy_candidates(
             no_query_session,
             snapshot_key=41,
-            rule_digest=row["rule_digest"],
+            rule_digest=projection_row["rule_digest"],
             schema_name="mrf",
             projection_manifest=tampered_manifest,
         )
     assert no_query_session.calls == []
 
-    tampered_payload = bytearray(row["member_keys"])
+    tampered_payload = bytearray(projection_row["member_keys"])
     tampered_payload[-1] ^= 1
     payload_session = _ScriptedSession(
-        _Result((_reader_row(row, member_keys=bytes(tampered_payload)),))
+        _Result(
+            (
+                _reader_row(
+                    projection_row,
+                    member_keys=bytes(tampered_payload),
+                ),
+            )
+        )
     )
     with pytest.raises(PTG2ManifestArtifactError, match="digest changed"):
         await candidates.load_v4_inferred_taxonomy_candidates(
             payload_session,
             snapshot_key=41,
-            rule_digest=row["rule_digest"],
+            rule_digest=projection_row["rule_digest"],
             schema_name="mrf",
             projection_manifest=manifest,
         )
@@ -918,7 +944,7 @@ async def test_reader_rejects_manifest_payload_and_cap_tamper() -> None:
         await candidates.load_v4_inferred_taxonomy_candidates(
             capped_session,
             snapshot_key=41,
-            rule_digest=row["rule_digest"],
+            rule_digest=projection_row["rule_digest"],
             schema_name="mrf",
             projection_manifest=capped_manifest,
         )
@@ -940,7 +966,7 @@ def test_seal_and_reuse_validation_reject_projection_manifest_drift() -> None:
         summary=summary,
         metadata=metadata,
     )
-    existing = {
+    existing_root_map = {
         "snapshot_key": 41,
         "layout_manifest": layout_manifest,
         "layout_mapping_digest": summary.map_digest,
@@ -962,9 +988,11 @@ def test_seal_and_reuse_validation_reject_projection_manifest_drift() -> None:
         "relation_count": metadata.relation_count,
         "heavy_owner_count": metadata.heavy_owner_count,
     }
-    assert snapshot_maps._validate_sealed_reservation(existing) == layout_manifest
+    assert snapshot_maps._validate_sealed_reservation(
+        existing_root_map
+    ) == layout_manifest
 
-    tampered = deepcopy(existing)
+    tampered = deepcopy(existing_root_map)
     projection_manifest = tampered["layout_manifest"]["serving_index"][
         "serving_binary"
     ]["provider_graph_v4"]["inferred_taxonomy_candidates"]

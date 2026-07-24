@@ -92,7 +92,7 @@ async def get_pharmacy_license_import_status(request):
     if run_row is None:
         raise NotFound("No pharmacy-license imports found")
 
-    run_data = dict(run_row._mapping)
+    run_by_field = dict(run_row._mapping)
     stats_row = (
         await session.execute(
             select(
@@ -101,20 +101,20 @@ async def get_pharmacy_license_import_status(request):
                 func.coalesce(func.sum(snapshot_table.c.row_count_matched), 0).label("matched_rows"),
                 func.coalesce(func.sum(snapshot_table.c.row_count_dropped), 0).label("dropped_rows"),
                 func.coalesce(func.sum(snapshot_table.c.row_count_inserted), 0).label("inserted_rows"),
-            ).where(snapshot_table.c.run_id == run_data["run_id"])
+            ).where(snapshot_table.c.run_id == run_by_field["run_id"])
         )
     ).first()
     stats = stats_row._mapping if stats_row else {}
 
     return response.json(
         {
-            "run_id": run_data.get("run_id"),
-            "import_id": run_data.get("import_id"),
-            "status": run_data.get("status"),
-            "started_at": run_data.get("started_at").isoformat() if run_data.get("started_at") else None,
-            "finished_at": run_data.get("finished_at").isoformat() if run_data.get("finished_at") else None,
-            "source_summary": run_data.get("source_summary") or {},
-            "error_text": run_data.get("error_text"),
+            "run_id": run_by_field.get("run_id"),
+            "import_id": run_by_field.get("import_id"),
+            "status": run_by_field.get("status"),
+            "started_at": run_by_field.get("started_at").isoformat() if run_by_field.get("started_at") else None,
+            "finished_at": run_by_field.get("finished_at").isoformat() if run_by_field.get("finished_at") else None,
+            "source_summary": run_by_field.get("source_summary") or {},
+            "error_text": run_by_field.get("error_text"),
             "snapshots": {
                 "count": int(stats.get("snapshot_count") or 0),
                 "parsed_rows": int(stats.get("parsed_rows") or 0),
@@ -141,16 +141,16 @@ async def get_pharmacy_license_coverage(request):
         )
 
     table = PharmacyLicenseStateCoverage.__table__
-    rows = (await session.execute(select(table).order_by(table.c.state_code.asc()))).all()
+    coverage_rows = (await session.execute(select(table).order_by(table.c.state_code.asc()))).all()
 
-    items: list[dict[str, Any]] = []
+    coverage_items: list[dict[str, Any]] = []
     supported = 0
-    for row in rows:
-        mapping = row._mapping
+    for coverage_row in coverage_rows:
+        mapping = coverage_row._mapping
         is_supported = bool(mapping.get("supported"))
         if is_supported:
             supported += 1
-        items.append(
+        coverage_items.append(
             {
                 "state_code": mapping.get("state_code"),
                 "state_name": mapping.get("state_name"),
@@ -173,13 +173,13 @@ async def get_pharmacy_license_coverage(request):
             }
         )
 
-    total_states = len(items)
+    total_states = len(coverage_items)
     return response.json(
         {
             "total_states": total_states,
             "supported_states": supported,
             "unsupported_states": max(total_states - supported, 0),
-            "items": items,
+            "items": coverage_items,
         }
     )
 
@@ -212,7 +212,7 @@ async def get_pharmacy_license_by_npi(request, npi):
         )
 
     table = PharmacyLicenseRecord.__table__
-    rows = (
+    license_rows = (
         await session.execute(
             select(table)
             .where(table.c.npi == parsed_npi)
@@ -223,11 +223,11 @@ async def get_pharmacy_license_by_npi(request, npi):
     licenses: list[dict[str, Any]] = []
     active_states: set[str] = set()
     active_license_count = 0
-    disciplinary_flag_any = False
+    has_disciplinary_flag = False
     latest_verified: datetime.datetime | None = None
 
-    for row in rows:
-        mapping = row._mapping
+    for license_row in license_rows:
+        mapping = license_row._mapping
         exp_date = mapping.get("license_expiration_date")
         status = str(mapping.get("license_status") or "unknown").lower()
         is_active = status == "active" and (exp_date is None or exp_date >= as_of)
@@ -235,7 +235,7 @@ async def get_pharmacy_license_by_npi(request, npi):
             active_states.add(str(mapping.get("state_code") or "").upper())
             active_license_count += 1
         if bool(mapping.get("disciplinary_flag")):
-            disciplinary_flag_any = True
+            has_disciplinary_flag = True
 
         verified_at = mapping.get("last_verified_at")
         if verified_at and (latest_verified is None or verified_at > latest_verified):
@@ -283,7 +283,7 @@ async def get_pharmacy_license_by_npi(request, npi):
             }
         )
 
-    history: list[dict[str, Any]] = []
+    license_history_rows: list[dict[str, Any]] = []
     if include_history and await _is_table_available(session, PharmacyLicenseRecordHistory.__tablename__):
         hist_table = PharmacyLicenseRecordHistory.__table__
         hist_rows = (
@@ -294,9 +294,9 @@ async def get_pharmacy_license_by_npi(request, npi):
                 .limit(history_limit)
             )
         ).all()
-        for row in hist_rows:
-            mapping = row._mapping
-            history.append(
+        for history_row in hist_rows:
+            mapping = history_row._mapping
+            license_history_rows.append(
                 {
                     "snapshot_id": mapping.get("snapshot_id"),
                     "run_id": mapping.get("run_id"),
@@ -321,10 +321,10 @@ async def get_pharmacy_license_by_npi(request, npi):
                 "total_licenses": len(licenses),
                 "active_license_count": active_license_count,
                 "active_states": sorted(state for state in active_states if state),
-                "disciplinary_flag_any": disciplinary_flag_any,
+                "disciplinary_flag_any": has_disciplinary_flag,
                 "latest_verified_at": latest_verified.isoformat() if latest_verified else None,
             },
             "licenses": licenses,
-            "history": history,
+            "history": license_history_rows,
         }
     )

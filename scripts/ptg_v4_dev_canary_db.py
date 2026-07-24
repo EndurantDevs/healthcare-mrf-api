@@ -230,6 +230,8 @@ async def _exact_counts(
     schema_name: str,
     snapshot_key: int,
 ) -> dict[str, int]:
+    """Collect exact candidate, map, graph, and pricing counts."""
+
     schema = _quote_identifier(schema_name)
     count_record = await connection.fetchrow(
         f"""
