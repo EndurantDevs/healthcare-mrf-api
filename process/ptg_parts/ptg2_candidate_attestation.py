@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Durable release-audit attestations for strict V3 candidate activation."""
+"""Durable release-audit attestations for shared candidate activation."""
 
 from __future__ import annotations
 
@@ -21,6 +21,12 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_TOOL,
     PTG2_FAST_AUDIT_TOOL_VERSION,
     validated_public_audit_sample_projection,
+)
+from process.ptg_parts.ptg2_candidate_layout_identity import (
+    PTG2_CANDIDATE_V3_GENERATION,
+    PTG2_CANDIDATE_V4_GENERATION,
+    normalize_candidate_storage_generation,
+    validate_candidate_layout_identity,
 )
 from process.ptg_parts.ptg2_batch_candidate_audit_report import (
     PTG2_BATCH_AUDIT_ATTESTATION_CONTRACT,
@@ -590,6 +596,7 @@ def _validate_v3_release_report(
     report_bytes = _canonical_report_bytes(sections.report_by_field)
     return {
         "contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+        "storage_generation": PTG2_CANDIDATE_V3_GENERATION,
         "tool_name": PTG2_CANDIDATE_AUDIT_TOOL,
         "tool_version": tool_version,
         "report_digest": hashlib.sha256(report_bytes).digest(),
@@ -611,10 +618,14 @@ def validate_candidate_release_audit_report(
     source_key: str,
     plan_id: str,
     plan_market_type: str,
+    storage_generation: str = PTG2_CANDIDATE_V3_GENERATION,
     evaluated_at: datetime.datetime | None = None,
 ) -> dict[str, Any]:
     """Dispatch strict V3 and V4 release reports without rewriting history."""
 
+    normalized_generation = normalize_candidate_storage_generation(
+        storage_generation
+    )
     if report.get("schema_version") == PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION:
         return validate_batch_candidate_release_audit_report(
             report,
@@ -622,7 +633,12 @@ def validate_candidate_release_audit_report(
             source_key=source_key,
             plan_id=plan_id,
             plan_market_type=plan_market_type,
+            storage_generation=normalized_generation,
             evaluated_at=evaluated_at,
+        )
+    if normalized_generation != PTG2_CANDIDATE_V3_GENERATION:
+        raise ValueError(
+            "legacy candidate audit reports require shared_blocks_v3"
         )
     return _validate_v3_release_report(
         report,
@@ -815,9 +831,14 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
         != PTG2_CANDIDATE_ACTIVATION_CONTRACT
         or activation_by_field.get("state") != "validated"
     ):
-        raise ValueError("snapshot is not a strict V3 validated candidate")
+        raise ValueError("snapshot is not a strict validated candidate")
     layout_serving_index_by_field = _mapping(
         layout_manifest_by_field.get("serving_index")
+    )
+    storage_generation = validate_candidate_layout_identity(
+        database_row,
+        serving_index_by_field,
+        layout_serving_index_by_field,
     )
     physical_identity = _validated_candidate_physical_identity(
         database_row,
@@ -845,6 +866,7 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
     )
     return {
         "snapshot_key": int(database_row["snapshot_key"]),
+        "storage_generation": storage_generation,
         "source_key": str(
             activation_by_field.get("source_key") or ""
         ).strip().lower(),
@@ -881,7 +903,12 @@ async def _locked_candidate_identity(
                    scope.plan_id,
                    scope.plan_market_type,
                    scope.coverage_scope_id,
+                   layout.state AS layout_state,
+                   layout.generation AS layout_generation,
+                   layout.mapping_digest AS layout_mapping_digest,
                    layout.layout_manifest,
+                   v4_root.state AS v4_root_state,
+                   v4_root.map_digest AS v4_root_map_digest,
                    ARRAY(
                        SELECT source.raw_container_sha256
                          FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_source source
@@ -895,13 +922,26 @@ async def _locked_candidate_identity(
                 ON scope.snapshot_id = snapshot.snapshot_id
               JOIN {_quote_ident(schema_name)}.ptg2_v3_snapshot_layout layout
                 ON layout.snapshot_key = binding.snapshot_key
+              LEFT JOIN {_quote_ident(schema_name)}.ptg2_v4_snapshot_map_root v4_root
+                ON v4_root.snapshot_key = layout.snapshot_key
              WHERE snapshot.snapshot_id = :snapshot_id
                AND layout.state = 'sealed'
-               AND layout.generation = 'shared_blocks_v3'
+               AND (
+                    layout.generation = :v3_generation
+                    OR (
+                        layout.generation = :v4_generation
+                        AND v4_root.state = 'complete'
+                        AND v4_root.map_digest = layout.mapping_digest
+                    )
+               )
              FOR UPDATE OF snapshot
             """
         ),
-        {"snapshot_id": snapshot_id},
+        {
+            "snapshot_id": snapshot_id,
+            "v3_generation": PTG2_CANDIDATE_V3_GENERATION,
+            "v4_generation": PTG2_CANDIDATE_V4_GENERATION,
+        },
     )
     candidate_row = query_result.one_or_none()
     if candidate_row is None:
@@ -926,6 +966,7 @@ async def record_candidate_audit_attestation(
     plan_id: str,
     plan_market_type: str,
     report: Mapping[str, Any],
+    storage_generation: str = PTG2_CANDIDATE_V3_GENERATION,
 ) -> dict[str, Any]:
     """Persist a passing release report against the candidate's immutable identity."""
 
@@ -933,6 +974,9 @@ async def record_candidate_audit_attestation(
     normalized_source_key = str(source_key or "").strip().lower()
     normalized_plan_id = str(plan_id or "").strip()
     normalized_market_type = str(plan_market_type or "").strip().lower()
+    normalized_storage_generation = normalize_candidate_storage_generation(
+        storage_generation
+    )
     if not all(
         (
             normalized_snapshot_id,
@@ -949,6 +993,7 @@ async def record_candidate_audit_attestation(
         source_key=normalized_source_key,
         plan_id=normalized_plan_id,
         plan_market_type=normalized_market_type,
+        storage_generation=normalized_storage_generation,
         evaluated_at=preflight_now,
     )
     _require_current_candidate_attestation_writer(evidence)
@@ -962,6 +1007,7 @@ async def record_candidate_audit_attestation(
             source_key=normalized_source_key,
             plan_id=normalized_plan_id,
             plan_market_type=normalized_market_type,
+            storage_generation=normalized_storage_generation,
             evaluated_at=now,
         )
         _require_current_candidate_attestation_writer(evidence)
@@ -980,6 +1026,10 @@ async def record_candidate_audit_attestation(
             identity["source_key"] != normalized_source_key
             or identity["plan_id"] != normalized_plan_id
             or identity["plan_market_type"] != normalized_market_type
+            or identity["storage_generation"]
+            != normalized_storage_generation
+            or evidence["storage_generation"]
+            != normalized_storage_generation
         ):
             raise ValueError("audit target does not match the candidate bindings")
         if evidence["audit_sample_digest"] != identity["audit_sample_digest"]:

@@ -229,6 +229,14 @@ def test_release_report_validation_is_exact_and_deterministic():
     assert first["standard_api_actual_http_requests"] == 10_001
 
 
+def test_release_report_rejects_a_missing_top_level_section():
+    report = _release_report()
+    report.pop("failures")
+
+    with pytest.raises(ValueError, match="missing=failures"):
+        ptg2_candidate_attestation._v3_report_sections(report)
+
+
 def test_release_report_rejects_non_uvloop_or_non_aiohttp_runtime():
     report = _release_report()
     report["runtime"] = {"http_client": "httpx", "event_loop": "asyncio"}
@@ -512,6 +520,8 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
     audit_sample_digest = "ab" * 32
     coverage_scope_id = b"c" * 32
     serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": _audit_sample(audit_sample_digest),
@@ -519,6 +529,8 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
     layout_serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_count": 1,
         "audit_sample": _audit_sample(audit_sample_digest),
@@ -539,6 +551,8 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
             },
             "layout_manifest": {"serving_index": layout_serving_index},
             "snapshot_key": 17,
+            "layout_state": "sealed",
+            "layout_generation": "shared_blocks_v3",
             "plan_id": "12-3456789",
             "plan_market_type": "group",
             "coverage_scope_id": coverage_scope_id,
@@ -557,6 +571,65 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
     )
 
 
+def test_candidate_identity_binds_complete_v4_packed_root():
+    raw_container_digest = b"x" * 32
+    map_digest = b"m" * 32
+    coverage_scope_id = b"c" * 32
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
+        [raw_container_digest.hex()]
+    )
+    common_index = {
+        "arch_version": "postgres_binary_v3",
+        "type": "ptg2_shared_blocks_v4",
+        "storage_generation": "shared_blocks_v4",
+        "provider_scope_strategy": "postgres_packed_graph_v4",
+        "shared_block_layout": "packed_snapshot_maps_v4",
+        "shared_snapshot_key": 17,
+        "snapshot_map": {"map_digest": map_digest.hex()},
+        "coverage_scope_id": coverage_scope_id.hex(),
+        "source_witness": _source_witness(source_set),
+        "audit_sample": _audit_sample("ab" * 32),
+        "provider_identifier_quarantine": (
+            EMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+        ),
+    }
+    identity = ptg2_candidate_attestation._candidate_identity(
+        {
+            "status": "validated",
+            "manifest": {
+                "activation": {
+                    "contract": "ptg2_candidate_activation_v1",
+                    "state": "validated",
+                    "source_key": "source_a",
+                },
+                "serving_index": {
+                    **common_index,
+                    "source_set": source_set,
+                },
+            },
+            "layout_manifest": {
+                "serving_index": {
+                    **common_index,
+                    "source_count": 1,
+                }
+            },
+            "snapshot_key": 17,
+            "layout_state": "sealed",
+            "layout_generation": "shared_blocks_v4",
+            "layout_mapping_digest": map_digest,
+            "v4_root_state": "complete",
+            "v4_root_map_digest": map_digest,
+            "plan_id": "12-3456789",
+            "plan_market_type": "group",
+            "coverage_scope_id": coverage_scope_id,
+            "raw_container_sha256_values": [raw_container_digest],
+        }
+    )
+
+    assert identity["storage_generation"] == "shared_blocks_v4"
+    assert identity["snapshot_key"] == 17
+
+
 def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
     raw_container_digest = b"x" * 32
     source_set = ptg2_candidate_attestation.shared_source_set_metadata(
@@ -564,6 +637,8 @@ def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
     )
     coverage_scope_id = b"c" * 32
     serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": _audit_sample("ab" * 32),
@@ -585,6 +660,8 @@ def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
                 },
                 "layout_manifest": {
                     "serving_index": {
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v3",
                         "coverage_scope_id": coverage_scope_id.hex(),
                         "source_count": 1,
                         "audit_sample": _audit_sample("cd" * 32),
@@ -593,6 +670,8 @@ def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
                     }
                 },
                 "snapshot_key": 17,
+                "layout_state": "sealed",
+                "layout_generation": "shared_blocks_v3",
                 "plan_id": "12-3456789",
                 "plan_market_type": "group",
                 "coverage_scope_id": coverage_scope_id,
@@ -608,6 +687,8 @@ def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
     )
     coverage_scope_id = b"c" * 32
     serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": _audit_sample("ab" * 32),
@@ -629,6 +710,8 @@ def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
                 },
                 "layout_manifest": {
                     "serving_index": {
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v3",
                         "coverage_scope_id": coverage_scope_id.hex(),
                         "source_count": 1,
                         "audit_sample": _audit_sample("ab" * 32),
@@ -637,6 +720,8 @@ def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
                     }
                 },
                 "snapshot_key": 17,
+                "layout_state": "sealed",
+                "layout_generation": "shared_blocks_v3",
                 "plan_id": "12-3456789",
                 "plan_market_type": "group",
                 "coverage_scope_id": coverage_scope_id,
@@ -652,6 +737,8 @@ def test_candidate_identity_rejects_snapshot_layout_physical_scope_mismatch():
     )
     coverage_scope_id = b"c" * 32
     serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_set": source_set,
         "audit_sample": _audit_sample("ab" * 32),
@@ -673,6 +760,8 @@ def test_candidate_identity_rejects_snapshot_layout_physical_scope_mismatch():
                 },
                 "layout_manifest": {
                     "serving_index": {
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v3",
                         "coverage_scope_id": (b"d" * 32).hex(),
                         "source_count": 1,
                         "audit_sample": _audit_sample("ab" * 32),
@@ -681,6 +770,8 @@ def test_candidate_identity_rejects_snapshot_layout_physical_scope_mismatch():
                     }
                 },
                 "snapshot_key": 17,
+                "layout_state": "sealed",
+                "layout_generation": "shared_blocks_v3",
                 "plan_id": "12-3456789",
                 "plan_market_type": "group",
                 "coverage_scope_id": coverage_scope_id,
@@ -749,6 +840,7 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     session = _Session()
     identity_map = {
         "snapshot_key": 17,
+        "storage_generation": "shared_blocks_v3",
         "source_key": "source_a",
         "plan_id": "12-3456789",
         "plan_market_type": "group",
@@ -829,6 +921,7 @@ def test_record_candidate_attestation_rejects_report_quarantine_mismatch(monkeyp
     session = _Session()
     identity_map = {
         "snapshot_key": 17,
+        "storage_generation": "shared_blocks_v3",
         "source_key": "source_a",
         "plan_id": "12-3456789",
         "plan_market_type": "group",
@@ -887,6 +980,7 @@ def test_attestation_expiry_is_capped_by_report_freshness(monkeypatch):
     session = _Session()
     identity_map = {
         "snapshot_key": 17,
+        "storage_generation": "shared_blocks_v3",
         "source_key": "source_a",
         "plan_id": "12-3456789",
         "plan_market_type": "group",
@@ -1923,6 +2017,15 @@ def test_candidate_attestation_report_shape_validation_edges():
             plan_id="p",
             plan_market_type="group",
         )
+    with pytest.raises(ValueError, match="legacy candidate audit reports require"):
+        ptg2_candidate_attestation.validate_candidate_release_audit_report(
+            _release_report(),
+            snapshot_id="snap_new",
+            source_key="source_a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            storage_generation="shared_blocks_v4",
+        )
 
 
 def test_candidate_attestation_physical_identity_validation_edges():
@@ -1986,7 +2089,7 @@ def test_candidate_attestation_source_witness_validation_edges():
 
 def test_candidate_attestation_v3_check_validation_edges():
     """Reject invalid V3 status, check counts, and witness sections."""
-    with pytest.raises(ValueError, match="strict V3 validated candidate"):
+    with pytest.raises(ValueError, match="strict validated candidate"):
         ptg2_candidate_attestation._candidate_identity({"status": "invalid"})
     check_counts_by_name = {
         "source_witnesses": 3,
@@ -2079,6 +2182,9 @@ def test_locked_candidate_identity_loads_and_validates_database_row(monkeypatch)
     assert identity == {"snapshot_key": 17}
     candidate_identity.assert_called_once_with(database_row_by_field)
     assert "FOR UPDATE OF snapshot" in session.calls[0][0]
+    assert "ptg2_v4_snapshot_map_root v4_root" in session.calls[0][0]
+    assert session.calls[0][1]["v3_generation"] == "shared_blocks_v3"
+    assert session.calls[0][1]["v4_generation"] == "shared_blocks_v4"
 
 
 def test_locked_candidate_identity_rejects_missing_candidate():
@@ -2124,10 +2230,11 @@ def _install_v4_attestation_writer(
     evidence,
     database_now,
 ):
+    report_validator = Mock(return_value=evidence)
     monkeypatch.setattr(
         ptg2_candidate_attestation,
         "validate_candidate_release_audit_report",
-        Mock(return_value=evidence),
+        report_validator,
     )
     monkeypatch.setattr(
         ptg2_candidate_attestation.db,
@@ -2149,15 +2256,17 @@ def _install_v4_attestation_writer(
         "_locked_candidate_identity",
         AsyncMock(return_value=identity),
     )
+    return report_validator
 
 
-def _record_v4_attestation():
+def _record_v4_attestation(*, storage_generation="shared_blocks_v3"):
     return ptg2_candidate_attestation.record_candidate_audit_attestation(
         snapshot_id="snap-new",
         source_key="source-a",
         plan_id="12-3456789",
         plan_market_type="group",
         report=writer_report_by_field(4),
+        storage_generation=storage_generation,
     )
 
 
@@ -2228,6 +2337,35 @@ def test_v4_attestation_writer_persists_request_accounting(monkeypatch):
     assert session.calls[0][1]["contract"] == (
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
     )
+
+
+def test_v4_attestation_writer_binds_packed_storage_generation(monkeypatch):
+    database_now = datetime.datetime(2026, 7, 20, 12, tzinfo=datetime.timezone.utc)
+    report = writer_report_by_field(4)
+    evidence = writer_evidence_by_field(report, completed_at=database_now)
+    evidence["storage_generation"] = "shared_blocks_v4"
+    identity = writer_identity_by_field()
+    identity["storage_generation"] = "shared_blocks_v4"
+    session = _Session()
+    report_validator = _install_v4_attestation_writer(
+        monkeypatch,
+        session=session,
+        identity=identity,
+        evidence=evidence,
+        database_now=database_now,
+    )
+
+    result = asyncio.run(
+        _record_v4_attestation(storage_generation="shared_blocks_v4")
+    )
+
+    assert result["status"] == "attested"
+    assert report_validator.call_count == 2
+    assert all(
+        call.kwargs["storage_generation"] == "shared_blocks_v4"
+        for call in report_validator.call_args_list
+    )
+    assert session.calls[0][1]["snapshot_key"] == 17
 
 
 def test_v4_attestation_writer_rejects_conflicting_existing_evidence(monkeypatch):

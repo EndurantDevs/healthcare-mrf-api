@@ -37,6 +37,11 @@ from process.ptg_parts.ptg2_candidate_attestation import (
     PTG2_VERIFIED_HTTPS_TRANSPORT,
     record_candidate_audit_attestation,
 )
+from process.ptg_parts.ptg2_candidate_layout_identity import (
+    PTG2_CANDIDATE_ARCH_VERSION,
+    PTG2_CANDIDATE_V3_GENERATION,
+    validate_candidate_layout_identity,
+)
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_evidence,
     validate_provider_identifier_quarantine_evidence,
@@ -61,8 +66,8 @@ from scripts.validation import ptg2_v3_source_api_audit
 
 
 IMPORTER_NAME = "ptg-candidate-audit"
-ARCH_VERSION = "postgres_binary_v3"
-STORAGE_GENERATION = "shared_blocks_v3"
+ARCH_VERSION = PTG2_CANDIDATE_ARCH_VERSION
+STORAGE_GENERATION = PTG2_CANDIDATE_V3_GENERATION
 PTG2_BATCH_AUDIT_WRITER_ENABLED = (
     PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
     == PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
@@ -84,7 +89,10 @@ _CANDIDATE_TARGET_SQL = """
            scope.plan_market_type,
            layout.state AS layout_state,
            layout.generation AS layout_generation,
+           layout.mapping_digest AS layout_mapping_digest,
            layout.layout_manifest,
+           v4_root.state AS v4_root_state,
+           v4_root.map_digest AS v4_root_map_digest,
            current_pointer.snapshot_id AS current_snapshot_id,
            attestation.report_digest AS audit_report_digest,
            attestation.report AS audit_report,
@@ -98,7 +106,10 @@ _CANDIDATE_TARGET_SQL = """
            current_scope.plan_market_type AS current_plan_market_type,
            current_layout.state AS current_layout_state,
            current_layout.generation AS current_layout_generation,
+           current_layout.mapping_digest AS current_layout_mapping_digest,
            current_layout.layout_manifest AS current_layout_manifest,
+           current_v4_root.state AS current_v4_root_state,
+           current_v4_root.map_digest AS current_v4_root_map_digest,
            current_attestation.report_digest AS current_audit_report_digest,
            current_attestation.report AS current_audit_report,
            current_attestation.activated_at AS current_audit_activated_at
@@ -109,6 +120,8 @@ _CANDIDATE_TARGET_SQL = """
         ON scope.snapshot_id = snapshot.snapshot_id
       JOIN {schema}.ptg2_v3_snapshot_layout AS layout
         ON layout.snapshot_key = binding.snapshot_key
+      LEFT JOIN {schema}.ptg2_v4_snapshot_map_root AS v4_root
+        ON v4_root.snapshot_key = layout.snapshot_key
       LEFT JOIN {schema}.ptg2_current_source_snapshot AS current_pointer
         ON current_pointer.source_key = lower(
             snapshot.manifest->'activation'->>'source_key'
@@ -121,6 +134,8 @@ _CANDIDATE_TARGET_SQL = """
         ON current_scope.snapshot_id = current_snapshot.snapshot_id
       LEFT JOIN {schema}.ptg2_v3_snapshot_layout AS current_layout
         ON current_layout.snapshot_key = current_binding.snapshot_key
+      LEFT JOIN {schema}.ptg2_v4_snapshot_map_root AS current_v4_root
+        ON current_v4_root.snapshot_key = current_layout.snapshot_key
       LEFT JOIN {schema}.ptg2_v3_candidate_audit_attestation AS attestation
         ON attestation.snapshot_id = snapshot.snapshot_id
        AND attestation.contract = ANY(CAST(:supported_contracts AS text[]))
@@ -150,6 +165,7 @@ class CandidateAuditTarget:
     source_witness: Mapping[str, Any]
     audit_sample: Mapping[str, Any]
     activated: bool
+    storage_generation: str = STORAGE_GENERATION
     audit_report: Mapping[str, Any] | None = None
     audit_report_digest: str | None = None
     equivalent_current_snapshot_id: str | None = None
@@ -310,6 +326,11 @@ def _candidate_target_from_row(
         raise ValueError(
             "candidate provider identifier quarantine changed after layout sealing"
         )
+    storage_generation = validate_candidate_layout_identity(
+        candidate_row,
+        serving_index,
+        layout_serving_index,
+    )
     expected_source_set_digest = source_set_digest(raw_container_sha256)
     if (
         source_witness != layout_source_witness
@@ -327,15 +348,9 @@ def _candidate_target_from_row(
         )
     if (
         not snapshot_id
-        or serving_index.get("arch_version") != ARCH_VERSION
-        or serving_index.get("storage_generation") != STORAGE_GENERATION
-        or layout_serving_index.get("arch_version") != ARCH_VERSION
-        or layout_serving_index.get("storage_generation") != STORAGE_GENERATION
-        or str(candidate_row.get("layout_state") or "") != "sealed"
-        or str(candidate_row.get("layout_generation") or "") != STORAGE_GENERATION
         or activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
     ):
-        raise ValueError("candidate is not an exact strict postgres_binary_v3 snapshot")
+        raise ValueError("candidate is not an exact strict shared snapshot")
 
     source_key = str(activation.get("source_key") or "").strip().lower()
     plan_id = str(candidate_row.get("plan_id") or "").strip()
@@ -394,6 +409,7 @@ def _candidate_target_from_row(
         source_witness=source_witness,
         audit_sample=audit_sample,
         activated=is_activated,
+        storage_generation=storage_generation,
         audit_report=report,
         audit_report_digest=report_digest,
     )
@@ -416,7 +432,14 @@ def _current_snapshot_row(candidate_row: Mapping[str, Any]) -> dict[str, Any] | 
         "plan_market_type": candidate_row.get("current_plan_market_type"),
         "layout_state": candidate_row.get("current_layout_state"),
         "layout_generation": candidate_row.get("current_layout_generation"),
+        "layout_mapping_digest": candidate_row.get(
+            "current_layout_mapping_digest"
+        ),
         "layout_manifest": candidate_row.get("current_layout_manifest"),
+        "v4_root_state": candidate_row.get("current_v4_root_state"),
+        "v4_root_map_digest": candidate_row.get(
+            "current_v4_root_map_digest"
+        ),
         "current_snapshot_id": snapshot_id,
         "audit_report_digest": candidate_row.get(
             "current_audit_report_digest"
@@ -445,6 +468,7 @@ async def _reuse_equivalent_current_target(
     )
     equivalent_identity = (
         candidate_target.snapshot_key,
+        candidate_target.storage_generation,
         candidate_target.source_key,
         candidate_target.plan_id,
         candidate_target.plan_market_type,
@@ -455,6 +479,7 @@ async def _reuse_equivalent_current_target(
     )
     current_identity = (
         current_target.snapshot_key,
+        current_target.storage_generation,
         current_target.source_key,
         current_target.plan_id,
         current_target.plan_market_type,
@@ -727,6 +752,7 @@ async def run_batch_release_audit(
                 provider_identifier_quarantine=(
                     candidate_target.provider_identifier_quarantine
                 ),
+                storage_generation=candidate_target.storage_generation,
             ),
             witness=witness,
             persisted_sample=persisted_sample,
@@ -1041,6 +1067,7 @@ async def _audit_and_activate(
         source_key=candidate_target.source_key,
         plan_id=candidate_target.plan_id,
         plan_market_type=candidate_target.plan_market_type,
+        storage_generation=candidate_target.storage_generation,
         report=report,
     )
     await _progress(

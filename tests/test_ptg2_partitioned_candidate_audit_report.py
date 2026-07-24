@@ -76,7 +76,7 @@ def _audit_sample():
     }
 
 
-def _target():
+def _target(storage_generation="shared_blocks_v3"):
     return BatchAuditReportTarget(
         snapshot_id="candidate-snapshot",
         source_key="test-source",
@@ -88,6 +88,7 @@ def _target():
         provider_identifier_quarantine=provider_identifier_quarantine_payload(
             {}
         ),
+        storage_generation=storage_generation,
     )
 
 
@@ -173,7 +174,7 @@ def _candidate_io(request):
     }
 
 
-def _report():
+def _report(storage_generation="shared_blocks_v3"):
     plan = _plan()
     partition_results = tuple(
         contract.build_partitioned_candidate_audit_result(
@@ -202,7 +203,7 @@ def _report():
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     return build_partitioned_audit_report(
         PartitionedAuditReportInput(
-            audit_target=_target(),
+            audit_target=_target(storage_generation),
             plan=plan,
             aggregate=aggregate,
             metrics=metrics,
@@ -247,6 +248,32 @@ def test_partitioned_report_validates_dynamic_request_count_and_wall_time():
     assert report["http"]["batch_api_actual_http_requests"] == 5
     assert report["duration_seconds"] == 2
     assert evidence["batch_api_actual_http_requests"] == 5
+
+
+def test_partitioned_report_binds_v4_storage_generation():
+    report = _report("shared_blocks_v4")
+
+    evidence = validate_batch_candidate_release_audit_report(
+        report,
+        snapshot_id="candidate-snapshot",
+        source_key="test-source",
+        plan_id="12-3456789",
+        plan_market_type="group",
+        storage_generation="shared_blocks_v4",
+    )
+
+    assert report["target"]["expected_storage_generation"] == (
+        "shared_blocks_v4"
+    )
+    assert evidence["storage_generation"] == "shared_blocks_v4"
+    with pytest.raises(ValueError, match="target does not match"):
+        validate_batch_candidate_release_audit_report(
+            report,
+            snapshot_id="candidate-snapshot",
+            source_key="test-source",
+            plan_id="12-3456789",
+            plan_market_type="group",
+        )
 
 
 def test_partitioned_report_validates_truthful_slow_start_span():
@@ -371,6 +398,27 @@ def test_http_metrics_report_zero_rate_until_two_distinct_starts_exist():
 
     metrics.start_times[:] = [1.0, 1.0]
     assert metrics.actual_start_rate_per_second == 0
+
+
+def test_partitioned_http_metrics_record_each_terminal_outcome(monkeypatch):
+    monotonic_values = iter((1.0, 2.0))
+    monkeypatch.setattr(
+        "process.ptg_parts.ptg2_partitioned_candidate_audit_report.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    metrics = PartitionedAuditHttpMetrics(planned_request_count=2)
+
+    metrics.started()
+    metrics.started()
+    metrics.completed()
+    metrics.failed()
+
+    assert metrics.started_request_count == 2
+    assert metrics.completed_request_count == 1
+    assert metrics.failed_request_count == 1
+    assert metrics.peak_in_flight == 2
+    assert metrics.in_flight == 0
+    assert metrics.start_span_seconds == 1.0
 
 
 def test_single_request_partitioned_http_metrics_require_zero_start_span():

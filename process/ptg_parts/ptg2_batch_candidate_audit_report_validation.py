@@ -31,6 +31,7 @@ from process.ptg_parts.ptg2_batch_candidate_audit_report_sections import (
     validate_report_timing,
     validated_report_source,
 )
+from process.ptg_parts import ptg2_candidate_layout_identity as layout_identity
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     AuditBatchRequest,
     PTG2_AUDIT_BATCH_API_PATH,
@@ -467,10 +468,10 @@ def validate_batch_candidate_release_audit_report(
     source_key: str,
     plan_id: str,
     plan_market_type: str,
+    storage_generation: str = layout_identity.PTG2_CANDIDATE_V3_GENERATION,
     evaluated_at: datetime.datetime | None = None,
 ) -> dict[str, Any]:
     """Validate and digest one strict V4 bounded release report."""
-
     report_by_field = dict(report)
     if set(report_by_field) != REPORT_FIELDS:
         raise ValueError("batch audit report fields are invalid")
@@ -482,9 +483,16 @@ def validate_batch_candidate_release_audit_report(
         source_key=source_key,
         plan_id=plan_id,
         plan_market_type=plan_market_type,
+        storage_generation=layout_identity.normalize_candidate_storage_generation(
+            storage_generation
+        ),
     )
-    parts = _validated_report_parts(report_by_field, coordinates, evaluation_time)
-    return _attestation_evidence(report_by_field, parts)
-
-
+    parts = _validated_report_parts(
+        report_by_field,
+        coordinates,
+        evaluation_time,
+    )
+    return _attestation_evidence(report_by_field, parts) | {
+        "storage_generation": coordinates.storage_generation
+    }
 __all__ = ["validate_batch_candidate_release_audit_report"]
