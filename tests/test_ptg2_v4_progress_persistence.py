@@ -12,6 +12,39 @@ from process.ptg_parts import ptg2_v4_graph_compiler as compiler
 from tests.live_progress_atomic_redis import AtomicLiveProgressRedis
 
 
+def _accepted_compiler_state() -> compiler._CompilerProgressState:
+    state = compiler._CompilerProgressState()
+    assert state.is_accepted(
+        {
+            "version": 1,
+            "seq": 1,
+            "phase": "derive_patterns",
+            "done": 50,
+            "total": 100,
+            "unit": "groups",
+            "elapsed_ms": 1_000,
+            "terminal": False,
+        }
+    )
+    return state
+
+
+async def _publish_compiler_state(
+    state: compiler._CompilerProgressState,
+    *,
+    heartbeat: bool = False,
+) -> None:
+    await compiler._publish_compiler_progress_state(
+        state,
+        emit_lock=asyncio.Lock(),
+        input_bytes=123,
+        input_factor_edges=456,
+        input_factor_owners=78,
+        checkpoint_reused=False,
+        heartbeat=heartbeat,
+    )
+
+
 @pytest.mark.asyncio
 async def test_compiler_heartbeat_persists_stage_without_fake_movement(
     monkeypatch,
@@ -33,41 +66,17 @@ async def test_compiler_heartbeat_persists_stage_without_fake_movement(
         lambda: base_time + datetime.timedelta(seconds=elapsed_seconds[0]),
     )
     monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
-    state = compiler._CompilerProgressState()
-    assert state.is_accepted(
-        {
-            "version": 1,
-            "seq": 1,
-            "phase": "derive_patterns",
-            "done": 50,
-            "total": 100,
-            "unit": "groups",
-            "elapsed_ms": 1_000,
-            "terminal": False,
-        }
-    )
+    state = _accepted_compiler_state()
     token = ptg_live_progress.set_live_progress_context(
         run_id="run-v4-compiler-heartbeat",
         attempt_id="attempt-1",
         attempt_started_at="2026-07-24T10:00:00Z",
     )
     try:
-        await compiler._publish_compiler_progress_state(
-            state,
-            emit_lock=asyncio.Lock(),
-            input_bytes=123,
-            input_factor_edges=456,
-            input_factor_owners=78,
-            checkpoint_reused=False,
-        )
+        await _publish_compiler_state(state)
         elapsed_seconds[0] = 5.0
-        await compiler._publish_compiler_progress_state(
+        await _publish_compiler_state(
             compiler.replace(state, elapsed_ms=5_000),
-            emit_lock=asyncio.Lock(),
-            input_bytes=123,
-            input_factor_edges=456,
-            input_factor_owners=78,
-            checkpoint_reused=False,
             heartbeat=True,
         )
     finally:

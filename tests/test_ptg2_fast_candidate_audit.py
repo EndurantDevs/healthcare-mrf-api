@@ -550,6 +550,63 @@ def _api_occurrence(record: SourceWitnessRecord) -> dict:
     }
 
 
+def _candidate_audit_test_app(
+    audit_target: audit.FastAuditTarget,
+    witness_record: SourceWitnessRecord,
+    recorded_queries: list[dict[str, str]],
+) -> web.Application:
+    async def challenge_handler(request: web.Request) -> web.Response:
+        recorded_queries.append(dict(request.query))
+        assert request.path == audit.source_audit.DEFAULT_CANDIDATE_API_PATH
+        expected_query_by_name = {
+            "snapshot_id": audit_target.snapshot_id,
+            "source_key": audit_target.source_key,
+            "code_system": "CPT",
+            "code": "99213",
+            "npi": "1234567890",
+            "negotiated_rate": "123.45",
+            "negotiated_rate_tolerance": "0",
+        }
+        assert {
+            name: request.query[name] for name in expected_query_by_name
+        } == expected_query_by_name
+        assert request.headers["Authorization"] == "Bearer test"
+        return web.json_response(
+            _api_contract_payload(
+                audit_target,
+                response_items=[_api_item(witness_record)],
+            )
+        )
+
+    async def preflight_handler(request: web.Request) -> web.Response:
+        recorded_queries.append(dict(request.query))
+        assert request.path == audit.source_audit.DEFAULT_API_AUDIT_PATH
+        assert request.query["limit"] == "1"
+        response_fields = _api_contract_payload(
+            audit_target,
+            response_items=[_api_occurrence(witness_record)],
+        )
+        response_fields["source_set"] = {
+            "contract": audit.source_audit.SOURCE_SET_CONTRACT,
+            "source_count": audit_target.source_count,
+            "raw_container_sha256_digest": audit_target.source_set_digest,
+        }
+        response_fields["audit_sample"] = audit.public_audit_sample_projection(
+            audit_target.audit_sample
+        )
+        response_fields["pagination"] = {"offset": 0, "limit": 1, "total": 1}
+        return web.json_response(response_fields)
+
+    app = web.Application()
+    app.router.add_get(
+        audit.source_audit.DEFAULT_CANDIDATE_API_PATH, challenge_handler
+    )
+    app.router.add_get(
+        audit.source_audit.DEFAULT_API_AUDIT_PATH, preflight_handler
+    )
+    return app
+
+
 def test_source_challenge_derives_later_price_and_provider_from_raw_evidence():
     challenge = source_challenge(_occurrence_record())
 
@@ -699,50 +756,9 @@ async def test_source_challenge_uses_candidate_api_with_exact_filters(
     witness_record = _occurrence_record()
     challenge = source_challenge(witness_record)
     audit_target = _target()
-    requests: list[dict[str, str]] = []
-
-    async def handler(request: web.Request) -> web.Response:
-        requests.append(dict(request.query))
-        assert request.path == audit.source_audit.DEFAULT_CANDIDATE_API_PATH
-        assert request.query["snapshot_id"] == audit_target.snapshot_id
-        assert request.query["source_key"] == audit_target.source_key
-        assert request.query["code_system"] == "CPT"
-        assert request.query["code"] == "99213"
-        assert request.query["npi"] == "1234567890"
-        assert request.query["negotiated_rate"] == "123.45"
-        assert request.query["negotiated_rate_tolerance"] == "0"
-        assert request.headers["Authorization"] == "Bearer test"
-        return web.json_response(
-            _api_contract_payload(
-                audit_target,
-                response_items=[_api_item(witness_record)],
-            )
-        )
-
-    async def preflight_handler(request: web.Request) -> web.Response:
-        requests.append(dict(request.query))
-        assert request.path == audit.source_audit.DEFAULT_API_AUDIT_PATH
-        assert request.query["limit"] == "1"
-        response_fields = _api_contract_payload(
-            audit_target,
-            response_items=[_api_occurrence(witness_record)],
-        )
-        response_fields["source_set"] = {
-            "contract": audit.source_audit.SOURCE_SET_CONTRACT,
-            "source_count": audit_target.source_count,
-            "raw_container_sha256_digest": audit_target.source_set_digest,
-        }
-        response_fields["audit_sample"] = audit.public_audit_sample_projection(
-            audit_target.audit_sample
-        )
-        response_fields["pagination"] = {"offset": 0, "limit": 1, "total": 1}
-        return web.json_response(response_fields)
-
-    app = web.Application()
-    app.router.add_get(audit.source_audit.DEFAULT_CANDIDATE_API_PATH, handler)
-    app.router.add_get(
-        audit.source_audit.DEFAULT_API_AUDIT_PATH,
-        preflight_handler,
+    recorded_queries: list[dict[str, str]] = []
+    app = _candidate_audit_test_app(
+        audit_target, witness_record, recorded_queries
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -773,7 +789,7 @@ async def test_source_challenge_uses_candidate_api_with_exact_filters(
     assert observed_sample == audit.public_audit_sample_projection(
         audit_target.audit_sample
     )
-    assert len(requests) == 2
+    assert len(recorded_queries) == 2
     assert metrics.request_count == 2
 
 

@@ -489,6 +489,174 @@ def _heavy_owner_row(
     }
 
 
+class _HeavyOwnerCacheSession:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def execute(self, statement, parameters):
+        sql = str(statement)
+        parameter_map = dict(parameters)
+        self.calls.append((sql, parameter_map))
+        is_other_schema = '"other"' in sql
+        owner_rows = []
+        for owner_key in parameter_map["owner_keys"]:
+            if owner_key < 10 or is_other_schema:
+                owner_rows.append(
+                    _heavy_owner_row(
+                        owner_key,
+                        snapshot_key=parameter_map["snapshot_key"],
+                        relation=parameter_map["relation"],
+                        member_base=200 if is_other_schema else 100,
+                    )
+                )
+        return tuple(owner_rows)
+
+
+async def _load_cached_heavy_owner(
+    session: _HeavyOwnerCacheSession,
+    owner_key: int,
+    *,
+    schema_name: str = "mrf",
+    snapshot_key: int = 17,
+    relation: str = "npi_groups_exact",
+):
+    return await graph.load_v4_heavy_owners(
+        session,
+        snapshot_key=snapshot_key,
+        relation=relation,
+        owner_keys=(owner_key,),
+        schema_name=schema_name,
+    )
+
+
+class _GraphCoordinate:
+    def __init__(self, key: int, block_hash: bytes, entries: int) -> None:
+        self.block_key = key
+        self.fragment_no = 0
+        self.block_hash = block_hash
+        self.entry_count = entries
+
+
+class _DirectRelationFixture:
+    def __init__(self) -> None:
+        self.requested_pages: list[tuple[str, tuple[int, ...]]] = []
+
+    async def root(self, *_args, **_kwargs):
+        return graph.V4GraphRoot(17, "direct_v1", b"r" * 32)
+
+    async def manifest(self, *_args, **_kwargs):
+        return graph.V4RelationManifest(
+            snapshot_key=17,
+            relation="set_groups_direct",
+            member_object_kind="v4_set_groups_direct_members_v1",
+            locator_object_kind="v4_set_groups_direct_locators_v1",
+            owner_base=1,
+            owner_count=3,
+            logical_member_count=3,
+            vector_member_count=3,
+            member_width=4,
+            member_page_bytes=16,
+            locator_page_bytes=24,
+            locator_owner_span=2,
+        )
+
+    async def heavy_owners(self, *_args, **kwargs):
+        assert kwargs["owner_keys"] == (2,)
+        return {}
+
+    async def coordinates(self, *_args, **kwargs):
+        keys = tuple(sorted(kwargs["block_keys"]))
+        kind = kwargs["object_kind"]
+        self.requested_pages.append((kind, keys))
+        if kind.endswith("locators_v1"):
+            return {1: _GraphCoordinate(1, b"l" * 32, 2)}
+        return {0: _GraphCoordinate(0, b"m" * 32, 3)}
+
+    async def blocks(self, *_args, **kwargs):
+        kind = kwargs["object_kind"]
+        if kind.endswith("locators_v1"):
+            locator_payload = struct.pack("<QI", 0, 1) + struct.pack("<QI", 1, 2)
+            return {
+                b"l" * 32: graph._CachedPhysicalBlock(
+                    b"l" * 32, kind, 2, locator_payload
+                )
+            }
+        return {
+            b"m" * 32: graph._CachedPhysicalBlock(
+                b"m" * 32, kind, 3, struct.pack("<III", 5, 7, 9)
+            )
+        }
+
+    def install(self, monkeypatch) -> None:
+        monkeypatch.setattr(graph, "load_v4_graph_root", self.root)
+        monkeypatch.setattr(graph, "load_v4_relation_manifest", self.manifest)
+        monkeypatch.setattr(graph, "load_v4_heavy_owners", self.heavy_owners)
+        monkeypatch.setattr(graph, "_load_map_coordinates", self.coordinates)
+        monkeypatch.setattr(graph, "_load_physical_blocks", self.blocks)
+
+
+class _OversizedPatternFixture:
+    class Coordinate:
+        block_key = 0
+        fragment_no = 0
+        block_hash = b"l" * 32
+        entry_count = 8
+
+    def __init__(self) -> None:
+        self.requested_kinds: list[str] = []
+
+    async def root(self, *_args, **_kwargs):
+        return graph.V4GraphRoot(17, "pattern_v1", b"r" * 32)
+
+    async def manifest(self, *_args, **_kwargs):
+        return graph.V4RelationManifest(
+            snapshot_key=17,
+            relation="pattern_groups",
+            member_object_kind="v4_pattern_groups_members_v1",
+            locator_object_kind="v4_pattern_groups_locators_v1",
+            owner_base=0,
+            owner_count=8,
+            logical_member_count=1_872_272,
+            vector_member_count=1_872_272,
+            member_width=4,
+            member_page_bytes=16_384,
+            locator_page_bytes=96,
+            locator_owner_span=8,
+        )
+
+    async def heavy_owners(self, *_args, **_kwargs):
+        return {}
+
+    async def coordinates(self, *_args, **kwargs):
+        kind = kwargs["object_kind"]
+        self.requested_kinds.append(kind)
+        if kind.endswith("members_v1"):
+            raise AssertionError("member coordinates must not be loaded")
+        return {0: self.Coordinate()}
+
+    async def blocks(self, *_args, **kwargs):
+        kind = kwargs["object_kind"]
+        self.requested_kinds.append(kind)
+        if kind.endswith("members_v1"):
+            raise AssertionError("member blocks must not be decoded")
+        locator_payload = b"".join(
+            struct.pack("<QI", 0, 1_872_272 if owner == 7 else 0)
+            for owner in range(8)
+        )
+        return {
+            b"l" * 32: graph._CachedPhysicalBlock(
+                b"l" * 32, kind, 8, locator_payload
+            )
+        }
+
+    def install(self, monkeypatch) -> None:
+        monkeypatch.setattr(graph, "load_v4_graph_root", self.root)
+        monkeypatch.setattr(graph, "load_v4_relation_manifest", self.manifest)
+        monkeypatch.setattr(graph, "load_v4_heavy_owners", self.heavy_owners)
+        monkeypatch.setattr(graph, "_load_map_coordinates", self.coordinates)
+        monkeypatch.setattr(graph, "_load_physical_blocks", self.blocks)
+
+
 @pytest.mark.asyncio
 async def test_heavy_owner_loader_caches_scoped_hits_and_misses(
     monkeypatch,
@@ -551,48 +719,14 @@ async def test_heavy_owner_lrus_are_bounded_and_isolated(
 ) -> None:
     """Bound positive and negative caches while isolating graph namespaces."""
 
-    class Session:
-        def __init__(self) -> None:
-            self.calls = []
-
-        async def execute(self, statement, parameters):
-            sql = str(statement)
-            parameter_map = dict(parameters)
-            self.calls.append((sql, parameter_map))
-            is_other_schema = '"other"' in sql
-            owner_rows = []
-            for owner_key in parameter_map["owner_keys"]:
-                if owner_key < 10 or is_other_schema:
-                    owner_rows.append(
-                        _heavy_owner_row(
-                            owner_key,
-                            snapshot_key=parameter_map["snapshot_key"],
-                            relation=parameter_map["relation"],
-                            member_base=(200 if is_other_schema else 100),
-                        )
-                    )
-            return tuple(owner_rows)
-
-    session = Session()
+    session = _HeavyOwnerCacheSession()
     monkeypatch.setattr(graph, "_HEAVY_OWNER_CACHE", OrderedDict())
     monkeypatch.setattr(graph, "_HEAVY_OWNER_NEGATIVE_CACHE", OrderedDict())
     monkeypatch.setattr(graph, "_HEAVY_OWNER_CACHE_MAX_ENTRIES", 2)
     monkeypatch.setattr(graph, "_HEAVY_OWNER_NEGATIVE_CACHE_MAX_ENTRIES", 2)
 
-    async def load(
-        owner_key: int,
-        *,
-        schema_name: str = "mrf",
-        snapshot_key: int = 17,
-        relation: str = "npi_groups_exact",
-    ):
-        return await graph.load_v4_heavy_owners(
-            session,
-            snapshot_key=snapshot_key,
-            relation=relation,
-            owner_keys=(owner_key,),
-            schema_name=schema_name,
-        )
+    async def load(owner_key: int, **scope):
+        return await _load_cached_heavy_owner(session, owner_key, **scope)
 
     await load(1)
     await load(2)
@@ -681,66 +815,8 @@ async def test_v4_relation_lookup_uses_manifest_owner_base_and_page_geometry(
 ) -> None:
     """Use manifest owner offsets and page geometry for packed lookup."""
 
-    class Coordinate:
-        def __init__(self, key: int, block_hash: bytes, entries: int) -> None:
-            self.block_key = key
-            self.fragment_no = 0
-            self.block_hash = block_hash
-            self.entry_count = entries
-
-    requested_pages: list[tuple[str, tuple[int, ...]]] = []
-
-    async def fake_root(*_args, **_kwargs):
-        return graph.V4GraphRoot(17, "direct_v1", b"r" * 32)
-
-    async def fake_manifest(*_args, **_kwargs):
-        return graph.V4RelationManifest(
-            snapshot_key=17,
-            relation="set_groups_direct",
-            member_object_kind="v4_set_groups_direct_members_v1",
-            locator_object_kind="v4_set_groups_direct_locators_v1",
-            owner_base=1,
-            owner_count=3,
-            logical_member_count=3,
-            vector_member_count=3,
-            member_width=4,
-            member_page_bytes=16,
-            locator_page_bytes=24,
-            locator_owner_span=2,
-        )
-
-    async def fake_heavy(*_args, **kwargs):
-        assert kwargs["owner_keys"] == (2,)
-        return {}
-
-    async def fake_coordinates(*_args, **kwargs):
-        keys = tuple(sorted(kwargs["block_keys"]))
-        kind = kwargs["object_kind"]
-        requested_pages.append((kind, keys))
-        if kind.endswith("locators_v1"):
-            return {1: Coordinate(1, b"l" * 32, 2)}
-        return {0: Coordinate(0, b"m" * 32, 3)}
-
-    async def fake_blocks(*_args, **kwargs):
-        kind = kwargs["object_kind"]
-        if kind.endswith("locators_v1"):
-            payload = struct.pack("<QI", 0, 1) + struct.pack("<QI", 1, 2)
-            return {
-                b"l" * 32: graph._CachedPhysicalBlock(
-                    b"l" * 32, kind, 2, payload
-                )
-            }
-        return {
-            b"m" * 32: graph._CachedPhysicalBlock(
-                b"m" * 32, kind, 3, struct.pack("<III", 5, 7, 9)
-            )
-        }
-
-    monkeypatch.setattr(graph, "load_v4_graph_root", fake_root)
-    monkeypatch.setattr(graph, "load_v4_relation_manifest", fake_manifest)
-    monkeypatch.setattr(graph, "load_v4_heavy_owners", fake_heavy)
-    monkeypatch.setattr(graph, "_load_map_coordinates", fake_coordinates)
-    monkeypatch.setattr(graph, "_load_physical_blocks", fake_blocks)
+    fixture = _DirectRelationFixture()
+    fixture.install(monkeypatch)
 
     assert await graph.lookup_v4_relation_members(
         object(),
@@ -749,7 +825,7 @@ async def test_v4_relation_lookup_uses_manifest_owner_base_and_page_geometry(
         owner_keys=(2,),
         schema_name="mrf",
     ) == {2: (7, 9)}
-    assert requested_pages == [
+    assert fixture.requested_pages == [
         ("v4_set_groups_direct_locators_v1", (1,)),
         ("v4_set_groups_direct_members_v1", (0,)),
     ]
@@ -761,58 +837,8 @@ async def test_v4_relation_budget_rejects_huge_pattern_before_member_pages(
 ) -> None:
     """Reject oversized results after locators and before member reads."""
 
-    class Coordinate:
-        block_key = 0
-        fragment_no = 0
-        block_hash = b"l" * 32
-        entry_count = 8
-
-    requested_kinds: list[str] = []
-
-    async def fake_root(*_args, **_kwargs):
-        return graph.V4GraphRoot(17, "pattern_v1", b"r" * 32)
-
-    async def fake_manifest(*_args, **_kwargs):
-        return graph.V4RelationManifest(
-            snapshot_key=17,
-            relation="pattern_groups",
-            member_object_kind="v4_pattern_groups_members_v1",
-            locator_object_kind="v4_pattern_groups_locators_v1",
-            owner_base=0,
-            owner_count=8,
-            logical_member_count=1_872_272,
-            vector_member_count=1_872_272,
-            member_width=4,
-            member_page_bytes=16_384,
-            locator_page_bytes=96,
-            locator_owner_span=8,
-        )
-
-    async def fake_heavy(*_args, **_kwargs):
-        return {}
-
-    async def fake_coordinates(*_args, **kwargs):
-        requested_kinds.append(kwargs["object_kind"])
-        if kwargs["object_kind"].endswith("members_v1"):
-            raise AssertionError("member coordinates must not be loaded")
-        return {0: Coordinate()}
-
-    async def fake_blocks(*_args, **kwargs):
-        kind = kwargs["object_kind"]
-        requested_kinds.append(kind)
-        if kind.endswith("members_v1"):
-            raise AssertionError("member blocks must not be decoded")
-        payload = b"".join(
-            struct.pack("<QI", 0, 1_872_272 if owner == 7 else 0)
-            for owner in range(8)
-        )
-        return {b"l" * 32: graph._CachedPhysicalBlock(b"l" * 32, kind, 8, payload)}
-
-    monkeypatch.setattr(graph, "load_v4_graph_root", fake_root)
-    monkeypatch.setattr(graph, "load_v4_relation_manifest", fake_manifest)
-    monkeypatch.setattr(graph, "load_v4_heavy_owners", fake_heavy)
-    monkeypatch.setattr(graph, "_load_map_coordinates", fake_coordinates)
-    monkeypatch.setattr(graph, "_load_physical_blocks", fake_blocks)
+    fixture = _OversizedPatternFixture()
+    fixture.install(monkeypatch)
 
     with pytest.raises(PTG2SharedBlockError, match="exceeds max_members"):
         await graph.lookup_v4_relation_members(
@@ -823,7 +849,7 @@ async def test_v4_relation_budget_rejects_huge_pattern_before_member_pages(
             schema_name="mrf",
             max_members=1,
         )
-    assert requested_kinds == [
+    assert fixture.requested_kinds == [
         "v4_pattern_groups_locators_v1",
         "v4_pattern_groups_locators_v1",
     ]

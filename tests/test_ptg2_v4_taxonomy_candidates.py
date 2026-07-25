@@ -205,6 +205,17 @@ def test_candidate_digests_reject_incompatible_identity_and_payload() -> None:
             )
 
 
+def test_rule_set_validation_rejects_empty_duplicate_and_malformed_digests() -> None:
+    """Fail closed when semantic rule-set identity is absent or non-unique."""
+
+    rule = _rules()[0]
+    for invalid_rules in ((), (rule, rule)):
+        with pytest.raises(ValueError, match="rules|duplicated"):
+            candidates.inferred_provider_taxonomy_rule_set_digest(invalid_rules)
+    with pytest.raises(ValueError, match="digest set"):
+        candidates._rule_set_digest_from_digests(())
+
+
 def test_projection_shaper_rejects_root_and_row_drift() -> None:
     row = _projection_row(_rules()[0])
     for npi_count, pattern_count in ((True, 0), (3, True), (-1, 0), (3, -1)):
@@ -356,6 +367,111 @@ def _rules() -> tuple[InferredProviderTaxonomyRule, ...]:
     )
 
 
+async def _noop_map_write_lock(*_args, **_kwargs) -> None:
+    return None
+
+
+async def _publish_candidate_projection(
+    session: _PublicationSession,
+    *,
+    representation: str,
+    pattern_count: int,
+):
+    return await candidates.publish_v4_inferred_taxonomy_candidates(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+        build_token="build-token",
+        rules=_rules(),
+        npi_count=3,
+        representation=representation,
+        pattern_count=pattern_count,
+    )
+
+
+async def _load_candidate_projection(session, projection_row, manifest):
+    return await candidates.load_v4_inferred_taxonomy_candidates(
+        session,
+        snapshot_key=41,
+        rule_digest=projection_row["rule_digest"],
+        schema_name="mrf",
+        projection_manifest=manifest,
+    )
+
+
+async def _assert_candidate_load_rejected(
+    session,
+    projection_row,
+    manifest,
+    message: str,
+) -> None:
+    with pytest.raises(PTG2ManifestArtifactError, match=message):
+        await _load_candidate_projection(session, projection_row, manifest)
+
+
+def _tampered_pattern_projection():
+    pattern_row = _projection_row(
+        _rules()[0],
+        npi_keys_by_pattern={9: (0, 2)},
+    )
+    pattern_manifest = candidates._candidate_projection_manifest(
+        (pattern_row,)
+    )
+    tampered_pattern_payload = bytearray(
+        pattern_row["pattern_member_payload"]
+    )
+    tampered_pattern_payload[-1] ^= 1
+    pattern_session = _ScriptedSession(
+        _Result(
+            (
+                _reader_row(
+                    pattern_row,
+                    pattern_member_payload=bytes(tampered_pattern_payload),
+                ),
+            )
+        )
+    )
+    return pattern_row, pattern_manifest, pattern_session
+
+
+def _assert_direct_publication_contract(publication, session) -> None:
+    assert "COALESCE(entity.entity_type_code, 0) = 1" in session.catalog_sql
+    assert "LIMIT :candidate_limit" in session.catalog_sql
+    assert {call["taxonomy_codes"] for call in session.catalog_calls} == {
+        ("AAA",),
+        ("BBB",),
+    }
+    assert {call["candidate_limit"] for call in session.catalog_calls} == {
+        37_001
+    }
+    assert publication.rule_count == 2
+    assert publication.member_count == 3
+    assert publication.packed_byte_count == 12
+    assert candidates.validate_v4_inferred_taxonomy_projection_manifest(
+        publication.manifest
+    ) == publication.manifest
+    expected_caps_by_name = {
+        "max_online_filtered_reverse_code_sets": 6_600,
+        "max_online_filtered_reverse_code_occurrences": 6_700,
+        "max_online_inferred_taxonomy_candidates": 37_000,
+        "max_online_candidate_pattern_projection_members": 131_072,
+        "max_online_inferred_taxonomy_retained_memberships": 65_536,
+        "max_online_inferred_taxonomy_graph_pages": 256,
+        "max_online_inferred_taxonomy_graph_bytes": 4_194_304,
+        "max_online_inferred_taxonomy_graph_batches": 32,
+        "pattern_count": 0,
+        "pattern_member_count": 0,
+        "pattern_member_bytes": 0,
+    }
+    assert {
+        name: publication.manifest[name] for name in expected_caps_by_name
+    } == expected_caps_by_name
+    assert {
+        stored_projection["representation"]
+        for stored_projection in session.stored_rows
+    } == {"direct_v1"}
+
+
 def _projection_row(
     rule: InferredProviderTaxonomyRule,
     npi_keys: tuple[int, ...] = (0, 2),
@@ -451,6 +567,41 @@ def _observe_projection_row(
     }
 
 
+def test_manifest_validator_rejects_invalid_top_level_shapes() -> None:
+    """Reject malformed containers, counters, and rule entries before sealing."""
+
+    manifest = candidates.shape_v4_inferred_taxonomy_projection_manifest(
+        (_projection_row(_rules()[0]),),
+        npi_count=3,
+        pattern_count=0,
+    )
+    with pytest.raises(PTG2ManifestArtifactError, match="manifest is invalid"):
+        candidates.validate_v4_inferred_taxonomy_projection_manifest([])
+
+    missing_field = deepcopy(manifest)
+    missing_field.pop("contract")
+    boolean_count = deepcopy(manifest)
+    boolean_count["rule_count"] = True
+    invalid_rule_container = deepcopy(manifest)
+    invalid_rule_container["rules"] = {}
+    invalid_rule_entry = deepcopy(manifest)
+    invalid_rule_entry["rules"] = [{}]
+    invalid_observe_entry = deepcopy(manifest)
+    invalid_observe_entry["observe_only_rules"] = [{}]
+    malformed_manifests = (
+        missing_field,
+        boolean_count,
+        invalid_rule_container,
+        invalid_rule_entry,
+        invalid_observe_entry,
+    )
+    for malformed_manifest in malformed_manifests:
+        with pytest.raises(PTG2ManifestArtifactError):
+            candidates.validate_v4_inferred_taxonomy_projection_manifest(
+                malformed_manifest
+            )
+
+
 def _reader_row(
     projection_row: dict[str, Any],
     *,
@@ -495,11 +646,60 @@ def _reader_row(
     }
 
 
+@pytest.mark.parametrize("npi_count", (True, -1))
 @pytest.mark.asyncio
-async def test_publication_is_individual_only_packed_and_rule_stable(
+async def test_publication_rejects_invalid_npi_dictionary_bounds(npi_count) -> None:
+    """Reject boolean and out-of-range NPI dictionary bounds before storage work."""
+
+    with pytest.raises(ValueError, match="NPI count"):
+        await candidates.publish_v4_inferred_taxonomy_candidates(
+            object(),
+            schema_name="mrf",
+            snapshot_key=41,
+            build_token="build-token",
+            rules=(_rules()[0],),
+            npi_count=npi_count,
+            representation="direct_v1",
+            pattern_count=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("catalog_row", "message"),
+    (
+        (
+            {
+                "npi_key": 3,
+                "npi": 1_234_567_890,
+                "matched_taxonomy_codes": ["AAA"],
+            },
+            "NPI key",
+        ),
+        (
+            {
+                "npi_key": 0,
+                "npi": 999,
+                "matched_taxonomy_codes": ["AAA"],
+            },
+            "NPI is invalid",
+        ),
+        (
+            {
+                "npi_key": 0,
+                "npi": 1_234_567_890,
+                "matched_taxonomy_codes": [],
+            },
+            "catalog evidence",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_publication_rejects_invalid_catalog_evidence(
     monkeypatch,
+    catalog_row,
+    message,
 ) -> None:
-    """Publish stable individual candidates and authenticate their rule set."""
+    """Reject catalog rows that escape the sealed NPI and taxonomy identities."""
 
     async def no_op_lock(*_args, **_kwargs):
         return None
@@ -509,62 +709,41 @@ async def test_publication_is_individual_only_packed_and_rule_stable(
         "lock_v4_shared_layout_for_map_write",
         no_op_lock,
     )
+    session = _PublicationSession(
+        catalog_rows_by_codes={("AAA",): (catalog_row,)}
+    )
+    with pytest.raises(RuntimeError, match=message):
+        await candidates.publish_v4_inferred_taxonomy_candidates(
+            session,
+            schema_name="mrf",
+            snapshot_key=41,
+            build_token="build-token",
+            rules=(_rules()[0],),
+            npi_count=3,
+            representation="direct_v1",
+            pattern_count=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_publication_is_individual_only_packed_and_rule_stable(
+    monkeypatch,
+) -> None:
+    """Publish stable individual candidates and authenticate their rule set."""
+
+    monkeypatch.setattr(
+        snapshot_maps,
+        "lock_v4_shared_layout_for_map_write",
+        _noop_map_write_lock,
+    )
     session = _PublicationSession()
-    publication = await candidates.publish_v4_inferred_taxonomy_candidates(
+    publication = await _publish_candidate_projection(
         session,
-        schema_name="mrf",
-        snapshot_key=41,
-        build_token="build-token",
-        rules=_rules(),
-        npi_count=3,
         representation="direct_v1",
         pattern_count=0,
     )
 
-    assert "COALESCE(entity.entity_type_code, 0) = 1" in session.catalog_sql
-    assert "LIMIT :candidate_limit" in session.catalog_sql
-    assert {
-        call["taxonomy_codes"] for call in session.catalog_calls
-    } == {("AAA",), ("BBB",)}
-    assert {
-        call["candidate_limit"] for call in session.catalog_calls
-    } == {37_001}
-    assert publication.rule_count == 2
-    assert publication.member_count == 3
-    assert publication.packed_byte_count == 12
-    assert candidates.validate_v4_inferred_taxonomy_projection_manifest(
-        publication.manifest
-    ) == publication.manifest
-    assert publication.manifest[
-        "max_online_filtered_reverse_code_sets"
-    ] == 6_600
-    assert publication.manifest[
-        "max_online_filtered_reverse_code_occurrences"
-    ] == 6_700
-    assert publication.manifest[
-        "max_online_inferred_taxonomy_candidates"
-    ] == 37_000
-    assert publication.manifest[
-        "max_online_candidate_pattern_projection_members"
-    ] == 131_072
-    assert publication.manifest[
-        "max_online_inferred_taxonomy_retained_memberships"
-    ] == 65_536
-    assert publication.manifest[
-        "max_online_inferred_taxonomy_graph_pages"
-    ] == 256
-    assert publication.manifest[
-        "max_online_inferred_taxonomy_graph_bytes"
-    ] == 4_194_304
-    assert publication.manifest[
-        "max_online_inferred_taxonomy_graph_batches"
-    ] == 32
-    assert publication.manifest["pattern_count"] == 0
-    assert publication.manifest["pattern_member_count"] == 0
-    assert publication.manifest["pattern_member_bytes"] == 0
-    assert {
-        stored_row["representation"] for stored_row in session.stored_rows
-    } == {"direct_v1"}
+    _assert_direct_publication_contract(publication, session)
 
     first_rule = _rules()[0]
     renamed_rule = replace(first_rule, display_terms=("renamed",))
@@ -588,13 +767,10 @@ async def test_publication_accepts_rule_scoped_pattern_projection(
 ) -> None:
     """Publish exact rule-scoped pattern postings under the sealed root."""
 
-    async def no_op_lock(*_args, **_kwargs):
-        return None
-
     monkeypatch.setattr(
         snapshot_maps,
         "lock_v4_shared_layout_for_map_write",
-        no_op_lock,
+        _noop_map_write_lock,
     )
     graph_calls: list[dict[str, Any]] = []
 
@@ -614,13 +790,8 @@ async def test_publication_accepts_rule_scoped_pattern_projection(
         _rules()[0]
     )
     session = _PublicationSession()
-    publication = await candidates.publish_v4_inferred_taxonomy_candidates(
+    publication = await _publish_candidate_projection(
         session,
-        schema_name="mrf",
-        snapshot_key=41,
-        build_token="build-token",
-        rules=_rules(),
-        npi_count=3,
         representation="pattern_v1",
         pattern_count=10,
     )
@@ -714,13 +885,10 @@ async def test_publication_bounds_rule_catalog_before_materialization(
 async def test_publication_can_seal_an_all_observe_rule_set(monkeypatch) -> None:
     """Seal a rule set whose every member vector exceeds the online cap."""
 
-    async def no_op_lock(*_args, **_kwargs):
-        return None
-
     monkeypatch.setattr(
         snapshot_maps,
         "lock_v4_shared_layout_for_map_write",
-        no_op_lock,
+        _noop_map_write_lock,
     )
     monkeypatch.setattr(
         candidates,
@@ -755,13 +923,8 @@ async def test_publication_can_seal_an_all_observe_rule_set(monkeypatch) -> None
             ),
         }
     )
-    publication = await candidates.publish_v4_inferred_taxonomy_candidates(
+    publication = await _publish_candidate_projection(
         session,
-        schema_name="mrf",
-        snapshot_key=41,
-        build_token="build-token",
-        rules=_rules(),
-        npi_count=3,
         representation="pattern_v1",
         pattern_count=10,
     )
@@ -784,13 +947,10 @@ async def test_pattern_publication_rejects_root_and_projection_drift(
 ) -> None:
     """Reject pattern evidence that changes its root or candidate coverage."""
 
-    async def no_op_lock(*_args, **_kwargs):
-        return None
-
     monkeypatch.setattr(
         snapshot_maps,
         "lock_v4_shared_layout_for_map_write",
-        no_op_lock,
+        _noop_map_write_lock,
     )
 
     async def out_of_root_patterns(_session, **kwargs):
@@ -802,13 +962,8 @@ async def test_pattern_publication_rejects_root_and_projection_drift(
         out_of_root_patterns,
     )
     with pytest.raises(RuntimeError, match="outside its root"):
-        await candidates.publish_v4_inferred_taxonomy_candidates(
+        await _publish_candidate_projection(
             _PublicationSession(),
-            schema_name="mrf",
-            snapshot_key=41,
-            build_token="build-token",
-            rules=_rules(),
-            npi_count=3,
             representation="pattern_v1",
             pattern_count=2,
         )
@@ -826,13 +981,8 @@ async def test_pattern_publication_rejects_root_and_projection_drift(
         "PTG2_V4_MAX_ONLINE_CANDIDATE_PATTERN_PROJECTION_MEMBERS",
         1,
     )
-    publication = await candidates.publish_v4_inferred_taxonomy_candidates(
+    publication = await _publish_candidate_projection(
         _PublicationSession(),
-        schema_name="mrf",
-        snapshot_key=41,
-        build_token="build-token",
-        rules=_rules(),
-        npi_count=3,
         representation="pattern_v1",
         pattern_count=2,
     )
@@ -948,7 +1098,12 @@ def test_pattern_posting_codec_is_compact_strict_and_deterministic() -> None:
 
 @pytest.mark.parametrize(
     ("representation", "pattern_count"),
-    (("direct_v1", 1), ("pattern_v1", 0), ("unknown", 0)),
+    (
+        ("direct_v1", True),
+        ("direct_v1", 1),
+        ("pattern_v1", 0),
+        ("unknown", 0),
+    ),
 )
 def test_publication_rejects_inconsistent_root_identity(
     representation: str,
@@ -956,6 +1111,36 @@ def test_publication_rejects_inconsistent_root_identity(
 ) -> None:
     with pytest.raises(ValueError, match="root identity"):
         candidates._normalized_root_identity(representation, pattern_count)
+
+
+@pytest.mark.asyncio
+async def test_pattern_projection_short_circuits_empty_and_rejects_gaps(
+    monkeypatch,
+) -> None:
+    """Avoid graph work for empty candidates and reject incomplete graph replies."""
+
+    assert await candidates._candidate_pattern_postings_for_rule(
+        object(),
+        schema_name="mrf",
+        snapshot_key=41,
+        build_token="build-token",
+        candidate_npi_keys=(),
+        root_pattern_count=3,
+    ) == {}
+    monkeypatch.setattr(
+        v4_graph,
+        "lookup_building_v4_relation_members",
+        AsyncMock(return_value={}),
+    )
+    with pytest.raises(RuntimeError, match="incomplete"):
+        await candidates._candidate_pattern_postings_for_rule(
+            object(),
+            schema_name="mrf",
+            snapshot_key=41,
+            build_token="build-token",
+            candidate_npi_keys=(1,),
+            root_pattern_count=3,
+        )
 
 
 def test_v2_row_shaper_rejects_missing_candidate_and_pattern_bound() -> None:
@@ -1048,6 +1233,32 @@ def test_observe_rule_is_explicit_fallback_and_status_is_authenticated(
         )
 
 
+def test_projection_rule_resolution_scans_and_rejects_unknown_digest() -> None:
+    projection_rows = tuple(
+        sorted(
+            (_projection_row(rule) for rule in _rules()),
+            key=lambda projection_row: projection_row["rule_digest"],
+        )
+    )
+    manifest = candidates.shape_v4_inferred_taxonomy_projection_manifest(
+        projection_rows,
+        npi_count=3,
+        pattern_count=0,
+    )
+
+    resolved = candidates.resolve_inferred_taxonomy_projection_rule_manifest(
+        manifest,
+        projection_rows[1]["rule_digest"],
+    )
+    assert resolved is not None
+    assert resolved.rule_digest == projection_rows[1]["rule_digest"]
+    with pytest.raises(PTG2ManifestArtifactError, match="not in the sealed"):
+        candidates.resolve_inferred_taxonomy_projection_rule_manifest(
+            manifest,
+            b"x" * 32,
+        )
+
+
 @pytest.mark.asyncio
 async def test_persisted_summary_enforces_global_pattern_bound() -> None:
     projection_row = _projection_row(
@@ -1101,14 +1312,9 @@ async def test_reader_rejects_manifest_payload_and_cap_tamper() -> None:
     tampered_manifest = deepcopy(manifest)
     tampered_manifest["projection_digest"] = "0" * 64
     no_query_session = _ScriptedSession()
-    with pytest.raises(PTG2ManifestArtifactError, match="digest changed"):
-        await candidates.load_v4_inferred_taxonomy_candidates(
-            no_query_session,
-            snapshot_key=41,
-            rule_digest=projection_row["rule_digest"],
-            schema_name="mrf",
-            projection_manifest=tampered_manifest,
-        )
+    await _assert_candidate_load_rejected(
+        no_query_session, projection_row, tampered_manifest, "digest changed"
+    )
     assert no_query_session.calls == []
 
     tampered_payload = bytearray(projection_row["member_keys"])
@@ -1123,74 +1329,36 @@ async def test_reader_rejects_manifest_payload_and_cap_tamper() -> None:
             )
         )
     )
-    with pytest.raises(PTG2ManifestArtifactError, match="digest changed"):
-        await candidates.load_v4_inferred_taxonomy_candidates(
-            payload_session,
-            snapshot_key=41,
-            rule_digest=projection_row["rule_digest"],
-            schema_name="mrf",
-            projection_manifest=manifest,
-        )
+    await _assert_candidate_load_rejected(
+        payload_session, projection_row, manifest, "digest changed"
+    )
 
-    pattern_row = _projection_row(
-        _rules()[0],
-        npi_keys_by_pattern={9: (0, 2)},
+    pattern_row, pattern_manifest, pattern_session = (
+        _tampered_pattern_projection()
     )
-    pattern_manifest = candidates._candidate_projection_manifest(
-        (pattern_row,)
+    await _assert_candidate_load_rejected(
+        pattern_session,
+        pattern_row,
+        pattern_manifest,
+        "pattern digest changed",
     )
-    tampered_pattern_payload = bytearray(
-        pattern_row["pattern_member_payload"]
-    )
-    tampered_pattern_payload[-1] ^= 1
-    pattern_session = _ScriptedSession(
-        _Result(
-            (
-                _reader_row(
-                    pattern_row,
-                    pattern_member_payload=bytes(tampered_pattern_payload),
-                ),
-            )
-        )
-    )
-    with pytest.raises(
-        PTG2ManifestArtifactError,
-        match="pattern digest changed",
-    ):
-        await candidates.load_v4_inferred_taxonomy_candidates(
-            pattern_session,
-            snapshot_key=41,
-            rule_digest=pattern_row["rule_digest"],
-            schema_name="mrf",
-            projection_manifest=pattern_manifest,
-        )
 
     pattern_bound_session = _ScriptedSession(
         _Result((_reader_row(pattern_row, root_pattern_count=9),))
     )
-    with pytest.raises(
-        PTG2ManifestArtifactError,
-        match="violates its root",
-    ):
-        await candidates.load_v4_inferred_taxonomy_candidates(
-            pattern_bound_session,
-            snapshot_key=41,
-            rule_digest=pattern_row["rule_digest"],
-            schema_name="mrf",
-            projection_manifest=pattern_manifest,
-        )
+    await _assert_candidate_load_rejected(
+        pattern_bound_session,
+        pattern_row,
+        pattern_manifest,
+        "violates its root",
+    )
 
     capped_manifest = deepcopy(manifest)
     capped_manifest["max_online_inferred_taxonomy_candidates"] = 1
     capped_session = _ScriptedSession()
-    with pytest.raises(PTG2ManifestArtifactError, match="projection rule"):
-        await candidates.load_v4_inferred_taxonomy_candidates(
-            capped_session,
-            snapshot_key=41,
-            rule_digest=projection_row["rule_digest"],
-            schema_name="mrf",
-            projection_manifest=capped_manifest,
-        )
+    await _assert_candidate_load_rejected(
+        capped_session, projection_row, capped_manifest, "projection rule"
+    )
     assert capped_session.calls == []
 
 

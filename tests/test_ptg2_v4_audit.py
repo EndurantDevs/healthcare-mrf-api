@@ -55,6 +55,72 @@ def _graph_compilation(
     )
 
 
+class _FixtureSession:
+    async def execute(self, _statement, _parameters):
+        return ({"npi": 1_234_567_890, "npi_key": 4},)
+
+
+class _FixtureReader:
+    def __init__(self, representation: str):
+        self.representation = representation
+        self.calls = []
+
+    async def single_members(self, relation, owner_keys):
+        owner_keys = tuple(owner_keys)
+        self.calls.append((relation, owner_keys))
+        assert relation == "group_patterns"
+        assert owner_keys == (7,)
+        return {7: 9}
+
+    async def contains_edges(self, relation, edges):
+        edges = tuple(sorted(edges))
+        self.calls.append((relation, edges))
+        return {edge: True for edge in edges}
+
+
+def _fragmented_bitmap_fixture():
+    object_kind = "v4_npi_groups_exact_heavy_bitmap_v1"
+    header = b"PTG2V4BM" + struct.pack("<IIII", 7, 100, 24, 6)
+
+    def frame(fragment_no, entry_count, fragment_payload):
+        return struct.pack(
+            "<8sIIIIII",
+            b"PTG2V4BF",
+            7,
+            100,
+            24,
+            6,
+            fragment_no,
+            entry_count,
+        ) + fragment_payload
+
+    logical_payloads = (
+        header + bytes((0b00000111,)),
+        bytes((0b00000011, 0b00000001)),
+    )
+    framed_payloads = (
+        frame(0, 3, logical_payloads[0]),
+        frame(1, 3, logical_payloads[1]),
+    )
+    coordinates_by_pair = {
+        (7, 0): v4_audit.V4SnapshotMapCoordinate(
+            object_kind, 7, 0, 3, b"a" * 32
+        ),
+        (7, 1): v4_audit.V4SnapshotMapCoordinate(
+            object_kind, 7, 1, 3, b"b" * 32
+        ),
+    }
+    blocks_by_hash = {
+        b"a" * 32: v4_audit._V4PhysicalBlock(
+            b"a" * 32, object_kind, 3, framed_payloads[0]
+        ),
+        b"b" * 32: v4_audit._V4PhysicalBlock(
+            b"b" * 32, object_kind, 3, framed_payloads[1]
+        ),
+    }
+    return object_kind, logical_payloads, coordinates_by_pair, blocks_by_hash
+
+
 def test_provider_set_witness_stream_is_authenticated_sorted_and_bounded(tmp_path):
     compilation = _graph_compilation(
         tmp_path,
@@ -120,27 +186,6 @@ async def test_v4_one_member_witness_matches_v3_occurrence_fixture(
 ):
     """Prove direct and pattern witnesses preserve V3 occurrence semantics."""
 
-    class Session:
-        async def execute(self, _statement, _parameters):
-            return ({"npi": 1_234_567_890, "npi_key": 4},)
-
-    class Reader:
-        def __init__(self):
-            self.representation = representation
-            self.calls = []
-
-        async def single_members(self, relation, owner_keys):
-            owner_keys = tuple(owner_keys)
-            self.calls.append((relation, owner_keys))
-            assert relation == "group_patterns"
-            assert owner_keys == (7,)
-            return {7: 9}
-
-        async def contains_edges(self, relation, edges):
-            edges = tuple(sorted(edges))
-            self.calls.append((relation, edges))
-            return {edge: True for edge in edges}
-
     candidate = v3_audit.AuditCandidate(
         code_key=1,
         provider_set_key=5,
@@ -149,9 +194,9 @@ async def test_v4_one_member_witness_matches_v3_occurrence_fixture(
         provider_count=1,
         candidate_ordinal=0,
     )
-    reader = Reader()
+    reader = _FixtureReader(representation)
     verified = await v4_audit._verified_provider_npis_by_candidate(
-        Session(),
+        _FixtureSession(),
         schema_name="mrf",
         snapshot_key=11,
         candidates=(candidate,),
@@ -219,45 +264,12 @@ async def test_audit_heavy_bitmap_fragments_use_physical_entry_counts(
 ):
     """Prove fragmented bitmap coordinates count physical set bits exactly."""
 
-    object_kind = "v4_npi_groups_exact_heavy_bitmap_v1"
-    header = b"PTG2V4BM" + struct.pack("<IIII", 7, 100, 24, 6)
-
-    def frame(fragment_no, entry_count, payload):
-        return struct.pack(
-            "<8sIIIIII",
-            b"PTG2V4BF",
-            7,
-            100,
-            24,
-            6,
-            fragment_no,
-            entry_count,
-        ) + payload
-
-    logical_payloads = (
-        header + bytes((0b00000111,)),
-        bytes((0b00000011, 0b00000001)),
-    )
-    payloads = (
-        frame(0, 3, logical_payloads[0]),
-        frame(1, 3, logical_payloads[1]),
-    )
-    coordinates_by_pair = {
-        (7, 0): v4_audit.V4SnapshotMapCoordinate(
-            object_kind, 7, 0, 3, b"a" * 32
-        ),
-        (7, 1): v4_audit.V4SnapshotMapCoordinate(
-            object_kind, 7, 1, 3, b"b" * 32
-        ),
-    }
-    blocks_by_hash = {
-        b"a" * 32: v4_audit._V4PhysicalBlock(
-            b"a" * 32, object_kind, 3, payloads[0]
-        ),
-        b"b" * 32: v4_audit._V4PhysicalBlock(
-            b"b" * 32, object_kind, 3, payloads[1]
-        ),
-    }
+    (
+        object_kind,
+        logical_payloads,
+        coordinates_by_pair,
+        blocks_by_hash,
+    ) = _fragmented_bitmap_fixture()
     reader = v4_audit._V4PersistedGraphReader(
         object(),
         schema_name="mrf",
