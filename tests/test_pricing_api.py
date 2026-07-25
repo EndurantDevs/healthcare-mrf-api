@@ -2546,6 +2546,54 @@ async def test_resolve_procedure_taxonomy_scalarizes_sanic_query_parameters(monk
 
 
 @pytest.mark.asyncio
+async def test_procedure_taxonomy_defaults_code_system_for_unmapped_sanic_parameters(
+    monkeypatch,
+):
+    async def fake_resolve_context(
+        _session,
+        code_system,
+        code_value,
+        *,
+        expand_codes,
+    ):
+        assert (code_system, code_value, expand_codes) == ("CPT", "70551", True)
+        return {
+            "input_code": {"code_system": code_system, "code": code_value},
+            "resolved_codes": [],
+            "internal_codes": [],
+            "matched_via": [],
+            "expanded": expand_codes,
+        }
+
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_code_context",
+        fake_resolve_context,
+    )
+
+    internal_codes, context = await pricing_module._procedure_taxonomy_code_context(
+        None,
+        RequestParameters(
+            {
+                "code": ["70551"],
+                "expand_codes": ["true"],
+            }
+        ),
+        "70551",
+    )
+
+    assert internal_codes == []
+    assert context == {
+        "input_code": {"code_system": "CPT", "code": "70551"},
+        "resolved_codes": [],
+        "internal_codes": [],
+        "matched_via": [],
+        "expanded": True,
+        "resolution_status": "unmapped",
+    }
+
+
+@pytest.mark.asyncio
 async def test_resolve_procedure_taxonomy_acl_uses_soft_ortho_boost(monkeypatch):
     async def fake_resolve_internal_codes(_session, _code, _args, default_system=None):
         return [12329888], {
