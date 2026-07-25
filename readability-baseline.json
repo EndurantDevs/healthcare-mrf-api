@@ -1,11 +1,11 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 34,
-    "ambiguous_variable_names": 11,
-    "boolean_name_mismatch": 25,
+    "ambiguous_variable_names": 4,
+    "boolean_name_mismatch": 14,
     "builtin_shadowing": 0,
     "class_name_shape": 2,
-    "collection_name_mismatch": 13,
+    "collection_name_mismatch": 2,
     "comment_noise": 0,
     "confusable_function_names": 0,
     "deep_nesting": 70,
@@ -14,7 +14,7 @@
     "inline_suppressions": 2,
     "long_files": 184,
     "long_functions": 874,
-    "missing_contract_docstrings": 2,
+    "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 7,
     "syntax_errors": 0,
@@ -61,35 +61,17 @@
     "ambiguous_variable_names": [
       "ambiguous_variable_name:api/endpoint/npi.py:get_npi:data",
       "ambiguous_variable_name:api/endpoint/site_intelligence.py:get_site_score:row",
-      "ambiguous_variable_name:process/cms_doctors.py:process_data._consume_reader:row",
-      "ambiguous_variable_name:process/facility_anchors.py:_fetch_and_parse_cms_hospitals:row",
-      "ambiguous_variable_name:process/facility_anchors.py:_fetch_and_parse_hrsa:row",
-      "ambiguous_variable_name:process/facility_anchors.py:_parse_lat_lng:row",
       "ambiguous_variable_name:process/mrf_source_discovery.py:_viva_health_employer_landing_target:source",
-      "ambiguous_variable_name:process/npi.py:refresh_do_business_as:source",
-      "ambiguous_variable_name:process/pharmacy_economics.py:_fetch_sdud:row",
-      "ambiguous_variable_name:process/provider_directory_fhir.py:_source_row_from_seed:row",
-      "ambiguous_variable_name:process/provider_directory_projection_db.py:set_local_projection_action:value"
+      "ambiguous_variable_name:process/provider_directory_fhir.py:_source_row_from_seed:row"
     ],
     "boolean_name_mismatch": [
-      "boolean_name_mismatch:api/control_workers.py:_worker_state:running:assignment",
-      "boolean_name_mismatch:api/control_workers.py:_worker_state:running:assignment",
-      "boolean_name_mismatch:api/endpoint/healthcheck.py:readiness:ready:assignment",
-      "boolean_name_mismatch:api/endpoint/pagination.py:parse_bool_alias:function",
-      "boolean_name_mismatch:api/endpoint/pricing.py:_parse_bool:function",
       "boolean_name_mismatch:api/provider_specialty_filters.py:ProviderSpecialtyFilter.active:function",
-      "boolean_name_mismatch:api/provider_specialty_filters.py:_resolve_provider_specialty_filter:primary_only:assignment",
-      "boolean_name_mismatch:api/provider_specialty_filters.py:_resolve_provider_specialty_filter:primary_only:assignment",
       "boolean_name_mismatch:api/tier_utils.py:normalize_drug_tier_slug._has:function",
       "boolean_name_mismatch:process/__init__.py:ptg:keep_partial_artifacts:assignment",
-      "boolean_name_mismatch:process/npi.py:_index_requires_postgis:function",
-      "boolean_name_mismatch:process/npi.py:_npi_requires_nucc:function",
       "boolean_name_mismatch:process/npi.py:shutdown.table_exists:function",
       "boolean_name_mismatch:process/npi.py:shutdown.table_has_column:function",
-      "boolean_name_mismatch:process/provider_enrichment.py:_looks_like_csv_download:function",
       "boolean_name_mismatch:process/provider_enrichment.py:_looks_like_provider_enrollment_title:function",
       "boolean_name_mismatch:process/provider_quality_parts/execution_helpers.py:_row_allowed_for_test:function",
-      "boolean_name_mismatch:process/provider_quality_parts/model_helpers.py:_cohort_models_present:function",
       "boolean_name_mismatch:process/provider_quality_parts/state.py:_claim_finalize_lock:function",
       "boolean_name_mismatch:process/provider_quality_parts/state.py:_claim_global_finalize_lock:function",
       "boolean_name_mismatch:process/ptg_parts/config.py:_env_bool:function",
@@ -104,19 +86,8 @@
       "class_name_shape:process/ptg_parts/provider_cache.py:PTG2InMemoryProviderReferenceCache:too_many_tokens"
     ],
     "collection_name_mismatch": [
-      "collection_name_mismatch:api/endpoint/nucc.py:all_of_nucc:applied_filters",
-      "collection_name_mismatch:api/endpoint/site_intelligence.py:get_site_score:chronic_breakdown_rows_15",
-      "collection_name_mismatch:api/endpoint/site_intelligence.py:get_site_score:chronic_rates_15",
-      "collection_name_mismatch:process/cms_doctors.py:process_data._consume_reader:batch",
-      "collection_name_mismatch:process/facility_anchors.py:_fetch_and_parse_cms_hospitals:batch",
-      "collection_name_mismatch:process/facility_anchors.py:_fetch_and_parse_hrsa:batch",
       "collection_name_mismatch:process/mrf_source_discovery.py:_crawl_targets_for_source:resolver",
-      "collection_name_mismatch:process/pharmacy_economics.py:process_data:batch",
-      "collection_name_mismatch:process/provider_directory_fhir.py:process_data:metrics",
-      "collection_name_mismatch:process/provider_quality_parts/cohort_context.py:_build_cohort_materialization_context:measure_meta_sources",
-      "collection_name_mismatch:process/provider_quality_parts/cohort_context.py:_build_cohort_materialization_context:measure_meta_sources",
-      "collection_name_mismatch:process/provider_quality_parts/cohort_context.py:_build_cohort_materialization_context:score_optional_mapping",
-      "collection_name_mismatch:process/provider_quality_parts/model_helpers.py:_optional_column_pairs:used"
+      "collection_name_mismatch:process/provider_directory_fhir.py:process_data:metrics"
     ],
     "comment_noise": [],
     "confusable_function_names": [],
@@ -1296,10 +1267,7 @@
       "long_function:tests/test_site_intelligence_api.py:test_site_intelligence_returns_trade_area_metrics",
       "long_function:tests/test_site_intelligence_api.py:test_site_intelligence_target_scripts_gates_recommendation"
     ],
-    "missing_contract_docstrings": [
-      "missing_contract_docstring:api/endpoint/partd_formulary.py:_fetch_state_license_summary",
-      "missing_contract_docstring:api/endpoint/site_intelligence.py:_radius_zip_weights"
-    ],
+    "missing_contract_docstrings": [],
     "pass_placeholders": [],
     "single_letter_names": [
       "single_letter_name:api/endpoint/clinical.py:_list_area_concepts_response:q",

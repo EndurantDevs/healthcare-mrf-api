@@ -281,21 +281,21 @@ def _worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> di
         return _kubernetes_worker_state(spec, payload)
 
     pid = _read_pid(_pid_path(spec))
-    running = _is_pid_running(pid) and _is_pid_spec_match(pid, spec)
-    if pid and not running:
+    is_running = _is_pid_running(pid) and _is_pid_spec_match(pid, spec)
+    if pid and not is_running:
         _remove_stale_pid(spec)
-    if not running:
+    if not is_running:
         pid = _find_running_pid(spec)
-        running = _is_pid_running(pid)
-        if running and pid:
+        is_running = _is_pid_running(pid)
+        if is_running and pid:
             _write_pid_file(spec, pid)
     return {
         "queue": spec.queue,
         "worker_class": spec.worker_class,
         "importers": list(spec.importers),
         "role": spec.role,
-        "running": running,
-        "pid": pid if running else None,
+        "running": is_running,
+        "pid": pid if is_running else None,
         "pid_path": str(_pid_path(spec)),
         "log_path": str(_log_path(spec)),
         "command": " ".join(_worker_command(sys.executable, spec)),

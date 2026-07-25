@@ -346,7 +346,7 @@ async def _build_cohort_materialization_context(
     measure_insert_cols_sql = ",\n            ".join(measure_insert_columns)
     measure_select_cols_sql = ",\n            ".join(measure_select_columns)
 
-    measure_meta_sources = {
+    measure_metadata_source_by_alias = {
         "selected_cohort_level": _first_existing_column(measure_columns, "cohort_level", "cohort_tier"),
         "selected_geography_scope": _first_existing_column(measure_columns, "cohort_geography_scope", "cohort_geo_scope"),
         "selected_geography_value": _first_existing_column(measure_columns, "cohort_geography_value", "cohort_geo_value"),
@@ -356,51 +356,58 @@ async def _build_cohort_materialization_context(
         "selected_procedure_bucket": _first_existing_column(measure_columns, "cohort_procedure_bucket"),
         "selected_peer_n": _first_existing_column(measure_columns, "cohort_peer_n"),
     }
-    measure_meta_sources = {alias: column for alias, column in measure_meta_sources.items() if column}
+    measure_metadata_source_by_alias = {
+        alias: column
+        for alias, column in measure_metadata_source_by_alias.items()
+        if column
+    }
 
-    score_optional_mapping: list[tuple[str, str]] = []
-    if "selected_cohort_level" in measure_meta_sources:
-        score_optional_mapping.extend(
+    score_optional_candidates: list[tuple[str, str]] = []
+    if "selected_cohort_level" in measure_metadata_source_by_alias:
+        score_optional_candidates.extend(
             (
                 ("cohort_level", "cm.selected_cohort_level"),
                 ("cohort_tier", "cm.selected_cohort_level"),
             )
         )
-    if "selected_geography_scope" in measure_meta_sources:
-        score_optional_mapping.extend(
+    if "selected_geography_scope" in measure_metadata_source_by_alias:
+        score_optional_candidates.extend(
             (
                 ("cohort_geography_scope", "cm.selected_geography_scope"),
                 ("cohort_geo_scope", "cm.selected_geography_scope"),
             )
         )
-    if "selected_geography_value" in measure_meta_sources:
-        score_optional_mapping.extend(
+    if "selected_geography_value" in measure_metadata_source_by_alias:
+        score_optional_candidates.extend(
             (
                 ("cohort_geography_value", "cm.selected_geography_value"),
                 ("cohort_geo_value", "cm.selected_geography_value"),
             )
         )
-    if "selected_specialty" in measure_meta_sources:
-        score_optional_mapping.extend(
+    if "selected_specialty" in measure_metadata_source_by_alias:
+        score_optional_candidates.extend(
             (
                 ("cohort_specialty", "cm.selected_specialty"),
                 ("cohort_specialty_key", "cm.selected_specialty"),
             )
         )
-    if "selected_taxonomy" in measure_meta_sources:
-        score_optional_mapping.extend(
+    if "selected_taxonomy" in measure_metadata_source_by_alias:
+        score_optional_candidates.extend(
             (
                 ("cohort_taxonomy", "cm.selected_taxonomy"),
                 ("cohort_taxonomy_code", "cm.selected_taxonomy"),
             )
         )
-    if "selected_classification" in measure_meta_sources:
-        score_optional_mapping.append(("cohort_classification", "cm.selected_classification"))
-    if "selected_procedure_bucket" in measure_meta_sources:
-        score_optional_mapping.append(("cohort_procedure_bucket", "cm.selected_procedure_bucket"))
-    if "selected_peer_n" in measure_meta_sources:
-        score_optional_mapping.append(("cohort_peer_n", "ROUND(cm.selected_peer_n)::int"))
-    score_optional_pairs = _optional_column_pairs(score_columns, tuple(score_optional_mapping))
+    if "selected_classification" in measure_metadata_source_by_alias:
+        score_optional_candidates.append(("cohort_classification", "cm.selected_classification"))
+    if "selected_procedure_bucket" in measure_metadata_source_by_alias:
+        score_optional_candidates.append(("cohort_procedure_bucket", "cm.selected_procedure_bucket"))
+    if "selected_peer_n" in measure_metadata_source_by_alias:
+        score_optional_candidates.append(("cohort_peer_n", "ROUND(cm.selected_peer_n)::int"))
+    score_optional_pairs = _optional_column_pairs(
+        score_columns,
+        tuple(score_optional_candidates),
+    )
 
     score_insert_columns = [
         "npi",
@@ -576,7 +583,7 @@ async def _build_cohort_materialization_context(
         "peer_procedure_bucket_match": peer_procedure_bucket_match,
         "provider_rx_cte": provider_rx_cte,
         "benchmark_mode_values": benchmark_mode_values,
-        "measure_meta_sources": measure_meta_sources,
+        "measure_meta_sources": measure_metadata_source_by_alias,
         "score_optional_pairs": score_optional_pairs,
         "npi_table_exists": npi_table_exists,
         "taxonomy_table_exists": taxonomy_table_exists,

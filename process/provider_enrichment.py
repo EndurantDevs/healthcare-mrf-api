@@ -203,9 +203,12 @@ def _is_csv_distribution(obj: dict[str, Any]) -> bool:
     return "csv" in media_type or "csv" in fmt
 
 
-def _looks_like_csv_download(url: str) -> bool:
+def _is_likely_csv_download(url: str) -> bool:
     normalized = str(url or "").strip().lower()
     return normalized.endswith(".csv")
+
+
+_looks_like_csv_download = _is_likely_csv_download
 
 
 def _extract_period_bounds(temporal: str | None) -> tuple[datetime.date | None, datetime.date | None]:

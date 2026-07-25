@@ -45,13 +45,32 @@ def _version_three_tables(**table_overrides_by_key):
     return ptg2_serving.PTG2ServingTables(**table_kwargs_by_key)
 
 
+async def _assert_cached_price_hydration(session, tables, block_read_names):
+    cached_prices_by_set = await ptg2_serving._prices_for_price_sets(
+        session,
+        tables,
+        ["00000000000000000000000000000011", "00000000000000000000000000000012"],
+        price_key_by_set_id={
+            "00000000000000000000000000000011": 10,
+            "00000000000000000000000000000012": 11,
+        },
+    )
+    assert block_read_names == ["memberships", "atoms"]
+    assert len(session.calls) == 1
+    assert cached_prices_by_set["00000000000000000000000000000011"][0][
+        "service_code"
+    ] == ["11"]
+
+
 @pytest.mark.asyncio
 async def test_v3_price_hydration_reads_dense_atoms_without_price_atom_table(monkeypatch):
     attribute_keys = (0, 1, 2, 3, 4, 5, 6)
     first_atom = PTG2V3PriceAtomRecord("100.00", attribute_keys)
     second_atom = PTG2V3PriceAtomRecord("125.00", attribute_keys)
+    block_read_names = []
 
     async def memberships(_session, snapshot_key, price_keys, *, atom_key_bits=None, block_span=None, schema_name=None):
+        block_read_names.append("memberships")
         assert snapshot_key == 41
         assert schema_name == "mrf"
         assert tuple(price_keys) == (10, 11)
@@ -60,6 +79,7 @@ async def test_v3_price_hydration_reads_dense_atoms_without_price_atom_table(mon
         return {10: (4, 5), 11: (5,)}
 
     async def atoms(_session, snapshot_key, atom_keys, *, atom_key_bits=None, block_span=None, schema_name=None):
+        block_read_names.append("atoms")
         assert snapshot_key == 41
         assert schema_name == "mrf"
         assert tuple(atom_keys) == (4, 5)
@@ -97,6 +117,9 @@ async def test_v3_price_hydration_reads_dense_atoms_without_price_atom_table(mon
     ]
     assert prices_by_set["00000000000000000000000000000012"][0]["service_code"] == ["11"]
     assert "price_atom_global_id_128" not in str(session.calls[0][0])
+    prices_by_set["00000000000000000000000000000011"][0]["service_code"].append("changed")
+
+    await _assert_cached_price_hydration(session, tables, block_read_names)
 
 
 @pytest.mark.asyncio

@@ -78,6 +78,7 @@
         "api/ptg2_db_serving_v3_pages.py",
         "api/ptg2_db_sidecars.py",
         "api/ptg2_online_work.py",
+        "api/ptg2_price_hydration_cache.py",
         "api/ptg2_response.py",
         "api/ptg2_serving.py",
         "api/ptg2_serving_utils.py",
@@ -91,6 +92,7 @@
         "api/tier_utils.py",
         "api/uhc_provider_file_catalog.py",
         "api/utils.py",
+        "api/worker_memory.py",
         "db/__init__.py",
         "db/connection.py",
         "db/json_mixin.py",
@@ -405,12 +407,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 32731,
-          "total": 38400
+          "covered": 32867,
+          "total": 38464
         },
         "lines": {
-          "covered": 104912,
-          "total": 113872
+          "covered": 105279,
+          "total": 114135
         }
       },
       "one_time_floor_reset": {

@@ -102,3 +102,17 @@ async def test_check_db_failure():
     payload = await health_module._check_db(session)
     assert payload["status"] == "Fail"
     assert "boom" in payload["details"]
+
+
+@pytest.mark.asyncio
+async def test_check_v3_schema_failure():
+    """Readiness reports a bounded V3 probe error instead of raising it."""
+
+    payload = await health_module._check_v3_schema(
+        FakeSession(error=SQLAlchemyError("schema unavailable"))
+    )
+
+    assert payload == {
+        "status": "Fail",
+        "details": "schema unavailable",
+    }

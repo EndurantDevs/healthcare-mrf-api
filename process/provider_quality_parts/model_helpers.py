@@ -75,8 +75,11 @@ def _cohort_model_classes() -> tuple[type, ...]:
     return tuple(classes)
 
 
-def _cohort_models_present(classes: dict[str, type]) -> bool:
+def _has_required_cohort_models(classes: dict[str, type]) -> bool:
     return all(name in classes for name in COHORT_MODEL_CLASS_NAMES)
+
+
+_cohort_models_present = _has_required_cohort_models
 
 
 def _model_columns(model: type | None) -> set[str]:
@@ -96,12 +99,12 @@ def _optional_column_pairs(
     available_columns: set[str],
     mapping: tuple[tuple[str, str], ...],
 ) -> list[tuple[str, str]]:
-    used: set[str] = set()
+    used_columns: set[str] = set()
     pairs: list[tuple[str, str]] = []
     for column_name, sql_expr in mapping:
-        if column_name in available_columns and column_name not in used:
+        if column_name in available_columns and column_name not in used_columns:
             pairs.append((column_name, sql_expr))
-            used.add(column_name)
+            used_columns.add(column_name)
     return pairs
 
 

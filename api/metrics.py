@@ -11,7 +11,9 @@ from sqlalchemy import func, select
 
 from api.control_imports import ACTIVE_STATUSES, node_health
 from api.ptg2_v4_graph import v4_graph_metrics_snapshot
+from api.ptg2_price_hydration_cache import price_hydration_cache_metrics
 from api.runtime_identity import runtime_identity
+from api.worker_memory import worker_memory_metrics
 from db.models import ImportRun, db
 
 blueprint = Blueprint("metrics")
@@ -83,6 +85,8 @@ async def render_prometheus_metrics() -> str:
     lines.extend(_runtime_metric_lines(health))
     lines.extend(_process_identity_metric_lines(runtime_identity()))
     lines.extend(_v4_graph_metric_lines(v4_graph_metrics_snapshot()))
+    lines.extend(_price_hydration_cache_metric_lines())
+    lines.extend(_worker_memory_metric_lines())
     return "\n".join(lines) + "\n"
 
 
@@ -206,6 +210,59 @@ def _v4_graph_metric_lines(graph_metrics_by_name: dict[str, Any]) -> list[str]:
         for source_name, metric_name in _V4_GRAPH_COUNTER_METRICS
     )
     return lines
+
+
+def _price_hydration_cache_metric_lines() -> list[str]:
+    cache_metrics = price_hydration_cache_metrics()
+    return [
+        _metric("hp_mrf_ptg_price_hydration_cache_hits_total", cache_metrics.hits),
+        _metric("hp_mrf_ptg_price_hydration_cache_misses_total", cache_metrics.misses),
+        _metric(
+            "hp_mrf_ptg_price_hydration_cache_admissions_total",
+            cache_metrics.admissions,
+        ),
+        _metric(
+            "hp_mrf_ptg_price_hydration_cache_evictions_total",
+            cache_metrics.evictions,
+        ),
+        _metric(
+            "hp_mrf_ptg_price_hydration_cache_rejected_batches_total",
+            cache_metrics.rejected_batches,
+        ),
+        _metric("hp_mrf_ptg_price_hydration_cache_bytes", cache_metrics.retained_bytes),
+        _metric("hp_mrf_ptg_price_hydration_cache_entries", cache_metrics.entries),
+        _metric(
+            "hp_mrf_ptg_price_hydration_cache_max_bytes",
+            cache_metrics.maximum_bytes,
+        ),
+    ]
+
+
+def _worker_memory_metric_lines() -> list[str]:
+    memory_metrics = worker_memory_metrics()
+    return [
+        _metric(
+            "hp_mrf_api_worker_gc_freeze_enabled",
+            int(memory_metrics.is_enabled),
+        ),
+        _metric("hp_mrf_api_worker_gc_frozen", int(memory_metrics.is_frozen)),
+        _metric(
+            "hp_mrf_api_worker_gc_freeze_successes_total",
+            memory_metrics.freeze_successes,
+        ),
+        _metric(
+            "hp_mrf_api_worker_gc_freeze_failures_total",
+            memory_metrics.freeze_failures,
+        ),
+        _metric(
+            "hp_mrf_api_worker_gc_explicit_collections_total",
+            memory_metrics.explicit_collections,
+        ),
+        _metric(
+            "hp_mrf_api_worker_gc_permanent_objects",
+            memory_metrics.permanent_objects,
+        ),
+    ]
 
 
 async def _active_run_counts() -> tuple[dict[str, int], dict[str, int]]:

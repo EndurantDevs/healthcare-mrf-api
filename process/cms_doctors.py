@@ -214,12 +214,12 @@ async def process_data(ctx, task=None):
                 """Normalize reader rows and persist bounded batches."""
 
                 nonlocal accepted_rows
-                batch = []
+                provider_batch_rows = []
                 seen_keys: set[int] = set()
                 now = datetime.datetime.utcnow()
 
-                for row in reader:
-                    npi_str = row.get("NPI") or row.get("npi")
+                for provider_row in reader:
+                    npi_str = provider_row.get("NPI") or provider_row.get("npi")
                     if not npi_str:
                         continue
 
@@ -228,12 +228,12 @@ async def process_data(ctx, task=None):
                     except ValueError:
                         continue
 
-                    addr1 = row.get("Line 1 Street Address") or row.get("adr_ln_1")
-                    addr2 = row.get("Line 2 Street Address") or row.get("adr_ln_2")
-                    city = row.get("City") or row.get("City/Town") or row.get("citytown")
-                    state = row.get("State") or row.get("state")
-                    zip_code = str(row.get("Zip Code") or row.get("ZIP Code") or row.get("zip_code") or "")[:5]
-                    provider_type = row.get("Primary specialty") or row.get("pri_spec")
+                    addr1 = provider_row.get("Line 1 Street Address") or provider_row.get("adr_ln_1")
+                    addr2 = provider_row.get("Line 2 Street Address") or provider_row.get("adr_ln_2")
+                    city = provider_row.get("City") or provider_row.get("City/Town") or provider_row.get("citytown")
+                    state = provider_row.get("State") or provider_row.get("state")
+                    zip_code = str(provider_row.get("Zip Code") or provider_row.get("ZIP Code") or provider_row.get("zip_code") or "")[:5]
+                    provider_type = provider_row.get("Primary specialty") or provider_row.get("pri_spec")
 
                     if not addr1 or not zip_code or len(zip_code) < 5:
                         continue
@@ -251,7 +251,7 @@ async def process_data(ctx, task=None):
                         continue
                     seen_keys.add(address_checksum)
 
-                    batch.append({
+                    provider_batch_rows.append({
                         "npi": npi,
                         "address_checksum": address_checksum,
                         "address_line1": addr1,
@@ -263,19 +263,19 @@ async def process_data(ctx, task=None):
                         "updated_at": now,
                     })
 
-                    if len(batch) >= batch_size:
+                    if len(provider_batch_rows) >= batch_size:
                         await raise_if_cancelled(ctx, task)
-                        await push_objects(batch, stage_cls)
-                        accepted_rows += len(batch)
-                        batch.clear()
+                        await push_objects(provider_batch_rows, stage_cls)
+                        accepted_rows += len(provider_batch_rows)
+                        provider_batch_rows.clear()
 
-                    if test_mode and accepted_rows + len(batch) >= test_row_limit:
+                    if test_mode and accepted_rows + len(provider_batch_rows) >= test_row_limit:
                         break
 
-                if batch:
+                if provider_batch_rows:
                     await raise_if_cancelled(ctx, task)
-                    await push_objects(batch, stage_cls)
-                    accepted_rows += len(batch)
+                    await push_objects(provider_batch_rows, stage_cls)
+                    accepted_rows += len(provider_batch_rows)
 
             if source_path.lower().endswith(".zip"):
                 with zipfile.ZipFile(source_path) as zf:

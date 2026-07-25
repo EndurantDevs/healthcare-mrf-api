@@ -9727,7 +9727,7 @@ async def get_full_taxonomy_list(_request, npi):
 async def get_plans_by_npi(_request, npi):
     """Return issuer plan links recorded for one NPI."""
 
-    data = []
+    npi_plan_rows = []
     plan_rows = []
     issuer_rows = []
     npi = int(npi)
@@ -9740,9 +9740,9 @@ async def get_plans_by_npi(_request, npi):
     )
 
     async for plan_raw, issuer in query.iterate():
-        data.append({"npi_info": plan_raw.to_json_dict(), "issuer_info": issuer.to_json_dict()})
+        npi_plan_rows.append({"npi_info": plan_raw.to_json_dict(), "issuer_info": issuer.to_json_dict()})
 
-    return response.json({"npi_data": data, "plan_data": plan_rows, "issuer_data": issuer_rows})
+    return response.json({"npi_data": npi_plan_rows, "plan_data": plan_rows, "issuer_data": issuer_rows})
 
 
 @blueprint.get("/id/<npi>")

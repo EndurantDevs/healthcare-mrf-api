@@ -112,7 +112,7 @@ def parse_pagination(
     )
 
 
-def parse_bool_alias(args, primary: str, alias: str, *, default: bool) -> bool:
+def is_bool_alias_enabled(args, primary: str, alias: str, *, default: bool) -> bool:
     """Parse equivalent boolean query arguments with a shared default."""
     def _coerce(raw: Any, name: str) -> Optional[bool]:
         if raw in (None, "", "null"):
@@ -141,3 +141,6 @@ def parse_bool_alias(args, primary: str, alias: str, *, default: bool) -> bool:
     if alias_value is not None:
         return alias_value
     return default
+
+
+parse_bool_alias = is_bool_alias_enabled

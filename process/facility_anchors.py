@@ -123,9 +123,9 @@ def _stage_index_name(stage_table: str, index_name: str) -> str:
     return f"{stage_table}_idx_{index_name}"
 
 
-def _parse_lat_lng(row: dict) -> tuple[float | None, float | None]:
-    lat_raw = row.get("Latitude")
-    lng_raw = row.get("Longitude")
+def _parse_lat_lng(address_row: dict) -> tuple[float | None, float | None]:
+    lat_raw = address_row.get("Latitude")
+    lng_raw = address_row.get("Longitude")
 
     try:
         lat = float(str(lat_raw).strip()) if lat_raw not in (None, "") else None
@@ -139,7 +139,7 @@ def _parse_lat_lng(row: dict) -> tuple[float | None, float | None]:
     if lat is not None and lng is not None:
         return lat, lng
 
-    location = str(row.get("Location") or "").strip()
+    location = str(address_row.get("Location") or "").strip()
     if not location:
         return lat, lng
 
@@ -298,7 +298,7 @@ async def _fetch_and_parse_hrsa(client, stage_cls, batch_size: int, test_mode: b
     """Fetch HRSA facility data and normalize accepted anchor rows."""
     logger.info("Fetching HRSA FQHC data...")
     accepted = 0
-    batch = []
+    facility_batch_rows = []
     now = datetime.datetime.utcnow()
 
     try:
@@ -309,21 +309,21 @@ async def _fetch_and_parse_hrsa(client, stage_cls, batch_size: int, test_mode: b
             content = await response.read()
 
         reader = csv.DictReader(content.decode("utf-8", errors="replace").splitlines())
-        for row in reader:
-            site_name = row.get("Site Name")
+        for facility_row in reader:
+            site_name = facility_row.get("Site Name")
             if not site_name:
                 continue
 
             try:
                 # Current HRSA file provides X=lng, Y=lat
                 lat = float(
-                    row.get("Geocode Latitude")
-                    or row.get("Geocoding Artifact Address Primary Y Coordinate")
+                    facility_row.get("Geocode Latitude")
+                    or facility_row.get("Geocoding Artifact Address Primary Y Coordinate")
                     or 0.0
                 )
                 lng = float(
-                    row.get("Geocode Longitude")
-                    or row.get("Geocoding Artifact Address Primary X Coordinate")
+                    facility_row.get("Geocode Longitude")
+                    or facility_row.get("Geocoding Artifact Address Primary X Coordinate")
                     or 0.0
                 )
             except (TypeError, ValueError):
@@ -332,46 +332,46 @@ async def _fetch_and_parse_hrsa(client, stage_cls, batch_size: int, test_mode: b
             if lat == 0.0 and lng == 0.0:
                 continue
 
-            batch.append({
-                "id": _stable_hrsa_site_id(row),
+            facility_batch_rows.append({
+                "id": _stable_hrsa_site_id(facility_row),
                 "name": site_name,
                 "facility_type": "FQHC",
-                "address_line1": row.get("Site Address"),
-                "city": row.get("Site City"),
-                "state": row.get("Site State Abbreviation"),
-                "zip_code": str(row.get("Site Postal Code") or "")[:5],
+                "address_line1": facility_row.get("Site Address"),
+                "city": facility_row.get("Site City"),
+                "state": facility_row.get("Site State Abbreviation"),
+                "zip_code": str(facility_row.get("Site Postal Code") or "")[:5],
                 "latitude": lat,
                 "longitude": lng,
-                "telephone_number": _normalize_phone(row.get("Site Telephone Number")),
-                "npi": _normalize_npi(row.get("FQHC Site NPI Number")),
-                "medicare_ccn": _normalize_medicare_ccn(row.get("FQHC Site Medicare Billing Number")),
-                "health_center_number": _normalize_medicare_ccn(row.get("Health Center Number")),
+                "telephone_number": _normalize_phone(facility_row.get("Site Telephone Number")),
+                "npi": _normalize_npi(facility_row.get("FQHC Site NPI Number")),
+                "medicare_ccn": _normalize_medicare_ccn(facility_row.get("FQHC Site Medicare Billing Number")),
+                "health_center_number": _normalize_medicare_ccn(facility_row.get("Health Center Number")),
                 "health_center_organization_id": _normalize_medicare_ccn(
-                    row.get("BHCMIS Organization Identification Number")
+                    facility_row.get("BHCMIS Organization Identification Number")
                 ),
-                "bphc_assigned_number": _normalize_medicare_ccn(row.get("BPHC Assigned Number")),
-                "health_center_name": row.get("Health Center Name"),
-                "health_center_organization_address_line1": row.get("Health Center Organization Street Address"),
-                "health_center_organization_city": row.get("Health Center Organization City"),
-                "health_center_organization_state": row.get("Health Center Organization State"),
+                "bphc_assigned_number": _normalize_medicare_ccn(facility_row.get("BPHC Assigned Number")),
+                "health_center_name": facility_row.get("Health Center Name"),
+                "health_center_organization_address_line1": facility_row.get("Health Center Organization Street Address"),
+                "health_center_organization_city": facility_row.get("Health Center Organization City"),
+                "health_center_organization_state": facility_row.get("Health Center Organization State"),
                 "health_center_organization_zip_code": str(
-                    row.get("Health Center Organization ZIP Code") or ""
+                    facility_row.get("Health Center Organization ZIP Code") or ""
                 )[:5],
                 "source_dataset": "HRSA_HEALTH_CENTER_SITES",
                 "updated_at": now,
             })
 
-            if len(batch) >= batch_size:
-                await push_objects(batch, stage_cls)
-                accepted += len(batch)
-                batch.clear()
+            if len(facility_batch_rows) >= batch_size:
+                await push_objects(facility_batch_rows, stage_cls)
+                accepted += len(facility_batch_rows)
+                facility_batch_rows.clear()
 
-            if test_mode and accepted + len(batch) >= test_limit:
+            if test_mode and accepted + len(facility_batch_rows) >= test_limit:
                 break
 
-        if batch:
-            await push_objects(batch, stage_cls)
-            accepted += len(batch)
+        if facility_batch_rows:
+            await push_objects(facility_batch_rows, stage_cls)
+            accepted += len(facility_batch_rows)
 
         logger.info("HRSA FQHC: %d rows accepted", accepted)
 
@@ -421,7 +421,7 @@ async def _fetch_and_parse_cms_hospitals(
     logger.info("Fetching CMS Hospital General Information...")
     accepted = 0
     with_coordinates = 0
-    batch = []
+    hospital_batch_rows = []
     now = datetime.datetime.utcnow()
 
     url = os.getenv("HLTHPRT_CMS_HOSPITAL_CSV_URL")
@@ -436,26 +436,26 @@ async def _fetch_and_parse_cms_hospitals(
             content = await response.read()
 
         reader = csv.DictReader(content.decode("utf-8", errors="replace").splitlines())
-        for row in reader:
-            facility_id = row.get("Facility ID") or row.get("Provider ID")
-            facility_name = row.get("Facility Name") or row.get("Hospital Name")
+        for hospital_row in reader:
+            facility_id = hospital_row.get("Facility ID") or hospital_row.get("Provider ID")
+            facility_name = hospital_row.get("Facility Name") or hospital_row.get("Hospital Name")
             if not facility_name:
                 continue
 
             # CMS Hospital dataset has Address, City, State, ZIP Code columns
-            state = row.get("State")
-            zip_code = _normalize_zip(row.get("ZIP Code"))
+            state = hospital_row.get("State")
+            zip_code = _normalize_zip(hospital_row.get("ZIP Code"))
 
-            lat, lng = _parse_lat_lng(row)
+            lat, lng = _parse_lat_lng(hospital_row)
             if lat is not None and lng is not None:
                 with_coordinates += 1
 
-            batch.append({
+            hospital_batch_rows.append({
                 "id": facility_id or str(uuid.uuid4()),
                 "name": facility_name,
                 "facility_type": "Hospital",
-                "address_line1": row.get("Address"),
-                "city": row.get("City") or row.get("City/Town"),
+                "address_line1": hospital_row.get("Address"),
+                "city": hospital_row.get("City") or hospital_row.get("City/Town"),
                 "state": state,
                 "zip_code": zip_code,
                 "latitude": lat,
@@ -467,17 +467,17 @@ async def _fetch_and_parse_cms_hospitals(
                 "updated_at": now,
             })
 
-            if len(batch) >= batch_size:
-                await push_objects(batch, stage_cls)
-                accepted += len(batch)
-                batch.clear()
+            if len(hospital_batch_rows) >= batch_size:
+                await push_objects(hospital_batch_rows, stage_cls)
+                accepted += len(hospital_batch_rows)
+                hospital_batch_rows.clear()
 
-            if test_mode and already_accepted + accepted + len(batch) >= test_limit:
+            if test_mode and already_accepted + accepted + len(hospital_batch_rows) >= test_limit:
                 break
 
-        if batch:
-            await push_objects(batch, stage_cls)
-            accepted += len(batch)
+        if hospital_batch_rows:
+            await push_objects(hospital_batch_rows, stage_cls)
+            accepted += len(hospital_batch_rows)
 
         logger.info(
             "CMS Hospitals: %d rows accepted (%d with coordinates)",

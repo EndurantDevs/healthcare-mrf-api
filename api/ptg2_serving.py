@@ -52,6 +52,10 @@ from api.ptg2_candidate_audit_capacity import (
     retain_unique_integer_keys,
 )
 from api.ptg2_online_work import PTG2OnlineWorkBudgetExceeded
+from api.ptg2_price_hydration_cache import (
+    PRICE_HYDRATION_CACHE,
+    PriceHydrationLayout,
+)
 from api.ptg2_code_context import (
     _resolve_ptg2_code_search_context,
 )
@@ -7119,13 +7123,100 @@ async def _version_three_prices_by_key(
 ) -> dict[int, list[dict[str, Any]]]:
     """Hydrate v3 price keys from compact memberships and dense atoms only."""
 
+    if not copy_payloads:
+        hydration = await _version_three_price_hydration(
+            session,
+            serving_tables,
+            price_keys,
+            copy_payloads=False,
+        )
+        return hydration.prices_by_key
+    _require_strict_shared_v3(serving_tables)
+    normalized_price_keys, _retained_bytes = _budgeted_hydration_integer_keys(
+        price_keys,
+        None,
+        category="online hydration price",
+    )
+    if not normalized_price_keys:
+        return {}
+    cache_layout = _version_three_price_cache_layout(serving_tables)
+    cached_rows, missing_keys = PRICE_HYDRATION_CACHE.get_many(
+        cache_layout,
+        normalized_price_keys,
+    )
+    if not missing_keys:
+        return cached_rows
     hydration = await _version_three_price_hydration(
         session,
         serving_tables,
-        price_keys,
-        copy_payloads=copy_payloads,
+        missing_keys,
     )
-    return hydration.prices_by_key
+    if any(
+        price_key not in hydration.prices_by_key
+        for price_key in missing_keys
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration omitted a requested price key"
+        )
+    PRICE_HYDRATION_CACHE.admit_many(
+        cache_layout,
+        hydration.prices_by_key,
+    )
+    return {
+        price_key: (
+            cached_rows[price_key]
+            if price_key in cached_rows
+            else hydration.prices_by_key[price_key]
+        )
+        for price_key in normalized_price_keys
+    }
+
+
+def _version_three_price_cache_layout(
+    serving_tables: PTG2ServingTables,
+) -> PriceHydrationLayout:
+    """Bind cached prices to the immutable snapshot and decoding geometry."""
+
+    constant_payload = json.dumps(
+        _version_three_price_atom_constants(serving_tables),
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return PriceHydrationLayout(
+        shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+        storage_generation=str(serving_tables.storage_generation or "").strip().lower(),
+        atom_key_bits=_version_three_atom_key_bits(serving_tables),
+        price_key_block_span=_required_price_cache_span(
+            serving_tables.price_key_block_span,
+            "price_key_block_span",
+        ),
+        atom_key_block_span=_required_price_cache_span(
+            serving_tables.atom_key_block_span,
+            "atom_key_block_span",
+        ),
+        constant_values_fingerprint=hashlib.sha256(constant_payload).hexdigest(),
+    )
+
+
+def _required_price_cache_span(value: Any, field_name: str) -> int:
+    """Reject invalid decoding geometry before a cache lookup can bypass I/O."""
+
+    if isinstance(value, bool):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 postgres_binary_v3 snapshot has invalid {field_name}"
+        )
+    try:
+        parsed_value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            f"PTG2 postgres_binary_v3 snapshot has invalid {field_name}"
+        ) from exc
+    if parsed_value <= 0:
+        raise PTG2ManifestArtifactError(
+            f"PTG2 postgres_binary_v3 snapshot has invalid {field_name}"
+        )
+    return parsed_value
 
 
 def _version_three_price_atom_constants(
