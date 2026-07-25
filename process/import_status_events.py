@@ -72,14 +72,14 @@ def bind_status_event_loop() -> None:
     _ensure_queue(loop)
 
 
-def enqueue_status_event(payload: dict[str, Any]) -> None:
+def enqueue_status_event(status_payload: dict[str, Any]) -> None:
     """Queue a status event without blocking the importer."""
     if not _status_event_url():
         return
-    run_id = str(payload.get("run_id") or "").strip()
+    run_id = str(status_payload.get("run_id") or "").strip()
     if not run_id:
         return
-    event = _event_payload(payload)
+    event = _event_payload(status_payload)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -257,15 +257,15 @@ async def flush_status_events(timeout_seconds: float = 2.0) -> None:
 
 
 def _event_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    event = {
+    event_by_field = {
         "engine": ENGINE_NAME,
         "node_id": os.getenv("HLTHPRT_IMPORT_NODE_ID"),
         **payload,
     }
     for key in _TIMESTAMP_KEYS:
-        if event.get(key) is not None:
-            event[key] = isoformat_utc(event[key])
-    return event
+        if event_by_field.get(key) is not None:
+            event_by_field[key] = isoformat_utc(event_by_field[key])
+    return event_by_field
 
 
 def _ensure_queue(loop: asyncio.AbstractEventLoop) -> asyncio.Queue[dict[str, Any]]:

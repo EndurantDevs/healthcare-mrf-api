@@ -349,14 +349,14 @@ def pack_inferred_taxonomy_pattern_npi_keys(
 
 
 def unpack_inferred_taxonomy_pattern_npi_keys(
-    payload: bytes,
+    packed_pattern_payload: bytes,
     *,
     pattern_count: int,
     pattern_member_count: int,
 ) -> dict[int, tuple[int, ...]]:
     """Decode exact pattern postings while rejecting structural drift."""
 
-    normalized_payload = bytes(payload)
+    normalized_payload = bytes(packed_pattern_payload)
     normalized_pattern_count = int(pattern_count)
     normalized_member_count = int(pattern_member_count)
     if normalized_pattern_count < 0 or normalized_member_count < 0:
@@ -466,7 +466,7 @@ def inferred_taxonomy_pattern_member_digest(
     representation: str,
     pattern_count: int,
     pattern_member_count: int,
-    payload: bytes,
+    packed_pattern_payload: bytes,
 ) -> bytes:
     """Authenticate one rule-bound direct or factored pattern projection."""
 
@@ -474,7 +474,7 @@ def inferred_taxonomy_pattern_member_digest(
     normalized_representation = str(representation)
     normalized_pattern_count = int(pattern_count)
     normalized_member_count = int(pattern_member_count)
-    normalized_payload = bytes(payload)
+    normalized_payload = bytes(packed_pattern_payload)
     if len(normalized_rule_digest) != 32:
         raise ValueError("PTG V4 inferred-taxonomy pattern identity is invalid")
     if normalized_representation not in {
@@ -658,7 +658,7 @@ def _update_projection_observe_rule_digest(
 
 
 def _shape_projection_manifest(
-    rows: Sequence[Mapping[str, Any]],
+    projection_rows: Sequence[Mapping[str, Any]],
     *,
     npi_count: int,
     pattern_count: int,
@@ -690,7 +690,7 @@ def _shape_projection_manifest(
     total_pattern_members = 0
     total_pattern_bytes = 0
     previous_rule_digest: bytes | None = None
-    for raw_row in rows:
+    for raw_row in projection_rows:
         rule_digest = bytes(raw_row["rule_digest"])
         catalog_digest = bytes(raw_row["catalog_digest"])
         member_digest = bytes(raw_row["member_digest"])
@@ -746,7 +746,7 @@ def _shape_projection_manifest(
                 representation=representation,
                 pattern_count=row_pattern_count,
                 pattern_member_count=pattern_member_count,
-                payload=pattern_payload,
+                packed_pattern_payload=pattern_payload,
             )
         except (PTG2ManifestArtifactError, ValueError) as exc:
             raise RuntimeError(
@@ -1239,7 +1239,7 @@ def _validate_projection_manifest(
                 ),
                 pattern_count=0,
                 pattern_member_count=0,
-                payload=b"",
+                packed_pattern_payload=b"",
             )
             if len(rule_digest) == 32
             else b""
@@ -1818,7 +1818,7 @@ async def publish_v4_inferred_taxonomy_candidates(
             representation=representation,
             pattern_count=pattern_count,
             pattern_member_count=pattern_member_count,
-            payload=pattern_payload,
+            packed_pattern_payload=pattern_payload,
         )
         expected_rows.append(
             {
@@ -2193,7 +2193,7 @@ async def load_v4_inferred_taxonomy_candidates(
                 representation=representation,
                 pattern_count=pattern_count,
                 pattern_member_count=pattern_member_count,
-                payload=pattern_payload,
+                packed_pattern_payload=pattern_payload,
             )
         )
     except ValueError as exc:

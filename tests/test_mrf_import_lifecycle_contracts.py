@@ -155,12 +155,14 @@ async def test_plan_import_preserves_year_benefit_and_cost_sharing_contracts(
         for formulary_row in row_dicts
         if label == "PlanFormulary"
     ]
-    assert {(row["plan_id"], row["year"]) for row in plan_rows} == {
+    assert {
+        (plan_row["plan_id"], plan_row["year"]) for plan_row in plan_rows
+    } == {
         (plan_id, 2026),
         (plan_id, 2027),
         ("54321BB0000000", 2026),
     }
-    assert {row["benefit_name"] for row in benefit_rows} >= {
+    assert {benefit_row["benefit_name"] for benefit_row in benefit_rows} >= {
         "virtual_visit",
         "deductible",
         "benefit_2",
@@ -265,7 +267,10 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
         for provider_row in row_dicts
         if label == "PlanNPIRaw"
     ]
-    assert {row["npi"] for row in provider_rows} == {1000000002, 1000000003}
+    assert {provider_row["npi"] for provider_row in provider_rows} == {
+        1000000002,
+        1000000003,
+    }
     assert any(
         provider_row["name_or_facility_name"] == "Dr. Ada M Example III"
         for provider_row in provider_rows
@@ -274,7 +279,10 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
         provider_row["name_or_facility_name"] == "Synthetic Clinic"
         for provider_row in provider_rows
     )
-    assert {row["year"] for row in provider_rows} == {current_year, current_year + 1}
+    assert {provider_row["year"] for provider_row in provider_rows} == {
+        current_year,
+        current_year + 1,
+    }
     initial._mark_mrf_provider_file_progress.assert_awaited_once_with(
         ANY,
         url="https://data.example.invalid/providers.json",
@@ -638,7 +646,11 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         for issuer_row in row_dicts
         if label == "Issuer"
     ]
-    assert {row["issuer_id"] for row in issuer_rows} == {12345, 23456, 99999}
+    assert {issuer_row["issuer_id"] for issuer_row in issuer_rows} == {
+        12345,
+        23456,
+        99999,
+    }
     assert next(
         issuer_row for issuer_row in issuer_rows if issuer_row["issuer_id"] == 12345
     ) == {

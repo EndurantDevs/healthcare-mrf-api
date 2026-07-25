@@ -113,6 +113,43 @@ def _valid_source_scope_tables() -> PTG2ServingTables:
     )
 
 
+def _persisted_occurrences() -> tuple[integrity.PersistedAuditOccurrence, ...]:
+    return (
+        integrity.PersistedAuditOccurrence(
+            occurrence_id=b"a" * 32,
+            code_key=7,
+            provider_set_key=5,
+            price_key=8,
+            source_artifact_key=0,
+            npi=1234567890,
+            atom_ordinal=0,
+            atom_key=9,
+        ),
+    )
+
+
+def _candidate_witness_scope(
+    persisted_occurrences: tuple[integrity.PersistedAuditOccurrence, ...],
+) -> integrity.CandidateWitnessScope:
+    return integrity.CandidateWitnessScope(
+        challenges=(
+            AuditBatchChallenge(
+                code_system="CPT",
+                code="99213",
+                npi=1234567890,
+                source_artifact_key=0,
+                tuple_digest="b" * 64,
+                network_name_digests=(),
+                multiplicity=2,
+            ),
+        ),
+        record_count=2,
+        unique_evidence_count=1,
+        evidence_reference_count=2,
+        persisted_audit_occurrences=persisted_occurrences,
+    )
+
+
 @pytest.mark.asyncio
 async def test_persisted_audit_sample_is_read_and_validated_once():
     persisted_rows = _persisted_audit_rows()
@@ -214,18 +251,7 @@ async def test_candidate_scope_binds_exact_ordered_source_identity(monkeypatch):
 
     audit_request = _audit_request()
     source_set_by_field = {"contract": "test", "source_count": 1}
-    persisted_occurrences = (
-        integrity.PersistedAuditOccurrence(
-            occurrence_id=b"a" * 32,
-            code_key=7,
-            provider_set_key=5,
-            price_key=8,
-            source_artifact_key=0,
-            npi=1234567890,
-            atom_ordinal=0,
-            atom_key=9,
-        ),
-    )
+    persisted_occurrences = _persisted_occurrences()
     persisted_sample = AsyncMock(return_value=persisted_occurrences)
     source_identity = AsyncMock(
         return_value=(
@@ -234,23 +260,7 @@ async def test_candidate_scope_binds_exact_ordered_source_identity(monkeypatch):
             ("a" * 64,),
         )
     )
-    witness_scope = integrity.CandidateWitnessScope(
-        challenges=(
-            AuditBatchChallenge(
-                code_system="CPT",
-                code="99213",
-                npi=1234567890,
-                source_artifact_key=0,
-                tuple_digest="b" * 64,
-                network_name_digests=(),
-                multiplicity=2,
-            ),
-        ),
-        record_count=2,
-        unique_evidence_count=1,
-        evidence_reference_count=2,
-        persisted_audit_occurrences=persisted_occurrences,
-    )
+    witness_scope = _candidate_witness_scope(persisted_occurrences)
     sealed_witness = AsyncMock(
         return_value=replace(witness_scope, persisted_audit_occurrences=())
     )

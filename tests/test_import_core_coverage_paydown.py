@@ -180,6 +180,113 @@ def test_status_enqueue_handles_absent_sink_and_event_loop(monkeypatch):
     status_events.enqueue_status_event({"run_id": "run-1", "status": "succeeded"})
 
 
+def test_status_publisher_recovers_stale_loops_and_flushes_edge_states(monkeypatch):
+    """Preserve events across stale owners, full pending buffers, and loop changes."""
+
+    monkeypatch.setattr(
+        status_events, "_status_event_url", lambda: "https://sink.invalid/events"
+    )
+
+    def no_running_loop():
+        raise RuntimeError("no loop")
+
+    monkeypatch.setattr(status_events.asyncio, "get_running_loop", no_running_loop)
+    status_events.bind_status_event_loop()
+
+    stale_loop = SimpleNamespace(is_running=lambda: False)
+    status_events._publisher_state.loop = stale_loop
+    status_events.enqueue_status_event(
+        {"run_id": "run-stale", "status": "running"}
+    )
+    assert status_events._publisher_state.pending[-1]["run_id"] == "run-stale"
+
+    class RejectingLoop:
+        @staticmethod
+        def is_running():
+            return True
+
+        @staticmethod
+        def call_soon_threadsafe(*_args):
+            raise RuntimeError("loop closed")
+
+    current_loop = object()
+    status_events._publisher_state.loop = RejectingLoop()
+    monkeypatch.setattr(
+        status_events.asyncio,
+        "get_running_loop",
+        lambda: current_loop,
+    )
+    status_events.enqueue_status_event(
+        {"run_id": "run-rejected", "status": "running"}
+    )
+    assert status_events._publisher_state.pending[-1]["run_id"] == "run-rejected"
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_STATUS_EVENT_QUEUE_SIZE", "1")
+    status_events._append_pending_event_locked({"status": "missing-run"})
+    status_events._append_pending_event_locked(
+        {"run_id": "run-bounded", "status": "running"}
+    )
+    assert list(status_events._publisher_state.pending) == [
+        {"run_id": "run-bounded", "status": "running"}
+    ]
+
+
+def test_status_publisher_flushes_missing_and_loop_change_states(monkeypatch):
+    """Flush coalesced events and cancel timers owned by a replaced loop."""
+
+    queue = _QueueProbe()
+    loop = _LoopProbe()
+    real_ensure_queue = status_events._ensure_queue
+    monkeypatch.setattr(status_events, "_ensure_queue", lambda _loop: queue)
+    status_events._accept_event_on_loop(loop, {})
+    status_events._publish_event_now(queue, {})
+    status_events._flush_coalesced_event(loop, "missing")
+
+    cancelled_run_ids: list[str] = []
+    status_events._publisher_state.coalesced_by_run.update(
+        {
+            "run-handled": {"run_id": "run-handled", "status": "running"},
+            "run-unhandled": {"run_id": "run-unhandled", "status": "running"},
+        }
+    )
+    status_events._publisher_state.flush_handle_by_run["run-handled"] = (
+        SimpleNamespace(cancel=lambda: cancelled_run_ids.append("run-handled"))
+    )
+    status_events._flush_all_coalesced(loop)
+    assert cancelled_run_ids == ["run-handled"]
+    assert [event["run_id"] for event in queue.items[-2:]] == [
+        "run-handled",
+        "run-unhandled",
+    ]
+
+    class MissingFirstEvent(dict):
+        def pop(self, key, default=None):
+            if key == "run-missing":
+                return None
+            return super().pop(key, default)
+
+    status_events._publisher_state.coalesced_by_run = MissingFirstEvent(
+        {
+            "run-missing": {},
+            "run-present": {"run_id": "run-present", "status": "running"},
+        }
+    )
+    status_events._flush_all_coalesced(loop)
+    assert queue.items[-1]["run_id"] == "run-present"
+
+    old_handle = SimpleNamespace(cancel=lambda: cancelled_run_ids.append("old-loop"))
+    status_events._publisher_state.loop = SimpleNamespace(is_running=lambda: False)
+    status_events._publisher_state.flush_handle_by_run["old-loop"] = old_handle
+    monkeypatch.setenv("HLTHPRT_IMPORT_STATUS_EVENT_QUEUE_SIZE", "1")
+    monkeypatch.setattr(
+        status_events,
+        "_ensure_queue",
+        real_ensure_queue,
+    )
+    status_events._ensure_queue(_LoopProbe())
+    assert cancelled_run_ids[-1] == "old-loop"
+
+
 @pytest.mark.asyncio
 async def test_status_event_bridge_delivers_worker_thread_and_prebound_events(
     monkeypatch,
@@ -266,6 +373,9 @@ async def test_status_event_bridge_coalesces_latest_progress_at_fixed_rate(
 @pytest.mark.asyncio
 async def test_status_flush_queue_creation_and_worker_failures(monkeypatch):
     await status_events.flush_status_events()
+    monkeypatch.setattr(
+        status_events, "_status_event_url", lambda: "https://sink.invalid/events"
+    )
     queue = asyncio.Queue()
     status_events._publisher_state.queue = queue
     await status_events.flush_status_events()

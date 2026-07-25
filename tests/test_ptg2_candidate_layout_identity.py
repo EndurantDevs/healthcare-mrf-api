@@ -28,7 +28,7 @@ def _projection_manifest() -> dict[str, object]:
             representation="direct_v1",
             pattern_count=0,
             pattern_member_count=0,
-            payload=b"",
+            packed_pattern_payload=b"",
         )
     )
     return candidates.shape_v4_inferred_taxonomy_projection_manifest(

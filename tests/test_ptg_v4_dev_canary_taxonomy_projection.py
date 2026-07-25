@@ -68,7 +68,7 @@ def _candidate_row(
             representation=representation,
             pattern_count=len(postings_by_pattern),
             pattern_member_count=pattern_member_count,
-            payload=pattern_payload,
+            packed_pattern_payload=pattern_payload,
         ),
         "pattern_member_payload": pattern_payload,
     }
@@ -126,7 +126,7 @@ def _observe_row(
             ),
             pattern_count=0,
             pattern_member_count=0,
-            payload=b"",
+            packed_pattern_payload=b"",
         ),
         "pattern_member_payload": b"",
     }

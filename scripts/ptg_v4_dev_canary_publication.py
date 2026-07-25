@@ -581,7 +581,7 @@ def _validate_physical_storage(
         failures.append("attributable V4 graph storage measurement is missing")
     if snapshot_gate_bytes is None:
         failures.append("whole-snapshot physical storage measurement is missing")
-    if not storage_budget.promotion_approved:
+    if not storage_budget.is_promotion_approved:
         failures.append(UNAPPROVED_STORAGE_CEILING_FAILURE)
     elif (
         graph_gate_bytes is not None
@@ -592,7 +592,7 @@ def _validate_physical_storage(
             "attributable V4 graph storage exceeds its source-controlled maximum"
         )
     if (
-        storage_budget.promotion_approved
+        storage_budget.is_promotion_approved
         and snapshot_gate_bytes is not None
         and snapshot_gate_bytes
         > int(storage_budget.maximum_snapshot_physical_storage_bytes or 0)

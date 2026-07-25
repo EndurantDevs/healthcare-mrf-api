@@ -99,7 +99,7 @@ def test_storage_budget_keeps_each_initial_canary_measurement_only(
     )
 
     assert budget.case == case
-    assert budget.promotion_approved is False
+    assert budget.is_promotion_approved is False
     assert budget.maximum_graph_physical_storage_bytes is None
     assert budget.maximum_snapshot_physical_storage_bytes is None
     report = budget.report(graph_gate_bytes=123, snapshot_gate_bytes=456)
@@ -126,7 +126,7 @@ def test_storage_budget_accepts_distinct_factored_bytes() -> None:
 
     assert budget.case.base_layout_logical_bytes == case.base_layout_logical_bytes
     assert budget.v4_factored_layout_logical_bytes == v4_logical_bytes
-    assert budget.promotion_approved is False
+    assert budget.is_promotion_approved is False
 
 
 def test_sealed_factor_scale_cannot_self_approve_a_storage_ceiling() -> None:
@@ -399,7 +399,7 @@ def test_checked_in_absolute_ceiling_requires_exact_reviewed_tolerance() -> None
     )
 
     assert failures == []
-    assert approved_budget.promotion_approved is True
+    assert approved_budget.is_promotion_approved is True
 
 
 def test_checked_in_absolute_ceiling_rejects_unreviewed_extra_headroom() -> None:
