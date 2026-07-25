@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api.ptg2_code_filters import InferredProviderTaxonomyRule
+from api.ptg2_shared_blocks import PTG2SharedBlockError
 from api import ptg2_v4_graph as v4_graph
 from process.ptg_parts import ptg2_v4_snapshot_maps as snapshot_maps
 from process.ptg_parts import ptg2_v4_taxonomy_candidates as candidates
@@ -1143,6 +1144,66 @@ async def test_pattern_projection_short_circuits_empty_and_rejects_gaps(
         )
 
 
+@pytest.mark.parametrize(
+    ("graph_message", "error_type", "message"),
+    (
+        (
+            "different graph failure",
+            PTG2SharedBlockError,
+            "different graph failure",
+        ),
+        (
+            "PTG V4 graph selection exceeds max_members",
+            candidates._PatternProjectionCapExceeded,
+            "pattern projection exceeds the online cap",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_pattern_projection_preserves_graph_failure_semantics(
+    monkeypatch,
+    graph_message: str,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        v4_graph,
+        "lookup_building_v4_relation_members",
+        AsyncMock(side_effect=PTG2SharedBlockError(graph_message)),
+    )
+
+    with pytest.raises(error_type, match=message):
+        await candidates._candidate_pattern_postings_for_rule(
+            object(),
+            schema_name="mrf",
+            snapshot_key=41,
+            build_token="build-token",
+            candidate_npi_keys=(1,),
+            root_pattern_count=3,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pattern_projection_rejects_boolean_pattern_keys(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        v4_graph,
+        "lookup_building_v4_relation_members",
+        AsyncMock(return_value={1: (True,)}),
+    )
+
+    with pytest.raises(RuntimeError, match="pattern key is invalid"):
+        await candidates._candidate_pattern_postings_for_rule(
+            object(),
+            schema_name="mrf",
+            snapshot_key=41,
+            build_token="build-token",
+            candidate_npi_keys=(1,),
+            root_pattern_count=3,
+        )
+
+
 def test_v2_row_shaper_rejects_missing_candidate_and_pattern_bound() -> None:
     missing_candidate = _projection_row(
         _rules()[0],
@@ -1259,6 +1320,15 @@ def test_projection_rule_resolution_scans_and_rejects_unknown_digest() -> None:
         )
 
 
+def test_compatibility_manifest_accepts_an_empty_direct_projection() -> None:
+    empty_projection = _projection_row(_rules()[0], npi_keys=())
+
+    manifest = candidates._candidate_projection_manifest((empty_projection,))
+
+    assert manifest["rules"][0]["member_count"] == 0
+    assert manifest["pattern_count"] == 0
+
+
 @pytest.mark.asyncio
 async def test_persisted_summary_enforces_global_pattern_bound() -> None:
     projection_row = _projection_row(
@@ -1360,6 +1430,37 @@ async def test_reader_rejects_manifest_payload_and_cap_tamper() -> None:
         capped_session, projection_row, capped_manifest, "projection rule"
     )
     assert capped_session.calls == []
+
+
+@pytest.mark.parametrize(
+    ("metadata_updates", "message"),
+    (
+        (None, "vector is unavailable"),
+        ({"root_state": "building"}, "snapshot is not complete"),
+        ({"catalog_contract": "incompatible"}, "contract is incompatible"),
+        ({"member_bytes": 7}, "metadata is inconsistent"),
+        ({"catalog_digest": b"z" * 32}, "metadata changed from its seal"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_reader_rejects_unsealed_metadata_states(
+    metadata_updates: dict[str, Any] | None,
+    message: str,
+) -> None:
+    projection_row = _projection_row(_rules()[0])
+    manifest = candidates._candidate_projection_manifest((projection_row,))
+    metadata_rows = ()
+    if metadata_updates is not None:
+        metadata_by_field = _reader_row(projection_row)
+        metadata_by_field.update(metadata_updates)
+        metadata_rows = (metadata_by_field,)
+
+    await _assert_candidate_load_rejected(
+        _ScriptedSession(_Result(metadata_rows)),
+        projection_row,
+        manifest,
+        message,
+    )
 
 
 def test_seal_and_reuse_validation_reject_projection_manifest_drift() -> None:
