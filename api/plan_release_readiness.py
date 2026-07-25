@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, MutableMapping
 
 from sqlalchemy import text
 
@@ -130,6 +130,10 @@ async def has_allowed_amount_binding_coverage(
 async def is_release_binding_serving_ready(
     session: Any,
     binding: PlanReleaseSnapshotBinding,
+    *,
+    validated_serving_tables_by_snapshot_id: MutableMapping[
+        str, PTG2ServingTables
+    ] | None = None,
 ) -> bool:
     """Validate selectors, strict V3 tables, scope, and role artifacts."""
 
@@ -153,4 +157,8 @@ async def is_release_binding_serving_ready(
         or not is_release_binding_serving_scope_exact(serving_tables, binding)
     ):
         return False
+    if validated_serving_tables_by_snapshot_id is not None:
+        validated_serving_tables_by_snapshot_id[
+            binding.snapshot_id
+        ] = serving_tables
     return True

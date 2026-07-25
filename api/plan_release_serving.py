@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 
 from api.plan_release_readiness import is_release_binding_serving_ready
+from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
@@ -126,6 +127,9 @@ class PlanReleaseServingSelection:
     release_status: str
     binding_set_digest: str
     bindings: tuple[PlanReleaseSnapshotBinding, ...]
+    _validated_serving_tables: tuple[
+        tuple[str, PTG2ServingTables], ...
+    ] = field(default=(), repr=False, compare=False)
 
     def bindings_for_role(
         self,
@@ -161,6 +165,45 @@ class PlanReleaseServingSelection:
         """Return the release's deduplicated allowed-amount bindings."""
 
         return self.bindings_for_role(PLAN_RELEASE_ALLOWED_AMOUNTS_ROLE)
+
+    def serving_tables_for_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> PTG2ServingTables | None:
+        """Reuse a descriptor validated while resolving this exact release."""
+
+        return next(
+            (
+                serving_tables
+                for validated_snapshot_id, serving_tables in (
+                    self._validated_serving_tables
+                )
+                if validated_snapshot_id == snapshot_id
+            ),
+            None,
+        )
+
+    def network_tables_by_snapshot(
+        self,
+    ) -> dict[str, PTG2ServingTables] | None:
+        """Return complete readiness descriptors or fail a partial release."""
+
+        serving_tables_by_snapshot_id = dict(
+            self._validated_serving_tables
+        )
+        validated_snapshot_ids = [
+            snapshot_id
+            for snapshot_id, _ in self._validated_serving_tables
+        ]
+        expected_snapshot_ids = {
+            binding.snapshot_id for binding in self.in_network_bindings
+        }
+        if (
+            len(validated_snapshot_ids) != len(serving_tables_by_snapshot_id)
+            or set(validated_snapshot_ids) != expected_snapshot_ids
+        ):
+            return None
+        return serving_tables_by_snapshot_id
 
     def response_metadata(self) -> dict[str, Any]:
         """Return canonical coordinates suitable for a pricing response."""
@@ -348,12 +391,21 @@ def _selection_from_rows(
 async def _is_release_binding_set_serving_ready(
     session: Any,
     selection: PlanReleaseServingSelection,
+    validated_serving_tables_by_snapshot_id: dict[
+        str, PTG2ServingTables
+    ],
 ) -> bool:
     """Require every frozen binding to pass the normal PTG2 serving guard."""
 
     try:
         for binding in selection.bindings:
-            if not await is_release_binding_serving_ready(session, binding):
+            if not await is_release_binding_serving_ready(
+                session,
+                binding,
+                validated_serving_tables_by_snapshot_id=(
+                    validated_serving_tables_by_snapshot_id
+                ),
+            ):
                 return False
     except PTG2ManifestArtifactError:
         return False
@@ -369,20 +421,40 @@ async def resolve_plan_release_serving(
     normalized_release_id = normalize_plan_release_id(plan_release_id)
     if normalized_release_id is None:
         return None
-    result = await session.execute(
+    release_query_result = await session.execute(
         text(_PLAN_RELEASE_SERVING_SQL),
         {
             "plan_release_id": normalized_release_id,
             "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
         },
     )
-    selection = _selection_from_rows(normalized_release_id, result)
-    if selection is None or not await _is_release_binding_set_serving_ready(
+    selection = _selection_from_rows(
+        normalized_release_id,
+        release_query_result,
+    )
+    if selection is None:
+        return None
+    validated_serving_tables_by_snapshot_id: dict[
+        str, PTG2ServingTables
+    ] = {}
+    if not await _is_release_binding_set_serving_ready(
         session,
         selection,
+        validated_serving_tables_by_snapshot_id,
     ):
         return None
-    return selection
+    resolved_selection = replace(
+        selection,
+        _validated_serving_tables=tuple(
+            validated_serving_tables_by_snapshot_id.items()
+        ),
+    )
+    if (
+        resolved_selection.network_tables_by_snapshot()
+        is None
+    ):
+        return None
+    return resolved_selection
 
 
 def binding_query_args(

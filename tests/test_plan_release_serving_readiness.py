@@ -54,15 +54,37 @@ def _serving_table_descriptor(**updates):
     return PTG2ServingTables(**fields_by_name)
 
 
-def _resolve_release(rows, monkeypatch, binding_resolver):
+def _resolve_release(release_rows, monkeypatch, binding_resolver):
+    async def compatible_binding_resolver(
+        session,
+        binding,
+        **_readiness_context,
+    ):
+        is_ready = await binding_resolver(session, binding)
+        validated_serving_tables_by_snapshot_id = _readiness_context.get(
+            "validated_serving_tables_by_snapshot_id"
+        )
+        if (
+            is_ready
+            and binding.role == "in_network"
+            and validated_serving_tables_by_snapshot_id is not None
+        ):
+            validated_serving_tables_by_snapshot_id[
+                binding.snapshot_id
+            ] = _serving_table_descriptor(
+                snapshot_id=binding.snapshot_id,
+                source_key=binding.source_key,
+            )
+        return is_ready
+
     monkeypatch.setattr(
         plan_release_serving,
         "is_release_binding_serving_ready",
-        binding_resolver,
+        compatible_binding_resolver,
     )
     return asyncio.run(
         plan_release_serving.resolve_plan_release_serving(
-            _Session(rows),
+            _Session(release_rows),
             PLAN_RELEASE_ID,
         )
     )
@@ -179,19 +201,27 @@ def test_release_resolver_catches_malformed_serving_manifest(monkeypatch):
 
 def test_binding_readiness_uses_exact_snapshot_selectors(monkeypatch):
     binding = _binding()
+    descriptor = _serving_table_descriptor()
     selector_calls = _install_snapshot_guards(
         monkeypatch,
-        _serving_table_descriptor(),
+        descriptor,
     )
+    validated_serving_tables_by_snapshot_id = {}
 
     is_ready = asyncio.run(
         plan_release_readiness.is_release_binding_serving_ready(
             object(),
             binding,
+            validated_serving_tables_by_snapshot_id=(
+                validated_serving_tables_by_snapshot_id
+            ),
         )
     )
 
     assert is_ready is True
+    assert validated_serving_tables_by_snapshot_id == {
+        binding.snapshot_id: descriptor
+    }
     assert selector_calls == [
         {
             "requested_snapshot_id": binding.snapshot_id,
@@ -200,6 +230,22 @@ def test_binding_readiness_uses_exact_snapshot_selectors(monkeypatch):
             "requested_plan_market_type": binding.plan_market_type,
         }
     ]
+
+
+def test_binding_readiness_does_not_require_descriptor_collection(monkeypatch):
+    """Keep the standalone readiness contract usable without a collector."""
+
+    descriptor = _serving_table_descriptor()
+    _install_snapshot_guards(monkeypatch, descriptor)
+
+    is_ready = asyncio.run(
+        plan_release_readiness.is_release_binding_serving_ready(
+            object(),
+            _binding(),
+        )
+    )
+
+    assert is_ready is True
 
 
 @pytest.mark.parametrize("resolved_snapshot_id", [None, "ptg2:wrong"])
