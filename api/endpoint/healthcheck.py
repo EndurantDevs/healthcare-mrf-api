@@ -55,15 +55,15 @@ async def readiness(request):
         if database['status'] == 'OK'
         else {'status': 'Fail', 'details': 'database unavailable'}
     )
-    ready = database['status'] == 'OK' and v3_schema['status'] == 'OK'
+    is_ready = database['status'] == 'OK' and v3_schema['status'] == 'OK'
     return response.json(
         {
-            'status': 'OK' if ready else 'Fail',
+            'status': 'OK' if is_ready else 'Fail',
             'database': database,
             'ptg_v3_schema': v3_schema,
             'release': request.app.config.get('RELEASE'),
         },
-        status=200 if ready else 503,
+        status=200 if is_ready else 503,
     )
 
 

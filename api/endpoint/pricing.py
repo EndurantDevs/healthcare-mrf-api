@@ -1083,7 +1083,7 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
-def _parse_bool(raw: Any, param: str, default: bool = False) -> bool:
+def _is_boolean_arg_enabled(raw: Any, param: str, default: bool = False) -> bool:
     if raw in (None, ""):
         return default
     if isinstance(raw, bool):
@@ -1094,6 +1094,9 @@ def _parse_bool(raw: Any, param: str, default: bool = False) -> bool:
     if text in {"0", "false", "no", "n", "off"}:
         return False
     raise InvalidUsage(f"Parameter '{param}' must be boolean")
+
+
+_parse_bool = _is_boolean_arg_enabled
 
 
 def _normalize_code_system(raw: Any) -> str:

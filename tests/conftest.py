@@ -35,6 +35,15 @@ def clear_npi_detail_response_cache():
 
 
 @pytest.fixture(autouse=True)
+def clear_ptg2_price_hydration_cache():
+    from api.ptg2_price_hydration_cache import PRICE_HYDRATION_CACHE
+
+    PRICE_HYDRATION_CACHE.clear()
+    yield
+    PRICE_HYDRATION_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def freeze_specialty_resolution_cache():
     # Endpoint handlers lazily refresh the shared specialty cache from the DB;
     # unit tests stub sessions with queued results, so a refresh would consume

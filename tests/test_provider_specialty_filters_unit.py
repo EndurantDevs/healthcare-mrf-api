@@ -293,3 +293,28 @@ def test_taxonomy_semijoin_sql_inactive_filter_returns_empty():
     params_by_name = {}
     assert provider_specialty_taxonomy_semijoin_sql(params_by_name, "p", resolve_provider_specialty_filter({}), schema="mrf") == ""
     assert params_by_name == {}
+
+
+def test_classification_only_filter_shapes_payload_and_allows_subspecialties():
+    """Classification-only filters omit code lists and can retain subspecialties."""
+
+    from api.provider_specialty_filters import provider_specialty_taxonomy_semijoin_sql
+
+    specialty_filter = psf.ProviderSpecialtyFilter(
+        classification="Internal Medicine",
+        include_subspecialties=True,
+    )
+    assert specialty_filter.response_payload() == {
+        "primary_only": True,
+        "include_subspecialties": True,
+        "classification": "Internal Medicine",
+    }
+    params_by_name = {}
+    sql = provider_specialty_taxonomy_semijoin_sql(
+        params_by_name,
+        "p",
+        specialty_filter,
+        schema="mrf",
+    )
+    assert "p_nucc.specialization" not in sql
+    assert params_by_name == {"p_classification": "Internal Medicine"}

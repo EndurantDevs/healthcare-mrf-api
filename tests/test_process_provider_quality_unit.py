@@ -1,5 +1,6 @@
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -572,6 +573,103 @@ async def test_shard_queries_delete_partition_before_insert(monkeypatch):
     assert "WITH deleted AS (" in score_sql
     assert f"DELETE FROM mrf.{ctx['score_table']} d" in score_sql
     assert "MOD((d.npi)::bigint, :shard_count) = :shard_id" in score_sql
+
+
+@pytest.mark.parametrize(
+    ("model_name", "columns", "error_pattern"),
+    [
+        ("PricingProviderQualityFeature", ("npi",), "feature model"),
+        (
+            "PricingProviderQualityProcedureLSH",
+            ("npi", "year", "band_no"),
+            "LSH model",
+        ),
+        (
+            "PricingProviderQualityPeerTarget",
+            (
+                "year",
+                "geography_scope",
+                "geography_value",
+                "cohort_level",
+                "peer_n",
+                "target_appropriateness",
+                "target_cost",
+                "target_effectiveness",
+                "target_qpp_cost",
+            ),
+            "peer-target model",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cohort_context_rejects_incomplete_required_models(
+    model_name,
+    columns,
+    error_pattern,
+):
+    """Materialization fails before SQL when a required model column is absent."""
+
+    async def is_table_present(_schema: str, _table: str) -> bool:
+        return False
+
+    classes = provider_quality._staging_classes("stage_test", "mrf")
+    table_name = classes[model_name].__tablename__
+    classes[model_name] = type(
+        f"Incomplete{model_name}",
+        (),
+        {
+            "__tablename__": table_name,
+            "__table__": SimpleNamespace(
+                columns=tuple(SimpleNamespace(name=column) for column in columns)
+            ),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=error_pattern):
+        await provider_quality_cohort_context._build_cohort_materialization_context(
+            classes,
+            "mrf",
+            table_exists=is_table_present,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cohort_context_projects_only_available_measure_metadata():
+    """Optional score metadata follows the exact columns retained by the measure model."""
+
+    async def is_table_present(_schema: str, _table: str) -> bool:
+        return False
+
+    classes = provider_quality._staging_classes("stage_test", "mrf")
+    measure_name = "PricingProviderQualityMeasure"
+    table_name = classes[measure_name].__tablename__
+    columns = (
+        "cohort_geography_scope",
+        "cohort_geography_value",
+        "cohort_classification",
+    )
+    classes[measure_name] = type(
+        "SelectedMeasureMetadata",
+        (),
+        {
+            "__tablename__": table_name,
+            "__table__": SimpleNamespace(
+                columns=tuple(SimpleNamespace(name=column) for column in columns)
+            ),
+        },
+    )
+
+    context = await provider_quality_cohort_context._build_cohort_materialization_context(
+        classes,
+        "mrf",
+        table_exists=is_table_present,
+    )
+
+    assert context["measure_meta_sources"] == {
+        "selected_geography_scope": "cohort_geography_scope",
+        "selected_geography_value": "cohort_geography_value",
+        "selected_classification": "cohort_classification",
+    }
 
 
 @pytest.mark.asyncio

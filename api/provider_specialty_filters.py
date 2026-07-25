@@ -356,9 +356,9 @@ def _resolve_provider_specialty_filter(
     classification = str(args.get("classification") or "").strip()
     taxonomy_codes = _normalize_taxonomy_codes(args.get("taxonomy_codes"))
     include_subspecialties = _is_normalized_boolean(args.get("include_subspecialties"))
-    primary_only = True
+    is_primary_only = True
     if args.get("primary_only") not in (None, ""):
-        primary_only = _is_normalized_boolean(args.get("primary_only"))
+        is_primary_only = _is_normalized_boolean(args.get("primary_only"))
 
     key = _normalize_specialty_key(specialty)
     if not taxonomy_codes and specialty:
@@ -391,7 +391,7 @@ def _resolve_provider_specialty_filter(
         classification=classification or None,
         taxonomy_codes=taxonomy_codes,
         include_subspecialties=include_subspecialties,
-        primary_only=primary_only,
+        primary_only=is_primary_only,
         use_classification_predicate=use_classification_predicate,
         unresolved_specialty=unresolved_specialty,
         suggested_specialties=suggested_specialties,

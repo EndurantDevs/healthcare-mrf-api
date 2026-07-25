@@ -68,6 +68,35 @@ def _graph_metrics_fixture() -> dict[str, object]:
     return graph_metrics_by_name
 
 
+def _install_memory_metric_fixtures(monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_metrics,
+        "price_hydration_cache_metrics",
+        lambda: SimpleNamespace(
+            hits=11,
+            misses=12,
+            admissions=13,
+            evictions=14,
+            rejected_batches=15,
+            retained_bytes=16,
+            entries=17,
+            maximum_bytes=18,
+        ),
+    )
+    monkeypatch.setattr(
+        api_metrics,
+        "worker_memory_metrics",
+        lambda: SimpleNamespace(
+            is_enabled=True,
+            is_frozen=True,
+            freeze_successes=2,
+            freeze_failures=3,
+            explicit_collections=4,
+            permanent_objects=5,
+        ),
+    )
+
+
 def _assert_engine_metric_contract(metric_lines: list[str]) -> None:
     assert metric_lines[:11] == [
         "# HELP hp_mrf_api_node_health Engine node health status, 1 for ok and 0 for degraded.",
@@ -104,7 +133,10 @@ def _assert_graph_metric_contract(
         f"{metric_name} {float(graph_metrics_by_name[source_name]):.6f}"
         for source_name, metric_name in EXPECTED_V4_COUNTER_METRICS
     ]
-    assert metric_lines[-len(expected_counter_lines) :] == expected_counter_lines
+    first_counter_index = metric_lines.index(expected_counter_lines[0])
+    assert metric_lines[
+        first_counter_index : first_counter_index + len(expected_counter_lines)
+    ] == expected_counter_lines
 
 
 @pytest.mark.asyncio
@@ -179,6 +211,8 @@ def test_v4_graph_counter_names_remain_stable():
 async def test_rendered_metrics_are_sorted_and_skip_unknown_runtime_values(
     monkeypatch,
 ):
+    """Project stable engine, cache, and worker metrics without unknown values."""
+
     async def node_health():
         return {
             "node_id": "node-a",
@@ -211,11 +245,16 @@ async def test_rendered_metrics_are_sorted_and_skip_unknown_runtime_values(
         "v4_graph_metrics_snapshot",
         lambda: graph_metrics_by_name,
     )
+    _install_memory_metric_fixtures(monkeypatch)
 
     metric_lines = (await api_metrics.render_prometheus_metrics()).splitlines()
 
     _assert_engine_metric_contract(metric_lines)
     _assert_graph_metric_contract(metric_lines, graph_metrics_by_name)
+    assert "hp_mrf_ptg_price_hydration_cache_hits_total 11.000000" in metric_lines
+    assert "hp_mrf_ptg_price_hydration_cache_max_bytes 18.000000" in metric_lines
+    assert "hp_mrf_api_worker_gc_freeze_enabled 1.000000" in metric_lines
+    assert "hp_mrf_api_worker_gc_permanent_objects 5.000000" in metric_lines
 
 
 def test_metric_labels_are_safely_normalized_and_escaped():

@@ -105,6 +105,8 @@ async def _is_table_available(session, table) -> bool:
 
 
 async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) -> dict[str, Any]:
+    """Return one pharmacy's active-license summary at the requested date."""
+
     table = PharmacyLicenseRecord.__table__
     empty_summary_dict = {
         "has_active_state_license": False,

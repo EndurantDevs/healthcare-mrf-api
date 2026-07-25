@@ -88,7 +88,7 @@ def _archived_identifier(name: str, suffix: str = "_old") -> str:
     return f"{name[:trim_to]}_{digest}{suffix}"
 
 
-def _index_requires_postgis(index: dict) -> bool:
+def _is_postgis_required_for_index(index: dict) -> bool:
     name = str(index.get("name") or "").lower()
     if name.startswith("geo_index_") or name.endswith("_geo_idx") or name == "geo_idx":
         return True
@@ -96,11 +96,15 @@ def _index_requires_postgis(index: dict) -> bool:
     return "st_makepoint" in elements or "geography" in elements
 
 
-def _npi_requires_nucc(context: dict | None = None) -> bool:
+def _is_nucc_required_for_npi(context: dict | None = None) -> bool:
     context = context or {}
     if context.get("test_mode"):
         return _is_environment_enabled("HLTHPRT_NPI_REQUIRE_NUCC_IN_TEST", False)
     return _is_environment_enabled("HLTHPRT_NPI_REQUIRE_NUCC", True)
+
+
+_index_requires_postgis = _is_postgis_required_for_index
+_npi_requires_nucc = _is_nucc_required_for_npi
 
 
 async def _assert_nucc_ready(schema: str) -> None:
@@ -919,13 +923,13 @@ async def refresh_do_business_as(
     await ensure_database(bool(test_mode))
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     table = target_table or NPIData.__tablename__
-    source = source_table or NPIDataOtherIdentifier.__tablename__
+    source_table_name = source_table or NPIDataOtherIdentifier.__tablename__
 
     source_exists = await db.scalar(
-        f"SELECT to_regclass('{db_schema}.{source}');"
+        f"SELECT to_regclass('{db_schema}.{source_table_name}');"
     )
     if not source_exists:
-        print(f"Skipping do_business_as refresh: source table {db_schema}.{source} does not exist.")
+        print(f"Skipping do_business_as refresh: source table {db_schema}.{source_table_name} does not exist.")
         return
 
     update_sql = f"""
@@ -934,7 +938,7 @@ async def refresh_do_business_as(
                 npi,
                 ARRAY_AGG(DISTINCT other_provider_identifier ORDER BY other_provider_identifier) AS names,
                 STRING_AGG(DISTINCT other_provider_identifier, ' ' ORDER BY other_provider_identifier) AS search_text
-            FROM {db_schema}.{source}
+            FROM {db_schema}.{source_table_name}
             WHERE other_provider_identifier_type_code = '3'
               AND NULLIF(other_provider_identifier, '') IS NOT NULL
             GROUP BY npi
@@ -968,7 +972,7 @@ async def refresh_do_business_as(
             )
               AND NOT EXISTS (
                     SELECT 1
-                    FROM {db_schema}.{source} AS s
+                    FROM {db_schema}.{source_table_name} AS s
                     WHERE s.npi = n.npi
                       AND s.other_provider_identifier_type_code = '3'
                       AND NULLIF(s.other_provider_identifier, '') IS NOT NULL

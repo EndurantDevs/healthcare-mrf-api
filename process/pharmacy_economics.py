@@ -234,13 +234,13 @@ async def _fetch_sdud(client, sdud_url: str) -> dict[str, dict[str, dict]]:
         csv_path = await _download_to_temp_csv(client, sdud_url, tmpdir, "sdud.csv")
         with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as fh:
             reader = csv.DictReader(fh)
-            for row in reader:
-                state = (row.get("state") or row.get("State") or "").upper().strip()
-                ndc = row.get("ndc") or row.get("NDC") or ""
-                product_name = row.get("product_name") or row.get("Product Name") or ""
+            for utilization_row in reader:
+                state = (utilization_row.get("state") or utilization_row.get("State") or "").upper().strip()
+                ndc = utilization_row.get("ndc") or utilization_row.get("NDC") or ""
+                product_name = utilization_row.get("product_name") or utilization_row.get("Product Name") or ""
                 qty = _parse_int(
-                    row.get("number_of_prescriptions")
-                    or row.get("Number of Prescriptions")
+                    utilization_row.get("number_of_prescriptions")
+                    or utilization_row.get("Number of Prescriptions")
                 )
 
                 if not state or len(state) != 2 or not ndc or qty <= 0:
@@ -338,7 +338,7 @@ async def process_data(ctx, task=None):
         await client.close()
 
     now = datetime.datetime.utcnow()
-    batch = []
+    pricing_batch_rows = []
 
     for state, ndcs in sdud_data.items():
         dispensing_fee = STATE_DISPENSING_FEES.get(state, 10.00)
@@ -357,7 +357,7 @@ async def process_data(ctx, task=None):
             total_cost = nadac_cost * qty
             gross_margin = total_reimb - total_cost
 
-            batch.append({
+            pricing_batch_rows.append({
                 "state": state,
                 "ndc11": ndc11,
                 "drug_name": info["name"],
@@ -369,22 +369,22 @@ async def process_data(ctx, task=None):
                 "updated_at": now,
             })
 
-            if len(batch) >= batch_size:
-                await push_objects(batch, stage_cls)
-                accepted_rows += len(batch)
-                batch.clear()
+            if len(pricing_batch_rows) >= batch_size:
+                await push_objects(pricing_batch_rows, stage_cls)
+                accepted_rows += len(pricing_batch_rows)
+                pricing_batch_rows.clear()
                 if test_mode and accepted_rows >= test_row_limit:
                     break
 
-            if test_mode and accepted_rows + len(batch) >= test_row_limit:
+            if test_mode and accepted_rows + len(pricing_batch_rows) >= test_row_limit:
                 break
 
-        if test_mode and accepted_rows + len(batch) >= test_row_limit:
+        if test_mode and accepted_rows + len(pricing_batch_rows) >= test_row_limit:
             break
 
-    if batch:
-        await push_objects(batch, stage_cls)
-        accepted_rows += len(batch)
+    if pricing_batch_rows:
+        await push_objects(pricing_batch_rows, stage_cls)
+        accepted_rows += len(pricing_batch_rows)
 
     ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
     logger.info("Pharmacy Economics import done: %d rows accepted", accepted_rows)

@@ -166,7 +166,7 @@ async def set_local_projection_action(
         admission_lease_token,
     )
     if (
-        any(HASH_PATTERN.fullmatch(value) is None for value in hash_values)
+        any(HASH_PATTERN.fullmatch(required_hash) is None for required_hash in hash_values)
         or any(
             candidate_hash is not None
             and HASH_PATTERN.fullmatch(candidate_hash) is None
@@ -214,7 +214,7 @@ async def set_local_projection_action(
             or partition_attempt is not None
             or shard_lease_token is not None
             or physical_projection_id is not None
-            or any(value is not None for value in reference_values)
+            or any(reference_value is not None for reference_value in reference_values)
         ):
             raise ProviderDirectoryProjectionError(
                 "provider_directory_projection_action_identity_invalid"

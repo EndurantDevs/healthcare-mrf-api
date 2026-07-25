@@ -42,12 +42,12 @@ async def all_of_nucc(request):
     )
 
     filters = []
-    applied_filters = {}
+    applied_filter_by_name = {}
     if code:
         filters.append(table.c.code.ilike(f"%{code}%"))
-        applied_filters["code"] = code
+        applied_filter_by_name["code"] = code
     if q:
-        applied_filters["q"] = q
+        applied_filter_by_name["q"] = q
         filters.append(
             or_(
                 table.c.code.ilike(f"%{q}%"),
@@ -103,7 +103,7 @@ async def all_of_nucc(request):
                     "limit": pagination.limit,
                     "page": pagination.page,
                     "offset": pagination.offset,
-                    **applied_filters,
+                    **applied_filter_by_name,
                 },
             }
         )

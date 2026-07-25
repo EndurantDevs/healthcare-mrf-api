@@ -26,6 +26,7 @@ from api.ptg2_capacity_evidence import (
     guard_isolated_capacity_process_request,
 )
 from api.runtime_identity import add_runtime_identity_headers
+from api.worker_memory import register_worker_memory_lifecycle
 from db.connection import db
 
 
@@ -46,6 +47,7 @@ def init_api(api):
     """Register public API blueprints on the Sanic application."""
 
     db.init_app(api)
+    register_worker_memory_lifecycle(api)
     api.register_middleware(_capacity_process_request_guard, "request")
     api.register_middleware(add_runtime_identity_headers, "response")
     api.blueprint(control_blueprint)

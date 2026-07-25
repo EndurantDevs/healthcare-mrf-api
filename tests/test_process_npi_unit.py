@@ -108,6 +108,31 @@ def test_npi_requires_nucc_defaults_to_full_imports_only(monkeypatch, npi_module
     assert npi_module._npi_requires_nucc({"test_mode": True}) is True
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [("7", 7), ("0", 3), ("-2", 3), ("invalid", 3)],
+)
+def test_npi_positive_integer_configuration_is_fail_safe(
+    monkeypatch,
+    npi_module,
+    raw_value,
+    expected,
+):
+    """Worker concurrency settings accept only positive integer overrides."""
+
+    monkeypatch.setenv("HLTHPRT_NPI_TEST_LIMIT", raw_value)
+    assert npi_module._env_positive_int("HLTHPRT_NPI_TEST_LIMIT", 3) == expected
+
+
+def test_npi_archived_identifier_stays_inside_postgres_limit(npi_module):
+    """Long archive names are deterministic and remain valid PostgreSQL identifiers."""
+
+    assert npi_module._archived_identifier("npi") == "npi_old"
+    archived_name = npi_module._archived_identifier("npi_" + "x" * 80)
+    assert len(archived_name) == npi_module.POSTGRES_IDENTIFIER_MAX_LENGTH
+    assert archived_name.endswith("_old")
+
+
 @pytest.mark.asyncio
 async def test_assert_nucc_ready_rejects_missing_table(monkeypatch, npi_module):
     async def fake_scalar(_sql):
@@ -158,6 +183,107 @@ async def test_assert_nppes_canonical_ready_rejects_missing_sql_function(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_assert_nppes_canonical_ready_validates_each_archive_prerequisite(
+    monkeypatch,
+    npi_module,
+):
+    """Canonical NPPES mode fails closed on missing archive table or key column."""
+
+    monkeypatch.delenv("HLTHPRT_ADDRESS_CANON_SOURCES", raising=False)
+    scalar = AsyncMock()
+    monkeypatch.setattr(npi_module.db, "scalar", scalar)
+    await npi_module._assert_nppes_canonical_ready("mrf")
+    scalar.assert_not_awaited()
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
+    scalar.side_effect = ["addr_key_v1", None]
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="address_archive"):
+        await npi_module._assert_nppes_canonical_ready("mrf")
+
+    scalar.side_effect = ["addr_key_v1", "address_archive_v2", False]
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="address_key"):
+        await npi_module._assert_nppes_canonical_ready("mrf")
+
+    scalar.side_effect = ["addr_key_v1", "address_archive_v2", True]
+    await npi_module._assert_nppes_canonical_ready("mrf")
+
+
+def test_npi_address_and_contact_helpers_preserve_empty_and_canonical_shapes(
+    monkeypatch,
+    npi_module,
+):
+    """Address helpers preserve empty input and attach typed canonical keys."""
+
+    expected_key = uuid.uuid4()
+    monkeypatch.setattr(
+        npi_module,
+        "canonicalize_address_batch",
+        lambda _rows: [{"address_key": str(expected_key)}],
+    )
+    address_map = {"first_line": "123 Main", "country_code": "US"}
+
+    assert npi_module.is_test_mode({"context": {"test_mode": True}})
+    assert not npi_module.is_test_mode({})
+    assert npi_module._attach_npi_contact_fields([]) == []
+    assert npi_module._attach_all_npi_address_keys(
+        [address_map.copy()],
+        canonical_enabled=False,
+    ) == [address_map]
+    attached = npi_module._attach_npi_address_key(
+        address_map.copy(),
+        canonical_enabled=True,
+    )
+    assert attached["address_key"] == expected_key
+
+
+@pytest.mark.asyncio
+async def test_npi_taxonomy_code_map_requires_a_table_and_filters_bad_rows(
+    monkeypatch,
+    npi_module,
+):
+    """Taxonomy mapping returns only complete code-to-integer pairs."""
+
+    scalar = AsyncMock(return_value=None)
+    all_rows = AsyncMock()
+    monkeypatch.setattr(npi_module.db, "scalar", scalar)
+    monkeypatch.setattr(npi_module.db, "all", all_rows)
+    assert await npi_module._load_nucc_taxonomy_int_code_map("mrf") == {}
+    all_rows.assert_not_awaited()
+
+    scalar.return_value = "mrf.nucc_taxonomy"
+    all_rows.return_value = [
+        ("207Q00000X", 41),
+        None,
+        (None, 42),
+        ("207R00000X", None),
+    ]
+    assert await npi_module._load_nucc_taxonomy_int_code_map("mrf") == {
+        "207Q00000X": 41
+    }
+
+
+def test_npi_taxonomy_array_is_distinct_sorted_and_fail_safe(npi_module):
+    """Address taxonomy arrays retain known distinct integers or the zero sentinel."""
+
+    npi_row_map = {
+        "Healthcare Provider Taxonomy Code_1": "B",
+        "Healthcare Provider Taxonomy Code_2": "A",
+        "Healthcare Provider Taxonomy Code_3": "B",
+        "Healthcare Provider Taxonomy Code_4": "UNKNOWN",
+        "Healthcare Provider Taxonomy Code_5": "",
+    }
+
+    assert npi_module._taxonomy_array_from_npi_row(npi_row_map, {"A": 1, "B": 2}) == [1, 2]
+    assert npi_module._taxonomy_array_from_npi_row(npi_row_map, {"C": 3}) == [0]
+    assert npi_module._taxonomy_array_from_npi_row(npi_row_map, None) == [0]
+    full_npi_row_map = {
+        f"Healthcare Provider Taxonomy Code_{index}": "A"
+        for index in range(1, 16)
+    }
+    assert npi_module._taxonomy_array_from_npi_row(full_npi_row_map, {"A": 1}) == [1]
+
+
+@pytest.mark.asyncio
 async def test_rebuild_phone_staffing_skips_missing_target(monkeypatch, npi_module):
     status_mock = AsyncMock()
 
@@ -192,6 +318,42 @@ async def test_rebuild_phone_staffing_rejects_missing_nucc(monkeypatch, npi_modu
             address_table="npi_address_20260603",
             schema="mrf",
         )
+
+
+@pytest.mark.asyncio
+async def test_rebuild_phone_staffing_rejects_missing_address_or_pharmacist_rows(
+    monkeypatch,
+    npi_module,
+):
+    """Phone staffing requires both the address stage and usable pharmacist taxonomy."""
+
+    scalar = AsyncMock(
+        side_effect=[
+            "target",
+            None,
+            "target",
+            "address",
+            "nucc",
+            0,
+        ]
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(npi_module.db, "scalar", scalar)
+    monkeypatch.setattr(npi_module.db, "status", status)
+
+    await npi_module.rebuild_phone_staffing_table(
+        target_table="npi_phone_staffing_stage",
+        address_table="npi_address_stage",
+        schema="mrf",
+    )
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="has no Pharmacist rows"):
+        await npi_module.rebuild_phone_staffing_table(
+            target_table="npi_phone_staffing_stage",
+            address_table="npi_address_stage",
+            schema="mrf",
+        )
+
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio

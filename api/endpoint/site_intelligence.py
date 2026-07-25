@@ -135,6 +135,8 @@ async def _radius_zip_weights(
     lng: float,
     radius_miles: float,
 ) -> tuple[dict[str, float], str]:
+    """Weight ZIP overlaps for a geographic radius using the best available tier."""
+
     if radius_miles <= 0:
         return {}, "none"
     if not await _is_zcta_overlap_available(session):
@@ -1231,25 +1233,25 @@ async def get_site_score(request):
     active_pharmacy_count_15 = (
         len(set().union(*(active_pharmacies_by_zip.get(z, set()) for z in zips_15))) if zips_15 else 0
     )
-    chronic_rates_15 = [
+    chronic_15_rates = [
         chronic_rate
         for zip_code in zips_15
         for chronic_rate in chronic_by_zip.get(zip_code, [])
     ]
     chronic_avg_15 = (
-        (sum(chronic_rates_15) / len(chronic_rates_15))
-        if chronic_rates_15
+        (sum(chronic_15_rates) / len(chronic_15_rates))
+        if chronic_15_rates
         else None
     )
     chronic_measure_values_15: dict[str, list[float]] = defaultdict(list)
     for (zip_code, measure_key), (_year, chronic_rate) in latest_places_by_key.items():
         if zip_code in zips_15:
             chronic_measure_values_15[measure_key].append(chronic_rate)
-    chronic_breakdown_rows_15 = []
+    chronic_breakdown_15_rows = []
     for measure_key, chronic_rates in sorted(chronic_measure_values_15.items()):
         if not chronic_rates:
             continue
-        chronic_breakdown_rows_15.append(
+        chronic_breakdown_15_rows.append(
             {
                 "measure_id": measure_key,
                 "measure_name": chronic_measure_name_by_key.get(measure_key, measure_key),
