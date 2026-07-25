@@ -9,7 +9,6 @@ from typing import Any, Callable, Mapping, Sequence
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
     CandidateAuditDecodedRetentionError,
-    retain_unique_integer_key_set,
 )
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
@@ -58,10 +57,9 @@ class V4CandidateBuilders:
 
 
 @dataclass(frozen=True)
-class _V4GraphReservation:
+class _V4CoordinateReservation:
     maximum_graph_members: int
     reservation_bytes: int
-    final_fixed_bytes: int
 
 
 def _candidate_map_retained_bytes(
@@ -77,28 +75,22 @@ def _candidate_map_retained_bytes(
     )
 
 
-def _reserve_v4_graph_projection(
-    candidate_keys_by_npi: Mapping[int, set[int]],
-    allowed_provider_set_keys: set[int],
+def _reserve_v4_coordinate_projection(
+    candidate_provider_set_count: int,
     retention_budget: CandidateAuditDecodedRetentionBudget,
-) -> _V4GraphReservation:
-    """Reserve a conservative peak before any V4 relation is decoded."""
+) -> _V4CoordinateReservation:
+    """Reserve one NPI's transient graph peak beside retained results."""
 
-    npi_count = len(candidate_keys_by_npi)
-    final_fixed_bytes = (
-        _V4_RESULT_MAP_BYTES + npi_count * _V4_RESULT_BUCKET_BYTES
-    )
     transient_fixed_bytes = (
         _V4_GRAPH_TRANSIENT_MAP_BYTES
-        + (4 * npi_count + len(allowed_provider_set_keys))
+        + (4 + int(candidate_provider_set_count))
         * _V4_GRAPH_TRANSIENT_OWNER_BYTES
     )
-    fixed_bytes = final_fixed_bytes + transient_fixed_bytes
     available_bytes = (
         retention_budget.maximum_bytes - retention_budget.retained_bytes
     )
     maximum_graph_members = (
-        available_bytes - fixed_bytes
+        available_bytes - transient_fixed_bytes
     ) // _V4_GRAPH_PEAK_MEMBER_BYTES
     if maximum_graph_members < 1:
         raise CandidateAuditDecodedRetentionError(
@@ -106,99 +98,119 @@ def _reserve_v4_graph_projection(
             "while retaining the bounded V4 candidate graph projection"
         )
     reservation_bytes = (
-        fixed_bytes
+        transient_fixed_bytes
         + maximum_graph_members * _V4_GRAPH_PEAK_MEMBER_BYTES
     )
     retention_budget.claim(
         reservation_bytes,
         category="the bounded V4 candidate graph projection",
     )
-    return _V4GraphReservation(
+    return _V4CoordinateReservation(
         maximum_graph_members=maximum_graph_members,
         reservation_bytes=reservation_bytes,
-        final_fixed_bytes=final_fixed_bytes,
     )
 
 
-def _filtered_v4_provider_sets(
-    raw_provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+def _v4_result_fixed_bytes(
     candidate_keys_by_npi: Mapping[int, set[int]],
-) -> dict[int, tuple[int, ...]]:
-    """Discard graph matches outside each NPI's code/source candidates."""
-
-    return {
-        npi: tuple(
-            provider_set_key
-            for provider_set_key in raw_provider_set_keys_by_npi.get(npi, ())
-            if provider_set_key in candidate_keys
-        )
-        for npi, candidate_keys in candidate_keys_by_npi.items()
-    }
-
-
-def _retained_v4_result_bytes(
-    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
-    final_fixed_bytes: int,
 ) -> int:
-    return final_fixed_bytes + sum(
-        len(provider_set_keys)
-        for provider_set_keys in provider_set_keys_by_npi.values()
-    ) * _V4_RESULT_MEMBERSHIP_BYTES
-
-
-def _empty_v4_provider_sets(
-    candidate_keys_by_npi: Mapping[int, set[int]],
-    retention_budget: CandidateAuditDecodedRetentionBudget,
-) -> dict[int, tuple[int, ...]]:
-    retained_bytes = (
+    return (
         _V4_RESULT_MAP_BYTES
         + len(candidate_keys_by_npi) * _V4_RESULT_BUCKET_BYTES
     )
-    retention_budget.claim(
-        retained_bytes,
-        category="the empty V4 candidate provider result",
+
+
+def _filtered_v4_coordinate_provider_sets(
+    raw_provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    npi: int,
+    candidate_provider_set_keys: set[int],
+) -> tuple[int, ...]:
+    """Return one stable code/source-scoped NPI result."""
+
+    return tuple(
+        sorted(
+            provider_set_key
+            for provider_set_key in raw_provider_set_keys_by_npi.get(npi, ())
+            if provider_set_key in candidate_provider_set_keys
+        )
     )
-    return {npi: () for npi in candidate_keys_by_npi}
 
 
-async def _load_proven_v4_provider_sets(
+async def _load_v4_coordinate_provider_sets(
     session: Any,
     serving_tables: PTG2ServingTables,
-    candidate_keys_by_npi: dict[int, set[int]],
-    allowed_provider_set_keys: set[int],
+    npi: int,
+    candidate_provider_set_keys: set[int],
     retention_budget: CandidateAuditDecodedRetentionBudget,
     *,
     schema_name: str,
-) -> dict[int, tuple[int, ...]]:
-    """Load, filter, and release one reserved V4 graph projection."""
+) -> tuple[tuple[int, ...], int]:
+    """Prove one NPI while converting its transient reservation to output."""
 
-    reservation = _reserve_v4_graph_projection(
-        candidate_keys_by_npi,
-        allowed_provider_set_keys,
+    if not candidate_provider_set_keys:
+        return (), 0
+    reservation = _reserve_v4_coordinate_projection(
+        len(candidate_provider_set_keys),
         retention_budget,
     )
     try:
         raw_provider_set_keys_by_npi = await _v4_sets_by_npi(
             session,
             serving_tables,
-            candidate_keys_by_npi,
-            allowed_provider_set_keys=allowed_provider_set_keys,
+            (npi,),
+            allowed_provider_set_keys=candidate_provider_set_keys,
             schema_name=schema_name,
             max_members=reservation.maximum_graph_members,
         )
-        provider_set_keys_by_npi = _filtered_v4_provider_sets(
+        provider_set_keys = _filtered_v4_coordinate_provider_sets(
             raw_provider_set_keys_by_npi,
-            candidate_keys_by_npi,
+            npi,
+            candidate_provider_set_keys,
         )
-        retained_result_bytes = _retained_v4_result_bytes(
-            provider_set_keys_by_npi,
-            reservation.final_fixed_bytes,
+        retained_result_bytes = (
+            len(provider_set_keys) * _V4_RESULT_MEMBERSHIP_BYTES
         )
         retention_budget.release(
             reservation.reservation_bytes - retained_result_bytes
         )
     except BaseException:
         retention_budget.release(reservation.reservation_bytes)
+        raise
+    return provider_set_keys, retained_result_bytes
+
+
+async def _load_proven_v4_provider_sets(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    candidate_keys_by_npi: dict[int, set[int]],
+    retention_budget: CandidateAuditDecodedRetentionBudget,
+    *,
+    schema_name: str,
+) -> dict[int, tuple[int, ...]]:
+    """Prove each independent NPI within one shared final-result budget."""
+
+    retained_result_bytes = _v4_result_fixed_bytes(candidate_keys_by_npi)
+    retention_budget.claim(
+        retained_result_bytes,
+        category="the V4 candidate provider result",
+    )
+    provider_set_keys_by_npi: dict[int, tuple[int, ...]] = {}
+    try:
+        for npi in sorted(candidate_keys_by_npi):
+            provider_set_keys, retained_coordinate_bytes = (
+                await _load_v4_coordinate_provider_sets(
+                    session,
+                    serving_tables,
+                    npi,
+                    candidate_keys_by_npi[npi],
+                    retention_budget,
+                    schema_name=schema_name,
+                )
+            )
+            provider_set_keys_by_npi[npi] = provider_set_keys
+            retained_result_bytes += retained_coordinate_bytes
+    except BaseException:
+        retention_budget.release(retained_result_bytes)
         raise
     return provider_set_keys_by_npi
 
@@ -216,32 +228,13 @@ async def prove_v4_candidate_sets(
     candidate_source_bytes = _candidate_map_retained_bytes(
         candidate_keys_by_npi
     )
-    allowed_provider_set_keys, allowed_set_bytes = retain_unique_integer_key_set(
-        (
-            provider_set_key
-            for candidate_keys in candidate_keys_by_npi.values()
-            for provider_set_key in candidate_keys
-        ),
+    provider_set_keys_by_npi = await _load_proven_v4_provider_sets(
+        session,
+        serving_tables,
+        candidate_keys_by_npi,
         retention_budget,
-        category="V4 candidate provider",
+        schema_name=schema_name,
     )
-    try:
-        if not allowed_provider_set_keys:
-            provider_set_keys_by_npi = _empty_v4_provider_sets(
-                candidate_keys_by_npi,
-                retention_budget,
-            )
-        else:
-            provider_set_keys_by_npi = await _load_proven_v4_provider_sets(
-                session,
-                serving_tables,
-                candidate_keys_by_npi,
-                allowed_provider_set_keys,
-                retention_budget,
-                schema_name=schema_name,
-            )
-    finally:
-        retention_budget.release(allowed_set_bytes)
     retention_budget.release(candidate_source_bytes)
     return provider_set_keys_by_npi
 

@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from api import ptg2_candidate_audit_capacity as capacity
 from api import ptg2_candidate_audit_graph as candidate_graph
 from api import ptg2_candidate_audit_reverse as reverse_scope
 from api import ptg2_candidate_audit_v4 as v4_scope
@@ -302,13 +301,8 @@ async def test_v4_candidate_graph_fails_before_unbounded_projection(
         + v4_scope._NPI_PROVIDER_BUCKET_BYTES
         + v4_scope._NPI_PROVIDER_MEMBERSHIP_BYTES
     )
-    allowed_set_bytes = (
-        capacity.INTEGER_KEY_SET_BYTES
-        + capacity.INTEGER_KEY_SET_MEMBERSHIP_BYTES
-    )
-    final_fixed_bytes = (
-        v4_scope._V4_RESULT_MAP_BYTES
-        + v4_scope._V4_RESULT_BUCKET_BYTES
+    final_fixed_bytes = v4_scope._v4_result_fixed_bytes(
+        candidate_keys_by_npi
     )
     transient_fixed_bytes = (
         v4_scope._V4_GRAPH_TRANSIENT_MAP_BYTES
@@ -317,7 +311,6 @@ async def test_v4_candidate_graph_fails_before_unbounded_projection(
     budget = CandidateAuditDecodedRetentionBudget(
         maximum_bytes=(
             candidate_source_bytes
-            + allowed_set_bytes
             + final_fixed_bytes
             + transient_fixed_bytes
             + v4_scope._V4_GRAPH_PEAK_MEMBER_BYTES

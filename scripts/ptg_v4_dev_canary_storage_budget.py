@@ -114,7 +114,7 @@ class StorageBudget:
     factor_edge_count: int
 
     @property
-    def promotion_approved(self) -> bool:
+    def is_promotion_approved(self) -> bool:
         """Return whether reviewed absolute physical ceilings exist."""
 
         return self.case.physical_storage_approval is not None
@@ -155,10 +155,10 @@ class StorageBudget:
             "contract": STORAGE_BUDGET_CONTRACT,
             "policy": STORAGE_BUDGET_POLICY,
             "policy_digest": STORAGE_BUDGET_POLICY_DIGEST,
-            "promotion_approved": self.promotion_approved,
+            "promotion_approved": self.is_promotion_approved,
             "promotion_state": (
                 "approved_absolute_ceiling"
-                if self.promotion_approved
+                if self.is_promotion_approved
                 else "measurement_only_pending_review"
             ),
             "case_name": self.case.case_name,
@@ -331,7 +331,7 @@ def _validate_source_set_binding(
 ) -> None:
     """Require both snapshots to identify the reviewed raw-container set."""
 
-    expected_source_set = {
+    expected_source_set_by_field = {
         "contract": PTG2_V3_SOURCE_SET_CONTRACT,
         "source_count": case.source_count,
         "raw_container_sha256_digest": case.source_set_digest,
@@ -339,8 +339,9 @@ def _validate_source_set_binding(
     if (
         equivalence.get("same_raw_sources") is not True
         or equivalence.get("same_source_trace_sets") is not True
-        or equivalence.get("v4_source_set") != expected_source_set
-        or equivalence.get("reference_source_set") != expected_source_set
+        or equivalence.get("v4_source_set") != expected_source_set_by_field
+        or equivalence.get("reference_source_set")
+        != expected_source_set_by_field
     ):
         raise CanaryConfigurationError(
             "sealed source set differs from the source-controlled storage case"
@@ -455,8 +456,8 @@ def _validate_storage_approval(
         or not approval.measurement_image_identity.strip()
         or approval.measurement_evidence_sha256
         != physical_storage_measurement_evidence_sha256(approval)
-        or any(value <= 0 for value in measured_values)
-        or any(value <= 0 for value in approved_values)
+        or any(measured_value <= 0 for measured_value in measured_values)
+        or any(approved_value <= 0 for approved_value in approved_values)
         or tolerance != APPROVED_TOLERANCE_BASIS_POINTS
         or approved_values != expected_approved_values
     ):

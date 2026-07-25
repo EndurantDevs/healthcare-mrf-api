@@ -180,9 +180,9 @@ def worker_state(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": status, "items": items}
 
 
-def _resolve_specs(payload: dict[str, Any]) -> list[WorkerSpec]:
-    worker_class = str(payload.get("worker_class") or "").strip()
-    queue = str(payload.get("queue") or "").strip()
+def _resolve_specs(launch_request: dict[str, Any]) -> list[WorkerSpec]:
+    worker_class = str(launch_request.get("worker_class") or "").strip()
+    queue = str(launch_request.get("queue") or "").strip()
     if worker_class:
         spec = _BY_WORKER_CLASS.get(worker_class)
         if spec is None:
@@ -191,10 +191,10 @@ def _resolve_specs(payload: dict[str, Any]) -> list[WorkerSpec]:
             return []
         return [spec]
 
-    importer = str(payload.get("importer") or "").strip()
-    role = str(payload.get("role") or "").strip().lower()
+    importer = str(launch_request.get("importer") or "").strip()
+    role = str(launch_request.get("role") or "").strip().lower()
     explicit_role = bool(role)
-    status = str(payload.get("status") or "").strip().lower()
+    status = str(launch_request.get("status") or "").strip().lower()
     if not role:
         role = "finish" if status == "finalizing" else "start"
     role_overrides_queue = bool(importer and (explicit_role or status == "finalizing"))
@@ -202,7 +202,10 @@ def _resolve_specs(payload: dict[str, Any]) -> list[WorkerSpec]:
         spec = _BY_QUEUE.get(queue)
         return [spec] if spec is not None else []
     if importer and role == "start" and not explicit_role:
-        finished_start_spec = _finish_spec_after_completed_start(importer, payload)
+        finished_start_spec = _finish_spec_after_completed_start(
+            importer,
+            launch_request,
+        )
         if finished_start_spec is not None:
             return [finished_start_spec]
     spec = _BY_IMPORTER_ROLE.get((importer, role))
@@ -484,7 +487,7 @@ def _kubernetes_delete_record(
     return deletion_summary_dict
 
 
-def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> dict[str, Any]:
     """Summarize Kubernetes jobs matching a worker spec and optional run."""
     state_base_dict = {
         "queue": spec.queue,
@@ -497,15 +500,15 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
         "command": " ".join(_worker_command(_worker_python(), spec)),
     }
     if not _is_kubernetes_configured():
-        return {**state_base_dict, "job_name": _worker_job_name(spec, payload or {}), "job_status": "unconfigured"}
+        return {**state_base_dict, "job_name": _worker_job_name(spec, launch_request or {}), "job_status": "unconfigured"}
 
-    selector = _kubernetes_label_selector(spec, payload or {})
+    selector = _kubernetes_label_selector(spec, launch_request or {})
     namespace = _kubernetes_namespace()
     path = f"/apis/batch/v1/namespaces/{namespace}/jobs?{urllib.parse.urlencode({'labelSelector': selector})}"
     try:
         body = _kubernetes_request("GET", path)
     except _KubernetesApiError as exc:
-        return {**state_base_dict, "job_name": _worker_job_name(spec, payload or {}), "job_status": "error", "message": str(exc)}
+        return {**state_base_dict, "job_name": _worker_job_name(spec, launch_request or {}), "job_status": "error", "message": str(exc)}
 
     raw_job_records = body.get("items") if isinstance(body, dict) else []
     jobs = [job_record for job_record in raw_job_records if isinstance(job_record, dict)]
@@ -513,7 +516,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
     succeeded = sum(int((job.get("status") or {}).get("succeeded") or 0) for job in jobs)
     failed = sum(int((job.get("status") or {}).get("failed") or 0) for job in jobs)
     latest = jobs[-1] if jobs else {}
-    latest_name = ((latest.get("metadata") or {}).get("name") if isinstance(latest, dict) else None) or _worker_job_name(spec, payload or {})
+    latest_name = ((latest.get("metadata") or {}).get("name") if isinstance(latest, dict) else None) or _worker_job_name(spec, launch_request or {})
     if active:
         job_status = "active"
     elif failed:
@@ -614,23 +617,27 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
     return ",".join(f"{key}={value}" for key, value in selector_label_map.items())
 
 
-def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) -> dict[str, Any]:
+def _worker_job_manifest(
+    spec: WorkerSpec,
+    launch_request: dict[str, Any],
+    image: str,
+) -> dict[str, Any]:
     """Build the Kubernetes Job manifest for one import worker."""
 
-    job_name = _worker_job_name(spec, payload)
+    job_name = _worker_job_name(spec, launch_request)
     env_list = [
         {"name": "HLTHPRT_WORKER_LAUNCHER", "value": "process"},
         {"name": "HLTHPRT_IMPORT_NODE_ID", "value": os.getenv("HLTHPRT_IMPORT_NODE_ID", "")},
         {"name": "HLTHPRT_ACTIVE_WORKER_CLASS", "value": spec.worker_class},
         {"name": "HLTHPRT_ACTIVE_WORKER_QUEUE", "value": spec.queue},
     ]
-    import_id = str(payload.get("import_id") or "").strip()
+    import_id = str(launch_request.get("import_id") or "").strip()
     if import_id:
         env_list.append({"name": "HLTHPRT_IMPORT_ID_OVERRIDE", "value": import_id})
-    run_id = str(payload.get("run_id") or "").strip()
+    run_id = str(launch_request.get("run_id") or "").strip()
     if run_id:
         env_list.append({"name": "HLTHPRT_CONTROL_RUN_ID", "value": run_id})
-    target_job_id = _single_job_worker_target(spec, payload)
+    target_job_id = _single_job_worker_target(spec, launch_request)
     if target_job_id:
         env_list.append(
             {
@@ -652,7 +659,7 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     env_from_list = _worker_job_env_from()
     if env_from_list:
         container_dict["envFrom"] = env_from_list
-    resource_dict = _worker_job_resources(spec, payload)
+    resource_dict = _worker_job_resources(spec, launch_request)
     if resource_dict:
         container_dict["resources"] = resource_dict
     pvc_volumes = _worker_job_pvc_volumes()

@@ -63,7 +63,7 @@ def _projection_fixture_for(
         representation=representation,
         pattern_count=len(npi_keys_by_pattern),
         pattern_member_count=pattern_member_count,
-        payload=pattern_payload,
+        packed_pattern_payload=pattern_payload,
     )
     projection_manifest = taxonomy._candidate_projection_manifest(
         (
@@ -160,7 +160,7 @@ def _observe_projection_fixture() -> dict[str, object]:
                         representation=representation,
                         pattern_count=0,
                         pattern_member_count=0,
-                        payload=b"",
+                        packed_pattern_payload=b"",
                     )
                 ),
                 "pattern_member_payload": b"",

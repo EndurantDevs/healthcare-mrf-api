@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -82,6 +83,42 @@ def _v4_serving_tables() -> PTG2ServingTables:
     )
 
 
+def _graph_member_lookup(graph_calls, first_relation):
+    async def graph_lookup(_session, **kwargs):
+        graph_calls.append(kwargs)
+        if kwargs["relation"] == first_relation:
+            members_by_owner = {4: (2,), 6: (3,)}
+            return {
+                owner_key: members_by_owner[owner_key]
+                for owner_key in kwargs["owner_keys"]
+            }
+        raise AssertionError(f"unexpected relation {kwargs['relation']}")
+
+    return graph_lookup
+
+
+def _graph_intersection_lookup(graph_calls, second_relation):
+    async def graph_intersection(_session, **kwargs):
+        graph_calls.append(kwargs)
+        if kwargs["relation"] != second_relation:
+            raise AssertionError(f"unexpected relation {kwargs['relation']}")
+        owner_key = tuple(kwargs["owner_keys"])[0]
+        candidates_by_owner = {2: {5, 9}, 3: {7}}
+        members_by_owner = {2: (5,), 3: (7,)}
+        assert set(kwargs["allowed_member_keys"]) == candidates_by_owner[owner_key]
+        return {owner_key: members_by_owner[owner_key]}
+
+    return graph_intersection
+
+
+def _npi_key_lookup(challenge, persisted):
+    async def npi_keys_for_values(_session, **kwargs):
+        key_by_npi = {challenge.npi: 4, persisted.npi: 6}
+        return {npi: key_by_npi[npi] for npi in kwargs["npis"]}
+
+    return npi_keys_for_values
+
+
 def _install_v4_graph(
     monkeypatch,
     *,
@@ -94,24 +131,10 @@ def _install_v4_graph(
     """Install one real pattern/direct traversal around mocked V4 storage."""
 
     graph_calls: list[dict[str, object]] = []
-
-    async def graph_lookup(_session, **kwargs):
-        graph_calls.append(kwargs)
-        if kwargs["relation"] == first_relation:
-            return {4: (2,), 6: (3,)}
-        raise AssertionError(f"unexpected relation {kwargs['relation']}")
-
-    async def graph_intersection(_session, **kwargs):
-        graph_calls.append(kwargs)
-        if kwargs["relation"] != second_relation:
-            raise AssertionError(f"unexpected relation {kwargs['relation']}")
-        assert set(kwargs["allowed_member_keys"]) == {5, 7, 9}
-        return {2: (5,), 3: (7,)}
-
     monkeypatch.setattr(
         serving,
         "v4_npi_keys_for_values",
-        AsyncMock(return_value={challenge.npi: 4, persisted.npi: 6}),
+        _npi_key_lookup(challenge, persisted),
     )
     monkeypatch.setattr(
         serving,
@@ -129,11 +152,15 @@ def _install_v4_graph(
         "_v4_reverse_members_for_sets",
         AsyncMock(return_value=None),
     )
-    monkeypatch.setattr(serving, "lookup_v4_relation_members", graph_lookup)
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_members",
+        _graph_member_lookup(graph_calls, first_relation),
+    )
     monkeypatch.setattr(
         serving,
         "lookup_v4_relation_intersections",
-        graph_intersection,
+        _graph_intersection_lookup(graph_calls, second_relation),
     )
     return graph_calls
 
@@ -197,9 +224,156 @@ async def test_v4_candidate_scope_uses_bounded_code_first_graph(
     assert [call["relation"] for call in graph_calls] == [
         first_relation,
         second_relation,
+        first_relation,
+        second_relation,
     ]
     assert all(call["schema_name"] == "candidate_schema" for call in graph_calls)
     assert all(int(call["max_members"]) > 0 for call in graph_calls)
+    assert all(len(tuple(call["owner_keys"])) == 1 for call in graph_calls)
+
+
+@pytest.mark.asyncio
+async def test_v4_candidate_graph_proves_each_npi_with_only_local_candidates(monkeypatch):
+    """Keep each coordinate independent even when their combined peak exceeds its cap."""
+
+    candidate_keys_by_npi = {2_222_222_222: {8, 7}, 1_111_111_111: {6, 5}}
+    candidate_source_bytes = v4_scope._candidate_map_retained_bytes(candidate_keys_by_npi)
+    result_fixed_bytes = v4_scope._v4_result_fixed_bytes(candidate_keys_by_npi)
+    coordinate_fixed_bytes = (
+        v4_scope._V4_GRAPH_TRANSIENT_MAP_BYTES
+        + 6 * v4_scope._V4_GRAPH_TRANSIENT_OWNER_BYTES
+    )
+    per_coordinate_member_limit = 2
+    peak_and_result_member_bytes = (
+        v4_scope._V4_GRAPH_PEAK_MEMBER_BYTES
+        + v4_scope._V4_RESULT_MEMBERSHIP_BYTES
+    )
+    maximum_bytes = candidate_source_bytes + result_fixed_bytes + coordinate_fixed_bytes
+    maximum_bytes += per_coordinate_member_limit * peak_and_result_member_bytes
+    budget = v4_scope.CandidateAuditDecodedRetentionBudget(maximum_bytes=maximum_bytes)
+    budget.claim(candidate_source_bytes, category="the candidate provider map")
+    calls: list[dict[str, object]] = []
+
+    async def graph_lookup(_session, _tables, npis, **kwargs):
+        normalized_npis = tuple(npis)
+        assert len(normalized_npis) == 1
+        calls.append({
+            "npi": normalized_npis[0],
+            "allowed": set(kwargs["allowed_provider_set_keys"]),
+            "max_members": kwargs["max_members"],
+        })
+        reversed_keys = tuple(reversed(sorted(kwargs["allowed_provider_set_keys"])))
+        return {normalized_npis[0]: reversed_keys}
+
+    monkeypatch.setattr(v4_scope, "_v4_sets_by_npi", graph_lookup)
+
+    observed = await v4_scope.prove_v4_candidate_sets(
+        object(),
+        _v4_serving_tables(),
+        candidate_keys_by_npi,
+        budget,
+        schema_name="candidate_schema",
+    )
+
+    assert list(observed) == [1_111_111_111, 2_222_222_222]
+    assert observed == {1_111_111_111: (5, 6), 2_222_222_222: (7, 8)}
+    assert calls == [
+        {"npi": 1_111_111_111, "allowed": {5, 6}, "max_members": 2},
+        {"npi": 2_222_222_222, "allowed": {7, 8}, "max_members": 2},
+    ]
+    assert budget.retained_bytes == (
+        result_fixed_bytes + 4 * v4_scope._V4_RESULT_MEMBERSHIP_BYTES
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_candidate_graph_keeps_final_results_inside_shared_budget(
+    monkeypatch,
+):
+    candidate_keys_by_npi = {
+        1_111_111_111: {5},
+        2_222_222_222: {7},
+    }
+    candidate_source_bytes = v4_scope._candidate_map_retained_bytes(
+        candidate_keys_by_npi
+    )
+    result_fixed_bytes = v4_scope._v4_result_fixed_bytes(
+        candidate_keys_by_npi
+    )
+    coordinate_fixed_bytes = (
+        v4_scope._V4_GRAPH_TRANSIENT_MAP_BYTES
+        + 5 * v4_scope._V4_GRAPH_TRANSIENT_OWNER_BYTES
+    )
+    budget = v4_scope.CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=(
+            candidate_source_bytes
+            + result_fixed_bytes
+            + coordinate_fixed_bytes
+            + v4_scope._V4_GRAPH_PEAK_MEMBER_BYTES
+        )
+    )
+    budget.claim(candidate_source_bytes, category="the candidate provider map")
+    graph_lookup = AsyncMock(
+        side_effect=(
+            {1_111_111_111: (5,)},
+            {2_222_222_222: (7,)},
+        )
+    )
+    monkeypatch.setattr(v4_scope, "_v4_sets_by_npi", graph_lookup)
+
+    with pytest.raises(
+        v4_scope.CandidateAuditDecodedRetentionError,
+        match="bounded V4 candidate graph projection",
+    ):
+        await v4_scope.prove_v4_candidate_sets(
+            object(),
+            _v4_serving_tables(),
+            candidate_keys_by_npi,
+            budget,
+            schema_name="candidate_schema",
+        )
+
+    assert graph_lookup.await_count == 1
+    assert budget.retained_bytes == candidate_source_bytes
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, asyncio.CancelledError))
+@pytest.mark.asyncio
+async def test_v4_candidate_graph_releases_prior_results_after_later_failure(
+    monkeypatch,
+    failure_type,
+):
+    candidate_keys_by_npi = {
+        1_111_111_111: {5},
+        2_222_222_222: {7},
+    }
+    candidate_source_bytes = v4_scope._candidate_map_retained_bytes(
+        candidate_keys_by_npi
+    )
+    budget = v4_scope.CandidateAuditDecodedRetentionBudget()
+    budget.claim(candidate_source_bytes, category="the candidate provider map")
+    observed_npis: list[int] = []
+
+    async def graph_lookup(_session, _tables, npis, **_kwargs):
+        npi = tuple(npis)[0]
+        observed_npis.append(npi)
+        if len(observed_npis) == 2:
+            raise failure_type("later coordinate failed")
+        return {npi: (5,)}
+
+    monkeypatch.setattr(v4_scope, "_v4_sets_by_npi", graph_lookup)
+
+    with pytest.raises(failure_type, match="later coordinate failed"):
+        await v4_scope.prove_v4_candidate_sets(
+            object(),
+            _v4_serving_tables(),
+            candidate_keys_by_npi,
+            budget,
+            schema_name="candidate_schema",
+        )
+
+    assert observed_npis == [1_111_111_111, 2_222_222_222]
+    assert budget.retained_bytes == candidate_source_bytes
 
 
 @pytest.mark.asyncio

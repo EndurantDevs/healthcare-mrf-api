@@ -198,16 +198,16 @@ async def control_ptg_source_snapshot_promote(request):
     """Promote a validated source snapshot and optionally refresh addresses."""
 
     _require_control_auth(request)
-    payload = request.json if isinstance(request.json, dict) else {}
-    source_key = str(payload.get("source_key") or "")
-    snapshot_id = str(payload.get("snapshot_id") or "")
+    request_payload = request.json if isinstance(request.json, dict) else {}
+    source_key = str(request_payload.get("source_key") or "")
+    snapshot_id = str(request_payload.get("snapshot_id") or "")
     try:
-        result = await promote_ptg2_source_snapshot(
+        promotion_by_field = await promote_ptg2_source_snapshot(
             source_key=source_key,
             snapshot_id=snapshot_id,
             expected_current_snapshot_id=(
-                str(payload.get("expected_current_snapshot_id"))
-                if payload.get("expected_current_snapshot_id") is not None
+                str(request_payload.get("expected_current_snapshot_id"))
+                if request_payload.get("expected_current_snapshot_id") is not None
                 else None
             ),
         )
@@ -215,19 +215,19 @@ async def control_ptg_source_snapshot_promote(request):
         raise SanicException(str(exc), status_code=409) from exc
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
-    if _is_ptg_snapshot_refresh_requested(payload):
+    if _is_ptg_snapshot_refresh_requested(request_payload):
         try:
             refresh_payload = _ptg_source_snapshot_refresh_payload(
-                payload,
+                request_payload,
                 source_key=source_key,
                 snapshot_id=snapshot_id,
             )
             refresh_run, created = await create_import_run(refresh_payload)
         except ValueError as exc:
             raise BadRequest(str(exc)) from exc
-        result = dict(result)
-        result["address_refresh"] = {"run": refresh_run, "created": created}
-    return response.json(result, default=str)
+        promotion_by_field = dict(promotion_by_field)
+        promotion_by_field["address_refresh"] = {"run": refresh_run, "created": created}
+    return response.json(promotion_by_field, default=str)
 
 
 @blueprint.post("/ptg/source-snapshots/attest")
@@ -389,7 +389,7 @@ async def control_finalize_import(request, run_id: str):
 
 
 def _ptg_import_file_payload(payload: dict) -> dict:
-    params = dict(payload.get("params") or {})
+    params_by_name = dict(payload.get("params") or {})
     for key in (
         "source_key",
         "source_file_id",
@@ -402,17 +402,17 @@ def _ptg_import_file_payload(payload: dict) -> dict:
         "max_files",
         "test_mode",
     ):
-        if key in payload and key not in params:
-            params[key] = payload[key]
+        if key in payload and key not in params_by_name:
+            params_by_name[key] = payload[key]
     return {
         "run_id": payload.get("run_id"),
         "importer": "ptg",
-        "params": params,
+        "params": params_by_name,
         "idempotency_key": payload.get("idempotency_key"),
         "triggered_by": payload.get("triggered_by") or "source_file_import",
         "schedule_id": payload.get("schedule_id"),
         "subscription_id": payload.get("subscription_id"),
-        "source_file_import_id": payload.get("source_file_import_id") or params.get("source_file_import_id"),
+        "source_file_import_id": payload.get("source_file_import_id") or params_by_name.get("source_file_import_id"),
     }
 
 
@@ -440,7 +440,7 @@ def _ptg_source_snapshot_refresh_payload(request_payload: dict, *, source_key: s
     if raw_refresh is not None and not isinstance(raw_refresh, dict):
         raise ValueError("address_refresh must be an object")
     refresh = raw_refresh or {}
-    params = dict(refresh.get("params") or {})
+    refresh_params_by_name = dict(refresh.get("params") or {})
     for key in (
         "test_mode",
         "limit_per_source",
@@ -448,17 +448,17 @@ def _ptg_source_snapshot_refresh_payload(request_payload: dict, *, source_key: s
         "skip_publish",
         "refresh_mode",
     ):
-        if key in refresh and key not in params:
-            params[key] = refresh[key]
-        elif key in request_payload and key not in params:
-            params[key] = request_payload[key]
-    params.setdefault("refresh_mode", "full")
-    params["trigger_source_key"] = source_key
-    params["trigger_snapshot_id"] = snapshot_id
+        if key in refresh and key not in refresh_params_by_name:
+            refresh_params_by_name[key] = refresh[key]
+        elif key in request_payload and key not in refresh_params_by_name:
+            refresh_params_by_name[key] = request_payload[key]
+    refresh_params_by_name.setdefault("refresh_mode", "full")
+    refresh_params_by_name["trigger_source_key"] = source_key
+    refresh_params_by_name["trigger_snapshot_id"] = snapshot_id
     return {
         "run_id": refresh.get("run_id") or request_payload.get("refresh_run_id"),
         "importer": "entity-address-unified",
-        "params": params,
+        "params": refresh_params_by_name,
         "idempotency_key": (
             refresh.get("idempotency_key")
             or request_payload.get("refresh_idempotency_key")

@@ -196,7 +196,7 @@ def test_candidate_digests_reject_incompatible_identity_and_payload() -> None:
             candidates.inferred_taxonomy_pattern_member_digest(
                 pattern_count=kwargs.get("pattern_count", 0),
                 pattern_member_count=0,
-                payload=b"",
+                packed_pattern_payload=b"",
                 **{
                     key: field_value
                     for key, field_value in kwargs.items()
@@ -400,7 +400,7 @@ def _projection_row(
                 representation=representation,
                 pattern_count=len(pattern_members),
                 pattern_member_count=pattern_member_count,
-                payload=pattern_payload,
+                packed_pattern_payload=pattern_payload,
             )
         ),
         "pattern_member_payload": pattern_payload,
@@ -444,7 +444,7 @@ def _observe_projection_row(
                 representation=representation,
                 pattern_count=0,
                 pattern_member_count=0,
-                payload=b"",
+                packed_pattern_payload=b"",
             )
         ),
         "pattern_member_payload": b"",

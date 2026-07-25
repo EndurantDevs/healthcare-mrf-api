@@ -298,9 +298,8 @@ async def test_v4_dictionary_reverse_lookup_and_candidate_bounds(
 
     tiny_budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=1)
     with pytest.raises(CandidateAuditDecodedRetentionError):
-        candidate_v4._reserve_v4_graph_projection(
-            {1000000001: {1}},
-            {1},
+        candidate_v4._reserve_v4_coordinate_projection(
+            1,
             tiny_budget,
         )
 
