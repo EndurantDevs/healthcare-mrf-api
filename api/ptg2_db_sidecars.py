@@ -101,6 +101,143 @@ class PTG2ServingBinaryRow:
     price_key: int | None = None
 
 
+class ForwardReadBudgetExceeded(RuntimeError):
+    """One valid forward read exceeded its request-scoped physical cap."""
+
+
+@dataclass
+class ForwardReadBudget:
+    """Bound cumulative physical work across related forward reads."""
+
+    maximum_fragments: int
+    maximum_raw_payload_bytes: int
+    maximum_row_capacity: int | None = None
+    fragment_count: int = 0
+    raw_payload_bytes: int = 0
+    active_read_row_capacity: int = 0
+    active_result_row_capacity: int = 0
+    peak_read_row_capacity: int = 0
+    peak_result_row_capacity: int = 0
+
+    def __post_init__(self) -> None:
+        limits = (self.maximum_fragments, self.maximum_raw_payload_bytes)
+        if any(isinstance(limit, bool) or int(limit) <= 0 for limit in limits):
+            raise PTG2ManifestArtifactError(
+                "PTG2 forward physical scan budget is invalid"
+            )
+        self.maximum_fragments = int(self.maximum_fragments)
+        self.maximum_raw_payload_bytes = int(
+            self.maximum_raw_payload_bytes
+        )
+        if self.maximum_row_capacity is not None:
+            if (
+                isinstance(self.maximum_row_capacity, bool)
+                or int(self.maximum_row_capacity) <= 0
+            ):
+                raise PTG2ManifestArtifactError(
+                    "PTG2 forward row-capacity budget is invalid"
+                )
+            self.maximum_row_capacity = int(self.maximum_row_capacity)
+
+    def claim(self, raw_payload_bytes: int) -> None:
+        """Charge one authenticated fragment before decoding it."""
+
+        normalized_raw_bytes = int(raw_payload_bytes)
+        next_fragment_count = self.fragment_count + 1
+        next_raw_payload_bytes = self.raw_payload_bytes + normalized_raw_bytes
+        if (
+            normalized_raw_bytes < 0
+            or next_fragment_count > self.maximum_fragments
+            or next_raw_payload_bytes > self.maximum_raw_payload_bytes
+        ):
+            raise ForwardReadBudgetExceeded(
+                "PTG2 forward read exceeds its sealed physical scan budget"
+            )
+        self.fragment_count = next_fragment_count
+        self.raw_payload_bytes = next_raw_payload_bytes
+
+    def claim_page_capacity(
+        self,
+        *,
+        page_count: int,
+        raw_payload_bytes: int,
+    ) -> None:
+        """Charge bounded page probes before issuing any of their reads."""
+
+        normalized_page_count = int(page_count)
+        normalized_raw_bytes = int(raw_payload_bytes)
+        next_fragment_count = self.fragment_count + normalized_page_count
+        next_raw_payload_bytes = self.raw_payload_bytes + normalized_raw_bytes
+        if (
+            normalized_page_count < 0
+            or normalized_raw_bytes < 0
+            or next_fragment_count > self.maximum_fragments
+            or next_raw_payload_bytes > self.maximum_raw_payload_bytes
+        ):
+            raise ForwardReadBudgetExceeded(
+                "PTG2 forward read exceeds its sealed physical scan budget"
+            )
+        self.fragment_count = next_fragment_count
+        self.raw_payload_bytes = next_raw_payload_bytes
+
+    def reserve_row_capacity(
+        self,
+        *,
+        read_rows: int,
+        result_rows: int,
+    ) -> None:
+        """Charge worst-case physical and logical rows before code I/O."""
+
+        normalized_read_rows = int(read_rows)
+        normalized_result_rows = int(result_rows)
+        next_read_capacity = (
+            self.active_read_row_capacity + normalized_read_rows
+        )
+        next_result_capacity = (
+            self.active_result_row_capacity + normalized_result_rows
+        )
+        if (
+            normalized_read_rows < 0
+            or normalized_result_rows < 0
+            or self.maximum_row_capacity is None
+            or next_read_capacity > self.maximum_row_capacity
+            or next_result_capacity > self.maximum_row_capacity
+        ):
+            raise ForwardReadBudgetExceeded(
+                "PTG2 forward read exceeds its sealed row-capacity budget"
+            )
+        self.active_read_row_capacity = next_read_capacity
+        self.active_result_row_capacity = next_result_capacity
+        self.peak_read_row_capacity = max(
+            self.peak_read_row_capacity,
+            next_read_capacity,
+        )
+        self.peak_result_row_capacity = max(
+            self.peak_result_row_capacity,
+            next_result_capacity,
+        )
+
+    def release_row_capacity(
+        self,
+        *,
+        read_rows: int,
+        result_rows: int,
+    ) -> None:
+        """Release one merge's temporary row reservation."""
+
+        normalized_read_rows = int(read_rows)
+        normalized_result_rows = int(result_rows)
+        if (
+            normalized_read_rows < 0
+            or normalized_result_rows < 0
+            or normalized_read_rows > self.active_read_row_capacity
+            or normalized_result_rows > self.active_result_row_capacity
+        ):
+            raise RuntimeError("PTG2 forward row-capacity release is invalid")
+        self.active_read_row_capacity -= normalized_read_rows
+        self.active_result_row_capacity -= normalized_result_rows
+
+
 @dataclass(frozen=True)
 class _ForwardLookupOptions:
     """Options for one strict V3 forward-block read."""
@@ -113,6 +250,7 @@ class _ForwardLookupOptions:
     provider_counts_by_key: Mapping[int, int] | None = None
     source_count: int | None = None
     schema_name: str = "mrf"
+    scan_budget: ForwardReadBudget | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +322,13 @@ class _ForwardShardVisitOptions:
     price_item_count: int
     provider_shard_span: int | None = None
     source_keys: Iterable[int] | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedProviderSetFilter:
+    """Validated immutable provider-set filter shared by shard visits."""
+
+    keys: frozenset[int] | None
 
 
 @dataclass(frozen=True)
@@ -367,6 +512,19 @@ def _normalized_provider_set_filter(
             )
         normalized_keys.add(normalized_key)
     return tuple(sorted(normalized_keys))
+
+
+def _prepare_provider_set_filter(
+    provider_set_keys: Iterable[int] | None,
+) -> _PreparedProviderSetFilter:
+    normalized_keys = _normalized_provider_set_filter(provider_set_keys)
+    return _PreparedProviderSetFilter(
+        keys=(
+            None
+            if normalized_keys is None
+            else frozenset(normalized_keys)
+        )
+    )
 
 
 def _normalized_provider_shard_span(provider_shard_span: int | None) -> int:
@@ -1431,7 +1589,7 @@ def _ordered_forward_fragments(
 def _visit_code_records_with_source_count(
     fragment_rows: Iterable[Mapping[str, Any]],
     *,
-    provider_set_keys: Iterable[int] | None,
+    provider_set_keys: Iterable[int] | _PreparedProviderSetFilter | None,
     occurrence_consumer: Callable[[int, int, int], None],
     expected_source_count: int | None = None,
     provider_key_min: int | None = None,
@@ -1441,13 +1599,10 @@ def _visit_code_records_with_source_count(
 ) -> int | None:
     """Validate ordered fragments while sending selected rows to one sink."""
 
-    normalized_provider_filter = _normalized_provider_set_filter(
-        provider_set_keys
-    )
     provider_filter = (
-        set(normalized_provider_filter)
-        if normalized_provider_filter is not None
-        else None
+        provider_set_keys
+        if isinstance(provider_set_keys, _PreparedProviderSetFilter)
+        else _prepare_provider_set_filter(provider_set_keys)
     )
     source_filter = _normalized_source_filter(
         source_keys,
@@ -1468,7 +1623,7 @@ def _visit_code_records_with_source_count(
         fragment_cursor, fragment_source_count = (
             _visit_serving_binary_by_code_record(
                 fragment_row,
-                provider_filter=provider_filter,
+                provider_filter=provider_filter.keys,
                 fragment_cursor=fragment_cursor,
                 validation=fragment_validation,
                 occurrence_consumer=occurrence_consumer,
@@ -1528,6 +1683,9 @@ def _visit_forward_shards_for_code(
     """Validate one code's selected shards and stream retained occurrences."""
 
     normalized_code_key = _normalized_code_key(options.code_key)
+    prepared_provider_filter = _prepare_provider_set_filter(
+        options.provider_set_keys
+    )
     expected_keys = tuple(
         sorted({int(key) for key in options.expected_block_keys})
     )
@@ -1557,7 +1715,7 @@ def _visit_forward_shards_for_code(
         )
         shard_source_count = _visit_code_records_with_source_count(
             fragments_by_block[block_key],
-            provider_set_keys=options.provider_set_keys,
+            provider_set_keys=prepared_provider_filter,
             occurrence_consumer=occurrence_consumer,
             expected_source_count=options.expected_source_count,
             provider_key_min=provider_key_min,
@@ -1775,6 +1933,15 @@ async def lookup_code_rows_from_db(
     )
     if not fragment_rows:
         return ()
+    if options.scan_budget is not None:
+        for fragment_row in fragment_rows:
+            decoded_payload = fragment_row.get("_decoded_payload")
+            raw_payload_bytes = (
+                len(decoded_payload)
+                if decoded_payload is not None
+                else int(fragment_row.get("raw_payload_bytes") or 0)
+            )
+            options.scan_budget.claim(raw_payload_bytes)
     decoded_keys = _decode_forward_shards_for_code(
         fragment_rows,
         code_key=normalized_code_key,
@@ -1890,6 +2057,8 @@ async def lookup_code_prefix_rows_from_db(
             block_keys=block_keys,
             require_all=require_all,
         ):
+            if options.scan_budget is not None:
+                options.scan_budget.claim(len(fragment.payload))
             if fragment.block_key not in expected_block_keys:
                 raise PTG2ManifestArtifactError(
                     "PTG2 v3 forward stream returned an unexpected shard block"

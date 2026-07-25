@@ -2780,11 +2780,13 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("budget_dimension", ("graph_pages", "forward_scan"))
 async def test_plan_pricing_translates_only_online_work_budget_to_503(
     monkeypatch,
+    budget_dimension,
 ):
     async def rejected_search(*_args, **_kwargs):
-        raise pricing_module.PTG2OnlineWorkBudgetExceeded("graph_pages")
+        raise pricing_module.PTG2OnlineWorkBudgetExceeded(budget_dimension)
 
     monkeypatch.setattr(
         pricing_module,
@@ -2811,7 +2813,7 @@ async def test_plan_pricing_translates_only_online_work_budget_to_503(
                 "The exact query exceeds this snapshot's sealed online work "
                 "budget."
             ),
-            "dimension": "graph_pages",
+            "dimension": budget_dimension,
         }
     }
 

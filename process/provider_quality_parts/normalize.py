@@ -72,9 +72,12 @@ def _pick_first(row: dict[str, Any], *keys: str) -> Any:
 
 
 def _pick_first_ci(row: dict[str, Any], *keys: str) -> Any:
-    lowered = {str(key).strip().lower(): value for key, value in row.items()}
+    value_by_normalized_key = {
+        str(key).strip().lower(): value
+        for key, value in row.items()
+    }
     for key in keys:
-        value = lowered.get(str(key).strip().lower())
+        value = value_by_normalized_key.get(str(key).strip().lower())
         if value not in (None, ""):
             return value
     return None

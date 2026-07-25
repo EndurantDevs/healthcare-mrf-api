@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -268,3 +268,56 @@ async def test_shared_rows_for_code_delegates_non_page_reads(monkeypatch):
 
     assert delegated_rows == [{"full": True}]
     full_rows.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_filtered_bounded_rows_materialize_only_retained_prefix(
+    monkeypatch,
+):
+    selected_rows = tuple(
+        SimpleNamespace(provider_set_key=provider_set_key)
+        for provider_set_key in (7, 8)
+    )
+    prefix_lookup = AsyncMock(return_value=selected_rows)
+    full_lookup = AsyncMock(
+        side_effect=AssertionError("bounded reads must not materialize all rows")
+    )
+    materialize = Mock(return_value=[{"bounded": True}])
+    monkeypatch.setattr(
+        serving,
+        "_version_three_projected_code_rows",
+        AsyncMock(return_value=(None, None)),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_lookup_shared_forward_prefix_rows",
+        prefix_lookup,
+    )
+    monkeypatch.setattr(serving, "_lookup_shared_forward_rows", full_lookup)
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_ids_for_keys",
+        AsyncMock(return_value={7: "07" * 16, 8: "08" * 16}),
+    )
+    monkeypatch.setattr(serving, "_materialize_full_shared_rows", materialize)
+    scan_budget = serving.ForwardReadBudget(8, 1024)
+
+    bounded_rows = await serving._full_shared_code_rows(
+        object(),
+        strict_v3_tables(),
+        code_data={"code_key": 7},
+        provider_set_keys=tuple(range(100)),
+        provider_pages_by_key=None,
+        source_trace_set_hash=None,
+        network_names=[],
+        limit=2,
+        offset=0,
+        descending=False,
+        scan_budget=scan_budget,
+    )
+
+    assert bounded_rows == [{"bounded": True}]
+    assert prefix_lookup.await_args.kwargs["limit"] == 2
+    assert prefix_lookup.await_args.kwargs["scan_budget"] is scan_budget
+    full_lookup.assert_not_awaited()
+    assert tuple(materialize.call_args.args[0]) == selected_rows

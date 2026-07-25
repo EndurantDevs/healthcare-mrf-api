@@ -42,10 +42,10 @@ def migrate(r):
 def generate(m):
     """Generate a migration revision with the supplied message."""
     alembic_cfg = Config(ALEMBIC_INI)
-    revision_kwargs = {'autogenerate': True}
+    revision_option_by_name = {'autogenerate': True}
     if m is not None:
-        revision_kwargs['message'] = m
-    revision(alembic_cfg, **revision_kwargs)
+        revision_option_by_name['message'] = m
+    revision(alembic_cfg, **revision_option_by_name)
 
 
 @click.command(help="List changeset scripts in chronological order")

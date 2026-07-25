@@ -88,11 +88,14 @@ async def coverage_statistics(request):
         pricing_provider_quality_score_table,
         pricing_provider_prescription_table,
     ]
-    table_exists: dict[str, bool] = {}
+    table_availability_by_name: dict[str, bool] = {}
     for table in tracked_tables:
-        table_exists[table.name] = await _is_table_available(session, table)
+        table_availability_by_name[table.name] = await _is_table_available(
+            session,
+            table,
+        )
 
-    payload = {
+    coverage_by_field = {
         "marketplace_plans": 0,
         "marketplace_issuers": 0,
         "provider_coverage_profiles": 0,
@@ -109,20 +112,23 @@ async def coverage_statistics(request):
         "prescription_codes_tracked": 0,
     }
 
-    payload["snapshot_date"] = await _latest_snapshot_date(session, table_exists)
+    coverage_by_field["snapshot_date"] = await _latest_snapshot_date(
+        session,
+        table_availability_by_name,
+    )
 
-    if table_exists.get(plan_table.name):
-        payload["marketplace_plans"] = await _scalar_int(session, select(func.count()).select_from(plan_table))
+    if table_availability_by_name.get(plan_table.name):
+        coverage_by_field["marketplace_plans"] = await _scalar_int(session, select(func.count()).select_from(plan_table))
 
-    if table_exists.get(issuer_table.name):
-        payload["marketplace_issuers"] = await _scalar_int(session, select(func.count()).select_from(issuer_table))
+    if table_availability_by_name.get(issuer_table.name):
+        coverage_by_field["marketplace_issuers"] = await _scalar_int(session, select(func.count()).select_from(issuer_table))
 
-    if table_exists.get(pricing_provider_table.name):
-        payload["provider_coverage_profiles"] = await _scalar_int(
+    if table_availability_by_name.get(pricing_provider_table.name):
+        coverage_by_field["provider_coverage_profiles"] = await _scalar_int(
             session,
             select(func.count(func.distinct(pricing_provider_table.c.npi))),
         )
-        payload["zip_codes_with_procedure_coverage"] = await _scalar_int(
+        coverage_by_field["zip_codes_with_procedure_coverage"] = await _scalar_int(
             session,
             select(func.count(func.distinct(pricing_provider_table.c.zip5)))
             .select_from(pricing_provider_table)
@@ -132,36 +138,36 @@ async def coverage_statistics(request):
             ),
         )
 
-    if table_exists.get(pricing_provider_procedure_table.name):
-        payload["providers_with_procedure_history"] = await _scalar_int(
+    if table_availability_by_name.get(pricing_provider_procedure_table.name):
+        coverage_by_field["providers_with_procedure_history"] = await _scalar_int(
             session,
             select(func.count(func.distinct(pricing_provider_procedure_table.c.npi))).select_from(
                 pricing_provider_procedure_table
             ),
         )
-    elif table_exists.get(pricing_provider_table.name):
-        payload["providers_with_procedure_history"] = await _scalar_int(
+    elif table_availability_by_name.get(pricing_provider_table.name):
+        coverage_by_field["providers_with_procedure_history"] = await _scalar_int(
             session,
             select(func.count())
             .select_from(pricing_provider_table)
             .where(func.coalesce(pricing_provider_table.c.total_distinct_hcpcs_codes, 0.0) > 0.0),
         )
 
-    if table_exists.get(pricing_procedure_table.name):
-        payload["procedure_codes_tracked"] = await _scalar_int(
+    if table_availability_by_name.get(pricing_procedure_table.name):
+        coverage_by_field["procedure_codes_tracked"] = await _scalar_int(
             session,
             select(func.count()).select_from(pricing_procedure_table),
         )
 
-    if table_exists.get(provider_enrichment_summary_table.name):
-        payload["hospitals_with_medicare_enrollment"] = await _scalar_int(
+    if table_availability_by_name.get(provider_enrichment_summary_table.name):
+        coverage_by_field["hospitals_with_medicare_enrollment"] = await _scalar_int(
             session,
             select(func.count(func.distinct(provider_enrichment_summary_table.c.npi)))
             .select_from(provider_enrichment_summary_table)
             .where(provider_enrichment_summary_table.c.has_hospital_enrollment.is_(True)),
         )
-        if table_exists.get(npi_data_table.name):
-            payload["medicare_clinicians"] = await _scalar_int(
+        if table_availability_by_name.get(npi_data_table.name):
+            coverage_by_field["medicare_clinicians"] = await _scalar_int(
                 session,
                 select(func.count())
                 .select_from(
@@ -176,8 +182,8 @@ async def coverage_statistics(request):
                 ),
             )
 
-    if table_exists.get(partd_pharmacy_activity_table.name):
-        payload["active_medicare_pharmacies"] = await _scalar_int(
+    if table_availability_by_name.get(partd_pharmacy_activity_table.name):
+        coverage_by_field["active_medicare_pharmacies"] = await _scalar_int(
             session,
             select(func.count(func.distinct(partd_pharmacy_activity_table.c.npi)))
             .select_from(partd_pharmacy_activity_table)
@@ -191,36 +197,36 @@ async def coverage_statistics(request):
             ),
         )
 
-    if table_exists.get(plan_drug_stats_table.name):
-        payload["formularies_tracked"] = await _scalar_int(
+    if table_availability_by_name.get(plan_drug_stats_table.name):
+        coverage_by_field["formularies_tracked"] = await _scalar_int(
             session,
             select(func.count(func.distinct(plan_drug_stats_table.c.plan_id))).select_from(plan_drug_stats_table),
         )
-        payload["drug_coverage_rows"] = await _scalar_int(
+        coverage_by_field["drug_coverage_rows"] = await _scalar_int(
             session,
             select(func.coalesce(func.sum(plan_drug_stats_table.c.total_drugs), 0)).select_from(plan_drug_stats_table),
         )
 
-    if table_exists.get(pricing_provider_quality_score_table.name):
-        payload["providers_with_quality_scores"] = await _scalar_int(
+    if table_availability_by_name.get(pricing_provider_quality_score_table.name):
+        coverage_by_field["providers_with_quality_scores"] = await _scalar_int(
             session,
             select(func.count(func.distinct(pricing_provider_quality_score_table.c.npi))).select_from(
                 pricing_provider_quality_score_table
             ),
         )
 
-    if table_exists.get(pricing_provider_prescription_table.name):
-        payload["providers_with_prescription_history"] = await _scalar_int(
+    if table_availability_by_name.get(pricing_provider_prescription_table.name):
+        coverage_by_field["providers_with_prescription_history"] = await _scalar_int(
             session,
             select(func.count(func.distinct(pricing_provider_prescription_table.c.npi))).select_from(
                 pricing_provider_prescription_table
             ),
         )
-        payload["prescription_codes_tracked"] = await _scalar_int(
+        coverage_by_field["prescription_codes_tracked"] = await _scalar_int(
             session,
             select(func.count(func.distinct(pricing_provider_prescription_table.c.rx_code))).select_from(
                 pricing_provider_prescription_table
             ),
         )
 
-    return response.json(payload)
+    return response.json(coverage_by_field)

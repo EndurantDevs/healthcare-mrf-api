@@ -171,8 +171,8 @@ async def test_v3_partial_page_fails(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_v3_variants_share_page(monkeypatch):
-    page = _provider_page(3, ((7, 2), (8, 3)))
-    page_probe = AsyncMock(return_value={3: page})
+    provider_page = _provider_page(3, ((7, 2), (8, 3)))
+    page_probe = AsyncMock(return_value={3: provider_page})
     row_probe = AsyncMock(return_value=[])
     monkeypatch.setattr(
         ptg2_serving,
@@ -181,10 +181,13 @@ async def test_v3_variants_share_page(monkeypatch):
     )
     monkeypatch.setattr(ptg2_serving, "_shared_rows_for_code", row_probe)
 
-    rows = await ptg2_serving._merge_manifest_code_variant_rows(
+    merged_rows = await ptg2_serving._merge_manifest_code_variant_rows(
         object(),
         _version_three_tables(),
-        code_rows=[{"code_key": 7}, {"code_key": 8}],
+        code_rows=[
+            {"code_key": 7, "rate_count": 1},
+            {"code_key": 8, "rate_count": 1},
+        ],
         provider_set_keys=(3,),
         source_trace_set_hash=None,
         network_names=[],
@@ -192,11 +195,11 @@ async def test_v3_variants_share_page(monkeypatch):
         offset=0,
     )
 
-    assert rows == []
+    assert merged_rows == []
     page_probe.assert_awaited_once()
     assert row_probe.await_count == 2
     assert all(
-        call.kwargs["provider_pages_by_key"] == {3: page}
+        call.kwargs["provider_pages_by_key"] == {3: provider_page}
         for call in row_probe.await_args_list
     )
 

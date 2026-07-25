@@ -39,7 +39,7 @@ async def sync_structure(add_columns: bool = True, add_indexes: bool = True) -> 
     Ensure tables, columns, and indexes defined in SQLAlchemy metadata exist in the database.
     """
     await db.connect()
-    results: Dict[str, List[str]] = {
+    sync_summary_by_kind: Dict[str, List[str]] = {
         "tables": [],
         "columns": [],
         "indexes": [],
@@ -51,12 +51,12 @@ async def sync_structure(add_columns: bool = True, add_indexes: bool = True) -> 
     async with db.engine.begin() as conn:
         await conn.run_sync(
             _sync_structure,
-            results,
+            sync_summary_by_kind,
             add_columns,
             add_indexes,
         )
 
-    return results
+    return sync_summary_by_kind
 
 
 def _sync_structure(
@@ -106,13 +106,13 @@ def _sync_structure(
 
 
 def _model_by_table_fullname() -> Dict[str, Any]:
-    mapping: Dict[str, Any] = {}
+    model_by_table: Dict[str, Any] = {}
     for mapper in Base.registry.mappers:
         cls = mapper.class_
         table = getattr(cls, "__table__", None)
         if table is not None:
-            mapping[table.fullname] = cls
-    return mapping
+            model_by_table[table.fullname] = cls
+    return model_by_table
 
 
 def _ensure_columns(sync_conn, inspector, table, results: Dict[str, List[str]]) -> None:

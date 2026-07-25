@@ -21,11 +21,13 @@ ADDRESS_ARCHIVE_QUEUE_NAME = "arq:AddressArchive"
 
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Process one address-archive migration task."""
-    payload = task if isinstance(task, dict) else {}
-    run_id = str(payload.get("run_id") or ctx.get("control_run_id") or "").strip()
+    task_by_field = task if isinstance(task, dict) else {}
+    run_id = str(
+        task_by_field.get("run_id") or ctx.get("control_run_id") or ""
+    ).strip()
 
     async def _cancel_check() -> None:
-        await raise_if_cancelled(ctx, payload)
+        await raise_if_cancelled(ctx, task_by_field)
 
     enqueue_live_progress(
         run_id=run_id or None,
@@ -39,16 +41,20 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         message="starting legacy address archive migration",
     )
     stats = await migrate_legacy_archive_to_v2(
-        schema=payload.get("schema") or None,
-        legacy_table=str(payload.get("legacy_table") or "address_archive"),
-        archive_table=str(payload.get("archive_table") or "address_archive_v2"),
-        work_mem=str(payload.get("work_mem") or "512MB"),
-        timeout=str(payload.get("timeout") or "30min"),
-        dry_run=bool(payload.get("dry_run", False)),
-        sample_limit=int(payload.get("sample_limit") or 20),
+        schema=task_by_field.get("schema") or None,
+        legacy_table=str(
+            task_by_field.get("legacy_table") or "address_archive"
+        ),
+        archive_table=str(
+            task_by_field.get("archive_table") or "address_archive_v2"
+        ),
+        work_mem=str(task_by_field.get("work_mem") or "512MB"),
+        timeout=str(task_by_field.get("timeout") or "30min"),
+        dry_run=bool(task_by_field.get("dry_run", False)),
+        sample_limit=int(task_by_field.get("sample_limit") or 20),
         cancel_check=_cancel_check,
     )
-    result = asdict(stats)
+    migration_result_by_field = asdict(stats)
     enqueue_live_progress(
         run_id=run_id or None,
         importer="address-archive-v2-migrate",
@@ -59,9 +65,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         total=4,
         pct=100,
         message="legacy address archive migration verified",
-        **{key: value for key, value in result.items() if key != "sample_rows"},
+        **{
+            metric_name: metric_value
+            for metric_name, metric_value in migration_result_by_field.items()
+            if metric_name != "sample_rows"
+        },
     )
-    return result
+    return migration_result_by_field
 
 
 async def main(
@@ -77,7 +87,7 @@ async def main(
 ) -> dict[str, Any] | None:
     """Run or enqueue the verified legacy address-archive migration."""
 
-    payload = {
+    task_by_field = {
         "dry_run": dry_run,
         "legacy_table": legacy_table,
         "archive_table": archive_table,
@@ -92,9 +102,13 @@ async def main(
             job_serializer=serialize_job,
             job_deserializer=deserialize_job,
         )
-        await redis.enqueue_job("process_data", payload, _queue_name=ADDRESS_ARCHIVE_QUEUE_NAME)
+        await redis.enqueue_job(
+            "process_data",
+            task_by_field,
+            _queue_name=ADDRESS_ARCHIVE_QUEUE_NAME,
+        )
         return None
-    return await process_data({}, payload)
+    return await process_data({}, task_by_field)
 
 
 if __name__ == "__main__":  # pragma: no cover

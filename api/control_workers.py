@@ -1009,10 +1009,12 @@ def _kubernetes_request(method: str, path: str, body: dict[str, Any] | None = No
         token = _K8S_API_TOKEN.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise _KubernetesApiError(0, f"cannot read Kubernetes service account token: {exc}") from exc
-    data = None if body is None else json.dumps(body).encode("utf-8")
+    request_body_bytes = (
+        None if body is None else json.dumps(body).encode("utf-8")
+    )
     request = urllib.request.Request(
         f"https://{host}:{port}{path}",
-        data=data,
+        data=request_body_bytes,
         method=method,
         headers={
             "Authorization": f"Bearer {token}",

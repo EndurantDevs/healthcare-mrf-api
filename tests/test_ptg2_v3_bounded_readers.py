@@ -9,6 +9,7 @@ from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
 )
 from api.ptg2_db_sidecars import (
+    ForwardReadBudget,
     PTG2ManifestArtifactError,
     lookup_code_prefix_rows_from_db,
 )
@@ -235,6 +236,7 @@ async def _prefix_rows(
     limit: int,
     descending: bool,
     item_count: int = 128,
+    scan_budget: ForwardReadBudget | None = None,
 ):
     block_keys = tuple(sorted({fragment.block_key for fragment in fragments}))
 
@@ -261,6 +263,7 @@ async def _prefix_rows(
         source_count=2,
         price_dictionary_item_count=item_count,
         price_dictionary_block_bytes=2048,
+        scan_budget=scan_budget,
     )
     return prefix_rows, provider_counts, dictionary
 
@@ -1664,6 +1667,52 @@ async def test_bounded_code_prefix_validates_unretained_price_keys(monkeypatch):
             descending=False,
             item_count=2,
         )
+
+
+@pytest.mark.asyncio
+async def test_bounded_code_prefix_charges_physical_work_across_reads(
+    monkeypatch,
+):
+    fragment = _fragment(
+        _grouped_payload(2, [(3, [(0, 0)]), (5, [(1, 1)])]),
+        entry_count=2,
+    )
+    scan_budget = ForwardReadBudget(
+        maximum_fragments=1,
+        maximum_raw_payload_bytes=len(fragment.payload) * 2,
+    )
+
+    prefix_rows, _provider_counts, _dictionary = await _prefix_rows(
+        monkeypatch,
+        fragments=(fragment,),
+        limit=1,
+        descending=False,
+        scan_budget=scan_budget,
+    )
+    assert len(prefix_rows) == 1
+    assert scan_budget.fragment_count == 1
+    assert scan_budget.raw_payload_bytes == len(fragment.payload)
+
+    with pytest.raises(
+        ptg2_db_sidecars.ForwardReadBudgetExceeded,
+        match="physical scan budget",
+    ):
+        await _prefix_rows(
+            monkeypatch,
+            fragments=(fragment,),
+            limit=1,
+            descending=False,
+            scan_budget=scan_budget,
+        )
+
+
+@pytest.mark.parametrize(
+    "budget_values",
+    ((True, 1), (1, True), (0, 1), (1, 0)),
+)
+def test_forward_read_budget_requires_positive_integer_limits(budget_values):
+    with pytest.raises(PTG2ManifestArtifactError, match="budget is invalid"):
+        ForwardReadBudget(*budget_values)
 
 
 @pytest.mark.asyncio

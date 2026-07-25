@@ -631,6 +631,58 @@ def test_live_progress_does_not_emit_unaccepted_event_when_redis_is_unavailable(
     assert events == []
 
 
+def test_live_progress_custom_event_tracks_the_accepted_attempt(monkeypatch):
+    """Custom status events inherit the sequence accepted by Redis."""
+
+    stored_by_key: dict[str, str] = {}
+    events: list[dict[str, object]] = []
+    fake_redis = AtomicLiveProgressRedis(stored_by_key)
+    monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(
+        live_progress,
+        "_utc_now",
+        lambda: dt.datetime(2026, 7, 23, 9, 30, 0),
+    )
+    monkeypatch.setattr(live_progress, "enqueue_status_event", events.append)
+
+    accepted = live_progress.write_live_progress(
+        run_id="run-custom-event",
+        attempt_id="run-custom-event:attempt-2",
+        attempt_started_at="2026-07-23T09:00:00Z",
+        status="running",
+        stage_id="scan",
+        stage_ordinal=2,
+        pct=25,
+        status_event_payload={
+            "run_id": "run-custom-event",
+            "status": "running",
+            "progress": {"contract": "retained"},
+            "heartbeat_at": "2026-07-23T08:00:00Z",
+        },
+    )
+
+    assert accepted is True
+    stored_progress_by_field = json.loads(
+        stored_by_key[live_progress.live_progress_key("run-custom-event")]
+    )
+    assert events == [
+        {
+            "run_id": "run-custom-event",
+            "status": "running",
+            "progress": {
+                "contract": "retained",
+                "attempt_id": stored_progress_by_field["attempt_id"],
+                "attempt_started_at": stored_progress_by_field[
+                    "attempt_started_at"
+                ],
+                "event_seq": stored_progress_by_field["event_seq"],
+                "progress_seq": stored_progress_by_field["progress_seq"],
+            },
+            "heartbeat_at": stored_progress_by_field["observed_at"],
+        }
+    ]
+
+
 def test_live_progress_heartbeat_advances_observation_not_work(monkeypatch):
     stored_by_key: dict[str, str] = {}
     instants = iter(

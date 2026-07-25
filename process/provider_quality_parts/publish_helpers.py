@@ -42,25 +42,28 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
         return archived_name
 
     for cls in final_classes:
-        obj = classes[cls.__name__]
-        stage_exists = await _is_table_available(schema, obj.__tablename__)
+        staged_model = classes[cls.__name__]
+        stage_exists = await _is_table_available(
+            schema,
+            staged_model.__tablename__,
+        )
         if not stage_exists:
             raise RuntimeError(
-                f"Staging table missing for publish: {schema}.{obj.__tablename__}. "
+                f"Staging table missing for publish: {schema}.{staged_model.__tablename__}. "
                 "Aborting publish to protect live tables."
             )
 
     async with db.transaction():
         for cls in final_classes:
-            obj = classes[cls.__name__]
+            staged_model = classes[cls.__name__]
             table = cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {schema}.{table} RENAME TO {table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {schema}.{obj.__tablename__} RENAME TO {table};")
+            await db.status(f"ALTER TABLE IF EXISTS {schema}.{staged_model.__tablename__} RENAME TO {table};")
 
             await archive_index(f"{table}_idx_primary")
             await db.status(
-                f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
+                f"ALTER INDEX IF EXISTS {schema}.{staged_model.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
             )
 
             move_indexes = []
@@ -76,7 +79,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
                 await archive_index(base_name)
                 await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_{base_name} RENAME TO {base_name};"
+                    f"ALTER INDEX IF EXISTS {schema}.{staged_model.__tablename__}_{base_name} RENAME TO {base_name};"
                 )
 
 
@@ -108,7 +111,7 @@ async def _insert_run_metadata(
         await db.scalar(f"SELECT COUNT(*) FROM {schema}.{PricingProviderQualityScore.__tablename__}"),
         0,
     )
-    row = {
+    run_record_by_field = {
         "run_id": run_id,
         "import_id": import_id,
         "year": _safe_int(manifest.get("year"), PROVIDER_QUALITY_MAX_YEAR),
@@ -125,4 +128,8 @@ async def _insert_run_metadata(
         "created_at": datetime.datetime.utcnow(),
         "updated_at": datetime.datetime.utcnow(),
     }
-    await _push_objects_with_retry([row], PricingQualityRun, rewrite=False)
+    await _push_objects_with_retry(
+        [run_record_by_field],
+        PricingQualityRun,
+        rewrite=False,
+    )
