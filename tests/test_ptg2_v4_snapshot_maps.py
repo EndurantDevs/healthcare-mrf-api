@@ -12,6 +12,7 @@ import uuid
 import pytest
 import sqlalchemy as sa
 
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from db.connection import Database
 from db.models import (
     PTG2V4HeavyOwner,
@@ -55,6 +56,9 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     v4_map_pack_target_hashes,
     touch_v4_shared_layout_build,
 )
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    publish_v4_inferred_taxonomy_candidates,
+)
 from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
@@ -68,12 +72,29 @@ MIGRATION_PATH = (
     / "versions"
     / "20260723100000_ptg2_v4_snapshot_map_pack.py"
 )
+TAXONOMY_MIGRATION_PATH = (
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260724120000_ptg2_v4_taxonomy_candidates.py"
+)
 
 
 def _load_migration():
     spec = importlib.util.spec_from_file_location(
         "ptg2_v4_snapshot_map_pack_migration",
         MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_taxonomy_migration():
+    spec = importlib.util.spec_from_file_location(
+        "ptg2_v4_taxonomy_candidates_migration",
+        TAXONOMY_MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -426,6 +447,10 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
     monkeypatch.setattr(migration, "op", recorder)
     monkeypatch.setattr(migration, "_schema", lambda: schema_name)
     migration.upgrade()
+    taxonomy_migration = _load_taxonomy_migration()
+    monkeypatch.setattr(taxonomy_migration, "op", recorder)
+    monkeypatch.setattr(taxonomy_migration, "_schema", lambda: schema_name)
+    taxonomy_migration.upgrade()
     try:
         await database.execute_ddl(f"CREATE SCHEMA {schema}")
         await database.execute_ddl(
@@ -483,6 +508,24 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             CREATE TABLE {schema}.ptg2_v3_npi_scope_p0
                 PARTITION OF {schema}.ptg2_v3_npi_scope
                 FOR VALUES WITH (MODULUS 1, REMAINDER 0)
+            """
+        )
+        await database.execute_ddl(
+            f"""
+            CREATE TABLE {schema}.npi (
+                npi bigint PRIMARY KEY,
+                entity_type_code integer
+            )
+            """
+        )
+        await database.execute_ddl(
+            f"""
+            CREATE TABLE {schema}.npi_taxonomy (
+                npi bigint NOT NULL,
+                checksum integer NOT NULL,
+                healthcare_provider_taxonomy_code varchar,
+                PRIMARY KEY (npi, checksum)
+            )
             """
         )
         await database.execute_ddl(
@@ -718,6 +761,18 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                 schema=schema,
                 snapshot_key=snapshot_key,
                 graph_blocks=graph_blocks,
+            )
+            taxonomy_publication = (
+                await publish_v4_inferred_taxonomy_candidates(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_key=snapshot_key,
+                    build_token="build-v4",
+                    rules=INFERRED_PROVIDER_TAXONOMY_RULES,
+                    npi_count=npi_publication.row_count,
+                    representation="pattern_v1",
+                    pattern_count=pattern_publication.row_count,
+                )
             )
             persisted_summary = await summarize_persisted_v4_snapshot_maps(
                 session,
@@ -1036,6 +1091,14 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             "factor_edge_count": 10,
             "empty_npi_tin_only_normalization_count": 0,
         }
+        assert taxonomy_publication.rule_count == len(
+            INFERRED_PROVIDER_TAXONOMY_RULES
+        )
+        assert taxonomy_publication.member_count == 0
+        assert taxonomy_publication.observe_only_rule_count == 0
+        assert provider_graph_by_field["inferred_taxonomy_candidates"] == dict(
+            taxonomy_publication.manifest
+        )
         assert provider_graph_by_field["hot_prefix"][
             "override_owner_count"
         ] == 0

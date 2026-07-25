@@ -97,9 +97,13 @@ async def _assert_direct_npi_layout(monkeypatch) -> None:
         direct_calls.append(relation)
         if relation == "npi_groups_exact":
             return {1: (7, 8)}
-        if relation == "group_sets_direct":
-            return {7: (10, 12), 8: (11, 12)}
         raise AssertionError(relation)
+
+    async def direct_intersections(*_args, **kwargs):
+        relation = kwargs["relation"]
+        direct_calls.append(relation)
+        assert kwargs["allowed_member_keys"] == (10, 11)
+        return {7: (10,), 8: (11,)}
 
     monkeypatch.setattr(
         serving,
@@ -112,6 +116,11 @@ async def _assert_direct_npi_layout(monkeypatch) -> None:
         AsyncMock(return_value={1_111_111_111: 1}),
     )
     monkeypatch.setattr(serving, "lookup_v4_relation_members", direct_lookup)
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        direct_intersections,
+    )
 
     async def direct_manifest(*_args, **kwargs):
         if kwargs["relation"] == "group_sets_direct":

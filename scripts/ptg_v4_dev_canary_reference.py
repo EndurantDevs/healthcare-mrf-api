@@ -66,6 +66,7 @@ def build_v3_reference_evidence(
         "storage_generation": V3_STORAGE_GENERATION,
         "query": _query_evidence(spec),
         "item_count": len(page["item_digests"]),
+        "pagination": _pagination_evidence(document_by_field),
         "semantic_key_count": len(set(page["item_digests"])),
         "item_digests": page["item_digests"],
         "minimum_negotiated_rates": page["minimum_negotiated_rates"],
@@ -92,8 +93,9 @@ def validate_reference_evidence(
             runtime_evidence if isinstance(runtime_evidence, Mapping) else {}
         )
     )
-    if int(evidence_by_field.get("item_count") or -1) != 25:
-        failures.append("public V3 reference is not the exact 25-item page")
+    item_count = int(evidence_by_field.get("item_count") or -1)
+    if item_count < 1 or item_count > 25:
+        failures.append("public V3 reference is not a bounded exact public page")
     query = evidence_by_field.get("query")
     fixed_query = dict(query) if isinstance(query, Mapping) else {}
     reference_snapshot_id = str(
@@ -107,6 +109,7 @@ def validate_reference_evidence(
         or fixed_query.get("limit") != 25
         or fixed_query.get("offset") != 0
         or fixed_query.get("npi") is not None
+        or fixed_query.get("mode") not in (None, "")
         or fixed_query.get("include_providers") is not True
         or fixed_query.get("order_by") != "negotiated_rate"
         or fixed_query.get("order") != "asc"
@@ -117,10 +120,10 @@ def validate_reference_evidence(
     if (
         not digest_rows
         or any(not _is_sha256(digest) for digest in digest_rows)
-        or len(digest_rows) != int(evidence_by_field.get("item_count") or -1)
+        or len(digest_rows) != item_count
         or len(set(digest_rows))
         != int(evidence_by_field.get("semantic_key_count") or -1)
-        or len(set(digest_rows)) != 25
+        or len(set(digest_rows)) != item_count
     ):
         failures.append("public V3 reference item digests are invalid")
     minimum_rates = evidence_by_field.get("minimum_negotiated_rates")
@@ -130,6 +133,11 @@ def validate_reference_evidence(
     expected_page_digest = _page_digest(digest_rows)
     if evidence_by_field.get("page_digest") != expected_page_digest:
         failures.append("public V3 reference page digest is not self-authenticating")
+    if item_count < 25 and not _is_exact_exhausted_pagination(
+        evidence_by_field.get("pagination"),
+        item_count=item_count,
+    ):
+        failures.append("public V3 reference short page is not exact and exhausted")
     if expected_spec is not None:
         failures.extend(_reference_query_failures(evidence_by_field, expected_spec))
     return failures
@@ -251,7 +259,35 @@ def _document_contract_failures(
         failures.append("public reference snapshot differs from the fixed query")
     if provenance_by_field.get("storage_generation") != expected_storage_generation:
         failures.append("public reference storage generation is incorrect")
+    if spec.expected_item_count < spec.limit and not _is_exact_exhausted_pagination(
+        document_by_field.get("pagination"),
+        item_count=spec.expected_item_count,
+    ):
+        failures.append("public reference short page is not exact and exhausted")
     return failures
+
+
+def _pagination_evidence(document_by_field: Mapping[str, Any]) -> dict[str, Any]:
+    raw_pagination = document_by_field.get("pagination")
+    pagination = dict(raw_pagination) if isinstance(raw_pagination, Mapping) else {}
+    return {
+        "limit": pagination.get("limit"),
+        "offset": pagination.get("offset"),
+        "has_more": pagination.get("has_more"),
+        "total": pagination.get("total"),
+        "total_is_exact": pagination.get("total_is_exact"),
+    }
+
+
+def _is_exact_exhausted_pagination(value: Any, *, item_count: int) -> bool:
+    pagination = dict(value) if isinstance(value, Mapping) else {}
+    return bool(
+        pagination.get("limit") == 25
+        and pagination.get("offset") == 0
+        and pagination.get("has_more") is False
+        and pagination.get("total_is_exact") is True
+        and pagination.get("total") == item_count
+    )
 
 
 def _semantic_page_failures(

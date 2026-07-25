@@ -146,13 +146,13 @@ def _normalize_zip(raw) -> str:
 
 
 async def _resolve_latest_annual_year(client, api_url: str) -> int:
-    params = {
+    query_params_by_field = {
         "size": "1",
         "sort": "-YEAR",
         "filter[MONTH]": "Year",
         "filter[BENE_GEO_LVL]": "County",
     }
-    query = urllib.parse.urlencode(params)
+    query = urllib.parse.urlencode(query_params_by_field)
     async with client.get(f"{api_url}?{query}", timeout=60) as response:
         rows = await response.json(content_type=None)
     if not rows:
@@ -167,22 +167,22 @@ def _allocate_by_weights(total: int, zip_weights: list[tuple[str, int]]) -> dict
     if total <= 0 or not zip_weights:
         return {}
 
-    positive = [(zip_code, max(int(weight or 0), 0)) for zip_code, weight in zip_weights]
-    if not positive:
+    positive_zip_weights = [(zip_code, max(int(weight or 0), 0)) for zip_code, weight in zip_weights]
+    if not positive_zip_weights:
         return {}
 
-    weight_sum = sum(weight for _, weight in positive)
+    weight_sum = sum(weight for _, weight in positive_zip_weights)
     if weight_sum <= 0:
-        positive = [(zip_code, 1) for zip_code, _ in positive]
-        weight_sum = len(positive)
+        positive_zip_weights = [(zip_code, 1) for zip_code, _ in positive_zip_weights]
+        weight_sum = len(positive_zip_weights)
 
-    base_alloc: dict[str, int] = {}
+    allocation_by_zip: dict[str, int] = {}
     remainders: list[tuple[float, str]] = []
     assigned = 0
-    for zip_code, weight in positive:
+    for zip_code, weight in positive_zip_weights:
         exact = (total * weight) / weight_sum
         base = int(exact)
-        base_alloc[zip_code] = base
+        allocation_by_zip[zip_code] = base
         assigned += base
         remainders.append((exact - base, zip_code))
 
@@ -192,15 +192,18 @@ def _allocate_by_weights(total: int, zip_weights: list[tuple[str, int]]) -> dict
         idx = 0
         while remainder > 0 and remainders:
             _, zip_code = remainders[idx % len(remainders)]
-            base_alloc[zip_code] += 1
+            allocation_by_zip[zip_code] += 1
             remainder -= 1
             idx += 1
 
-    return base_alloc
+    return allocation_by_zip
 
 
-async def _geo_zip_lookup_exists(db_schema: str) -> bool:
+async def _has_geo_zip_lookup_table(db_schema: str) -> bool:
     return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{db_schema}.geo_zip_lookup"))
+
+
+_geo_zip_lookup_exists = _has_geo_zip_lookup_table
 
 
 async def _load_county_zip_weight_rows():
@@ -218,31 +221,31 @@ async def _load_county_zip_weight_rows():
 
 async def _load_county_zip_weights(*, test_mode: bool = False) -> dict[str, list[tuple[str, int]]]:
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
-    if await _geo_zip_lookup_exists(db_schema):
-        rows = await _load_county_zip_weight_rows()
+    if await _has_geo_zip_lookup_table(db_schema):
+        county_zip_rows = await _load_county_zip_weight_rows()
     elif test_mode:
         previous_override = getattr(db, "_database_override", None)
         db._database_override = None
         try:
             await db.connect()
-            if not await _geo_zip_lookup_exists(db_schema):
+            if not await _has_geo_zip_lookup_table(db_schema):
                 logger.info("Medicare Enrollment test mode: %s.geo_zip_lookup is unavailable; ZIP allocation will be empty.", db_schema)
-                rows = []
+                county_zip_rows = []
             else:
-                rows = await _load_county_zip_weight_rows()
+                county_zip_rows = await _load_county_zip_weight_rows()
         finally:
             db._database_override = previous_override
             await db.connect()
     else:
         raise RuntimeError(f"Medicare Enrollment requires {db_schema}.geo_zip_lookup for ZIP allocation.")
     mapping: dict[str, dict[str, int]] = defaultdict(dict)
-    for row in rows:
-        county_code = _normalize_fips(getattr(row, "county_code", None))
-        zip_code = _normalize_zip(getattr(row, "zip_code", None))
+    for county_zip_row in county_zip_rows:
+        county_code = _normalize_fips(getattr(county_zip_row, "county_code", None))
+        zip_code = _normalize_zip(getattr(county_zip_row, "zip_code", None))
         if not county_code or not zip_code:
             continue
         try:
-            population = int(getattr(row, "population") or 0)
+            population = int(getattr(county_zip_row, "population") or 0)
         except (TypeError, ValueError):
             population = 0
         existing = mapping[county_code].get(zip_code, 0)
@@ -310,7 +313,7 @@ async def process_data(ctx, task=None):
     import aiohttp
     client = aiohttp.ClientSession()
     latest_year = 0
-    county_agg: dict[tuple[str, int], dict[str, int]] = {}
+    enrollment_by_county: dict[tuple[str, int], dict[str, int]] = {}
     try:
         api_url = await _resolve_enrollment_api_url(client)
         latest_year = await _resolve_latest_annual_year(client, api_url)
@@ -322,7 +325,7 @@ async def process_data(ctx, task=None):
 
         offset = 0
         while True:
-            params = {
+            query_params_by_field = {
                 "size": str(page_size),
                 "offset": str(offset),
                 "sort": "-YEAR",
@@ -330,34 +333,34 @@ async def process_data(ctx, task=None):
                 "filter[BENE_GEO_LVL]": "County",
                 "filter[YEAR]": str(latest_year),
             }
-            query = urllib.parse.urlencode(params)
+            query = urllib.parse.urlencode(query_params_by_field)
             async with client.get(f"{api_url}?{query}", timeout=60) as response:
                 if response.status != 200:
                     raise ValueError(
                         f"Medicare Monthly Enrollment API returned HTTP {response.status} "
                         f"at offset {offset}"
                     )
-                rows = await response.json(content_type=None)
+                enrollment_rows = await response.json(content_type=None)
 
-            if not rows:
+            if not enrollment_rows:
                 break
 
-            for row in rows:
-                county_fips = _normalize_fips(row.get("BENE_FIPS_CD"))
+            for enrollment_row in enrollment_rows:
+                county_fips = _normalize_fips(enrollment_row.get("BENE_FIPS_CD"))
                 if not county_fips:
                     continue
 
-                year = _to_int(row.get("YEAR"))
-                total_benes = _to_int(row.get("TOT_BENES"))
-                part_d_benes = _to_int(row.get("PRSCRPTN_DRUG_TOT_BENES"))
+                year = _to_int(enrollment_row.get("YEAR"))
+                total_benes = _to_int(enrollment_row.get("TOT_BENES"))
+                part_d_benes = _to_int(enrollment_row.get("PRSCRPTN_DRUG_TOT_BENES"))
 
                 if year <= 0 or total_benes <= 0:
                     continue
 
                 key = (county_fips, year)
-                current = county_agg.get(key)
+                current = enrollment_by_county.get(key)
                 if current is None:
-                    county_agg[key] = {
+                    enrollment_by_county[key] = {
                         "total_beneficiaries": total_benes,
                         "part_d_beneficiaries": max(part_d_benes, 0),
                     }
@@ -365,24 +368,24 @@ async def process_data(ctx, task=None):
                     current["total_beneficiaries"] += total_benes
                     current["part_d_beneficiaries"] += max(part_d_benes, 0)
 
-                if test_mode and len(county_agg) >= test_row_limit:
+                if test_mode and len(enrollment_by_county) >= test_row_limit:
                     break
 
-            if test_mode and len(county_agg) >= test_row_limit:
+            if test_mode and len(enrollment_by_county) >= test_row_limit:
                 break
-            offset += len(rows)
+            offset += len(enrollment_rows)
     finally:
         await client.close()
 
     now = datetime.datetime.utcnow()
     county_rows = []
-    for (county_fips, year), values in sorted(county_agg.items()):
+    for (county_fips, year), county_totals in sorted(enrollment_by_county.items()):
         county_rows.append(
             {
                 "county_fips": county_fips,
                 "year": year,
-                "part_d_beneficiaries": int(values.get("part_d_beneficiaries", 0) or 0),
-                "total_beneficiaries": int(values.get("total_beneficiaries", 0) or 0),
+                "part_d_beneficiaries": int(county_totals.get("part_d_beneficiaries", 0) or 0),
+                "total_beneficiaries": int(county_totals.get("total_beneficiaries", 0) or 0),
                 "updated_at": now,
             }
         )
@@ -410,13 +413,13 @@ async def process_data(ctx, task=None):
             zip_agg[key]["part_d_beneficiaries"] += partd_alloc.get(zip_code, 0)
 
     zip_rows = []
-    for (zip_code, year), values in sorted(zip_agg.items()):
+    for (zip_code, year), zip_totals in sorted(zip_agg.items()):
         zip_rows.append(
             {
                 "zcta_code": zip_code,
                 "year": year,
-                "part_d_beneficiaries": int(values["part_d_beneficiaries"]),
-                "total_beneficiaries": int(values["total_beneficiaries"]),
+                "part_d_beneficiaries": int(zip_totals["part_d_beneficiaries"]),
+                "total_beneficiaries": int(zip_totals["total_beneficiaries"]),
                 "updated_at": now,
             }
         )

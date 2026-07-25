@@ -99,9 +99,14 @@ def _install_v4_graph(
         graph_calls.append(kwargs)
         if kwargs["relation"] == first_relation:
             return {4: (2,), 6: (3,)}
-        if kwargs["relation"] == second_relation:
-            return {2: (5, 11), 3: (7,)}
         raise AssertionError(f"unexpected relation {kwargs['relation']}")
+
+    async def graph_intersection(_session, **kwargs):
+        graph_calls.append(kwargs)
+        if kwargs["relation"] != second_relation:
+            raise AssertionError(f"unexpected relation {kwargs['relation']}")
+        assert set(kwargs["allowed_member_keys"]) == {5, 7, 9}
+        return {2: (5,), 3: (7,)}
 
     monkeypatch.setattr(
         serving,
@@ -125,6 +130,11 @@ def _install_v4_graph(
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(serving, "lookup_v4_relation_members", graph_lookup)
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        graph_intersection,
+    )
     return graph_calls
 
 

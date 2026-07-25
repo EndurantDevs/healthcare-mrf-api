@@ -43,6 +43,7 @@ from api.ptg2_candidate_audit_capacity import (
     PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES,
     PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES,
 )
+from api.ptg2_online_work import PTG2OnlineWorkBudgetExceeded
 from api.ptg2_shared_blocks import (
     PTG2SharedBlockError,
     shared_block_read_once_scope,
@@ -10999,12 +11000,32 @@ async def list_providers_by_procedure(request):
         route_name = str(getattr(getattr(request, "route", None), "name", ""))
         if route_name.endswith("pricing.providers.audit_search_by_procedure"):
             attach_candidate_audit_access(request, ptg_args_by_name)
-        ptg2_payload = await search_current_ptg2_index(
-            session,
-            ptg_args_by_name,
-            pagination,
-            **release_selection_args_by_name,
-        )
+        try:
+            ptg2_payload = await search_current_ptg2_index(
+                session,
+                ptg_args_by_name,
+                pagination,
+                **release_selection_args_by_name,
+            )
+        except PTG2OnlineWorkBudgetExceeded as exc:
+            logger.info(
+                "PTG2 exact query exceeded its sealed online-work budget",
+                extra={"ptg2_budget_dimension": exc.dimension},
+            )
+            return _ptg_json_response(
+                request,
+                {
+                    "error": {
+                        "code": exc.error_code,
+                        "message": (
+                            "The exact query exceeds this snapshot's sealed "
+                            "online work budget."
+                        ),
+                        "dimension": exc.dimension,
+                    }
+                },
+                status=503,
+            )
         if ptg2_payload is None:
             if include_allowed_amounts:
                 allowed_amount_payload = (

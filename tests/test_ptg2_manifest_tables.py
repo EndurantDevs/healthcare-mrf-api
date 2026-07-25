@@ -543,6 +543,17 @@ def test_v4_manifest_accepts_v3_price_contract() -> None:
     assert cold_contract == "ptg_v3_cold_v2"
 
 
+def test_legacy_v4_manifest_without_taxonomy_projection_remains_servable() -> None:
+    serving_index = strict_v4_serving_index()
+    provider_graph = serving_index["serving_binary"]["provider_graph_v4"]
+    assert "inferred_taxonomy_candidates" not in provider_graph
+
+    _shared_snapshot_key, generation, _cold_contract, _audit = (
+        ptg2_tables._strict_v3_manifest_fields(serving_index)
+    )
+    assert generation == "shared_blocks_v4"
+
+
 @pytest.mark.parametrize(
     "mutator",
     [

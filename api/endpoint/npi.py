@@ -279,7 +279,7 @@ def _parse_optional_bounded_int(
     return parsed
 
 
-def _parse_bool_arg(raw_value: Any, *, default: bool) -> bool:
+def _is_truthy_arg(raw_value: Any, *, default: bool) -> bool:
     if raw_value in (None, "", "null"):
         return default
     return str(raw_value).strip().lower() in {"1", "true", "yes", "on", "y"}
@@ -1006,7 +1006,7 @@ def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _provider_directory_source_ids_from_record_ids(record_ids: Any) -> list[str]:
+def _directory_source_ids(record_ids: Any) -> list[str]:
     if not record_ids:
         return []
     candidates = record_ids if isinstance(record_ids, (list, tuple, set)) else [record_ids]
@@ -1038,7 +1038,7 @@ def _provider_directory_source_ids_from_addresses(addresses: Sequence[Any]) -> l
     for address in addresses or []:
         if not isinstance(address, Mapping):
             continue
-        for source_id in _provider_directory_source_ids_from_record_ids(
+        for source_id in _directory_source_ids(
             _provider_directory_record_ids_from_address(address)
         ):
             if source_id in seen_source_ids:
@@ -3836,7 +3836,7 @@ async def _attach_provider_directory_source_details(
         provider_directory_record_ids = _provider_directory_record_ids_from_address(
             address
         )
-        address_source_ids = _provider_directory_source_ids_from_record_ids(
+        address_source_ids = _directory_source_ids(
             provider_directory_record_ids
         )
         address_role_keys = _directory_role_keys_from_records(
@@ -6287,11 +6287,11 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
     if provider_type and specialty and provider_type.strip().lower() != specialty.strip().lower():
         raise sanic.exceptions.InvalidUsage("provider_type and specialty must match when both are provided")
     provider_type = provider_type or specialty
-    include_subspecialties = _parse_bool_arg(args.get("include_subspecialties"), default=True)
-    include_sources = _parse_bool_arg(args.get("include_sources"), default=False)
-    include_evidence = _parse_bool_arg(args.get("include_evidence"), default=False)
-    debug = _parse_bool_arg(args.get("debug"), default=False)
-    if debug:
+    include_subspecialties = _is_truthy_arg(args.get("include_subspecialties"), default=True)
+    include_sources = _is_truthy_arg(args.get("include_sources"), default=False)
+    include_evidence = _is_truthy_arg(args.get("include_evidence"), default=False)
+    is_debug_requested = _is_truthy_arg(args.get("debug"), default=False)
+    if is_debug_requested:
         include_sources = True
         include_evidence = True
     limit = _normalize_match_candidate_limit(args.get("limit"))
@@ -6348,7 +6348,7 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
         "include_subspecialties": include_subspecialties,
         "include_sources": include_sources,
         "include_evidence": include_evidence,
-        "debug": debug,
+        "debug": is_debug_requested,
         "limit": limit,
     }
 
@@ -7465,14 +7465,14 @@ async def get_all(request):
     request.args.get("npi")
     request.args.get("address_site_key")
     request.args.get("provider_sex_code")
-    include_sources = _parse_bool_arg(request.args.get("include_sources"), default=False)
-    include_evidence = _parse_bool_arg(request.args.get("include_evidence"), default=False)
-    if _parse_bool_arg(request.args.get("debug"), default=False):
+    include_sources = _is_truthy_arg(request.args.get("include_sources"), default=False)
+    include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
+    if _is_truthy_arg(request.args.get("debug"), default=False):
         include_sources = True
         include_evidence = True
     q_value = str(request.args.get("q") or "").strip().lower()
     include_total_raw = request.args.get("include_total")
-    include_total = _parse_bool_arg(
+    include_total = _is_truthy_arg(
         include_total_raw,
         default=_should_include_npi_all_total(request.args, is_count_only),
     )
@@ -7482,12 +7482,12 @@ async def get_all(request):
         view_mode == "sitemap"
         and str(classification or "").strip().lower() == "pharmacy"
     )
-    names_like: list[str] = []
+    name_like_values: list[str] = []
     if q_value:
-        names_like.append(q_value)
+        name_like_values.append(q_value)
     for legacy_name_filter in legacy_name_like:
-        if legacy_name_filter not in names_like:
-            names_like.append(legacy_name_filter)
+        if legacy_name_filter not in name_like_values:
+            name_like_values.append(legacy_name_filter)
     pagination = parse_pagination(
         request.args,
         default_limit=50,
@@ -7513,7 +7513,7 @@ async def get_all(request):
     postal_code_raw = request.args.get("postal_code")
     entity_type_code_raw = request.args.get("entity_type_code")
     provider_sex_code_raw = request.args.get("provider_sex_code")
-    plan_network = request.args.get("plan_network")
+    plan_network_ids = request.args.get("plan_network")
     has_insurance = request.args.get("has_insurance")
     city = request.args.get("city")
     state = request.args.get("state")
@@ -7531,8 +7531,8 @@ async def get_all(request):
         codes = [x.strip() for x in codes.split(",")]
     _validate_section_filters(section, classification, codes)
 
-    if plan_network:
-        plan_network = [int(x) for x in plan_network.split(",")]
+    if plan_network_ids:
+        plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
 
     requested_procedure_codes = _parse_code_tokens(procedure_codes_raw, "procedure_codes")
     requested_medication_codes = _parse_code_tokens(medication_codes_raw, "medication_codes")
@@ -7620,7 +7620,7 @@ async def get_all(request):
                 "medication_codes",
             )
 
-    filter_capabilities = {
+    capability_by_name = {
         "npi_procedures_array_available": True,
         "npi_medications_array_available": True,
         "pricing_provider_procedure_available": False,
@@ -7628,9 +7628,9 @@ async def get_all(request):
     }
     if requested_procedure_codes or requested_medication_codes:
         if request_session is not None:
-            filter_capabilities = await _resolve_npi_filter_capabilities(session=request_session)
+            capability_by_name = await _resolve_npi_filter_capabilities(session=request_session)
         else:
-            filter_capabilities = await _resolve_npi_filter_capabilities()
+            capability_by_name = await _resolve_npi_filter_capabilities()
 
     zip_code = _normalize_zip_code(zip_code_raw, "zip_code")
     postal_code = _normalize_zip_code(postal_code_raw, "postal_code")
@@ -7662,7 +7662,7 @@ async def get_all(request):
             "provider_sex_code cannot be combined with entity_type_code=2"
         )
 
-    filters = {
+    filters_by_name = {
         "classification": classification,
         "specialization": specialization,
         "section": section,
@@ -7677,8 +7677,8 @@ async def get_all(request):
         "zip_code": zip_code,
         "entity_type_code": entity_type_code,
         "provider_sex_code": provider_sex_code,
-        "plan_network": plan_network,
-        "names_like": names_like,
+        "plan_network": plan_network_ids,
+        "names_like": name_like_values,
         "codes": codes,
         "has_insurance": has_insurance,
         "city": city,
@@ -7694,14 +7694,14 @@ async def get_all(request):
         "medication_match_via": medication_match_via,
         "filter_year": filter_year,
         "filter_year_source": filter_year_source,
-        "npi_procedures_array_available": filter_capabilities["npi_procedures_array_available"],
-        "npi_medications_array_available": filter_capabilities["npi_medications_array_available"],
-        "pricing_provider_procedure_available": filter_capabilities["pricing_provider_procedure_available"],
-        "pricing_provider_prescription_available": filter_capabilities["pricing_provider_prescription_available"],
+        "npi_procedures_array_available": capability_by_name["npi_procedures_array_available"],
+        "npi_medications_array_available": capability_by_name["npi_medications_array_available"],
+        "pricing_provider_procedure_available": capability_by_name["pricing_provider_procedure_available"],
+        "pricing_provider_prescription_available": capability_by_name["pricing_provider_prescription_available"],
     }
 
     simple_filter_present = any(
-        filters.get(field)
+        filters_by_name.get(field)
         for field in (
             "classification",
             "specialization",
@@ -7725,7 +7725,7 @@ async def get_all(request):
             "medication_internal_codes",
         )
     )
-    broad_name_total_deferred = bool(names_like) and not any(
+    broad_name_total_deferred = bool(name_like_values) and not any(
         [
             classification,
             specialization,
@@ -7741,7 +7741,7 @@ async def get_all(request):
             zip_code,
             entity_type_code,
             provider_sex_code,
-            plan_network,
+            plan_network_ids,
             codes,
             has_insurance,
             city,
@@ -7752,62 +7752,65 @@ async def get_all(request):
         ]
     )
 
-    def _append_array_filters(address_where: list[str], local_filters: dict[str, Any]) -> dict[str, int]:
-        params: dict[str, int] = {}
-        filter_year = local_filters.get("filter_year")
-        procedure_internal_codes = local_filters.get("procedure_internal_codes") or []
-        medication_internal_codes = local_filters.get("medication_internal_codes") or []
-        procedures_array_available = bool(local_filters.get("npi_procedures_array_available", True))
-        medications_array_available = bool(local_filters.get("npi_medications_array_available", True))
-        procedure_table_available = bool(local_filters.get("pricing_provider_procedure_available", False))
-        medication_table_available = bool(local_filters.get("pricing_provider_prescription_available", False))
+    def _append_array_filters(
+        address_clauses: list[str],
+        filters_by_name: dict[str, Any],
+    ) -> dict[str, int]:
+        parameters_by_name: dict[str, int] = {}
+        filter_year = filters_by_name.get("filter_year")
+        procedure_internal_codes = filters_by_name.get("procedure_internal_codes") or []
+        medication_internal_codes = filters_by_name.get("medication_internal_codes") or []
+        procedures_array_available = bool(filters_by_name.get("npi_procedures_array_available", True))
+        medications_array_available = bool(filters_by_name.get("npi_medications_array_available", True))
+        procedure_table_available = bool(filters_by_name.get("pricing_provider_procedure_available", False))
+        medication_table_available = bool(filters_by_name.get("pricing_provider_prescription_available", False))
 
         if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
-            params["filter_year"] = int(filter_year)
+            parameters_by_name["filter_year"] = int(filter_year)
 
         for idx, code in enumerate(procedure_internal_codes):
-            param = f"procedure_code_{idx}"
-            params[param] = int(code)
-            array_clause = f"c.procedures_array @> ARRAY[:{param}]::INTEGER[]"
+            parameter_name = f"procedure_code_{idx}"
+            parameters_by_name[parameter_name] = int(code)
+            array_clause = f"c.procedures_array @> ARRAY[:{parameter_name}]::INTEGER[]"
             exists_clause = (
                 "EXISTS ("
                 "SELECT 1 FROM mrf.pricing_provider_procedure AS pp "
-                f"WHERE pp.npi = c.npi AND pp.procedure_code = :{param}"
+                f"WHERE pp.npi = c.npi AND pp.procedure_code = :{parameter_name}"
                 + (" AND pp.year = :filter_year" if filter_year is not None else "")
                 + ")"
             )
             if procedures_array_available and procedure_table_available:
-                address_where.append(f"({array_clause} OR {exists_clause})")
+                address_clauses.append(f"({array_clause} OR {exists_clause})")
             elif procedures_array_available:
-                address_where.append(array_clause)
+                address_clauses.append(array_clause)
             elif procedure_table_available:
-                address_where.append(exists_clause)
+                address_clauses.append(exists_clause)
             else:
-                address_where.append("1=0")
+                address_clauses.append("1=0")
 
         for idx, code in enumerate(medication_internal_codes):
-            param = f"medication_code_{idx}"
-            params[param] = int(code)
-            array_clause = f"c.medications_array @> ARRAY[:{param}]::INTEGER[]"
+            parameter_name = f"medication_code_{idx}"
+            parameters_by_name[parameter_name] = int(code)
+            array_clause = f"c.medications_array @> ARRAY[:{parameter_name}]::INTEGER[]"
             exists_clause = (
                 "EXISTS ("
                 "SELECT 1 FROM mrf.pricing_provider_prescription AS pr "
                 "WHERE pr.npi = c.npi "
                 "AND pr.rx_code_system = 'HP_RX_CODE' "
                 + ("AND pr.year = :filter_year " if filter_year is not None else "")
-                + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{param} "
+                + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{parameter_name} "
                 ")"
             )
             if medications_array_available and medication_table_available:
-                address_where.append(f"({array_clause} OR {exists_clause})")
+                address_clauses.append(f"({array_clause} OR {exists_clause})")
             elif medications_array_available:
-                address_where.append(array_clause)
+                address_clauses.append(array_clause)
             elif medication_table_available:
-                address_where.append(exists_clause)
+                address_clauses.append(exists_clause)
             else:
-                address_where.append("1=0")
+                address_clauses.append("1=0")
 
-        return params
+        return parameters_by_name
 
     address_required_columns = _public_address_serving_column_keys()
     address_table_sql = await _address_serving_table_sql(
@@ -7815,28 +7818,28 @@ async def get_all(request):
         session=request_session,
     )
 
-    async def get_count(filters):
+    async def get_count(filters_by_name):
         """Count providers matching the normalized request filters."""
-        classification = filters.get("classification")
-        specialization = filters.get("specialization")
-        section = filters.get("section")
-        display_name = filters.get("display_name")
-        first_name = filters.get("first_name")
-        last_name = filters.get("last_name")
-        organization_name = filters.get("organization_name")
-        entity_type_code = filters.get("entity_type_code")
-        provider_sex_code = filters.get("provider_sex_code")
-        plan_network = filters.get("plan_network")
-        names_like = filters.get("names_like") or []
-        codes = filters.get("codes")
-        has_insurance = filters.get("has_insurance")
-        city = filters.get("city")
-        state = filters.get("state")
-        zip_code = filters.get("zip_code")
-        phone_digits = filters.get("phone_digits")
-        address_key = filters.get("address_key")
-        address_site_key = filters.get(PUBLIC_ADDRESS_SITE_KEY)
-        exact_npi = filters.get("npi")
+        classification = filters_by_name.get("classification")
+        specialization = filters_by_name.get("specialization")
+        section = filters_by_name.get("section")
+        display_name = filters_by_name.get("display_name")
+        first_name = filters_by_name.get("first_name")
+        last_name = filters_by_name.get("last_name")
+        organization_name = filters_by_name.get("organization_name")
+        entity_type_code = filters_by_name.get("entity_type_code")
+        provider_sex_code = filters_by_name.get("provider_sex_code")
+        plan_network_ids = filters_by_name.get("plan_network")
+        name_like_values = filters_by_name.get("names_like") or []
+        codes = filters_by_name.get("codes")
+        has_insurance = filters_by_name.get("has_insurance")
+        city = filters_by_name.get("city")
+        state = filters_by_name.get("state")
+        zip_code = filters_by_name.get("zip_code")
+        phone_digits = filters_by_name.get("phone_digits")
+        address_key = filters_by_name.get("address_key")
+        address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
+        exact_npi = filters_by_name.get("npi")
 
         taxonomy_filters = []
         if classification:
@@ -7852,7 +7855,7 @@ async def get_all(request):
 
         npi_where, npi_params = _build_npi_where_clause(
             "b",
-            names_like,
+            name_like_values,
             first_name,
             last_name,
             organization_name,
@@ -7874,7 +7877,7 @@ async def get_all(request):
             ),
         )
         include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
-        address_where = [
+        address_clauses = [
             _provider_list_address_type_clause(
                 "c",
                 address_table_sql,
@@ -7884,38 +7887,38 @@ async def get_all(request):
         phone_candidates_cte = None
         phone_candidates_join = ""
         if use_taxonomy_filter and not use_location_first_taxonomy:
-            address_where.insert(0, "c.taxonomy_array && q.int_codes")
-        if plan_network:
-            address_where.append("plans_network_array && :plan_network_array")
+            address_clauses.insert(0, "c.taxonomy_array && q.int_codes")
+        if plan_network_ids:
+            address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_where.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
         if city:
-            address_where.append("city_name = :city")
+            address_clauses.append("city_name = :city")
         if state:
-            address_where.append("state_name = :state")
+            address_clauses.append("state_name = :state")
         if zip_code:
-            address_where.append(_address_zip5_filter("c", address_table_sql))
+            address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
             else:
-                address_where.append(_address_phone_digits_filter("c", address_table_sql))
+                address_clauses.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
-            address_where.append("c.address_key = CAST(:address_key AS uuid)")
+            address_clauses.append("c.address_key = CAST(:address_key AS uuid)")
         if address_site_key:
-            address_where.append(_address_site_key_filter("c", address_table_sql))
+            address_clauses.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
-            address_where.append(_address_npi_filter("c", address_table_sql))
+            address_clauses.append(_address_npi_filter("c", address_table_sql))
         if provider_sex_code is not None:
-            address_where.append(
+            address_clauses.append(
                 "EXISTS ("
                 "SELECT 1 FROM mrf.npi AS sex_provider "
                 "WHERE sex_provider.npi = c.npi "
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
-        dynamic_code_params = _append_array_filters(address_where, filters)
+        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
@@ -7948,7 +7951,7 @@ async def get_all(request):
                   JOIN {address_table_sql} AS c ON c.npi = fn.npi
                   {phone_candidates_join}
                   {taxonomy_join}
-                 WHERE {' AND '.join(address_where)}
+                 WHERE {' AND '.join(address_clauses)}
                 """
             )
         elif npi_where:
@@ -7963,7 +7966,7 @@ async def get_all(request):
                   FROM filtered_npi AS fn
                   JOIN {address_table_sql} AS c ON c.npi = fn.npi
                   {phone_candidates_join}
-                 WHERE {' AND '.join(address_where)}
+                 WHERE {' AND '.join(address_clauses)}
                 """
             )
         elif use_taxonomy_filter:
@@ -7974,7 +7977,7 @@ async def get_all(request):
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                   {taxonomy_join}
-                 WHERE {' AND '.join(address_where)}
+                 WHERE {' AND '.join(address_clauses)}
                 """
             )
         else:
@@ -7984,15 +7987,15 @@ async def get_all(request):
                 SELECT COUNT(DISTINCT c.npi)
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
-                 WHERE {' AND '.join(address_where)}
+                 WHERE {' AND '.join(address_clauses)}
                 """
             )
 
-        query_params = {
+        query_parameters_by_name = {
             "classification": classification,
             "section": section,
             "display_name": display_name,
-            "plan_network_array": plan_network,
+            "plan_network_array": plan_network_ids,
             "codes": codes,
             "city": city.upper() if city else None,
             "state": state.upper() if state else None,
@@ -8007,18 +8010,18 @@ async def get_all(request):
             "organization_name": organization_name,
             "entity_type_code": entity_type_code,
             "provider_sex_code": provider_sex_code,
-            "filter_year": filters.get("filter_year"),
+            "filter_year": filters_by_name.get("filter_year"),
         }
-        query_params.update(dynamic_code_params)
-        query_params.update(npi_params)
+        query_parameters_by_name.update(dynamic_code_parameters)
+        query_parameters_by_name.update(npi_params)
         if phone_candidates_cte:
-            query_params["candidate_limit"] = _provider_list_phone_candidate_limit(
+            query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
                 count_query=True,
             )
 
         async with db.acquire() as conn:
-            count_records = await conn.all(query, **query_params)
+            count_records = await conn.all(query, **query_parameters_by_name)
         return count_records[0][0] if count_records else 0
 
     async def get_formatted_count(response_format: str) -> dict:
@@ -8042,28 +8045,28 @@ async def get_all(request):
             for count_record in formatted_count_records
         }
 
-    async def get_classification_count_map(filters) -> dict:
+    async def get_classification_count_map(filters_by_name) -> dict:
         """Return provider counts grouped by NUCC classification."""
-        classification = filters.get("classification")
-        specialization = filters.get("specialization")
-        section = filters.get("section")
-        display_name = filters.get("display_name")
-        first_name = filters.get("first_name")
-        last_name = filters.get("last_name")
-        organization_name = filters.get("organization_name")
-        entity_type_code = filters.get("entity_type_code")
-        provider_sex_code = filters.get("provider_sex_code")
-        plan_network = filters.get("plan_network")
-        names_like = filters.get("names_like") or []
-        codes = filters.get("codes")
-        has_insurance = filters.get("has_insurance")
-        city = filters.get("city")
-        state = filters.get("state")
-        zip_code = filters.get("zip_code")
-        phone_digits = filters.get("phone_digits")
-        address_key = filters.get("address_key")
-        address_site_key = filters.get(PUBLIC_ADDRESS_SITE_KEY)
-        exact_npi = filters.get("npi")
+        classification = filters_by_name.get("classification")
+        specialization = filters_by_name.get("specialization")
+        section = filters_by_name.get("section")
+        display_name = filters_by_name.get("display_name")
+        first_name = filters_by_name.get("first_name")
+        last_name = filters_by_name.get("last_name")
+        organization_name = filters_by_name.get("organization_name")
+        entity_type_code = filters_by_name.get("entity_type_code")
+        provider_sex_code = filters_by_name.get("provider_sex_code")
+        plan_network_ids = filters_by_name.get("plan_network")
+        name_like_values = filters_by_name.get("names_like") or []
+        codes = filters_by_name.get("codes")
+        has_insurance = filters_by_name.get("has_insurance")
+        city = filters_by_name.get("city")
+        state = filters_by_name.get("state")
+        zip_code = filters_by_name.get("zip_code")
+        phone_digits = filters_by_name.get("phone_digits")
+        address_key = filters_by_name.get("address_key")
+        address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
+        exact_npi = filters_by_name.get("npi")
 
         taxonomy_filters = []
         if classification:
@@ -8079,7 +8082,7 @@ async def get_all(request):
 
         npi_where, npi_params = _build_npi_where_clause(
             "b",
-            names_like,
+            name_like_values,
             first_name,
             last_name,
             organization_name,
@@ -8087,7 +8090,7 @@ async def get_all(request):
         )
 
         include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
-        address_where = [
+        address_clauses = [
             _provider_list_address_type_clause(
                 "c",
                 address_table_sql,
@@ -8096,39 +8099,39 @@ async def get_all(request):
         ]
         phone_candidates_cte = None
         phone_candidates_join = ""
-        if plan_network:
-            address_where.append("plans_network_array && :plan_network_array")
+        if plan_network_ids:
+            address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_where.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
         if city:
-            address_where.append("city_name = :city")
+            address_clauses.append("city_name = :city")
         if state:
-            address_where.append("state_name = :state")
+            address_clauses.append("state_name = :state")
         if zip_code:
-            address_where.append(_address_zip5_filter("c", address_table_sql))
+            address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
             else:
-                address_where.append(_address_phone_digits_filter("c", address_table_sql))
+                address_clauses.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
-            address_where.append("c.address_key = CAST(:address_key AS uuid)")
+            address_clauses.append("c.address_key = CAST(:address_key AS uuid)")
         if address_site_key:
-            address_where.append(_address_site_key_filter("c", address_table_sql))
+            address_clauses.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
-            address_where.append(_address_npi_filter("c", address_table_sql))
+            address_clauses.append(_address_npi_filter("c", address_table_sql))
         if provider_sex_code is not None:
-            address_where.append(
+            address_clauses.append(
                 "EXISTS ("
                 "SELECT 1 FROM mrf.npi AS sex_provider "
                 "WHERE sex_provider.npi = c.npi "
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
-        dynamic_code_params = _append_array_filters(address_where, filters)
+        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
         if npi_where:
-            address_where.append(
+            address_clauses.append(
                 f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = c.npi AND {npi_where})"
             )
 
@@ -8141,7 +8144,7 @@ async def get_all(request):
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                   CROSS JOIN LATERAL unnest(COALESCE(c.taxonomy_array, ARRAY[]::INTEGER[])) AS code(int_code)
-                 WHERE {' AND '.join(address_where)}
+                 WHERE {' AND '.join(address_clauses)}
             )
             SELECT q.classification AS key,
                    COUNT(DISTINCT ft.npi) AS value
@@ -8151,11 +8154,11 @@ async def get_all(request):
              GROUP BY q.classification
             """
         )
-        query_params = {
+        query_parameters_by_name = {
             "classification": classification,
             "section": section,
             "display_name": display_name,
-            "plan_network_array": plan_network,
+            "plan_network_array": plan_network_ids,
             "codes": codes,
             "city": city,
             "state": state,
@@ -8170,17 +8173,17 @@ async def get_all(request):
             "organization_name": organization_name,
             "entity_type_code": entity_type_code,
             "provider_sex_code": provider_sex_code,
-            "filter_year": filters.get("filter_year"),
+            "filter_year": filters_by_name.get("filter_year"),
         }
-        query_params.update(dynamic_code_params)
-        query_params.update(npi_params)
+        query_parameters_by_name.update(dynamic_code_parameters)
+        query_parameters_by_name.update(npi_params)
         if phone_candidates_cte:
-            query_params["candidate_limit"] = _provider_list_phone_candidate_limit(
+            query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
                 count_query=True,
             )
         async with db.acquire() as conn:
-            classification_count_records = await conn.all(query, **query_params)
+            classification_count_records = await conn.all(query, **query_parameters_by_name)
         return {
             count_record[0]: count_record[1]
             for count_record in classification_count_records
@@ -8213,7 +8216,7 @@ async def get_all(request):
         return response.json({"rows": insurance_provider_count}, default=str)
 
     if is_count_only and response_format == "all":
-        mapping = await get_classification_count_map(filters)
+        mapping = await get_classification_count_map(filters_by_name)
         return response.json({"rows": mapping}, default=str)
 
     if is_count_only and response_format in {"full_taxonomy", "classification"}:
@@ -8288,31 +8291,31 @@ async def get_all(request):
             for count_record in formatted_count_records
         }
 
-    async def get_results(start, limit, filters):
+    async def get_results(start, limit, filters_by_name):
         """Return one provider result page for normalized search filters."""
-        classification = filters.get("classification")
-        section = filters.get("section")
-        display_name = filters.get("display_name")
-        first_name = filters.get("first_name")
-        last_name = filters.get("last_name")
-        organization_name = filters.get("organization_name")
-        entity_type_code = filters.get("entity_type_code")
-        provider_sex_code = filters.get("provider_sex_code")
-        plan_network = filters.get("plan_network")
-        names_like = filters.get("names_like") or []
-        specialization = filters.get("specialization")
-        city = filters.get("city")
-        state = filters.get("state")
-        has_insurance = filters.get("has_insurance")
-        codes = filters.get("codes")
-        zip_code = filters.get("zip_code")
-        phone_digits = filters.get("phone_digits")
-        address_key = filters.get("address_key")
-        address_site_key = filters.get(PUBLIC_ADDRESS_SITE_KEY)
-        exact_npi = filters.get("npi")
-        where = []
+        classification = filters_by_name.get("classification")
+        section = filters_by_name.get("section")
+        display_name = filters_by_name.get("display_name")
+        first_name = filters_by_name.get("first_name")
+        last_name = filters_by_name.get("last_name")
+        organization_name = filters_by_name.get("organization_name")
+        entity_type_code = filters_by_name.get("entity_type_code")
+        provider_sex_code = filters_by_name.get("provider_sex_code")
+        plan_network_ids = filters_by_name.get("plan_network")
+        name_like_values = filters_by_name.get("names_like") or []
+        specialization = filters_by_name.get("specialization")
+        city = filters_by_name.get("city")
+        state = filters_by_name.get("state")
+        has_insurance = filters_by_name.get("has_insurance")
+        codes = filters_by_name.get("codes")
+        zip_code = filters_by_name.get("zip_code")
+        phone_digits = filters_by_name.get("phone_digits")
+        address_key = filters_by_name.get("address_key")
+        address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
+        exact_npi = filters_by_name.get("npi")
+        taxonomy_clauses = []
         include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
-        address_where = [
+        address_clauses = [
             _provider_list_address_type_clause(
                 "c",
                 address_table_sql,
@@ -8322,16 +8325,16 @@ async def get_all(request):
         phone_candidates_cte = None
         phone_candidates_join = ""
         if classification:
-            where.append("classification = :classification")
+            taxonomy_clauses.append("classification = :classification")
         if specialization:
-            where.append("specialization = :specialization")
+            taxonomy_clauses.append("specialization = :specialization")
         if section:
-            where.append("section = :section")
+            taxonomy_clauses.append("section = :section")
         if display_name:
-            where.append("display_name = :display_name")
+            taxonomy_clauses.append("display_name = :display_name")
         if codes:
-            where.append("code = ANY(:codes)")
-        use_taxonomy_filter = bool(where)
+            taxonomy_clauses.append("code = ANY(:codes)")
+        use_taxonomy_filter = bool(taxonomy_clauses)
         use_location_first_taxonomy = _is_location_first_taxonomy_filter(
             use_taxonomy_filter,
             (
@@ -8345,48 +8348,48 @@ async def get_all(request):
             ),
         )
         if use_taxonomy_filter and not use_location_first_taxonomy:
-            address_where.insert(0, "c.taxonomy_array && q.int_codes")
-        if plan_network:
-            address_where.append("plans_network_array && :plan_network_array")
+            address_clauses.insert(0, "c.taxonomy_array && q.int_codes")
+        if plan_network_ids:
+            address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_where.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
         if city:
-            address_where.append("city_name = :city")
+            address_clauses.append("city_name = :city")
         if state:
-            address_where.append("state_name = :state")
+            address_clauses.append("state_name = :state")
         if zip_code:
-            address_where.append(_address_zip5_filter("c", address_table_sql))
+            address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
             else:
-                address_where.append(_address_phone_digits_filter("c", address_table_sql))
+                address_clauses.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
-            address_where.append("c.address_key = CAST(:address_key AS uuid)")
+            address_clauses.append("c.address_key = CAST(:address_key AS uuid)")
         if address_site_key:
-            address_where.append(_address_site_key_filter("c", address_table_sql))
+            address_clauses.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
-            address_where.append(_address_npi_filter("c", address_table_sql))
+            address_clauses.append(_address_npi_filter("c", address_table_sql))
         if provider_sex_code is not None:
-            address_where.append(
+            address_clauses.append(
                 "EXISTS ("
                 "SELECT 1 FROM mrf.npi AS sex_provider "
                 "WHERE sex_provider.npi = c.npi "
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
-        dynamic_code_params = _append_array_filters(address_where, filters)
+        dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
         npi_where, npi_params = _build_npi_where_clause(
             "b",
-            names_like,
+            name_like_values,
             first_name,
             last_name,
             organization_name,
             entity_type_code,
         )
 
-        taxonomy_filter = " and ".join(where) if where else "1=1"
+        taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
         filtered_npi_cte = None
         if npi_where:
             filtered_npi_cte = f"""
@@ -8406,7 +8409,7 @@ async def get_all(request):
         )
         taxonomy_parameters_by_name: dict[str, str] = {}
         if use_location_first_taxonomy:
-            if codes and len(where) == 1:
+            if codes and len(taxonomy_clauses) == 1:
                 taxonomy_parameters_by_name, taxonomy_code_placeholders = (
                     _provider_taxonomy_code_parameters(
                         codes,
@@ -8446,7 +8449,7 @@ async def get_all(request):
         {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte)}page_npis AS (
             SELECT DISTINCT c.npi
               FROM {address_source}
-             WHERE {' and '.join(address_where)}
+             WHERE {' and '.join(address_clauses)}
              ORDER BY c.npi
              LIMIT :limit OFFSET :start
         ),
@@ -8457,7 +8460,7 @@ async def get_all(request):
               JOIN LATERAL (
                   SELECT c.*
                     FROM {address_source}
-                   WHERE {' and '.join(address_where)}
+                   WHERE {' and '.join(address_clauses)}
                      AND c.npi = pn.npi
                    ORDER BY {address_order}
                    LIMIT 1
@@ -8471,14 +8474,14 @@ async def get_all(request):
 
         providers_by_npi = {}
         async with db.acquire() as conn:
-            query_params = {
+            query_parameters_by_name = {
                 "start": start,
                 "limit": limit,
                 "classification": classification,
                 "section": section,
                 "display_name": display_name,
                 "codes": codes,
-                "plan_network_array": plan_network,
+                "plan_network_array": plan_network_ids,
                 "specialization": specialization,
                 "city": city,
                 "state": state,
@@ -8489,17 +8492,17 @@ async def get_all(request):
                 "npi_filter": exact_npi,
                 "provider_sex_code": provider_sex_code,
                 **npi_params,
-                **dynamic_code_params,
+                **dynamic_code_parameters,
                 **taxonomy_parameters_by_name,
             }
             if phone_candidates_cte:
-                query_params["candidate_limit"] = _provider_list_phone_candidate_limit(
+                query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                     limit,
                     start,
                 )
             rows_iter = await conn.all(
                 provider_page_query,
-                **query_params,
+                **query_parameters_by_name,
             )
             for provider_record in rows_iter:
                 # Prefer key-based extraction so schema drift in upstream tables
@@ -8541,14 +8544,14 @@ async def get_all(request):
                         provider_by_field.setdefault("procedures_array", [])
                         provider_by_field.setdefault("medications_array", [])
 
-                    taxonomy = {}
+                    taxonomy_by_field = {}
                     for column in NPIDataTaxonomy.__table__.columns:
                         if column.key in ("npi", "checksum"):
                             continue
                         if column.key in row_mapping:
-                            taxonomy[column.key] = row_mapping.get(column.key)
-                    if taxonomy:
-                        provider_by_field["taxonomy_list"].append(taxonomy)
+                            taxonomy_by_field[column.key] = row_mapping.get(column.key)
+                    if taxonomy_by_field:
+                        provider_by_field["taxonomy_list"].append(taxonomy_by_field)
 
                     providers_by_npi[npi_value] = provider_by_field
                     continue
@@ -8584,16 +8587,16 @@ async def get_all(request):
                     provider_by_field.setdefault("procedures_array", [])
                     provider_by_field.setdefault("medications_array", [])
 
-                taxonomy = {}
+                taxonomy_by_field = {}
                 for column in NPIDataTaxonomy.__table__.columns:
                     count += 1
                     if count >= row_len:
                         break
                     if column.key in ("npi", "checksum"):
                         continue
-                    taxonomy[column.key] = provider_record[count]
-                if taxonomy:
-                    provider_by_field["taxonomy_list"].append(taxonomy)
+                    taxonomy_by_field[column.key] = provider_record[count]
+                if taxonomy_by_field:
+                    provider_by_field["taxonomy_list"].append(taxonomy_by_field)
                 providers_by_npi[npi_value] = provider_by_field
 
             if (
@@ -8604,15 +8607,15 @@ async def get_all(request):
                 and not use_taxonomy_filter
                 and provider_sex_code is None
             ):
-                fallback_where = list(address_where)
-                if fallback_where:
-                    fallback_where[0] = _provider_list_address_type_clause(
+                fallback_clauses = list(address_clauses)
+                if fallback_clauses:
+                    fallback_clauses[0] = _provider_list_address_type_clause(
                         "c",
                         address_table_sql,
                         include_service_locations=True,
                     )
-                fallback_params = {
-                    "plan_network_array": plan_network,
+                fallback_parameters_by_name = {
+                    "plan_network_array": plan_network_ids,
                     "city": city,
                     "state": state,
                     "zip_code": zip_code,
@@ -8620,20 +8623,20 @@ async def get_all(request):
                     "address_key": address_key,
                     "address_site_key": address_site_key,
                     "npi_filter": exact_npi,
-                    **dynamic_code_params,
+                    **dynamic_code_parameters,
                 }
                 fallback_rows = await conn.all(
                     text(
                         f"""
                         SELECT c.*
                           FROM {address_table_sql} AS c
-                         WHERE {' AND '.join(fallback_where)}
+                         WHERE {' AND '.join(fallback_clauses)}
                          ORDER BY {_primary_address_order_clause("c", address_table_sql)}
                          LIMIT :fallback_limit
                         """
                     ),
                     fallback_limit=limit,
-                    **fallback_params,
+                    **fallback_parameters_by_name,
                 )
                 for fallback_record in fallback_rows:
                     mapping = getattr(fallback_record, "_mapping", fallback_record)
@@ -8677,7 +8680,7 @@ async def get_all(request):
         return provider_results
 
     if is_count_only:
-        count_rows = await get_count(filters)
+        count_rows = await get_count(filters_by_name)
         return response.json({"rows": count_rows}, default=str)
 
     async def _count_with_timeout() -> Optional[int]:
@@ -8695,7 +8698,7 @@ async def get_all(request):
             return await _fast_primary_npi_count()
         try:
             return await asyncio.wait_for(
-                get_count(filters),
+                get_count(filters_by_name),
                 timeout=max(0.1, _NPI_ALL_TOTAL_TIMEOUT_SECONDS),
             )
         except asyncio.TimeoutError:
@@ -8733,8 +8736,8 @@ async def get_all(request):
                 zip_code,
                 entity_type_code,
                 provider_sex_code,
-                plan_network,
-                names_like,
+                plan_network_ids,
+                name_like_values,
                 codes,
                 response_format,
                 procedure_internal_codes,
@@ -8752,7 +8755,7 @@ async def get_all(request):
     else:
         raw_total, result_rows = await asyncio.gather(
             _count_with_timeout(),
-            get_results(start, limit, filters),
+            get_results(start, limit, filters_by_name),
         )
     if include_total and raw_total is not None:
         total = int(raw_total)
@@ -8858,7 +8861,7 @@ async def get_facility_connected_providers(request):
         minimum=1,
         maximum=500,
     )
-    include_specialty_stats = _parse_bool_arg(request.args.get("include_specialty_stats"), default=True)
+    include_specialty_stats = _is_truthy_arg(request.args.get("include_specialty_stats"), default=True)
 
     if ccn is None and organization_name is None:
         raise sanic.exceptions.InvalidUsage("At least one facility locator is required: ccn or organization_name")
@@ -9168,9 +9171,9 @@ async def get_near_npi(request):
     if codes:
         codes = [x.strip() for x in codes.split(",")]
 
-    plan_network = request.args.get("plan_network")
-    if plan_network:
-        plan_network = [int(x) for x in plan_network.split(",")]
+    plan_network_ids = request.args.get("plan_network")
+    if plan_network_ids:
+        plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
     classification = request.args.get("classification")
     section = request.args.get("section")
     display_name = request.args.get("display_name")
@@ -9192,7 +9195,7 @@ async def get_near_npi(request):
     limit = int(request.args.get("limit", 5))
     if limit < 1:
         raise sanic.exceptions.InvalidUsage("limit must be at least 1")
-    include_total = _parse_bool_arg(request.args.get("include_total"), default=False)
+    include_total = _is_truthy_arg(request.args.get("include_total"), default=False)
     cursor_raw = str(request.args.get("cursor") or "").strip()
     pagination_requested = include_total or bool(cursor_raw)
     cursor_scope = _nearby_cursor_scope(request.args)
@@ -9305,7 +9308,7 @@ async def get_near_npi(request):
             )
         return response.json([], default=str)
 
-    filter_capabilities = {
+    capability_by_name = {
         "npi_procedures_array_available": True,
         "npi_medications_array_available": True,
         "pricing_provider_procedure_available": False,
@@ -9313,9 +9316,9 @@ async def get_near_npi(request):
     }
     if requested_procedure_codes or requested_medication_codes:
         if request_session is not None:
-            filter_capabilities = await _resolve_npi_filter_capabilities(session=request_session)
+            capability_by_name = await _resolve_npi_filter_capabilities(session=request_session)
         else:
-            filter_capabilities = await _resolve_npi_filter_capabilities()
+            capability_by_name = await _resolve_npi_filter_capabilities()
 
     _validate_section_filters(section, classification, codes)
     # If only zip was provided, resolve to coordinates first using a separate connection.
@@ -9339,7 +9342,7 @@ async def get_near_npi(request):
     extra_filters: list[str] = []
     if exclude_npi:
         extra_filters.append("a.npi <> :exclude_npi")
-    if plan_network:
+    if plan_network_ids:
         extra_filters.append("a.plans_network_array && (:plan_network_array)")
     if provider_sex_code is not None:
         extra_filters.append(
@@ -9349,18 +9352,18 @@ async def get_near_npi(request):
             "AND sex_provider.provider_sex_code = :provider_sex_code"
             ")"
         )
-    dynamic_code_params: dict[str, int] = {}
+    dynamic_code_parameters_by_name: dict[str, int] = {}
     if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
-        dynamic_code_params["filter_year"] = int(filter_year)
+        dynamic_code_parameters_by_name["filter_year"] = int(filter_year)
 
-    procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
-    medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
-    procedure_table_available = bool(filter_capabilities.get("pricing_provider_procedure_available", False))
-    medication_table_available = bool(filter_capabilities.get("pricing_provider_prescription_available", False))
+    procedures_array_available = bool(capability_by_name.get("npi_procedures_array_available", True))
+    medications_array_available = bool(capability_by_name.get("npi_medications_array_available", True))
+    procedure_table_available = bool(capability_by_name.get("pricing_provider_procedure_available", False))
+    medication_table_available = bool(capability_by_name.get("pricing_provider_prescription_available", False))
 
     for idx, code in enumerate(procedure_internal_codes):
         param = f"procedure_code_{idx}"
-        dynamic_code_params[param] = int(code)
+        dynamic_code_parameters_by_name[param] = int(code)
         array_clause = f"a.procedures_array @> ARRAY[:{param}]::INTEGER[]"
         exists_clause = (
             "EXISTS ("
@@ -9380,7 +9383,7 @@ async def get_near_npi(request):
 
     for idx, code in enumerate(medication_internal_codes):
         param = f"medication_code_{idx}"
-        dynamic_code_params[param] = int(code)
+        dynamic_code_parameters_by_name[param] = int(code)
         array_clause = f"a.medications_array @> ARRAY[:{param}]::INTEGER[]"
         exists_clause = (
             "EXISTS ("
@@ -9400,27 +9403,27 @@ async def get_near_npi(request):
         else:
             extra_filters.append("1=0")
 
-    where: list[str] = []
+    taxonomy_clauses: list[str] = []
     if zip_codes:
         # Default to a reasonable search radius when zip is used; avoid huge fan-out.
         radius = 25
         extra_filters.append(_address_zip5_filter("a", address_table_sql, any_array=True))
 
     if classification:
-        where.append("classification = :classification")
+        taxonomy_clauses.append("classification = :classification")
     if section:
-        where.append("section = :section")
+        taxonomy_clauses.append("section = :section")
     if display_name:
-        where.append("display_name = :display_name")
+        taxonomy_clauses.append("display_name = :display_name")
     if codes:
-        where.append("code = ANY(:codes)")
+        taxonomy_clauses.append("code = ANY(:codes)")
     ilike_clause = ""
     q_like = None
     if name_query:
         q_like = f"%{name_query}%"
         ilike_clause = f"\n            AND {_name_like_clause('d', 'q')}"
 
-    taxonomy_conditions = " AND ".join(where) if where else "1=1"
+    taxonomy_conditions = " AND ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
     extra_clause = ""
     if extra_filters:
         extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
@@ -9436,9 +9439,9 @@ async def get_near_npi(request):
         "q": q_like,
         "codes": codes,
         "zip_codes": zip_codes,
-        "plan_network_array": plan_network,
+        "plan_network_array": plan_network_ids,
         "provider_sex_code": provider_sex_code,
-        **dynamic_code_params,
+        **dynamic_code_parameters_by_name,
     }
 
     async def fetch_nearby_rows() -> list[Any]:
@@ -9461,7 +9464,7 @@ async def get_near_npi(request):
                     taxonomy_conditions,
                     extra_clause,
                     ilike_clause,
-                    use_taxonomy_filter=bool(where),
+                    use_taxonomy_filter=bool(taxonomy_clauses),
                     address_table_sql=address_table_sql,
                     geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
                     cursor_clause=cursor_clause,
@@ -9501,13 +9504,13 @@ async def get_near_npi(request):
 
         return collected_rows
 
-    bbox_params: dict[str, float] = {}
+    bbox_parameters_by_name: dict[str, float] = {}
     bbox_clause = ""
     if in_long is not None and in_lat is not None:
         delta_lat = radius / 69.0
         cos_lat = math.cos(math.radians(in_lat)) or 1e-6
         delta_long = radius / (69.0 * cos_lat)
-        bbox_params = {
+        bbox_parameters_by_name = {
             "min_lat": in_lat - delta_lat,
             "max_lat": in_lat + delta_lat,
             "min_long": in_long - delta_long,
@@ -9528,7 +9531,7 @@ async def get_near_npi(request):
             taxonomy_conditions,
             extra_clause,
             ilike_clause,
-            use_taxonomy_filter=bool(where),
+            use_taxonomy_filter=bool(taxonomy_clauses),
             address_table_sql=address_table_sql,
             geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
             bbox_clause=bbox_clause,
@@ -9537,7 +9540,7 @@ async def get_near_npi(request):
             rows = await conn.all(
                 text(count_sql),
                 **query_parameters_by_name,
-                **bbox_params,
+                **bbox_parameters_by_name,
             )
         if not rows:
             return 0
@@ -9603,14 +9606,14 @@ async def get_near_npi(request):
                     if column.key in row_dict:
                         provider_by_field[column.key] = row_dict[column.key]
 
-            taxonomy = {}
+            taxonomy_by_field = {}
             for column in NPIDataTaxonomy.__table__.columns:
                 if column.key in ("npi", "checksum"):
                     continue
                 if column.key in row_dict:
-                    taxonomy[column.key] = row_dict[column.key]
-            if taxonomy and taxonomy not in provider_by_field["taxonomy_list"]:
-                provider_by_field["taxonomy_list"].append(taxonomy)
+                    taxonomy_by_field[column.key] = row_dict[column.key]
+            if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
+                provider_by_field["taxonomy_list"].append(taxonomy_by_field)
 
             providers_by_identity[identity] = provider_by_field
             continue
@@ -9647,16 +9650,16 @@ async def get_near_npi(request):
         identity = (int(npi_value), str(address_key_value or "").lower())
         if identity in providers_by_identity:
             provider_by_field = providers_by_identity[identity]
-        taxonomy = {}
+        taxonomy_by_field = {}
         for column in NPIDataTaxonomy.__table__.columns:
             count += 1
             if count >= row_len:
                 break
             if column.key in ("npi", "checksum"):
                 continue
-            taxonomy[column.key] = provider_record[count]
-        if taxonomy and taxonomy not in provider_by_field["taxonomy_list"]:
-            provider_by_field["taxonomy_list"].append(taxonomy)
+            taxonomy_by_field[column.key] = provider_record[count]
+        if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
+            provider_by_field["taxonomy_list"].append(taxonomy_by_field)
 
         providers_by_identity[identity] = provider_by_field
 
@@ -9745,22 +9748,22 @@ async def get_plans_by_npi(_request, npi):
 @blueprint.get("/id/<npi>")
 async def get_npi(request, npi):
     """Return one NPPES- or profile-backed provider with optional provenance."""
-    force_address_update = _parse_bool_arg(request.args.get("force_address_update"), default=False)
-    include_sources = _parse_bool_arg(request.args.get("include_sources"), default=False)
-    include_evidence = _parse_bool_arg(request.args.get("include_evidence"), default=False)
-    include_profile = _parse_bool_arg(
+    should_force_address_update = _is_truthy_arg(request.args.get("force_address_update"), default=False)
+    include_sources = _is_truthy_arg(request.args.get("include_sources"), default=False)
+    include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
+    include_profile = _is_truthy_arg(
         request.args.get("include_profile"),
         default=True,
     )
-    if _parse_bool_arg(request.args.get("debug"), default=False):
+    if _is_truthy_arg(request.args.get("debug"), default=False):
         include_sources = True
         include_evidence = True
-    include_extra_info = _parse_bool_arg(request.args.get("extra_info"), default=False)
-    sync_geocode = _parse_bool_arg(
+    include_extra_info = _is_truthy_arg(request.args.get("extra_info"), default=False)
+    should_sync_geocode = _is_truthy_arg(
         request.args.get("sync_geocode"),
         default=_is_environment_flag_enabled("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True),
     )
-    lookup_stored_geocode = _parse_bool_arg(
+    should_lookup_stored_geocode = _is_truthy_arg(
         request.args.get("lookup_stored_geocode"),
         default=_is_environment_flag_enabled(
             "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
@@ -9786,7 +9789,7 @@ async def get_npi(request, npi):
         address_offset = max(int(request.args.get("address_offset") or 0), 0)
     except (TypeError, ValueError):
         address_offset = 0
-    include_address_total = _parse_bool_arg(request.args.get("include_address_total"), default=True)
+    include_address_total = _is_truthy_arg(request.args.get("include_address_total"), default=True)
     raw_address_key = request.args.get("address_key")
     if raw_address_key is None or not str(raw_address_key).strip():
         address_key = None
@@ -9818,8 +9821,8 @@ async def get_npi(request, npi):
         view=provider_enrichment_view,
         include_chain=include_chain_enrichment,
         extra_info=include_extra_info,
-        sync_geocode=sync_geocode,
-        lookup_stored_geocode=lookup_stored_geocode,
+        sync_geocode=should_sync_geocode,
+        lookup_stored_geocode=should_lookup_stored_geocode,
         include_sources=include_sources,
         include_evidence=include_evidence,
         include_profile=include_profile,
@@ -9833,7 +9836,7 @@ async def get_npi(request, npi):
         include_address_total=include_address_total,
         address_key=address_key,
     )
-    if not force_address_update:
+    if not should_force_address_update:
         cached_body = _npi_detail_response_cache_get(cache_key)
         if cached_body is not None:
             return response.raw(cached_body, content_type="application/json")
@@ -10082,11 +10085,11 @@ async def get_npi(request, npi):
         except Exception as exc:
             logger.warning("Could not archive address checksum=%s: %s", checksum, exc)
 
-    async def _update_address(x):
+    async def _update_address(address_by_field):
         """Geocode one address when it does not already have coordinates."""
-        if x.get("lat"):
-            return x
-        postal_code = x.get("postal_code")
+        if address_by_field.get("lat"):
+            return address_by_field
+        postal_code = address_by_field.get("postal_code")
         if postal_code is not None:
             postal_code = str(postal_code)
         if postal_code and len(postal_code) > 5:
@@ -10094,7 +10097,7 @@ async def get_npi(request, npi):
         state_postal = " ".join(
             part
             for part in [
-                str(x.get("state_name") or "").strip(),
+                str(address_by_field.get("state_name") or "").strip(),
                 str(postal_code or "").strip(),
             ]
             if part
@@ -10102,25 +10105,24 @@ async def get_npi(request, npi):
         t_addr = ", ".join(
             part
             for part in [
-                str(x.get("first_line") or "").strip(),
-                str(x.get("second_line") or "").strip(),
-                str(x.get("city_name") or "").strip(),
+                str(address_by_field.get("first_line") or "").strip(),
+                str(address_by_field.get("second_line") or "").strip(),
+                str(address_by_field.get("city_name") or "").strip(),
                 state_postal,
             ]
             if part
         )
         t_addr = t_addr.replace(" , ", " ")
 
-        d = x
         for key in ("lat", "long", "formatted_address", "place_id"):
-            d.setdefault(key, None)
-        if force_address_update:
-            d["long"] = None
-            d["lat"] = None
-            d["formatted_address"] = None
-            d["place_id"] = None
+            address_by_field.setdefault(key, None)
+        if should_force_address_update:
+            address_by_field["long"] = None
+            address_by_field["lat"] = None
+            address_by_field["formatted_address"] = None
+            address_by_field["place_id"] = None
 
-        if not d["lat"]:
+        if not address_by_field["lat"]:
 
             # try:
             #     raw_sql = text(f"""SELECT
@@ -10156,35 +10158,39 @@ async def get_npi(request, npi):
             # except:
             #     pass
             should_update_geo = False
-            if request.app.config.get("NPI_API_UPDATE_GEOCODE") and not d["lat"]:
+            if request.app.config.get("NPI_API_UPDATE_GEOCODE") and not address_by_field["lat"]:
                 should_update_geo = True
 
-            if lookup_stored_geocode and (not d["lat"]) and (not force_address_update):
-                stored_coordinates = await _archive_coordinates_for(x)
+            if should_lookup_stored_geocode and (not address_by_field["lat"]) and (not should_force_address_update):
+                stored_coordinates = await _archive_coordinates_for(address_by_field)
                 if stored_coordinates:
-                    d["long"] = stored_coordinates.long
-                    d["lat"] = stored_coordinates.lat
-                    d["formatted_address"] = stored_coordinates.formatted_address
-                    d["place_id"] = stored_coordinates.place_id
-                    d["geo_source"] = getattr(stored_coordinates, "geo_source", None) or (
+                    address_by_field["long"] = stored_coordinates.long
+                    address_by_field["lat"] = stored_coordinates.lat
+                    address_by_field["formatted_address"] = stored_coordinates.formatted_address
+                    address_by_field["place_id"] = stored_coordinates.place_id
+                    address_by_field["geo_source"] = getattr(stored_coordinates, "geo_source", None) or (
                         "google" if stored_coordinates.place_id else None
                     )
 
-            if (lookup_stored_geocode or sync_geocode or force_address_update) and not d["lat"]:
+            if (
+                should_lookup_stored_geocode
+                or should_sync_geocode
+                or should_force_address_update
+            ) and not address_by_field["lat"]:
                 try:
-                    openaddresses_coordinates = await _openaddresses_coordinates_for(x)
+                    openaddresses_coordinates = await _openaddresses_coordinates_for(address_by_field)
                     if openaddresses_coordinates:
-                        d["long"] = openaddresses_coordinates.long
-                        d["lat"] = openaddresses_coordinates.lat
-                        d["formatted_address"] = openaddresses_coordinates.formatted_address
-                        d["place_id"] = openaddresses_coordinates.place_id
-                        d["geo_source"] = openaddresses_coordinates.geo_source
-                        d["geocode_source"] = openaddresses_coordinates.geocode_source
-                        d["geocode_quality"] = openaddresses_coordinates.geocode_quality
+                        address_by_field["long"] = openaddresses_coordinates.long
+                        address_by_field["lat"] = openaddresses_coordinates.lat
+                        address_by_field["formatted_address"] = openaddresses_coordinates.formatted_address
+                        address_by_field["place_id"] = openaddresses_coordinates.place_id
+                        address_by_field["geo_source"] = openaddresses_coordinates.geo_source
+                        address_by_field["geocode_source"] = openaddresses_coordinates.geocode_source
+                        address_by_field["geocode_quality"] = openaddresses_coordinates.geocode_quality
                 except Exception as exc:
                     logger.debug("OpenAddresses geocoding failed for %s: %s", t_addr, exc)
 
-            if (sync_geocode or force_address_update) and not d["lat"]:
+            if (should_sync_geocode or should_force_address_update) and not address_by_field["lat"]:
                 try:
                     geocoder_parameter_map = {
                         request.app.config.get("GEOCODE_MAPBOX_STYLE_KEY_PARAM"): random.choice(
@@ -10208,18 +10214,18 @@ async def get_npi(request, npi):
                     resp = await download_it(url, local_timeout=5)
                     geo_data = json.loads(resp)
                     if geo_data.get("features", []):
-                        d["long"] = geo_data["features"][0]["geometry"]["coordinates"][0]
-                        d["lat"] = geo_data["features"][0]["geometry"]["coordinates"][1]
+                        address_by_field["long"] = geo_data["features"][0]["geometry"]["coordinates"][0]
+                        address_by_field["lat"] = geo_data["features"][0]["geometry"]["coordinates"][1]
                         if t2 := geo_data["features"][0].get("matching_place_name"):
-                            d["formatted_address"] = t2
+                            address_by_field["formatted_address"] = t2
                         else:
-                            d["formatted_address"] = geo_data["features"][0]["place_name"]
-                        d["place_id"] = None
-                        d["geo_source"] = "mapbox"
+                            address_by_field["formatted_address"] = geo_data["features"][0]["place_name"]
+                        address_by_field["place_id"] = None
+                        address_by_field["geo_source"] = "mapbox"
                 except Exception as exc:
                     logger.debug("Mapbox geocoding failed for %s: %s", t_addr, exc)
 
-            if (sync_geocode or force_address_update) and not d["lat"]:
+            if (should_sync_geocode or should_force_address_update) and not address_by_field["lat"]:
                 try:
                     geocoder_parameter_map = {
                         request.app.config.get("GEOCODE_GOOGLE_STYLE_ADDRESS_PARAM"): t_addr,
@@ -10244,29 +10250,29 @@ async def get_npi(request, npi):
                     resp = await download_it(url)
                     geo_data = json.loads(resp)
                     if geo_data.get("results", []):
-                        d["long"] = geo_data["results"][0]["geometry"]["location"]["lng"]
-                        d["lat"] = geo_data["results"][0]["geometry"]["location"]["lat"]
-                        d["formatted_address"] = geo_data["results"][0]["formatted_address"]
-                        d["place_id"] = geo_data["results"][0]["place_id"]
-                        d["geo_source"] = "google"
+                        address_by_field["long"] = geo_data["results"][0]["geometry"]["location"]["lng"]
+                        address_by_field["lat"] = geo_data["results"][0]["geometry"]["location"]["lat"]
+                        address_by_field["formatted_address"] = geo_data["results"][0]["formatted_address"]
+                        address_by_field["place_id"] = geo_data["results"][0]["place_id"]
+                        address_by_field["geo_source"] = "google"
                 except Exception as exc:
                     logger.warning("Google geocoding failed for %s: %s", t_addr, exc)
 
-            if should_update_geo and d.get("lat"):
+            if should_update_geo and address_by_field.get("lat"):
                 request.app.add_task(
                     update_addr_coordinates(
-                        x,
-                        d["long"],
-                        d["lat"],
-                        d["formatted_address"],
-                        d["place_id"],
-                        d.get("geo_source"),
-                        d.get("geocode_source"),
-                        d.get("geocode_quality"),
+                        address_by_field,
+                        address_by_field["long"],
+                        address_by_field["lat"],
+                        address_by_field["formatted_address"],
+                        address_by_field["place_id"],
+                        address_by_field.get("geo_source"),
+                        address_by_field.get("geocode_source"),
+                        address_by_field.get("geocode_quality"),
                     )
                 )
 
-        return d
+        return address_by_field
 
     detail_build_map: dict[str, Any] = {
         "address_limit": address_limit,
@@ -10299,8 +10305,8 @@ async def get_npi(request, npi):
         ).encode("utf-8")
         if _is_npi_detail_response_cacheable(
             data,
-            force_address_update=force_address_update,
-            sync_geocode=sync_geocode,
+            force_address_update=should_force_address_update,
+            sync_geocode=should_sync_geocode,
         ):
             _npi_detail_response_cache_set(cache_key, response_body)
         return response.raw(response_body, content_type="application/json")
@@ -10332,7 +10338,11 @@ async def get_npi(request, npi):
                 include_role_evidence=include_evidence,
                 session=request_session,
             )
-        update_address_tasks = [_update_address(a) for a in addresses if a]
+        update_address_tasks = [
+            _update_address(address)
+            for address in addresses
+            if address
+        ]
         if update_address_tasks:
             data["address_list"] = list(await asyncio.gather(*update_address_tasks))
         else:
@@ -10440,8 +10450,8 @@ async def get_npi(request, npi):
     response_body = json.dumps(data, default=str, separators=(",", ":")).encode("utf-8")
     if _is_npi_detail_response_cacheable(
         data,
-        force_address_update=force_address_update,
-        sync_geocode=sync_geocode,
+        force_address_update=should_force_address_update,
+        sync_geocode=should_sync_geocode,
     ):
         _npi_detail_response_cache_set(cache_key, response_body)
     return response.raw(response_body, content_type="application/json")

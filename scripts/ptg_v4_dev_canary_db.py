@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import asyncpg
 
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    shape_v4_inferred_taxonomy_projection_manifest,
+)
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
     PTG2_V4_GRAPH_RESOURCE_FIELDS,
@@ -118,15 +121,24 @@ async def _collect_v4_database_rows(
         scope.schema_name,
         snapshot_key,
     )
+    exact_counts = await _exact_counts(
+        connection,
+        scope.schema_name,
+        snapshot_key,
+    )
+    inferred_taxonomy_candidates = await _inferred_taxonomy_candidates(
+        connection,
+        scope.schema_name,
+        snapshot_key,
+        npi_count=exact_counts["npi_count"],
+        pattern_count=exact_counts["pattern_count"],
+    )
     return {
         "snapshot": snapshot_by_field,
         "root": root_by_field,
-        "exact_counts": await _exact_counts(
-            connection,
-            scope.schema_name,
-            snapshot_key,
-        ),
+        "exact_counts": exact_counts,
         "relations": relation_rows,
+        "inferred_taxonomy_candidates": inferred_taxonomy_candidates,
         "heavy_owners": await _heavy_owner_diagnostics(
             connection,
             scope.schema_name,
@@ -218,6 +230,8 @@ async def _exact_counts(
     schema_name: str,
     snapshot_key: int,
 ) -> dict[str, int]:
+    """Collect exact candidate, map, graph, and pricing counts."""
+
     schema = _quote_identifier(schema_name)
     count_record = await connection.fetchrow(
         f"""
@@ -249,7 +263,39 @@ async def _exact_counts(
              FROM {schema}.ptg2_v4_provider_set_npi_prefix
             WHERE snapshot_key = $1)::bigint AS prefix_member_count,
           (SELECT COUNT(*) FROM {schema}.ptg2_v4_provider_graph_diagnostic
-            WHERE snapshot_key = $1)::bigint AS diagnostic_count
+            WHERE snapshot_key = $1)::bigint AS diagnostic_count,
+          (SELECT COUNT(*) FILTER (
+                    WHERE representation <> 'observe_v1'
+                  )
+             FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
+            WHERE snapshot_key = $1)::bigint
+            AS inferred_taxonomy_rule_count,
+          (SELECT COUNT(*) FILTER (
+                    WHERE representation = 'observe_v1'
+                  )
+             FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
+            WHERE snapshot_key = $1)::bigint
+            AS inferred_taxonomy_observe_only_rule_count,
+          (SELECT COALESCE(SUM(member_count), 0)
+             FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
+            WHERE snapshot_key = $1)::bigint
+            AS inferred_taxonomy_member_count,
+          (SELECT COALESCE(SUM(OCTET_LENGTH(member_keys)), 0)
+             FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
+            WHERE snapshot_key = $1)::bigint
+            AS inferred_taxonomy_packed_byte_count,
+          (SELECT COALESCE(SUM(pattern_count), 0)
+             FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
+            WHERE snapshot_key = $1)::bigint
+            AS inferred_taxonomy_pattern_count,
+          (SELECT COALESCE(SUM(pattern_member_count), 0)
+             FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
+            WHERE snapshot_key = $1)::bigint
+            AS inferred_taxonomy_pattern_member_count,
+          (SELECT COALESCE(SUM(OCTET_LENGTH(pattern_member_payload)), 0)
+             FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
+            WHERE snapshot_key = $1)::bigint
+            AS inferred_taxonomy_pattern_payload_byte_count
         """,
         snapshot_key,
     )
@@ -257,6 +303,68 @@ async def _exact_counts(
         field_name: int(field_count or 0)
         for field_name, field_count in dict(count_record).items()
     }
+
+
+async def _inferred_taxonomy_candidates(
+    connection: asyncpg.Connection,
+    schema_name: str,
+    snapshot_key: int,
+    *,
+    npi_count: int,
+    pattern_count: int,
+) -> dict[str, Any]:
+    """Rebuild the exact projection manifest from snapshot-owned rows."""
+
+    schema = _quote_identifier(schema_name)
+    candidate_records = await connection.fetch(
+        f"""
+        SELECT rule_digest,
+               catalog_contract,
+               catalog_digest,
+               vector_format,
+               member_count,
+               member_digest,
+               member_keys,
+               representation,
+               observe_reason,
+               observe_count_lower_bound,
+               pattern_count,
+               pattern_member_count,
+               pattern_member_bytes,
+               pattern_member_digest,
+               pattern_member_payload
+          FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
+         WHERE snapshot_key = $1
+         ORDER BY rule_digest
+        """,
+        snapshot_key,
+    )
+    return _shape_inferred_taxonomy_candidates(
+        candidate_records,
+        npi_count=npi_count,
+        pattern_count=pattern_count,
+    )
+
+
+def _shape_inferred_taxonomy_candidates(
+    candidate_records: Sequence[Mapping[str, Any]],
+    *,
+    npi_count: int,
+    pattern_count: int,
+) -> dict[str, Any]:
+    """Authenticate rows independently and produce their canonical evidence."""
+
+    rows = tuple(candidate_records)
+    if not rows:
+        # Legacy V4 layouts predate the sidecar and have no manifest to
+        # authenticate.  Keep absence explicit rather than fabricating an
+        # invalid zero-rule V2 descriptor.
+        return {}
+    return shape_v4_inferred_taxonomy_projection_manifest(
+        rows,
+        npi_count=int(npi_count),
+        pattern_count=int(pattern_count),
+    )
 
 
 async def _relation_manifests(

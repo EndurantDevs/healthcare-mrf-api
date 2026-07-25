@@ -2672,6 +2672,80 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_argument_map["radius_miles"] == 10.0
 
 
+@pytest.mark.asyncio
+async def test_plan_pricing_translates_only_online_work_budget_to_503(
+    monkeypatch,
+):
+    async def rejected_search(*_args, **_kwargs):
+        raise pricing_module.PTG2OnlineWorkBudgetExceeded("graph_pages")
+
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        rejected_search,
+    )
+    request = make_request(
+        [FakeResult(scalar=1)],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "70553",
+            "include_providers": "true",
+        },
+    )
+
+    endpoint_response = await list_providers_by_procedure(request)
+
+    assert endpoint_response.status == 503
+    assert json.loads(endpoint_response.body) == {
+        "error": {
+            "code": "ptg2_online_work_budget_exceeded",
+            "message": (
+                "The exact query exceeds this snapshot's sealed online work "
+                "budget."
+            ),
+            "dimension": "graph_pages",
+        }
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "integrity_error_type",
+    (
+        pricing_module.PTG2ManifestArtifactError,
+        pricing_module.PTG2SharedBlockError,
+    ),
+)
+async def test_plan_pricing_does_not_translate_ptg2_integrity_failure(
+    monkeypatch,
+    integrity_error_type,
+):
+    async def corrupt_search(*_args, **_kwargs):
+        raise integrity_error_type("candidate projection digest changed")
+
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        corrupt_search,
+    )
+    request = make_request(
+        [FakeResult(scalar=1)],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "70553",
+            "include_providers": "true",
+        },
+    )
+
+    with pytest.raises(
+        integrity_error_type,
+        match="candidate projection digest changed",
+    ):
+        await list_providers_by_procedure(request)
+
+
 def _configure_pricing_capacity_evidence(monkeypatch):
     """Configure a fresh, isolated Ed25519 evidence signer for this test."""
 

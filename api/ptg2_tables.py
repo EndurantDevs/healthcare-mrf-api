@@ -41,6 +41,9 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_RELATION_MANIFEST_TABLE,
     PTG2_V4_SHARED_GENERATION,
 )
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    validate_v4_inferred_taxonomy_projection_manifest,
+)
 from process.ptg_parts.ptg2_shared_source_set import (
     PTG2_V3_SOURCE_SET_CONTRACT,
     shared_source_set_metadata,
@@ -715,6 +718,13 @@ def _strict_v3_manifest_fields(
             raise PTG2ManifestArtifactError(
                 "PTG2 V4 provider graph metadata is invalid; reimport the snapshot"
             )
+        inferred_taxonomy_projection = provider_graph.get(
+            "inferred_taxonomy_candidates"
+        )
+        if inferred_taxonomy_projection is not None:
+            validate_v4_inferred_taxonomy_projection_manifest(
+                inferred_taxonomy_projection
+            )
 
     price_dictionary = serving_binary["price_dictionary"]
     membership = serving_binary["price_set_atom_memberships_v3"]
@@ -1275,6 +1285,7 @@ async def snapshot_serving_tables(
         )
     network_names = serving_index.get("network_names")
     provider_graph_v4_hot_prefix_by_field: dict[str, Any] | None = None
+    provider_graph_v4_inferred_taxonomy_candidates: dict[str, Any] | None = None
     if storage_generation == PTG2_V4_SHARED_GENERATION:
         serving_binary = serving_index.get("serving_binary")
         provider_graph = (
@@ -1293,6 +1304,17 @@ async def snapshot_serving_tables(
                 "reimport the snapshot"
             )
         provider_graph_v4_hot_prefix_by_field = dict(raw_hot_prefix)
+        raw_inferred_taxonomy_candidates = (
+            provider_graph.get("inferred_taxonomy_candidates")
+            if isinstance(provider_graph, dict)
+            else None
+        )
+        if raw_inferred_taxonomy_candidates is not None:
+            provider_graph_v4_inferred_taxonomy_candidates = (
+                validate_v4_inferred_taxonomy_projection_manifest(
+                    raw_inferred_taxonomy_candidates
+                )
+            )
     return PTG2ServingTables(
         snapshot_id=str(snapshot_id),
         arch_version=PTG2_V3_ARCH_VERSION,
@@ -1319,6 +1341,9 @@ async def snapshot_serving_tables(
         source_set=source_set_by_field,
         database_evidence=_database_execution_evidence(row_fields),
         provider_graph_v4_hot_prefix=provider_graph_v4_hot_prefix_by_field,
+        provider_graph_v4_inferred_taxonomy_candidates=(
+            provider_graph_v4_inferred_taxonomy_candidates
+        ),
         source_trace_set_hash=str(
             serving_index.get("source_trace_set_hash") or ""
         ).strip()

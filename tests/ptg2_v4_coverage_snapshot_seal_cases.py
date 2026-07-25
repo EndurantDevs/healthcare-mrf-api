@@ -103,6 +103,8 @@ async def _assert_persisted_metadata_summary(
     expected_summary,
     no_op,
 ) -> None:
+    """Assert persisted graph metadata is summarized without identity drift."""
+
     async def fake_aggregate(*_args, **_kwargs):
         return {
             "npi_count": 1,
@@ -135,6 +137,12 @@ async def _assert_persisted_metadata_summary(
     async def fake_resources(*_args, **_kwargs):
         return expected_metadata.provider_graph_resources
 
+    taxonomy_calls = []
+
+    async def fake_taxonomy_candidates(*_args, **kwargs):
+        taxonomy_calls.append(dict(kwargs))
+        return expected_metadata.inferred_taxonomy_candidates
+
     monkeypatch.setattr(snapshot_maps, "_load_metadata_aggregate", fake_aggregate)
     monkeypatch.setattr(snapshot_maps, "_load_relation_metadata", fake_relations)
     monkeypatch.setattr(snapshot_maps, "_load_entry_counts_by_kind", fake_counts)
@@ -150,6 +158,11 @@ async def _assert_persisted_metadata_summary(
         "_load_provider_graph_resources",
         fake_resources,
     )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "summarize_v4_inferred_taxonomy_candidates",
+        fake_taxonomy_candidates,
+    )
     observed_metadata = await snapshot_maps.summarize_persisted_v4_snapshot_metadata(
         object(),
         schema_name="mrf",
@@ -157,6 +170,15 @@ async def _assert_persisted_metadata_summary(
         map_summary=expected_summary,
     )
     assert observed_metadata == expected_metadata
+    assert taxonomy_calls == [
+        {
+            "schema_name": "mrf",
+            "snapshot_key": 17,
+            "npi_count": 1,
+            "pattern_count": 1,
+            "rules": snapshot_maps.INFERRED_PROVIDER_TAXONOMY_RULES,
+        }
+    ]
 
 
 async def _assert_new_layout_seal(monkeypatch, expected_summary):

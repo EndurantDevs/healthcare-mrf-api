@@ -5,6 +5,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+    validate_v4_inferred_taxonomy_projection_manifest,
+)
+
 
 PTG2_CANDIDATE_ARCH_VERSION = "postgres_binary_v3"
 PTG2_CANDIDATE_V3_GENERATION = "shared_blocks_v3"
@@ -15,6 +19,7 @@ PTG2_CANDIDATE_SUPPORTED_GENERATIONS = frozenset(
         PTG2_CANDIDATE_V4_GENERATION,
     }
 )
+_MISSING = object()
 
 
 def normalize_candidate_storage_generation(value: Any) -> str:
@@ -164,6 +169,81 @@ def _validate_v4_map_root(
         )
 
 
+def _optional_projection(
+    serving_index: Mapping[str, Any],
+    *,
+    sealed_layout: bool,
+) -> Any:
+    """Return one advertised projection or an exact missing sentinel."""
+
+    if sealed_layout:
+        serving_binary = serving_index.get("serving_binary")
+        if serving_binary is None:
+            return _MISSING
+        if not isinstance(serving_binary, Mapping):
+            raise ValueError(
+                "candidate V4 sealed serving binary is invalid"
+            )
+        provider_graph = serving_binary.get("provider_graph_v4")
+    else:
+        provider_graph = serving_index.get("provider_graph")
+    if provider_graph is None:
+        return _MISSING
+    if not isinstance(provider_graph, Mapping):
+        raise ValueError("candidate V4 provider graph manifest is invalid")
+    return provider_graph.get("inferred_taxonomy_candidates", _MISSING)
+
+
+def _validate_v4_inferred_taxonomy_projection(
+    serving_index: Mapping[str, Any],
+    layout_serving_index: Mapping[str, Any],
+) -> None:
+    """Bind every serving projection copy to the sealed canonical descriptor."""
+
+    projections = (
+        _optional_projection(serving_index, sealed_layout=False),
+        _optional_projection(serving_index, sealed_layout=True),
+        _optional_projection(layout_serving_index, sealed_layout=False),
+        _optional_projection(layout_serving_index, sealed_layout=True),
+    )
+    present_projections = tuple(
+        projection for projection in projections if projection is not _MISSING
+    )
+    if not present_projections:
+        # Compatibility path for V4 layouts sealed before the optional
+        # snapshot-local taxonomy projection existed.
+        return
+    if len(present_projections) != len(projections):
+        raise ValueError(
+            "candidate V4 inferred-taxonomy projection is missing from "
+            "its serving or sealed layout manifest"
+        )
+    first_projection = present_projections[0]
+    if not isinstance(first_projection, Mapping) or any(
+        not isinstance(projection, Mapping)
+        or dict(projection) != dict(first_projection)
+        for projection in present_projections[1:]
+    ):
+        raise ValueError(
+            "candidate V4 inferred-taxonomy projection changed after "
+            "layout sealing"
+        )
+    try:
+        canonical_projection = (
+            validate_v4_inferred_taxonomy_projection_manifest(
+                first_projection
+            )
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "candidate V4 inferred-taxonomy projection is invalid"
+        ) from exc
+    if dict(first_projection) != canonical_projection:
+        raise ValueError(
+            "candidate V4 inferred-taxonomy projection is not canonical"
+        )
+
+
 def validate_candidate_layout_identity(
     database_row: Mapping[str, Any],
     serving_index: Mapping[str, Any],
@@ -185,6 +265,10 @@ def validate_candidate_layout_identity(
     )
     _validate_v4_map_root(
         database_row,
+        serving_index,
+        layout_serving_index,
+    )
+    _validate_v4_inferred_taxonomy_projection(
         serving_index,
         layout_serving_index,
     )

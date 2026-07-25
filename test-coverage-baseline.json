@@ -77,6 +77,7 @@
         "api/ptg2_db_serving_v3.py",
         "api/ptg2_db_serving_v3_pages.py",
         "api/ptg2_db_sidecars.py",
+        "api/ptg2_online_work.py",
         "api/ptg2_response.py",
         "api/ptg2_serving.py",
         "api/ptg2_serving_utils.py",
@@ -346,6 +347,7 @@
         "process/ptg_parts/ptg2_v4_stale_metadata_report.py",
         "process/ptg_parts/ptg2_v4_stale_metadata_store.py",
         "process/ptg_parts/ptg2_v4_stale_metadata_types.py",
+        "process/ptg_parts/ptg2_v4_taxonomy_candidates.py",
         "process/ptg_parts/row_helpers.py",
         "process/ptg_parts/rust_scanner.py",
         "process/ptg_parts/rust_stage.py",
@@ -403,12 +405,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 31823,
-          "total": 37804
+          "covered": 32333,
+          "total": 38240
         },
         "lines": {
-          "covered": 102639,
-          "total": 112232
+          "covered": 104107,
+          "total": 113444
         }
       },
       "one_time_floor_reset": {
