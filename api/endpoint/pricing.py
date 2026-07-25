@@ -10041,7 +10041,12 @@ async def _procedure_taxonomy_code_context(
 ) -> tuple[list[int], dict[str, Any]]:
     """Resolve requested procedure coordinates or return explicit unmapped context."""
 
-    resolver_arg_map = dict(args)
+    # Sanic's RequestParameters stores every value as a list.  ``args.get``
+    # intentionally returns the scalar value expected by the pricing helpers,
+    # while ``dict(args)`` exposes the backing lists (for example ``["CPT"]``).
+    # Preserve the normal query-parameter semantics before handing the mapping
+    # to code-system normalization and crosswalk resolution.
+    resolver_arg_map = {key: args.get(key) for key in args.keys()}
     default_system = _reported_procedure_code_system(code) or INTERNAL_CODE_SYSTEM
     if not resolver_arg_map.get("code_system"):
         resolver_arg_map["code_system"] = default_system
