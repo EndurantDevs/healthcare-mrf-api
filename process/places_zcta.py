@@ -150,13 +150,13 @@ async def _detect_latest_year(csv_path: str) -> int:
 
 
 async def _flush_places_rows(
-    row_buffer: dict[tuple[str, int, str], dict[str, Any]],
+    place_by_key: dict[tuple[str, int, str], dict[str, Any]],
     target_cls,
 ) -> int:
-    if not row_buffer:
+    if not place_by_key:
         return 0
-    rows = list(row_buffer.values())
-    row_buffer.clear()
+    rows = list(place_by_key.values())
+    place_by_key.clear()
     await push_objects(rows, target_cls, rewrite=True, use_copy=False)
     return len(rows)
 
@@ -190,32 +190,39 @@ async def process_data(ctx, task=None):  # pragma: no cover
         )
 
         latest_year = await _detect_latest_year(tmp_filename)
-        row_buffer: dict[tuple[str, int, str], dict[str, Any]] = {}
+        place_by_key: dict[tuple[str, int, str], dict[str, Any]] = {}
         processed_rows = 0
         accepted_rows = 0
         matched_rows = 0
 
         async with async_open(tmp_filename, "r", encoding="utf-8-sig") as handle:
             reader = AsyncDictReader(handle, delimiter=",")
-            async for row in reader:
+            async for source_row in reader:
                 processed_rows += 1
-                record = _build_places_record(row, latest_year)
-                if not record:
+                place_record = _build_places_record(source_row, latest_year)
+                if not place_record:
                     continue
 
                 matched_rows += 1
-                key = (record["zcta"], record["year"], record["measure_id"])
-                row_buffer[key] = record
+                key = (
+                    place_record["zcta"],
+                    place_record["year"],
+                    place_record["measure_id"],
+                )
+                place_by_key[key] = place_record
 
-                if len(row_buffer) >= batch_size:
+                if len(place_by_key) >= batch_size:
                     await raise_if_cancelled(ctx, task)
-                    accepted_rows += await _flush_places_rows(row_buffer, target_cls)
+                    accepted_rows += await _flush_places_rows(
+                        place_by_key,
+                        target_cls,
+                    )
 
                 if test_mode and matched_rows >= test_row_limit:
                     break
 
         await raise_if_cancelled(ctx, task)
-        accepted_rows += await _flush_places_rows(row_buffer, target_cls)
+        accepted_rows += await _flush_places_rows(place_by_key, target_cls)
 
     if accepted_rows <= 0:
         raise RuntimeError(

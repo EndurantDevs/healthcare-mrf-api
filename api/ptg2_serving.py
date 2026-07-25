@@ -88,6 +88,8 @@ from api.ptg2_tables import (
 )
 from api.ptg2_types import PTG2ServingTables
 from api.ptg2_db_sidecars import (
+    ForwardReadBudget,
+    ForwardReadBudgetExceeded,
     lookup_serving_binary_by_code_from_db,
     lookup_code_prefix_rows_from_db,
     lookup_binary_code_batch_from_db,
@@ -2073,6 +2075,7 @@ async def _lookup_shared_forward_rows(
     *,
     provider_set_keys: Iterable[int] | None = None,
     provider_counts_by_key: Mapping[int, int] | None = None,
+    scan_budget: ForwardReadBudget | None = None,
 ):
     _require_strict_shared_v3(serving_tables)
     sparse_count_kwargs = (
@@ -2087,8 +2090,43 @@ async def _lookup_shared_forward_rows(
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
         source_count=_required_source_count(serving_tables),
         provider_set_keys=provider_set_keys,
+        scan_budget=scan_budget,
         **sparse_count_kwargs,
         **dictionary_hints,
+        schema_name=PTG2_SCHEMA,
+    )
+
+
+async def _lookup_shared_forward_prefix_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_key: int,
+    *,
+    provider_set_keys: Iterable[int] | None,
+    provider_counts_by_key: Mapping[int, int] | None,
+    limit: int,
+    descending: bool,
+    scan_budget: ForwardReadBudget | None,
+):
+    """Read one bounded exact prefix with a shared physical-work budget."""
+
+    _require_strict_shared_v3(serving_tables)
+    sparse_count_kwargs = (
+        {"provider_counts_by_key": provider_counts_by_key}
+        if provider_counts_by_key is not None
+        else {}
+    )
+    return await lookup_code_prefix_rows_from_db(
+        session,
+        int(code_key),
+        limit=int(limit),
+        descending=bool(descending),
+        shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+        source_count=_required_source_count(serving_tables),
+        provider_set_keys=provider_set_keys,
+        scan_budget=scan_budget,
+        **sparse_count_kwargs,
+        **_version_three_forward_lookup_hints(serving_tables),
         schema_name=PTG2_SCHEMA,
     )
 
@@ -2372,6 +2410,7 @@ async def _shared_rows_for_code(
     limit: int | None = None,
     offset: int = 0,
     descending: bool = False,
+    scan_budget: ForwardReadBudget | None = None,
 ) -> list[dict[str, Any]] | None:
     """Read strict shared code rows and materialize only one page."""
     code_key = code_data.get("code_key")
@@ -2400,6 +2439,7 @@ async def _shared_rows_for_code(
                 descending=descending,
                 shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
                 source_count=_required_source_count(serving_tables),
+                scan_budget=scan_budget,
                 **_version_three_forward_lookup_hints(serving_tables),
                 schema_name=PTG2_SCHEMA,
             )
@@ -2442,6 +2482,7 @@ async def _shared_rows_for_code(
         limit=limit,
         offset=offset,
         descending=descending,
+        scan_budget=scan_budget,
     )
 
 
@@ -2481,6 +2522,27 @@ class _ManifestCodeReadScope:
     source_trace_set_hash: str | None
     network_names: list[str]
     descending: bool
+    scan_budget: ForwardReadBudget | None
+
+
+_PTG2_PAGE_SCAN_MAX_RAW_BYTES = PTG2_SERVING_BINARY_V3_PAGE_ROWS * 32
+
+
+def _claim_forward_page_capacity(
+    scan_budget: ForwardReadBudget | None,
+    page_count: int,
+) -> None:
+    """Translate sealed page-probe admission into the public budget type."""
+
+    if scan_budget is None or page_count <= 0:
+        return
+    try:
+        scan_budget.claim_page_capacity(
+            page_count=page_count,
+            raw_payload_bytes=page_count * _PTG2_PAGE_SCAN_MAX_RAW_BYTES,
+        )
+    except ForwardReadBudgetExceeded as exc:
+        raise PTG2OnlineWorkBudgetExceeded("forward_scan") from exc
 
 
 async def _version_three_provider_filter_scope(
@@ -2491,6 +2553,7 @@ async def _version_three_provider_filter_scope(
     network_names: list[str],
     *,
     descending: bool,
+    scan_budget: ForwardReadBudget | None = None,
 ) -> _ManifestCodeReadScope:
     """Normalize one provider filter and read its bounded page projection."""
 
@@ -2499,15 +2562,21 @@ async def _version_three_provider_filter_scope(
         if provider_set_keys is not None
         else None
     )
+    uses_provider_pages = bool(
+        normalized_keys
+        and len(normalized_keys)
+        <= _PTG2_VERSION_THREE_PAGE_PROVIDER_SET_LIMIT
+        and not descending
+    )
+    if uses_provider_pages:
+        _claim_forward_page_capacity(scan_budget, len(normalized_keys or ()))
     provider_pages_by_key = (
         await _version_three_provider_pages_for_keys(
             session,
             serving_tables,
             normalized_keys,
         )
-        if normalized_keys
-        and len(normalized_keys) <= _PTG2_VERSION_THREE_PAGE_PROVIDER_SET_LIMIT
-        and not descending
+        if uses_provider_pages
         else None
     )
     return _ManifestCodeReadScope(
@@ -2516,6 +2585,7 @@ async def _version_three_provider_filter_scope(
         source_trace_set_hash=source_trace_set_hash,
         network_names=network_names,
         descending=descending,
+        scan_budget=scan_budget,
     )
 
 
@@ -2530,14 +2600,218 @@ async def _shared_rows_for_scope(
 ) -> list[dict[str, Any]] | None:
     """Read one code with a provider projection shared across variants."""
 
-    return await _shared_rows_for_code(
-        session, serving_tables, code_data=code_data,
-        provider_set_keys=read_scope.provider_set_keys,
-        provider_pages_by_key=read_scope.provider_pages_by_key,
-        source_trace_set_hash=read_scope.source_trace_set_hash,
-        network_names=read_scope.network_names, limit=limit, offset=offset,
-        descending=read_scope.descending,
+    try:
+        return await _shared_rows_for_code(
+            session, serving_tables, code_data=code_data,
+            provider_set_keys=read_scope.provider_set_keys,
+            provider_pages_by_key=read_scope.provider_pages_by_key,
+            source_trace_set_hash=read_scope.source_trace_set_hash,
+            network_names=read_scope.network_names, limit=limit, offset=offset,
+            descending=read_scope.descending,
+            scan_budget=read_scope.scan_budget,
+        )
+    except ForwardReadBudgetExceeded as exc:
+        raise PTG2OnlineWorkBudgetExceeded("forward_scan") from exc
+
+
+def _manifest_code_rows_by_key(
+    code_rows: Iterable[Mapping[str, Any]],
+) -> dict[int, list[Mapping[str, Any]]]:
+    """Group logical code identities by their one physical forward key."""
+
+    logical_rows_by_code_key: dict[int, list[Mapping[str, Any]]] = {}
+    for code_row in code_rows:
+        if code_row.get("code_key") is not None:
+            logical_rows_by_code_key.setdefault(
+                int(code_row["code_key"]),
+                [],
+            ).append(code_row)
+    return logical_rows_by_code_key
+
+
+def _manifest_code_group_rate_count(
+    logical_code_rows: Sequence[Mapping[str, Any]],
+) -> int:
+    """Require logical aliases of one physical code to agree on row count."""
+
+    declared_counts: set[int] = set()
+    for logical_code_row in logical_code_rows:
+        raw_count = logical_code_row.get("rate_count")
+        if isinstance(raw_count, bool) or raw_count is None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 code variant is missing its declared rate count"
+            )
+        try:
+            declared_count = int(raw_count)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 code variant has an invalid declared rate count"
+            ) from exc
+        if declared_count < 0:
+            raise PTG2ManifestArtifactError(
+                "PTG2 code variant has an invalid declared rate count"
+            )
+        declared_counts.add(declared_count)
+    if len(declared_counts) != 1:
+        raise PTG2ManifestArtifactError(
+            "PTG2 logical code variants disagree on physical rate count"
+        )
+    return declared_counts.pop()
+
+
+def _reserve_manifest_code_merge_capacity(
+    scan_budget: ForwardReadBudget | None,
+    logical_rows_by_code_key: Mapping[int, Sequence[Mapping[str, Any]]],
+    per_code_limit: int | None,
+    retained_row_count: int,
+) -> tuple[int, int] | None:
+    """Admit physical and logical code multiplicity before any code read."""
+
+    if scan_budget is not None and per_code_limit is None:
+        raise PTG2OnlineWorkBudgetExceeded("forward_scan")
+    retained_rows = max(int(retained_row_count), 0)
+    read_rows = retained_rows
+    result_rows = retained_rows
+    for logical_code_rows in logical_rows_by_code_key.values():
+        declared_rate_count = _manifest_code_group_rate_count(
+            logical_code_rows
+        )
+        physical_row_capacity = (
+            min(per_code_limit, declared_rate_count)
+            if per_code_limit is not None
+            else declared_rate_count
+        )
+        read_rows += physical_row_capacity
+        result_rows += physical_row_capacity * len(logical_code_rows)
+    if scan_budget is None:
+        return None
+    try:
+        scan_budget.reserve_row_capacity(
+            read_rows=read_rows,
+            result_rows=result_rows,
+        )
+    except ForwardReadBudgetExceeded as exc:
+        raise PTG2OnlineWorkBudgetExceeded("forward_scan") from exc
+    return read_rows, result_rows
+
+
+async def _read_manifest_code_groups(
+    session,
+    serving_tables: PTG2ServingTables,
+    logical_rows_by_code_key: Mapping[int, Sequence[Mapping[str, Any]]],
+    read_scope: _ManifestCodeReadScope,
+    per_code_limit: int | None,
+) -> list[dict[str, Any]] | None:
+    """Read admitted physical codes and clone their logical identities."""
+
+    combined_rows: list[dict[str, Any]] = []
+    for logical_code_rows in logical_rows_by_code_key.values():
+        variant_rows = await _shared_rows_for_scope(
+            session,
+            serving_tables,
+            logical_code_rows[0],
+            read_scope,
+            limit=per_code_limit,
+            offset=0,
+        )
+        if variant_rows is None:
+            return None
+        declared_rate_count = _manifest_code_group_rate_count(
+            logical_code_rows
+        )
+        admitted_row_count = (
+            declared_rate_count
+            if per_code_limit is None
+            else min(per_code_limit, declared_rate_count)
+        )
+        if len(variant_rows) > admitted_row_count:
+            raise PTG2ManifestArtifactError(
+                "PTG2 code variant exceeds its declared rate count"
+            )
+        for logical_code_row in logical_code_rows:
+            combined_rows.extend(
+                {
+                    **variant_row,
+                    "plan_id": logical_code_row.get("plan_id"),
+                    "plan_market_type": logical_code_row.get(
+                        "plan_market_type"
+                    ),
+                }
+                for variant_row in variant_rows
+            )
+    return combined_rows
+
+
+@dataclass(frozen=True)
+class _ManifestCodeMergeScope:
+    """Pre-admitted inputs shared by every physical code in one merge."""
+
+    logical_rows_by_code_key: Mapping[
+        int,
+        Sequence[Mapping[str, Any]],
+    ]
+    provider_set_keys: Iterable[int] | None
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    per_code_limit: int | None
+    descending: bool
+    scan_budget: ForwardReadBudget | None
+
+
+async def _read_manifest_code_merge(
+    session,
+    serving_tables: PTG2ServingTables,
+    merge_scope: _ManifestCodeMergeScope,
+) -> list[dict[str, Any]] | None:
+    """Read all admitted physical code groups under one provider scope."""
+
+    uses_fast_code_pages = bool(
+        merge_scope.provider_set_keys is None
+        and merge_scope.per_code_limit is not None
+        and merge_scope.per_code_limit <= PTG2_SERVING_BINARY_V3_PAGE_ROWS
+        and not merge_scope.descending
     )
+    if uses_fast_code_pages:
+        _claim_forward_page_capacity(
+            merge_scope.scan_budget,
+            len(merge_scope.logical_rows_by_code_key),
+        )
+    read_scope = await _version_three_provider_filter_scope(
+        session,
+        serving_tables,
+        merge_scope.provider_set_keys,
+        merge_scope.source_trace_set_hash,
+        merge_scope.network_names,
+        descending=merge_scope.descending,
+        scan_budget=merge_scope.scan_budget,
+    )
+    return await _read_manifest_code_groups(
+        session,
+        serving_tables,
+        merge_scope.logical_rows_by_code_key,
+        read_scope,
+        merge_scope.per_code_limit,
+    )
+
+
+def _manifest_code_merge_window(
+    combined_rows: list[dict[str, Any]],
+    *,
+    start: int,
+    limit: int | None,
+    descending: bool,
+) -> list[dict[str, Any]]:
+    """Sort admitted logical rows and retain only the requested window."""
+
+    combined_rows.sort(
+        key=lambda merged_row: _manifest_response_row_order_for_direction(
+            merged_row,
+            descending=descending,
+        )
+    )
+    if limit is None:
+        return combined_rows[start:]
+    return combined_rows[start : start + max(int(limit), 0)]
 
 
 async def _merge_manifest_code_variant_rows(
@@ -2551,52 +2825,52 @@ async def _merge_manifest_code_variant_rows(
     limit: int | None,
     offset: int,
     descending: bool = False,
+    scan_budget: ForwardReadBudget | None = None,
+    retained_row_count: int = 0,
 ) -> list[dict[str, Any]] | None:
     """Merge one ordered serving window across compatible persisted code forms."""
 
-    read_scope = await _version_three_provider_filter_scope(
-        session, serving_tables, provider_set_keys,
-        source_trace_set_hash, network_names, descending=descending,
-    )
-    if len(code_rows) == 1:
-        return await _shared_rows_for_scope(
-            session, serving_tables, code_rows[0], read_scope,
-            limit=limit, offset=offset,
-        )
     start = max(int(offset), 0)
+    if limit is not None and max(int(limit), 0) == 0:
+        return []
     per_code_limit = None if limit is None else start + max(int(limit), 0)
-    logical_rows_by_code_key: dict[int, list[Mapping[str, Any]]] = {}
-    for code_row in code_rows:
-        if code_row.get("code_key") is None:
-            continue
-        logical_rows_by_code_key.setdefault(int(code_row["code_key"]), []).append(code_row)
-    combined_rows: list[dict[str, Any]] = []
-    for logical_code_rows in logical_rows_by_code_key.values():
-        physical_code_row = logical_code_rows[0]
-        variant_rows = await _shared_rows_for_scope(
-            session, serving_tables, physical_code_row, read_scope,
-            limit=per_code_limit, offset=0,
+    logical_rows_by_code_key = _manifest_code_rows_by_key(code_rows)
+    if not logical_rows_by_code_key:
+        return []
+    row_reservation = _reserve_manifest_code_merge_capacity(
+        scan_budget,
+        logical_rows_by_code_key,
+        per_code_limit,
+        retained_row_count,
+    )
+    try:
+        combined_rows = await _read_manifest_code_merge(
+            session,
+            serving_tables,
+            _ManifestCodeMergeScope(
+                logical_rows_by_code_key=logical_rows_by_code_key,
+                provider_set_keys=provider_set_keys,
+                source_trace_set_hash=source_trace_set_hash,
+                network_names=network_names,
+                per_code_limit=per_code_limit,
+                descending=descending,
+                scan_budget=scan_budget,
+            ),
         )
-        if variant_rows is None:
+        if combined_rows is None:
             return None
-        for logical_code_row in logical_code_rows:
-            combined_rows.extend(
-                {
-                    **variant_row,
-                    "plan_id": logical_code_row.get("plan_id"),
-                    "plan_market_type": logical_code_row.get("plan_market_type"),
-                }
-                for variant_row in variant_rows
-            )
-    combined_rows.sort(
-        key=lambda row: _manifest_response_row_order_for_direction(
-            row,
+        return _manifest_code_merge_window(
+            combined_rows,
+            start=start,
+            limit=limit,
             descending=descending,
         )
-    )
-    if limit is None:
-        return combined_rows[start:]
-    return combined_rows[start : start + max(int(limit), 0)]
+    finally:
+        if scan_budget is not None and row_reservation is not None:
+            scan_budget.release_row_capacity(
+                read_rows=row_reservation[0],
+                result_rows=row_reservation[1],
+            )
 
 
 async def _version_three_projected_code_rows(
@@ -2631,6 +2905,53 @@ async def _version_three_projected_code_rows(
     }
 
 
+@dataclass(frozen=True)
+class _SharedForwardSelection:
+    """One full or bounded forward read after page projection misses."""
+
+    provider_set_keys: Iterable[int] | None
+    provider_counts_by_key: Mapping[int, int] | None
+    limit: int | None
+    offset: int
+    descending: bool
+    scan_budget: ForwardReadBudget | None
+
+
+async def _selected_shared_forward_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_key: int,
+    selection: _SharedForwardSelection,
+):
+    """Retain a bounded prefix unless the caller requests the full block."""
+
+    if selection.limit is None:
+        return await _lookup_shared_forward_rows(
+            session,
+            serving_tables,
+            code_key,
+            provider_set_keys=selection.provider_set_keys,
+            provider_counts_by_key=selection.provider_counts_by_key,
+            scan_budget=selection.scan_budget,
+        )
+    prefix_end = max(int(selection.offset), 0) + max(
+        int(selection.limit),
+        0,
+    )
+    if prefix_end == 0:
+        return ()
+    return await _lookup_shared_forward_prefix_rows(
+        session,
+        serving_tables,
+        code_key,
+        provider_set_keys=selection.provider_set_keys,
+        provider_counts_by_key=selection.provider_counts_by_key,
+        limit=prefix_end,
+        descending=selection.descending,
+        scan_budget=selection.scan_budget,
+    )
+
+
 async def _full_shared_code_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -2643,6 +2964,7 @@ async def _full_shared_code_rows(
     limit: int | None,
     offset: int,
     descending: bool,
+    scan_budget: ForwardReadBudget | None,
 ) -> list[dict[str, Any]]:
     """Read and materialize an authoritative complete by-code block."""
 
@@ -2653,12 +2975,18 @@ async def _full_shared_code_rows(
     )
     if projected_rows is not None:
         return projected_rows
-    forward_rows = await _lookup_shared_forward_rows(
+    forward_rows = await _selected_shared_forward_rows(
         session,
         serving_tables,
         code_key,
-        provider_set_keys=provider_set_keys,
-        provider_counts_by_key=provider_counts_by_key,
+        _SharedForwardSelection(
+            provider_set_keys=provider_set_keys,
+            provider_counts_by_key=provider_counts_by_key,
+            limit=limit,
+            offset=offset,
+            descending=descending,
+            scan_budget=scan_budget,
+        )
     )
     if not forward_rows:
         await _raise_missing_v3_block(session, serving_tables, code_key)
@@ -10846,6 +11174,47 @@ def _v4_pattern_candidate_prefix(
     return tuple(selected_occurrences), True
 
 
+def _is_v4_rate_prefix_exhausted(
+    code_rows: Iterable[Mapping[str, Any]],
+    serving_rows: Sequence[Mapping[str, Any]],
+    *,
+    rate_window: int,
+) -> bool:
+    """Return whether one authenticated prefix covers every declared row."""
+
+    declared_occurrences = sum(
+        max(int(code_row.get("rate_count") or 0), 0)
+        for code_row in code_rows
+    )
+    expected_row_count = min(int(rate_window), declared_occurrences)
+    if len(serving_rows) != expected_row_count:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy rate prefix is incomplete"
+        )
+    return int(rate_window) >= declared_occurrences
+
+
+def _next_v4_taxonomy_rate_window(
+    current_window: int,
+    *,
+    target_count: int,
+    distinct_count: int,
+    declared_occurrences: int,
+    maximum_occurrences: int,
+) -> int:
+    """Grow an exact rate prefix without crossing its sealed online cap."""
+
+    return min(
+        int(maximum_occurrences),
+        _next_provider_expansion_rate_window(
+            int(current_window),
+            target_count=max(int(target_count), 1),
+            distinct_count=max(int(distinct_count), 0),
+            declared_rate_count=max(int(declared_occurrences), 0),
+        ),
+    )
+
+
 def _v4_selected_pattern_memberships(
     selected_npi_keys: tuple[int, ...],
     npi_keys_by_pattern: Mapping[int, tuple[int, ...]],
@@ -10894,6 +11263,177 @@ def _v4_selected_pattern_memberships(
     return provider_set_ids_by_npi_key
 
 
+def _validate_v4_pattern_ranked_memberships(
+    selected_occurrences: tuple[tuple[int, int], ...],
+    prefix_rows: Sequence[Mapping[str, Any]],
+    provider_set_ids_by_npi_key: Mapping[int, tuple[str, ...]],
+    provider_set_id_by_key: Mapping[int, str],
+) -> None:
+    """Require completion to retain every provider-set ranking witness."""
+
+    for row_index, npi_key in selected_occurrences:
+        witness_provider_set_key = int(
+            prefix_rows[row_index]["_ptg_provider_set_key"]
+        )
+        witness_provider_set_id = provider_set_id_by_key.get(
+            witness_provider_set_key
+        )
+        if (
+            witness_provider_set_id is None
+            or witness_provider_set_id
+            not in provider_set_ids_by_npi_key.get(npi_key, ())
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 inferred-taxonomy completion lost a ranked membership"
+            )
+
+
+async def _v4_pattern_completion_projection(
+    session,
+    *,
+    snapshot_key: int,
+    selected_npi_keys: tuple[int, ...],
+    npi_keys_by_pattern: Mapping[int, tuple[int, ...]],
+    max_members: int,
+) -> tuple[tuple[int, ...], dict[int, tuple[int, ...]]]:
+    """Resolve every set reached by patterns of the selected provider NPIs."""
+
+    selected_npi_key_set = frozenset(selected_npi_keys)
+    selected_pattern_keys = tuple(
+        sorted(
+            pattern_key
+            for pattern_key, pattern_npi_keys in npi_keys_by_pattern.items()
+            if not selected_npi_key_set.isdisjoint(pattern_npi_keys)
+        )
+    )
+    if not selected_pattern_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy selected candidate lost its pattern"
+        )
+    try:
+        provider_set_keys_by_pattern = await lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation="pattern_sets",
+            owner_keys=selected_pattern_keys,
+            schema_name=PTG2_SCHEMA,
+            max_members=max_members,
+        )
+    except PTG2SharedBlockError as exc:
+        if str(exc) != "PTG V4 graph selection exceeds max_members":
+            raise
+        raise PTG2OnlineWorkBudgetExceeded(
+            "retained_memberships"
+        ) from exc
+    if set(provider_set_keys_by_pattern) != set(selected_pattern_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy pattern-set projection is incomplete"
+        )
+    pattern_keys_by_set: dict[int, list[int]] = defaultdict(list)
+    for pattern_key in selected_pattern_keys:
+        for provider_set_key in provider_set_keys_by_pattern[pattern_key]:
+            pattern_keys_by_set[int(provider_set_key)].append(
+                int(pattern_key)
+            )
+    return (
+        tuple(sorted(pattern_keys_by_set)),
+        {
+            provider_set_key: tuple(pattern_keys)
+            for provider_set_key, pattern_keys in pattern_keys_by_set.items()
+        },
+    )
+
+
+@dataclass(frozen=True)
+class _V4PatternCompletionRequest:
+    """Inputs and sealed caps for one selected-pattern completion."""
+
+    code_rows: list[Mapping[str, Any]]
+    prefix_rows: list[dict[str, Any]]
+    candidate_provider_set_keys: tuple[int, ...]
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    descending: bool
+    is_source_exhausted: bool
+    maximum_occurrences: int
+    maximum_code_sets: int
+    scan_budget: ForwardReadBudget
+
+
+async def _v4_pattern_completion_rate_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _V4PatternCompletionRequest,
+) -> list[dict[str, Any]]:
+    """Read only exact-code rates reached by the selected patterns."""
+
+    candidate_key_set = frozenset(request.candidate_provider_set_keys)
+    if request.is_source_exhausted:
+        return [
+            serving_row
+            for serving_row in request.prefix_rows
+            if int(serving_row["_ptg_provider_set_key"]) in candidate_key_set
+        ]
+    remaining_occurrences = request.maximum_occurrences - len(
+        request.prefix_rows
+    )
+    if remaining_occurrences < 0:
+        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+    completion_rows = await _merge_manifest_code_variant_rows(
+        session,
+        serving_tables,
+        code_rows=request.code_rows,
+        provider_set_keys=request.candidate_provider_set_keys,
+        source_trace_set_hash=request.source_trace_set_hash,
+        network_names=request.network_names,
+        limit=remaining_occurrences + 1,
+        offset=0,
+        descending=request.descending,
+        scan_budget=request.scan_budget,
+        retained_row_count=len(request.prefix_rows),
+    )
+    if completion_rows is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy completion rows are unavailable"
+        )
+    return completion_rows
+
+
+async def _v4_pattern_completion_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _V4PatternCompletionRequest,
+) -> tuple[list[dict[str, Any]], dict[int, str]]:
+    """Read all exact-code rates belonging to selected provider patterns."""
+
+    completion_rows = await _v4_pattern_completion_rate_rows(
+        session,
+        serving_tables,
+        request,
+    )
+    completion_work = (
+        len(request.prefix_rows)
+        if request.is_source_exhausted
+        else len(request.prefix_rows) + len(completion_rows)
+    )
+    if completion_work > request.maximum_occurrences:
+        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+    provider_set_id_by_key = _v4_rate_scope_set_ids(
+        completion_rows,
+        request.candidate_provider_set_keys,
+    )
+    prefix_provider_set_keys = {
+        int(prefix_row["_ptg_provider_set_key"])
+        for prefix_row in request.prefix_rows
+    }
+    if (
+        len(prefix_provider_set_keys | set(provider_set_id_by_key))
+        > request.maximum_code_sets
+    ):
+        raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    return completion_rows, provider_set_id_by_key
+
+
 async def _select_v4_pattern_taxonomy_expansion(
     session,
     serving_tables: PTG2ServingTables,
@@ -10911,40 +11451,46 @@ async def _select_v4_pattern_taxonomy_expansion(
     """Serve one exact pattern quotient with bounded, target-first work."""
 
     normalized_target_count = max(int(target_count), 1)
+    _v4_provider_expansion_request_caps(
+        serving_tables,
+        target_count=normalized_target_count,
+    )
     maximum_occurrences = int(
         projection_rule.max_online_filtered_reverse_code_occurrences
     )
-    serving_rows = await _merge_manifest_code_variant_rows(
-        session,
-        serving_tables,
-        code_rows=code_rows,
-        provider_set_keys=None,
-        source_trace_set_hash=source_trace_set_hash,
-        network_names=network_names,
-        limit=maximum_occurrences + 1,
-        offset=0,
-        descending=descending,
-    )
-    if serving_rows is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 filtered reverse rate rows are unavailable"
-        )
-    if len(serving_rows) > maximum_occurrences:
+    if maximum_occurrences <= 0:
         raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
-    provider_set_id_by_key = _v4_rate_scope_set_ids(
-        serving_rows,
-        None,
+    declared_occurrences = sum(
+        max(int(code_row.get("rate_count") or 0), 0)
+        for code_row in code_rows
     )
-    provider_set_keys = tuple(sorted(provider_set_id_by_key))
-    if (
-        len(provider_set_keys)
-        > int(projection_rule.max_online_filtered_reverse_code_sets)
-    ):
-        raise PTG2OnlineWorkBudgetExceeded("code_sets")
-    if not provider_set_keys:
+    if declared_occurrences == 0:
         return _ProviderExpansionSelection([], {}, {}, True)
+    scan_budget = ForwardReadBudget(
+        maximum_fragments=int(
+            projection_rule.max_online_inferred_taxonomy_graph_pages
+        ),
+        maximum_raw_payload_bytes=int(
+            projection_rule.max_online_inferred_taxonomy_graph_bytes
+        ),
+        maximum_row_capacity=maximum_occurrences + 1,
+    )
+    rate_window = min(
+        maximum_occurrences,
+        PTG2_SERVING_BINARY_V3_PAGE_ROWS,
+        declared_occurrences,
+    )
     pattern_keys = tuple(sorted(candidates.npi_keys_by_pattern))
     snapshot_key = _required_shared_snapshot_key(serving_tables)
+    serving_rows: list[dict[str, Any]] = []
+    provider_set_id_by_key: dict[int, str] = {}
+    pattern_keys_by_set: dict[int, tuple[int, ...]] = {}
+    selected_occurrences: tuple[tuple[int, int], ...] = ()
+    selected_npi_keys: tuple[int, ...] = ()
+    completion_provider_set_keys: tuple[int, ...] = ()
+    completion_pattern_keys_by_set: dict[int, tuple[int, ...]] = {}
+    is_candidate_prefix_exhausted = False
+    is_source_exhausted = False
     with (
         v4_graph_request_scope(),
         v4_graph_taxonomy_projection_scope(
@@ -10962,33 +11508,118 @@ async def _select_v4_pattern_taxonomy_expansion(
             ),
         ),
     ):
-        pattern_keys_by_set = await lookup_v4_relation_intersections(
-            session,
-            snapshot_key=snapshot_key,
-            relation="set_patterns",
-            owner_keys=provider_set_keys,
-            allowed_member_keys=pattern_keys,
-            schema_name=PTG2_SCHEMA,
-            max_members=None,
-        )
-    if set(pattern_keys_by_set) != set(provider_set_keys) or any(
-        not set(set_pattern_keys).issubset(pattern_keys)
-        for set_pattern_keys in pattern_keys_by_set.values()
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 inferred-taxonomy set-pattern projection is incomplete"
-        )
-    selected_occurrences, exhausted = _v4_pattern_candidate_prefix(
-        serving_rows,
-        pattern_keys_by_set,
-        candidates.npi_keys_by_pattern,
-        target_count=normalized_target_count,
-    )
+        while True:
+            serving_rows = await _merge_manifest_code_variant_rows(
+                session,
+                serving_tables,
+                code_rows=code_rows,
+                provider_set_keys=None,
+                source_trace_set_hash=source_trace_set_hash,
+                network_names=network_names,
+                limit=rate_window,
+                offset=0,
+                descending=descending,
+                scan_budget=scan_budget,
+            )
+            if serving_rows is None:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 V4 filtered reverse rate rows are unavailable"
+                )
+            provider_set_id_by_key = _v4_rate_scope_set_ids(
+                serving_rows,
+                None,
+            )
+            provider_set_keys = tuple(sorted(provider_set_id_by_key))
+            if len(provider_set_keys) > int(
+                projection_rule.max_online_filtered_reverse_code_sets
+            ):
+                raise PTG2OnlineWorkBudgetExceeded("code_sets")
+            new_provider_set_keys = tuple(
+                provider_set_key
+                for provider_set_key in provider_set_keys
+                if provider_set_key not in pattern_keys_by_set
+            )
+            if new_provider_set_keys:
+                new_pattern_keys_by_set = (
+                    await lookup_v4_relation_intersections(
+                        session,
+                        snapshot_key=snapshot_key,
+                        relation="set_patterns",
+                        owner_keys=new_provider_set_keys,
+                        allowed_member_keys=pattern_keys,
+                        schema_name=PTG2_SCHEMA,
+                        max_members=None,
+                    )
+                )
+                if set(new_pattern_keys_by_set) != set(
+                    new_provider_set_keys
+                ) or any(
+                    not set(set_pattern_keys).issubset(pattern_keys)
+                    for set_pattern_keys in new_pattern_keys_by_set.values()
+                ):
+                    raise PTG2ManifestArtifactError(
+                        "PTG2 V4 inferred-taxonomy set-pattern projection is incomplete"
+                    )
+                pattern_keys_by_set.update(new_pattern_keys_by_set)
+            selected_occurrences, is_candidate_prefix_exhausted = (
+                _v4_pattern_candidate_prefix(
+                    serving_rows,
+                    pattern_keys_by_set,
+                    candidates.npi_keys_by_pattern,
+                    target_count=normalized_target_count,
+                )
+            )
+            is_source_exhausted = _is_v4_rate_prefix_exhausted(
+                code_rows,
+                serving_rows,
+                rate_window=rate_window,
+            )
+            if (
+                len(selected_occurrences) >= normalized_target_count
+                or is_source_exhausted
+            ):
+                break
+            if rate_window >= maximum_occurrences:
+                raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+            next_window = _next_v4_taxonomy_rate_window(
+                rate_window,
+                target_count=normalized_target_count,
+                distinct_count=len(selected_occurrences),
+                declared_occurrences=declared_occurrences,
+                maximum_occurrences=maximum_occurrences,
+            )
+            if next_window <= rate_window:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 V4 inferred-taxonomy rate prefix did not make progress"
+                )
+            serving_rows.clear()
+            rate_window = next_window
+        if selected_occurrences:
+            selected_npi_keys = tuple(
+                dict.fromkeys(
+                    npi_key
+                    for _row_index, npi_key in selected_occurrences
+                )
+            )
+            (
+                completion_provider_set_keys,
+                completion_pattern_keys_by_set,
+            ) = await _v4_pattern_completion_projection(
+                session,
+                snapshot_key=snapshot_key,
+                selected_npi_keys=selected_npi_keys,
+                npi_keys_by_pattern=candidates.npi_keys_by_pattern,
+                max_members=int(
+                    projection_rule.max_online_inferred_taxonomy_retained_memberships
+                ),
+            )
     if not selected_occurrences:
-        return _ProviderExpansionSelection([], {}, {}, True)
-    selected_npi_keys = tuple(
-        dict.fromkeys(npi_key for _row_index, npi_key in selected_occurrences)
-    )
+        return _ProviderExpansionSelection(
+            [],
+            {},
+            {},
+            is_source_exhausted and is_candidate_prefix_exhausted,
+        )
     npi_by_key = await v4_npi_values_for_keys(
         session,
         snapshot_key=snapshot_key,
@@ -11002,14 +11633,56 @@ async def _select_v4_pattern_taxonomy_expansion(
         raise PTG2ManifestArtifactError(
             "PTG2 V4 inferred-taxonomy NPI dictionary is incomplete"
         )
+    rank_by_key = {
+        _provider_expansion_key(
+            serving_rows[row_index],
+            npi=int(npi_by_key[npi_key]),
+        ): rank
+        for rank, (row_index, npi_key) in enumerate(selected_occurrences)
+    }
+    if len(rank_by_key) != len(selected_occurrences):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy dense ranking is not unique"
+        )
+    completion_rows, provider_set_id_by_key = (
+        await _v4_pattern_completion_rows(
+            session,
+            serving_tables,
+            _V4PatternCompletionRequest(
+                code_rows=code_rows,
+                prefix_rows=serving_rows,
+                candidate_provider_set_keys=completion_provider_set_keys,
+                source_trace_set_hash=source_trace_set_hash,
+                network_names=network_names,
+                descending=descending,
+                is_source_exhausted=is_source_exhausted,
+                maximum_occurrences=maximum_occurrences,
+                maximum_code_sets=int(
+                    projection_rule.max_online_filtered_reverse_code_sets
+                ),
+                scan_budget=scan_budget,
+            ),
+        )
+    )
     memberships_by_npi_key = _v4_selected_pattern_memberships(
         selected_npi_keys,
         candidates.npi_keys_by_pattern,
-        pattern_keys_by_set,
+        {
+            provider_set_key: completion_pattern_keys_by_set[
+                provider_set_key
+            ]
+            for provider_set_key in provider_set_id_by_key
+        },
         provider_set_id_by_key,
         max_members=int(
             projection_rule.max_online_inferred_taxonomy_retained_memberships
         ),
+    )
+    _validate_v4_pattern_ranked_memberships(
+        selected_occurrences,
+        serving_rows,
+        memberships_by_npi_key,
+        provider_set_id_by_key,
     )
     selected_npis = tuple(int(npi_by_key[npi_key]) for npi_key in selected_npi_keys)
     provider_set_ids_by_npi = {
@@ -11023,23 +11696,12 @@ async def _select_v4_pattern_taxonomy_expansion(
     }
     completion_rows = [
         serving_row
-        for serving_row in serving_rows
+        for serving_row in completion_rows
         if _ptg2_manifest_id(
             serving_row.get("provider_set_global_id_128")
         )
         in retained_provider_set_ids
     ]
-    rank_by_key = {
-        _provider_expansion_key(
-            serving_rows[row_index],
-            npi=int(npi_by_key[npi_key]),
-        ): rank
-        for rank, (row_index, npi_key) in enumerate(selected_occurrences)
-    }
-    if len(rank_by_key) != len(selected_occurrences):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 inferred-taxonomy dense ranking is not unique"
-        )
     providers_by_set = await _selected_provider_rows_by_set(
         session,
         serving_tables,
@@ -11056,7 +11718,7 @@ async def _select_v4_pattern_taxonomy_expansion(
         row_data=completion_rows,
         providers_by_set=providers_by_set,
         rank_by_key=rank_by_key,
-        exhausted=exhausted,
+        exhausted=is_source_exhausted and is_candidate_prefix_exhausted,
     )
 
 

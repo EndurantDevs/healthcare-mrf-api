@@ -91,27 +91,29 @@ async def get_issuer_data(request, issuer_id):
 
     plans_result = await session.execute(plans_stmt)
     plans = []
-    seen = {}
+    plan_by_key = {}
 
-    for row in plans_result:
-        row_dict = _row_to_dict(row)
+    for plan_result_row in plans_result:
+        row_dict = _row_to_dict(plan_result_row)
         plan_key = (row_dict.get("plan_id"), row_dict.get("year"))
 
-        plan_entry = seen.get(plan_key)
-        if plan_entry is None:
-            plan_entry = {
+        plan_data_by_field = plan_by_key.get(plan_key)
+        if plan_data_by_field is None:
+            plan_data_by_field = {
                 column.name: row_dict.get(column.name)
                 for column in plan_table.c
             }
-            plan_entry["network"] = {"cmsgov_network": plan_entry.get("network")}
-            seen[plan_key] = plan_entry
-            plans.append(plan_entry)
+            plan_data_by_field["network"] = {
+                "cmsgov_network": plan_data_by_field.get("network")
+            }
+            plan_by_key[plan_key] = plan_data_by_field
+            plans.append(plan_data_by_field)
 
         checksum_network = row_dict.get("network_checksum")
         network_tier = row_dict.get("network_tier_value")
         if checksum_network is not None:
             display_name = (network_tier or "N/A").replace("-", " ").replace("  ", " ")
-            plan_entry["network"].update(
+            plan_data_by_field["network"].update(
                 {
                     "network_tier": network_tier or "N/A",
                     "display_name": display_name,
@@ -142,7 +144,7 @@ async def get_issuer_data(request, issuer_id):
     stats_result = await session.execute(stats_stmt)
     stats_row = stats_result.first()
     stats_map = getattr(stats_row, "_mapping", {}) if stats_row else {}
-    drug_summary = {
+    drug_summary_by_field = {
         "total_drugs": int(stats_map.get("total_drugs") or 0),
         "authorization": {
             "required": int(stats_map.get("auth_required") or 0),
@@ -174,19 +176,19 @@ async def get_issuer_data(request, issuer_id):
     )
     tier_rows = (await session.execute(tier_stmt)).all()
     tiers = []
-    for row in tier_rows:
-        label = row[0] or "UNKNOWN"
+    for tier_summary_row in tier_rows:
+        label = tier_summary_row[0] or "UNKNOWN"
         tiers.append(
             {
                 "tier_slug": normalize_drug_tier_slug(label),
                 "tier_label": label,
-                "drug_count": int(row[1] or 0),
+                "drug_count": int(tier_summary_row[1] or 0),
             }
         )
     tiers.sort(key=lambda entry: (-entry["drug_count"], entry["tier_slug"]))
-    drug_summary["tiers"] = tiers
+    drug_summary_by_field["tiers"] = tiers
 
-    issuer_data["drug_summary"] = drug_summary
+    issuer_data["drug_summary"] = drug_summary_by_field
 
     return response.json(issuer_data, default=str)
 
@@ -234,7 +236,10 @@ async def get_issuers(request, state=None):
     )
 
     issuer_rows = await session.execute(issuer_stmt)
-    issuers = [_row_to_dict(row) for row in issuer_rows]
+    issuers = [
+        _row_to_dict(issuer_result_row)
+        for issuer_result_row in issuer_rows
+    ]
 
     if not issuers:
         raise sanic.exceptions.NotFound
@@ -261,7 +266,10 @@ async def get_issuers(request, state=None):
         ).where(issuer_table.c.state == state_filter)
 
     error_rows = await session.execute(error_stmt)
-    error_counts = {row[0]: row[1] for row in error_rows}
+    error_count_by_issuer = {
+        error_count_row[0]: error_count_row[1]
+        for error_count_row in error_rows
+    }
 
     plan_stmt = select(
         plan_table.c.issuer_id,
@@ -275,12 +283,15 @@ async def get_issuers(request, state=None):
         ).where(issuer_table.c.state == state_filter)
 
     plan_rows = await session.execute(plan_stmt)
-    plan_counts = {row[0]: row[1] for row in plan_rows}
+    plan_count_by_issuer = {
+        plan_count_row[0]: plan_count_row[1]
+        for plan_count_row in plan_rows
+    }
 
     for issuer in issuers:
         issuer_id = issuer.get("issuer_id")
-        issuer["import_errors"] = error_counts.get(issuer_id, 0)
-        issuer["plan_count"] = plan_counts.get(issuer_id, 0)
+        issuer["import_errors"] = error_count_by_issuer.get(issuer_id, 0)
+        issuer["plan_count"] = plan_count_by_issuer.get(issuer_id, 0)
 
     if pagination is not None:
         start = max(0, pagination.offset)

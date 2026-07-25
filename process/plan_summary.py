@@ -62,12 +62,12 @@ def _normalize_keyword_groups(keywords: Sequence[Sequence[str]] | Sequence[str])
         groups = keywords
     else:
         groups = (keywords,)
-    normalized = []
+    normalized_groups = []
     for group in groups:
         values = tuple(word.strip().lower() for word in group if isinstance(word, str) and word.strip())
         if values:
-            normalized.append(values)
-    return normalized
+            normalized_groups.append(values)
+    return normalized_groups
 
 
 def _keyword_condition(column_expr, keywords: Sequence[Sequence[str]] | Sequence[str]):

@@ -233,11 +233,11 @@ def stop():
 
 
 def _run_worker_command(target: str, burst: bool, env: dict[str, str]):
-    cmd = [sys.executable, __file__, "worker", target]
+    command_parts = [sys.executable, __file__, "worker", target]
     if burst:
-        cmd.append("--burst")
-    click.echo(f"Executing: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True, env=env)
+        command_parts.append("--burst")
+    click.echo(f"Executing: {' '.join(command_parts)}")
+    subprocess.run(command_parts, check=True, env=env)
 
 
 @stop.command("mrf")

@@ -45,11 +45,15 @@ class JSONOutputMixin:
 
     def to_json_dict(self):
         """Return JSON-ready column and computed fields after configured exclusions."""
-        res = {
+        result_by_field = {
             **dict(self._get_column_items()),
             **self._get_executable_fields()
         }
-        data = {k: v for k, v in res.items() if k not in self.EXCLUDE_FIELDS}
+        data = {
+            key: value
+            for key, value in result_by_field.items()
+            if key not in self.EXCLUDE_FIELDS
+        }
         return self.map_anything(data, self.prepare_for_json)
 
     def to_json(self, rel=None):

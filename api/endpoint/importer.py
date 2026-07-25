@@ -10,7 +10,7 @@ blueprint = Blueprint('import', url_prefix='/import', version=1)
 
 
 async def _collect_import_stats():
-    states_data = {"issuer_number": {}, "plan_number": {}}
+    count_by_category = {"issuer_number": {}, "plan_number": {}}
 
     async with db.transaction():
         issuer_rows = await db.all(
@@ -19,8 +19,12 @@ async def _collect_import_stats():
         plan_rows = await db.all(
             select(Plan.state, func.count(distinct(Plan.plan_id))).group_by(Plan.state)
         )
-        states_data["issuer_number"] = {row[0]: row[1] for row in issuer_rows}
-        states_data["plan_number"] = {row[0]: row[1] for row in plan_rows}
+        count_by_category["issuer_number"] = {
+            row[0]: row[1] for row in issuer_rows
+        }
+        count_by_category["plan_number"] = {
+            row[0]: row[1] for row in plan_rows
+        }
 
         return {
             "plans_count": await db.scalar(select(func.count(Plan.plan_id))),
@@ -31,8 +35,8 @@ async def _collect_import_stats():
                 .limit(1)
             ),
             "issuers_number": await db.scalar(select(func.count(Issuer.issuer_id))),
-            "issuers_by_state": states_data["issuer_number"],
-            "plans_by_state": states_data["plan_number"],
+            "issuers_by_state": count_by_category["issuer_number"],
+            "plans_by_state": count_by_category["plan_number"],
         }
 
 

@@ -16,6 +16,7 @@ from process.ptg_parts import ptg2_v4_taxonomy_candidates as taxonomy
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
 )
+from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 
 
 def _projection_fixture() -> tuple[
@@ -114,6 +115,7 @@ def _tables(projection_manifest: dict[str, object] | None) -> PTG2ServingTables:
         shared_block_layout="packed_snapshot_maps_v4",
         source_count=1,
         source_key="synthetic-source",
+        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(),
         provider_graph_v4_inferred_taxonomy_candidates=projection_manifest,
     )
 
@@ -454,7 +456,7 @@ def test_pattern_v1_retained_membership_budget_failure_is_typed() -> None:
 async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
     monkeypatch,
 ) -> None:
-    """Keep 36k candidates factored while probing the 6,448 CPT sets once."""
+    """Fill the page from the sealed 64-row prefix without a broad reverse."""
 
     candidate_count = 36_224
     provider_set_count = 6_448
@@ -493,8 +495,44 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
             npi_key: 1_000_000_001 + npi_key for npi_key in npi_keys
         }
     )
-    merge_rows = AsyncMock(return_value=serving_rows)
-    set_pattern_lookup = AsyncMock(return_value=pattern_keys_by_set)
+    async def merge_rate_rows(
+        *_args,
+        provider_set_keys,
+        limit,
+        offset,
+        **_kwargs,
+    ):
+        eligible_rows = (
+            serving_rows
+            if provider_set_keys is None
+            else [
+                serving_row
+                for serving_row in serving_rows
+                if int(serving_row["_ptg_provider_set_key"])
+                in set(provider_set_keys)
+            ]
+        )
+        return eligible_rows[offset : offset + limit]
+
+    merge_rows = AsyncMock(side_effect=merge_rate_rows)
+    set_pattern_lookup = AsyncMock(
+        side_effect=lambda *_args, owner_keys, **_kwargs: {
+            provider_set_key: pattern_keys_by_set[provider_set_key]
+            for provider_set_key in owner_keys
+        }
+    )
+    pattern_set_lookup = AsyncMock(
+        side_effect=lambda *_args, owner_keys, **_kwargs: {
+            pattern_key: tuple(
+                provider_set_key
+                for provider_set_key, set_pattern_keys in (
+                    pattern_keys_by_set.items()
+                )
+                if pattern_key in set_pattern_keys
+            )
+            for pattern_key in owner_keys
+        }
+    )
     generic_candidate_reverse = AsyncMock(
         side_effect=AssertionError("broad candidate reverse must not run")
     )
@@ -521,6 +559,11 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
         serving,
         "lookup_v4_relation_intersections",
         set_pattern_lookup,
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_members",
+        pattern_set_lookup,
     )
     monkeypatch.setattr(
         serving,
@@ -562,15 +605,20 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
     expected_selected_npi_keys = tuple(range(0, 26 * pattern_count, pattern_count))
     assert selection.total_lower_bound == 26
     assert selection.exhausted is False
-    assert merge_rows.await_count == 1
-    assert merge_rows.await_args.kwargs["provider_set_keys"] is None
-    assert merge_rows.await_args.kwargs["limit"] == 6_701
+    assert merge_rows.await_count == 2
+    assert merge_rows.await_args_list[0].kwargs["provider_set_keys"] is None
+    assert merge_rows.await_args_list[0].kwargs["limit"] == 64
+    assert merge_rows.await_args_list[1].kwargs["limit"] == 6_637
+    assert len(
+        tuple(merge_rows.await_args_list[1].kwargs["provider_set_keys"])
+    ) == 144
     assert set_pattern_lookup.await_count == 1
     assert set_pattern_lookup.await_args.kwargs["relation"] == "set_patterns"
-    assert len(set_pattern_lookup.await_args.kwargs["owner_keys"]) == provider_set_count
+    assert len(set_pattern_lookup.await_args.kwargs["owner_keys"]) == 64
     assert set_pattern_lookup.await_args.kwargs["allowed_member_keys"] == tuple(
         range(pattern_count)
     )
+    assert pattern_set_lookup.await_args.kwargs["owner_keys"] == (0,)
     assert selected_value_lookup.await_count == 1
     assert selected_value_lookup.await_args.kwargs["npi_keys"] == (
         expected_selected_npi_keys
@@ -842,21 +890,478 @@ async def _select_pattern_fixture(
     projection_manifest,
     candidates,
     projection_rule,
+    *,
+    code_rows=None,
+    target_count=1,
+    descending=False,
 ):
     """Run the pattern selector with the shared synthetic request."""
     return await serving._select_v4_pattern_taxonomy_expansion(
         object(),
         _tables(projection_manifest),
-        code_rows=[{"code_key": 4, "rate_count": 1}],
+        code_rows=(
+            [{"code_key": 4, "rate_count": 1}]
+            if code_rows is None
+            else code_rows
+        ),
         args={"code_system": "CPT", "code": "70553"},
         snapshot_id="snapshot",
         source_trace_set_hash=None,
         network_names=[],
-        target_count=1,
-        descending=False,
+        target_count=target_count,
+        descending=descending,
         projection_rule=projection_rule,
         candidates=candidates,
     )
+
+
+def _install_pattern_prefix_fakes(
+    monkeypatch,
+    serving_rows,
+    pattern_keys_by_set,
+):
+    """Install exact prefix-shaped fakes and return their call records."""
+
+    merge_calls: list[tuple[int, bool, int, tuple[int, ...] | None]] = []
+    intersection_calls: list[tuple[int, ...]] = []
+
+    async def merge_rows(
+        *_args,
+        code_rows,
+        provider_set_keys,
+        limit,
+        offset,
+        descending,
+        **_kwargs,
+    ):
+        normalized_provider_set_keys = (
+            None
+            if provider_set_keys is None
+            else tuple(sorted(provider_set_keys))
+        )
+        merge_calls.append(
+            (limit, descending, len(code_rows), normalized_provider_set_keys)
+        )
+        eligible_rows = (
+            serving_rows
+            if normalized_provider_set_keys is None
+            else [
+                serving_row
+                for serving_row in serving_rows
+                if int(serving_row["_ptg_provider_set_key"])
+                in normalized_provider_set_keys
+            ]
+        )
+        return eligible_rows[offset : offset + limit]
+
+    async def intersect_patterns(*_args, owner_keys, **_kwargs):
+        normalized_owner_keys = tuple(owner_keys)
+        intersection_calls.append(normalized_owner_keys)
+        return {
+            owner_key: pattern_keys_by_set.get(owner_key, ())
+            for owner_key in normalized_owner_keys
+        }
+
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        merge_rows,
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        intersect_patterns,
+    )
+    _install_pattern_completion_fakes(monkeypatch, pattern_keys_by_set)
+    return merge_calls, intersection_calls
+
+
+def _install_pattern_completion_fakes(monkeypatch, pattern_keys_by_set):
+    """Install selected-pattern completion and enrichment fakes."""
+
+    provider_set_keys_by_pattern: dict[int, list[int]] = {}
+    for provider_set_key, pattern_keys in pattern_keys_by_set.items():
+        for pattern_key in pattern_keys:
+            provider_set_keys_by_pattern.setdefault(pattern_key, []).append(
+                provider_set_key
+            )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_members",
+        AsyncMock(
+            side_effect=lambda *_args, owner_keys, **_kwargs: {
+                pattern_key: tuple(
+                    provider_set_keys_by_pattern.get(pattern_key, ())
+                )
+                for pattern_key in owner_keys
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        serving,
+        "v4_npi_values_for_keys",
+        AsyncMock(
+            side_effect=lambda *_args, npi_keys, **_kwargs: {
+                npi_key: 1_000_000_000 + npi_key
+                for npi_key in npi_keys
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_selected_provider_rows_by_set",
+        AsyncMock(return_value={}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_stops_on_authenticated_first_page(
+    monkeypatch,
+) -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1, 2, 3),
+        {7: (1, 2, 3)},
+    )
+    serving_rows = [_rate_row(key) for key in range(1, 101)]
+    merge_calls, intersection_calls = _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {1: (7,)},
+    )
+
+    selection = await _select_pattern_fixture(
+        projection_manifest,
+        candidates,
+        _projection_rule(projection_manifest),
+        code_rows=[{"code_key": 4, "rate_count": 100}],
+        target_count=2,
+    )
+
+    assert selection.total_lower_bound == 2
+    assert selection.exhausted is False
+    assert merge_calls == [
+        (64, False, 1, None),
+        (6_637, False, 1, (1,)),
+    ]
+    assert intersection_calls == [tuple(range(1, 65))]
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_starts_at_authenticated_page_above_64_target(
+    monkeypatch,
+) -> None:
+    npi_keys = tuple(range(1, 101))
+    projection_manifest, candidates = _projection_fixture_for(
+        npi_keys,
+        {7: npi_keys},
+    )
+    serving_rows = [_rate_row(key) for key in range(1, 101)]
+    merge_calls, _intersection_calls = _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {1: (7,)},
+    )
+
+    selection = await _select_pattern_fixture(
+        projection_manifest,
+        candidates,
+        _projection_rule(projection_manifest),
+        code_rows=[{"code_key": 4, "rate_count": 100}],
+        target_count=70,
+    )
+
+    assert selection.total_lower_bound == 70
+    assert merge_calls[0] == (64, False, 1, None)
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_rejects_unsealed_target_before_reads(
+    monkeypatch,
+) -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1,),
+        {7: (1,)},
+    )
+    merge_rows = AsyncMock()
+    intersect_patterns = AsyncMock()
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        merge_rows,
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        intersect_patterns,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="hot-prefix target"):
+        await _select_pattern_fixture(
+            projection_manifest,
+            candidates,
+            _projection_rule(projection_manifest),
+            code_rows=[{"code_key": 4, "rate_count": 1_000}],
+            target_count=202,
+        )
+
+    merge_rows.assert_not_awaited()
+    intersect_patterns.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_grows_until_late_match(monkeypatch) -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1, 2, 3),
+        {7: (1, 2, 3)},
+    )
+    serving_rows = [_rate_row(key) for key in range(1, 101)]
+    merge_calls, intersection_calls = _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {70: (7,)},
+    )
+
+    selection = await _select_pattern_fixture(
+        projection_manifest,
+        candidates,
+        _projection_rule(projection_manifest),
+        code_rows=[{"code_key": 4, "rate_count": 100}],
+        target_count=2,
+    )
+
+    assert selection.total_lower_bound == 2
+    assert selection.exhausted is False
+    assert merge_calls == [
+        (64, False, 1, None),
+        (100, False, 1, None),
+    ]
+    assert intersection_calls == [tuple(range(1, 65)), tuple(range(65, 101))]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("declared_occurrences", "raises_budget"),
+    ((100, False), (101, True)),
+)
+async def test_pattern_selector_cap_distinguishes_exhausted_source(
+    monkeypatch,
+    declared_occurrences,
+    raises_budget,
+) -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1,),
+        {7: (1,)},
+    )
+    projection_rule = replace(
+        _projection_rule(projection_manifest),
+        max_online_filtered_reverse_code_occurrences=100,
+    )
+    serving_rows = [_rate_row(key) for key in range(1, 101)]
+    merge_calls, _intersection_calls = _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {},
+    )
+
+    selection_call = _select_pattern_fixture(
+        projection_manifest,
+        candidates,
+        projection_rule,
+        code_rows=[{"code_key": 4, "rate_count": declared_occurrences}],
+        target_count=2,
+    )
+    if raises_budget:
+        with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+            await selection_call
+        assert exc_info.value.dimension == "code_occurrences"
+    else:
+        selection = await selection_call
+        assert selection.row_data == []
+        assert selection.exhausted is True
+    assert merge_calls == [
+        (64, False, 1, None),
+        (100, False, 1, None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_grows_across_code_variants(monkeypatch) -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1, 2),
+        {7: (1, 2)},
+    )
+    serving_rows = [_rate_row(key) for key in range(1, 81)]
+    merge_calls, _intersection_calls = _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {70: (7,)},
+    )
+
+    selection = await _select_pattern_fixture(
+        projection_manifest,
+        candidates,
+        _projection_rule(projection_manifest),
+        code_rows=[
+            {"code_key": 4, "rate_count": 40},
+            {"code_key": 5, "rate_count": 40},
+        ],
+        target_count=2,
+    )
+
+    assert selection.total_lower_bound == 2
+    assert merge_calls == [
+        (64, False, 2, None),
+        (80, False, 2, None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_preserves_descending_prefix(monkeypatch) -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1, 2),
+        {7: (1, 2)},
+    )
+    serving_rows = [_rate_row(key) for key in range(100, 0, -1)]
+    merge_calls, _intersection_calls = _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {100: (7,)},
+    )
+
+    selection = await _select_pattern_fixture(
+        projection_manifest,
+        candidates,
+        _projection_rule(projection_manifest),
+        code_rows=[{"code_key": 4, "rate_count": 100}],
+        target_count=2,
+        descending=True,
+    )
+
+    assert selection.total_lower_bound == 2
+    assert merge_calls == [
+        (64, True, 1, None),
+        (6_637, True, 1, (100,)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_completes_later_selected_npi_rates(
+    monkeypatch,
+) -> None:
+    selected_npi_keys = tuple(range(1, 26))
+    projection_manifest, candidates = _projection_fixture_for(
+        selected_npi_keys,
+        {7: selected_npi_keys},
+    )
+    serving_rows = [
+        {
+            **_rate_row(1),
+            "serving_content_hash_128": f"{occurrence:032x}",
+            "price_key": occurrence,
+        }
+        for occurrence in range(1, 65)
+    ]
+    serving_rows.append(
+        {
+            **_rate_row(2),
+            "serving_content_hash_128": f"{65:032x}",
+            "price_key": 65,
+        }
+    )
+    merge_calls, _intersection_calls = _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {1: (7,), 2: (7,)},
+    )
+
+    selection = await _select_pattern_fixture(
+        projection_manifest,
+        candidates,
+        _projection_rule(projection_manifest),
+        code_rows=[{"code_key": 4, "rate_count": 65}],
+        target_count=25,
+    )
+
+    assert selection.total_lower_bound == 25
+    assert any(
+        int(completion_row["_ptg_provider_set_key"]) == 2
+        and int(completion_row["price_key"]) == 65
+        for completion_row in selection.row_data
+    )
+    assert merge_calls == [
+        (64, False, 1, None),
+        (6_637, False, 1, (1, 2)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_rejects_lost_ranked_membership(
+    monkeypatch,
+) -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1,),
+        {7: (1,)},
+    )
+    serving_rows = [_rate_row(1), _rate_row(2), *[
+        _rate_row(key) for key in range(3, 101)
+    ]]
+    _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {1: (7,), 2: (7,)},
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_members",
+        AsyncMock(return_value={7: (2,)}),
+    )
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="completion lost a ranked membership",
+    ):
+        await _select_pattern_fixture(
+            projection_manifest,
+            candidates,
+            _projection_rule(projection_manifest),
+            code_rows=[{"code_key": 4, "rate_count": 100}],
+            target_count=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_charges_completion_after_prefix(
+    monkeypatch,
+) -> None:
+    projection_manifest, candidates = _projection_fixture_for(
+        (1,),
+        {7: (1,)},
+    )
+    projection_rule = replace(
+        _projection_rule(projection_manifest),
+        max_online_filtered_reverse_code_occurrences=64,
+    )
+    serving_rows = [_rate_row(key) for key in range(1, 101)]
+    merge_calls, _intersection_calls = _install_pattern_prefix_fakes(
+        monkeypatch,
+        serving_rows,
+        {1: (7,)},
+    )
+
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+        await _select_pattern_fixture(
+            projection_manifest,
+            candidates,
+            projection_rule,
+            code_rows=[{"code_key": 4, "rate_count": 100}],
+            target_count=1,
+        )
+
+    assert exc_info.value.dimension == "code_occurrences"
+    assert merge_calls == [
+        (64, False, 1, None),
+        (1, False, 1, (1,)),
+    ]
 
 
 async def _select_direct_fixture(
@@ -922,25 +1427,12 @@ async def test_pattern_selector_rejects_broken_sealed_boundaries(
             "_v4_pattern_candidate_prefix",
             lambda *_args, **_kwargs: (((0, 1), (0, 1)), False),
         )
-    monkeypatch.setattr(
-        serving,
-        "_merge_manifest_code_variant_rows",
-        AsyncMock(return_value=serving_rows),
-    )
-    monkeypatch.setattr(
-        serving,
-        "lookup_v4_relation_intersections",
-        AsyncMock(return_value=pattern_keys_by_set),
-    )
-    monkeypatch.setattr(
-        serving,
-        "v4_npi_values_for_keys",
-        AsyncMock(return_value=npi_by_key),
-    )
-    monkeypatch.setattr(
-        serving,
-        "_selected_provider_rows_by_set",
-        AsyncMock(return_value=providers_by_set),
+    _install_pattern_boundary_fakes(
+        monkeypatch,
+        serving_rows=serving_rows,
+        pattern_keys_by_set=pattern_keys_by_set,
+        npi_by_key=npi_by_key,
+        providers_by_set=providers_by_set,
     )
 
     with pytest.raises(error_type, match=error_match) as exc_info:
@@ -953,14 +1445,49 @@ async def test_pattern_selector_rejects_broken_sealed_boundaries(
         assert exc_info.value.dimension == expected_dimension
 
 
+def _install_pattern_boundary_fakes(
+    monkeypatch,
+    *,
+    serving_rows,
+    pattern_keys_by_set,
+    npi_by_key,
+    providers_by_set,
+):
+    """Install corrupted-boundary fixtures for the pattern selector."""
+
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(return_value=serving_rows),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        AsyncMock(return_value=pattern_keys_by_set),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_members",
+        AsyncMock(return_value={7: (1,)}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "v4_npi_values_for_keys",
+        AsyncMock(return_value=npi_by_key),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_selected_provider_rows_by_set",
+        AsyncMock(return_value=providers_by_set),
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("empty_stage", ("rate_scope", "candidate_scope"))
 async def test_pattern_selector_returns_exact_empty_selection(
     monkeypatch,
-    empty_stage,
 ) -> None:
     projection_manifest, candidates = _projection_fixture_for((1,), {7: (1,)})
-    serving_rows = [] if empty_stage == "rate_scope" else [_rate_row(1)]
+    serving_rows = [_rate_row(1)]
     pattern_keys_by_set = {1: ()}
     intersection_lookup = AsyncMock(return_value=pattern_keys_by_set)
     monkeypatch.setattr(
@@ -978,7 +1505,29 @@ async def test_pattern_selector_returns_exact_empty_selection(
 
     assert selection.row_data == []
     assert selection.exhausted is True
-    assert intersection_lookup.await_count == (0 if empty_stage == "rate_scope" else 1)
+    assert intersection_lookup.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pattern_selector_rejects_short_authenticated_prefix(
+    monkeypatch,
+) -> None:
+    projection_manifest, candidates = _projection_fixture_for((1,), {7: (1,)})
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(return_value=[]),
+    )
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="rate prefix is incomplete",
+    ):
+        await _select_pattern_fixture(
+            projection_manifest,
+            candidates,
+            _projection_rule(projection_manifest),
+        )
 
 
 @pytest.mark.asyncio

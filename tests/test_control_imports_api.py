@@ -563,6 +563,30 @@ Hugetlb:         92274688 kB
     }
 
 
+def test_ram_status_uses_sysconf_when_proc_meminfo_is_unavailable(monkeypatch):
+    """Node memory remains observable on hosts without Linux procfs."""
+
+    def unavailable_meminfo(*_args, **_kwargs):
+        raise OSError("procfs unavailable")
+
+    sysconf_value_by_key = {
+        "SC_PAGE_SIZE": 4096,
+        "SC_PHYS_PAGES": 1024,
+    }
+    monkeypatch.setattr("builtins.open", unavailable_meminfo)
+    monkeypatch.setattr(
+        control_imports.os,
+        "sysconf",
+        lambda key: sysconf_value_by_key[key],
+    )
+
+    assert control_imports._ram_status() == {
+        "total": 4096 * 1024,
+        "available": None,
+        "schedulable": 4096 * 1024,
+    }
+
+
 def test_normalize_run_accepts_plain_dict():
     run_row_map = {"run_id": "run_1", "status": "queued"}
 

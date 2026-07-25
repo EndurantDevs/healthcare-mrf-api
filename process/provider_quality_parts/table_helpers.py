@@ -16,29 +16,32 @@ def _index_name_for_table(table_name: str, base_name: str) -> str:
     return f"{prefix}_{digest}"
 
 
-async def _ensure_indexes(obj: type, db_schema: str) -> None:
-    if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
-        cols = ", ".join(obj.__my_index_elements__)
-        name = _index_name_for_table(obj.__tablename__, f"{obj.__tablename__}_idx_primary")
+async def _ensure_indexes(model_class: type, db_schema: str) -> None:
+    if hasattr(model_class, "__my_index_elements__") and model_class.__my_index_elements__:
+        cols = ", ".join(model_class.__my_index_elements__)
+        name = _index_name_for_table(
+            model_class.__tablename__,
+            f"{model_class.__tablename__}_idx_primary",
+        )
         await db.status(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
-            + f"{name} ON {db_schema}.{obj.__tablename__} ({cols});"
+            + f"{name} ON {db_schema}.{model_class.__tablename__} ({cols});"
         )
-    if hasattr(obj, "__my_additional_indexes__") and obj.__my_additional_indexes__:
-        for idx in obj.__my_additional_indexes__:
+    if hasattr(model_class, "__my_additional_indexes__") and model_class.__my_additional_indexes__:
+        for idx in model_class.__my_additional_indexes__:
             elements = idx.get("index_elements")
             if not elements:
                 continue
-            base_name = idx.get("name") or f"{obj.__tablename__}_{'_'.join(elements)}_idx"
-            if getattr(obj, "__main_table__", obj.__tablename__) != obj.__tablename__:
-                name = f"{obj.__tablename__}_{base_name}"
+            base_name = idx.get("name") or f"{model_class.__tablename__}_{'_'.join(elements)}_idx"
+            if getattr(model_class, "__main_table__", model_class.__tablename__) != model_class.__tablename__:
+                name = f"{model_class.__tablename__}_{base_name}"
             else:
                 name = base_name
-            name = _index_name_for_table(obj.__tablename__, name)
+            name = _index_name_for_table(model_class.__tablename__, name)
             using = idx.get("using")
             where = idx.get("where")
             cols = ", ".join(elements)
-            statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{obj.__tablename__}"
+            statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{model_class.__tablename__}"
             if using:
                 statement += f" USING {using}"
             statement += f" ({cols})"

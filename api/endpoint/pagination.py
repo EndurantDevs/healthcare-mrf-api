@@ -99,12 +99,17 @@ def parse_pagination(
                 )
         offset = explicit_offset
         page = (offset // limit) + 1
-        source = "offset" if raw_offset is not None else "start"
+        pagination_source = "offset" if raw_offset is not None else "start"
     else:
         offset = (page - 1) * limit
-        source = "page"
+        pagination_source = "page"
 
-    return PaginationParams(page=page, limit=limit, offset=offset, source=source)
+    return PaginationParams(
+        page=page,
+        limit=limit,
+        offset=offset,
+        source=pagination_source,
+    )
 
 
 def parse_bool_alias(args, primary: str, alias: str, *, default: bool) -> bool:

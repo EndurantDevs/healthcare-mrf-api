@@ -92,10 +92,14 @@ async def _run_materialize_shard_job(
                 exc,
             )
         sql = sql_builder(cohort_context)
-        params: dict[str, Any] = {"year": year, "shard_id": shard_id, "shard_count": shard_count}
+        parameter_by_name: dict[str, Any] = {
+            "year": year,
+            "shard_id": shard_id,
+            "shard_count": shard_count,
+        }
         if include_run_id:
-            params["run_id"] = run_id
-        await _execute_shard_sql(sql, **params)
+            parameter_by_name["run_id"] = run_id
+        await _execute_shard_sql(sql, **parameter_by_name)
         rows_after: int | None = None
         try:
             rows_after = await _count_shard_rows(
@@ -207,4 +211,3 @@ async def provider_quality_materialize_score_shard(
         target_table_key="score_table",
         include_run_id=True,
     )
-

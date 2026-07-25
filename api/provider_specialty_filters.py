@@ -288,12 +288,12 @@ def _normalize_taxonomy_codes(value: Any) -> tuple[str, ...]:
     else:
         raw_items = [value]
     codes: list[str] = []
-    seen: set[str] = set()
+    seen_codes: set[str] = set()
     for item in raw_items:
         code = str(item or "").strip().upper()
-        if not code or code in seen:
+        if not code or code in seen_codes:
             continue
-        seen.add(code)
+        seen_codes.add(code)
         codes.append(code)
     return tuple(codes)
 

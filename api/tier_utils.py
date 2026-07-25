@@ -28,14 +28,14 @@ TIER_SLUGS = (
 )
 
 
-def normalize_drug_tier_slug(value: Optional[str]) -> str:
+def normalize_drug_tier_slug(tier_label: Optional[str]) -> str:
     """
     Collapse free-form drug tier labels into a predictable slug.
     Unknown or unclassified tiers fall back to 'other'/'unknown'.
     """
-    if not value:
+    if not tier_label:
         return "unknown"
-    lowered = value.strip().lower()
+    lowered = tier_label.strip().lower()
     lowered = _TIER_PATTERN.sub(" ", lowered)
     if not lowered:
         return "unknown"
