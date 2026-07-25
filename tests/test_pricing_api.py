@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from sanic.request import RequestParameters
 
 from api import ptg2_capacity_evidence as capacity_evidence
 from api import plan_release_serving
@@ -2484,6 +2485,112 @@ async def test_resolve_procedure_taxonomy_em_code_needs_intent(monkeypatch):
     assert pricing_response["resolution"]["recommended_mode"] == "ambiguous"
     assert pricing_response["resolution"]["needs_intent"] is True
     assert pricing_response["resolution"]["provider_filter"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_procedure_taxonomy_scalarizes_sanic_query_parameters(monkeypatch):
+    async def fake_resolve_code_context(
+        _session,
+        code_system,
+        code_value,
+        *,
+        expand_codes,
+    ):
+        assert code_system == "CPT"
+        assert code_value == "70551"
+        assert expand_codes is False
+        return {
+            "input_code": {"code_system": code_system, "code": code_value},
+            "resolved_codes": [
+                {
+                    "code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM,
+                    "code": "170551",
+                }
+            ],
+            "internal_codes": [170551],
+            "matched_via": ["test_crosswalk"],
+            "expanded": expand_codes,
+        }
+
+    async def fake_load_evidence(_session, *, year, internal_codes, limit):
+        assert year == 2023
+        assert internal_codes == [170551]
+        assert limit == 10
+        return []
+
+    monkeypatch.setattr(pricing_module, "_resolve_code_context", fake_resolve_code_context)
+    monkeypatch.setattr(pricing_module, "_load_procedure_taxonomy_evidence", fake_load_evidence)
+    request = make_request(
+        [],
+        args=RequestParameters(
+            {
+                "code": ["70551"],
+                "code_system": ["CPT"],
+                "year": ["2023"],
+                "expand_codes": ["false"],
+            }
+        ),
+    )
+
+    response = await resolve_procedure_taxonomy(request)
+    pricing_response = json.loads(response.body)
+
+    assert pricing_response["query"]["code_system"] == "CPT"
+    assert pricing_response["code_context"]["input_code"] == {
+        "code_system": "CPT",
+        "code": "70551",
+    }
+    assert pricing_response["code_context"]["internal_codes"] == [170551]
+    assert pricing_response["code_context"].get("resolution_status") != "unmapped"
+    assert "['CPT']" not in response.body.decode()
+
+
+@pytest.mark.asyncio
+async def test_procedure_taxonomy_defaults_code_system_for_unmapped_sanic_parameters(
+    monkeypatch,
+):
+    async def fake_resolve_context(
+        _session,
+        code_system,
+        code_value,
+        *,
+        expand_codes,
+    ):
+        assert (code_system, code_value, expand_codes) == ("CPT", "70551", True)
+        return {
+            "input_code": {"code_system": code_system, "code": code_value},
+            "resolved_codes": [],
+            "internal_codes": [],
+            "matched_via": [],
+            "expanded": expand_codes,
+        }
+
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_code_context",
+        fake_resolve_context,
+    )
+
+    internal_codes, context = await pricing_module._procedure_taxonomy_code_context(
+        None,
+        RequestParameters(
+            {
+                "code": ["70551"],
+                "expand_codes": ["true"],
+            }
+        ),
+        "70551",
+    )
+
+    assert internal_codes == []
+    assert context == {
+        "input_code": {"code_system": "CPT", "code": "70551"},
+        "resolved_codes": [],
+        "internal_codes": [],
+        "matched_via": [],
+        "expanded": True,
+        "resolution_status": "unmapped",
+    }
 
 
 @pytest.mark.asyncio
