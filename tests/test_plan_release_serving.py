@@ -37,19 +37,35 @@ def _binding_row(**updates):
     return row_by_field
 
 
-def _network_binding(ordinal, snapshot_id, source_key):
+def _network_binding(
+    ordinal,
+    snapshot_id,
+    source_key,
+    *,
+    plan_id="99-0000001",
+):
     return plan_release_serving.PlanReleaseSnapshotBinding(
         binding_ordinal=ordinal,
         snapshot_id=snapshot_id,
         source_key=source_key,
-        plan_id="99-0000001",
+        plan_id=plan_id,
         plan_market_type="group",
         role="in_network",
         required=True,
     )
 
 
-def _release_selection(*bindings, digest="a"):
+def _release_selection(
+    *bindings,
+    digest="a",
+    validated_serving_tables=None,
+):
+    if validated_serving_tables is None:
+        validated_serving_tables = tuple(
+            (binding.snapshot_id, object())
+            for binding in bindings
+            if binding.role == "in_network"
+        )
     return plan_release_serving.PlanReleaseServingSelection(
         serving_revision_id=SERVING_REVISION_ID,
         plan_release_id=PLAN_RELEASE_ID,
@@ -59,10 +75,16 @@ def _release_selection(*bindings, digest="a"):
         release_status="published",
         binding_set_digest=digest * 64,
         bindings=tuple(bindings),
+        _validated_serving_tables=tuple(validated_serving_tables),
     )
 
 
-def _install_single_snapshot_search(monkeypatch, selection, calls):
+def _install_single_snapshot_search(
+    monkeypatch,
+    selection,
+    calls,
+    serving_table_calls=None,
+):
     async def fake_release_resolver(_session, release_id):
         assert release_id == PLAN_RELEASE_ID
         return selection
@@ -78,6 +100,8 @@ def _install_single_snapshot_search(monkeypatch, selection, calls):
         **_kwargs,
     ):
         calls.append((snapshot_id, dict(args)))
+        if serving_table_calls is not None:
+            serving_table_calls.append(_kwargs.get("serving_tables"))
         return {
             "items": [],
             "pagination": {"total": 0},
@@ -128,7 +152,19 @@ class _Session:
         return list(self.rows)
 
 
-async def _is_serving_binding_ready(_session, _binding):
+async def _is_serving_binding_ready(
+    _session,
+    binding,
+    **readiness_context,
+):
+    validated_serving_tables_by_snapshot_id = readiness_context.get(
+        "validated_serving_tables_by_snapshot_id"
+    )
+    if (
+        binding.role == "in_network"
+        and validated_serving_tables_by_snapshot_id is not None
+    ):
+        validated_serving_tables_by_snapshot_id[binding.snapshot_id] = object()
     return True
 
 

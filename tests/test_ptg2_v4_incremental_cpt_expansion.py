@@ -134,7 +134,7 @@ async def test_empty_and_repeated_sets_are_exact_and_traversed_once(
     assert harness.completion_reads == [
         ((1, 2), 3, 0, False)
     ]
-    assert selection.providers_by_set[empty_set] == []
+    assert list(selection.providers_by_set[empty_set]) == []
 
 
 _EQUIVALENCE_CASES = (

@@ -68,7 +68,7 @@ async def test_selected_npi_receives_later_set_rates_beyond_rank_cutoff(
         ((1, 2), 64, 0, False),
         ((1, 2), 1, 64, False),
     ]
-    assert selection.providers_by_set[later_set] == [
+    assert [dict(provider) for provider in selection.providers_by_set[later_set]] == [
         {
             "npi": selected_npi,
             "provider_name": f"Provider {selected_npi}",

@@ -10,9 +10,9 @@ import json
 import os
 import re
 from collections import OrderedDict, defaultdict
-from copy import deepcopy
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from sqlalchemy import text
@@ -7876,14 +7876,31 @@ def _ptg2_provider_rate_group_key(
     )
 
 
-def _append_unique_value(values: list[Any], value: Any) -> None:
+def _payload_merge_key(item: Any) -> str:
+    return _price_row_key(item) if isinstance(item, dict) else str(item)
+
+
+def _append_unique_payload_value(
+    values: list[Any],
+    value: Any,
+    seen_payload_keys: set[str],
+) -> None:
     if value in (None, ""):
         return
-    if value not in values:
-        values.append(value)
+    payload_key = _payload_merge_key(value)
+    if payload_key in seen_payload_keys:
+        return
+    seen_payload_keys.add(payload_key)
+    values.append(value)
 
 
-def _merge_unique_payload_list(target: dict[str, Any], field: str, value: Any) -> None:
+def _merge_unique_payload_list(
+    target: dict[str, Any],
+    field: str,
+    value: Any,
+    *,
+    seen_payload_keys: set[str] | None = None,
+) -> None:
     payload = _coerce_json_payload(value, [])
     if payload in (None, ""):
         return
@@ -7893,14 +7910,14 @@ def _merge_unique_payload_list(target: dict[str, Any], field: str, value: Any) -
     if not isinstance(target_values, list):
         target_values = [target_values]
         target[field] = target_values
-    seen_payload_keys = {
-        _price_row_key(item) if isinstance(item, dict) else str(item)
-        for item in target_values
-    }
+    if seen_payload_keys is None:
+        seen_payload_keys = {
+            _payload_merge_key(item) for item in target_values
+        }
     for item in payload:
         if item in (None, ""):
             continue
-        key = _price_row_key(item) if isinstance(item, dict) else str(item)
+        key = _payload_merge_key(item)
         if key in seen_payload_keys:
             continue
         seen_payload_keys.add(key)
@@ -7921,6 +7938,10 @@ def _merge_ptg2_provider_rate_items(
     """Collapse duplicate provider/location rows while preserving every rate option."""
     merged_provider_rates: list[dict[str, Any]] = []
     provider_rate_by_group_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    seen_payload_keys_by_group: dict[
+        tuple[Any, ...],
+        dict[str, set[str]],
+    ] = {}
     price_dirty_group_keys: set[tuple[Any, ...]] = set()
     for provider_rate in provider_rate_items:
         group_key = _ptg2_provider_rate_group_key(provider_rate)
@@ -7943,34 +7964,35 @@ def _merge_ptg2_provider_rate_items(
                 merged_provider_rate_by_field[list_field] = list(
                     merged_provider_rate_by_field.get(list_field) or []
                 )
-            _append_unique_value(
-                merged_provider_rate_by_field["price_set_hashes"],
-                provider_rate.get("price_set_hash"),
-            )
-            _append_unique_value(
-                merged_provider_rate_by_field["rate_pack_hashes"],
-                provider_rate.get("rate_pack_hash"),
-            )
-            _append_unique_value(
-                merged_provider_rate_by_field["provider_set_hashes"],
-                provider_rate.get("provider_set_hash"),
-            )
-            _merge_unique_payload_list(
-                merged_provider_rate_by_field,
-                "price_set_hashes",
-                provider_rate.get("price_set_hashes"),
-            )
-            _merge_unique_payload_list(
-                merged_provider_rate_by_field,
-                "rate_pack_hashes",
-                provider_rate.get("rate_pack_hashes"),
-            )
-            _merge_unique_payload_list(
-                merged_provider_rate_by_field,
-                "provider_set_hashes",
-                provider_rate.get("provider_set_hashes"),
-            )
+            seen_payload_keys_by_field = {
+                list_field: {
+                    _payload_merge_key(payload_value)
+                    for payload_value in (
+                        merged_provider_rate_by_field[list_field]
+                    )
+                }
+                for list_field in (
+                    "price_set_hashes",
+                    "rate_pack_hashes",
+                    "provider_set_hashes",
+                    "source_trace",
+                )
+            }
+            for hash_field in (
+                "price_set_hash",
+                "rate_pack_hash",
+                "provider_set_hash",
+            ):
+                hash_list_field = f"{hash_field}es"
+                _append_unique_payload_value(
+                    merged_provider_rate_by_field[hash_list_field],
+                    provider_rate.get(hash_field),
+                    seen_payload_keys_by_field[hash_list_field],
+                )
             provider_rate_by_group_key[group_key] = merged_provider_rate_by_field
+            seen_payload_keys_by_group[group_key] = (
+                seen_payload_keys_by_field
+            )
             merged_provider_rates.append(merged_provider_rate_by_field)
             continue
 
@@ -7990,14 +8012,17 @@ def _merge_ptg2_provider_rate_items(
             existing_price_key is None or int(item_price_key) < int(existing_price_key)
         ):
             merged_provider_rate_by_field["_ptg_price_key"] = int(item_price_key)
+        seen_payload_keys_by_field = seen_payload_keys_by_group[group_key]
         for hash_field in (
             "price_set_hash",
             "rate_pack_hash",
             "provider_set_hash",
         ):
-            _append_unique_value(
-                merged_provider_rate_by_field.setdefault(f"{hash_field}es", []),
+            hash_list_field = f"{hash_field}es"
+            _append_unique_payload_value(
+                merged_provider_rate_by_field[hash_list_field],
                 provider_rate.get(hash_field),
+                seen_payload_keys_by_field[hash_list_field],
             )
         for hash_list_field in (
             "price_set_hashes",
@@ -8009,6 +8034,9 @@ def _merge_ptg2_provider_rate_items(
                 merged_provider_rate_by_field,
                 hash_list_field,
                 provider_rate.get(hash_list_field),
+                seen_payload_keys=seen_payload_keys_by_field[
+                    hash_list_field
+                ],
             )
         merged_provider_rate_by_field["price_set_count"] = len(
             merged_provider_rate_by_field.get("price_set_hashes") or []
@@ -9572,9 +9600,9 @@ _ProviderExpansionKey = tuple[str, str, str, str, str, str]
 
 @dataclass(frozen=True)
 class _ProviderExpansionSelection:
-    row_data: list[dict[str, Any]]
-    providers_by_set: dict[str, list[dict[str, Any]]]
-    rank_by_key: dict[_ProviderExpansionKey, int]
+    row_data: Sequence[Mapping[str, Any]]
+    providers_by_set: Mapping[str, Sequence[Mapping[str, Any]]]
+    rank_by_key: Mapping[_ProviderExpansionKey, int]
     exhausted: bool
 
     @property
@@ -9584,10 +9612,155 @@ class _ProviderExpansionSelection:
 
 
 _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_ENTRIES = 1024
+_PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_BYTES = 32 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _CachedProviderExpansionSelection:
+    selection: _ProviderExpansionSelection
+    retained_weight: int
+
+
 _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE: OrderedDict[
     tuple[int, str, int, bool, str],
-    _ProviderExpansionSelection,
+    _CachedProviderExpansionSelection,
 ] = OrderedDict()
+
+
+def _provider_expansion_cache_value_weight(
+    cache_payload: Any,
+    seen_value_ids: set[int],
+) -> int:
+    """Conservatively estimate retained cache bytes with stable coefficients."""
+
+    value_id = id(cache_payload)
+    if value_id in seen_value_ids:
+        return 0
+    seen_value_ids.add(value_id)
+    if isinstance(cache_payload, Mapping):
+        return 64 + 32 * len(cache_payload) + sum(
+            _provider_expansion_cache_value_weight(key, seen_value_ids)
+            + _provider_expansion_cache_value_weight(
+                nested_payload,
+                seen_value_ids,
+            )
+            for key, nested_payload in cache_payload.items()
+        )
+    if isinstance(cache_payload, (list, tuple)):
+        return 56 + 8 * len(cache_payload) + sum(
+            _provider_expansion_cache_value_weight(
+                nested_payload,
+                seen_value_ids,
+            )
+            for nested_payload in cache_payload
+        )
+    if isinstance(cache_payload, (set, frozenset)):
+        return 216 + 32 * len(cache_payload) + sum(
+            _provider_expansion_cache_value_weight(
+                nested_payload,
+                seen_value_ids,
+            )
+            for nested_payload in cache_payload
+        )
+    if isinstance(cache_payload, str):
+        return 49 + len(cache_payload.encode("utf-8"))
+    if isinstance(cache_payload, bytes):
+        return 33 + len(cache_payload)
+    if cache_payload is None or isinstance(
+        cache_payload,
+        (bool, int, float, Decimal),
+    ):
+        return 32
+    return 64 + len(str(cache_payload).encode("utf-8"))
+
+
+def _provider_expansion_selection_retained_weight(
+    selection: _ProviderExpansionSelection,
+) -> int:
+    """Measure one selection only while admitting it to the cache."""
+
+    return _provider_expansion_cache_value_weight(
+        (
+            selection.row_data,
+            selection.providers_by_set,
+            selection.rank_by_key,
+            selection.exhausted,
+        ),
+        set(),
+    )
+
+
+def _freeze_provider_expansion_cache_value(
+    cache_payload: Any,
+    frozen_value_by_identity: dict[int, Any],
+) -> Any:
+    """Recursively freeze one JSON-like expansion proof for shared reuse."""
+
+    cached_value = frozen_value_by_identity.get(id(cache_payload))
+    if cached_value is not None:
+        return cached_value
+    if isinstance(cache_payload, Mapping):
+        frozen_mapping: dict[Any, Any] = {}
+        frozen_proxy = MappingProxyType(frozen_mapping)
+        frozen_value_by_identity[id(cache_payload)] = frozen_proxy
+        frozen_mapping.update(
+            {
+                key: _freeze_provider_expansion_cache_value(
+                    nested_payload,
+                    frozen_value_by_identity,
+                )
+                for key, nested_payload in cache_payload.items()
+            }
+        )
+        return frozen_proxy
+    if isinstance(cache_payload, (list, tuple)):
+        frozen_values = tuple(
+            _freeze_provider_expansion_cache_value(
+                nested_payload,
+                frozen_value_by_identity,
+            )
+            for nested_payload in cache_payload
+        )
+        frozen_value_by_identity[id(cache_payload)] = frozen_values
+        return frozen_values
+    if isinstance(cache_payload, (set, frozenset)):
+        frozen_set = frozenset(
+            _freeze_provider_expansion_cache_value(
+                nested_payload,
+                frozen_value_by_identity,
+            )
+            for nested_payload in cache_payload
+        )
+        frozen_value_by_identity[id(cache_payload)] = frozen_set
+        return frozen_set
+    return cache_payload
+
+
+def _request_local_provider_expansion_selection(
+    selection: _ProviderExpansionSelection,
+) -> _ProviderExpansionSelection:
+    """Copy only rate rows that receive request-local network hydration."""
+
+    return _ProviderExpansionSelection(
+        row_data=[dict(serving_row) for serving_row in selection.row_data],
+        providers_by_set=selection.providers_by_set,
+        rank_by_key=selection.rank_by_key,
+        exhausted=selection.exhausted,
+    )
+
+
+def _provider_expansion_selection_from_cache(
+    cache_key: tuple[int, str, int, bool, str],
+) -> _ProviderExpansionSelection | None:
+    """Return request-local mutable rate rows over shared read-only proofs."""
+
+    cached_entry = _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.get(cache_key)
+    if cached_entry is None:
+        return None
+    _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.move_to_end(cache_key)
+    return _request_local_provider_expansion_selection(
+        cached_entry.selection
+    )
 
 
 def _provider_expansion_selection_cache_key(
@@ -9630,18 +9803,181 @@ def _provider_expansion_selection_cache_key(
 def _cache_provider_expansion_selection(
     cache_key: tuple[int, str, int, bool, str] | None,
     selection: _ProviderExpansionSelection,
-) -> None:
+) -> _ProviderExpansionSelection:
     """Retain one sealed-snapshot expansion proof under the bounded LRU."""
 
     if cache_key is None:
-        return
-    _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE[cache_key] = deepcopy(selection)
+        return _request_local_provider_expansion_selection(selection)
+    estimated_weight = _provider_expansion_selection_retained_weight(selection)
+    if estimated_weight > _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_BYTES:
+        _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.pop(cache_key, None)
+        return _request_local_provider_expansion_selection(selection)
+    frozen_value_by_identity: dict[int, Any] = {}
+    cached_selection = _ProviderExpansionSelection(
+        row_data=tuple(
+            _freeze_provider_expansion_cache_value(
+                serving_row,
+                frozen_value_by_identity,
+            )
+            for serving_row in selection.row_data
+        ),
+        providers_by_set=_freeze_provider_expansion_cache_value(
+            selection.providers_by_set,
+            frozen_value_by_identity,
+        ),
+        rank_by_key=_freeze_provider_expansion_cache_value(
+            selection.rank_by_key,
+            frozen_value_by_identity,
+        ),
+        exhausted=selection.exhausted,
+    )
+    retained_weight = _provider_expansion_selection_retained_weight(
+        cached_selection
+    )
+    if retained_weight > _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_BYTES:
+        _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.pop(cache_key, None)
+        return _request_local_provider_expansion_selection(selection)
+    _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE[cache_key] = (
+        _CachedProviderExpansionSelection(cached_selection, retained_weight)
+    )
     _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.move_to_end(cache_key)
     while (
         len(_PTG2_PROVIDER_EXPANSION_SELECTION_CACHE)
         > _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_ENTRIES
+        or sum(
+            entry.retained_weight
+            for entry in _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.values()
+        )
+        > _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE_MAX_BYTES
     ):
         _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.popitem(last=False)
+    return _provider_expansion_selection_from_cache(cache_key) or (
+        _request_local_provider_expansion_selection(selection)
+    )
+
+
+@dataclass(frozen=True)
+class _RankedProviderExpansionMaterialization:
+    """Exact rate rows and providers that can satisfy one ranked prefix."""
+
+    row_data: list[Mapping[str, Any]]
+    providers_by_row_identity: Mapping[int, Sequence[Mapping[str, Any]]]
+
+    def providers_for(
+        self,
+        serving_row: Mapping[str, Any],
+    ) -> Sequence[Mapping[str, Any]]:
+        """Return only ranked providers for one retained rate occurrence."""
+
+        return self.providers_by_row_identity.get(id(serving_row), ())
+
+
+def _provider_expansion_row_npi(provider: Mapping[str, Any]) -> int | None:
+    raw_npi = provider.get("npi")
+    if raw_npi in (None, ""):
+        return None
+    try:
+        return int(raw_npi)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 strict V3 provider expansion contains an invalid NPI"
+        ) from exc
+
+
+def _ranked_provider_rows_for_rate(
+    serving_row: Mapping[str, Any],
+    provider_rows: Sequence[Mapping[str, Any]],
+    rank_by_key: Mapping[_ProviderExpansionKey, int],
+    witnessed_keys: set[_ProviderExpansionKey],
+) -> tuple[Mapping[str, Any], ...]:
+    ranked_providers: list[Mapping[str, Any]] = []
+    for provider in provider_rows:
+        expansion_key = _provider_expansion_key(
+            serving_row,
+            npi=_provider_expansion_row_npi(provider),
+        )
+        if expansion_key not in rank_by_key:
+            continue
+        witnessed_keys.add(expansion_key)
+        ranked_providers.append(provider)
+    return tuple(ranked_providers)
+
+
+def _ranked_provider_expansion_materialization(
+    selection: _ProviderExpansionSelection,
+) -> _RankedProviderExpansionMaterialization:
+    """Discard unranked provider-rate pairs before public response shaping."""
+
+    retained_rows: list[Mapping[str, Any]] = []
+    providers_by_row_identity: dict[int, Sequence[Mapping[str, Any]]] = {}
+    witnessed_keys: set[_ProviderExpansionKey] = set()
+    for serving_row in selection.row_data:
+        provider_set_id = _ptg2_manifest_id(
+            serving_row.get("provider_set_global_id_128")
+        )
+        if not provider_set_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 strict V3 rate is missing its provider-set identity"
+            )
+        provider_rows = selection.providers_by_set.get(provider_set_id, ())
+        ranked_providers = _ranked_provider_rows_for_rate(
+            serving_row,
+            provider_rows,
+            selection.rank_by_key,
+            witnessed_keys,
+        )
+        if provider_rows and not ranked_providers:
+            continue
+        if not provider_rows:
+            expansion_key = _provider_expansion_key(serving_row, npi=None)
+            if expansion_key not in selection.rank_by_key:
+                continue
+            witnessed_keys.add(expansion_key)
+        retained_rows.append(serving_row)
+        providers_by_row_identity[id(serving_row)] = ranked_providers
+    if witnessed_keys != set(selection.rank_by_key):
+        raise PTG2ManifestArtifactError(
+            "PTG2 strict V3 provider expansion failed to materialize its selected page"
+        )
+    return _RankedProviderExpansionMaterialization(
+        retained_rows,
+        providers_by_row_identity,
+    )
+
+
+def _request_local_provider_payload(value: Any) -> Any:
+    """Copy nested cached provider evidence into one mutable response item."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _request_local_provider_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_request_local_provider_payload(item) for item in value]
+    return value
+
+
+def _request_local_provider_fields(
+    provider: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Copy the nested provider fields exposed by one public result item."""
+
+    fields_by_name = {
+        response_field: _request_local_provider_payload(
+            _coerce_json_payload(provider.get(source_field), default_value)
+        )
+        for response_field, source_field, default_value in (
+            ("address", "address_payload", {}),
+            ("taxonomy_codes", "taxonomy_codes", []),
+            ("specialties", "specialties", []),
+            ("classifications", "classifications", []),
+            ("specializations", "specializations", []),
+        )
+    }
+    if not isinstance(fields_by_name["address"], dict):
+        fields_by_name["address"] = {}
+    return fields_by_name
 
 
 def _provider_expansion_key(
@@ -11964,12 +12300,9 @@ async def _strict_cost_provider_expansion_selection(
         descending=descending,
     )
     if cache_key is not None:
-        cached_selection = _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.get(
-            cache_key
-        )
+        cached_selection = _provider_expansion_selection_from_cache(cache_key)
         if cached_selection is not None:
-            _PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.move_to_end(cache_key)
-            return deepcopy(cached_selection)
+            return cached_selection
     declared_rate_count = sum(
         max(int(code_row.get("rate_count") or 0), 0)
         for code_row in code_rows
@@ -12000,11 +12333,10 @@ async def _strict_cost_provider_expansion_selection(
                 projection_rule=projection_rule,
             )
         )
-        _cache_provider_expansion_selection(
+        return _cache_provider_expansion_selection(
             cache_key,
             exact_inferred_selection,
         )
-        return exact_inferred_selection
     if (
         bool(getattr(serving_tables, "uses_v4_graph", False))
         and not is_provider_filter_requested
@@ -12026,11 +12358,11 @@ async def _strict_cost_provider_expansion_selection(
             )
         )
         if incremental_selection is not None:
-            _cache_provider_expansion_selection(
+            return _cache_provider_expansion_selection(
                 cache_key,
                 incremental_selection,
             )
-        return incremental_selection
+        return None
     rate_window = min(
         declared_rate_count,
         max(PTG2_SERVING_BINARY_V3_PAGE_ROWS, max(int(target_count), 1)),
@@ -12188,8 +12520,7 @@ async def _strict_cost_provider_expansion_selection(
         rank_by_key=rank_by_key,
         exhausted=is_exhausted and len(rank_by_key) < target_count,
     )
-    _cache_provider_expansion_selection(cache_key, selection)
-    return selection
+    return _cache_provider_expansion_selection(cache_key, selection)
 
 
 async def _procedure_details_for_rows(
@@ -12522,6 +12853,9 @@ async def _search_manifest_serving_table(
 
     network_names = serving_tables.network_names or []
     exact_provider_selection: _ProviderExpansionSelection | None = None
+    exact_provider_materialization: (
+        _RankedProviderExpansionMaterialization | None
+    ) = None
     strict_cost_provider_expansion = (
         include_providers
         and not location_filter_requested
@@ -12547,7 +12881,12 @@ async def _search_manifest_serving_table(
         )
         if exact_provider_selection is None:
             return None
-        serving_rows = exact_provider_selection.row_data
+        exact_provider_materialization = (
+            _ranked_provider_expansion_materialization(
+                exact_provider_selection
+            )
+        )
+        serving_rows = list(exact_provider_materialization.row_data)
     else:
         serving_rows = await _merge_manifest_code_variant_rows(
             session,
@@ -12685,10 +13024,8 @@ async def _search_manifest_serving_table(
         for price_set_id in retained_price_set_ids
     }
     providers_by_set: dict[str, list[dict[str, Any]]] = {}
-    if include_providers:
-        if exact_provider_selection is not None:
-            providers_by_set = exact_provider_selection.providers_by_set
-        elif location_filter_requested:
+    if include_providers and exact_provider_materialization is None:
+        if location_filter_requested:
             providers_by_set = location_providers_by_set
         elif candidate_audit_npi is not None:
             providers_by_set = _candidate_audit_provider_rows_by_set(
@@ -12828,11 +13165,15 @@ async def _search_manifest_serving_table(
         if not include_providers:
             response_items.append(base_response_by_field)
             continue
-        provider_rows = providers_by_set.get(
-            _ptg2_manifest_id(
-                serving_row.get("provider_set_global_id_128")
-            ),
-            [],
+        provider_rows = (
+            exact_provider_materialization.providers_for(serving_row)
+            if exact_provider_materialization is not None
+            else providers_by_set.get(
+                _ptg2_manifest_id(
+                    serving_row.get("provider_set_global_id_128")
+                ),
+                [],
+            )
         )
         if (
             not provider_rows
@@ -12848,7 +13189,10 @@ async def _search_manifest_serving_table(
             continue
         for provider in provider_rows:
             response_item_by_field = dict(base_response_by_field)
-            address_payload = _coerce_json_payload(provider.get("address_payload"), {})
+            provider_fields = _request_local_provider_fields(provider)
+            address_payload = provider_fields["address"]
+            classifications = provider_fields["classifications"]
+            specializations = provider_fields["specializations"]
             response_item_by_field.update(
                 {
                     "provider_ordinal": provider.get("npi") or provider_set_hash,
@@ -12863,15 +13207,15 @@ async def _search_manifest_serving_table(
                     "location_source": provider.get("location_source"),
                     "location_confidence_code": provider.get("location_confidence_code"),
                     "address": address_payload,
-                    "taxonomy_codes": _coerce_json_payload(provider.get("taxonomy_codes"), []),
-                    "specialties": _coerce_json_payload(provider.get("specialties"), []),
+                    "taxonomy_codes": provider_fields["taxonomy_codes"],
+                    "specialties": provider_fields["specialties"],
                     "primary_specialty": provider.get("primary_specialty"),
-                    "classification": (_coerce_json_payload(provider.get("classifications"), []) or [None])[0],
-                    "classifications": _coerce_json_payload(provider.get("classifications"), []),
+                    "classification": (classifications or [None])[0],
+                    "classifications": classifications,
                     "specialization": provider.get("primary_specialization")
-                    or ((_coerce_json_payload(provider.get("specializations"), []) or [None])[0]),
+                    or ((specializations or [None])[0]),
                     "primary_specialization": provider.get("primary_specialization"),
-                    "specializations": _coerce_json_payload(provider.get("specializations"), []),
+                    "specializations": specializations,
                     "distance_miles": provider.get("distance_miles"),
                     "zip_match_type": provider.get("zip_match_type"),
                     "anchor_zip5": provider.get("anchor_zip5"),
@@ -14517,10 +14861,6 @@ async def _read_multi_ptg2_snapshots(
     sub_pagination: PaginationParams,
     release_selection: PlanReleaseServingSelection | None,
 ) -> list[tuple[str, str, dict[str, Any] | None]] | None:
-    serving_tables_by_snapshot_id = await _network_tables_by_snapshot_id(
-        session,
-        network_snapshots,
-    )
     binding_by_network = {
         (binding.source_key, binding.snapshot_id): binding
         for binding in (
@@ -14529,6 +14869,22 @@ async def _read_multi_ptg2_snapshots(
             else ()
         )
     }
+    if release_selection is None:
+        serving_tables_by_snapshot_id = await _network_tables_by_snapshot_id(
+            session,
+            network_snapshots,
+        )
+    else:
+        if tuple(network_snapshots) != tuple(binding_by_network):
+            return None
+        validated_serving_tables_by_snapshot_id = (
+            release_selection.network_tables_by_snapshot()
+        )
+        if validated_serving_tables_by_snapshot_id is None:
+            return None
+        serving_tables_by_snapshot_id = (
+            validated_serving_tables_by_snapshot_id
+        )
     network_responses = []
     for source_key, snapshot_id in network_snapshots:
         network_args = args
@@ -14555,8 +14911,13 @@ async def _search_plan_release_index(
     args: dict[str, Any],
     pagination,
     release_selection: PlanReleaseServingSelection,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     release_bindings = release_selection.in_network_bindings
+    serving_tables_by_snapshot_id = (
+        release_selection.network_tables_by_snapshot()
+    )
+    if serving_tables_by_snapshot_id is None:
+        return None
     if not release_bindings:
         return _plan_release_no_match_response(
             release_selection, args, pagination
@@ -14575,11 +14936,17 @@ async def _search_plan_release_index(
         )
     else:
         binding = release_bindings[0]
+        serving_tables = serving_tables_by_snapshot_id.get(
+            binding.snapshot_id
+        )
+        if serving_tables is None:
+            return None
         response_by_field = await _search_one_ptg2_snapshot(
             session,
             binding.snapshot_id,
             binding_query_args(args, binding),
             pagination,
+            serving_tables=serving_tables,
         )
     return _plan_release_response_or_no_match(
         response_by_field,
