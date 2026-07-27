@@ -268,7 +268,7 @@ def _cms_edge_csv(rows: list[list[str]]) -> str:
 
 def test_cms_sma_parser_covers_skips_and_capability_only_fallback():
     missing_headers = "ignored\nignored\n"
-    assert importer._cms_sma_endpoint_directory_seed_rows_from_csv(
+    assert importer._cms_sma_seed_rows_from_csv(
         missing_headers
     ) == []
     csv_text = _cms_edge_csv(
@@ -285,7 +285,7 @@ def test_cms_sma_parser_covers_skips_and_capability_only_fallback():
         ]
     )
 
-    rows = importer._cms_sma_endpoint_directory_seed_rows_from_csv(csv_text)
+    rows = importer._cms_sma_seed_rows_from_csv(csv_text)
 
     assert [row["org_name"] for row in rows] == ["State of Fallback"]
     assert rows[0]["api_base"] == "https://fallback.test/fhir"

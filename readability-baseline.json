@@ -1,22 +1,22 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 34,
-    "ambiguous_variable_names": 4,
-    "boolean_name_mismatch": 9,
+    "ambiguous_variable_names": 0,
+    "boolean_name_mismatch": 0,
     "builtin_shadowing": 0,
-    "class_name_shape": 2,
+    "class_name_shape": 1,
     "collection_name_mismatch": 2,
     "comment_noise": 0,
     "confusable_function_names": 0,
     "deep_nesting": 66,
-    "function_name_shape": 11,
+    "function_name_shape": 0,
     "global_state_usage": 3,
     "inline_suppressions": 2,
     "long_files": 183,
-    "long_functions": 823,
+    "long_functions": 820,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
-    "single_letter_names": 7,
+    "single_letter_names": 6,
     "syntax_errors": 0,
     "too_many_locals": 179,
     "too_many_parameters": 73
@@ -58,27 +58,11 @@
       "ambiguous_function_name:process/ptg.py:main",
       "ambiguous_function_name:process/ptg_candidate_audit.py:main"
     ],
-    "ambiguous_variable_names": [
-      "ambiguous_variable_name:api/endpoint/npi.py:get_npi:data",
-      "ambiguous_variable_name:api/endpoint/site_intelligence.py:get_site_score:row",
-      "ambiguous_variable_name:process/mrf_source_discovery.py:_viva_health_employer_landing_target:source",
-      "ambiguous_variable_name:process/provider_directory_fhir.py:_source_row_from_seed:row"
-    ],
-    "boolean_name_mismatch": [
-      "boolean_name_mismatch:api/provider_specialty_filters.py:ProviderSpecialtyFilter.active:function",
-      "boolean_name_mismatch:api/tier_utils.py:normalize_drug_tier_slug._has:function",
-      "boolean_name_mismatch:process/__init__.py:ptg:keep_partial_artifacts:assignment",
-      "boolean_name_mismatch:process/npi.py:shutdown.table_exists:function",
-      "boolean_name_mismatch:process/npi.py:shutdown.table_has_column:function",
-      "boolean_name_mismatch:process/provider_enrichment.py:_looks_like_provider_enrollment_title:function",
-      "boolean_name_mismatch:process/provider_quality_parts/execution_helpers.py:_row_allowed_for_test:function",
-      "boolean_name_mismatch:process/provider_quality_parts/state.py:_claim_finalize_lock:function",
-      "boolean_name_mismatch:process/provider_quality_parts/state.py:_claim_global_finalize_lock:function"
-    ],
+    "ambiguous_variable_names": [],
+    "boolean_name_mismatch": [],
     "builtin_shadowing": [],
     "class_name_shape": [
-      "class_name_shape:db/connection.py:Base:generic",
-      "class_name_shape:process/ptg_parts/provider_cache.py:PTG2InMemoryProviderReferenceCache:too_many_tokens"
+      "class_name_shape:db/connection.py:Base:generic"
     ],
     "collection_name_mismatch": [
       "collection_name_mismatch:process/mrf_source_discovery.py:_crawl_targets_for_source:resolver",
@@ -154,23 +138,11 @@
       "deep_nesting:scripts/validation/ptg2_v3_source_api_audit.py:SourceIndex._is_rate_event_consumed",
       "deep_nesting:tests/test_ptg2_v4_snapshot_maps.py:test_real_postgres_v4_root_pack_overlap_and_publication"
     ],
-    "function_name_shape": [
-      "function_name_shape:process/provider_directory_fhir.py:_amerihealth_caritas_seed_rows_from_catalog_html:too_many_tokens",
-      "function_name_shape:process/provider_directory_fhir.py:_cms_sma_endpoint_directory_seed_rows_from_csv:too_many_tokens",
-      "function_name_shape:process/provider_directory_fhir.py:_contra_costa_seed_rows_from_developer_html:too_many_tokens",
-      "function_name_shape:process/provider_directory_fhir.py:_fetch_oauth2_client_credentials_token_sync:too_many_tokens",
-      "function_name_shape:process/provider_directory_fhir.py:provider_directory_location_address_key_batch_sql:too_many_tokens",
-      "function_name_shape:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_2_build_lsh_shard:too_many_tokens",
-      "function_name_shape:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_3_update_procedure_bucket:too_many_tokens",
-      "function_name_shape:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_4_build_peer_targets:too_many_tokens",
-      "function_name_shape:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_5_build_measure_shard:too_many_tokens",
-      "function_name_shape:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_6_build_domain_shard:too_many_tokens",
-      "function_name_shape:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_7_build_score_shard:too_many_tokens"
-    ],
+    "function_name_shape": [],
     "global_state_usage": [
       "global_state_usage:process/cms_doctors.py:process_data._consume_reader:nonlocal:216:accepted_rows",
       "global_state_usage:process/ext/utils.py:_download_parallel_by_ranges._download_range:nonlocal:309:downloaded_bytes,last_progress_time",
-      "global_state_usage:process/provider_quality.py:_split_source_into_chunks.flush_chunk:nonlocal:517:chunk_rows,chunk_bytes,chunk_index"
+      "global_state_usage:process/provider_quality.py:_split_source_into_chunks.flush_chunk:nonlocal:529:chunk_rows,chunk_bytes,chunk_index"
     ],
     "inline_suppressions": [
       "inline_suppression:support/ptg2_scanner/src/main.rs:rust_allow:f8cf193d33c0",
@@ -475,7 +447,6 @@
       "long_function:api/ptg2_snapshot.py:current_snapshot_id",
       "long_function:api/ptg2_tables.py:_strict_v3_manifest_fields",
       "long_function:api/ptg2_tables.py:snapshot_serving_tables",
-      "long_function:api/ptg2_v4_graph.py:_load_building_v4_graph_root",
       "long_function:api/ptg2_v4_graph.py:_load_map_coordinate_pairs",
       "long_function:api/ptg2_v4_graph.py:_load_physical_blocks",
       "long_function:api/ptg2_v4_graph.py:_load_v4_heavy_bitmap_payloads",
@@ -549,7 +520,6 @@
       "long_function:process/initial.py:process_provider",
       "long_function:process/initial.py:shutdown",
       "long_function:process/lodes.py:_load_tract_to_zip_crosswalk",
-      "long_function:process/lodes.py:_process_lodes_state",
       "long_function:process/lodes.py:process_data",
       "long_function:process/lodes.py:shutdown",
       "long_function:process/medicare_enrollment.py:process_data",
@@ -651,11 +621,11 @@
       "long_function:process/provider_directory_fhir.py:_bulk_export_poll_outputs",
       "long_function:process/provider_directory_fhir.py:_canonical_backfill_resource_sql",
       "long_function:process/provider_directory_fhir.py:_claim_provider_directory_profile_build_checkpoint",
-      "long_function:process/provider_directory_fhir.py:_cms_sma_endpoint_directory_seed_rows_from_csv",
+      "long_function:process/provider_directory_fhir.py:_cms_sma_seed_rows_from_csv",
       "long_function:process/provider_directory_fhir.py:_copy_upsert_rows",
       "long_function:process/provider_directory_fhir.py:_delete_stale_resource_rows",
       "long_function:process/provider_directory_fhir.py:_fetch_bulk_export_resource_rows",
-      "long_function:process/provider_directory_fhir.py:_fetch_oauth2_client_credentials_token_sync",
+      "long_function:process/provider_directory_fhir.py:_fetch_oauth2_client_token_sync",
       "long_function:process/provider_directory_fhir.py:_fetch_owned_checkpointed_bulk_resource_rows",
       "long_function:process/provider_directory_fhir.py:_fetch_resource_rows",
       "long_function:process/provider_directory_fhir.py:_fetch_scan_practitioner_role_rows",
@@ -665,7 +635,6 @@
       "long_function:process/provider_directory_fhir.py:_import_resources.import_one_group",
       "long_function:process/provider_directory_fhir.py:_is_profile_build_checkpoint_reusable",
       "long_function:process/provider_directory_fhir.py:_linked_resource_candidate_urls",
-      "long_function:process/provider_directory_fhir.py:_mark_resource_rows_seen",
       "long_function:process/provider_directory_fhir.py:_populate_provider_directory_profile_compact_stage",
       "long_function:process/provider_directory_fhir.py:_populate_provider_directory_profile_evidence_stage",
       "long_function:process/provider_directory_fhir.py:_publish_provider_directory_artifacts",
@@ -688,7 +657,7 @@
       "long_function:process/provider_directory_fhir.py:parse_fhir_resource",
       "long_function:process/provider_directory_fhir.py:process_data",
       "long_function:process/provider_directory_fhir.py:provider_directory_address_corroboration_sql",
-      "long_function:process/provider_directory_fhir.py:provider_directory_location_address_key_batch_sql",
+      "long_function:process/provider_directory_fhir.py:provider_directory_address_key_batch_sql",
       "long_function:process/provider_directory_fhir.py:provider_directory_location_address_key_sql",
       "long_function:process/provider_directory_fhir.py:provider_directory_location_archive_stage_sql",
       "long_function:process/provider_directory_fhir.py:provider_directory_network_catalog_insert_sql",
@@ -719,10 +688,10 @@
       "long_function:process/provider_quality.py:provider_quality_start",
       "long_function:process/provider_quality_parts/cohort_context.py:_build_cohort_materialization_context",
       "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_1_build_features",
-      "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_2_build_lsh_shard",
-      "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_4_build_peer_targets",
-      "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_5_build_measure_shard",
-      "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_7_build_score_shard",
+      "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_2_lsh_shard",
+      "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_4_peer_targets",
+      "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_5_measure_shard",
+      "long_function:process/provider_quality_parts/cohort_sql.py:_cohort_sql_phase_7_score_shard",
       "long_function:process/provider_quality_parts/materialize_shards.py:_run_materialize_shard_job",
       "long_function:process/ptg.py:_annotate_v3_result_identity",
       "long_function:process/ptg.py:_copy_manifest_files_direct_with_progress",
@@ -1194,8 +1163,7 @@
       "single_letter_name:api/endpoint/clinical.py:list_clinical_areas:q",
       "single_letter_name:api/endpoint/clinical.py:list_concepts:q",
       "single_letter_name:api/endpoint/codes.py:list_codes:q",
-      "single_letter_name:api/endpoint/nucc.py:all_of_nucc:q",
-      "single_letter_name:process/pharmacy_economics.py:_fetch_sdud:v"
+      "single_letter_name:api/endpoint/nucc.py:all_of_nucc:q"
     ],
     "syntax_errors": [],
     "too_many_locals": [
@@ -1292,7 +1260,7 @@
       "too_many_locals:process/pharmacy_license.py:_import_state_source",
       "too_many_locals:process/pharmacy_license.py:_load_rows_from_aspnet_search_state",
       "too_many_locals:process/pharmacy_license.py:_normalize_stage_row",
-      "too_many_locals:process/provider_directory_fhir.py:_cms_sma_endpoint_directory_seed_rows_from_csv",
+      "too_many_locals:process/provider_directory_fhir.py:_cms_sma_seed_rows_from_csv",
       "too_many_locals:process/provider_directory_fhir.py:_copy_upsert_rows",
       "too_many_locals:process/provider_directory_fhir.py:_fetch_bulk_export_resource_rows",
       "too_many_locals:process/provider_directory_fhir.py:_fetch_resource_rows",

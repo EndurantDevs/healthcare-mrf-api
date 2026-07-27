@@ -482,7 +482,7 @@ def _is_ffs_bundle_dataset_title(title: str) -> bool:
     return False
 
 
-def _looks_like_provider_enrollment_title(title: str) -> bool:
+def _is_provider_enrollment_title(title: str) -> bool:
     normalized = _normalize_title(title)
     if "enrollment" not in normalized:
         return False
@@ -621,7 +621,7 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
 
         spec = _match_spec(dataset_title)
         if spec is None:
-            if _looks_like_provider_enrollment_title(dataset_title):
+            if _is_provider_enrollment_title(dataset_title):
                 unmapped_titles.add(dataset_title)
             continue
 

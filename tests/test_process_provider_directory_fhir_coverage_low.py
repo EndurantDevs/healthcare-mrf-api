@@ -107,7 +107,7 @@ def test_oauth_transport_failure_is_local(monkeypatch):
         "urlopen",
         Mock(side_effect=RuntimeError("offline")),
     )
-    token = importer._fetch_oauth2_client_credentials_token_sync(
+    token = importer._fetch_oauth2_client_token_sync(
         {
             "token_url": "https://auth.example.test/token",
             "client_id": "client",
@@ -127,7 +127,11 @@ def test_credential_options_tolerate_empty_oauth_token(monkeypatch):
         Mock(return_value=credential_spec_by_field),
     )
     monkeypatch.setattr(importer, "_is_credential_allowed_for_url", Mock(return_value=True))
-    monkeypatch.setattr(importer, "_fetch_oauth2_client_credentials_token_sync", Mock(return_value=None))
+    monkeypatch.setattr(
+        importer,
+        "_fetch_oauth2_client_token_sync",
+        Mock(return_value=None),
+    )
     options_by_field = importer._credential_request_options_for_source(
         {"source_id": "source-1"}, "https://example.test/fhir"
     )
@@ -267,7 +271,7 @@ def test_catalog_filters_skip_unmatched_public_rows():
 State,Provider Directory Production Base URL,Status - Drop Down List,Is the API public? (Y/N) - Drop Down List,FHIR Capability Statement link
 Iowa,https://fixture.test/fhir/Practitioner,Active,Yes,
 """
-    assert importer._cms_sma_endpoint_directory_seed_rows_from_csv(
+    assert importer._cms_sma_seed_rows_from_csv(
         cms_csv, source_query="not-iowa", source_url="fixture.csv"
     ) == []
     amerigroup_html = """
@@ -276,7 +280,7 @@ Iowa,https://fixture.test/fhir/Practitioner,Active,Yes,
       <td><a href="https://api-ext.amerihealthcaritas.com/5400/provider-api/swagger-ui/">API</a></td>
     </tr></table>
     """
-    assert importer._amerihealth_caritas_seed_rows_from_catalog_html(
+    assert importer._amerihealth_seed_rows_from_catalog_html(
         amerigroup_html, source_query="not-amerihealth", source_url="fixture.html"
     ) == []
 

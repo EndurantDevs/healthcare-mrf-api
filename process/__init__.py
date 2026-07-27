@@ -1026,8 +1026,9 @@ def ptg(
         raise click.UsageError(
             "controlled PTG rebuilds must be requested through import control"
         )
+    should_keep_partial_artifacts = keep_partial_artifacts
     if keep_artifacts_on_failure:
-        keep_partial_artifacts = True
+        should_keep_partial_artifacts = True
     _run(
         initiate_ptg(
             test_mode=test,
@@ -1046,7 +1047,7 @@ def ptg(
             plan_market_types=list(plan_market_type),
             file_url_contains=list(file_url_contains),
             reuse_raw_artifacts=reuse_raw_artifacts,
-            keep_partial_artifacts=keep_partial_artifacts,
+            keep_partial_artifacts=should_keep_partial_artifacts,
         )
     )
 

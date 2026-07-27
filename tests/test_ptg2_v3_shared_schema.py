@@ -195,7 +195,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260727100000_ptg2_provider_tax_identity"
+        "20260727110000_ptg2_legacy_orphan_sweep_audit"
     ]
 
 

@@ -263,7 +263,7 @@ async def _fetch_sdud(client, sdud_url: str) -> dict[str, dict[str, dict]]:
     logger.info(
         "SDUD parsed: %d states, %d total state-NDC combos (dropped_invalid_state=%d)",
         len(by_state),
-        sum(len(v) for v in by_state.values()),
+        sum(len(state_ndcs) for state_ndcs in by_state.values()),
         dropped_invalid_state,
     )
     return by_state

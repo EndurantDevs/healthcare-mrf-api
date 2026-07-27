@@ -288,6 +288,19 @@
         "process/ptg_parts/ptg2_fast_candidate_audit.py",
         "process/ptg_parts/ptg2_fast_candidate_audit_report.py",
         "process/ptg_parts/ptg2_input_artifact_gc.py",
+        "process/ptg_parts/ptg2_legacy_orphan_contract.py",
+        "process/ptg_parts/ptg2_legacy_orphan_models.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_catalog.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_catalog_sql.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_common.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_mutation.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_ownership.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_references.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_replay.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_schema.py",
+        "process/ptg_parts/ptg2_legacy_orphan_sweeper.py",
+        "process/ptg_parts/ptg2_legacy_orphan_sweeper_cli.py",
         "process/ptg_parts/ptg2_lifecycle_lock.py",
         "process/ptg_parts/ptg2_manifest_artifacts.py",
         "process/ptg_parts/ptg2_manifest_publish.py",
@@ -411,12 +424,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 33406,
-          "total": 38724
+          "covered": 33825,
+          "total": 39070
         },
         "lines": {
-          "covered": 106760,
-          "total": 115181
+          "covered": 108120,
+          "total": 116317
         }
       },
       "one_time_floor_reset": {

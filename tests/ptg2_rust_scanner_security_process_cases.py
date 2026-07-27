@@ -142,6 +142,15 @@ def test_signal_group_fallback_and_terminal_shortcuts(monkeypatch) -> None:
     rust_scanner._signal_process_group(process, signal.SIGTERM)
     assert process.signals == [signal.SIGTERM]
 
+    async_process = SimpleNamespace(
+        pid=process.pid,
+        returncode=None,
+        signals=[],
+    )
+    async_process.send_signal = async_process.signals.append
+    rust_scanner._signal_process_group(async_process, signal.SIGTERM)
+    assert async_process.signals == [signal.SIGTERM]
+
     process.send_signal = lambda _signal: (_ for _ in ()).throw(ProcessLookupError())
     rust_scanner._signal_process_group(process, signal.SIGTERM)
 

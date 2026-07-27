@@ -129,7 +129,7 @@ class PTG2ProviderReferenceCache:
         self.conn.close()
 
 
-class PTG2InMemoryProviderReferenceCache:
+class PTG2MemoryProviderReferenceCache:
     def __init__(self, initial: dict[Any, list[dict[str, Any]]] | None = None):
         self.refs: dict[str, list[dict[str, Any]]] = {}
         self.provider_hashes: set[int] = set()
@@ -185,6 +185,9 @@ class PTG2InMemoryProviderReferenceCache:
     def close(self) -> None:
         """Provide the persistent-cache close interface without doing work."""
         return None
+
+
+PTG2InMemoryProviderReferenceCache = PTG2MemoryProviderReferenceCache
 
 
 def _provider_cache_get(provider_cache: Any, ref: Any) -> list[dict[str, Any]]:

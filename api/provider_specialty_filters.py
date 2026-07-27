@@ -310,13 +310,15 @@ class ProviderSpecialtyFilter:
     suggested_specialties: tuple[str, ...] = field(default=())
 
     @property
-    def active(self) -> bool:
+    def is_active(self) -> bool:
         """Return whether any specialty constraint is active."""
         return bool(self.classification or self.taxonomy_codes)
 
+    active = is_active
+
     def response_payload(self) -> dict[str, Any] | None:
         """Build the public response representation for this filter."""
-        if not self.active:
+        if not self.is_active:
             return None
         payload: dict[str, Any] = {
             "primary_only": self.primary_only,
@@ -421,7 +423,11 @@ async def resolve_ptg_provider_specialty_filter(session, args: Mapping[str, Any]
         specialty_lookup=_static_specialty_lookup,
         specialty_suggestions=_static_specialty_suggestions,
     )
-    if resolved.active or not resolved.specialty or _normalize_taxonomy_codes(args.get("taxonomy_codes")):
+    if (
+        resolved.is_active
+        or not resolved.specialty
+        or _normalize_taxonomy_codes(args.get("taxonomy_codes"))
+    ):
         return resolved
 
     try:
@@ -462,7 +468,7 @@ def provider_specialty_taxonomy_semijoin_sql(
     unbounded — e.g. a whole group-plan network member table, where the correlated
     EXISTS form degraded to one index probe per member row.
     """
-    if not specialty_filter.active:
+    if not specialty_filter.is_active:
         return ""
 
     nt = nt_alias or f"{param_prefix}_nt"
@@ -510,7 +516,7 @@ def provider_specialty_taxonomy_exists_sql(
     nucc_alias: str | None = None,
 ) -> str:
     """Build a correlated taxonomy predicate for a specialty filter."""
-    if not specialty_filter.active:
+    if not specialty_filter.is_active:
         return ""
 
     nt = nt_alias or f"{param_prefix}_nt"

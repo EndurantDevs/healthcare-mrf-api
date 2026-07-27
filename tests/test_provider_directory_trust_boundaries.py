@@ -2317,7 +2317,7 @@ def test_oauth_credentials_fail_closed_and_cache_valid_token(monkeypatch):
     """Reject incomplete token responses and cache one valid body-auth token."""
     importer._OAUTH_TOKEN_CACHE.clear()
     assert (
-        importer._fetch_oauth2_client_credentials_token_sync(
+        importer._fetch_oauth2_client_token_sync(
             {"token_url": "https://auth.test/token"}
         )
         is None
@@ -2343,19 +2343,19 @@ def test_oauth_credentials_fail_closed_and_cache_valid_token(monkeypatch):
         "extra_params": {"audience": "aud-a", "empty": ""},
     }
     assert (
-        importer._fetch_oauth2_client_credentials_token_sync(oauth_by_field)
+        importer._fetch_oauth2_client_token_sync(oauth_by_field)
         is None
     )
     assert (
-        importer._fetch_oauth2_client_credentials_token_sync(oauth_by_field)
+        importer._fetch_oauth2_client_token_sync(oauth_by_field)
         is None
     )
     assert (
-        importer._fetch_oauth2_client_credentials_token_sync(oauth_by_field)
+        importer._fetch_oauth2_client_token_sync(oauth_by_field)
         == "token-a"
     )
     assert (
-        importer._fetch_oauth2_client_credentials_token_sync(oauth_by_field)
+        importer._fetch_oauth2_client_token_sync(oauth_by_field)
         == "token-a"
     )
     importer._OAUTH_TOKEN_CACHE.clear()
@@ -2390,7 +2390,7 @@ def test_credential_request_options_resolve_oauth_and_drop_empty_values(
     )
     monkeypatch.setattr(
         importer,
-        "_fetch_oauth2_client_credentials_token_sync",
+        "_fetch_oauth2_client_token_sync",
         Mock(return_value="token-a"),
     )
     source_by_field = {

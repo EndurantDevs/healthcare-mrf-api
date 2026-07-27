@@ -4702,7 +4702,7 @@ def _collect_viva_health_commercial_targets(
 
 
 def _viva_health_employer_landing_target(
-    source: dict[str, Any],
+    source_row: dict[str, Any],
     *,
     employer_url: str,
     employer_page_url: str,
@@ -4724,7 +4724,7 @@ def _viva_health_employer_landing_target(
             }
         )
     return CrawlTarget(
-        source=source,
+        source=source_row,
         url=employer_url,
         label=employer_name or "VIVA Health employer MRF page",
         resolved_from_url=employer_page_url,

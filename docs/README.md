@@ -14,6 +14,7 @@ It is intended for readers on GitHub who need to understand:
 - [Import index](./imports/README.md): every import command in one place
 - [MRF source discovery DevOps](./devops/mrf-source-discovery.md): payer/TPA source catalog schedules, smokes, and troubleshooting
 - [PTG2 source snapshot GC DevOps](./devops/ptg2-source-snapshot-gc.md): old source-snapshot cleanup guardrails and verification
+- [Legacy PTG orphan sweeper](./devops/ptg2-legacy-orphan-sweeper.md): bounded dry-run/apply cleanup for pre-shared dynamic relation families
 - [Address canonical DevOps](./devops/address-canonical.md): deduplicated address archive rollout, ARQ restart, and smoke checks
 - [MS-DRG DevOps](./devops/ms-drg.md): CMS MS-DRG reference refresh and smoke checks
 - [Clinical reference DevOps](./devops/clinical-reference.md): direct-replace runbook and attribution rule

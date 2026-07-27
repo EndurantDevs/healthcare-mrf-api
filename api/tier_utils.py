@@ -43,7 +43,7 @@ def normalize_drug_tier_slug(tier_label: Optional[str]) -> str:
     if not tokens:
         return "unknown"
 
-    def _has(word: str) -> bool:
+    def _has_tier_word(word: str) -> bool:
         return word in tokens
 
     # Tier 1-6 shortcuts (common in CMS data)
@@ -53,26 +53,30 @@ def normalize_drug_tier_slug(tier_label: Optional[str]) -> str:
             return f"tier_{number}"
 
     # Specialty tiers
-    if _has("specialty"):
-        if _has("preferred"):
+    if _has_tier_word("specialty"):
+        if _has_tier_word("preferred"):
             return "preferred_specialty"
-        if _has("non") or _has("nonpreferred") or "nonpreferred" in lowered:
+        if (
+            _has_tier_word("non")
+            or _has_tier_word("nonpreferred")
+            or "nonpreferred" in lowered
+        ):
             return "non_preferred_specialty"
         return "specialty"
 
     # Generic tiers
-    if _has("generic"):
-        if _has("preferred"):
+    if _has_tier_word("generic"):
+        if _has_tier_word("preferred"):
             return "preferred_generic"
-        if _has("non") or "nonpreferred" in lowered:
+        if _has_tier_word("non") or "nonpreferred" in lowered:
             return "non_preferred_generic"
         return "generic"
 
     # Brand tiers
-    if _has("brand"):
-        if _has("preferred"):
+    if _has_tier_word("brand"):
+        if _has_tier_word("preferred"):
             return "preferred_brand"
-        if _has("non") or "nonpreferred" in lowered:
+        if _has_tier_word("non") or "nonpreferred" in lowered:
             return "non_preferred_brand"
         return "brand"
 
