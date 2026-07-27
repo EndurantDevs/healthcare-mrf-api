@@ -3573,7 +3573,6 @@ def _allowed_amount_metrics_from_results(
             )
     metrics_by_name["allowed_amount_evidence"] = bool(
         int(metrics_by_name.get("allowed_amount_provider_payments") or 0) > 0
-        or int(metrics_by_name.get("allowed_amount_payments") or 0) > 0
     )
     return metrics_by_name
 

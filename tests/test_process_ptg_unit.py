@@ -5431,6 +5431,89 @@ class _AllowedAmountBatchOrderRecorder:
             self.provider_batch_sizes.append(len(object_rows))
 
 
+def test_parse_allowed_amounts_records_structure_without_payment_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    """A valid empty payment list is structural metadata, not pricing evidence."""
+    allowed_path = _write_allowed_amount_batch_fixture(
+        tmp_path,
+        "allowed-empty-payments.json",
+        [],
+    )
+    batch_recorder = _AllowedAmountBatchOrderRecorder()
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", batch_recorder.push)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    metrics = asyncio.run(
+        ptg_allowed_amounts._parse_allowed_amounts(
+            str(allowed_path),
+            123,
+            "ptg2:202607:allowed-empty-payments",
+            "source-version-empty-payments",
+            {},
+            None,
+            False,
+            "import_log",
+            "https://example.test/allowed-empty-payments.json",
+        )
+    )
+
+    assert metrics["allowed_amount_items"] == 1
+    assert metrics["allowed_amount_blocks"] == 1
+    assert metrics["allowed_amount_payments"] == 0
+    assert metrics["allowed_amount_provider_payments"] == 0
+    assert metrics["allowed_amount_npi_references"] == 0
+    assert len(batch_recorder.persisted_item_hashes) == 1
+    assert batch_recorder.payment_batch_sizes == []
+    assert batch_recorder.provider_batch_sizes == []
+
+
+def test_parse_allowed_amounts_preserves_zero_valued_payment_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    """A zero monetary value remains evidence when its provider edge is valid."""
+    allowed_path = _write_allowed_amount_batch_fixture(
+        tmp_path,
+        "allowed-zero-value.json",
+        [
+            {
+                "allowed_amount": 0,
+                "providers": [{"billed_charge": 0, "npi": [1427166008]}],
+            }
+        ],
+    )
+    pushed_rows_by_class: dict[str, list[dict]] = {}
+
+    async def record_rows(object_rows, model_class, **_kwargs):
+        pushed_rows_by_class.setdefault(model_class.__name__, []).extend(
+            copy.deepcopy(object_rows)
+        )
+
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", record_rows)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    metrics = asyncio.run(
+        ptg_allowed_amounts._parse_allowed_amounts(
+            str(allowed_path),
+            123,
+            "ptg2:202607:allowed-zero-value",
+            "source-version-zero-value",
+            {},
+            None,
+            False,
+            "import_log",
+            "https://example.test/allowed-zero-value.json",
+        )
+    )
+
+    payment_row = pushed_rows_by_class["PTG2AllowedAmountPayment"][0]
+    assert payment_row["allowed_amount"] == 0
+    assert metrics["allowed_amount_payments"] == 1
+    assert metrics["allowed_amount_provider_payments"] == 1
+
+
 def test_parse_allowed_amounts_flushes_item_before_large_payment_batch(
     monkeypatch,
     tmp_path,
@@ -5571,6 +5654,30 @@ def _build_allowed_amount_file_result(
             "allowed_amount_evidence": True,
         },
     )
+
+
+def test_allowed_amount_evidence_requires_provider_linked_payment():
+    """A payment row without a provider edge cannot serve plan pricing."""
+    metrics = process_ptg._allowed_amount_metrics_from_results(
+        [
+            {
+                "source_type": "allowed_amounts",
+                "summary": {
+                    "allowed_amount_plans": 1,
+                    "allowed_amount_items": 1,
+                    "allowed_amount_blocks": 1,
+                    "allowed_amount_payments": 1,
+                    "allowed_amount_provider_payments": 0,
+                    "allowed_amount_npi_references": 0,
+                    "allowed_amount_unique_tins": 1,
+                },
+            }
+        ]
+    )
+
+    assert metrics["allowed_amount_payments"] == 1
+    assert metrics["allowed_amount_provider_payments"] == 0
+    assert metrics["allowed_amount_evidence"] is False
 
 
 def _build_allowed_only_push_recorder(
@@ -5786,6 +5893,107 @@ def test_ptg2_allowed_current_pointer_replaces_previous_snapshot(monkeypatch):
         import_month=datetime.date(2026, 7, 1),
         updated_at=final_snapshot["published_at"],
     )
+
+
+def _build_empty_allowed_amount_file_result(
+    job_by_field: dict,
+    *_args,
+    **_kwargs,
+) -> process_ptg.PTG2FileProcessResult:
+    return process_ptg.PTG2FileProcessResult(
+        "allowed_amounts",
+        job_by_field["url"],
+        True,
+        file_id=123,
+        summary={
+            "engine_source_identity_hash": "a" * 64,
+            "engine_source_file_version_id": "source-version-empty-allowed",
+            "allowed_amount_plans": 1,
+            "allowed_amount_items": 1,
+            "allowed_amount_blocks": 1,
+            "allowed_amount_payments": 0,
+            "allowed_amount_provider_payments": 0,
+            "allowed_amount_npi_references": 0,
+            "allowed_amount_unique_tins": 1,
+            "allowed_amount_evidence": False,
+        },
+    )
+
+
+def _assert_empty_allowed_failure_rows(
+    pushed_rows: list[tuple[str, dict]],
+) -> None:
+    snapshot_rows = [
+        row_by_field
+        for class_name, row_by_field in pushed_rows
+        if class_name == "PTG2Snapshot"
+    ]
+    import_run_rows = [
+        row_by_field
+        for class_name, row_by_field in pushed_rows
+        if class_name == "PTG2ImportRun"
+    ]
+    final_report = import_run_rows[-1]["report"]
+    assert [snapshot_row["status"] for snapshot_row in snapshot_rows] == [
+        process_ptg.PTG2_STATUS_BUILDING,
+        process_ptg.PTG2_STATUS_FAILED,
+    ]
+    assert final_report["allowed_amount_lane"]["files_processed"] == 1
+    successful_file = final_report["allowed_amount_lane"][
+        "successful_files"
+    ][0]
+    assert successful_file["summary"]["allowed_amount_evidence"] is False
+    expected_error = (
+        "PTG2 allowed-amount import produced no payment evidence"
+    )
+    assert import_run_rows[-1]["error"] == expected_error
+    assert snapshot_rows[-1]["manifest"]["error"] == expected_error
+
+
+def test_ptg2_allowed_only_zero_payment_fails_without_pointer_cutover(
+    monkeypatch,
+):
+    """Do not publish a structurally valid file that has no payment evidence."""
+    (
+        pushed_rows,
+        manifest_stage,
+        publish_source_pointers,
+        publish_allowed_pointer,
+    ) = _install_allowed_only_main_mocks(monkeypatch)
+    process_allowed_file = AsyncMock(
+        side_effect=_build_empty_allowed_amount_file_result
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_process_allowed_amounts_file",
+        process_allowed_file,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_current_allowed_snapshot_id",
+        AsyncMock(return_value="ptg2:202606:previous-allowed"),
+    )
+    _install_failed_import_cleanup_mocks(monkeypatch)
+
+    with pytest.raises(
+        RuntimeError,
+        match="allowed-amount import produced no payment evidence",
+    ):
+        asyncio.run(
+            process_ptg.main(
+                toc_urls=["https://example.test/index.json"],
+                import_month="2026-07",
+                import_id="allowed_amount_empty",
+                source_key="example_allowed_source",
+            )
+        )
+
+    _assert_empty_allowed_failure_rows(pushed_rows)
+    manifest_stage.assert_not_awaited()
+    publish_source_pointers.assert_not_awaited()
+    publish_allowed_pointer.assert_not_awaited()
+    process_ptg._delete_allowed_snapshot_rows.assert_awaited()
+    assert process_ptg._delete_allowed_snapshot_rows.await_count == 2
 
 
 def _mixed_partial_allowed_jobs() -> list[dict]:
