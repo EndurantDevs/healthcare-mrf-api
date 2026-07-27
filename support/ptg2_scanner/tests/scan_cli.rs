@@ -1,6 +1,8 @@
+mod support;
+
 use std::fs;
-use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use support::write_stdin_and_wait;
 
 fn scanner() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
@@ -27,15 +29,14 @@ fn postgres_copy(rows: &[Vec<Option<Vec<u8>>>]) -> Vec<u8> {
 }
 
 fn run_scanner_with_stdin(arguments: &[&str], stdin: &[u8]) -> Output {
-    let mut child = scanner()
+    let child = scanner()
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
-    child.wait_with_output().unwrap()
+    write_stdin_and_wait(child, stdin)
 }
 
 fn pg_i32(value: i32) -> Option<Vec<u8>> {

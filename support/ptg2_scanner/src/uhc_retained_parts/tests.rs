@@ -494,4 +494,6 @@ mod tests {
             "0cd8eb9ccef2be7d4abb442b48d51f56e76fb11670ce662568cba4dc6ee15bb8"
         );
     }
+
+    include!("publication_tests.rs");
 }
