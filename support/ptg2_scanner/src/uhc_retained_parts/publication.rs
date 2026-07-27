@@ -12,6 +12,15 @@ fn encode_manifest(manifest: &UHCRetainedManifest) -> io::Result<Vec<u8>> {
 
 fn read_bounded_stable_file(file: &File, maximum_bytes: u64, label: &str) -> io::Result<Vec<u8>> {
     let before = FileIdentity::from_file(file)?;
+    read_bounded_file_from_identity(file, before, maximum_bytes, label)
+}
+
+fn read_bounded_file_from_identity(
+    file: &File,
+    before: FileIdentity,
+    maximum_bytes: u64,
+    label: &str,
+) -> io::Result<Vec<u8>> {
     if before.byte_count == 0 || before.byte_count > maximum_bytes {
         return Err(invalid_data(format!(
             "UHC retained {label} has an invalid byte count"
@@ -189,6 +198,24 @@ fn publish_or_verify_manifest(
         );
     }
 
+    publish_manifest_candidate(
+        root,
+        manifest_name,
+        candidate,
+        expected_raw,
+        expected_ranges,
+        expected_range_set_sha256,
+    )
+}
+
+fn publish_manifest_candidate(
+    root: &Arc<RootDirectory>,
+    manifest_name: &str,
+    candidate: &UHCRetainedManifest,
+    expected_raw: &UHCRawArtifactManifest,
+    expected_ranges: &[UHCRawRangeManifest],
+    expected_range_set_sha256: &str,
+) -> io::Result<ManifestPublication> {
     let encoded = encode_manifest(candidate)?;
     let mut temporary = root.create_temporary("manifest")?;
     temporary.file_mut().write_all(&encoded)?;
@@ -200,24 +227,12 @@ fn publish_or_verify_manifest(
             root.open_existing_regular(manifest_name)?,
             "published retained UHC manifest is not visible in its root",
         )?;
-        let final_identity = FileIdentity::from_file(&final_file)?;
-        if !same_inode(temporary_identity, final_identity) {
-            return Err(invalid_data(
-                "published retained UHC manifest inode changed unexpectedly",
-            ));
-        }
-        let observed = read_bounded_stable_file(&final_file, MAX_MANIFEST_BYTES, "manifest")?;
-        if observed != encoded {
-            return Err(invalid_data(
-                "published retained UHC manifest bytes changed unexpectedly",
-            ));
-        }
-        return Ok(ManifestPublication {
-            producer_build_id: candidate.producer_build_id.clone(),
+        return verify_new_manifest_publication(
+            &final_file,
+            temporary_identity,
+            &candidate.producer_build_id,
             encoded,
-            reused: false,
-            final_identity,
-        });
+        );
     }
 
     let existing = some_or_invalid_data(
@@ -230,6 +245,32 @@ fn publish_or_verify_manifest(
         expected_ranges,
         expected_range_set_sha256,
     )
+}
+
+fn verify_new_manifest_publication(
+    final_file: &File,
+    temporary_identity: FileIdentity,
+    producer_build_id: &str,
+    encoded: Vec<u8>,
+) -> io::Result<ManifestPublication> {
+    let final_identity = FileIdentity::from_file(final_file)?;
+    if !same_inode(temporary_identity, final_identity) {
+        return Err(invalid_data(
+            "published retained UHC manifest inode changed unexpectedly",
+        ));
+    }
+    let observed = read_bounded_stable_file(final_file, MAX_MANIFEST_BYTES, "manifest")?;
+    if observed != encoded {
+        return Err(invalid_data(
+            "published retained UHC manifest bytes changed unexpectedly",
+        ));
+    }
+    Ok(ManifestPublication {
+        producer_build_id: producer_build_id.to_owned(),
+        encoded,
+        reused: false,
+        final_identity,
+    })
 }
 
 fn reverify_manifest_path(

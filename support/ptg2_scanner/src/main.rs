@@ -24674,6 +24674,136 @@ mod tests {
     }
 
     #[test]
+    fn indexed_range_and_cli_usage_guards_are_explicit() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = scanner_env_lock().lock().unwrap();
+        {
+            let _unset = TestEnvVar::remove("HLTHPRT_PTG2_RUST_INDEXED_RANGE_PRODUCERS");
+            assert_eq!(
+                indexed_range_producers_requested().unwrap(),
+                DEFAULT_INDEXED_RANGE_PRODUCERS
+            );
+        }
+        {
+            let _valid = TestEnvVar::set("HLTHPRT_PTG2_RUST_INDEXED_RANGE_PRODUCERS", "2");
+            assert_eq!(indexed_range_producers_requested().unwrap(), 2);
+        }
+        {
+            let _invalid = TestEnvVar::set("HLTHPRT_PTG2_RUST_INDEXED_RANGE_PRODUCERS", "0");
+            assert!(indexed_range_producers_requested().is_err());
+        }
+
+        assert!(strict_v3_price_copy_stdio_usage().contains("<24|32>"));
+        assert_eq!(
+            shared_graph_summary_path(Path::new("/tmp/shared-graph"), "fixture").unwrap(),
+            "/tmp/shared-graph"
+        );
+        let non_utf8 = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+        assert!(shared_graph_summary_path(&non_utf8, "fixture").is_err());
+
+        let progress = IndexedProducerProgress::default();
+        progress.record_object(3, 128);
+        emit_indexed_range_progress(
+            Path::new("/tmp/indexed-progress"),
+            2,
+            &progress,
+            Instant::now(),
+            true,
+        );
+        assert!(run_shared_graph_converter(&[]).is_err());
+        assert!(run_v3_finalizer(&[]).is_err());
+    }
+
+    #[test]
+    fn compact_scan_entrypoints_reject_startup_boundaries_before_work() {
+        let _guard = scanner_env_lock().lock().unwrap();
+        let _factor_mode = TestEnvVar::remove(PROVIDER_GRAPH_V4_ENV);
+        let directory = tempfile::tempdir().unwrap();
+        let _strict_env = strict_scan_env(directory.path());
+        let missing = directory.path().join("missing.json.gz");
+        let scan_error = scan_compact(&missing).unwrap_err();
+        assert_eq!(scan_error.kind(), io::ErrorKind::NotFound);
+
+        let indexed_error = build_indexed_top_level_reorder(
+            &missing,
+            &RapidgzipConfig::default(),
+            Arc::new(AtomicU64::new(0)),
+            1,
+            1,
+        )
+        .err()
+        .expect("missing scanner input rejected");
+        assert_eq!(indexed_error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            indexed_error.to_string(),
+            "indexed scans require rapidgzip and gzip input"
+        );
+
+        let context = CompactContext {
+            snapshot_id: "snapshot".to_owned(),
+            plan_id: "plan".to_owned(),
+            plan_month_id: "month".to_owned(),
+            source_trace_set_hash: "trace".to_owned(),
+            confidence_code: "exact".to_owned(),
+            source_witness: Arc::new(SourceWitnessCollector::new(&"00".repeat(32)).unwrap()),
+        };
+        let parallel_error = scan_compact_struson_parallel(
+            &missing,
+            context,
+            1,
+            1,
+            CopyPathConfig::default(),
+            1,
+            CompactParallelScanSelection {
+                preflight_metrics: CompactPreflightMetrics {
+                    order_detection_seconds: 0.0,
+                    order_detection_compressed_bytes: 0,
+                },
+                top_level_byte_scan_requested: false,
+                top_level_byte_scan_fallback_reason: "test",
+            },
+        )
+        .unwrap_err();
+        assert_eq!(parallel_error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn pre_cancelled_indexed_producer_never_opens_its_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.json.gz");
+        let (worker_tx, _worker_rx) = unbounded();
+        let (_recycle_tx, recycle_rx) = unbounded();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = produce_indexed_in_network_range(IndexedRangeProducerConfig {
+            path: missing.clone(),
+            rapidgzip_config: RapidgzipConfig::default(),
+            index_path: missing.with_extension("index"),
+            range_id: 0,
+            range: IndexedInNetworkRange {
+                offset: 0,
+                length: 1,
+                object_count: 1,
+            },
+            object_ordinal_base: 0,
+            tx: worker_tx,
+            cancelled,
+            queue_bytes: Arc::new(QueueByteMetrics::default()),
+            recycle_rx,
+            progress: Arc::new(IndexedProducerProgress::default()),
+            enqueue_options: InNetworkEnqueueOptions {
+                chunk_size: 1,
+                raw_chunk_byte_limit: 1,
+                parse_in_workers: false,
+                object_ordinal: 0,
+            },
+        })
+        .err()
+        .expect("pre-cancelled indexed producer rejected");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
     fn compact_worker_failure_precedes_peer_cancellation() {
         for peer_kind in [io::ErrorKind::Interrupted, io::ErrorKind::BrokenPipe] {
             let error = compact_pipeline_error(

@@ -519,16 +519,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3170,
-          "total": 3655
+          "covered": 3183,
+          "total": 3661
         },
         "lines": {
-          "covered": 48290,
-          "total": 55731
+          "covered": 48530,
+          "total": 55879
         },
         "regions": {
-          "covered": 71613,
-          "total": 82485
+          "covered": 71904,
+          "total": 82702
         }
       },
       "one_time_floor_reset": {

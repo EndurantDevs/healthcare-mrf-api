@@ -28,6 +28,14 @@ fn manifest_admission_rejects_size_encoding_and_proof_drift() {
     let retained = Fixture::new(FIXTURE);
     retain_uhc_artifact(&retained.request(4)).expect("retain fixture");
     let manifest_bytes = fs::read(retained.manifest_path(4)).expect("read canonical manifest");
+    let mut oversized_manifest =
+        parse_strict_manifest(&manifest_bytes).expect("parse oversized manifest fixture");
+    oversized_manifest.producer_build_id = "x".repeat(MAX_MANIFEST_BYTES as usize);
+    assert!(encode_manifest(&oversized_manifest)
+        .expect_err("oversized encoded manifest rejected")
+        .to_string()
+        .contains("exceeds its byte limit"));
+
     let mut noncanonical = manifest_bytes.clone();
     noncanonical.push(b'\n');
     assert!(parse_strict_manifest(&noncanonical)
@@ -63,6 +71,20 @@ fn manifest_admission_rejects_size_encoding_and_proof_drift() {
     .to_string()
     .contains("raw SHA-256 is invalid"));
 
+    let mut invalid_sequence = parse_strict_manifest(&manifest_bytes).expect("parse manifest");
+    invalid_sequence.ranges[0].range_ordinal += 1;
+    let expected_raw = invalid_sequence.raw_artifact.clone();
+    let expected_ranges = invalid_sequence.ranges.clone();
+    assert!(validate_existing_manifest(
+        &invalid_sequence,
+        &expected_raw,
+        &expected_ranges,
+        &invalid_sequence.range_set_sha256,
+    )
+    .expect_err("invalid logical range sequence rejected")
+    .to_string()
+    .contains("invalid logical range"));
+
     let non_utf8_path = PathBuf::from(
         <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![0xff]),
     );
@@ -70,6 +92,117 @@ fn manifest_admission_rejects_size_encoding_and_proof_drift() {
         .expect_err("non-UTF-8 path rejected")
         .to_string()
         .contains("path is not UTF-8"));
+}
+
+#[test]
+fn bounded_reader_reports_truncation_and_post_read_identity_drift() {
+    let truncated = Fixture::new(b"truncated");
+    let truncated_file = File::open(&truncated.source).expect("open truncation fixture");
+    let truncated_identity =
+        FileIdentity::from_file(&truncated_file).expect("truncation fixture identity");
+    OpenOptions::new()
+        .write(true)
+        .open(&truncated.source)
+        .expect("open truncation writer")
+        .set_len(0)
+        .expect("truncate fixture after identity capture");
+    assert!(read_bounded_file_from_identity(
+        &truncated_file,
+        truncated_identity,
+        truncated_identity.byte_count,
+        "manifest",
+    )
+    .expect_err("truncated file rejected")
+    .to_string()
+    .contains("ended unexpectedly"));
+
+    let changed = Fixture::new(b"changed");
+    let changed_file = File::open(&changed.source).expect("open changed fixture");
+    let changed_identity =
+        FileIdentity::from_file(&changed_file).expect("changed fixture identity");
+    let mut changed_writer = OpenOptions::new()
+        .append(true)
+        .open(&changed.source)
+        .expect("open changed writer");
+    changed_writer
+        .write_all(b"!")
+        .expect("change fixture after identity capture");
+    changed_writer.sync_all().expect("sync changed fixture");
+    assert!(read_bounded_file_from_identity(
+        &changed_file,
+        changed_identity,
+        changed_identity.byte_count,
+        "manifest",
+    )
+    .expect_err("post-read identity drift rejected")
+    .to_string()
+    .contains("changed while it was read"));
+}
+
+#[test]
+fn candidate_publish_collision_and_post_link_checks_are_deterministic() {
+    let retained = Fixture::new(FIXTURE);
+    retain_uhc_artifact(&retained.request(4)).expect("retain manifest fixture");
+    let candidate = parse_strict_manifest(
+        &fs::read(retained.manifest_path(4)).expect("read manifest fixture"),
+    )
+    .expect("parse manifest fixture");
+    let expected_raw = candidate.raw_artifact.clone();
+    let expected_ranges = candidate.ranges.clone();
+    let expected_range_set_sha256 = candidate.range_set_sha256.clone();
+    let manifest_name = manifest_file_name(&retained.sha256, 4);
+
+    let retained_root = RootDirectory::open(&retained.output).expect("open retained root");
+    let collision = publish_manifest_candidate(
+        &retained_root,
+        &manifest_name,
+        &candidate,
+        &expected_raw,
+        &expected_ranges,
+        &expected_range_set_sha256,
+    )
+    .expect("verify deterministic publication collision");
+    assert!(collision.reused);
+
+    let fresh = Fixture::new(FIXTURE);
+    let fresh_root = RootDirectory::open(&fresh.output).expect("open fresh root");
+    let publication = publish_manifest_candidate(
+        &fresh_root,
+        &manifest_name,
+        &candidate,
+        &expected_raw,
+        &expected_ranges,
+        &expected_range_set_sha256,
+    )
+    .expect("publish deterministic manifest fixture");
+    assert!(!publication.reused);
+
+    let final_file = fresh_root
+        .open_existing_regular(&manifest_name)
+        .expect("open final manifest")
+        .expect("published manifest exists");
+    let final_identity = FileIdentity::from_file(&final_file).expect("final manifest identity");
+    let unrelated_file = File::open(&fresh.source).expect("open unrelated inode");
+    let unrelated_identity =
+        FileIdentity::from_file(&unrelated_file).expect("unrelated file identity");
+    let inode_error = verify_new_manifest_publication(
+        &final_file,
+        unrelated_identity,
+        &candidate.producer_build_id,
+        publication.encoded.clone(),
+    )
+    .err()
+    .expect("post-link inode substitution rejected");
+    assert!(inode_error.to_string().contains("inode changed"));
+    let byte_error = verify_new_manifest_publication(
+        &final_file,
+        final_identity,
+        &candidate.producer_build_id,
+        b"{}\n".to_vec(),
+    )
+    .err()
+    .expect("post-link byte substitution rejected");
+    assert!(byte_error.to_string().contains("bytes changed"));
 }
 
 #[test]
@@ -311,4 +444,57 @@ fn concurrent_range_sender_failure_is_explicit_at_flush_and_finish() {
         .expect_err("stopped range worker rejects its terminal boundary")
         .to_string()
         .contains("stopped unexpectedly"));
+}
+
+#[test]
+fn range_and_filesystem_admission_guards_reject_boundary_drift() {
+    let fixture = Fixture::new(FIXTURE);
+    retain_uhc_artifact(&fixture.request(4)).expect("retain manifest fixture");
+    let manifest = parse_strict_manifest(
+        &fs::read(fixture.manifest_path(4)).expect("read manifest fixture"),
+    )
+    .expect("parse manifest fixture");
+    assert!(validate_range_sequence(&manifest.ranges, 8, 5)
+        .expect_err("range-list length mismatch rejected")
+        .to_string()
+        .contains("range count"));
+    let mut overlapping = manifest.ranges.clone();
+    overlapping[1].raw_byte_start = overlapping[0].raw_byte_end;
+    overlapping[1].raw_byte_count =
+        overlapping[1].raw_byte_end - overlapping[1].raw_byte_start;
+    assert!(validate_range_sequence(&overlapping, 8, 4)
+        .expect_err("overlapping raw ranges rejected")
+        .to_string()
+        .contains("overlap"));
+    assert!(validate_range_sequence(&manifest.ranges, 9, 4)
+        .expect_err("incomplete record coverage rejected")
+        .to_string()
+        .contains("cover every record"));
+    let directory = File::open(&fixture.output).expect("open directory fixture");
+    let directory_identity = FileIdentity::from_file(&directory).expect("directory identity");
+    assert!(require_stable_regular_file(&directory, directory_identity, 0, "fixture")
+        .expect_err("directory rejected as regular file")
+        .to_string()
+        .contains("not a regular file"));
+    assert!(open_regular_nofollow(&fixture.output, "fixture")
+        .expect_err("directory rejected by no-follow opener")
+        .to_string()
+        .contains("not a regular file"));
+    let root = RootDirectory::open(&fixture.output).expect("open retained root");
+    fs::create_dir(fixture.output.join("nested")).expect("create nested directory");
+    assert!(root
+        .open_existing_regular("nested")
+        .expect_err("nested directory rejected")
+        .to_string()
+        .contains("not a regular file"));
+    let writable = fixture.output.join("writable");
+    fs::write(&writable, b"fixture").expect("write writable fixture");
+    fs::set_permissions(&writable, fs::Permissions::from_mode(0o622))
+        .expect("set unsafe fixture mode");
+    assert!(root.open_existing_regular("writable").is_err());
+    root.unlink("already-absent").expect("missing unlink is idempotent");
+    let moved = fixture.output.with_extension("moved");
+    fs::rename(&fixture.output, &moved).expect("move admitted root");
+    fs::create_dir(&fixture.output).expect("replace admitted root path");
+    assert!(root.verify_path_identity().is_err());
 }
