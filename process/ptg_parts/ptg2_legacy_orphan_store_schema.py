@@ -243,7 +243,7 @@ def _present_optional_authority_payload_entry(
         and str(mapping.get("table_name") or "") == expected_name
         and mapping.get("relation_oid") is not None
         and mapping.get("owner_oid") is not None
-        and _catalog_text(mapping.get("relkind")) in {"p", "r"}
+        and _catalog_text(mapping.get("relkind")) == "r"
         and _catalog_text(mapping.get("relpersistence")) in {"p", "u"}
     )
     if not is_catalog_valid:

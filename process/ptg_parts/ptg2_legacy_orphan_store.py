@@ -18,6 +18,7 @@ from process.ptg_parts.ptg2_legacy_orphan_store_mutation import (
     load_legacy_sweep_audit,
     lock_legacy_root_relations,
     lock_legacy_sweep_authority,
+    lock_legacy_sweep_lifecycle,
     with_catalog_ambiguity,
 )
 from process.ptg_parts.ptg2_legacy_orphan_store_replay import (
@@ -40,6 +41,7 @@ __all__ = [
     "load_legacy_sweep_audit",
     "lock_legacy_root_relations",
     "lock_legacy_sweep_authority",
+    "lock_legacy_sweep_lifecycle",
     "require_legacy_sweep_schema",
     "verify_applied_audit_state",
     "with_catalog_ambiguity",

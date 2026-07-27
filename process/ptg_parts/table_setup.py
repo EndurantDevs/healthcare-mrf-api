@@ -79,6 +79,7 @@ from process.ptg_parts.ptg2_shared_gc import (
     require_migration_owned_tables,
     resolve_ptg2_schema,
 )
+from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from db.ptg2_v4_attempt_schema import (
     ATTEMPT_FENCE_TABLE,
     ATTEMPT_IMPORT_JOB_TABLE,
@@ -373,7 +374,7 @@ async def _drop_ptg2_columns(db_schema: str, table_name: str, column_names: tupl
             logger.debug("Skipping %s column %s drop: %s", table_name, column_name, exc)
 
 
-async def _ensure_price_stage_table(db_schema: str) -> None:
+async def _ensure_price_stage_table_locked(db_schema: str) -> None:
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     await db.status(
         f"""
@@ -403,10 +404,18 @@ async def _ensure_price_stage_table(db_schema: str) -> None:
         logger.debug("Skipping ptg2_price_set_stage index ensure: %s", exc)
 
 
+async def _ensure_price_stage_table(db_schema: str) -> None:
+    """Serialize price-stage DDL with PTG lifecycle mutations."""
+
+    async with db.transaction() as session:
+        await acquire_ptg2_lifecycle_lock(session)
+        await _ensure_price_stage_table_locked(db_schema)
+
+
 _ensure_ptg2_price_set_stage_table = _ensure_price_stage_table
 
 
-async def _ensure_rate_stage_table(db_schema: str) -> None:
+async def _ensure_rate_stage_table_locked(db_schema: str) -> None:
     """Create and configure the PTG2 staging table for serving-rate rows."""
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     await db.status(
@@ -505,6 +514,14 @@ async def _ensure_rate_stage_table(db_schema: str) -> None:
         )
     except Exception as exc:
         logger.debug("Skipping ptg2_serving_rate_stage index ensure: %s", exc)
+
+
+async def _ensure_rate_stage_table(db_schema: str) -> None:
+    """Serialize serving-stage DDL with PTG lifecycle mutations."""
+
+    async with db.transaction() as session:
+        await acquire_ptg2_lifecycle_lock(session)
+        await _ensure_rate_stage_table_locked(db_schema)
 
 
 _ensure_ptg2_serving_rate_stage_table = _ensure_rate_stage_table

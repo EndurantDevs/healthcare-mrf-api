@@ -191,6 +191,25 @@ def test_optional_authority_rejects_present_catalog_drift() -> None:
         _validated_optional_authority(relation_rows, schema_name="mrf")
 
 
+def test_optional_authority_rejects_partitioned_stage_relation() -> None:
+    relation_rows = [
+        {
+            **_optional_authority_row(
+                "ptg2_price_set_stage",
+                relation_oid=101,
+            ),
+            "relkind": "p",
+        },
+        _optional_authority_row("ptg2_serving_rate_stage"),
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="legacy_sweep_optional_relations_catalog_invalid",
+    ):
+        _validated_optional_authority(relation_rows, schema_name="mrf")
+
+
 class _StatusExecutor:
     def __init__(self) -> None:
         self.statements: list[str] = []
@@ -215,9 +234,8 @@ async def test_authority_lock_rejects_unrecognized_optional_table() -> None:
             present_optional_table_names=("unknown_stage",),
         )
 
-    assert executor.statements[-1] == (
-        "LOCK TABLE pg_catalog.pg_class IN SHARE MODE"
-    )
+    assert "pg_advisory_xact_lock" in executor.statements[-1]
+    assert all("pg_catalog.pg_class" not in statement for statement in executor.statements)
 
 
 def test_residue_sql_rejects_unrecognized_optional_table() -> None:

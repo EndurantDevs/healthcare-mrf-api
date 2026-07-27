@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import pytest
 from sqlalchemy.exc import DBAPIError
 
 from process.ptg_parts import ptg2_legacy_orphan_sweeper as legacy_sweeper
+from process.ptg_parts import table_setup
 from process.ptg_parts.ptg2_legacy_orphan_contract import LegacySweepLimits
 from process.ptg_parts.ptg2_legacy_orphan_store import (
     require_legacy_sweep_schema,
@@ -19,6 +21,7 @@ from process.ptg_parts.ptg2_legacy_orphan_store_common import (
 from process.ptg_parts.ptg2_legacy_orphan_store_mutation import (
     lock_legacy_sweep_authority as _lock_legacy_sweep_authority,
 )
+from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_legacy_orphan_sweeper import (
     build_legacy_orphan_sweep_plan,
     execute_legacy_orphan_sweep,
@@ -44,6 +47,96 @@ async def _set_optional_stage_presence(
                 await connection.status(
                     f"DROP TABLE {_q(case.mrf_schema)}.{_q(table_name)}"
                 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "table_name,ensure_name",
+    (
+        ("ptg2_price_set_stage", "_ensure_ptg2_price_set_stage_table"),
+        ("ptg2_serving_rate_stage", "_ensure_ptg2_serving_rate_stage_table"),
+    ),
+)
+async def test_stage_ddl_waits_for_sweeper_lifecycle_lock(
+    monkeypatch,
+    table_name: str,
+    ensure_name: str,
+) -> None:
+    release_sweeper = asyncio.Event()
+    sweeper_locked = asyncio.Event()
+    async with _prepared_case(monkeypatch) as case:
+        await _set_optional_stage_presence(case, frozenset())
+        monkeypatch.setattr(table_setup, "db", case.database)
+
+        async def hold_sweeper_lock() -> None:
+            async with case.database.acquire() as connection:
+                await _lock_legacy_sweep_authority(
+                    connection,
+                    schema_name=case.mrf_schema,
+                    control_schema_name=case.control_schema,
+                    lock_timeout="5s",
+                    present_optional_table_names=(),
+                )
+                sweeper_locked.set()
+                await release_sweeper.wait()
+
+        sweeper_task = asyncio.create_task(hold_sweeper_lock())
+        await asyncio.wait_for(sweeper_locked.wait(), timeout=5)
+        ensure_task = asyncio.create_task(
+            getattr(table_setup, ensure_name)(case.mrf_schema)
+        )
+        await asyncio.sleep(0.15)
+        assert not ensure_task.done()
+        assert not await _has_relation(
+            case.database,
+            case.mrf_schema,
+            table_name,
+        )
+        release_sweeper.set()
+        await asyncio.wait_for(sweeper_task, timeout=5)
+        await asyncio.wait_for(ensure_task, timeout=5)
+        assert await _has_relation(
+            case.database,
+            case.mrf_schema,
+            table_name,
+        )
+
+
+@pytest.mark.asyncio
+async def test_authority_lock_runs_as_role_without_catalog_lock_privilege(
+    monkeypatch,
+) -> None:
+    role_name = f"ptg2_sweep_restricted_{uuid.uuid4().hex}"
+    async with _prepared_case(monkeypatch) as case:
+        try:
+            async with case.database.acquire() as connection:
+                await connection.status(f"CREATE ROLE {_q(role_name)} NOLOGIN")
+                await connection.status(
+                    f"GRANT USAGE ON SCHEMA {_q(case.mrf_schema)}, "
+                    f"{_q(case.control_schema)} TO {_q(role_name)}"
+                )
+                await connection.status(
+                    f"GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "
+                    f"{_q(case.mrf_schema)}, {_q(case.control_schema)} "
+                    f"TO {_q(role_name)}"
+                )
+        except DBAPIError as exc:
+            pytest.skip(f"disposable PostgreSQL cannot create restricted roles: {exc}")
+        try:
+            async with case.database.acquire() as connection:
+                await connection.status(f"SET LOCAL ROLE {_q(role_name)}")
+                await _lock_legacy_sweep_authority(
+                    connection,
+                    schema_name=case.mrf_schema,
+                    control_schema_name=case.control_schema,
+                    lock_timeout="5s",
+                    present_optional_table_names=tuple(_MRF_OPTIONAL_TABLES),
+                )
+                assert await connection.scalar("SELECT current_user") == role_name
+        finally:
+            async with case.database.acquire() as connection:
+                await connection.status(f"DROP OWNED BY {_q(role_name)}")
+                await connection.status(f"DROP ROLE {_q(role_name)}")
 
 
 @pytest.mark.asyncio
@@ -229,18 +322,12 @@ async def test_optional_catalog_drift_after_authority_lock_fails_closed(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ("create", "drop"))
-async def test_catalog_lock_blocks_concurrent_optional_relation_ddl(
+async def test_present_optional_table_lock_blocks_concurrent_drop(
     monkeypatch,
-    mutation: str,
 ) -> None:
-    """Fence concurrent create and drop after the final catalog snapshot."""
+    """Fence removal of an optional table bound into the authority digest."""
 
     async with _prepared_case(monkeypatch) as case:
-        if mutation == "create":
-            await _set_optional_stage_presence(
-                case, frozenset({"ptg2_serving_rate_stage"})
-            )
         async with case.database.acquire() as sweep_connection:
             authority = await require_legacy_sweep_schema(
                 sweep_connection,
@@ -271,10 +358,61 @@ async def test_catalog_lock_blocks_concurrent_optional_relation_ddl(
                         _mutate_optional_catalog(
                             ddl_connection,
                             schema_name=case.mrf_schema,
-                            mutation=mutation,
+                            mutation="drop",
                         ),
                         timeout=2,
                     )
+
+
+@pytest.mark.asyncio
+async def test_sweep_waits_for_stage_ddl_then_observes_created_relation(
+    monkeypatch,
+) -> None:
+    """Acquire the lifecycle lock before taking the first authority snapshot."""
+
+    async with _prepared_case(monkeypatch) as case:
+        await _set_optional_stage_presence(case, frozenset())
+        monkeypatch.setattr(table_setup, "db", case.database)
+        ddl_ready = asyncio.Event()
+        release_ddl = asyncio.Event()
+
+        async def hold_stage_ddl() -> None:
+            async with case.database.transaction() as session:
+                await acquire_ptg2_lifecycle_lock(session)
+                await table_setup._ensure_price_stage_table_locked(
+                    case.mrf_schema
+                )
+                ddl_ready.set()
+                await release_ddl.wait()
+
+        async def locked_authority():
+            async with case.database.acquire() as sweep_connection:
+                await legacy_sweeper.lock_legacy_sweep_lifecycle(
+                    sweep_connection,
+                    lock_timeout="5s",
+                )
+                return await require_legacy_sweep_schema(
+                    sweep_connection,
+                    schema_name=case.mrf_schema,
+                    control_schema_name=case.control_schema,
+                )
+
+        ddl_task = asyncio.create_task(hold_stage_ddl())
+        await asyncio.wait_for(ddl_ready.wait(), timeout=5)
+        sweep_task = asyncio.create_task(locked_authority())
+        await asyncio.sleep(0.15)
+        assert not sweep_task.done()
+        release_ddl.set()
+        await asyncio.wait_for(ddl_task, timeout=5)
+        authority = await asyncio.wait_for(sweep_task, timeout=5)
+
+        assert authority.present_optional_table_names == (
+            "ptg2_price_set_stage",
+        )
+        assert any(
+            relation_oid > 0
+            for relation_oid in authority.relation_oids
+        )
 
 
 @pytest.mark.asyncio
