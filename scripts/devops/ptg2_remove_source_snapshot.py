@@ -38,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def _execute_removal(cli_args: argparse.Namespace) -> dict[str, Any]:
     from process.ptg_parts.source_snapshot_control import (
-        build_ptg2_source_snapshot_remove_plan,
+        build_source_snapshot_remove_plan,
         remove_ptg2_source_snapshot,
     )
 
@@ -48,7 +48,7 @@ async def _execute_removal(cli_args: argparse.Namespace) -> dict[str, Any]:
     }
     if cli_args.execute:
         return await remove_ptg2_source_snapshot(**remove_request_by_name)
-    plan = await build_ptg2_source_snapshot_remove_plan(**remove_request_by_name)
+    plan = await build_source_snapshot_remove_plan(**remove_request_by_name)
     return {**plan, "executed": False}
 
 

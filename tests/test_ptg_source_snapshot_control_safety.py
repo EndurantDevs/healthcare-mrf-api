@@ -85,7 +85,7 @@ def test_manual_removal_rejects_in_flight_snapshot(monkeypatch, snapshot_status)
     )
 
     removal_plan = asyncio.run(
-        source_snapshot_control.build_ptg2_source_snapshot_remove_plan(
+        source_snapshot_control.build_source_snapshot_remove_plan(
             snapshot_id="snap_retry",
             source_key="source_a",
         )
@@ -130,7 +130,7 @@ def test_manual_removal_allows_unreferenced_validated_candidate(monkeypatch):
     )
 
     removal_plan = asyncio.run(
-        source_snapshot_control.build_ptg2_source_snapshot_remove_plan(
+        source_snapshot_control.build_source_snapshot_remove_plan(
             snapshot_id="snap_validated",
             source_key="source_a",
         )
@@ -167,7 +167,7 @@ def test_manual_removal_rejects_previous_pointer_reference(monkeypatch):
     )
 
     removal_plan = asyncio.run(
-        source_snapshot_control.build_ptg2_source_snapshot_remove_plan(
+        source_snapshot_control.build_source_snapshot_remove_plan(
             snapshot_id="snap_a",
             source_key="source_a",
         )

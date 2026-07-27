@@ -356,11 +356,13 @@ def test_factor_mode_environment_requires_paired_outputs(monkeypatch) -> None:
             environment_by_name,
             provider_set_component_path="one",
             provider_component_group_path=None,
+            provider_group_tax_identity_path="three",
         )
     assert not rust_scanner._use_v4_provider_factors(
         environment_by_name,
         provider_set_component_path=None,
         provider_component_group_path=None,
+        provider_group_tax_identity_path=None,
     )
     assert rust_scanner._PROVIDER_GRAPH_V4_FACTORS_ENV not in environment_by_name
 
@@ -370,12 +372,14 @@ def test_factor_mode_environment_requires_paired_outputs(monkeypatch) -> None:
             {},
             provider_set_component_path=None,
             provider_component_group_path=None,
+            provider_group_tax_identity_path=None,
         )
     enabled_environment_by_name: dict[str, str] = {}
     assert rust_scanner._use_v4_provider_factors(
         enabled_environment_by_name,
         provider_set_component_path="one",
         provider_component_group_path="two",
+        provider_group_tax_identity_path="three",
     )
     assert enabled_environment_by_name[rust_scanner._PROVIDER_GRAPH_V4_ENV] == "true"
     assert (

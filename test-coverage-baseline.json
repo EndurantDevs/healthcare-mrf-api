@@ -361,6 +361,7 @@
         "process/ptg_parts/source_jobs.py",
         "process/ptg_parts/source_pointers.py",
         "process/ptg_parts/source_snapshot_control.py",
+        "process/ptg_parts/source_snapshot_control_results.py",
         "process/ptg_parts/source_snapshot_rollback.py",
         "process/ptg_parts/source_snapshot_rollback_allowed.py",
         "process/ptg_parts/source_snapshot_rollback_relations.py",
@@ -407,12 +408,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 32867,
-          "total": 38464
+          "covered": 33254,
+          "total": 38700
         },
         "lines": {
-          "covered": 105279,
-          "total": 114135
+          "covered": 106203,
+          "total": 114833
         }
       },
       "one_time_floor_reset": {
@@ -495,6 +496,7 @@
         "support/ptg2_scanner/src/shared_graph.rs",
         "support/ptg2_scanner/src/source_witness.rs",
         "support/ptg2_scanner/src/source_witness_spool.rs",
+        "support/ptg2_scanner/src/tax_identity.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/core.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/filesystem.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/json_framing.rs",
@@ -517,16 +519,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 2994,
-          "total": 3524
+          "covered": 3160,
+          "total": 3655
         },
         "lines": {
-          "covered": 45217,
-          "total": 53351
+          "covered": 48250,
+          "total": 55725
         },
         "regions": {
-          "covered": 67206,
-          "total": 79013
+          "covered": 71573,
+          "total": 82478
         }
       },
       "one_time_floor_reset": {

@@ -2,10 +2,13 @@ use ptg2_scanner::v3_runs::{
     external_sort_assigned_serving_records, external_sort_dedupe_partition_files,
     external_sort_dense_ids, external_sort_lexicographic_records, external_sort_partition_files,
     external_sort_provider_code_pairs, external_sort_provider_identities,
-    external_sort_tagged_partition_files, merge_sorted_provider_identities,
-    read_audit_candidate_file, write_audit_candidate_file, AssignedServingRunBuilder,
-    AssignedServingRunMerger, AuditCandidateRecord, ScratchDurability, ServingRunRecord,
-    TaggedServingRunCodec, ASSIGNED_SERVING_RECORD_BYTES,
+    external_sort_tagged_partition_files, merge_sorted_provider_identities, partition_for_code_id,
+    partition_for_record, read_audit_candidate_file, source_key_bits, source_key_bytes,
+    tagged_serving_run_record_bytes, validate_partition_count, write_audit_candidate_file,
+    AssignedServingRunBuilder, AssignedServingRunMerger, AuditCandidateRecord,
+    AuditCandidateSelector, NaturalLeanCodeFields, ScratchDurability, ServingRunRecord,
+    TaggedServingRunCodec, TaggedServingRunRecord, ASSIGNED_SERVING_RECORD_BYTES,
+    COVERAGE_SCOPE_ID_BYTES,
 };
 use std::fs;
 use std::path::Path;
@@ -210,4 +213,53 @@ fn importer_serving_sort_audit_and_bounded_builder_surfaces_are_exact() {
         assert!(call.is_err());
     }
     assert!(AssignedServingRunBuilder::new(root.path().join("bad-builder"), 0).is_err());
+}
+
+#[test]
+fn importer_tagged_audit_and_partition_contracts_are_exact() {
+    let mut selector = AuditCandidateSelector::new(3);
+    for ordinal in 0..3 {
+        selector
+            .observe(ordinal, ordinal + 1, ordinal + 2, ordinal + 3, ordinal + 4)
+            .unwrap();
+    }
+    assert_eq!(selector.finish().unwrap().len(), 3);
+
+    let codec = TaggedServingRunCodec::new(257, 2).unwrap();
+    let tagged = TaggedServingRunRecord {
+        record: serving_record(0x80, 2, 3),
+        source_key: 256,
+    };
+    let mut encoded = Vec::new();
+    tagged.write_to(&mut encoded, codec).unwrap();
+    assert_eq!(
+        TaggedServingRunRecord::read_from(&mut encoded.as_slice(), codec).unwrap(),
+        Some(tagged)
+    );
+    assert_eq!(
+        TaggedServingRunRecord::read_from(&mut [].as_slice(), codec).unwrap(),
+        None
+    );
+
+    assert_eq!(source_key_bits(1).unwrap(), 0);
+    assert_eq!(source_key_bits(257).unwrap(), 9);
+    assert_eq!(source_key_bytes(257).unwrap(), 2);
+    assert_eq!(tagged_serving_run_record_bytes(257).unwrap(), encoded.len());
+    assert!(source_key_bits(0).is_err());
+    assert!(validate_partition_count(3).is_err());
+    validate_partition_count(4).unwrap();
+    assert_eq!(partition_for_code_id(&[0x80; 16], 4).unwrap(), 2);
+    assert_eq!(partition_for_record(&tagged.record, 4).unwrap(), 2);
+
+    let coverage_scope = [7u8; COVERAGE_SCOPE_ID_BYTES];
+    let fields = NaturalLeanCodeFields {
+        coverage_scope_id: &coverage_scope,
+        reported_code_system: Some("CPT"),
+        reported_code: Some("70553"),
+        negotiation_arrangement: Some("ffs"),
+        billing_code_type_version: None,
+        name: None,
+        description: None,
+    };
+    assert_ne!(fields.identity(), [0u8; 16]);
 }

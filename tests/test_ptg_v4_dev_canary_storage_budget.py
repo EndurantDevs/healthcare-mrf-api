@@ -27,6 +27,7 @@ from scripts.ptg_v4_dev_canary_storage_budget import (
     StorageCanaryCase,
     storage_budget,
 )
+from scripts.ptg_v4_dev_canary_storage_sql import _ownership_predicates
 from scripts.ptg_v4_dev_canary_support import CanaryConfigurationError
 
 
@@ -297,6 +298,32 @@ def _physical_storage_evidence(
             "shared_block_count": 0,
         },
     }
+
+
+def test_tax_identity_sidecars_are_snapshot_owned_graph_storage() -> None:
+    """Keep every token-only sidecar inside both physical storage gates."""
+
+    tax_relations = {
+        "ptg2_provider_tax_identity_manifest",
+        "ptg2_provider_tax_identity",
+        "ptg2_provider_group_tax_identity",
+    }
+    assert tax_relations <= publication.REQUIRED_PHYSICAL_RELATIONS
+    assert tax_relations <= WHOLE_SNAPSHOT_PHYSICAL_RELATIONS
+    assert (
+        "ptg2_provider_tax_identity_legacy_layout"
+        in WHOLE_SNAPSHOT_PHYSICAL_RELATIONS
+    )
+    for relation_name in tax_relations:
+        assert _ownership_predicates(
+            relation_name,
+            "ptg2:ignored",
+            501,
+        ) == (
+            '"snapshot_key" = $1::bigint',
+            '"snapshot_key" IS NOT NULL',
+            501,
+        )
 
 
 def _physical_storage_approval(

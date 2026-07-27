@@ -1,9 +1,7 @@
 import asyncio
 from copy import deepcopy
-import hashlib
 import io
 import json
-import struct
 from pathlib import Path
 
 import pytest
@@ -13,100 +11,10 @@ from process.ptg_parts.ptg2_v4_graph_compiler import (
     V4GraphResourceAdmissionError,
     compile_provider_graph_v4_rust,
 )
-
-
-_STANDARD_FORMAT = (
-    "magic8:uint32_le_version:uint64_le_entry_count:"
-    "index(owner16:uint64_le_offset:uint32_le_count):members16"
+from tests.ptg2_v4_graph_compiler_test_support import (
+    compiler_fixture as _fixture,
+    scanner_binary as _binary,
 )
-
-
-def _global(domain: int, value: int) -> bytes:
-    return bytes([domain]) + bytes(7) + value.to_bytes(8, "big")
-
-
-def _npi(value: int) -> bytes:
-    return bytes(8) + value.to_bytes(8, "big")
-
-
-def _write_membership(
-    path: Path, *, name: str, shard_id: str, pairs: list[tuple[bytes, bytes]]
-) -> dict[str, object]:
-    by_owner: dict[bytes, set[bytes]] = {}
-    for owner, member in pairs:
-        by_owner.setdefault(owner, set()).add(member)
-    memberships = [
-        (owner, sorted(members)) for owner, members in sorted(by_owner.items())
-    ]
-    membership_payload = bytearray(b"PTG2MNSC")
-    membership_payload.extend(struct.pack("<IQ", 1, len(memberships)))
-    offset = 0
-    for owner, members in memberships:
-        membership_payload.extend(owner)
-        membership_payload.extend(struct.pack("<QI", offset, len(members)))
-        offset += len(members)
-    for _, members in memberships:
-        for member in members:
-            membership_payload.extend(member)
-    path.write_bytes(membership_payload)
-    return {
-        "name": name,
-        "source_shard_id": shard_id,
-        "path": str(path),
-        "record_format": _STANDARD_FORMAT,
-        "sha256": hashlib.sha256(membership_payload).hexdigest(),
-        "byte_count": len(membership_payload),
-        "owner_count": len(memberships),
-        "member_count": offset,
-    }
-
-
-def _fixture(tmp_path: Path) -> tuple[list[dict[str, object]], Path]:
-    shard_id = "shard-a"
-    provider_set = _global(1, 1)
-    component = _global(2, 1)
-    groups = [_global(3, 1), _global(3, 2)]
-    provider_npi = _npi(1_234_567_890)
-    artifacts = [
-        _write_membership(
-            tmp_path / "set-component.sidecar",
-            name="provider_set_component",
-            shard_id=shard_id,
-            pairs=[(provider_set, component)],
-        ),
-        _write_membership(
-            tmp_path / "component-group.sidecar",
-            name="provider_component_group",
-            shard_id=shard_id,
-            pairs=[(component, group) for group in groups],
-        ),
-        _write_membership(
-            tmp_path / "group-npi.sidecar",
-            name="provider_group_npi",
-            shard_id=shard_id,
-            pairs=[(group, provider_npi) for group in groups],
-        ),
-        _write_membership(
-            tmp_path / "npi-group.sidecar",
-            name="provider_npi_group",
-            shard_id=shard_id,
-            pairs=[(provider_npi, group) for group in groups],
-        ),
-    ]
-    provider_map = tmp_path / "provider-set-map.tsv"
-    provider_map.write_text(f"{provider_set.hex()}\t1\n")
-    return artifacts, provider_map
-
-
-def _binary() -> Path:
-    return (
-        Path(__file__).resolve().parents[1]
-        / "support"
-        / "ptg2_scanner"
-        / "target"
-        / "debug"
-        / "ptg2_provider_graph_v4"
-    )
 
 
 def _progress_event(
@@ -180,32 +88,6 @@ def _tampered_summary_cases(
 
 
 @pytest.mark.asyncio
-async def test_wrapper_authenticates_and_reuses_complete_checkpoint(tmp_path: Path) -> None:
-    artifacts, provider_map = _fixture(tmp_path)
-    output = tmp_path / "compiled"
-
-    first = await compile_provider_graph_v4_rust(
-        graph_artifact_entries=artifacts,
-        provider_set_key_map_path=provider_map,
-        output_directory=output,
-        binary_path=_binary(),
-    )
-    assert first.checkpoint_reused is False
-    assert first.resource_admission["factor_edge_count"] == 7
-    assert (output / "v4-complete.json").is_file()
-
-    second = await compile_provider_graph_v4_rust(
-        graph_artifact_entries=artifacts,
-        provider_set_key_map_path=provider_map,
-        output_directory=output,
-        binary_path=_binary(),
-    )
-    assert second.checkpoint_reused is True
-    assert second.selected_layout == first.selected_layout
-    assert second.selected_encoded_bytes == first.selected_encoded_bytes
-
-
-@pytest.mark.asyncio
 async def test_wrapper_discards_mismatched_checkpoint_and_rebuilds(tmp_path: Path) -> None:
     artifacts, provider_map = _fixture(tmp_path)
     output = tmp_path / "compiled"
@@ -247,6 +129,9 @@ async def test_wrapper_rejects_component_fallback_summary_tampering(
         "expected_input_bytes": int(summary_by_field["input_byte_count"]),
         "expected_factor_edges": int(
             summary_by_field["resource_admission"]["factor_edge_count"]
+        ),
+        "expected_factor_owners": int(
+            summary_by_field["resource_admission"]["factor_owner_count"]
         ),
         "expected_options": expected_options,
         "allow_checkpoint": True,

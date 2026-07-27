@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
+import re
+import struct
 import tempfile
 import time
 import uuid
@@ -133,6 +137,56 @@ _REQUIRED_PRICE_OBJECT_KINDS = _REQUIRED_OBJECT_KINDS - {
     "graph_provider_set_groups_v1",
 }
 _V4_DICTIONARY_RANGE_ROWS = 10_000
+_V4_TAX_IDENTITY_MANIFEST_CONTRACT = "ptg2_provider_group_tax_identity_v1"
+_V4_TAX_IDENTITY_PROJECTION_CONTRACT = (
+    "ptg2_provider_tax_identity_projection_v1"
+)
+_V4_TAX_NORMALIZATION_CONTRACT = "ein_ascii_digits_or_2_7_hyphen_v1"
+_V4_TAX_HMAC_CONTRACT = "hmac_sha256_ptg_tin_v1"
+_V4_TAX_CANDIDATE_PREFIX_CONTRACT = (
+    "tin_id_128=first_16_bytes(tin_hmac_sha256)"
+)
+_V4_TAX_AUTHORITY_CONTRACT = (
+    "tin_hmac_sha256_full_32_bytes_authoritative"
+)
+_V4_TAX_SOURCE_ORDINAL_CONTRACT = (
+    "snapshot_shard_id_sorted_lsb0_bitmap_v1"
+)
+_V4_TAX_POLICY_DESCRIPTOR_DOMAIN = b"PTG2V4TINPOLICY\x01"
+_V4_TAX_SOURCE_ORDINAL_DOMAIN = b"PTG2V4TAXORD\x01"
+_V4_TAX_CONTENT_DOMAIN = b"PTG2V4TAXCONTENT\x01"
+_V4_TAX_POLICY_ID = re.compile(
+    r"ptg-tin-hmac-sha256-v1:[a-z0-9](?:[a-z0-9._-]{0,31})\Z"
+)
+_V4_TAX_STATE_CODE = {
+    "matched_ein": 1,
+    "missing": 2,
+    "malformed": 3,
+    "unsupported_type": 4,
+}
+_V4_TAX_SUMMARY_FIELDS = frozenset(
+    {
+        "contract",
+        "token_policy_id",
+        "token_policy_descriptor_sha256",
+        "normalization_contract",
+        "hmac_contract",
+        "candidate_prefix_contract",
+        "authority_contract",
+        "source_ordinal_contract",
+        "source_ordinal_map",
+        "source_ordinal_map_digest",
+        "source_shard_count",
+        "source_bitmap_bytes",
+        "provider_group_count",
+        "tax_identity_count",
+        "matched_ein_count",
+        "missing_count",
+        "malformed_count",
+        "unsupported_type_count",
+        "content_digest",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -202,6 +256,35 @@ class _V4DenseDictionaryStage:
     sum_expression: str = "0"
     expected_sum: int | None = None
     dense_keys: bool = True
+
+
+@dataclass(frozen=True)
+class _V4TaxIdentityContract:
+    """Independently authenticated tax-identity publication contract."""
+
+    token_policy_id: str
+    token_policy_descriptor_sha256: bytes
+    source_ordinal_map: tuple[Mapping[str, Any], ...]
+    source_ordinal_map_digest: bytes
+    source_shard_count: int
+    source_bitmap_bytes: int
+    provider_group_count: int
+    tax_identity_count: int
+    matched_ein_count: int
+    missing_count: int
+    malformed_count: int
+    unsupported_type_count: int
+    content_digest: bytes
+
+
+@dataclass(frozen=True)
+class _V4TaxIdentityPublication:
+    """Exact manifest and relational storage accounted beneath one V4 root."""
+
+    manifest: Mapping[str, Any]
+    provider_group_count: int
+    tax_identity_count: int
+    artifact_byte_count: int
 
 
 class _MeasuredPublicationProgress:
@@ -280,6 +363,7 @@ class _V4GraphPublication:
     representation: str
     compiler_summary: Mapping[str, Any]
     inferred_taxonomy_candidates: Mapping[str, Any]
+    provider_tax_identity: Mapping[str, Any]
     audit_witness_path: Path
 
 
@@ -1497,6 +1581,877 @@ async def _publish_v4_sparse_dictionary_stage_ranges(
         raise RuntimeError("PTG V4 persisted dictionary rows changed")
 
 
+def _v4_tax_length_prefixed_digest(
+    domain: bytes,
+    fields: Iterable[bytes],
+) -> bytes:
+    """Hash independently framed contract fields exactly as the Rust compiler."""
+
+    digest = hashlib.sha256()
+    digest.update(domain)
+    for field in fields:
+        digest.update(struct.pack(">I", len(field)))
+        digest.update(field)
+    return digest.digest()
+
+
+def _v4_tax_policy_descriptor(token_policy_id: str) -> bytes:
+    """Rebuild the policy descriptor without trusting compiler output."""
+
+    return _v4_tax_length_prefixed_digest(
+        _V4_TAX_POLICY_DESCRIPTOR_DOMAIN,
+        (
+            token_policy_id.encode("ascii"),
+            _V4_TAX_NORMALIZATION_CONTRACT.encode("ascii"),
+            _V4_TAX_HMAC_CONTRACT.encode("ascii"),
+            _V4_TAX_CANDIDATE_PREFIX_CONTRACT.encode("ascii"),
+            _V4_TAX_AUTHORITY_CONTRACT.encode("ascii"),
+        ),
+    )
+
+
+def _v4_tax_source_ordinal_digest(
+    source_ordinal_map: Iterable[Mapping[str, Any]],
+) -> bytes:
+    """Bind stable source ordinals and names through an independent digest."""
+
+    entries = tuple(source_ordinal_map)
+    digest = hashlib.sha256()
+    digest.update(_V4_TAX_SOURCE_ORDINAL_DOMAIN)
+    digest.update(struct.pack(">I", len(entries)))
+    for expected_ordinal, entry in enumerate(entries):
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"shard_id", "ordinal"}
+            or entry.get("ordinal") != expected_ordinal
+            or not isinstance(entry.get("shard_id"), str)
+            or not entry["shard_id"]
+        ):
+            raise RuntimeError(
+                "PTG V4 tax identity source ordinal map changed"
+            )
+        encoded_shard_id = entry["shard_id"].encode("utf-8")
+        digest.update(struct.pack(">I", len(encoded_shard_id)))
+        digest.update(encoded_shard_id)
+        digest.update(struct.pack(">I", expected_ordinal))
+    return digest.digest()
+
+
+def _v4_tax_summary_digest(value: Any, label: str) -> bytes:
+    """Decode one exact lowercase SHA-256 field."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value.lower() != value
+    ):
+        raise RuntimeError(f"PTG V4 tax identity {label} changed")
+    try:
+        decoded = bytes.fromhex(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"PTG V4 tax identity {label} changed"
+        ) from exc
+    if len(decoded) != 32:
+        raise RuntimeError(f"PTG V4 tax identity {label} changed")
+    return decoded
+
+
+def _v4_tax_summary_count(summary: Mapping[str, Any], name: str) -> int:
+    """Read one strict nonnegative counter without accepting booleans."""
+
+    value = summary.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"PTG V4 tax identity {name} changed")
+    return int(value)
+
+
+def _has_expected_v4_tax_contract(
+    tax_summary: Mapping[str, Any],
+    token_policy_id: Any,
+) -> bool:
+    """Return whether scalar policy fields match the frozen Release-1 wire."""
+
+    return (
+        set(tax_summary) == _V4_TAX_SUMMARY_FIELDS
+        and tax_summary.get("contract")
+        == _V4_TAX_IDENTITY_PROJECTION_CONTRACT
+        and isinstance(token_policy_id, str)
+        and _V4_TAX_POLICY_ID.fullmatch(token_policy_id) is not None
+        and len(token_policy_id.encode("ascii")) <= 55
+        and tax_summary.get("normalization_contract")
+        == _V4_TAX_NORMALIZATION_CONTRACT
+        and tax_summary.get("hmac_contract") == _V4_TAX_HMAC_CONTRACT
+        and tax_summary.get("candidate_prefix_contract")
+        == _V4_TAX_CANDIDATE_PREFIX_CONTRACT
+        and tax_summary.get("authority_contract")
+        == _V4_TAX_AUTHORITY_CONTRACT
+        and tax_summary.get("source_ordinal_contract")
+        == _V4_TAX_SOURCE_ORDINAL_CONTRACT
+    )
+
+
+def _v4_tax_contract_header(
+    tax_summary: Mapping[str, Any],
+) -> tuple[str, tuple[Mapping[str, Any], ...], bytes, bytes]:
+    """Validate descriptor fields and return independently rebuilt bindings."""
+
+    token_policy_id = tax_summary.get("token_policy_id")
+    if not _has_expected_v4_tax_contract(tax_summary, token_policy_id):
+        raise RuntimeError("PTG V4 tax identity contract changed")
+    raw_source_ordinals = tax_summary.get("source_ordinal_map")
+    if (
+        not isinstance(raw_source_ordinals, list)
+        or not raw_source_ordinals
+    ):
+        raise RuntimeError("PTG V4 tax identity source map changed")
+    source_ordinals = tuple(
+        dict(entry) if isinstance(entry, Mapping) else entry
+        for entry in raw_source_ordinals
+    )
+    source_shard_ids = tuple(
+        entry.get("shard_id")
+        for entry in source_ordinals
+        if isinstance(entry, Mapping)
+    )
+    if source_shard_ids != tuple(sorted(set(source_shard_ids))):
+        raise RuntimeError("PTG V4 tax identity source map changed")
+    source_ordinal_map_digest = _v4_tax_source_ordinal_digest(
+        source_ordinals
+    )
+    token_policy_descriptor = _v4_tax_policy_descriptor(token_policy_id)
+    if (
+        not hmac.compare_digest(
+            token_policy_descriptor,
+            _v4_tax_summary_digest(
+                tax_summary.get("token_policy_descriptor_sha256"),
+                "policy descriptor",
+            ),
+        )
+        or not hmac.compare_digest(
+            source_ordinal_map_digest,
+            _v4_tax_summary_digest(
+                tax_summary.get("source_ordinal_map_digest"),
+                "source ordinal digest",
+            ),
+        )
+    ):
+        raise RuntimeError("PTG V4 tax identity descriptor changed")
+    return (
+        token_policy_id,
+        source_ordinals,
+        token_policy_descriptor,
+        source_ordinal_map_digest,
+    )
+
+
+def _v4_tax_contract_counts(
+    tax_summary: Mapping[str, Any],
+    *,
+    expected_group_count: int,
+) -> Mapping[str, int]:
+    """Validate source width and exact per-state publication counts."""
+
+    source_shard_count = _v4_tax_summary_count(
+        tax_summary, "source_shard_count"
+    )
+    source_bitmap_bytes = _v4_tax_summary_count(
+        tax_summary, "source_bitmap_bytes"
+    )
+    if (
+        source_bitmap_bytes != (source_shard_count + 7) // 8
+        or source_shard_count <= 0
+    ):
+        raise RuntimeError("PTG V4 tax identity source shape changed")
+    count_by_name = {
+        name: _v4_tax_summary_count(tax_summary, name)
+        for name in (
+            "provider_group_count",
+            "tax_identity_count",
+            "matched_ein_count",
+            "missing_count",
+            "malformed_count",
+            "unsupported_type_count",
+        )
+    }
+    if (
+        sum(
+            count_by_name[name]
+            for name in (
+                "matched_ein_count",
+                "missing_count",
+                "malformed_count",
+                "unsupported_type_count",
+            )
+        )
+        != count_by_name["provider_group_count"]
+        or count_by_name["tax_identity_count"]
+        > count_by_name["matched_ein_count"]
+        or count_by_name["provider_group_count"] != expected_group_count
+    ):
+        raise RuntimeError("PTG V4 tax identity counts changed")
+    return {
+        **count_by_name,
+        "source_shard_count": source_shard_count,
+        "source_bitmap_bytes": source_bitmap_bytes,
+    }
+
+
+def _validated_v4_tax_identity_contract(
+    compilation: V4GraphCompilationResult,
+) -> _V4TaxIdentityContract:
+    """Recompute all non-row tax contracts before any durable persistence."""
+
+    tax_summary = compilation.summary.get("tax_identity")
+    if not isinstance(tax_summary, Mapping):
+        raise RuntimeError("PTG V4 tax identity summary is missing")
+    (
+        token_policy_id,
+        source_ordinals,
+        token_policy_descriptor,
+        source_ordinal_map_digest,
+    ) = _v4_tax_contract_header(tax_summary)
+    count_by_name = _v4_tax_contract_counts(
+        tax_summary,
+        expected_group_count=int(
+            compilation.observe.get("group_count") or 0
+        ),
+    )
+    if count_by_name["source_shard_count"] != len(source_ordinals):
+        raise RuntimeError("PTG V4 tax identity source shape changed")
+    return _V4TaxIdentityContract(
+        token_policy_id=token_policy_id,
+        token_policy_descriptor_sha256=token_policy_descriptor,
+        source_ordinal_map=source_ordinals,
+        source_ordinal_map_digest=source_ordinal_map_digest,
+        source_shard_count=count_by_name["source_shard_count"],
+        source_bitmap_bytes=count_by_name["source_bitmap_bytes"],
+        provider_group_count=count_by_name["provider_group_count"],
+        tax_identity_count=count_by_name["tax_identity_count"],
+        matched_ein_count=count_by_name["matched_ein_count"],
+        missing_count=count_by_name["missing_count"],
+        malformed_count=count_by_name["malformed_count"],
+        unsupported_type_count=count_by_name["unsupported_type_count"],
+        content_digest=_v4_tax_summary_digest(
+            tax_summary.get("content_digest"),
+            "content digest",
+        ),
+    )
+
+
+def _v4_tax_artifact_byte_count(
+    compilation: V4GraphCompilationResult,
+) -> int:
+    """Account both mandatory token-only COPY artifacts separately."""
+
+    artifact_by_name = {
+        artifact.name: artifact for artifact in compilation.output_artifacts
+    }
+    expected_names = (
+        "provider_tax_identities",
+        "provider_group_tax_identities",
+    )
+    if any(name not in artifact_by_name for name in expected_names):
+        raise RuntimeError("PTG V4 tax identity artifacts are missing")
+    return sum(
+        int(artifact_by_name[name].byte_count) for name in expected_names
+    )
+
+
+def _v4_tax_result_rows(result: Any) -> tuple[Any, ...]:
+    """Normalize the bounded SQLAlchemy row result used by publication."""
+
+    rows = result.all()
+    return tuple(rows)
+
+
+async def _validate_v4_tax_token_rows(
+    session: Any,
+    *,
+    schema: str,
+    tax_identity_stage: str,
+    contract: _V4TaxIdentityContract,
+    content_digest: Any,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """Authenticate the dense token dictionary and append it to the digest."""
+
+    tax_stage = _quote_ident(tax_identity_stage)
+    observed_token_count = 0
+    for range_start, range_end in _v4_dictionary_ranges(
+        contract.tax_identity_count
+    ):
+        token_result = await session.execute(
+            db.text(
+                f"""
+                SELECT tin_key, tin_id_128, tin_hmac_sha256
+                  FROM {schema}.{tax_stage}
+                 WHERE tin_key >= :range_start
+                   AND tin_key < :range_end
+                 ORDER BY tin_key
+                """
+            ),
+            {"range_start": range_start, "range_end": range_end},
+        )
+        token_rows = _v4_tax_result_rows(token_result)
+        if len(token_rows) != range_end - range_start:
+            raise RuntimeError("PTG V4 tax identity dictionary changed")
+        for expected_key, token_row in enumerate(
+            token_rows,
+            range_start,
+        ):
+            tin_key = int(token_row[0])
+            tin_id_128 = bytes(token_row[1])
+            tin_hmac_sha256 = bytes(token_row[2])
+            if (
+                tin_key != expected_key
+                or len(tin_id_128) != 16
+                or len(tin_hmac_sha256) != 32
+                or not hmac.compare_digest(
+                    tin_id_128,
+                    tin_hmac_sha256[:16],
+                )
+            ):
+                raise RuntimeError("PTG V4 tax identity dictionary changed")
+            content_digest.update(tin_hmac_sha256)
+        observed_token_count += len(token_rows)
+        if progress_callback is not None:
+            progress_callback(
+                "validated_dictionary_rows",
+                len(token_rows),
+            )
+            progress_callback("publish_batches", 1)
+    if observed_token_count != contract.tax_identity_count:
+        raise RuntimeError("PTG V4 tax identity dictionary changed")
+
+
+def _validated_v4_tax_group_row(
+    group_row: Any,
+    *,
+    previous_group_id: bytes,
+    contract: _V4TaxIdentityContract,
+) -> tuple[bytes, str, int | None, bytes]:
+    """Validate one ordered group row and its state-specific token reference."""
+
+    group_id = bytes(group_row[0])
+    tax_state = str(group_row[1])
+    raw_tin_key = group_row[2]
+    source_bitmap = bytes(group_row[3])
+    tin_key = None if raw_tin_key is None else int(raw_tin_key)
+    if (
+        len(group_id) != 16
+        or group_id <= previous_group_id
+        or tax_state not in _V4_TAX_STATE_CODE
+        or len(source_bitmap) != contract.source_bitmap_bytes
+        or not any(source_bitmap)
+        or (
+            tax_state == "matched_ein"
+            and (
+                tin_key is None
+                or tin_key < 0
+                or tin_key >= contract.tax_identity_count
+            )
+        )
+        or (tax_state != "matched_ein" and tin_key is not None)
+    ):
+        raise RuntimeError("PTG V4 provider-group tax identity changed")
+    unused_bits = (
+        contract.source_bitmap_bytes * 8 - contract.source_shard_count
+    )
+    if unused_bits and (
+        source_bitmap[-1] & (0xFF << (8 - unused_bits))
+    ):
+        raise RuntimeError("PTG V4 provider-group source bitmap changed")
+    return group_id, tax_state, tin_key, source_bitmap
+
+
+def _append_v4_tax_group_digest(
+    content_digest: Any,
+    *,
+    group_id: bytes,
+    tax_state: str,
+    tin_key: int | None,
+    source_bitmap: bytes,
+) -> None:
+    """Append one canonical provider-group row to the content digest."""
+
+    content_digest.update(group_id)
+    content_digest.update(bytes([_V4_TAX_STATE_CODE[tax_state]]))
+    if tin_key is None:
+        content_digest.update(b"\x00")
+    else:
+        content_digest.update(b"\x01")
+        content_digest.update(struct.pack(">I", tin_key))
+    content_digest.update(struct.pack(">I", len(source_bitmap)))
+    content_digest.update(source_bitmap)
+
+
+async def _validate_v4_tax_group_rows(
+    session: Any,
+    *,
+    schema: str,
+    group_tax_identity_stage: str,
+    contract: _V4TaxIdentityContract,
+    content_digest: Any,
+    progress_callback: Callable[[str, int], None] | None,
+) -> Mapping[str, int]:
+    """Authenticate ordered provider-group sidecars in bounded batches."""
+
+    group_tax_stage = _quote_ident(group_tax_identity_stage)
+    previous_group_id = b""
+    observed_group_count = 0
+    count_by_state = {name: 0 for name in _V4_TAX_STATE_CODE}
+    while True:
+        group_result = await session.execute(
+            db.text(
+                f"""
+                SELECT provider_group_global_id_128, tax_identity_state,
+                       tin_key, source_bitmap
+                  FROM {schema}.{group_tax_stage}
+                 WHERE provider_group_global_id_128 > :previous_group_id
+                 ORDER BY provider_group_global_id_128
+                 LIMIT {_V4_DICTIONARY_RANGE_ROWS}
+                """
+            ),
+            {"previous_group_id": previous_group_id},
+        )
+        group_rows = _v4_tax_result_rows(group_result)
+        if not group_rows:
+            break
+        for group_row in group_rows:
+            group_id, tax_state, tin_key, source_bitmap = (
+                _validated_v4_tax_group_row(
+                    group_row,
+                    previous_group_id=previous_group_id,
+                    contract=contract,
+                )
+            )
+            _append_v4_tax_group_digest(
+                content_digest,
+                group_id=group_id,
+                tax_state=tax_state,
+                tin_key=tin_key,
+                source_bitmap=source_bitmap,
+            )
+            count_by_state[tax_state] += 1
+            previous_group_id = group_id
+        observed_group_count += len(group_rows)
+        if progress_callback is not None:
+            progress_callback(
+                "validated_dictionary_rows",
+                len(group_rows),
+            )
+            progress_callback("publish_batches", 1)
+    return {
+        **count_by_state,
+        "provider_group_count": observed_group_count,
+    }
+
+
+async def _validate_v4_tax_relations(
+    session: Any,
+    *,
+    schema: str,
+    group_dictionary_stage: str,
+    tax_identity_stage: str,
+    group_tax_identity_stage: str,
+    contract: _V4TaxIdentityContract,
+) -> None:
+    """Prove graph coverage and that every token is referenced."""
+
+    tax_stage = _quote_ident(tax_identity_stage)
+    group_tax_stage = _quote_ident(group_tax_identity_stage)
+    graph_group_stage = _quote_ident(group_dictionary_stage)
+    relation_result = await session.execute(
+        db.text(
+            f"""
+            SELECT
+                (SELECT COUNT(*)::bigint
+                   FROM {schema}.{graph_group_stage}),
+                (SELECT COUNT(*)::bigint
+                   FROM {schema}.{group_tax_stage} AS sidecar
+                   JOIN {schema}.{graph_group_stage} AS graph_group
+                     ON graph_group.provider_group_global_id_128 =
+                        sidecar.provider_group_global_id_128),
+                (SELECT COUNT(DISTINCT tin_key)::bigint
+                   FROM {schema}.{group_tax_stage}
+                  WHERE tax_identity_state = 'matched_ein'),
+                (SELECT COUNT(*)::bigint
+                   FROM {schema}.{tax_stage} AS token
+                  WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM {schema}.{group_tax_stage} AS sidecar
+                         WHERE sidecar.tax_identity_state = 'matched_ein'
+                           AND sidecar.tin_key = token.tin_key
+                  ))
+            """
+        )
+    )
+    relation_summary = relation_result.one()
+    observed_relation_counts = tuple(
+        int(relation_count) for relation_count in relation_summary
+    )
+    if observed_relation_counts != (
+        contract.provider_group_count,
+        contract.provider_group_count,
+        contract.tax_identity_count,
+        0,
+    ):
+        raise RuntimeError(
+            "PTG V4 tax identity relational completeness changed"
+        )
+
+
+def _v4_tax_content_hasher(
+    contract: _V4TaxIdentityContract,
+) -> Any:
+    """Initialize the independently reconstructed content digest."""
+
+    content_digest = hashlib.sha256()
+    content_digest.update(_V4_TAX_CONTENT_DOMAIN)
+    content_digest.update(contract.token_policy_descriptor_sha256)
+    content_digest.update(contract.source_ordinal_map_digest)
+    content_digest.update(struct.pack(">Q", contract.tax_identity_count))
+    return content_digest
+
+
+async def _validate_v4_tax_identity_stages(
+    session: Any,
+    *,
+    schema: str,
+    group_dictionary_stage: str,
+    tax_identity_stage: str,
+    group_tax_identity_stage: str,
+    contract: _V4TaxIdentityContract,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """Recompute content and relational completeness from staged COPY rows."""
+
+    content_digest = _v4_tax_content_hasher(contract)
+    await _validate_v4_tax_token_rows(
+        session,
+        schema=schema,
+        tax_identity_stage=tax_identity_stage,
+        contract=contract,
+        content_digest=content_digest,
+        progress_callback=progress_callback,
+    )
+    content_digest.update(struct.pack(">Q", contract.provider_group_count))
+    count_by_state = await _validate_v4_tax_group_rows(
+        session,
+        schema=schema,
+        group_tax_identity_stage=group_tax_identity_stage,
+        contract=contract,
+        content_digest=content_digest,
+        progress_callback=progress_callback,
+    )
+    expected_counts = (
+        contract.provider_group_count,
+        contract.matched_ein_count,
+        contract.missing_count,
+        contract.malformed_count,
+        contract.unsupported_type_count,
+    )
+    observed_counts = (
+        count_by_state["provider_group_count"],
+        count_by_state["matched_ein"],
+        count_by_state["missing"],
+        count_by_state["malformed"],
+        count_by_state["unsupported_type"],
+    )
+    if observed_counts != expected_counts or not hmac.compare_digest(
+        content_digest.digest(),
+        contract.content_digest,
+    ):
+        raise RuntimeError("PTG V4 tax identity content digest changed")
+    await _validate_v4_tax_relations(
+        session,
+        schema=schema,
+        group_dictionary_stage=group_dictionary_stage,
+        tax_identity_stage=tax_identity_stage,
+        group_tax_identity_stage=group_tax_identity_stage,
+        contract=contract,
+    )
+
+
+def _v4_tax_manifest_values(
+    *,
+    snapshot_key: int,
+    contract: _V4TaxIdentityContract,
+) -> Mapping[str, Any]:
+    """Build exact database manifest values from the validated contract."""
+
+    return {
+        "snapshot_key": int(snapshot_key),
+        "contract": _V4_TAX_IDENTITY_MANIFEST_CONTRACT,
+        "token_policy_id": contract.token_policy_id,
+        "token_policy_descriptor_sha256": (
+            contract.token_policy_descriptor_sha256
+        ),
+        "normalization_contract": _V4_TAX_NORMALIZATION_CONTRACT,
+        "hmac_contract": _V4_TAX_HMAC_CONTRACT,
+        "source_ordinal_contract": _V4_TAX_SOURCE_ORDINAL_CONTRACT,
+        "source_ordinal_map": [
+            dict(entry) for entry in contract.source_ordinal_map
+        ],
+        "source_ordinal_map_digest": contract.source_ordinal_map_digest,
+        "source_shard_count": contract.source_shard_count,
+        "provider_group_count": contract.provider_group_count,
+        "tax_identity_count": contract.tax_identity_count,
+        "matched_ein_count": contract.matched_ein_count,
+        "missing_count": contract.missing_count,
+        "malformed_count": contract.malformed_count,
+        "unsupported_type_count": contract.unsupported_type_count,
+        "content_digest": contract.content_digest,
+    }
+
+
+async def _insert_v4_tax_manifest(
+    session: Any,
+    *,
+    schema: str,
+    expected_by_name: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Insert the manifest idempotently and return its stable column order."""
+
+    parameters_by_name = {
+        **expected_by_name,
+        "source_ordinal_map": json.dumps(
+            expected_by_name["source_ordinal_map"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    }
+    columns = tuple(expected_by_name)
+    value_expressions = tuple(
+        "CAST(:source_ordinal_map AS jsonb)"
+        if column == "source_ordinal_map"
+        else f":{column}"
+        for column in columns
+    )
+    await session.execute(
+        db.text(
+            f"""
+            INSERT INTO {schema}.ptg2_provider_tax_identity_manifest
+                ({", ".join(columns)})
+            VALUES
+                ({", ".join(value_expressions)})
+            ON CONFLICT DO NOTHING
+            """
+        ),
+        parameters_by_name,
+    )
+    return columns
+
+
+async def _stored_v4_tax_manifest(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    columns: tuple[str, ...],
+) -> Mapping[str, Any]:
+    """Read the immutable manifest through the same canonical column order."""
+
+    stored_result = await session.execute(
+        db.text(
+            f"""
+            SELECT {", ".join(columns[1:])}
+              FROM {schema}.ptg2_provider_tax_identity_manifest
+             WHERE snapshot_key = :snapshot_key
+            """
+        ),
+        {"snapshot_key": int(snapshot_key)},
+    )
+    return dict(zip(columns[1:], stored_result.one()))
+
+
+async def _publish_v4_tax_identity_manifest(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    contract: _V4TaxIdentityContract,
+) -> Mapping[str, Any]:
+    """Publish and re-read the immutable manifest before any child rows."""
+
+    expected_by_name = _v4_tax_manifest_values(
+        snapshot_key=snapshot_key,
+        contract=contract,
+    )
+    columns = await _insert_v4_tax_manifest(
+        session,
+        schema=schema,
+        expected_by_name=expected_by_name,
+    )
+    stored_by_name = await _stored_v4_tax_manifest(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        columns=columns,
+    )
+    for name, expected in expected_by_name.items():
+        if name == "snapshot_key":
+            continue
+        observed = stored_by_name[name]
+        if isinstance(expected, bytes):
+            is_matching = hmac.compare_digest(bytes(observed), expected)
+        else:
+            is_matching = observed == expected
+        if not is_matching:
+            raise RuntimeError("PTG V4 tax identity manifest replay changed")
+    return {
+        name: (
+            manifest_value.hex()
+            if isinstance(manifest_value, bytes)
+            else manifest_value
+        )
+        for name, manifest_value in expected_by_name.items()
+    }
+
+
+async def _v4_tax_group_batch_boundary(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    previous_group_id: bytes,
+) -> tuple[int, bytes | None]:
+    """Return one bounded group batch count and inclusive upper key."""
+
+    batch_result = await session.execute(
+        db.text(
+            f"""
+            SELECT COUNT(*)::bigint,
+                   MAX(provider_group_global_id_128)
+              FROM (
+                    SELECT provider_group_global_id_128
+                      FROM {schema}.{stage}
+                     WHERE provider_group_global_id_128 >
+                           :previous_group_id
+                     ORDER BY provider_group_global_id_128
+                     LIMIT {_V4_DICTIONARY_RANGE_ROWS}
+                   ) AS batch
+            """
+        ),
+        {"previous_group_id": previous_group_id},
+    )
+    batch_count, raw_last_group_id = batch_result.one()
+    return (
+        int(batch_count),
+        None if raw_last_group_id is None else bytes(raw_last_group_id),
+    )
+
+
+async def _publish_v4_tax_group_batch(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    parameters_by_name: Mapping[str, Any],
+) -> int:
+    """Insert one group batch and return its exact replay match count."""
+
+    await session.execute(
+        db.text(
+            f"""
+            INSERT INTO {schema}.ptg2_provider_group_tax_identity
+                (snapshot_key, provider_group_global_id_128,
+                 tax_identity_state, tin_key, source_bitmap)
+            SELECT :snapshot_key, provider_group_global_id_128,
+                   tax_identity_state, tin_key, source_bitmap
+              FROM {schema}.{stage}
+             WHERE provider_group_global_id_128 > :previous_group_id
+               AND provider_group_global_id_128 <= :last_group_id
+             ORDER BY provider_group_global_id_128
+            ON CONFLICT DO NOTHING
+            """
+        ),
+        parameters_by_name,
+    )
+    matching_count = await session.scalar(
+        db.text(
+            f"""
+            SELECT COUNT(*)::bigint
+              FROM {schema}.{stage} AS staged
+              JOIN {schema}.ptg2_provider_group_tax_identity AS stored
+                ON stored.snapshot_key = :snapshot_key
+               AND stored.provider_group_global_id_128 =
+                   staged.provider_group_global_id_128
+               AND stored.tax_identity_state = staged.tax_identity_state
+               AND stored.tin_key IS NOT DISTINCT FROM staged.tin_key
+               AND stored.source_bitmap = staged.source_bitmap
+             WHERE staged.provider_group_global_id_128 > :previous_group_id
+               AND staged.provider_group_global_id_128 <= :last_group_id
+            """
+        ),
+        parameters_by_name,
+    )
+    return int(matching_count or 0)
+
+
+async def _publish_v4_tax_group_ranges(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    stage_table: str,
+    expected_count: int,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """Publish fixed-width group sidecars through bounded byte-key ranges."""
+
+    stage = _quote_ident(stage_table)
+    previous_group_id = b""
+    published_count = 0
+    while True:
+        batch_count, last_group_id = await _v4_tax_group_batch_boundary(
+            session,
+            schema=schema,
+            stage=stage,
+            previous_group_id=previous_group_id,
+        )
+        if batch_count == 0 or last_group_id is None:
+            break
+        parameters_by_name = {
+            "snapshot_key": int(snapshot_key),
+            "previous_group_id": previous_group_id,
+            "last_group_id": last_group_id,
+        }
+        matching_count = await _publish_v4_tax_group_batch(
+            session,
+            schema=schema,
+            stage=stage,
+            parameters_by_name=parameters_by_name,
+        )
+        if matching_count != batch_count:
+            raise RuntimeError(
+                "PTG V4 persisted provider-group tax identity changed"
+            )
+        published_count += batch_count
+        previous_group_id = last_group_id
+        if progress_callback is not None:
+            progress_callback("published_dictionary_rows", batch_count)
+            progress_callback("publish_batches", 1)
+    target_count = await session.scalar(
+        db.text(
+            f"""
+            SELECT COUNT(*)::bigint
+              FROM {schema}.ptg2_provider_group_tax_identity
+             WHERE snapshot_key = :snapshot_key
+            """
+        ),
+        {"snapshot_key": int(snapshot_key)},
+    )
+    if (
+        published_count != int(expected_count)
+        or int(target_count or 0) != int(expected_count)
+    ):
+        raise RuntimeError(
+            "PTG V4 persisted provider-group tax identity changed"
+        )
+
+
 async def _publish_v4_taxonomy_sidecar(
     session: Any,
     *,
@@ -1521,6 +2476,24 @@ async def _publish_v4_taxonomy_sidecar(
     )
 
 
+async def _drop_v4_dictionary_stages(
+    schema: str,
+    stages: Iterable[str],
+) -> None:
+    """Remove only this publication attempt's randomized unlogged stages."""
+
+    stage_names = tuple(stages)
+    if not stage_names:
+        return
+    await db.status(
+        "DROP TABLE IF EXISTS "
+        + ", ".join(
+            f"{schema}.{_quote_ident(stage)}" for stage in stage_names
+        )
+        + ";"
+    )
+
+
 async def _publish_v4_dictionaries_and_maps(
     compilation: V4GraphCompilationResult,
     *,
@@ -1530,7 +2503,11 @@ async def _publish_v4_dictionaries_and_maps(
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
     progress_callback: Callable[[str, int], None] | None = None,
-) -> tuple[V4SnapshotMapSummary, V4InferredTaxonomyPublication]:
+) -> tuple[
+    V4SnapshotMapSummary,
+    V4InferredTaxonomyPublication,
+    _V4TaxIdentityPublication,
+]:
     """Bulk-copy dense dictionaries, then publish exact metadata and packed maps."""
 
     if int(compressed_acquisition_bytes) <= 0:
@@ -1564,13 +2541,24 @@ async def _publish_v4_dictionaries_and_maps(
     expected_prefix_member_count = int(
         compilation.observe.get("npi_prefix_override_member_count") or 0
     )
+    tax_identity_contract = _validated_v4_tax_identity_contract(compilation)
+    tax_identity_artifact_bytes = _v4_tax_artifact_byte_count(compilation)
     prefix_target = int(compilation.summary["npi_prefix_target"])
     group_stage = f"ptg2_v4_group_stage_{token}"
     component_stage = f"ptg2_v4_component_stage_{token}"
     npi_stage = f"ptg2_v4_npi_stage_{token}"
     pattern_stage = f"ptg2_v4_pattern_stage_{token}"
     prefix_stage = f"ptg2_v4_npi_prefix_stage_{token}"
-    stages = [group_stage, component_stage, npi_stage, prefix_stage]
+    tax_identity_stage = f"ptg2_v4_tax_identity_stage_{token}"
+    group_tax_identity_stage = f"ptg2_v4_group_tax_identity_stage_{token}"
+    stages = [
+        group_stage,
+        component_stage,
+        npi_stage,
+        prefix_stage,
+        tax_identity_stage,
+        group_tax_identity_stage,
+    ]
     if compilation.pattern_copy_path is not None:
         stages.append(pattern_stage)
     stage_create_statements = [
@@ -1589,6 +2577,17 @@ async def _publish_v4_dictionaries_and_maps(
         "(provider_set_key integer PRIMARY KEY CHECK (provider_set_key >= 0), "
         f" member_count integer NOT NULL CHECK (member_count BETWEEN 0 AND {prefix_target}), "
         " member_digest bytea NOT NULL CHECK (octet_length(member_digest) = 32))",
+        f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(tax_identity_stage)} "
+        "(tin_key integer PRIMARY KEY CHECK (tin_key >= 0), "
+        " tin_id_128 bytea NOT NULL "
+        " CHECK (octet_length(tin_id_128) = 16), "
+        " tin_hmac_sha256 bytea NOT NULL UNIQUE "
+        " CHECK (octet_length(tin_hmac_sha256) = 32))",
+        f"CREATE UNLOGGED TABLE {schema}.{_quote_ident(group_tax_identity_stage)} "
+        "(provider_group_global_id_128 bytea PRIMARY KEY "
+        " CHECK (octet_length(provider_group_global_id_128) = 16), "
+        " tax_identity_state text NOT NULL, tin_key integer, "
+        " source_bitmap bytea NOT NULL)",
     ]
     if compilation.pattern_copy_path is not None:
         stage_create_statements.append(
@@ -1598,10 +2597,20 @@ async def _publish_v4_dictionaries_and_maps(
             " CHECK (octet_length(pattern_digest) = 32), "
             " set_count bigint NOT NULL CHECK (set_count >= 0))"
         )
-    for statement in stage_create_statements:
-        await db.status(statement)
-        if progress_callback is not None:
-            progress_callback("publish_batches", 1)
+    created_stages: list[str] = []
+    try:
+        for stage, statement in zip(
+            stages,
+            stage_create_statements,
+            strict=True,
+        ):
+            await db.status(statement)
+            created_stages.append(stage)
+            if progress_callback is not None:
+                progress_callback("publish_batches", 1)
+    except BaseException:
+        await _drop_v4_dictionary_stages(schema, created_stages)
+        raise
     try:
         await _copy_binary_file_to_stage(
             compilation.group_copy_path,
@@ -1629,6 +2638,25 @@ async def _publish_v4_dictionaries_and_maps(
             schema_name=schema_name,
             stage_table=prefix_stage,
             columns=("provider_set_key", "member_count", "member_digest"),
+            **_progress_callback_kwargs(progress_callback),
+        )
+        await _copy_binary_file_to_stage(
+            compilation.provider_tax_identity_copy_path,
+            schema_name=schema_name,
+            stage_table=tax_identity_stage,
+            columns=("tin_key", "tin_id_128", "tin_hmac_sha256"),
+            **_progress_callback_kwargs(progress_callback),
+        )
+        await _copy_binary_file_to_stage(
+            compilation.provider_group_tax_identity_copy_path,
+            schema_name=schema_name,
+            stage_table=group_tax_identity_stage,
+            columns=(
+                "provider_group_global_id_128",
+                "tax_identity_state",
+                "tin_key",
+                "source_bitmap",
+            ),
             **_progress_callback_kwargs(progress_callback),
         )
         if compilation.pattern_copy_path is not None:
@@ -1698,6 +2726,18 @@ async def _publish_v4_dictionaries_and_maps(
                     ),
                 )
             )
+        tax_dictionary_stage = _V4DenseDictionaryStage(
+            stage_table=tax_identity_stage,
+            key_name="tin_key",
+            expected_count=tax_identity_contract.tax_identity_count,
+            target_table="ptg2_provider_tax_identity",
+            columns=("tin_key", "tin_id_128", "tin_hmac_sha256"),
+            value_predicate=(
+                "octet_length(tin_id_128) = 16 "
+                "AND octet_length(tin_hmac_sha256) = 32 "
+                "AND tin_id_128 = substring(tin_hmac_sha256 FROM 1 FOR 16)"
+            ),
+        )
         async with db.transaction() as session:
             snapshot_parameter_map = {"snapshot_key": int(snapshot_key)}
             await lock_v4_shared_layout_for_map_write(
@@ -1713,6 +2753,21 @@ async def _publish_v4_dictionaries_and_maps(
                     stage=dictionary_stage,
                     progress_callback=progress_callback,
                 )
+            await _validate_v4_dictionary_stage(
+                session,
+                schema=schema,
+                stage=tax_dictionary_stage,
+                progress_callback=progress_callback,
+            )
+            await _validate_v4_tax_identity_stages(
+                session,
+                schema=schema,
+                group_dictionary_stage=group_stage,
+                tax_identity_stage=tax_identity_stage,
+                group_tax_identity_stage=group_tax_identity_stage,
+                contract=tax_identity_contract,
+                progress_callback=progress_callback,
+            )
 
             # Metadata tables are trigger-fenced by the building map root.
             # Publish the authenticated coordinate map first in this same
@@ -1729,6 +2784,16 @@ async def _publish_v4_dictionaries_and_maps(
                 **_progress_callback_kwargs(progress_callback),
             )
 
+            tax_identity_manifest = await _publish_v4_tax_identity_manifest(
+                session,
+                schema=schema,
+                snapshot_key=int(snapshot_key),
+                contract=tax_identity_contract,
+            )
+            if progress_callback is not None:
+                progress_callback("published_dictionary_rows", 1)
+                progress_callback("publish_batches", 1)
+
             for dictionary_stage in dictionary_stages:
                 await _publish_v4_dictionary_stage_ranges(
                     session,
@@ -1737,6 +2802,21 @@ async def _publish_v4_dictionaries_and_maps(
                     stage=dictionary_stage,
                     progress_callback=progress_callback,
                 )
+            await _publish_v4_dictionary_stage_ranges(
+                session,
+                schema=schema,
+                snapshot_key=int(snapshot_key),
+                stage=tax_dictionary_stage,
+                progress_callback=progress_callback,
+            )
+            await _publish_v4_tax_group_ranges(
+                session,
+                schema=schema,
+                snapshot_key=int(snapshot_key),
+                stage_table=group_tax_identity_stage,
+                expected_count=tax_identity_contract.provider_group_count,
+                progress_callback=progress_callback,
+            )
 
             diagnostic_parameters_by_name = {
                 "snapshot_key": int(snapshot_key),
@@ -2120,13 +3200,25 @@ async def _publish_v4_dictionaries_and_maps(
                     + int(taxonomy_publication.observe_only_rule_count),
                 )
                 progress_callback("publish_batches", 1)
-            return map_summary, taxonomy_publication
+            return (
+                map_summary,
+                taxonomy_publication,
+                _V4TaxIdentityPublication(
+                    manifest={
+                        **dict(tax_identity_manifest),
+                        "artifact_byte_count": (
+                            tax_identity_artifact_bytes
+                        ),
+                    },
+                    provider_group_count=(
+                        tax_identity_contract.provider_group_count
+                    ),
+                    tax_identity_count=tax_identity_contract.tax_identity_count,
+                    artifact_byte_count=tax_identity_artifact_bytes,
+                ),
+            )
     finally:
-        await db.status(
-            "DROP TABLE IF EXISTS "
-            + ", ".join(f"{schema}.{_quote_ident(stage)}" for stage in stages)
-            + ";"
-        )
+        await _drop_v4_dictionary_stages(schema, stages)
 
 
 async def _publish_v4_graph(
@@ -2161,7 +3253,11 @@ async def _publish_v4_graph(
             build_token=build_token,
             **_progress_callback_kwargs(progress_callback),
         )
-        map_summary, taxonomy_publication = (
+        (
+            map_summary,
+            taxonomy_publication,
+            tax_identity_publication,
+        ) = (
             await _publish_v4_dictionaries_and_maps(
                 compilation,
                 schema_name=schema_name,
@@ -2209,6 +3305,9 @@ async def _publish_v4_graph(
             "inferred_taxonomy_candidates": dict(
                 taxonomy_publication.manifest
             ),
+            "provider_tax_identity": dict(
+                tax_identity_publication.manifest
+            ),
             "observe": dict(compilation.observe),
             "resource_admission": {
                 "compressed_acquisition_bytes": int(
@@ -2237,12 +3336,14 @@ async def _publish_v4_graph(
             int(cas_publication.logical_byte_count)
             + int(taxonomy_publication.packed_byte_count)
             + int(taxonomy_publication.pattern_member_bytes)
+            + int(tax_identity_publication.artifact_byte_count)
         ),
         stored_byte_count=(
             int(cas_publication.stored_byte_count)
             + int(map_summary.stored_map_byte_count)
             + int(taxonomy_publication.packed_byte_count)
             + int(taxonomy_publication.pattern_member_bytes)
+            + int(tax_identity_publication.artifact_byte_count)
         ),
         map_summary=map_summary,
         representation=(
@@ -2250,6 +3351,7 @@ async def _publish_v4_graph(
         ),
         compiler_summary=dict(compilation.summary),
         inferred_taxonomy_candidates=dict(taxonomy_publication.manifest),
+        provider_tax_identity=dict(tax_identity_publication.manifest),
         audit_witness_path=compilation.provider_set_audit_npi_copy_path,
     )
 
@@ -2377,6 +3479,13 @@ def _physical_serving_index(
                 getattr(
                     graph_publication,
                     "inferred_taxonomy_candidates",
+                    {},
+                )
+            ),
+            "provider_tax_identity": dict(
+                getattr(
+                    graph_publication,
+                    "provider_tax_identity",
                     {},
                 )
             ),

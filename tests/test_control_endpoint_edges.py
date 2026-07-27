@@ -80,7 +80,7 @@ async def test_control_ptg_wrappers_translate_validation_errors(monkeypatch):
 async def test_control_snapshot_wrappers_translate_validation_errors(monkeypatch):
     endpoint_by_dependency = (
         (
-            "build_ptg2_source_snapshot_remove_plan",
+            "build_source_snapshot_remove_plan",
             control.control_ptg_source_snapshot_remove_plan,
         ),
         ("remove_ptg2_source_snapshot", control.control_ptg_source_snapshot_remove),

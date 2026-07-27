@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const DENSE_FORMAT: &str = "magic8:uint32_le_version:uint64_le_entry_count:uint64_le_member_global_count:index(owner16:uint64_le_offset:uint32_le_count):member_globals16:members_uint32_le";
+const TAX_POLICY_ID: &str = "ptg-tin-hmac-sha256-v1:test-1";
+
+fn sha256_hex(payload: &[u8]) -> String {
+    Sha256::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 fn global(domain: u8, value: u64) -> GlobalId128 {
     let mut result = [0u8; 16];
@@ -48,6 +56,46 @@ fn write_membership(path: &Path, name: &str, shard_id: &str, entries: Vec<Sideca
             "member_count": member_count,
             "member_global_count": distinct_members.len(),
             "name": name,
+            "source_shard_id": shard_id,
+        }
+    })
+}
+
+fn write_missing_tax_identity(path: &Path, shard_id: &str, groups: &[GlobalId128]) -> Value {
+    let mut groups = groups.to_vec();
+    groups.sort_unstable();
+    groups.dedup();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PTG2TAX1");
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&65u16.to_le_bytes());
+    bytes.push(TAX_POLICY_ID.len() as u8);
+    bytes.extend_from_slice(TAX_POLICY_ID.as_bytes());
+    for group in &groups {
+        bytes.extend_from_slice(&group.0);
+        bytes.push(2);
+        bytes.extend_from_slice(&[0u8; 48]);
+    }
+    fs::write(path, &bytes).expect("write missing tax identities");
+    json!({
+        "path": path,
+        "metadata": {
+            "record_format": "ptg2_provider_group_tax_identity_v1",
+            "sha256": sha256_hex(&bytes),
+            "byte_count": bytes.len(),
+            "row_count": groups.len(),
+            "provider_group_count": groups.len(),
+            "matched_ein_count": 0,
+            "missing_count": groups.len(),
+            "malformed_count": 0,
+            "unsupported_type_count": 0,
+            "version": 1,
+            "record_bytes": 65,
+            "token_policy_id": TAX_POLICY_ID,
+            "normalization_contract": "ein_ascii_digits_or_2_7_hyphen_v1",
+            "hmac_contract": "hmac_sha256_ptg_tin_v1",
+            "final": true,
+            "name": "provider_group_tax_identity",
             "source_shard_id": shard_id,
         }
     })
@@ -100,9 +148,11 @@ fn write_manifest(root: &Path) -> PathBuf {
         shard_id,
         vec![SidecarEntry {
             owner: provider_npi,
-            members: groups,
+            members: groups.clone(),
         }],
     );
+    let group_tax_identity =
+        write_missing_tax_identity(&root.join("group-tax-identity.sidecar"), shard_id, &groups);
     let provider_map = root.join("provider-map.copy");
     let map = sets
         .iter()
@@ -119,6 +169,7 @@ fn write_manifest(root: &Path) -> PathBuf {
             "provider_component_group": component_group,
             "provider_group_npi": group_npi,
             "provider_npi_group": npi_group,
+            "provider_group_tax_identity": group_tax_identity,
         }],
         "provider_set_key_map_path": provider_map,
         "output_directory": root.join("compiled"),
@@ -195,6 +246,11 @@ fn write_direct_manifest(root: &Path) -> PathBuf {
             })
             .collect(),
     );
+    let group_tax_identity = write_missing_tax_identity(
+        &root.join("direct-group-tax-identity.sidecar"),
+        shard_id,
+        &groups,
+    );
     let provider_map = root.join("direct-provider-map.copy");
     fs::write(
         &provider_map,
@@ -212,6 +268,7 @@ fn write_direct_manifest(root: &Path) -> PathBuf {
             "provider_component_group": component_group,
             "provider_group_npi": group_npi,
             "provider_npi_group": npi_group,
+            "provider_group_tax_identity": group_tax_identity,
         }],
         "provider_set_key_map_path": provider_map,
         "output_directory": root.join("direct-compiled"),
@@ -280,6 +337,11 @@ fn write_heavy_direct_manifest(root: &Path) -> PathBuf {
             })
             .collect(),
     );
+    let group_tax_identity = write_missing_tax_identity(
+        &root.join("heavy-direct-group-tax-identity.sidecar"),
+        shard_id,
+        &[group],
+    );
     let provider_map = root.join("heavy-direct-provider-map.copy");
     fs::write(
         &provider_map,
@@ -297,6 +359,7 @@ fn write_heavy_direct_manifest(root: &Path) -> PathBuf {
             "provider_component_group": component_group,
             "provider_group_npi": group_npi,
             "provider_npi_group": npi_group,
+            "provider_group_tax_identity": group_tax_identity,
         }],
         "provider_set_key_map_path": provider_map,
         "output_directory": root.join("heavy-direct-compiled"),

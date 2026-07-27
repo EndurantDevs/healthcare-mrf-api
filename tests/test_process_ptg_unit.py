@@ -392,7 +392,7 @@ def test_ptg2_auto_address_refresh_skips_test_mode_by_default(monkeypatch):
     monkeypatch.delenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_TEST_ENV, raising=False)
 
     result = asyncio.run(
-        process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+        process_ptg._enqueue_address_refresh_after_import(
             source_key="source-alpha",
             snapshot_id="snap-new",
             import_run_id="run-source-alpha",
@@ -421,7 +421,7 @@ def test_ptg2_auto_address_refresh_enqueues_control_run(monkeypatch):
     monkeypatch.setattr(control_imports, "create_import_run", fake_create_import_run)
 
     enqueue_result = asyncio.run(
-        process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+        process_ptg._enqueue_address_refresh_after_import(
             source_key="source-alpha",
             snapshot_id="snap-new",
             import_run_id="run-source-alpha",
@@ -456,7 +456,7 @@ def test_ptg2_auto_address_refresh_reports_existing_or_enqueue_failure(monkeypat
     monkeypatch.setattr(control_imports, "ensure_import_run_table", fake_ensure_import_run_table)
     monkeypatch.setattr(control_imports, "create_import_run", fake_existing_import_run)
     existing = asyncio.run(
-        process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+        process_ptg._enqueue_address_refresh_after_import(
             source_key="source-alpha",
             snapshot_id="snap-new",
             import_run_id="run-source-alpha",
@@ -471,7 +471,7 @@ def test_ptg2_auto_address_refresh_reports_existing_or_enqueue_failure(monkeypat
 
     monkeypatch.setattr(control_imports, "create_import_run", fake_failed_import_run)
     failed = asyncio.run(
-        process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+        process_ptg._enqueue_address_refresh_after_import(
             source_key="source-alpha",
             snapshot_id="snap-new",
             import_run_id="run-source-alpha",
@@ -3910,6 +3910,42 @@ def test_download_raw_artifact_redownloads_corrupt_gzip_reuse_candidate(monkeypa
     assert any('"status": "available"' in line and artifact.raw_sha256 in line for line in manifest_lines)
 
 
+async def _download_from_test_server(handler, tmp_path):
+    app = web.Application()
+    app.router.add_route("*", "/artifact.bin", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    sockets = site._server.sockets
+    assert sockets
+    port = sockets[0].getsockname()[1]
+    try:
+        return await process_ptg.download_raw_artifact(
+            f"http://127.0.0.1:{port}/artifact.bin",
+            store=process_ptg.PTG2ArtifactStore(tmp_path),
+        )
+    finally:
+        await runner.cleanup()
+
+
+def _configure_range_download(monkeypatch, *, retries: int | None = None):
+    monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, "1")
+    monkeypatch.setenv(
+        process_ptg.PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV,
+        str(1024 * 1024),
+    )
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_TASKS_ENV, "2")
+    if retries is not None:
+        monkeypatch.setenv(process_ptg.PTG2_DOWNLOAD_RETRIES_ENV, str(retries))
+        monkeypatch.setenv(
+            process_ptg.PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV,
+            "0",
+        )
+
+
 def test_ptg2_range_download_assembles_artifact(monkeypatch, tmp_path):
     """Verify this PTG import regression contract."""
     artifact_bytes = (b"0123456789abcdef" * 1024 * 1024)[:3 * 1024 * 1024]
@@ -3942,31 +3978,8 @@ def test_ptg2_range_download_assembles_artifact(monkeypatch, tmp_path):
             )
         return web.Response(body=artifact_bytes, headers={"Content-Length": str(len(artifact_bytes))})
 
-    async def run_download():
-        app = web.Application()
-        app.router.add_route("*", "/artifact.bin", handle)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", 0)
-        await site.start()
-        sockets = site._server.sockets
-        assert sockets
-        port = sockets[0].getsockname()[1]
-        try:
-            return await process_ptg.download_raw_artifact(
-                f"http://127.0.0.1:{port}/artifact.bin",
-                store=process_ptg.PTG2ArtifactStore(tmp_path),
-            )
-        finally:
-            await runner.cleanup()
-
-    monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
-    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "true")
-    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, "1")
-    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, str(1024 * 1024))
-    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_TASKS_ENV, "2")
-
-    artifact = asyncio.run(run_download())
+    _configure_range_download(monkeypatch)
+    artifact = asyncio.run(_download_from_test_server(handle, tmp_path))
 
     assert Path(artifact.raw_path).read_bytes() == artifact_bytes
     assert any(request == "bytes=0-0" for request in requests)
@@ -4008,33 +4021,8 @@ def test_ptg2_range_download_retries_short_chunk(monkeypatch, tmp_path):
             },
         )
 
-    async def run_download():
-        app = web.Application()
-        app.router.add_route("*", "/artifact.bin", handle)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", 0)
-        await site.start()
-        sockets = site._server.sockets
-        assert sockets
-        port = sockets[0].getsockname()[1]
-        try:
-            return await process_ptg.download_raw_artifact(
-                f"http://127.0.0.1:{port}/artifact.bin",
-                store=process_ptg.PTG2ArtifactStore(tmp_path),
-            )
-        finally:
-            await runner.cleanup()
-
-    monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
-    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "true")
-    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, "1")
-    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, str(1024 * 1024))
-    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_TASKS_ENV, "2")
-    monkeypatch.setenv(process_ptg.PTG2_DOWNLOAD_RETRIES_ENV, "2")
-    monkeypatch.setenv(process_ptg.PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV, "0")
-
-    artifact = asyncio.run(run_download())
+    _configure_range_download(monkeypatch, retries=2)
+    artifact = asyncio.run(_download_from_test_server(handle, tmp_path))
 
     assert Path(artifact.raw_path).read_bytes() == artifact_bytes
     assert attempts_by_range["bytes=1048576-2097151"] == 2
@@ -4900,7 +4888,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     )
     monkeypatch.setattr(
         process_ptg,
-        "_merge_and_copy_ptg2_manifest_files",
+        "_merge_ptg2_manifest_files",
         AsyncMock(
             return_value={
                 "enabled": True,
@@ -4922,7 +4910,11 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_enqueue_ptg2_auto_address_refresh_after_import", refresh_mock)
+    monkeypatch.setattr(
+        process_ptg,
+        "_enqueue_address_refresh_after_import",
+        refresh_mock,
+    )
     monkeypatch.setenv(process_ptg.PTG2_FILE_PROCESS_CONCURRENCY_ENV, "2")
     monkeypatch.setattr(
         process_ptg,
@@ -6446,6 +6438,8 @@ def test_v4_flag_enables_rust_factor_mode(
             / "set-component.ptg2sc",
             manifest_provider_component_group_sidecar_path=tmp_path
             / "component-group.ptg2sc",
+            manifest_provider_group_tax_identity_sidecar_path=tmp_path
+            / "provider-group-tax-identity.ptg2tax",
             manifest_only=True,
         )
     )
@@ -6456,13 +6450,23 @@ def test_v4_flag_enables_rust_factor_mode(
     assert framed_records[1][1]["factor_mode"] is True
 
 
-@pytest.mark.parametrize("configured_factor_paths", [(False, False), (True, False)])
+@pytest.mark.parametrize(
+    "configured_factor_paths",
+    [
+        (False, False, False),
+        (True, False, True),
+        (True, True, False),
+        (False, False, True),
+    ],
+)
 def test_ptg2_rust_compact_rejects_incomplete_v4_factor_paths(
     configured_factor_paths,
     monkeypatch,
     tmp_path,
 ):
-    has_set_path, has_component_path = configured_factor_paths
+    has_set_path, has_component_path, has_tax_identity_path = (
+        configured_factor_paths
+    )
     monkeypatch.setenv("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "1")
     monkeypatch.setattr(
         ptg_rust_scanner,
@@ -6492,6 +6496,11 @@ def test_ptg2_rust_compact_rejects_incomplete_v4_factor_paths(
                 manifest_provider_component_group_sidecar_path=(
                     tmp_path / "component-group.ptg2sc"
                     if has_component_path
+                    else None
+                ),
+                manifest_provider_group_tax_identity_sidecar_path=(
+                    tmp_path / "provider-group-tax-identity.ptg2tax"
+                    if has_tax_identity_path
                     else None
                 ),
                 manifest_only=True,
@@ -6670,6 +6679,113 @@ def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
     assert artifacts["provider_forward"]["owner_index_fence_owners"] == [
         owner_global_id.hex()
     ]
+
+
+def test_ptg2_manifest_artifacts_authenticate_tax_identity_sidecar(tmp_path):
+    artifact_path = tmp_path / "provider-group-tax-identity.ptg2tax"
+    policy_id = "ptg-tin-hmac-sha256-v1:release-1"
+    identity_record_bytes = b"g" * 16 + b"\x01" + b"c" * 16 + b"h" * 32
+    artifact_bytes = (
+        b"PTG2TAX1"
+        + (1).to_bytes(2, "little")
+        + (65).to_bytes(2, "little")
+        + bytes([len(policy_id)])
+        + policy_id.encode("ascii")
+        + identity_record_bytes
+    )
+    artifact_path.write_bytes(artifact_bytes)
+    scanner_artifact_by_field = {
+        "path": str(artifact_path),
+        "bytes": len(artifact_bytes),
+        "row_count": 1,
+        "provider_group_count": 1,
+        "matched_ein_count": 1,
+        "missing_count": 0,
+        "malformed_count": 0,
+        "unsupported_type_count": 0,
+        "format": "ptg2_provider_group_tax_identity_v1",
+        "version": 1,
+        "record_bytes": 65,
+        "token_policy_id": policy_id,
+        "normalization_contract": "ein_ascii_digits_or_2_7_hyphen_v1",
+        "hmac_contract": "hmac_sha256_ptg_tin_v1",
+        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "final": True,
+    }
+
+    artifacts = process_ptg._collect_ptg2_manifest_sidecar_artifacts(
+        {"provider_group_tax_identity": artifact_path},
+        provider_group_tax_identity_artifact=scanner_artifact_by_field,
+    )
+
+    assert artifacts["provider_group_tax_identity"] == {
+        "name": "provider_group_tax_identity",
+        "path": str(artifact_path),
+        "record_format": "ptg2_provider_group_tax_identity_v1",
+        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "byte_count": len(artifact_bytes),
+        "row_count": 1,
+        "provider_group_count": 1,
+        "matched_ein_count": 1,
+        "missing_count": 0,
+        "malformed_count": 0,
+        "unsupported_type_count": 0,
+        "version": 1,
+        "record_bytes": 65,
+        "token_policy_id": policy_id,
+        "normalization_contract": "ein_ascii_digits_or_2_7_hyphen_v1",
+        "hmac_contract": "hmac_sha256_ptg_tin_v1",
+        "final": True,
+    }
+
+
+def test_ptg2_manifest_artifacts_reject_tax_identity_summary_drift(tmp_path):
+    artifact_path = tmp_path / "provider-group-tax-identity.ptg2tax"
+    policy_id = "ptg-tin-hmac-sha256-v1:release-1"
+    artifact_bytes = (
+        b"PTG2TAX1"
+        + (1).to_bytes(2, "little")
+        + (65).to_bytes(2, "little")
+        + bytes([len(policy_id)])
+        + policy_id.encode("ascii")
+    )
+    artifact_path.write_bytes(artifact_bytes)
+    scanner_artifact_by_field = {
+        "path": str(artifact_path),
+        "bytes": len(artifact_bytes),
+        "row_count": 0,
+        "provider_group_count": 0,
+        "matched_ein_count": 1,
+        "missing_count": 0,
+        "malformed_count": 0,
+        "unsupported_type_count": 0,
+        "format": "ptg2_provider_group_tax_identity_v1",
+        "version": 1,
+        "record_bytes": 65,
+        "token_policy_id": policy_id,
+        "normalization_contract": "ein_ascii_digits_or_2_7_hyphen_v1",
+        "hmac_contract": "hmac_sha256_ptg_tin_v1",
+        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "final": True,
+    }
+
+    with pytest.raises(RuntimeError, match="counts are inconsistent"):
+        process_ptg._collect_ptg2_manifest_sidecar_artifacts(
+            {"provider_group_tax_identity": artifact_path},
+            provider_group_tax_identity_artifact=scanner_artifact_by_field,
+        )
+
+
+def test_ptg2_manifest_artifacts_reject_missing_tax_identity_file(tmp_path):
+    with pytest.raises(RuntimeError, match="artifact is missing"):
+        process_ptg._collect_ptg2_manifest_sidecar_artifacts(
+            {
+                "provider_group_tax_identity": (
+                    tmp_path / "missing-provider-tax-identity.ptg2tax"
+                )
+            },
+            provider_group_tax_identity_artifact={"final": True},
+        )
 
 
 def test_ptg2_manifest_artifacts_fallback_collects_from_summary_paths(tmp_path):
@@ -7200,7 +7316,7 @@ def test_strict_v3_precopy_rejects_partial_price_artifacts_per_source(
         match=r"source-1\.json\.gz.*price_set_summary",
     ):
         asyncio.run(
-            process_ptg._merge_and_copy_ptg2_manifest_files(
+            process_ptg._merge_ptg2_manifest_files(
                 successful_files=successful_files,
                 manifest_stage_table="ptg2_manifest_stage_serving_partial",
             )
@@ -7932,7 +8048,7 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
     )
     monkeypatch.setattr(
         process_ptg,
-        "_merge_and_copy_ptg2_manifest_files",
+        "_merge_ptg2_manifest_files",
         AsyncMock(
             return_value={
                 "enabled": True,
@@ -7949,7 +8065,7 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
     monkeypatch.setattr(
         process_ptg,
-        "_enqueue_ptg2_auto_address_refresh_after_import",
+        "_enqueue_address_refresh_after_import",
         AsyncMock(return_value={"status": "disabled"}),
     )
     return publish
@@ -8610,7 +8726,7 @@ def _install_reused_mixed_support_mocks(monkeypatch):
     )
     monkeypatch.setattr(
         process_ptg,
-        "_enqueue_ptg2_auto_address_refresh_after_import",
+        "_enqueue_address_refresh_after_import",
         AsyncMock(return_value={"status": "disabled"}),
     )
     monkeypatch.setattr(
@@ -9085,7 +9201,7 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
     )
     monkeypatch.setattr(
         process_ptg,
-        "_enqueue_ptg2_auto_address_refresh_after_import",
+        "_enqueue_address_refresh_after_import",
         address_refresh,
     )
 
@@ -9213,7 +9329,7 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
     )
     monkeypatch.setattr(
         process_ptg,
-        "_enqueue_ptg2_auto_address_refresh_after_import",
+        "_enqueue_address_refresh_after_import",
         enqueue_address_refresh,
     )
     monkeypatch.setattr(

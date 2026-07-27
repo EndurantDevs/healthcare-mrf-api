@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any
@@ -287,18 +288,69 @@ def _iter_inline_provider_groups(path: str | Path, max_json_fallback_bytes: int)
                     yield group
 
 
+@dataclass
+class _LocationEvidenceAudit:
+    summary: dict[str, Any]
+    address_paths: Counter[str]
+    phone_paths: Counter[str]
+    network_paths: Counter[str]
+    samples: list[dict[str, Any]]
+    max_samples: int
+
+
+_NO_REFERENCE_ID = object()
+
+
+def _audit_provider_group(
+    group: dict[str, Any],
+    audit: _LocationEvidenceAudit,
+    *,
+    counter_prefix: str,
+    scope: str,
+    ref_id: Any = _NO_REFERENCE_ID,
+) -> None:
+    audit.summary[counter_prefix] += 1
+    group_addresses, group_phones, group_network_names = (
+        _collect_matching_fields(group)
+    )
+    if group_addresses or group_phones:
+        audit.summary[f"{counter_prefix}_with_direct_location_fields"] += 1
+        has_displayable_address = _has_displayable_address_value(group)
+        if has_displayable_address:
+            audit.summary[
+                f"{counter_prefix}_with_displayable_location_fields"
+            ] += 1
+        _add_field_counts(audit.address_paths, group_addresses)
+        _add_field_counts(audit.phone_paths, group_phones)
+        sample_by_field = {
+            "scope": scope,
+            "tin": _sample_value(group.get("tin")),
+            "npi_count": (
+                len(group.get("npi") or [])
+                if isinstance(group.get("npi"), list)
+                else None
+            ),
+            "displayable_address_present": has_displayable_address,
+            "address_fields": group_addresses,
+            "phone_fields": group_phones,
+        }
+        if ref_id is not _NO_REFERENCE_ID:
+            sample_by_field["provider_group_id"] = ref_id
+        _append_sample(
+            audit.samples,
+            sample_by_field,
+            audit.max_samples,
+        )
+    if group_network_names:
+        _add_field_counts(audit.network_paths, group_network_names)
+
+
 def _audit_provider_reference(
     ref: dict[str, Any],
-    *,
-    summary: dict[str, Any],
-    address_paths: Counter[str],
-    phone_paths: Counter[str],
-    network_paths: Counter[str],
-    samples: list[dict[str, Any]],
-    max_samples: int,
+    audit: _LocationEvidenceAudit,
 ) -> None:
     """Accumulate location evidence from one provider reference."""
-    summary["provider_references"] += 1
+    audit.summary["provider_references"] += 1
     ref_id = ref.get("provider_group_id") or ref.get("provider_group_ref")
     reference_fields_map = dict(ref)
     reference_fields_map.pop("provider_groups", None)
@@ -306,14 +358,18 @@ def _audit_provider_reference(
         reference_fields_map
     )
     if ref_addresses or ref_phones:
-        summary["provider_references_with_direct_location_fields"] += 1
+        audit.summary[
+            "provider_references_with_direct_location_fields"
+        ] += 1
         has_displayable_address = _has_displayable_address_value(reference_fields_map)
         if has_displayable_address:
-            summary["provider_references_with_displayable_location_fields"] += 1
-        _add_field_counts(address_paths, ref_addresses)
-        _add_field_counts(phone_paths, ref_phones)
+            audit.summary[
+                "provider_references_with_displayable_location_fields"
+            ] += 1
+        _add_field_counts(audit.address_paths, ref_addresses)
+        _add_field_counts(audit.phone_paths, ref_phones)
         _append_sample(
-            samples,
+            audit.samples,
             {
                 "scope": "provider_reference",
                 "provider_group_id": ref_id,
@@ -321,74 +377,75 @@ def _audit_provider_reference(
                 "address_fields": ref_addresses,
                 "phone_fields": ref_phones,
             },
-            max_samples,
+            audit.max_samples,
         )
     if ref_network_names:
-        summary["provider_references_with_network_names"] += 1
-        _add_field_counts(network_paths, ref_network_names)
+        audit.summary["provider_references_with_network_names"] += 1
+        _add_field_counts(audit.network_paths, ref_network_names)
 
     for group in ref.get("provider_groups") or []:
         if not isinstance(group, dict):
             continue
-        summary["provider_groups"] += 1
-        group_addresses, group_phones, group_network_names = _collect_matching_fields(group)
-        if group_addresses or group_phones:
-            summary["provider_groups_with_direct_location_fields"] += 1
-            has_displayable_address = _has_displayable_address_value(group)
-            if has_displayable_address:
-                summary["provider_groups_with_displayable_location_fields"] += 1
-            _add_field_counts(address_paths, group_addresses)
-            _add_field_counts(phone_paths, group_phones)
-            _append_sample(
-                samples,
-                {
-                    "scope": "provider_reference.provider_groups",
-                    "provider_group_id": ref_id,
-                    "tin": _sample_value(group.get("tin")),
-                    "npi_count": len(group.get("npi") or []) if isinstance(group.get("npi"), list) else None,
-                    "displayable_address_present": has_displayable_address,
-                    "address_fields": group_addresses,
-                    "phone_fields": group_phones,
-                },
-                max_samples,
-            )
-        if group_network_names:
-            _add_field_counts(network_paths, group_network_names)
+        _audit_provider_group(
+            group,
+            audit,
+            counter_prefix="provider_groups",
+            scope="provider_reference.provider_groups",
+            ref_id=ref_id,
+        )
 
 
-def _audit_inline_provider_group(
-    group: dict[str, Any],
-    *,
-    summary: dict[str, Any],
+def _finalize_location_evidence_summary(
+    evidence_summary_map: dict[str, Any],
     address_paths: Counter[str],
     phone_paths: Counter[str],
     network_paths: Counter[str],
     samples: list[dict[str, Any]],
-    max_samples: int,
-) -> None:
-    summary["inline_provider_groups"] += 1
-    address_fields, phone_fields, network_name_fields = _collect_matching_fields(group)
-    if address_fields or phone_fields:
-        summary["inline_provider_groups_with_direct_location_fields"] += 1
-        has_displayable_address = _has_displayable_address_value(group)
-        if has_displayable_address:
-            summary["inline_provider_groups_with_displayable_location_fields"] += 1
-        _add_field_counts(address_paths, address_fields)
-        _add_field_counts(phone_paths, phone_fields)
-        _append_sample(
-            samples,
-            {
-                "scope": "in_network.negotiated_rates.provider_groups",
-                "tin": _sample_value(group.get("tin")),
-                "npi_count": len(group.get("npi") or []) if isinstance(group.get("npi"), list) else None,
-                "displayable_address_present": has_displayable_address,
-                "address_fields": address_fields,
-                "phone_fields": phone_fields,
-            },
-            max_samples,
-        )
-    if network_name_fields:
-        _add_field_counts(network_paths, network_name_fields)
+) -> dict[str, Any]:
+    evidence_summary_map["direct_location_fields_present"] = bool(
+        evidence_summary_map["provider_references_with_direct_location_fields"]
+        or evidence_summary_map["provider_groups_with_direct_location_fields"]
+        or evidence_summary_map[
+            "inline_provider_groups_with_direct_location_fields"
+        ]
+    )
+    evidence_summary_map["direct_displayable_location_fields_present"] = bool(
+        evidence_summary_map[
+            "provider_references_with_displayable_location_fields"
+        ]
+        or evidence_summary_map[
+            "provider_groups_with_displayable_location_fields"
+        ]
+        or evidence_summary_map[
+            "inline_provider_groups_with_displayable_location_fields"
+        ]
+    )
+    evidence_summary_map["direct_phone_fields_present"] = bool(phone_paths)
+    evidence_summary_map["address_field_paths"] = dict(
+        sorted(address_paths.items())
+    )
+    evidence_summary_map["phone_field_paths"] = dict(sorted(phone_paths.items()))
+    evidence_summary_map["network_name_field_paths"] = dict(
+        sorted(network_paths.items())
+    )
+    evidence_summary_map["samples"] = samples
+    return evidence_summary_map
+
+
+def _new_location_evidence_summary(path: str | Path) -> dict[str, Any]:
+    return {
+        "path": str(Path(path)),
+        "provider_references": 0,
+        "provider_references_with_direct_location_fields": 0,
+        "provider_references_with_displayable_location_fields": 0,
+        "provider_references_with_network_names": 0,
+        "provider_groups": 0,
+        "provider_groups_with_direct_location_fields": 0,
+        "provider_groups_with_displayable_location_fields": 0,
+        "inline_provider_groups": 0,
+        "inline_provider_groups_with_direct_location_fields": 0,
+        "inline_provider_groups_with_displayable_location_fields": 0,
+    }
 
 
 def audit_tic_provider_location_evidence(
@@ -405,61 +462,31 @@ def audit_tic_provider_location_evidence(
     location for a negotiated rate.
     """
 
-    artifact_path = str(Path(path))
-    evidence_summary_map: dict[str, Any] = {
-        "path": artifact_path,
-        "provider_references": 0,
-        "provider_references_with_direct_location_fields": 0,
-        "provider_references_with_displayable_location_fields": 0,
-        "provider_references_with_network_names": 0,
-        "provider_groups": 0,
-        "provider_groups_with_direct_location_fields": 0,
-        "provider_groups_with_displayable_location_fields": 0,
-        "inline_provider_groups": 0,
-        "inline_provider_groups_with_direct_location_fields": 0,
-        "inline_provider_groups_with_displayable_location_fields": 0,
-    }
-    address_paths: Counter[str] = Counter()
-    phone_paths: Counter[str] = Counter()
-    network_paths: Counter[str] = Counter()
-    samples: list[dict[str, Any]] = []
+    audit = _LocationEvidenceAudit(
+        summary=_new_location_evidence_summary(path),
+        address_paths=Counter(),
+        phone_paths=Counter(),
+        network_paths=Counter(),
+        samples=[],
+        max_samples=max_samples,
+    )
 
     for ref in _iter_provider_references(path, max_json_fallback_bytes):
-        _audit_provider_reference(
-            ref,
-            summary=evidence_summary_map,
-            address_paths=address_paths,
-            phone_paths=phone_paths,
-            network_paths=network_paths,
-            samples=samples,
-            max_samples=max_samples,
-        )
+        _audit_provider_reference(ref, audit)
 
     if scan_inline_provider_groups:
         for group in _iter_inline_provider_groups(path, max_json_fallback_bytes):
-            _audit_inline_provider_group(
+            _audit_provider_group(
                 group,
-                summary=evidence_summary_map,
-                address_paths=address_paths,
-                phone_paths=phone_paths,
-                network_paths=network_paths,
-                samples=samples,
-                max_samples=max_samples,
+                audit,
+                counter_prefix="inline_provider_groups",
+                scope="in_network.negotiated_rates.provider_groups",
             )
 
-    evidence_summary_map["direct_location_fields_present"] = bool(
-        evidence_summary_map["provider_references_with_direct_location_fields"]
-        or evidence_summary_map["provider_groups_with_direct_location_fields"]
-        or evidence_summary_map["inline_provider_groups_with_direct_location_fields"]
+    return _finalize_location_evidence_summary(
+        audit.summary,
+        audit.address_paths,
+        audit.phone_paths,
+        audit.network_paths,
+        audit.samples,
     )
-    evidence_summary_map["direct_displayable_location_fields_present"] = bool(
-        evidence_summary_map["provider_references_with_displayable_location_fields"]
-        or evidence_summary_map["provider_groups_with_displayable_location_fields"]
-        or evidence_summary_map["inline_provider_groups_with_displayable_location_fields"]
-    )
-    evidence_summary_map["direct_phone_fields_present"] = bool(phone_paths)
-    evidence_summary_map["address_field_paths"] = dict(sorted(address_paths.items()))
-    evidence_summary_map["phone_field_paths"] = dict(sorted(phone_paths.items()))
-    evidence_summary_map["network_name_field_paths"] = dict(sorted(network_paths.items()))
-    evidence_summary_map["samples"] = samples
-    return evidence_summary_map

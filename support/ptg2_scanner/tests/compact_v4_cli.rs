@@ -333,10 +333,12 @@ fn run_v3_finalizer(
 fn run_compact_v4(source: &Path, output: &Path) -> Output {
     let serving = output.join("serving");
     let witness_scratch = output.join("witness-scratch");
+    let tax_secret = output.join("tin-token-secret.bin");
     let raw_source_sha256 =
         sha256_hex(&fs::read(source).expect("read compact V4 source for digest"));
     fs::create_dir_all(&serving).expect("create serving directory");
     fs::create_dir_all(&witness_scratch).expect("create witness scratch directory");
+    fs::write(&tax_secret, [17u8; 32]).expect("write exact test token secret");
     Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
         .args(["--compact-serving", source.to_str().expect("UTF-8 source")])
         .env("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
@@ -354,6 +356,15 @@ fn run_compact_v4(source: &Path, output: &Path) -> Output {
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH",
             output.join("provider-component-group.ptg2sc"),
         )
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
+            output.join("provider-group-tax-identity.ptg2tax"),
+        )
+        .env(
+            "HLTHPRT_PTG2_TIN_TOKEN_POLICY_ID",
+            "ptg-tin-hmac-sha256-v1:test-1",
+        )
+        .env("HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE", &tax_secret)
         .env(
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH",
             output.join("provider-set-metadata.copy"),

@@ -18,6 +18,7 @@ from tests.ptg_v4_import_orchestration_support import (
     transaction_factory,
 )
 process_ptg = importlib.import_module("process.ptg")
+ptg_domain = importlib.import_module("process.ptg_parts.domain")
 
 @pytest.mark.asyncio
 async def test_terminal_stage_names_are_returned_in_database_order(monkeypatch):
@@ -303,6 +304,7 @@ def test_source_version_helpers_ignore_empty_and_duplicate_results():
         logical_sha256=None,
         logical_hash_deferred=True,
         content_length=42,
+        raw_byte_count=40,
         etag="etag",
         last_modified="today",
     )
@@ -315,12 +317,30 @@ def test_source_version_helpers_ignore_empty_and_duplicate_results():
         {"summary": summary, "source_type": "in_network", "file_id": 7},
     ]
 
-    versions = process_ptg._ptg2_source_file_versions_from_results(files)
+    versions = process_ptg._source_file_versions_from_results(files)
 
     assert len(versions) == 2
     assert versions[0]["canonical_url"] == "fallback"
     assert versions[1]["engine_source_identity_hash"] == "identity"
     assert versions[1]["logical_hash_deferred"] is True
+    assert versions[1]["raw_byte_count"] == 40
+    assert versions[1]["content_length"] == 42
+
+
+@pytest.mark.parametrize("raw_byte_count", [True, -1, 1.5, "1"])
+def test_source_version_rejects_ambiguous_downloaded_byte_evidence(
+    raw_byte_count,
+):
+    """Keep actual downloaded bytes distinct and strictly numeric."""
+
+    with pytest.raises(ValueError, match="raw_byte_count"):
+        ptg_domain.PTG2SourceVersion(
+            source_identity_hash="identity",
+            source_file_version_id="version",
+            original_url="https://example.test/original",
+            canonical_url="https://example.test/canonical",
+            raw_byte_count=raw_byte_count,
+        )
 
 
 @pytest.mark.asyncio

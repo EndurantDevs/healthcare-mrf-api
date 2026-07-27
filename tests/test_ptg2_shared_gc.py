@@ -38,6 +38,12 @@ def test_shared_schema_requires_all_migration_owned_lifecycle_tables():
         "ptg2_v3_audit_occurrence"
         in snapshot_cleanup._STRICT_V3_SHARED_TABLE_NAMES
     )
+    assert shared_gc.PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES == (
+        "ptg2_provider_tax_identity_legacy_layout",
+        "ptg2_provider_tax_identity_manifest",
+        "ptg2_provider_tax_identity",
+        "ptg2_provider_group_tax_identity",
+    )
 
 
 def test_cleanup_recognizes_current_and_legacy_shared_generations_only():
@@ -47,6 +53,54 @@ def test_cleanup_recognizes_current_and_legacy_shared_generations_only():
         )
     assert not shared_gc.is_shared_blocks_cleanup_manifest(
         {"storage_generation": "shared_blocks_v0"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_abandonment_acquires_connection_without_executor(
+    monkeypatch,
+):
+    """The convenience entry point must run the guarded path on one lease."""
+
+    connection = object()
+    expected = shared_gc.PTG2SharedLayoutGCStats(logical_layout_count=1)
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    shared_tables = AsyncMock(return_value=True)
+    map_tables = AsyncMock(return_value=True)
+    abandon = AsyncMock(return_value=expected)
+    monkeypatch.setattr(shared_gc.db, "acquire", acquire)
+    monkeypatch.setattr(shared_gc, "_has_shared_tables", shared_tables)
+    monkeypatch.setattr(shared_gc, "_has_v4_map_tables", map_tables)
+    monkeypatch.setattr(
+        shared_gc,
+        "_abandon_owned_v4_layout_ready",
+        abandon,
+    )
+
+    observed = await shared_gc.abandon_owned_v4_layout(
+        schema_name="mrf",
+        snapshot_key=17,
+        build_token="build-token",
+        grace_seconds=23,
+    )
+
+    assert observed is expected
+    shared_tables.assert_awaited_once_with(
+        connection,
+        "mrf",
+        require_shared=True,
+    )
+    map_tables.assert_awaited_once_with(connection, "mrf")
+    abandon.assert_awaited_once_with(
+        connection,
+        schema_name="mrf",
+        snapshot_key=17,
+        build_token="build-token",
+        grace_seconds=23,
     )
 
 
@@ -299,6 +353,33 @@ async def test_migration_preflight_requires_candidate_attestation_table():
             executor=executor,
             require_shared=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_rejects_partial_provider_tax_identity_schema():
+    executor = _SharedGCExecutor()
+    legacy_layout, manifest, dictionary, group_sidecar = (
+        shared_gc.PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES
+    )
+    executor.present_tables.add(legacy_layout)
+    executor.present_tables.add(manifest)
+
+    with pytest.raises(
+        RuntimeError,
+        match="complete additive schema.*missing tables",
+    ):
+        await shared_gc.build_shared_layout_release_plan(
+            executor=executor,
+            require_shared=True,
+        )
+
+    executor.present_tables.update((dictionary, group_sidecar))
+    plan = await shared_gc.build_shared_layout_release_plan(
+        executor=executor,
+        require_shared=True,
+    )
+
+    assert plan.tables_available is True
 
 
 @pytest.mark.asyncio

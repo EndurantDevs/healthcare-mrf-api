@@ -25,6 +25,24 @@ use std::time::Instant;
 const MANIFEST_VERSION: u32 = 1;
 const STANDARD_MAGIC: &[u8; 8] = b"PTG2MNSC";
 const DENSE_MAGIC: &[u8; 8] = b"PTG2MNDS";
+const TAX_IDENTITY_MAGIC: &[u8; 8] = b"PTG2TAX1";
+const TAX_IDENTITY_FORMAT: &str = "ptg2_provider_group_tax_identity_v1";
+const TAX_IDENTITY_VERSION: u16 = 1;
+const TAX_IDENTITY_RECORD_BYTES: u16 = 65;
+const TAX_IDENTITY_FIXED_HEADER_BYTES: usize = 13;
+const TAX_IDENTITY_NORMALIZATION_CONTRACT: &str = "ein_ascii_digits_or_2_7_hyphen_v1";
+const TAX_IDENTITY_HMAC_CONTRACT: &str = "hmac_sha256_ptg_tin_v1";
+const TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT: &str = "tin_id_128=first_16_bytes(tin_hmac_sha256)";
+const TAX_IDENTITY_AUTHORITY_CONTRACT: &str = "tin_hmac_sha256_full_32_bytes_authoritative";
+const TAX_IDENTITY_PROJECTION_CONTRACT: &str = "ptg2_provider_tax_identity_projection_v1";
+const TAX_SOURCE_ORDINAL_CONTRACT: &str = "snapshot_shard_id_sorted_lsb0_bitmap_v1";
+const TAX_SOURCE_ORDINAL_FIXED_UPPER_BOUND_BYTES: u64 = 256;
+const TAX_SOURCE_IDENTITY_COPY_UPPER_BOUND: u64 = 2;
+const TAX_IDENTITY_GROUP_ENTRY_UPPER_BOUND_BYTES: u64 = 256;
+const TAX_IDENTITY_DICTIONARY_ENTRY_UPPER_BOUND_BYTES: u64 = 128;
+const TAX_POLICY_DESCRIPTOR_HASH_DOMAIN: &[u8] = b"PTG2V4TINPOLICY\x01";
+const TAX_SOURCE_ORDINAL_HASH_DOMAIN: &[u8] = b"PTG2V4TAXORD\x01";
+const TAX_CONTENT_HASH_DOMAIN: &[u8] = b"PTG2V4TAXCONTENT\x01";
 const STANDARD_FORMAT: &str = "magic8:uint32_le_version:uint64_le_entry_count:index(owner16:uint64_le_offset:uint32_le_count):members16";
 const DENSE_FORMAT: &str = "magic8:uint32_le_version:uint64_le_entry_count:uint64_le_member_global_count:index(owner16:uint64_le_offset:uint32_le_count):member_globals16:members_uint32_le";
 const STANDARD_HEADER_BYTES: usize = 20;
@@ -81,7 +99,7 @@ const PROGRESS_PREFIX: &str = "PTG2_V4_PROGRESS\t";
 const PROGRESS_VERSION: u8 = 1;
 const PROGRESS_MAX_PERIODIC_EVENTS: u64 = 256;
 
-const OUTPUT_NAMES: [&str; 9] = [
+const OUTPUT_NAMES: [&str; 11] = [
     "v4-graph-blocks.copy",
     "v4-graph-references.jsonl",
     "v4-provider-groups.copy",
@@ -89,6 +107,8 @@ const OUTPUT_NAMES: [&str; 9] = [
     "v4-npi-scope.copy",
     "v4-provider-set-audit-npi.copy",
     "v4-provider-set-npi-prefix-overrides.copy",
+    "v4-provider-tax-identities.copy",
+    "v4-provider-group-tax-identities.copy",
     "v4-patterns.copy",
     "v4-summary.json",
 ];
@@ -254,12 +274,46 @@ pub struct V4MembershipArtifactDescriptor {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct V4TaxIdentityMetadata {
+    pub record_format: String,
+    pub sha256: String,
+    pub byte_count: u64,
+    pub row_count: u64,
+    pub provider_group_count: u64,
+    pub matched_ein_count: u64,
+    pub missing_count: u64,
+    pub malformed_count: u64,
+    pub unsupported_type_count: u64,
+    pub version: u16,
+    pub record_bytes: u16,
+    pub token_policy_id: String,
+    pub normalization_contract: String,
+    pub hmac_contract: String,
+    #[serde(rename = "final")]
+    pub final_file: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub source_shard_id: Option<String>,
+    #[serde(default)]
+    pub shard_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct V4TaxIdentityArtifactDescriptor {
+    pub path: PathBuf,
+    pub metadata: V4TaxIdentityMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct V4ProviderGraphShardDescriptor {
     pub shard_id: String,
     pub provider_set_component: V4MembershipArtifactDescriptor,
     pub provider_component_group: V4MembershipArtifactDescriptor,
     pub provider_group_npi: V4MembershipArtifactDescriptor,
     pub provider_npi_group: V4MembershipArtifactDescriptor,
+    pub provider_group_tax_identity: V4TaxIdentityArtifactDescriptor,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -512,6 +566,35 @@ pub struct V4OutputArtifactSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct V4TaxSourceOrdinal {
+    pub shard_id: String,
+    pub ordinal: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct V4TaxIdentitySummary {
+    pub contract: String,
+    pub token_policy_id: String,
+    pub token_policy_descriptor_sha256: String,
+    pub normalization_contract: String,
+    pub hmac_contract: String,
+    pub candidate_prefix_contract: String,
+    pub authority_contract: String,
+    pub source_ordinal_contract: String,
+    pub source_ordinal_map: Vec<V4TaxSourceOrdinal>,
+    pub source_ordinal_map_digest: String,
+    pub source_shard_count: u64,
+    pub source_bitmap_bytes: u64,
+    pub provider_group_count: u64,
+    pub tax_identity_count: u64,
+    pub matched_ein_count: u64,
+    pub missing_count: u64,
+    pub malformed_count: u64,
+    pub unsupported_type_count: u64,
+    pub content_digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct V4ObserveCounters {
     pub component_count: u64,
     pub group_count: u64,
@@ -615,8 +698,12 @@ pub struct V4ResourceAdmissionSummary {
     pub provider_set_key_map_bytes: u64,
     pub factor_edge_count: u64,
     pub factor_owner_count: u64,
+    pub tax_identity_merge_bitmap_upper_bound_bytes: u64,
+    pub tax_identity_source_ordinal_upper_bound_bytes: u64,
+    pub tax_identity_projection_upper_bound_bytes: u64,
     pub base_estimated_model_bytes: u64,
     pub derived_projection_bytes: u64,
+    pub tax_identity_projection_bytes: u64,
     pub retained_scratch_high_water_bytes: u64,
     pub bounded_emission_buffer_bytes: u64,
     pub estimated_peak_bytes: u64,
@@ -627,6 +714,7 @@ pub struct V4ResourceAdmissionSummary {
 #[derive(Debug)]
 struct ResourceAdmissionTracker {
     summary: V4ResourceAdmissionSummary,
+    tax_identity_projection_reconciled: bool,
 }
 
 impl ResourceAdmissionTracker {
@@ -638,6 +726,7 @@ impl ResourceAdmissionTracker {
         self.summary
             .base_estimated_model_bytes
             .checked_add(derived_projection_bytes)
+            .and_then(|value| value.checked_add(self.summary.tax_identity_projection_bytes))
             .and_then(|value| value.checked_add(retained_scratch_high_water_bytes))
             .and_then(|value| value.checked_add(self.summary.bounded_emission_buffer_bytes))
             .ok_or(invalid(
@@ -693,6 +782,31 @@ impl ResourceAdmissionTracker {
     ) -> ProviderGraphV4Result<()> {
         let requested = estimated_u32_capacity_bytes(members)?;
         self.reserve_scratch_bytes(label, requested)
+    }
+
+    fn reconcile_tax_identity_projection(&mut self, bytes: u64) -> ProviderGraphV4Result<()> {
+        if self.tax_identity_projection_reconciled {
+            return Err(invalid(
+                "resource_admission: tax identity projection was reconciled twice",
+            ));
+        }
+        if bytes > self.summary.tax_identity_projection_upper_bound_bytes {
+            return Err(invalid(
+                "resource_admission: exact tax identity projection exceeds its preflight upper bound",
+            ));
+        }
+        self.summary.tax_identity_projection_bytes = bytes;
+        let estimated_peak_bytes = self.checked_peak(
+            self.summary.derived_projection_bytes,
+            self.summary.retained_scratch_high_water_bytes,
+        )?;
+        self.ensure_within_limit(
+            estimated_peak_bytes,
+            &format!("reserving provider tax identity projection; bytes {bytes}"),
+        )?;
+        self.summary.estimated_peak_bytes = estimated_peak_bytes;
+        self.tax_identity_projection_reconciled = true;
+        Ok(())
     }
 
     fn reserve_scratch_bytes(&mut self, label: &str, requested: u64) -> ProviderGraphV4Result<()> {
@@ -751,6 +865,8 @@ pub struct ProviderGraphV4ConversionSummary {
     pub npi_copy_path: PathBuf,
     pub provider_set_audit_npi_copy_path: PathBuf,
     pub provider_set_npi_prefix_override_copy_path: PathBuf,
+    pub provider_tax_identity_copy_path: PathBuf,
+    pub provider_group_tax_identity_copy_path: PathBuf,
     pub pattern_copy_path: Option<PathBuf>,
     pub summary_path: PathBuf,
     pub block_count: u64,
@@ -758,6 +874,7 @@ pub struct ProviderGraphV4ConversionSummary {
     pub relation_summaries: Vec<V4RelationSummary>,
     pub heavy_bitmaps: Vec<V4HeavyBitmapSummary>,
     pub output_artifacts: Vec<V4OutputArtifactSummary>,
+    pub tax_identity: V4TaxIdentitySummary,
     pub observe: V4ObserveCounters,
     pub resource_admission: V4ResourceAdmissionSummary,
     pub input_byte_count: u64,
@@ -1027,6 +1144,264 @@ impl ValidatedArtifact {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V4TaxIdentityState {
+    MatchedEin,
+    Missing,
+    Malformed,
+    UnsupportedType,
+}
+
+impl V4TaxIdentityState {
+    fn parse(value: u8) -> ProviderGraphV4Result<Self> {
+        match value {
+            1 => Ok(Self::MatchedEin),
+            2 => Ok(Self::Missing),
+            3 => Ok(Self::Malformed),
+            4 => Ok(Self::UnsupportedType),
+            _ => Err(invalid(
+                "V4 provider tax identity record has an invalid state",
+            )),
+        }
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::MatchedEin => 4,
+            Self::UnsupportedType => 3,
+            Self::Malformed => 2,
+            Self::Missing => 1,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MatchedEin => "matched_ein",
+            Self::Missing => "missing",
+            Self::Malformed => "malformed",
+            Self::UnsupportedType => "unsupported_type",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::MatchedEin => 1,
+            Self::Missing => 2,
+            Self::Malformed => 3,
+            Self::UnsupportedType => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct V4TaxIdentityRecord {
+    provider_group_global_id: GlobalId,
+    state: V4TaxIdentityState,
+    tin_id_128: [u8; 16],
+    tin_hmac_sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+struct ValidatedTaxIdentityArtifact {
+    _file: File,
+    bytes: Mmap,
+    header_bytes: usize,
+    row_count: u64,
+    token_policy_id: String,
+    byte_count: u64,
+    sha256: [u8; 32],
+}
+
+impl ValidatedTaxIdentityArtifact {
+    fn open(descriptor: &V4TaxIdentityArtifactDescriptor) -> ProviderGraphV4Result<Self> {
+        let metadata = &descriptor.metadata;
+        if metadata.record_format != TAX_IDENTITY_FORMAT
+            || metadata.name.as_deref() != Some("provider_group_tax_identity")
+            || metadata.version != TAX_IDENTITY_VERSION
+            || metadata.record_bytes != TAX_IDENTITY_RECORD_BYTES
+            || metadata.normalization_contract != TAX_IDENTITY_NORMALIZATION_CONTRACT
+            || metadata.hmac_contract != TAX_IDENTITY_HMAC_CONTRACT
+            || !metadata.final_file
+            || metadata.provider_group_count != metadata.row_count
+            || metadata
+                .matched_ein_count
+                .checked_add(metadata.missing_count)
+                .and_then(|value| value.checked_add(metadata.malformed_count))
+                .and_then(|value| value.checked_add(metadata.unsupported_type_count))
+                != Some(metadata.row_count)
+        {
+            return Err(invalid("V4 provider tax identity metadata is inconsistent"));
+        }
+        let policy_bytes = metadata.token_policy_id.as_bytes();
+        if !valid_tax_token_policy_id(&metadata.token_policy_id) {
+            return Err(invalid(
+                "V4 provider tax identity token policy ID is invalid",
+            ));
+        }
+        let expected_digest = parse_sha256(&metadata.sha256)?;
+        let file = File::open(&descriptor.path).map_err(|error| {
+            invalid(format!(
+                "V4 provider tax identity sidecar is unavailable ({}): {error}",
+                descriptor.path.display()
+            ))
+        })?;
+        let observed_size = file.metadata()?.len();
+        if observed_size != metadata.byte_count {
+            return Err(invalid(
+                "V4 provider tax identity byte count metadata mismatch",
+            ));
+        }
+        // SAFETY: completed scanner sidecars are immutable for the conversion.
+        let bytes = unsafe { MmapOptions::new().map(&file)? };
+        let observed_digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if observed_digest != expected_digest {
+            return Err(invalid(
+                "V4 provider tax identity checksum metadata mismatch",
+            ));
+        }
+        let header_bytes = TAX_IDENTITY_FIXED_HEADER_BYTES
+            .checked_add(policy_bytes.len())
+            .ok_or(invalid("V4 provider tax identity header size overflows"))?;
+        let expected_size = header_bytes
+            .checked_add(
+                invalid_conversion(
+                    usize::try_from(metadata.row_count),
+                    "V4 provider tax identity row count exceeds addressable memory",
+                )?
+                .checked_mul(TAX_IDENTITY_RECORD_BYTES as usize)
+                .ok_or(invalid("V4 provider tax identity artifact size overflows"))?,
+            )
+            .ok_or(invalid("V4 provider tax identity artifact size overflows"))?;
+        if bytes.len() != expected_size
+            || bytes.get(..8) != Some(TAX_IDENTITY_MAGIC)
+            || bytes.get(8..10) != Some(TAX_IDENTITY_VERSION.to_le_bytes().as_slice())
+            || bytes.get(10..12) != Some(TAX_IDENTITY_RECORD_BYTES.to_le_bytes().as_slice())
+            || bytes.get(12).copied() != Some(policy_bytes.len() as u8)
+            || bytes.get(13..header_bytes) != Some(policy_bytes)
+        {
+            return Err(invalid(
+                "V4 provider tax identity artifact header or size is invalid",
+            ));
+        }
+        let artifact = Self {
+            _file: file,
+            bytes,
+            header_bytes,
+            row_count: metadata.row_count,
+            token_policy_id: metadata.token_policy_id.clone(),
+            byte_count: metadata.byte_count,
+            sha256: observed_digest,
+        };
+        artifact.validate(metadata)?;
+        Ok(artifact)
+    }
+
+    fn record(&self, index: u64) -> ProviderGraphV4Result<V4TaxIdentityRecord> {
+        if index >= self.row_count {
+            return Err(invalid(
+                "V4 provider tax identity row index is out of range",
+            ));
+        }
+        let offset = self
+            .header_bytes
+            .checked_add(
+                invalid_conversion(
+                    usize::try_from(index),
+                    "V4 provider tax identity row index exceeds addressable memory",
+                )?
+                .checked_mul(TAX_IDENTITY_RECORD_BYTES as usize)
+                .ok_or(invalid("V4 provider tax identity row offset overflows"))?,
+            )
+            .ok_or(invalid("V4 provider tax identity row offset overflows"))?;
+        let provider_group_global_id = read_global_id(&self.bytes, offset)?;
+        let state = V4TaxIdentityState::parse(
+            *self
+                .bytes
+                .get(offset + 16)
+                .ok_or(invalid("V4 provider tax identity state is truncated"))?,
+        )?;
+        let tin_id_128: [u8; 16] = invalid_conversion(
+            self.bytes
+                .get(offset + 17..offset + 33)
+                .ok_or(invalid("V4 provider tax identity candidate is truncated"))?
+                .try_into(),
+            "V4 provider tax identity candidate width changed",
+        )?;
+        let tin_hmac_sha256: [u8; 32] = invalid_conversion(
+            self.bytes
+                .get(offset + 33..offset + 65)
+                .ok_or(invalid("V4 provider tax identity token is truncated"))?
+                .try_into(),
+            "V4 provider tax identity token width changed",
+        )?;
+        match state {
+            V4TaxIdentityState::MatchedEin => {
+                if tin_id_128 != tin_hmac_sha256[..16] {
+                    return Err(invalid(
+                        "V4 provider tax identity candidate does not match its full HMAC",
+                    ));
+                }
+            }
+            _ if tin_id_128 != [0; 16] || tin_hmac_sha256 != [0; 32] => {
+                return Err(invalid(
+                    "V4 unavailable provider tax identity carries a token",
+                ));
+            }
+            _ => {}
+        }
+        Ok(V4TaxIdentityRecord {
+            provider_group_global_id,
+            state,
+            tin_id_128,
+            tin_hmac_sha256,
+        })
+    }
+
+    fn validate(&self, metadata: &V4TaxIdentityMetadata) -> ProviderGraphV4Result<()> {
+        let mut previous_group = None;
+        let mut counts = [0u64; 4];
+        for index in 0..self.row_count {
+            let record = self.record(index)?;
+            if previous_group.is_some_and(|previous| record.provider_group_global_id <= previous) {
+                return Err(invalid(
+                    "V4 provider tax identity groups must be sorted and unique",
+                ));
+            }
+            match record.state {
+                V4TaxIdentityState::MatchedEin => counts[0] += 1,
+                V4TaxIdentityState::Missing => counts[1] += 1,
+                V4TaxIdentityState::Malformed => counts[2] += 1,
+                V4TaxIdentityState::UnsupportedType => counts[3] += 1,
+            }
+            previous_group = Some(record.provider_group_global_id);
+        }
+        if counts
+            != [
+                metadata.matched_ein_count,
+                metadata.missing_count,
+                metadata.malformed_count,
+                metadata.unsupported_type_count,
+            ]
+        {
+            return Err(invalid("V4 provider tax identity state counts changed"));
+        }
+        Ok(())
+    }
+}
+
+fn valid_tax_token_policy_id(value: &str) -> bool {
+    let Some(key_id) = value.strip_prefix("ptg-tin-hmac-sha256-v1:") else {
+        return false;
+    };
+    value.len() <= 55
+        && !key_id.is_empty()
+        && key_id.as_bytes().iter().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct EdgeFingerprint {
     xor: [u8; 32],
@@ -1156,8 +1531,25 @@ struct RawFactors {
     set_components: HashMap<GlobalId, Vec<GlobalId>>,
     component_groups: HashMap<GlobalId, Vec<GlobalId>>,
     group_npis: HashMap<GlobalId, Vec<GlobalId>>,
+    tax_identities: V4TaxIdentityFactors,
     input_byte_count: u64,
     input_digest: Sha256,
+}
+
+#[derive(Clone, Debug)]
+struct V4MergedTaxIdentity {
+    state: V4TaxIdentityState,
+    tin_hmac_sha256: Option<[u8; 32]>,
+    source_bitmap: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct V4TaxIdentityFactors {
+    token_policy_id: String,
+    source_ordinals: Vec<V4TaxSourceOrdinal>,
+    source_ordinal_sha256: [u8; 32],
+    source_bitmap_bytes: usize,
+    by_group: BTreeMap<GlobalId, V4MergedTaxIdentity>,
 }
 
 impl RawFactors {
@@ -1168,18 +1560,114 @@ impl RawFactors {
             set_components: HashMap::new(),
             component_groups: HashMap::new(),
             group_npis: HashMap::new(),
+            tax_identities: V4TaxIdentityFactors::default(),
             input_byte_count: 0,
             input_digest,
         }
     }
 
     fn record_artifact(&mut self, label: &str, artifact: &ValidatedArtifact) {
+        self.record_input(label, artifact.sha256, artifact.byte_count);
+    }
+
+    fn record_tax_artifact(&mut self, label: &str, artifact: &ValidatedTaxIdentityArtifact) {
+        self.record_input(label, artifact.sha256, artifact.byte_count);
+    }
+
+    fn record_input(&mut self, label: &str, sha256: [u8; 32], byte_count: u64) {
         self.input_digest.update((label.len() as u32).to_be_bytes());
         self.input_digest.update(label.as_bytes());
-        self.input_digest.update(artifact.sha256);
-        self.input_digest.update(artifact.byte_count.to_be_bytes());
-        self.input_byte_count = self.input_byte_count.saturating_add(artifact.byte_count);
+        self.input_digest.update(sha256);
+        self.input_digest.update(byte_count.to_be_bytes());
+        self.input_byte_count = self.input_byte_count.saturating_add(byte_count);
     }
+}
+
+fn tax_source_ordinal_sha256(
+    source_ordinals: &[V4TaxSourceOrdinal],
+) -> ProviderGraphV4Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(TAX_SOURCE_ORDINAL_HASH_DOMAIN);
+    hasher.update(
+        invalid_conversion(
+            u32::try_from(source_ordinals.len()),
+            "V4 tax identity source count exceeds uint32",
+        )?
+        .to_be_bytes(),
+    );
+    for source in source_ordinals {
+        update_length_prefixed(&mut hasher, source.shard_id.as_bytes())?;
+        hasher.update(source.ordinal.to_be_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn token_policy_descriptor_sha256(token_policy_id: &str) -> ProviderGraphV4Result<[u8; 32]> {
+    token_policy_descriptor_sha256_fields([
+        token_policy_id,
+        TAX_IDENTITY_NORMALIZATION_CONTRACT,
+        TAX_IDENTITY_HMAC_CONTRACT,
+        TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT,
+        TAX_IDENTITY_AUTHORITY_CONTRACT,
+    ])
+}
+
+fn token_policy_descriptor_sha256_fields(fields: [&str; 5]) -> ProviderGraphV4Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(TAX_POLICY_DESCRIPTOR_HASH_DOMAIN);
+    for field in fields {
+        update_length_prefixed(&mut hasher, field.as_bytes())?;
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn merge_tax_identity_artifact(
+    factors: &mut V4TaxIdentityFactors,
+    artifact: &ValidatedTaxIdentityArtifact,
+    source_ordinal: usize,
+    progress: &mut ProgressReporter<'_>,
+    completed_items: &mut u64,
+    total_items: u64,
+) -> ProviderGraphV4Result<()> {
+    let bitmap_index = source_ordinal / 8;
+    let bitmap_bit = 1u8 << (source_ordinal % 8);
+    for index in 0..artifact.row_count {
+        let record = artifact.record(index)?;
+        let token =
+            (record.state == V4TaxIdentityState::MatchedEin).then_some(record.tin_hmac_sha256);
+        let merged = factors
+            .by_group
+            .entry(record.provider_group_global_id)
+            .or_insert_with(|| V4MergedTaxIdentity {
+                state: record.state,
+                tin_hmac_sha256: token,
+                source_bitmap: vec![0; factors.source_bitmap_bytes],
+            });
+        if let (Some(left), Some(right)) = (merged.tin_hmac_sha256, token) {
+            if left != right {
+                return Err(invalid(
+                    "V4 provider group has conflicting full tax identity HMACs",
+                ));
+            }
+        }
+        if record.state.priority() > merged.state.priority() {
+            merged.state = record.state;
+            merged.tin_hmac_sha256 = token;
+        }
+        *merged.source_bitmap.get_mut(bitmap_index).ok_or(invalid(
+            "V4 tax identity source bitmap ordinal is out of range",
+        ))? |= bitmap_bit;
+        *completed_items = completed_items
+            .checked_add(1)
+            .ok_or(invalid("V4 factor progress count overflows"))?;
+        progress.periodic(
+            "load_factors",
+            *completed_items,
+            total_items,
+            "factor_items",
+        );
+    }
+    Ok(())
 }
 
 fn normalize_map(map: &mut HashMap<GlobalId, Vec<GlobalId>>) {
@@ -1205,7 +1693,7 @@ fn merge_artifact_into(
             "load_factors",
             *completed_edges,
             total_edges,
-            "factor_edges",
+            "factor_items",
         );
         Ok(())
     })
@@ -1237,7 +1725,7 @@ fn group_npi_fingerprint(
             "load_factors",
             *completed_edges,
             total_edges,
-            "factor_edges",
+            "factor_items",
         );
         Ok(())
     })?;
@@ -1251,31 +1739,67 @@ fn load_raw_factors(
     if descriptors.is_empty() {
         return Err(invalid("V4 provider graph requires at least one shard"));
     }
-    let total_edges = descriptors.iter().try_fold(0u64, |total, descriptor| {
-        let reciprocal_group_npi_edges = descriptor
-            .provider_group_npi
-            .metadata
-            .member_count
-            .checked_mul(2)
-            .ok_or(invalid("V4 factor progress total overflows"))?;
-        total
-            .checked_add(descriptor.provider_set_component.metadata.member_count)
-            .and_then(|value| {
-                value.checked_add(descriptor.provider_component_group.metadata.member_count)
-            })
-            .and_then(|value| value.checked_add(reciprocal_group_npi_edges))
-            .and_then(|value| {
-                value.checked_add(descriptor.provider_npi_group.metadata.member_count)
-            })
-            .ok_or(invalid("V4 factor progress total overflows"))
-    })?;
+    let mut ordered_descriptors = descriptors.iter().collect::<Vec<_>>();
+    ordered_descriptors.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    let total_edges = ordered_descriptors
+        .iter()
+        .try_fold(0u64, |total, descriptor| {
+            let reciprocal_group_npi_edges = descriptor
+                .provider_group_npi
+                .metadata
+                .member_count
+                .checked_mul(2)
+                .ok_or(invalid("V4 factor progress total overflows"))?;
+            total
+                .checked_add(descriptor.provider_set_component.metadata.member_count)
+                .and_then(|value| {
+                    value.checked_add(descriptor.provider_component_group.metadata.member_count)
+                })
+                .and_then(|value| value.checked_add(reciprocal_group_npi_edges))
+                .and_then(|value| {
+                    value.checked_add(descriptor.provider_npi_group.metadata.member_count)
+                })
+                .and_then(|value| {
+                    value.checked_add(descriptor.provider_group_tax_identity.metadata.row_count)
+                })
+                .ok_or(invalid("V4 factor progress total overflows"))
+        })?;
     let mut completed_edges = 0u64;
-    progress.periodic("load_factors", 0, total_edges, "factor_edges");
+    progress.periodic("load_factors", 0, total_edges, "factor_items");
     let mut seen = HashSet::new();
     let mut raw = RawFactors::new();
-    for descriptor in descriptors {
+    let source_bitmap_bytes = ordered_descriptors
+        .len()
+        .checked_add(7)
+        .ok_or(invalid("V4 tax identity source bitmap width overflows"))?
+        / 8;
+    if source_bitmap_bytes == 0 {
+        return Err(invalid(
+            "V4 provider tax identity source set must not be empty",
+        ));
+    }
+    raw.tax_identities.source_bitmap_bytes = source_bitmap_bytes;
+    raw.tax_identities.source_ordinals = ordered_descriptors
+        .iter()
+        .enumerate()
+        .map(|(ordinal, descriptor)| {
+            Ok(V4TaxSourceOrdinal {
+                shard_id: descriptor.shard_id.clone(),
+                ordinal: invalid_conversion(
+                    u32::try_from(ordinal),
+                    "V4 tax identity source ordinal exceeds uint32",
+                )?,
+            })
+        })
+        .collect::<ProviderGraphV4Result<Vec<_>>>()?;
+    raw.tax_identities.source_ordinal_sha256 =
+        tax_source_ordinal_sha256(&raw.tax_identities.source_ordinals)?;
+    for (source_ordinal, descriptor) in ordered_descriptors.into_iter().enumerate() {
         let shard_id = descriptor.shard_id.trim();
-        if shard_id.is_empty() || !seen.insert(shard_id.to_owned()) {
+        if shard_id.is_empty()
+            || descriptor.shard_id != shard_id
+            || !seen.insert(shard_id.to_owned())
+        {
             return Err(invalid(
                 "V4 provider graph shard IDs must be non-empty and unique",
             ));
@@ -1297,10 +1821,32 @@ fn load_raw_factors(
                 )));
             }
         }
+        let tax_metadata = &descriptor.provider_group_tax_identity.metadata;
+        let source = tax_metadata.source_shard_id.as_deref().map(str::trim);
+        let alias = tax_metadata.shard_id.as_deref().map(str::trim);
+        if source.is_some() && alias.is_some() && source != alias {
+            return Err(invalid(
+                "V4 provider tax identity has contradictory shard IDs",
+            ));
+        }
+        if source.or(alias) != Some(shard_id) {
+            return Err(invalid(format!(
+                "V4 provider tax identity shard ID does not match bundle {shard_id}"
+            )));
+        }
         let set_component = ValidatedArtifact::open(&descriptor.provider_set_component)?;
         let component_group = ValidatedArtifact::open(&descriptor.provider_component_group)?;
         let group_npi = ValidatedArtifact::open(&descriptor.provider_group_npi)?;
         let npi_group = ValidatedArtifact::open(&descriptor.provider_npi_group)?;
+        let tax_identity =
+            ValidatedTaxIdentityArtifact::open(&descriptor.provider_group_tax_identity)?;
+        if raw.tax_identities.token_policy_id.is_empty() {
+            raw.tax_identities.token_policy_id = tax_identity.token_policy_id.clone();
+        } else if raw.tax_identities.token_policy_id != tax_identity.token_policy_id {
+            return Err(invalid(
+                "V4 provider tax identity token policy differs across shards",
+            ));
+        }
         if group_npi_fingerprint(
             &group_npi,
             false,
@@ -1322,6 +1868,15 @@ fn load_raw_factors(
         raw.record_artifact("provider_component_group", &component_group);
         raw.record_artifact("provider_group_npi", &group_npi);
         raw.record_artifact("provider_npi_group", &npi_group);
+        raw.record_tax_artifact("provider_group_tax_identity", &tax_identity);
+        merge_tax_identity_artifact(
+            &mut raw.tax_identities,
+            &tax_identity,
+            source_ordinal,
+            progress,
+            &mut completed_edges,
+            total_edges,
+        )?;
         merge_artifact_into(
             &set_component,
             &mut raw.set_components,
@@ -1352,6 +1907,11 @@ fn load_raw_factors(
     normalize_map(&mut raw.set_components);
     normalize_map(&mut raw.component_groups);
     normalize_map(&mut raw.group_npis);
+    if raw.tax_identities.token_policy_id.is_empty() {
+        return Err(invalid(
+            "V4 provider tax identity token policy is unavailable",
+        ));
+    }
     Ok(raw)
 }
 
@@ -1366,6 +1926,22 @@ fn resource_admission_preflight(
     let mut input_factor_bytes = 0u64;
     let mut factor_edge_count = 0u64;
     let mut factor_owner_count = 0u64;
+    let mut matched_ein_occurrence_upper_bound = 0u64;
+    let shard_count = invalid_conversion(
+        u64::try_from(descriptors.len()),
+        "resource_admission: shard count exceeds uint64",
+    )?;
+    let source_bitmap_bytes = shard_count.checked_add(7).ok_or(invalid(
+        "resource_admission: tax identity bitmap width overflows",
+    ))? / 8;
+    let mut tax_identity_group_occurrence_upper_bound = 0u64;
+    // This covers the ordinal vector, cloned shard IDs, and the temporary
+    // uniqueness set before any factor mmap is opened.
+    let mut tax_identity_source_ordinal_upper_bound_bytes = shard_count
+        .checked_mul(TAX_SOURCE_ORDINAL_FIXED_UPPER_BOUND_BYTES)
+        .ok_or(invalid(
+            "resource_admission: tax identity source ordinal bytes overflow",
+        ))?;
     for shard in descriptors {
         for artifact in [
             &shard.provider_set_component,
@@ -1383,7 +1959,68 @@ fn resource_admission_preflight(
                 .checked_add(artifact.metadata.owner_count)
                 .ok_or(invalid("resource_admission: factor owner count overflows"))?;
         }
+        input_factor_bytes = input_factor_bytes
+            .checked_add(shard.provider_group_tax_identity.metadata.byte_count)
+            .ok_or(invalid("resource_admission: input byte count overflows"))?;
+        factor_edge_count = factor_edge_count
+            .checked_add(shard.provider_group_tax_identity.metadata.row_count)
+            .ok_or(invalid("resource_admission: factor edge count overflows"))?;
+        factor_owner_count = factor_owner_count
+            .checked_add(
+                shard
+                    .provider_group_tax_identity
+                    .metadata
+                    .provider_group_count,
+            )
+            .ok_or(invalid("resource_admission: factor owner count overflows"))?;
+        tax_identity_group_occurrence_upper_bound = tax_identity_group_occurrence_upper_bound
+            .checked_add(
+                shard
+                    .provider_group_tax_identity
+                    .metadata
+                    .provider_group_count,
+            )
+            .ok_or(invalid(
+                "resource_admission: tax identity group occurrence count overflows",
+            ))?;
+        matched_ein_occurrence_upper_bound = matched_ein_occurrence_upper_bound
+            .checked_add(shard.provider_group_tax_identity.metadata.matched_ein_count)
+            .ok_or(invalid(
+                "resource_admission: matched tax identity count overflows",
+            ))?;
+        let shard_id_bytes = invalid_conversion(
+            u64::try_from(shard.shard_id.len()),
+            "resource_admission: shard ID length exceeds uint64",
+        )?;
+        tax_identity_source_ordinal_upper_bound_bytes =
+            tax_identity_source_ordinal_upper_bound_bytes
+                .checked_add(
+                    shard_id_bytes
+                        .checked_mul(TAX_SOURCE_IDENTITY_COPY_UPPER_BOUND)
+                        .ok_or(invalid(
+                            "resource_admission: tax identity source ID bytes overflow",
+                        ))?,
+                )
+                .ok_or(invalid(
+                    "resource_admission: tax identity source ordinal bytes overflow",
+                ))?;
     }
+    let tax_identity_merge_bitmap_upper_bound_bytes = tax_identity_group_occurrence_upper_bound
+        .checked_mul(source_bitmap_bytes)
+        .ok_or(invalid(
+            "resource_admission: tax identity merge bitmap bytes overflow",
+        ))?;
+    let tax_identity_projection_upper_bound_bytes = tax_identity_group_occurrence_upper_bound
+        .checked_mul(TAX_IDENTITY_GROUP_ENTRY_UPPER_BOUND_BYTES.saturating_add(source_bitmap_bytes))
+        .and_then(|value| {
+            value.checked_add(
+                matched_ein_occurrence_upper_bound
+                    .saturating_mul(TAX_IDENTITY_DICTIONARY_ENTRY_UPPER_BOUND_BYTES),
+            )
+        })
+        .ok_or(invalid(
+            "resource_admission: tax identity projection upper bound overflows",
+        ))?;
     let provider_set_key_map_bytes = match fs::metadata(provider_set_key_map_path) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
@@ -1400,6 +2037,8 @@ fn resource_admission_preflight(
         .checked_add(provider_set_key_map_bytes.saturating_mul(4))
         .and_then(|value| value.checked_add(factor_edge_count.saturating_mul(128)))
         .and_then(|value| value.checked_add(factor_owner_count.saturating_mul(256)))
+        .and_then(|value| value.checked_add(tax_identity_merge_bitmap_upper_bound_bytes))
+        .and_then(|value| value.checked_add(tax_identity_source_ordinal_upper_bound_bytes))
         .ok_or(invalid(
             "resource_admission: estimated peak byte count overflows",
         ))?;
@@ -1418,7 +2057,8 @@ fn resource_admission_preflight(
         "resource_admission: emission buffer byte count overflows",
     ))?;
     let estimated_peak_bytes = base_estimated_model_bytes
-        .checked_add(bounded_emission_buffer_bytes)
+        .checked_add(tax_identity_projection_upper_bound_bytes)
+        .and_then(|value| value.checked_add(bounded_emission_buffer_bytes))
         .ok_or(invalid(
             "resource_admission: estimated peak byte count overflows",
         ))?;
@@ -1442,20 +2082,25 @@ fn resource_admission_preflight(
     }
     Ok(ResourceAdmissionTracker {
         summary: V4ResourceAdmissionSummary {
-            formula: "base(input_factor_bytes + provider_set_key_map_bytes*4 + factor_edges*128 + factor_owners*256) + derived_projection_bytes + retained_scratch_high_water_bytes + bounded_emission_buffer_bytes"
+            formula: "base(input_factor_bytes + provider_set_key_map_bytes*4 + factor_edges*128 + factor_owners*256 + tax_identity_merge_bitmap_upper_bound_bytes + tax_identity_source_ordinal_upper_bound_bytes) + derived_projection_bytes + tax_identity_projection_bytes(preflight=tax_identity_projection_upper_bound_bytes,reconciled=exact) + retained_scratch_high_water_bytes + bounded_emission_buffer_bytes"
                 .to_string(),
             input_factor_bytes,
             provider_set_key_map_bytes,
             factor_edge_count,
             factor_owner_count,
+            tax_identity_merge_bitmap_upper_bound_bytes,
+            tax_identity_source_ordinal_upper_bound_bytes,
+            tax_identity_projection_upper_bound_bytes,
             base_estimated_model_bytes,
             derived_projection_bytes: 0,
+            tax_identity_projection_bytes: tax_identity_projection_upper_bound_bytes,
             retained_scratch_high_water_bytes: 0,
             bounded_emission_buffer_bytes,
             estimated_peak_bytes,
             max_estimated_model_bytes: options.max_estimated_model_bytes,
             max_factor_edges: options.max_factor_edges,
         },
+        tax_identity_projection_reconciled: false,
     })
 }
 
@@ -1482,6 +2127,174 @@ struct GraphModel {
     npi_patterns: Vec<Vec<u32>>,
     direct_edge_count: u64,
     observe: V4ObserveCounters,
+}
+
+#[derive(Debug)]
+struct V4TaxIdentityModel {
+    token_policy_id: String,
+    source_ordinals: Vec<V4TaxSourceOrdinal>,
+    source_ordinal_sha256: [u8; 32],
+    source_bitmap_bytes: usize,
+    tin_hmacs: Vec<[u8; 32]>,
+    group_rows: Vec<(GlobalId, V4TaxIdentityState, Option<u32>, Vec<u8>)>,
+}
+
+impl V4TaxIdentityModel {
+    fn build(
+        factors: &V4TaxIdentityFactors,
+        provider_group_globals: &[GlobalId],
+    ) -> ProviderGraphV4Result<Self> {
+        let observed_groups = factors.by_group.keys().copied().collect::<Vec<_>>();
+        if observed_groups != provider_group_globals {
+            return Err(invalid(
+                "V4 provider tax identity group set differs from provider-group dictionary",
+            ));
+        }
+        let mut tin_hmacs = factors
+            .by_group
+            .values()
+            .filter_map(|identity| identity.tin_hmac_sha256)
+            .collect::<Vec<_>>();
+        tin_hmacs.sort_unstable();
+        tin_hmacs.dedup();
+        if tin_hmacs.len() > u32::MAX as usize {
+            return Err(invalid(
+                "V4 provider tax identity dictionary exceeds uint32",
+            ));
+        }
+        let tin_key_by_hmac = tin_hmacs
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, hmac)| (hmac, index as u32))
+            .collect::<HashMap<_, _>>();
+        let mut group_rows = Vec::with_capacity(provider_group_globals.len());
+        for group in provider_group_globals {
+            let identity = factors
+                .by_group
+                .get(group)
+                .ok_or(invalid("V4 provider tax identity group disappeared"))?;
+            if identity.source_bitmap.len() != factors.source_bitmap_bytes
+                || identity.source_bitmap.iter().all(|byte| *byte == 0)
+            {
+                return Err(invalid(
+                    "V4 provider tax identity source bitmap is not canonical",
+                ));
+            }
+            let unused_bits = factors.source_bitmap_bytes * 8 - factors.source_ordinals.len();
+            if unused_bits > 0 {
+                let valid_bits = 8 - unused_bits;
+                let invalid_mask = !((1u8 << valid_bits) - 1);
+                if identity.source_bitmap.last().copied().unwrap_or_default() & invalid_mask != 0 {
+                    return Err(invalid(
+                        "V4 provider tax identity source bitmap has out-of-range bits",
+                    ));
+                }
+            }
+            let tin_key = match (identity.state, identity.tin_hmac_sha256) {
+                (V4TaxIdentityState::MatchedEin, Some(hmac)) => {
+                    Some(*tin_key_by_hmac.get(&hmac).ok_or(invalid(
+                        "V4 provider tax identity dictionary lookup is inconsistent",
+                    ))?)
+                }
+                (V4TaxIdentityState::MatchedEin, None) => {
+                    return Err(invalid("V4 matched provider tax identity has no full HMAC"));
+                }
+                (_, None) => None,
+                (_, Some(_)) => {
+                    return Err(invalid(
+                        "V4 unavailable provider tax identity has a full HMAC",
+                    ));
+                }
+            };
+            group_rows.push((
+                *group,
+                identity.state,
+                tin_key,
+                identity.source_bitmap.clone(),
+            ));
+        }
+        Ok(Self {
+            token_policy_id: factors.token_policy_id.clone(),
+            source_ordinals: factors.source_ordinals.clone(),
+            source_ordinal_sha256: factors.source_ordinal_sha256,
+            source_bitmap_bytes: factors.source_bitmap_bytes,
+            tin_hmacs,
+            group_rows,
+        })
+    }
+
+    fn content_digest(&self) -> ProviderGraphV4Result<[u8; 32]> {
+        let mut hasher = Sha256::new();
+        hasher.update(TAX_CONTENT_HASH_DOMAIN);
+        hasher.update(token_policy_descriptor_sha256(&self.token_policy_id)?);
+        hasher.update(self.source_ordinal_sha256);
+        hasher.update(
+            invalid_conversion(
+                u64::try_from(self.tin_hmacs.len()),
+                "V4 tax identity dictionary count exceeds uint64",
+            )?
+            .to_be_bytes(),
+        );
+        for hmac in &self.tin_hmacs {
+            hasher.update(hmac);
+        }
+        hasher.update(
+            invalid_conversion(
+                u64::try_from(self.group_rows.len()),
+                "V4 provider tax identity row count exceeds uint64",
+            )?
+            .to_be_bytes(),
+        );
+        for (group, state, tin_key, source_bitmap) in &self.group_rows {
+            hasher.update(group);
+            hasher.update([state.code()]);
+            match tin_key {
+                Some(value) => {
+                    hasher.update([1]);
+                    hasher.update(value.to_be_bytes());
+                }
+                None => hasher.update([0]),
+            }
+            update_length_prefixed(&mut hasher, source_bitmap)?;
+        }
+        Ok(hasher.finalize().into())
+    }
+
+    fn summary(&self) -> ProviderGraphV4Result<V4TaxIdentitySummary> {
+        let mut counts = [0u64; 4];
+        for (_, state, _, _) in &self.group_rows {
+            match state {
+                V4TaxIdentityState::MatchedEin => counts[0] += 1,
+                V4TaxIdentityState::Missing => counts[1] += 1,
+                V4TaxIdentityState::Malformed => counts[2] += 1,
+                V4TaxIdentityState::UnsupportedType => counts[3] += 1,
+            }
+        }
+        Ok(V4TaxIdentitySummary {
+            contract: TAX_IDENTITY_PROJECTION_CONTRACT.to_owned(),
+            token_policy_id: self.token_policy_id.clone(),
+            token_policy_descriptor_sha256: hex(&token_policy_descriptor_sha256(
+                &self.token_policy_id,
+            )?),
+            normalization_contract: TAX_IDENTITY_NORMALIZATION_CONTRACT.to_owned(),
+            hmac_contract: TAX_IDENTITY_HMAC_CONTRACT.to_owned(),
+            candidate_prefix_contract: TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT.to_owned(),
+            authority_contract: TAX_IDENTITY_AUTHORITY_CONTRACT.to_owned(),
+            source_ordinal_contract: TAX_SOURCE_ORDINAL_CONTRACT.to_owned(),
+            source_ordinal_map: self.source_ordinals.clone(),
+            source_ordinal_map_digest: hex(&self.source_ordinal_sha256),
+            source_shard_count: self.source_ordinals.len() as u64,
+            source_bitmap_bytes: self.source_bitmap_bytes as u64,
+            provider_group_count: self.group_rows.len() as u64,
+            tax_identity_count: self.tin_hmacs.len() as u64,
+            matched_ein_count: counts[0],
+            missing_count: counts[1],
+            malformed_count: counts[2],
+            unsupported_type_count: counts[3],
+            content_digest: hex(&self.content_digest()?),
+        })
+    }
 }
 
 fn dense_global_map(
@@ -3361,6 +4174,30 @@ fn dictionary_copy_bytes(
         .ok_or(invalid("V4 dictionary COPY encoded size overflows"))
 }
 
+fn tax_identity_copy_bytes(model: &V4TaxIdentityModel) -> ProviderGraphV4Result<u64> {
+    let token_bytes = dictionary_copy_bytes(&[4, 16, 32], model.tin_hmacs.len())?;
+    let group_rows =
+        model
+            .group_rows
+            .iter()
+            .try_fold(0u64, |total, (_, state, tin_key, bitmap)| {
+                let row_bytes = 2u64
+                    .checked_add(4 + GLOBAL_ID_BYTES as u64)
+                    .and_then(|value| value.checked_add(4 + state.as_str().len() as u64))
+                    .and_then(|value| value.checked_add(4 + u64::from(tin_key.is_some()) * 4))
+                    .and_then(|value| value.checked_add(4 + bitmap.len() as u64))
+                    .ok_or(invalid("V4 tax identity COPY row size overflows"))?;
+                total
+                    .checked_add(row_bytes)
+                    .ok_or(invalid("V4 tax identity COPY size overflows"))
+            })?;
+    token_bytes
+        .checked_add(PG_COPY_HEADER.len() as u64)
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(group_rows))
+        .ok_or(invalid("V4 tax identity COPY size overflows"))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HeavyBitmapPlan {
     relation: &'static str,
@@ -3453,6 +4290,7 @@ struct LayoutSizes {
 
 fn compute_layout_sizes(
     model: &GraphModel,
+    tax_identity: &V4TaxIdentityModel,
     options: &ProviderGraphV4Options,
 ) -> ProviderGraphV4Result<LayoutSizes> {
     let common_shapes = [
@@ -3487,6 +4325,7 @@ fn compute_layout_sizes(
             .checked_add(relation_encoded_bytes(shape, options)?)
             .ok_or(invalid("V4 common encoded byte count overflows"))
     })?;
+    let tax_dictionary_bytes = tax_identity_copy_bytes(tax_identity)?;
     let common_dictionaries = dictionary_copy_bytes(&[4, 16], model.group_globals.len())?
         .checked_add(dictionary_copy_bytes(
             &[4, 16],
@@ -3513,6 +4352,7 @@ fn compute_layout_sizes(
                 .expect("NPI prefix override metadata size was validated"),
             )
         })
+        .and_then(|value| value.checked_add(tax_dictionary_bytes))
         .ok_or(invalid("V4 common dictionary byte count overflows"))?;
 
     let direct_shapes = [
@@ -4565,6 +5405,11 @@ impl PgCopyFileWriter {
     }
 
     fn row(&mut self, fields: &[&[u8]]) -> ProviderGraphV4Result<()> {
+        let nullable = fields.iter().copied().map(Some).collect::<Vec<_>>();
+        self.row_nullable(&nullable)
+    }
+
+    fn row_nullable(&mut self, fields: &[Option<&[u8]>]) -> ProviderGraphV4Result<()> {
         self.writer.write_all(
             &invalid_conversion(
                 i16::try_from(fields.len()),
@@ -4573,6 +5418,10 @@ impl PgCopyFileWriter {
             .to_be_bytes(),
         )?;
         for field in fields {
+            let Some(field) = field else {
+                self.writer.write_all(&(-1i32).to_be_bytes())?;
+                continue;
+            };
             self.writer.write_all(
                 &invalid_conversion(
                     i32::try_from(field.len()),
@@ -4601,11 +5450,24 @@ impl Drop for PgCopyFileWriter {
     }
 }
 
+struct EmittedDictionaries {
+    group_copy_path: PathBuf,
+    component_copy_path: PathBuf,
+    npi_copy_path: PathBuf,
+    provider_set_audit_npi_copy_path: PathBuf,
+    provider_set_npi_prefix_override_copy_path: PathBuf,
+    provider_tax_identity_copy_path: PathBuf,
+    provider_group_tax_identity_copy_path: PathBuf,
+    pattern_copy_path: Option<PathBuf>,
+}
+
 fn emit_dictionaries(
     output_directory: &Path,
     model: &GraphModel,
+    tax_identity: &V4TaxIdentityModel,
     layout: ProviderGraphV4Layout,
-) -> ProviderGraphV4Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, Option<PathBuf>)> {
+    progress: &mut ProgressReporter<'_>,
+) -> ProviderGraphV4Result<EmittedDictionaries> {
     let group_path = output_directory.join("v4-provider-groups.copy");
     let mut groups = PgCopyFileWriter::create(&group_path)?;
     for (key, global) in model.group_globals.iter().enumerate() {
@@ -4648,6 +5510,53 @@ fn emit_dictionaries(
         ])?;
     }
     provider_set_npi_prefix_overrides.finish()?;
+    let provider_tax_identity_path = output_directory.join("v4-provider-tax-identities.copy");
+    let mut provider_tax_identities = PgCopyFileWriter::create(&provider_tax_identity_path)?;
+    let tax_row_total = tax_identity
+        .tin_hmacs
+        .len()
+        .checked_add(tax_identity.group_rows.len())
+        .ok_or(invalid(
+            "V4 tax identity dictionary progress total overflows",
+        ))? as u64;
+    let mut tax_rows_done = 0u64;
+    progress.periodic("emit_dictionaries", 0, tax_row_total, "tax_rows");
+    for (tin_key, tin_hmac_sha256) in tax_identity.tin_hmacs.iter().enumerate() {
+        provider_tax_identities.row(&[
+            &(tin_key as i32).to_be_bytes(),
+            &tin_hmac_sha256[..16],
+            tin_hmac_sha256,
+        ])?;
+        tax_rows_done += 1;
+        progress.periodic(
+            "emit_dictionaries",
+            tax_rows_done,
+            tax_row_total,
+            "tax_rows",
+        );
+    }
+    provider_tax_identities.finish()?;
+    let provider_group_tax_identity_path =
+        output_directory.join("v4-provider-group-tax-identities.copy");
+    let mut provider_group_tax_identities =
+        PgCopyFileWriter::create(&provider_group_tax_identity_path)?;
+    for (provider_group_global_id, state, tin_key, source_bitmap) in &tax_identity.group_rows {
+        let tin_key_bytes = tin_key.map(|value| (value as i32).to_be_bytes());
+        provider_group_tax_identities.row_nullable(&[
+            Some(provider_group_global_id),
+            Some(state.as_str().as_bytes()),
+            tin_key_bytes.as_ref().map(|value| value.as_slice()),
+            Some(source_bitmap),
+        ])?;
+        tax_rows_done += 1;
+        progress.periodic(
+            "emit_dictionaries",
+            tax_rows_done,
+            tax_row_total,
+            "tax_rows",
+        );
+    }
+    provider_group_tax_identities.finish()?;
     let pattern_path = if layout == ProviderGraphV4Layout::Pattern {
         let path = output_directory.join("v4-patterns.copy");
         let mut patterns = PgCopyFileWriter::create(&path)?;
@@ -4672,14 +5581,16 @@ fn emit_dictionaries(
     } else {
         None
     };
-    Ok((
-        group_path,
-        component_path,
-        npi_path,
-        provider_set_audit_npi_path,
-        provider_set_npi_prefix_override_path,
-        pattern_path,
-    ))
+    Ok(EmittedDictionaries {
+        group_copy_path: group_path,
+        component_copy_path: component_path,
+        npi_copy_path: npi_path,
+        provider_set_audit_npi_copy_path: provider_set_audit_npi_path,
+        provider_set_npi_prefix_override_copy_path: provider_set_npi_prefix_override_path,
+        provider_tax_identity_copy_path: provider_tax_identity_path,
+        provider_group_tax_identity_copy_path: provider_group_tax_identity_path,
+        pattern_copy_path: pattern_path,
+    })
 }
 
 /// Compile complete factor sidecars into one deterministic adaptive V4 graph.
@@ -4757,8 +5668,24 @@ fn compile_provider_graph_v4_inner(
         &mut resource_admission,
         options,
     )?;
+    let tax_identity = V4TaxIdentityModel::build(&raw.tax_identities, &model.group_globals)?;
+    let tax_dictionary_projection_bytes = (tax_identity.tin_hmacs.len() as u64)
+        .checked_mul(TAX_IDENTITY_DICTIONARY_ENTRY_UPPER_BOUND_BYTES)
+        .ok_or(invalid(
+            "resource_admission: tax identity projection byte count overflows",
+        ))?;
+    let tax_projection_bytes = (tax_identity.group_rows.len() as u64)
+        .checked_mul(
+            TAX_IDENTITY_GROUP_ENTRY_UPPER_BOUND_BYTES
+                .saturating_add(tax_identity.source_bitmap_bytes as u64),
+        )
+        .and_then(|value| value.checked_add(tax_dictionary_projection_bytes))
+        .ok_or(invalid(
+            "resource_admission: tax identity projection byte count overflows",
+        ))?;
+    resource_admission.reconcile_tax_identity_projection(tax_projection_bytes)?;
     let mut observe = model.observe.clone();
-    let sizes = compute_layout_sizes(&model, options)?;
+    let sizes = compute_layout_sizes(&model, &tax_identity, options)?;
     let pattern_layout_serving_degree_eligible =
         record_pattern_fallback_diagnostics(&model, options, &mut observe);
     let selected_layout = choose_layout(
@@ -4890,19 +5817,22 @@ fn compile_provider_graph_v4_inner(
     progress.emit("emit_bitmaps", 1, 1, "stage", false);
     let heavy_bitmaps = selected_bitmaps;
     let (block_count, block_copy_bytes) = cas.finish()?;
-    let (
+    let EmittedDictionaries {
         group_copy_path,
         component_copy_path,
         npi_copy_path,
         provider_set_audit_npi_copy_path,
         provider_set_npi_prefix_override_copy_path,
+        provider_tax_identity_copy_path,
+        provider_group_tax_identity_copy_path,
         pattern_copy_path,
-    ) = {
-        progress.emit("emit_dictionaries", 0, 1, "stage", false);
-        let emitted = emit_dictionaries(output_directory, &model, selected_layout)?;
-        progress.emit("emit_dictionaries", 1, 1, "stage", false);
-        emitted
-    };
+    } = emit_dictionaries(
+        output_directory,
+        &model,
+        &tax_identity,
+        selected_layout,
+        progress,
+    )?;
     let summary_path = output_directory.join("v4-summary.json");
     let input_digest: [u8; 32] = raw.input_digest.finalize().into();
     let mut database_output_bytes = block_copy_bytes;
@@ -4912,6 +5842,8 @@ fn compile_provider_graph_v4_inner(
         &npi_copy_path,
         &provider_set_audit_npi_copy_path,
         &provider_set_npi_prefix_override_copy_path,
+        &provider_tax_identity_copy_path,
+        &provider_group_tax_identity_copy_path,
     ] {
         database_output_bytes = database_output_bytes
             .checked_add(fs::metadata(path)?.len())
@@ -4955,6 +5887,16 @@ fn compile_provider_graph_v4_inner(
             "provider_set_npi_prefix_overrides",
             &provider_set_npi_prefix_override_copy_path,
             model.provider_set_npi_prefix_override_metadata.len() as u64,
+        )?,
+        output_artifact(
+            "provider_tax_identities",
+            &provider_tax_identity_copy_path,
+            tax_identity.tin_hmacs.len() as u64,
+        )?,
+        output_artifact(
+            "provider_group_tax_identities",
+            &provider_group_tax_identity_copy_path,
+            tax_identity.group_rows.len() as u64,
         )?,
     ];
     if let Some(path) = pattern_copy_path.as_ref() {
@@ -5007,6 +5949,8 @@ fn compile_provider_graph_v4_inner(
         npi_copy_path,
         provider_set_audit_npi_copy_path,
         provider_set_npi_prefix_override_copy_path,
+        provider_tax_identity_copy_path,
+        provider_group_tax_identity_copy_path,
         pattern_copy_path,
         summary_path: summary_path.clone(),
         block_count,
@@ -5014,6 +5958,7 @@ fn compile_provider_graph_v4_inner(
         relation_summaries,
         heavy_bitmaps,
         output_artifacts,
+        tax_identity: tax_identity.summary()?,
         observe,
         resource_admission: resource_admission.into_summary(),
         input_byte_count: raw.input_byte_count,
@@ -5281,6 +6226,80 @@ mod tests {
         }
     }
 
+    fn write_tax_identity(
+        path: &Path,
+        shard_id: &str,
+        policy_id: &str,
+        records: impl IntoIterator<Item = (GlobalId, V4TaxIdentityState, Option<[u8; 32]>)>,
+    ) -> V4TaxIdentityArtifactDescriptor {
+        let mut records = records.into_iter().collect::<Vec<_>>();
+        records.sort_unstable_by_key(|record| record.0);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(TAX_IDENTITY_MAGIC);
+        bytes.extend_from_slice(&TAX_IDENTITY_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&TAX_IDENTITY_RECORD_BYTES.to_le_bytes());
+        bytes.push(policy_id.len() as u8);
+        bytes.extend_from_slice(policy_id.as_bytes());
+        let mut counts = [0u64; 4];
+        for (group, state, hmac) in &records {
+            bytes.extend_from_slice(group);
+            bytes.push(match state {
+                V4TaxIdentityState::MatchedEin => 1,
+                V4TaxIdentityState::Missing => 2,
+                V4TaxIdentityState::Malformed => 3,
+                V4TaxIdentityState::UnsupportedType => 4,
+            });
+            let hmac = hmac.unwrap_or([0; 32]);
+            bytes.extend_from_slice(&hmac[..16]);
+            bytes.extend_from_slice(&hmac);
+            match state {
+                V4TaxIdentityState::MatchedEin => counts[0] += 1,
+                V4TaxIdentityState::Missing => counts[1] += 1,
+                V4TaxIdentityState::Malformed => counts[2] += 1,
+                V4TaxIdentityState::UnsupportedType => counts[3] += 1,
+            }
+        }
+        fs::write(path, &bytes).unwrap();
+        V4TaxIdentityArtifactDescriptor {
+            path: path.to_path_buf(),
+            metadata: V4TaxIdentityMetadata {
+                record_format: TAX_IDENTITY_FORMAT.to_owned(),
+                sha256: hex(&Sha256::digest(&bytes)),
+                byte_count: bytes.len() as u64,
+                row_count: records.len() as u64,
+                provider_group_count: records.len() as u64,
+                matched_ein_count: counts[0],
+                missing_count: counts[1],
+                malformed_count: counts[2],
+                unsupported_type_count: counts[3],
+                version: TAX_IDENTITY_VERSION,
+                record_bytes: TAX_IDENTITY_RECORD_BYTES,
+                token_policy_id: policy_id.to_owned(),
+                normalization_contract: TAX_IDENTITY_NORMALIZATION_CONTRACT.to_owned(),
+                hmac_contract: TAX_IDENTITY_HMAC_CONTRACT.to_owned(),
+                final_file: true,
+                name: Some("provider_group_tax_identity".to_owned()),
+                source_shard_id: Some(shard_id.to_owned()),
+                shard_id: None,
+            },
+        }
+    }
+
+    fn write_missing_tax_identity(
+        path: &Path,
+        shard_id: &str,
+        groups: impl IntoIterator<Item = GlobalId>,
+    ) -> V4TaxIdentityArtifactDescriptor {
+        write_tax_identity(
+            path,
+            shard_id,
+            "ptg-tin-hmac-sha256-v1:test",
+            groups
+                .into_iter()
+                .map(|group| (group, V4TaxIdentityState::Missing, None)),
+        )
+    }
+
     fn write_provider_map(path: &Path, sets: &[GlobalId], key_base: u32) {
         let mut sorted = sets.to_vec();
         sorted.sort_unstable();
@@ -5342,6 +6361,11 @@ mod tests {
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 1);
         let output = temporary.path().join("output");
+        let provider_group_tax_identity = write_missing_tax_identity(
+            &temporary.path().join("group-tax-identity.sidecar"),
+            "shard-a",
+            groups,
+        );
         Fixture {
             _temporary: temporary,
             shard: V4ProviderGraphShardDescriptor {
@@ -5350,6 +6374,7 @@ mod tests {
                 provider_component_group: component_group,
                 provider_group_npi: group_npi,
                 provider_npi_group: npi_group,
+                provider_group_tax_identity,
             },
             provider_map,
             output,
@@ -5417,6 +6442,11 @@ mod tests {
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 1);
         let output = temporary.path().join("output");
+        let provider_group_tax_identity = write_missing_tax_identity(
+            &temporary.path().join("group-tax-identity.sidecar"),
+            "shard-mixed",
+            groups,
+        );
         Fixture {
             _temporary: temporary,
             shard: V4ProviderGraphShardDescriptor {
@@ -5425,6 +6455,7 @@ mod tests {
                 provider_component_group: component_group,
                 provider_group_npi: group_npi,
                 provider_npi_group: npi_group,
+                provider_group_tax_identity,
             },
             provider_map,
             output,
@@ -5468,6 +6499,11 @@ mod tests {
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 0);
         let output = temporary.path().join("output");
+        let provider_group_tax_identity = write_missing_tax_identity(
+            &temporary.path().join("group-tax-identity.sidecar"),
+            "shard-b",
+            groups,
+        );
         Fixture {
             _temporary: temporary,
             shard: V4ProviderGraphShardDescriptor {
@@ -5476,6 +6512,7 @@ mod tests {
                 provider_component_group: component_group,
                 provider_group_npi: group_npi,
                 provider_npi_group: npi_group,
+                provider_group_tax_identity,
             },
             provider_map,
             output,
@@ -5619,6 +6656,11 @@ mod tests {
                 "provider_npi_group",
                 groups.iter().copied().map(|group| (provider_npi, group)),
                 true,
+            ),
+            provider_group_tax_identity: write_missing_tax_identity(
+                &temporary.path().join("group-tax-identity.sidecar"),
+                "tuple-cache",
+                groups.iter().copied(),
             ),
         };
         let provider_map = temporary.path().join("provider-map.copy");
@@ -5989,7 +7031,9 @@ mod tests {
         assert_eq!(summary.observe.maximum_online_group_npi_batch_work, 1);
         assert_eq!(summary.observe.maximum_online_group_npi_member_work, 2);
         assert_eq!(summary.observe.provider_set_audit_npi_count, 16);
-        assert_eq!(summary.resource_admission.factor_edge_count, 208);
+        assert_eq!(summary.resource_admission.factor_edge_count, 272);
+        assert_eq!(summary.resource_admission.factor_owner_count, 146);
+        assert!(summary.resource_admission.tax_identity_projection_bytes > 0);
         assert!(summary.resource_admission.estimated_peak_bytes > 0);
         assert_eq!(
             summary.resource_admission.estimated_peak_bytes,
@@ -5997,6 +7041,9 @@ mod tests {
                 .resource_admission
                 .base_estimated_model_bytes
                 .checked_add(summary.resource_admission.derived_projection_bytes)
+                .and_then(|value| {
+                    value.checked_add(summary.resource_admission.tax_identity_projection_bytes)
+                })
                 .and_then(|value| {
                     value.checked_add(summary.resource_admission.retained_scratch_high_water_bytes)
                 })
@@ -6419,7 +7466,7 @@ mod tests {
         assert!(events.iter().all(|event| event.done <= event.total));
         assert!(events.windows(2).all(|pair| pair[1].seq == pair[0].seq + 1));
         for (phase, unit) in [
-            ("load_factors", "factor_edges"),
+            ("load_factors", "factor_items"),
             ("build_model", "factor_items"),
         ] {
             let phase_events = events
@@ -6979,6 +8026,11 @@ mod tests {
                 groups.into_iter().map(|group| (provider_npi, group)),
                 true,
             ),
+            provider_group_tax_identity: write_missing_tax_identity(
+                &temporary.path().join("group-tax-identity.sidecar"),
+                "multi-shard",
+                groups,
+            ),
         };
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 0);
@@ -7053,6 +8105,136 @@ mod tests {
         let mut progress = ProgressReporter::new(&mut sink);
         assert!(load_raw_factors(&[progress_overflow], &mut progress).is_err());
 
+        let admitted = resource_admission_preflight(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &ProviderGraphV4Options::default(),
+        )
+        .unwrap();
+        let membership_edges = [
+            &fixture.shard.provider_set_component,
+            &fixture.shard.provider_component_group,
+            &fixture.shard.provider_group_npi,
+            &fixture.shard.provider_npi_group,
+        ]
+        .iter()
+        .map(|artifact| artifact.metadata.member_count)
+        .sum::<u64>();
+        let membership_owners = [
+            &fixture.shard.provider_set_component,
+            &fixture.shard.provider_component_group,
+            &fixture.shard.provider_group_npi,
+            &fixture.shard.provider_npi_group,
+        ]
+        .iter()
+        .map(|artifact| artifact.metadata.owner_count)
+        .sum::<u64>();
+        assert_eq!(
+            admitted.summary.factor_edge_count,
+            membership_edges + fixture.shard.provider_group_tax_identity.metadata.row_count
+        );
+        assert_eq!(
+            admitted.summary.factor_owner_count,
+            membership_owners
+                + fixture
+                    .shard
+                    .provider_group_tax_identity
+                    .metadata
+                    .provider_group_count
+        );
+        assert_eq!(
+            admitted.summary.tax_identity_merge_bitmap_upper_bound_bytes,
+            fixture
+                .shard
+                .provider_group_tax_identity
+                .metadata
+                .provider_group_count
+        );
+        assert_eq!(
+            admitted
+                .summary
+                .tax_identity_source_ordinal_upper_bound_bytes,
+            TAX_SOURCE_ORDINAL_FIXED_UPPER_BOUND_BYTES
+                + (fixture.shard.shard_id.len() as u64) * TAX_SOURCE_IDENTITY_COPY_UPPER_BOUND
+        );
+
+        let mut high_shard_factors = Vec::new();
+        for ordinal in 0..9 {
+            let mut shard = fixture.shard.clone();
+            shard.shard_id = format!("disjoint-{ordinal}");
+            shard
+                .provider_group_tax_identity
+                .metadata
+                .provider_group_count = 10_000;
+            shard.provider_group_tax_identity.metadata.row_count = 10_000;
+            shard.provider_group_tax_identity.path =
+                temporary_missing_path(fixture._temporary.path());
+            high_shard_factors.push(shard);
+        }
+        let high_shard_admission = resource_admission_preflight(
+            &high_shard_factors,
+            &fixture.provider_map,
+            &ProviderGraphV4Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            high_shard_admission
+                .summary
+                .tax_identity_merge_bitmap_upper_bound_bytes,
+            180_000
+        );
+        let pre_tax_limit = high_shard_admission
+            .summary
+            .estimated_peak_bytes
+            .checked_sub(
+                high_shard_admission
+                    .summary
+                    .tax_identity_merge_bitmap_upper_bound_bytes,
+            )
+            .and_then(|value| {
+                value.checked_sub(
+                    high_shard_admission
+                        .summary
+                        .tax_identity_source_ordinal_upper_bound_bytes,
+                )
+            })
+            .unwrap();
+        let adversarial_output = fixture._temporary.path().join("adversarial-output");
+        let failure = compile_provider_graph_v4(
+            &high_shard_factors,
+            &fixture.provider_map,
+            &adversarial_output,
+            ProviderGraphV4Options {
+                max_estimated_model_bytes: Some(pre_tax_limit),
+                ..ProviderGraphV4Options::default()
+            },
+        )
+        .unwrap_err();
+        assert!(failure.to_string().contains("resource_admission"));
+        assert!(fs::read_dir(adversarial_output).unwrap().next().is_none());
+        let pre_projection_limit = high_shard_admission
+            .summary
+            .estimated_peak_bytes
+            .checked_sub(
+                high_shard_admission
+                    .summary
+                    .tax_identity_projection_upper_bound_bytes,
+            )
+            .unwrap();
+        let projection_output = fixture._temporary.path().join("projection-output");
+        let failure = compile_provider_graph_v4(
+            &high_shard_factors,
+            &fixture.provider_map,
+            &projection_output,
+            ProviderGraphV4Options {
+                max_estimated_model_bytes: Some(pre_projection_limit),
+                ..ProviderGraphV4Options::default()
+            },
+        )
+        .unwrap_err();
+        assert!(failure.to_string().contains("resource_admission"));
+        assert!(fs::read_dir(projection_output).unwrap().next().is_none());
+
         let limited_edges = ProviderGraphV4Options {
             max_factor_edges: Some(1),
             ..ProviderGraphV4Options::default()
@@ -7103,6 +8285,29 @@ mod tests {
             )
             .is_err());
         }
+
+        let mut tax_edge_overflow = fixture.shard.clone();
+        tax_edge_overflow
+            .provider_group_tax_identity
+            .metadata
+            .row_count = u64::MAX;
+        assert!(resource_admission_preflight(
+            &[tax_edge_overflow],
+            &fixture.provider_map,
+            &ProviderGraphV4Options::default(),
+        )
+        .is_err());
+        let mut tax_owner_overflow = fixture.shard.clone();
+        tax_owner_overflow
+            .provider_group_tax_identity
+            .metadata
+            .provider_group_count = u64::MAX;
+        assert!(resource_admission_preflight(
+            &[tax_owner_overflow],
+            &fixture.provider_map,
+            &ProviderGraphV4Options::default(),
+        )
+        .is_err());
     }
 
     fn temporary_missing_path(root: &Path) -> PathBuf {
@@ -7485,14 +8690,19 @@ mod tests {
                 provider_set_key_map_bytes: 0,
                 factor_edge_count: 0,
                 factor_owner_count: 0,
+                tax_identity_merge_bitmap_upper_bound_bytes: 0,
+                tax_identity_source_ordinal_upper_bound_bytes: 0,
+                tax_identity_projection_upper_bound_bytes: 0,
                 base_estimated_model_bytes: 0,
                 derived_projection_bytes: 0,
+                tax_identity_projection_bytes: 0,
                 retained_scratch_high_water_bytes: 0,
                 bounded_emission_buffer_bytes: 0,
                 estimated_peak_bytes: 0,
                 max_estimated_model_bytes,
                 max_factor_edges: None,
             },
+            tax_identity_projection_reconciled: false,
         }
     }
 
@@ -7780,5 +8990,376 @@ mod tests {
             .heavy_bitmaps
             .iter()
             .any(|bitmap| bitmap.relation == "group_sets_direct"));
+    }
+
+    #[test]
+    fn tax_policy_descriptor_has_cross_language_vector_and_binds_every_field() {
+        let fields = [
+            "ptg-tin-hmac-sha256-v1:release-1",
+            TAX_IDENTITY_NORMALIZATION_CONTRACT,
+            TAX_IDENTITY_HMAC_CONTRACT,
+            TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT,
+            TAX_IDENTITY_AUTHORITY_CONTRACT,
+        ];
+        let expected = token_policy_descriptor_sha256_fields(fields).unwrap();
+        assert_eq!(
+            hex(&expected),
+            "a0c06f5494f80663686be6861038a8804d9509d0fdc2d2c8cc56c259e53d761c"
+        );
+        for index in 0..fields.len() {
+            let mut changed = fields;
+            changed[index] = "changed";
+            assert_ne!(
+                token_policy_descriptor_sha256_fields(changed).unwrap(),
+                expected,
+                "descriptor field {index} was not authenticated"
+            );
+        }
+    }
+
+    #[test]
+    fn tax_artifact_parser_rejects_reordering_and_candidate_drift() {
+        let temporary = tempfile::tempdir().unwrap();
+        let groups = [global(3, 1), global(3, 2)];
+        let hmac = [0x5au8; 32];
+        let descriptor = write_tax_identity(
+            &temporary.path().join("tax.sidecar"),
+            "tax-shard",
+            "ptg-tin-hmac-sha256-v1:release-1",
+            [
+                (groups[0], V4TaxIdentityState::MatchedEin, Some(hmac)),
+                (groups[1], V4TaxIdentityState::Missing, None),
+            ],
+        );
+        let artifact = ValidatedTaxIdentityArtifact::open(&descriptor).unwrap();
+        assert_eq!(artifact.record(0).unwrap().tin_hmac_sha256, hmac);
+
+        let header_bytes =
+            TAX_IDENTITY_FIXED_HEADER_BYTES + descriptor.metadata.token_policy_id.len();
+        let mut candidate_drift = descriptor.clone();
+        let mut bytes = fs::read(&candidate_drift.path).unwrap();
+        bytes[header_bytes + 17] ^= 1;
+        fs::write(&candidate_drift.path, &bytes).unwrap();
+        candidate_drift.metadata.sha256 = hex(&Sha256::digest(&bytes));
+        assert!(ValidatedTaxIdentityArtifact::open(&candidate_drift)
+            .unwrap_err()
+            .to_string()
+            .contains("candidate"));
+
+        let mut reordered = write_tax_identity(
+            &temporary.path().join("tax-reordered.sidecar"),
+            "tax-shard",
+            "ptg-tin-hmac-sha256-v1:release-1",
+            [
+                (groups[0], V4TaxIdentityState::MatchedEin, Some(hmac)),
+                (groups[1], V4TaxIdentityState::Missing, None),
+            ],
+        );
+        let mut bytes = fs::read(&reordered.path).unwrap();
+        let first = bytes[header_bytes..header_bytes + 65].to_vec();
+        let second = bytes[header_bytes + 65..header_bytes + 130].to_vec();
+        bytes[header_bytes..header_bytes + 65].copy_from_slice(&second);
+        bytes[header_bytes + 65..header_bytes + 130].copy_from_slice(&first);
+        fs::write(&reordered.path, &bytes).unwrap();
+        reordered.metadata.sha256 = hex(&Sha256::digest(&bytes));
+        assert!(ValidatedTaxIdentityArtifact::open(&reordered)
+            .unwrap_err()
+            .to_string()
+            .contains("sorted and unique"));
+    }
+
+    #[test]
+    fn tax_merge_uses_state_priority_fixed_bitmaps_and_dense_hmac_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let groups = [global(3, 1), global(3, 2)];
+        let lower_hmac = [0x11u8; 32];
+        let higher_hmac = [0x22u8; 32];
+        let policy = "ptg-tin-hmac-sha256-v1:release-1";
+        let first = write_tax_identity(
+            &temporary.path().join("tax-first.sidecar"),
+            "source-00",
+            policy,
+            [
+                (groups[0], V4TaxIdentityState::Missing, None),
+                (groups[1], V4TaxIdentityState::Malformed, None),
+            ],
+        );
+        let last = write_tax_identity(
+            &temporary.path().join("tax-last.sidecar"),
+            "source-08",
+            policy,
+            [
+                (groups[0], V4TaxIdentityState::MatchedEin, Some(higher_hmac)),
+                (groups[1], V4TaxIdentityState::UnsupportedType, None),
+            ],
+        );
+        let source_ordinals = (0..9)
+            .map(|ordinal| V4TaxSourceOrdinal {
+                shard_id: format!("source-{ordinal:02}"),
+                ordinal,
+            })
+            .collect::<Vec<_>>();
+        let mut factors = V4TaxIdentityFactors {
+            token_policy_id: policy.to_owned(),
+            source_ordinal_sha256: tax_source_ordinal_sha256(&source_ordinals).unwrap(),
+            source_ordinals,
+            source_bitmap_bytes: 2,
+            by_group: BTreeMap::new(),
+        };
+        let mut sink = |_event: &V4ProgressEvent| {};
+        let mut progress = ProgressReporter::new(&mut sink);
+        let mut completed = 0;
+        merge_tax_identity_artifact(
+            &mut factors,
+            &ValidatedTaxIdentityArtifact::open(&first).unwrap(),
+            0,
+            &mut progress,
+            &mut completed,
+            4,
+        )
+        .unwrap();
+        merge_tax_identity_artifact(
+            &mut factors,
+            &ValidatedTaxIdentityArtifact::open(&last).unwrap(),
+            8,
+            &mut progress,
+            &mut completed,
+            4,
+        )
+        .unwrap();
+        let model = V4TaxIdentityModel::build(&factors, &groups).unwrap();
+        assert_eq!(model.tin_hmacs, vec![higher_hmac]);
+        assert_eq!(
+            model.group_rows,
+            vec![
+                (
+                    groups[0],
+                    V4TaxIdentityState::MatchedEin,
+                    Some(0),
+                    vec![1, 1],
+                ),
+                (
+                    groups[1],
+                    V4TaxIdentityState::UnsupportedType,
+                    None,
+                    vec![1, 1],
+                ),
+            ]
+        );
+        assert!(V4TaxIdentityModel::build(&factors, &groups[..1])
+            .unwrap_err()
+            .to_string()
+            .contains("group set differs"));
+
+        let conflict = write_tax_identity(
+            &temporary.path().join("tax-conflict.sidecar"),
+            "source-08",
+            policy,
+            [(groups[0], V4TaxIdentityState::MatchedEin, Some(lower_hmac))],
+        );
+        assert!(merge_tax_identity_artifact(
+            &mut factors,
+            &ValidatedTaxIdentityArtifact::open(&conflict).unwrap(),
+            8,
+            &mut progress,
+            &mut completed,
+            5,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting full tax identity HMACs"));
+    }
+
+    #[test]
+    fn tax_dictionary_keeps_full_hmacs_distinct_after_candidate_collision() {
+        let groups = [global(3, 1), global(3, 2)];
+        let mut first = [0x44u8; 32];
+        let mut second = first;
+        first[31] = 1;
+        second[31] = 2;
+        let source_ordinals = vec![V4TaxSourceOrdinal {
+            shard_id: "source".to_owned(),
+            ordinal: 0,
+        }];
+        let factors = V4TaxIdentityFactors {
+            token_policy_id: "ptg-tin-hmac-sha256-v1:release-1".to_owned(),
+            source_ordinal_sha256: tax_source_ordinal_sha256(&source_ordinals).unwrap(),
+            source_ordinals,
+            source_bitmap_bytes: 1,
+            by_group: BTreeMap::from([
+                (
+                    groups[0],
+                    V4MergedTaxIdentity {
+                        state: V4TaxIdentityState::MatchedEin,
+                        tin_hmac_sha256: Some(second),
+                        source_bitmap: vec![1],
+                    },
+                ),
+                (
+                    groups[1],
+                    V4MergedTaxIdentity {
+                        state: V4TaxIdentityState::MatchedEin,
+                        tin_hmac_sha256: Some(first),
+                        source_bitmap: vec![1],
+                    },
+                ),
+            ]),
+        };
+        let model = V4TaxIdentityModel::build(&factors, &groups).unwrap();
+        assert_eq!(first[..16], second[..16]);
+        assert_eq!(model.tin_hmacs, vec![first, second]);
+        assert_eq!(model.group_rows[0].2, Some(1));
+        assert_eq!(model.group_rows[1].2, Some(0));
+    }
+
+    #[test]
+    fn tax_model_rejects_noncanonical_state_token_and_source_combinations() {
+        let groups = [global(3, 1), global(3, 2), global(3, 3), global(3, 4)];
+        let hmac = [0x31; 32];
+        let source_ordinals = vec![V4TaxSourceOrdinal {
+            shard_id: "source".to_owned(),
+            ordinal: 0,
+        }];
+        let make_factors = |rows| V4TaxIdentityFactors {
+            token_policy_id: "ptg-tin-hmac-sha256-v1:release-1".to_owned(),
+            source_ordinal_sha256: tax_source_ordinal_sha256(&source_ordinals).unwrap(),
+            source_ordinals: source_ordinals.clone(),
+            source_bitmap_bytes: 1,
+            by_group: rows,
+        };
+        let valid = make_factors(BTreeMap::from([
+            (
+                groups[0],
+                V4MergedTaxIdentity {
+                    state: V4TaxIdentityState::MatchedEin,
+                    tin_hmac_sha256: Some(hmac),
+                    source_bitmap: vec![1],
+                },
+            ),
+            (
+                groups[1],
+                V4MergedTaxIdentity {
+                    state: V4TaxIdentityState::Missing,
+                    tin_hmac_sha256: None,
+                    source_bitmap: vec![1],
+                },
+            ),
+            (
+                groups[2],
+                V4MergedTaxIdentity {
+                    state: V4TaxIdentityState::Malformed,
+                    tin_hmac_sha256: None,
+                    source_bitmap: vec![1],
+                },
+            ),
+            (
+                groups[3],
+                V4MergedTaxIdentity {
+                    state: V4TaxIdentityState::UnsupportedType,
+                    tin_hmac_sha256: None,
+                    source_bitmap: vec![1],
+                },
+            ),
+        ]));
+        let model = V4TaxIdentityModel::build(&valid, &groups).unwrap();
+        let summary = model.summary().unwrap();
+        assert_eq!(summary.provider_group_count, 4);
+        assert_eq!(summary.tax_identity_count, 1);
+        assert_eq!(summary.matched_ein_count, 1);
+        assert_eq!(summary.missing_count, 1);
+        assert_eq!(summary.malformed_count, 1);
+        assert_eq!(summary.unsupported_type_count, 1);
+        assert_eq!(summary.content_digest.len(), 64);
+
+        for (value, state, priority, label) in [
+            (1, V4TaxIdentityState::MatchedEin, 4, "matched_ein"),
+            (2, V4TaxIdentityState::Missing, 1, "missing"),
+            (3, V4TaxIdentityState::Malformed, 2, "malformed"),
+            (
+                4,
+                V4TaxIdentityState::UnsupportedType,
+                3,
+                "unsupported_type",
+            ),
+        ] {
+            assert_eq!(V4TaxIdentityState::parse(value).unwrap(), state);
+            assert_eq!(state.priority(), priority);
+            assert_eq!(state.as_str(), label);
+            assert_eq!(state.code(), value);
+        }
+        assert!(V4TaxIdentityState::parse(0).is_err());
+
+        let invalid_cases = [
+            V4MergedTaxIdentity {
+                state: V4TaxIdentityState::Missing,
+                tin_hmac_sha256: None,
+                source_bitmap: vec![0],
+            },
+            V4MergedTaxIdentity {
+                state: V4TaxIdentityState::Missing,
+                tin_hmac_sha256: None,
+                source_bitmap: vec![2],
+            },
+            V4MergedTaxIdentity {
+                state: V4TaxIdentityState::MatchedEin,
+                tin_hmac_sha256: None,
+                source_bitmap: vec![1],
+            },
+            V4MergedTaxIdentity {
+                state: V4TaxIdentityState::Malformed,
+                tin_hmac_sha256: Some(hmac),
+                source_bitmap: vec![1],
+            },
+        ];
+        for invalid_identity in invalid_cases {
+            let factors = make_factors(BTreeMap::from([(groups[0], invalid_identity)]));
+            assert!(V4TaxIdentityModel::build(&factors, &groups[..1]).is_err());
+        }
+        let wrong_width = make_factors(BTreeMap::from([(
+            groups[0],
+            V4MergedTaxIdentity {
+                state: V4TaxIdentityState::Missing,
+                tin_hmac_sha256: None,
+                source_bitmap: vec![1, 0],
+            },
+        )]));
+        assert!(V4TaxIdentityModel::build(&wrong_width, &groups[..1]).is_err());
+    }
+
+    #[test]
+    fn tax_projection_resource_admission_is_single_reservation_and_bounded() {
+        let summary = V4ResourceAdmissionSummary {
+            formula: "test".to_owned(),
+            input_factor_bytes: 1,
+            provider_set_key_map_bytes: 2,
+            factor_edge_count: 3,
+            factor_owner_count: 4,
+            tax_identity_merge_bitmap_upper_bound_bytes: 0,
+            tax_identity_source_ordinal_upper_bound_bytes: 0,
+            tax_identity_projection_upper_bound_bytes: 8,
+            base_estimated_model_bytes: 10,
+            derived_projection_bytes: 0,
+            tax_identity_projection_bytes: 8,
+            retained_scratch_high_water_bytes: 0,
+            bounded_emission_buffer_bytes: 5,
+            estimated_peak_bytes: 23,
+            max_estimated_model_bytes: Some(50),
+            max_factor_edges: None,
+        };
+        let mut admission = ResourceAdmissionTracker {
+            summary,
+            tax_identity_projection_reconciled: false,
+        };
+        admission.reserve_projection("group dictionary", 4).unwrap();
+        admission.reserve_scratch_members("group sort", 2).unwrap();
+        admission.reconcile_tax_identity_projection(6).unwrap();
+        assert!(admission.reconcile_tax_identity_projection(1).is_err());
+        assert!(admission.reserve_projection("over limit", 100).is_err());
+        let summary = admission.into_summary();
+        assert_eq!(summary.tax_identity_projection_upper_bound_bytes, 8);
+        assert_eq!(summary.tax_identity_projection_bytes, 6);
+        assert_eq!(summary.derived_projection_bytes, 4);
+        assert!(summary.retained_scratch_high_water_bytes >= 8);
+        assert!(summary.estimated_peak_bytes <= 50);
     }
 }

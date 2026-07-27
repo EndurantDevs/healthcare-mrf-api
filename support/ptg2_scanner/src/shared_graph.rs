@@ -2495,4 +2495,43 @@ mod tests {
             "d1df104a844b74ff6a7f450d5075ce3669d1117d3081ea6d57bc245578c21261"
         );
     }
+
+    #[test]
+    fn graph_errors_and_member_heap_ordering_preserve_typed_contracts() {
+        let borrowed = invalid("invalid membership");
+        assert_eq!(borrowed.to_string(), "invalid membership");
+        assert!(borrowed.source().is_none());
+        let owned = invalid("invalid owner".to_string());
+        assert_eq!(owned.to_string(), "invalid owner");
+
+        let io_error = SharedGraphError::from(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated sidecar",
+        ));
+        assert_eq!(io_error.to_string(), "truncated sidecar");
+        assert_eq!(
+            io_error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let earlier = MemberHeapItem {
+            member: global(1),
+            artifact_index: 0,
+            member_index: 0,
+            end_index: 1,
+        };
+        let later = MemberHeapItem {
+            member: global(2),
+            artifact_index: 1,
+            member_index: 1,
+            end_index: 2,
+        };
+        assert_eq!(later.cmp(&earlier), Ordering::Less);
+        assert_eq!(later.partial_cmp(&earlier), Some(Ordering::Less));
+    }
 }

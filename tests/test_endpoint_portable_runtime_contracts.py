@@ -310,3 +310,21 @@ async def test_npi_table_availability_caches_resolved_presence(monkeypatch):
         session=object(),
     )
     assert execute_statement.await_count == 1
+
+
+def test_npi_cache_set_preserves_state_when_cache_is_disabled(monkeypatch):
+    """Disabling schema caching must not retain a newly observed value."""
+
+    cached_values_by_key: dict[str, tuple[float, object]] = {}
+    value = object()
+    monkeypatch.setattr(npi_endpoint, "ENABLE_NPI_SCHEMA_CACHE", False)
+
+    assert (
+        npi_endpoint._cache_set(
+            cached_values_by_key,
+            "synthetic",
+            value,
+        )
+        is value
+    )
+    assert cached_values_by_key == {}

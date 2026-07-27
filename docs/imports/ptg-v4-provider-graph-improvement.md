@@ -142,6 +142,67 @@ group-to-NPI work, and the actual provider-expansion rate rows, distinct sets,
 graph batches, and cap rejections. This keeps a low-latency answer auditable
 against the sealed work model.
 
+## Provider-group tax-identity sidecar
+
+V4 retains one version-neutral tax-identity sidecar row for every canonical
+provider group, keyed by the shared
+`(snapshot_key, provider_group_global_id_128)` identity. The scanner emits this
+row while the source TIN is still available, including for TIN-only groups with
+an empty NPI array. It classifies each row as `matched_ein`, `missing`,
+`malformed`, or `unsupported_type`; only an exact EIN expressed as nine ASCII
+digits or `NN-NNNNNNN`, with outer ASCII whitespace allowed, is matchable.
+Unavailable states remain valid billing-identity diagnostics and do not make a
+snapshot unpriceable.
+
+Raw TINs and business names are not retained in graph artifacts or PostgreSQL.
+For `matched_ein`, the scanner computes a policy-scoped HMAC from the canonical
+TIN type and nine digits using a file-mounted 32-byte secret. The snapshot
+stores the full 256-bit HMAC as authority, its first 128 bits only as a
+candidate locator, and a dense snapshot-local `tin_key`. The key and locator
+must never be treated as durable cross-snapshot identities. Cross-source
+connectors join by the manifest `token_policy_id` plus the full HMAC and verify
+the full value in constant time after candidate lookup.
+
+Release 1 freezes the exact wire contract. The HMAC message is
+`healthporta.ptg.tin.v1`, one NUL byte, the ASCII `ein` length as unsigned
+16-bit big-endian plus `ein`, then the nine-digit value length in the same
+format plus the value. The policy ID is
+`ptg-tin-hmac-sha256-v1:release-1`. Its descriptor is
+`PTG2V4TINPOLICY\x01` followed by five independently unsigned-32-bit
+big-endian-length-prefixed ASCII fields: policy ID, normalization contract,
+HMAC contract, candidate-prefix contract, and full-authority contract. The
+descriptor is 208 bytes and its SHA-256 is
+`a0c06f5494f80663686be6861038a8804d9509d0fdc2d2c8cc56c259e53d761c`.
+
+The manifest authenticates the policy descriptor, normalization and HMAC
+contracts, per-state counts, a deterministic sorted source-shard ordinal map,
+its digest, and the sidecar content digest. Each group also carries the exact
+source-shard bitmap under that ordinal map. A partial reverse index on
+`(snapshot_key, tin_key, provider_group_global_id_128)` contains only
+`matched_ein` rows so TIN-to-group lookup is bounded without making unavailable
+states matchable.
+
+Policy secrets are supplied only through scoped worker file mounts; they never
+enter arguments, environment values, logs, manifests, artifacts, or config
+dumps. Every token policy referenced by a live layout must remain computable by
+the trusted connector until that layout is retired, or the layout must be
+reimported before the old policy secret is removed.
+
+The sidecar publishes atomically with the V4 provider-group dictionary and is
+immutable under the same building-to-complete lifecycle. Completion proves
+exactly one sidecar row per provider group, exact state and token counts,
+contiguous source ordinals, nonempty correctly sized bitmaps with no unused
+high bits, and no unmatched group in the reverse index. Snapshot removal and
+layout cleanup cascade through the sidecar without a separate destructive
+path. Pre-sidecar V4 snapshots remain readable and removable.
+
+This foundation does not change the V4 factoring or traversal algorithm, but
+it does change physical storage and import work. Therefore every V4 storage
+baseline, import ceiling, and canary approval is remeasured after the sidecar
+is present. The direct baseline, provider-fragmented, and reference-extreme
+cases remain neutrally identified in source control. No earlier V4 measurement
+can be used as the final approval value.
+
 ## Import progress and timing
 
 The importer publishes weighted progress from download, scan, graph compile,
@@ -212,6 +273,15 @@ the exact pinned predecessor and reverses source, plan, same-source global, and
 declared allowed-amount pointers in one lifecycle-locked transaction. It
 validates the retained snapshot's sealed scope and activated audit attestation
 before changing any pointer, and an exact retry performs no writes.
+
+When a retained source wrapper no longer resolves but its active stored direct
+projection is revalidated from fresh bytes, exact-period planning may consume
+an immutable future-only attestation. The proof binds the exact source-file and
+content version, direct-dispatch CAS, semantic month, current source and plan
+lineage, HTTP validators, byte count and hashes, and the validating code image.
+It is idempotent by proof digest, consumed at most once, and can be revoked
+without rewriting history. It does not repair historical provenance, authorize
+catalog refresh, or change an import, snapshot, release, route, or V3 artifact.
 
 The V3 oracle is pinned to its reviewed image. Reference capture first attests
 the singular ready Deployment and Pod, immutable image digest, V3-only

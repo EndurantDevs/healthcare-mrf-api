@@ -12,24 +12,24 @@ from tests.ptg2_v4_summary_fixture_support import (
     EMPTY_SHA256,
     empty_observe_fixture,
     empty_relation_fixture,
+    empty_tax_identity_summary,
     heavy_bitmap_block_mismatch_fixture,
     pattern_summary_fixture,
     write_empty_artifacts,
 )
+from tests.ptg2_v4_resource_admission_mutations import (
+    resource_admission_mutations,
+)
 _OUTPUT_ARTIFACT_NAMES = (
-    "graph_blocks",
-    "graph_references",
-    "provider_groups",
-    "provider_components",
-    "npi_scope",
-    "provider_set_audit_npi",
-    "provider_set_npi_prefix_overrides",
+    "graph_blocks", "graph_references",
+    "provider_groups", "provider_components",
+    "npi_scope", "provider_set_audit_npi",
+    "provider_set_npi_prefix_overrides", "provider_tax_identities",
+    "provider_group_tax_identities",
 )
 
 
-def _selected_encoded_bytes(
-    artifact_by_name: dict[str, dict[str, Any]],
-) -> int:
+def _selected_encoded_bytes(artifact_by_name: dict[str, dict[str, Any]]) -> int:
     return sum(
         int(artifact["byte_count"])
         for name, artifact in artifact_by_name.items()
@@ -53,6 +53,8 @@ def _summary_path_fields(
         "provider_set_npi_prefix_override_copy_path": artifact_by_name[
             "provider_set_npi_prefix_overrides"
         ]["path"],
+        "provider_tax_identity_copy_path": artifact_by_name["provider_tax_identities"]["path"],
+        "provider_group_tax_identity_copy_path": artifact_by_name["provider_group_tax_identities"]["path"],
         "pattern_copy_path": None,
         "summary_path": str(output_directory / "v4-summary.json"),
     }
@@ -70,6 +72,10 @@ def _resource_fixture(
         "provider_set_key_map_bytes": 0,
         "factor_edge_count": factor_edges,
         "factor_owner_count": 0,
+        "tax_identity_merge_bitmap_upper_bound_bytes": 0,
+        "tax_identity_source_ordinal_upper_bound_bytes": 268,
+        "tax_identity_projection_upper_bound_bytes": 0,
+        "tax_identity_projection_bytes": 0,
         "estimated_peak_bytes": 0,
         "max_estimated_model_bytes": option_by_name["max_estimated_model_bytes"],
         "max_factor_edges": option_by_name["max_factor_edges"],
@@ -102,6 +108,7 @@ def _valid_summary_fixture(
         "observe": empty_observe_fixture(),
         "relation_summaries": empty_relation_fixture(),
         "heavy_bitmaps": [],
+        "tax_identity": empty_tax_identity_summary(),
         "output_artifacts": [
             artifact_by_name[name] for name in _OUTPUT_ARTIFACT_NAMES
         ],
@@ -169,54 +176,6 @@ def _header_mutations(
                 summary["direct_complete_encoded_bytes"] + 1,
             ),
             "adaptive-layout choice",
-        ),
-    )
-
-
-def _resource_mutations(
-    summary: dict[str, Any],
-    option_by_name: dict[str, int],
-) -> tuple[tuple[Any, str], ...]:
-    return (
-        (
-            _mutated(summary, ("resource_admission",), None),
-            "invalid resource admission",
-        ),
-        (
-            _mutated(
-                summary,
-                ("resource_admission", "input_factor_bytes"),
-                summary["resource_admission"]["input_factor_bytes"] + 1,
-            ),
-            "resource input byte count changed",
-        ),
-        (
-            _mutated(
-                summary,
-                ("resource_admission", "factor_edge_count"),
-                summary["resource_admission"]["factor_edge_count"] + 1,
-            ),
-            "resource factor edge count changed",
-        ),
-        (
-            _mutated(
-                summary,
-                ("resource_admission", "max_estimated_model_bytes"),
-                option_by_name["max_estimated_model_bytes"] + 1,
-            ),
-            "resource model byte limit changed",
-        ),
-        (
-            _mutated(
-                summary,
-                ("resource_admission", "max_factor_edges"),
-                option_by_name["max_factor_edges"] + 1,
-            ),
-            "resource factor edge limit changed",
-        ),
-        (
-            _mutated(summary, ("resource_admission", "formula"), None),
-            "admission formula is missing",
         ),
     )
 
@@ -412,7 +371,7 @@ def _summary_mutations(
 ) -> tuple[tuple[Any, str], ...]:
     return (
         *_header_mutations(summary, option_by_name),
-        *_resource_mutations(summary, option_by_name),
+        *resource_admission_mutations(summary, option_by_name),
         *_relation_mutations(summary),
         *_output_mutations(summary),
     )
@@ -422,13 +381,27 @@ def test_compiler_summary_authentication_branch_matrix(tmp_path: Path) -> None:
     output = tmp_path / "compiled"
     option_by_name = compiler._effective_compiler_options(None)
     summary = _valid_summary_fixture(output, option_by_name)
+    tax_identity = summary["tax_identity"]
     validation_arguments_by_name = {
         "output_directory": output,
         "expected_input_bytes": int(summary["input_byte_count"]),
         "expected_factor_edges": int(
             summary["resource_admission"]["factor_edge_count"]
         ),
+        "expected_factor_owners": int(
+            summary["resource_admission"]["factor_owner_count"]
+        ),
         "expected_options": option_by_name,
+        "expected_tax_identity": {
+            "token_policy_id": tax_identity["token_policy_id"],
+            "source_shard_ids": tuple(
+                source_entry["shard_id"]
+                for source_entry in tax_identity["source_ordinal_map"]
+            ),
+            "merge_bitmap_upper_bound_bytes": 0,
+            "source_ordinal_upper_bound_bytes": 268,
+            "projection_upper_bound_bytes": 0,
+        },
         "allow_checkpoint": False,
     }
 

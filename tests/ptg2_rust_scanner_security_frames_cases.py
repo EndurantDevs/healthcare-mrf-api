@@ -72,6 +72,10 @@ def test_compact_scanner_all_optional_paths_and_factor_frames(
         "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH"
         in observed_environment_by_name
     )
+    assert (
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH"
+        in observed_environment_by_name
+    )
 
 
 @pytest.mark.parametrize("attach_failure", [False, True])

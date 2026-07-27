@@ -44,7 +44,7 @@ from api.mrf_discovery_catalog import (
 from process.ptg_parts.ptg2_candidate_attestation import record_candidate_audit_attestation
 from process.ptg_parts.source_snapshot_control import (
     SourceSnapshotConflict,
-    build_ptg2_source_snapshot_remove_plan,
+    build_source_snapshot_remove_plan,
     promote_ptg2_source_snapshot,
     remove_ptg2_source_snapshot,
     retire_ptg2_source_snapshot,
@@ -259,7 +259,7 @@ async def control_ptg_source_snapshot_remove_plan(request):
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:
-        plan = await build_ptg2_source_snapshot_remove_plan(
+        plan = await build_source_snapshot_remove_plan(
             snapshot_id=str(payload.get("snapshot_id") or ""),
             source_key=str(payload.get("source_key") or "") or None,
         )

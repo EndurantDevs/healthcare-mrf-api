@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import struct
@@ -138,8 +139,46 @@ _ARTIFACT_FIELD_BY_NAME = {
     "provider_component_group": "provider_component_group",
     "provider_group_npi": "provider_group_npi",
     "provider_npi_group": "provider_npi_group",
+    "provider_group_tax_identity": "provider_group_tax_identity",
 }
+_REQUIRED_MEMBERSHIP_SHARD_FIELDS = frozenset(
+    {
+        "provider_set_component",
+        "provider_component_group",
+        "provider_group_npi",
+        "provider_npi_group",
+    }
+)
 _REQUIRED_SHARD_FIELDS = frozenset(_ARTIFACT_FIELD_BY_NAME.values())
+_TAX_IDENTITY_FIELD = "provider_group_tax_identity"
+_TAX_IDENTITY_FORMAT = "ptg2_provider_group_tax_identity_v1"
+_TAX_IDENTITY_VERSION = 1
+_TAX_IDENTITY_RECORD_BYTES = 65
+_TAX_IDENTITY_NORMALIZATION_CONTRACT = "ein_ascii_digits_or_2_7_hyphen_v1"
+_TAX_IDENTITY_HMAC_CONTRACT = "hmac_sha256_ptg_tin_v1"
+_TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT = (
+    "tin_id_128=first_16_bytes(tin_hmac_sha256)"
+)
+_TAX_IDENTITY_AUTHORITY_CONTRACT = (
+    "tin_hmac_sha256_full_32_bytes_authoritative"
+)
+_TAX_IDENTITY_PROJECTION_CONTRACT = "ptg2_provider_tax_identity_projection_v1"
+_TAX_SOURCE_ORDINAL_CONTRACT = "snapshot_shard_id_sorted_lsb0_bitmap_v1"
+_TAX_SOURCE_ORDINAL_FIXED_UPPER_BOUND_BYTES = 256
+_TAX_SOURCE_IDENTITY_COPY_UPPER_BOUND = 2
+_TAX_IDENTITY_GROUP_ENTRY_UPPER_BOUND_BYTES = 256
+_TAX_IDENTITY_DICTIONARY_ENTRY_UPPER_BOUND_BYTES = 128
+_TAX_POLICY_DESCRIPTOR_HASH_DOMAIN = b"PTG2V4TINPOLICY\x01"
+_TAX_SOURCE_ORDINAL_HASH_DOMAIN = b"PTG2V4TAXORD\x01"
+_TAX_POLICY_ID = re.compile(
+    r"ptg-tin-hmac-sha256-v1:[a-z0-9](?:[a-z0-9._-]{0,31})\Z"
+)
+_TAX_STATE_CODE_BY_NAME = {
+    "matched_ein": 1,
+    "missing": 2,
+    "malformed": 3,
+    "unsupported_type": 4,
+}
 _OUTPUT_FILE_BY_NAME = {
     "graph_blocks": ("v4-graph-blocks.copy", 10),
     "graph_references": ("v4-graph-references.jsonl", None),
@@ -150,6 +189,11 @@ _OUTPUT_FILE_BY_NAME = {
     "provider_set_npi_prefix_overrides": (
         "v4-provider-set-npi-prefix-overrides.copy",
         3,
+    ),
+    "provider_tax_identities": ("v4-provider-tax-identities.copy", 3),
+    "provider_group_tax_identities": (
+        "v4-provider-group-tax-identities.copy",
+        4,
     ),
     "patterns": ("v4-patterns.copy", 3),
 }
@@ -203,6 +247,8 @@ class V4GraphCompilationResult:
     npi_copy_path: Path
     provider_set_audit_npi_copy_path: Path
     provider_set_npi_prefix_override_copy_path: Path
+    provider_tax_identity_copy_path: Path
+    provider_group_tax_identity_copy_path: Path
     pattern_copy_path: Path | None
     selected_layout: str
     direct_complete_encoded_bytes: int
@@ -1031,6 +1077,138 @@ def _artifact_manifest(raw_entry: Mapping[str, Any]) -> tuple[dict[str, Any], in
     return {"path": str(path), "metadata": metadata}, byte_count
 
 
+def _validated_tax_identity_artifact_counts(
+    raw_entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate per-state scanner counts for one tax artifact."""
+
+    count_by_name = {
+        name: _strict_nonnegative_int(
+            raw_entry.get(name), label=f"tax input {name}"
+        )
+        for name in (
+            "row_count",
+            "provider_group_count",
+            "matched_ein_count",
+            "missing_count",
+            "malformed_count",
+            "unsupported_type_count",
+        )
+    }
+    state_count = sum(
+        count_by_name[name]
+        for name in (
+            "matched_ein_count",
+            "missing_count",
+            "malformed_count",
+            "unsupported_type_count",
+        )
+    )
+    if (
+        count_by_name["provider_group_count"] != count_by_name["row_count"]
+        or state_count != count_by_name["row_count"]
+    ):
+        raise RuntimeError("V4 provider tax identity counts are inconsistent")
+    return count_by_name
+
+
+def _validated_tax_identity_artifact_metadata(
+    raw_entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the authenticated metadata contract for one tax artifact."""
+
+    record_format = raw_entry.get("record_format")
+    token_policy_id = raw_entry.get("token_policy_id")
+    if (
+        record_format != _TAX_IDENTITY_FORMAT
+        or raw_entry.get("version") != _TAX_IDENTITY_VERSION
+        or raw_entry.get("record_bytes") != _TAX_IDENTITY_RECORD_BYTES
+        or raw_entry.get("normalization_contract")
+        != _TAX_IDENTITY_NORMALIZATION_CONTRACT
+        or raw_entry.get("hmac_contract") != _TAX_IDENTITY_HMAC_CONTRACT
+        or raw_entry.get("final") is not True
+        or not isinstance(token_policy_id, str)
+        or len(token_policy_id.encode("ascii", errors="ignore"))
+        != len(token_policy_id)
+        or len(token_policy_id.encode("ascii")) > 55
+        or _TAX_POLICY_ID.fullmatch(token_policy_id) is None
+    ):
+        raise RuntimeError("V4 provider tax identity artifact metadata is invalid")
+    digest = _strict_sha256(raw_entry.get("sha256"), label="tax input sha256")
+    byte_count = _strict_nonnegative_int(
+        raw_entry.get("byte_count"), label="tax input byte_count"
+    )
+    count_by_name = _validated_tax_identity_artifact_counts(raw_entry)
+    return {
+        "record_format": record_format,
+        "sha256": digest,
+        "byte_count": byte_count,
+        **count_by_name,
+        "version": _TAX_IDENTITY_VERSION,
+        "record_bytes": _TAX_IDENTITY_RECORD_BYTES,
+        "token_policy_id": token_policy_id,
+        "normalization_contract": _TAX_IDENTITY_NORMALIZATION_CONTRACT,
+        "hmac_contract": _TAX_IDENTITY_HMAC_CONTRACT,
+        "final": True,
+        "name": "provider_group_tax_identity",
+    }
+
+
+def _validate_tax_identity_artifact_file(
+    path: Path,
+    *,
+    metadata: Mapping[str, Any],
+) -> None:
+    """Authenticate fixed-record bytes against validated tax metadata."""
+
+    policy_bytes = str(metadata["token_policy_id"]).encode("ascii")
+    expected_bytes = 13 + len(policy_bytes) + (
+        int(metadata["row_count"]) * _TAX_IDENTITY_RECORD_BYTES
+    )
+    if (
+        metadata["byte_count"] != expected_bytes
+        or path.stat().st_size != metadata["byte_count"]
+        or _sha256_file(path) != metadata["sha256"]
+    ):
+        raise RuntimeError("V4 provider tax identity artifact authentication failed")
+    with path.open("rb") as artifact_file:
+        header = artifact_file.read(13 + len(policy_bytes))
+    if (
+        len(header) != 13 + len(policy_bytes)
+        or header[:8] != b"PTG2TAX1"
+        or int.from_bytes(header[8:10], "little") != _TAX_IDENTITY_VERSION
+        or int.from_bytes(header[10:12], "little")
+        != _TAX_IDENTITY_RECORD_BYTES
+        or header[12] != len(policy_bytes)
+        or header[13:] != policy_bytes
+    ):
+        raise RuntimeError("V4 provider tax identity artifact header is invalid")
+
+
+def _tax_identity_artifact_manifest(
+    raw_entry: Mapping[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """Authenticate one fixed-record scanner tax-identity artifact."""
+
+    path_text = raw_entry.get("path")
+    if not isinstance(path_text, str) or not path_text.strip():
+        raise RuntimeError("V4 provider tax identity artifact lacks a path")
+    path = Path(path_text).resolve()
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError(f"V4 provider tax identity artifact is unavailable: {path}")
+    metadata = _validated_tax_identity_artifact_metadata(raw_entry)
+    _validate_tax_identity_artifact_file(path, metadata=metadata)
+    for name in ("source_shard_id", "shard_id"):
+        metadata_value = raw_entry.get(name)
+        if metadata_value is not None:
+            if not isinstance(metadata_value, str):
+                raise RuntimeError(
+                    f"V4 provider tax identity artifact has invalid {name}"
+                )
+            metadata[name] = metadata_value
+    return {"path": str(path), "metadata": metadata}, int(metadata["byte_count"])
+
+
 def build_v4_graph_compiler_manifest(
     *,
     graph_artifact_entries: Iterable[Mapping[str, Any]],
@@ -1072,11 +1250,16 @@ def build_v4_graph_compiler_manifest(
             )
         shard_manifest_by_field: dict[str, Any] = {"shard_id": shard_id}
         for field_name in sorted(_REQUIRED_SHARD_FIELDS):
-            artifact, artifact_bytes = _artifact_manifest(fields[field_name])
+            artifact, artifact_bytes = (
+                _tax_identity_artifact_manifest(fields[field_name])
+                if field_name == _TAX_IDENTITY_FIELD
+                else _artifact_manifest(fields[field_name])
+            )
             shard_manifest_by_field[field_name] = artifact
             input_byte_count += artifact_bytes
         manifest_shards.append(shard_manifest_by_field)
 
+    _tax_manifest_expectation({"shards": manifest_shards})
     provider_map = Path(provider_set_key_map_path).resolve()
     if not provider_map.is_file() or provider_map.is_symlink() or provider_map.stat().st_size <= 0:
         raise RuntimeError("V4 graph compilation requires an authoritative provider-set map")
@@ -1106,10 +1289,13 @@ def _manifest_factor_counts(manifest: Mapping[str, Any]) -> tuple[int, int]:
     edges = 0
     owners = 0
     for shard in manifest["shards"]:
-        for field_name in sorted(_REQUIRED_SHARD_FIELDS):
+        for field_name in sorted(_REQUIRED_MEMBERSHIP_SHARD_FIELDS):
             metadata = shard[field_name]["metadata"]
             edges += int(metadata["member_count"])
             owners += int(metadata["owner_count"])
+        tax_metadata = shard[_TAX_IDENTITY_FIELD]["metadata"]
+        edges += int(tax_metadata["row_count"])
+        owners += int(tax_metadata["provider_group_count"])
     return edges, owners
 
 
@@ -1135,7 +1321,7 @@ def _checkpoint_binding(
 
 def _checkpoint_payload(
     *,
-    result: V4GraphCompilationResult,
+    compilation: V4GraphCompilationResult,
     binding_sha256: str,
     provider_map_sha256: str,
     options: Mapping[str, int],
@@ -1148,10 +1334,11 @@ def _checkpoint_payload(
         "binding_sha256": binding_sha256,
         "provider_set_key_map_sha256": provider_map_sha256,
         "options": dict(sorted(options.items())),
-        "summary_sha256": _sha256_file(result.summary_path),
-        "selected_layout": result.selected_layout,
-        "block_count": result.block_count,
-        "selected_encoded_bytes": result.selected_encoded_bytes,
+        "summary_sha256": _sha256_file(compilation.summary_path),
+        "selected_layout": compilation.selected_layout,
+        "block_count": compilation.block_count,
+        "selected_encoded_bytes": compilation.selected_encoded_bytes,
+        "tax_identity": compilation.summary["tax_identity"],
         "output_artifacts": [
             {
                 "name": artifact.name,
@@ -1159,7 +1346,7 @@ def _checkpoint_payload(
                 "sha256": artifact.sha256,
                 "row_count": artifact.row_count,
             }
-            for artifact in result.output_artifacts
+            for artifact in compilation.output_artifacts
         ],
     }
 
@@ -1210,6 +1397,10 @@ def _validate_checkpoint(
         validated_result.summary_path
     ):
         raise RuntimeError("V4 graph checkpoint changed summary bytes")
+    if checkpoint.get("tax_identity") != validated_result.summary.get(
+        "tax_identity"
+    ):
+        raise RuntimeError("V4 graph checkpoint changed tax identity binding")
     expected_artifacts = [
         {
             "name": artifact.name,
@@ -1362,7 +1553,11 @@ def _read_error_tail(path: Path) -> str:
 
 
 def _count_pg_binary_rows(
-    path: Path, *, expected_field_count: int, validate_shared_version: bool = False
+    path: Path,
+    *,
+    expected_field_count: int,
+    validate_shared_version: bool = False,
+    nullable_field_indices: frozenset[int] = frozenset(),
 ) -> int:
     row_count = 0
     with path.open("rb") as copy_file:
@@ -1385,7 +1580,11 @@ def _count_pg_binary_rows(
                     raise RuntimeError(f"V4 graph compiler output truncates COPY field: {path}")
                 field_bytes = struct.unpack(">i", length_bytes)[0]
                 if field_bytes < 0:
-                    raise RuntimeError(f"V4 graph compiler output contains NULL COPY field: {path}")
+                    if field_bytes == -1 and field_index in nullable_field_indices:
+                        continue
+                    raise RuntimeError(
+                        f"V4 graph compiler output contains invalid NULL COPY field: {path}"
+                    )
                 if validate_shared_version and field_index == 1:
                     if field_bytes != 2:
                         raise RuntimeError("V4 graph block has invalid format-version width")
@@ -1398,6 +1597,223 @@ def _count_pg_binary_rows(
                 if copy_file.tell() > path.stat().st_size:
                     raise RuntimeError(f"V4 graph compiler output truncates COPY field: {path}")
             row_count += 1
+
+
+def _iter_pg_binary_rows(
+    path: Path,
+    *,
+    expected_field_count: int,
+    nullable_field_indices: frozenset[int] = frozenset(),
+):
+    with path.open("rb") as copy_file:
+        if copy_file.read(len(_PG_COPY_HEADER)) != _PG_COPY_HEADER:
+            raise RuntimeError(f"V4 graph compiler output has invalid COPY header: {path}")
+        while True:
+            width = copy_file.read(2)
+            if len(width) != 2:
+                raise RuntimeError(f"V4 graph compiler output truncates COPY rows: {path}")
+            field_count = struct.unpack(">h", width)[0]
+            if field_count == -1:
+                if copy_file.read(1):
+                    raise RuntimeError(
+                        f"V4 graph compiler output has trailing COPY bytes: {path}"
+                    )
+                return
+            if field_count != expected_field_count:
+                raise RuntimeError(
+                    f"V4 graph compiler output has wrong COPY width: {path}"
+                )
+            fields: list[bytes | None] = []
+            for field_index in range(field_count):
+                width = copy_file.read(4)
+                if len(width) != 4:
+                    raise RuntimeError(
+                        f"V4 graph compiler output truncates COPY field: {path}"
+                    )
+                field_bytes = struct.unpack(">i", width)[0]
+                if field_bytes == -1 and field_index in nullable_field_indices:
+                    fields.append(None)
+                    continue
+                if field_bytes < 0:
+                    raise RuntimeError(
+                        f"V4 graph compiler output contains invalid NULL COPY field: {path}"
+                    )
+                field = copy_file.read(field_bytes)
+                if len(field) != field_bytes:
+                    raise RuntimeError(
+                        f"V4 graph compiler output truncates COPY field: {path}"
+                    )
+                fields.append(field)
+            yield tuple(fields)
+
+
+def _validate_tax_token_dictionary(
+    token_path: Path,
+    *,
+    token_count: int,
+    content_hasher: Any,
+) -> None:
+    """Validate dense full-HMAC dictionary rows and extend content binding."""
+
+    content_hasher.update(struct.pack(">Q", token_count))
+    previous_hmac: bytes | None = None
+    observed_tokens = 0
+    for copy_fields in _iter_pg_binary_rows(
+        token_path, expected_field_count=3
+    ):
+        key, candidate, full_hmac = copy_fields
+        if (
+            key is None
+            or candidate is None
+            or full_hmac is None
+            or len(key) != 4
+            or struct.unpack(">i", key)[0] != observed_tokens
+            or len(candidate) != 16
+            or len(full_hmac) != 32
+            or candidate != full_hmac[:16]
+            or (previous_hmac is not None and full_hmac <= previous_hmac)
+        ):
+            raise RuntimeError(
+                "V4 graph compiler tax identity dictionary is not canonical"
+            )
+        content_hasher.update(full_hmac)
+        previous_hmac = full_hmac
+        observed_tokens += 1
+    if observed_tokens != token_count:
+        raise RuntimeError("V4 graph compiler tax identity dictionary count changed")
+
+
+def _validated_tax_group_copy_fields(
+    copy_fields: tuple[bytes | None, ...],
+    *,
+    previous_group: bytes | None,
+    summary: Mapping[str, Any],
+) -> tuple[bytes, str, bytes | None, bytes]:
+    """Validate one canonical provider-group tax projection row."""
+
+    source_shard_count = int(summary["source_shard_count"])
+    source_bitmap_bytes = int(summary["source_bitmap_bytes"])
+    token_count = int(summary["tax_identity_count"])
+    group, state_bytes, key, bitmap = copy_fields
+    if group is None or state_bytes is None or bitmap is None:
+        raise RuntimeError(
+            "V4 graph compiler provider tax identity rows contain NULL fields"
+        )
+    try:
+        state = state_bytes.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            "V4 graph compiler tax identity state is invalid"
+        ) from exc
+    if (
+        len(group) != 16
+        or (previous_group is not None and group <= previous_group)
+        or state not in _TAX_STATE_CODE_BY_NAME
+        or len(bitmap) != source_bitmap_bytes
+        or not any(bitmap)
+    ):
+        raise RuntimeError(
+            "V4 graph compiler provider tax identity rows are not canonical"
+        )
+    valid_last_bits = source_shard_count % 8
+    if valid_last_bits and bitmap[-1] & ~((1 << valid_last_bits) - 1):
+        raise RuntimeError(
+            "V4 graph compiler tax identity bitmap has out-of-range bits"
+        )
+    if state == "matched_ein":
+        if (
+            key is None
+            or len(key) != 4
+            or not 0 <= struct.unpack(">i", key)[0] < token_count
+        ):
+            raise RuntimeError(
+                "V4 graph compiler matched tax identity key is invalid"
+            )
+    elif key is not None:
+        raise RuntimeError(
+            "V4 graph compiler unavailable tax identity has a key"
+        )
+    return group, state, key, bitmap
+
+
+def _validate_tax_group_projection(
+    group_path: Path,
+    *,
+    summary: Mapping[str, Any],
+    content_hasher: Any,
+) -> None:
+    """Validate group tax projection rows and extend content binding."""
+
+    group_count = int(summary["provider_group_count"])
+    content_hasher.update(struct.pack(">Q", group_count))
+    observed_groups = 0
+    previous_group: bytes | None = None
+    count_by_state = dict.fromkeys(_TAX_STATE_CODE_BY_NAME, 0)
+    for copy_fields in _iter_pg_binary_rows(
+        group_path,
+        expected_field_count=4,
+        nullable_field_indices=frozenset({2}),
+    ):
+        group, state, key, bitmap = _validated_tax_group_copy_fields(
+            copy_fields,
+            previous_group=previous_group,
+            summary=summary,
+        )
+        content_hasher.update(group)
+        content_hasher.update(bytes((_TAX_STATE_CODE_BY_NAME[state],)))
+        if key is None:
+            content_hasher.update(b"\0")
+        else:
+            content_hasher.update(b"\1")
+            content_hasher.update(key)
+        content_hasher.update(struct.pack(">I", len(bitmap)))
+        content_hasher.update(bitmap)
+        count_by_state[state] += 1
+        previous_group = group
+        observed_groups += 1
+    if (
+        observed_groups != group_count
+        or count_by_state["matched_ein"] != summary["matched_ein_count"]
+        or count_by_state["missing"] != summary["missing_count"]
+        or count_by_state["malformed"] != summary["malformed_count"]
+        or count_by_state["unsupported_type"]
+        != summary["unsupported_type_count"]
+    ):
+        raise RuntimeError(
+            "V4 graph compiler tax identity content binding changed"
+        )
+
+
+def _validate_tax_identity_copy_outputs(
+    *,
+    token_path: Path,
+    group_path: Path,
+    summary: Mapping[str, Any],
+) -> None:
+    """Independently authenticate both tax COPY outputs against the summary."""
+
+    content_hasher = hashlib.sha256()
+    content_hasher.update(b"PTG2V4TAXCONTENT\x01")
+    content_hasher.update(
+        bytes.fromhex(str(summary["token_policy_descriptor_sha256"]))
+    )
+    content_hasher.update(
+        bytes.fromhex(str(summary["source_ordinal_map_digest"]))
+    )
+    _validate_tax_token_dictionary(
+        token_path,
+        token_count=int(summary["tax_identity_count"]),
+        content_hasher=content_hasher,
+    )
+    _validate_tax_group_projection(
+        group_path,
+        summary=summary,
+        content_hasher=content_hasher,
+    )
+    if content_hasher.hexdigest() != summary["content_digest"]:
+        raise RuntimeError(
+            "V4 graph compiler tax identity content binding changed"
+        )
 
 
 def _read_prefix_override_metadata(
@@ -1492,6 +1908,227 @@ def _validate_reference_manifest(path: Path, expected_rows: int) -> None:
         raise RuntimeError("V4 graph reference row count disagrees with summary")
 
 
+def _length_prefixed_sha256(domain: bytes, fields: Iterable[bytes]) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(domain)
+    for field in fields:
+        hasher.update(struct.pack(">I", len(field)))
+        hasher.update(field)
+    return hasher.hexdigest()
+
+
+def _tax_policy_descriptor_sha256(token_policy_id: str) -> str:
+    return _length_prefixed_sha256(
+        _TAX_POLICY_DESCRIPTOR_HASH_DOMAIN,
+        (
+            token_policy_id.encode("ascii"),
+            _TAX_IDENTITY_NORMALIZATION_CONTRACT.encode("ascii"),
+            _TAX_IDENTITY_HMAC_CONTRACT.encode("ascii"),
+            _TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT.encode("ascii"),
+            _TAX_IDENTITY_AUTHORITY_CONTRACT.encode("ascii"),
+        ),
+    )
+
+
+def _tax_source_ordinal_digest(source_shard_ids: Iterable[str]) -> str:
+    source_ids = tuple(source_shard_ids)
+    hasher = hashlib.sha256()
+    hasher.update(_TAX_SOURCE_ORDINAL_HASH_DOMAIN)
+    hasher.update(struct.pack(">I", len(source_ids)))
+    for ordinal, shard_id in enumerate(source_ids):
+        encoded = shard_id.encode("utf-8")
+        hasher.update(struct.pack(">I", len(encoded)))
+        hasher.update(encoded)
+        hasher.update(struct.pack(">I", ordinal))
+    return hasher.hexdigest()
+
+
+def _tax_manifest_expectation(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    source_shard_ids = tuple(str(shard["shard_id"]) for shard in manifest["shards"])
+    if not source_shard_ids or tuple(sorted(source_shard_ids)) != source_shard_ids:
+        raise RuntimeError("V4 tax identity shard order is not canonical")
+    policies = {
+        str(shard[_TAX_IDENTITY_FIELD]["metadata"]["token_policy_id"])
+        for shard in manifest["shards"]
+    }
+    if len(policies) != 1:
+        raise RuntimeError("V4 provider tax identity token policy differs across shards")
+    source_bitmap_bytes = (len(source_shard_ids) + 7) // 8
+    group_occurrence_count = sum(
+        int(shard[_TAX_IDENTITY_FIELD]["metadata"]["provider_group_count"])
+        for shard in manifest["shards"]
+    )
+    matched_ein_occurrence_count = sum(
+        int(shard[_TAX_IDENTITY_FIELD]["metadata"]["matched_ein_count"])
+        for shard in manifest["shards"]
+    )
+    return {
+        "token_policy_id": policies.pop(),
+        "source_shard_ids": source_shard_ids,
+        "merge_bitmap_upper_bound_bytes": (
+            group_occurrence_count * source_bitmap_bytes
+        ),
+        "source_ordinal_upper_bound_bytes": (
+            len(source_shard_ids) * _TAX_SOURCE_ORDINAL_FIXED_UPPER_BOUND_BYTES
+            + sum(
+                len(shard_id.encode("utf-8"))
+                * _TAX_SOURCE_IDENTITY_COPY_UPPER_BOUND
+                for shard_id in source_shard_ids
+            )
+        ),
+        "projection_upper_bound_bytes": (
+            group_occurrence_count
+            * (_TAX_IDENTITY_GROUP_ENTRY_UPPER_BOUND_BYTES + source_bitmap_bytes)
+            + matched_ein_occurrence_count
+            * _TAX_IDENTITY_DICTIONARY_ENTRY_UPPER_BOUND_BYTES
+        ),
+    }
+
+
+def _validate_tax_summary_contract(raw: Mapping[str, Any]) -> str:
+    """Validate immutable tax projection contract fields."""
+
+    expected_fields = {
+        "contract",
+        "token_policy_id",
+        "token_policy_descriptor_sha256",
+        "normalization_contract",
+        "hmac_contract",
+        "candidate_prefix_contract",
+        "authority_contract",
+        "source_ordinal_contract",
+        "source_ordinal_map",
+        "source_ordinal_map_digest",
+        "source_shard_count",
+        "source_bitmap_bytes",
+        "provider_group_count",
+        "tax_identity_count",
+        "matched_ein_count",
+        "missing_count",
+        "malformed_count",
+        "unsupported_type_count",
+        "content_digest",
+    }
+    if set(raw) != expected_fields:
+        raise RuntimeError("V4 graph compiler tax identity summary shape changed")
+    token_policy_id = raw.get("token_policy_id")
+    if (
+        raw.get("contract") != _TAX_IDENTITY_PROJECTION_CONTRACT
+        or not isinstance(token_policy_id, str)
+        or len(token_policy_id.encode("ascii", errors="ignore"))
+        != len(token_policy_id)
+        or len(token_policy_id.encode("ascii")) > 55
+        or _TAX_POLICY_ID.fullmatch(token_policy_id) is None
+        or raw.get("normalization_contract")
+        != _TAX_IDENTITY_NORMALIZATION_CONTRACT
+        or raw.get("hmac_contract") != _TAX_IDENTITY_HMAC_CONTRACT
+        or raw.get("candidate_prefix_contract")
+        != _TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT
+        or raw.get("authority_contract") != _TAX_IDENTITY_AUTHORITY_CONTRACT
+        or raw.get("source_ordinal_contract") != _TAX_SOURCE_ORDINAL_CONTRACT
+        or raw.get("token_policy_descriptor_sha256")
+        != _tax_policy_descriptor_sha256(token_policy_id)
+    ):
+        raise RuntimeError("V4 graph compiler tax identity contract changed")
+    return token_policy_id
+
+
+def _validate_tax_source_binding(
+    raw: Mapping[str, Any],
+    *,
+    token_policy_id: str,
+    expected: Mapping[str, Any] | None,
+) -> None:
+    """Validate deterministic source ordinals and optional input binding."""
+
+    source_ordinal_map = raw.get("source_ordinal_map")
+    if not isinstance(source_ordinal_map, list) or not source_ordinal_map:
+        raise RuntimeError("V4 graph compiler tax identity source map is invalid")
+    source_shard_ids: list[str] = []
+    for ordinal, entry in enumerate(source_ordinal_map):
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"shard_id", "ordinal"}
+            or entry.get("ordinal") != ordinal
+            or not isinstance(entry.get("shard_id"), str)
+            or not entry["shard_id"]
+        ):
+            raise RuntimeError("V4 graph compiler tax identity source map is invalid")
+        source_shard_ids.append(entry["shard_id"])
+    if source_shard_ids != sorted(set(source_shard_ids)):
+        raise RuntimeError("V4 graph compiler tax identity source map is not canonical")
+    source_shard_count = _strict_nonnegative_int(
+        raw.get("source_shard_count"), label="tax source_shard_count"
+    )
+    source_bitmap_bytes = _strict_nonnegative_int(
+        raw.get("source_bitmap_bytes"), label="tax source_bitmap_bytes"
+    )
+    if (
+        source_shard_count != len(source_shard_ids)
+        or source_bitmap_bytes != (source_shard_count + 7) // 8
+        or raw.get("source_ordinal_map_digest")
+        != _tax_source_ordinal_digest(source_shard_ids)
+    ):
+        raise RuntimeError("V4 graph compiler tax identity source binding changed")
+    if expected is not None and (
+        token_policy_id != expected.get("token_policy_id")
+        or tuple(source_shard_ids) != tuple(expected.get("source_shard_ids") or ())
+    ):
+        raise RuntimeError("V4 graph compiler tax identity input binding changed")
+
+
+def _validate_tax_summary_counts(raw: Mapping[str, Any]) -> None:
+    """Validate state totals and both authenticated summary digests."""
+
+    count_by_name = {
+        name: _strict_nonnegative_int(raw.get(name), label=f"tax {name}")
+        for name in (
+            "provider_group_count",
+            "tax_identity_count",
+            "matched_ein_count",
+            "missing_count",
+            "malformed_count",
+            "unsupported_type_count",
+        )
+    }
+    if (
+        sum(
+            count_by_name[name]
+            for name in (
+                "matched_ein_count",
+                "missing_count",
+                "malformed_count",
+                "unsupported_type_count",
+            )
+        )
+        != count_by_name["provider_group_count"]
+        or count_by_name["tax_identity_count"]
+        > count_by_name["matched_ein_count"]
+    ):
+        raise RuntimeError("V4 graph compiler tax identity counts are inconsistent")
+    _strict_sha256(raw.get("source_ordinal_map_digest"), label="tax source map digest")
+    _strict_sha256(raw.get("content_digest"), label="tax content digest")
+
+
+def _validate_tax_identity_summary(
+    raw: Any,
+    *,
+    expected: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Authenticate tax summary shape, contracts, counts, and input binding."""
+
+    if not isinstance(raw, dict):
+        raise RuntimeError("V4 graph compiler has invalid tax identity summary")
+    token_policy_id = _validate_tax_summary_contract(raw)
+    _validate_tax_source_binding(
+        raw,
+        token_policy_id=token_policy_id,
+        expected=expected,
+    )
+    _validate_tax_summary_counts(raw)
+    return dict(raw)
+
+
 def _normalized_observe_value(name: str, observed_value: Any) -> Any:
     optional_key_fields = {
         "npi_prefix_worst_provider_set_key",
@@ -1537,7 +2174,9 @@ def _validate_compiler_summary(
     output_directory: Path,
     expected_input_bytes: int,
     expected_factor_edges: int,
+    expected_factor_owners: int,
     expected_options: Mapping[str, int],
+    expected_tax_identity: Mapping[str, Any] | None = None,
     allow_checkpoint: bool = False,
 ) -> V4GraphCompilationResult:
     """Authenticate compiler geometry, outputs, and admission evidence."""
@@ -1567,6 +2206,10 @@ def _validate_compiler_summary(
     block_count = _strict_nonnegative_int(summary.get("block_count"), label="block_count")
     observe_raw = summary.get("observe")
     observe_by_name = _normalize_observe_counters(observe_raw)
+    tax_identity_by_name = _validate_tax_identity_summary(
+        summary.get("tax_identity"),
+        expected=expected_tax_identity,
+    )
     max_set_patterns_per_set = _strict_nonnegative_int(
         summary.get("max_set_patterns_per_set"),
         label="max_set_patterns_per_set",
@@ -1684,6 +2327,10 @@ def _validate_compiler_summary(
         "provider_set_key_map_bytes",
         "factor_edge_count",
         "factor_owner_count",
+        "tax_identity_merge_bitmap_upper_bound_bytes",
+        "tax_identity_source_ordinal_upper_bound_bytes",
+        "tax_identity_projection_upper_bound_bytes",
+        "tax_identity_projection_bytes",
         "estimated_peak_bytes",
         "max_estimated_model_bytes",
         "max_factor_edges",
@@ -1695,6 +2342,20 @@ def _validate_compiler_summary(
         raise RuntimeError("V4 graph resource input byte count changed")
     if resource_admission_by_name["factor_edge_count"] != expected_factor_edges:
         raise RuntimeError("V4 graph resource factor edge count changed")
+    if resource_admission_by_name["factor_owner_count"] != expected_factor_owners:
+        raise RuntimeError("V4 graph resource factor owner count changed")
+    if expected_tax_identity is None or resource_admission_by_name[
+        "tax_identity_merge_bitmap_upper_bound_bytes"
+    ] != expected_tax_identity["merge_bitmap_upper_bound_bytes"]:
+        raise RuntimeError("V4 graph tax identity merge bitmap admission changed")
+    if resource_admission_by_name[
+        "tax_identity_source_ordinal_upper_bound_bytes"
+    ] != expected_tax_identity["source_ordinal_upper_bound_bytes"]:
+        raise RuntimeError("V4 graph tax identity source ordinal admission changed")
+    if resource_admission_by_name[
+        "tax_identity_projection_upper_bound_bytes"
+    ] != expected_tax_identity["projection_upper_bound_bytes"]:
+        raise RuntimeError("V4 graph tax identity projection admission changed")
     if resource_admission_by_name[
         "max_estimated_model_bytes"
     ] != expected_options.get(
@@ -1849,6 +2510,10 @@ def _validate_compiler_summary(
         / "v4-provider-set-audit-npi.copy",
         "provider_set_npi_prefix_override_copy_path": output_directory
         / "v4-provider-set-npi-prefix-overrides.copy",
+        "provider_tax_identity_copy_path": output_directory
+        / "v4-provider-tax-identities.copy",
+        "provider_group_tax_identity_copy_path": output_directory
+        / "v4-provider-group-tax-identities.copy",
         "summary_path": output_directory / "v4-summary.json",
     }
     path_by_field = {
@@ -1889,6 +2554,11 @@ def _validate_compiler_summary(
                 path,
                 expected_field_count=field_count,
                 validate_shared_version=name == "graph_blocks",
+                nullable_field_indices=(
+                    frozenset({2})
+                    if name == "provider_group_tax_identities"
+                    else frozenset()
+                ),
             )
             if observed_rows != row_count:
                 raise RuntimeError(f"V4 graph compiler COPY row count changed: {path}")
@@ -1903,6 +2573,8 @@ def _validate_compiler_summary(
         "npi_scope",
         "provider_set_audit_npi",
         "provider_set_npi_prefix_overrides",
+        "provider_tax_identities",
+        "provider_group_tax_identities",
     }
     if selected_layout == "pattern":
         expected_artifact_names.add("patterns")
@@ -1926,11 +2598,28 @@ def _validate_compiler_summary(
         "provider_set_npi_prefix_overrides": observe_by_name.get(
             "npi_prefix_override_owner_count"
         ),
+        "provider_tax_identities": tax_identity_by_name.get(
+            "tax_identity_count"
+        ),
+        "provider_group_tax_identities": tax_identity_by_name.get(
+            "provider_group_count"
+        ),
         "patterns": observe_by_name.get("pattern_count"),
     }
+    if tax_identity_by_name["provider_group_count"] != observe_by_name.get(
+        "group_count"
+    ):
+        raise RuntimeError(
+            "V4 graph provider tax identity group count disagrees with graph"
+        )
     for name, expected_rows in expected_dictionary_rows.items():
         if name in artifact_by_name and artifact_by_name[name].row_count != expected_rows:
             raise RuntimeError(f"V4 graph {name} row count disagrees with observe counters")
+    _validate_tax_identity_copy_outputs(
+        token_path=path_by_field["provider_tax_identity_copy_path"],
+        group_path=path_by_field["provider_group_tax_identity_copy_path"],
+        summary=tax_identity_by_name,
+    )
     prefix_metadata = _read_prefix_override_metadata(
         path_by_field["provider_set_npi_prefix_override_copy_path"],
         prefix_target=int(expected_options["npi_prefix_target"]),
@@ -1985,6 +2674,12 @@ def _validate_compiler_summary(
         ],
         provider_set_npi_prefix_override_copy_path=path_by_field[
             "provider_set_npi_prefix_override_copy_path"
+        ],
+        provider_tax_identity_copy_path=path_by_field[
+            "provider_tax_identity_copy_path"
+        ],
+        provider_group_tax_identity_copy_path=path_by_field[
+            "provider_group_tax_identity_copy_path"
         ],
         pattern_copy_path=pattern_copy_path,
         selected_layout=selected_layout,
@@ -2054,6 +2749,7 @@ async def compile_provider_graph_v4_rust(
         options=effective_options,
     )
     expected_factor_edges, expected_factor_owners = _manifest_factor_counts(manifest)
+    expected_tax_identity = _tax_manifest_expectation(manifest)
     manifest_bytes = _canonical_json_bytes(manifest)
     provider_map = Path(manifest["provider_set_key_map_path"])
     binding_sha256, provider_map_sha256 = _checkpoint_binding(
@@ -2088,7 +2784,9 @@ async def compile_provider_graph_v4_rust(
                 output_directory=output,
                 expected_input_bytes=expected_input_bytes,
                 expected_factor_edges=expected_factor_edges,
+                expected_factor_owners=expected_factor_owners,
                 expected_options=effective_options,
+                expected_tax_identity=expected_tax_identity,
                 allow_checkpoint=True,
             )
             _validate_checkpoint(
@@ -2269,10 +2967,12 @@ async def compile_provider_graph_v4_rust(
             output_directory=output,
             expected_input_bytes=expected_input_bytes,
             expected_factor_edges=expected_factor_edges,
+            expected_factor_owners=expected_factor_owners,
             expected_options=effective_options,
+            expected_tax_identity=expected_tax_identity,
         )
         checkpoint = _checkpoint_payload(
-            result=compilation_result,
+            compilation=compilation_result,
             binding_sha256=binding_sha256,
             provider_map_sha256=provider_map_sha256,
             options=effective_options,

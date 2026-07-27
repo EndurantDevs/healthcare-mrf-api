@@ -21,6 +21,10 @@ from process.ptg_parts.source_pointers import (
     PTG2SourcePointerConflict,
     activate_ptg2_source_candidate,
 )
+from process.ptg_parts.source_snapshot_control_results import (
+    executed_empty_remove_plan as _executed_empty_remove_plan,
+    missing_snapshot_remove_plan as _missing_snapshot_remove_plan,
+)
 
 
 class SourceSnapshotConflict(ValueError):
@@ -165,7 +169,7 @@ async def promote_ptg2_source_snapshot(
     return result
 
 
-async def build_ptg2_source_snapshot_remove_plan(
+async def build_source_snapshot_remove_plan(
     *,
     snapshot_id: str,
     source_key: str | None = None,
@@ -178,16 +182,7 @@ async def build_ptg2_source_snapshot_remove_plan(
     schema = _schema_name()
     snapshot = await _snapshot_row(schema, snapshot_id)
     if not snapshot:
-        return {
-            "snapshot_id": snapshot_id,
-            "source_key": source_key,
-            "exists": False,
-            "removable": True,
-            "metadata_only": True,
-            "tables": [],
-            "artifact_manifest_ids": [],
-            "current_references": {},
-        }
+        return _missing_snapshot_remove_plan(snapshot_id, source_key)
     manifest = _manifest_dict(snapshot.get("manifest"))
     serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
     if not is_strict_ptg2_v3_shared_blocks_manifest(serving_index):
@@ -238,20 +233,14 @@ async def remove_ptg2_source_snapshot(
     schema = _schema_name()
     async with db.transaction() as session:
         await _lock_source_pointer_gc(session)
-        plan = await build_ptg2_source_snapshot_remove_plan(snapshot_id=snapshot_id, source_key=source_key)
+        plan = await build_source_snapshot_remove_plan(
+            snapshot_id=snapshot_id,
+            source_key=source_key,
+        )
         if not plan.get("removable"):
             raise ValueError(str(plan.get("reason") or "snapshot is not removable"))
         if not plan.get("exists"):
-            return {
-                **plan,
-                "executed": True,
-                "deleted_tables": 0,
-                "deleted_v3_snapshot_scopes": 0,
-                "deleted_v3_snapshot_bindings": 0,
-                "deleted_artifact_manifests": 0,
-                "deleted_snapshots": 0,
-                "released_shared_layouts": 0,
-            }
+            return _executed_empty_remove_plan(plan)
         tables: list[str] = []
         deleted_v3_snapshot_scopes = await db.status(
             f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_scope WHERE snapshot_id = :snapshot_id",
