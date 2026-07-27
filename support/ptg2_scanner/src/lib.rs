@@ -15,6 +15,7 @@ pub mod provider_directory_projection;
 pub mod provider_graph_v4;
 pub mod rate_schedule_observe;
 pub mod shared_graph;
+pub mod tax_identity;
 pub mod uhc_retained;
 pub mod v3_dense;
 pub mod v3_runs;

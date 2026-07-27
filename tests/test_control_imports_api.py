@@ -3660,7 +3660,11 @@ async def test_control_ptg_source_snapshot_remove_plan_endpoint(monkeypatch):
         calls.append(kwargs)
         return {"snapshot_id": kwargs["snapshot_id"], "source_key": kwargs["source_key"], "removable": True}
 
-    monkeypatch.setattr(control, "build_ptg2_source_snapshot_remove_plan", fake_remove_plan)
+    monkeypatch.setattr(
+        control,
+        "build_source_snapshot_remove_plan",
+        fake_remove_plan,
+    )
 
     response = await control.control_ptg_source_snapshot_remove_plan(
         authed_request(json={"snapshot_id": "snap_old", "source_key": "source_a"})

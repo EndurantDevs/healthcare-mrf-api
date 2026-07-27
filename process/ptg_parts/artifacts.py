@@ -304,6 +304,27 @@ def _valid_raw_sha256(candidate: dict[str, Any]) -> str | None:
     return raw_sha256.lower()
 
 
+def _has_retained_raw_file(
+    candidate: dict[str, Any],
+    store: PTG2ArtifactStore | None,
+) -> bool:
+    if store is None:
+        return True
+    raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
+    return bool(raw_uri and store.path_from_uri(raw_uri).exists())
+
+
+def _has_matching_content_length(
+    candidate: dict[str, Any],
+    head: PTG2HeadMetadata,
+) -> bool:
+    return (
+        head.content_length is not None
+        and candidate.get("content_length") is not None
+        and int(candidate["content_length"]) == int(head.content_length)
+    )
+
+
 def choose_reusable_raw_artifact(
     candidates: list[dict[str, Any]],
     head: PTG2HeadMetadata | None,
@@ -320,38 +341,23 @@ def choose_reusable_raw_artifact(
     if not candidates:
         return None, None
 
-    def has_raw_file(candidate: dict[str, Any]) -> bool:
-        """Return whether a candidate's retained raw file exists."""
-        if store is None:
-            return True
-        raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
-        if not raw_uri:
-            return False
-        return store.path_from_uri(raw_uri).exists()
-
     if head is not None:
         for candidate in reversed(candidates):
-            has_same_length = (
-                head.content_length is not None
-                and candidate.get("content_length") is not None
-                and int(candidate["content_length"]) == int(head.content_length)
-            )
             if (
-                has_same_length
+                _has_matching_content_length(candidate, head)
                 and _is_strong_etag(head.etag)
                 and candidate.get("etag") == head.etag
-                and has_raw_file(candidate)
+                and _has_retained_raw_file(candidate, store)
             ):
                 return candidate, "strong_etag_length"
         if reuse_policy in {"metadata", "metadata_or_hash"}:
             for candidate in reversed(candidates):
-                has_same_length = (
-                    head.content_length is not None
-                    and candidate.get("content_length") is not None
-                    and int(candidate["content_length"]) == int(head.content_length)
-                )
                 same_modified = bool(head.last_modified and candidate.get("last_modified") == head.last_modified)
-                if has_same_length and same_modified and has_raw_file(candidate):
+                if (
+                    _has_matching_content_length(candidate, head)
+                    and same_modified
+                    and _has_retained_raw_file(candidate, store)
+                ):
                     return candidate, "length_last_modified"
     if store is not None and reuse_policy in {"hash", "metadata_or_hash"}:
         for candidate in reversed(candidates):

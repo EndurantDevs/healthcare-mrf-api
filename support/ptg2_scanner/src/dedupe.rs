@@ -4,6 +4,7 @@ use crate::hashing::{
     provider_set_component_key, provider_set_entry_key, shard_for_u128, shard_for_u64,
 };
 use crate::manifest::GlobalId128;
+use crate::tax_identity::{TaxIdentityObservation, TinTokenPolicy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -59,6 +60,72 @@ impl ShardedDedupe128 {
 struct DedupeCounter {
     attempted: AtomicU64,
     unique: AtomicU64,
+}
+
+struct ShardedProviderGroupTaxIdentity {
+    policy: TinTokenPolicy,
+    shards: Vec<Mutex<HashMap<u64, TaxIdentityObservation>>>,
+}
+
+const PROVIDER_GROUP_TAX_IDENTITY_SHARDS: usize = 256;
+
+impl ShardedProviderGroupTaxIdentity {
+    fn new(policy: TinTokenPolicy) -> Self {
+        Self {
+            policy,
+            shards: (0..PROVIDER_GROUP_TAX_IDENTITY_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn record(&self, group_hash: i64, tin: Option<&Value>) -> io::Result<()> {
+        let key = group_hash as u64;
+        let group_id = provider_group_global_id_from_hash(group_hash);
+        let shard_index = usize::from(group_id.0[0]);
+        let mut shard = self.shards[shard_index]
+            .lock()
+            .map_err(|_| io::Error::other("provider tax identity lock poisoned"))?;
+        let observation = self.policy.observe(tin);
+        match shard.get_mut(&key) {
+            Some(current) => *current = current.merge(observation)?,
+            None => {
+                shard.insert(key, observation);
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_sorted(
+        &self,
+        mut visitor: impl FnMut(i64, TaxIdentityObservation) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for shard in &self.shards {
+            let mut rows = shard
+                .lock()
+                .map_err(|_| io::Error::other("provider tax identity lock poisoned"))?
+                .iter()
+                .map(|(group_hash, observation)| {
+                    let signed_hash = *group_hash as i64;
+                    (
+                        provider_group_global_id_from_hash(signed_hash),
+                        signed_hash,
+                        *observation,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable_by_key(|(group_id, _group_hash, _observation)| *group_id);
+            for (_group_id, group_hash, observation) in rows {
+                visitor(group_hash, observation)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn provider_group_global_id_from_hash(provider_group_hash: i64) -> GlobalId128 {
+    let hash_text = provider_group_hash.to_string();
+    GlobalId128::from_parts("provider_group_manifest", &[&hash_text])
 }
 
 const PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT: &str = "ptg2_provider_identifier_quarantine_v1";
@@ -202,6 +269,7 @@ pub struct SharedDedupe {
     provider_set_entry: ShardedDedupe128,
     provider_entry_component: Option<ShardedDedupe128>,
     provider_group: ShardedDedupe64,
+    provider_group_tax_identity: Option<ShardedProviderGroupTaxIdentity>,
     provider_group_member: ShardedDedupe128,
     dedupe_high_cardinality_entries: bool,
     serving_rate_counter: DedupeCounter,
@@ -228,6 +296,26 @@ impl SharedDedupe {
         worker_count: usize,
         serving_rate_dedupe_enabled: bool,
     ) -> Self {
+        Self::new_with_optional_tax_identity(worker_count, serving_rate_dedupe_enabled, None)
+    }
+
+    pub fn new_with_v4_tax_identity(
+        worker_count: usize,
+        serving_rate_dedupe_enabled: bool,
+        policy: TinTokenPolicy,
+    ) -> Self {
+        Self::new_with_optional_tax_identity(
+            worker_count,
+            serving_rate_dedupe_enabled,
+            Some(policy),
+        )
+    }
+
+    fn new_with_optional_tax_identity(
+        worker_count: usize,
+        serving_rate_dedupe_enabled: bool,
+        policy: Option<TinTokenPolicy>,
+    ) -> Self {
         let shard_count = (worker_count.max(1) * 4).max(16);
         let dedupe_high_cardinality_entries =
             env_bool("HLTHPRT_PTG2_RUST_DEDUPE_HIGH_CARDINALITY_ENTRIES", false);
@@ -245,6 +333,7 @@ impl SharedDedupe {
             provider_entry_component: dedupe_high_cardinality_entries
                 .then(|| ShardedDedupe128::new(shard_count)),
             provider_group: ShardedDedupe64::new(shard_count),
+            provider_group_tax_identity: policy.map(ShardedProviderGroupTaxIdentity::new),
             provider_group_member: ShardedDedupe128::new(shard_count),
             dedupe_high_cardinality_entries,
             serving_rate_counter: DedupeCounter::new(),
@@ -381,6 +470,40 @@ impl SharedDedupe {
         let inserted = self.provider_group.insert(group_hash as u64);
         self.provider_group_counter.record(inserted);
         inserted
+    }
+
+    pub fn insert_provider_group_with_tax_identity(
+        &self,
+        group_hash: i64,
+        tin: Option<&Value>,
+    ) -> io::Result<bool> {
+        let inserted = self.provider_group.insert(group_hash as u64);
+        self.provider_group_counter.record(inserted);
+        self.provider_group_tax_identity
+            .as_ref()
+            .ok_or_else(|| io::Error::other("provider tax identity output is not configured"))?
+            .record(group_hash, tin)?;
+        Ok(inserted)
+    }
+
+    pub fn provider_group_tax_identity_policy_id(&self) -> Option<&str> {
+        self.provider_group_tax_identity
+            .as_ref()
+            .map(|identity| identity.policy.policy_id())
+    }
+
+    pub fn visit_provider_group_tax_identities(
+        &self,
+        visitor: impl FnMut(i64, TaxIdentityObservation) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.provider_group_tax_identity
+            .as_ref()
+            .ok_or_else(|| io::Error::other("provider tax identity output is not configured"))?
+            .visit_sorted(visitor)
+    }
+
+    pub fn unique_provider_group_count(&self) -> u64 {
+        self.provider_group_counter.snapshot().1
     }
 
     pub fn record_cached_provider_group_attempts(&self, count: u64) {
@@ -566,9 +689,10 @@ pub fn emit_dedupe_summary(dedupe: &SharedDedupe, object_counts: &HashMap<String
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_summary_payload, SharedDedupe};
+    use super::{dedupe_summary_payload, emit_dedupe_summary, SharedDedupe};
     use crate::manifest::GlobalId128;
-    use serde_json::Value;
+    use crate::tax_identity::{TaxIdentityState, TinTokenPolicy};
+    use serde_json::{json, Value};
     use std::collections::HashMap;
 
     #[test]
@@ -643,5 +767,84 @@ mod tests {
         assert_eq!(payload["price_atom_unique"], 2);
         assert_eq!(payload["price_set_attempted"], 3);
         assert_eq!(payload["price_set_unique"], 2);
+    }
+
+    #[test]
+    fn v4_tax_identity_dedupe_preserves_every_group_and_state() {
+        let policy =
+            TinTokenPolicy::from_secret("ptg-tin-hmac-sha256-v1:coverage".to_string(), [7; 32])
+                .unwrap();
+        let dedupe = SharedDedupe::new_with_v4_tax_identity(2, false, policy);
+        assert_eq!(
+            dedupe.provider_group_tax_identity_policy_id(),
+            Some("ptg-tin-hmac-sha256-v1:coverage")
+        );
+        let matched = json!({"type": "ein", "value": "12-3456789"});
+        let malformed = json!({"type": "ein", "value": "12 3456789"});
+        assert!(dedupe
+            .insert_provider_group_with_tax_identity(20, Some(&matched))
+            .unwrap());
+        assert!(!dedupe
+            .insert_provider_group_with_tax_identity(20, Some(&matched))
+            .unwrap());
+        assert!(dedupe
+            .insert_provider_group_with_tax_identity(-1, Some(&malformed))
+            .unwrap());
+        assert!(dedupe
+            .insert_provider_group_with_tax_identity(5, None)
+            .unwrap());
+
+        let mut rows = Vec::new();
+        dedupe
+            .visit_provider_group_tax_identities(|group_hash, observation| {
+                rows.push((group_hash, observation));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|(group_hash, observation)| {
+            *group_hash == 20
+                && observation.state == TaxIdentityState::MatchedEin
+                && observation.tin_hmac_sha256.is_some()
+        }));
+        assert!(rows.iter().any(|(group_hash, observation)| {
+            *group_hash == -1 && observation.state == TaxIdentityState::Malformed
+        }));
+        assert_eq!(dedupe.unique_provider_group_count(), 3);
+        dedupe.record_cached_provider_group_attempts(4);
+        dedupe.record_empty_npi_tin_only_normalizations(2);
+        assert_eq!(dedupe.empty_npi_tin_only_normalization_count(), 2);
+    }
+
+    #[test]
+    fn v4_projection_dedupe_and_quarantine_metrics_are_exact() {
+        let dedupe = SharedDedupe::new(1);
+        let first = GlobalId128([1; 16]);
+        let second = GlobalId128([2; 16]);
+        assert!(dedupe.insert_procedure("CPT:70553"));
+        assert!(!dedupe.insert_procedure("CPT:70553"));
+        assert!(dedupe.insert_price_code_set("11,12"));
+        assert!(!dedupe.insert_price_code_set("11,12"));
+        assert!(dedupe.insert_price_set_entry(first, second));
+        assert!(dedupe.insert_provider_set(first));
+        assert!(!dedupe.insert_provider_set(first));
+        assert!(dedupe.insert_provider_set_component("set-1", 7));
+        assert!(!dedupe.insert_provider_set_component("set-1", 7));
+        assert!(dedupe.insert_provider_set_entry("set-1", 8));
+        assert!(!dedupe.insert_provider_set_entry("set-1", 8));
+        assert!(dedupe.insert_provider_entry_component(8, 7));
+        dedupe.record_local_price_set_duplicates(2);
+        dedupe.record_local_price_atom_duplicates(3);
+        dedupe.record_local_provider_set_duplicates(4);
+        dedupe
+            .record_quarantined_provider_identifiers(&[123, 123])
+            .unwrap();
+        let quarantine = dedupe.provider_identifier_quarantine().unwrap();
+        assert_eq!(quarantine.payload().unwrap()["occurrence_count"], 2);
+
+        let payload = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(payload["procedure_duplicate"], 1);
+        assert_eq!(payload["provider_set_component_duplicate"], Value::Null);
+        emit_dedupe_summary(&dedupe, &HashMap::new());
     }
 }

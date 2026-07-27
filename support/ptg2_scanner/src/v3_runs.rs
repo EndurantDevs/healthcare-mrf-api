@@ -4721,4 +4721,33 @@ mod tests {
         assert!(fs::read(&output).unwrap().is_empty());
         assert!(directory_is_empty(&temporary));
     }
+
+    #[test]
+    fn tagged_record_codec_exposes_exact_width_and_identity_contract() {
+        let codec = TaggedServingRunCodec::new(257, 2).unwrap();
+        assert_eq!(codec.source_count(), 257);
+        assert_eq!(codec.source_key_bytes(), 2);
+        assert_eq!(codec.record_bytes(), SERVING_RUN_RECORD_BYTES + 2);
+
+        let base_record = record(1, 2, 3, 4);
+        let same_identity = record(1, 2, 3, 99);
+        assert_eq!(base_record, same_identity);
+        let tagged = TaggedServingRunRecord {
+            record: base_record,
+            source_key: 256,
+        };
+        let encoded = tagged.encode(codec).unwrap();
+        assert_eq!(encoded.len(), codec.record_bytes());
+        assert_eq!(&encoded[48..50], &[1, 0]);
+        assert_eq!(
+            TaggedServingRunRecord::decode(&encoded, codec).unwrap(),
+            tagged
+        );
+
+        let outside_scope = TaggedServingRunRecord {
+            source_key: 257,
+            ..tagged
+        };
+        assert!(outside_scope.encode(codec).is_err());
+    }
 }

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+import struct
 from typing import Any, Mapping, Sequence
 
 from process.ptg_parts.ptg2_manifest_artifacts import (
@@ -24,6 +27,19 @@ from scripts.ptg_v4_dev_canary_storage_budget import (
 
 
 STORAGE_EVIDENCE_CONTRACT = "ptg_v4_physical_storage_v1"
+_TAX_IDENTITY_CONTRACT = "ptg2_provider_group_tax_identity_v1"
+_TAX_NORMALIZATION_CONTRACT = "ein_ascii_digits_or_2_7_hyphen_v1"
+_TAX_HMAC_CONTRACT = "hmac_sha256_ptg_tin_v1"
+_TAX_CANDIDATE_PREFIX_CONTRACT = (
+    "tin_id_128=first_16_bytes(tin_hmac_sha256)"
+)
+_TAX_AUTHORITY_CONTRACT = "tin_hmac_sha256_full_32_bytes_authoritative"
+_TAX_SOURCE_ORDINAL_CONTRACT = "snapshot_shard_id_sorted_lsb0_bitmap_v1"
+_TAX_POLICY_DESCRIPTOR_HASH_DOMAIN = b"PTG2V4TINPOLICY\x01"
+_TAX_SOURCE_ORDINAL_HASH_DOMAIN = b"PTG2V4TAXORD\x01"
+_TAX_POLICY_ID = re.compile(
+    r"^ptg-tin-hmac-sha256-v1:[a-z0-9][a-z0-9._-]{0,31}$"
+)
 REQUIRED_PHYSICAL_RELATIONS = frozenset(
     {
         "ptg2_v3_block",
@@ -40,6 +56,9 @@ REQUIRED_PHYSICAL_RELATIONS = frozenset(
         "ptg2_v4_provider_set_npi_prefix",
         "ptg2_v4_provider_graph_diagnostic",
         "ptg2_v4_inferred_taxonomy_candidate",
+        "ptg2_provider_tax_identity_manifest",
+        "ptg2_provider_tax_identity",
+        "ptg2_provider_group_tax_identity",
     }
 )
 WHOLE_SNAPSHOT_PHYSICAL_RELATIONS = frozenset(
@@ -63,6 +82,7 @@ WHOLE_SNAPSHOT_PHYSICAL_RELATIONS = frozenset(
         "ptg2_v3_source_audit_witness",
         "ptg2_v3_candidate_audit_attestation",
         "ptg2_v3_gc_candidate",
+        "ptg2_provider_tax_identity_legacy_layout",
         *REQUIRED_PHYSICAL_RELATIONS,
     }
 )
@@ -88,6 +108,9 @@ def evaluate_v4_evidence(
     )
     inferred_taxonomy_candidates = _mapping(
         evidence_by_field.get("inferred_taxonomy_candidates")
+    )
+    provider_tax_identity = _mapping(
+        evidence_by_field.get("provider_tax_identity")
     )
     physical_storage = _mapping(evidence_by_field.get("physical_storage"))
     _validate_v4_state(
@@ -117,6 +140,11 @@ def evaluate_v4_evidence(
         failures,
         expected_representation=storage_budget.case.expected_representation,
     )
+    _validate_provider_tax_identity(
+        provider_tax_identity,
+        exact_counts,
+        failures,
+    )
     manifest_summary = _manifest_summary(
         snapshot,
         root,
@@ -139,6 +167,7 @@ def evaluate_v4_evidence(
         "heavy_owner_diagnostics": evidence_by_field.get("heavy_owners", []),
         "provider_graph_diagnostic": provider_graph_diagnostic,
         "inferred_taxonomy_candidates": inferred_taxonomy_candidates,
+        "provider_tax_identity": provider_tax_identity,
         "manifest": manifest_summary,
         "physical_storage": physical_storage,
         "storage_budget": storage_budget.report(
@@ -602,6 +631,168 @@ def _validate_physical_storage(
         )
     if storage.get("storage_claim_scope") != "whole_snapshot_and_v4_graph":
         failures.append("physical storage evidence is graph-only or ambiguously scoped")
+
+
+def _validate_provider_tax_identity(
+    evidence: Mapping[str, Any],
+    exact_counts: Mapping[str, Any],
+    failures: list[str],
+) -> None:
+    """Reconcile the token-only sidecar manifest with exact snapshot rows."""
+
+    fields = _mapping(evidence.get("fields"))
+    if _optional_int(evidence.get("row_count")) != 1:
+        failures.append("provider tax-identity manifest is missing or duplicated")
+        return
+    _validate_tax_identity_contract(fields, failures)
+    _validate_tax_identity_source_map(fields, failures)
+    _validate_tax_identity_counts(fields, exact_counts, failures)
+
+
+def _validate_tax_identity_contract(
+    fields: Mapping[str, Any],
+    failures: list[str],
+) -> None:
+    """Validate the public token-policy and digest manifest fields."""
+
+    expected_contract_by_field = {
+        "contract": _TAX_IDENTITY_CONTRACT,
+        "normalization_contract": _TAX_NORMALIZATION_CONTRACT,
+        "hmac_contract": _TAX_HMAC_CONTRACT,
+        "source_ordinal_contract": _TAX_SOURCE_ORDINAL_CONTRACT,
+    }
+    if any(
+        fields.get(field_name) != expected_value
+        for field_name, expected_value in expected_contract_by_field.items()
+    ):
+        failures.append("provider tax-identity manifest contract is invalid")
+    token_policy_id = fields.get("token_policy_id")
+    if (
+        not isinstance(token_policy_id, str)
+        or len(token_policy_id.encode("utf-8")) > 55
+        or _TAX_POLICY_ID.fullmatch(token_policy_id) is None
+    ):
+        failures.append("provider tax-identity token policy is invalid")
+    elif fields.get("token_policy_descriptor_sha256") != (
+        _tax_policy_descriptor_digest(token_policy_id)
+    ):
+        failures.append("provider tax-identity token policy descriptor is invalid")
+    for digest_field in (
+        "token_policy_descriptor_sha256",
+        "source_ordinal_map_digest",
+        "content_digest",
+    ):
+        digest = fields.get(digest_field)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            failures.append(f"provider tax-identity {digest_field} is invalid")
+
+
+def _tax_policy_descriptor_digest(token_policy_id: str) -> str:
+    """Rebuild the policy descriptor without secret or snapshot material."""
+
+    descriptor = hashlib.sha256()
+    descriptor.update(_TAX_POLICY_DESCRIPTOR_HASH_DOMAIN)
+    for value in (
+        token_policy_id,
+        _TAX_NORMALIZATION_CONTRACT,
+        _TAX_HMAC_CONTRACT,
+        _TAX_CANDIDATE_PREFIX_CONTRACT,
+        _TAX_AUTHORITY_CONTRACT,
+    ):
+        encoded_value = value.encode("ascii")
+        descriptor.update(struct.pack(">I", len(encoded_value)))
+        descriptor.update(encoded_value)
+    return descriptor.hexdigest()
+
+
+def _validate_tax_identity_source_map(
+    fields: Mapping[str, Any],
+    failures: list[str],
+) -> None:
+    """Validate the authenticated source-shard ordinal map."""
+
+    source_ordinal_map = fields.get("source_ordinal_map")
+    source_shard_count = _optional_int(fields.get("source_shard_count"))
+    if not _is_valid_tax_source_ordinal_map(
+        source_ordinal_map,
+        source_shard_count,
+        str(fields.get("source_ordinal_map_digest") or ""),
+    ):
+        failures.append("provider tax-identity source ordinal map is invalid")
+
+
+def _validate_tax_identity_counts(
+    fields: Mapping[str, Any],
+    exact_counts: Mapping[str, Any],
+    failures: list[str],
+) -> None:
+    """Reconcile manifest counts against exact snapshot-owned rows."""
+
+    count_field_by_exact_field = {
+        "provider_group_count": "provider_group_count",
+        "tax_identity_count": "provider_tax_identity_count",
+        "matched_ein_count": "provider_tax_matched_ein_count",
+        "missing_count": "provider_tax_missing_count",
+        "malformed_count": "provider_tax_malformed_count",
+        "unsupported_type_count": "provider_tax_unsupported_type_count",
+    }
+    if any(
+        _optional_int(fields.get(manifest_field))
+        != _optional_int(exact_counts.get(exact_field))
+        for manifest_field, exact_field in count_field_by_exact_field.items()
+    ):
+        failures.append("provider tax-identity manifest counts differ from rows")
+    if (
+        _optional_int(exact_counts.get("provider_tax_identity_manifest_count"))
+        != 1
+        or _optional_int(exact_counts.get("provider_group_tax_identity_count"))
+        != _optional_int(exact_counts.get("provider_group_count"))
+        or _optional_int(exact_counts.get("provider_tax_referenced_identity_count"))
+        != _optional_int(exact_counts.get("provider_tax_identity_count"))
+    ):
+        failures.append("provider tax-identity exact cardinality is invalid")
+
+
+def _is_valid_tax_source_ordinal_map(
+    source_ordinal_map: Any,
+    source_shard_count: int | None,
+    expected_digest: str,
+) -> bool:
+    """Authenticate the sorted contiguous source-shard ordinal map."""
+
+    if (
+        not isinstance(source_ordinal_map, list)
+        or source_shard_count is None
+        or source_shard_count <= 0
+        or len(source_ordinal_map) != source_shard_count
+    ):
+        return False
+    shard_ids: list[str] = []
+    for ordinal, entry in enumerate(source_ordinal_map):
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"shard_id", "ordinal"}
+            or entry.get("ordinal") != ordinal
+            or not isinstance(entry.get("shard_id"), str)
+            or not entry["shard_id"]
+        ):
+            return False
+        shard_ids.append(str(entry["shard_id"]))
+    if shard_ids != sorted(set(shard_ids)):
+        return False
+    digest = hashlib.sha256()
+    digest.update(_TAX_SOURCE_ORDINAL_HASH_DOMAIN)
+    digest.update(struct.pack(">I", len(shard_ids)))
+    for ordinal, shard_id in enumerate(shard_ids):
+        encoded_shard_id = shard_id.encode("utf-8")
+        digest.update(struct.pack(">I", len(encoded_shard_id)))
+        digest.update(encoded_shard_id)
+        digest.update(struct.pack(">I", ordinal))
+    return digest.hexdigest() == expected_digest
 
 
 def _validate_cas_attribution(

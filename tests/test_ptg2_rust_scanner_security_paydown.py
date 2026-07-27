@@ -16,6 +16,9 @@ from tests.ptg2_rust_scanner_security_process_cases import (
     test_factor_mode_environment_requires_paired_outputs,
     test_top_level_scanner_malformed_frames_and_typed_failure,
 )
+from tests.ptg2_rust_scanner_security_tax_cases import (
+    test_v4_tin_secret_preflight_is_artifact_free_and_redacted,
+)
 from tests.ptg2_rust_scanner_security_frames_cases import (
     test_compact_scanner_all_optional_paths_and_factor_frames,
     test_compact_scanner_setup_failure_reaps_process_and_scratch,

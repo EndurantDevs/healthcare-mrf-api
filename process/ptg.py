@@ -381,7 +381,7 @@ def _ptg2_auto_address_refresh_payload(
     }
 
 
-async def _enqueue_ptg2_auto_address_refresh_after_import(
+async def _enqueue_address_refresh_after_import(
     *,
     source_key: str | None,
     snapshot_id: str,
@@ -862,9 +862,32 @@ def _ptg2_copy_file_row_count(path: Path) -> int:
 
 def _collect_ptg2_manifest_sidecar_artifacts(
     sidecar_paths: dict[str, Path | None],
+    *,
+    provider_group_tax_identity_artifact: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     artifacts_by_kind: dict[str, dict[str, Any]] = {}
     for artifact_kind, artifact_path in sidecar_paths.items():
+        if artifact_kind == "provider_group_tax_identity":
+            if (
+                artifact_path is None
+                and provider_group_tax_identity_artifact is None
+            ):
+                continue
+            if (
+                artifact_path is None
+                or not artifact_path.exists()
+                or artifact_path.stat().st_size <= 0
+            ):
+                raise RuntimeError(
+                    "PTG V4 provider-group tax identity artifact is missing"
+                )
+            artifacts_by_kind[artifact_kind] = (
+                _validated_provider_group_tax_identity_artifact(
+                    artifact_path,
+                    provider_group_tax_identity_artifact,
+                )
+            )
+            continue
         if (
             artifact_path is None
             or not artifact_path.exists()
@@ -885,6 +908,181 @@ def _collect_ptg2_manifest_sidecar_artifacts(
             **membership_index_fence_metadata(artifact_path),
         }
     return artifacts_by_kind
+
+
+_PTG2_TAX_IDENTITY_MAGIC = b"PTG2TAX1"
+_PTG2_TAX_IDENTITY_VERSION = 1
+_PTG2_TAX_IDENTITY_RECORD_BYTES = 65
+_PTG2_TAX_IDENTITY_POLICY_ID_RE = re.compile(
+    r"ptg-tin-hmac-sha256-v1:[a-z0-9](?:[a-z0-9._-]{0,31})\Z"
+)
+_PTG2_TAX_IDENTITY_FRAME_FIELDS = frozenset(
+    {
+        "path",
+        "bytes",
+        "row_count",
+        "provider_group_count",
+        "matched_ein_count",
+        "missing_count",
+        "malformed_count",
+        "unsupported_type_count",
+        "format",
+        "version",
+        "record_bytes",
+        "token_policy_id",
+        "normalization_contract",
+        "hmac_contract",
+        "sha256",
+        "final",
+    }
+)
+
+
+def _validate_tax_identity_summary_frame(
+    artifact_path: Path,
+    scanner_artifact_by_field: Mapping[str, Any] | None,
+) -> tuple[str, str, dict[str, int]]:
+    if (
+        not isinstance(scanner_artifact_by_field, Mapping)
+        or set(scanner_artifact_by_field) != _PTG2_TAX_IDENTITY_FRAME_FIELDS
+    ):
+        raise RuntimeError(
+            "PTG V4 scanner omitted provider-group tax identity evidence"
+        )
+    expected_path = artifact_path.resolve()
+    reported_path = Path(
+        str(scanner_artifact_by_field.get("path") or "")
+    ).resolve()
+    policy_id = scanner_artifact_by_field.get("token_policy_id")
+    digest = str(scanner_artifact_by_field.get("sha256") or "").lower()
+    count_names = (
+        "row_count",
+        "provider_group_count",
+        "matched_ein_count",
+        "missing_count",
+        "malformed_count",
+        "unsupported_type_count",
+    )
+    count_by_name = {
+        name: scanner_artifact_by_field.get(name) for name in count_names
+    }
+    if (
+        reported_path != expected_path
+        or scanner_artifact_by_field.get("format")
+        != "ptg2_provider_group_tax_identity_v1"
+        or scanner_artifact_by_field.get("version")
+        != _PTG2_TAX_IDENTITY_VERSION
+        or scanner_artifact_by_field.get("record_bytes")
+        != _PTG2_TAX_IDENTITY_RECORD_BYTES
+        or scanner_artifact_by_field.get("normalization_contract")
+        != "ein_ascii_digits_or_2_7_hyphen_v1"
+        or scanner_artifact_by_field.get("hmac_contract")
+        != "hmac_sha256_ptg_tin_v1"
+        or scanner_artifact_by_field.get("final") is not True
+        or not isinstance(policy_id, str)
+        or len(policy_id.encode("ascii", errors="ignore")) != len(policy_id)
+        or len(policy_id.encode("ascii")) > 55
+        or _PTG2_TAX_IDENTITY_POLICY_ID_RE.fullmatch(policy_id) is None
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or any(
+            type(count_value) is not int or count_value < 0
+            for count_value in count_by_name.values()
+        )
+    ):
+        raise RuntimeError(
+            "PTG V4 provider-group tax identity evidence is invalid"
+        )
+    return policy_id, digest, count_by_name
+
+
+def _validate_tax_identity_artifact_content(
+    artifact_path: Path,
+    scanner_artifact_by_field: Mapping[str, Any],
+    policy_id: str,
+    digest: str,
+    count_by_name: dict[str, int],
+) -> int:
+    row_count = count_by_name["row_count"]
+    if (
+        count_by_name["provider_group_count"] != row_count
+        or sum(
+            count_by_name[name]
+            for name in (
+                "matched_ein_count",
+                "missing_count",
+                "malformed_count",
+                "unsupported_type_count",
+            )
+        )
+        != row_count
+    ):
+        raise RuntimeError(
+            "PTG V4 provider-group tax identity counts are inconsistent"
+        )
+    byte_count = artifact_path.stat().st_size
+    policy_bytes = policy_id.encode("ascii")
+    expected_bytes = 13 + len(policy_bytes) + row_count * _PTG2_TAX_IDENTITY_RECORD_BYTES
+    if (
+        scanner_artifact_by_field.get("bytes") != byte_count
+        or byte_count != expected_bytes
+    ):
+        raise RuntimeError(
+            "PTG V4 provider-group tax identity artifact size changed"
+        )
+    with artifact_path.open("rb") as artifact_file:
+        header = artifact_file.read(13 + len(policy_bytes))
+    if (
+        len(header) != 13 + len(policy_bytes)
+        or header[:8] != _PTG2_TAX_IDENTITY_MAGIC
+        or int.from_bytes(header[8:10], "little")
+        != _PTG2_TAX_IDENTITY_VERSION
+        or int.from_bytes(header[10:12], "little")
+        != _PTG2_TAX_IDENTITY_RECORD_BYTES
+        or header[12] != len(policy_bytes)
+        or header[13:] != policy_bytes
+    ):
+        raise RuntimeError(
+            "PTG V4 provider-group tax identity artifact header is invalid"
+        )
+    actual_digest, actual_bytes = sha256_file(artifact_path)
+    if actual_digest != digest or actual_bytes != byte_count:
+        raise RuntimeError(
+            "PTG V4 provider-group tax identity artifact digest changed"
+        )
+    return byte_count
+
+
+def _validated_provider_group_tax_identity_artifact(
+    artifact_path: Path,
+    scanner_artifact_by_field: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Authenticate the scanner's token-only tax-identity artifact summary."""
+
+    policy_id, digest, count_by_name = _validate_tax_identity_summary_frame(
+        artifact_path,
+        scanner_artifact_by_field,
+    )
+    assert isinstance(scanner_artifact_by_field, Mapping)
+    byte_count = _validate_tax_identity_artifact_content(
+        artifact_path,
+        scanner_artifact_by_field,
+        policy_id,
+        digest,
+        count_by_name,
+    )
+    return {
+        "name": "provider_group_tax_identity",
+        "path": str(artifact_path),
+        "record_format": scanner_artifact_by_field["format"],
+        "sha256": digest,
+        "byte_count": byte_count,
+        **{
+            field_name: scanner_artifact_by_field[field_name]
+            for field_name in _PTG2_TAX_IDENTITY_FRAME_FIELDS
+            if field_name not in {"path", "bytes", "format", "sha256"}
+        },
+    }
 
 
 def _ptg2_existing_manifest_copy_paths(input_paths: list[Path]) -> list[Path]:
@@ -1554,7 +1752,7 @@ def _cleanup_manifest_copy_family(copy_path: Path) -> None:
             logger.debug("Failed to remove PTG2 manifest copy file %s", family_path, exc_info=True)
 
 
-async def _merge_and_copy_ptg2_manifest_files(
+async def _merge_ptg2_manifest_files(
     *,
     successful_files: list[dict[str, Any]],
     manifest_stage_table: str,
@@ -1573,72 +1771,76 @@ async def _merge_and_copy_ptg2_manifest_files(
                 copy_kinds,
                 require_complete_sources=True,
             )
-            if len(set(source_files_by_kind.values())) > 1:
-                raise RuntimeError(
-                    "strict V3 price COPY artifact source counts disagree: "
-                    + json.dumps(source_files_by_kind, sort_keys=True)
-                )
-            if not any(copy_files_by_kind.values()):
-                return {
-                    "enabled": False,
-                    "reason": "no_strict_v3_price_copy_files",
-                    "source_files_by_kind": source_files_by_kind,
-                }
-            missing_kinds = [
-                kind for kind in copy_kinds if not copy_files_by_kind[kind]
-            ]
-            if missing_kinds:
-                raise RuntimeError(
-                    "strict V3 scanner omitted required price COPY artifacts: "
-                    + ", ".join(missing_kinds)
-                )
-            target_by_kind = {
-                "price_atom": _ptg2_manifest_support_stage_table(
-                    manifest_stage_table,
-                    "price_atom",
-                ),
-                "price_set_atom": _ptg2_manifest_support_stage_table(
-                    manifest_stage_table,
-                    "price_set_atom",
-                ),
-                "price_set_summary": _ptg2_manifest_support_stage_table(
-                    manifest_stage_table,
-                    "price_set_summary",
-                ),
-            }
-            copy_func_by_kind = {
-                "price_atom": _copy_price_atom_file,
-                "price_set_atom": _copy_price_atom_member_file,
-                "price_set_summary": _copy_price_set_summary_file,
-            }
-            copy_report_map: dict[str, Any] = {
-                "enabled": True,
-                "strict_v3_price_only": True,
-                "kinds": {},
-                "emitted_rows": emitted_rows_by_kind,
-                "source_files_by_kind": source_files_by_kind,
-            }
-            active_kinds = [
-                kind for kind in copy_kinds if copy_files_by_kind[kind]
-            ]
-            for completed_steps, kind in enumerate(active_kinds):
-                copy_report_map["kinds"][kind] = await _copy_manifest_files_direct_with_progress(
-                    kind,
-                    target_table=target_by_kind[kind],
-                    input_paths=copy_files_by_kind[kind],
-                    copy_func=copy_func_by_kind[kind],
-                    completed_steps_before_copy=completed_steps,
-                    total_steps=max(len(active_kinds), 1),
-                    emitted_rows=emitted_rows_by_kind.get(kind),
-                )
-            copy_report_map["direct_to_copy"] = True
-            _emit_screen_line(
-                "PTG2_STRICT_V3_PRICE_COPY\t"
-                f"{json.dumps(copy_report_map, sort_keys=True)}"
+            return await _copy_strict_v3_price_files(
+                copy_kinds,
+                copy_files_by_kind,
+                emitted_rows_by_kind,
+                source_files_by_kind,
+                manifest_stage_table,
             )
-            return copy_report_map
         finally:
             _cleanup_manifest_copy_paths(copy_files_by_kind)
+
+
+async def _copy_strict_v3_price_files(
+    copy_kinds: tuple[str, ...],
+    copy_files_by_kind: dict[str, list[Path]],
+    emitted_rows_by_kind: dict[str, int],
+    source_files_by_kind: dict[str, int],
+    manifest_stage_table: str,
+) -> dict[str, Any]:
+    if len(set(source_files_by_kind.values())) > 1:
+        raise RuntimeError(
+            "strict V3 price COPY artifact source counts disagree: "
+            + json.dumps(source_files_by_kind, sort_keys=True)
+        )
+    if not any(copy_files_by_kind.values()):
+        return {
+            "enabled": False,
+            "reason": "no_strict_v3_price_copy_files",
+            "source_files_by_kind": source_files_by_kind,
+        }
+    missing_kinds = [kind for kind in copy_kinds if not copy_files_by_kind[kind]]
+    if missing_kinds:
+        raise RuntimeError(
+            "strict V3 scanner omitted required price COPY artifacts: "
+            + ", ".join(missing_kinds)
+        )
+    target_by_kind = {
+        kind: _ptg2_manifest_support_stage_table(manifest_stage_table, kind)
+        for kind in copy_kinds
+    }
+    copy_func_by_kind = {
+        "price_atom": _copy_price_atom_file,
+        "price_set_atom": _copy_price_atom_member_file,
+        "price_set_summary": _copy_price_set_summary_file,
+    }
+    copy_report_map: dict[str, Any] = {
+        "enabled": True,
+        "strict_v3_price_only": True,
+        "kinds": {},
+        "emitted_rows": emitted_rows_by_kind,
+        "source_files_by_kind": source_files_by_kind,
+    }
+    active_kinds = [kind for kind in copy_kinds if copy_files_by_kind[kind]]
+    for completed_steps, kind in enumerate(active_kinds):
+        copy_report_map["kinds"][kind] = (
+            await _copy_manifest_files_direct_with_progress(
+                kind,
+                target_table=target_by_kind[kind],
+                input_paths=copy_files_by_kind[kind],
+                copy_func=copy_func_by_kind[kind],
+                completed_steps_before_copy=completed_steps,
+                total_steps=max(len(active_kinds), 1),
+                emitted_rows=emitted_rows_by_kind.get(kind),
+            )
+        )
+    copy_report_map["direct_to_copy"] = True
+    _emit_screen_line(
+        "PTG2_STRICT_V3_PRICE_COPY\t"
+        f"{json.dumps(copy_report_map, sort_keys=True)}"
+    )
+    return copy_report_map
 
 
 def _record_v3_scanner_summary(
@@ -1709,6 +1911,7 @@ async def _parse_strict_v3_file(
     rust_dedupe_summary_by_field: dict[str, Any] = {}
     rust_scanner_config_by_name: dict[str, Any] = {}
     rust_scanner_summary_by_name: dict[str, Any] = {}
+    provider_group_tax_identity_artifact_by_field: dict[str, Any] | None = None
     procedure_hashes: set[str] = set()
     deferred_copy_entries_by_kind: dict[str, list[dict[str, Any]]] = {
         "serving_run": [],
@@ -1839,6 +2042,10 @@ async def _parse_strict_v3_file(
         / f"provider_component_group_{manifest_file_token}.ptg2sc"
         if provider_graph_v4
         else None,
+        "provider_group_tax_identity": manifest_artifact_dir
+        / f"provider_group_tax_identity_{manifest_file_token}.ptg2tax"
+        if provider_graph_v4
+        else None,
         "provider_group_npi": manifest_artifact_dir
         / f"provider_group_npi_{manifest_file_token}.ptg2sc",
         "provider_npi_group": manifest_artifact_dir
@@ -1951,6 +2158,9 @@ async def _parse_strict_v3_file(
             manifest_provider_component_group_sidecar_path=manifest_sidecar_paths_by_kind[
                 "provider_component_group"
             ],
+            manifest_provider_group_tax_identity_sidecar_path=(
+                manifest_sidecar_paths_by_kind["provider_group_tax_identity"]
+            ),
             manifest_provider_npi_sidecar_path=None,
             manifest_price_forward_sidecar_path=None,
             manifest_price_atom_copy_path=manifest_price_atom_copy_path,
@@ -1990,6 +2200,21 @@ async def _parse_strict_v3_file(
                     witness_entry_by_field
                 )
                 continue
+            if record_kind == "manifest_provider_group_tax_identity_sidecar_file":
+                if not provider_graph_v4:
+                    raise RuntimeError(
+                        "strict V3 scanner emitted an unexpected provider-group "
+                        "tax identity artifact"
+                    )
+                if provider_group_tax_identity_artifact_by_field is not None:
+                    raise RuntimeError(
+                        "PTG V4 scanner emitted duplicate provider-group tax "
+                        "identity evidence"
+                    )
+                provider_group_tax_identity_artifact_by_field = dict(
+                    record_row or {}
+                )
+                continue
             rust_records += 1
             if record_kind == "manifest_price_atom_copy_file":
                 record_ready_manifest_file("price_atom", record_row)
@@ -2016,6 +2241,13 @@ async def _parse_strict_v3_file(
                     {"path": str(candidate_copy_path), "row_count": 0},
                     from_recovery=True,
                 )
+        if (
+            provider_graph_v4
+            and provider_group_tax_identity_artifact_by_field is None
+        ):
+            raise RuntimeError(
+                "PTG V4 scanner omitted provider-group tax identity evidence"
+            )
         is_scan_complete = True
     finally:
         manifest_copy_paths = (
@@ -2075,7 +2307,10 @@ async def _parse_strict_v3_file(
         discard_file_scratch()
         raise
     manifest_artifacts = _collect_ptg2_manifest_sidecar_artifacts(
-        manifest_sidecar_paths_by_kind
+        manifest_sidecar_paths_by_kind,
+        provider_group_tax_identity_artifact=(
+            provider_group_tax_identity_artifact_by_field
+        ),
     )
     import_summary_by_field = {
         "provider_refs": 0,
@@ -3252,12 +3487,15 @@ def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[st
         "logical_sha256": source_version.logical_sha256,
         "logical_hash_deferred": source_version.logical_hash_deferred,
         "content_length": source_version.content_length,
+        "raw_byte_count": source_version.raw_byte_count,
         "etag": source_version.etag,
         "last_modified": source_version.last_modified,
     }
 
 
-def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _source_file_versions_from_results(
+    files: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     versions: list[dict[str, Any]] = []
     seen_version_keys: set[tuple[str | None, str | None]] = set()
     for file_result in files:
@@ -3286,6 +3524,7 @@ def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list
                 "logical_sha256": summary.get("logical_sha256"),
                 "logical_hash_deferred": bool(summary.get("logical_hash_deferred")),
                 "content_length": summary.get("content_length"),
+                "raw_byte_count": summary.get("raw_byte_count"),
                 "etag": summary.get("etag"),
                 "last_modified": summary.get("last_modified"),
             }
@@ -4657,7 +4896,7 @@ async def _publish_reused_shared_v3_snapshot(
                 "reused strict V3 mixed publication has no allowed payment evidence"
             )
         allowed_source_file_versions = (
-            _ptg2_source_file_versions_from_results(
+            _source_file_versions_from_results(
                 allowed_successful_files
             )
         )
@@ -4859,7 +5098,7 @@ async def _publish_reused_shared_v3_snapshot(
         )
     post_publish_stage_timer.mark("old_state_cleanup")
     address_refresh = (
-        await _enqueue_ptg2_auto_address_refresh_after_import(
+        await _enqueue_address_refresh_after_import(
             source_key=source_key,
             snapshot_id=snapshot_id,
             import_run_id=import_run_id,
@@ -5279,7 +5518,7 @@ def _prepare_allowed_snapshot_publish(
         raise RuntimeError(
             "PTG2 allowed-amount import produced no payment evidence"
         )
-    source_file_versions = _ptg2_source_file_versions_from_results(
+    source_file_versions = _source_file_versions_from_results(
         successful_files
     )
     published_at = _utcnow()
@@ -5717,7 +5956,7 @@ async def _main_with_artifact_lease(
                         exc_info=True,
                     )
                 candidate_result["address_refresh"] = (
-                    await _enqueue_ptg2_auto_address_refresh_after_import(
+                    await _enqueue_address_refresh_after_import(
                         source_key=source_key_val,
                         snapshot_id=snapshot_id,
                         import_run_id=import_run_id,
@@ -6707,7 +6946,7 @@ async def _main_with_artifact_lease(
                 **precompile_progress_options,
             )
             manifest_precopy_merge_started_monotonic = _ptg2_monotonic()
-            manifest_merge_metrics_by_name = await _merge_and_copy_ptg2_manifest_files(
+            manifest_merge_metrics_by_name = await _merge_ptg2_manifest_files(
                 successful_files=successful_files,
                 manifest_stage_table=ptg2_manifest_stage_table,
             )
@@ -7060,7 +7299,7 @@ async def _main_with_artifact_lease(
             message_text="checking PTG address-refresh follow-up",
         )
         address_refresh_result = (
-            await _enqueue_ptg2_auto_address_refresh_after_import(
+            await _enqueue_address_refresh_after_import(
                 source_key=source_key_val,
                 snapshot_id=snapshot_id,
                 import_run_id=import_run_id,
@@ -7160,7 +7399,9 @@ async def _main_with_artifact_lease(
             "files_skipped": len(skipped_files),
             "serving_rates": report_by_field.get("serving_rates"),
             "rate_count": report_by_field.get("rate_count"),
-            "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
+            "source_file_versions": _source_file_versions_from_results(
+                successful_files + skipped_files
+            ),
             "address_refresh": address_refresh_result,
             **allowed_metrics_by_name,
             **full_rebuild_metrics,

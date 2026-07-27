@@ -34,12 +34,7 @@ class _RecordingTransaction:
         self.statements.append((str(statement), params))
 
 
-@pytest.mark.asyncio
-async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(monkeypatch):
-    """Verify remove v3 snapshot releases layout in the removal transaction."""
-    transaction = _RecordingTransaction()
-    events = []
-
+def _install_remove_transaction_fakes(monkeypatch, transaction, events):
     async def fake_plan(**_kwargs):
         assert transaction.active
         return {
@@ -79,8 +74,20 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
 
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
-    monkeypatch.setattr(source_snapshot_control, "build_ptg2_source_snapshot_remove_plan", fake_plan)
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "build_source_snapshot_remove_plan",
+        fake_plan,
+    )
     monkeypatch.setattr(source_snapshot_control, "release_unbound_ptg2_shared_layouts", fake_release)
+
+
+@pytest.mark.asyncio
+async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(monkeypatch):
+    """Verify remove v3 snapshot releases layout in the removal transaction."""
+    transaction = _RecordingTransaction()
+    events = []
+    _install_remove_transaction_fakes(monkeypatch, transaction, events)
 
     removal_result = await source_snapshot_control.remove_ptg2_source_snapshot(
         snapshot_id="shared-a",

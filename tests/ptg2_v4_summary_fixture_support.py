@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,8 @@ _COPY_ARTIFACT_NAMES = (
     "npi_scope",
     "provider_set_audit_npi",
     "provider_set_npi_prefix_overrides",
+    "provider_tax_identities",
+    "provider_group_tax_identities",
 )
 
 
@@ -89,6 +92,44 @@ def empty_relation_fixture() -> list[dict[str, int | str]]:
         }
         for relation in _DIRECT_RELATIONS
     ]
+
+
+def empty_tax_identity_summary() -> dict[str, Any]:
+    """Build a source-bound zero-group tax projection."""
+
+    policy_id = "ptg-tin-hmac-sha256-v1:release-1"
+    source_ids = ("source",)
+    policy_digest = compiler._tax_policy_descriptor_sha256(policy_id)
+    source_digest = compiler._tax_source_ordinal_digest(source_ids)
+    content = hashlib.sha256()
+    content.update(b"PTG2V4TAXCONTENT\x01")
+    content.update(bytes.fromhex(policy_digest))
+    content.update(bytes.fromhex(source_digest))
+    content.update(struct.pack(">Q", 0))
+    content.update(struct.pack(">Q", 0))
+    return {
+        "contract": compiler._TAX_IDENTITY_PROJECTION_CONTRACT,
+        "token_policy_id": policy_id,
+        "token_policy_descriptor_sha256": policy_digest,
+        "normalization_contract": compiler._TAX_IDENTITY_NORMALIZATION_CONTRACT,
+        "hmac_contract": compiler._TAX_IDENTITY_HMAC_CONTRACT,
+        "candidate_prefix_contract": (
+            compiler._TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT
+        ),
+        "authority_contract": compiler._TAX_IDENTITY_AUTHORITY_CONTRACT,
+        "source_ordinal_contract": compiler._TAX_SOURCE_ORDINAL_CONTRACT,
+        "source_ordinal_map": [{"shard_id": "source", "ordinal": 0}],
+        "source_ordinal_map_digest": source_digest,
+        "source_shard_count": 1,
+        "source_bitmap_bytes": 1,
+        "provider_group_count": 0,
+        "tax_identity_count": 0,
+        "matched_ein_count": 0,
+        "missing_count": 0,
+        "malformed_count": 0,
+        "unsupported_type_count": 0,
+        "content_digest": content.hexdigest(),
+    }
 
 
 def write_empty_artifacts(

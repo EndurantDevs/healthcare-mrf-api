@@ -125,6 +125,32 @@ class _InterleavingDB:
         return statement
 
 
+def _validated_candidate_row():
+    return {
+        "snapshot_id": "snap_new",
+        "import_run_id": "run_new",
+        "status": "validated",
+        "import_month": datetime.date(2026, 7, 1),
+        "created_at": datetime.datetime(2026, 7, 1),
+        "validated_at": datetime.datetime(2026, 7, 1, 0, 1),
+        "published_at": None,
+        "previous_snapshot_id": "snap_old",
+        "snapshot_key": 17,
+        "plan_id": "P1",
+        "plan_market_type": "group",
+        "coverage_scope_id": b"c" * 32,
+        "manifest": {
+            "activation": {
+                "contract": "ptg2_candidate_activation_v1",
+                "state": "validated",
+                "source_key": "source_a",
+                "expected_previous_snapshot_id": "snap_old",
+            },
+            "serving_index": {"source_key": "source_a"},
+        },
+    }
+
+
 def _install_control_fakes(monkeypatch, state):
     """Support the install control fakes test fixture."""
     fake_db = _InterleavingDB(state)
@@ -133,31 +159,7 @@ def _install_control_fakes(monkeypatch, state):
     monkeypatch.setattr(
         source_pointers,
         "_locked_candidate_activation_row",
-        AsyncMock(
-            return_value={
-                "snapshot_id": "snap_new",
-                "import_run_id": "run_new",
-                "status": "validated",
-                "import_month": datetime.date(2026, 7, 1),
-                "created_at": datetime.datetime(2026, 7, 1),
-                "validated_at": datetime.datetime(2026, 7, 1, 0, 1),
-                "published_at": None,
-                "previous_snapshot_id": "snap_old",
-                "snapshot_key": 17,
-                "plan_id": "P1",
-                "plan_market_type": "group",
-                "coverage_scope_id": b"c" * 32,
-                "manifest": {
-                    "activation": {
-                        "contract": "ptg2_candidate_activation_v1",
-                        "state": "validated",
-                        "source_key": "source_a",
-                        "expected_previous_snapshot_id": "snap_old",
-                    },
-                    "serving_index": {"source_key": "source_a"},
-                },
-            }
-        ),
+        AsyncMock(return_value=_validated_candidate_row()),
     )
     monkeypatch.setattr(
         source_pointers,

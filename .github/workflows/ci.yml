@@ -560,11 +560,14 @@ jobs:
           HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST: "1"
           HLTHPRT_PTG2_V4_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
           HLTHPRT_PTG2_V4_TAXONOMY_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+          HLTHPRT_PTG2_TAX_IDENTITY_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
           HLTHPRT_PTG2_PROVIDER_GRAPH_V4_BIN: "${{ github.workspace }}/support/ptg2_scanner/target/debug/ptg2_provider_graph_v4"
         run: >
           python -m pytest -q
           tests/test_ptg2_v4_migration_postgres.py
           tests/test_ptg2_v4_taxonomy_candidates_postgres.py
+          tests/test_ptg2_provider_tax_identity_postgres.py
+          tests/test_ptg2_tax_identity_publication_postgres.py
           tests/test_ptg2_v4_snapshot_maps.py
           tests/test_ptg2_v4_postgres_e2e.py
           tests/test_ptg2_v4_stale_metadata_reconcile_postgres.py

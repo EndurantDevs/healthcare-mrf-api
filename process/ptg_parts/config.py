@@ -171,11 +171,14 @@ PTG2_STAGE_COPY_DEDUPE_DEFAULT_KINDS = frozenset(
 )
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _is_env_enabled(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_env_bool = _is_env_enabled
 
 
 def _env_int(name: str, default: int) -> int:

@@ -183,7 +183,7 @@ async def test_strict_v3_precopy_loads_only_price_inputs(tmp_path, monkeypatch):
         price_set_summary_copy,
     )
 
-    metrics = await process_ptg._merge_and_copy_ptg2_manifest_files(
+    metrics = await process_ptg._merge_ptg2_manifest_files(
         successful_files=[
             {"summary": {"manifest": {"copy_files": copy_files_by_kind}}}
         ],
@@ -220,7 +220,7 @@ async def test_strict_v3_precopy_missing_kind_still_cleans_present_price_files(
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
 
     with pytest.raises(RuntimeError, match="price_set_summary"):
-        await process_ptg._merge_and_copy_ptg2_manifest_files(
+        await process_ptg._merge_ptg2_manifest_files(
             successful_files=[
                 {
                     "summary": {

@@ -663,14 +663,16 @@ def _worker_job_manifest(
     if resource_dict:
         container_dict["resources"] = resource_dict
     pvc_volumes = _worker_job_pvc_volumes()
-    volumes = [*pvc_volumes, *_worker_job_secret_volumes()]
+    volumes = [*pvc_volumes, *_worker_job_secret_volumes(spec)]
     if volumes:
         container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
 
     pod_spec_dict: dict[str, Any] = {
         "restartPolicy": "Never",
         "automountServiceAccountToken": False,
-        "securityContext": _worker_job_pod_security_context(has_pvc=bool(pvc_volumes)),
+        "securityContext": _worker_job_pod_security_context(
+            has_group_read_volume=bool(volumes),
+        ),
         "containers": [container_dict],
     }
     if volumes:
@@ -789,14 +791,17 @@ def _worker_job_container_security_context() -> dict[str, Any]:
     }
 
 
-def _worker_job_pod_security_context(*, has_pvc: bool) -> dict[str, Any]:
+def _worker_job_pod_security_context(
+    *,
+    has_group_read_volume: bool,
+) -> dict[str, Any]:
     security_context_dict: dict[str, Any] = {
         "runAsNonRoot": True,
         "runAsUser": 65534,
         "runAsGroup": 65534,
         "seccompProfile": {"type": "RuntimeDefault"},
     }
-    if has_pvc:
+    if has_group_read_volume:
         security_context_dict["fsGroup"] = 65534
         security_context_dict["fsGroupChangePolicy"] = "OnRootMismatch"
     return security_context_dict
@@ -895,7 +900,62 @@ def _worker_job_pvc_volumes() -> list[dict[str, Any]]:
     ]
 
 
-def _worker_job_secret_volumes() -> list[dict[str, Any]]:
+def _is_secret_mount_selected(
+    mount_spec: dict[str, Any],
+    worker_class: str,
+) -> bool:
+    has_worker_classes = "workerClasses" in mount_spec
+    has_worker_classes_alias = "worker_classes" in mount_spec
+    if has_worker_classes and has_worker_classes_alias:
+        return False
+    if not has_worker_classes and not has_worker_classes_alias:
+        return True
+    selected_worker_classes = mount_spec[
+        "workerClasses" if has_worker_classes else "worker_classes"
+    ]
+    if (
+        not isinstance(selected_worker_classes, list)
+        or not selected_worker_classes
+        or any(
+            not isinstance(selected_class, str) or not selected_class.strip()
+            for selected_class in selected_worker_classes
+        )
+    ):
+        return False
+    return worker_class in {
+        selected_class.strip() for selected_class in selected_worker_classes
+    }
+
+
+def _worker_job_secret_source(
+    mount_spec: dict[str, Any],
+    secret_name: str,
+) -> dict[str, Any] | None:
+    secret_source_by_field: dict[str, Any] = {"secretName": secret_name}
+    if bool(mount_spec.get("optional", False)):
+        secret_source_by_field["optional"] = True
+    has_default_mode = "defaultMode" in mount_spec
+    has_default_mode_alias = "default_mode" in mount_spec
+    if has_default_mode and has_default_mode_alias:
+        return None
+    if not has_default_mode and not has_default_mode_alias:
+        return secret_source_by_field
+    default_mode = mount_spec[
+        "defaultMode" if has_default_mode else "default_mode"
+    ]
+    if (
+        isinstance(default_mode, bool)
+        or not isinstance(default_mode, int)
+        or not 0 <= default_mode <= 0o777
+    ):
+        return None
+    secret_source_by_field["defaultMode"] = default_mode
+    return secret_source_by_field
+
+
+def _worker_job_secret_volumes(spec: WorkerSpec) -> list[dict[str, Any]]:
+    """Build validated secret mounts selected for one worker class."""
+
     raw = os.getenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", "").strip()
     if not raw:
         return []
@@ -911,17 +971,19 @@ def _worker_job_secret_volumes() -> list[dict[str, Any]]:
     for index, mount_spec in enumerate(mount_specs):
         if not isinstance(mount_spec, dict):
             continue
+        if not _is_secret_mount_selected(mount_spec, spec.worker_class):
+            continue
         secret_name = str(mount_spec.get("secretName") or mount_spec.get("secret_name") or "").strip()
         mount_path = str(mount_spec.get("mountPath") or mount_spec.get("mount_path") or "").strip()
         if not secret_name or not mount_path:
+            continue
+        secret_dict = _worker_job_secret_source(mount_spec, secret_name)
+        if secret_dict is None:
             continue
         volume_name = _dns_safe(str(mount_spec.get("name") or secret_name))[:54].strip("-") or f"secret-{index}"
         if volume_name in used_names:
             volume_name = f"{volume_name[:50].rstrip('-')}-{index}"
         used_names.add(volume_name)
-        secret_dict: dict[str, Any] = {"secretName": secret_name}
-        if bool(mount_spec.get("optional", False)):
-            secret_dict["optional"] = True
         volume_mount_dict: dict[str, Any] = {
             "name": volume_name,
             "mountPath": mount_path,

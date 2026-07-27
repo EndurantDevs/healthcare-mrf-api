@@ -114,18 +114,7 @@ class PTGFileProgressCoordinator:
     ) -> None:
         """Publish the aggregate run position while holding the coordinator lock."""
 
-        weighted_done = sum(
-            weight * fraction
-            for weight, fraction in zip(
-                self._weights,
-                self._fraction_by_index,
-                strict=True,
-            )
-        )
-        stage_fraction = weighted_done / self._total_weight
-        run_pct = self._stage_start_pct + (
-            (self._stage_end_pct - self._stage_start_pct) * stage_fraction
-        )
+        weighted_done, stage_fraction, run_pct = self._weighted_progress()
         file_weight_pct = self._weights[file_index] * 100.0 / self._total_weight
         counters = _aggregate_file_progress_counters(self._counters_by_index)
         counters.update(
@@ -139,11 +128,63 @@ class PTGFileProgressCoordinator:
                 ),
             }
         )
+        progress_position_by_field = self._progress_position_by_field(
+            file_index,
+            scanner_observation,
+            weighted_done,
+            stage_fraction,
+            run_pct,
+        )
+        weight_label = f"{file_weight_pct:.1f}% of compressed input"
+        if file_index == self._dominant_index:
+            weight_label += "; largest file"
         original_message = str(
             scanner_observation.get("message")
             or scanner_observation.get("phase")
             or "processing"
         )
+        progress_by_field = {
+            **dict(scanner_observation),
+            "stage_id": self._stage_id,
+            "stage_ordinal": self._stage_ordinal,
+            **progress_position_by_field,
+            "file_index": file_index + 1,
+            "file_count": len(self._weights),
+            "file_name": self._labels[file_index],
+            "file_weight": self._weights[file_index],
+            "file_weight_pct": file_weight_pct,
+            "dominant_file": file_index == self._dominant_index,
+            "counters": counters,
+            "message": (
+                f"File {file_index + 1}/{len(self._weights)} "
+                f"({weight_label}): {original_message}"
+            )[:512],
+        }
+        write_live_progress(**progress_by_field)
+
+    def _weighted_progress(self) -> tuple[float, float, float]:
+        weighted_done = sum(
+            weight * fraction
+            for weight, fraction in zip(
+                self._weights,
+                self._fraction_by_index,
+                strict=True,
+            )
+        )
+        stage_fraction = weighted_done / self._total_weight
+        run_pct = self._stage_start_pct + (
+            (self._stage_end_pct - self._stage_start_pct) * stage_fraction
+        )
+        return weighted_done, stage_fraction, run_pct
+
+    def _progress_position_by_field(
+        self,
+        file_index: int,
+        scanner_observation: Mapping[str, Any],
+        weighted_done: float,
+        stage_fraction: float,
+        run_pct: float,
+    ) -> dict[str, Any]:
         is_indeterminate = (
             file_index not in self._completed_indices
             and _is_progress_denominator_indeterminate(scanner_observation)
@@ -152,7 +193,7 @@ class PTGFileProgressCoordinator:
             semantic_work_done = scanner_observation.get("work_done")
             if semantic_work_done is None:
                 semantic_work_done = scanner_observation.get("done")
-            progress_position_by_field = {
+            return {
                 "stage_pct": None,
                 "phase_pct": None,
                 "unit": (
@@ -178,40 +219,18 @@ class PTGFileProgressCoordinator:
                 "pct_lower_bound": min(run_pct, self._stage_end_pct),
                 "eta_seconds": None,
             }
-        else:
-            progress_position_by_field = {
-                "stage_pct": stage_fraction * 100.0,
-                "phase_pct": scanner_observation.get("phase_pct"),
-                "unit": "compressed_input_bytes",
-                "basis": "weighted_compressed_input_bytes",
-                "denominator_state": "known",
-                "done": int(weighted_done),
-                "total": self._total_weight,
-                "work_done": int(weighted_done),
-                "work_total": self._total_weight,
-                "pct": min(run_pct, self._stage_end_pct),
-            }
-        weight_label = f"{file_weight_pct:.1f}% of compressed input"
-        if file_index == self._dominant_index:
-            weight_label += "; largest file"
-        progress_by_field = {
-            **dict(scanner_observation),
-            "stage_id": self._stage_id,
-            "stage_ordinal": self._stage_ordinal,
-            **progress_position_by_field,
-            "file_index": file_index + 1,
-            "file_count": len(self._weights),
-            "file_name": self._labels[file_index],
-            "file_weight": self._weights[file_index],
-            "file_weight_pct": file_weight_pct,
-            "dominant_file": file_index == self._dominant_index,
-            "counters": counters,
-            "message": (
-                f"File {file_index + 1}/{len(self._weights)} "
-                f"({weight_label}): {original_message}"
-            )[:512],
+        return {
+            "stage_pct": stage_fraction * 100.0,
+            "phase_pct": scanner_observation.get("phase_pct"),
+            "unit": "compressed_input_bytes",
+            "basis": "weighted_compressed_input_bytes",
+            "denominator_state": "known",
+            "done": int(weighted_done),
+            "total": self._total_weight,
+            "work_done": int(weighted_done),
+            "work_total": self._total_weight,
+            "pct": min(run_pct, self._stage_end_pct),
         }
-        write_live_progress(**progress_by_field)
 
     def _validate_index(self, file_index: int) -> None:
         if file_index < 0 or file_index >= len(self._weights):
@@ -281,15 +300,23 @@ def _aggregate_file_progress_counters(
     counters_by_name: dict[str, Any] = {}
     for file_counters in counters_by_index:
         for name, value in file_counters.items():
-            if isinstance(value, bool):
-                counters_by_name[name] = bool(
-                    counters_by_name.get(name, False) or value
-                )
-            elif isinstance(value, (int, float)):
-                counters_by_name[name] = counters_by_name.get(name, 0) + value
-            elif name not in counters_by_name:
-                counters_by_name[name] = value
+            _merge_aggregate_counter(counters_by_name, name, value)
     return counters_by_name
+
+
+def _merge_aggregate_counter(
+    counters_by_name: dict[str, Any],
+    name: str,
+    value: Any,
+) -> None:
+    if isinstance(value, bool):
+        counters_by_name[name] = bool(
+            counters_by_name.get(name, False) or value
+        )
+    elif isinstance(value, (int, float)):
+        counters_by_name[name] = counters_by_name.get(name, 0) + value
+    elif name not in counters_by_name:
+        counters_by_name[name] = value
 
 
 def _safe_progress_file_label(value: str) -> str:
@@ -349,6 +376,34 @@ def _scale_stage_progress_pct(
     return max(0.0, min(100.0, start + ((end - start) * (phase / 100.0))))
 
 
+def _item_progress_details(
+    state: dict[str, Any],
+    now: float,
+    item_count: int,
+    expected_items: int,
+) -> tuple[str, float | None, float | None]:
+    if item_count <= 0:
+        return "", None, None
+    item_started_at = state.setdefault(
+        "first_item_at",
+        state.get("started_at", now),
+    )
+    item_elapsed = max(now - item_started_at, 1e-6)
+    item_rate = item_count / item_elapsed
+    item_parts = f", item_rate={item_rate:.2f}/s"
+    if expected_items <= 0:
+        return item_parts, None, None
+    remaining_items = max(expected_items - item_count, 0)
+    item_eta = remaining_items / item_rate if item_rate > 0 else None
+    item_pct = min((item_count / expected_items) * 100, 100)
+    item_parts += (
+        f", item_progress={item_pct:.2f}% "
+        f"({item_count}/{expected_items}), "
+        f"item_eta={_format_duration(item_eta)}"
+    )
+    return item_parts, item_pct, item_eta
+
+
 def _maybe_log_artifact_progress(
     path: str | Path,
     stream: Any,
@@ -378,20 +433,12 @@ def _maybe_log_artifact_progress(
     compressed_eta = (total - position) / rate if rate and rate > 0 else None
     compressed_pct = (position / total) * 100
     expected_items = max(_env_int(PTG2_EXPECTED_IN_NETWORK_ITEMS_ENV, 0), 0)
-    item_parts = ""
-    if item_count > 0:
-        item_started_at = state.setdefault("first_item_at", state.get("started_at", now))
-        item_elapsed = max(now - item_started_at, 1e-6)
-        item_rate = item_count / item_elapsed
-        item_parts = f", item_rate={item_rate:.2f}/s"
-        if expected_items > 0:
-            remaining_items = max(expected_items - item_count, 0)
-            item_eta = remaining_items / item_rate if item_rate > 0 else None
-            item_pct = min((item_count / expected_items) * 100, 100)
-            item_parts += (
-                f", item_progress={item_pct:.2f}% "
-                f"({item_count}/{expected_items}), item_eta={_format_duration(item_eta)}"
-            )
+    item_parts, item_pct, item_eta = _item_progress_details(
+        state,
+        now,
+        item_count,
+        expected_items,
+    )
     message = (
         f"PTG2 progress {label}: compressed_read={compressed_pct:.2f}% "
         f"({position / (1024 ** 3):.2f}/{total / (1024 ** 3):.2f} GiB), "

@@ -87,71 +87,70 @@ async def _load_provider_references_from_file(
     return None
 
 
-async def _process_provider_reference_file(
+async def _load_provider_reference_content(
     url: str,
-    classes: dict[str, type],
-    test_mode: bool,
-    reuse_raw_artifacts: bool = True,
-    max_bytes: int | None = None,
-    import_run_id: str | None = None,
-    keep_partial_artifacts: bool | None = None,
-) -> dict[int, list[dict[str, Any]]]:
-    """Materialize one provider-reference artifact and return grouped providers."""
-    provider_cls = classes["PTGProviderGroup"]
-    file_cls = classes["PTGFile"]
-    import_log_cls = classes["ImportLog"]
-    provider_map: dict[int, list[dict[str, Any]]] = {}
-
-    with tempfile.TemporaryDirectory(dir=_ptg_facade().ptg2_temp_parent()) as tmpdir:
-        try:
-            raw_artifact, logical_artifact = await _ptg_facade().materialize_json_source(
+    temp_directory: str,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    import_run_id: str | None,
+    keep_partial_artifacts: bool | None,
+) -> dict[str, Any] | None:
+    try:
+        raw_artifact, logical_artifact = (
+            await _ptg_facade().materialize_json_source(
                 url,
-                tmpdir,
+                temp_directory,
                 reuse_raw_artifacts=reuse_raw_artifacts,
                 max_bytes=max_bytes,
                 keep_partial_artifacts=keep_partial_artifacts,
             )
-        except Exception as exc:
-            logger.warning("Failed to download provider-reference from %s: %s", url, exc)
-            return provider_map
-        provider_content = load_json_artifact(logical_artifact.logical_path)
-        await _ptg_facade()._record_source_version(
-            source_type="provider-reference",
-            domain="provider_reference",
-            raw_artifact=raw_artifact,
-            logical_artifact=logical_artifact,
-            import_run_id=import_run_id,
         )
-
-    file_metadata_by_field = {
-        "version": provider_content.get("version"),
-    }
-    file_row = _build_file_row(
-        url,
-        "provider-reference",
-        file_metadata_by_field,
-        None,
-        None,
-        None,
+    except Exception as exc:
+        logger.warning(
+            "Failed to download provider-reference from %s: %s",
+            url,
+            exc,
+        )
+        return None
+    provider_content = load_json_artifact(logical_artifact.logical_path)
+    await _ptg_facade()._record_source_version(
+        source_type="provider-reference",
+        domain="provider_reference",
+        raw_artifact=raw_artifact,
+        logical_artifact=logical_artifact,
+        import_run_id=import_run_id,
     )
-    await _push_ptg2_objects_from_facade([file_row], file_cls, rewrite=True)
+    return provider_content
 
-    provider_groups = provider_content.get("provider_groups") or []
+
+def _provider_reference_rows(
+    provider_content: dict[str, Any],
+    file_id: int,
+    test_mode: bool,
+) -> tuple[dict[int, list[dict[str, Any]]], list[dict[str, Any]]]:
+    provider_map: dict[int, list[dict[str, Any]]] = {}
     provider_rows: list[dict[str, Any]] = []
-    for idx, group in enumerate(provider_groups):
+    for index, group in enumerate(
+        provider_content.get("provider_groups") or [],
+    ):
         tin_info = group.get("tin") or {}
-        npi_list = group.get("npi") or []
-        normalized_npi = _normalized_npi_list(npi_list)
+        normalized_npi = _normalized_npi_list(group.get("npi") or [])
         provider_group_ref = _normalize_provider_ref(
-            group.get("provider_group_id") or group.get("provider_group_ref") or (idx + 1)
+            group.get("provider_group_id")
+            or group.get("provider_group_ref")
+            or (index + 1)
         )
         provider_hash = _provider_group_identity_hash(tin_info, normalized_npi)
         provider_rows.append(
             {
                 "provider_group_hash": provider_hash,
                 "provider_group_ref": provider_group_ref,
-                "file_id": file_row["file_id"],
-                "network_names": group.get("network_name") or group.get("network_names") or [],
+                "file_id": file_id,
+                "network_names": (
+                    group.get("network_name")
+                    or group.get("network_names")
+                    or []
+                ),
                 "tin_type": tin_info.get("type"),
                 "tin_value": tin_info.get("value"),
                 "tin_business_name": tin_info.get("business_name"),
@@ -168,10 +167,60 @@ async def _process_provider_reference_file(
         )
         if test_mode and len(provider_rows) >= _ptg_facade().TEST_PROVIDER_GROUPS:
             break
+    return provider_map, provider_rows
 
+
+async def _process_provider_reference_file(
+    url: str,
+    classes: dict[str, type],
+    test_mode: bool,
+    reuse_raw_artifacts: bool = True,
+    max_bytes: int | None = None,
+    import_run_id: str | None = None,
+    keep_partial_artifacts: bool | None = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Materialize one provider-reference artifact and return grouped providers."""
+
+    provider_map: dict[int, list[dict[str, Any]]] = {}
+    with tempfile.TemporaryDirectory(
+        dir=_ptg_facade().ptg2_temp_parent()
+    ) as temp_directory:
+        provider_content = await _load_provider_reference_content(
+            url,
+            temp_directory,
+            reuse_raw_artifacts,
+            max_bytes,
+            import_run_id,
+            keep_partial_artifacts,
+        )
+        if provider_content is None:
+            return provider_map
+
+    file_metadata_by_field = {
+        "version": provider_content.get("version"),
+    }
+    file_row = _build_file_row(
+        url,
+        "provider-reference",
+        file_metadata_by_field,
+        None,
+        None,
+        None,
+    )
+    await _push_ptg2_objects_from_facade(
+        [file_row],
+        classes["PTGFile"],
+        rewrite=True,
+    )
+    provider_map, provider_rows = _provider_reference_rows(
+        provider_content,
+        file_row["file_id"],
+        test_mode,
+    )
     if provider_rows:
         await _push_objects_from_facade(
-            _dedupe_rows_by(provider_rows, "provider_group_hash"), provider_cls
+            _dedupe_rows_by(provider_rows, "provider_group_hash"),
+            classes["PTGProviderGroup"],
         )
-    await _ptg_facade().flush_error_log(import_log_cls)
+    await _ptg_facade().flush_error_log(classes["ImportLog"])
     return provider_map

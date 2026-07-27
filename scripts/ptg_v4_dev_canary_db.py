@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from typing import Any, Mapping, Sequence
 
 import asyncpg
@@ -133,12 +134,18 @@ async def _collect_v4_database_rows(
         npi_count=exact_counts["npi_count"],
         pattern_count=exact_counts["pattern_count"],
     )
+    provider_tax_identity = await _provider_tax_identity(
+        connection,
+        scope.schema_name,
+        snapshot_key,
+    )
     return {
         "snapshot": snapshot_by_field,
         "root": root_by_field,
         "exact_counts": exact_counts,
         "relations": relation_rows,
         "inferred_taxonomy_candidates": inferred_taxonomy_candidates,
+        "provider_tax_identity": provider_tax_identity,
         "heavy_owners": await _heavy_owner_diagnostics(
             connection,
             scope.schema_name,
@@ -264,6 +271,37 @@ async def _exact_counts(
             WHERE snapshot_key = $1)::bigint AS prefix_member_count,
           (SELECT COUNT(*) FROM {schema}.ptg2_v4_provider_graph_diagnostic
             WHERE snapshot_key = $1)::bigint AS diagnostic_count,
+          (SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_group
+            WHERE snapshot_key = $1)::bigint AS provider_group_count,
+          (SELECT COUNT(*) FROM {schema}.ptg2_provider_tax_identity_manifest
+            WHERE snapshot_key = $1)::bigint AS
+            provider_tax_identity_manifest_count,
+          (SELECT COUNT(*) FROM {schema}.ptg2_provider_tax_identity
+            WHERE snapshot_key = $1)::bigint AS provider_tax_identity_count,
+          (SELECT COUNT(*) FROM {schema}.ptg2_provider_group_tax_identity
+            WHERE snapshot_key = $1)::bigint AS
+            provider_group_tax_identity_count,
+          (SELECT COUNT(*) FROM {schema}.ptg2_provider_group_tax_identity
+            WHERE snapshot_key = $1
+              AND tax_identity_state = 'matched_ein')::bigint AS
+            provider_tax_matched_ein_count,
+          (SELECT COUNT(*) FROM {schema}.ptg2_provider_group_tax_identity
+            WHERE snapshot_key = $1
+              AND tax_identity_state = 'missing')::bigint AS
+            provider_tax_missing_count,
+          (SELECT COUNT(*) FROM {schema}.ptg2_provider_group_tax_identity
+            WHERE snapshot_key = $1
+              AND tax_identity_state = 'malformed')::bigint AS
+            provider_tax_malformed_count,
+          (SELECT COUNT(*) FROM {schema}.ptg2_provider_group_tax_identity
+            WHERE snapshot_key = $1
+              AND tax_identity_state = 'unsupported_type')::bigint AS
+            provider_tax_unsupported_type_count,
+          (SELECT COUNT(DISTINCT tin_key)
+             FROM {schema}.ptg2_provider_group_tax_identity
+            WHERE snapshot_key = $1
+              AND tax_identity_state = 'matched_ein')::bigint AS
+            provider_tax_referenced_identity_count,
           (SELECT COUNT(*) FILTER (
                     WHERE representation <> 'observe_v1'
                   )
@@ -303,6 +341,51 @@ async def _exact_counts(
         field_name: int(field_count or 0)
         for field_name, field_count in dict(count_record).items()
     }
+
+
+async def _provider_tax_identity(
+    connection: asyncpg.Connection,
+    schema_name: str,
+    snapshot_key: int,
+) -> dict[str, Any]:
+    """Load the immutable provider tax-identity manifest for canary proof."""
+
+    schema = _quote_identifier(schema_name)
+    manifest_records = await connection.fetch(
+        f"""
+        SELECT contract,
+               token_policy_id,
+               encode(token_policy_descriptor_sha256, 'hex')
+                   AS token_policy_descriptor_sha256,
+               normalization_contract,
+               hmac_contract,
+               source_ordinal_contract,
+               source_ordinal_map::text AS source_ordinal_map_json,
+               encode(source_ordinal_map_digest, 'hex')
+                   AS source_ordinal_map_digest,
+               source_shard_count,
+               provider_group_count,
+               tax_identity_count,
+               matched_ein_count,
+               missing_count,
+               malformed_count,
+               unsupported_type_count,
+               encode(content_digest, 'hex') AS content_digest
+          FROM {schema}.ptg2_provider_tax_identity_manifest
+         WHERE snapshot_key = $1
+        """,
+        snapshot_key,
+    )
+    if len(manifest_records) != 1:
+        return {"row_count": len(manifest_records), "fields": {}}
+    manifest_by_field = dict(manifest_records[0])
+    source_ordinal_map_json = manifest_by_field.pop(
+        "source_ordinal_map_json"
+    )
+    manifest_by_field["source_ordinal_map"] = json.loads(
+        str(source_ordinal_map_json)
+    )
+    return {"row_count": 1, "fields": _json_safe(manifest_by_field)}
 
 
 async def _inferred_taxonomy_candidates(

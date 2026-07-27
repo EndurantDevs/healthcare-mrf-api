@@ -22,7 +22,8 @@ use ptg2_scanner::copy_format::{
     CompactCopyRow,
 };
 use ptg2_scanner::dedupe::{
-    dedupe_summary_payload, emit_dedupe_summary, ProviderIdentifierQuarantine, SharedDedupe,
+    dedupe_summary_payload, emit_dedupe_summary, provider_group_global_id_from_hash,
+    ProviderIdentifierQuarantine, SharedDedupe,
 };
 use ptg2_scanner::hashing::{
     checksum_i64_list, hash_i64_list, hash_string_list, hash_text, make_checksum, semantic_hash,
@@ -60,6 +61,9 @@ use ptg2_scanner::shared_graph::{
     convert_shared_provider_graph, MembershipArtifactDescriptor, MembershipMetadata,
     SharedGraphShardDescriptor,
 };
+#[cfg(test)]
+use ptg2_scanner::tax_identity::TinTokenPolicy;
+use ptg2_scanner::tax_identity::{load_tin_token_policy_from_env, TaxIdentityState};
 use ptg2_scanner::uhc_retained::run_uhc_retain_cli;
 use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
 use ptg2_scanner::v3_runs::{
@@ -714,6 +718,7 @@ struct CopyPathConfig {
     manifest_provider_inverted_sidecar: Option<String>,
     manifest_provider_set_component_sidecar: Option<String>,
     manifest_provider_component_group_sidecar: Option<String>,
+    manifest_provider_group_tax_identity_sidecar: Option<String>,
     manifest_provider_npi_sidecar: Option<String>,
     manifest_price_forward_sidecar: Option<String>,
     manifest_price_atom: Option<String>,
@@ -738,6 +743,7 @@ fn configured_v4_factor_mode(paths: &CopyPathConfig) -> io::Result<bool> {
     let enabled = env_bool(PROVIDER_GRAPH_V4_ENV, false);
     let has_set_component_path = paths.manifest_provider_set_component_sidecar.is_some();
     let has_component_group_path = paths.manifest_provider_component_group_sidecar.is_some();
+    let has_tax_identity_path = paths.manifest_provider_group_tax_identity_sidecar.is_some();
     if has_set_component_path != has_component_group_path {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -750,7 +756,39 @@ fn configured_v4_factor_mode(paths: &CopyPathConfig) -> io::Result<bool> {
             format!("{PROVIDER_GRAPH_V4_ENV} requires both V4 provider factor sidecar paths"),
         ));
     }
+    if enabled && !has_tax_identity_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{PROVIDER_GRAPH_V4_ENV} requires the provider-group tax identity sidecar path"
+            ),
+        ));
+    }
+    if !enabled && has_tax_identity_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider-group tax identity output requires V4 provider factor mode",
+        ));
+    }
     Ok(enabled)
+}
+
+fn configured_shared_dedupe(
+    worker_count: usize,
+    serving_rate_dedupe_enabled: bool,
+    factor_mode: bool,
+) -> io::Result<SharedDedupe> {
+    if factor_mode {
+        return Ok(SharedDedupe::new_with_v4_tax_identity(
+            worker_count,
+            serving_rate_dedupe_enabled,
+            load_tin_token_policy_from_env()?,
+        ));
+    }
+    Ok(SharedDedupe::new_with_serving_rate_dedupe(
+        worker_count,
+        serving_rate_dedupe_enabled,
+    ))
 }
 
 impl CopyPathConfig {
@@ -805,6 +843,9 @@ impl CopyPathConfig {
             manifest_provider_component_group_sidecar: env_path(
                 "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH",
             ),
+            manifest_provider_group_tax_identity_sidecar: env_path(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
+            ),
             manifest_price_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"),
             manifest_price_set_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH"),
             manifest_price_set_summary: env_path(
@@ -851,6 +892,7 @@ impl CopyPathConfig {
             || self.manifest_provider_inverted_sidecar.is_some()
             || self.manifest_provider_set_component_sidecar.is_some()
             || self.manifest_provider_component_group_sidecar.is_some()
+            || self.manifest_provider_group_tax_identity_sidecar.is_some()
             || self.manifest_provider_npi_sidecar.is_some()
             || self.manifest_price_forward_sidecar.is_some()
     }
@@ -876,6 +918,9 @@ impl CopyPathConfig {
                 .clone(),
             manifest_provider_component_group_sidecar: self
                 .manifest_provider_component_group_sidecar
+                .clone(),
+            manifest_provider_group_tax_identity_sidecar: self
+                .manifest_provider_group_tax_identity_sidecar
                 .clone(),
             manifest_provider_npi_sidecar: self.manifest_provider_npi_sidecar.clone(),
             manifest_price_forward_sidecar: self.manifest_price_forward_sidecar.clone(),
@@ -958,6 +1003,9 @@ impl CopyPathConfig {
                 .clone(),
             manifest_provider_component_group_sidecar: self
                 .manifest_provider_component_group_sidecar
+                .clone(),
+            manifest_provider_group_tax_identity_sidecar: self
+                .manifest_provider_group_tax_identity_sidecar
                 .clone(),
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
@@ -1265,6 +1313,9 @@ fn validate_provider_group(
     } else {
         strict_npi_partition(group.get("npi"))?
     };
+    if allow_empty_npi_tin_only {
+        return Ok(npi_partition);
+    }
     let tin = group.get("tin").and_then(Value::as_object).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1440,6 +1491,7 @@ fn build_provider_entry_audited(
     ))
 }
 
+#[cfg(test)]
 fn build_provider_entry(provider_ref: &Value) -> io::Result<ProviderEntry> {
     build_provider_entry_audited(provider_ref, false).map(|(entry, _normalization_count)| entry)
 }
@@ -1454,6 +1506,7 @@ fn provider_ref_key(value: &Value) -> io::Result<ProviderRefKey> {
     ProviderRefKey::from_number(number.clone(), "provider_group_id")
 }
 
+#[cfg(test)]
 fn provider_ref_definition(value: &Value) -> io::Result<(ProviderRefKey, ProviderEntry)> {
     provider_ref_definition_audited(value, false)
         .map(|(key, entry, _normalization_count)| (key, entry))
@@ -1723,6 +1776,7 @@ fn price_atom_from_owned_lite(price: PriceLite) -> PriceAtomLite {
     }
 }
 
+#[cfg(test)]
 fn price_code_set_hash(codes: &[String]) -> String {
     hash_string_list("price_code_set", codes)
 }
@@ -1741,6 +1795,7 @@ fn price_set_from_atoms(atoms: Vec<PriceAtomLite>) -> Option<PriceSetLite> {
     })
 }
 
+#[cfg(test)]
 fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
     price_set_from_atoms(prices.iter().map(price_atom_from_lite).collect())
 }
@@ -1777,10 +1832,12 @@ impl RatePriceSet<'_> {
 fn rate_price_set(rate: &RateLite) -> Option<RatePriceSet<'_>> {
     match rate.prepared_price_set.as_ref() {
         Some(price_set) => Some(RatePriceSet::Borrowed(price_set)),
-        None => price_lite_set(&rate.prices).map(RatePriceSet::Owned),
+        None => price_set_from_atoms(rate.prices.iter().map(price_atom_from_lite).collect())
+            .map(RatePriceSet::Owned),
     }
 }
 
+#[cfg(test)]
 fn price_atom_global_id(atom: &PriceAtomLite) -> GlobalId128 {
     atom.global_id
 }
@@ -1789,9 +1846,126 @@ fn price_set_global_id(price_set: &PriceSetLite) -> GlobalId128 {
     price_set.global_id
 }
 
-fn provider_group_global_id_from_hash(provider_group_hash: i64) -> GlobalId128 {
-    let hash_text = provider_group_hash.to_string();
-    GlobalId128::from_parts("provider_group_manifest", &[&hash_text])
+const PROVIDER_GROUP_TAX_IDENTITY_MAGIC: &[u8; 8] = b"PTG2TAX1";
+const PROVIDER_GROUP_TAX_IDENTITY_VERSION: u16 = 1;
+const PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES: u16 = 65;
+
+fn emit_provider_group_tax_identity_sidecar<W: Write>(
+    writer: &mut W,
+    paths: &CopyPathConfig,
+    dedupe: &SharedDedupe,
+) -> io::Result<()> {
+    let Some(output_path) = paths
+        .manifest_provider_group_tax_identity_sidecar
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    let policy_id = dedupe
+        .provider_group_tax_identity_policy_id()
+        .ok_or_else(|| io::Error::other("provider tax identity policy is not configured"))?;
+    let policy_id_bytes = policy_id.as_bytes();
+    let policy_id_length = u8::try_from(policy_id_bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider tax identity policy id is too long",
+        )
+    })?;
+    let temporary_path = format!("{output_path}.building");
+    let result = (|| -> io::Result<Value> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)?;
+        let mut artifact = BufWriter::new(file);
+        artifact.write_all(PROVIDER_GROUP_TAX_IDENTITY_MAGIC)?;
+        artifact.write_all(&PROVIDER_GROUP_TAX_IDENTITY_VERSION.to_le_bytes())?;
+        artifact.write_all(&PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES.to_le_bytes())?;
+        artifact.write_all(&[policy_id_length])?;
+        artifact.write_all(policy_id_bytes)?;
+        let mut row_count = 0u64;
+        let mut matched_ein_count = 0u64;
+        let mut missing_count = 0u64;
+        let mut malformed_count = 0u64;
+        let mut unsupported_type_count = 0u64;
+        dedupe.visit_provider_group_tax_identities(|group_hash, observation| {
+            let hmac = match (observation.state, observation.tin_hmac_sha256) {
+                (TaxIdentityState::MatchedEin, Some(hmac)) => hmac,
+                (TaxIdentityState::MatchedEin, None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "matched provider tax identity is missing its token",
+                    ));
+                }
+                (_, None) => [0u8; 32],
+                (_, Some(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unavailable provider tax identity carries a token",
+                    ));
+                }
+            };
+            let group_id = provider_group_global_id_from_hash(group_hash);
+            artifact.write_all(&group_id.0)?;
+            artifact.write_all(&[observation.state as u8])?;
+            artifact.write_all(&hmac[..16])?;
+            artifact.write_all(&hmac)?;
+            row_count = row_count.saturating_add(1);
+            match observation.state {
+                TaxIdentityState::MatchedEin => {
+                    matched_ein_count = matched_ein_count.saturating_add(1)
+                }
+                TaxIdentityState::Missing => missing_count = missing_count.saturating_add(1),
+                TaxIdentityState::Malformed => malformed_count = malformed_count.saturating_add(1),
+                TaxIdentityState::UnsupportedType => {
+                    unsupported_type_count = unsupported_type_count.saturating_add(1)
+                }
+            }
+            Ok(())
+        })?;
+        let expected_count = dedupe.unique_provider_group_count();
+        if row_count != expected_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "provider tax identity row count {row_count} does not match provider group count {expected_count}"
+                ),
+            ));
+        }
+        artifact.flush()?;
+        drop(artifact);
+        let artifact_sha256 = sha256_hex(&sha256_file(Path::new(&temporary_path))?);
+        let artifact_bytes = std::fs::metadata(&temporary_path)?.len();
+        std::fs::rename(&temporary_path, output_path)?;
+        Ok(json!({
+            "path": output_path,
+            "bytes": artifact_bytes,
+            "row_count": row_count,
+            "provider_group_count": expected_count,
+            "matched_ein_count": matched_ein_count,
+            "missing_count": missing_count,
+            "malformed_count": malformed_count,
+            "unsupported_type_count": unsupported_type_count,
+            "format": "ptg2_provider_group_tax_identity_v1",
+            "version": PROVIDER_GROUP_TAX_IDENTITY_VERSION,
+            "record_bytes": PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES,
+            "token_policy_id": policy_id,
+            "normalization_contract": "ein_ascii_digits_or_2_7_hyphen_v1",
+            "hmac_contract": "hmac_sha256_ptg_tin_v1",
+            "sha256": artifact_sha256,
+            "final": true,
+        }))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    emit_json_record(
+        writer,
+        "manifest_provider_group_tax_identity_sidecar_file",
+        &result?,
+    )?;
+    writer.flush()
 }
 
 fn provider_component_global_id_from_hash(provider_component_hash: i64) -> GlobalId128 {
@@ -4102,8 +4276,9 @@ impl DictionaryCopySinks {
             return Ok(false);
         };
         let price_atom_id = atom.global_id.to_hex();
-        let service_code_set_hash = price_code_set_hash(&atom.service_code);
-        let billing_code_modifier_set_hash = price_code_set_hash(&atom.billing_code_modifier);
+        let service_code_set_hash = hash_string_list("price_code_set", &atom.service_code);
+        let billing_code_modifier_set_hash =
+            hash_string_list("price_code_set", &atom.billing_code_modifier);
         let fields = [
             pg_text_copy_field(Some(&price_atom_id)),
             pg_text_copy_field(atom.negotiated_type.as_deref()),
@@ -4130,7 +4305,7 @@ impl DictionaryCopySinks {
         let Some(sink) = self.manifest_price_atom.as_mut() else {
             return Ok(false);
         };
-        let price_atom_global_id = price_atom_global_id(atom).to_hex();
+        let price_atom_global_id = atom.global_id.to_hex();
         let fields = [
             pg_text_copy_field(Some(&price_atom_global_id)),
             pg_text_copy_field(atom.negotiated_type.as_deref()),
@@ -4166,7 +4341,7 @@ impl DictionaryCopySinks {
         })?;
         let mut rows_written = 0u64;
         for atom in &price_set.atoms {
-            let price_atom_global_id = price_atom_global_id(atom).to_hex();
+            let price_atom_global_id = atom.global_id.to_hex();
             let fields = [
                 pg_text_copy_field(Some(&price_set_global_id)),
                 pg_text_copy_field(Some(&price_atom_global_id)),
@@ -4225,11 +4400,11 @@ impl DictionaryCopySinks {
         if self.price_code_set.is_none() {
             return Ok(());
         }
-        let service_code_set_hash = price_code_set_hash(&atom.service_code);
+        let service_code_set_hash = hash_string_list("price_code_set", &atom.service_code);
         if emitted_price_code_sets.insert(service_code_set_hash.clone()) {
             self.write_price_code_set(&service_code_set_hash, &atom.service_code)?;
         }
-        let modifier_set_hash = price_code_set_hash(&atom.billing_code_modifier);
+        let modifier_set_hash = hash_string_list("price_code_set", &atom.billing_code_modifier);
         if emitted_price_code_sets.insert(modifier_set_hash.clone()) {
             self.write_price_code_set(&modifier_set_hash, &atom.billing_code_modifier)?;
         }
@@ -4244,11 +4419,11 @@ impl DictionaryCopySinks {
         if self.price_code_set.is_none() {
             return Ok(());
         }
-        let service_code_set_hash = price_code_set_hash(&atom.service_code);
+        let service_code_set_hash = hash_string_list("price_code_set", &atom.service_code);
         if dedupe.insert_price_code_set(&service_code_set_hash) {
             self.write_price_code_set(&service_code_set_hash, &atom.service_code)?;
         }
-        let modifier_set_hash = price_code_set_hash(&atom.billing_code_modifier);
+        let modifier_set_hash = hash_string_list("price_code_set", &atom.billing_code_modifier);
         if dedupe.insert_price_code_set(&modifier_set_hash) {
             self.write_price_code_set(&modifier_set_hash, &atom.billing_code_modifier)?;
         }
@@ -4726,7 +4901,12 @@ impl DictionaryCopySinks {
             let group_hash =
                 provider_group_hash(tin, &npi_partition.valid, &npi_partition.quarantined);
             let npi = npi_partition.valid;
-            if !dedupe.insert_provider_group(group_hash) {
+            let inserted = if allow_empty_npi_tin_only {
+                dedupe.insert_provider_group_with_tax_identity(group_hash, group.get("tin"))?
+            } else {
+                dedupe.insert_provider_group(group_hash)
+            };
+            if !inserted {
                 continue;
             }
             let provider_group_global_id = provider_group_global_id_from_hash(group_hash).to_hex();
@@ -5005,7 +5185,8 @@ fn process_compact_rate_lites<W: Write>(
             let provider_ref = json!({"provider_groups": rate.provider_groups});
             dictionary_copy_sinks
                 .write_provider_group_members(&provider_ref, dedupe.provider_group_members)?;
-            let inline_entry = build_provider_entry(&provider_ref)?;
+            let inline_entry = build_provider_entry_audited(&provider_ref, false)
+                .map(|(entry, _normalization_count)| entry)?;
             dedupe
                 .provider_identifier_quarantine
                 .record(&inline_entry.quarantined_npi)?;
@@ -7763,7 +7944,8 @@ fn provider_entry_view_for_worker_rate<'a>(
 
     let provider_ref = json!({"provider_groups": rate.provider_groups});
     dictionary_copy_sinks.write_provider_group_members_shared(&provider_ref, dedupe, false)?;
-    let inline_entry = build_provider_entry(&provider_ref)?;
+    let inline_entry = build_provider_entry_audited(&provider_ref, false)
+        .map(|(entry, _normalization_count)| entry)?;
     dedupe.record_quarantined_provider_identifiers(&inline_entry.quarantined_npi)?;
     if rate.provider_refs.is_empty() {
         return Ok(Some(ProviderEntryView::Owned(inline_entry)));
@@ -10590,10 +10772,11 @@ fn scan_compact_byte_top_level_parallel(
         (bounded_queue_size * 4).max(worker_count),
     )
     .max(1);
-    let dedupe = Arc::new(SharedDedupe::new_with_serving_rate_dedupe(
+    let dedupe = Arc::new(configured_shared_dedupe(
         worker_count,
         !copy_paths.manifest_only,
-    ));
+        factor_mode,
+    )?);
     let provider_graph_v4_factor_cache = Arc::new(
         V4ProviderSetFactorSharedCache::configured_for_mode(factor_mode)?,
     );
@@ -11394,6 +11577,7 @@ fn scan_compact_byte_top_level_parallel(
                         }
                     }
                     emit_dedupe_summary(&dedupe, &object_counts);
+                    emit_provider_group_tax_identity_sidecar(&mut writer, &copy_paths, &dedupe)?;
                     if let Some(sidecars) = manifest_sidecars.as_ref() {
                         let sidecar_finalize_started_at = Instant::now();
                         let sidecar_lock_started_at = Instant::now();
@@ -11802,10 +11986,11 @@ fn scan_compact_struson_parallel(
         DEFAULT_PARSE_IN_WORKERS,
     );
     let bounded_queue_size = queue_size.max(worker_count).max(1);
-    let dedupe = Arc::new(SharedDedupe::new_with_serving_rate_dedupe(
+    let dedupe = Arc::new(configured_shared_dedupe(
         worker_count,
         !copy_paths.manifest_only,
-    ));
+        factor_mode,
+    )?);
     let provider_graph_v4_factor_cache = Arc::new(
         V4ProviderSetFactorSharedCache::configured_for_mode(factor_mode)?,
     );
@@ -12254,6 +12439,7 @@ fn scan_compact_struson_parallel(
                     );
                 }
                 emit_dedupe_summary(&dedupe, &object_counts);
+                emit_provider_group_tax_identity_sidecar(&mut writer, &copy_paths, &dedupe)?;
                 drain_copy_file_events(&event_rx, &mut writer)?;
                 for event in copy_file_events {
                     emit_copy_file_event(&mut writer, &event)?;
@@ -13000,7 +13186,8 @@ fn compact_provider_reference_order(
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                    let (key, entry) = provider_ref_definition(&value)?;
+                    let (key, entry, _normalization_count) =
+                        provider_ref_definition_audited(&value, false)?;
                     insert_provider_definition(&mut provider_map, key, entry)?;
                 }
                 json_reader.end_array().map_err(to_io_error)?;
@@ -13501,10 +13688,10 @@ fn scan_compact_struson_inner(
                     provider_parse_micros = provider_parse_micros
                         .saturating_add(parse_started_at.elapsed().as_micros());
                     let transform_started_at = Instant::now();
-                    let provider_entry = provider_ref_definition(&value)?;
+                    let (key, entry, _normalization_count) =
+                        provider_ref_definition_audited(&value, false)?;
                     provider_transform_micros = provider_transform_micros
                         .saturating_add(transform_started_at.elapsed().as_micros());
-                    let (key, entry) = provider_entry;
                     if let Some(sidecars) = manifest_sidecars.as_mut() {
                         sidecars.record_provider_component(
                             entry.entry_hash,
@@ -18443,7 +18630,20 @@ impl ServingBinaryV3ProviderCodeSpool {
                 "provider-code external sort output accounting mismatch",
             ));
         }
-        let merge_pass_count = provider_code_merge_pass_count(stats.chunk_count);
+        let merge_pass_count = {
+            let mut chunk_count = stats.chunk_count;
+            if chunk_count == 0 {
+                0
+            } else {
+                let mut pass_count = 1usize;
+                while chunk_count >= SERVING_BINARY_V3_PROVIDER_CODE_MERGE_FAN_IN as u64 {
+                    chunk_count =
+                        chunk_count.div_ceil(SERVING_BINARY_V3_PROVIDER_CODE_MERGE_FAN_IN as u64);
+                    pass_count = pass_count.saturating_add(1);
+                }
+                pass_count
+            }
+        };
         Ok(ServingBinaryV3ProviderCodeSortSummary {
             input_pair_count: self.row_count,
             unique_pair_count,
@@ -18787,6 +18987,7 @@ impl ServingBinaryV3ProviderCodeIndex {
     }
 }
 
+#[cfg(test)]
 fn provider_code_merge_pass_count(mut chunk_count: u64) -> usize {
     if chunk_count == 0 {
         return 0;
@@ -25266,8 +25467,58 @@ mod tests {
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH",
             component_path.to_str().unwrap(),
         );
+        let tax_identity_path = directory.join("provider-group-tax-identity.ptg2tax");
+        let _tax_identity_path = TestEnvVar::set(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
+            tax_identity_path.to_str().unwrap(),
+        );
         let config = CopyPathConfig::from_env().unwrap();
         assert!(configured_v4_factor_mode(&config).unwrap());
+    }
+
+    #[test]
+    fn v4_tax_secret_failure_precedes_sidecar_output_and_hides_its_path() {
+        let _lock = scanner_env_lock().lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("ptg2-v4-tax-secret-{}", std::process::id()));
+        let output_path = directory.join("tax-identities.ptg2tax");
+        let secret_path = directory.join("secret.bin");
+        let _ = std::fs::create_dir_all(&directory);
+        let _policy = TestEnvVar::set(
+            "HLTHPRT_PTG2_TIN_TOKEN_POLICY_ID",
+            "ptg-tin-hmac-sha256-v1:test-1",
+        );
+        let _missing_secret = TestEnvVar::remove("HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE");
+
+        let missing = configured_shared_dedupe(2, false, true).err().unwrap();
+        assert_eq!(missing.kind(), io::ErrorKind::InvalidInput);
+        assert!(!output_path.exists());
+
+        std::fs::write(&secret_path, [9u8; 31]).unwrap();
+        let _secret = TestEnvVar::set(
+            "HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE",
+            secret_path.to_str().unwrap(),
+        );
+        let malformed = configured_shared_dedupe(2, false, true).err().unwrap();
+        assert_eq!(malformed.kind(), io::ErrorKind::InvalidInput);
+        assert!(!malformed
+            .to_string()
+            .contains(secret_path.to_str().unwrap()));
+        assert!(!output_path.exists());
+
+        std::fs::write(&secret_path, [9u8; 33]).unwrap();
+        let oversized = configured_shared_dedupe(2, false, true).err().unwrap();
+        assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
+        assert!(!oversized
+            .to_string()
+            .contains(secret_path.to_str().unwrap()));
+        assert!(!output_path.exists());
+
+        std::fs::write(&secret_path, [9u8; 32]).unwrap();
+        configured_shared_dedupe(2, false, true).unwrap();
+        assert!(!output_path.exists());
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -25286,6 +25537,9 @@ mod tests {
             ),
             manifest_provider_component_group_sidecar: Some(
                 "provider-component-group.sidecar".to_string(),
+            ),
+            manifest_provider_group_tax_identity_sidecar: Some(
+                "provider-group-tax-identity.sidecar".to_string(),
             ),
             manifest_provider_npi_sidecar: Some("provider-npi.copy".to_string()),
             manifest_price_forward_sidecar: Some("price-forward.copy".to_string()),
@@ -25383,6 +25637,10 @@ mod tests {
             paths.manifest_provider_inverted_sidecar
         );
         assert_eq!(
+            worker_paths.manifest_provider_group_tax_identity_sidecar,
+            paths.manifest_provider_group_tax_identity_sidecar
+        );
+        assert_eq!(
             worker_paths.manifest_provider_npi_sidecar,
             paths.manifest_provider_npi_sidecar
         );
@@ -25437,6 +25695,7 @@ mod tests {
             manifest_provider_inverted_sidecar: None,
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
+            manifest_provider_group_tax_identity_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -25493,6 +25752,7 @@ mod tests {
             manifest_provider_inverted_sidecar: None,
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
+            manifest_provider_group_tax_identity_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: Some(base.join("unused-price.copy").to_string_lossy().to_string()),
@@ -25559,6 +25819,122 @@ mod tests {
         assert_eq!(summary["provider_group_member_attempted"], 2);
         assert_eq!(summary["provider_group_member_unique"], 2);
         assert_eq!(summary["provider_group_member_duplicate"], 0);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn v4_tax_identity_sidecar_is_token_only_complete_and_deterministic() {
+        fn build_artifact(path: &Path, worker_count: usize, reverse: bool) -> (Vec<u8>, String) {
+            let policy =
+                TinTokenPolicy::from_secret("ptg-tin-hmac-sha256-v1:test-1".to_string(), [7u8; 32])
+                    .unwrap();
+            let dedupe = SharedDedupe::new_with_v4_tax_identity(worker_count, false, policy);
+            let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
+            let mut provider_refs = vec![
+                json!({"provider_groups": [{
+                    "tin": {"type": "ein", "value": "01💥2345678"},
+                    "npi": [1234567890]
+                }]}),
+                json!({"provider_groups": [{
+                    "tin": {"type": " EIN ", "value": "012345678"},
+                    "npi": [1234567890]
+                }]}),
+                json!({"provider_groups": [{
+                    "npi": []
+                }]}),
+                json!({"provider_groups": [{
+                    "tin": {"type": "other", "value": "opaque"},
+                    "npi": [1234567891]
+                }]}),
+            ];
+            if reverse {
+                provider_refs.reverse();
+            }
+            for provider_ref in provider_refs {
+                sinks
+                    .write_provider_group_members_shared(&provider_ref, &dedupe, true)
+                    .unwrap();
+            }
+            let paths = CopyPathConfig {
+                manifest_provider_group_tax_identity_sidecar: Some(
+                    path.to_string_lossy().to_string(),
+                ),
+                ..CopyPathConfig::default()
+            };
+            let mut event = Vec::new();
+            emit_provider_group_tax_identity_sidecar(&mut event, &paths, &dedupe).unwrap();
+            (
+                std::fs::read(path).unwrap(),
+                String::from_utf8(event).unwrap(),
+            )
+        }
+
+        let base =
+            std::env::temp_dir().join(format!("ptg2-provider-tax-identity-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let first_path = base.join("first.ptg2tax");
+        let second_path = base.join("second.ptg2tax");
+        let (first, first_event) = build_artifact(&first_path, 1, false);
+        let (second, _second_event) = build_artifact(&second_path, 8, true);
+
+        assert_eq!(first, second);
+        assert_eq!(&first[..8], PROVIDER_GROUP_TAX_IDENTITY_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes(first[8..10].try_into().unwrap()),
+            PROVIDER_GROUP_TAX_IDENTITY_VERSION
+        );
+        assert_eq!(
+            u16::from_le_bytes(first[10..12].try_into().unwrap()),
+            PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES
+        );
+        let policy_length = first[12] as usize;
+        let records = &first[13 + policy_length..];
+        assert_eq!(
+            records.len(),
+            PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES as usize * 3
+        );
+        let rows = records
+            .chunks_exact(PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES as usize)
+            .collect::<Vec<_>>();
+        assert!(rows.windows(2).all(|pair| pair[0][..16] < pair[1][..16]));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row[16] == TaxIdentityState::MatchedEin as u8)
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row[16] == TaxIdentityState::Missing as u8)
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row[16] == TaxIdentityState::UnsupportedType as u8)
+                .count(),
+            1
+        );
+        for row in rows {
+            let token = &row[17..];
+            if row[16] == TaxIdentityState::MatchedEin as u8 {
+                assert!(token.iter().any(|byte| *byte != 0));
+                assert_eq!(&token[..16], &token[16..32]);
+            } else {
+                assert!(token.iter().all(|byte| *byte == 0));
+            }
+        }
+        assert!(first_event.contains(r#""row_count":3"#));
+        assert!(first_event.contains(r#""matched_ein_count":1"#));
+        assert!(first_event.contains(r#""missing_count":1"#));
+        assert!(first_event.contains(r#""unsupported_type_count":1"#));
+        assert!(!first
+            .windows("012345678".len())
+            .any(|part| part == b"012345678"));
+        assert!(!first.windows("opaque".len()).any(|part| part == b"opaque"));
+        assert!(!first_event.contains("012345678"));
+        assert!(!first_event.contains("opaque"));
 
         let _ = std::fs::remove_dir_all(base);
     }
@@ -26128,6 +26504,13 @@ mod tests {
         RawValue::from_string(value.to_owned()).expect("valid raw provider_groups JSON")
     }
 
+    fn v4_test_shared_dedupe(worker_count: usize) -> SharedDedupe {
+        let policy =
+            TinTokenPolicy::from_secret("ptg-tin-hmac-sha256-v1:test-1".to_string(), [7u8; 32])
+                .unwrap();
+        SharedDedupe::new_with_v4_tax_identity(worker_count, false, policy)
+    }
+
     fn reference_extreme_inline_rate() -> RateLite {
         RateLite {
             provider_refs: Vec::new(),
@@ -26163,7 +26546,7 @@ mod tests {
         const RATE_ATTEMPTS: usize = 6_250;
         let rate = Arc::new(reference_extreme_inline_rate());
         let cache = Arc::new(V4InlineProviderTransformSharedCache::new(cache_max_bytes));
-        let dedupe = Arc::new(SharedDedupe::new(worker_count));
+        let dedupe = Arc::new(v4_test_shared_dedupe(worker_count));
         let mut handles = Vec::new();
         for worker_id in 0..worker_count {
             let rate = Arc::clone(&rate);
@@ -26284,7 +26667,7 @@ mod tests {
         let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
         let mut scope_cache = ProviderSetScopeCache::configured(Arc::clone(&shared), true);
         let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
-        let dedupe = SharedDedupe::new(1);
+        let dedupe = v4_test_shared_dedupe(1);
         let provider_map = HashMap::new();
         let context = test_compact_context();
         let first = resolve_worker_provider(
@@ -26350,7 +26733,7 @@ mod tests {
         let shared = Arc::new(V4ProviderSetFactorSharedCache::new(1024 * 1024));
         let mut scope_cache = ProviderSetScopeCache::configured(Arc::clone(&shared), true);
         let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
-        let dedupe = SharedDedupe::new(1);
+        let dedupe = v4_test_shared_dedupe(1);
         let provider_map = HashMap::new();
         let context = test_compact_context();
         let first = resolve_worker_provider(
@@ -27059,6 +27442,32 @@ mod tests {
     }
 
     #[test]
+    fn v4_provider_definition_classifies_tin_without_rejecting_pricing() {
+        for unavailable_tin in [
+            Value::Null,
+            json!(true),
+            json!([]),
+            json!({}),
+            json!({"type": "ein"}),
+            json!({"value": "123456789"}),
+            json!({"type": 7, "value": "123456789"}),
+            json!({"type": "ein", "value": 123456789}),
+            json!({"type": " ", "value": "123456789"}),
+            json!({"type": "ein", "value": " "}),
+            json!({"type": "ein", "value": "01💥2345678"}),
+            json!({"type": "ein", "value": "123456789", "business_name": 7}),
+        ] {
+            let mut provider_ref = valid_provider_reference();
+            provider_ref["provider_groups"][0]["tin"] = unavailable_tin;
+            provider_ref_definition_audited(&provider_ref, true).unwrap();
+        }
+
+        let mut provider_ref = valid_provider_reference();
+        provider_ref["network_name"] = json!(["network", 7]);
+        assert!(provider_ref_definition_audited(&provider_ref, true).is_err());
+    }
+
+    #[test]
     fn strict_rate_parser_rejects_invalid_provider_reference_scalar_types() {
         for invalid in [r#""7""#, "true", "{}", "[]", "null", "7.5"] {
             let raw = format!(
@@ -27190,7 +27599,7 @@ mod tests {
         raw_refs.push_current_value_span(0);
 
         let mut sinks = DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
-        let dedupe = SharedDedupe::new(2);
+        let dedupe = v4_test_shared_dedupe(2);
         let mut provider_map = HashMap::new();
         let processed =
             process_provider_ref_raw_batch(&raw_refs, &mut provider_map, &mut sinks, &dedupe, true)
@@ -27382,6 +27791,7 @@ mod tests {
             manifest_provider_inverted_sidecar: None,
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
+            manifest_provider_group_tax_identity_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -27628,7 +28038,7 @@ mod tests {
 
         let mut dictionary_sinks =
             DictionaryCopySinks::from_paths(&CopyPathConfig::default(), 0).unwrap();
-        let dedupe = SharedDedupe::new(2);
+        let dedupe = v4_test_shared_dedupe(2);
         let mut provider_cache = ProviderSetScopeCache::with_v4_factor_mode(true);
         let provider_map = HashMap::new();
         let resolved = resolve_worker_provider(
@@ -27978,6 +28388,7 @@ mod tests {
             manifest_provider_inverted_sidecar: None,
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
+            manifest_provider_group_tax_identity_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -28088,6 +28499,7 @@ mod tests {
             manifest_provider_inverted_sidecar: None,
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
+            manifest_provider_group_tax_identity_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -30183,6 +30595,47 @@ mod tests {
         assert_eq!(cancellation_error.kind(), io::ErrorKind::BrokenPipe);
         assert!(writer.pending_shared_blocks.is_empty());
         assert_eq!(writer.shared_blocks.row_count, 0);
+    }
+
+    #[test]
+    fn shared_block_fail_after_writer_preserves_complete_copy_on_sufficient_capacity() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let _compression = TestEnvVar::set(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "none");
+        let mut writer = CountingWriter::with_shared_block_preparation_batch(
+            FailAfterWriter {
+                remaining_bytes: 4096,
+                bytes: Vec::new(),
+            },
+            SharedBlockPreparationBatchLimits {
+                maximum_raw_bytes: 4096,
+                maximum_records: 2,
+            },
+        )
+        .unwrap();
+
+        write_serving_binary_copy_header(&mut writer, ServingBinaryTargetCopyFormat::SharedBinary)
+            .unwrap();
+        write_serving_binary_copy_record_with_i64_key_and_stats(
+            &mut writer,
+            ServingBinaryTargetCopyFormat::SharedBinary,
+            PTG2_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
+            7,
+            0,
+            2,
+            &[3, 1, 4, 1, 5, 9],
+        )
+        .unwrap();
+        write_serving_binary_copy_trailer(&mut writer, ServingBinaryTargetCopyFormat::SharedBinary)
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(&writer.inner.bytes[..11], b"PGCOPY\n\xff\r\n\0");
+        assert_eq!(
+            &writer.inner.bytes[writer.inner.bytes.len() - 2..],
+            &[0xff, 0xff]
+        );
+        assert_eq!(writer.shared_blocks.row_count, 1);
+        assert!(writer.pending_shared_blocks.is_empty());
     }
 
     #[test]
@@ -35036,6 +35489,337 @@ mod tests {
             .unwrap();
         assert!(no_events.is_empty());
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn v4_identity_and_projection_helpers_preserve_exact_boundaries() {
+        let first_definition = json!({
+            "provider_group_id": 7,
+            "network_name": [" network-b ", "network-a", "network-a"],
+            "provider_groups": [{
+                "tin": {"type": "ein", "value": "12-3456789"},
+                "npi": [1234567890, 1234567891]
+            }]
+        });
+        let second_definition = json!({
+            "provider_group_id": 8,
+            "network_name": ["network-c"],
+            "provider_groups": [{
+                "tin": {"type": "ein", "value": "98-7654321"},
+                "npi": [1234567891, 1234567892]
+            }]
+        });
+        let (first_key, first_entry) = provider_ref_definition(&first_definition).unwrap();
+        let (second_key, second_entry) = provider_ref_definition(&second_definition).unwrap();
+        assert_eq!(ProviderRefKey::from("7"), first_key);
+        assert_eq!(ProviderRefKey::from("8".to_string()), second_key);
+
+        let rebuilt = build_provider_entry(&first_definition).unwrap();
+        assert_eq!(rebuilt, first_entry);
+        let mut provider_map = HashMap::new();
+        insert_provider_definition(&mut provider_map, first_key.clone(), first_entry.clone())
+            .unwrap();
+        insert_provider_definition(&mut provider_map, second_key.clone(), second_entry.clone())
+            .unwrap();
+        insert_provider_definition(&mut provider_map, first_key.clone(), first_entry.clone())
+            .unwrap();
+        assert!(insert_provider_definition(
+            &mut provider_map,
+            first_key.clone(),
+            second_entry.clone(),
+        )
+        .is_err());
+        validate_preloaded_provider_definition(&provider_map, &first_key, &first_entry).unwrap();
+        assert!(
+            validate_preloaded_provider_definition(&provider_map, &first_key, &second_entry)
+                .is_err()
+        );
+        assert!(validate_preloaded_provider_definition(
+            &provider_map,
+            &ProviderRefKey::from("missing"),
+            &first_entry,
+        )
+        .is_err());
+
+        let borrowed =
+            provider_entry_view_from_ref_keys(&provider_map, std::slice::from_ref(&first_key))
+                .unwrap()
+                .unwrap();
+        assert_eq!(borrowed.entry_hash(), first_entry.entry_hash);
+        assert_eq!(borrowed.provider_count(), 2);
+        assert_eq!(
+            borrowed.provider_group_hashes(),
+            first_entry.provider_group_hashes
+        );
+        assert_eq!(borrowed.npi(), first_entry.npi);
+        assert_eq!(borrowed.network_names(), first_entry.network_names);
+
+        let owned = provider_entry_view_from_ref_keys(
+            &provider_map,
+            &[first_key.clone(), second_key.clone()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(owned.provider_count(), 3);
+        assert_eq!(owned.npi(), &[1234567890, 1234567891, 1234567892]);
+        assert_eq!(
+            provider_set_from_ref_keys(&provider_map, &[]).unwrap(),
+            None
+        );
+        assert!(
+            provider_set_from_ref_keys(&provider_map, &[ProviderRefKey::from("unknown")]).is_err()
+        );
+
+        let combined = combine_provider_entries(first_entry.clone(), second_entry.clone());
+        assert_eq!(combined.provider_count, 3);
+        assert_eq!(combined.npi, vec![1234567890, 1234567891, 1234567892]);
+        let first_group_payload = provider_group_payload_canonical_json(
+            first_entry.provider_group_hashes[0],
+            "ein",
+            "123456789",
+            &first_entry.npi,
+            &[9, 8, 9],
+        );
+        let second_group_payload = provider_group_payload_canonical_json(
+            second_entry.provider_group_hashes[0],
+            "ein",
+            "987654321",
+            &second_entry.npi,
+            &[],
+        );
+        assert_eq!(
+            provider_set_checksum_from_group_payloads(vec![
+                first_group_payload.clone(),
+                second_group_payload.clone(),
+            ]),
+            provider_set_checksum_from_group_payloads(vec![
+                second_group_payload,
+                first_group_payload,
+            ])
+        );
+        assert_eq!(
+            provider_set_scope_hash(&[1, 2], &["a".to_string(), "b".to_string()]),
+            provider_set_scope_hash(&[1, 2], &["a".to_string(), "b".to_string()])
+        );
+        assert_ne!(npi_member_id(1234567890), npi_member_id(1234567891));
+
+        let prices = vec![
+            PriceLite {
+                negotiated_type: Some("negotiated".to_string()),
+                negotiated_rate: "12.50".to_string(),
+                expiration_date: Some("2027-01-01".to_string()),
+                service_code: vec!["11".to_string()],
+                billing_class: Some("professional".to_string()),
+                setting: Some("outpatient".to_string()),
+                billing_code_modifier: vec!["26".to_string()],
+                additional_information: Some("contract".to_string()),
+            },
+            PriceLite {
+                negotiated_type: Some("fee schedule".to_string()),
+                negotiated_rate: "9.75".to_string(),
+                expiration_date: None,
+                service_code: vec!["12".to_string()],
+                billing_class: None,
+                setting: None,
+                billing_code_modifier: Vec::new(),
+                additional_information: None,
+            },
+        ];
+        let first_atom = price_atom_from_lite(&prices[0]);
+        assert_eq!(first_atom.global_id, price_atom_global_id(&first_atom));
+        assert_eq!(
+            price_code_set_hash(&first_atom.service_code),
+            price_code_set_hash(&["11".to_string()])
+        );
+        let price_set = price_lite_set(&prices).unwrap();
+        assert_eq!(price_set.minimum_negotiated_rate(), "9.75");
+        assert_eq!(price_set.global_id, price_set_global_id(&price_set));
+        let rate = RateLite {
+            provider_refs: vec![first_key],
+            provider_groups: Vec::new(),
+            provider_groups_raw: None,
+            network_names: Vec::new(),
+            prices: Vec::new(),
+            prepared_price_set: Some(price_set.clone()),
+        };
+        assert_eq!(rate, rate.clone());
+        assert_eq!(rate.price_count(), 2);
+        assert!(!rate.has_inline_provider_groups());
+        assert_eq!(rate_price_set(&rate).unwrap().into_owned(), price_set);
+        let grouped: GroupedPriceSet = (
+            price_set,
+            HashSet::from([first_entry.entry_hash]),
+            HashSet::from([first_entry.provider_group_hashes[0]]),
+            HashSet::from([1234567890]),
+            1,
+            HashSet::from(["network-a".to_string()]),
+            BTreeMap::from([(
+                first_entry.entry_hash,
+                first_entry.provider_group_hashes.clone(),
+            )]),
+        )
+            .into();
+        assert_eq!(grouped.provider_count, 1);
+
+        let default_cache = ProviderSetScopeCache::default();
+        assert!(!default_cache.v4_factor_mode());
+        assert!(ProviderSetScopeCache::with_v4_factor_mode(true).v4_factor_mode());
+    }
+
+    #[test]
+    fn manifest_merge_ordering_and_empty_merge_cleanup_are_exact() {
+        let pair_one = [1u8; MANIFEST_PAIR_RECORD_BYTES];
+        let pair_two = [2u8; MANIFEST_PAIR_RECORD_BYTES];
+        let first_pair = ManifestPairMergeItem {
+            pair: pair_one,
+            reader_index: 0,
+        };
+        let same_pair = ManifestPairMergeItem {
+            pair: pair_one,
+            reader_index: 0,
+        };
+        let later_pair = ManifestPairMergeItem {
+            pair: pair_two,
+            reader_index: 1,
+        };
+        assert!(first_pair == same_pair);
+        assert!(first_pair != later_pair);
+        assert_eq!(
+            first_pair.partial_cmp(&later_pair),
+            Some(first_pair.cmp(&later_pair))
+        );
+
+        let first_line = ManifestMergeItem {
+            key: b"a".to_vec(),
+            line: b"first\n".to_vec(),
+            reader_index: 0,
+        };
+        let same_line = ManifestMergeItem {
+            key: b"a".to_vec(),
+            line: b"first\n".to_vec(),
+            reader_index: 0,
+        };
+        let later_line = ManifestMergeItem {
+            key: b"b".to_vec(),
+            line: b"second\n".to_vec(),
+            reader_index: 1,
+        };
+        assert!(first_line == same_line);
+        assert!(first_line != later_line);
+        assert_eq!(
+            first_line.partial_cmp(&later_line),
+            Some(first_line.cmp(&later_line))
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("pairs.bin");
+        let mut tracked_files = ManifestPairTemporaryFiles::default();
+        let mut progress = ManifestFinalizeProgress::new(None);
+        let merged =
+            merge_sorted_pair_chunks(&source, &[], &mut tracked_files, &mut progress).unwrap();
+        assert_eq!(merged.entry_count, 0);
+        assert_eq!(merged.member_count, 0);
+        assert!(merged.member_ids.is_empty());
+        assert!(merged.path.is_file());
+        let merged_path = merged.path.clone();
+        drop(tracked_files);
+        assert!(!merged_path.exists());
+
+        assert_eq!(provider_code_merge_pass_count(0), 0);
+        assert_eq!(provider_code_merge_pass_count(1), 1);
+        assert!(
+            provider_code_merge_pass_count(SERVING_BINARY_V3_PROVIDER_CODE_MERGE_FAN_IN as u64) > 1
+        );
+    }
+
+    #[test]
+    fn scanner_failure_and_binary_value_helpers_fail_closed() {
+        let diagnostic =
+            primary_producer_failure_diagnostic(&io::Error::other("upstream contract failed"))
+                .unwrap();
+        assert!(diagnostic.contains("producer_error"));
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::BrokenPipe] {
+            assert!(primary_producer_failure_diagnostic(&io::Error::new(kind, "peer")).is_none());
+        }
+        assert_eq!(panic_payload_message(&"borrowed panic"), "borrowed panic");
+        assert_eq!(
+            panic_payload_message(&"owned panic".to_string()),
+            "owned panic"
+        );
+        assert_eq!(panic_payload_message(&17usize), "non-string panic payload");
+        log_worker_failure(7, "contract", "expected test diagnostic");
+
+        assert_eq!(decimal_text_field(b"-12.50"), Some("-12.50"));
+        assert_eq!(decimal_text_field(b"+7"), Some("+7"));
+        for invalid in [b"".as_slice(), b"+", b"1.2.3", b"NaN", b"\xff"] {
+            assert_eq!(decimal_text_field(invalid), None);
+        }
+        assert_eq!(pg_binary_u64(&7i32.to_be_bytes(), "value").unwrap(), 7);
+        assert_eq!(pg_binary_u64(&9i64.to_be_bytes(), "value").unwrap(), 9);
+        assert!(pg_binary_u64(&(-1i32).to_be_bytes(), "value").is_err());
+        assert!(pg_binary_u64(&(-1i64).to_be_bytes(), "value").is_err());
+        assert!(pg_binary_u64(&[0; 3], "value").is_err());
+        assert_eq!(
+            pg_binary_nonnegative_i64(&7i32.to_be_bytes(), "value").unwrap(),
+            7
+        );
+        assert_eq!(
+            pg_binary_optional_nonnegative_i64(None, "value").unwrap(),
+            None
+        );
+        assert_eq!(
+            pg_binary_optional_nonnegative_i64(Some(&7i32.to_be_bytes()), "value").unwrap(),
+            Some(7)
+        );
+        assert_eq!(pg_binary_negotiated_rate(b"12.50").unwrap(), "12.50");
+        assert!(pg_binary_numeric_text(&[0; 7]).is_err());
+    }
+
+    #[test]
+    fn worker_copy_reader_orders_shards_and_refuses_absent_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let copy_path = temporary.path().join("provider-members.copy");
+        std::fs::write(
+            temporary.path().join("provider-members.copy.0001"),
+            b"second\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temporary.path().join("provider-members.copy.0000"),
+            b"first\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_worker_copy_text(&copy_path).unwrap(),
+            "first\nsecond\n"
+        );
+        let absent = temporary.path().join("absent.copy");
+        let error = read_worker_copy_text(&absent).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn benchmark_fixture_helpers_build_small_partition_complete_manifest() {
+        let temporary = tempfile::tempdir().unwrap();
+        let coverage_scope_id = [0x75; COVERAGE_SCOPE_ID_BYTES];
+        let codes = v3_finalizer_benchmark_codes_by_partition(&coverage_scope_id, 2);
+        assert_eq!(codes.len(), 2);
+        assert_ne!(codes[0], codes[1]);
+
+        let manifest_path =
+            write_v3_finalizer_benchmark_manifest(temporary.path(), "small", 8, 2, 3, 2);
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["source_count"], 1);
+        assert_eq!(manifest["expected_serving_run_rows"], 8);
+        assert_eq!(
+            manifest["serving_run_partition_files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ import sys
 import threading
 
 _SCREEN_QUEUE: queue.SimpleQueue[tuple[str, str] | None] = queue.SimpleQueue()
-_SCREEN_WRITER_STARTED = False
+_SCREEN_WRITER_READY = threading.Event()
 _SCREEN_WRITER_LOCK = threading.Lock()
 
 
@@ -33,15 +33,14 @@ def _write_screen_line(stream_name: str, line: str) -> None:
 
 
 def _ensure_screen_writer() -> None:
-    global _SCREEN_WRITER_STARTED
-    if _SCREEN_WRITER_STARTED:
+    if _SCREEN_WRITER_READY.is_set():
         return
     with _SCREEN_WRITER_LOCK:
-        if _SCREEN_WRITER_STARTED:
+        if _SCREEN_WRITER_READY.is_set():
             return
         thread = threading.Thread(target=_screen_writer, name="ptg2-screen-writer", daemon=True)
         thread.start()
-        _SCREEN_WRITER_STARTED = True
+        _SCREEN_WRITER_READY.set()
 
 
 def _emit_screen_line(line: str, *, stderr: bool = False) -> None:

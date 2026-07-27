@@ -145,7 +145,7 @@ def test_promote_ptg2_source_snapshot_refuses_stale_expected_pointer(monkeypatch
     publish.assert_awaited_once()
 
 
-def test_build_ptg2_source_snapshot_remove_plan_refuses_current_references(monkeypatch):
+def test_source_snapshot_remove_plan_refuses_current_references(monkeypatch):
     monkeypatch.setattr(
         source_snapshot_control,
         "_snapshot_row",
@@ -170,7 +170,7 @@ def test_build_ptg2_source_snapshot_remove_plan_refuses_current_references(monke
     monkeypatch.setattr(source_snapshot_control, "_artifact_manifest_ids", AsyncMock(return_value=["artifact_1"]))
 
     plan = asyncio.run(
-        source_snapshot_control.build_ptg2_source_snapshot_remove_plan(
+        source_snapshot_control.build_source_snapshot_remove_plan(
             snapshot_id="snap_live",
             source_key="source_a",
         )
@@ -183,7 +183,7 @@ def test_build_ptg2_source_snapshot_remove_plan_refuses_current_references(monke
     assert plan["artifact_manifest_ids"] == ["artifact_1"]
 
 
-def test_build_ptg2_source_snapshot_remove_plan_rejects_legacy_manifest(monkeypatch):
+def test_source_snapshot_remove_plan_rejects_legacy_manifest(monkeypatch):
     monkeypatch.setattr(
         source_snapshot_control,
         "_snapshot_row",
@@ -209,7 +209,7 @@ def test_build_ptg2_source_snapshot_remove_plan_rejects_legacy_manifest(monkeypa
         ),
     )
     plan = asyncio.run(
-        source_snapshot_control.build_ptg2_source_snapshot_remove_plan(
+        source_snapshot_control.build_source_snapshot_remove_plan(
             snapshot_id="snap_old",
             source_key="source_a",
         )
@@ -218,6 +218,54 @@ def test_build_ptg2_source_snapshot_remove_plan_rejects_legacy_manifest(monkeypa
     assert plan["removable"] is False
     assert plan["reason"] == "only postgres_binary_v3/shared_blocks_v3 snapshots can be removed"
     assert plan["tables"] == []
+
+
+def _assert_source_snapshot_remove_results(
+    cleanup_summary,
+    transaction_statements,
+    status_calls,
+) -> None:
+    assert cleanup_summary["executed"] is True
+    assert cleanup_summary["deleted_tables"] == 0
+    assert cleanup_summary["deleted_v3_snapshot_scopes"] == 0
+    assert cleanup_summary["deleted_v3_snapshot_bindings"] == 0
+    assert cleanup_summary["deleted_artifact_chunks"] == 1
+    assert cleanup_summary["deleted_artifact_manifests"] == 1
+    assert cleanup_summary["deleted_snapshots"] == 1
+    assert cleanup_summary["released_shared_layouts"] == 0
+    assert transaction_statements == [
+        (
+            "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
+            {"publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY},
+        )
+    ]
+    assert any("ptg2_artifact_blob_chunk" in call[0] for call in status_calls)
+    assert any(
+        "ptg2_artifact_manifest" in call[0]
+        and call[1]["snapshot_id"] == "snap_old"
+        for call in status_calls
+    )
+    assert any(
+        "ptg2_snapshot" in call[0]
+        and call[1]["snapshot_id"] == "snap_old"
+        for call in status_calls
+    )
+    scope_delete_index = next(
+        index
+        for index, call in enumerate(status_calls)
+        if "ptg2_v3_snapshot_scope" in call[0]
+    )
+    binding_delete_index = next(
+        index
+        for index, call in enumerate(status_calls)
+        if "ptg2_v3_snapshot_binding" in call[0]
+    )
+    snapshot_delete_index = next(
+        index
+        for index, call in enumerate(status_calls)
+        if 'DELETE FROM "mrf".ptg2_snapshot WHERE' in call[0]
+    )
+    assert scope_delete_index < binding_delete_index < snapshot_delete_index
 
 
 def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
@@ -247,7 +295,7 @@ def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
 
     monkeypatch.setattr(
         source_snapshot_control,
-        "build_ptg2_source_snapshot_remove_plan",
+        "build_source_snapshot_remove_plan",
         fake_remove_plan,
     )
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
@@ -257,35 +305,40 @@ def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
         source_snapshot_control.remove_ptg2_source_snapshot(snapshot_id="snap_old", source_key="source_a")
     )
 
-    assert cleanup_summary["executed"] is True
-    assert cleanup_summary["deleted_tables"] == 0
-    assert cleanup_summary["deleted_v3_snapshot_scopes"] == 0
-    assert cleanup_summary["deleted_v3_snapshot_bindings"] == 0
-    assert cleanup_summary["deleted_artifact_chunks"] == 1
-    assert cleanup_summary["deleted_artifact_manifests"] == 1
-    assert cleanup_summary["deleted_snapshots"] == 1
-    assert cleanup_summary["released_shared_layouts"] == 0
+    _assert_source_snapshot_remove_results(
+        cleanup_summary,
+        transaction_statements,
+        status_calls,
+    )
+
+
+def _assert_source_snapshot_retirement_results(
+    retire_summary,
+    transaction_statements,
+    status_calls,
+    clear_calls,
+) -> None:
+    assert retire_summary["retired"] is True
+    assert retire_summary["deleted_plan_pointers"] == 1
+    assert retire_summary["deleted_source_pointers"] == 1
+    assert retire_summary["previous_current_references"]["source_keys"] == [
+        "source_a"
+    ]
+    assert retire_summary["current_references"]["source_keys"] == []
     assert transaction_statements == [
         (
             "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
             {"publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY},
         )
     ]
-    assert any("ptg2_artifact_blob_chunk" in call[0] for call in status_calls)
-    assert any("ptg2_artifact_manifest" in call[0] and call[1]["snapshot_id"] == "snap_old" for call in status_calls)
-    assert any("ptg2_snapshot" in call[0] and call[1]["snapshot_id"] == "snap_old" for call in status_calls)
-    scope_delete_index = next(
-        index for index, call in enumerate(status_calls) if "ptg2_v3_snapshot_scope" in call[0]
+    assert len(status_calls) == 2
+    assert all(
+        call[1] == {"snapshot_id": "snap_live", "source_key": "source_a"}
+        for call in status_calls
     )
-    binding_delete_index = next(
-        index for index, call in enumerate(status_calls) if "ptg2_v3_snapshot_binding" in call[0]
-    )
-    snapshot_delete_index = next(
-        index
-        for index, call in enumerate(status_calls)
-        if 'DELETE FROM "mrf".ptg2_snapshot WHERE' in call[0]
-    )
-    assert scope_delete_index < binding_delete_index < snapshot_delete_index
+    assert any("ptg2_current_plan_source" in call[0] for call in status_calls)
+    assert any("ptg2_current_source_snapshot" in call[0] for call in status_calls)
+    assert clear_calls == [True]
 
 
 def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(monkeypatch):
@@ -333,19 +386,9 @@ def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(mo
         )
     )
 
-    assert retire_summary["retired"] is True
-    assert retire_summary["deleted_plan_pointers"] == 1
-    assert retire_summary["deleted_source_pointers"] == 1
-    assert retire_summary["previous_current_references"]["source_keys"] == ["source_a"]
-    assert retire_summary["current_references"]["source_keys"] == []
-    assert transaction_statements == [
-        (
-            "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
-            {"publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY},
-        )
-    ]
-    assert len(status_calls) == 2
-    assert all(call[1] == {"snapshot_id": "snap_live", "source_key": "source_a"} for call in status_calls)
-    assert any("ptg2_current_plan_source" in call[0] for call in status_calls)
-    assert any("ptg2_current_source_snapshot" in call[0] for call in status_calls)
-    assert clear_calls == [True]
+    _assert_source_snapshot_retirement_results(
+        retire_summary,
+        transaction_statements,
+        status_calls,
+        clear_calls,
+    )

@@ -251,7 +251,7 @@ async def test_validated_retry_can_leave_activation_deferred(monkeypatch):
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", cleanup)
     monkeypatch.setattr(
         process_ptg,
-        "_enqueue_ptg2_auto_address_refresh_after_import",
+        "_enqueue_address_refresh_after_import",
         refresh,
     )
     monkeypatch.setattr(process_ptg, "_finalize_resumed_terminal_attempt", AsyncMock())
@@ -297,7 +297,7 @@ async def test_validated_retry_activation_survives_old_state_cleanup(
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", cleanup)
     monkeypatch.setattr(
         process_ptg,
-        "_enqueue_ptg2_auto_address_refresh_after_import",
+        "_enqueue_address_refresh_after_import",
         refresh,
     )
     monkeypatch.setattr(process_ptg, "_finalize_resumed_terminal_attempt", AsyncMock())

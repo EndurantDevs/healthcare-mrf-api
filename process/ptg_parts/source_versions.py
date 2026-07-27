@@ -168,6 +168,7 @@ async def _record_source_version(
         logical_sha256=logical_artifact.logical_sha256,
         logical_hash_deferred=logical_hash_deferred,
         content_length=raw_artifact.head.content_length if raw_artifact.head else raw_artifact.byte_count,
+        raw_byte_count=raw_artifact.byte_count,
         etag=raw_artifact.head.etag if raw_artifact.head else None,
         last_modified=raw_artifact.head.last_modified if raw_artifact.head else None,
         verification_mode=raw_artifact.verification_mode,

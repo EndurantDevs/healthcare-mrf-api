@@ -43,6 +43,12 @@ PTG2_V4_GC_TABLE_NAMES = (
     "ptg2_v4_snapshot_map_root",
     "ptg2_v4_snapshot_map_pack",
 )
+PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES = (
+    "ptg2_provider_tax_identity_legacy_layout",
+    "ptg2_provider_tax_identity_manifest",
+    "ptg2_provider_tax_identity",
+    "ptg2_provider_group_tax_identity",
+)
 
 PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (
     "ptg2_v3_snapshot_layout",
@@ -316,6 +322,7 @@ async def _has_shared_tables(
     *,
     require_shared: bool,
 ) -> bool:
+    await _has_provider_tax_identity_tables(executor, schema_name)
     table_names = ["ptg2_snapshot", *_SHARED_TABLE_NAMES]
     table_records = await executor.all(
         """
@@ -351,6 +358,39 @@ async def _has_shared_tables(
             f"missing tables: {', '.join(missing)}"
         )
     return False
+
+
+async def _has_provider_tax_identity_tables(
+    executor: Any,
+    schema_name: str,
+) -> bool:
+    """Reject partial installation of the additive shared tax sidecar."""
+
+    table_records = await executor.all(
+        """
+        SELECT table_name
+          FROM information_schema.tables
+         WHERE table_schema = :schema_name
+           AND table_name = ANY(CAST(:table_names AS text[]))
+        """,
+        schema_name=schema_name,
+        table_names=list(PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES),
+    )
+    present_names = {
+        str(_row_mapping(table_record).get("table_name") or "")
+        for table_record in table_records
+        if _row_mapping(table_record).get("table_name")
+    }
+    expected_names = set(PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES)
+    installed_names = expected_names & present_names
+    if installed_names and installed_names != expected_names:
+        missing = ", ".join(sorted(expected_names - present_names))
+        raise RuntimeError(
+            "PTG provider tax-identity cleanup requires the complete "
+            f"additive schema; missing tables: {missing}; "
+            "run alembic upgrade head"
+        )
+    return installed_names == expected_names
 
 
 async def _has_v4_map_tables(executor: Any, schema_name: str) -> bool:

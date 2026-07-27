@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import json
+import struct
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -27,6 +29,113 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
 def test_snapshot_publish_rejects_missing_summary_mapping():
     with pytest.raises(RuntimeError, match="missing blocks"):
         shared_snapshot_publish._mapping(None, "blocks")
+
+
+def _length_prefixed_sha256(domain, fields):
+    digest = hashlib.sha256()
+    digest.update(domain)
+    for field in fields:
+        digest.update(struct.pack(">I", len(field)))
+        digest.update(field)
+    return digest.hexdigest()
+
+
+def _tax_identity_compilation_summary():
+    policy_id = "ptg-tin-hmac-sha256-v1:release-1"
+    normalization = "ein_ascii_digits_or_2_7_hyphen_v1"
+    hmac_contract = "hmac_sha256_ptg_tin_v1"
+    prefix_contract = "tin_id_128=first_16_bytes(tin_hmac_sha256)"
+    authority_contract = "tin_hmac_sha256_full_32_bytes_authoritative"
+    source_ordinals = [{"shard_id": "shard-a", "ordinal": 0}]
+    source_digest = hashlib.sha256()
+    source_digest.update(b"PTG2V4TAXORD\x01")
+    source_digest.update(struct.pack(">I", 1))
+    source_digest.update(struct.pack(">I", len(b"shard-a")))
+    source_digest.update(b"shard-a")
+    source_digest.update(struct.pack(">I", 0))
+    tax_summary_by_name = {
+        "contract": "ptg2_provider_tax_identity_projection_v1",
+        "token_policy_id": policy_id,
+        "token_policy_descriptor_sha256": _length_prefixed_sha256(
+            b"PTG2V4TINPOLICY\x01",
+            (
+                policy_id.encode(),
+                normalization.encode(),
+                hmac_contract.encode(),
+                prefix_contract.encode(),
+                authority_contract.encode(),
+            ),
+        ),
+        "normalization_contract": normalization,
+        "hmac_contract": hmac_contract,
+        "candidate_prefix_contract": prefix_contract,
+        "authority_contract": authority_contract,
+        "source_ordinal_contract": (
+            "snapshot_shard_id_sorted_lsb0_bitmap_v1"
+        ),
+        "source_ordinal_map": source_ordinals,
+        "source_ordinal_map_digest": source_digest.hexdigest(),
+        "source_shard_count": 1,
+        "source_bitmap_bytes": 1,
+        "provider_group_count": 4,
+        "tax_identity_count": 1,
+        "matched_ein_count": 1,
+        "missing_count": 1,
+        "malformed_count": 1,
+        "unsupported_type_count": 1,
+        "content_digest": "33" * 32,
+    }
+    return SimpleNamespace(
+        summary={"tax_identity": tax_summary_by_name},
+        observe={"group_count": 4},
+        output_artifacts=(
+            SimpleNamespace(
+                name="provider_tax_identities",
+                byte_count=91,
+            ),
+            SimpleNamespace(
+                name="provider_group_tax_identities",
+                byte_count=303,
+            ),
+        ),
+    )
+
+
+def test_v4_tax_policy_descriptor_matches_frozen_cross_language_vector():
+    descriptor = shared_snapshot_publish._v4_tax_policy_descriptor(
+        "ptg-tin-hmac-sha256-v1:release-1"
+    )
+
+    assert descriptor.hex() == (
+        "a0c06f5494f80663686be6861038a880"
+        "4d9509d0fdc2d2c8cc56c259e53d761c"
+    )
+
+
+def test_v4_tax_contract_is_recomputed_before_publication():
+    compilation = _tax_identity_compilation_summary()
+
+    contract = (
+        shared_snapshot_publish._validated_v4_tax_identity_contract(
+            compilation
+        )
+    )
+
+    assert contract.provider_group_count == 4
+    assert contract.tax_identity_count == 1
+    assert contract.source_bitmap_bytes == 1
+    assert (
+        shared_snapshot_publish._v4_tax_artifact_byte_count(compilation)
+        == 394
+    )
+
+    compilation.summary["tax_identity"][
+        "token_policy_descriptor_sha256"
+    ] = "00" * 32
+    with pytest.raises(RuntimeError, match="descriptor"):
+        shared_snapshot_publish._validated_v4_tax_identity_contract(
+            compilation
+        )
 
 
 @pytest.mark.asyncio
@@ -333,6 +442,48 @@ def test_v4_reference_manifest_rejects_noncanonical_order(tmp_path):
         tuple(shared_snapshot_publish._iter_v4_block_references(path))
 
 
+@pytest.mark.asyncio
+async def test_failed_v4_graph_hashes_are_queued_in_bounded_batches(
+    monkeypatch,
+    tmp_path,
+):
+    """Retain every orphan candidate without one unbounded SQL parameter."""
+
+    session = SimpleNamespace(execute=AsyncMock())
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    def references(_path):
+        for value in range(8_193):
+            yield SimpleNamespace(block_hash=value.to_bytes(32, "big"))
+
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_iter_v4_block_references",
+        references,
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish.db,
+        "transaction",
+        transaction,
+    )
+
+    await shared_snapshot_publish._queue_failed_v4_graph_blocks(
+        schema_name="mrf",
+        reference_manifest_path=tmp_path / "unused.jsonl",
+    )
+
+    assert session.execute.await_count == 2
+    first_hashes = session.execute.await_args_list[0].args[1]["block_hashes"]
+    second_hashes = session.execute.await_args_list[1].args[1]["block_hashes"]
+    assert len(first_hashes) == 8_192
+    assert first_hashes[0] == bytes(32)
+    assert first_hashes[-1] == (8_191).to_bytes(32, "big")
+    assert second_hashes == [(8_192).to_bytes(32, "big")]
+
+
 def _v4_graph_publication_fixture(tmp_path):
     artifact = SimpleNamespace(
         name="graph_blocks",
@@ -381,8 +532,21 @@ def _patch_v4_graph_publication(
         pattern_member_bytes=40,
         manifest={},
     )
+    tax_identity_publication = SimpleNamespace(
+        artifact_byte_count=24,
+        manifest={
+            "contract": "ptg2_provider_group_tax_identity_v1",
+            "provider_group_count": 3,
+            "tax_identity_count": 1,
+            "content_digest": (b"t" * 32).hex(),
+        },
+    )
     publish_maps_mock = AsyncMock(
-        return_value=(map_summary, taxonomy_publication)
+        return_value=(
+            map_summary,
+            taxonomy_publication,
+            tax_identity_publication,
+        )
     )
     replacements_by_name = {
         "create_shared_block_stage": AsyncMock(),
@@ -425,8 +589,9 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
         empty_npi_tin_only_normalization_count=2,
     )
 
-    assert publication.logical_byte_count == 64
-    assert publication.stored_byte_count == 128
+    assert publication.logical_byte_count == 88
+    assert publication.stored_byte_count == 152
+    assert publication.provider_tax_identity["tax_identity_count"] == 1
     assert publish_cas_mock.await_args.kwargs == {
         "schema_name": "mrf",
         "stage_table": publish_cas_mock.await_args.kwargs["stage_table"],
@@ -439,6 +604,229 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
     assert publish_maps_mock.await_args.kwargs[
         "empty_npi_tin_only_normalization_count"
     ] == 2
+
+
+@pytest.mark.asyncio
+async def test_v4_graph_publish_queues_blocks_after_stage_failure(
+    monkeypatch,
+    tmp_path,
+):
+    """A partial CAS copy stays recoverable while its stage is removed."""
+
+    compilation, _, _ = _v4_graph_publication_fixture(tmp_path)
+    queue_failed = AsyncMock()
+    status = AsyncMock()
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "create_shared_block_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "copy_shared_block_binary_file",
+        AsyncMock(side_effect=RuntimeError("copy failed")),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_queue_failed_v4_graph_blocks",
+        queue_failed,
+    )
+    monkeypatch.setattr(shared_snapshot_publish.db, "status", status)
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        await shared_snapshot_publish._publish_v4_graph(
+            compilation,
+            schema_name="mrf",
+            snapshot_key=17,
+            build_token="token",
+            compressed_acquisition_bytes=1,
+            empty_npi_tin_only_normalization_count=0,
+        )
+
+    queue_failed.assert_awaited_once_with(
+        schema_name="mrf",
+        reference_manifest_path=compilation.reference_manifest_path,
+    )
+    assert "DROP TABLE IF EXISTS" in status.await_args.args[0]
+
+
+def _failed_tax_stage_compilation(tmp_path):
+    """Return the minimum compilation needed to reach the build fence."""
+
+    return SimpleNamespace(
+        observe={
+            "group_count": 4,
+            "component_count": 0,
+            "npi_count": 0,
+            "npi_prefix_override_owner_count": 0,
+            "npi_prefix_override_member_count": 0,
+        },
+        selected_layout="direct",
+        pattern_copy_path=None,
+        summary={"npi_prefix_target": 201},
+        group_copy_path=tmp_path / "groups.copy",
+        component_copy_path=tmp_path / "components.copy",
+        npi_copy_path=tmp_path / "npi.copy",
+        provider_set_npi_prefix_override_copy_path=tmp_path / "prefix.copy",
+        provider_tax_identity_copy_path=tmp_path / "tax.copy",
+        provider_group_tax_identity_copy_path=tmp_path / "group-tax.copy",
+        output_artifacts=(),
+    )
+
+
+def _tax_stage_contract():
+    """Return one complete four-state publication contract."""
+
+    return shared_snapshot_publish._V4TaxIdentityContract(
+        token_policy_id="ptg-tin-hmac-sha256-v1:release-1",
+        token_policy_descriptor_sha256=b"p" * 32,
+        source_ordinal_map=({"shard_id": "shard-a", "ordinal": 0},),
+        source_ordinal_map_digest=b"s" * 32,
+        source_shard_count=1,
+        source_bitmap_bytes=1,
+        provider_group_count=4,
+        tax_identity_count=1,
+        matched_ein_count=1,
+        missing_count=1,
+        malformed_count=1,
+        unsupported_type_count=1,
+        content_digest=b"c" * 32,
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_tax_stages_are_removed_after_transaction_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A fenced publication failure must not strand token-bearing stages."""
+
+    @asynccontextmanager
+    async def transaction():
+        yield object()
+
+    status_mock = AsyncMock()
+    monkeypatch.setattr(shared_snapshot_publish.db, "status", status_mock)
+    monkeypatch.setattr(
+        shared_snapshot_publish.db,
+        "transaction",
+        transaction,
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_validated_v4_tax_identity_contract",
+        lambda _compilation: _tax_stage_contract(),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_v4_tax_artifact_byte_count",
+        lambda _compilation: 394,
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_copy_binary_file_to_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "lock_v4_shared_layout_for_map_write",
+        AsyncMock(side_effect=RuntimeError("fenced publication")),
+    )
+
+    with pytest.raises(RuntimeError, match="fenced publication"):
+        await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
+            _failed_tax_stage_compilation(tmp_path),
+            schema_name="mrf",
+            snapshot_key=41,
+            build_token="exact-build",
+            compressed_acquisition_bytes=1,
+            empty_npi_tin_only_normalization_count=0,
+        )
+
+    cleanup_statement = str(status_mock.await_args.args[0])
+    assert "DROP TABLE IF EXISTS" in cleanup_statement
+    assert "ptg2_v4_tax_identity_stage_" in cleanup_statement
+    assert "ptg2_v4_group_tax_identity_stage_" in cleanup_statement
+
+
+@pytest.mark.asyncio
+async def test_v4_partial_stage_creation_is_removed(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A failed CREATE sequence removes every randomized stage name."""
+
+    status_mock = AsyncMock(
+        side_effect=(
+            None,
+            None,
+            None,
+            None,
+            None,
+            RuntimeError("stage create failed"),
+            None,
+        )
+    )
+    monkeypatch.setattr(shared_snapshot_publish.db, "status", status_mock)
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_validated_v4_tax_identity_contract",
+        lambda _compilation: _tax_stage_contract(),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_v4_tax_artifact_byte_count",
+        lambda _compilation: 394,
+    )
+
+    with pytest.raises(RuntimeError, match="stage create failed"):
+        await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
+            _failed_tax_stage_compilation(tmp_path),
+            schema_name="mrf",
+            snapshot_key=42,
+            build_token="exact-build",
+            compressed_acquisition_bytes=1,
+            empty_npi_tin_only_normalization_count=0,
+        )
+
+    cleanup_statement = str(status_mock.await_args.args[0])
+    assert "DROP TABLE IF EXISTS" in cleanup_statement
+    assert "ptg2_v4_tax_identity_stage_" in cleanup_statement
+
+
+@pytest.mark.asyncio
+async def test_v4_first_stage_creation_failure_preserves_original_error(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """No invalid empty DROP may mask failure of the first stage CREATE."""
+
+    status_mock = AsyncMock(
+        side_effect=RuntimeError("first stage create failed")
+    )
+    monkeypatch.setattr(shared_snapshot_publish.db, "status", status_mock)
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_validated_v4_tax_identity_contract",
+        lambda _compilation: _tax_stage_contract(),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_v4_tax_artifact_byte_count",
+        lambda _compilation: 394,
+    )
+
+    with pytest.raises(RuntimeError, match="first stage create failed"):
+        await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
+            _failed_tax_stage_compilation(tmp_path),
+            schema_name="mrf",
+            snapshot_key=43,
+            build_token="exact-build",
+            compressed_acquisition_bytes=1,
+            empty_npi_tin_only_normalization_count=0,
+        )
+
+    status_mock.assert_awaited_once()
 
 
 def _patch_disabled_v4_publication(monkeypatch):

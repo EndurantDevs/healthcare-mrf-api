@@ -146,10 +146,25 @@ class PTG2SourceVersion:
     logical_sha256: str | None = None
     logical_hash_deferred: bool = False
     content_length: int | None = None
+    raw_byte_count: int | None = None
     etag: str | None = None
     last_modified: str | None = None
     verification_mode: str | None = None
     reused_from_source_file_version_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous downloaded-byte evidence at its domain boundary."""
+
+        if self.raw_byte_count is None:
+            return
+        if (
+            isinstance(self.raw_byte_count, bool)
+            or not isinstance(self.raw_byte_count, int)
+            or self.raw_byte_count < 0
+        ):
+            raise ValueError(
+                "source version raw_byte_count must be a non-negative integer"
+            )
 
 
 @dataclass(frozen=True)

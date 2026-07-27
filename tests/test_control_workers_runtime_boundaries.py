@@ -268,7 +268,8 @@ def test_process_match_and_node_match_branch_matrix(monkeypatch):
 @pytest.mark.parametrize("raw", ["not-json", "{}", '[1, {"secretName":"only"}]'])
 def test_secret_volumes_reject_invalid_config(monkeypatch, raw):
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", raw)
-    assert control_workers._worker_job_secret_volumes() == []
+    spec = control_workers.WorkerSpec("arq:PTG", "process.PTG", ("ptg",))
+    assert control_workers._worker_job_secret_volumes(spec) == []
 
 
 def test_secret_volumes_normalize_aliases_duplicates_and_options(monkeypatch):
@@ -284,6 +285,7 @@ def test_secret_volumes_normalize_aliases_duplicates_and_options(monkeypatch):
                     "secretName": "provider-a",
                     "mountPath": "/secrets/a",
                     "optional": True,
+                    "default_mode": 0o400,
                     "readOnly": False,
                     "subPath": "token",
                 },
@@ -296,11 +298,16 @@ def test_secret_volumes_normalize_aliases_duplicates_and_options(monkeypatch):
             ]
         ),
     )
-    volumes = control_workers._worker_job_secret_volumes()
+    spec = control_workers.WorkerSpec("arq:PTG", "process.PTG", ("ptg",))
+    volumes = control_workers._worker_job_secret_volumes(spec)
     assert volumes[0] == {
         "volume": {
             "name": "provider-secret",
-            "secret": {"secretName": "provider-a", "optional": True},
+            "secret": {
+                "secretName": "provider-a",
+                "optional": True,
+                "defaultMode": 0o400,
+            },
         },
         "volumeMount": {
             "name": "provider-secret",

@@ -311,7 +311,11 @@ def test_worker_manifest_sets_pod_identity_options(monkeypatch):
         lambda *_args: {},
     )
     monkeypatch.setattr(control_workers, "_worker_job_pvc_volumes", lambda: [])
-    monkeypatch.setattr(control_workers, "_worker_job_secret_volumes", lambda: [])
+    monkeypatch.setattr(
+        control_workers,
+        "_worker_job_secret_volumes",
+        lambda *_args: [],
+    )
     monkeypatch.setattr(
         control_workers,
         "_worker_job_container_security_context",
@@ -320,7 +324,9 @@ def test_worker_manifest_sets_pod_identity_options(monkeypatch):
     monkeypatch.setattr(
         control_workers,
         "_worker_job_pod_security_context",
-        lambda *, has_pvc: {"hasPvc": has_pvc},
+        lambda *, has_group_read_volume: {
+            "hasGroupReadVolume": has_group_read_volume,
+        },
     )
     monkeypatch.setattr(control_workers, "_worker_start_replicas", lambda _spec: 1)
 
@@ -330,6 +336,7 @@ def test_worker_manifest_sets_pod_identity_options(monkeypatch):
         "example.invalid/worker:test",
     )
     pod_spec = manifest["spec"]["template"]["spec"]
+    assert pod_spec["securityContext"] == {"hasGroupReadVolume": False}
     assert pod_spec["serviceAccountName"] == "worker-service-account"
     assert pod_spec["imagePullSecrets"] == [
         {"name": "secret-one"},

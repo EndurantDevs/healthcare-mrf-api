@@ -48,6 +48,7 @@ _COMPACT_OPTIONAL_PATH_NAMES = (
     "manifest_provider_inverted_sidecar_path",
     "manifest_provider_set_component_sidecar_path",
     "manifest_provider_component_group_sidecar_path",
+    "manifest_provider_group_tax_identity_sidecar_path",
     "manifest_provider_npi_sidecar_path",
     "manifest_price_forward_sidecar_path",
     "manifest_price_atom_copy_path",

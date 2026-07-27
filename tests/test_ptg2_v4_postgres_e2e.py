@@ -48,6 +48,7 @@ from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
 )
+from tests.ptg2_v4_graph_compiler_test_support import _write_tax_identity
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 
 
@@ -63,6 +64,12 @@ TAXONOMY_MIGRATION_PATH = (
     / "alembic"
     / "versions"
     / "20260724120000_ptg2_v4_taxonomy_candidates.py"
+)
+TAX_IDENTITY_MIGRATION_PATH = (
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260727100000_ptg2_provider_tax_identity.py"
 )
 _STANDARD_FORMAT = (
     "magic8:uint32_le_version:uint64_le_entry_count:"
@@ -96,6 +103,17 @@ def _load_v4_taxonomy_migration():
     spec = importlib.util.spec_from_file_location(
         "ptg2_v4_postgres_e2e_taxonomy_migration",
         TAXONOMY_MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_v4_tax_identity_migration():
+    spec = importlib.util.spec_from_file_location(
+        "ptg2_v4_tax_identity_migration",
+        TAX_IDENTITY_MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -177,6 +195,11 @@ def _factor_fixture(tmp_path: Path) -> tuple[list[dict[str, object]], Path]:
             name="provider_npi_group",
             pairs=[(npi, group) for group in groups],
         ),
+        _write_tax_identity(
+            tmp_path / "group-tax-identity.sidecar",
+            shard_id="postgres-e2e",
+            tax_observations=[(group, 2, None) for group in groups],
+        ),
     ]
     provider_map = tmp_path / "provider-set-map.tsv"
     provider_map.write_text(
@@ -216,6 +239,11 @@ def _direct_factor_fixture(
             tmp_path / "direct-npi-group.sidecar",
             name="provider_npi_group",
             pairs=list(zip(npis, groups, strict=True)),
+        ),
+        _write_tax_identity(
+            tmp_path / "direct-group-tax-identity.sidecar",
+            shard_id="postgres-e2e",
+            tax_observations=[(group, 2, None) for group in groups],
         ),
     ]
     provider_map = tmp_path / "direct-provider-set-map.tsv"
@@ -410,6 +438,16 @@ async def _create_v4_test_schema(
     taxonomy_migration.upgrade()
     for statement in recorder.executed:
         await database.execute_ddl(statement)
+
+    tax_recorder = _OpRecorder()
+    tax_identity_migration = _load_v4_tax_identity_migration()
+    monkeypatch.setattr(tax_identity_migration, "op", tax_recorder)
+    monkeypatch.setattr(tax_identity_migration, "_schema", lambda: schema_name)
+    tax_identity_migration.upgrade()
+    async with database.transaction() as session:
+        connection = await session.connection()
+        for statement in tax_recorder.executed:
+            await connection.exec_driver_sql(statement)
 
 
 async def _complete_shared_gc_test_schema(
