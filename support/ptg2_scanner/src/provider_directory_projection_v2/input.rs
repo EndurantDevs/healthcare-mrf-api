@@ -242,7 +242,13 @@ mod tests {
         assert!(StrictJsonValueVisitor.visit_u64::<ValueError>(1).is_ok());
         assert!(StrictJsonValueVisitor.visit_f64::<ValueError>(1.5).is_ok());
         assert!(StrictJsonValueVisitor
+            .visit_f64::<serde_json::Error>(1.5)
+            .is_ok());
+        assert!(StrictJsonValueVisitor
             .visit_str::<ValueError>("text")
+            .is_ok());
+        assert!(StrictJsonValueVisitor
+            .visit_str::<serde_json::Error>("text")
             .is_ok());
         assert!(StrictJsonValueVisitor
             .visit_borrowed_str::<ValueError>("borrowed")

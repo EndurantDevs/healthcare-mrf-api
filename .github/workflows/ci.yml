@@ -267,6 +267,14 @@ jobs:
           cargo llvm-cov --manifest-path support/ptg2_scanner/Cargo.toml \
             --all-targets --features python --json --summary-only \
             --output-path test-coverage-rust.json
+      - name: Upload Rust coverage data
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mrf-rust-coverage
+          path: test-coverage-rust.json
+          if-no-files-found: ignore
+          retention-days: 1
       - name: Rust coverage ratchet
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
