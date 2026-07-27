@@ -223,7 +223,11 @@ def test_manual_retire_rejects_legacy_manifest_before_pointer_mutation(monkeypat
     )
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
 
-    with pytest.raises(ValueError, match="postgres_binary_v3/shared_blocks_v3"):
+    with pytest.raises(
+        ValueError,
+        match="postgres_binary_v3/shared_blocks_v3 or "
+        "postgres_binary_v3/shared_blocks_v4",
+    ):
         asyncio.run(
             source_snapshot_control.retire_ptg2_source_snapshot(
                 snapshot_id="snap_legacy",

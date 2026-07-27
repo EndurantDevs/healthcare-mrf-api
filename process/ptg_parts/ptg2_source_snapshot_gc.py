@@ -28,7 +28,7 @@ from process.ptg_parts.ptg2_shared_gc import (
     resolve_ptg2_schema,
 )
 from process.ptg_parts.snapshot_cleanup import (
-    is_strict_ptg2_v3_shared_blocks_manifest,
+    is_shared_snapshot_control_manifest,
 )
 
 
@@ -251,20 +251,9 @@ def _serving_index(row: dict[str, Any]) -> dict[str, Any]:
 def _is_gc_shared_manifest(
     serving_index: dict[str, Any] | None,
 ) -> bool:
-    """Admit V4 without changing the established strict V3 predicate."""
+    """Use the same explicit V3/V4 generation gate as targeted control."""
 
-    if is_strict_ptg2_v3_shared_blocks_manifest(serving_index):
-        return True
-    if not isinstance(serving_index, dict):
-        return False
-    return (
-        str(serving_index.get("arch_version") or "").strip().lower()
-        == "postgres_binary_v3"
-        and str(
-            serving_index.get("storage_generation") or ""
-        ).strip().lower()
-        == PTG2_V4_SHARED_GENERATION
-    )
+    return is_shared_snapshot_control_manifest(serving_index)
 
 
 def _is_allowed_amount_snapshot(row: dict[str, Any]) -> bool:
@@ -562,7 +551,7 @@ async def _select_bounded_gc_plan(
     return selected_plan
 
 
-async def build_ptg2_source_snapshot_gc_plan(
+async def build_source_gc_plan(
     *,
     schema_name: str | None = None,
     executor: Any | None = None,
@@ -613,7 +602,10 @@ async def build_ptg2_source_snapshot_gc_plan(
     )
 
 
-def validate_ptg2_source_snapshot_gc_plan(
+build_ptg2_source_snapshot_gc_plan = build_source_gc_plan
+
+
+def validate_source_gc_plan(
     plan: PTG2SourceSnapshotGCPlan,
     *,
     max_snapshots: int,
@@ -634,6 +626,9 @@ def validate_ptg2_source_snapshot_gc_plan(
         raise RuntimeError(
             f"Refusing cleanup: candidate bytes {plan.total_bytes} exceeds safety bound {max_bytes}"
         )
+
+
+validate_ptg2_source_snapshot_gc_plan = validate_source_gc_plan
 
 
 async def _lock_ptg2_pointer_state(connection: Any, schema_name: str) -> None:
@@ -735,7 +730,7 @@ async def _execute_snapshot_gc_actions(
         )
 
 
-async def execute_ptg2_source_snapshot_gc_plan(
+async def execute_source_gc_plan(
     *,
     schema_name: str | None = None,
     max_snapshots: int = 400,
@@ -772,6 +767,9 @@ async def execute_ptg2_source_snapshot_gc_plan(
             plan,
         )
         return plan
+
+
+execute_ptg2_source_snapshot_gc_plan = execute_source_gc_plan
 
 
 if __name__ == "__main__":

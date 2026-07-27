@@ -204,10 +204,7 @@ class _SharedGCExecutor:
             "stored_bytes": sum(self.blocks[block_hash] for block_hash in mapped_hashes),
         }
 
-    async def all(self, statement: str, **params):
-        """Emulate the executor SQL used by shared-layout GC tests."""
-
-        self.calls.append((statement, dict(params)))
+    def _metadata_rows(self, statement: str, _params: dict[str, object]):
         if "FROM information_schema.tables" in statement:
             return [{"table_name": table_name} for table_name in sorted(self.present_tables)]
         if "FROM \"mrf\".ptg2_snapshot" in statement and "AS involved" in statement:
@@ -216,6 +213,9 @@ class _SharedGCExecutor:
             return [{"involved": bool(self.bindings)}]
         if "FROM \"mrf\".ptg2_v3_snapshot_scope" in statement and "AS involved" in statement:
             return [{"involved": bool(self.scopes)}]
+        return None
+
+    def _eligible_rows(self, statement: str, params: dict[str, object]):
         if "WITH eligible_layouts AS MATERIALIZED" in statement:
             layout_keys = self._eligible_layouts(
                 removing_snapshot_ids=set(params["removing_snapshot_ids"]),
@@ -243,6 +243,9 @@ class _SharedGCExecutor:
                     if snapshot_key in allowed_layout_keys
                 ]
             return [{"snapshot_key": snapshot_key} for snapshot_key in layout_keys]
+        return None
+
+    def _release_rows(self, statement: str, params: dict[str, object]):
         if "WITH layout_batch AS MATERIALIZED" in statement:
             assert "GREATEST(" in statement
             for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
@@ -281,6 +284,9 @@ class _SharedGCExecutor:
                 mapping for mapping in self.mappings if mapping[0] not in layout_keys
             }
             return [stats]
+        return None
+
+    def _candidate_rows(self, statement: str, params: dict[str, object]):
         if "SELECT candidate.block_hash" in statement:
             assert "payload" not in statement
             eligible_block_rows = []
@@ -303,6 +309,9 @@ class _SharedGCExecutor:
                         }
                     )
             return eligible_block_rows[: int(params["max_rows"])]
+        return None
+
+    def _deleted_block_rows(self, statement: str, params: dict[str, object]):
         if "DELETE FROM \"mrf\".ptg2_v3_block AS block" in statement:
             assert "NOT EXISTS" in statement
             if self.rereference_on_delete is not None:
@@ -319,6 +328,22 @@ class _SharedGCExecutor:
                     {"block_hash": block_hash, "stored_byte_count": stored_bytes}
                 )
             return deleted_blocks
+        return None
+
+    async def all(self, statement: str, **params):
+        """Emulate the executor SQL used by shared-layout GC tests."""
+
+        self.calls.append((statement, dict(params)))
+        for handler in (
+            self._metadata_rows,
+            self._eligible_rows,
+            self._release_rows,
+            self._candidate_rows,
+            self._deleted_block_rows,
+        ):
+            result = handler(statement, params)
+            if result is not None:
+                return result
         raise AssertionError(statement)
 
     async def status(self, statement: str, **params):
@@ -721,48 +746,45 @@ async def test_normal_snapshot_cleanup_releases_shared_layouts(monkeypatch):
     )
 
 
+class _SourceGCProjectionExecutor:
+    async def all(self, statement, **params):
+        if "FROM information_schema.tables" in statement:
+            return [
+                {"table_name": table_name}
+                for table_name in shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES
+            ]
+        if "SELECT DISTINCT snapshot_id" in statement:
+            return []
+        if 'FROM "mrf".ptg2_snapshot' in statement:
+            return [
+                {
+                    "snapshot_id": "shared-old",
+                    "status": "published",
+                    "source_key": "source-a",
+                    "serving_index": {
+                        "storage": "manifest_snapshot",
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v3",
+                        "source_key": "source-a",
+                    },
+                }
+            ]
+        if "WITH eligible_layouts AS MATERIALIZED" in statement:
+            assert "candidate_binding.snapshot_id" in statement
+            assert params["removing_snapshot_ids"] == ["shared-old"]
+            return [{
+                "logical_layout_count": 1,
+                "candidate_hash_count": 1,
+                "stored_bytes": 25,
+            }]
+        raise AssertionError(statement)
+
+
 @pytest.mark.asyncio
 async def test_source_snapshot_gc_does_not_project_unrelated_shared_layout_bytes():
     """Verify source snapshot gc does not project unrelated shared layout bytes."""
-    class _SourceGCExecutor:
-        async def all(self, statement, **_params):
-            if "FROM information_schema.tables" in statement:
-                return [
-                    {"table_name": table_name}
-                    for table_name in shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES
-                ]
-            if "SELECT DISTINCT snapshot_id" in statement:
-                return []
-            if 'FROM "mrf".ptg2_snapshot' in statement:
-                return [
-                    {
-                        "snapshot_id": "shared-old",
-                        "status": "published",
-                        "source_key": "source-a",
-                        "serving_index": {
-                            "storage": "manifest_snapshot",
-                            "arch_version": "postgres_binary_v3",
-                            "storage_generation": "shared_blocks_v3",
-                            "source_key": "source-a",
-                        },
-                    }
-                ]
-            if "WITH eligible_layouts AS MATERIALIZED" in statement:
-                assert "candidate_binding.snapshot_id" in statement
-                assert _params["removing_snapshot_ids"] == ["shared-old"]
-                # The selected layout is 25 bytes. A separate 1,000-byte
-                # unbound layout is deliberately outside this projection.
-                return [
-                    {
-                        "logical_layout_count": 1,
-                        "candidate_hash_count": 1,
-                        "stored_bytes": 25,
-                    }
-                ]
-            raise AssertionError(statement)
-
     plan = await source_snapshot_gc.build_ptg2_source_snapshot_gc_plan(
-        executor=_SourceGCExecutor()
+        executor=_SourceGCProjectionExecutor()
     )
 
     assert plan.shared_snapshot_ids == ("shared-old",)
@@ -896,6 +918,184 @@ async def test_source_snapshot_gc_skips_layout_release_without_deleted_binding(m
     release.assert_not_awaited()
 
 
+async def _create_gc_layout_schema(connection, schema: str) -> None:
+    await connection.status(
+        f"CREATE TABLE {schema}.ptg2_snapshot "
+        "(snapshot_id varchar(96) PRIMARY KEY, manifest jsonb)"
+    )
+    await connection.status(
+        f"""
+        CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
+            snapshot_key bigint PRIMARY KEY,
+            generation varchar(32) NOT NULL,
+            state varchar(16) NOT NULL,
+            created_at timestamptz NOT NULL,
+            heartbeat_at timestamptz NOT NULL,
+            lease_until timestamptz
+        )
+        """
+    )
+    await connection.status(
+        f"""
+        CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
+            snapshot_id varchar(96) PRIMARY KEY
+                REFERENCES {schema}.ptg2_snapshot(snapshot_id) ON DELETE CASCADE,
+            snapshot_key bigint NOT NULL
+                REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE RESTRICT
+        )
+        """
+    )
+
+
+async def _create_gc_block_schema(connection, schema: str) -> None:
+    await connection.status(
+        f"""
+        CREATE TABLE {schema}.ptg2_v3_block (
+            block_hash bytea PRIMARY KEY,
+            stored_byte_count bigint NOT NULL
+        )
+        """
+    )
+    await connection.status(
+        f"""
+        CREATE TABLE {schema}.ptg2_v3_snapshot_block (
+            snapshot_key bigint NOT NULL
+                REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+            block_hash bytea NOT NULL REFERENCES {schema}.ptg2_v3_block(block_hash),
+            PRIMARY KEY (snapshot_key, block_hash)
+        )
+        """
+    )
+    await connection.status(
+        f"""
+        CREATE TABLE {schema}.ptg2_v3_gc_candidate (
+            block_hash bytea PRIMARY KEY
+                REFERENCES {schema}.ptg2_v3_block(block_hash) ON DELETE CASCADE,
+            eligible_at timestamptz NOT NULL,
+            queued_at timestamptz NOT NULL
+        )
+        """
+    )
+    excluded_tables = {
+        "ptg2_v3_snapshot_layout",
+        "ptg2_v3_snapshot_binding",
+        "ptg2_v3_block",
+        "ptg2_v3_snapshot_block",
+        "ptg2_v3_gc_candidate",
+    }
+    for table_name in set(shared_gc._SHARED_TABLE_NAMES) - excluded_tables:
+        await connection.status(
+            f'CREATE TABLE {schema}."{table_name}" (snapshot_key bigint)'
+        )
+
+
+async def _insert_gc_layout_fixture(connection, schema: str) -> None:
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_snapshot_layout
+            (snapshot_key, generation, state, created_at, heartbeat_at, lease_until)
+        VALUES
+            (10, :generation, 'sealed', transaction_timestamp(),
+             transaction_timestamp(), NULL),
+            (20, :generation, 'sealed', transaction_timestamp(),
+             transaction_timestamp(), NULL)
+        """,
+        generation=shared_gc.PTG2_V3_SHARED_GENERATION,
+    )
+    for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
+        await connection.status(
+            f'INSERT INTO {schema}."{table_name}" (snapshot_key) VALUES (10)'
+        )
+    await connection.status(
+        f"INSERT INTO {schema}.ptg2_snapshot (snapshot_id, manifest) "
+        "VALUES ('selected-snapshot', '{}'::jsonb)"
+    )
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_snapshot_binding
+            (snapshot_id, snapshot_key)
+        VALUES ('selected-snapshot', 10)
+        """
+    )
+
+
+async def _insert_gc_block_fixture(
+    connection,
+    schema: str,
+    block_hash: bytes,
+    unrelated_hash: bytes,
+) -> None:
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_block
+            (block_hash, stored_byte_count)
+        VALUES (:block_hash, 25), (:unrelated_hash, 1000)
+        """,
+        block_hash=block_hash,
+        unrelated_hash=unrelated_hash,
+    )
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_snapshot_block
+            (snapshot_key, block_hash)
+        VALUES (10, :block_hash), (20, :unrelated_hash)
+        """,
+        block_hash=block_hash,
+        unrelated_hash=unrelated_hash,
+    )
+
+
+async def _release_and_sweep_gc_fixture(
+    database: Database,
+    schema_name: str,
+    schema: str,
+    block_hash: bytes,
+) -> None:
+    async with database.acquire() as connection:
+        dry_run = await shared_gc.build_shared_layout_release_plan(
+            schema_name=schema_name,
+            executor=connection,
+            removing_snapshot_ids=("selected-snapshot",),
+            all_eligible_layouts=True,
+            require_shared=True,
+        )
+    assert dry_run == shared_gc.PTG2SharedLayoutGCStats(1, 1, 25)
+    async with database.acquire() as connection:
+        await connection.status(
+            f"DELETE FROM {schema}.ptg2_v3_snapshot_binding "
+            "WHERE snapshot_id = 'selected-snapshot'"
+        )
+        released = await shared_gc.release_unbound_ptg2_shared_layouts(
+            schema_name=schema_name,
+            executor=connection,
+            grace_seconds=0,
+            require_shared=True,
+            layout_keys=(10,),
+        )
+    assert released == shared_gc.PTG2SharedLayoutGCStats(1, 1, 25)
+    async with database.acquire() as connection:
+        swept = await shared_gc.sweep_ptg2_shared_blocks(
+            schema_name=schema_name,
+            executor=connection,
+            max_bytes=25,
+            require_shared=True,
+        )
+    assert swept == shared_gc.PTG2SharedBlockSweepPlan((block_hash,), 25)
+
+
+async def _assert_gc_fixture_storage(database: Database, schema: str) -> None:
+    async with database.acquire() as connection:
+        assert await connection.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout"
+        ) == 1
+        assert await connection.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block"
+        ) == 1
+        assert await connection.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
+        ) == 0
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_candidate_scoped_release_and_sweep_sql():
     """Exercise candidate-scoped layout release and block sweep in PostgreSQL."""
@@ -912,165 +1112,22 @@ async def test_real_postgres_candidate_scoped_release_and_sweep_sql():
     try:
         async with database.acquire() as connection:
             await connection.status(f"CREATE SCHEMA {schema}")
-            await connection.status(
-                f"CREATE TABLE {schema}.ptg2_snapshot "
-                "(snapshot_id varchar(96) PRIMARY KEY, manifest jsonb)"
+            await _create_gc_layout_schema(connection, schema)
+            await _create_gc_block_schema(connection, schema)
+            await _insert_gc_layout_fixture(connection, schema)
+            await _insert_gc_block_fixture(
+                connection,
+                schema,
+                block_hash,
+                unrelated_hash,
             )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
-                    snapshot_key bigint PRIMARY KEY,
-                    generation varchar(32) NOT NULL,
-                    state varchar(16) NOT NULL,
-                    created_at timestamptz NOT NULL,
-                    heartbeat_at timestamptz NOT NULL,
-                    lease_until timestamptz
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
-                    snapshot_id varchar(96) PRIMARY KEY
-                        REFERENCES {schema}.ptg2_snapshot(snapshot_id) ON DELETE CASCADE,
-                    snapshot_key bigint NOT NULL
-                        REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE RESTRICT
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_v3_block (
-                    block_hash bytea PRIMARY KEY,
-                    stored_byte_count bigint NOT NULL
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_v3_snapshot_block (
-                    snapshot_key bigint NOT NULL
-                        REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
-                    block_hash bytea NOT NULL REFERENCES {schema}.ptg2_v3_block(block_hash),
-                    PRIMARY KEY (snapshot_key, block_hash)
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_v3_gc_candidate (
-                    block_hash bytea PRIMARY KEY
-                        REFERENCES {schema}.ptg2_v3_block(block_hash) ON DELETE CASCADE,
-                    eligible_at timestamptz NOT NULL,
-                    queued_at timestamptz NOT NULL
-                )
-                """
-            )
-            for table_name in set(shared_gc._SHARED_TABLE_NAMES) - {
-                "ptg2_v3_snapshot_layout",
-                "ptg2_v3_snapshot_binding",
-                "ptg2_v3_block",
-                "ptg2_v3_snapshot_block",
-                "ptg2_v3_gc_candidate",
-            }:
-                await connection.status(
-                    f"CREATE TABLE {schema}.\"{table_name}\" (snapshot_key bigint)"
-                )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_snapshot_layout
-                    (snapshot_key, generation, state, created_at, heartbeat_at, lease_until)
-                VALUES (
-                    10, :generation, 'sealed', transaction_timestamp(),
-                    transaction_timestamp(), NULL
-                ), (
-                    20, :generation, 'sealed', transaction_timestamp(),
-                    transaction_timestamp(), NULL
-                )
-                """,
-                generation=shared_gc.PTG2_V3_SHARED_GENERATION,
-            )
-            for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
-                await connection.status(
-                    f"INSERT INTO {schema}.\"{table_name}\" (snapshot_key) VALUES (10)"
-                )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_snapshot (snapshot_id, manifest)
-                VALUES ('selected-snapshot', '{{}}'::jsonb)
-                """
-            )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_snapshot_binding
-                    (snapshot_id, snapshot_key)
-                VALUES ('selected-snapshot', 10)
-                """
-            )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_block
-                    (block_hash, stored_byte_count)
-                VALUES (:block_hash, 25), (:unrelated_hash, 1000)
-                """,
-                block_hash=block_hash,
-                unrelated_hash=unrelated_hash,
-            )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_snapshot_block
-                    (snapshot_key, block_hash)
-                VALUES (10, :block_hash), (20, :unrelated_hash)
-                """,
-                block_hash=block_hash,
-                unrelated_hash=unrelated_hash,
-            )
-
-        async with database.acquire() as connection:
-            dry_run = await shared_gc.build_shared_layout_release_plan(
-                schema_name=schema_name,
-                executor=connection,
-                removing_snapshot_ids=("selected-snapshot",),
-                all_eligible_layouts=True,
-                require_shared=True,
-            )
-        assert dry_run == shared_gc.PTG2SharedLayoutGCStats(1, 1, 25)
-
-        async with database.acquire() as connection:
-            await connection.status(
-                f"""
-                DELETE FROM {schema}.ptg2_v3_snapshot_binding
-                 WHERE snapshot_id = 'selected-snapshot'
-                """
-            )
-            released = await shared_gc.release_unbound_ptg2_shared_layouts(
-                schema_name=schema_name,
-                executor=connection,
-                grace_seconds=0,
-                require_shared=True,
-                layout_keys=(10,),
-            )
-        assert released == shared_gc.PTG2SharedLayoutGCStats(1, 1, 25)
-
-        async with database.acquire() as connection:
-            swept = await shared_gc.sweep_ptg2_shared_blocks(
-                schema_name=schema_name,
-                executor=connection,
-                max_bytes=25,
-                require_shared=True,
-            )
-        assert swept == shared_gc.PTG2SharedBlockSweepPlan((block_hash,), 25)
-
-        async with database.acquire() as connection:
-            assert await connection.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout"
-            ) == 1
-            assert await connection.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block"
-            ) == 1
-            assert await connection.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
-            ) == 0
+        await _release_and_sweep_gc_fixture(
+            database,
+            schema_name,
+            schema,
+            block_hash,
+        )
+        await _assert_gc_fixture_storage(database, schema)
     finally:
         try:
             async with database.acquire() as connection:

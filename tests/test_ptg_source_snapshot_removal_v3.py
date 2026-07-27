@@ -1,6 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import json
 import os
 import uuid
 from types import SimpleNamespace
@@ -10,9 +9,10 @@ import pytest
 
 from db.connection import Database
 from process.ptg_parts import source_snapshot_control
-from process.ptg_parts.ptg2_shared_blocks import (
-    PTG2_V3_DENSE_LAYOUT_TABLES,
-    PTG2_V3_SHARED_GENERATION,
+from tests.ptg_source_snapshot_removal_postgres_support import (
+    count_rows as _count,
+    create_production_shaped_schema as _create_production_shaped_schema,
+    insert_shared_snapshots as _insert_shared_snapshots,
 )
 
 
@@ -34,7 +34,7 @@ class _RecordingTransaction:
         self.statements.append((str(statement), params))
 
 
-def _install_remove_transaction_fakes(monkeypatch, transaction, events):
+def _remove_plan_fake(transaction):
     async def fake_plan(**_kwargs):
         assert transaction.active
         return {
@@ -45,8 +45,14 @@ def _install_remove_transaction_fakes(monkeypatch, transaction, events):
             "tables": [],
             "artifact_manifest_ids": [],
             "current_references": {},
+            "storage_generation": "shared_blocks_v3",
+            "shared_snapshot_key": 11,
         }
 
+    return fake_plan
+
+
+def _remove_status_fake(transaction, events):
     async def fake_status(statement, **params):
         assert transaction.active
         assert params == {"snapshot_id": "shared-a"}
@@ -64,22 +70,56 @@ def _install_remove_transaction_fakes(monkeypatch, transaction, events):
             return 1
         raise AssertionError(statement)
 
-    async def fake_release(*, schema_name, executor, require_shared):
+    return fake_status
+
+
+def _layout_release_fake(transaction, events):
+    async def fake_release(
+        *,
+        schema_name,
+        executor,
+        require_shared,
+        layout_keys,
+    ):
         assert transaction.active
         assert schema_name == "mrf"
         assert require_shared is True
         assert executor._session is transaction
+        assert layout_keys == (11,)
         events.append("layout-release")
-        return SimpleNamespace(logical_layout_count=1)
+        return SimpleNamespace(
+            logical_layout_count=1,
+            candidate_hash_count=2,
+            stored_bytes=4096,
+        )
+
+    return fake_release
+
+
+def _install_remove_transaction_fakes(monkeypatch, transaction, events):
+    """Install transaction-bound fakes for the removal ordering assertion."""
 
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
-    monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
+    monkeypatch.setattr(
+        source_snapshot_control.db,
+        "status",
+        _remove_status_fake(transaction, events),
+    )
     monkeypatch.setattr(
         source_snapshot_control,
         "build_source_snapshot_remove_plan",
-        fake_plan,
+        _remove_plan_fake(transaction),
     )
-    monkeypatch.setattr(source_snapshot_control, "release_unbound_ptg2_shared_layouts", fake_release)
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "bound_shared_layout_keys",
+        AsyncMock(return_value=(11,)),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "release_unbound_ptg2_shared_layouts",
+        _layout_release_fake(transaction, events),
+    )
 
 
 @pytest.mark.asyncio
@@ -105,329 +145,9 @@ async def test_remove_v3_snapshot_releases_layout_in_the_removal_transaction(mon
     assert removal_result["deleted_v3_snapshot_bindings"] == 1
     assert removal_result["deleted_snapshots"] == 1
     assert removal_result["released_shared_layouts"] == 1
-
-
-async def _create_production_shaped_schema(database, schema_name):
-    """Support the create production shaped schema test fixture."""
-    schema = f'"{schema_name}"'
-    async with database.acquire() as connection:
-        await connection.status(f"CREATE SCHEMA {schema}")
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_snapshot (
-                snapshot_id varchar(96) PRIMARY KEY,
-                import_month date NOT NULL,
-                previous_snapshot_id varchar(96),
-                status varchar(32) NOT NULL,
-                manifest jsonb NOT NULL
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_snapshot_pin (
-                owner_type varchar(48) NOT NULL,
-                owner_id varchar(96) NOT NULL,
-                snapshot_id varchar(128) NOT NULL REFERENCES
-                    {schema}.ptg2_snapshot(snapshot_id) ON DELETE RESTRICT,
-                reason varchar(256),
-                created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
-                PRIMARY KEY (owner_type, owner_id, snapshot_id),
-                CHECK (btrim(owner_type) <> '' AND btrim(owner_id) <> '')
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_current_snapshot (
-                slot varchar(32) PRIMARY KEY,
-                snapshot_id varchar(96),
-                previous_snapshot_id varchar(96)
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_current_source_snapshot (
-                source_key varchar(255) PRIMARY KEY,
-                snapshot_id varchar(96),
-                previous_snapshot_id varchar(96)
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_current_plan_source (
-                plan_source_key varchar(255) PRIMARY KEY,
-                snapshot_id varchar(96),
-                previous_snapshot_id varchar(96)
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_artifact_manifest (
-                artifact_id varchar(255) PRIMARY KEY,
-                snapshot_id varchar(96)
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
-                snapshot_key bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                storage_shard_id smallint NOT NULL DEFAULT 0,
-                build_token varchar(96) NOT NULL,
-                generation varchar(32) NOT NULL,
-                state varchar(16) NOT NULL CHECK (state IN ('building', 'sealed')),
-                mapping_digest bytea,
-                support_digest bytea,
-                layout_manifest jsonb NOT NULL DEFAULT '{{}}'::jsonb,
-                logical_byte_count bigint NOT NULL DEFAULT 0,
-                created_at timestamptz NOT NULL DEFAULT now(),
-                heartbeat_at timestamptz NOT NULL DEFAULT now(),
-                lease_until timestamptz,
-                published_at timestamptz
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_layout_fingerprint (
-                semantic_fingerprint bytea PRIMARY KEY,
-                snapshot_key bigint NOT NULL REFERENCES
-                    {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
-                created_at timestamptz NOT NULL DEFAULT now()
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
-                snapshot_id varchar(96) PRIMARY KEY REFERENCES
-                    {schema}.ptg2_snapshot(snapshot_id) ON DELETE CASCADE,
-                snapshot_key bigint NOT NULL REFERENCES
-                    {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE RESTRICT,
-                created_at timestamptz NOT NULL DEFAULT now()
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_snapshot_scope (
-                snapshot_id varchar(96) PRIMARY KEY REFERENCES
-                    {schema}.ptg2_snapshot(snapshot_id) ON DELETE CASCADE,
-                plan_id varchar(64) NOT NULL,
-                plan_market_type varchar(32) NOT NULL DEFAULT '',
-                coverage_scope_id bytea NOT NULL CHECK (octet_length(coverage_scope_id) = 32),
-                created_at timestamptz NOT NULL DEFAULT now()
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_snapshot_plan_scope (
-                snapshot_id varchar(96) NOT NULL REFERENCES
-                    {schema}.ptg2_v3_snapshot_scope(snapshot_id) ON DELETE CASCADE,
-                plan_id varchar(64) NOT NULL,
-                plan_market_type varchar(32) NOT NULL DEFAULT '',
-                created_at timestamptz NOT NULL DEFAULT now(),
-                PRIMARY KEY (snapshot_id, plan_id, plan_market_type)
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_source_trace_set (
-                source_trace_set_hash varchar(64) PRIMARY KEY,
-                source_trace_hashes varchar(64)[] NOT NULL
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_snapshot_source (
-                snapshot_id varchar(96) NOT NULL REFERENCES
-                    {schema}.ptg2_v3_snapshot_scope(snapshot_id) ON DELETE CASCADE,
-                source_key integer NOT NULL,
-                source_type varchar(32) NOT NULL,
-                identity_kind varchar(64) NOT NULL,
-                identity_sha256 varchar(64) NOT NULL,
-                raw_container_sha256 varchar(64) NOT NULL,
-                logical_json_sha256 varchar(64),
-                logical_hash_deferred boolean NOT NULL,
-                source_trace_set_hash varchar(64) NOT NULL REFERENCES
-                    {schema}.ptg2_source_trace_set(source_trace_set_hash) ON DELETE RESTRICT,
-                PRIMARY KEY (snapshot_id, source_key)
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_candidate_audit_attestation (
-                snapshot_id varchar(96) PRIMARY KEY REFERENCES
-                    {schema}.ptg2_v3_snapshot_scope(snapshot_id) ON DELETE CASCADE,
-                snapshot_key bigint NOT NULL REFERENCES
-                    {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE RESTRICT,
-                source_key varchar(96) NOT NULL,
-                plan_id varchar(64) NOT NULL,
-                plan_market_type varchar(32) NOT NULL,
-                coverage_scope_id bytea NOT NULL,
-                source_set_digest bytea NOT NULL,
-                audit_sample_digest bytea NOT NULL,
-                contract varchar(64) NOT NULL,
-                tool_name varchar(64) NOT NULL,
-                tool_version varchar(32) NOT NULL,
-                report_digest bytea NOT NULL,
-                report jsonb NOT NULL,
-                attested_at timestamptz NOT NULL,
-                expires_at timestamptz NOT NULL,
-                activated_at timestamptz
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_block (
-                block_hash bytea PRIMARY KEY,
-                stored_byte_count bigint NOT NULL
-            )
-            """
-        )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_snapshot_block (
-                snapshot_key bigint NOT NULL REFERENCES
-                    {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
-                object_kind varchar(64) NOT NULL,
-                block_key bigint NOT NULL,
-                fragment_no integer NOT NULL,
-                entry_count bigint NOT NULL,
-                block_hash bytea NOT NULL REFERENCES {schema}.ptg2_v3_block(block_hash),
-                PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
-            )
-            """
-        )
-        for table_name in PTG2_V3_DENSE_LAYOUT_TABLES:
-            await connection.status(
-                f'CREATE TABLE {schema}."{table_name}" (snapshot_key bigint NOT NULL)'
-            )
-        await connection.status(
-            f"""
-            CREATE TABLE {schema}.ptg2_v3_gc_candidate (
-                block_hash bytea PRIMARY KEY REFERENCES
-                    {schema}.ptg2_v3_block(block_hash) ON DELETE CASCADE,
-                eligible_at timestamptz NOT NULL,
-                queued_at timestamptz NOT NULL DEFAULT now()
-            )
-            """
-        )
-
-
-async def _insert_shared_snapshots(database, schema_name):
-    """Support the insert shared snapshots test fixture."""
-    schema = f'"{schema_name}"'
-    manifest_json_by_snapshot = {
-        snapshot_id: json.dumps(
-            {
-                "serving_index": {
-                    "arch_version": "postgres_binary_v3",
-                    "storage_generation": PTG2_V3_SHARED_GENERATION,
-                    "shared_snapshot_key": 10,
-                    "source_key": source_key,
-                }
-            }
-        )
-        for snapshot_id, source_key in (
-            ("shared-a", "source_a"),
-            ("shared-b", "source_b"),
-        )
-    }
-    async with database.acquire() as connection:
-        await connection.status(
-            f"""
-            INSERT INTO {schema}.ptg2_v3_snapshot_layout
-                (snapshot_key, build_token, generation, state, created_at, heartbeat_at, lease_until)
-            VALUES
-                (10, 'build-10', :generation, 'sealed', now() - INTERVAL '2 hours',
-                 now() - INTERVAL '2 hours', NULL)
-            """,
-            generation=PTG2_V3_SHARED_GENERATION,
-        )
-        for snapshot_id, source_key in (("shared-a", "source_a"), ("shared-b", "source_b")):
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_snapshot
-                    (snapshot_id, import_month, previous_snapshot_id, status, manifest)
-                VALUES (:snapshot_id, DATE '2026-07-01', NULL, 'published', CAST(:manifest AS jsonb))
-                """,
-                snapshot_id=snapshot_id,
-                manifest=manifest_json_by_snapshot[snapshot_id],
-            )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_snapshot_binding (snapshot_id, snapshot_key)
-                VALUES (:snapshot_id, 10)
-                """,
-                snapshot_id=snapshot_id,
-            )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_snapshot_scope
-                    (snapshot_id, plan_id, plan_market_type, coverage_scope_id)
-                VALUES (:snapshot_id, :plan_id, 'group', :coverage_scope_id)
-                """,
-                snapshot_id=snapshot_id,
-                plan_id=f"plan-{source_key}",
-                coverage_scope_id=bytes([1 if source_key == "source_a" else 2]) * 32,
-            )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_snapshot_plan_scope
-                    (snapshot_id, plan_id, plan_market_type)
-                VALUES (:snapshot_id, :plan_id, 'group')
-                """,
-                snapshot_id=snapshot_id,
-                plan_id=f"plan-{source_key}",
-            )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_v3_candidate_audit_attestation
-                    (snapshot_id, snapshot_key, source_key, plan_id,
-                     plan_market_type, coverage_scope_id, source_set_digest,
-                     audit_sample_digest, contract, tool_name, tool_version,
-                     report_digest, report, attested_at, expires_at, activated_at)
-                VALUES
-                    (:snapshot_id, 10, :source_key, :plan_id, 'group',
-                     :coverage_scope_id, :source_set_digest, :audit_sample_digest,
-                     'source_to_api_v1', 'fixture-auditor', '1.0',
-                     :report_digest, '{{}}'::jsonb, now(),
-                     now() + INTERVAL '1 hour', NULL)
-                """,
-                snapshot_id=snapshot_id,
-                source_key=source_key,
-                plan_id=f"plan-{source_key}",
-                coverage_scope_id=bytes([1 if source_key == "source_a" else 2]) * 32,
-                source_set_digest=bytes([3 if source_key == "source_a" else 4]) * 32,
-                audit_sample_digest=bytes([5 if source_key == "source_a" else 6]) * 32,
-                report_digest=bytes([7 if source_key == "source_a" else 8]) * 32,
-            )
-
-
-async def _count(database, schema_name, table_name, *, snapshot_id=None):
-    schema = f'"{schema_name}"'
-    where_clause = ""
-    query_param_map = {}
-    if snapshot_id is not None:
-        where_clause = " WHERE snapshot_id = :snapshot_id"
-        query_param_map["snapshot_id"] = snapshot_id
-    return int(
-        await database.scalar(
-            f'SELECT COUNT(*) FROM {schema}."{table_name}"{where_clause}',
-            **query_param_map,
-        )
-        or 0
-    )
+    assert removal_result["queued_shared_block_candidates"] == 2
+    assert removal_result["queued_shared_block_bytes"] == 4096
+    assert removal_result["physical_cleanup"] == "released"
 
 
 @pytest.mark.asyncio

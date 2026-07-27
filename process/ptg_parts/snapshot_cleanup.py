@@ -31,6 +31,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
     PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
     PTG2_V3_SHARED_GENERATION,
+    PTG2_V4_SHARED_GENERATION,
 )
 from process.ptg_parts.ptg2_shared_gc import (
     release_unbound_ptg2_shared_layouts,
@@ -117,6 +118,53 @@ SELECT DISTINCT snapshot_id
   ) current_refs
 """
 
+_SNAPSHOT_SERVING_RESOURCE_SQL = """
+SELECT layout.state,
+       layout.generation,
+       layout.layout_manifest,
+       layout.mapping_digest,
+       layout.support_digest,
+       (SELECT COUNT(*) FROM __SCHEMA__.ptg2_v3_snapshot_block AS mapping
+         WHERE mapping.snapshot_key = layout.snapshot_key) AS mapping_count,
+       (SELECT COUNT(*)
+          FROM __SCHEMA__.ptg2_v3_snapshot_block AS mapping
+          JOIN __SCHEMA__.ptg2_v3_block AS block
+            ON block.block_hash = mapping.block_hash
+         WHERE mapping.snapshot_key = layout.snapshot_key) AS resolved_mapping_count,
+       EXISTS (SELECT 1 FROM __SCHEMA__.ptg2_v3_graph_owner AS dense
+                WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1) AS has_graph_owner,
+       EXISTS (SELECT 1 FROM __SCHEMA__.ptg2_v3_code AS dense
+                WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1) AS has_code,
+       (SELECT COUNT(*) FROM __SCHEMA__.ptg2_v3_code AS dense
+         WHERE dense.snapshot_key = layout.snapshot_key) AS code_count,
+       (SELECT COUNT(DISTINCT dense.coverage_scope_id)
+          FROM __SCHEMA__.ptg2_v3_code AS dense
+         WHERE dense.snapshot_key = layout.snapshot_key) AS code_scope_count,
+       (SELECT COUNT(*) FROM __SCHEMA__.ptg2_v3_code AS dense
+         WHERE dense.snapshot_key = layout.snapshot_key
+           AND dense.coverage_scope_id = :coverage_scope_id) AS matching_code_scope_count,
+       EXISTS (SELECT 1 FROM __SCHEMA__.ptg2_v3_provider_group AS dense
+                WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1) AS has_provider_group,
+       EXISTS (SELECT 1 FROM __SCHEMA__.ptg2_v3_provider_set AS dense
+                WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1) AS has_provider_set,
+       EXISTS (SELECT 1 FROM __SCHEMA__.ptg2_v3_price_attr AS dense
+                WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1) AS has_price_attr,
+       EXISTS (SELECT 1 FROM __SCHEMA__.ptg2_v3_npi_scope AS dense
+                WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1) AS has_npi_scope,
+       (SELECT COUNT(*) FROM __SCHEMA__.ptg2_v3_snapshot_scope AS scope
+         WHERE scope.snapshot_id = binding.snapshot_id) AS scope_count,
+       (SELECT COUNT(*) FROM __SCHEMA__.ptg2_v3_snapshot_scope AS scope
+         WHERE scope.snapshot_id = binding.snapshot_id
+           AND scope.coverage_scope_id = :coverage_scope_id) AS matching_scope_count,
+       (SELECT COUNT(*) FROM __SCHEMA__.ptg2_v3_snapshot_plan_scope AS plan_scope
+         WHERE plan_scope.snapshot_id = binding.snapshot_id) AS logical_plan_scope_count
+  FROM __SCHEMA__.ptg2_v3_snapshot_binding AS binding
+  JOIN __SCHEMA__.ptg2_v3_snapshot_layout AS layout
+    ON layout.snapshot_key = binding.snapshot_key
+ WHERE binding.snapshot_id = :snapshot_id
+   AND binding.snapshot_key = :shared_snapshot_key
+"""
+
 
 def _is_ptg2_snapshot_in_flight(snapshot_status: Any) -> bool:
     return (
@@ -124,7 +172,7 @@ def _is_ptg2_snapshot_in_flight(snapshot_status: Any) -> bool:
     )
 
 
-def is_strict_ptg2_v3_shared_blocks_manifest(
+def _is_strict_shared_manifest(
     serving_index: dict[str, Any] | None,
 ) -> bool:
     """Return whether a manifest declares the only cleanup-safe layout."""
@@ -136,6 +184,24 @@ def is_strict_ptg2_v3_shared_blocks_manifest(
         == PTG2_V3_ARCH_VERSION
         and str(serving_index.get("storage_generation") or "").strip().lower()
         == PTG2_V3_SHARED_GENERATION
+    )
+
+
+is_strict_ptg2_v3_shared_blocks_manifest = _is_strict_shared_manifest
+
+
+def is_shared_snapshot_control_manifest(
+    serving_index: dict[str, Any] | None,
+) -> bool:
+    """Admit only shared V3/V4 layouts to generation-aware snapshot control."""
+
+    if not isinstance(serving_index, dict):
+        return False
+    return (
+        str(serving_index.get("arch_version") or "").strip().lower()
+        == PTG2_V3_ARCH_VERSION
+        and str(serving_index.get("storage_generation") or "").strip().lower()
+        in {PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION}
     )
 
 
@@ -339,193 +405,122 @@ async def _available_snapshot_db_artifact_ids(
     }
 
 
-async def _missing_snapshot_serving_resources(
-    schema_name: str,
-    snapshot_id: str,
-    serving_index: dict[str, Any],
-) -> tuple[list[str], list[str]]:
-    """Return missing serving resources and contract errors for a snapshot."""
-    arch_version = str(serving_index.get("arch_version") or "").strip().lower()
-    storage_generation = (
-        str(serving_index.get("storage_generation") or "").strip().lower()
-    )
-    cold_lookup_contract = (
-        str(serving_index.get("cold_lookup_contract") or "").strip().lower()
-    )
-    price_membership_semantics = (
-        str(serving_index.get("price_membership_semantics") or "").strip().lower()
-    )
-    serving_multiplicity_semantics = (
-        str(serving_index.get("serving_multiplicity_semantics") or "").strip().lower()
-    )
-    contract_errors: list[str] = []
-    if arch_version != "postgres_binary_v3":
-        contract_errors.append("arch_version")
-    if storage_generation != PTG2_V3_SHARED_GENERATION:
-        contract_errors.append("storage_generation")
-    if cold_lookup_contract != PTG2_V3_COLD_LOOKUP_CONTRACT:
-        contract_errors.append("cold_lookup_contract")
-    if price_membership_semantics != PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS:
-        contract_errors.append("price_membership_semantics")
-    if serving_multiplicity_semantics != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS:
-        contract_errors.append("serving_multiplicity_semantics")
+def _audit_sample_context(
+    audit_sample: Any,
+) -> tuple[int, str, bool]:
+    if not isinstance(audit_sample, dict):
+        return -1, "", False
     try:
-        shared_snapshot_key = int(serving_index.get("shared_snapshot_key"))
+        sample_count = int(audit_sample.get("sample_count"))
+        format_version = int(audit_sample.get("format_version"))
+        maximum_rows = int(audit_sample.get("maximum_rows"))
     except (TypeError, ValueError):
-        shared_snapshot_key = 0
-    if shared_snapshot_key <= 0:
-        contract_errors.append("shared_snapshot_key")
+        return -1, "", False
+    sample_digest = str(audit_sample.get("sample_digest") or "").strip().lower()
+    valid = (
+        audit_sample.get("contract") == PTG2_V3_AUDIT_CONTRACT
+        and audit_sample.get("method") == PTG2_V3_AUDIT_METHOD
+        and audit_sample.get("serving_multiplicity_semantics")
+        == PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
+        and audit_sample.get("complete_population") is False
+        and format_version == 2
+        and maximum_rows == PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
+        and 0 <= sample_count <= PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
+        and bool(_COVERAGE_SCOPE_ID_RE.fullmatch(sample_digest))
+    )
+    return sample_count, sample_digest, valid
+
+
+def _serving_contract_context(
+    serving_index: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+    expected_by_field = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": PTG2_V3_SHARED_GENERATION,
+        "cold_lookup_contract": PTG2_V3_COLD_LOOKUP_CONTRACT,
+        "price_membership_semantics": PTG2_V3_PRICE_MEMBERSHIP_SEMANTICS,
+        "serving_multiplicity_semantics": PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS,
+    }
+    for field_name, expected_value in expected_by_field.items():
+        observed = str(serving_index.get(field_name) or "").strip().lower()
+        if observed != expected_value:
+            errors.append(field_name)
+    try:
+        snapshot_key = int(serving_index.get("shared_snapshot_key"))
+    except (TypeError, ValueError):
+        snapshot_key = 0
+    if snapshot_key <= 0:
+        errors.append("shared_snapshot_key")
     raw_coverage_scope_id = serving_index.get("coverage_scope_id")
     if isinstance(raw_coverage_scope_id, str) and _COVERAGE_SCOPE_ID_RE.fullmatch(
         raw_coverage_scope_id
     ):
-        coverage_scope_hex = raw_coverage_scope_id
-        coverage_scope_id = bytes.fromhex(coverage_scope_hex)
+        coverage_scope_id = bytes.fromhex(raw_coverage_scope_id)
     else:
-        coverage_scope_hex = ""
         coverage_scope_id = b""
     if len(coverage_scope_id) != 32:
-        contract_errors.append("coverage_scope_id")
-    audit_sample = serving_index.get("audit_sample")
-    audit_sample_count = -1
-    audit_sample_digest = ""
-    if not isinstance(audit_sample, dict):
-        contract_errors.append("audit_sample")
-    else:
-        try:
-            audit_sample_count = int(audit_sample.get("sample_count"))
-            audit_format_version = int(audit_sample.get("format_version"))
-            audit_maximum_rows = int(audit_sample.get("maximum_rows"))
-        except (TypeError, ValueError):
-            audit_sample_count = -1
-            audit_format_version = -1
-            audit_maximum_rows = -1
-        audit_sample_digest = (
-            str(audit_sample.get("sample_digest") or "").strip().lower()
-        )
-        if (
-            audit_sample.get("contract") != PTG2_V3_AUDIT_CONTRACT
-            or audit_sample.get("method") != PTG2_V3_AUDIT_METHOD
-            or audit_sample.get("serving_multiplicity_semantics")
-            != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
-            or audit_sample.get("complete_population") is not False
-            or audit_format_version != 2
-            or audit_maximum_rows != PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
-            or audit_sample_count < 0
-            or audit_sample_count > PTG2_V3_AUDIT_MAX_SAMPLE_ROWS
-            or not _COVERAGE_SCOPE_ID_RE.fullmatch(audit_sample_digest)
-        ):
-            contract_errors.append("audit_sample")
+        errors.append("coverage_scope_id")
+    sample_count, sample_digest, audit_valid = _audit_sample_context(
+        serving_index.get("audit_sample")
+    )
+    if not audit_valid:
+        errors.append("audit_sample")
+    return {
+        "snapshot_key": snapshot_key,
+        "coverage_scope_id": coverage_scope_id,
+        "audit_sample_count": sample_count,
+        "audit_sample_digest": sample_digest,
+    }, errors
 
-    missing_table_names = [
-        table_name
-        for table_name in _STRICT_V3_SHARED_TABLE_NAMES
-        if not await _is_table_available(schema_name, table_name)
-    ]
-    if missing_table_names or contract_errors:
-        return missing_table_names, contract_errors
 
-    schema = _quote_ident(schema_name)
-    resource_records = await db.all(
-        f"""
-        SELECT layout.state,
-               layout.generation,
-               layout.layout_manifest,
-               layout.mapping_digest,
-               layout.support_digest,
-               (SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_snapshot_block AS mapping
-                 WHERE mapping.snapshot_key = layout.snapshot_key) AS mapping_count,
-               (SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_snapshot_block AS mapping
-                  JOIN {schema}.ptg2_v3_block AS block
-                    ON block.block_hash = mapping.block_hash
-                 WHERE mapping.snapshot_key = layout.snapshot_key) AS resolved_mapping_count,
-               EXISTS (
-                   SELECT 1 FROM {schema}.ptg2_v3_graph_owner AS dense
-                    WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1
-               ) AS has_graph_owner,
-               EXISTS (
-                   SELECT 1 FROM {schema}.ptg2_v3_code AS dense
-                    WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1
-               ) AS has_code,
-               (SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_code AS dense
-                 WHERE dense.snapshot_key = layout.snapshot_key) AS code_count,
-               (SELECT COUNT(DISTINCT dense.coverage_scope_id)
-                  FROM {schema}.ptg2_v3_code AS dense
-                 WHERE dense.snapshot_key = layout.snapshot_key) AS code_scope_count,
-               (SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_code AS dense
-                 WHERE dense.snapshot_key = layout.snapshot_key
-                   AND dense.coverage_scope_id = :coverage_scope_id)
-                   AS matching_code_scope_count,
-               EXISTS (
-                   SELECT 1 FROM {schema}.ptg2_v3_provider_group AS dense
-                    WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1
-               ) AS has_provider_group,
-               EXISTS (
-                   SELECT 1 FROM {schema}.ptg2_v3_provider_set AS dense
-                    WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1
-               ) AS has_provider_set,
-               EXISTS (
-                   SELECT 1 FROM {schema}.ptg2_v3_price_attr AS dense
-                    WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1
-               ) AS has_price_attr,
-               EXISTS (
-                   SELECT 1 FROM {schema}.ptg2_v3_npi_scope AS dense
-                    WHERE dense.snapshot_key = layout.snapshot_key LIMIT 1
-               ) AS has_npi_scope,
-               (SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_snapshot_scope AS scope
-                 WHERE scope.snapshot_id = binding.snapshot_id) AS scope_count,
-               (SELECT COUNT(*)
-                 FROM {schema}.ptg2_v3_snapshot_scope AS scope
-                 WHERE scope.snapshot_id = binding.snapshot_id
-                   AND scope.coverage_scope_id = :coverage_scope_id) AS matching_scope_count,
-               (SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_snapshot_plan_scope AS plan_scope
-                 WHERE plan_scope.snapshot_id = binding.snapshot_id)
-                   AS logical_plan_scope_count
-          FROM {schema}.ptg2_v3_snapshot_binding AS binding
-          JOIN {schema}.ptg2_v3_snapshot_layout AS layout
-            ON layout.snapshot_key = binding.snapshot_key
-         WHERE binding.snapshot_id = :snapshot_id
-           AND binding.snapshot_key = :shared_snapshot_key
-        """,
+async def _load_serving_resource_record(
+    schema_name: str,
+    snapshot_id: str,
+    context: dict[str, Any],
+) -> dict[str, Any] | None:
+    rows = await db.all(
+        _SNAPSHOT_SERVING_RESOURCE_SQL.replace(
+            "__SCHEMA__",
+            _quote_ident(schema_name),
+        ),
         snapshot_id=snapshot_id,
-        shared_snapshot_key=shared_snapshot_key,
-        coverage_scope_id=coverage_scope_id,
+        shared_snapshot_key=context["snapshot_key"],
+        coverage_scope_id=context["coverage_scope_id"],
     )
-    if len(resource_records) != 1:
-        return missing_table_names, ["snapshot_binding"]
-    resource_record = (
-        resource_records[0]
-        if isinstance(resource_records[0], dict)
-        else dict(resource_records[0]._mapping)
-    )
+    if len(rows) != 1:
+        return None
+    return rows[0] if isinstance(rows[0], dict) else dict(rows[0]._mapping)
+
+
+def _validate_resource_identity(resource_record: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
     if str(resource_record.get("state") or "").strip().lower() != "sealed":
-        contract_errors.append("layout_state")
+        errors.append("layout_state")
     if (
         str(resource_record.get("generation") or "").strip().lower()
         != PTG2_V3_SHARED_GENERATION
     ):
-        contract_errors.append("layout_generation")
+        errors.append("layout_generation")
     if len(bytes(resource_record.get("mapping_digest") or b"")) != 32:
-        contract_errors.append("mapping_digest")
+        errors.append("mapping_digest")
     if len(bytes(resource_record.get("support_digest") or b"")) != 32:
-        contract_errors.append("support_digest")
+        errors.append("support_digest")
     mapping_count = int(resource_record.get("mapping_count") or 0)
     if mapping_count <= 0:
-        contract_errors.append("snapshot_blocks")
+        errors.append("snapshot_blocks")
     if int(resource_record.get("resolved_mapping_count") or 0) != mapping_count:
-        contract_errors.append("unresolved_snapshot_blocks")
+        errors.append("unresolved_snapshot_blocks")
     if int(resource_record.get("scope_count") or 0) != 1:
-        contract_errors.append("snapshot_scope")
+        errors.append("snapshot_scope")
     if int(resource_record.get("matching_scope_count") or 0) != 1:
-        contract_errors.append("coverage_scope_binding")
+        errors.append("coverage_scope_binding")
     if int(resource_record.get("logical_plan_scope_count") or 0) <= 0:
-        contract_errors.append("logical_plan_scope")
+        errors.append("logical_plan_scope")
+    return errors
+
+
+def _validate_code_scope(resource_record: dict[str, Any]) -> tuple[int, list[str]]:
     code_count = int(resource_record.get("code_count") or 0)
     code_scope_count = int(resource_record.get("code_scope_count") or 0)
     matching_code_scope_count = int(
@@ -533,10 +528,16 @@ async def _missing_snapshot_serving_resources(
     )
     if code_count == 0:
         if code_scope_count != 0 or matching_code_scope_count != 0:
-            contract_errors.append("coverage_scope_code")
+            return code_count, ["coverage_scope_code"]
     elif code_scope_count != 1 or matching_code_scope_count != code_count:
-        contract_errors.append("coverage_scope_code")
+        return code_count, ["coverage_scope_code"]
+    return code_count, []
 
+
+def _validate_layout_manifest(
+    resource_record: dict[str, Any],
+    serving_index: dict[str, Any],
+) -> list[str]:
     layout_manifest = resource_record.get("layout_manifest")
     if isinstance(layout_manifest, str):
         try:
@@ -549,23 +550,31 @@ async def _missing_snapshot_serving_resources(
         else None
     )
     if not isinstance(layout_serving_index, dict):
-        contract_errors.append("layout_manifest")
-    else:
-        for field_name in (
-            "arch_version",
-            "storage_generation",
-            "cold_lookup_contract",
-            "price_membership_semantics",
-            "serving_multiplicity_semantics",
-            "shared_snapshot_key",
-            "coverage_scope_id",
-            "serving_rates",
-            "atom_key_bits",
-            "audit_sample",
-        ):
-            if layout_serving_index.get(field_name) != serving_index.get(field_name):
-                contract_errors.append(f"layout_manifest:{field_name}")
+        return ["layout_manifest"]
+    fields = (
+        "arch_version",
+        "storage_generation",
+        "cold_lookup_contract",
+        "price_membership_semantics",
+        "serving_multiplicity_semantics",
+        "shared_snapshot_key",
+        "coverage_scope_id",
+        "serving_rates",
+        "atom_key_bits",
+        "audit_sample",
+    )
+    return [
+        f"layout_manifest:{field_name}"
+        for field_name in fields
+        if layout_serving_index.get(field_name) != serving_index.get(field_name)
+    ]
 
+
+async def _validate_persisted_audit(
+    schema_name: str,
+    context: dict[str, Any],
+) -> list[str]:
+    schema = _quote_ident(schema_name)
     audit_rows = await db.all(
         f"""
         SELECT occurrence_id, code_key, provider_set_key, price_key,
@@ -575,18 +584,29 @@ async def _missing_snapshot_serving_resources(
          ORDER BY occurrence_id
          LIMIT :row_limit
         """,
-        shared_snapshot_key=shared_snapshot_key,
+        shared_snapshot_key=context["snapshot_key"],
         row_limit=PTG2_V3_AUDIT_MAX_SAMPLE_ROWS + 1,
     )
     audit_row_mappings = [
         audit_row if isinstance(audit_row, dict) else dict(audit_row._mapping)
         for audit_row in audit_rows
     ]
-    if len(audit_row_mappings) != audit_sample_count:
-        contract_errors.append("audit_sample:row_count")
-    elif persisted_audit_sample_digest(audit_row_mappings) != audit_sample_digest:
-        contract_errors.append("audit_sample:digest")
+    if len(audit_row_mappings) != context["audit_sample_count"]:
+        return ["audit_sample:row_count"]
+    if (
+        persisted_audit_sample_digest(audit_row_mappings)
+        != context["audit_sample_digest"]
+    ):
+        return ["audit_sample:digest"]
+    return []
 
+
+def _validate_dense_resources(
+    resource_record: dict[str, Any],
+    serving_index: dict[str, Any],
+    code_count: int,
+) -> list[str]:
+    errors: list[str] = []
     serving_rate_count = int(serving_index.get("serving_rates") or 0)
     provider_graph = serving_index.get("provider_graph")
     provider_graph = provider_graph if isinstance(provider_graph, dict) else {}
@@ -601,11 +621,48 @@ async def _missing_snapshot_serving_resources(
         if expected_count > 0 and not bool(
             resource_record.get(f"has_{dense_name}")
         ):
-            contract_errors.append(f"dense:{dense_name}")
+            errors.append(f"dense:{dense_name}")
     if serving_rate_count > 0 and (
         code_count <= 0 or not bool(resource_record.get("has_code"))
     ):
-        contract_errors.append("dense:code")
+        errors.append("dense:code")
+    return errors
+
+
+async def _missing_snapshot_serving_resources(
+    schema_name: str,
+    snapshot_id: str,
+    serving_index: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Return missing serving resources and contract errors for a snapshot."""
+
+    context, contract_errors = _serving_contract_context(serving_index)
+    missing_table_names = [
+        table_name
+        for table_name in _STRICT_V3_SHARED_TABLE_NAMES
+        if not await _is_table_available(schema_name, table_name)
+    ]
+    if missing_table_names or contract_errors:
+        return missing_table_names, contract_errors
+    resource_record = await _load_serving_resource_record(
+        schema_name,
+        snapshot_id,
+        context,
+    )
+    if resource_record is None:
+        return missing_table_names, ["snapshot_binding"]
+    contract_errors.extend(_validate_resource_identity(resource_record))
+    code_count, code_errors = _validate_code_scope(resource_record)
+    contract_errors.extend(code_errors)
+    contract_errors.extend(
+        _validate_layout_manifest(resource_record, serving_index)
+    )
+    contract_errors.extend(
+        await _validate_persisted_audit(schema_name, context)
+    )
+    contract_errors.extend(
+        _validate_dense_resources(resource_record, serving_index, code_count)
+    )
     return missing_table_names, contract_errors
 
 
@@ -641,7 +698,7 @@ async def _drop_ptg2_snapshot_table_names(
         )
 
 
-async def _drop_ptg2_snapshot_tables_for_manifest(
+async def _drop_snapshot_tables_for_manifest(
     serving_index: dict[str, Any] | None,
 ) -> None:
     if not is_strict_ptg2_v3_shared_blocks_manifest(serving_index):
@@ -649,6 +706,9 @@ async def _drop_ptg2_snapshot_tables_for_manifest(
     # Strict V3 stores serving data in shared PostgreSQL blocks, never in
     # manifest-declared snapshot tables.
     await _drop_ptg2_snapshot_table_names([])
+
+
+_drop_ptg2_snapshot_tables_for_manifest = _drop_snapshot_tables_for_manifest
 
 
 def _source_snapshot_lineage_limit() -> int:
