@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -259,3 +260,160 @@ async def test_audit_timestamp_and_insert_are_fail_closed(monkeypatch):
                 tzinfo=datetime.UTC,
             ),
         )
+
+
+def test_database_row_and_sqlstate_adapters_preserve_driver_boundaries():
+    """Accept supported driver rows and safely unwrap nested database errors."""
+
+    assert store._row_mapping(None) == {}
+    assert store._row_mapping(SimpleNamespace(_mapping={"value": 1})) == {
+        "value": 1
+    }
+    assert store._row_mapping((("value", 2),)) == {"value": 2}
+
+    lock_error = RuntimeError("lock unavailable")
+    lock_error.pgcode = "55P03"
+    wrapped_error = RuntimeError("driver wrapper")
+    wrapped_error.orig = lock_error
+    assert store._database_sqlstate(wrapped_error) == "55P03"
+
+    cyclic_error = RuntimeError("cyclic driver wrapper")
+    cyclic_error.orig = cyclic_error
+    cyclic_error.context = "not an exception"
+    assert store._database_sqlstate(cyclic_error) == ""
+
+
+class _RowsResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+    def one_or_none(self):
+        return self._rows[0] if self._rows else None
+
+
+@pytest.mark.asyncio
+async def test_store_read_adapters_keep_driver_rows_as_plain_mappings():
+    """Normalize multi-row and optional-row results before policy evaluation."""
+
+    session = AsyncMock()
+    session.execute.return_value = _RowsResult(
+        [
+            {"surface": "source"},
+            SimpleNamespace(_mapping={"surface": "plan"}),
+        ]
+    )
+
+    assert await store._all(session, "SELECT surfaces", {"key": "value"}) == (
+        {"surface": "source"},
+        {"surface": "plan"},
+    )
+    assert await store._one(session, "SELECT surface", {}) == {
+        "surface": "source"
+    }
+
+
+@pytest.mark.asyncio
+async def test_changed_count_accepts_only_the_exact_returning_cardinality():
+    """Require every planned plan-pointer CAS to report a changed row."""
+
+    session = AsyncMock()
+    session.execute.return_value = _RowsResult([{"plan": "a"}, {"plan": "b"}])
+
+    await store._require_changed_count(
+        session,
+        "UPDATE exact plan rows",
+        {},
+        expected_count=2,
+        conflict_message="plan rows changed",
+    )
+    with pytest.raises(PTG2PredecessorRetirementConflict, match="changed"):
+        await store._require_changed_count(
+            session,
+            "UPDATE exact plan rows",
+            {},
+            expected_count=1,
+            conflict_message="plan rows changed",
+        )
+
+
+class _LockingSession:
+    def __init__(self, lock_error):
+        self._lock_error = lock_error
+        self._call_count = 0
+
+    async def execute(self, _statement, _params=None):
+        self._call_count += 1
+        if self._call_count == 2:
+            raise self._lock_error
+        return _RowsResult([])
+
+
+@pytest.mark.asyncio
+async def test_retirement_context_translates_only_retryable_lock_contention(
+    monkeypatch,
+):
+    """Expose retryable lock races without hiding unrelated database failures."""
+
+    monkeypatch.setattr(
+        store,
+        "_load_context_surfaces",
+        AsyncMock(return_value={}),
+    )
+    lock_error = RuntimeError("lock unavailable")
+    lock_error.sqlstate = "55P03"
+    with pytest.raises(
+        PTG2PredecessorRetirementConflict,
+        match="contending with a release update",
+    ):
+        await store.load_retirement_context(
+            _LockingSession(lock_error),
+            schema_name="mrf",
+            control_schema_name="control",
+            request=_request(),
+        )
+
+    database_error = RuntimeError("permission denied")
+    with pytest.raises(RuntimeError, match="permission denied"):
+        await store.load_retirement_context(
+            _LockingSession(database_error),
+            schema_name="mrf",
+            control_schema_name="control",
+            request=_request(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_database_clock_is_used_when_retirement_time_is_not_supplied(
+    monkeypatch,
+):
+    """Persist the transaction clock instead of an application-generated time."""
+
+    retired_at = datetime.datetime(2026, 7, 27, tzinfo=datetime.UTC)
+    monkeypatch.setattr(
+        store,
+        "database_utc_timestamp",
+        AsyncMock(return_value=retired_at),
+    )
+    monkeypatch.setattr(
+        store,
+        "_one",
+        AsyncMock(
+            return_value={
+                "idempotency_key": "retire-synthetic-001",
+                "retired_at": retired_at,
+            }
+        ),
+    )
+
+    audit_record_by_field = await store.insert_retirement_audit(
+        object(),
+        schema_name="mrf",
+        request=_request(),
+        decision=PredecessorRetirementDecision(1, 1, 0, 1),
+    )
+
+    store.database_utc_timestamp.assert_awaited_once()
+    assert audit_record_by_field["retired_at"] == retired_at

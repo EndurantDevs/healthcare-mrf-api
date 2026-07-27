@@ -179,6 +179,32 @@ def test_pin_mode_and_owner_are_an_explicit_request_pair():
         )
 
 
+def test_unknown_pin_mode_fails_closed_at_request_and_decision_boundaries():
+    request_by_field = {
+        **_coordinates(),
+        "rollback_pin_mode": "future-mode",
+        "actor": ACTOR,
+        "reason": REASON,
+        "idempotency_key": IDEMPOTENCY_KEY,
+    }
+
+    with pytest.raises(ValueError, match="must be owned or absent"):
+        retirement.normalized_predecessor_retirement_request(
+            **request_by_field
+        )
+    with pytest.raises(
+        PTG2PredecessorRetirementConflict,
+        match="pin expectation is invalid",
+    ):
+        state.predecessor_retirement_decision(
+            _context(),
+            **{
+                **_coordinates(),
+                "rollback_pin_mode": "future-mode",
+            },
+        )
+
+
 @pytest.mark.parametrize(
     ("context", "message"),
     [

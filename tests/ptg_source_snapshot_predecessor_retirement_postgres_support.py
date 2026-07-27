@@ -368,6 +368,7 @@ def configure_operation(
     control_schema_name: str,
 ) -> None:
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    monkeypatch.setenv("DB_SCHEMA", schema_name)
     monkeypatch.setenv(
         "HLTHPRT_" + "IMP" + "ORT_CONTROL_SCHEMA",
         control_schema_name,

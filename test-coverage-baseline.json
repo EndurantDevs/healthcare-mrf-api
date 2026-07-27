@@ -10,6 +10,7 @@
         "api/control_ptg2_v4_stale_metadata.py",
         "api/control_ptg_v4.py",
         "api/control_ptg_v4_recovery.py",
+        "api/control_snapshot_predecessor_retirement.py",
         "api/control_snapshot_rollback.py",
         "api/control_workers.py",
         "api/endpoint/__init__.py",
@@ -102,6 +103,7 @@
         "db/migration_expression_adoption.py",
         "db/migration_index_adoption.py",
         "db/migration_index_catalog.py",
+        "db/migration_ptg2_predecessor_retirement_audit.py",
         "db/migration_ptg2_v4_attempt_audit.py",
         "db/migration_ptg2_v4_attempt_catalog.py",
         "db/migration_ptg2_v4_attempt_checks.py",
@@ -379,6 +381,11 @@
         "process/ptg_parts/source_snapshot_control.py",
         "process/ptg_parts/source_snapshot_control_policy.py",
         "process/ptg_parts/source_snapshot_control_results.py",
+        "process/ptg_parts/source_snapshot_predecessor_retirement.py",
+        "process/ptg_parts/source_snapshot_predecessor_retirement_sql.py",
+        "process/ptg_parts/source_snapshot_predecessor_retirement_state.py",
+        "process/ptg_parts/source_snapshot_predecessor_retirement_store.py",
+        "process/ptg_parts/source_snapshot_predecessor_retirement_types.py",
         "process/ptg_parts/source_snapshot_references.py",
         "process/ptg_parts/source_snapshot_rollback.py",
         "process/ptg_parts/source_snapshot_rollback_allowed.py",
@@ -427,12 +434,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 34552,
-          "total": 39718
+          "covered": 34711,
+          "total": 39810
         },
         "lines": {
-          "covered": 110056,
-          "total": 118135
+          "covered": 110563,
+          "total": 118527
         }
       },
       "one_time_floor_reset": {
