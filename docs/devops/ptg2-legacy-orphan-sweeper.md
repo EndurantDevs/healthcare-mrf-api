@@ -43,8 +43,10 @@ The sweeper:
 - validates schema, owner, OID, relation kind, persistence, columns, indexes,
   sequences, inheritance, user-trigger definitions/enabled state, and generic
   PostgreSQL dependencies before probing rows;
-- binds every lifecycle-authority OID and column shape, plus the immutable
-  audit trigger, into the reviewed plan;
+- binds every required lifecycle-authority OID and column shape, the exact
+  present/absent state of optional transient stage relations (plus their OID
+  and shape when present), and the immutable audit trigger into the reviewed
+  plan;
 - blocks building, running, validated-without-owner, active/unknown placement,
   current/previous pointer, route, release, pin, shared-binding, attempt-fence,
   cross-owner, serving-row, allowed-amount, candidate-audit, and stage residue;
@@ -58,7 +60,9 @@ The sweeper:
 - permits ownerless relations only when every allowed root table is proven
   empty;
 - serializes with the shared PTG lifecycle lock and rechecks the complete plan
-  after acquiring exact table locks;
+  after acquiring a PostgreSQL catalog lock and exact table locks; the catalog
+  lock prevents an absent optional stage relation from being created inside
+  the final plan/apply window, and missing catalog-lock privilege aborts;
 - caps suffixes, root tables, dependent relations, and bytes with hard
   non-overridable ceilings;
 - skips and explicitly classifies an individually oversized lexical family so

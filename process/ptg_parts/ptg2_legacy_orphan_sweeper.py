@@ -85,6 +85,9 @@ async def build_legacy_orphan_sweep_plan(
         schema_name=resolved_schema,
         control_schema_name=resolved_control_schema,
         catalog=catalog,
+        present_optional_table_names=frozenset(
+            authority.present_optional_table_names
+        ),
     )
     candidates: list[LegacySweepCandidate] = []
     blocked_suffixes: list[LegacyBlockedSuffix] = []
@@ -283,6 +286,7 @@ async def execute_legacy_orphan_sweep(
             schema_name=resolved_schema,
             control_schema_name=resolved_control_schema,
             lock_timeout=lock_timeout,
+            present_optional_table_names=authority_before_lock.present_optional_table_names,
         )
         authority_after_lock = await require_legacy_sweep_schema(
             connection,

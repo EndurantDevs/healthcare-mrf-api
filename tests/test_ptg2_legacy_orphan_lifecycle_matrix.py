@@ -164,6 +164,7 @@ async def test_reference_attachment_boundaries(monkeypatch) -> None:
         schema_name="mrf",
         accumulators=accumulators_by_suffix,
         suffixes_by_snapshot={},
+        present_optional_table_names=frozenset(),
     )
 
     empty = _OwnershipAccumulator()
@@ -180,6 +181,37 @@ async def test_reference_attachment_boundaries(monkeypatch) -> None:
         accumulators={},
         suffixes_by_snapshot={},
     )
+
+
+@pytest.mark.asyncio
+async def test_present_optional_stage_residue_blocks_exact_owner() -> None:
+    accumulator = _OwnershipAccumulator()
+    accumulator.declared_snapshot_ids.add("snapshot")
+    executor = _ResultSetExecutor(
+        [
+            [
+                {
+                    "attachment_name": "ptg2_price_set_stage",
+                    "snapshot_id": "snapshot",
+                    "internal_run_id": None,
+                }
+            ]
+        ]
+    )
+
+    await _attach_blocking_residue(
+        executor,
+        schema_name="mrf",
+        accumulators={SUFFIX: accumulator},
+        suffixes_by_snapshot={"snapshot": {SUFFIX}},
+        present_optional_table_names=frozenset(
+            {"ptg2_price_set_stage"}
+        ),
+    )
+
+    assert accumulator.active_references == {
+        "nonserving_residue:ptg2_price_set_stage"
+    }
 
 
 @pytest.mark.asyncio
