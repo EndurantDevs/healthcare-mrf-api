@@ -1463,7 +1463,10 @@ async def test_reader_rejects_unsealed_metadata_states(
     )
 
 
-def test_seal_and_reuse_validation_reject_projection_manifest_drift() -> None:
+def _sealed_taxonomy_reservation_fixture() -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+]:
     projection = candidates._candidate_projection_manifest(
         (_projection_row(_rules()[0]),)
     )
@@ -1500,9 +1503,17 @@ def test_seal_and_reuse_validation_reject_projection_manifest_drift() -> None:
         "relation_count": metadata.relation_count,
         "heavy_owner_count": metadata.heavy_owner_count,
     }
+    return layout_manifest, existing_root_map
+
+
+def test_seal_and_reuse_validation_reject_projection_manifest_drift() -> None:
+    """Sealed reuse rejects a taxonomy projection changed after publication."""
+
+    layout_manifest, existing_root_map = _sealed_taxonomy_reservation_fixture()
     assert snapshot_maps._validate_sealed_reservation(
         existing_root_map
     ) == layout_manifest
+
 
     tampered = deepcopy(existing_root_map)
     projection_manifest = tampered["layout_manifest"]["serving_index"][
@@ -1511,6 +1522,30 @@ def test_seal_and_reuse_validation_reject_projection_manifest_drift() -> None:
     projection_manifest["rules"][0]["member_count"] += 1
     with pytest.raises(PTG2ManifestArtifactError, match="projection rule"):
         snapshot_maps._validate_sealed_reservation(tampered)
+
+
+def test_sealed_reservation_without_snapshot_map_has_no_object_kinds() -> None:
+    """Legacy manifest gaps reconstruct an empty immutable map-kind tuple."""
+
+    _, existing_root_map = _sealed_taxonomy_reservation_fixture()
+    absent_snapshot_map = deepcopy(existing_root_map)
+    absent_snapshot_map["layout_manifest"]["serving_index"].pop(
+        "snapshot_map"
+    )
+    _, absent_map_summary, _ = snapshot_maps._sealed_root_summaries(
+        absent_snapshot_map
+    )
+    assert absent_map_summary.object_kinds == ()
+
+
+def test_sealed_reservation_rejects_incomplete_root() -> None:
+    """A building root cannot be reused as a sealed V4 reservation."""
+
+    _, existing_root_map = _sealed_taxonomy_reservation_fixture()
+    incomplete_root = deepcopy(existing_root_map)
+    incomplete_root["root_state"] = "building"
+    with pytest.raises(RuntimeError, match="reuse root is inconsistent"):
+        snapshot_maps._validate_sealed_reservation(incomplete_root)
 
 
 def test_migration_installs_guard_and_cascading_snapshot_ownership() -> None:

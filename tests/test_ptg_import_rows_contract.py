@@ -48,6 +48,36 @@ def test_provider_set_combination_preserves_one_exact_group() -> None:
     }
 
 
+def test_provider_group_builder_handles_empty_and_name_only_groups() -> None:
+    """Provider-group rows retain available identity without inventing a TIN."""
+
+    assert import_rows._build_provider_set_entry(
+        file_id=7,
+        provider_group_ref=None,
+        provider_groups=[],
+    ) == (None, None)
+
+    provider_entry, provider_row = import_rows._build_provider_set_entry(
+        file_id=7,
+        provider_group_ref="group-name-only",
+        provider_groups=[
+            {
+                "tin": {"business_name": "Example Provider Group"},
+                "npi": [],
+            }
+        ],
+    )
+
+    assert provider_entry["tin"] == {
+        "type": None,
+        "value": None,
+        "business_name": "Example Provider Group",
+    }
+    assert provider_row["tin_type"] is None
+    assert provider_row["tin_value"] is None
+    assert provider_row["tin_business_name"] == "Example Provider Group"
+
+
 def test_provider_set_row_inlines_npis_without_group_dictionary() -> None:
     """Legacy NPI-only provider sets retain their exact inline members."""
 
