@@ -7,6 +7,9 @@ from sanic import response
 from sanic.exceptions import BadRequest, SanicException
 
 from api.control_auth import require_control_auth
+from api.control_snapshot_predecessor_retirement import (
+    register_predecessor_retirement_route,
+)
 from process.ptg_parts.source_snapshot_rollback import (
     rollback_pinned_ptg2_source_snapshot,
 )
@@ -39,8 +42,9 @@ async def control_ptg_source_snapshot_rollback(request):
 
 
 def register_source_snapshot_rollback_route(blueprint) -> None:
-    """Register the distinct published-snapshot rollback operation."""
+    """Register exact rollback and predecessor-retirement operations."""
 
     blueprint.post("/ptg/source-snapshots/rollback")(
         control_ptg_source_snapshot_rollback
     )
+    register_predecessor_retirement_route(blueprint)

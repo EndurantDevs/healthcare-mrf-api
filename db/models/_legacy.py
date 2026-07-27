@@ -2002,6 +2002,63 @@ class PTG2SnapshotPin(Base, JSONOutputMixin):
     created_at = Column(DateTime(timezone=True))
 
 
+class PTG2PredecessorRetirementAudit(Base, JSONOutputMixin):
+    """Immutable operation record retained after predecessor deletion."""
+
+    __tablename__ = "ptg2_predecessor_retirement_audit"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("idempotency_key"),
+        CheckConstraint(
+            "request_digest ~ '^[0-9a-f]{64}$'",
+            name="ptg2_predecessor_retirement_audit_digest_check",
+        ),
+        CheckConstraint(
+            "btrim(idempotency_key) <> '' "
+            "AND btrim(source_key) <> '' "
+            "AND btrim(current_snapshot_id) <> '' "
+            "AND btrim(predecessor_snapshot_id) <> '' "
+            "AND btrim(actor) <> '' "
+            "AND btrim(reason) <> ''",
+            name="ptg2_predecessor_retirement_audit_text_check",
+        ),
+        CheckConstraint(
+            "current_snapshot_id <> predecessor_snapshot_id",
+            name="ptg2_predecessor_retirement_audit_pair_check",
+        ),
+        CheckConstraint(
+            "cleared_source_pointer_count = 1 "
+            "AND cleared_plan_pointer_count > 0 "
+            "AND cleared_global_pointer_count IN (0, 1) "
+            "AND ((rollback_pin_mode = 'owned' "
+            "AND rollback_owner_id IS NOT NULL "
+            "AND btrim(rollback_owner_id) <> '' "
+            "AND deleted_rollback_pin_count = 1) "
+            "OR (rollback_pin_mode = 'absent' "
+            "AND rollback_owner_id IS NULL "
+            "AND deleted_rollback_pin_count = 0))",
+            name="ptg2_predecessor_retirement_audit_counts_check",
+        ),
+        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
+    )
+    __my_index_elements__ = ["idempotency_key"]
+
+    idempotency_key = Column(String(160), nullable=False)
+    request_digest = Column(String(64), nullable=False)
+    source_key = Column(String(96), nullable=False)
+    current_snapshot_id = Column(String(96), nullable=False)
+    predecessor_snapshot_id = Column(String(96), nullable=False)
+    rollback_pin_mode = Column(String(16), nullable=False)
+    rollback_owner_id = Column(String(96))
+    actor = Column(String(128), nullable=False)
+    reason = Column(String(512), nullable=False)
+    retired_at = Column(DateTime(timezone=True), nullable=False)
+    cleared_source_pointer_count = Column(Integer, nullable=False)
+    cleared_plan_pointer_count = Column(Integer, nullable=False)
+    cleared_global_pointer_count = Column(Integer, nullable=False)
+    deleted_rollback_pin_count = Column(Integer, nullable=False)
+
+
 class PTG2AllowedAmountPlan(Base, JSONOutputMixin):
     __tablename__ = "ptg2_allowed_amount_plan"
     __main_table__ = __tablename__
