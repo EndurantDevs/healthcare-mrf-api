@@ -238,7 +238,7 @@ async def _get_run_progress(redis, run_id: str, expected_default: int) -> tuple[
     return total_chunks, done_chunks
 
 
-async def _claim_finalize_lock(redis, run_id: str) -> bool:
+async def _has_finalize_lock(redis, run_id: str) -> bool:
     lock_key = _state_key(run_id, "finalize_lock")
     lock_set = await redis.set(lock_key, run_id, ex=PROVIDER_QUALITY_REDIS_TTL_SECONDS, nx=True)
     if lock_set:
@@ -246,7 +246,7 @@ async def _claim_finalize_lock(redis, run_id: str) -> bool:
     return bool(await redis.get(lock_key))
 
 
-async def _claim_global_finalize_lock(redis, run_id: str) -> bool:
+async def _has_global_finalize_lock(redis, run_id: str) -> bool:
     lock_set = await redis.set(
         PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY,
         run_id,

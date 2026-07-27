@@ -340,7 +340,7 @@ def _cohort_sql_phase_1_build_features(ctx: dict[str, Any]) -> str:
     """
 
 
-def _cohort_sql_phase_2_build_lsh_shard(ctx: dict[str, Any]) -> str:
+def _cohort_sql_phase_2_lsh_shard(ctx: dict[str, Any]) -> str:
     """Build phase-two LSH shard SQL."""
     schema = ctx["schema"]
     lsh_table = ctx["lsh_table"]
@@ -410,7 +410,7 @@ def _cohort_sql_phase_2_build_lsh_shard(ctx: dict[str, Any]) -> str:
     """
 
 
-def _cohort_sql_phase_3_update_procedure_bucket(ctx: dict[str, Any]) -> str | None:
+def _cohort_sql_phase_3_procedure_bucket(ctx: dict[str, Any]) -> str | None:
     if not ctx["feature_procedure_bucket_col"]:
         return None
     schema = ctx["schema"]
@@ -447,7 +447,7 @@ def _cohort_sql_phase_3_update_procedure_bucket(ctx: dict[str, Any]) -> str | No
     """
 
 
-def _cohort_sql_phase_4_build_peer_targets(ctx: dict[str, Any]) -> str:
+def _cohort_sql_phase_4_peer_targets(ctx: dict[str, Any]) -> str:
     """Build phase-four peer-target SQL."""
     schema = ctx["schema"]
     qpp_table = ctx["qpp_table"]
@@ -621,7 +621,7 @@ def _cohort_sql_phase_4_build_peer_targets(ctx: dict[str, Any]) -> str:
     """
 
 
-def _cohort_sql_phase_5_build_measure_shard(ctx: dict[str, Any]) -> str:
+def _cohort_sql_phase_5_measure_shard(ctx: dict[str, Any]) -> str:
     """Build phase-five measure shard SQL."""
     schema = ctx["schema"]
     qpp_table = ctx["qpp_table"]
@@ -1005,7 +1005,7 @@ def _cohort_sql_phase_5_build_measure_shard(ctx: dict[str, Any]) -> str:
     """
 
 
-def _cohort_sql_phase_6_build_domain_shard(ctx: dict[str, Any]) -> str:
+def _cohort_sql_phase_6_domain_shard(ctx: dict[str, Any]) -> str:
     schema = ctx["schema"]
     return f"""
         WITH deleted AS (
@@ -1051,7 +1051,7 @@ def _cohort_sql_phase_6_build_domain_shard(ctx: dict[str, Any]) -> str:
     """
 
 
-def _cohort_sql_phase_7_build_score_shard(ctx: dict[str, Any]) -> str:
+def _cohort_sql_phase_7_score_shard(ctx: dict[str, Any]) -> str:
     """Build phase-seven score shard SQL."""
     schema = ctx["schema"]
     cohort_meta_cte = ""
@@ -1272,4 +1272,3 @@ def _cohort_sql_phase_7_build_score_shard(ctx: dict[str, Any]) -> str:
             {ctx["score_select_cols_sql"]}
         FROM finalized c{cohort_meta_join_final};
     """
-

@@ -7768,7 +7768,7 @@ async def test_viva_health_resolver_adds_commercial_and_employer_landing_targets
         employer_call_by_field["session"] = session
         return [
             discovery._viva_health_employer_landing_target(
-                source=source,
+                source_row=source,
                 employer_url="https://www.mymedicalshopper.com/mrf/viva-client-x01234",
                 employer_page_url=employer_page_url,
             )

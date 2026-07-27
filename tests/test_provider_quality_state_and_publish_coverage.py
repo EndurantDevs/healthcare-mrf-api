@@ -221,11 +221,11 @@ async def test_mark_chunk_done_accepts_a_zero_retry_budget(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_finalize_lock_claim_and_release_are_owner_fenced() -> None:
     redis = _MemoryRedis()
-    assert await state._claim_finalize_lock(redis, "run")
-    assert await state._claim_finalize_lock(redis, "run")
-    assert await state._claim_global_finalize_lock(redis, "owner")
-    assert await state._claim_global_finalize_lock(redis, "owner")
-    assert not await state._claim_global_finalize_lock(redis, "other")
+    assert await state._has_finalize_lock(redis, "run")
+    assert await state._has_finalize_lock(redis, "run")
+    assert await state._has_global_finalize_lock(redis, "owner")
+    assert await state._has_global_finalize_lock(redis, "owner")
+    assert not await state._has_global_finalize_lock(redis, "other")
     await state._release_global_finalize_lock(redis, "other")
     assert state.PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY in redis.values
     await state._release_global_finalize_lock(redis, "owner")

@@ -780,15 +780,19 @@ async def get_site_score(request):
             )
         ).all()
     medicare_by_zip: dict[str, dict] = {}
-    for row in medicare_rows:
-        zip_code = str(row.zcta_code)
-        year = _safe_int(getattr(row, "year", 0))
+    for medicare_row in medicare_rows:
+        zip_code = str(medicare_row.zcta_code)
+        year = _safe_int(getattr(medicare_row, "year", 0))
         current = medicare_by_zip.get(zip_code)
         if not current or year > current["year"]:
             medicare_by_zip[zip_code] = {
                 "year": year,
-                "total_beneficiaries": _safe_int(row.total_beneficiaries),
-                "part_d_beneficiaries": _safe_int(row.part_d_beneficiaries),
+                "total_beneficiaries": _safe_int(
+                    medicare_row.total_beneficiaries
+                ),
+                "part_d_beneficiaries": _safe_int(
+                    medicare_row.part_d_beneficiaries
+                ),
             }
 
     lodes_rows = []
@@ -805,14 +809,14 @@ async def get_site_score(request):
             )
         ).all()
     workers_by_zip: dict[str, dict] = {}
-    for row in lodes_rows:
-        zip_code = str(row.zcta_code)
-        year = _safe_int(getattr(row, "year", 0))
+    for workplace_row in lodes_rows:
+        zip_code = str(workplace_row.zcta_code)
+        year = _safe_int(getattr(workplace_row, "year", 0))
         current = workers_by_zip.get(zip_code)
         if not current or year > current["year"]:
             workers_by_zip[zip_code] = {
                 "year": year,
-                "total_workers": _safe_int(row.total_workers),
+                "total_workers": _safe_int(workplace_row.total_workers),
             }
 
     places_rows = []
@@ -872,13 +876,13 @@ async def get_site_score(request):
                 ).where(DoctorClinicianAddress.zip_code.in_(all_zip_codes))
             )
         ).all()
-    for row in provider_zip_rows:
-        zip_code = str(row.zip_code or "")
-        npi = _safe_int(row.npi, default=0)
+    for provider_zip_row in provider_zip_rows:
+        zip_code = str(provider_zip_row.zip_code or "")
+        npi = _safe_int(provider_zip_row.npi, default=0)
         if not zip_code or npi <= 0:
             continue
         all_providers_by_zip[zip_code].add(npi)
-        provider_type = str(row.provider_type or "").lower()
+        provider_type = str(provider_zip_row.provider_type or "").lower()
         if any(hint in provider_type for hint in NP_PA_TYPE_HINTS):
             np_pa_by_zip[zip_code].add(npi)
 
@@ -894,19 +898,19 @@ async def get_site_score(request):
                 ).where(PartDPharmacyActivity.zip_code.in_(all_zip_codes))
             )
         ).all()
-    for row in partd_pharmacy_rows:
-        if bool(row.medicare_active):
-            active_pharmacy_rows.append(row)
+    for partd_pharmacy_row in partd_pharmacy_rows:
+        if bool(partd_pharmacy_row.medicare_active):
+            active_pharmacy_rows.append(partd_pharmacy_row)
     active_pharmacies_by_zip: dict[str, set[int]] = defaultdict(set)
     partd_pharmacies_by_zip: dict[str, set[int]] = defaultdict(set)
-    for row in active_pharmacy_rows:
-        zip_code = str(row.zip_code or "")
-        npi = _safe_int(row.npi, default=0)
+    for active_pharmacy_row in active_pharmacy_rows:
+        zip_code = str(active_pharmacy_row.zip_code or "")
+        npi = _safe_int(active_pharmacy_row.npi, default=0)
         if zip_code and npi > 0:
             active_pharmacies_by_zip[zip_code].add(npi)
-    for row in partd_pharmacy_rows:
-        zip_code = str(row.zip_code or "")
-        npi = _safe_int(row.npi, default=0)
+    for partd_pharmacy_row in partd_pharmacy_rows:
+        zip_code = str(partd_pharmacy_row.zip_code or "")
+        npi = _safe_int(partd_pharmacy_row.npi, default=0)
         if zip_code and npi > 0:
             partd_pharmacies_by_zip[zip_code].add(npi)
 
@@ -930,10 +934,10 @@ async def get_site_score(request):
             )
         ).all()
     pharmacy_distance_map: dict[int, float] = {}
-    for row in pharmacy_rows:
-        npi = _safe_int(row.npi, default=0)
-        row_lat = _safe_float(row.lat)
-        row_lng = _safe_float(row.long)
+    for pharmacy_row in pharmacy_rows:
+        npi = _safe_int(pharmacy_row.npi, default=0)
+        row_lat = _safe_float(pharmacy_row.lat)
+        row_lng = _safe_float(pharmacy_row.long)
         if npi <= 0 or row_lat is None or row_lng is None:
             continue
         distance = _haversine_miles(lat, lng, row_lat, row_lng)
@@ -1134,9 +1138,9 @@ async def get_site_score(request):
         first = economics_rows[0]
         top_generic = str(first.drug_name or "N/A")
         top_margin = _safe_float(first.estimated_gross_margin, 0.0) or 0.0
-        for row in economics_rows:
-            volume = _safe_int(row.sdud_volume)
-            margin = _safe_float(row.estimated_gross_margin)
+        for economics_row in economics_rows:
+            volume = _safe_int(economics_row.sdud_volume)
+            margin = _safe_float(economics_row.estimated_gross_margin)
             if volume > 0 and margin is not None:
                 weighted_margin_numerator += margin * volume
                 weighted_margin_denominator += volume
@@ -1464,11 +1468,18 @@ async def get_site_score(request):
                 "top_dispensed_margin": f"${top_margin:.2f}",
                 "top_generic_breakdown": [
                     {
-                        "drug_name": str(row.drug_name or "N/A").strip(),
-                        "estimated_margin": round(_safe_float(row.estimated_gross_margin, 0.0) or 0.0, 2),
-                        "sdud_volume": _safe_int(row.sdud_volume),
+                        "drug_name": str(economics_row.drug_name or "N/A").strip(),
+                        "estimated_margin": round(
+                            _safe_float(
+                                economics_row.estimated_gross_margin,
+                                0.0,
+                            )
+                            or 0.0,
+                            2,
+                        ),
+                        "sdud_volume": _safe_int(economics_row.sdud_volume),
                     }
-                    for row in economics_rows[:10]
+                    for economics_row in economics_rows[:10]
                 ],
             },
             "expected_volume": expected_volume,

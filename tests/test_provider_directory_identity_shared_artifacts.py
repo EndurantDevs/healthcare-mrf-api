@@ -371,9 +371,9 @@ def test_catalog_rejects_duplicate_and_unmatched_contra_costa_rows(tmp_path):
         "<a href='https://example.test/provider-directory/metadata'>"
         "Provider Directory API Base URL</a>"
     )
-    rows = fhir._contra_costa_seed_rows_from_developer_html(link + link)
+    rows = fhir._contra_costa_seed_rows_from_html(link + link)
     assert len(rows) == 1
-    assert fhir._contra_costa_seed_rows_from_developer_html(
+    assert fhir._contra_costa_seed_rows_from_html(
         link,
         source_query="not-this-source",
     ) == []
@@ -474,5 +474,4 @@ def test_complete_artifact_stage_bundle_matches_expected_relation():
         {"network_catalog": {"published": True}},
         fhir.ProviderDirectoryArtifactBundle(stages=[stage]),
     )
-
 

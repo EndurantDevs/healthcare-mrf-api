@@ -4385,7 +4385,11 @@ def _oauth2_cache_key(oauth2: dict[str, Any]) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
-def _fetch_oauth2_client_credentials_token_sync(oauth2: dict[str, Any], *, timeout: int = 15) -> str | None:
+def _fetch_oauth2_client_token_sync(
+    oauth2: dict[str, Any],
+    *,
+    timeout: int = 15,
+) -> str | None:
     """Fetch oauth2 client credentials token sync for provider-directory ingestion."""
     token_url = _resolve_secret_text(oauth2.get("token_url") or oauth2.get("tokenUrl"))
     client_id = _resolve_secret_text(oauth2.get("client_id") or oauth2.get("clientId"))
@@ -4458,7 +4462,7 @@ def _credential_request_options_for_source(source_record: dict[str, Any], url: s
     if bearer:
         headers_by_name["Authorization"] = f"Bearer {bearer}"
     elif _oauth2_spec(spec):
-        oauth_token = _fetch_oauth2_client_credentials_token_sync(_oauth2_spec(spec))
+        oauth_token = _fetch_oauth2_client_token_sync(_oauth2_spec(spec))
         if oauth_token:
             headers_by_name["Authorization"] = f"Bearer {oauth_token}"
     api_key_header = _api_key_header(spec)
@@ -5648,43 +5652,43 @@ def _scan_provider_directory_override(
     }
 
 
-def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
+def _source_row_from_seed(seed_row: dict[str, Any]) -> dict[str, Any]:
     """Run the source row from seed step within provider-directory ingestion."""
     now = _now()
-    api_base = _clean_text(row.get("api_base"))
+    api_base = _clean_text(seed_row.get("api_base"))
     canonical_api_base = _canonical_base(api_base)
     metadata = {
-        "external_seed_id": _clean_text(row.get("id")),
-        "note": _clean_text(row.get("note")),
+        "external_seed_id": _clean_text(seed_row.get("id")),
+        "note": _clean_text(seed_row.get("note")),
     }
-    seed_metadata = _json_object(row.get("metadata_json"))
+    seed_metadata = _json_object(seed_row.get("metadata_json"))
     if seed_metadata:
         metadata.update(seed_metadata)
-        metadata["external_seed_id"] = _clean_text(row.get("id"))
-        metadata["note"] = _clean_text(row.get("note"))
-    if _clean_text(row.get("source")) == "amerihealth-caritas-developer-portal":
+        metadata["external_seed_id"] = _clean_text(seed_row.get("id"))
+        metadata["note"] = _clean_text(seed_row.get("note"))
+    if _clean_text(seed_row.get("source")) == "amerihealth-caritas-developer-portal":
         metadata["provider_directory_replaces_stale_generic_api_bases"] = [
             AMERIHEALTH_CARITAS_STALE_GENERIC_BASE
         ]
         metadata["provider_directory_confirmed_catalog_url"] = AMERIHEALTH_CARITAS_DOC_URL
     override = (
-        _aetna_provider_directory_override(row)
-        or _alohr_provider_directory_override(row)
-        or _cigna_provider_directory_override(row)
-        or _caresource_provider_directory_override(row)
-        or _centene_provider_directory_override(row)
-        or _amerihealth_caritas_provider_directory_override(row)
-        or _molina_provider_directory_override(row)
-        or _uhc_provider_directory_override(row)
-        or _el_dorado_provider_directory_override(row)
-        or _michigan_provider_directory_override(row)
-        or _washington_provider_directory_override(row)
-        or _state_public_provider_directory_override(row)
-        or _maine_provider_directory_override(row)
-        or _hap_provider_directory_override(row)
-        or _humana_provider_directory_override(row)
-        or _iehp_provider_directory_override(row)
-        or _scan_provider_directory_override(row)
+        _aetna_provider_directory_override(seed_row)
+        or _alohr_provider_directory_override(seed_row)
+        or _cigna_provider_directory_override(seed_row)
+        or _caresource_provider_directory_override(seed_row)
+        or _centene_provider_directory_override(seed_row)
+        or _amerihealth_caritas_provider_directory_override(seed_row)
+        or _molina_provider_directory_override(seed_row)
+        or _uhc_provider_directory_override(seed_row)
+        or _el_dorado_provider_directory_override(seed_row)
+        or _michigan_provider_directory_override(seed_row)
+        or _washington_provider_directory_override(seed_row)
+        or _state_public_provider_directory_override(seed_row)
+        or _maine_provider_directory_override(seed_row)
+        or _hap_provider_directory_override(seed_row)
+        or _humana_provider_directory_override(seed_row)
+        or _iehp_provider_directory_override(seed_row)
+        or _scan_provider_directory_override(seed_row)
     )
     if override:
         api_base = override["api_base"]
@@ -5698,7 +5702,7 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         metadata["provider_directory_base_normalization"] = "resource_or_metadata_parent_base"
         metadata["provider_directory_confirmed_base"] = parent_api_base
         endpoint_overrides = _rebased_derived_endpoint_fields(
-            row,
+            seed_row,
             endpoint_overrides,
             previous_api_base,
             parent_api_base,
@@ -5712,107 +5716,115 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
     ) or api_base
     source_id = _stable_source_id(
         {
-            **row,
+            **seed_row,
             "api_base": source_identity_api_base,
         }
     )
     return {
         "source_id": source_id,
-        "org_tin": _clean_text(row.get("org_tin")),
+        "org_tin": _clean_text(seed_row.get("org_tin")),
         "org_name": (
             override.get("org_name")
             if override and "org_name" in override
-            else _clean_text(row.get("org_name")) or "Unknown payer"
+            else _clean_text(seed_row.get("org_name")) or "Unknown payer"
         ),
         "plan_name": (
             override.get("plan_name")
             if override and "plan_name" in override
-            else _clean_text(row.get("plan_name"))
+            else _clean_text(seed_row.get("plan_name"))
         ),
-        "portal_url": _clean_text(row.get("portal_url")),
+        "portal_url": _clean_text(seed_row.get("portal_url")),
         "api_base": api_base,
         "canonical_api_base": canonical_api_base,
         "endpoint_insurance_plan": _clean_text(
             endpoint_overrides.get("endpoint_insurance_plan")
             if "endpoint_insurance_plan" in endpoint_overrides
-            else row.get("endpoint_insurance_plan")
+            else seed_row.get("endpoint_insurance_plan")
         ),
         "endpoint_practitioner": _clean_text(
             endpoint_overrides.get("endpoint_practitioner")
             if "endpoint_practitioner" in endpoint_overrides
-            else row.get("endpoint_practitioner")
+            else seed_row.get("endpoint_practitioner")
         ),
         "endpoint_practitioner_role": _clean_text(
             endpoint_overrides.get("endpoint_practitioner_role")
             if "endpoint_practitioner_role" in endpoint_overrides
-            else row.get("endpoint_practitioner_role")
+            else seed_row.get("endpoint_practitioner_role")
         ),
         "endpoint_organization": _clean_text(
             endpoint_overrides.get("endpoint_organization")
             if "endpoint_organization" in endpoint_overrides
-            else row.get("endpoint_organization")
+            else seed_row.get("endpoint_organization")
         ),
         "endpoint_organization_affiliation": _clean_text(
             endpoint_overrides.get("endpoint_organization_affiliation")
             if "endpoint_organization_affiliation" in endpoint_overrides
-            else row.get("endpoint_organization_affiliation")
+            else seed_row.get("endpoint_organization_affiliation")
         ),
         "endpoint_location": _clean_text(
             endpoint_overrides.get("endpoint_location")
             if "endpoint_location" in endpoint_overrides
-            else row.get("endpoint_location")
+            else seed_row.get("endpoint_location")
         ),
         "endpoint_healthcare_service": _clean_text(
             endpoint_overrides.get("endpoint_healthcare_service")
             if "endpoint_healthcare_service" in endpoint_overrides
-            else row.get("endpoint_healthcare_service")
+            else seed_row.get("endpoint_healthcare_service")
         ),
         "endpoint_network": _clean_text(
             endpoint_overrides.get("endpoint_network")
             if "endpoint_network" in endpoint_overrides
-            else row.get("endpoint_network")
+            else seed_row.get("endpoint_network")
         ),
         "endpoint_endpoint": _clean_text(
             endpoint_overrides.get("endpoint_endpoint")
             if "endpoint_endpoint" in endpoint_overrides
-            else row.get("endpoint_endpoint")
+            else seed_row.get("endpoint_endpoint")
         ),
         "requires_registration": (
             bool(override["requires_registration"])
             if override and "requires_registration" in override
-            else bool(_bool_from_seed(row.get("requires_registration")))
+            else bool(_bool_from_seed(seed_row.get("requires_registration")))
         ),
         "requires_api_key": (
             bool(override["requires_api_key"])
             if override and "requires_api_key" in override
-            else bool(_bool_from_seed(row.get("requires_api_key")))
+            else bool(_bool_from_seed(seed_row.get("requires_api_key")))
         ),
-        "auth_type": override.get("auth_type") if override else _clean_text(row.get("auth_type")),
-        "last_validated": _clean_text(row.get("last_validated")),
+        "auth_type": (
+            override.get("auth_type")
+            if override
+            else _clean_text(seed_row.get("auth_type"))
+        ),
+        "last_validated": _clean_text(seed_row.get("last_validated")),
         "last_validated_status": (
             _clean_text(override.get("last_validated_status"))
             if override and "last_validated_status" in override
-            else _clean_text(row.get("last_validated_status"))
+            else _clean_text(seed_row.get("last_validated_status"))
         ),
-        "fhir_version": _clean_text(row.get("fhir_version")),
-        "compliance_flag": _clean_text(row.get("compliance_flag")),
-        "violation_type": _clean_text(row.get("violation_type")),
-        "violation_detail": _clean_text(row.get("violation_detail")),
-        "data_quality_flag": _clean_text(row.get("data_quality_flag")),
-        "data_quality_sample_npi": _clean_text(row.get("data_quality_sample_npi")),
-        "data_quality_practitioner_count": _clean_text(row.get("data_quality_practitioner_count")),
-        "data_quality_checked": _clean_text(row.get("data_quality_checked")),
-        "is_medicare_advantage": _bool_from_seed(row.get("is_medicare_advantage")),
-        "is_medicaid_mco": _bool_from_seed(row.get("is_medicaid_mco")),
-        "is_chip": _bool_from_seed(row.get("is_chip")),
-        "is_qhp": _bool_from_seed(row.get("is_qhp")),
-        "seed_source": _clean_text(row.get("source")),
-        "seed_source_detail": _clean_text(row.get("source_detail")),
-        "seed_source_url": _clean_text(row.get("source_url")),
-        "seed_source_date": _clean_text(row.get("source_date")),
-        "seed_row_id": _clean_text(row.get("id")),
-        "id_provider_alt": _clean_text(row.get("id_provider_alt")),
-        "team_status": _clean_text(row.get("team_status")),
+        "fhir_version": _clean_text(seed_row.get("fhir_version")),
+        "compliance_flag": _clean_text(seed_row.get("compliance_flag")),
+        "violation_type": _clean_text(seed_row.get("violation_type")),
+        "violation_detail": _clean_text(seed_row.get("violation_detail")),
+        "data_quality_flag": _clean_text(seed_row.get("data_quality_flag")),
+        "data_quality_sample_npi": _clean_text(seed_row.get("data_quality_sample_npi")),
+        "data_quality_practitioner_count": _clean_text(
+            seed_row.get("data_quality_practitioner_count")
+        ),
+        "data_quality_checked": _clean_text(seed_row.get("data_quality_checked")),
+        "is_medicare_advantage": _bool_from_seed(
+            seed_row.get("is_medicare_advantage")
+        ),
+        "is_medicaid_mco": _bool_from_seed(seed_row.get("is_medicaid_mco")),
+        "is_chip": _bool_from_seed(seed_row.get("is_chip")),
+        "is_qhp": _bool_from_seed(seed_row.get("is_qhp")),
+        "seed_source": _clean_text(seed_row.get("source")),
+        "seed_source_detail": _clean_text(seed_row.get("source_detail")),
+        "seed_source_url": _clean_text(seed_row.get("source_url")),
+        "seed_source_date": _clean_text(seed_row.get("source_date")),
+        "seed_row_id": _clean_text(seed_row.get("id")),
+        "id_provider_alt": _clean_text(seed_row.get("id_provider_alt")),
+        "team_status": _clean_text(seed_row.get("team_status")),
         "metadata_json": metadata,
         "created_at": now,
         "updated_at": now,
@@ -9395,7 +9407,7 @@ def provider_directory_location_address_key_sql(
     """
 
 
-def provider_directory_location_address_key_batch_sql(
+def provider_directory_address_key_batch_sql(
     db_schema: str | None = None,
     *,
     restore_state_from_zip: bool = True,
@@ -9569,6 +9581,11 @@ def provider_directory_location_address_key_batch_sql(
         (SELECT resource_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
             AS last_resource_id;
     """
+
+
+provider_directory_location_address_key_batch_sql = (
+    provider_directory_address_key_batch_sql
+)
 
 
 async def _has_address_canon_functions(db_schema: str) -> bool:
@@ -17336,6 +17353,18 @@ def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_pr
     return f"{incoming_prefix}.{_q(column)}"
 
 
+def _resource_identity_pairs(
+    resource_rows: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    seen_pairs_by_key: dict[tuple[str, str], tuple[str, str]] = {}
+    for resource_row in resource_rows:
+        source_id = _clean_text(resource_row.get("source_id"))
+        resource_id = _clean_text(resource_row.get("resource_id"))
+        if source_id and resource_id:
+            seen_pairs_by_key[(source_id, resource_id)] = (source_id, resource_id)
+    return list(seen_pairs_by_key.values())
+
+
 async def _mark_resource_rows_seen(
     model,
     resource_rows: list[dict[str, Any]],
@@ -17347,15 +17376,9 @@ async def _mark_resource_rows_seen(
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
     if not run_id or not resource_type or not resource_rows:
         return 0
-    seen_pairs_by_key: dict[tuple[str, str], tuple[str, str]] = {}
-    for resource_row in resource_rows:
-        source_id = _clean_text(resource_row.get("source_id"))
-        resource_id = _clean_text(resource_row.get("resource_id"))
-        if source_id and resource_id:
-            seen_pairs_by_key[(source_id, resource_id)] = (source_id, resource_id)
-    if not seen_pairs_by_key:
+    seen_pairs = _resource_identity_pairs(resource_rows)
+    if not seen_pairs:
         return 0
-    seen_pairs = list(seen_pairs_by_key.values())
     if _is_copy_upsert_enabled() and len(seen_pairs) >= _copy_upsert_min_rows():
         try:
             return await _copy_mark_resource_rows_seen(
@@ -18358,7 +18381,7 @@ def _cms_sma_cell(row: list[str], index: int | None) -> str | None:
     return _clean_text(row[index])
 
 
-def _cms_sma_endpoint_directory_seed_rows_from_csv(
+def _cms_sma_seed_rows_from_csv(
     csv_text: str,
     *,
     source_query: str | None = None,
@@ -18516,7 +18539,7 @@ def _external_splash_target_url(href: str | None, *, source_url: str) -> str | N
     return absolute
 
 
-def _amerihealth_caritas_seed_rows_from_catalog_html(
+def _amerihealth_seed_rows_from_catalog_html(
     html_text: str,
     *,
     source_query: str | None = None,
@@ -18596,7 +18619,7 @@ def _seed_rows_from_amerihealth_caritas_catalog(
         or AMERIHEALTH_CARITAS_DOC_URL
     )
     text, source = _read_text_from_path_or_url(catalog_path, url, timeout=timeout)
-    rows = _amerihealth_caritas_seed_rows_from_catalog_html(
+    rows = _amerihealth_seed_rows_from_catalog_html(
         text,
         source_query=source_query,
         source_url=source,
@@ -18641,7 +18664,7 @@ def _contra_costa_seed_row(
     }
 
 
-def _contra_costa_seed_rows_from_developer_html(
+def _contra_costa_seed_rows_from_html(
     html_text: str,
     *,
     source_query: str | None = None,
@@ -18712,7 +18735,7 @@ def _seed_rows_from_contra_costa_catalog(
             "fallback": True,
             "error": _short_error(exc),
         }
-    seed_rows = _contra_costa_seed_rows_from_developer_html(
+    seed_rows = _contra_costa_seed_rows_from_html(
         text,
         source_query=source_query,
         source_url=catalog_source,
@@ -18743,7 +18766,7 @@ def _cms_sma_seed_rows(
         or CMS_SMA_ENDPOINT_DIRECTORY_URL
     )
     text, source = _read_text_from_path_or_url(catalog_path, url, timeout=timeout)
-    rows = _cms_sma_endpoint_directory_seed_rows_from_csv(
+    rows = _cms_sma_seed_rows_from_csv(
         text,
         source_query=source_query,
         source_url=source,

@@ -286,7 +286,10 @@ def _signal_process_group(process: Any, signal_number: int) -> None:
             if getattr(process, "returncode", None) is not None:
                 return
         except PermissionError:
-            if process.poll() is not None:
+            if getattr(process, "returncode", None) is not None:
+                return
+            poll = getattr(process, "poll", None)
+            if callable(poll) and poll() is not None:
                 return
     try:
         process.send_signal(signal_number)

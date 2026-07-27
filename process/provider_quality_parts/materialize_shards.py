@@ -10,10 +10,10 @@ from typing import Any
 from process.ext.utils import ensure_database, get_import_schema
 from process.provider_quality_parts.cohort_context import _build_cohort_materialization_context
 from process.provider_quality_parts.cohort_sql import (
-    _cohort_sql_phase_2_build_lsh_shard,
-    _cohort_sql_phase_5_build_measure_shard,
-    _cohort_sql_phase_6_build_domain_shard,
-    _cohort_sql_phase_7_build_score_shard,
+    _cohort_sql_phase_2_lsh_shard,
+    _cohort_sql_phase_5_measure_shard,
+    _cohort_sql_phase_6_domain_shard,
+    _cohort_sql_phase_7_score_shard,
 )
 from process.provider_quality_parts.config import (
     MAT_PHASE_2_BUILD_LSH_SHARDED,
@@ -167,7 +167,7 @@ async def provider_quality_materialize_lsh_shard(
     return await _run_materialize_shard_job(
         ctx,
         task,
-        sql_builder=_cohort_sql_phase_2_build_lsh_shard,
+        sql_builder=_cohort_sql_phase_2_lsh_shard,
         phase=MAT_PHASE_2_BUILD_LSH_SHARDED,
         target_table_key="lsh_table",
     )
@@ -180,7 +180,7 @@ async def provider_quality_materialize_measure_shard(
     return await _run_materialize_shard_job(
         ctx,
         task,
-        sql_builder=_cohort_sql_phase_5_build_measure_shard,
+        sql_builder=_cohort_sql_phase_5_measure_shard,
         phase=MAT_PHASE_5_BUILD_MEASURE_SHARDED,
         target_table_key="measure_table",
     )
@@ -193,7 +193,7 @@ async def provider_quality_materialize_domain_shard(
     return await _run_materialize_shard_job(
         ctx,
         task,
-        sql_builder=_cohort_sql_phase_6_build_domain_shard,
+        sql_builder=_cohort_sql_phase_6_domain_shard,
         phase=MAT_PHASE_6_BUILD_DOMAIN_SHARDED,
         target_table_key="domain_table",
     )
@@ -206,7 +206,7 @@ async def provider_quality_materialize_score_shard(
     return await _run_materialize_shard_job(
         ctx,
         task,
-        sql_builder=_cohort_sql_phase_7_build_score_shard,
+        sql_builder=_cohort_sql_phase_7_score_shard,
         phase=MAT_PHASE_7_BUILD_SCORE_SHARDED,
         target_table_key="score_table",
         include_run_id=True,

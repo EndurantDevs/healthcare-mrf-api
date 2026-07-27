@@ -897,6 +897,24 @@ async def load_v4_graph_root(
     return root
 
 
+def _is_building_v4_root_match(
+    fields: Mapping[str, Any],
+    snapshot_key: int,
+    build_token: str,
+    representation: str,
+) -> bool:
+    return (
+        int(fields.get("snapshot_key") or 0) == snapshot_key
+        and int(fields.get("format_version") or 0)
+        == PTG2_V4_MAP_FORMAT_VERSION
+        and fields.get("map_format") == PTG2_V4_MAP_FORMAT
+        and fields.get("projection_id_scope") == PTG2_V4_PROJECTION_ID_SCOPE
+        and fields.get("build_token") == build_token
+        and fields.get("layout_state") == "building"
+        and representation in {"direct_v1", "pattern_v1"}
+    )
+
+
 async def _load_building_v4_graph_root(
     session: Any,
     snapshot_key: int,
@@ -937,16 +955,11 @@ async def _load_building_v4_graph_root(
     root_row = query_result.first()
     fields = _row_mapping(root_row) if root_row is not None else {}
     representation = str(fields.get("representation") or "")
-    if (
-        int(fields.get("snapshot_key") or 0) != normalized_snapshot_key
-        or int(fields.get("format_version") or 0)
-        != PTG2_V4_MAP_FORMAT_VERSION
-        or fields.get("map_format") != PTG2_V4_MAP_FORMAT
-        or fields.get("projection_id_scope")
-        != PTG2_V4_PROJECTION_ID_SCOPE
-        or fields.get("build_token") != normalized_build_token
-        or fields.get("layout_state") != "building"
-        or representation not in {"direct_v1", "pattern_v1"}
+    if not _is_building_v4_root_match(
+        fields,
+        normalized_snapshot_key,
+        normalized_build_token,
+        representation,
     ):
         raise PTG2SharedBlockError(
             "PTG V4 building snapshot map root is unavailable or invalid"

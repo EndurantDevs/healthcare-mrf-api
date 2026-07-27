@@ -102,5 +102,5 @@ async def _push_objects_with_retry(
             await asyncio.sleep(delay)
 
 
-def _row_allowed_for_test(row_number: int) -> bool:
+def _is_row_allowed_for_test(row_number: int) -> bool:
     return row_number % 11 == 0

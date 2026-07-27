@@ -118,8 +118,14 @@ def test_state_split_keeps_facade_helpers_stable():
     assert provider_quality._mark_chunk_done is provider_quality_state._mark_chunk_done
     assert provider_quality._mark_chunk_done_with_retry is provider_quality_state._mark_chunk_done_with_retry
     assert provider_quality._get_run_progress is provider_quality_state._get_run_progress
-    assert provider_quality._claim_finalize_lock is provider_quality_state._claim_finalize_lock
-    assert provider_quality._claim_global_finalize_lock is provider_quality_state._claim_global_finalize_lock
+    assert (
+        provider_quality._has_finalize_lock
+        is provider_quality_state._has_finalize_lock
+    )
+    assert (
+        provider_quality._has_global_finalize_lock
+        is provider_quality_state._has_global_finalize_lock
+    )
     assert provider_quality._release_global_finalize_lock is provider_quality_state._release_global_finalize_lock
     assert provider_quality._log_materialize_phase_summary is provider_quality_state._log_materialize_phase_summary
     assert provider_quality._safe_int(b"42") == 42
@@ -169,21 +175,30 @@ def test_sql_helper_split_keeps_facade_helpers_stable():
 
 def test_cohort_sql_split_keeps_facade_helpers_stable():
     assert provider_quality._cohort_sql_phase_1_build_features is provider_quality_cohort_sql._cohort_sql_phase_1_build_features
-    assert provider_quality._cohort_sql_phase_2_build_lsh_shard is provider_quality_cohort_sql._cohort_sql_phase_2_build_lsh_shard
     assert (
-        provider_quality._cohort_sql_phase_3_update_procedure_bucket
-        is provider_quality_cohort_sql._cohort_sql_phase_3_update_procedure_bucket
-    )
-    assert provider_quality._cohort_sql_phase_4_build_peer_targets is provider_quality_cohort_sql._cohort_sql_phase_4_build_peer_targets
-    assert (
-        provider_quality._cohort_sql_phase_5_build_measure_shard
-        is provider_quality_cohort_sql._cohort_sql_phase_5_build_measure_shard
+        provider_quality._cohort_sql_phase_2_lsh_shard
+        is provider_quality_cohort_sql._cohort_sql_phase_2_lsh_shard
     )
     assert (
-        provider_quality._cohort_sql_phase_6_build_domain_shard
-        is provider_quality_cohort_sql._cohort_sql_phase_6_build_domain_shard
+        provider_quality._cohort_sql_phase_3_procedure_bucket
+        is provider_quality_cohort_sql._cohort_sql_phase_3_procedure_bucket
     )
-    assert provider_quality._cohort_sql_phase_7_build_score_shard is provider_quality_cohort_sql._cohort_sql_phase_7_build_score_shard
+    assert (
+        provider_quality._cohort_sql_phase_4_peer_targets
+        is provider_quality_cohort_sql._cohort_sql_phase_4_peer_targets
+    )
+    assert (
+        provider_quality._cohort_sql_phase_5_measure_shard
+        is provider_quality_cohort_sql._cohort_sql_phase_5_measure_shard
+    )
+    assert (
+        provider_quality._cohort_sql_phase_6_domain_shard
+        is provider_quality_cohort_sql._cohort_sql_phase_6_domain_shard
+    )
+    assert (
+        provider_quality._cohort_sql_phase_7_score_shard
+        is provider_quality_cohort_sql._cohort_sql_phase_7_score_shard
+    )
 
 
 def test_cohort_context_split_keeps_wrapper_available():
@@ -256,7 +271,10 @@ def test_execution_helper_split_keeps_facade_helpers_stable():
     assert provider_quality._execute_shard_sql is provider_quality_execution_helpers._execute_shard_sql
     assert provider_quality._count_shard_rows is provider_quality_execution_helpers._count_shard_rows
     assert provider_quality._push_objects_with_retry is provider_quality_execution_helpers._push_objects_with_retry
-    assert provider_quality._row_allowed_for_test is provider_quality_execution_helpers._row_allowed_for_test
+    assert (
+        provider_quality._is_row_allowed_for_test
+        is provider_quality_execution_helpers._is_row_allowed_for_test
+    )
 
 
 def test_provider_quality_sql_helpers_build_expected_fragments():
@@ -553,10 +571,10 @@ async def test_shard_queries_delete_partition_before_insert(monkeypatch):
     classes = provider_quality._staging_classes("stage_test", "mrf")
     ctx = await provider_quality._build_cohort_materialization_context(classes, "mrf")
 
-    lsh_sql = provider_quality._cohort_sql_phase_2_build_lsh_shard(ctx)
-    measure_sql = provider_quality._cohort_sql_phase_5_build_measure_shard(ctx)
-    domain_sql = provider_quality._cohort_sql_phase_6_build_domain_shard(ctx)
-    score_sql = provider_quality._cohort_sql_phase_7_build_score_shard(ctx)
+    lsh_sql = provider_quality._cohort_sql_phase_2_lsh_shard(ctx)
+    measure_sql = provider_quality._cohort_sql_phase_5_measure_shard(ctx)
+    domain_sql = provider_quality._cohort_sql_phase_6_domain_shard(ctx)
+    score_sql = provider_quality._cohort_sql_phase_7_score_shard(ctx)
 
     assert "WITH deleted AS (" in lsh_sql
     assert f"DELETE FROM mrf.{ctx['lsh_table']} d" in lsh_sql
@@ -684,7 +702,7 @@ async def test_measure_shard_limits_rx_cte_to_provider_base():
         table_exists=is_table_existing,
     )
 
-    measure_sql = provider_quality._cohort_sql_phase_5_build_measure_shard(ctx)
+    measure_sql = provider_quality._cohort_sql_phase_5_measure_shard(ctx)
 
     assert "FROM provider_base b" in measure_sql
     assert "JOIN mrf.pricing_provider_prescription r" in measure_sql
@@ -704,7 +722,7 @@ async def test_measure_shard_prefers_rx_aggregate_table():
         table_exists=is_table_existing,
     )
 
-    measure_sql = provider_quality._cohort_sql_phase_5_build_measure_shard(ctx)
+    measure_sql = provider_quality._cohort_sql_phase_5_measure_shard(ctx)
 
     assert ctx["rx_agg_table"] == "pricing_provider_quality_rx_agg_stage_test"
     assert "JOIN mrf.pricing_provider_quality_rx_agg_stage_test r" in measure_sql

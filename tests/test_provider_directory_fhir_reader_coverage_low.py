@@ -402,9 +402,9 @@ def test_catalog_parser_skip_boundaries(monkeypatch):
     monkeypatch.setattr(
         fhir, "_provider_directory_base_from_catalog_url", lambda _url: None
     )
-    assert fhir._cms_sma_endpoint_directory_seed_rows_from_csv(_cms_reader_csv()) == []
+    assert fhir._cms_sma_seed_rows_from_csv(_cms_reader_csv()) == []
     assert (
-        fhir._amerihealth_caritas_seed_rows_from_catalog_html(
+        fhir._amerihealth_seed_rows_from_catalog_html(
             "<table><tr><td>code</td><td>Plan</td></tr></table>"
         )
         == []

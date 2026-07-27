@@ -116,12 +116,12 @@ from process.provider_quality_parts.config import (
 )
 from process.provider_quality_parts.cohort_sql import (
     _cohort_sql_phase_1_build_features,
-    _cohort_sql_phase_2_build_lsh_shard,
-    _cohort_sql_phase_3_update_procedure_bucket,
-    _cohort_sql_phase_4_build_peer_targets,
-    _cohort_sql_phase_5_build_measure_shard,
-    _cohort_sql_phase_6_build_domain_shard,
-    _cohort_sql_phase_7_build_score_shard,
+    _cohort_sql_phase_2_lsh_shard,
+    _cohort_sql_phase_3_procedure_bucket,
+    _cohort_sql_phase_4_peer_targets,
+    _cohort_sql_phase_5_measure_shard,
+    _cohort_sql_phase_6_domain_shard,
+    _cohort_sql_phase_7_score_shard,
 )
 from process.provider_quality_parts.cohort_context import (
     _build_cohort_materialization_context as _build_cohort_materialization_context_impl,
@@ -132,7 +132,7 @@ from process.provider_quality_parts.execution_helpers import (
     _is_deadlock_error,
     _print_row_progress,
     _push_objects_with_retry,
-    _row_allowed_for_test,
+    _is_row_allowed_for_test,
     _step_end,
     _step_start,
 )
@@ -188,8 +188,8 @@ from process.provider_quality_parts.sql_helpers import (
     _state_code_sql,
 )
 from process.provider_quality_parts.state import (
-    _claim_finalize_lock,
-    _claim_global_finalize_lock,
+    _has_finalize_lock,
+    _has_global_finalize_lock,
     _decode_redis_str,
     _get_materialize_phase,
     _get_materialize_phase_elapsed_seconds,
@@ -487,6 +487,18 @@ async def _download_source_file(
     return await _create_empty_source_file(dataset_key, temp_dir, reporting_year), True
 
 
+def _provider_quality_chunk_descriptor(
+    dataset_key: str,
+    chunk_index: int,
+    chunk_path: Path,
+) -> dict[str, Any]:
+    return {
+        "dataset_key": dataset_key,
+        "chunk_index": chunk_index,
+        "chunk_path": str(chunk_path),
+    }
+
+
 async def _split_source_into_chunks(
     dataset_key: str,
     source_path: str,
@@ -522,11 +534,11 @@ async def _split_source_into_chunks(
                 out.write(header)
                 out.writelines(chunk_rows)
             chunks.append(
-                {
-                    "dataset_key": dataset_key,
-                    "chunk_index": chunk_index,
-                    "chunk_path": str(chunk_path),
-                }
+                _provider_quality_chunk_descriptor(
+                    dataset_key,
+                    chunk_index,
+                    chunk_path,
+                )
             )
             chunk_rows = []
             chunk_bytes = 0
@@ -535,7 +547,7 @@ async def _split_source_into_chunks(
         for line in src:
             row_number += 1
             if test_mode:
-                if not _row_allowed_for_test(row_number):
+                if not _is_row_allowed_for_test(row_number):
                     continue
                 if accepted >= row_limit:
                     break
@@ -798,24 +810,24 @@ async def _materialize_quality_rows_cohort(classes: dict[str, type], schema: str
 
     for year in PROVIDER_QUALITY_YEAR_WINDOW:
         await db.status(
-            _cohort_sql_phase_2_build_lsh_shard(ctx),
+            _cohort_sql_phase_2_lsh_shard(ctx),
             year=year,
             shard_id=0,
             shard_count=1,
         )
 
-    phase_3_sql = _cohort_sql_phase_3_update_procedure_bucket(ctx)
+    phase_3_sql = _cohort_sql_phase_3_procedure_bucket(ctx)
     if phase_3_sql:
         await db.status(phase_3_sql)
 
-    await db.status(_cohort_sql_phase_4_build_peer_targets(ctx))
+    await db.status(_cohort_sql_phase_4_peer_targets(ctx))
 
     for year in PROVIDER_QUALITY_YEAR_WINDOW:
         shard_parameter_map = {"year": year, "shard_id": 0, "shard_count": 1}
-        await db.status(_cohort_sql_phase_5_build_measure_shard(ctx), **shard_parameter_map)
-        await db.status(_cohort_sql_phase_6_build_domain_shard(ctx), **shard_parameter_map)
+        await db.status(_cohort_sql_phase_5_measure_shard(ctx), **shard_parameter_map)
+        await db.status(_cohort_sql_phase_6_domain_shard(ctx), **shard_parameter_map)
         await db.status(
-            _cohort_sql_phase_7_build_score_shard(ctx),
+            _cohort_sql_phase_7_score_shard(ctx),
             run_id=run_id,
             **shard_parameter_map,
         )
@@ -1657,7 +1669,7 @@ async def _materialize_quality_rows_sharded(
 
     if phase == MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET:
         logger.info("provider quality materialize phase start run_id=%s phase=%s", run_id, phase)
-        procedure_bucket_sql = _cohort_sql_phase_3_update_procedure_bucket(context)
+        procedure_bucket_sql = _cohort_sql_phase_3_procedure_bucket(context)
         if procedure_bucket_sql:
             await db.status(procedure_bucket_sql)
         await db.status(f"ANALYZE {schema}.{context['feature_table']};")
@@ -1666,7 +1678,7 @@ async def _materialize_quality_rows_sharded(
 
     if phase == MAT_PHASE_4_BUILD_PEER_TARGETS:
         logger.info("provider quality materialize phase start run_id=%s phase=%s", run_id, phase)
-        await db.status(_cohort_sql_phase_4_build_peer_targets(context))
+        await db.status(_cohort_sql_phase_4_peer_targets(context))
         await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityPeerTarget")
         await _enqueue_materialize_phase_shards(
             redis,
@@ -2023,9 +2035,9 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
             )
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
 
-        if not await _claim_finalize_lock(redis, run_id):
+        if not await _has_finalize_lock(redis, run_id):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
-        if not await _claim_global_finalize_lock(redis, run_id):
+        if not await _has_global_finalize_lock(redis, run_id):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
         has_global_lock = True
         await mark_control_run(

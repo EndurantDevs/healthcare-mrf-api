@@ -319,6 +319,26 @@ async def _resolve_state_year(
     return None
 
 
+def _lodes_zcta_worker_totals(
+    compressed_content: bytes,
+    crosswalk: dict[str, str],
+) -> dict[str, int]:
+    decompressed = gzip.decompress(compressed_content).decode("utf-8")
+    reader = csv.DictReader(decompressed.splitlines())
+    zcta_totals: dict[str, int] = defaultdict(int)
+    for workplace_row in reader:
+        block_id = workplace_row.get("w_geocode", "")
+        try:
+            worker_count = int(float(workplace_row.get("C000") or 0))
+        except (TypeError, ValueError):
+            worker_count = 0
+        if not block_id or worker_count == 0:
+            continue
+        if zcta_code := _block_to_zcta(block_id, crosswalk):
+            zcta_totals[zcta_code] += worker_count
+    return zcta_totals
+
+
 async def _process_lodes_state(
     client,
     state: str,
@@ -338,25 +358,7 @@ async def _process_lodes_state(
                 return 0
 
             content = await response.read()
-            decompressed = gzip.decompress(content).decode("utf-8")
-
-            reader = csv.DictReader(decompressed.splitlines())
-            zcta_totals: dict[str, int] = defaultdict(int)
-
-            for workplace_row in reader:
-                block_id = workplace_row.get("w_geocode", "")
-                try:
-                    c000 = int(float(workplace_row.get("C000") or 0))
-                except (TypeError, ValueError):
-                    c000 = 0
-
-                if not block_id or c000 == 0:
-                    continue
-
-                zcta = _block_to_zcta(block_id, crosswalk)
-
-                if zcta:
-                    zcta_totals[zcta] += c000
+            zcta_totals = _lodes_zcta_worker_totals(content, crosswalk)
 
             now = datetime.datetime.utcnow()
             pending_workplace_rows = []

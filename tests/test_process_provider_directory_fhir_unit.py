@@ -631,7 +631,7 @@ def test_ambiguous_amerihealth_retest_base_is_not_guessed():
 
 
 def test_amerihealth_caritas_catalog_parser_emits_plan_specific_sources():
-    observed_rows = importer._amerihealth_caritas_seed_rows_from_catalog_html(
+    observed_rows = importer._amerihealth_seed_rows_from_catalog_html(
         """
         <table>
           <tr><td><b>PlanID</b></td><td><b>Plan Name</b></td><td><b>Provider Directory API</b></td></tr>
@@ -914,7 +914,7 @@ def test_michigan_probe_only_source_supports_opaque_cursor_checkpoints():
 
 
 def test_contra_costa_catalog_parser_extracts_provider_directory_base_from_external_link():
-    rows = importer._contra_costa_seed_rows_from_developer_html(
+    rows = importer._contra_costa_seed_rows_from_html(
         """
         <p>
           <a href="/?____isexternal=true&splash=https%3A%2F%2Fihyml0v6d9.execute-api.us-east-1.amazonaws.com%2Fhxprod%2Fmetadata">
@@ -1309,7 +1309,7 @@ def _cms_sma_fixture_csv() -> str:
 
 
 def test_cms_sma_endpoint_directory_parser_emits_public_active_catalog_sources():
-    observed_rows = importer._cms_sma_endpoint_directory_seed_rows_from_csv(
+    observed_rows = importer._cms_sma_seed_rows_from_csv(
         _cms_sma_fixture_csv(),
         source_url="fixture.csv",
     )
@@ -1354,7 +1354,7 @@ def test_cms_sma_endpoint_directory_parser_emits_public_active_catalog_sources()
 
 
 def test_cms_sma_catalog_sources_need_live_probe_before_resource_import():
-    seed_row = importer._cms_sma_endpoint_directory_seed_rows_from_csv(
+    seed_row = importer._cms_sma_seed_rows_from_csv(
         _cms_sma_fixture_csv(),
         source_url="fixture.csv",
     )[0]
@@ -5180,7 +5180,7 @@ def test_provider_directory_credentials_resolve_oauth2_client_credentials(monkey
     )
     monkeypatch.setattr(
         importer,
-        "_fetch_oauth2_client_credentials_token_sync",
+        "_fetch_oauth2_client_token_sync",
         lambda _oauth2: "oauth-token",
     )
 
@@ -5235,8 +5235,8 @@ def test_oauth2_client_credentials_token_request_uses_basic_auth_and_cache(monke
         "client_secret": "env:PAYER_DIRECTORY_CLIENT_SECRET",
         "scope": "system/*.read",
     }
-    first = importer._fetch_oauth2_client_credentials_token_sync(oauth2_config_map)
-    second = importer._fetch_oauth2_client_credentials_token_sync(oauth2_config_map)
+    first = importer._fetch_oauth2_client_token_sync(oauth2_config_map)
+    second = importer._fetch_oauth2_client_token_sync(oauth2_config_map)
 
     assert first == "token-1"
     assert second == "token-1"

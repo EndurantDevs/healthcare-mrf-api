@@ -1136,11 +1136,10 @@ def _validated_plan_release_id(args: Mapping[str, Any]) -> str:
 
 
 def _reject_broad_group_plan_provider_expansion(
-    args: Mapping[str, Any],
-    context: Mapping[str, Any],
-    *,
-    specialty_filter=None,
+    args: Mapping[str, Any], context: Mapping[str, Any], *, specialty_filter=None
 ) -> None:
+    """Reject unsafe broad group-plan office-visit provider expansion."""
+
     code = str(context.get("code") or "")
     code_system = context.get("code_system")
     plan_id = str(context.get("plan_id") or "")
@@ -1182,7 +1181,11 @@ def _reject_broad_group_plan_provider_expansion(
     if _parse_int(npi, "npi", minimum=1) is not None:
         return
     specialty_filter = specialty_filter or resolve_provider_specialty_filter(args)
-    if specialty_filter.active or args.get("taxonomy_code") or args.get("taxonomy_classification"):
+    if (
+        specialty_filter.is_active
+        or args.get("taxonomy_code")
+        or args.get("taxonomy_classification")
+    ):
         return
     if specialty_filter.unresolved_specialty:
         _raise_unresolved_specialty(specialty_filter)
@@ -5517,7 +5520,7 @@ def _allowed_amount_provider_filter_sql(
 
     predicates = _allowed_amount_base_provider_predicates(args, parameter_map)
     specialty_filter = resolve_provider_specialty_filter(args)
-    if specialty_filter.active:
+    if specialty_filter.is_active:
         predicates.append(
             provider_specialty_taxonomy_exists_sql(
                 "provider_rollup.npi",
@@ -7277,7 +7280,7 @@ async def group_plan_providers(request):
         query_params_by_name,
         "group_provider_specialty",
         specialty_filter,
-    ) if specialty_filter.active else ""
+    ) if specialty_filter.is_active else ""
     taxonomy_where = f"\n               AND {taxonomy_predicate}" if taxonomy_predicate else ""
     provider_sex_predicate = provider_sex_exists_sql(
         "gm.npi",
@@ -7360,7 +7363,7 @@ async def group_plan_providers(request):
     # before it collects LIMIT matches. Compute the small local-specialty
     # candidate set first (zip-index + taxonomy-index hash join) and drive
     # the member lookup from it instead.
-    use_local_candidates = bool(specialty_filter.active and location_zips)
+    use_local_candidates = bool(specialty_filter.is_active and location_zips)
     candidate_cte = ""
     provider_npis: list[int] | None = None
     if use_local_candidates:

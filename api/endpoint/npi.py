@@ -9951,15 +9951,15 @@ async def get_npi(request, npi):
             else:
                 row = await db.first(query, **params)
             if row:
-                data = row._mapping
+                coordinate_data = row._mapping
                 return SimpleNamespace(
-                    long=data["long"],
-                    lat=data["lat"],
-                    formatted_address=data["formatted_address"],
-                    place_id=data["place_id"],
-                    geo_source=data["geo_source"],
-                    geocode_source=data["geocode_source"],
-                    geocode_quality=data["geocode_quality"],
+                    long=coordinate_data["long"],
+                    lat=coordinate_data["lat"],
+                    formatted_address=coordinate_data["formatted_address"],
+                    place_id=coordinate_data["place_id"],
+                    geo_source=coordinate_data["geo_source"],
+                    geocode_source=coordinate_data["geocode_source"],
+                    geocode_quality=coordinate_data["geocode_quality"],
                 )
         return None
 
@@ -10285,35 +10285,35 @@ async def get_npi(request, npi):
     if include_sources or include_evidence:
         detail_build_map["include_sources"] = include_sources
         detail_build_map["include_evidence"] = include_evidence
-    data = await _build_npi_details(npi, **detail_build_map)
+    provider_detail_by_field = await _build_npi_details(npi, **detail_build_map)
 
-    if not data:
+    if not provider_detail_by_field:
         if not profile_record:
             raise sanic.exceptions.NotFound
-        data = {
+        provider_detail_by_field = {
             "npi": npi,
             "provider_directory_profile": profile_record["profile"],
         }
         if include_evidence and profile_record.get("evidence") is not None:
-            data["provider_directory_profile_evidence"] = profile_record[
-                "evidence"
-            ]
+            provider_detail_by_field["provider_directory_profile_evidence"] = (
+                profile_record["evidence"]
+            )
         response_body = json.dumps(
-            data,
+            provider_detail_by_field,
             default=str,
             separators=(",", ":"),
         ).encode("utf-8")
         if _is_npi_detail_response_cacheable(
-            data,
+            provider_detail_by_field,
             force_address_update=should_force_address_update,
             sync_geocode=should_sync_geocode,
         ):
             _npi_detail_response_cache_set(cache_key, response_body)
         return response.raw(response_body, content_type="application/json")
 
-    address_total = data.pop("address_total", None)
+    address_total = provider_detail_by_field.pop("address_total", None)
 
-    addresses = data.get("address_list") or []
+    addresses = provider_detail_by_field.get("address_list") or []
     addresses.extend(
         await _fetch_provider_directory_address_overlay(
             npi,
@@ -10344,12 +10344,14 @@ async def get_npi(request, npi):
             if address
         ]
         if update_address_tasks:
-            data["address_list"] = list(await asyncio.gather(*update_address_tasks))
+            provider_detail_by_field["address_list"] = list(
+                await asyncio.gather(*update_address_tasks)
+            )
         else:
-            data["address_list"] = []
+            provider_detail_by_field["address_list"] = []
     else:
-        data["address_list"] = []
-    for address in data["address_list"]:
+        provider_detail_by_field["address_list"] = []
+    for address in provider_detail_by_field["address_list"]:
         if isinstance(address, dict):
             _attach_public_address_site_key(address, address)
             for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
@@ -10358,8 +10360,8 @@ async def get_npi(request, npi):
                 address.pop("source_record_ids", None)
     if address_limit is not None:
         # Never silently truncate: tell the caller the full count and how to page.
-        returned = len(data["address_list"])
-        data["address_pagination"] = {
+        returned = len(provider_detail_by_field["address_list"])
+        provider_detail_by_field["address_pagination"] = {
             "limit": address_limit,
             "offset": address_offset,
             "returned": returned,
@@ -10402,27 +10404,35 @@ async def get_npi(request, npi):
         except Exception:  # pragma: no cover - defensive fallback
             other_names = []
         provider_enrichment_payload = None
-    data["other_name_list"] = other_names
+    provider_detail_by_field["other_name_list"] = other_names
 
-    existing_dba_names = [name for name in (data.get("do_business_as") or []) if name]
+    existing_dba_names = [
+        name
+        for name in (provider_detail_by_field.get("do_business_as") or [])
+        if name
+    ]
     if existing_dba_names:
-        data["do_business_as"] = list(dict.fromkeys(existing_dba_names))
+        provider_detail_by_field["do_business_as"] = list(
+            dict.fromkeys(existing_dba_names)
+        )
     else:
         candidates = [
             entry.get("other_provider_identifier")
             for entry in other_names
             if entry.get("other_provider_identifier_type_code") == "3" and entry.get("other_provider_identifier")
         ]
-        data["do_business_as"] = list(dict.fromkeys(candidates)) if candidates else []
+        provider_detail_by_field["do_business_as"] = (
+            list(dict.fromkeys(candidates)) if candidates else []
+        )
 
     if provider_enrichment_payload is not None:
-        data["provider_enrichment"] = provider_enrichment_payload
+        provider_detail_by_field["provider_enrichment"] = provider_enrichment_payload
     else:
-        data["provider_enrichment"] = {
+        provider_detail_by_field["provider_enrichment"] = {
             "summary": None,
         }
         if provider_enrichment_view == "full":
-            data["provider_enrichment"]["enrollments"] = {
+            provider_detail_by_field["provider_enrichment"]["enrollments"] = {
                 "ffs_public": [],
                 "hospital": [],
                 "hha": [],
@@ -10432,7 +10442,7 @@ async def get_npi(request, npi):
                 "snf": [],
             }
         else:
-            data["provider_enrichment"]["ffs_visibility"] = {
+            provider_detail_by_field["provider_enrichment"]["ffs_visibility"] = {
                 "show_mode": "chain" if include_chain_enrichment else "default",
                 "chain_hidden": False,
                 "chain_enrollment_count": 0,
@@ -10440,16 +10450,22 @@ async def get_npi(request, npi):
             }
 
     if include_profile and profile_record:
-        data["provider_directory_profile"] = profile_record["profile"]
+        provider_detail_by_field["provider_directory_profile"] = profile_record[
+            "profile"
+        ]
         if include_evidence and profile_record.get("evidence") is not None:
-            data["provider_directory_profile_evidence"] = profile_record[
-                "evidence"
-            ]
+            provider_detail_by_field["provider_directory_profile_evidence"] = (
+                profile_record["evidence"]
+            )
 
-    _redact_internal_address_fields(data)
-    response_body = json.dumps(data, default=str, separators=(",", ":")).encode("utf-8")
+    _redact_internal_address_fields(provider_detail_by_field)
+    response_body = json.dumps(
+        provider_detail_by_field,
+        default=str,
+        separators=(",", ":"),
+    ).encode("utf-8")
     if _is_npi_detail_response_cacheable(
-        data,
+        provider_detail_by_field,
         force_address_update=should_force_address_update,
         sync_geocode=should_sync_geocode,
     ):

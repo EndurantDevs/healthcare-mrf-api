@@ -1279,12 +1279,12 @@ async def shutdown(ctx):  # pragma: no cover
         NPIPhoneStaffing,
     )
 
-    async def table_exists(table_name: str) -> bool:
+    async def has_table(table_name: str) -> bool:
         """Check whether a table exists in the active import schema."""
         exists = await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}');")
         return bool(exists)
 
-    async def table_has_column(table_name: str, column_name: str) -> bool:
+    async def has_table_column(table_name: str, column_name: str) -> bool:
         """Check whether an import table exposes a named column."""
         return bool(await db.scalar(
             f"""
@@ -1301,7 +1301,7 @@ async def shutdown(ctx):  # pragma: no cover
     stage_row_counts_by_table: dict[str, int] = {}
     for cls in processing_classes_array:
         stage_obj = make_class(cls, import_date)
-        if await table_exists(stage_obj.__tablename__):
+        if await has_table(stage_obj.__tablename__):
             stage_row_counts_by_table[cls.__main_table__] = int(
                 await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_obj.__tablename__};") or 0
             )
@@ -1369,19 +1369,26 @@ async def shutdown(ctx):  # pragma: no cover
                 "set HLTHPRT_NPI_OPENADDRESSES_BACKFILL=1 to run it."
             )
 
-    async def _timed_geo_update(obj, archive_source: str, use_canonical_archive: bool):
+    async def _timed_geo_update(
+        staged_address_model,
+        archive_source: str,
+        use_canonical_archive: bool,
+    ):
         async def _run_geo_update():
-            if use_canonical_archive and await table_has_column(archive_source, "address_key"):
+            if use_canonical_archive and await has_table_column(
+                archive_source,
+                "address_key",
+            ):
                 await db.status(
-                    f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, "
+                    f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = b.formatted_address, "
                     f"lat = b.lat, long = b.long, place_id = b.place_id "
                     f"FROM {db_schema}.{archive_source} as b "
                     f"WHERE a.address_key IS NOT NULL AND a.address_key = b.address_key"
                     f" AND b.lat IS NOT NULL AND b.long IS NOT NULL"
                 )
-                if await table_exists("address_checksum_map"):
+                if await has_table("address_checksum_map"):
                     await db.status(
-                        f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, "
+                        f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = b.formatted_address, "
                         f"lat = b.lat, long = b.long, place_id = b.place_id "
                         f"FROM {db_schema}.address_checksum_map as m "
                         f"JOIN {db_schema}.{archive_source} as b ON b.address_key = m.address_key "
@@ -1390,7 +1397,7 @@ async def shutdown(ctx):  # pragma: no cover
                     )
             else:
                 await db.status(
-                    f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, "
+                    f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = b.formatted_address, "
                     f"lat = b.lat, long = b.long, place_id = b.place_id "
                     f"FROM {db_schema}.{archive_source} as b WHERE a.checksum = b.checksum"
                 )
@@ -1458,7 +1465,9 @@ async def shutdown(ctx):  # pragma: no cover
                     deferred_npi_indexes_obj = None
             if cls is NPIAddress:
                 npi_taxonomy_table = f"npi_taxonomy_{import_date}"
-                if await table_exists(npi_taxonomy_table) and await table_exists("nucc_taxonomy"):
+                if await has_table(npi_taxonomy_table) and await has_table(
+                    "nucc_taxonomy"
+                ):
                     print("Updating NUCC Taxonomy for NPI Addresses...")
                     await timed_shutdown_phase(
                         "taxonomy_array_enrichment",
@@ -1478,16 +1487,16 @@ async def shutdown(ctx):  # pragma: no cover
                 use_canonical_archive = _is_environment_enabled("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
                 archive_source = (
                     preferred_archive
-                    if use_canonical_archive and await table_exists(preferred_archive)
+                    if use_canonical_archive and await has_table(preferred_archive)
                     else "address_archive"
                 )
-                if await table_exists(archive_source):
+                if await has_table(archive_source):
                     print(f"Updating NPI Addresses Geo from Archive {archive_source}...")
                     await _timed_geo_update(staged_model, archive_source, use_canonical_archive)
                 else:
                     print(f"Skipping NPI geo update: no address archive table is available in {db_schema}.")
 
-                if await table_exists("plan_npi_raw"):
+                if await has_table("plan_npi_raw"):
                     print("Updating NPI Plan-Network Array from Plans Import Data...")
                     await timed_shutdown_phase(
                         "plan_network_array_enrichment",
@@ -1509,7 +1518,7 @@ WHERE
                 else:
                     print(f"Skipping NPI plan-network update: source table {db_schema}.plan_npi_raw is missing.")
 
-                if await table_exists("pricing_provider_procedure"):
+                if await has_table("pricing_provider_procedure"):
                     print("Updating NPI procedures_array from pricing provider procedures...")
                     await timed_shutdown_phase(
                         "procedures_array_enrichment",
@@ -1534,7 +1543,7 @@ WHERE
                         f"{db_schema}.pricing_provider_procedure is missing."
                     )
 
-                if await table_exists("pricing_provider_prescription"):
+                if await has_table("pricing_provider_prescription"):
                     print("Updating NPI medications_array from pricing provider prescriptions...")
                     await timed_shutdown_phase(
                         "medications_array_enrichment",
@@ -1588,7 +1597,7 @@ WHERE
     # Run VACUUM FULL ANALYZE in parallel for all tables
     async def vacuum_table(obj):
         """Run the post-index full vacuum for one promoted NPI table."""
-        if not await table_exists(obj.__tablename__):
+        if not await has_table(obj.__tablename__):
             print(f"Skipping VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__}: table is missing.")
             return
         print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
@@ -1607,7 +1616,7 @@ WHERE
         for cls in processing_classes_array:
             staged_model = staged_models_by_table[cls.__main_table__]
             table = staged_model.__main_table__
-            if not await table_exists(staged_model.__tablename__):
+            if not await has_table(staged_model.__tablename__):
                 print(
                     f"Skipping publish rotation for {db_schema}.{staged_model.__tablename__}: "
                     "staging table is missing."
