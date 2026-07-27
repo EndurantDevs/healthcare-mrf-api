@@ -297,7 +297,7 @@ async def _ensure_ptg2_serving_rate_columns(db_schema: str) -> None:
             logger.debug("Skipping ptg2_serving_rate column %s ensure: %s", column_name, exc)
 
 
-async def _ensure_ptg2_serving_rate_compact_columns(db_schema: str) -> None:
+async def _ensure_rate_compact_columns(db_schema: str) -> None:
     column_types_by_name = {
         "network_names": "varchar[]",
     }
@@ -309,6 +309,9 @@ async def _ensure_ptg2_serving_rate_compact_columns(db_schema: str) -> None:
             )
         except Exception as exc:
             logger.debug("Skipping ptg2_serving_rate_compact column %s ensure: %s", column_name, exc)
+
+
+_ensure_ptg2_serving_rate_compact_columns = _ensure_rate_compact_columns
 
 
 async def _ensure_ptg2_provider_set_columns(db_schema: str) -> None:
@@ -370,7 +373,7 @@ async def _drop_ptg2_columns(db_schema: str, table_name: str, column_names: tupl
             logger.debug("Skipping %s column %s drop: %s", table_name, column_name, exc)
 
 
-async def _ensure_ptg2_price_set_stage_table(db_schema: str) -> None:
+async def _ensure_price_stage_table(db_schema: str) -> None:
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     await db.status(
         f"""
@@ -400,7 +403,10 @@ async def _ensure_ptg2_price_set_stage_table(db_schema: str) -> None:
         logger.debug("Skipping ptg2_price_set_stage index ensure: %s", exc)
 
 
-async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
+_ensure_ptg2_price_set_stage_table = _ensure_price_stage_table
+
+
+async def _ensure_rate_stage_table(db_schema: str) -> None:
     """Create and configure the PTG2 staging table for serving-rate rows."""
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     await db.status(
@@ -499,6 +505,9 @@ async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
         )
     except Exception as exc:
         logger.debug("Skipping ptg2_serving_rate_stage index ensure: %s", exc)
+
+
+_ensure_ptg2_serving_rate_stage_table = _ensure_rate_stage_table
 
 
 async def ensure_ptg2_tables() -> None:

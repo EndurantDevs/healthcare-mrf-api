@@ -157,6 +157,26 @@ def _finalizer_inputs(tmp_path: Path):
     )
 
 
+def _finalizer_arguments(tmp_path, work_directory):
+    (
+        identity,
+        serving_entries,
+        code_entries,
+        provider_metadata_entries,
+        price_key_map,
+    ) = _finalizer_inputs(tmp_path)
+    return {
+        "work_directory": work_directory,
+        "serving_run_entries": serving_entries,
+        "code_dictionary_entries": code_entries,
+        "provider_set_metadata_entries": provider_metadata_entries,
+        "expected_source_identities": [identity],
+        "price_key_map_input": price_key_map,
+        "price_key_map_row_count": 1,
+        "scratch_durability": finalizer.PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
+    }
+
+
 @pytest.mark.parametrize("cancel_mode", ["cancel", "timeout"])
 @pytest.mark.asyncio
 async def test_finalizer_cancellation_reaps_group_and_allows_same_directory_retry(
@@ -181,23 +201,7 @@ async def test_finalizer_cancellation_reaps_group_and_allows_same_directory_retr
     )
     monkeypatch.setattr(rust_scanner, "_PROCESS_GROUP_TERM_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(rust_scanner, "_PROCESS_GROUP_KILL_TIMEOUT_SECONDS", 2.0)
-    (
-        identity,
-        serving_entries,
-        code_entries,
-        provider_metadata_entries,
-        price_key_map,
-    ) = _finalizer_inputs(tmp_path)
-    finalizer_argument_map = dict(
-        work_directory=work_directory,
-        serving_run_entries=serving_entries,
-        code_dictionary_entries=code_entries,
-        provider_set_metadata_entries=provider_metadata_entries,
-        expected_source_identities=[identity],
-        price_key_map_input=price_key_map,
-        price_key_map_row_count=1,
-        scratch_durability=finalizer.PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY,
-    )
+    finalizer_argument_map = _finalizer_arguments(tmp_path, work_directory)
 
     first_attempt = asyncio.create_task(
         finalizer.run_v3_direct_finalizer(**finalizer_argument_map)

@@ -1,14 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
-import os
-import uuid
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from db.connection import Database
 from process.ptg_parts import ptg2_source_snapshot_gc as snapshot_gc
 
 
@@ -176,7 +172,7 @@ def test_gc_plan_additively_selects_unreferenced_strict_v4_snapshots():
     assert plan.tables == ()
 
 
-def test_gc_protected_set_unions_owner_qualified_snapshot_pins():
+def test_gc_protected_set_unions_pins_and_direct_release_bindings():
     executor = _Executor(
         [
             {
@@ -205,6 +201,7 @@ def test_gc_protected_set_unions_owner_qualified_snapshot_pins():
         if "SELECT DISTINCT snapshot_id" in statement
     )
     assert "ptg2_snapshot_pin" in pointer_sql
+    assert "plan_release_snapshot_binding" in pointer_sql
     assert plan.current_snapshot_ids == ("release-pinned",)
     assert plan.candidate_snapshot_ids == ("unreferenced",)
 
@@ -349,153 +346,3 @@ def test_execute_gc_deletes_v3_metadata_with_strict_sql_admission(monkeypatch):
         require_shared=True,
         layout_keys=(10,),
     )
-
-
-@pytest.mark.asyncio
-async def test_real_postgres_stale_cutoff_is_utc_naive_under_non_utc_session(
-    monkeypatch,
-):
-    """Verify real postgres stale cutoff is utc naive under non utc session."""
-    if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
-        pytest.skip(
-            "set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated "
-            "PostgreSQL test"
-        )
-
-    database = Database()
-    schema_name = f"ptg2_source_gc_utc_{uuid.uuid4().hex}"
-    schema = f'"{schema_name}"'
-    monkeypatch.setattr(
-        snapshot_gc,
-        "require_migration_owned_tables",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        snapshot_gc,
-        "build_shared_layout_release_plan",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                logical_layout_count=0,
-                candidate_hash_count=0,
-                stored_bytes=0,
-            )
-        ),
-    )
-    await database.connect()
-    try:
-        async with database.acquire() as connection:
-            await connection.status(f"CREATE SCHEMA {schema}")
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_current_snapshot (
-                    slot varchar(32) PRIMARY KEY,
-                    snapshot_id varchar(96),
-                    previous_snapshot_id varchar(96)
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_current_source_snapshot (
-                    source_key varchar(96) PRIMARY KEY,
-                    snapshot_id varchar(96),
-                    previous_snapshot_id varchar(96)
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_current_plan_source (
-                    plan_source_key varchar(96) PRIMARY KEY,
-                    snapshot_id varchar(96),
-                    previous_snapshot_id varchar(96)
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_snapshot_pin (
-                    snapshot_id varchar(96) PRIMARY KEY
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_import_run (
-                    import_run_id varchar(96) PRIMARY KEY,
-                    status varchar(32) NOT NULL,
-                    started_at timestamp without time zone,
-                    heartbeat_at timestamp without time zone
-                )
-                """
-            )
-            await connection.status(
-                f"""
-                CREATE TABLE {schema}.ptg2_snapshot (
-                    snapshot_id varchar(96) PRIMARY KEY,
-                    import_run_id varchar(96),
-                    status varchar(32) NOT NULL,
-                    previous_snapshot_id varchar(96),
-                    manifest jsonb NOT NULL,
-                    created_at timestamp without time zone NOT NULL
-                )
-                """
-            )
-            await connection.status("SET TIME ZONE 'Europe/Prague'")
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_import_run
-                    (import_run_id, status, started_at, heartbeat_at)
-                VALUES
-                    ('run-fresh', 'failed',
-                     timezone('UTC', transaction_timestamp()),
-                     timezone('UTC', transaction_timestamp()))
-                """
-            )
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_snapshot
-                    (snapshot_id, import_run_id, status, previous_snapshot_id,
-                     manifest, created_at)
-                VALUES
-                    ('fresh-building', 'run-fresh', 'building', NULL,
-                     jsonb_build_object(
-                         'serving_index',
-                         jsonb_build_object(
-                             'arch_version', 'postgres_binary_v3',
-                             'storage_generation', 'shared_blocks_v3',
-                             'source_key', 'source-a'
-                         )
-                     ),
-                     timezone('UTC', transaction_timestamp())
-                         - INTERVAL '30 minutes')
-                """
-            )
-
-            fresh_plan = await snapshot_gc.build_ptg2_source_snapshot_gc_plan(
-                schema_name=schema_name,
-                executor=connection,
-                stale_build_seconds=3_600,
-            )
-            assert fresh_plan.candidate_snapshot_ids == ()
-
-            await connection.status(
-                f"""
-                UPDATE {schema}.ptg2_snapshot
-                   SET created_at = timezone('UTC', transaction_timestamp())
-                                    - INTERVAL '2 hours'
-                 WHERE snapshot_id = 'fresh-building'
-                """
-            )
-            stale_plan = await snapshot_gc.build_ptg2_source_snapshot_gc_plan(
-                schema_name=schema_name,
-                executor=connection,
-                stale_build_seconds=3_600,
-            )
-            assert stale_plan.candidate_snapshot_ids == ("fresh-building",)
-    finally:
-        try:
-            async with database.acquire() as connection:
-                await connection.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-        finally:
-            await database.disconnect()

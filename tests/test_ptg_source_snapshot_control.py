@@ -158,6 +158,7 @@ def test_source_snapshot_remove_plan_refuses_current_references(monkeypatch):
                     "source_key": "source_a",
                     "arch_version": "postgres_binary_v3",
                     "storage_generation": "shared_blocks_v3",
+                    "shared_snapshot_key": 17,
                 }},
             }
         ),
@@ -216,8 +217,57 @@ def test_source_snapshot_remove_plan_rejects_legacy_manifest(monkeypatch):
     )
 
     assert plan["removable"] is False
-    assert plan["reason"] == "only postgres_binary_v3/shared_blocks_v3 snapshots can be removed"
+    assert plan["reason"] == (
+        "only postgres_binary_v3/shared_blocks_v3 or "
+        "postgres_binary_v3/shared_blocks_v4 snapshots can be removed"
+    )
     assert plan["tables"] == []
+
+
+def test_source_snapshot_remove_plan_accepts_v4_manifest(monkeypatch):
+    """V4 uses the same logical ownership with a different physical generation."""
+
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_snapshot_row",
+        AsyncMock(
+            return_value={
+                "snapshot_id": "snap_v4",
+                "status": "published",
+                "import_month": "2026-07-01",
+                "manifest": {
+                    "serving_index": {
+                        "source_key": "source_a",
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v4",
+                        "shared_snapshot_key": 41,
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_current_references",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_artifact_manifest_ids",
+        AsyncMock(return_value=["artifact_v4"]),
+    )
+
+    plan = asyncio.run(
+        source_snapshot_control.build_source_snapshot_remove_plan(
+            snapshot_id="snap_v4",
+            source_key="source_a",
+        )
+    )
+
+    assert plan["removable"] is True
+    assert plan["storage_generation"] == "shared_blocks_v4"
+    assert plan["shared_snapshot_key"] == 41
+    assert plan["artifact_manifest_ids"] == ["artifact_v4"]
 
 
 def _assert_source_snapshot_remove_results(
@@ -233,6 +283,10 @@ def _assert_source_snapshot_remove_results(
     assert cleanup_summary["deleted_artifact_manifests"] == 1
     assert cleanup_summary["deleted_snapshots"] == 1
     assert cleanup_summary["released_shared_layouts"] == 0
+    assert cleanup_summary["queued_shared_block_candidates"] == 0
+    assert cleanup_summary["queued_shared_block_bytes"] == 0
+    assert cleanup_summary["layout_cleanup"] == "not_applicable"
+    assert cleanup_summary["physical_cleanup"] == "not_applicable"
     assert transaction_statements == [
         (
             "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
@@ -291,12 +345,20 @@ def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
             "tables": [],
             "artifact_manifest_ids": ["artifact_1"],
             "current_references": {},
+            "storage_generation": "shared_blocks_v3",
+            "shared_snapshot_key": 17,
         }
 
+    bound_layout_keys = AsyncMock(return_value=())
     monkeypatch.setattr(
         source_snapshot_control,
         "build_source_snapshot_remove_plan",
         fake_remove_plan,
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "bound_shared_layout_keys",
+        bound_layout_keys,
     )
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
@@ -310,6 +372,7 @@ def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
         transaction_statements,
         status_calls,
     )
+    bound_layout_keys.assert_awaited_once()
 
 
 def _assert_source_snapshot_retirement_results(
@@ -341,7 +404,29 @@ def _assert_source_snapshot_retirement_results(
     assert clear_calls == [True]
 
 
-def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(monkeypatch):
+def _retirement_snapshot(storage_generation):
+    return {
+        "snapshot_id": "snap_live",
+        "status": "published",
+        "manifest": {
+            "serving_index": {
+                "source_key": "source_a",
+                "arch_version": "postgres_binary_v3",
+                "storage_generation": storage_generation,
+                "shared_snapshot_key": 17,
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "storage_generation",
+    ["shared_blocks_v3", "shared_blocks_v4"],
+)
+def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(
+    monkeypatch,
+    storage_generation,
+):
     """Verify retire ptg2 source snapshot deletes current source and plan pointers."""
     status_calls = []
     reference_calls = []
@@ -361,20 +446,18 @@ def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(mo
         return {"global_slots": [], "source_keys": [], "plan_source_keys": []}
 
     clear_calls = []
-    async def fake_snapshot_row(*_args):
-        assert transaction.active
-        return {
-            "snapshot_id": "snap_live",
-            "status": "published",
-            "manifest": {"serving_index": {
-                "source_key": "source_a",
-                "arch_version": "postgres_binary_v3",
-                "storage_generation": "shared_blocks_v3",
-            }},
-        }
-
-    monkeypatch.setattr(source_snapshot_control, "_snapshot_row", fake_snapshot_row)
+    validate_layout = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_snapshot_row",
+        AsyncMock(return_value=_retirement_snapshot(storage_generation)),
+    )
     monkeypatch.setattr(source_snapshot_control, "_current_references", fake_current_references)
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "validate_retirement_shared_layout",
+        validate_layout,
+    )
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
     monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: clear_calls.append(True))
@@ -392,3 +475,4 @@ def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(mo
         status_calls,
         clear_calls,
     )
+    validate_layout.assert_awaited_once()

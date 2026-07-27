@@ -1300,6 +1300,7 @@ async def test_v3_lifecycle_fails_closed(
             "previous_source_keys": [],
             "previous_plan_source_keys": [],
             "plan_release_pins": [],
+            "plan_release_bindings": [],
         }
 
         block_rows = await db.all(

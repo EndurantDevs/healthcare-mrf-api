@@ -542,17 +542,7 @@ def _shared_graph_artifact_manifest(
         raise RuntimeError(
             "strict V3 graph artifact metadata has invalid record_format"
         )
-    digest_text = metadata.get("sha256")
-    if not isinstance(digest_text, str):
-        raise RuntimeError("strict V3 graph artifact metadata has invalid sha256")
-    try:
-        digest = bytes.fromhex(digest_text)
-    except ValueError as exc:
-        raise RuntimeError(
-            "strict V3 graph artifact metadata has invalid sha256"
-        ) from exc
-    if len(digest) != 32:
-        raise RuntimeError("strict V3 graph artifact metadata has invalid sha256")
+    digest = _shared_graph_artifact_digest(metadata)
     byte_count = _shared_graph_manifest_int(metadata, "byte_count")
     owner_count = _shared_graph_manifest_int(metadata, "owner_count")
     member_count = _shared_graph_manifest_int(metadata, "member_count")
@@ -587,6 +577,23 @@ def _shared_graph_artifact_manifest(
         byte_count,
         member_count,
     )
+
+
+def _shared_graph_artifact_digest(metadata: Mapping[str, Any]) -> bytes:
+    """Decode one strict SHA-256 artifact digest."""
+
+    digest_text = metadata.get("sha256")
+    if not isinstance(digest_text, str):
+        raise RuntimeError("strict V3 graph artifact metadata has invalid sha256")
+    try:
+        digest = bytes.fromhex(digest_text)
+    except ValueError as exc:
+        raise RuntimeError(
+            "strict V3 graph artifact metadata has invalid sha256"
+        ) from exc
+    if len(digest) != 32:
+        raise RuntimeError("strict V3 graph artifact metadata has invalid sha256")
+    return digest
 
 
 def _shared_graph_manifest(
@@ -1261,7 +1268,7 @@ def _log_ptg2_rust_scanner_binary(binary: Path) -> None:
     )
 
 
-async def convert_membership_shards_to_shared_graph_rust(
+async def convert_shared_graph_rust(
     *,
     shards: Iterable[SharedGraphShardBundle],
     provider_set_key_map_path: str | Path,
@@ -1362,6 +1369,9 @@ async def convert_membership_shards_to_shared_graph_rust(
         )
         await _await_cancellation_resistant_cleanup(cleanup_task)
         raise
+
+
+convert_membership_shards_to_shared_graph_rust = convert_shared_graph_rust
 
 
 def _scanner_error_message(prefix: str, return_code: int, stderr_tail: list[str]) -> str:

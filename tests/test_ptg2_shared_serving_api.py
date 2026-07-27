@@ -798,10 +798,7 @@ async def test_large_shared_dictionary_reads_only_the_requested_tail_fragment(
     assert len(dictionary_fragment) <= entries_per_fragment * 16
 
 
-@pytest.mark.asyncio
-async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
-    """Keep shared-code and provider support reads within one snapshot."""
-
+def _provider_scope_query():
     provider_session = _Session(
         [
             {
@@ -810,13 +807,47 @@ async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
             }
         ]
     )
+    return provider_session
+
+
+def _assert_provider_snapshot_scope(provider_ids, provider_session):
+    provider_sql, provider_params = provider_session.calls[0]
+    assert provider_ids == {3: "00000000000000000000000000000003"}
+    assert "ptg2_v3_provider_set" in provider_sql
+    assert provider_params["shared_snapshot_key"] == 41
+
+
+def _assert_code_snapshot_scope(code_rows, code_session):
+    code_sql, code_params = code_session.calls[0]
+    assert code_rows[0]["code_key"] == 7
+    assert code_rows[0]["negotiation_arrangement"] == "FFS"
+    assert "ptg2_v3_code" in code_sql
+    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
+    assert "JOIN LATERAL (" in code_sql
+    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
+    assert "logical_scope.plan_id" in code_sql
+    assert "code_metadata.negotiation_arrangement" in code_sql
+    assert "code_metadata.plan_id" not in code_sql
+    assert "snapshot_key = :shared_snapshot_key" in code_sql
+    assert "plan_id = :plan_id" in code_sql
+    assert "OR COALESCE(plan_id, '') = ''" not in code_sql
+    assert code_params["shared_snapshot_key"] == 41
+    assert code_params["logical_snapshot_id"] == "logical-snapshot"
+
+
+@pytest.mark.asyncio
+async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
+    """Keep shared-code and provider support reads within one snapshot."""
+
+    provider_session = _provider_scope_query()
     provider_ids = await ptg2_serving._provider_set_ids_for_keys(
         provider_session,
         _strict_tables(),
         (3,),
     )
-    provider_sql, provider_params = provider_session.calls[0]
-
     code_session = _Session(
         [
             {
@@ -837,30 +868,8 @@ async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
         q_text="",
         code_context=None,
     )
-    code_sql, code_params = code_session.calls[0]
-
-    assert provider_ids == {3: "00000000000000000000000000000003"}
-    assert "ptg2_v3_provider_set" in provider_sql
-    assert provider_params["shared_snapshot_key"] == 41
-    assert code_rows[0]["code_key"] == 7
-    assert code_rows[0]["negotiation_arrangement"] == "FFS"
-    assert "ptg2_v3_code" in code_sql
-    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
-    assert "JOIN LATERAL (" in code_sql
-    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
-    assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
-    assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
-    assert (
-        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
-    )
-    assert "logical_scope.plan_id" in code_sql
-    assert "code_metadata.negotiation_arrangement" in code_sql
-    assert "code_metadata.plan_id" not in code_sql
-    assert "snapshot_key = :shared_snapshot_key" in code_sql
-    assert "plan_id = :plan_id" in code_sql
-    assert "OR COALESCE(plan_id, '') = ''" not in code_sql
-    assert code_params["shared_snapshot_key"] == 41
-    assert code_params["logical_snapshot_id"] == "logical-snapshot"
+    _assert_provider_snapshot_scope(provider_ids, provider_session)
+    _assert_code_snapshot_scope(code_rows, code_session)
 
 
 @pytest.mark.asyncio

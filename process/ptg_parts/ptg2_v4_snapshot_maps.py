@@ -2071,15 +2071,24 @@ def _sealed_root_summaries(
         if isinstance(serving_binary, Mapping)
         else None
     )
-    object_kinds = (
-        tuple(
+    sealed_summary = _sealed_map_summary(existing, snapshot_map)
+    sealed_metadata = _sealed_metadata_summary(existing, provider_graph)
+    return manifest, sealed_summary, sealed_metadata
+
+
+def _sealed_map_summary(
+    existing: Mapping[str, Any],
+    snapshot_map: Any,
+) -> V4SnapshotMapSummary:
+    """Reconstruct the immutable packed-map summary."""
+
+    object_kinds = ()
+    if isinstance(snapshot_map, Mapping):
+        object_kinds = tuple(
             str(object_kind)
             for object_kind in snapshot_map.get("object_kinds") or ()
         )
-        if isinstance(snapshot_map, Mapping)
-        else ()
-    )
-    sealed_summary = V4SnapshotMapSummary(
+    return V4SnapshotMapSummary(
         map_digest=bytes(existing.get("map_digest") or b""),
         object_kinds=object_kinds,
         map_pack_count=int(existing.get("map_pack_count") or 0),
@@ -2088,7 +2097,15 @@ def _sealed_root_summaries(
         logical_byte_count=int(existing.get("logical_byte_count") or 0),
         stored_map_byte_count=int(existing.get("stored_map_byte_count") or 0),
     )
-    sealed_metadata = V4SnapshotMetadataSummary(
+
+
+def _sealed_metadata_summary(
+    existing: Mapping[str, Any],
+    provider_graph: Any,
+) -> V4SnapshotMetadataSummary:
+    """Reconstruct the immutable V4 graph metadata summary."""
+
+    return V4SnapshotMetadataSummary(
         npi_count=int(existing.get("npi_count") or 0),
         component_count=int(existing.get("component_count") or 0),
         pattern_count=int(existing.get("pattern_count") or 0),
@@ -2110,7 +2127,6 @@ def _sealed_root_summaries(
         if isinstance(provider_graph, Mapping)
         else {},
     )
-    return manifest, sealed_summary, sealed_metadata
 
 
 def _validate_sealed_reservation(existing: Mapping[str, Any]) -> Mapping[str, Any]:

@@ -1,8 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
+import pytest
+
+from process.ptg_parts import ptg2_source_snapshot_gc as snapshot_gc
 from process.ptg_parts import snapshot_cleanup
+from process.ptg_parts import source_snapshot_control
 
 
 def _snapshot_row(snapshot_id, status, table_name, previous_snapshot_id=None):
@@ -89,6 +95,8 @@ def test_rollback_cleanup_ignores_legacy_layouts(monkeypatch):
     )
 
     assert connection.pointer_sql.count("previous_snapshot_id AS snapshot_id") == 3
+    assert "plan_release_snapshot_binding" in connection.pointer_sql
+    assert "binding.source_key = :source_key" in connection.pointer_sql
     assert _dropped_table_statements(connection) == []
 
 
@@ -112,3 +120,102 @@ def test_locked_cleanup_never_drops_legacy_tables(monkeypatch):
 
     assert "status" in connection.manifest_sql
     assert _dropped_table_statements(connection) == []
+
+
+@asynccontextmanager
+async def _transaction():
+    yield object()
+
+
+@pytest.mark.asyncio
+async def test_unlocked_cleanup_uses_only_source_table_cleanup(monkeypatch) -> None:
+    """Default cleanup stays within the bounded source-table path."""
+
+    cleanup = AsyncMock()
+    monkeypatch.setattr(snapshot_cleanup, "_cleanup_source_tables", cleanup)
+    await snapshot_cleanup._cleanup_old_ptg2_source_tables(
+        "source-a",
+        {"current"},
+    )
+    cleanup.assert_awaited_once_with(
+        snapshot_cleanup.db,
+        source_key="source-a",
+        keep_snapshot_ids={"current"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_retirement_keeps_source_key_boundary(monkeypatch) -> None:
+    """Exact retirement keeps every pointer delete source-scoped."""
+
+    monkeypatch.setattr(source_snapshot_control.db, "transaction", _transaction)
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_lock_source_pointer_gc",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_snapshot_row",
+        AsyncMock(return_value={"snapshot_id": "candidate"}),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "retirement_manifest_source_key",
+        lambda _snapshot, _source_key: "manifest-source",
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "validate_retirement_shared_layout",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_current_references",
+        AsyncMock(side_effect=[{}, {}]),
+    )
+    pointer_deletes = AsyncMock(return_value=(2, 1))
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_delete_retired_source_pointers",
+        pointer_deletes,
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_clear_ptg2_snapshot_cache",
+        lambda: None,
+    )
+
+    retirement_result = await source_snapshot_control.retire_ptg2_source_snapshot(
+        snapshot_id="candidate",
+        source_key="manifest-source",
+    )
+
+    assert retirement_result["source_key"] == "manifest-source"
+    assert retirement_result["deleted_plan_pointers"] == 2
+    assert retirement_result["deleted_source_pointers"] == 1
+    pointer_deletes.assert_awaited_once_with(
+        "mrf",
+        snapshot_id="candidate",
+        source_key="manifest-source",
+    )
+
+
+def test_every_cleanup_retention_query_includes_direct_release_bindings() -> None:
+    """Alternate cleanup paths retain partial release projections too."""
+
+    assert "plan_release_snapshot_binding" in snapshot_gc._CURRENT_SNAPSHOT_IDS_SQL
+    source_query = snapshot_cleanup._CURRENT_SOURCE_POINTER_SNAPSHOT_IDS_SQL
+    assert "plan_release_snapshot_binding" in source_query
+    assert "binding.source_key = :source_key" in source_query
+
+
+def test_invalid_source_lineage_limit_uses_safe_default(monkeypatch) -> None:
+    """Malformed retention configuration cannot broaden cleanup."""
+
+    monkeypatch.setenv(
+        snapshot_cleanup.PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE_ENV,
+        "not-a-number",
+    )
+
+    assert snapshot_cleanup._source_snapshot_lineage_limit() == 4

@@ -1489,6 +1489,55 @@ async def test_bounded_prefix_rejects_materialized_row_without_dense_rank(
         )
 
 
+def _eager_ranked_prefix(encoded_payload, entries, descending):
+    eager_rows = ptg2_db_sidecars._decode_serving_binary_code_records(
+        [
+            {
+                "block_no": 0,
+                "entry_count": len(entries),
+                "_decoded_payload": encoded_payload,
+            }
+        ],
+        provider_set_keys=None,
+        expected_source_count=2,
+    )
+    return sorted(
+        eager_rows,
+        key=lambda item: (
+            -item[1] if descending else item[1],
+            item[0],
+            item[2],
+            item[0] * 10,
+        ),
+    )[:3]
+
+
+def _assert_prefix_reference_reads(
+    bounded_rows,
+    provider_counts,
+    dictionary,
+    expected,
+):
+    actual_prefix_rows = [
+        (
+            bounded_row.provider_set_key,
+            bounded_row.price_key,
+            bounded_row.source_key,
+        )
+        for bounded_row in bounded_rows
+    ]
+    assert actual_prefix_rows == expected
+    assert {
+        (provider_set_key, price_key, source_key)
+        for provider_set_key, price_key, source_key in provider_counts.await_args.kwargs[
+            "decoded_keys"
+        ]
+    } == set(expected)
+    assert set(dictionary.await_args.kwargs["item_keys"]) == {
+        price_key for _provider_set_key, price_key, _source_key in expected
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("descending", "expected"),
@@ -1519,46 +1568,14 @@ async def test_bounded_code_prefix_matches_eager_rank_and_reads_selected_refs(
         limit=3,
         descending=descending,
     )
-
-    eager = ptg2_db_sidecars._decode_serving_binary_code_records(
-        [
-            {
-                "block_no": 0,
-                "entry_count": len(entries),
-                "_decoded_payload": encoded_payload,
-            }
-        ],
-        provider_set_keys=None,
-        expected_source_count=2,
+    eager_prefix = _eager_ranked_prefix(encoded_payload, entries, descending)
+    assert eager_prefix == expected
+    _assert_prefix_reference_reads(
+        bounded_rows,
+        provider_counts,
+        dictionary,
+        expected,
     )
-    eager_prefix = sorted(
-        eager,
-        key=lambda item: (
-            -item[1] if descending else item[1],
-            item[0],
-            item[2],
-            item[0] * 10,
-        ),
-    )[:3]
-    actual_prefix_rows = [
-        (
-            bounded_row.provider_set_key,
-            bounded_row.price_key,
-            bounded_row.source_key,
-        )
-        for bounded_row in bounded_rows
-    ]
-
-    assert actual_prefix_rows == expected == eager_prefix
-    assert {
-        (provider_set_key, price_key, source_key)
-        for provider_set_key, price_key, source_key in provider_counts.await_args.kwargs[
-            "decoded_keys"
-        ]
-    } == set(expected)
-    assert set(dictionary.await_args.kwargs["item_keys"]) == {
-        price_key for _provider_set_key, price_key, _source_key in expected
-    }
 
 
 @pytest.mark.asyncio
