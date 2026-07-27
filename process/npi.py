@@ -862,9 +862,7 @@ async def startup(ctx):  # pragma: no cover
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 
     staged_models_by_table = {}  # for the future complex usage
-
     await _ensure_required_extensions()
-
     try:
         archive_model = AddressArchive
         await db.create_table(AddressArchive.__table__, checkfirst=True)
@@ -876,7 +874,6 @@ async def startup(ctx):  # pragma: no cover
             )
     except DuplicateTableError:
         print(f"Address archive table {db_schema}.{archive_model.__tablename__} already exists.")
-
     for cls in (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress, NPIPhoneStaffing):
         staged_models_by_table[cls.__main_table__] = make_class(cls, import_date)
         staged_model = staged_models_by_table[cls.__main_table__]
@@ -888,14 +885,12 @@ async def startup(ctx):  # pragma: no cover
                 f"{db_schema}.{staged_model.__tablename__} "
                 f"({', '.join(staged_model.__my_index_elements__)});"
             )
-
         if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
             for index in cls.__my_initial_indexes__:
                 index_name = index.get("name", "_".join(index.get("index_elements")))
                 using = ""
                 if index_method := index.get("using"):
                     using = f"USING {index_method} "
-
                 unique = ' '
                 if index.get('unique'):
                     unique = ' UNIQUE '
@@ -909,7 +904,6 @@ async def startup(ctx):  # pragma: no cover
                 )
                 print(create_index_sql)
                 await db.status(create_index_sql)
-
     print("Preparing done")
 
 async def refresh_do_business_as(

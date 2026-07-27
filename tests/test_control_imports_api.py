@@ -68,6 +68,21 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert importer_by_name["provider-directory-fhir"]["queue"] == "arq:ProviderDirectoryFHIR"
     assert importer_by_name["provider-directory-fhir"]["schedulable"] is True
     assert importer_by_name["provider-directory-fhir"]["cancelable"] is True
+    florida_profile = importer_by_name["florida-mqa-profile"]
+    assert florida_profile["family"] == "provider"
+    assert florida_profile["enqueue_adapter"] == "arq_single_job"
+    assert florida_profile["queue"] == "arq:FloridaMQAProfile"
+    assert florida_profile["depends_on"] == ["npi"]
+    assert florida_profile["cancelable"] is False
+    assert {
+        param["name"] for param in florida_profile["params_schema"]
+    } >= {
+        "sources",
+        "max_providers",
+        "only_matched",
+        "publish_partial",
+        "allow_volume_drop",
+    }
     resources_param = next(
         param
         for param in importer_by_name["provider-directory-fhir"]["params_schema"]

@@ -39442,7 +39442,10 @@ def _dataset_rehydration_runtime(
     )
 
 
-async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
+async def process_provider_directory_fhir_data(
+    ctx: dict[str, Any],
+    task: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
     task = _apply_provider_directory_refresh_preset(task or {})
     await _raise_if_resource_import_cancelled(ctx, task)
@@ -39574,17 +39577,17 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         else None
     )
     if canonical_backfill_only:
-        metrics = await backfill_provider_directory_canonical_resources(
+        metrics_by_key = await backfill_provider_directory_canonical_resources(
             resources=task.get("resources"),
         )
-        ctx["context"]["audit"] = metrics
+        ctx["context"]["audit"] = metrics_by_key
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
-        return metrics
+        return metrics_by_key
     if contact_backfill_only:
-        metrics = await backfill_provider_directory_location_contacts()
-        ctx["context"]["audit"] = metrics
+        metrics_by_key = await backfill_provider_directory_location_contacts()
+        ctx["context"]["audit"] = metrics_by_key
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
-        return metrics
+        return metrics_by_key
     if publish_artifacts_only:
         publish_metric_by_name = {
             "publish_artifacts": True,
@@ -39695,7 +39698,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             )
             stale_source_deletion_by_type = catalog_cleanup_result["deleted"]
             missing_protected_source_ids = catalog_cleanup_result["protected_source_ids_missing"]
-        metrics: dict[str, Any] = {
+        metrics_by_key: dict[str, Any] = {
             "sources_seeded": len(source_rows),
             "api_endpoints_seeded": endpoint_rows_seeded,
             "source_ids": requested_source_ids,
@@ -39738,7 +39741,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             done=1,
             total=1,
             message=f"seeded {len(source_rows)} Provider Directory source(s)",
-            metrics=metrics,
+            metrics=metrics_by_key,
         )
         valid_source_ids: set[str] | None = None
         if not seed_only and probe and source_rows:
@@ -39748,8 +39751,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 concurrency=concurrency,
                 run_id=run_id,
             )
-            metrics["sources_probed"] = probed
-            metrics["valid_capability_sources"] = valid
+            metrics_by_key["sources_probed"] = probed
+            metrics_by_key["valid_capability_sources"] = valid
         if not seed_only and import_resources and source_rows:
             checkpoint_retry_source_ids = (
                 set(requested_source_ids)
@@ -39766,14 +39769,14 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 checkpoint_retry_source_ids=checkpoint_retry_source_ids,
                 requested_resource_types=resources,
             )
-            metrics.update(selection_metrics)
+            metrics_by_key.update(selection_metrics)
             if requested_source_ids and not importable:
                 selection_error = _requested_source_import_empty_error(
                     requested_source_ids,
                     selection_metrics,
                 )
-                metrics["requested_source_import_error"] = selection_error
-                ctx["context"]["audit"] = metrics
+                metrics_by_key["requested_source_import_error"] = selection_error
+                ctx["context"]["audit"] = metrics_by_key
                 raise RuntimeError(selection_error)
             try:
                 resolved_endpoint_scope = _validate_provider_directory_endpoint_scope(
@@ -39781,20 +39784,20 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     provider_directory_endpoint_scope,
                 )
             except RuntimeError as endpoint_scope_error:
-                metrics["provider_directory_endpoint_scope_error"] = str(
+                metrics_by_key["provider_directory_endpoint_scope_error"] = str(
                     endpoint_scope_error
                 )
-                ctx["context"]["audit"] = metrics
+                ctx["context"]["audit"] = metrics_by_key
                 raise
-            metrics["provider_directory_endpoint_scope_resolved"] = (
+            metrics_by_key["provider_directory_endpoint_scope_resolved"] = (
                 resolved_endpoint_scope
             )
             source_import_groups = _group_resource_import_sources(
                 importable,
                 linked_resource_limit=linked_resource_limit,
             )
-            metrics["source_import_groups_attempted"] = len(source_import_groups)
-            metrics["source_import_duplicate_sources_collapsed"] = len(importable) - len(source_import_groups)
+            metrics_by_key["source_import_groups_attempted"] = len(source_import_groups)
+            metrics_by_key["source_import_duplicate_sources_collapsed"] = len(importable) - len(source_import_groups)
 
             async def resource_progress(
                 done: int,
@@ -39803,8 +39806,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 details: dict[str, Any] | None = None,
             ) -> None:
                 """Publish progress for the active provider-directory resource."""
-                metrics["resource_rows"] = counts
-                metrics["resource_fetch_completed_source_ids"] = {
+                metrics_by_key["resource_rows"] = counts
+                metrics_by_key["resource_fetch_completed_source_ids"] = {
                     resource_type: sorted(source_ids)
                     for resource_type, source_ids in sorted(
                         completed_source_ids_by_resource.items()
@@ -39815,7 +39818,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     if isinstance(details, dict)
                     else []
                 )
-                metrics["active_source_groups"] = active_source_groups
+                metrics_by_key["active_source_groups"] = active_source_groups
                 active_preview = ", ".join(
                     (
                         f"{group.get('sample_org_name') or group.get('sample_source_id')}:"
@@ -39835,7 +39838,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                         f"{active_suffix}"
                     ),
                     details={"active_source_groups": active_source_groups},
-                    metrics=metrics,
+                    metrics=metrics_by_key,
                 )
 
             await _mark_provider_directory_progress(
@@ -39844,14 +39847,14 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 done=0,
                 total=max(len(source_import_groups), 1),
                 message=f"importing resources from {len(source_import_groups)} source group(s)",
-                metrics=metrics,
+                metrics=metrics_by_key,
             )
             completed_source_ids_by_resource: dict[str, set[str]] = {}
             retry_not_before_by_resource: dict[str, str] = {}
             pagination_resume_required_entries: set[str] = set()
-            metrics["resource_rows"] = {}
+            metrics_by_key["resource_rows"] = {}
             if importable:
-                metrics["resource_rows"] = await _import_resources(
+                metrics_by_key["resource_rows"] = await _import_resources(
                     importable,
                     resources=resources,
                     per_resource_limit=resource_limit,
@@ -39863,11 +39866,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     linked_resource_concurrency=concurrency,
                     linked_resource_deadline_seconds=linked_resource_deadline_seconds,
                     resource_deadline_seconds=resource_deadline_seconds,
-                    linked_counts=metrics.setdefault("linked_resource_rows", {}),
-                    resource_fetch_stats=metrics.setdefault("resource_fetch_stats", {}),
+                    linked_counts=metrics_by_key.setdefault("linked_resource_rows", {}),
+                    resource_fetch_stats=metrics_by_key.setdefault("resource_fetch_stats", {}),
                     resource_completion=completed_source_ids_by_resource,
                     resource_retry_not_before=retry_not_before_by_resource,
-                    stale_counts=metrics.setdefault("stale_resource_rows_deleted", {}),
+                    stale_counts=metrics_by_key.setdefault("stale_resource_rows_deleted", {}),
                     stale_cleanup=should_cleanup_stale_rows,
                     stream_batch_size=stream_batch_size,
                     source_concurrency=source_concurrency,
@@ -39891,25 +39894,25 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     ),
                 )
             if retry_not_before_by_resource:
-                metrics["provider_directory_retry_not_before_by_resource"] = dict(
+                metrics_by_key["provider_directory_retry_not_before_by_resource"] = dict(
                     sorted(retry_not_before_by_resource.items())
                 )
-                metrics[SOURCE_RETRY_NOT_BEFORE_METRIC] = max(
+                metrics_by_key[SOURCE_RETRY_NOT_BEFORE_METRIC] = max(
                     retry_not_before_by_resource.values()
                 )
-            metrics["bulk_export_mode"] = _bulk_export_mode_metrics(
+            metrics_by_key["bulk_export_mode"] = _bulk_export_mode_metrics(
                 use_bulk_export,
-                metrics.get("resource_fetch_stats") or {},
+                metrics_by_key.get("resource_fetch_stats") or {},
             )
-            metrics["plan_graph_complete_resource_fetches"] = _resource_fetch_metric_total(
-                metrics.get("resource_fetch_stats") or {},
+            metrics_by_key["plan_graph_complete_resource_fetches"] = _resource_fetch_metric_total(
+                metrics_by_key.get("resource_fetch_stats") or {},
                 "plan_graph_complete_sources",
             )
-            metrics["collection_complete_resource_fetches"] = _resource_fetch_metric_total(
-                metrics.get("resource_fetch_stats") or {},
+            metrics_by_key["collection_complete_resource_fetches"] = _resource_fetch_metric_total(
+                metrics_by_key.get("resource_fetch_stats") or {},
                 "collection_complete_sources",
             )
-            metrics["resource_fetch_completed_source_ids"] = {
+            metrics_by_key["resource_fetch_completed_source_ids"] = {
                 resource_type: sorted(source_ids)
                 for resource_type, source_ids in sorted(
                     completed_source_ids_by_resource.items()
@@ -39917,13 +39920,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             }
             if pagination_resume_required_entries:
                 required_entries = sorted(pagination_resume_required_entries)
-                metrics["pagination_resume_required"] = required_entries
-                ctx["context"]["audit"] = metrics
+                metrics_by_key["pagination_resume_required"] = required_entries
+                ctx["context"]["audit"] = metrics_by_key
                 raise RuntimeError(
                     f"{PAGINATION_RESUME_REQUIRED_ERROR}:"
                     + ",".join(required_entries)
                 )
-            metrics["sources_import_attempted"] = len(importable)
+            metrics_by_key["sources_import_attempted"] = len(importable)
             if should_publish_artifacts or publish_after_acquisition:
                 artifact_source_ids = requested_source_ids
                 if not artifact_source_ids:
@@ -39937,7 +39940,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     for resource_type in ("PractitionerRole", "Practitioner", "Location")
                     if resource_type in resources
                 ]
-                resource_fetch_stats_by_resource = metrics.get("resource_fetch_stats") or {}
+                resource_fetch_stats_by_resource = metrics_by_key.get("resource_fetch_stats") or {}
                 completion_tracking_available = bool(completed_source_ids_by_resource) or bool(
                     resource_fetch_stats_by_resource
                 )
@@ -39952,11 +39955,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     ]
                 else:
                     publishable_artifact_source_ids = list(artifact_source_ids)
-                metrics["publishable_artifact_source_ids"] = publishable_artifact_source_ids
+                metrics_by_key["publishable_artifact_source_ids"] = publishable_artifact_source_ids
                 skipped_artifact_source_ids = sorted(set(artifact_source_ids) - set(publishable_artifact_source_ids))
                 if skipped_artifact_source_ids:
-                    metrics["artifact_publish_skipped_source_ids"] = skipped_artifact_source_ids
-                    metrics["artifact_publish_required_resources"] = required_publish_resources
+                    metrics_by_key["artifact_publish_skipped_source_ids"] = skipped_artifact_source_ids
+                    metrics_by_key["artifact_publish_required_resources"] = required_publish_resources
                 if required_publish_resources and not publishable_artifact_source_ids:
                     skip_payload_by_metric = {
                         "skipped": True,
@@ -39964,18 +39967,18 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                         "required_resources": required_publish_resources,
                         "source_ids": artifact_source_ids,
                     }
-                    metrics["location_contacts_backfilled"] = skip_payload_by_metric
-                    metrics["location_coordinates_backfilled"] = skip_payload_by_metric
-                    metrics["location_address_keys_stamped"] = skip_payload_by_metric
-                    metrics["location_archive"] = skip_payload_by_metric
-                    metrics["address_overlay"] = skip_payload_by_metric
-                    metrics["network_catalog"] = skip_payload_by_metric
-                    metrics["ptg_corroboration_view_published"] = False
-                    metrics["ptg_corroboration_view_skipped"] = skip_payload_by_metric
+                    metrics_by_key["location_contacts_backfilled"] = skip_payload_by_metric
+                    metrics_by_key["location_coordinates_backfilled"] = skip_payload_by_metric
+                    metrics_by_key["location_address_keys_stamped"] = skip_payload_by_metric
+                    metrics_by_key["location_archive"] = skip_payload_by_metric
+                    metrics_by_key["address_overlay"] = skip_payload_by_metric
+                    metrics_by_key["network_catalog"] = skip_payload_by_metric
+                    metrics_by_key["ptg_corroboration_view_published"] = False
+                    metrics_by_key["ptg_corroboration_view_skipped"] = skip_payload_by_metric
                 else:
-                    metrics = await _publish_selected_provider_directory_artifacts(
+                    metrics_by_key = await _publish_selected_provider_directory_artifacts(
                         run_id=run_id,
-                        metrics=metrics,
+                        metrics=metrics_by_key,
                         source_ids=publishable_artifact_source_ids,
                         seen_table=seen_stage_table_for_publish,
                         publish_after_acquisition=publish_after_acquisition,
@@ -39983,17 +39986,17 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                         publish_artifacts_targets=publish_artifacts_targets,
                     )
             else:
-                metrics["location_contacts_backfilled"] = {
+                metrics_by_key["location_contacts_backfilled"] = {
                     "skipped": True,
                     "reason": "publish_artifacts_disabled",
                 }
-                metrics["location_coordinates_backfilled"] = {
+                metrics_by_key["location_coordinates_backfilled"] = {
                     "skipped": True,
                     "reason": "publish_artifacts_disabled",
                 }
-                metrics["location_address_keys_stamped"] = 0
-                metrics["location_archive"] = {"skipped": True, "reason": "publish_artifacts_disabled"}
-                metrics["ptg_corroboration_view_published"] = False
+                metrics_by_key["location_address_keys_stamped"] = 0
+                metrics_by_key["location_archive"] = {"skipped": True, "reason": "publish_artifacts_disabled"}
+                metrics_by_key["ptg_corroboration_view_published"] = False
             source_local_ids = list(requested_source_ids)
             if not source_local_ids and len(importable) == 1:
                 source_id = _clean_text(importable[0].get("source_id"))
@@ -40005,18 +40008,18 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 ),
             )
             if profile_followup is not None:
-                metrics["profile_followup"] = profile_followup
-        ctx["context"]["audit"] = metrics
+                metrics_by_key["profile_followup"] = profile_followup
+        ctx["context"]["audit"] = metrics_by_key
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         print(
             "Provider Directory FHIR import done: "
-            f"sources_seeded={metrics['sources_seeded']} "
-            f"sources_probed={metrics['sources_probed']} "
-            f"valid_capability_sources={metrics['valid_capability_sources']} "
-            f"resource_rows={metrics['resource_rows']}"
+            f"sources_seeded={metrics_by_key['sources_seeded']} "
+            f"sources_probed={metrics_by_key['sources_probed']} "
+            f"valid_capability_sources={metrics_by_key['valid_capability_sources']} "
+            f"resource_rows={metrics_by_key['resource_rows']}"
         )
-        print("PROVIDER_DIRECTORY_FHIR_IMPORT_DONE\t" + json.dumps(metrics, sort_keys=True, default=str))
-        return metrics
+        print("PROVIDER_DIRECTORY_FHIR_IMPORT_DONE\t" + json.dumps(metrics_by_key, sort_keys=True, default=str))
+        return metrics_by_key
     finally:
         if seen_stage_table_for_publish:
             await _drop_import_seen_stage_table(seen_stage_table_for_publish)
@@ -40025,6 +40028,10 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             tmpdir.cleanup()
         if retest_tmpdir is not None:
             retest_tmpdir.cleanup()
+
+
+process_data = process_provider_directory_fhir_data
+process_data.__name__ = "process_data"
 
 
 async def startup(ctx: dict[str, Any]) -> None:
@@ -40043,7 +40050,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     ctx.setdefault("context", {})["finished_at"] = _now().isoformat()
 
 
-async def main(
+async def run_provider_directory_fhir_command(
     *,
     test_mode: bool = False,
     seed_db_path: str | None = None,
@@ -40150,6 +40157,10 @@ async def main(
     import_result = await process_data(runtime_context_by_key, task_by_field)
     await shutdown(runtime_context_by_key)
     return import_result
+
+
+main = run_provider_directory_fhir_command
+main.__name__ = "main"
 
 
 def _clean_source_id_list(raw_source_ids: Any) -> list[str]:

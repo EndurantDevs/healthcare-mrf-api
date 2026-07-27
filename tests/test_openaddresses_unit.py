@@ -835,35 +835,26 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
 
     async def fake_create_indexes(table_name, schema):
         seen_by_field["create_indexes"] = (schema, table_name)
-
     async def fake_refresh_archive_geocodes_sharded(**_kwargs):
         return openaddresses.OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
-
     async def fake_restore_zip5_from_tiger(**_kwargs):
         return openaddresses.OpenAddressesZipRestoreStats()
-
     class FakeTransaction:
         async def __aenter__(self):
             return None
-
         async def __aexit__(self, *_exc):
             return False
-
     class FakeDb:
         async def scalar(self, stmt, **_params):
             if "WHERE zip5 IS NULL" in stmt:
                 return 0
             return 3
-
         async def execute_ddl(self, _stmt):
             return None
-
         async def status(self, _stmt, **_params):
             return None
-
         def transaction(self):
             return FakeTransaction()
-
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
     monkeypatch.setattr(openaddresses, "_is_table_present", is_table_present)
     monkeypatch.setattr(openaddresses, "_create_indexes", fake_create_indexes)
@@ -879,7 +870,6 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     )
     monkeypatch.setattr(openaddresses, "db", FakeDb())
     monkeypatch.setattr(openaddresses, "print_time_info", lambda _started_at: None)
-
     await openaddresses.shutdown(
         {
             "import_date": "startupwrong",
@@ -890,7 +880,6 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
             },
         }
     )
-
     assert seen_by_field["table_exists"] == ("mrf", "openaddresses_geocode_oadev20260619")
     assert seen_by_field["create_indexes"] == ("mrf", "openaddresses_geocode_oadev20260619")
 

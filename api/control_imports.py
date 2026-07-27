@@ -50,6 +50,7 @@ _IMPORT_RUN_ENSURE_STATE = _ImportRunEnsureState()
 
 _IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
     "npi": ["nucc"],
+    "florida-mqa-profile": ["npi"],
     "terminology-synonyms": ["nucc", "code-sets", "clinical-reference", "claims-pricing", "drug-claims"],
 }
 
@@ -197,6 +198,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.provider_directory_fhir",
         "target_function": "process_data",
         "run_shutdown": True,
+    },
+    "florida-mqa-profile": {
+        "queue": "arq:FloridaMQAProfile",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "process.florida_mqa_profile",
+        "target_function": "process_data",
     },
     "entity-address-unified": {
         "queue": "arq:EntityAddressUnified",
@@ -350,6 +358,7 @@ def _importer_family(importer: str) -> str:
         "provider-quality",
         "provider-enrichment",
         "provider-directory-fhir",
+        "florida-mqa-profile",
         "entity-address-unified",
         "cms-doctors",
         "address-archive-v2-migrate",

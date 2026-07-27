@@ -19,7 +19,7 @@ from process.serialization import deserialize_job, serialize_job
 ADDRESS_ARCHIVE_QUEUE_NAME = "arq:AddressArchive"
 
 
-async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
+async def process_address_archive_migration_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Process one address-archive migration task."""
     task_by_field = task if isinstance(task, dict) else {}
     run_id = str(
@@ -74,7 +74,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     return migration_result_by_field
 
 
-async def main(
+process_data = process_address_archive_migration_data
+process_data.__name__ = "process_data"
+
+
+async def run_address_archive_migration_command(
     *,
     dry_run: bool = False,
     legacy_table: str = "address_archive",
@@ -109,6 +113,10 @@ async def main(
         )
         return None
     return await process_data({}, task_by_field)
+
+
+main = run_address_archive_migration_command
+main.__name__ = "main"
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -303,7 +303,11 @@ def test_worker_manifest_sets_pod_identity_options(monkeypatch):
         "secret-one, secret-two",
     )
     monkeypatch.delenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", raising=False)
-    monkeypatch.setattr(control_workers, "_worker_job_secret_env", lambda: [])
+    monkeypatch.setattr(
+        control_workers,
+        "_worker_job_secret_env",
+        lambda _worker_class: [],
+    )
     monkeypatch.setattr(control_workers, "_worker_job_env_from", lambda: [])
     monkeypatch.setattr(
         control_workers,

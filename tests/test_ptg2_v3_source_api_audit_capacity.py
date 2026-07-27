@@ -228,20 +228,16 @@ def test_request_page_binds_exact_body_status_multivalue_headers_and_latency(
     monkeypatch,
 ):
     """Bind signed evidence to exact HTTP status, body, headers, and latency."""
-
     captured_request_map = {}
-
     def collect(response_headers, **kwargs):
         captured_request_map.update(kwargs)
         captured_request_map["header_pairs"] = response_headers.items(multi=True)
         return _observation(kwargs["query_parameters"])
-
     monkeypatch.setattr(
         audit.capacity_evidence,
         "collect_capacity_http_observation",
         collect,
     )
-
     def handler(request):
         assert capacity.CAPACITY_CHALLENGE_HEADER in request.headers
         assert capacity.CAPACITY_RUN_NONCE_HEADER in request.headers
@@ -257,7 +253,6 @@ def test_request_page_binds_exact_body_status_multivalue_headers_and_latency(
             headers=[("X-Duplicate", "one"), ("X-Duplicate", "two")],
             request=request,
         )
-
     collector = audit.CapacityEvidenceCollector(
         TRUST,
         contention_run_id=CONTENTION_RUN_ID,
@@ -276,7 +271,6 @@ def test_request_page_binds_exact_body_status_multivalue_headers_and_latency(
         )
         assert capacity.CAPACITY_CHALLENGE_HEADER not in fetcher.client.headers
         assert capacity.CAPACITY_RUN_NONCE_HEADER not in fetcher.client.headers
-
     assert response_body_json == {"ok": True}
     assert retries == 0
     assert page_latency_ms >= observations[0].latency_ms >= 0

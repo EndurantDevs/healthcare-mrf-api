@@ -384,18 +384,15 @@ async def test_new_checkpoint_is_reserved_before_ownership_probe(monkeypatch):
 
     async def ownership_probe():
         events.append("ownership")
-
     async def stop_after_claim(*_args, **_kwargs):
         events.append("manifest")
         return None, "bulk_export_test_stop", 0
-
     monkeypatch.setattr(importer, "_bulk_client_session", client_session)
     monkeypatch.setattr(importer, "_load_bulk_export_checkpoint", load_checkpoint)
     monkeypatch.setattr(importer, "_reserve_bulk_export_checkpoint", reserve_checkpoint)
     monkeypatch.setattr(importer, "_start_checkpointed_bulk_export", start_checkpoint)
     monkeypatch.setattr(importer, "_bulk_checkpoint_primary_secret", lambda: "key")
     monkeypatch.setattr(importer, "_checkpointed_bulk_export_manifest", stop_after_claim)
-
     fetch_result = await importer._fetch_owned_checkpointed_bulk_resource_rows(
         _source(),
         identity,
@@ -409,7 +406,6 @@ async def test_new_checkpoint_is_reserved_before_ownership_probe(monkeypatch):
         ),
         ownership_probe,
     )
-
     assert fetch_result is not None
     assert fetch_result.error == "bulk_export_test_stop"
     assert events == [
@@ -440,31 +436,24 @@ async def test_retry_checkpoint_is_adopted_before_ownership_probe(monkeypatch):
     @contextlib.asynccontextmanager
     async def client_session():
         yield object()
-
     async def load_checkpoint(_identity):
         events.append("load")
         return prior_checkpoint_by_field
-
     async def adopt_checkpoint(_identity):
         events.append("adopt")
         return adopted_checkpoint_by_field
-
     async def ownership_probe():
         events.append("ownership")
-
     async def cancel_probe(_ctx, _task, _deadline_at):
         events.append("cancel")
-
     async def stop_after_claim(*_args, **_kwargs):
         events.append("manifest")
         return None, "bulk_export_test_stop", 0
-
     monkeypatch.setattr(importer, "_bulk_client_session", client_session)
     monkeypatch.setattr(importer, "_load_bulk_export_checkpoint", load_checkpoint)
     monkeypatch.setattr(importer, "_adopt_bulk_export_checkpoint", adopt_checkpoint)
     monkeypatch.setattr(importer, "_bulk_cancel_probe", cancel_probe)
     monkeypatch.setattr(importer, "_checkpointed_bulk_export_manifest", stop_after_claim)
-
     fetch_result = await importer._fetch_owned_checkpointed_bulk_resource_rows(
         _source(),
         identity,
@@ -478,7 +467,6 @@ async def test_retry_checkpoint_is_adopted_before_ownership_probe(monkeypatch):
         ),
         ownership_probe,
     )
-
     assert fetch_result is not None
     assert fetch_result.error == "bulk_export_test_stop"
     assert events == [

@@ -234,10 +234,8 @@ async def process_data(ctx, task=None):
                     state = provider_row.get("State") or provider_row.get("state")
                     zip_code = str(provider_row.get("Zip Code") or provider_row.get("ZIP Code") or provider_row.get("zip_code") or "")[:5]
                     provider_type = provider_row.get("Primary specialty") or provider_row.get("pri_spec")
-
                     if not addr1 or not zip_code or len(zip_code) < 5:
                         continue
-
                     address_checksum = return_checksum([
                         npi,
                         addr1 or "",
@@ -250,7 +248,6 @@ async def process_data(ctx, task=None):
                     if address_checksum in seen_keys:
                         continue
                     seen_keys.add(address_checksum)
-
                     provider_batch_rows.append({
                         "npi": npi,
                         "address_checksum": address_checksum,
@@ -262,16 +259,13 @@ async def process_data(ctx, task=None):
                         "provider_type": provider_type,
                         "updated_at": now,
                     })
-
                     if len(provider_batch_rows) >= batch_size:
                         await raise_if_cancelled(ctx, task)
                         await push_objects(provider_batch_rows, stage_cls)
                         accepted_rows += len(provider_batch_rows)
                         provider_batch_rows.clear()
-
                     if test_mode and accepted_rows + len(provider_batch_rows) >= test_row_limit:
                         break
-
                 if provider_batch_rows:
                     await raise_if_cancelled(ctx, task)
                     await push_objects(provider_batch_rows, stage_cls)
@@ -324,7 +318,7 @@ async def startup(ctx):
     logger.info("CMS Doctors startup ready: schema=%s import_date=%s", db_schema, import_date)
 
 
-async def shutdown(ctx):
+async def publish_cms_doctors_generation(ctx):
     """Publish a completed CMS Doctors stage or record its terminal failure."""
 
     import_date = ctx.get("import_date")
@@ -432,6 +426,10 @@ async def shutdown(ctx):
             **({"address_resolve": address_stats.__dict__} if address_stats else {}),
         },
     )
+
+
+shutdown = publish_cms_doctors_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(test_mode: bool = False):

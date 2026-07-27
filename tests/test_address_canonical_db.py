@@ -671,7 +671,6 @@ async def test_resolve_aborts_when_stamped_key_disagrees_with_identity(monkeypat
             priority=1,
             schema=schema,
         )
-
     assert str(stale_key) in str(exc.value)
     assert str(expected_key) in str(exc.value)
     assert int(await db.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2;") or 0) == 0
@@ -1547,16 +1546,13 @@ async def test_address_canonical_helpers_honor_cancel_before_writes():
         "zip": "zip_code",
         "country": "'US'",
     }
-
     with pytest.raises(RuntimeError, match="cancel requested"):
         await stamp_address_keys(stage_table, field_map, schema=schema, cancel_check=cancel_check)
-
     keyed_rows = int(
         await db.scalar(f"SELECT count(*) FROM {schema}.{stage_table} WHERE address_key IS NOT NULL;")
         or 0
     )
     assert keyed_rows == 0
-
     await stamp_address_keys(stage_table, field_map, schema=schema)
     with pytest.raises(RuntimeError, match="cancel requested"):
         await resolve_into_archive(
@@ -1567,6 +1563,5 @@ async def test_address_canonical_helpers_honor_cancel_before_writes():
             schema=schema,
             cancel_check=cancel_check,
         )
-
     archive_rows = int(await db.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2;") or 0)
     assert archive_rows == 0

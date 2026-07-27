@@ -7105,11 +7105,9 @@ def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "")
         parsed = urlsplit(url)
-        host = parsed.netloc.lower()
-        path = parsed.path.lower()
+        host, path = parsed.netloc.lower(), parsed.path.lower()
         file_name = Path(path).name
-        label = _clean_text(candidate.get("label"))
-        text = f"{path} {label}".lower().replace("_", "-")
+        text = f"{path} {_clean_text(candidate.get('label'))}".lower().replace("_", "-")
         if host == "github.com" and path.startswith("/cmsgov/price-transparency-guide"):
             continue
         if host.endswith("cms.gov") and "price-transparency" in path:
@@ -13339,100 +13337,100 @@ async def _crawl_targets_for_source(
 ) -> list[CrawlTarget]:
     """Resolve crawl targets for one source URL using its platform resolver."""
     platform = source_row.get("hosting_platform") or classify_hosting_platform(url)
-    resolver = _platform_resolver_config(str(platform) if platform else None)
-    if resolver and target_limit and target_limit > 0:
-        resolver = dict(resolver)
-        existing_max_targets = _as_int(resolver.get("max_targets"))
-        resolver["max_targets"] = (
+    resolver_by_key = _platform_resolver_config(str(platform) if platform else None)
+    if resolver_by_key and target_limit and target_limit > 0:
+        resolver_by_key = dict(resolver_by_key)
+        existing_max_targets = _as_int(resolver_by_key.get("max_targets"))
+        resolver_by_key["max_targets"] = (
             min(existing_max_targets, target_limit)
             if existing_max_targets
             else target_limit
         )
-    resolver_type = str(resolver.get("type") or "").strip()
+    resolver_type = str(resolver_by_key.get("type") or "").strip()
     if resolver_type == "bcbsma_monthly_tocs":
-        return _bcbsma_monthly_toc_targets(source_row, url, resolver)
+        return _bcbsma_monthly_toc_targets(source_row, url, resolver_by_key)
     if resolver_type == "monthly_toc_templates":
-        return _monthly_toc_targets(source_row, url, resolver)
+        return _monthly_toc_targets(source_row, url, resolver_by_key)
     if resolver_type == "kaiser_monthly_inventory":
         return await _resolve_kaiser_monthly_inventory(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "azure_mrf_listing":
-        return await _resolve_azure_mrf_listing(source_row, url, resolver, session)
+        return await _resolve_azure_mrf_listing(source_row, url, resolver_by_key, session)
     if resolver_type == "triples_mtt_api":
-        return await _resolve_triples_mtt_api(source_row, url, resolver, session)
+        return await _resolve_triples_mtt_api(source_row, url, resolver_by_key, session)
     if resolver_type == "s3_xml_listing":
-        return await _resolve_s3_xml_listing(source_row, url, resolver, session)
+        return await _resolve_s3_xml_listing(source_row, url, resolver_by_key, session)
     if resolver_type == "cigna_static_mrf_lookup":
-        return await _resolve_cigna_static_mrf_lookup(source_row, url, resolver, session)
+        return await _resolve_cigna_static_mrf_lookup(source_row, url, resolver_by_key, session)
     if resolver_type == "bcbs_global_solutions_mrf":
-        return await _resolve_bcbs_global_solutions_mrf(source_row, url, resolver, session)
+        return await _resolve_bcbs_global_solutions_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "bcbs_asomrf_filelist":
-        return await _resolve_bcbs_asomrf_filelist(source_row, url, resolver, session)
+        return await _resolve_bcbs_asomrf_filelist(source_row, url, resolver_by_key, session)
     if resolver_type == "meritain_mrf_search":
-        return await _resolve_meritain_mrf_search(source_row, url, resolver, session)
+        return await _resolve_meritain_mrf_search(source_row, url, resolver_by_key, session)
     if resolver_type == "healthcarebluebook_mrf":
-        return await _resolve_healthcarebluebook_mrf(source_row, url, resolver, session)
+        return await _resolve_healthcarebluebook_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "ebms_caa_directory":
-        return await _resolve_ebms_caa_directory(source_row, url, resolver, session)
+        return await _resolve_ebms_caa_directory(source_row, url, resolver_by_key, session)
     if resolver_type == "html_mrf_with_healthcarebluebook":
         return await _resolve_html_mrf_with_healthcarebluebook(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "healthgram_network_index":
-        return await _resolve_healthgram_network_index(source_row, url, resolver, session)
+        return await _resolve_healthgram_network_index(source_row, url, resolver_by_key, session)
     if resolver_type == "anthem_s3_mrf":
-        return await _resolve_anthem_s3_mrf(source_row, url, resolver, session)
+        return await _resolve_anthem_s3_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "hcsc_asomrf_landing":
-        return await _resolve_hcsc_asomrf_landing(source_row, url, resolver, session)
+        return await _resolve_hcsc_asomrf_landing(source_row, url, resolver_by_key, session)
     if resolver_type == "point32_azure_mrf_directory":
         return await _resolve_point32_azure_mrf_directory(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "html_delegated_mrf_links":
-        return await _resolve_html_delegated_mrf_links(source_row, url, resolver, session)
+        return await _resolve_html_delegated_mrf_links(source_row, url, resolver_by_key, session)
     if resolver_type == "midlandschoice_mrf":
-        return await _resolve_midlandschoice_mrf(source_row, url, resolver, session)
+        return await _resolve_midlandschoice_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "wordpress_elfinder_mrf_links":
         return await _resolve_wordpress_elfinder_mrf_links(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "html_mrf_links":
-        return await _resolve_html_mrf_links(source_row, url, resolver, session)
+        return await _resolve_html_mrf_links(source_row, url, resolver_by_key, session)
     if resolver_type == "socrata_data_json_mrf_catalog":
         return await _resolve_socrata_data_json_mrf_catalog(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "json_mrf_directory_links":
-        return await _resolve_json_mrf_directory_links(source_row, url, resolver, session)
+        return await _resolve_json_mrf_directory_links(source_row, url, resolver_by_key, session)
     if resolver_type == "healthspace_machine_readable_files":
         return await _resolve_healthspace_machine_readable_files(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "humana_pct_file_list":
-        return await _resolve_humana_pct_file_list(source_row, url, resolver, session)
+        return await _resolve_humana_pct_file_list(source_row, url, resolver_by_key, session)
     if resolver_type == "fchn_payor_search":
-        return await _resolve_fchn_payor_search(source_row, url, resolver, session)
+        return await _resolve_fchn_payor_search(source_row, url, resolver_by_key, session)
     if resolver_type == "viva_health_mrf":
-        return await _resolve_viva_health_mrf(source_row, url, resolver, session)
+        return await _resolve_viva_health_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "healthez_benefits_mrf":
-        return await _resolve_healthez_benefits_mrf(source_row, url, resolver, session)
+        return await _resolve_healthez_benefits_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "payercompass_mrf":
-        return await _resolve_payercompass_mrf(source_row, url, resolver, session)
+        return await _resolve_payercompass_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "webtpa_mrf_api":
-        return await _resolve_webtpa_mrf_api(source_row, url, resolver, session)
+        return await _resolve_webtpa_mrf_api(source_row, url, resolver_by_key, session)
     if resolver_type == "cmstic_file_info":
-        return await _resolve_cmstic_file_info(source_row, url, resolver, session)
+        return await _resolve_cmstic_file_info(source_row, url, resolver_by_key, session)
     if resolver_type == "cmstic_keyed_toc_redirect":
         return await _resolve_cmstic_keyed_toc_redirect(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "direct_toc":
         crawl_target = _direct_toc_crawl_target(
             source_row,
             url,
             resolver=resolver_type,
-            target_max_bytes=_parse_size_bytes(resolver.get("toc_max_bytes")),
+            target_max_bytes=_parse_size_bytes(resolver_by_key.get("toc_max_bytes")),
         )
         if crawl_target:
             return [crawl_target]
@@ -13443,31 +13441,31 @@ async def _crawl_targets_for_source(
             return [crawl_target]
         raise ValueError(f"no direct MRF body target found for {url}")
     if resolver_type == "github_repo_mrf_tree":
-        return await _resolve_github_repo_mrf(source_row, url, resolver, session)
+        return await _resolve_github_repo_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "auxiant_wordpress_directory":
         return await _resolve_auxiant_wordpress_directory(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "healthsparq_direct_metadata":
-        return await _resolve_healthsparq_direct_metadata(source_row, url, resolver, session)
+        return await _resolve_healthsparq_direct_metadata(source_row, url, resolver_by_key, session)
     if resolver_type == "healthsparq_public_mrf":
-        return await _resolve_healthsparq_public_mrf(source_row, url, resolver, session)
+        return await _resolve_healthsparq_public_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "providence_mrf_api":
-        return await _resolve_providence_mrf_api(source_row, url, resolver, session)
+        return await _resolve_providence_mrf_api(source_row, url, resolver_by_key, session)
     if resolver_type == "magnacare_transparency_mrf":
         return await _resolve_magnacare_transparency_mrf(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "mymedicalshopper_talon_mrf":
-        return await _resolve_mymedicalshopper_talon_mrf(source_row, url, resolver, session)
+        return await _resolve_mymedicalshopper_talon_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "asr_health_benefits_mrf":
-        return _resolve_asr_health_benefits_mrf(source_row, url, resolver)
+        return _resolve_asr_health_benefits_mrf(source_row, url, resolver_by_key)
     if resolver_type == "highmark_hmhs_script":
-        script_path = str(resolver.get("script_path") or "/js/script.js")
+        script_path = str(resolver_by_key.get("script_path") or "/js/script.js")
         script_url = urljoin(url, script_path)
         script_text = await _fetch_text(
             script_url,
-            max_bytes=int(resolver.get("max_bytes") or 1024 * 1024),
+            max_bytes=int(resolver_by_key.get("max_bytes") or 1024 * 1024),
             session=session,
         )
         crawl_targets = _parse_highmark_hmhs_script(script_text, base_url=url)
@@ -13492,7 +13490,7 @@ async def _crawl_targets_for_source(
         listing_url = _uhc_provider_mrf_api_url(url)
         listing = await _fetch_json(
             listing_url,
-            max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+            max_bytes=int(resolver_by_key.get("max_bytes") or 10 * 1024 * 1024),
             session=session,
         )
         crawl_targets = _uhc_provider_mrf_targets_from_payload(
@@ -13500,7 +13498,7 @@ async def _crawl_targets_for_source(
             listing,
             listing_url=listing_url,
             resolver_type=resolver_type,
-            max_targets=_as_int(resolver.get("max_targets")),
+            max_targets=_as_int(resolver_by_key.get("max_targets")),
         )
         if not crawl_targets:
             raise ValueError(f"no UHC provider MRF files found for {url}")
@@ -13508,9 +13506,9 @@ async def _crawl_targets_for_source(
     if resolver_type == "uhc_blob_listing":
         host = _domain(url) or ""
         configured_paths = (
-            resolver.get("optum_path_templates")
+            resolver_by_key.get("optum_path_templates")
             if "optum.com" in host
-            else resolver.get("path_templates")
+            else resolver_by_key.get("path_templates")
         )
         paths = [str(resolver_entry) for resolver_entry in (configured_paths or ()) if str(resolver_entry).strip()]
         target_query = _source_target_payer_query(source_row)
@@ -13519,7 +13517,7 @@ async def _crawl_targets_for_source(
             listing_url = urljoin(url, path)
             listing = await _fetch_json(
                 listing_url,
-                max_bytes=int(resolver.get("max_bytes") or 64 * 1024 * 1024),
+                max_bytes=int(resolver_by_key.get("max_bytes") or 64 * 1024 * 1024),
                 session=session,
             )
             parsed_targets = _uhc_blob_targets_matching_query(
@@ -13527,7 +13525,7 @@ async def _crawl_targets_for_source(
                 target_query,
             )
             if target_query:
-                max_targets = _as_int(resolver.get("max_targets"))
+                max_targets = _as_int(resolver_by_key.get("max_targets"))
                 if max_targets and max_targets > 0:
                     parsed_targets = parsed_targets[:max_targets]
             for crawl_target in parsed_targets:
@@ -13574,13 +13572,13 @@ async def _crawl_targets_for_source(
             ]
         html_text = await _fetch_text(
             url,
-            max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+            max_bytes=int(resolver_by_key.get("max_bytes") or 5 * 1024 * 1024),
             session=session,
         )
         crawl_targets = _parse_sapphire_toc_links(html_text, base_url=url)
         if not crawl_targets:
             crawl_targets = await _resolve_sapphire_static_query_toc_links(
-                url, resolver, session
+                url, resolver_by_key, session
             )
         if not crawl_targets:
             raise ValueError(f"no Sapphire TOC links found for {url}")
@@ -13599,51 +13597,51 @@ async def _crawl_targets_for_source(
             for crawl_target in crawl_targets
         ]
     if resolver_type == "anthem_s3_mrf":
-        return await _resolve_anthem_s3_mrf(source_row, url, resolver, session)
+        return await _resolve_anthem_s3_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "hcsc_asomrf_landing":
-        return await _resolve_hcsc_asomrf_landing(source_row, url, resolver, session)
+        return await _resolve_hcsc_asomrf_landing(source_row, url, resolver_by_key, session)
     if resolver_type == "point32_azure_mrf_directory":
         return await _resolve_point32_azure_mrf_directory(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "html_delegated_mrf_links":
-        return await _resolve_html_delegated_mrf_links(source_row, url, resolver, session)
+        return await _resolve_html_delegated_mrf_links(source_row, url, resolver_by_key, session)
     if resolver_type == "wordpress_elfinder_mrf_links":
         return await _resolve_wordpress_elfinder_mrf_links(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "html_mrf_links":
-        return await _resolve_html_mrf_links(source_row, url, resolver, session)
+        return await _resolve_html_mrf_links(source_row, url, resolver_by_key, session)
     if resolver_type == "socrata_data_json_mrf_catalog":
         return await _resolve_socrata_data_json_mrf_catalog(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "json_mrf_directory_links":
-        return await _resolve_json_mrf_directory_links(source_row, url, resolver, session)
+        return await _resolve_json_mrf_directory_links(source_row, url, resolver_by_key, session)
     if resolver_type == "healthspace_machine_readable_files":
         return await _resolve_healthspace_machine_readable_files(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "humana_pct_file_list":
-        return await _resolve_humana_pct_file_list(source_row, url, resolver, session)
+        return await _resolve_humana_pct_file_list(source_row, url, resolver_by_key, session)
     if resolver_type == "fchn_payor_search":
-        return await _resolve_fchn_payor_search(source_row, url, resolver, session)
+        return await _resolve_fchn_payor_search(source_row, url, resolver_by_key, session)
     if resolver_type == "payercompass_mrf":
-        return await _resolve_payercompass_mrf(source_row, url, resolver, session)
+        return await _resolve_payercompass_mrf(source_row, url, resolver_by_key, session)
     if resolver_type == "webtpa_mrf_api":
-        return await _resolve_webtpa_mrf_api(source_row, url, resolver, session)
+        return await _resolve_webtpa_mrf_api(source_row, url, resolver_by_key, session)
     if resolver_type == "cmstic_file_info":
-        return await _resolve_cmstic_file_info(source_row, url, resolver, session)
+        return await _resolve_cmstic_file_info(source_row, url, resolver_by_key, session)
     if resolver_type == "cmstic_keyed_toc_redirect":
         return await _resolve_cmstic_keyed_toc_redirect(
-            source_row, url, resolver, session
+            source_row, url, resolver_by_key, session
         )
     if resolver_type == "direct_toc":
         crawl_target = _direct_toc_crawl_target(
             source_row,
             url,
             resolver=resolver_type,
-            target_max_bytes=_parse_size_bytes(resolver.get("toc_max_bytes")),
+            target_max_bytes=_parse_size_bytes(resolver_by_key.get("toc_max_bytes")),
         )
         if crawl_target:
             return [crawl_target]
@@ -15767,7 +15765,7 @@ async def _execute_discovery_source_batch(
         )
 
 
-async def main(
+async def run_mrf_source_discovery_command(
     test_mode: bool = False,
     provider: str | None = None,
     limit: int | None = None,
@@ -16178,7 +16176,11 @@ async def main(
     return discovery_result.as_dict()
 
 
-async def process_data(
+main = run_mrf_source_discovery_command
+main.__name__ = "main"
+
+
+async def process_mrf_source_discovery_data(
     ctx: dict[str, Any] | None = None, task: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """Run discovery from a worker task and return its result mapping."""
@@ -16217,6 +16219,10 @@ async def process_data(
             str(task.get("mrf_discovery_root_run_id") or "").strip() or None
         ),
     )
+
+
+process_data = process_mrf_source_discovery_data
+process_data.__name__ = "process_data"
 
 
 async def startup(ctx: dict[str, Any]) -> None:

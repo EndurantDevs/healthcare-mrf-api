@@ -10277,7 +10277,7 @@ def _inference_sql(
     """
 
 
-async def process_data(ctx, task=None):
+async def process_entity_address_unified_data(ctx, task=None):
     """Materialize and optionally publish the unified entity-address dataset."""
     task = task or {}
     ctx.setdefault("context", {})
@@ -11784,6 +11784,10 @@ async def process_data(ctx, task=None):
     )
 
 
+process_data = process_entity_address_unified_data
+process_data.__name__ = "process_data"
+
+
 async def startup(ctx):
     """Initialize one entity-address-unified import context."""
     await my_init_db(db)
@@ -11805,7 +11809,7 @@ async def startup(ctx):
     )
 
 
-async def shutdown(ctx):
+async def publish_entity_address_unified_generation(ctx):
     """Finalize, validate, and publish one entity-address-unified import."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
@@ -12306,7 +12310,11 @@ async def shutdown(ctx):
     print_time_info(context.get("start"))
 
 
-async def main(
+shutdown = publish_entity_address_unified_generation
+shutdown.__name__ = "shutdown"
+
+
+async def run_entity_address_unified_command(
     test_mode: bool = False,
     limit_per_source: int | None = None,
     publish: bool | None = None,
@@ -12348,3 +12356,7 @@ async def main(
         task_payload_map,
         _queue_name=ENTITY_ADDRESS_UNIFIED_QUEUE_NAME,
     )
+
+
+main = run_entity_address_unified_command
+main.__name__ = "main"

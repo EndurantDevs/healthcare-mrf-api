@@ -7,7 +7,9 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import importlib
+import io
 import json
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -198,6 +200,12 @@ def test_import_run_cursor_rejects_invalid_and_normalizes_aware_time():
     blank_cursor = base64.urlsafe_b64encode(blank_payload).decode().rstrip("=")
     with pytest.raises(ValueError, match="invalid cursor"):
         control_imports._decode_import_run_cursor(blank_cursor)
+    aware_payload = json.dumps(
+        {"created_at": "2026-07-21T01:00:00+01:00", "run_id": "offset"}
+    ).encode()
+    aware_cursor = base64.urlsafe_b64encode(aware_payload).decode().rstrip("=")
+    decoded_time, _run_id = control_imports._decode_import_run_cursor(aware_cursor)
+    assert decoded_time == dt.datetime(2026, 7, 21)
 
 
 @pytest.mark.asyncio
@@ -232,6 +240,21 @@ async def test_worker_state_helpers_cover_unsupported_error_and_failed_items(
         {**failed_item_by_field, "failure": {"exitCode": 17}}
     )
     assert error["exitCode"] == 17
+    assert "exitCode" not in control_imports._worker_job_failure_error(
+        failed_item_by_field
+    )
+
+    class TruthyBlank:
+        def __bool__(self):
+            return True
+
+        def __str__(self):
+            return ""
+
+    blank_reason = control_imports._worker_job_failure_error(
+        {**failed_item_by_field, "failure": {"reason": TruthyBlank()}}
+    )
+    assert blank_reason["reason"] == "failed"
 
 
 def _acquisition_params() -> dict[str, object]:
@@ -269,7 +292,6 @@ def test_acquisition_scope_rejects_source_and_discovered_endpoint_edges():
         )
         is None
     )
-
     metrics_by_name = {
         "active_source_groups": [
             {"api_base": "https://one.test/fhir"},
@@ -283,3 +305,166 @@ def test_acquisition_scope_rejects_source_and_discovered_endpoint_edges():
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_health_helpers_report_success_and_invalid_sysconf(monkeypatch):
+    monkeypatch.setattr(control_imports.db, "execute", AsyncMock())
+    assert await control_imports._database_check() == {"ok": True}
+
+    redis_client = Mock()
+    monkeypatch.setattr(control_imports, "_redis_client", lambda: redis_client)
+    assert control_imports._redis_check() == {"ok": True}
+
+    from api import control_workers
+
+    monkeypatch.setattr(
+        control_workers,
+        "worker_registry",
+        lambda: [
+            {
+                "queue": "profile",
+                "worker_class": "process.FloridaMQAProfile",
+                "role": "provider-profile",
+                "running": True,
+                "pid": 42,
+            }
+        ],
+    )
+    assert control_imports._worker_health()["profile"]["running"] is True
+
+    monkeypatch.setattr(
+        control_imports,
+        "_worker_health",
+        lambda: {"profile": {"running": True}},
+    )
+    monkeypatch.setattr(control_imports, "_queue_depths", lambda: {"profile": 2})
+    checks, workers, depths = control_imports._worker_and_queue_health()
+    assert checks["workers"] == {"ok": True, "running": 1}
+    assert workers["profile"]["running"] is True
+    assert depths == {"profile": 2}
+
+    monkeypatch.setattr("builtins.open", Mock(side_effect=OSError("no proc")))
+    monkeypatch.setattr(
+        control_imports.os,
+        "sysconf",
+        Mock(side_effect=ValueError("unsupported")),
+    )
+    assert control_imports._ram_status()["total"] is None
+
+    monkeypatch.setattr(
+        "builtins.open",
+        Mock(return_value=io.StringIO("Malformed:\nMemTotal: 1 kB\n")),
+    )
+    assert control_imports._ram_status()["total"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_table_bootstrap_skips_incomplete_index_specs(monkeypatch):
+    class Connection:
+        execute = AsyncMock()
+        run_sync = AsyncMock()
+
+    connection = Connection()
+
+    class Begin:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, *_args):
+            return False
+
+    database = SimpleNamespace(
+        connect=AsyncMock(),
+        engine=SimpleNamespace(begin=lambda: Begin()),
+    )
+    monkeypatch.setattr(control_imports, "db", database)
+    monkeypatch.setattr(
+        control_imports.ImportRun,
+        "__my_additional_indexes__",
+        [
+            {"name": "", "index_elements": ["run_id"]},
+            {"name": "valid_idx", "index_elements": ["run_id"]},
+        ],
+    )
+
+    await control_imports._ensure_import_run_table_once()
+
+    database.connect.assert_awaited_once()
+    assert connection.execute.await_count == 3
+
+
+def test_toc_preview_rejects_non_objects_and_skips_malformed_plans(monkeypatch):
+    with pytest.raises(ValueError, match="toc must be an object"):
+        control_imports.parse_ptg_toc_preview({"toc": []})
+
+    @dataclass
+    class Entry:
+        domain: str
+        plan_info: list[object]
+
+    source_jobs = importlib.import_module("process.ptg_parts.source_jobs")
+    monkeypatch.setattr(
+        source_jobs,
+        "parse_toc_catalog_entries",
+        lambda *_args, **_kwargs: [
+            Entry(
+                "provider",
+                [
+                    "malformed",
+                    {"plan_id": ""},
+                    {"plan_id": "plan-one", "plan_market_type": "group"},
+                ],
+            )
+        ],
+    )
+
+    result = control_imports.parse_ptg_toc_preview({"toc": {}})
+    assert result["counts"]["plans"] == 1
+    assert result["counts"]["by_domain"] == {"provider": 1}
+
+
+@pytest.mark.asyncio
+async def test_run_page_applies_all_filters_and_emits_cursor(monkeypatch):
+    created_at = dt.datetime(2026, 7, 27)
+    source_rows = [
+        SimpleNamespace(
+            run_id="run-two",
+            created_at=created_at,
+            status="queued",
+            importer="florida-mqa-profile",
+        ),
+        SimpleNamespace(
+            run_id="run-one",
+            created_at=created_at - dt.timedelta(seconds=1),
+            status="queued",
+            importer="florida-mqa-profile",
+        ),
+    ]
+
+    class Scalars:
+        def all(self):
+            return source_rows
+
+    operation_result = SimpleNamespace(scalars=lambda: Scalars())
+    monkeypatch.setattr(control_imports.db, "execute", AsyncMock(return_value=operation_result))
+    monkeypatch.setattr(
+        control_imports,
+        "_overlay_live_progress",
+        lambda run: run,
+    )
+    cursor = control_imports._encode_import_run_cursor(
+        created_at.replace(tzinfo=dt.UTC),
+        "cursor-run",
+    )
+
+    page = await control_imports.list_import_runs_page(
+        status="queued",
+        importer="florida-mqa-profile",
+        retry_of_run_id="parent",
+        limit=1,
+        cursor=cursor,
+    )
+
+    assert len(page["items"]) == 1
+    assert page["next_cursor"]

@@ -557,9 +557,7 @@ async def _split_source_into_chunks(
             accepted += 1
             if chunk_bytes >= PROVIDER_QUALITY_CHUNK_TARGET_BYTES:
                 flush_chunk()
-
         flush_chunk()
-
     return chunks
 
 

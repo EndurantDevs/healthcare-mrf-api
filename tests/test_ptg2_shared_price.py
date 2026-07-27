@@ -621,14 +621,12 @@ async def test_price_prepare_repeated_cancellation_finishes_drain_and_cleanup(
     monkeypatch,
 ):
     """Drain child and stage cleanup despite repeated task cancellation."""
-
     child_cleanup_started = asyncio.Event()
     release_child_cleanup = asyncio.Event()
     child_cleanup_finished = asyncio.Event()
     stage_cleanup_started = asyncio.Event()
     release_stage_cleanup = asyncio.Event()
     stage_cleanup_finished = asyncio.Event()
-
     async def delayed_price_stage(**_kwargs):
         try:
             await asyncio.Future()
@@ -636,16 +634,13 @@ async def test_price_prepare_repeated_cancellation_finishes_drain_and_cleanup(
             child_cleanup_started.set()
             await release_child_cleanup.wait()
             child_cleanup_finished.set()
-
     async def fail_atom_stage(**_kwargs):
         raise RuntimeError("broken atom stage")
-
     async def status(sql):
         if "," in sql:
             stage_cleanup_started.set()
             await release_stage_cleanup.wait()
             stage_cleanup_finished.set()
-
     monkeypatch.setattr(shared_price.db, "status", status)
     monkeypatch.setattr(
         shared_price,
@@ -657,7 +652,6 @@ async def test_price_prepare_repeated_cancellation_finishes_drain_and_cleanup(
         "_create_v3_price_key_stage",
         delayed_price_stage,
     )
-
     prepare_task = asyncio.create_task(
         shared_price.prepare_shared_price_artifacts(
             schema_name="mrf",
@@ -671,7 +665,6 @@ async def test_price_prepare_repeated_cancellation_finishes_drain_and_cleanup(
     prepare_task.cancel()
     await asyncio.sleep(0)
     assert not prepare_task.done()
-
     release_child_cleanup.set()
     await stage_cleanup_started.wait()
     assert child_cleanup_finished.is_set()
@@ -680,7 +673,6 @@ async def test_price_prepare_repeated_cancellation_finishes_drain_and_cleanup(
     prepare_task.cancel()
     await asyncio.sleep(0)
     assert not prepare_task.done()
-
     release_stage_cleanup.set()
     with pytest.raises(RuntimeError, match="broken atom stage"):
         await prepare_task

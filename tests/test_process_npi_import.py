@@ -124,10 +124,8 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
     async def fake_unzip(source, target, **_kwargs):
         with zipfile.ZipFile(source) as archive:
             archive.extractall(target)
-
     async def fake_save(_ctx, payload):
         captured_payloads.append(payload)
-
     monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR", "https://example.com/")
     monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE", "feed.html")
     monkeypatch.setattr(npi_module, "download_it", fake_download)
@@ -139,18 +137,14 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
     monkeypatch.setattr(npi_module, "_assert_nppes_canonical_ready", AsyncMock())
     monkeypatch.setattr(npi_module, "_load_nucc_taxonomy_int_code_map", AsyncMock(return_value={}))
     monkeypatch.setattr(npi_module, "save_npi_data", fake_save)
-
     worker_context_map = {
         "context": {},
         "redis": SimpleNamespace(enqueue_job=AsyncMock()),
         "import_date": "20260331",
     }
-
     await npi_module.process_data(worker_context_map, {"test_mode": True})
-
     assert worker_context_map["context"]["run"] == 1
     assert worker_context_map["context"]["test_mode"] is True
-
     npi_payload = next(
         candidate_npi_payload
         for candidate_npi_payload in captured_payloads
@@ -161,7 +155,6 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
     assert npi_payload["npi_taxonomy_group_list"][0]["healthcare_provider_taxonomy_group"]
     assert npi_payload["npi_other_id_list"][0]["other_provider_identifier"] == "ALT123"
     assert {address["type"] for address in npi_payload["npi_address_list"]} == {"primary", "mail"}
-
     secondary_payload = next(
         candidate_secondary_payload
         for candidate_secondary_payload in captured_payloads
@@ -169,7 +162,6 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
         and candidate_secondary_payload["npi_address_list"][0]["type"] == "secondary"
     )
     assert secondary_payload["npi_address_list"][0]["city_name"] == "AUSTIN"
-
     other_name_payload = next(
         candidate_other_name_payload
         for candidate_other_name_payload in captured_payloads

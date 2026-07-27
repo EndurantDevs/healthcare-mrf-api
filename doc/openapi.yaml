@@ -2504,6 +2504,97 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/NpiTaxonomyWithNucc'
+  /npi/id/{npi}/profile:
+    get:
+      operationId: getNpiIdNpiProviderProfile
+      summary: Retrieve a categorized provider profile
+      description: |
+        Composes reviewed state-regulator facts with available FHIR Provider
+        Directory facts. Use `categories` for a compact multi-category response.
+        For a potentially large category, use `category`, `limit`, and `offset`;
+        pin later pages with the first page's `generation_id`. A generation
+        change returns `409`, and the client should restart pagination.
+
+        Potentially sensitive public-record categories are excluded unless
+        `include_sensitive=true`. Administrative complaints remain explicitly
+        labeled as allegations rather than final actions.
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[1-9][0-9]{9}$'
+        - name: categories
+          in: query
+          schema:
+            type: string
+          example: identity,licenses,education
+          description: Comma-separated provider-profile categories for a compact response.
+        - name: category
+          in: query
+          schema:
+            $ref: '#/components/schemas/ProviderProfileCategory'
+          description: One category to return with stable offset pagination.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 25
+          description: Page size; valid only with `category`.
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+            default: 0
+          description: Zero-based category offset; valid only with `category`.
+        - name: generation_id
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+          description: First-page generation pin; valid only with `category`.
+        - name: include_evidence
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include source evidence for only the returned facts.
+        - name: include_sensitive
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Explicitly include sensitive public-record facts.
+      responses:
+        '200':
+          description: Categorized provider profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderProfileResponse'
+        '400':
+          description: Invalid NPI, category, generation, or pagination parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No reviewed profile facts are available for this NPI
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The profile changed after the client loaded its first page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderProfileGenerationConflict'
   /npi/plans_by_npi/{npi}:
     get:
       operationId: getNpiPlansByNpiNpi
@@ -8895,4 +8986,229 @@ components:
             enum: [npi, address_key]
           example: [npi, address_key]
       required: [items, total_count, next_cursor, has_more, result_identity]
+      additionalProperties: false
+    ProviderProfileCategory:
+      type: string
+      enum:
+        - identity
+        - demographics
+        - contact
+        - locations
+        - specialties
+        - services
+        - organizations
+        - network_participation
+        - accepting_patients
+        - telehealth
+        - licenses
+        - professional_experience
+        - education
+        - training
+        - certifications
+        - privileges
+        - academic_appointments
+        - affiliations
+        - memberships
+        - languages
+        - honors
+        - publications
+        - financial_responsibility
+        - criminal_disclosures
+        - regulatory_actions
+        - complaints
+        - liability_claims
+        - prescribing_authorizations
+        - pharmacy_relationships
+        - program_reports
+    ProviderProfileFact:
+      type: object
+      required:
+        - item_id
+        - type
+        - display
+        - value
+        - assertion_type
+        - verification_status
+        - sensitive
+        - public_default
+        - source_kinds
+        - assertion_count
+      properties:
+        item_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Stable across state/FHIR assertion composition changes.
+        type:
+          type: string
+        display:
+          type: string
+          description: Concise human-readable rendering of the normalized fact.
+        value:
+          type: object
+          additionalProperties: true
+        assertion_type:
+          type: string
+        verification_status:
+          type: string
+        effective_period:
+          type: object
+          properties:
+            start:
+              type: string
+              nullable: true
+            end:
+              type: string
+              nullable: true
+          additionalProperties: false
+        sensitive:
+          type: boolean
+        public_default:
+          type: boolean
+        source_kinds:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum: [state_regulator, provider_directory_fhir]
+        assertions:
+          type: array
+          description: |
+            Per-source-kind provenance summary. Its length can be smaller than
+            `assertion_count` when one source kind has multiple supporting records.
+          items:
+            type: object
+            additionalProperties: true
+        assertion_count:
+          type: integer
+          minimum: 1
+          description: |
+            Total supporting source records across all composed source kinds.
+            This is not the number of entries in the `assertions` summary.
+      additionalProperties: true
+    ProviderProfileCategoryResult:
+      type: object
+      required: [availability, items, total, returned, truncated]
+      properties:
+        availability:
+          type: string
+          enum: [available, not_reported, unavailable, restricted]
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderProfileFact'
+        total:
+          type: integer
+          minimum: 0
+        returned:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        source_reported_total:
+          type: integer
+          minimum: 0
+          description: |
+            Upstream FHIR total when it is larger than the materialized facts
+            or the upstream source reports truncation.
+      additionalProperties: false
+    ProviderProfileCategoryPagination:
+      type: object
+      required: [category, total, returned, limit, offset, has_more]
+      properties:
+        category:
+          $ref: '#/components/schemas/ProviderProfileCategory'
+        total:
+          type: integer
+          minimum: 0
+        returned:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+        offset:
+          type: integer
+          minimum: 0
+        has_more:
+          type: boolean
+      additionalProperties: false
+    ProviderProfileDocument:
+      type: object
+      required:
+        - schema_version
+        - composer_version
+        - npi
+        - generation_id
+        - source_generations
+        - categories
+        - sources
+      properties:
+        schema_version:
+          type: string
+          enum: [provider-profile/v1]
+        composer_version:
+          type: string
+          example: provider-profile-composer/v1
+        npi:
+          type: integer
+          minimum: 1000000000
+          maximum: 9999999999
+        generation_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        source_generations:
+          type: object
+          additionalProperties:
+            type: string
+        categories:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ProviderProfileCategoryResult'
+        category_pagination:
+          $ref: '#/components/schemas/ProviderProfileCategoryPagination'
+        sources:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        important_context:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+    ProviderProfileResponse:
+      type: object
+      required: [npi, provider_profile]
+      properties:
+        npi:
+          type: integer
+          minimum: 1000000000
+          maximum: 9999999999
+        provider_profile:
+          $ref: '#/components/schemas/ProviderProfileDocument'
+        provider_profile_evidence:
+          type: object
+          description: Evidence is filtered to the facts returned on this page.
+          additionalProperties: true
+      additionalProperties: false
+    ProviderProfileGenerationConflict:
+      type: object
+      required:
+        - error
+        - message
+        - requested_generation_id
+        - current_generation_id
+      properties:
+        error:
+          type: string
+          enum: [provider_profile_generation_changed]
+        message:
+          type: string
+        requested_generation_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        current_generation_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
       additionalProperties: false

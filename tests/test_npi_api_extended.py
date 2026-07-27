@@ -2346,15 +2346,11 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
 
     async def fail_download(*_args, **_kwargs):  # pragma: no cover - guard
         raise AssertionError('download should not run when legacy archive hit')
-
     monkeypatch.setattr(npi_module, 'download_it', fail_download)
-
     class FakeApp:
         config = {'NPI_API_UPDATE_GEOCODE': False}
-
         def add_task(self, coro):  # pragma: no cover - guard
             raise AssertionError('no geocode update task expected')
-
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
     response_body = json.loads(response.body)
@@ -2592,7 +2588,6 @@ async def test_get_npi_hides_provider_directory_source_details_by_default(monkey
                 }
             ],
         }
-
     fetch_details = AsyncMock(return_value={
         'pdfhir_cigna': {
             'source': 'provider_directory_fhir',
@@ -2605,22 +2600,17 @@ async def test_get_npi_hides_provider_directory_source_details_by_default(monkey
             'last_validated_status': 'valid',
         }
     })
-
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
     monkeypatch.setattr(npi_module, '_fetch_provider_directory_source_detail_map', fetch_details)
     monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
-
     class FakeApp:
         config = {'NPI_API_UPDATE_GEOCODE': False}
-
         def add_task(self, coro):  # pragma: no cover - guard
             raise AssertionError('no task expected')
-
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379602')
     response_body = json.loads(response.body)
     address = response_body['address_list'][0]
-
     fetch_details.assert_not_awaited()
     assert 'provider_directory_sources' not in address
     assert address['address_sources'] == ['provider_directory_fhir']

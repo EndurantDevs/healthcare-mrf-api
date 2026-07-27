@@ -1099,7 +1099,7 @@ async def _audit_and_activate(
     )
 
 
-async def main(
+async def run_ptg_candidate_audit_command(
     *,
     candidate_run_id: str,
     snapshot_id: str | None = None,
@@ -1152,6 +1152,10 @@ async def main(
             control_run_id=run_id,
             http_config=http_config,
         )
+
+
+main = run_ptg_candidate_audit_command
+main.__name__ = "main"
 
 
 __all__ = [

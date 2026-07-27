@@ -136,7 +136,7 @@ async def _list_codes(request, code_type: str):
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     system = _normalize_system(args.get("system") or args.get("code_system"))
-    q = str(args.get("q") or "").strip().lower()
+    query_text = str(args.get("q") or "").strip().lower()
     clinical_area_id = str(args.get("clinical_area_id") or "").strip()
 
     if clinical_area_id and code_type in {"condition", "treatment"}:
@@ -145,7 +145,7 @@ async def _list_codes(request, code_type: str):
             clinical_area_id=clinical_area_id,
             mapping_kind=code_type,
             system=system,
-            q=q,
+            q=query_text,
             require_area=False,
         )
 
@@ -155,8 +155,8 @@ async def _list_codes(request, code_type: str):
         filters.append(restricted_filter)
     if system:
         filters.append(func.upper(code_table.c.code_system) == system)
-    if q:
-        q_like = f"%{q}%"
+    if query_text:
+        q_like = f"%{query_text}%"
         filters.append(
             or_(
                 func.lower(code_table.c.code).like(q_like),
@@ -190,7 +190,7 @@ async def _list_codes(request, code_type: str):
             "query": {
                 "code_type": code_type,
                 "system": system or None,
-                "q": q or None,
+                "q": query_text or None,
                 "clinical_area_id": clinical_area_id or None,
             },
         }
@@ -313,7 +313,7 @@ async def list_concepts(request):
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     system = _normalize_system(args.get("system") or args.get("code_system"))
     code_type = str(args.get("code_type") or "").strip().lower()
-    q = str(args.get("q") or "").strip().lower()
+    query_text = str(args.get("q") or "").strip().lower()
     filters = []
     restricted_filter = _restricted_public_filter(code_table.c.code_system)
     if restricted_filter is not None:
@@ -322,8 +322,8 @@ async def list_concepts(request):
         filters.append(func.upper(code_table.c.code_system) == system)
     if code_type:
         filters.append(func.lower(code_table.c.code_type) == code_type)
-    if q:
-        q_like = f"%{q}%"
+    if query_text:
+        q_like = f"%{query_text}%"
         filters.append(
             or_(
                 func.lower(code_table.c.code).like(q_like),
@@ -351,7 +351,7 @@ async def list_concepts(request):
                 "offset": pagination.offset,
                 "page": pagination.page,
             },
-            "query": {"system": system or None, "code_type": code_type or None, "q": q or None},
+            "query": {"system": system or None, "code_type": code_type or None, "q": query_text or None},
         }
     )
 
@@ -524,11 +524,11 @@ async def list_clinical_areas(request):
     session = _session(request)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
-    q = str(args.get("q") or "").strip().lower()
+    query_text = str(args.get("q") or "").strip().lower()
     filters = []
     filters.extend(_restricted_pair_filters(crosswalk_table.c.from_system, crosswalk_table.c.to_system))
-    if q:
-        q_like = f"%{q}%"
+    if query_text:
+        q_like = f"%{query_text}%"
         filters.append(
             or_(
                 func.lower(area_table.c.clinical_area_id).like(q_like),
@@ -557,7 +557,7 @@ async def list_clinical_areas(request):
                 "offset": pagination.offset,
                 "page": pagination.page,
             },
-            "query": {"q": q or None},
+            "query": {"q": query_text or None},
         }
     )
 

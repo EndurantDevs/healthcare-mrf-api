@@ -606,7 +606,6 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
     @contextlib.asynccontextmanager
     async def transaction():
         yield None
-
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=0))
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
@@ -622,13 +621,11 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
         "_assert_provider_directory_logged_relation",
         assert_logged,
     )
-
     _metrics, stages = await importer._build_provider_directory_profile_stages(
         build,
         build_fence,
         build_fence,
     )
-
     joined_sql = "\n".join(
         str(awaited.args[0]) for awaited in status.await_args_list
     )

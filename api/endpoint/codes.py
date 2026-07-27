@@ -85,7 +85,7 @@ async def list_codes(request):
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
 
     code_system = _normalize_code_system(args.get("code_system"))
-    q = str(args.get("q", "")).strip().lower()
+    query_text = str(args.get("q", "")).strip().lower()
     source_name = str(args.get("source", "")).strip().lower()
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "code").strip().lower()
@@ -98,8 +98,8 @@ async def list_codes(request):
         filters.append(func.upper(code_catalog_table.c.code_system) == code_system)
     if source_name:
         filters.append(func.lower(code_catalog_table.c.source) == source_name)
-    if q:
-        q_like = f"%{q}%"
+    if query_text:
+        q_like = f"%{query_text}%"
         filters.append(
             or_(
                 func.lower(code_catalog_table.c.code).like(q_like),
@@ -157,7 +157,7 @@ async def list_codes(request):
             },
             "query": {
                 "code_system": code_system or None,
-                "q": q or None,
+                "q": query_text or None,
                 "source": source_name or None,
                 "order_by": order_by,
                 "order": order,

@@ -378,13 +378,12 @@ async def _process_lodes_state(
 
             logger.info("LODES %s: %d ZCTAs aggregated", state, len(zcta_totals))
             return len(zcta_totals)
-
     except Exception as e:
         logger.error("Error processing LODES for %s: %s", state, str(e))
         return 0
 
 
-async def process_data(ctx, task=None):
+async def process_lodes_data(ctx, task=None):
     """Process one queued LODES import task."""
     task = task or {}
     ctx.setdefault("context", {})
@@ -457,6 +456,10 @@ async def process_data(ctx, task=None):
     logger.info("LODES import done: %d total ZCTA rows", total_zctas)
 
 
+process_data = process_lodes_data
+process_data.__name__ = "process_data"
+
+
 async def startup(ctx):
     """Initialize resources required by the LODES worker."""
     await my_init_db(db)
@@ -487,7 +490,7 @@ async def startup(ctx):
     logger.info("LODES startup ready: schema=%s import_date=%s", db_schema, import_date)
 
 
-async def shutdown(ctx):
+async def publish_lodes_generation(ctx):
     """Finalize the LODES run and release worker resources."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
@@ -610,6 +613,10 @@ async def shutdown(ctx):
             "geo_match_ratio": geo_match_ratio,
         },
     )
+
+
+shutdown = publish_lodes_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(test_mode: bool = False):

@@ -491,7 +491,7 @@ async def _fetch_and_parse_cms_hospitals(
     return accepted, with_coordinates
 
 
-async def process_data(ctx, task=None):
+async def process_facility_anchors_data(ctx, task=None):
     """Process one queued facility-anchor import task."""
     task = task or {}
     ctx.setdefault("context", {})
@@ -528,6 +528,10 @@ async def process_data(ctx, task=None):
     logger.info("Facility Anchors import done: %d FQHC + %d Hospital rows", hrsa_count, hosp_count)
 
 
+process_data = process_facility_anchors_data
+process_data.__name__ = "process_data"
+
+
 async def startup(ctx):
     """Initialize resources required by the facility-anchor worker."""
     await my_init_db(db)
@@ -552,7 +556,7 @@ async def startup(ctx):
     logger.info("Facility Anchors startup ready: schema=%s import_date=%s", db_schema, import_date)
 
 
-async def shutdown(ctx):
+async def publish_facility_anchors_generation(ctx):
     """Finalize the facility-anchor run and release worker resources."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
@@ -706,6 +710,10 @@ async def shutdown(ctx):
             **({"address_resolve": address_stats.__dict__} if address_stats else {}),
         },
     )
+
+
+shutdown = publish_facility_anchors_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(test_mode: bool = False):

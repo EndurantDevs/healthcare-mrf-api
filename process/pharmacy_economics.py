@@ -309,7 +309,7 @@ async def _fetch_ful(client, ful_url: str) -> dict[str, float]:
     return ful_map
 
 
-async def process_data(ctx, task=None):
+async def process_pharmacy_economics_data(ctx, task=None):
     """Load pharmacy economics source data into staging."""
     task = task or {}
     ctx.setdefault("context", {})
@@ -390,6 +390,10 @@ async def process_data(ctx, task=None):
     logger.info("Pharmacy Economics import done: %d rows accepted", accepted_rows)
 
 
+process_data = process_pharmacy_economics_data
+process_data.__name__ = "process_data"
+
+
 async def startup(ctx):
     """Initialize the pharmacy economics worker context."""
     await my_init_db(db)
@@ -414,32 +418,26 @@ async def startup(ctx):
     logger.info("Pharmacy Economics startup ready: schema=%s import_date=%s", db_schema, import_date)
 
 
-async def shutdown(ctx):
+async def publish_pharmacy_economics_generation(ctx):
     """Publish a completed pharmacy economics import."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
-
     if not context.get("run"):
         logger.info("No Pharmacy Economics jobs ran; skipping shutdown.")
         return
-
     await ensure_database(bool(context.get("test_mode")))
-
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(PharmacyEconomicsSummary, import_date)
-
     stage_rows = int(await db.scalar(
         f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
     ) or 0)
-
     if context.get("test_mode"):
         logger.info("Pharmacy Economics test mode: staged rows=%d", stage_rows)
     elif stage_rows < DEFAULT_MIN_ROWS:
         raise RuntimeError(
             f"Pharmacy Economics stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
         )
-
     async with db.transaction():
         table = PharmacyEconomicsSummary.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
@@ -447,7 +445,6 @@ async def shutdown(ctx):
         await db.status(
             f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
         )
-
         archived = _archived_identifier(f"{table}_idx_primary")
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
         await db.status(
@@ -457,7 +454,6 @@ async def shutdown(ctx):
             f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
             f"RENAME TO {table}_idx_primary;"
         )
-
         if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
             for index in stage_cls.__my_additional_indexes__:
                 index_name = index.get("name", "_".join(index.get("index_elements")))
@@ -473,7 +469,6 @@ async def shutdown(ctx):
                     f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
                     f"RENAME TO {old_live_name};"
                 )
-
     logger.info("Pharmacy Economics publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
     await mark_control_run(
@@ -483,6 +478,10 @@ async def shutdown(ctx):
         progress_message="succeeded",
         metrics={"rows": stage_rows},
     )
+
+
+shutdown = publish_pharmacy_economics_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(test_mode: bool = False):

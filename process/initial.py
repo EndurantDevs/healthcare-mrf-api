@@ -3139,7 +3139,7 @@ async def startup(ctx):
         ctx["context"]["import_date"] = datetime.datetime.utcnow().strftime("%Y%m%d")
 
 
-async def shutdown(ctx, task):
+async def publish_initial_generation(ctx, task):
     """
     The shutdown function is called after the import process has completed.
     It should be used to clean up any temporary tables or files that were created during the import process.
@@ -3458,6 +3458,10 @@ async def shutdown(ctx, task):
     )
     if redis:
         await _cleanup_mrf_finalize_jobs(redis, import_date)
+
+
+shutdown = publish_initial_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(test_mode: bool = False):
