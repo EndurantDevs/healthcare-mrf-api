@@ -20,6 +20,10 @@ from api.control_imports import (
     request_cancel,
     retry_import_run,
 )
+from api.control_frozen_rate_files import (
+    ptg_import_file_payload as _ptg_import_file_payload,
+    validated_control_import_payload as _validated_control_import_payload,
+)
 from api.control_workers import ensure_worker, worker_registry
 from api.control_auth import require_control_auth as _require_control_auth
 from api.control_snapshot_rollback import register_source_snapshot_rollback_route
@@ -185,8 +189,8 @@ async def control_ptg_import_file(request):
 
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
-    run_payload = _ptg_import_file_payload(payload)
     try:
+        run_payload = _ptg_import_file_payload(payload)
         run, created = await create_import_run(run_payload)
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
@@ -306,6 +310,7 @@ async def control_create_import(request):
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:
+        payload = _validated_control_import_payload(payload)
         run, created = await create_import_run(payload)
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
@@ -386,34 +391,6 @@ async def control_finalize_import(request, run_id: str):
     if run is None:
         raise NotFound("import run not found")
     return response.json(run, status=202, default=str)
-
-
-def _ptg_import_file_payload(payload: dict) -> dict:
-    params_by_name = dict(payload.get("params") or {})
-    for key in (
-        "source_key",
-        "source_file_id",
-        "source_file_import_id",
-        "in_network_url",
-        "content_version",
-        "import_month",
-        "plan_ids",
-        "plan_market_types",
-        "max_files",
-        "test_mode",
-    ):
-        if key in payload and key not in params_by_name:
-            params_by_name[key] = payload[key]
-    return {
-        "run_id": payload.get("run_id"),
-        "importer": "ptg",
-        "params": params_by_name,
-        "idempotency_key": payload.get("idempotency_key"),
-        "triggered_by": payload.get("triggered_by") or "source_file_import",
-        "schedule_id": payload.get("schedule_id"),
-        "subscription_id": payload.get("subscription_id"),
-        "source_file_import_id": payload.get("source_file_import_id") or params_by_name.get("source_file_import_id"),
-    }
 
 
 def _is_request_enabled(value) -> bool:

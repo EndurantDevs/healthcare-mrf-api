@@ -82,6 +82,7 @@ from process.ptg_parts.input_artifact_retention import (
     publish_artifact_file,
     publish_verified_artifact_stage,
 )
+from process.ptg_parts.frozen_rate_files import validate_frozen_artifacts
 from process.ptg_parts.progress import _scale_stage_progress_pct
 from process.ptg_parts.screen import _emit_screen_line
 from process.url_security import UnsafeUrlError, assert_safe_url
@@ -1658,6 +1659,13 @@ async def _download_ptg_job_artifact(
                 allow_deferred=True,
             )
         )
+        frozen_descriptor = job.get("_frozen_rate_file")
+        if isinstance(frozen_descriptor, dict):
+            validate_frozen_artifacts(
+                frozen_descriptor,
+                raw_artifact,
+                logical_artifact,
+            )
         _observe_logical_artifact_stage(
             artifact_stage_observer,
             logical_artifact,

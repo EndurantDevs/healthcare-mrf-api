@@ -101,6 +101,13 @@ from process.ptg_parts.config import (
     TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
     _is_postgres_binary_v3_arch, _ptg2_snapshot_arch_from_env)
 from process.ptg_parts.config import _should_auto_activate_ptg2_candidates
+from process.ptg_parts.frozen_rate_files import (
+    assert_frozen_input_compatibility,
+    bind_frozen_rate_set_to_scope,
+    build_frozen_rate_jobs,
+    normalize_frozen_rate_file_set,
+    validate_frozen_processed_results,
+)
 from process.ptg_parts.copy_load import (_copy_ignore_ptg2_objects,
                                          _copy_insert_ptg2_objects,
                                          _copy_upsert_ptg2_objects)
@@ -3490,6 +3497,11 @@ def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[st
         "raw_byte_count": source_version.raw_byte_count,
         "etag": source_version.etag,
         "last_modified": source_version.last_modified,
+        "verification_mode": getattr(
+            source_version,
+            "verification_mode",
+            None,
+        ),
     }
 
 
@@ -3527,9 +3539,25 @@ def _source_file_versions_from_results(
                 "raw_byte_count": summary.get("raw_byte_count"),
                 "etag": summary.get("etag"),
                 "last_modified": summary.get("last_modified"),
+                "verification_mode": summary.get("verification_mode"),
             }
         )
     return versions
+
+
+def _frozen_rate_file_proof(
+    options_by_name: Mapping[str, Any],
+    file_results: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return exact per-part proof when this import used a frozen file set."""
+
+    frozen_rate_files = options_by_name.get("frozen_rate_files")
+    if not isinstance(frozen_rate_files, list) or not frozen_rate_files:
+        return []
+    return validate_frozen_processed_results(
+        frozen_rate_files,
+        file_results,
+    )
 
 
 _ALLOWED_AMOUNT_METRIC_KEYS = (
@@ -3664,6 +3692,8 @@ _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS = (
     "toc_list",
     "in_network_url",
     "allowed_url",
+    "frozen_rate_file_set_sha256",
+    "frozen_rate_file_count",
     "source_key",
     *_PTG2_SNAPSHOT_SET_OPTION_KEYS,
     "source_network_names",
@@ -4096,6 +4126,7 @@ async def _resume_validated_candidate(
             if isinstance(source_file_versions, list)
             else []
         ),
+        **_frozen_manifest_result_fields(manifest),
     }
     if has_allowed_amount_index:
         assert isinstance(allowed_amount_index, Mapping)
@@ -4178,6 +4209,7 @@ def _already_published_result(
         "activation_status": manifest.get("activation_status"),
         "snapshot_status": PTG2_STATUS_PUBLISHED,
         "source_file_versions": manifest.get("source_file_versions") or [],
+        **_frozen_manifest_result_fields(manifest),
         **allowed_metrics_by_name,
         "address_refresh": manifest.get("address_refresh"),
         "pointer_reconciliation": pointer_reconciliation,
@@ -4691,6 +4723,22 @@ def _finalizer_block_copy_terminal_metrics(
     }
 
 
+def _frozen_manifest_result_fields(
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return frozen multipart proof only when the manifest carries its digest."""
+
+    if not manifest.get("frozen_rate_file_set_sha256"):
+        return {}
+    return {
+        "frozen_rate_file_set_sha256": manifest.get(
+            "frozen_rate_file_set_sha256"
+        ),
+        "frozen_rate_file_count": manifest.get("frozen_rate_file_count"),
+        "frozen_rate_file_proof": manifest.get("frozen_rate_file_proof"),
+    }
+
+
 def _full_rebuild_proof_metrics(
     stage_counts: PTG2ArtifactStageCounts,
     *,
@@ -4937,6 +4985,18 @@ async def _publish_reused_shared_v3_snapshot(
             }
         )
     source_file_versions.extend(allowed_source_file_versions)
+    frozen_rate_file_proof = _frozen_rate_file_proof(
+        options,
+        [
+            {
+                "source_type": source_version.get("source_type"),
+                "url": source_version.get("url"),
+                "success": True,
+                "summary": source_version,
+            }
+            for source_version in source_file_versions
+        ],
+    )
 
     serving_index = _reused_shared_v3_serving_index(
         layout_manifest,
@@ -4994,6 +5054,19 @@ async def _publish_reused_shared_v3_snapshot(
         "serving_rates": rate_count,
         "rate_count": rate_count,
         "source_file_versions": source_file_versions,
+        **(
+            {
+                "frozen_rate_file_set_sha256": options.get(
+                    "frozen_rate_file_set_sha256"
+                ),
+                "frozen_rate_file_count": options.get(
+                    "frozen_rate_file_count"
+                ),
+                "frozen_rate_file_proof": frozen_rate_file_proof,
+            }
+            if frozen_rate_file_proof
+            else {}
+        ),
         "shared_layout_reused": True,
         "shared_snapshot_key": int(shared_snapshot_key),
         "shared_semantic_fingerprint": bytes(semantic_fingerprint).hex(),
@@ -5364,7 +5437,7 @@ def _allowed_snapshot_report(
     source_file_versions: list[dict[str, Any]],
     timing_by_metric: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    report_by_field = {
         "snapshot_id": context.snapshot_id,
         "source_key": context.source_key,
         "import_month": context.import_month.isoformat(),
@@ -5394,6 +5467,23 @@ def _allowed_snapshot_report(
         **allowed_metrics_by_name,
         "timings": timing_by_metric,
     }
+    frozen_set_digest = context.options_by_name.get(
+        "frozen_rate_file_set_sha256"
+    )
+    if frozen_set_digest:
+        report_by_field.update(
+            {
+                "frozen_rate_file_set_sha256": frozen_set_digest,
+                "frozen_rate_file_count": context.options_by_name.get(
+                    "frozen_rate_file_count"
+                ),
+                "frozen_rate_file_proof": _frozen_rate_file_proof(
+                    context.options_by_name,
+                    successful_files,
+                ),
+            }
+        )
+    return report_by_field
 
 
 async def _persist_allowed_snapshot(
@@ -5495,6 +5585,21 @@ def _allowed_snapshot_result(
         "serving_rates": 0,
         "rate_count": 0,
         "source_file_versions": report_by_field["source_file_versions"],
+        **(
+            {
+                "frozen_rate_file_set_sha256": report_by_field[
+                    "frozen_rate_file_set_sha256"
+                ],
+                "frozen_rate_file_count": report_by_field[
+                    "frozen_rate_file_count"
+                ],
+                "frozen_rate_file_proof": report_by_field[
+                    "frozen_rate_file_proof"
+                ],
+            }
+            if report_by_field.get("frozen_rate_file_set_sha256")
+            else {}
+        ),
         "address_refresh": report_by_field["address_refresh"],
         **{
             metric_name: report_by_field[metric_name]
@@ -5666,6 +5771,8 @@ async def _main_with_artifact_lease(
     toc_list: str | None = None,
     in_network_url: str | None = None,
     allowed_url: str | None = None,
+    frozen_rate_files: list[dict[str, Any]] | None = None,
+    frozen_rate_file_set_sha256: str | None = None,
     provider_ref_url: str | None = None,
     import_id: str | None = None,
     source_key: str | None = None,
@@ -5700,9 +5807,40 @@ async def _main_with_artifact_lease(
         if provider_graph_v4_enabled
         else PTG2_V3_SHARED_GENERATION
     )
+    if (frozen_rate_files is None) != (
+        frozen_rate_file_set_sha256 is None
+    ):
+        raise ValueError(
+            "frozen_rate_files and frozen_rate_file_set_sha256 are required together"
+        )
+    normalized_frozen_rate_files: list[dict[str, Any]] = []
+    normalized_frozen_set_digest: str | None = None
+    if frozen_rate_files is not None:
+        (
+            normalized_frozen_rate_files,
+            normalized_frozen_set_digest,
+        ) = normalize_frozen_rate_file_set(
+            frozen_rate_files,
+            frozen_rate_file_set_sha256,
+        )
+        assert_frozen_input_compatibility(
+            normalized_frozen_rate_files,
+            in_network_url=in_network_url,
+            allowed_url=allowed_url,
+            toc_urls=toc_urls,
+            toc_list=toc_list,
+            file_url_contains=file_url_contains,
+            max_files=max_files,
+        )
     rebuild_scope_digest = normalized_full_rebuild_scope_digest(
         full_rebuild_scope_digest
     )
+    if normalized_frozen_set_digest is not None:
+        rebuild_scope_digest = bind_frozen_rate_set_to_scope(
+            rebuild_scope_digest,
+            normalized_frozen_set_digest,
+            len(normalized_frozen_rate_files),
+        )
     should_reuse_raw_artifacts = (
         reuse_raw_artifacts if rebuild_scope_digest is None else False
     )
@@ -5716,15 +5854,25 @@ async def _main_with_artifact_lease(
         )
     import_id_val = _normalize_import_id(
         import_id
-        or _default_ptg2_import_id(
-            import_month_value,
-            source_key_val,
-            toc_urls=toc_urls,
-            toc_list=toc_list,
-            in_network_url=in_network_url,
-            allowed_url=allowed_url,
-            provider_ref_url=provider_ref_url,
-            arch_variant=shared_storage_generation,
+        or (
+            _frozen_ptg2_import_id(
+                import_month_value,
+                source_key_val,
+                frozen_rate_file_set_sha256=normalized_frozen_set_digest,
+                frozen_rate_file_count=len(normalized_frozen_rate_files),
+                arch_variant=shared_storage_generation,
+            )
+            if normalized_frozen_set_digest is not None
+            else _default_ptg2_import_id(
+                import_month_value,
+                source_key_val,
+                toc_urls=toc_urls,
+                toc_list=toc_list,
+                in_network_url=in_network_url,
+                allowed_url=allowed_url,
+                provider_ref_url=provider_ref_url,
+                arch_variant=shared_storage_generation,
+            )
         )
     )
     import_run_id = _ptg2_import_run_id(
@@ -5747,6 +5895,9 @@ async def _main_with_artifact_lease(
         "toc_list": toc_list,
         "in_network_url": in_network_url,
         "allowed_url": allowed_url,
+        "frozen_rate_files": normalized_frozen_rate_files,
+        "frozen_rate_file_set_sha256": normalized_frozen_set_digest,
+        "frozen_rate_file_count": len(normalized_frozen_rate_files),
         "source_key": source_key_val,
         "plan_ids": plan_ids or [],
         "plan_name_contains": plan_name_contains or [],
@@ -5814,6 +5965,16 @@ async def _main_with_artifact_lease(
                 max_bytes = int(raw_max_bytes)
             except ValueError:
                 logger.warning("Ignoring invalid HLTHPRT_PTG2_TEST_MAX_BYTES=%s", raw_max_bytes)
+    oversized_frozen_files = [
+        descriptor["ordinal"]
+        for descriptor in normalized_frozen_rate_files
+        if descriptor["content_length"] > max_bytes
+    ]
+    if oversized_frozen_files:
+        raise ValueError(
+            "frozen rate file content_length exceeds the configured streaming "
+            f"cap at ordinal(s) {oversized_frozen_files}"
+        )
     write_live_progress(phase="initializing", pct=1, message="initializing PTG import")
     await ensure_database(test_mode)
     setup_stage_timer.mark("ensure_database")
@@ -6007,7 +6168,22 @@ async def _main_with_artifact_lease(
             f"Refusing PTG snapshot claim for {snapshot_id}: existing status is "
             f"{existing_status}"
         )
-    failure_report_by_field: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
+    failure_report_by_field: dict[str, Any] = {
+        "snapshot_id": snapshot_id,
+        "legacy_table_suffix": import_id_val,
+        **(
+            {
+                "frozen_rate_file_set_sha256": (
+                    normalized_frozen_set_digest
+                ),
+                "frozen_rate_file_count": len(
+                    normalized_frozen_rate_files
+                ),
+            }
+            if normalized_frozen_set_digest is not None
+            else {}
+        ),
+    }
     ptg2_manifest_stage_table: str | None = None
     ptg2_import_heartbeat_task: asyncio.Task[Any] | None = None
     shared_layout_reservation = None
@@ -6140,7 +6316,19 @@ async def _main_with_artifact_lease(
         )
         setup_stage_timer.mark("control_tables")
 
-        jobs: list[dict[str, Any]] = []
+        direct_frozen_plans = _direct_dispatch_plan_info(
+            plan_ids,
+            plan_market_types,
+        )
+        jobs: list[dict[str, Any]] = (
+            build_frozen_rate_jobs(
+                normalized_frozen_rate_files,
+                plan_info=direct_frozen_plans,
+                source_network_names=source_network_name_values,
+            )
+            if normalized_frozen_rate_files
+            else []
+        )
         data_started_monotonic = _ptg2_monotonic()
 
         toc_candidates: list[str] = []
@@ -6342,6 +6530,13 @@ async def _main_with_artifact_lease(
             ):
                 raise RuntimeError(
                     "PTG2 allowed-amount import produced no payment evidence"
+                )
+            if normalized_frozen_rate_files:
+                failure_report_by_field["frozen_rate_file_proof"] = (
+                    _frozen_rate_file_proof(
+                        options_by_name,
+                        successful_allowed_files,
+                    )
                 )
         pre_rate_rebuild_metrics = _full_rebuild_proof_metrics(
             full_rebuild_stage_tracker.snapshot(),
@@ -6840,6 +7035,18 @@ async def _main_with_artifact_lease(
             "toc_failures": toc_failures,
             "snapshot_id": snapshot_id,
             "legacy_table_suffix": import_id_val,
+            **(
+                {
+                    "frozen_rate_file_set_sha256": (
+                        normalized_frozen_set_digest
+                    ),
+                    "frozen_rate_file_count": len(
+                        normalized_frozen_rate_files
+                    ),
+                }
+                if normalized_frozen_set_digest is not None
+                else {}
+            ),
         }
         if allowed_jobs:
             failure_report_by_field["allowed_amount_lane"] = (
@@ -6873,6 +7080,13 @@ async def _main_with_artifact_lease(
         if jobs and processed_file_count_map["done"] == 0:
             raise RuntimeError(
                 f"PTG2 import discovered {len(jobs)} job(s) but processed zero files successfully"
+            )
+        if normalized_frozen_rate_files:
+            failure_report_by_field["frozen_rate_file_proof"] = (
+                _frozen_rate_file_proof(
+                    options_by_name,
+                    successful_files + skipped_files,
+                )
             )
 
         if shared_input_identity is None:
@@ -7401,6 +7615,23 @@ async def _main_with_artifact_lease(
             "source_file_versions": _source_file_versions_from_results(
                 successful_files + skipped_files
             ),
+            **(
+                {
+                    "frozen_rate_file_set_sha256": (
+                        normalized_frozen_set_digest
+                    ),
+                    "frozen_rate_file_count": len(
+                        normalized_frozen_rate_files
+                    ),
+                    "frozen_rate_file_proof": (
+                        failure_report_by_field[
+                            "frozen_rate_file_proof"
+                        ]
+                    ),
+                }
+                if normalized_frozen_set_digest is not None
+                else {}
+            ),
             "address_refresh": address_refresh_result,
             **allowed_metrics_by_name,
             **full_rebuild_metrics,
@@ -7485,6 +7716,8 @@ async def run_ptg_command(
     toc_list: str | None = None,
     in_network_url: str | None = None,
     allowed_url: str | None = None,
+    frozen_rate_files: list[dict[str, Any]] | None = None,
+    frozen_rate_file_set_sha256: str | None = None,
     provider_ref_url: str | None = None,
     import_id: str | None = None,
     source_key: str | None = None,
@@ -7505,13 +7738,20 @@ async def run_ptg_command(
 ) -> dict[str, Any]:
     """Run one PTG import while retaining shared inputs through a live lease."""
 
-    forwarded_arguments = locals().copy()
-    if full_rebuild_scope_digest is None:
+    return await _guard_ptg_main_artifact_lease(locals())
+
+
+async def _guard_ptg_main_artifact_lease(
+    forwarded_arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the forwarded import arguments under one retained-artifact lease."""
+
+    if forwarded_arguments.get("full_rebuild_scope_digest") is None:
         forwarded_arguments.pop("full_rebuild_scope_digest")
     lease_owner = str(
-        control_run_id
-        or import_id
-        or source_key
+        forwarded_arguments.get("control_run_id")
+        or forwarded_arguments.get("import_id")
+        or forwarded_arguments.get("source_key")
         or f"standalone-{uuid.uuid4().hex}"
     )
     with artifact_lease_context(owner=f"ptg:{lease_owner}") as lease:
@@ -7550,12 +7790,49 @@ def _default_ptg2_import_id(
     }
     if not any(
         source_inputs_by_name[key]
-        for key in ("toc_urls", "toc_list", "in_network_url", "allowed_url", "provider_ref_url")
+        for key in (
+            "toc_urls",
+            "toc_list",
+            "in_network_url",
+            "allowed_url",
+            "provider_ref_url",
+        )
     ):
         return month_id
     fingerprint = hash_prefix(
         semantic_hash(
             {"import_month": month_id, **source_inputs_by_name},
+            domain="ptg2_import_identity",
+        ),
+        16,
+    )
+    return f"{month_id}_{fingerprint}"
+
+
+def _frozen_ptg2_import_id(
+    import_month_value: datetime.date,
+    source_key_val: str | None,
+    *,
+    frozen_rate_file_set_sha256: str,
+    frozen_rate_file_count: int,
+    arch_variant: str,
+) -> str:
+    """Bind the default import identity to the complete frozen multipart set."""
+
+    month_id = import_month_value.strftime("%Y%m%d")
+    if not source_key_val:
+        return month_id
+    fingerprint = hash_prefix(
+        semantic_hash(
+            {
+                "import_month": month_id,
+                "source_key": source_key_val,
+                "frozen_rate_file_set_sha256": (
+                    frozen_rate_file_set_sha256
+                ),
+                "frozen_rate_file_count": frozen_rate_file_count,
+                "arch_variant": arch_variant,
+            },
             domain="ptg2_import_identity",
         ),
         16,
