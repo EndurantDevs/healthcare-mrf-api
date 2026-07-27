@@ -1797,7 +1797,6 @@ async def _load_rows_from_configured_source(
             page_size=_NY_ROSA_PAGE_SIZE,
         )
         return True, license_records, source_url, metadata, error
-
     if state_source.state_code == "MA":
         license_records, source_url, metadata, error = await _load_rows_from_ma_export_source(
             session,
@@ -1806,7 +1805,6 @@ async def _load_rows_from_configured_source(
             board_id=_MA_EXPORT_BOARD_ID,
         )
         return True, license_records, source_url, metadata, error
-
     return False, [], None, {}, None
 
 

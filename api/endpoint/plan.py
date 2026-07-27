@@ -1125,7 +1125,6 @@ async def get_price_plans_bulk(request):
     raw_plan_ids = request_body.get("plan_ids")
     if not isinstance(raw_plan_ids, (list, tuple, set)):
         raise sanic.exceptions.BadRequest("plan_ids must be an array of plan IDs")
-
     plan_ids = []
     for raw_plan_id in raw_plan_ids:
         if raw_plan_id is None:
@@ -1134,27 +1133,23 @@ async def get_price_plans_bulk(request):
     plan_ids = [pid for pid in plan_ids if pid]
     if not plan_ids:
         raise sanic.exceptions.BadRequest("plan_ids cannot be empty")
-
     year = request_body.get("year")
     if year is not None:
         try:
             year = int(year)
         except (TypeError, ValueError) as exc:
             raise sanic.exceptions.BadRequest("year must be numeric") from exc
-
     age = request_body.get("age")
     if age is not None:
         try:
             age = int(age)
         except (TypeError, ValueError) as exc:
             raise sanic.exceptions.BadRequest("age must be numeric") from exc
-
     rating_area = request_body.get("rating_area")
     if rating_area is not None:
         rating_area = str(rating_area).strip()
         if not rating_area:
             rating_area = None
-
     stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id.in_(plan_ids))
     if year is not None:
         stmt = stmt.where(plan_prices_table.c.year == year)
@@ -1164,22 +1159,18 @@ async def get_price_plans_bulk(request):
         stmt = stmt.where(
             and_(plan_prices_table.c.min_age <= age, plan_prices_table.c.max_age >= age)
         )
-
     price_result = await session.execute(stmt)
     price_rows = [
         _row_to_dict(price_row) for price_row in _result_rows(price_result)
     ]
-
     prices_by_plan = {pid: [] for pid in plan_ids}
     for price_row in price_rows:
         pid = price_row.get("plan_id")
         if pid in prices_by_plan:
             prices_by_plan[pid].append(price_row)
-
     missing_plan_ids = [
         pid for pid, entries in prices_by_plan.items() if not entries
     ]
-
     return response.json(
         {"results": prices_by_plan, "missing": missing_plan_ids},
         default=str,

@@ -150,6 +150,7 @@ class FloridaSource:
 
     @property
     def url(self) -> str:
+        """Return the authenticated portal URL for this source."""
         if "handler=" in self.path:
             return self.path
         separator = "&" if "?" in self.path else "?"
@@ -1027,50 +1028,50 @@ def _profession_details(
 
 
 def _canonical_match_row(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     profession_details: Mapping[str, set[tuple[str, str]]] | None = None,
 ) -> dict[str, str]:
     """Map source-specific identity fields into the conservative NPI matcher."""
-    canonical = dict(row)
+    canonical_by_key = dict(source_row)
     profession_name = ""
     source_name = ""
-    if source.key == "administrative_complaints":
-        profession_name = row.get("profession", "")
-        source_name = row.get("respondent_name", "")
-    elif source.key == "pain_management_report":
-        profession_name = row.get("reporting_phy_prof", "")
-        source_name = row.get("reporting_phy_name", "")
-        canonical["lic_nbr"] = row.get("reporting_phy_lic_nbr", "")
-        canonical["license_number"] = canonical["lic_nbr"]
-    elif source.key == "pharmacy_pharmacist":
-        profession_name = row.get("rltn_prof_nme", "")
-        source_name = row.get("rltn_key_nme", "")
-        canonical["lic_nbr"] = row.get("rltn_lic_nbr", "")
-        canonical["license_number"] = canonical["lic_nbr"]
-    elif source.key in {"licensure_current", "licensure_all_statuses"}:
-        profession_name = row.get("profession_name", "")
-        canonical["rank_cde"] = row.get("rank_code", "")
+    if profile_source.key == "administrative_complaints":
+        profession_name = source_row.get("profession", "")
+        source_name = source_row.get("respondent_name", "")
+    elif profile_source.key == "pain_management_report":
+        profession_name = source_row.get("reporting_phy_prof", "")
+        source_name = source_row.get("reporting_phy_name", "")
+        canonical_by_key["lic_nbr"] = source_row.get("reporting_phy_lic_nbr", "")
+        canonical_by_key["license_number"] = canonical_by_key["lic_nbr"]
+    elif profile_source.key == "pharmacy_pharmacist":
+        profession_name = source_row.get("rltn_prof_nme", "")
+        source_name = source_row.get("rltn_key_nme", "")
+        canonical_by_key["lic_nbr"] = source_row.get("rltn_lic_nbr", "")
+        canonical_by_key["license_number"] = canonical_by_key["lic_nbr"]
+    elif profile_source.key in {"licensure_current", "licensure_all_statuses"}:
+        profession_name = source_row.get("profession_name", "")
+        canonical_by_key["rank_cde"] = source_row.get("rank_code", "")
 
     if profession_name:
-        canonical["profession_name"] = profession_name
+        canonical_by_key["profession_name"] = profession_name
         profession_code, rank_code = _profession_details(
             profession_name,
             profession_details,
         )
         if profession_code:
-            canonical["pro_cde"] = profession_code
+            canonical_by_key["pro_cde"] = profession_code
         if rank_code:
-            canonical["rank_cde"] = rank_code
+            canonical_by_key["rank_cde"] = rank_code
     if source_name:
         first_name, last_name = _person_name_parts(source_name)
         if first_name and last_name:
-            canonical["first_name"] = first_name
-            canonical["last_name"] = last_name
-    return canonical
+            canonical_by_key["first_name"] = first_name
+            canonical_by_key["last_name"] = last_name
+    return canonical_by_key
 
 
-def _name_compatible(source: Mapping[str, str], candidate: Mapping[str, Any]) -> bool:
+def _is_name_compatible(source: Mapping[str, str], candidate: Mapping[str, Any]) -> bool:
     source_last = _name_token(
         _first(source, "last_name", "lname", "last_nm", "last_nme", "l_name")
     )
@@ -1086,7 +1087,7 @@ def _name_compatible(source: Mapping[str, str], candidate: Mapping[str, Any]) ->
     return True
 
 
-def _taxonomy_compatible(profession_code: str, taxonomy_code: str) -> bool:
+def _is_taxonomy_compatible(profession_code: str, taxonomy_code: str) -> bool:
     prefixes = _PROFESSION_TAXONOMY_PREFIXES.get(profession_code)
     return not prefixes or taxonomy_code.startswith(prefixes)
 
@@ -1165,7 +1166,7 @@ def _address_value(
 
 
 def _address_display(value: Mapping[str, Any]) -> str:
-    labels = {
+    labels_by_key = {
         "mailing": "Mailing address",
         "practice_primary": "Primary practice location",
         "practice_secondary_2": "Additional practice location",
@@ -1185,7 +1186,7 @@ def _address_display(value: Mapping[str, Any]) -> str:
     )
     location_types = value.get("location_types") or [value.get("location_type")]
     location_labels = [
-        labels.get(str(location_type), "Provider location")
+        labels_by_key.get(str(location_type), "Provider location")
         for location_type in location_types
         if location_type
     ]
@@ -1206,6 +1207,7 @@ class FloridaMQAClient:
         return self.opener.open(request, timeout=120)
 
     def authenticate(self) -> None:
+        """Authenticate to the source portal without retaining credential values."""
         response = self._open(f"{self.base_url}/ProfileData")
         body = response.read().decode("utf-8", "replace")
         if "Sign out" in body:
@@ -1257,14 +1259,14 @@ class FloridaMQAClient:
         if not form_match:
             raise RuntimeError("florida_mqa_login_callback_missing")
         callback_url = urljoin(confirmed.geturl(), html.unescape(form_match.group(1)))
-        callback_fields = {
-            html.unescape(name): html.unescape(value)
-            for name, value in _INPUT_RE.findall(form_match.group(2))
+        callback_fields_by_key = {
+            html.unescape(name): html.unescape(field_value)
+            for name, field_value in _INPUT_RE.findall(form_match.group(2))
         }
         callback = self._open(
             Request(
                 callback_url,
-                data=urlencode(callback_fields).encode(),
+                data=urlencode(callback_fields_by_key).encode(),
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         )
@@ -1273,6 +1275,7 @@ class FloridaMQAClient:
             raise RuntimeError("florida_mqa_login_callback_failed")
 
     def download(self, source: FloridaSource, target: Path) -> tuple[str, int]:
+        """Download one authenticated source artifact to the import workspace."""
         url = urljoin(self.base_url, source.url)
         target.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256()
@@ -1304,41 +1307,41 @@ def _normalized_source_header(
     *,
     artifact_name: str,
 ) -> list[str]:
-    normalized = [_snake(field) for field in raw_header if field and _snake(field)]
-    if not normalized:
+    normalized_items = [_snake(field) for field in raw_header if field and _snake(field)]
+    if not normalized_items:
         raise RuntimeError(f"florida_mqa_header_missing:{artifact_name}")
-    if source.expected_fields and tuple(normalized) != source.expected_fields:
+    if source.expected_fields and tuple(normalized_items) != source.expected_fields:
         raise RuntimeError(
             f"florida_mqa_schema_changed:{source.key}:expected_header"
         )
-    return normalized
+    return normalized_items
 
 
-def _artifact_header(path: Path, source: FloridaSource) -> list[str]:
+def _artifact_header(path: Path, profile_source: FloridaSource) -> list[str]:
     headers: list[list[str]] = []
     for _name, stream in _data_stream(path):
         raw_header = stream.readline().rstrip("\r\n").split("|")
         if raw_header == [""]:
             raise RuntimeError(f"florida_mqa_header_missing:{path.name}")
-        if not source.has_header:
-            if not source.expected_fields:
+        if not profile_source.has_header:
+            if not profile_source.expected_fields:
                 raise RuntimeError(
-                    f"florida_mqa_headerless_schema_missing:{source.key}"
+                    f"florida_mqa_headerless_schema_missing:{profile_source.key}"
                 )
-            if len(raw_header) != len(source.expected_fields):
+            if len(raw_header) != len(profile_source.expected_fields):
                 raise RuntimeError(
-                    f"florida_mqa_row_changed:{source.key}:1:{len(raw_header)}"
+                    f"florida_mqa_row_changed:{profile_source.key}:1:{len(raw_header)}"
                 )
-            headers.append(list(source.expected_fields))
+            headers.append(list(profile_source.expected_fields))
             continue
-        if source.key == "medical_cannabis_authorization" and len(raw_header) != len(
-            source.expected_fields
+        if profile_source.key == "medical_cannabis_authorization" and len(raw_header) != len(
+            profile_source.expected_fields
         ):
             raise RuntimeError(
                 f"florida_mqa_cannabis_header_changed:{len(raw_header)}"
             )
         normalized = _normalized_source_header(
-            source,
+            profile_source,
             raw_header,
             artifact_name=path.name,
         )
@@ -1364,7 +1367,7 @@ def _physical_row_sha256(values: Iterable[str]) -> str:
     return hashlib.sha256("|".join(values).encode("latin-1")).hexdigest()
 
 
-def _plausible_email(value: str) -> bool:
+def _is_plausible_email(value: str) -> bool:
     return bool(
         re.fullmatch(
             r"[^@\s|]+@[^@\s|]+",
@@ -1373,9 +1376,9 @@ def _plausible_email(value: str) -> bool:
     )
 
 
-def _licensure_email_alignment_is_plausible(
+def _is_licensure_email_alignment_plausible(
     header: list[str],
-    values: list[str],
+    field_values: list[str],
     email_index: int,
 ) -> bool:
     """Validate location and suffix alignment around a split email."""
@@ -1387,32 +1390,32 @@ def _licensure_email_alignment_is_plausible(
     )
     if any(field not in header for field in expected_location_fields):
         return False
-    location_values = {
-        field: values[header.index(field)].strip()
+    location_values_by_key = {
+        field: field_values[header.index(field)].strip()
         for field in expected_location_fields
     }
-    suffix_values = values[email_index + 2 :]
+    suffix_values = field_values[email_index + 2 :]
     if len(suffix_values) != 5:
         return False
-    _mod_codes, prescribe, dispensing, birth_year_range, other_license = (
-        value.strip() for value in suffix_values
+    _mod_codes, prescribe_items, dispensing_items, birth_year_range_items, other_license_items = (
+        field_value.strip() for field_value in suffix_values
     )
     indicator_values = {"", "Y", "N"}
     return (
         all(
-            not location_values[field]
-            or bool(re.fullmatch(r"[A-Za-z]{2}", location_values[field]))
+            not location_values_by_key[field]
+            or bool(re.fullmatch(r"[A-Za-z]{2}", location_values_by_key[field]))
             for field in (
                 "mailing_address_state",
                 "practice_location_address_state",
             )
         )
         and all(
-            not location_values[field]
+            not location_values_by_key[field]
             or bool(
                 re.fullmatch(
                     r"\d{5}(?:-?\d{4})?",
-                    location_values[field],
+                    location_values_by_key[field],
                 )
             )
             for field in (
@@ -1421,13 +1424,13 @@ def _licensure_email_alignment_is_plausible(
             )
         )
         and
-        prescribe.upper() in indicator_values
-        and dispensing.upper() in indicator_values
-        and other_license.upper() in indicator_values
+        prescribe_items.upper() in indicator_values
+        and dispensing_items.upper() in indicator_values
+        and other_license_items.upper() in indicator_values
         and bool(
             re.fullmatch(
                 r"(?:|N/A|\d{2,3}\s*-\s*\d{2,3})",
-                birth_year_range.upper(),
+                birth_year_range_items.upper(),
             )
         )
     )
@@ -1444,10 +1447,10 @@ def _license_status_continuation_values(
     if (
         header != list(_LICENSE_STATUS_FIELDS)
         or len(physical_rows) != 3
-        or [len(values) for _, values in physical_rows] != [11, 5, 1]
+        or [len(field_values) for _, field_values in physical_rows] != [11, 5, 1]
     ):
         return None
-    physical_lines = ["|".join(values) for _, values in physical_rows]
+    physical_lines = ["|".join(field_values) for _, field_values in physical_rows]
     if (
         any(len(line) != 125 for line in physical_lines)
         or not physical_rows[0][1][-1].strip()
@@ -1455,30 +1458,30 @@ def _license_status_continuation_values(
     ):
         return None
 
-    values = "".join(physical_lines).split("|")
-    if len(values) != len(header):
+    field_values = "".join(physical_lines).split("|")
+    if len(field_values) != len(header):
         return None
-    cleaned = [value.strip() for value in values]
+    cleaned_items = [field_value.strip() for field_value in field_values]
     if (
-        not re.fullmatch(r"\d{4}", cleaned[0])
-        or not re.fullmatch(r"[A-Za-z0-9]{1,3}", cleaned[1])
-        or not re.fullmatch(r"\d{1,12}", cleaned[2])
-        or not cleaned[3]
-        or not cleaned[4]
-        or not cleaned[8]
-        or not cleaned[10]
-        or any(value.upper() not in {"", "Y", "N"} for value in cleaned[11:15])
+        not re.fullmatch(r"\d{4}", cleaned_items[0])
+        or not re.fullmatch(r"[A-Za-z0-9]{1,3}", cleaned_items[1])
+        or not re.fullmatch(r"\d{1,12}", cleaned_items[2])
+        or not cleaned_items[3]
+        or not cleaned_items[4]
+        or not cleaned_items[8]
+        or not cleaned_items[10]
+        or any(field_value.upper() not in {"", "Y", "N"} for field_value in cleaned_items[11:15])
     ):
         return None
     try:
-        for value in cleaned[5:8]:
-            datetime.strptime(value, "%m/%d/%Y")
+        for field_value in cleaned_items[5:8]:
+            datetime.strptime(field_value, "%m/%d/%Y")
     except ValueError:
         return None
 
     _increment_parser_metric(parser_metrics, "recovered_rows")
     _increment_parser_metric(parser_metrics, "continuation_physical_rows", 3)
-    return values, {
+    return field_values, {
         "kind": "wrapped_license_name_recovered",
         "artifact_member": artifact_member,
         "physical_row_numbers": [
@@ -1491,25 +1494,25 @@ def _license_status_continuation_values(
             _physical_row_sha256(row_values)
             for _, row_values in physical_rows
         ],
-        "logical_field_count": len(values),
+        "logical_field_count": len(field_values),
     }
 
 
 def _normalized_pipe_values(
-    source: FloridaSource,
+    profile_source: FloridaSource,
     header: list[str],
-    values: list[str],
+    field_values: list[str],
     *,
     row_number: int,
     artifact_member: str,
     parser_metrics: dict[str, Any] | None,
 ) -> tuple[list[str] | None, dict[str, Any] | None]:
     """Normalize only explicit source quirks; otherwise quarantine the row."""
-    physical_field_count = len(values)
-    physical_row_sha256 = _physical_row_sha256(values)
+    physical_field_count = len(field_values)
+    physical_row_sha256 = _physical_row_sha256(field_values)
     trailing_empty_count = 0
-    if len(values) > len(header) and values[-1] == "":
-        values = values[:-1]
+    if len(field_values) > len(header) and field_values[-1] == "":
+        field_values = field_values[:-1]
         trailing_empty_count = 1
     if trailing_empty_count:
         _increment_parser_metric(
@@ -1522,54 +1525,54 @@ def _normalized_pipe_values(
             trailing_empty_count,
         )
 
-    repair_metadata: dict[str, Any] | None = None
+    repair_metadata_by_key: dict[str, Any] | None = None
     if (
-        len(values) == len(header) + 1
-        and source.key == "profile_indicators"
+        len(field_values) == len(header) + 1
+        and profile_source.key == "profile_indicators"
         and header[-1:] == ["e_mail_addr"]
-        and values[-2] == ""
+        and field_values[-2] == ""
     ):
-        values = [*values[:-2], values[-1]]
-        repair_metadata = {
+        field_values = [*field_values[:-2], field_values[-1]]
+        repair_metadata_by_key = {
             "kind": "shifted_raw_email_recovered",
             "field": "e_mail_addr",
             "physical_field_count": physical_field_count,
         }
         _increment_parser_metric(parser_metrics, "recovered_rows")
     if (
-        len(values) == len(header) + 1
-        and source.key in {"licensure_current", "licensure_all_statuses"}
+        len(field_values) == len(header) + 1
+        and profile_source.key in {"licensure_current", "licensure_all_statuses"}
         and "email" in header
     ):
         email_index = header.index("email")
-        email_values = values[email_index : email_index + 2]
+        email_values = field_values[email_index : email_index + 2]
         if (
-            all(_plausible_email(value) for value in email_values)
-            and _licensure_email_alignment_is_plausible(
+            all(_is_plausible_email(field_value) for field_value in email_values)
+            and _is_licensure_email_alignment_plausible(
                 header,
-                values,
+                field_values,
                 email_index,
             )
         ):
-            suffix_values = values[email_index + 2 :]
-            values = [
-                *values[:email_index],
+            suffix_values = field_values[email_index + 2 :]
+            field_values = [
+                *field_values[:email_index],
                 "|".join(email_values),
                 *suffix_values,
             ]
-            repair_metadata = {
+            repair_metadata_by_key = {
                 "kind": "embedded_delimiter_recovered",
                 "field": "email",
                 "physical_field_count": physical_field_count,
             }
             _increment_parser_metric(parser_metrics, "recovered_rows")
 
-    if len(values) == len(header):
-        return values, repair_metadata
+    if len(field_values) == len(header):
+        return field_values, repair_metadata_by_key
     _increment_parser_metric(parser_metrics, "quarantined_rows")
     return None, {
         "kind": "field_count_mismatch",
-        "source_key": source.key,
+        "source_key": profile_source.key,
         "artifact_member": artifact_member,
         "row_number": row_number,
         "physical_field_count": physical_field_count,
@@ -1581,17 +1584,18 @@ def _normalized_pipe_values(
 
 def _iter_rows(
     path: Path,
-    source: FloridaSource | None = None,
+    profile_source: FloridaSource | None = None,
     *,
     parser_metrics: dict[str, Any] | None = None,
 ) -> Iterator[tuple[int, dict[str, Any], dict[str, str], list[str]]]:
+    """Yield normalized source rows together with retained parsing evidence."""
     for artifact_member, stream in _data_stream(path):
-        if source and not source.has_header:
-            if not source.expected_fields:
+        if profile_source and not profile_source.has_header:
+            if not profile_source.expected_fields:
                 raise RuntimeError(
-                    f"florida_mqa_headerless_schema_missing:{source.key}"
+                    f"florida_mqa_headerless_schema_missing:{profile_source.key}"
                 )
-            header = list(source.expected_fields)
+            header_items = list(profile_source.expected_fields)
             reader = csv.reader(
                 stream,
                 delimiter="|",
@@ -1610,77 +1614,77 @@ def _iter_rows(
                     break
                 continuation: tuple[list[str], dict[str, Any]] | None = None
                 if (
-                    source.key == "license_status"
+                    profile_source.key == "license_status"
                     and len(physical_values) == 11
                     and len("|".join(physical_values)) == 125
                 ):
-                    lookahead: list[tuple[int, list[str]]] = []
+                    lookahead_items: list[tuple[int, list[str]]] = []
                     for _ in range(2):
                         try:
-                            lookahead.append(next(numbered_rows))
+                            lookahead_items.append(next(numbered_rows))
                         except StopIteration:
                             break
                     continuation = _license_status_continuation_values(
-                        header,
-                        [(row_number, physical_values), *lookahead],
+                        header_items,
+                        [(row_number, physical_values), *lookahead_items],
                         artifact_member=artifact_member,
                         parser_metrics=parser_metrics,
                     )
                     if continuation is None:
-                        pending_rows.extend(lookahead)
+                        pending_rows.extend(lookahead_items)
                 if continuation is not None:
-                    values, parse_metadata = continuation
+                    field_values, parse_metadata = continuation
                 else:
-                    values, parse_metadata = _normalized_pipe_values(
-                        source,
-                        header,
+                    field_values, parse_metadata = _normalized_pipe_values(
+                        profile_source,
+                        header_items,
                         list(physical_values),
                         row_number=row_number,
                         artifact_member=artifact_member,
                         parser_metrics=parser_metrics,
                     )
-                if values is None:
-                    raw_row = {
+                if field_values is None:
+                    raw_row_by_key = {
                         "_physical_fields": physical_values,
                         "_source_parse_metadata": parse_metadata,
                     }
-                    cleaned = {
+                    cleaned_by_key = {
                         "_source_parse_quarantine": "field_count_mismatch",
                         "_physical_field_count": str(len(physical_values)),
                     }
                 else:
-                    raw_row = dict(zip(header, values, strict=True))
+                    raw_row_by_key = dict(zip(header_items, field_values, strict=True))
                     if parse_metadata:
-                        raw_row["_source_parse_metadata"] = parse_metadata
-                    cleaned = _clean_row(raw_row)
+                        raw_row_by_key["_source_parse_metadata"] = parse_metadata
+                    cleaned_by_key = _clean_row(raw_row_by_key)
                     if parse_metadata:
-                        cleaned["_source_parse_repair"] = str(
+                        cleaned_by_key["_source_parse_repair"] = str(
                             parse_metadata["kind"]
                         )
-                if any(cleaned.values()):
-                    yield row_number, raw_row, cleaned, header
+                if any(cleaned_by_key.values()):
+                    yield row_number, raw_row_by_key, cleaned_by_key, header_items
             continue
-        if source and source.key == "medical_cannabis_authorization":
+        if profile_source and profile_source.key == "medical_cannabis_authorization":
             raw_header = stream.readline().rstrip("\r\n").split("|")
-            header = _normalized_source_header(
-                source,
+            header_items = _normalized_source_header(
+                profile_source,
                 raw_header,
                 artifact_name=path.name,
             )
-            if len(raw_header) != len(source.expected_fields):
+            if len(raw_header) != len(profile_source.expected_fields):
                 raise RuntimeError(
                     f"florida_mqa_cannabis_header_changed:{len(raw_header)}"
                 )
             for row_number, line in enumerate(stream, start=2):
-                values = line.rstrip("\r\n").split("|", 14)
-                if len(values) != 15:
+                field_values = line.rstrip("\r\n").split("|", 14)
+                if len(field_values) != 15:
                     raise RuntimeError(
-                        f"florida_mqa_cannabis_row_changed:{row_number}:{len(values)}"
+                        f"florida_mqa_cannabis_row_changed:{row_number}:{len(field_values)}"
                     )
-                raw_row = dict(zip(raw_header, values, strict=True))
-                cleaned = _clean_row(raw_row)
-                if any(cleaned.values()):
-                    yield row_number, raw_row, cleaned, header
+                raw_row_by_key = dict(zip(raw_header, field_values, strict=True))
+                cleaned_by_key = _clean_row(raw_row_by_key)
+                if any(cleaned_by_key.values()):
+                    yield row_number, raw_row_by_key, cleaned_by_key, header_items
             continue
 
         reader = csv.reader(
@@ -1694,23 +1698,23 @@ def _iter_rows(
             raise RuntimeError(
                 f"florida_mqa_header_missing:{path.name}"
             ) from exc
-        header = (
+        header_items = (
             _normalized_source_header(
-                source,
+                profile_source,
                 raw_header,
                 artifact_name=path.name,
             )
-            if source is not None
+            if profile_source is not None
             else [
                 _snake(field)
                 for field in raw_header
                 if field and _snake(field)
             ]
         )
-        if not header:
+        if not header_items:
             raise RuntimeError(f"florida_mqa_header_missing:{path.name}")
-        if source is None:
-            source = FloridaSource(
+        if profile_source is None:
+            profile_source = FloridaSource(
                 key="untyped",
                 path="",
                 filename=path.name,
@@ -1718,23 +1722,23 @@ def _iter_rows(
                 fact_type="",
                 title="",
                 label_fields=(),
-                expected_fields=tuple(header),
+                expected_fields=tuple(header_items),
             )
         for row_number, physical_values in enumerate(reader, start=2):
-            values, parse_metadata = _normalized_pipe_values(
-                source,
-                header,
+            field_values, parse_metadata = _normalized_pipe_values(
+                profile_source,
+                header_items,
                 list(physical_values),
                 row_number=row_number,
                 artifact_member=artifact_member,
                 parser_metrics=parser_metrics,
             )
-            if values is None:
-                raw_row = {
+            if field_values is None:
+                raw_row_by_key = {
                     "_physical_fields": physical_values,
                     "_source_parse_metadata": parse_metadata,
                 }
-                cleaned = {
+                cleaned_by_key = {
                     "_source_parse_quarantine": "field_count_mismatch",
                     "_physical_field_count": str(len(physical_values)),
                 }
@@ -1742,18 +1746,18 @@ def _iter_rows(
                 raw_field_names = [
                     field for field in raw_header if field and _snake(field)
                 ]
-                raw_row = dict(
-                    zip(raw_field_names, values, strict=True)
+                raw_row_by_key = dict(
+                    zip(raw_field_names, field_values, strict=True)
                 )
                 if parse_metadata:
-                    raw_row["_source_parse_metadata"] = parse_metadata
-                cleaned = _clean_row(raw_row)
+                    raw_row_by_key["_source_parse_metadata"] = parse_metadata
+                cleaned_by_key = _clean_row(raw_row_by_key)
                 if parse_metadata:
-                    cleaned["_source_parse_repair"] = str(
+                    cleaned_by_key["_source_parse_repair"] = str(
                         parse_metadata["kind"]
                     )
-            if any(cleaned.values()):
-                yield row_number, raw_row, cleaned, header
+            if any(cleaned_by_key.values()):
+                yield row_number, raw_row_by_key, cleaned_by_key, header_items
 
 
 async def _ensure_tables() -> None:
@@ -1801,7 +1805,7 @@ async def _load_florida_license_index() -> dict[str, list[dict[str, Any]]]:
     schema = ProviderProfileProjection.__table__.schema or "mrf"
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
         raise RuntimeError("provider_profile_schema_invalid")
-    rows = await db.all(
+    source_rows = await db.all(
         text(
             f"""
             SELECT t.npi, t.provider_license_number, t.healthcare_provider_taxonomy_code,
@@ -1814,12 +1818,12 @@ async def _load_florida_license_index() -> dict[str, list[dict[str, Any]]]:
             """
         )
     )
-    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        mapping = row._mapping
+    operation_result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for source_row in source_rows:
+        mapping = source_row._mapping
         license_key = _NON_ALNUM.sub("", str(mapping["provider_license_number"]).upper())
         if license_key:
-            result[license_key].append(
+            operation_result[license_key].append(
                 {
                     "npi": int(mapping["npi"]),
                     "taxonomy": str(mapping["healthcare_provider_taxonomy_code"] or ""),
@@ -1828,44 +1832,44 @@ async def _load_florida_license_index() -> dict[str, list[dict[str, Any]]]:
                     "license_number": mapping["provider_license_number"],
                 }
             )
-    return result
+    return operation_result
 
 
 def _match_master(
-    row: Mapping[str, str],
+    source_row: Mapping[str, str],
     license_index: Mapping[str, list[dict[str, Any]]],
 ) -> tuple[int | None, str, dict[str, Any]]:
-    profession_code = _first(row, "pro_cde", "profession_code")
-    rank_code = _first(row, "rank_cde", "rank_code", "profession_rank_code")
-    license_number = _first(row, "lic_nbr", "license_number", "license_nbr")
+    profession_code = _first(source_row, "pro_cde", "profession_code")
+    rank_code = _first(source_row, "rank_cde", "rank_code", "profession_rank_code")
+    license_number = _first(source_row, "lic_nbr", "license_number", "license_nbr")
     candidates_by_npi: dict[int, dict[str, Any]] = {}
     tested = _license_candidates(license_number, profession_code, rank_code)
     for candidate_key in tested:
         for candidate in license_index.get(candidate_key, ()):
-            if _taxonomy_compatible(profession_code, candidate["taxonomy"]):
+            if _is_taxonomy_compatible(profession_code, candidate["taxonomy"]):
                 candidates_by_npi[candidate["npi"]] = candidate
-    compatible = [
+    compatible_items = [
         candidate for candidate in candidates_by_npi.values()
-        if _name_compatible(row, candidate)
+        if _is_name_compatible(source_row, candidate)
     ]
-    evidence = {
+    evidence_by_key = {
         "method": "exact_state_license_profession_name",
         "jurisdiction": "FL",
         "profession_code": profession_code or None,
         "rank_code": rank_code or None,
         "license_candidates": list(tested),
         "candidate_count": len(candidates_by_npi),
-        "name_compatible_count": len(compatible),
+        "name_compatible_count": len(compatible_items),
     }
-    if len(compatible) == 1:
-        evidence["matched_license_number"] = compatible[0]["license_number"]
-        evidence["taxonomy_code"] = compatible[0]["taxonomy"]
-        return compatible[0]["npi"], "deterministic", evidence
-    if candidates_by_npi and not compatible:
-        return None, "identity_conflict", evidence
-    if len(compatible) > 1:
-        return None, "ambiguous", evidence
-    return None, "unmatched", evidence
+    if len(compatible_items) == 1:
+        evidence_by_key["matched_license_number"] = compatible_items[0]["license_number"]
+        evidence_by_key["taxonomy_code"] = compatible_items[0]["taxonomy"]
+        return compatible_items[0]["npi"], "deterministic", evidence_by_key
+    if candidates_by_npi and not compatible_items:
+        return None, "identity_conflict", evidence_by_key
+    if len(compatible_items) > 1:
+        return None, "ambiguous", evidence_by_key
+    return None, "unmatched", evidence_by_key
 
 
 def _record_key(source: FloridaSource, row: Mapping[str, str], row_number: int) -> str:
@@ -1884,8 +1888,8 @@ def _record_key(source: FloridaSource, row: Mapping[str, str], row_number: int) 
 
 
 def _fact_payload(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
@@ -1903,15 +1907,16 @@ def _fact_payload(
     sensitive: bool | None = None,
     public_default: bool | None = None,
 ) -> dict[str, Any]:
-    resolved_category = category or source.category
-    resolved_fact_type = fact_type or source.fact_type
+    """Build the reviewed public and restricted payloads for one source fact."""
+    resolved_category = category or profile_source.category
+    resolved_fact_type = fact_type or profile_source.fact_type
     resolved_value = (
         dict(value_json)
         if value_json is not None
         else _without_empty(
             {
-                key: value
-                for key, value in row.items()
+                key: field_value
+                for key, field_value in source_row.items()
                 if key not in _PROFILE_RAW_ONLY_FIELDS
             }
         )
@@ -1929,9 +1934,9 @@ def _fact_payload(
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
-    source_json = {
+    source_json_by_key = {
         "source_key": FL_MQA_SOURCE_KEY,
-        "dataset": source.key,
+        "dataset": profile_source.key,
         "agency": FL_MQA_AGENCY,
         "jurisdiction": "FL",
         "artifact_id": artifact["artifact_id"],
@@ -1949,21 +1954,21 @@ def _fact_payload(
         "logical_fact_key": logical_fact_key,
         "category": resolved_category,
         "fact_type": resolved_fact_type,
-        "display": display or _human_display(source, row),
+        "display": display or _human_display(profile_source, source_row),
         "value_json": resolved_value,
         "availability": "available",
-        "assertion_type": assertion_type or source.assertion_type,
-        "verification_status": verification_status or source.verification_status,
+        "assertion_type": assertion_type or profile_source.assertion_type,
+        "verification_status": verification_status or profile_source.verification_status,
         "effective_start": effective_start
-        or _first(row, "effective_date", "action_date", "orig_dte", "issue_date")
+        or _first(source_row, "effective_date", "action_date", "orig_dte", "issue_date")
         or None,
         "effective_end": effective_end
-        or _first(row, "expiration_date", "expr_dte", "end_date")
+        or _first(source_row, "expiration_date", "expr_dte", "end_date")
         or None,
-        "source_json": source_json,
-        "sensitive": source.sensitive if sensitive is None else sensitive,
+        "source_json": source_json_by_key,
+        "sensitive": profile_source.sensitive if sensitive is None else sensitive,
         "public_default": (
-            source.public_default
+            profile_source.public_default
             if public_default is None
             else public_default
         ),
@@ -1982,81 +1987,83 @@ def _indicator_value(source_value: str) -> dict[str, Any]:
 
 
 def _mapped_profile_data_fact(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
-    field_map = _PROFILE_VALUE_FIELDS.get(source.key)
+    """Build one reviewed fact from a mapped practitioner-profile source."""
+    field_map = _PROFILE_VALUE_FIELDS.get(profile_source.key)
     if field_map is None:
         raise RuntimeError(
-            f"provider_profile_source_adapter_missing:{source.key}"
+            f"provider_profile_source_adapter_missing:{profile_source.key}"
         )
-    date_fields = _PROFILE_DATE_VALUE_FIELDS.get(source.key, frozenset())
-    value: dict[str, Any] = {}
+    date_fields = _PROFILE_DATE_VALUE_FIELDS.get(profile_source.key, frozenset())
+    field_value_by_key: dict[str, Any] = {}
     for output_field, source_field in field_map:
-        source_value = row.get(source_field, "")
+        source_value = source_row.get(source_field, "")
         if not source_value:
             continue
         if output_field in date_fields:
             normalized_date, precision = _normalize_source_date(source_value)
-            value[output_field] = normalized_date
-            value[f"{output_field}_precision"] = precision
+            field_value_by_key[output_field] = normalized_date
+            field_value_by_key[f"{output_field}_precision"] = precision
         else:
-            value[output_field] = source_value
-    value = _without_empty(value)
+            field_value_by_key[output_field] = source_value
+    field_value_by_key = _without_empty(field_value_by_key)
     display_values = [
-        str(value[field])
-        for field in _PROFILE_DISPLAY_VALUE_FIELDS.get(source.key, ())
-        if value.get(field)
+        str(field_value_by_key[field])
+        for field in _PROFILE_DISPLAY_VALUE_FIELDS.get(profile_source.key, ())
+        if field_value_by_key.get(field)
     ]
     display_values = list(dict.fromkeys(display_values))
     display = (
-        f"{source.title}: {' — '.join(display_values)}"
+        f"{profile_source.title}: {' — '.join(display_values)}"
         if display_values
-        else source.title
+        else profile_source.title
     )
     start_field, end_field = _PROFILE_EFFECTIVE_FIELDS.get(
-        source.key,
+        profile_source.key,
         (None, None),
     )
     return _fact_payload(
-        source,
-        row,
+        profile_source,
+        source_row,
         run_id=run_id,
         record_id=record_id,
         npi=npi,
         artifact=artifact,
         display=display,
-        value_json=value,
+        value_json=field_value_by_key,
         effective_start=(
-            str(value.get(start_field) or "")
+            str(field_value_by_key.get(start_field) or "")
             if start_field
             else None
         )
         or None,
         effective_end=(
-            str(value.get(end_field) or "")
+            str(field_value_by_key.get(end_field) or "")
             if end_field
             else None
         )
         or None,
-        fact_key=value,
+        fact_key=field_value_by_key,
     )
 
 
 def _profile_indicator_facts(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    """Build reviewed practitioner-profile indicator facts."""
     safe_indicators = (
         ("other_health_degree", "health_degree", "Other health degree"),
         (
@@ -2073,17 +2080,17 @@ def _profile_indicator_facts(
         ("staff_privileges", "staff_priv", "Staff privileges"),
         ("certifications", "certification", "Certifications"),
     )
-    sections = {
-        output_field: _indicator_value(row[source_field])
+    sections_by_key = {
+        output_field: _indicator_value(source_row[source_field])
         for output_field, source_field, _label in safe_indicators
-        if row.get(source_field)
+        if source_row.get(source_field)
     }
     facts: list[dict[str, Any]] = []
-    if sections:
+    if sections_by_key:
         available_labels = [
             label
             for output_field, _source_field, label in safe_indicators
-            if sections.get(output_field, {}).get("reported") is True
+            if sections_by_key.get(output_field, {}).get("reported") is True
         ]
         display = (
             "Profile information reported for: "
@@ -2093,16 +2100,16 @@ def _profile_indicator_facts(
         )
         facts.append(
             _fact_payload(
-                source,
-                row,
+                profile_source,
+                source_row,
                 run_id=run_id,
                 record_id=record_id,
                 npi=npi,
                 artifact=artifact,
                 fact_type="profile_section_availability",
                 display=display,
-                value_json={"sections": sections},
-                fact_key={"sections": sections},
+                value_json={"sections": sections_by_key},
+                fact_key={"sections": sections_by_key},
             )
         )
     restricted_indicators = (
@@ -2120,13 +2127,13 @@ def _profile_indicator_facts(
         ),
     )
     for output_field, source_field, category, fact_type in restricted_indicators:
-        if not row.get(source_field):
+        if not source_row.get(source_field):
             continue
-        indicator = _indicator_value(row[source_field])
+        indicator = _indicator_value(source_row[source_field])
         facts.append(
             _fact_payload(
-                source,
-                row,
+                profile_source,
+                source_row,
                 run_id=run_id,
                 record_id=record_id,
                 npi=npi,
@@ -2144,32 +2151,33 @@ def _profile_indicator_facts(
 
 
 def _financial_responsibility_facts(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    """Build reviewed financial-responsibility facts from one source row."""
     public_value = _without_empty(
         {
-            "financial_responsibility": row.get("financial_resp", ""),
+            "financial_responsibility": source_row.get("financial_resp", ""),
             "financial_exemption": (
-                _indicator_value(row["financial_exempt"])
-                if row.get("financial_exempt")
+                _indicator_value(source_row["financial_exempt"])
+                if source_row.get("financial_exempt")
                 else {}
             ),
             "insurance": _without_empty(
                 {
                     "currently_insured": (
-                        _indicator_value(row["insured"])
-                        if row.get("insured")
+                        _indicator_value(source_row["insured"])
+                        if source_row.get("insured")
                         else {}
                     ),
                     "insured_for_ten_years": (
-                        _indicator_value(row["insured_10_yr"])
-                        if row.get("insured_10_yr")
+                        _indicator_value(source_row["insured_10_yr"])
+                        if source_row.get("insured_10_yr")
                         else {}
                     ),
                 }
@@ -2179,47 +2187,47 @@ def _financial_responsibility_facts(
     facts: list[dict[str, Any]] = []
     if public_value:
         display_values = [
-            value
-            for value in (
-                row.get("financial_resp", ""),
+            field_value
+            for field_value in (
+                source_row.get("financial_resp", ""),
                 (
                     "exemption reported"
-                    if row.get("financial_exempt", "").upper()
+                    if source_row.get("financial_exempt", "").upper()
                     in {"Y", "YES", "TRUE", "1", "X"}
                     else ""
                 ),
                 (
                     "insurance reported"
-                    if row.get("insured", "").upper()
+                    if source_row.get("insured", "").upper()
                     in {"Y", "YES", "TRUE", "1", "X"}
                     else ""
                 ),
             )
-            if value
+            if field_value
         ]
         facts.append(
             _fact_payload(
-                source,
-                row,
+                profile_source,
+                source_row,
                 run_id=run_id,
                 record_id=record_id,
                 npi=npi,
                 artifact=artifact,
                 display=(
-                    f"{source.title}: {' — '.join(display_values)}"
+                    f"{profile_source.title}: {' — '.join(display_values)}"
                     if display_values
-                    else source.title
+                    else profile_source.title
                 ),
                 value_json=public_value,
                 fact_key=public_value,
             )
         )
-    if row.get("liability_claim"):
-        liability_indicator = _indicator_value(row["liability_claim"])
+    if source_row.get("liability_claim"):
+        liability_indicator = _indicator_value(source_row["liability_claim"])
         facts.append(
             _fact_payload(
-                source,
-                row,
+                profile_source,
+                source_row,
                 run_id=run_id,
                 record_id=record_id,
                 npi=npi,
@@ -2241,27 +2249,27 @@ def _financial_responsibility_facts(
 
 
 def _profile_data_facts(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    if source.key == "profile_indicators":
+    if profile_source.key == "profile_indicators":
         return _profile_indicator_facts(
-            source,
-            row,
+            profile_source,
+            source_row,
             run_id=run_id,
             record_id=record_id,
             npi=npi,
             artifact=artifact,
         )
-    if source.key == "financial_responsibility":
+    if profile_source.key == "financial_responsibility":
         return _financial_responsibility_facts(
-            source,
-            row,
+            profile_source,
+            source_row,
             run_id=run_id,
             record_id=record_id,
             npi=npi,
@@ -2269,8 +2277,8 @@ def _profile_data_facts(
         )
     return [
         _mapped_profile_data_fact(
-            source,
-            row,
+            profile_source,
+            source_row,
             run_id=run_id,
             record_id=record_id,
             npi=npi,
@@ -2280,36 +2288,37 @@ def _profile_data_facts(
 
 
 def _profile_master_facts(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    """Build reviewed identity and biography facts from a profile master row."""
     facts: list[dict[str, Any]] = []
-    given = [
-        value
-        for value in (row.get("f_name", ""), row.get("m_name", ""))
-        if value
+    given_items = [
+        field_value
+        for field_value in (source_row.get("f_name", ""), source_row.get("m_name", ""))
+        if field_value
     ]
-    suffix = [row["name_suffix"]] if row.get("name_suffix") else []
+    suffix = [source_row["name_suffix"]] if source_row.get("name_suffix") else []
     display_name = " ".join(
-        [*given, row.get("l_name", ""), *suffix]
+        [*given_items, source_row.get("l_name", ""), *suffix]
     ).strip()
     if display_name:
         name = _without_empty(
             {
                 "text": display_name,
-                "family": row.get("l_name", ""),
-                "given": given,
+                "family": source_row.get("l_name", ""),
+                "given": given_items,
                 "suffix": suffix,
             }
         )
         facts.append(
             _fact_payload(
-                source, row, run_id=run_id, record_id=record_id, npi=npi,
+                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
                 artifact=artifact, category="identity", fact_type="name",
                 display=f"Practitioner name: {display_name}", value_json=name,
                 fact_key={"name": name},
@@ -2317,73 +2326,73 @@ def _profile_master_facts(
                 verification_status="government_source",
             )
         )
-    birth_year_range = row.get("birth_year_range", "")
+    birth_year_range = source_row.get("birth_year_range", "")
     if birth_year_range:
         birth_years = re.findall(r"\b(?:19|20)\d{2}\b", birth_year_range)
-        birth_value = {"source_text": birth_year_range, "precision": "range"}
+        birth_value_by_key = {"source_text": birth_year_range, "precision": "range"}
         if birth_years:
-            birth_value["start_year"] = int(birth_years[0])
-            birth_value["end_year"] = int(birth_years[-1])
+            birth_value_by_key["start_year"] = int(birth_years[0])
+            birth_value_by_key["end_year"] = int(birth_years[-1])
         facts.append(
             _fact_payload(
-                source, row, run_id=run_id, record_id=record_id, npi=npi,
+                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
                 artifact=artifact, category="demographics", fact_type="birth_year_range",
                 display=f"Birth year range: {birth_year_range}",
-                value_json=birth_value,
-                fact_key={"birth_year_range": birth_value},
+                value_json=birth_value_by_key,
+                fact_key={"birth_year_range": birth_value_by_key},
             )
         )
-    rank_effective_date, _ = _normalize_source_date(row.get("rank_efct_dte", ""))
-    original_issue_date, _ = _normalize_source_date(row.get("orig_dte", ""))
-    expiration_date, _ = _normalize_source_date(row.get("expr_dte", ""))
+    rank_effective_date, _ = _normalize_source_date(source_row.get("rank_efct_dte", ""))
+    original_issue_date, _ = _normalize_source_date(source_row.get("orig_dte", ""))
+    expiration_date, _ = _normalize_source_date(source_row.get("expr_dte", ""))
     license_value = _without_empty(
         {
             "jurisdiction": "FL",
-            "profession_code": row.get("pro_cde", ""),
-            "license_number": row.get("lic_nbr", ""),
-            "status_code": row.get("lic_sta_cde", ""),
-            "status": row.get("lic_sta_desc", ""),
-            "active_status_code": row.get("lic_actv_sta_cde", ""),
-            "active_status": row.get("lic_actv_sta_desc", ""),
-            "rank_code": row.get("rank_cde", ""),
-            "rank": row.get("rank_desc", ""),
+            "profession_code": source_row.get("pro_cde", ""),
+            "license_number": source_row.get("lic_nbr", ""),
+            "status_code": source_row.get("lic_sta_cde", ""),
+            "status": source_row.get("lic_sta_desc", ""),
+            "active_status_code": source_row.get("lic_actv_sta_cde", ""),
+            "active_status": source_row.get("lic_actv_sta_desc", ""),
+            "rank_code": source_row.get("rank_cde", ""),
+            "rank": source_row.get("rank_desc", ""),
             "rank_effective_date": rank_effective_date,
             "original_issue_date": original_issue_date,
             "expiration_date": expiration_date,
         }
     )
     license_display = " — ".join(
-        value
-        for value in (
-            row.get("lic_nbr", ""),
-            row.get("lic_sta_desc", ""),
-            row.get("rank_desc", ""),
+        field_value
+        for field_value in (
+            source_row.get("lic_nbr", ""),
+            source_row.get("lic_sta_desc", ""),
+            source_row.get("rank_desc", ""),
         )
-        if value
+        if field_value
     )
     facts.append(
         _fact_payload(
-            source, row, run_id=run_id, record_id=record_id, npi=npi,
+            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
             artifact=artifact, category="licenses", fact_type="state_license",
             display=f"Florida license: {license_display}", value_json=license_value,
             effective_start=original_issue_date or None,
             effective_end=expiration_date or None,
             fact_key=(
                 "state_license:FL:"
-                f"{_NON_ALNUM.sub('', row.get('lic_nbr', '').upper())}:"
-                f"{row.get('pro_cde', '')}"
+                f"{_NON_ALNUM.sub('', source_row.get('lic_nbr', '').upper())}:"
+                f"{source_row.get('pro_cde', '')}"
             ),
             assertion_type="state_reported",
             verification_status="government_source",
         )
     )
-    other_license = row.get("other_license", "").upper()
+    other_license = source_row.get("other_license", "").upper()
     if other_license:
-        other_license_labels = {
+        other_license_labels_by_key = {
             "Y": (True, "Reported another state license"),
             "N": (False, "Reported no other state license"),
         }
-        reported, other_license_display = other_license_labels.get(
+        reported, other_license_display = other_license_labels_by_key.get(
             other_license,
             (None, f"Other state license indicator: {other_license}"),
         )
@@ -2392,7 +2401,7 @@ def _profile_master_facts(
         )
         facts.append(
             _fact_payload(
-                source, row, run_id=run_id, record_id=record_id, npi=npi,
+                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
                 artifact=artifact, category="licenses",
                 fact_type="other_state_license_indicator",
                 display=other_license_display,
@@ -2400,39 +2409,39 @@ def _profile_master_facts(
                 fact_key={"other_state_license_indicator": other_license_value},
             )
         )
-    practice_start = row.get("yr_began_practice", "")
+    practice_start = source_row.get("yr_began_practice", "")
     if practice_start:
         normalized_practice_start, precision = _normalize_source_date(practice_start)
-        practice_start_value = {
+        practice_start_value_by_key = {
             "start": normalized_practice_start,
             "precision": precision,
         }
         facts.append(
             _fact_payload(
-                source, row, run_id=run_id, record_id=record_id, npi=npi,
+                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
                 artifact=artifact, category="professional_experience",
                 fact_type="practice_start",
                 display=f"Began practicing: {practice_start}",
-                value_json=practice_start_value,
+                value_json=practice_start_value_by_key,
                 effective_start=normalized_practice_start,
-                fact_key={"practice_start": practice_start_value},
+                fact_key={"practice_start": practice_start_value_by_key},
             )
         )
-    nica_code = row.get("nica_payment", "").upper()
+    nica_code = source_row.get("nica_payment", "").upper()
     if nica_code:
         nica_status = {
             "Y": ("reported_paid", "NICA assessment reported paid"),
             "E": ("reported_exempt", "NICA assessment reported exempt"),
             "N": ("reported_not_paid", "NICA assessment reported not paid"),
         }.get(nica_code, ("reported_unknown", f"NICA assessment code: {nica_code}"))
-        nica_value = {"status": nica_status[0], "source_code": nica_code}
+        nica_value_by_key = {"status": nica_status[0], "source_code": nica_code}
         facts.append(
             _fact_payload(
-                source, row, run_id=run_id, record_id=record_id, npi=npi,
+                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
                 artifact=artifact, category="program_reports",
                 fact_type="nica_assessment_status", display=nica_status[1],
-                value_json=nica_value,
-                fact_key={"nica_assessment_status": nica_value},
+                value_json=nica_value_by_key,
+                fact_key={"nica_assessment_status": nica_value_by_key},
             )
         )
     addresses_by_key: dict[str, dict[str, Any]] = {}
@@ -2442,23 +2451,23 @@ def _profile_master_facts(
         ("pl2_", "practice_secondary_2"),
         ("pl3_", "practice_secondary_3"),
     ):
-        address = _address_value(row, prefix=prefix, location_type=location_type)
+        address = _address_value(source_row, prefix=prefix, location_type=location_type)
         if address is None:
             continue
-        address_without_role = {
-            key: value for key, value in address.items() if key != "location_type"
+        address_without_role_by_key = {
+            key: field_value for key, field_value in address.items() if key != "location_type"
         }
-        address_key = json.dumps(address_without_role, sort_keys=True)
+        address_key = json.dumps(address_without_role_by_key, sort_keys=True)
         existing_address = addresses_by_key.setdefault(
             address_key,
-            {**address_without_role, "location_types": []},
+            {**address_without_role_by_key, "location_types": []},
         )
         existing_address["location_types"].append(location_type)
     for address_key, address in sorted(addresses_by_key.items()):
         address["location_types"] = sorted(set(address["location_types"]))
         facts.append(
             _fact_payload(
-                source, row, run_id=run_id, record_id=record_id, npi=npi,
+                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
                 artifact=artifact, category="locations", fact_type="provider_address",
                 display=_address_display(address), value_json=address,
                 fact_key=hashlib.sha256(address_key.encode()).hexdigest()[:16],
@@ -2467,9 +2476,9 @@ def _profile_master_facts(
     return facts
 
 
-def _state_licensure_fact(
-    source: FloridaSource,
-    row: Mapping[str, str],
+def _state_license_fact_payload(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
@@ -2478,39 +2487,39 @@ def _state_licensure_fact(
 ) -> dict[str, Any]:
     """Publish reviewed license fields while keeping contact/identity data raw-only."""
     original_date, _ = _normalize_source_date(
-        _first(row, "orig_dte", "original_date")
+        _first(source_row, "orig_dte", "original_date")
     )
     expiration_date, _ = _normalize_source_date(
-        _first(row, "expr_dte", "expire_date")
+        _first(source_row, "expr_dte", "expire_date")
     )
     status_effective_date, _ = _normalize_source_date(
-        row.get("status_effective_date", "")
+        source_row.get("status_effective_date", "")
     )
-    profession_code = _first(row, "pro_cde", "profession_code")
-    rank_code = _first(row, "rank_cde", "rank_code")
-    license_number = _first(row, "lic_nbr", "license_number")
-    status = _first(row, "lic_sta_desc", "license_status_description")
+    profession_code = _first(source_row, "pro_cde", "profession_code")
+    rank_code = _first(source_row, "rank_cde", "rank_code")
+    license_number = _first(source_row, "lic_nbr", "license_number")
+    status = _first(source_row, "lic_sta_desc", "license_status_description")
     active_status = _first(
-        row,
+        source_row,
         "lic_actv_sta_desc",
         "license_active_status_description",
     )
     safe_indicators = _without_empty(
         {
-            "multi_state_license": row.get(
+            "multi_state_license": source_row.get(
                 "multi_state_license_indicator",
                 "",
             ),
-            "prescribing": row.get("prescribe_ind", ""),
-            "dispensing": row.get("dispensing_ind", ""),
-            "other_license": row.get("other_license", ""),
+            "prescribing": source_row.get("prescribe_ind", ""),
+            "dispensing": source_row.get("dispensing_ind", ""),
+            "other_license": source_row.get("other_license", ""),
         }
     )
-    value = _without_empty(
+    field_value = _without_empty(
         {
             "jurisdiction": "FL",
             "profession_code": profession_code,
-            "profession": row.get("profession_name", ""),
+            "profession": source_row.get("profession_name", ""),
             "rank_code": rank_code,
             "license_number": license_number,
             "status": status,
@@ -2518,32 +2527,32 @@ def _state_licensure_fact(
             "original_issue_date": original_date,
             "expiration_date": expiration_date,
             "status_effective_date": status_effective_date,
-            "modifiers": row.get("mod_cdes", ""),
+            "modifiers": source_row.get("mod_cdes", ""),
             "license_indicators": safe_indicators,
         }
     )
     display_parts = [
-        value
-        for value in (
-            row.get("profession_name", ""),
+        field_value
+        for field_value in (
+            source_row.get("profession_name", ""),
             license_number,
             status,
             active_status,
         )
-        if value
+        if field_value
     ]
     display = " — ".join(display_parts)
     return _fact_payload(
-        source,
-        row,
+        profile_source,
+        source_row,
         run_id=run_id,
         record_id=record_id,
         npi=npi,
         artifact=artifact,
         category="licenses",
-        fact_type=source.fact_type,
-        display=f"{source.title}: {display}" if display else source.title,
-        value_json=value,
+        fact_type=profile_source.fact_type,
+        display=f"{profile_source.title}: {display}" if display else profile_source.title,
+        value_json=field_value,
         effective_start=status_effective_date or original_date or None,
         effective_end=expiration_date or None,
         fact_key={
@@ -2560,9 +2569,9 @@ def _state_licensure_fact(
     )
 
 
-def _state_licensure_facts(
-    source: FloridaSource,
-    row: Mapping[str, str],
+def _state_license_facts(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
@@ -2570,9 +2579,9 @@ def _state_licensure_facts(
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     facts = [
-        _state_licensure_fact(
-            source,
-            row,
+        _state_license_fact_payload(
+            profile_source,
+            source_row,
             run_id=run_id,
             record_id=record_id,
             npi=npi,
@@ -2581,27 +2590,27 @@ def _state_licensure_facts(
     ]
     restricted_indicators = _without_empty(
         {
-            "board_action": row.get("board_action_indicator", ""),
-            "administrative_complaints": row.get(
+            "board_action": source_row.get("board_action_indicator", ""),
+            "administrative_complaints": source_row.get(
                 "administrative_complaints_indicator",
                 "",
             ),
-            "emergency_order": row.get("emergency_order_indicator", ""),
-            "final_order": row.get("final_order_indicator", ""),
+            "emergency_order": source_row.get("emergency_order_indicator", ""),
+            "final_order": source_row.get("final_order_indicator", ""),
         }
     )
     if not restricted_indicators:
         return facts
-    license_number = _first(row, "lic_nbr", "license_number")
-    value = {
+    license_number = _first(source_row, "lic_nbr", "license_number")
+    field_value_by_key = {
         "jurisdiction": "FL",
         "license_number": license_number,
         "regulatory_indicators": restricted_indicators,
     }
     facts.append(
         _fact_payload(
-            source,
-            row,
+            profile_source,
+            source_row,
             run_id=run_id,
             record_id=record_id,
             npi=npi,
@@ -2609,8 +2618,8 @@ def _state_licensure_facts(
             category="regulatory_actions",
             fact_type="license_regulatory_indicators",
             display="Restricted Florida license regulatory indicators",
-            value_json=value,
-            fact_key=value,
+            value_json=field_value_by_key,
+            fact_key=field_value_by_key,
             assertion_type="state_reported",
             verification_status="government_source",
             sensitive=True,
@@ -2621,38 +2630,38 @@ def _state_licensure_facts(
 
 
 def _administrative_complaint_fact(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
-    activity_date, _ = _normalize_source_date(row.get("case_activity_date", ""))
-    value = _without_empty(
+    activity_date, _ = _normalize_source_date(source_row.get("case_activity_date", ""))
+    field_value = _without_empty(
         {
             "jurisdiction": "FL",
-            "case_number": row.get("case_number", ""),
-            "activity_type": row.get("case_activity_type", ""),
+            "case_number": source_row.get("case_number", ""),
+            "activity_type": source_row.get("case_activity_type", ""),
             "activity_date": activity_date,
-            "profession": row.get("profession", ""),
-            "license_number": row.get("license_number", ""),
+            "profession": source_row.get("profession", ""),
+            "license_number": source_row.get("license_number", ""),
             "disposition": "allegation_not_final_action",
         }
     )
     details = " — ".join(
-        item
-        for item in (
-            row.get("case_number", ""),
-            row.get("case_activity_type", ""),
+        profile_item
+        for profile_item in (
+            source_row.get("case_number", ""),
+            source_row.get("case_activity_type", ""),
             activity_date,
         )
-        if item
+        if profile_item
     )
     return _fact_payload(
-        source,
-        row,
+        profile_source,
+        source_row,
         run_id=run_id,
         record_id=record_id,
         npi=npi,
@@ -2660,131 +2669,133 @@ def _administrative_complaint_fact(
         display=(
             f"Administrative complaint (allegation): {details}"
             if details
-            else source.title
+            else profile_source.title
         ),
-        value_json=value,
+        value_json=field_value,
         effective_start=activity_date or None,
         fact_key={
-            "case_number": row.get("case_number", ""),
-            "activity_type": row.get("case_activity_type", ""),
+            "case_number": source_row.get("case_number", ""),
+            "activity_type": source_row.get("case_activity_type", ""),
             "activity_date": activity_date,
         },
     )
 
 
 def _pain_management_fact(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Build one reviewed pain-management report fact."""
     report_period = _without_empty(
-        {"year": row.get("year", ""), "quarter": row.get("qtr", "")}
+        {"year": source_row.get("year", ""), "quarter": source_row.get("qtr", "")}
     )
-    value = _without_empty(
+    field_value = _without_empty(
         {
             "jurisdiction": "FL",
             "clinic": _without_empty(
                 {
-                    "name": row.get("clinic_name", ""),
-                    "license_number": row.get("lic_nbr", ""),
-                    "license_status": row.get("lic_status", ""),
-                    "practice_location": row.get("pl_address", ""),
+                    "name": source_row.get("clinic_name", ""),
+                    "license_number": source_row.get("lic_nbr", ""),
+                    "license_status": source_row.get("lic_status", ""),
+                    "practice_location": source_row.get("pl_address", ""),
                 }
             ),
             "reporting_period": report_period,
             "reporting_provider": _without_empty(
                 {
-                    "profession": row.get("reporting_phy_prof", ""),
-                    "license_number": row.get("reporting_phy_lic_nbr", ""),
+                    "profession": source_row.get("reporting_phy_prof", ""),
+                    "license_number": source_row.get("reporting_phy_lic_nbr", ""),
                 }
             ),
             "patient_counts": _without_empty(
                 {
-                    "new": row.get("new_cnt", ""),
-                    "repeat": row.get("repeat_cnt", ""),
-                    "discharged_for_abuse": row.get("abuse_cnt", ""),
-                    "discharged_for_diversion": row.get("divrsn_cnt", ""),
-                    "out_of_state": row.get("oos_cnt", ""),
+                    "new": source_row.get("new_cnt", ""),
+                    "repeat": source_row.get("repeat_cnt", ""),
+                    "discharged_for_abuse": source_row.get("abuse_cnt", ""),
+                    "discharged_for_diversion": source_row.get("divrsn_cnt", ""),
+                    "out_of_state": source_row.get("oos_cnt", ""),
                 }
             ),
         }
     )
     period_display = " ".join(
-        item
-        for item in (
-            row.get("year", ""),
-            f"Q{row['qtr']}" if row.get("qtr") else "",
+        profile_item
+        for profile_item in (
+            source_row.get("year", ""),
+            f"Q{source_row['qtr']}" if source_row.get("qtr") else "",
         )
-        if item
+        if profile_item
     )
     details = " — ".join(
-        item
-        for item in (row.get("clinic_name", ""), period_display)
-        if item
+        profile_item
+        for profile_item in (source_row.get("clinic_name", ""), period_display)
+        if profile_item
     )
     return _fact_payload(
-        source,
-        row,
+        profile_source,
+        source_row,
         run_id=run_id,
         record_id=record_id,
         npi=npi,
         artifact=artifact,
-        display=f"Pain management clinic report: {details}" if details else source.title,
-        value_json=value,
+        display=f"Pain management clinic report: {details}" if details else profile_source.title,
+        value_json=field_value,
         fact_key={
-            "clinic_license": row.get("lic_nbr", ""),
-            "reporting_provider_license": row.get(
+            "clinic_license": source_row.get("lic_nbr", ""),
+            "reporting_provider_license": source_row.get(
                 "reporting_phy_lic_nbr",
                 "",
             ),
-            "year": row.get("year", ""),
-            "quarter": row.get("qtr", ""),
+            "year": source_row.get("year", ""),
+            "quarter": source_row.get("qtr", ""),
         },
     )
 
 
 def _pharmacy_relationship_fact(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
-    original_date, _ = _normalize_source_date(row.get("pharm_orig_dte", ""))
-    expiration_date, _ = _normalize_source_date(row.get("pharm_expr_dte", ""))
+    """Build one reviewed pharmacy relationship fact."""
+    original_date, _ = _normalize_source_date(source_row.get("pharm_orig_dte", ""))
+    expiration_date, _ = _normalize_source_date(source_row.get("pharm_expr_dte", ""))
     status_effective_date, _ = _normalize_source_date(
-        row.get("pharm_stat_efctv_dte", "")
+        source_row.get("pharm_stat_efctv_dte", "")
     )
     pharmacy_location = _without_empty(
         {
-            "address_line_1": row.get("pharm_pl_addr_l1", ""),
-            "address_line_2": row.get("pharm_pl_addr_l2", ""),
-            "address_line_3": row.get("pharm_pl_addr_l3", ""),
-            "city": row.get("pharm_pl_cty", ""),
-            "state": row.get("pharm_pl_st", ""),
-            "postal_code": row.get("pharm_pl_zip", ""),
+            "address_line_1": source_row.get("pharm_pl_addr_l1", ""),
+            "address_line_2": source_row.get("pharm_pl_addr_l2", ""),
+            "address_line_3": source_row.get("pharm_pl_addr_l3", ""),
+            "city": source_row.get("pharm_pl_cty", ""),
+            "state": source_row.get("pharm_pl_st", ""),
+            "postal_code": source_row.get("pharm_pl_zip", ""),
         }
     )
-    value = _without_empty(
+    field_value = _without_empty(
         {
             "jurisdiction": "FL",
-            "relationship_profession": row.get("rltn_prof_nme", ""),
+            "relationship_profession": source_row.get("rltn_prof_nme", ""),
             "related_license": _without_empty(
                 {
-                    "license_number": row.get("rltn_lic_nbr", ""),
-                    "status_code": row.get("rltn_lic_sta_cde", ""),
-                    "status": row.get("rltn_lic_sta_desc", ""),
-                    "secondary_status_code": row.get(
+                    "license_number": source_row.get("rltn_lic_nbr", ""),
+                    "status_code": source_row.get("rltn_lic_sta_cde", ""),
+                    "status": source_row.get("rltn_lic_sta_desc", ""),
+                    "secondary_status_code": source_row.get(
                         "rltn_lic_sec_sta_cde",
                         "",
                     ),
-                    "secondary_status": row.get(
+                    "secondary_status": source_row.get(
                         "rltn_lic_sec_sta_desc",
                         "",
                     ),
@@ -2792,53 +2803,54 @@ def _pharmacy_relationship_fact(
             ),
             "pharmacy": _without_empty(
                 {
-                    "name": row.get("pharm_key_name", ""),
-                    "doing_business_as": row.get("pharm_dba_name", ""),
-                    "license_number": row.get("pharm_lic_nbr", ""),
-                    "license_status_code": row.get("pharm_lic_sta_cde", ""),
-                    "license_status": row.get("pharm_lic_sta_desc", ""),
+                    "name": source_row.get("pharm_key_name", ""),
+                    "doing_business_as": source_row.get("pharm_dba_name", ""),
+                    "license_number": source_row.get("pharm_lic_nbr", ""),
+                    "license_status_code": source_row.get("pharm_lic_sta_cde", ""),
+                    "license_status": source_row.get("pharm_lic_sta_desc", ""),
                     "original_issue_date": original_date,
                     "status_effective_date": status_effective_date,
                     "expiration_date": expiration_date,
                     "practice_location": pharmacy_location,
-                    "phone": row.get("pharm_phne_nbr", ""),
-                    "phone_extension": row.get("pharm_phne_ext", ""),
+                    "phone": source_row.get("pharm_phne_nbr", ""),
+                    "phone_extension": source_row.get("pharm_phne_ext", ""),
                 }
             ),
         }
     )
-    relationship = row.get("rltn_prof_nme", "")
-    pharmacy_name = row.get("pharm_key_name", "")
-    details = " — ".join(item for item in (relationship, pharmacy_name) if item)
+    relationship = source_row.get("rltn_prof_nme", "")
+    pharmacy_name = source_row.get("pharm_key_name", "")
+    details = " — ".join(profile_item for profile_item in (relationship, pharmacy_name) if profile_item)
     return _fact_payload(
-        source,
-        row,
+        profile_source,
+        source_row,
         run_id=run_id,
         record_id=record_id,
         npi=npi,
         artifact=artifact,
-        display=f"Pharmacy relationship: {details}" if details else source.title,
-        value_json=value,
+        display=f"Pharmacy relationship: {details}" if details else profile_source.title,
+        value_json=field_value,
         effective_start=status_effective_date or original_date or None,
         effective_end=expiration_date or None,
         fact_key={
-            "pharmacy_license": row.get("pharm_lic_nbr", ""),
-            "related_license": row.get("rltn_lic_nbr", ""),
+            "pharmacy_license": source_row.get("pharm_lic_nbr", ""),
+            "related_license": source_row.get("rltn_lic_nbr", ""),
             "relationship_profession": relationship,
         },
     )
 
 
 def _medical_cannabis_fact(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
-    course = row.get("course_type", "")
+    """Build one reviewed medical-cannabis authorization fact."""
+    course = source_row.get("course_type", "")
     course_token = course.strip().upper()
     if course_token in {"D", "DIRECTOR"}:
         authorization_type = "dispensing_organization_medical_director_eligibility"
@@ -2854,18 +2866,18 @@ def _medical_cannabis_fact(
         display = "Florida medical cannabis course listing"
     practice_location = _without_empty(
         {
-            "address_line_1": row.get("pl_addr_line1", ""),
-            "address_line_2": row.get("pl_addr_line2", ""),
-            "address_line_3": row.get("pl_addr_line3", ""),
-            "city": row.get("pl_addr_cty", ""),
-            "state": row.get("pl_st_cde", ""),
-            "postal_code": row.get("pl_zip", ""),
-            "county": row.get("pl_cnty", ""),
+            "address_line_1": source_row.get("pl_addr_line1", ""),
+            "address_line_2": source_row.get("pl_addr_line2", ""),
+            "address_line_3": source_row.get("pl_addr_line3", ""),
+            "city": source_row.get("pl_addr_cty", ""),
+            "state": source_row.get("pl_st_cde", ""),
+            "postal_code": source_row.get("pl_zip", ""),
+            "county": source_row.get("pl_cnty", ""),
         }
     )
-    completion_date_source = row.get("dte_compl", "")
+    completion_date_source = source_row.get("dte_compl", "")
     completion_date, completion_precision = _normalize_source_date(completion_date_source)
-    value = _without_empty(
+    field_value = _without_empty(
         {
             "jurisdiction": "FL",
             "authorization_type": authorization_type,
@@ -2873,14 +2885,14 @@ def _medical_cannabis_fact(
             "course_type_code": course_token,
             "course_completed_date": completion_date,
             "course_completed_precision": completion_precision if completion_date else "",
-            "submitted_by_code": row.get("submitted_by", ""),
-            "license_number": row.get("lic_nbr", ""),
+            "submitted_by_code": source_row.get("submitted_by", ""),
+            "license_number": source_row.get("lic_nbr", ""),
             "practice_location": practice_location,
-            "practice_phone": row.get("phne_nbr", ""),
+            "practice_phone": source_row.get("phne_nbr", ""),
             "specialties": [
-                value.strip()
-                for value in row.get("specialties", "").split("|")
-                if value.strip()
+                field_value.strip()
+                for field_value in source_row.get("specialties", "").split("|")
+                if field_value.strip()
             ],
             "location_context": "source_reported_practice_contact",
             "network_bound": False,
@@ -2889,85 +2901,86 @@ def _medical_cannabis_fact(
     if completion_date:
         display = f"{display} — course completed {completion_date}"
     return _fact_payload(
-        source, row, run_id=run_id, record_id=record_id, npi=npi,
+        profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
         artifact=artifact, category="prescribing_authorizations",
         fact_type=semantic_fact_type, display=display,
-        value_json=value,
+        value_json=field_value,
     )
 
 
 def _facts_for_row(
-    source: FloridaSource,
-    row: Mapping[str, str],
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
     *,
     run_id: str,
     record_id: str,
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    if source.key == "counties":
+    """Map one normalized source row into reviewed provider-profile facts."""
+    if profile_source.key == "counties":
         return []
-    if source.key == "profile_master":
+    if profile_source.key == "profile_master":
         return _profile_master_facts(
-            source, row, run_id=run_id, record_id=record_id, npi=npi,
+            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
             artifact=artifact,
         )
-    if source.key in {
+    if profile_source.key in {
         "license_status",
         "licensure_current",
         "licensure_all_statuses",
     }:
-        return _state_licensure_facts(
-            source,
-            row,
+        return _state_license_facts(
+            profile_source,
+            source_row,
             run_id=run_id,
             record_id=record_id,
             npi=npi,
             artifact=artifact,
         )
-    if source.path == "/ProfileData":
+    if profile_source.path == "/ProfileData":
         return _profile_data_facts(
-            source,
-            row,
+            profile_source,
+            source_row,
             run_id=run_id,
             record_id=record_id,
             npi=npi,
             artifact=artifact,
         )
-    if source.key == "medical_cannabis_authorization":
+    if profile_source.key == "medical_cannabis_authorization":
         return [
             _medical_cannabis_fact(
-                source, row, run_id=run_id, record_id=record_id, npi=npi,
+                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
                 artifact=artifact,
             )
         ]
-    if source.key == "administrative_complaints":
+    if profile_source.key == "administrative_complaints":
         return [
             _administrative_complaint_fact(
-                source,
-                row,
+                profile_source,
+                source_row,
                 run_id=run_id,
                 record_id=record_id,
                 npi=npi,
                 artifact=artifact,
             )
         ]
-    if source.key == "pain_management_report":
+    if profile_source.key == "pain_management_report":
         return [
             _pain_management_fact(
-                source,
-                row,
+                profile_source,
+                source_row,
                 run_id=run_id,
                 record_id=record_id,
                 npi=npi,
                 artifact=artifact,
             )
         ]
-    if source.key == "pharmacy_pharmacist":
+    if profile_source.key == "pharmacy_pharmacist":
         return [
             _pharmacy_relationship_fact(
-                source,
-                row,
+                profile_source,
+                source_row,
                 run_id=run_id,
                 record_id=record_id,
                 npi=npi,
@@ -2976,7 +2989,7 @@ def _facts_for_row(
         ]
     return [
         _fact_payload(
-            source, row, run_id=run_id, record_id=record_id, npi=npi,
+            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
             artifact=artifact,
         )
     ]
@@ -3069,7 +3082,7 @@ def _env_positive_int(name: str, default: int) -> int:
         return default
 
 
-def _copy_upsert_enabled() -> bool:
+def _is_copy_upsert_enabled() -> bool:
     return os.getenv("HLTHPRT_FL_MQA_COPY_UPSERT", "1").strip().lower() not in {
         "0",
         "false",
@@ -3132,45 +3145,45 @@ def _copy_json_default(value: Any) -> Any:
     return str(value)
 
 
-def _copy_value_for_type(column_type: Any, value: Any) -> Any:
-    value = _strip_postgres_nuls(value)
-    if value is None:
+def _copy_value_for_type(column_type: Any, field_value: Any) -> Any:
+    field_value = _strip_postgres_nuls(field_value)
+    if field_value is None:
         return None
     if isinstance(column_type, SQLAlchemyJSON):
         return json.dumps(
-            value,
+            field_value,
             sort_keys=True,
             separators=(",", ":"),
             default=_copy_json_default,
         )
     if isinstance(column_type, ARRAY):
-        if isinstance(value, str):
+        if isinstance(field_value, str):
             try:
-                value = json.loads(value)
+                field_value = json.loads(field_value)
             except json.JSONDecodeError as exc:
                 raise ValueError("COPY array value must be a JSON array or sequence") from exc
-        if not isinstance(value, (list, tuple)):
+        if not isinstance(field_value, (list, tuple)):
             raise ValueError("COPY array value must be a sequence")
         return [
-            _copy_value_for_type(column_type.item_type, item)
-            for item in value
+            _copy_value_for_type(column_type.item_type, profile_item)
+            for profile_item in field_value
         ]
     if isinstance(column_type, DateTime):
-        if isinstance(value, str):
-            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        if not isinstance(value, datetime):
+        if isinstance(field_value, str):
+            field_value = datetime.fromisoformat(field_value.strip().replace("Z", "+00:00"))
+        if not isinstance(field_value, datetime):
             raise ValueError("COPY timestamp value must be datetime or ISO-8601 text")
-        if not getattr(column_type, "timezone", False) and value.tzinfo is not None:
-            value = value.astimezone(UTC).replace(tzinfo=None)
-        return value
+        if not getattr(column_type, "timezone", False) and field_value.tzinfo is not None:
+            field_value = field_value.astimezone(UTC).replace(tzinfo=None)
+        return field_value
     if isinstance(column_type, Date):
-        if isinstance(value, datetime):
-            return value.date()
-        if isinstance(value, str):
-            return date.fromisoformat(value.strip())
-        if not isinstance(value, date):
+        if isinstance(field_value, datetime):
+            return field_value.date()
+        if isinstance(field_value, str):
+            return date.fromisoformat(field_value.strip())
+        if not isinstance(field_value, date):
             raise ValueError("COPY date value must be date or ISO-8601 text")
-    return value
+    return field_value
 
 
 def _copy_records(
@@ -3194,7 +3207,7 @@ def _copy_records(
 async def _copy_upsert_chunk_on_connection(
     connection: Any,
     model: Any,
-    rows: list[dict[str, Any]],
+    source_rows: list[dict[str, Any]],
     key: str,
 ) -> None:
     """COPY one bounded chunk and merge it in the same short transaction."""
@@ -3222,7 +3235,7 @@ async def _copy_upsert_chunk_on_connection(
             "active database driver lacks copy_records_to_table"
         )
 
-    column_names, copy_rows = _copy_records(table, rows)
+    column_names, copy_rows = _copy_records(table, source_rows)
     stage_table = _copy_stage_table_name(table_name)
     quoted_stage = _quoted_identifier(stage_table)
     target_ref = (
@@ -3292,14 +3305,14 @@ async def _upsert_rows_values(
     for offset in range(0, len(rows), 1_000):
         chunk = rows[offset : offset + 1_000]
         statement = db.insert(model.__table__).values(chunk)
-        update_fields = {
+        update_fields_by_key = {
             column.name: getattr(statement.excluded, column.name)
             for column in model.__table__.columns
             if column.name != key
         }
         await statement.on_conflict_do_update(
             index_elements=[key],
-            set_=update_fields,
+            set_=update_fields_by_key,
         ).status()
 
 
@@ -3309,22 +3322,22 @@ async def _upsert_rows(model: Any, rows: list[dict[str, Any]], key: str) -> None
     table_name = _validated_identifier(model.__table__.name)
     if (
         table_name not in _COPY_UPSERT_TABLES
-        or not _copy_upsert_enabled()
+        or not _is_copy_upsert_enabled()
         or len(rows) < _copy_upsert_min_rows()
     ):
         await _upsert_rows_values(model, rows, key)
         return
 
     batch_rows = _copy_upsert_batch_rows()
-    copy_available = True
+    is_copy_available = True
     for offset in range(0, len(rows), batch_rows):
         chunk = rows[offset : offset + batch_rows]
-        if copy_available:
+        if is_copy_available:
             try:
                 await _copy_upsert_chunk(model, chunk, key)
                 continue
             except _CopyUpsertUnavailable:
-                copy_available = False
+                is_copy_available = False
         await _upsert_rows_values(model, chunk, key)
 
 
@@ -3395,10 +3408,10 @@ def _failure_status_window_seconds() -> float:
 
 
 def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
-    seen: set[int] = set()
+    seen_items: set[int] = set()
     current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
+    while current is not None and id(current) not in seen_items:
+        seen_items.add(id(current))
         yield current
         current = (
             getattr(current, "orig", None)
@@ -3440,16 +3453,16 @@ async def _mark_failed_run_status(
     cleanup_error: str | None,
 ) -> str | None:
     """Best-effort failure status that never overwrites an atomic completion."""
-    error_payload = {
+    error_payload_by_key = {
         "type": type(original_error).__name__,
         "message": str(original_error),
     }
     if cleanup_error:
-        error_payload["stage_cleanup_error"] = cleanup_error
-    status_values = {
+        error_payload_by_key["stage_cleanup_error"] = cleanup_error
+    status_values_by_key = {
         "status": "failed",
         "metrics": run_row.get("metrics") or {},
-        "error": error_payload,
+        "error": error_payload_by_key,
         "finished_at": _utcnow(),
     }
     attempts = _failure_status_attempts()
@@ -3468,14 +3481,14 @@ async def _mark_failed_run_status(
                     ProviderProfileImportRun.run_id == run_id,
                     ProviderProfileImportRun.status != "completed",
                 )
-                .values(**status_values)
+                .values(**status_values_by_key)
             )
             affected_rows = await asyncio.wait_for(
                 statement.status(),
                 timeout=min(timeout_seconds, remaining_seconds),
             )
             if affected_rows:
-                run_row.update(status_values)
+                run_row.update(status_values_by_key)
             return None
         except Exception as exc:
             last_error = exc
@@ -3518,11 +3531,10 @@ async def _projection_row_batches(
                 ProviderProfileFact.npi.is_not(None),
                 ProviderProfileFact.npi > last_npi,
             )
-            .distinct()
-            .order_by(ProviderProfileFact.npi)
+            .distinct().order_by(ProviderProfileFact.npi)
             .limit(npi_batch_size)
         )
-        npis = [int(row._mapping["npi"]) for row in npi_rows]
+        npis = [int(source_row._mapping["npi"]) for source_row in npi_rows]
         if not npis:
             return
         fact_rows = await db.all(
@@ -3539,8 +3551,8 @@ async def _projection_row_batches(
         )
         facts_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for fact_row in fact_rows:
-            fact = dict(fact_row._mapping)
-            facts_by_npi[int(fact["npi"])].append(fact)
+            fact_by_key = dict(fact_row._mapping)
+            facts_by_npi[int(fact_by_key["npi"])].append(fact_by_key)
         projection_rows: list[dict[str, Any]] = []
         for npi in npis:
             profile, evidence = _projection(
@@ -3616,14 +3628,14 @@ async def _publish_projection_swap(
             f"expected={inserted_count}:rows={stage_count}:"
             f"distinct_npis={distinct_npi_count}"
         )
-    publication = {
+    publication_by_key = {
         "stage_table": f"{schema}.{stage_name}",
         "published_table": f"{schema}.{live_name}",
         "rollback_table": f"{schema}.{old_name}",
         "published_rows": stage_count,
         "publication": "atomic_table_swap",
     }
-    final_metrics: dict[str, Any] = {}
+    final_metrics_by_key: dict[str, Any] = {}
 
     async with db.transaction():
         await db.scalar(
@@ -3672,7 +3684,7 @@ async def _publish_projection_swap(
                 previous_source_records = previous_metrics.get("source_records")
                 if isinstance(previous_source_records, int):
                     previous_source_record_count = previous_source_records
-            if _generation_is_newer(
+            if _is_generation_newer(
                 current_started_at,
                 current_generation_id,
                 started_at,
@@ -3681,31 +3693,31 @@ async def _publish_projection_swap(
                 raise RuntimeError(
                     "provider_profile_newer_generation_already_published"
                 )
-        candidate_source_metrics = completion_metrics.get("source_metrics")
-        if not isinstance(candidate_source_metrics, Mapping):
-            candidate_source_metrics = {}
-        previous_source_metrics: Mapping[str, Any] = {}
+        candidate_source_metrics_by_key = completion_metrics.get("source_metrics")
+        if not isinstance(candidate_source_metrics_by_key, Mapping):
+            candidate_source_metrics_by_key = {}
+        previous_source_metrics_by_key: Mapping[str, Any] = {}
         if isinstance(previous_metrics, Mapping):
             prior = previous_metrics.get("source_metrics")
             if isinstance(prior, Mapping):
-                previous_source_metrics = prior
+                previous_source_metrics_by_key = prior
         source_validation_reasons = _source_validation_guard_reasons(
-            candidate_source_metrics,
+            candidate_source_metrics_by_key,
             expected_source_keys=completion_metrics.get(
                 "selected_sources",
                 (),
             ),
         )
         source_ratio_reasons = _source_ratio_guard_reasons(
-            candidate_source_metrics,
-            previous_source_metrics,
+            candidate_source_metrics_by_key,
+            previous_source_metrics_by_key,
             min_publish_ratio=min_publish_ratio,
         )
         source_header_reasons = _source_header_drift_guard_reasons(
-            candidate_source_metrics,
-            previous_source_metrics,
+            candidate_source_metrics_by_key,
+            previous_source_metrics_by_key,
         )
-        publication["source_guard"] = {
+        publication_by_key["source_guard"] = {
             "allow_volume_drop": allow_volume_drop,
             "min_publish_ratio": min_publish_ratio,
             "validation_reasons": source_validation_reasons,
@@ -3734,7 +3746,7 @@ async def _publish_projection_swap(
             min_first_publish_providers=min_first_publish_providers,
             min_publish_ratio=min_publish_ratio,
         )
-        publication["volume_guard"] = {
+        publication_by_key["volume_guard"] = {
             "allow_volume_drop": allow_volume_drop,
             "candidate_providers": stage_count,
             "current_providers": current_provider_count,
@@ -3751,10 +3763,10 @@ async def _publish_projection_swap(
                 "provider_profile_publication_volume_guard:"
                 + ",".join(guard_reasons)
             )
-        final_metrics = {
+        final_metrics_by_key = {
             **completion_metrics,
             "published_providers": stage_count,
-            "publication": publication,
+            "publication": publication_by_key,
         }
         projection_tables = await db.all(
             text(
@@ -3800,13 +3812,13 @@ async def _publish_projection_swap(
             .where(ProviderProfileImportRun.run_id == run_id)
             .values(
                 status="completed",
-                metrics=final_metrics,
+                metrics=final_metrics_by_key,
                 error=None,
                 finished_at=_utcnow(),
             )
             .status()
         )
-    return publication, final_metrics
+    return publication_by_key, final_metrics_by_key
 
 
 def _source_validation_guard_reasons(
@@ -3829,8 +3841,8 @@ def _source_validation_guard_reasons(
             continue
         if metric.get("schema_complete") is not True:
             reasons.append(f"source_schema_incomplete:{source_key}")
-        rows = metric.get("rows")
-        if not isinstance(rows, int) or rows <= 0:
+        source_rows = metric.get("rows")
+        if not isinstance(source_rows, int) or source_rows <= 0:
             reasons.append(f"source_rows_empty:{source_key}")
         quarantined_rows = metric.get("quarantined_rows", 0)
         if (
@@ -3870,13 +3882,13 @@ def _source_validation_guard_reasons(
                     f"source_quarantine_ratio_limit_invalid:{source_key}"
                 )
             elif (
-                isinstance(rows, int)
-                and rows > 0
-                and quarantined_rows / rows > max_quarantined_ratio
+                isinstance(source_rows, int)
+                and source_rows > 0
+                and quarantined_rows / source_rows > max_quarantined_ratio
             ):
                 reasons.append(
                     f"source_quarantine_ratio_exceeded:{source_key}:"
-                    f"{quarantined_rows}/{rows}>{max_quarantined_ratio:g}"
+                    f"{quarantined_rows}/{source_rows}>{max_quarantined_ratio:g}"
                 )
         header_sha256 = metric.get("header_sha256")
         if not isinstance(header_sha256, str) or not re.fullmatch(
@@ -3887,7 +3899,7 @@ def _source_validation_guard_reasons(
     return reasons
 
 
-def _source_quarantine_within_threshold(
+def _is_source_quarantine_within_threshold(
     metric: Mapping[str, Any],
 ) -> bool:
     rows = metric.get("rows")
@@ -4028,15 +4040,15 @@ def _retention_eligible_run_ids(
     failed_cutoff: datetime,
 ) -> list[str]:
     """Select terminal heavy-data generations without touching active/audit runs."""
-    eligible: list[str] = []
-    protected = {*protected_run_ids, current_run_id}
+    eligible_items: list[str] = []
+    protected_items = {*protected_run_ids, current_run_id}
     for row in run_rows:
         run_id = str(row.get("run_id") or "")
-        if not _RUN_ID_RE.fullmatch(run_id) or run_id in protected:
+        if not _RUN_ID_RE.fullmatch(run_id) or run_id in protected_items:
             continue
         status = str(row.get("status") or "")
         if status == "completed":
-            eligible.append(run_id)
+            eligible_items.append(run_id)
             continue
         finished_at = row.get("finished_at")
         if (
@@ -4044,8 +4056,8 @@ def _retention_eligible_run_ids(
             and isinstance(finished_at, datetime)
             and finished_at <= failed_cutoff
         ):
-            eligible.append(run_id)
-    return sorted(set(eligible))
+            eligible_items.append(run_id)
+    return sorted(set(eligible_items))
 
 
 def _remove_artifact_run_directories(
@@ -4056,17 +4068,17 @@ def _remove_artifact_run_directories(
     root = artifact_root.resolve()
     if root == Path(root.anchor):
         raise RuntimeError("provider_profile_artifact_root_too_broad")
-    deleted: list[str] = []
-    missing: list[str] = []
-    errors: dict[str, str] = {}
+    deleted_items: list[str] = []
+    missing_items: list[str] = []
+    errors_by_key: dict[str, str] = {}
     for run_id in sorted(set(run_ids)):
         if not _RUN_ID_RE.fullmatch(run_id):
-            errors[run_id] = "invalid_run_id"
+            errors_by_key[run_id] = "invalid_run_id"
             continue
         candidate = root / run_id
         try:
             if not candidate.exists():
-                missing.append(run_id)
+                missing_items.append(run_id)
                 continue
             if candidate.is_symlink():
                 raise RuntimeError("symlink_not_allowed")
@@ -4076,13 +4088,13 @@ def _remove_artifact_run_directories(
             if not resolved.is_dir():
                 raise RuntimeError("artifact_path_not_directory")
             shutil.rmtree(resolved)
-            deleted.append(run_id)
+            deleted_items.append(run_id)
         except Exception as exc:  # best effort; a later success retries cleanup
-            errors[run_id] = f"{type(exc).__name__}: {exc}"
+            errors_by_key[run_id] = f"{type(exc).__name__}: {exc}"
     return {
-        "deleted": deleted,
-        "missing": missing,
-        "errors": errors,
+        "deleted": deleted_items,
+        "missing": missing_items,
+        "errors": errors_by_key,
     }
 
 
@@ -4090,14 +4102,14 @@ async def _delete_retained_payload_rows(
     run_ids: list[str],
 ) -> dict[str, int]:
     """Delete heavy rows and report pre-counts independent of driver status text."""
-    deleted_rows: dict[str, int] = {}
+    deleted_rows_by_key: dict[str, int] = {}
     for model, metric_name in (
         (ProviderProfileFact, "facts"),
         (ProviderProfileSourceRecord, "source_records"),
         (ProviderProfileArtifact, "artifacts"),
     ):
         predicate = model.run_id.in_(run_ids)
-        deleted_rows[metric_name] = int(
+        deleted_rows_by_key[metric_name] = int(
             await db.scalar(
                 select(func.count())
                 .select_from(model.__table__)
@@ -4106,7 +4118,7 @@ async def _delete_retained_payload_rows(
             or 0
         )
         await db.delete(model.__table__).where(predicate).status()
-    return deleted_rows
+    return deleted_rows_by_key
 
 
 async def _post_success_retention(
@@ -4121,7 +4133,7 @@ async def _post_success_retention(
     old_name = f"{live_name}_old"
     protected_run_ids: set[str] = set()
     eligible_run_ids: list[str] = []
-    deleted_rows: dict[str, int] = {}
+    deleted_rows_by_key: dict[str, int] = {}
     failed_cutoff = _utcnow() - timedelta(days=failed_retention_days)
 
     async with db.transaction():
@@ -4153,9 +4165,9 @@ async def _post_success_retention(
                 )
             )
             protected_run_ids.update(
-                str(row._mapping["generation_id"])
-                for row in generation_rows
-                if row._mapping["generation_id"]
+                str(source_row._mapping["generation_id"])
+                for source_row in generation_rows
+                if source_row._mapping["generation_id"]
             )
         terminal_rows = await db.all(
             select(
@@ -4167,13 +4179,13 @@ async def _post_success_retention(
             )
         )
         eligible_run_ids = _retention_eligible_run_ids(
-            (row._mapping for row in terminal_rows),
+            (source_row._mapping for source_row in terminal_rows),
             protected_run_ids=protected_run_ids,
             current_run_id=run_id,
             failed_cutoff=failed_cutoff,
         )
         if eligible_run_ids:
-            deleted_rows = await _delete_retained_payload_rows(
+            deleted_rows_by_key = await _delete_retained_payload_rows(
                 eligible_run_ids,
             )
 
@@ -4191,7 +4203,7 @@ async def _post_success_retention(
         "failed_retention_days": failed_retention_days,
         "protected_audit_run_ids": sorted(protected_run_ids),
         "deleted_run_ids": eligible_run_ids,
-        "deleted_rows": deleted_rows,
+        "deleted_rows": deleted_rows_by_key,
         "artifact_directories": directory_result,
     }
 
@@ -4229,13 +4241,13 @@ async def _apply_post_success_retention(
 ) -> dict[str, Any]:
     """Keep a published run successful even if best-effort retention needs retry."""
     try:
-        retention = await _post_success_retention(
+        retention_by_key = await _post_success_retention(
             run_id=run_id,
             artifact_root=artifact_root,
             failed_retention_days=failed_retention_days,
         )
     except Exception as exc:
-        retention = {
+        retention_by_key = {
             "status": "failed",
             "failed_retention_days": failed_retention_days,
             "error": {
@@ -4243,28 +4255,28 @@ async def _apply_post_success_retention(
                 "message": str(exc),
             },
         }
-    final_metrics = {**metrics, "retention": retention}
+    final_metrics_by_key = {**metrics, "retention": retention_by_key}
     try:
         await (
             db.update(ProviderProfileImportRun.__table__)
             .where(ProviderProfileImportRun.run_id == run_id)
-            .values(metrics=final_metrics)
+            .values(metrics=final_metrics_by_key)
             .status()
         )
     except Exception as exc:
-        retention["metrics_persist_error"] = {
+        retention_by_key["metrics_persist_error"] = {
             "type": type(exc).__name__,
             "message": str(exc),
         }
-    return final_metrics
+    return final_metrics_by_key
 
 
 def _ordered_source_keys(source_keys: Iterable[str]) -> tuple[str, ...]:
     """Deduplicate requested sources while loading the identity master first."""
-    requested = tuple(dict.fromkeys(source_keys))
+    requested_items = tuple(dict.fromkeys(source_keys))
     return (
         "profile_master",
-        *(key for key in requested if key != "profile_master"),
+        *(key for key in requested_items if key != "profile_master"),
     )
 
 
@@ -4285,7 +4297,7 @@ def _partial_publish_reasons(
     return reasons
 
 
-def _generation_is_newer(
+def _is_generation_newer(
     current_started_at: datetime | None,
     current_generation_id: str,
     candidate_started_at: datetime,
@@ -4311,15 +4323,16 @@ def _projection(
     facts: Iterable[Mapping[str, Any]],
     loaded_categories: set[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Compose the stable, categorized state-provider projection for one NPI."""
     grouped: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-    evidence: list[dict[str, Any]] = []
+    evidence_items: list[dict[str, Any]] = []
     source_keys: set[str] = set()
     for fact in facts:
         logical_key = str(fact["logical_fact_key"])
         category_facts = grouped[fact["category"]]
-        item = category_facts.get(logical_key)
-        if item is None:
-            item = {
+        profile_item_by_key = category_facts.get(logical_key)
+        if profile_item_by_key is None:
+            profile_item_by_key = {
                 "type": fact["fact_type"],
                 "logical_fact_key": logical_key,
                 "display": fact["display"],
@@ -4344,40 +4357,40 @@ def _projection(
                 ],
                 "assertion_count": 1,
             }
-            category_facts[logical_key] = item
-        elif fact["source_record_id"] not in item["source_record_ids"]:
-            item["source_record_ids"].append(fact["source_record_id"])
-            item["source_record_ids"].sort()
-            item["assertion_count"] = len(item["source_record_ids"])
+            category_facts[logical_key] = profile_item_by_key
+        elif fact["source_record_id"] not in profile_item_by_key["source_record_ids"]:
+            profile_item_by_key["source_record_ids"].append(fact["source_record_id"])
+            profile_item_by_key["source_record_ids"].sort()
+            profile_item_by_key["assertion_count"] = len(profile_item_by_key["source_record_ids"])
             if fact["fact_type"] == "provider_address":
                 merged_location_types = sorted(
                     {
-                        *item["value"].get("location_types", []),
+                        *profile_item_by_key["value"].get("location_types", []),
                         *fact["value_json"].get("location_types", []),
                     }
                 )
-                item["value"]["location_types"] = merged_location_types
-                item["display"] = _address_display(item["value"])
+                profile_item_by_key["value"]["location_types"] = merged_location_types
+                profile_item_by_key["display"] = _address_display(profile_item_by_key["value"])
         source_keys.add(fact["source_json"]["source_key"])
-        evidence.append(fact["source_json"])
-    categories: dict[str, Any] = {}
+        evidence_items.append(fact["source_json"])
+    categories_by_key: dict[str, Any] = {}
     for category in STANDARD_CATEGORIES:
-        items = list(grouped.get(category, {}).values())
-        categories[category] = {
+        profile_items = list(grouped.get(category, {}).values())
+        categories_by_key[category] = {
             "availability": (
                 "available"
-                if items
+                if profile_items
                 else "not_reported"
                 if category in loaded_categories
                 else "unavailable"
             ),
-            "items": items,
+            "items": profile_items,
         }
-    profile = {
+    profile_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": npi,
         "generation_id": generation_id,
-        "categories": categories,
+        "categories": categories_by_key,
         "sources": [
             {
                 "source_key": FL_MQA_SOURCE_KEY,
@@ -4392,16 +4405,16 @@ def _projection(
             "Administrative complaints are allegations and are not final disciplinary actions.",
         ],
     }
-    evidence_json = {
+    evidence_json_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": npi,
         "generation_id": generation_id,
         "records": sorted(
-            {json.dumps(item, sort_keys=True) for item in evidence}
+            {json.dumps(profile_item_by_key, sort_keys=True) for profile_item_by_key in evidence_items}
         ),
     }
-    evidence_json["records"] = [json.loads(item) for item in evidence_json["records"]]
-    return profile, evidence_json
+    evidence_json_by_key["records"] = [json.loads(profile_item_by_key) for profile_item_by_key in evidence_json_by_key["records"]]
+    return profile_by_key, evidence_json_by_key
 
 
 async def import_florida_mqa_profile(
@@ -4415,6 +4428,7 @@ async def import_florida_mqa_profile(
     control_run_id: str | None = None,
     manage_db: bool = True,
 ) -> dict[str, Any]:
+    """Import, validate, and atomically publish one Florida provider-profile generation."""
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     email = (
         os.getenv("HLTHPRT_FL_MQA_USERNAME")
@@ -4496,7 +4510,7 @@ async def import_florida_mqa_profile(
     root = artifact_root or Path(
         os.getenv(
             "HLTHPRT_FL_MQA_ARTIFACT_ROOT",
-            "/Volumes/Data/healthporta/florida-mqa",
+            "/data/healthporta/florida-mqa",
         )
     )
     run_root = root / run_id
@@ -4513,7 +4527,7 @@ async def import_florida_mqa_profile(
         if manage_db:
             await db.disconnect()
         raise
-    run_row = {
+    run_row_by_key = {
         "run_id": run_id,
         "source_key": FL_MQA_SOURCE_KEY,
         "jurisdiction": "FL",
@@ -4541,7 +4555,7 @@ async def import_florida_mqa_profile(
         "finished_at": None,
     }
     try:
-        await _claim_import_run(run_row)
+        await _claim_import_run(run_row_by_key)
     except BaseException:
         if manage_db:
             await db.disconnect()
@@ -4553,7 +4567,7 @@ async def import_florida_mqa_profile(
             password,
         )
         await asyncio.to_thread(client.authenticate)
-        artifacts: dict[str, dict[str, Any]] = {}
+        artifacts_by_key: dict[str, dict[str, Any]] = {}
         enqueue_live_progress(
             phase="downloading",
             pct=5,
@@ -4562,37 +4576,37 @@ async def import_florida_mqa_profile(
         )
         downloaded_bytes = 0
         for source_index, source_key in enumerate(selected_keys, start=1):
-            source = FLORIDA_SOURCES[source_key]
-            target = run_root / source.filename
-            sha256, size = await asyncio.to_thread(client.download, source, target)
+            profile_source = FLORIDA_SOURCES[source_key]
+            publication_target = run_root / profile_source.filename
+            sha256, size = await asyncio.to_thread(client.download, profile_source, publication_target)
             downloaded_bytes += size
-            artifact = {
+            artifact_by_key = {
                 "artifact_id": hashlib.sha256(f"{run_id}:{source_key}:{sha256}".encode()).hexdigest(),
                 "run_id": run_id,
                 "source_key": source_key,
-                "file_name": source.filename,
-                "source_url": urljoin(client.base_url, source.url),
-                "category": source.category,
+                "file_name": profile_source.filename,
+                "source_url": urljoin(client.base_url, profile_source.url),
+                "category": profile_source.category,
                 "content_sha256": sha256,
                 "content_bytes": size,
                 "header": None,
                 "downloaded_at": _utcnow(),
                 "metadata_json": {"daily_refresh": True},
             }
-            artifacts[source_key] = artifact
+            artifacts_by_key[source_key] = artifact_by_key
             enqueue_live_progress(
                 phase="downloading",
                 pct=5 + int(30 * source_index / len(selected_keys)),
-                message=f"Downloaded {source.title}",
+                message=f"Downloaded {profile_source.title}",
                 file_index=source_index,
                 file_count=len(selected_keys),
-                file_name=source.filename,
+                file_name=profile_source.filename,
                 counters={
                     "artifacts": source_index,
                     "artifact_bytes": downloaded_bytes,
                 },
             )
-        await _upsert_rows(ProviderProfileArtifact, list(artifacts.values()), "artifact_id")
+        await _upsert_rows(ProviderProfileArtifact, list(artifacts_by_key.values()), "artifact_id")
 
         enqueue_live_progress(
             phase="matching",
@@ -4600,22 +4614,22 @@ async def import_florida_mqa_profile(
             message="Loading Florida NPI license identity index",
         )
         license_index = await _load_florida_license_index()
-        master_identities: dict[tuple[str, str], tuple[int | None, str, str]] = {}
+        master_identities_by_key: dict[tuple[str, str], tuple[int | None, str, str]] = {}
         discovered_profession_details: dict[str, set[tuple[str, str]]] = defaultdict(set)
-        records: list[dict[str, Any]] = []
+        source_records: list[dict[str, Any]] = []
         facts: list[dict[str, Any]] = []
         source_record_count = 0
         fact_count = 0
         matched_record_count = 0
         non_projectable_record_count = 0
         selected_count = 0
-        source_metrics: dict[str, dict[str, Any]] = {}
+        source_metrics_by_key: dict[str, dict[str, Any]] = {}
         for source_index, source_key in enumerate(selected_keys, start=1):
-            source = FLORIDA_SOURCES[source_key]
-            path = run_root / source.filename
-            header_seen = _artifact_header(path, source)
-            missing = sorted(set(source.required_fields) - set(header_seen))
-            source_metric = {
+            profile_source = FLORIDA_SOURCES[source_key]
+            path = run_root / profile_source.filename
+            header_seen = _artifact_header(path, profile_source)
+            missing = sorted(set(profile_source.required_fields) - set(header_seen))
+            source_metric_by_key = {
                 "rows": 0,
                 "matched": 0,
                 "facts": 0,
@@ -4633,83 +4647,83 @@ async def import_florida_mqa_profile(
                 "missing_required_fields": missing,
                 "validated": False,
             }
-            source_metrics[source_key] = source_metric
-            artifacts[source_key]["header"] = header_seen
-            artifacts[source_key]["metadata_json"] = {
-                **artifacts[source_key]["metadata_json"],
-                "header_sha256": source_metric["header_sha256"],
+            source_metrics_by_key[source_key] = source_metric_by_key
+            artifacts_by_key[source_key]["header"] = header_seen
+            artifacts_by_key[source_key]["metadata_json"] = {
+                **artifacts_by_key[source_key]["metadata_json"],
+                "header_sha256": source_metric_by_key["header_sha256"],
             }
             if missing:
-                run_row["metrics"] = {
-                    "artifacts": len(artifacts),
-                    "source_metrics": source_metrics,
+                run_row_by_key["metrics"] = {
+                    "artifacts": len(artifacts_by_key),
+                    "source_metrics": source_metrics_by_key,
                 }
                 await _upsert_rows(
                     ProviderProfileArtifact,
-                    [artifacts[source_key]],
+                    [artifacts_by_key[source_key]],
                     "artifact_id",
                 )
                 await _upsert_rows(
                     ProviderProfileImportRun,
-                    [run_row],
+                    [run_row_by_key],
                     "run_id",
                 )
                 raise RuntimeError(
-                    f"florida_mqa_schema_changed:{source.key}:{','.join(missing)}"
+                    f"florida_mqa_schema_changed:{profile_source.key}:{','.join(missing)}"
                 )
-            for row_number, raw_row, row, header in _iter_rows(
+            for row_number, raw_row, source_row, header in _iter_rows(
                 path,
-                source,
-                parser_metrics=source_metric,
+                profile_source,
+                parser_metrics=source_metric_by_key,
             ):
-                source_metric["rows"] += 1
+                source_metric_by_key["rows"] += 1
                 if header != header_seen:
-                    source_metric["schema_complete"] = False
-                    source_metric["missing_required_fields"] = [
+                    source_metric_by_key["schema_complete"] = False
+                    source_metric_by_key["missing_required_fields"] = [
                         "inconsistent_header"
                     ]
-                    run_row["metrics"] = {
-                        "artifacts": len(artifacts),
+                    run_row_by_key["metrics"] = {
+                        "artifacts": len(artifacts_by_key),
                         "source_records": source_record_count,
                         "facts": fact_count,
                         "matched_records": matched_record_count,
                         "non_projectable_records": non_projectable_record_count,
-                        "source_metrics": source_metrics,
+                        "source_metrics": source_metrics_by_key,
                     }
                     await _upsert_rows(
                         ProviderProfileArtifact,
-                        [artifacts[source_key]],
+                        [artifacts_by_key[source_key]],
                         "artifact_id",
                     )
                     await _upsert_rows(
                         ProviderProfileImportRun,
-                        [run_row],
+                        [run_row_by_key],
                         "run_id",
                     )
                     raise RuntimeError(
-                        f"florida_mqa_schema_changed:{source.key}:inconsistent_header"
+                        f"florida_mqa_schema_changed:{profile_source.key}:inconsistent_header"
                     )
-                if row.get("_source_parse_quarantine"):
+                if source_row.get("_source_parse_quarantine"):
                     source_record_key = _record_key(
-                        source,
-                        row,
+                        profile_source,
+                        source_row,
                         row_number,
                     )
                     record_id = hashlib.sha256(
                         f"{run_id}:{source_record_key}".encode()
                     ).hexdigest()
-                    records.append(
+                    source_records.append(
                         _retained_source_record(
                             record_id=record_id,
                             run_id=run_id,
-                            artifact_id=artifacts[source_key]["artifact_id"],
+                            artifact_id=artifacts_by_key[source_key]["artifact_id"],
                             source_key=source_key,
                             source_record_key=source_record_key,
                             profession_code=None,
                             license_id=None,
                             license_number=None,
                             raw_payload=raw_row,
-                            normalized_payload=row,
+                            normalized_payload=source_row,
                             matched_npi=None,
                             match_status="quarantined_schema_anomaly",
                             match_evidence={
@@ -4724,35 +4738,35 @@ async def import_florida_mqa_profile(
                     )
                     source_record_count += 1
                     non_projectable_record_count += 1
-                    source_metric["non_projectable_records"] += 1
-                    if len(records) >= 1_000:
+                    source_metric_by_key["non_projectable_records"] += 1
+                    if len(source_records) >= 1_000:
                         await _upsert_rows(
                             ProviderProfileSourceRecord,
-                            records,
+                            source_records,
                             "record_id",
                         )
-                        records.clear()
+                        source_records.clear()
                     continue
                 if source_key == "profile_master":
-                    profession_name = _first(row, "rank_desc", "profession_name")
+                    profession_name = _first(source_row, "rank_desc", "profession_name")
                     profession_detail = (
-                        _first(row, "pro_cde", "profession_code"),
-                        _first(row, "rank_cde", "rank_code"),
+                        _first(source_row, "pro_cde", "profession_code"),
+                        _first(source_row, "rank_cde", "rank_code"),
                     )
                     if profession_name and all(profession_detail):
                         discovered_profession_details[
                             _name_token(profession_name)
                         ].add(profession_detail)
                 match_row = _canonical_match_row(
-                    source,
-                    row,
+                    profile_source,
+                    source_row,
                     discovered_profession_details,
                 )
                 profession = _first(match_row, "pro_cde", "profession_code")
                 license_id = _first(match_row, "lic_id", "license_id")
                 join_key = (profession, license_id)
                 if source_key == "profile_master":
-                    npi, match_status, match_evidence = _match_master(
+                    npi, match_status, match_evidence_by_key = _match_master(
                         match_row,
                         license_index,
                     )
@@ -4761,7 +4775,7 @@ async def import_florida_mqa_profile(
                     if max_providers is not None and selected_count >= max_providers:
                         break
                     selected_count += 1
-                    master_identities[join_key] = (
+                    master_identities_by_key[join_key] = (
                         npi,
                         match_status,
                         _first(match_row, "lic_nbr", "license_number"),
@@ -4769,12 +4783,12 @@ async def import_florida_mqa_profile(
                 elif source_key == "counties":
                     npi = None
                     match_status = "reference"
-                    match_evidence = {
+                    match_evidence_by_key = {
                         "method": "reference_dataset_no_npi",
                         "jurisdiction": "FL",
                     }
-                elif source.path == "/ProfileData":
-                    identity = master_identities.get(join_key)
+                elif profile_source.path == "/ProfileData":
+                    identity = master_identities_by_key.get(join_key)
                     supplement_match = _profile_supplement_match(
                         identity,
                         profession_code=profession,
@@ -4783,20 +4797,20 @@ async def import_florida_mqa_profile(
                     )
                     if supplement_match is None:
                         continue
-                    npi, match_status, match_evidence = supplement_match
+                    npi, match_status, match_evidence_by_key = supplement_match
                 else:
-                    npi, match_status, match_evidence = _match_master(
+                    npi, match_status, match_evidence_by_key = _match_master(
                         match_row,
                         license_index,
                     )
-                source_record_key = _record_key(source, row, row_number)
+                source_record_key = _record_key(profile_source, source_row, row_number)
                 record_id = hashlib.sha256(f"{run_id}:{source_record_key}".encode()).hexdigest()
-                identity = master_identities.get(join_key)
+                identity = master_identities_by_key.get(join_key)
                 identity_license_number = identity[2] if identity else ""
-                record = _retained_source_record(
+                source_record = _retained_source_record(
                     record_id=record_id,
                     run_id=run_id,
-                    artifact_id=artifacts[source_key]["artifact_id"],
+                    artifact_id=artifacts_by_key[source_key]["artifact_id"],
                     source_key=source_key,
                     source_record_key=source_record_key,
                     profession_code=profession or None,
@@ -4808,22 +4822,22 @@ async def import_florida_mqa_profile(
                     )
                     or identity_license_number,
                     raw_payload=raw_row,
-                    normalized_payload=row,
+                    normalized_payload=source_row,
                     matched_npi=npi,
                     match_status=match_status,
-                    match_evidence=match_evidence,
+                    match_evidence=match_evidence_by_key,
                     row_number=row_number,
                 )
-                records.append(record)
+                source_records.append(source_record)
                 projectable_npi = _projectable_fact_npi(npi, match_status)
                 row_facts = (
                     _facts_for_row(
-                        source,
-                        row,
+                        profile_source,
+                        source_row,
                         run_id=run_id,
                         record_id=record_id,
                         npi=projectable_npi,
-                        artifact=artifacts[source_key],
+                        artifact=artifacts_by_key[source_key],
                     )
                     if projectable_npi is not None
                     else []
@@ -4834,53 +4848,53 @@ async def import_florida_mqa_profile(
                 matched_record_count += match_status == "deterministic"
                 if projectable_npi is None:
                     non_projectable_record_count += 1
-                    source_metric["non_projectable_records"] += 1
-                source_metric["facts"] += len(row_facts)
-                source_metric["matched"] += match_status == "deterministic"
-                if len(records) >= 1_000:
+                    source_metric_by_key["non_projectable_records"] += 1
+                source_metric_by_key["facts"] += len(row_facts)
+                source_metric_by_key["matched"] += match_status == "deterministic"
+                if len(source_records) >= 1_000:
                     await _upsert_rows(
                         ProviderProfileSourceRecord,
-                        records,
+                        source_records,
                         "record_id",
                     )
-                    records.clear()
+                    source_records.clear()
                 if len(facts) >= 5_000:
                     await _upsert_rows(ProviderProfileFact, facts, "fact_id")
                     facts.clear()
-            source_metric["quarantine_ratio"] = (
-                source_metric["quarantined_rows"]
-                / source_metric["rows"]
-                if source_metric["rows"]
+            source_metric_by_key["quarantine_ratio"] = (
+                source_metric_by_key["quarantined_rows"]
+                / source_metric_by_key["rows"]
+                if source_metric_by_key["rows"]
                 else 0.0
             )
-            source_metric["quarantine_within_threshold"] = (
-                _source_quarantine_within_threshold(source_metric)
+            source_metric_by_key["quarantine_within_threshold"] = (
+                _is_source_quarantine_within_threshold(source_metric_by_key)
             )
-            source_metric["validated"] = bool(
-                source_metric["schema_complete"]
-                and source_metric["rows"] > 0
-                and source_metric["quarantine_within_threshold"]
+            source_metric_by_key["validated"] = bool(
+                source_metric_by_key["schema_complete"]
+                and source_metric_by_key["rows"] > 0
+                and source_metric_by_key["quarantine_within_threshold"]
             )
-            run_row["metrics"] = {
-                "artifacts": len(artifacts),
+            run_row_by_key["metrics"] = {
+                "artifacts": len(artifacts_by_key),
                 "source_records": source_record_count,
                 "facts": fact_count,
                 "matched_records": matched_record_count,
                 "non_projectable_records": non_projectable_record_count,
-                "source_metrics": source_metrics,
+                "source_metrics": source_metrics_by_key,
             }
             await _upsert_rows(
                 ProviderProfileImportRun,
-                [run_row],
+                [run_row_by_key],
                 "run_id",
             )
             enqueue_live_progress(
                 phase="normalizing",
                 pct=36 + int(49 * source_index / len(selected_keys)),
-                message=f"Normalized {source.title}",
+                message=f"Normalized {profile_source.title}",
                 file_index=source_index,
                 file_count=len(selected_keys),
-                file_name=source.filename,
+                file_name=profile_source.filename,
                 counters={
                     "source_records": source_record_count,
                     "facts": fact_count,
@@ -4889,12 +4903,12 @@ async def import_florida_mqa_profile(
                 },
             )
 
-        await _upsert_rows(ProviderProfileSourceRecord, records, "record_id")
+        await _upsert_rows(ProviderProfileSourceRecord, source_records, "record_id")
         await _upsert_rows(ProviderProfileFact, facts, "fact_id")
-        records.clear()
+        source_records.clear()
         facts.clear()
-        await _upsert_rows(ProviderProfileArtifact, list(artifacts.values()), "artifact_id")
-        loaded_categories = _validated_loaded_categories(source_metrics)
+        await _upsert_rows(ProviderProfileArtifact, list(artifacts_by_key.values()), "artifact_id")
+        loaded_categories = _validated_loaded_categories(source_metrics_by_key)
         projected_provider_count = int(
             await db.scalar(
                 select(func.count(func.distinct(ProviderProfileFact.npi))).where(
@@ -4904,8 +4918,8 @@ async def import_florida_mqa_profile(
             )
             or 0
         )
-        run_row.update(status="validating")
-        await _upsert_rows(ProviderProfileImportRun, [run_row], "run_id")
+        run_row_by_key.update(status="validating")
+        await _upsert_rows(ProviderProfileImportRun, [run_row_by_key], "run_id")
         enqueue_live_progress(
             phase="validating",
             pct=88,
@@ -4918,19 +4932,19 @@ async def import_florida_mqa_profile(
                 "projected_providers": projected_provider_count,
             },
         )
-        completion_metrics = {
-            "artifacts": len(artifacts),
+        completion_metrics_by_key = {
+            "artifacts": len(artifacts_by_key),
             "source_records": source_record_count,
             "facts": fact_count,
             "matched_records": matched_record_count,
             "non_projectable_records": non_projectable_record_count,
             "projected_providers": projected_provider_count,
             "selected_sources": list(selected_keys),
-            "source_metrics": source_metrics,
+            "source_metrics": source_metrics_by_key,
         }
         if publish_enabled:
             source_validation_reasons = _source_validation_guard_reasons(
-                source_metrics,
+                source_metrics_by_key,
                 expected_source_keys=selected_keys,
             )
             if source_validation_reasons:
@@ -4943,7 +4957,7 @@ async def import_florida_mqa_profile(
                 pct=94,
                 message="Building and atomically publishing provider profile generation",
             )
-            publication, metrics = await _publish_projection_swap(
+            publication_by_key, metrics_by_key = await _publish_projection_swap(
                 run_id,
                 _projection_row_batches(
                     run_id,
@@ -4951,31 +4965,31 @@ async def import_florida_mqa_profile(
                     _utcnow(),
                 ),
                 started_at=started_at,
-                completion_metrics=completion_metrics,
+                completion_metrics=completion_metrics_by_key,
                 allow_volume_drop=allow_volume_drop,
                 min_first_publish_providers=min_first_publish_providers,
                 min_publish_ratio=min_publish_ratio,
             )
         else:
-            publication = {
+            publication_by_key = {
                 "publication": "skipped_partial",
                 "reasons": partial_publish_reasons,
                 "published_rows": 0,
             }
-            metrics = {
-                **completion_metrics,
+            metrics_by_key = {
+                **completion_metrics_by_key,
                 "published_providers": 0,
-                "publication": publication,
+                "publication": publication_by_key,
             }
-            run_row.update(
+            run_row_by_key.update(
                 status="completed",
-                metrics=metrics,
+                metrics=metrics_by_key,
                 finished_at=_utcnow(),
             )
-            await _upsert_rows(ProviderProfileImportRun, [run_row], "run_id")
-        metrics = await _apply_post_success_retention(
+            await _upsert_rows(ProviderProfileImportRun, [run_row_by_key], "run_id")
+        metrics_by_key = await _apply_post_success_retention(
             run_id=run_id,
-            metrics=metrics,
+            metrics=metrics_by_key,
             artifact_root=root,
             failed_retention_days=failed_retention_days,
         )
@@ -4993,13 +5007,13 @@ async def import_florida_mqa_profile(
                 "matched_records": matched_record_count,
                 "non_projectable_records": non_projectable_record_count,
                 "projected_providers": projected_provider_count,
-                "published_providers": int(metrics["published_providers"]),
+                "published_providers": int(metrics_by_key["published_providers"]),
             },
         )
         return {
             "run_id": run_id,
             "control_run_id": control_run_id,
-            **metrics,
+            **metrics_by_key,
         }
     except BaseException as exc:
         cleanup_error: str | None = None
@@ -5012,11 +5026,11 @@ async def import_florida_mqa_profile(
                 await db.status(
                     f"DROP TABLE IF EXISTS {projection_schema}.{projection_stage};"
                 )
-            except Exception as cleanup_exc:  # pragma: no cover - best-effort cleanup
+            except Exception as cleanup_exc:
                 cleanup_error = f"{type(cleanup_exc).__name__}: {cleanup_exc}"
         failure_status_error = await _mark_failed_run_status(
             run_id=run_id,
-            run_row=run_row,
+            run_row=run_row_by_key,
             original_error=exc,
             cleanup_error=cleanup_error,
         )
@@ -5044,15 +5058,18 @@ async def import_florida_mqa_profile(
 
 async def process_data(
     *,
-    sources: str | Iterable[str] = ",".join(DEFAULT_SOURCE_KEYS),
+    sources: str | Iterable[str] | None = None,
     max_providers: int | None = None,
     only_matched: bool = False,
     publish_partial: bool = False,
     allow_volume_drop: bool = False,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Import-control adapter; the worker owns the shared DB connection."""
+    """Worker entry point using the shared database connection."""
     source_keys = (
+        list(DEFAULT_SOURCE_KEYS)
+        if sources is None
+        else
         [value.strip() for value in sources.split(",") if value.strip()]
         if isinstance(sources, str)
         else [str(value).strip() for value in sources if str(value).strip()]

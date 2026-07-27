@@ -34,7 +34,7 @@ def is_test_mode(ctx: dict) -> bool:
     return bool(ctx.get("context", {}).get("test_mode"))
 
 
-async def process_data(ctx, task=None):
+async def process_nucc_data(ctx, task=None):
     """Process one queued NUCC taxonomy import task."""
     task = task or {}
     await raise_if_cancelled(ctx, task)
@@ -162,6 +162,10 @@ async def process_data(ctx, task=None):
         return 1
 
 
+process_data = process_nucc_data
+process_data.__name__ = "process_data"
+
+
 async def startup(ctx):
     """Initialize resources required by the NUCC worker."""
     loop = asyncio.get_event_loop()
@@ -195,7 +199,7 @@ async def startup(ctx):
     print("Preparing done")
 
 
-async def shutdown(ctx):
+async def publish_nucc_generation(ctx):
     """Finalize the NUCC run and release worker resources."""
     import_date = ctx['import_date']
     context = ctx.get("context") or {}
@@ -248,6 +252,10 @@ async def shutdown(ctx):
         metrics={"rows": stage_rows},
     )
     print_time_info(ctx['context']['start'])
+
+
+shutdown = publish_nucc_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(test_mode: bool = False):

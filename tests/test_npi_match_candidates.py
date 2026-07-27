@@ -61,7 +61,6 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
     """Verify match candidate params accept every public filter."""
     async def fake_ensure_specialty_resolution_cache(session):
         assert session == "test-session"
-
     def fake_resolve_provider_specialty_filter(args):
         assert args == {"specialty": "hospital", "include_subspecialties": False}
         return types.SimpleNamespace(
@@ -70,7 +69,6 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
             unresolved_specialty=False,
             suggested_specialties=(),
         )
-
     monkeypatch.setattr(
         npi_module,
         "ensure_specialty_resolution_cache",
@@ -102,9 +100,7 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
         },
         ctx=types.SimpleNamespace(sa_session="test-session"),
     )
-
     params = await npi_module._normalize_match_candidate_params(request)
-
     assert params["address_site_key"] == "22222222-2222-2222-2222-222222222222"
     assert params["address_key"] == "11111111-1111-1111-1111-111111111111"
     assert params["lat"] == 40.0

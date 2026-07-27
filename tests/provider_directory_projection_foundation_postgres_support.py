@@ -278,7 +278,6 @@ async def projection_foundation_postgres(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[ProjectionFoundationPostgres]:
     """Yield an isolated schema at the retained-acquisition predecessor."""
-
     database_url = _database_url()
     schema_name = f"mrf_projection_foundation_{uuid.uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_DRIVER", "asyncpg")
@@ -298,7 +297,6 @@ async def projection_foundation_postgres(
         "projection-foundation-retained-test-key-material",
     )
     monkeypatch.delenv("HLTHPRT_DB_DATABASE_OVERRIDE", raising=False)
-
     migration_engine = create_async_engine(
         database_url.set(drivername="postgresql+asyncpg")
     )

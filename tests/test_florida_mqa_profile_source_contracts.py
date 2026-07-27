@@ -53,15 +53,15 @@ def _nested_keys(value):
 
 
 def test_every_profile_data_source_has_an_exact_header_contract():
-    profile_sources = {
+    profile_sources_by_key = {
         key: source
         for key, source in florida.FLORIDA_SOURCES.items()
         if source.path == "/ProfileData"
     }
 
-    assert set(profile_sources) == set(florida._PROFILE_EXPECTED_FIELDS)
-    assert len(profile_sources) == 21
-    for key, source in profile_sources.items():
+    assert set(profile_sources_by_key) == set(florida._PROFILE_EXPECTED_FIELDS)
+    assert len(profile_sources_by_key) == 21
+    for key, source in profile_sources_by_key.items():
         assert source.expected_fields == florida._PROFILE_EXPECTED_FIELDS[key]
         assert source.expected_fields
 
@@ -71,27 +71,27 @@ def test_every_profile_data_source_has_an_exact_header_contract():
     reason="retained Florida header artifacts are not available",
 )
 def test_retained_profile_data_artifacts_match_exact_header_contracts():
-    verified = []
+    verified_items = []
     for key, source in florida.FLORIDA_SOURCES.items():
         if source.path != "/ProfileData":
             continue
-        header = tuple(
+        header_items = tuple(
             florida._artifact_header(
                 _REAL_ARTIFACT_ROOT / source.filename,
                 source,
             )
         )
-        assert header == source.expected_fields
-        verified.append(key)
+        assert header_items == source.expected_fields
+        verified_items.append(key)
 
-    assert len(verified) == 21
+    assert len(verified_items) == 21
 
 
 def test_profile_data_header_order_or_addition_fails_closed(tmp_path):
     source = florida.FLORIDA_SOURCES["education"]
-    changed_header = [*source.expected_fields, "unexpected_new_field"]
+    changed_header_items = [*source.expected_fields, "unexpected_new_field"]
     artifact = tmp_path / source.filename
-    artifact.write_text("|".join(changed_header) + "\n", encoding="latin-1")
+    artifact.write_text("|".join(changed_header_items) + "\n", encoding="latin-1")
 
     with pytest.raises(
         RuntimeError,
@@ -103,8 +103,8 @@ def test_profile_data_header_order_or_addition_fails_closed(tmp_path):
 def test_every_mapped_profile_source_uses_readable_canonical_fields():
     expected_mapped_sources = {
         key
-        for key, source in florida.FLORIDA_SOURCES.items()
-        if source.path == "/ProfileData"
+        for key, profile_source in florida.FLORIDA_SOURCES.items()
+        if profile_source.path == "/ProfileData"
     } - {
         "profile_master",
         "profile_indicators",
@@ -118,7 +118,7 @@ def test_every_mapped_profile_source_uses_readable_canonical_fields():
             source_key,
             frozenset(),
         )
-        row = {
+        source_row_by_key = {
             source_field: (
                 "2026-07-27"
                 if output_field in date_fields
@@ -126,7 +126,7 @@ def test_every_mapped_profile_source_uses_readable_canonical_fields():
             )
             for output_field, source_field in field_map
         }
-        row.update(
+        source_row_by_key.update(
             {
                 "pro_cde": "internal-profession",
                 "lic_id": "internal-license-id",
@@ -135,7 +135,7 @@ def test_every_mapped_profile_source_uses_readable_canonical_fields():
             }
         )
 
-        facts = _facts(source_key, row)
+        facts = _facts(source_key, source_row_by_key)
 
         assert len(facts) == 1
         fact = facts[0]
@@ -192,7 +192,8 @@ def test_education_adapter_preserves_human_dates_and_meaning():
 
 
 def test_profile_indicators_keep_email_raw_only_and_disclosures_restricted():
-    row = {
+    """Verify profile indicators keep email raw only and disclosures restricted."""
+    source_row_by_key = {
         "pro_cde": "1501",
         "lic_id": "internal-license-id",
         "health_degree": "Y",
@@ -206,7 +207,7 @@ def test_profile_indicators_keep_email_raw_only_and_disclosures_restricted():
         "e_mail_addr": "private@example.invalid",
     }
 
-    facts = _facts("profile_indicators", row)
+    facts = _facts("profile_indicators", source_row_by_key)
     public_facts = [
         fact
         for fact in facts
@@ -286,36 +287,36 @@ def test_profile_indicators_keep_email_raw_only_and_disclosures_restricted():
 
 
 def test_profile_indicator_parser_recovers_shifted_raw_only_email(tmp_path):
-    source = florida.FLORIDA_SOURCES["profile_indicators"]
-    values = [""] * len(source.expected_fields)
-    values[source.expected_fields.index("pro_cde")] = "1501"
-    values[source.expected_fields.index("lic_id")] = "42"
-    values[source.expected_fields.index("health_degree")] = "Y"
-    assert source.expected_fields[-1] == "e_mail_addr"
-    assert values[-1] == ""
-    metrics: dict[str, int] = {}
-    source, artifact = _write_pipe_artifact(
+    profile_source = florida.FLORIDA_SOURCES["profile_indicators"]
+    field_values = [""] * len(profile_source.expected_fields)
+    field_values[profile_source.expected_fields.index("pro_cde")] = "1501"
+    field_values[profile_source.expected_fields.index("lic_id")] = "42"
+    field_values[profile_source.expected_fields.index("health_degree")] = "Y"
+    assert profile_source.expected_fields[-1] == "e_mail_addr"
+    assert field_values[-1] == ""
+    metrics_by_key: dict[str, int] = {}
+    profile_source, artifact = _write_pipe_artifact(
         tmp_path,
         "profile_indicators",
-        [*values, "private@example.invalid", ""],
+        [*field_values, "private@example.invalid", ""],
     )
 
-    rows = list(
+    source_rows = list(
         florida._iter_rows(
             artifact,
-            source,
-            parser_metrics=metrics,
+            profile_source,
+            parser_metrics=metrics_by_key,
         )
     )
 
-    assert len(rows) == 1
-    _row_number, raw_row, normalized, _header = rows[0]
+    assert len(source_rows) == 1
+    _row_number, raw_row, normalized, _header = source_rows[0]
     assert raw_row["e_mail_addr"] == "private@example.invalid"
     assert normalized["e_mail_addr"] == "private@example.invalid"
     assert normalized["_source_parse_repair"] == (
         "shifted_raw_email_recovered"
     )
-    assert metrics == {
+    assert metrics_by_key == {
         "trailing_empty_rows": 1,
         "trailing_empty_fields": 1,
         "recovered_rows": 1,
@@ -407,12 +408,12 @@ def test_public_license_fact_splits_restricted_regulatory_indicators(source_key)
 
 
 def test_raw_and_normalized_profile_indicator_record_retains_private_source_data():
-    raw_payload = {
+    raw_payload_by_key = {
         "PRO_CDE": "1501",
         "LIC_ID": "42",
         "E_MAIL_ADDR": "private@example.invalid",
     }
-    normalized_payload = {
+    normalized_payload_by_key = {
         "pro_cde": "1501",
         "lic_id": "42",
         "e_mail_addr": "private@example.invalid",
@@ -427,16 +428,16 @@ def test_raw_and_normalized_profile_indicator_record_retains_private_source_data
         profession_code="1501",
         license_id="42",
         license_number=None,
-        raw_payload=raw_payload,
-        normalized_payload=normalized_payload,
+        raw_payload=raw_payload_by_key,
+        normalized_payload=normalized_payload_by_key,
         matched_npi=_NPI,
         match_status="deterministic",
         match_evidence={"method": "profile_master_profession_license_id"},
         row_number=2,
     )
 
-    assert retained["raw_payload"] == raw_payload
-    assert retained["normalized_payload"] == normalized_payload
+    assert retained["raw_payload"] == raw_payload_by_key
+    assert retained["normalized_payload"] == normalized_payload_by_key
 
 
 def _write_pipe_artifact(
@@ -492,7 +493,7 @@ def test_pipe_parser_explicitly_trims_one_trailing_empty_sentinel(tmp_path):
     values[source.expected_fields.index("pro_cde")] = "1501"
     values[source.expected_fields.index("lic_id")] = "42"
     values[source.expected_fields.index("inst_nme")] = "Synthetic College"
-    metrics: dict[str, int] = {}
+    metrics_by_key: dict[str, int] = {}
     source, artifact = _write_pipe_artifact(
         tmp_path,
         "education",
@@ -503,13 +504,13 @@ def test_pipe_parser_explicitly_trims_one_trailing_empty_sentinel(tmp_path):
         florida._iter_rows(
             artifact,
             source,
-            parser_metrics=metrics,
+            parser_metrics=metrics_by_key,
         )
     )
 
     assert len(rows) == 1
     assert rows[0][2]["inst_nme"] == "Synthetic College"
-    assert metrics == {
+    assert metrics_by_key == {
         "trailing_empty_rows": 1,
         "trailing_empty_fields": 1,
     }
@@ -520,7 +521,7 @@ def test_pipe_parser_quarantines_multiple_trailing_empty_fields(tmp_path):
     values = [""] * len(source.expected_fields)
     values[source.expected_fields.index("pro_cde")] = "1501"
     values[source.expected_fields.index("lic_id")] = "42"
-    metrics: dict[str, int] = {}
+    metrics_by_key: dict[str, int] = {}
     source, artifact = _write_pipe_artifact(
         tmp_path,
         "education",
@@ -531,14 +532,14 @@ def test_pipe_parser_quarantines_multiple_trailing_empty_fields(tmp_path):
         florida._iter_rows(
             artifact,
             source,
-            parser_metrics=metrics,
+            parser_metrics=metrics_by_key,
         )
     )
 
     assert rows[0][2]["_source_parse_quarantine"] == (
         "field_count_mismatch"
     )
-    assert metrics == {
+    assert metrics_by_key == {
         "trailing_empty_rows": 1,
         "trailing_empty_fields": 1,
         "quarantined_rows": 1,
@@ -553,40 +554,41 @@ def test_licensure_parser_recovers_embedded_email_delimiter_as_raw_only(
     tmp_path,
     source_key,
 ):
-    source = florida.FLORIDA_SOURCES[source_key]
-    values = [""] * len(source.expected_fields)
-    values[source.expected_fields.index("pro_cde")] = "1501"
-    values[source.expected_fields.index("profession_name")] = "Medical Doctor"
-    values[source.expected_fields.index("rank_code")] = "ME"
-    values[source.expected_fields.index("license_number")] = "12345"
-    values[source.expected_fields.index("license_status_description")] = (
+    """Verify licensure parser recovers embedded email delimiter as raw only."""
+    profile_source = florida.FLORIDA_SOURCES[source_key]
+    field_values = [""] * len(profile_source.expected_fields)
+    field_values[profile_source.expected_fields.index("pro_cde")] = "1501"
+    field_values[profile_source.expected_fields.index("profession_name")] = "Medical Doctor"
+    field_values[profile_source.expected_fields.index("rank_code")] = "ME"
+    field_values[profile_source.expected_fields.index("license_number")] = "12345"
+    field_values[profile_source.expected_fields.index("license_status_description")] = (
         "Clear/Active"
     )
-    email_index = source.expected_fields.index("email")
+    email_index = profile_source.expected_fields.index("email")
     physical_values = [
-        *values[:email_index],
+        *field_values[:email_index],
         "first@example.invalid",
         "second@example.invalid",
-        *values[email_index + 1 :],
+        *field_values[email_index + 1 :],
         "",
     ]
-    metrics: dict[str, int] = {}
-    source, artifact = _write_pipe_artifact(
+    metrics_by_key: dict[str, int] = {}
+    profile_source, artifact = _write_pipe_artifact(
         tmp_path,
         source_key,
         physical_values,
     )
 
-    rows = list(
+    source_rows = list(
         florida._iter_rows(
             artifact,
-            source,
-            parser_metrics=metrics,
+            profile_source,
+            parser_metrics=metrics_by_key,
         )
     )
 
-    assert len(rows) == 1
-    _row_number, raw_row, normalized, _header = rows[0]
+    assert len(source_rows) == 1
+    _row_number, raw_row, normalized, _header = source_rows[0]
     assert raw_row["email"] == (
         "first@example.invalid|second@example.invalid"
     )
@@ -597,13 +599,13 @@ def test_licensure_parser_recovers_embedded_email_delimiter_as_raw_only(
     assert normalized["_source_parse_repair"] == (
         "embedded_delimiter_recovered"
     )
-    assert metrics == {
+    assert metrics_by_key == {
         "trailing_empty_rows": 1,
         "trailing_empty_fields": 1,
         "recovered_rows": 1,
     }
     public_facts = florida._facts_for_row(
-        source,
+        profile_source,
         normalized,
         run_id="synthetic-run",
         record_id=f"synthetic-{source_key}",
@@ -618,37 +620,37 @@ def test_licensure_parser_recovers_embedded_email_delimiter_as_raw_only(
 
 
 def test_licensure_parser_quarantines_ambiguous_extra_field(tmp_path):
-    source = florida.FLORIDA_SOURCES["licensure_current"]
-    values = [""] * len(source.expected_fields)
-    values[source.expected_fields.index("pro_cde")] = "1501"
-    values[source.expected_fields.index("license_number")] = "12345"
-    email_index = source.expected_fields.index("email")
+    profile_source = florida.FLORIDA_SOURCES["licensure_current"]
+    field_values = [""] * len(profile_source.expected_fields)
+    field_values[profile_source.expected_fields.index("pro_cde")] = "1501"
+    field_values[profile_source.expected_fields.index("license_number")] = "12345"
+    email_index = profile_source.expected_fields.index("email")
     physical_values = [
-        *values[:email_index],
+        *field_values[:email_index],
         "ambiguous-prefix",
         "private@example.invalid",
-        *values[email_index + 1 :],
+        *field_values[email_index + 1 :],
         "",
     ]
-    metrics: dict[str, int] = {}
-    source, artifact = _write_pipe_artifact(
+    metrics_by_key: dict[str, int] = {}
+    profile_source, artifact = _write_pipe_artifact(
         tmp_path,
         "licensure_current",
         physical_values,
     )
 
-    rows = list(
+    source_rows = list(
         florida._iter_rows(
             artifact,
-            source,
-            parser_metrics=metrics,
+            profile_source,
+            parser_metrics=metrics_by_key,
         )
     )
 
-    assert rows[0][2]["_source_parse_quarantine"] == (
+    assert source_rows[0][2]["_source_parse_quarantine"] == (
         "field_count_mismatch"
     )
-    assert metrics == {
+    assert metrics_by_key == {
         "trailing_empty_rows": 1,
         "trailing_empty_fields": 1,
         "quarantined_rows": 1,
@@ -656,35 +658,35 @@ def test_licensure_parser_quarantines_ambiguous_extra_field(tmp_path):
 
 
 def test_unrecognized_width_mismatch_is_retained_for_quarantine(tmp_path):
-    source = florida.FLORIDA_SOURCES["education"]
-    values = [""] * len(source.expected_fields)
-    values[source.expected_fields.index("pro_cde")] = "1501"
-    values[source.expected_fields.index("lic_id")] = "42"
-    values[source.expected_fields.index("inst_nme")] = "Synthetic College"
-    metrics: dict[str, int] = {}
-    source, artifact = _write_pipe_artifact(
+    profile_source = florida.FLORIDA_SOURCES["education"]
+    field_values = [""] * len(profile_source.expected_fields)
+    field_values[profile_source.expected_fields.index("pro_cde")] = "1501"
+    field_values[profile_source.expected_fields.index("lic_id")] = "42"
+    field_values[profile_source.expected_fields.index("inst_nme")] = "Synthetic College"
+    metrics_by_key: dict[str, int] = {}
+    profile_source, artifact = _write_pipe_artifact(
         tmp_path,
         "education",
-        [*values, "unexpected-nonempty-field"],
+        [*field_values, "unexpected-nonempty-field"],
     )
 
-    rows = list(
+    source_rows = list(
         florida._iter_rows(
             artifact,
-            source,
-            parser_metrics=metrics,
+            profile_source,
+            parser_metrics=metrics_by_key,
         )
     )
 
-    assert len(rows) == 1
-    _row_number, raw_row, normalized, _header = rows[0]
+    assert len(source_rows) == 1
+    _row_number, raw_row, normalized, _header = source_rows[0]
     assert raw_row["_physical_fields"][-1] == "unexpected-nonempty-field"
     assert raw_row["_source_parse_metadata"]["kind"] == (
         "field_count_mismatch"
     )
     assert raw_row["_source_parse_metadata"]["physical_row_sha256"] == (
         florida.hashlib.sha256(
-            "|".join([*values, "unexpected-nonempty-field"]).encode(
+            "|".join([*field_values, "unexpected-nonempty-field"]).encode(
                 "latin-1"
             )
         ).hexdigest()
@@ -692,13 +694,14 @@ def test_unrecognized_width_mismatch_is_retained_for_quarantine(tmp_path):
     assert normalized["_source_parse_quarantine"] == (
         "field_count_mismatch"
     )
-    assert metrics == {"quarantined_rows": 1}
+    assert metrics_by_key == {"quarantined_rows": 1}
 
 
 def test_license_status_parser_recovers_fixed_width_name_continuation(
     tmp_path,
 ):
-    source = florida.FLORIDA_SOURCES["license_status"]
+    """Verify license status parser recovers fixed width name continuation."""
+    profile_source = florida.FLORIDA_SOURCES["license_status"]
     fields = [
         "1501",
         "ME",
@@ -721,27 +724,27 @@ def test_license_status_parser_recovers_fixed_width_name_continuation(
         logical_row[offset : offset + 125]
         for offset in range(0, 375, 125)
     ]
-    assert [len(row.split("|")) for row in physical_rows] == [11, 5, 1]
-    artifact = tmp_path / source.filename
+    assert [len(source_row.split("|")) for source_row in physical_rows] == [11, 5, 1]
+    artifact = tmp_path / profile_source.filename
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr(
             "lic_status.dat",
             "\n".join(physical_rows) + "\n",
         )
-    metrics: dict[str, int] = {}
+    metrics_by_key: dict[str, int] = {}
 
-    rows = list(
+    source_rows = list(
         florida._iter_rows(
             artifact,
-            source,
-            parser_metrics=metrics,
+            profile_source,
+            parser_metrics=metrics_by_key,
         )
     )
 
-    assert len(rows) == 1
-    row_number, raw_row, normalized, header = rows[0]
+    assert len(source_rows) == 1
+    row_number, raw_row, normalized, header = source_rows[0]
     assert row_number == 1
-    assert header == list(source.expected_fields)
+    assert header == list(profile_source.expected_fields)
     assert normalized["l_name"] == "L" * 80
     assert raw_row["_source_parse_metadata"]["kind"] == (
         "wrapped_license_name_recovered"
@@ -754,7 +757,7 @@ def test_license_status_parser_recovers_fixed_width_name_continuation(
     assert len(
         raw_row["_source_parse_metadata"]["physical_row_sha256"]
     ) == 3
-    assert metrics == {
+    assert metrics_by_key == {
         "recovered_rows": 1,
         "continuation_physical_rows": 3,
     }
@@ -763,7 +766,7 @@ def test_license_status_parser_recovers_fixed_width_name_continuation(
 def test_license_status_parser_does_not_swallow_invalid_continuation(
     tmp_path,
 ):
-    source = florida.FLORIDA_SOURCES["license_status"]
+    profile_source = florida.FLORIDA_SOURCES["license_status"]
     fields = [
         "1501",
         "ME",
@@ -786,29 +789,29 @@ def test_license_status_parser_does_not_swallow_invalid_continuation(
         logical_row[offset : offset + 125]
         for offset in range(0, 375, 125)
     ]
-    artifact = tmp_path / source.filename
+    artifact = tmp_path / profile_source.filename
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr(
             "lic_status.dat",
             "\n".join(physical_rows) + "\n",
         )
-    metrics: dict[str, int] = {}
+    metrics_by_key: dict[str, int] = {}
 
-    rows = list(
+    source_rows = list(
         florida._iter_rows(
             artifact,
-            source,
-            parser_metrics=metrics,
+            profile_source,
+            parser_metrics=metrics_by_key,
         )
     )
 
-    assert len(rows) == 3
-    assert [row[0] for row in rows] == [1, 2, 3]
+    assert len(source_rows) == 3
+    assert [source_row[0] for source_row in source_rows] == [1, 2, 3]
     assert all(
-        row[2]["_source_parse_quarantine"] == "field_count_mismatch"
-        for row in rows
+        source_row[2]["_source_parse_quarantine"] == "field_count_mismatch"
+        for source_row in source_rows
     )
-    assert metrics == {"quarantined_rows": 3}
+    assert metrics_by_key == {"quarantined_rows": 3}
 
 
 def test_source_validation_allows_only_bounded_quarantine():
@@ -881,13 +884,13 @@ def test_real_licensure_first_row_aligns_after_trailing_sentinel(
     filename,
 ):
     source = florida.FLORIDA_SOURCES[source_key]
-    metrics: dict[str, int] = {}
+    metrics_by_key: dict[str, int] = {}
 
     _row_number, raw_row, normalized, header = next(
         florida._iter_rows(
             _REAL_ARTIFACT_ROOT / filename,
             source,
-            parser_metrics=metrics,
+            parser_metrics=metrics_by_key,
         )
     )
 
@@ -895,7 +898,7 @@ def test_real_licensure_first_row_aligns_after_trailing_sentinel(
     assert "" not in raw_row
     assert len(raw_row) == len(source.expected_fields)
     assert normalized.get("license_number")
-    assert metrics == {
+    assert metrics_by_key == {
         "trailing_empty_rows": 1,
         "trailing_empty_fields": 1,
     }
@@ -907,18 +910,18 @@ def test_real_licensure_first_row_aligns_after_trailing_sentinel(
 )
 def test_real_profile_indicators_shifted_email_shape_is_fully_recovered():
     source = florida.FLORIDA_SOURCES["profile_indicators"]
-    metrics: dict[str, int] = {}
+    metrics_by_key: dict[str, int] = {}
     rows = sum(
         1
         for _row in florida._iter_rows(
             _REAL_ARTIFACT_ROOT / source.filename,
             source,
-            parser_metrics=metrics,
+            parser_metrics=metrics_by_key,
         )
     )
 
     assert rows == 195_709
-    assert metrics == {
+    assert metrics_by_key == {
         "trailing_empty_rows": 195_709,
         "trailing_empty_fields": 195_709,
         "recovered_rows": 195_709,
@@ -931,18 +934,18 @@ def test_real_profile_indicators_shifted_email_shape_is_fully_recovered():
 )
 def test_real_license_status_continuation_is_fully_recovered():
     source = florida.FLORIDA_SOURCES["license_status"]
-    metrics: dict[str, int] = {}
+    metrics_by_key: dict[str, int] = {}
     rows = sum(
         1
         for _row in florida._iter_rows(
             _REAL_ARTIFACT_ROOT / source.filename,
             source,
-            parser_metrics=metrics,
+            parser_metrics=metrics_by_key,
         )
     )
 
     assert rows == 3_529_816
-    assert metrics == {
+    assert metrics_by_key == {
         "recovered_rows": 1,
         "continuation_physical_rows": 3,
     }

@@ -292,7 +292,7 @@ async def _publish_stage_table(db_schema: str, model_cls, stage_cls) -> None:
             )
 
 
-async def process_data(ctx, task=None):
+async def process_medicare_enrollment_data(ctx, task=None):
     """Load Medicare enrollment source data into staging."""
     task = task or {}
     ctx.setdefault("context", {})
@@ -439,6 +439,10 @@ async def process_data(ctx, task=None):
     )
 
 
+process_data = process_medicare_enrollment_data
+process_data.__name__ = "process_data"
+
+
 async def startup(ctx):
     """Initialize the Medicare enrollment worker context."""
     await my_init_db(db)
@@ -473,7 +477,7 @@ async def startup(ctx):
     )
 
 
-async def shutdown(ctx):
+async def publish_medicare_enrollment_generation(ctx):
     """Publish a completed Medicare enrollment import."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
@@ -551,6 +555,10 @@ async def shutdown(ctx):
             "unmatched_ratio": unmatched_ratio,
         },
     )
+
+
+shutdown = publish_medicare_enrollment_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(test_mode: bool = False):

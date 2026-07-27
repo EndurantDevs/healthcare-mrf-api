@@ -7538,7 +7538,6 @@ def test_completed_strict_v3_file_registers_scratch_before_batch_end(
     monkeypatch,
 ):
     """Register completed V3 scratch artifacts before their batch exits."""
-
     artifact_root = tmp_path / "artifacts"
     sidecar_path = artifact_root / "serving" / "attempt" / "provider.ptg2sc"
     sidecar_path.parent.mkdir(parents=True)
@@ -7564,7 +7563,6 @@ def test_completed_strict_v3_file_registers_scratch_before_batch_end(
         "resolve_ptg2_artifact_dir",
         lambda: artifact_root,
     )
-
     file_result = process_ptg.PTG2FileProcessResult(
         "in_network",
         "https://example.test/in-network.json.gz",
@@ -7576,21 +7574,17 @@ def test_completed_strict_v3_file_registers_scratch_before_batch_end(
             }
         },
     )
-
     async def exercise_done_but_undrained_cancellation_window():
         async def finish_file():
             process_ptg._claim_strict_v3_file_scratch(pending, file_result)
             return file_result
-
         task = asyncio.create_task(finish_file())
         await asyncio.sleep(0)
         assert task.done()
         tasks = {task}
         await process_ptg._cancel_and_wait_tasks(tasks)
         assert tasks == set()
-
     asyncio.run(exercise_done_but_undrained_cancellation_window())
-
     assert set(pending.copy_entries_by_kind) == set(copy_entries_by_kind)
     assert pending.graph_artifacts_map["sidecars"] == [
         {"path": str(sidecar_path)}

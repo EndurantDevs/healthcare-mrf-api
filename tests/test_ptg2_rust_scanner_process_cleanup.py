@@ -57,14 +57,11 @@ def test_compact_scanner_reaps_process_still_running_after_stdout(
     )
     terminated_process_list = []
     observed_scratch_paths: list[Path] = []
-
     def terminate(running_process):
         terminated_process_list.append(running_process)
         running_process.returncode = -15
         return running_process.returncode
-
     monkeypatch.setattr(rust_scanner, "_ptg2_rust_scanner_binary", lambda: binary)
-
     def fake_popen(*_args, **kwargs):
         scratch_path = Path(
             kwargs["env"][rust_scanner._SOURCE_WITNESS_SCRATCH_DIR_ENV]
@@ -73,14 +70,12 @@ def test_compact_scanner_reaps_process_still_running_after_stdout(
         assert rust_scanner._source_witness_scratch_marker(scratch_path).is_file()
         observed_scratch_paths.append(scratch_path)
         return process
-
     monkeypatch.setattr(
         rust_scanner.subprocess,
         "Popen",
         fake_popen,
     )
     monkeypatch.setattr(rust_scanner, "_terminate_subprocess_group", terminate)
-
     scanner_records = list(
         rust_scanner._iter_compact_serving_records_rust(
             tmp_path / "input.json",
@@ -93,7 +88,6 @@ def test_compact_scanner_reaps_process_still_running_after_stdout(
             v3_serving_run_directory=tmp_path / "runs",
         )
     )
-
     assert [record_kind for record_kind, _payload in scanner_records] == [
         "scanner_config",
         "scanner_summary",

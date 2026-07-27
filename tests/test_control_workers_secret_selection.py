@@ -180,10 +180,10 @@ def test_non_profile_job_manifest_never_receives_profile_credentials(monkeypatch
     )
 
     assert {
-        item["name"] for item in profile_pod["containers"][0]["env"]
+        profile_item["name"] for profile_item in profile_pod["containers"][0]["env"]
     } >= {"HLTHPRT_FL_MQA_USERNAME", "HLTHPRT_FL_MQA_PASSWORD"}
     assert {
-        item["name"] for item in npi_pod["containers"][0]["env"]
+        profile_item["name"] for profile_item in npi_pod["containers"][0]["env"]
     }.isdisjoint({"HLTHPRT_FL_MQA_USERNAME", "HLTHPRT_FL_MQA_PASSWORD"})
 
 

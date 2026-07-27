@@ -1759,7 +1759,6 @@ async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkey
         emit_start=True,
         emit_done=True,
     )
-
     assert rowcount == 7
     set_statements = [statement for statement in statements if statement.startswith("SET LOCAL")]
     assert set_statements[:7] == [
@@ -1826,29 +1825,23 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
     events = []
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM", "32MB")
-
     class FakeModel:
         __tablename__ = "entity_address_evidence"
-
     class FakeStage:
         __tablename__ = "entity_address_evidence_20260614"
-
     class FakeConn:
         async def status(self, statement):
             statements.append(statement)
             if "INSERT INTO mrf.entity_address_evidence_20260614" in statement:
                 return 11
             return None
-
     class FakeDB:
         @asynccontextmanager
         async def acquire(self):
             yield FakeConn()
-
         async def scalar(self, statement):
             statements.append(statement)
             return 3
-
     def fake_support_stage_statements(*_args, **_kwargs):
         return [
             entity_address_unified._SupportStageStatement(
@@ -1861,7 +1854,6 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
                 "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
             ),
         ]
-
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(
         entity_address_unified,
@@ -1869,7 +1861,6 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
         fake_support_stage_statements,
     )
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
-
     support_context_map = {}
     counts = await entity_address_unified._populate_support_stage_tables(
         "mrf",
@@ -1880,7 +1871,6 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
         run_id="run_eau",
         context=support_context_map,
     )
-
     assert counts == {"entity_address_evidence": 3}
     assert "SET LOCAL work_mem = '32MB';" in statements
     assert "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;" in statements
@@ -1896,13 +1886,10 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
     """Independent unified support inserts execute concurrently."""
     concurrency_map = {"active": 0, "max_active": 0}
     operation_order_list = []
-
     class FakeModel:
         __tablename__ = "entity_address_evidence"
-
     class FakeStage:
         __tablename__ = "entity_address_evidence_20260614"
-
     class FakeDB:
         async def status(self, statement):
             if "TRUNCATE TABLE" in statement:
@@ -1914,10 +1901,8 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
             await asyncio.sleep(0.01)
             concurrency_map["active"] -= 1
             return 1
-
         async def scalar(self, _statement):
             return 0
-
     def fake_support_stage_statements(*_args, **_kwargs):
         return [
             entity_address_unified._SupportStageStatement(
@@ -1938,7 +1923,6 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
                 "INSERT INTO mrf.entity_address_medication_bridge_20260614 SELECT 1;",
             ),
         ]
-
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CONCURRENCY", "2")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(
@@ -1946,7 +1930,6 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
         "_support_stage_statements",
         fake_support_stage_statements,
     )
-
     support_context_map = {}
     await entity_address_unified._populate_support_stage_tables(
         "mrf",
@@ -1956,7 +1939,6 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
         node_id="node_a",
         context=support_context_map,
     )
-
     assert operation_order_list[0] == "truncate"
     assert concurrency_map["max_active"] in {2}
     assert support_context_map["support_stage_concurrency"] == 2

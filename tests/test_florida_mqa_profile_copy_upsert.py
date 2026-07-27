@@ -158,9 +158,9 @@ async def test_run_scope_replay_never_overwrites_existing_rows(
 
 
 def test_unmatched_rows_retain_rematch_evidence_without_orphan_facts():
-    raw_payload = {"LIC_NBR": "ME12345", "FIRST_NAME": "Alex"}
-    normalized_payload = {"lic_nbr": "ME12345", "first_name": "Alex"}
-    match_evidence = {
+    raw_payload_by_key = {"LIC_NBR": "ME12345", "FIRST_NAME": "Alex"}
+    normalized_payload_by_key = {"lic_nbr": "ME12345", "first_name": "Alex"}
+    match_evidence_by_key = {
         "method": "exact_license",
         "candidate_count": 2,
     }
@@ -174,18 +174,18 @@ def test_unmatched_rows_retain_rematch_evidence_without_orphan_facts():
         profession_code="1501",
         license_id="42",
         license_number="ME12345",
-        raw_payload=raw_payload,
-        normalized_payload=normalized_payload,
+        raw_payload=raw_payload_by_key,
+        normalized_payload=normalized_payload_by_key,
         matched_npi=None,
         match_status="ambiguous",
-        match_evidence=match_evidence,
+        match_evidence=match_evidence_by_key,
         row_number=1,
     )
 
-    assert retained["raw_payload"] == raw_payload
-    assert retained["normalized_payload"] == normalized_payload
+    assert retained["raw_payload"] == raw_payload_by_key
+    assert retained["normalized_payload"] == normalized_payload_by_key
     assert retained["match_status"] == "ambiguous"
-    assert retained["match_evidence"] == match_evidence
+    assert retained["match_evidence"] == match_evidence_by_key
     assert florida._projectable_fact_npi(None, "ambiguous") is None
     assert florida._projectable_fact_npi(
         1000000004,
@@ -440,11 +440,11 @@ async def test_failure_status_retries_transient_recovery_without_publication_ret
         "HLTHPRT_FL_MQA_FAILURE_STATUS_TIMEOUT_SECONDS",
         "1",
     )
-    run_row = {"metrics": {"facts": 12}}
+    run_row_by_key = {"metrics": {"facts": 12}}
 
     status_error = await florida._mark_failed_run_status(
         run_id="run-1",
-        run_row=run_row,
+        run_row=run_row_by_key,
         original_error=RuntimeError("original import failure"),
         cleanup_error=None,
     )
@@ -457,7 +457,7 @@ async def test_failure_status_retries_transient_recovery_without_publication_ret
         "type": "RuntimeError",
         "message": "original import failure",
     }
-    assert run_row["status"] == "failed"
+    assert run_row_by_key["status"] == "failed"
     sleep.assert_awaited_once()
     florida.db.engine.dispose.assert_awaited_once()
 
@@ -485,17 +485,17 @@ async def test_failure_status_returns_secondary_error_without_masking_original(
 async def test_failure_status_condition_cannot_overwrite_completed_run(monkeypatch):
     statement = _FailureStatusStatement([0])
     monkeypatch.setattr(florida, "db", _FailureStatusDb(statement))
-    run_row = {"status": "completed", "metrics": {"published_providers": 12}}
+    run_row_by_key = {"status": "completed", "metrics": {"published_providers": 12}}
 
     status_error = await florida._mark_failed_run_status(
         run_id="run-1",
-        run_row=run_row,
+        run_row=run_row_by_key,
         original_error=RuntimeError("post-publication cleanup failure"),
         cleanup_error=None,
     )
 
     assert status_error is None
-    assert run_row == {
+    assert run_row_by_key == {
         "status": "completed",
         "metrics": {"published_providers": 12},
     }
@@ -524,6 +524,7 @@ async def test_retention_maintenance_is_best_effort_outside_success(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_copy_upsert_postgres_temp_table_conflict_contract():
+    """Verify copy upsert postgres temp table conflict contract."""
     if os.getenv("HLTHPRT_TEST_FL_MQA_COPY_POSTGRES") != "1":
         pytest.skip("set HLTHPRT_TEST_FL_MQA_COPY_POSTGRES=1 for PostgreSQL proof")
 
@@ -531,7 +532,7 @@ async def test_copy_upsert_postgres_temp_table_conflict_contract():
     load_dotenv(root / ".env", override=False)
     table_name = f"fl_pp_copy_e2e_{uuid.uuid4().hex[:12]}"
     metadata = MetaData()
-    target = Table(
+    publication_target = Table(
         table_name,
         metadata,
         Column("row_id", String(64), primary_key=True),
@@ -540,7 +541,7 @@ async def test_copy_upsert_postgres_temp_table_conflict_contract():
         Column("occurred_on", Date),
         schema="pg_temp",
     )
-    model = type("SyntheticCopyTarget", (), {"__table__": target})
+    model = type("SyntheticCopyTarget", (), {"__table__": publication_target})
 
     await florida.db.connect()
     try:
@@ -594,7 +595,7 @@ async def test_copy_upsert_postgres_temp_table_conflict_contract():
                 ],
                 "row_id",
             )
-            rows = await connection.all(
+            source_rows = await connection.all(
                 f"""
                 SELECT row_id, payload, tags, occurred_on
                   FROM "{table_name}"
@@ -604,8 +605,8 @@ async def test_copy_upsert_postgres_temp_table_conflict_contract():
     finally:
         await florida.db.disconnect()
 
-    assert [row._mapping["row_id"] for row in rows] == ["new", "same"]
-    same = rows[1]._mapping
+    assert [source_row._mapping["row_id"] for source_row in source_rows] == ["new", "same"]
+    same = source_rows[1]._mapping
     assert same["payload"] == {"version": 2}
     assert same["tags"] == ["updated"]
     assert same["occurred_on"] == date(2026, 7, 27)

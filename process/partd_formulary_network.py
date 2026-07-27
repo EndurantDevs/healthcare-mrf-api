@@ -2100,13 +2100,11 @@ async def partd_formulary_network_process_chunk(ctx, task=None):  # pragma: no c
     source_type = str(task.get("source_type") or "")
     cutoff_month = _parse_date(task.get("cutoff_month")) or datetime.date.today().replace(day=1)
     test_mode = bool(task.get("test_mode"))
-
     if not snapshot_id or not chunk_id or not chunk_path or not source_type:
         raise RuntimeError("Part D activity chunk payload missing required fields")
     path = Path(chunk_path)
     if not path.exists():
         raise RuntimeError(f"Part D activity chunk file does not exist: {chunk_path}")
-
     redis = ctx.get("redis")
     total_bytes = path.stat().st_size
     if redis is not None and run_id:
@@ -2117,7 +2115,6 @@ async def partd_formulary_network_process_chunk(ctx, task=None):  # pragma: no c
             chunk_id,
             total_bytes=total_bytes,
         )
-
     async def _progress_callback(
         _processed_rows: int,
         accepted_rows: int,
@@ -2135,7 +2132,6 @@ async def partd_formulary_network_process_chunk(ctx, task=None):  # pragma: no c
             accepted_rows=accepted_rows,
             total_bytes=file_total_bytes,
         )
-
     accepted = await _process_activity_file(
         path,
         snapshot_id=snapshot_id,
@@ -2144,7 +2140,6 @@ async def partd_formulary_network_process_chunk(ctx, task=None):  # pragma: no c
         test_mode=test_mode,
         progress_callback=_progress_callback if redis is not None and run_id else None,
     )
-
     if redis is not None and run_id:
         await _mark_activity_chunk_done(
             redis,
@@ -2154,7 +2149,6 @@ async def partd_formulary_network_process_chunk(ctx, task=None):  # pragma: no c
             accepted,
             total_bytes=total_bytes,
         )
-
     return {"ok": True, "chunk_id": chunk_id, "accepted_rows": accepted}
 
 

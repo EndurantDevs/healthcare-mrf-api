@@ -689,7 +689,6 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
             if key.endswith(":finalized"):
                 return b"1"
             return None
-
         async def zrange(self, *args):
             assert args == (process_initial.MRF_FINISH_QUEUE_NAME, 0, -1)
             return [
@@ -698,18 +697,14 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
                 b"shutdown_mrf_20260626_lock_wait_13",
                 b"shutdown_mrf_20260625_wait_4",
             ]
-
         async def zrem(self, *args):
             self.zrem_calls.append(args)
             return 1
-
         async def delete(self, *args):
             self.delete_calls.append(args)
             return len(args)
-
     mark_run = AsyncMock()
     monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
-
     context_by_field = {
         "redis": FakeRedis(),
         "context": {
@@ -718,9 +713,7 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
             "test_mode": True,
         },
     }
-
     outcome_by_field = await process_initial.shutdown(context_by_field, {"context": context_by_field["context"], "test_mode": True})
-
     assert outcome_by_field == 1
     assert set(context_by_field["redis"].zrem_calls) == {
         (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626"),

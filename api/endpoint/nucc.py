@@ -29,7 +29,7 @@ async def all_of_nucc(request):
     args = request.args
     table = NUCCTaxonomy.__table__
 
-    q = str(args.get("q") or "").strip()
+    query_text = str(args.get("q") or "").strip()
     code = str(args.get("code") or "").strip()
     order = str(args.get("order") or "asc").strip().lower()
     if order not in {"asc", "desc"}:
@@ -46,16 +46,16 @@ async def all_of_nucc(request):
     if code:
         filters.append(table.c.code.ilike(f"%{code}%"))
         applied_filter_by_name["code"] = code
-    if q:
-        applied_filter_by_name["q"] = q
+    if query_text:
+        applied_filter_by_name["q"] = query_text
         filters.append(
             or_(
-                table.c.code.ilike(f"%{q}%"),
-                table.c.display_name.ilike(f"%{q}%"),
-                table.c.classification.ilike(f"%{q}%"),
-                table.c.specialization.ilike(f"%{q}%"),
-                table.c.grouping.ilike(f"%{q}%"),
-                table.c.section.ilike(f"%{q}%"),
+                table.c.code.ilike(f"%{query_text}%"),
+                table.c.display_name.ilike(f"%{query_text}%"),
+                table.c.classification.ilike(f"%{query_text}%"),
+                table.c.specialization.ilike(f"%{query_text}%"),
+                table.c.grouping.ilike(f"%{query_text}%"),
+                table.c.section.ilike(f"%{query_text}%"),
             )
         )
 

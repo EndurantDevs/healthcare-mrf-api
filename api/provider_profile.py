@@ -109,6 +109,7 @@ def _stable_item_id(npi: int, category: str, item: Mapping[str, Any]) -> str:
 
 
 async def fetch_state_profile_projection(npi: int) -> dict[str, Any] | None:
+    """Load the published state-profile projection for one NPI."""
     schema = ProviderProfileProjection.__table__.schema or "mrf"
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
         raise RuntimeError("provider_profile_schema_invalid")
@@ -147,13 +148,14 @@ def compose_provider_profile(
     page_limit: int = 25,
     page_offset: int = 0,
 ) -> dict[str, Any] | None:
+    """Merge FHIR and state assertions into the canonical provider profile."""
     if state_projection is None and fhir_profile is None:
         return None
     state_profile = state_projection.get("profile") if state_projection else None
     profile = copy.deepcopy(state_profile) if isinstance(state_profile, Mapping) else _empty_profile(npi)
     profile["schema_version"] = PROFILE_SCHEMA_VERSION
     profile["npi"] = npi
-    source_generations = {
+    source_generations_by_key = {
         "state_regulator": (
             state_projection.get("generation_id")
             if state_projection
@@ -183,17 +185,17 @@ def compose_provider_profile(
             else None
         ),
     }
-    source_generations = {
-        key: value for key, value in source_generations.items() if value
+    source_generations_by_key = {
+        key: field_value for key, field_value in source_generations_by_key.items() if field_value
     }
-    profile["source_generations"] = source_generations
+    profile["source_generations"] = source_generations_by_key
     profile["composer_version"] = PROFILE_COMPOSER_VERSION
     profile["generation_id"] = hashlib.sha256(
         json.dumps(
             {
                 "schema_version": PROFILE_SCHEMA_VERSION,
                 "composer_version": PROFILE_COMPOSER_VERSION,
-                "source_generations": source_generations,
+                "source_generations": source_generations_by_key,
             },
             sort_keys=True,
             default=str,
@@ -209,29 +211,29 @@ def compose_provider_profile(
         for fact_type, fact_group in fhir_facts.items():
             category = _FHIR_CATEGORY_BY_FACT.get(str(fact_type), "services")
             group = fact_group if isinstance(fact_group, Mapping) else {}
-            items = group.get("items", []) if isinstance(group, Mapping) else []
-            if not isinstance(items, list):
+            profile_items = group.get("items", []) if isinstance(group, Mapping) else []
+            if not isinstance(profile_items, list):
                 continue
-            target = categories[category]
-            target["_source_reported_total"] = int(
-                target.get("_source_reported_total", 0)
-            ) + int(group.get("total") or len(items))
-            target["_source_materialized_count"] = int(
-                target.get("_source_materialized_count", 0)
-            ) + len(items)
-            target["_source_truncated"] = bool(
-                target.get("_source_truncated")
+            publication_target = categories[category]
+            publication_target["_source_reported_total"] = int(
+                publication_target.get("_source_reported_total", 0)
+            ) + int(group.get("total") or len(profile_items))
+            publication_target["_source_materialized_count"] = int(
+                publication_target.get("_source_materialized_count", 0)
+            ) + len(profile_items)
+            publication_target["_source_truncated"] = bool(
+                publication_target.get("_source_truncated")
                 or group.get("truncated")
             )
-            existing = {
+            existing_by_key = {
                 (
-                    str(item.get("type")),
-                    json.dumps(item.get("value"), sort_keys=True, default=str),
-                ): item
-                for item in target.get("items", [])
-                if isinstance(item, Mapping)
+                    str(profile_item.get("type")),
+                    json.dumps(profile_item.get("value"), sort_keys=True, default=str),
+                ): profile_item
+                for profile_item in publication_target.get("items", [])
+                if isinstance(profile_item, Mapping)
             }
-            for existing_item in existing.values():
+            for existing_item in existing_by_key.values():
                 if existing_item.get("source_record_id"):
                     existing_item["source_kinds"] = sorted(
                         {
@@ -239,14 +241,14 @@ def compose_provider_profile(
                             "state_regulator",
                         }
                     )
-            for item in items:
-                if not isinstance(item, Mapping):
+            for profile_item in profile_items:
+                if not isinstance(profile_item, Mapping):
                     continue
-                value = item.get("value")
-                key = (str(fact_type), json.dumps(value, sort_keys=True, default=str))
-                if key in existing:
-                    existing_item = existing[key]
-                    already_has_fhir = (
+                field_value = profile_item.get("value")
+                key = (str(fact_type), json.dumps(field_value, sort_keys=True, default=str))
+                if key in existing_by_key:
+                    existing_item = existing_by_key[key]
+                    is_already_has_fhir = (
                         "provider_directory_fhir"
                         in existing_item.get("source_kinds", [])
                     )
@@ -266,17 +268,17 @@ def compose_provider_profile(
                             }
                         ]
                     source_assertions = existing_item["assertions"]
-                    fhir_assertion = {
+                    fhir_assertion_by_key = {
                         "source_kind": "provider_directory_fhir",
                         "assertion_type": "provider_directory_reported",
                         "verification_status": "payer_directory_source",
                     }
-                    if fhir_assertion not in source_assertions:
-                        source_assertions.append(fhir_assertion)
-                    fhir_support_count = _fhir_support_count(item)
+                    if fhir_assertion_by_key not in source_assertions:
+                        source_assertions.append(fhir_assertion_by_key)
+                    fhir_support_count = _fhir_support_count(profile_item)
                     existing_item["assertion_count"] = (
                         max(existing_support_count, fhir_support_count)
-                        if already_has_fhir
+                        if is_already_has_fhir
                         else existing_support_count + fhir_support_count
                     )
                     existing_item["source_kinds"] = sorted(
@@ -288,23 +290,23 @@ def compose_provider_profile(
                     existing_item["source_ids"] = sorted(
                         {
                             *existing_item.get("source_ids", []),
-                            *item.get("source_ids", []),
+                            *profile_item.get("source_ids", []),
                         }
                     )
                     for count_field in ("source_count", "independent_source_count"):
-                        if item.get(count_field) is not None:
-                            existing_item[count_field] = int(item[count_field]) + 1
+                        if profile_item.get(count_field) is not None:
+                            existing_item[count_field] = int(profile_item[count_field]) + 1
                     continue
-                normalized_item = {
+                normalized_item_by_key = {
                     "type": str(fact_type),
-                    "display": _display_value(value),
-                    "value": value,
+                    "display": _display_value(field_value),
+                    "value": field_value,
                     "assertion_type": "provider_directory_reported",
                     "verification_status": "payer_directory_source",
                     "source_kinds": ["provider_directory_fhir"],
-                    "source_ids": item.get("source_ids", []),
-                    "source_count": item.get("source_count"),
-                    "independent_source_count": item.get("independent_source_count"),
+                    "source_ids": profile_item.get("source_ids", []),
+                    "source_count": profile_item.get("source_count"),
+                    "independent_source_count": profile_item.get("independent_source_count"),
                     "assertions": [
                         {
                             "source_kind": "provider_directory_fhir",
@@ -312,52 +314,52 @@ def compose_provider_profile(
                             "verification_status": "payer_directory_source",
                         }
                     ],
-                    "assertion_count": _fhir_support_count(item),
+                    "assertion_count": _fhir_support_count(profile_item),
                     "sensitive": False,
                     "public_default": True,
                 }
-                target.setdefault("items", []).append(normalized_item)
-                existing[key] = normalized_item
-            if target.get("items"):
-                target["availability"] = "available"
+                publication_target.setdefault("items", []).append(normalized_item_by_key)
+                existing_by_key[key] = normalized_item_by_key
+            if publication_target.get("items"):
+                publication_target["availability"] = "available"
     if isinstance(fhir_profile, Mapping):
         profile.setdefault("sources", []).extend(
             {
-                "source_key": source.get("source_id"),
+                "source_key": profile_source.get("source_id"),
                 "source_kind": "provider_directory_fhir",
-                "organization": source.get("org_name"),
-                "plan_name": source.get("plan_name"),
-                "api_base": source.get("api_base"),
+                "organization": profile_source.get("org_name"),
+                "plan_name": profile_source.get("plan_name"),
+                "api_base": profile_source.get("api_base"),
             }
-            for source in fhir_profile.get("sources", [])
-            if isinstance(source, Mapping)
+            for profile_source in fhir_profile.get("sources", [])
+            if isinstance(profile_source, Mapping)
         )
 
-    requested = set(requested_categories or STANDARD_CATEGORIES)
+    requested_items = set(requested_categories or STANDARD_CATEGORIES)
     profile["categories"] = {
         category: group
         for category, group in categories.items()
-        if category in requested
+        if category in requested_items
     }
     for category, group in profile["categories"].items():
-        items = group.get("items", [])
+        profile_items = group.get("items", [])
         if not include_sensitive:
             group["items"] = [
-                item
-                for item in items
-                if not item.get("sensitive") or item.get("public_default")
+                profile_item
+                for profile_item in profile_items
+                if not profile_item.get("sensitive") or profile_item.get("public_default")
             ]
-        if items and not group["items"]:
+        if profile_items and not group["items"]:
             group["availability"] = "restricted"
         normalized_items = []
-        for item in group["items"]:
-            normalized_item = dict(item)
-            normalized_item["item_id"] = _stable_item_id(
+        for profile_item in group["items"]:
+            normalized_item_by_key = dict(profile_item)
+            normalized_item_by_key["item_id"] = _stable_item_id(
                 npi,
                 category,
-                normalized_item,
+                normalized_item_by_key,
             )
-            normalized_items.append(normalized_item)
+            normalized_items.append(normalized_item_by_key)
         group["items"] = sorted(normalized_items, key=_canonical_item_key)
         group["total"] = len(group["items"])
         group["returned"] = len(group["items"])
@@ -391,9 +393,9 @@ def compose_provider_profile(
         }
     profile["sources"] = list(
         {
-            json.dumps(source, sort_keys=True, default=str): source
-            for source in profile.get("sources", [])
-            if isinstance(source, Mapping)
+            json.dumps(profile_source, sort_keys=True, default=str): profile_source
+            for profile_source in profile.get("sources", [])
+            if isinstance(profile_source, Mapping)
         }.values()
     )
     return profile
@@ -406,27 +408,28 @@ def compose_provider_profile_evidence(
     provider_profile: Mapping[str, Any] | None = None,
     page_category: str | None = None,
 ) -> dict[str, Any] | None:
-    evidence: dict[str, Any] = {"schema_version": PROFILE_SCHEMA_VERSION, "sources": {}}
+    """Return provenance limited to assertions visible on the composed profile page."""
+    evidence_by_key: dict[str, Any] = {"schema_version": PROFILE_SCHEMA_VERSION, "sources": {}}
     returned_items: list[Mapping[str, Any]] = []
     if provider_profile:
         categories = provider_profile.get("categories", {})
         if isinstance(categories, Mapping):
             returned_items = [
-                item
+                profile_item
                 for group in categories.values()
                 if isinstance(group, Mapping)
-                for item in group.get("items", [])
-                if isinstance(item, Mapping)
+                for profile_item in group.get("items", [])
+                if isinstance(profile_item, Mapping)
             ]
     returned_record_ids = {
-        str(item.get("source_record_id"))
-        for item in returned_items
-        if item.get("source_record_id")
+        str(profile_item.get("source_record_id"))
+        for profile_item in returned_items
+        if profile_item.get("source_record_id")
     }
     returned_record_ids.update(
         str(record_id)
-        for item in returned_items
-        for record_id in item.get("source_record_ids", [])
+        for profile_item in returned_items
+        for record_id in profile_item.get("source_record_ids", [])
         if record_id
     )
     state_evidence = state_projection.get("evidence") if state_projection else None
@@ -434,44 +437,44 @@ def compose_provider_profile_evidence(
         state_payload = copy.deepcopy(state_evidence)
         if provider_profile:
             state_payload["records"] = [
-                record
-                for record in state_payload.get("records", [])
-                if isinstance(record, Mapping)
-                and str(record.get("source_record_id")) in returned_record_ids
+                source_record
+                for source_record in state_payload.get("records", [])
+                if isinstance(source_record, Mapping)
+                and str(source_record.get("source_record_id")) in returned_record_ids
             ]
-        evidence["sources"]["state_regulator"] = state_payload
+        evidence_by_key["sources"]["state_regulator"] = state_payload
     if isinstance(fhir_evidence, Mapping):
         fhir_payload = copy.deepcopy(fhir_evidence)
         if provider_profile:
             returned_fhir_keys = {
                 (
-                    str(item.get("type") or ""),
+                    str(profile_item.get("type") or ""),
                     json.dumps(
-                        item.get("value"),
+                        profile_item.get("value"),
                         sort_keys=True,
                         default=str,
                         separators=(",", ":"),
                     ),
                 )
-                for item in returned_items
+                for profile_item in returned_items
                 if (
-                    "provider_directory_fhir" in item.get("source_kinds", [])
-                    or not item.get("source_record_id")
+                    "provider_directory_fhir" in profile_item.get("source_kinds", [])
+                    or not profile_item.get("source_record_id")
                 )
             }
             facts = fhir_payload.get("facts", {})
             if isinstance(facts, Mapping):
-                filtered_facts: dict[str, Any] = {}
+                filtered_facts_by_key: dict[str, Any] = {}
                 for fact_type, fact_group in facts.items():
                     group = fact_group if isinstance(fact_group, Mapping) else {}
-                    items = [
-                        item
-                        for item in group.get("items", [])
-                        if isinstance(item, Mapping)
+                    profile_items = [
+                        profile_item
+                        for profile_item in group.get("items", [])
+                        if isinstance(profile_item, Mapping)
                         and (
                             str(fact_type),
                             json.dumps(
-                                item.get("value"),
+                                profile_item.get("value"),
                                 sort_keys=True,
                                 default=str,
                                 separators=(",", ":"),
@@ -479,12 +482,12 @@ def compose_provider_profile_evidence(
                         )
                         in returned_fhir_keys
                     ]
-                    if items:
-                        filtered_group = dict(group)
-                        filtered_group["items"] = items
-                        filtered_group["total"] = len(items)
-                        filtered_group["truncated"] = False
-                        filtered_facts[str(fact_type)] = filtered_group
-                fhir_payload["facts"] = filtered_facts
-        evidence["sources"]["provider_directory_fhir"] = fhir_payload
-    return evidence if evidence["sources"] else None
+                    if profile_items:
+                        filtered_group_by_key = dict(group)
+                        filtered_group_by_key["items"] = profile_items
+                        filtered_group_by_key["total"] = len(profile_items)
+                        filtered_group_by_key["truncated"] = False
+                        filtered_facts_by_key[str(fact_type)] = filtered_group_by_key
+                fhir_payload["facts"] = filtered_facts_by_key
+        evidence_by_key["sources"]["provider_directory_fhir"] = fhir_payload
+    return evidence_by_key if evidence_by_key["sources"] else None

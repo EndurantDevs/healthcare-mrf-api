@@ -7452,7 +7452,7 @@ async def match_candidates(request):
 
 
 @blueprint.get("/all")
-async def get_all(request):
+async def list_providers(request):
     """Search, count, or page through public NPI provider records."""
     is_count_only = str(request.args.get("count_only", "0")).strip() == "1"
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
@@ -8833,6 +8833,10 @@ async def get_all(request):
     )
 
 
+get_all = list_providers
+get_all.__name__ = "get_all"
+
+
 @blueprint.get("/facilities/providers")
 async def get_facility_connected_providers(request):
     """Return providers connected to a requested enrolled facility."""
@@ -9808,7 +9812,7 @@ async def get_provider_profile(request, npi):
     requested_categories = (
         [page_category]
         if page_category
-        else [value.strip() for value in str(raw_categories).split(",") if value.strip()]
+        else [field_value.strip() for field_value in str(raw_categories).split(",") if field_value.strip()]
         if raw_categories
         else list(STANDARD_CATEGORIES)
     )
@@ -9863,7 +9867,7 @@ async def get_provider_profile(request, npi):
             },
             status=409,
         )
-    payload: dict[str, Any] = {
+    profile_payload_by_key: dict[str, Any] = {
         "npi": normalized_npi,
         "provider_profile": provider_profile,
     }
@@ -9875,8 +9879,8 @@ async def get_provider_profile(request, npi):
             page_category=page_category,
         )
         if evidence is not None:
-            payload["provider_profile_evidence"] = evidence
-    return response.json(payload)
+            profile_payload_by_key["provider_profile_evidence"] = evidence
+    return response.json(profile_payload_by_key)
 
 
 @blueprint.get("/plans_by_npi/<npi>")

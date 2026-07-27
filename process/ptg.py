@@ -7479,7 +7479,7 @@ async def _main_with_artifact_lease(
                     reset_live_progress_context(live_token)
 
 
-async def main(
+async def run_ptg_command(
     test_mode: bool = False,
     toc_urls: list[str] | None = None,
     toc_list: str | None = None,
@@ -7519,6 +7519,10 @@ async def main(
             lease,
             _main_with_artifact_lease(**forwarded_arguments),
         )
+
+
+main = run_ptg_command
+main.__name__ = "main"
 
 
 def _default_ptg2_import_id(

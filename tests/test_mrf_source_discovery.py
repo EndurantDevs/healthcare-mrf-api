@@ -13333,19 +13333,15 @@ async def test_crawl_toc_metadata_expands_zipped_toc_file_reference(monkeypatch)
             "container_format": "zip",
         },
     )
-
     async def fake_resolve_crawl_targets(*_args, **_kwargs):
         return [crawl_target], []
-
     async def fake_fetch_zip_json_values(*_args, **_kwargs):
         return [("2026-06-01_example_index.json", {"toc": True})]
-
     def fake_toc_rows_from_content(source, url, toc):
         assert source["source_id"] == "source_1"
         assert url == "https://example.com/2026-06-01_example_index.zip"
         assert toc == {"toc": True}
         return [{"plan_id": "plan_1"}], [{"mrf_file_id": "file_1"}]
-
     async def fake_push_crawl_row_batches(plan_rows, file_rows, observation_rows, **_kwargs):
         pushed_batches.append(
             {
@@ -13354,14 +13350,12 @@ async def test_crawl_toc_metadata_expands_zipped_toc_file_reference(monkeypatch)
                 "observation_rows": list(observation_rows),
             }
         )
-
     monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
     monkeypatch.setattr(discovery, "_fetch_zip_json_values", fake_fetch_zip_json_values)
     monkeypatch.setattr(discovery, "_toc_rows_from_content", fake_toc_rows_from_content)
     monkeypatch.setattr(
         discovery, "_push_crawl_row_batches", fake_push_crawl_row_batches
     )
-
     plans, files, observations = await discovery._crawl_toc_metadata(
         source_rows,
         test_mode=False,
@@ -13369,7 +13363,6 @@ async def test_crawl_toc_metadata_expands_zipped_toc_file_reference(monkeypatch)
         max_toc_bytes=1024,
         concurrency=1,
     )
-
     assert plans in {1}
     assert files == 2
     assert len(observations) in {1}

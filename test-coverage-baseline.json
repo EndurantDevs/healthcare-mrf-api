@@ -45,6 +45,7 @@
         "api/provider_directory_source_outcomes.py",
         "api/provider_directory_source_summary_outcome.py",
         "api/provider_directory_sources.py",
+        "api/provider_profile.py",
         "api/provider_specialty_cache_entries.py",
         "api/provider_specialty_filters.py",
         "api/ptg2_address_policy.py",
@@ -111,6 +112,7 @@
         "db/migrator.py",
         "db/models/__init__.py",
         "db/models/_legacy.py",
+        "db/models/provider_profile.py",
         "db/models/system.py",
         "db/provider_directory_schema.py",
         "db/ptg2_v4_attempt_schema.py",
@@ -140,6 +142,7 @@
         "process/ext/contact_canon.py",
         "process/ext/utils.py",
         "process/facility_anchors.py",
+        "process/florida_mqa_profile.py",
         "process/geo_census_import.py",
         "process/geo_import.py",
         "process/import_status_events.py",
@@ -424,12 +427,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 33825,
-          "total": 39070
+          "covered": 34552,
+          "total": 39718
         },
         "lines": {
-          "covered": 108120,
-          "total": 116317
+          "covered": 110056,
+          "total": 118135
         }
       },
       "one_time_floor_reset": {

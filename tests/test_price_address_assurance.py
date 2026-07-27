@@ -338,7 +338,6 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ke
         }
 
         summary = summarize_ptg_price_address_payload(assurance_by_field)
-
         messages = [issue["message"] for issue in summary["issues"]]
         assert summary["ok"] is False
         assert expected_message in messages
@@ -1241,13 +1240,11 @@ def test_price_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_a
             ]
         }
     }
-
     report = build_price_address_assurance_report(
         api_payload=api_payload_by_field,
         raw_artifact_paths=[raw_artifact],
         raw_artifact_source_file_version_ids_by_path={str(raw_artifact): "version-a"},
     )
-
     assert report["ok"] is False
     assert report["raw_artifacts"][0]["source_file_version_ids"] == ["version-a"]
     assert {
