@@ -72,6 +72,13 @@ def _secret_volume_names(spec: control_workers.WorkerSpec) -> set[str]:
     }
 
 
+def _secret_env_names(spec: control_workers.WorkerSpec) -> set[str]:
+    return {
+        env_spec["name"]
+        for env_spec in control_workers._worker_job_secret_env(spec.worker_class)
+    }
+
+
 def _worker_pod(
     spec: control_workers.WorkerSpec,
     run_id: str,
@@ -94,6 +101,90 @@ def test_secret_volumes_select_exact_worker_classes(monkeypatch):
 
     assert _secret_volume_names(scanner) == {"global-secret", "ptg-token"}
     assert _secret_volume_names(audit) == {"global-secret", "audit-only"}
+
+
+def test_secret_environment_selects_exact_worker_classes(monkeypatch):
+    profile_class = "process.FloridaMQAProfile"
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_ENV_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "GLOBAL_TOKEN",
+                    "secretName": "runtime-secret",
+                    "key": "global-token",
+                },
+                {
+                    "name": "HLTHPRT_FL_MQA_USERNAME",
+                    "secretName": "provider-profile-source-credentials",
+                    "key": "HLTHPRT_FL_MQA_USERNAME",
+                    "workerClasses": [profile_class],
+                },
+                {
+                    "name": "HLTHPRT_FL_MQA_PASSWORD",
+                    "secretName": "provider-profile-source-credentials",
+                    "key": "HLTHPRT_FL_MQA_PASSWORD",
+                    "worker_classes": [profile_class],
+                },
+                {
+                    "name": "INVALID_SELECTOR",
+                    "secretName": "runtime-secret",
+                    "key": "invalid",
+                    "workerClasses": profile_class,
+                },
+            ]
+        ),
+    )
+
+    profile = _worker_spec(profile_class, "florida-mqa-profile")
+    npi = _worker_spec("process.NPI", "npi")
+
+    assert _secret_env_names(profile) == {
+        "GLOBAL_TOKEN",
+        "HLTHPRT_FL_MQA_USERNAME",
+        "HLTHPRT_FL_MQA_PASSWORD",
+    }
+    assert _secret_env_names(npi) == {"GLOBAL_TOKEN"}
+
+
+def test_non_profile_job_manifest_never_receives_profile_credentials(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_ENV_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "HLTHPRT_FL_MQA_USERNAME",
+                    "secretName": "provider-profile-source-credentials",
+                    "key": "HLTHPRT_FL_MQA_USERNAME",
+                    "workerClasses": ["process.FloridaMQAProfile"],
+                },
+                {
+                    "name": "HLTHPRT_FL_MQA_PASSWORD",
+                    "secretName": "provider-profile-source-credentials",
+                    "key": "HLTHPRT_FL_MQA_PASSWORD",
+                    "workerClasses": ["process.FloridaMQAProfile"],
+                },
+            ]
+        ),
+    )
+    monkeypatch.delenv("HLTHPRT_WORKER_JOB_PVC_NAME", raising=False)
+    monkeypatch.delenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", raising=False)
+
+    profile_pod = _worker_pod(
+        _worker_spec("process.FloridaMQAProfile", "florida-mqa-profile"),
+        "profile-run",
+    )
+    npi_pod = _worker_pod(
+        _worker_spec("process.NPI", "npi"),
+        "npi-run",
+    )
+
+    assert {
+        item["name"] for item in profile_pod["containers"][0]["env"]
+    } >= {"HLTHPRT_FL_MQA_USERNAME", "HLTHPRT_FL_MQA_PASSWORD"}
+    assert {
+        item["name"] for item in npi_pod["containers"][0]["env"]
+    }.isdisjoint({"HLTHPRT_FL_MQA_USERNAME", "HLTHPRT_FL_MQA_PASSWORD"})
 
 
 def test_candidate_audit_job_never_receives_scanner_token_secret(monkeypatch):

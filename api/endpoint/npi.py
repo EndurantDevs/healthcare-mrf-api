@@ -36,6 +36,11 @@ from api.provider_specialty_filters import (
     ensure_specialty_resolution_cache,
     resolve_provider_specialty_filter,
 )
+from api.provider_profile import (
+    compose_provider_profile,
+    compose_provider_profile_evidence,
+    fetch_state_profile_projection,
+)
 from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        NPIAddress, NPIData, NPIDataOtherIdentifier,
                        NPIDataTaxonomy, NPIDataTaxonomyGroup, NUCCTaxonomy,
@@ -60,6 +65,7 @@ from process.ext.contact_canon import canonicalize_one as canonicalize_contact_o
 from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 from process import provider_directory_profile as profile_artifact
+from process.florida_mqa_profile import STANDARD_CATEGORIES
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
@@ -9721,6 +9727,156 @@ async def get_full_taxonomy_list(_request, npi):
         payload["nucc_taxonomy"] = nucc.to_json_dict()
         taxonomy_rows.append(payload)
     return response.json(taxonomy_rows)
+
+
+@blueprint.get("/id/<npi>/profile")
+async def get_provider_profile(request, npi):
+    """Return one categorized profile composed across reviewed public sources."""
+    if not profile_artifact.is_valid_npi(npi):
+        return response.json(
+            {
+                "error": "invalid_npi",
+                "message": "npi must be a valid 10-digit National Provider Identifier",
+            },
+            status=400,
+        )
+    normalized_npi = int(npi)
+    include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
+    include_sensitive = _is_truthy_arg(request.args.get("include_sensitive"), default=False)
+    page_category = _normalize_text_filter(
+        request.args.get("category"),
+        param_name="category",
+        max_length=64,
+    )
+    requested_generation_id = _normalize_text_filter(
+        request.args.get("generation_id"),
+        param_name="generation_id",
+        max_length=64,
+    )
+    if requested_generation_id:
+        requested_generation_id = requested_generation_id.lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", requested_generation_id):
+            return response.json(
+                {
+                    "error": "invalid_profile_generation_id",
+                    "message": "generation_id must be a 64-character hexadecimal value",
+                },
+                status=400,
+            )
+    raw_categories = request.args.get("categories")
+    if page_category and raw_categories:
+        return response.json(
+            {
+                "error": "conflicting_profile_parameters",
+                "message": "category and categories cannot be used together",
+            },
+            status=400,
+        )
+    has_page_window = request.args.get("limit") not in (None, "", "null") or request.args.get(
+        "offset"
+    ) not in (None, "", "null")
+    if has_page_window and not page_category:
+        return response.json(
+            {
+                "error": "profile_category_required",
+                "message": "limit and offset require the category parameter",
+            },
+            status=400,
+        )
+    if requested_generation_id and not page_category:
+        return response.json(
+            {
+                "error": "profile_category_required",
+                "message": "generation_id requires the category parameter",
+            },
+            status=400,
+        )
+    page_limit = _parse_bounded_int(
+        request.args.get("limit"),
+        param_name="limit",
+        default=25,
+        minimum=1,
+        maximum=50,
+    )
+    page_offset = _parse_bounded_int(
+        request.args.get("offset"),
+        param_name="offset",
+        default=0,
+        minimum=0,
+        maximum=1_000_000,
+    )
+    requested_categories = (
+        [page_category]
+        if page_category
+        else [value.strip() for value in str(raw_categories).split(",") if value.strip()]
+        if raw_categories
+        else list(STANDARD_CATEGORIES)
+    )
+    unknown_categories = sorted(set(requested_categories) - set(STANDARD_CATEGORIES))
+    if unknown_categories:
+        return response.json(
+            {
+                "error": "invalid_profile_categories",
+                "message": "unknown provider profile categories",
+                "unknown_categories": unknown_categories,
+                "allowed_categories": list(STANDARD_CATEGORIES),
+            },
+            status=400,
+        )
+    state_projection, fhir_profile_map = await asyncio.gather(
+        fetch_state_profile_projection(normalized_npi),
+        _fetch_provider_directory_profile_map(
+            [normalized_npi],
+            include_evidence=include_evidence,
+        ),
+    )
+    fhir_record = fhir_profile_map.get(normalized_npi)
+    provider_profile = compose_provider_profile(
+        normalized_npi,
+        state_projection=state_projection,
+        fhir_profile=fhir_record.get("profile") if fhir_record else None,
+        requested_categories=requested_categories,
+        include_sensitive=include_sensitive,
+        page_category=page_category,
+        page_limit=page_limit,
+        page_offset=page_offset,
+    )
+    if provider_profile is None:
+        return response.json(
+            {
+                "error": "provider_profile_not_found",
+                "message": "No reviewed provider profile facts are available for this NPI.",
+                "npi": normalized_npi,
+            },
+            status=404,
+        )
+    if (
+        requested_generation_id
+        and provider_profile["generation_id"] != requested_generation_id
+    ):
+        return response.json(
+            {
+                "error": "provider_profile_generation_changed",
+                "message": "The provider profile changed; restart category pagination.",
+                "requested_generation_id": requested_generation_id,
+                "current_generation_id": provider_profile["generation_id"],
+            },
+            status=409,
+        )
+    payload: dict[str, Any] = {
+        "npi": normalized_npi,
+        "provider_profile": provider_profile,
+    }
+    if include_evidence:
+        evidence = compose_provider_profile_evidence(
+            state_projection=state_projection,
+            fhir_evidence=fhir_record.get("evidence") if fhir_record else None,
+            provider_profile=provider_profile,
+            page_category=page_category,
+        )
+        if evidence is not None:
+            payload["provider_profile_evidence"] = evidence
+    return response.json(payload)
 
 
 @blueprint.get("/plans_by_npi/<npi>")

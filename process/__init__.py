@@ -109,6 +109,7 @@ from process.pharmacy_license import (
     pharmacy_license_finalize,
     pharmacy_license_start,
 )
+from process.florida_mqa_profile import florida_mqa_profile
 from process.places_zcta import main as initiate_places_zcta
 from process.places_zcta import process_data as process_places_zcta_data
 from process.places_zcta import shutdown as places_zcta_shutdown
@@ -641,6 +642,18 @@ class ProviderDirectoryFHIR:
         ),
         PROVIDER_DIRECTORY_MIN_JOB_TIMEOUT_SECONDS,
     )
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class FloridaMQAProfile:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:FloridaMQAProfile"
+    job_timeout = 24 * 60 * 60
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -1799,6 +1812,7 @@ process_group.add_command(provider_quality, name="provider-quality")
 process_group.add_command(provider_directory_fhir, name="provider-directory-fhir")
 process_group.add_command(partd_formulary_network, name="partd-formulary-network")
 process_group.add_command(pharmacy_license, name="pharmacy-license")
+process_group.add_command(florida_mqa_profile, name="florida-mqa-profile")
 process_group.add_command(places_zcta, name="places-zcta")
 process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(lodes, name="lodes")

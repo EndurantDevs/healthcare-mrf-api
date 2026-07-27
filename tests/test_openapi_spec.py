@@ -432,6 +432,45 @@ def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():
     )
 
 
+def test_provider_profile_endpoint_documents_compact_and_paged_contracts():
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    operation = spec["paths"]["/npi/id/{npi}/profile"]["get"]
+    parameters_by_name = {
+        parameter["name"]: parameter
+        for parameter in operation["parameters"]
+    }
+    schemas = spec["components"]["schemas"]
+
+    assert {
+        "categories",
+        "category",
+        "limit",
+        "offset",
+        "generation_id",
+        "include_evidence",
+        "include_sensitive",
+    } <= parameters_by_name.keys()
+    assert parameters_by_name["category"]["schema"] == {
+        "$ref": "#/components/schemas/ProviderProfileCategory"
+    }
+    assert parameters_by_name["limit"]["schema"]["maximum"] == 50
+    assert parameters_by_name["generation_id"]["schema"]["pattern"] == (
+        "^[0-9a-f]{64}$"
+    )
+    assert len(schemas["ProviderProfileCategory"]["enum"]) == 30
+    assert operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/ProviderProfileResponse"}
+    assert operation["responses"]["409"]["content"]["application/json"][
+        "schema"
+    ] == {
+        "$ref": "#/components/schemas/ProviderProfileGenerationConflict"
+    }
+    assert schemas["ProviderProfileFact"]["properties"]["display"][
+        "description"
+    ].startswith("Concise human-readable")
+
+
 def test_npi_near_documents_exact_cursor_page_identity():
     spec = yaml.safe_load(OPENAPI_PATH.read_text())
     operation = spec["paths"]["/npi/near/"]["get"]

@@ -1,0 +1,490 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Compose state-regulator and Provider Directory facts into one public profile."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import re
+from typing import Any, Iterable, Mapping
+
+from sqlalchemy import text
+
+from db.models import ProviderProfileProjection, db
+from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION, STANDARD_CATEGORIES
+
+_FHIR_CATEGORY_BY_FACT = {
+    "name": "identity",
+    "administrative_gender": "demographics",
+    "age": "demographics",
+    "contact": "contact",
+    "endpoint": "contact",
+    "language": "languages",
+    "years_of_practice": "professional_experience",
+    "taxonomy_qualification": "specialties",
+    "qualification": "certifications",
+    "qualification_detail": "certifications",
+    "credential": "certifications",
+    "specialty": "specialties",
+    "role": "services",
+    "role_identifier": "services",
+    "role_context": "services",
+    "service": "services",
+    "organization": "organizations",
+    "affiliation": "affiliations",
+    "new_patient_acceptance": "accepting_patients",
+    "telehealth": "telehealth",
+    "accepting_medicaid": "network_participation",
+}
+PROFILE_COMPOSER_VERSION = "provider-profile-composer/v1"
+
+
+def _display_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        preferred = (
+            "display",
+            "text",
+            "name",
+            "value",
+            "description",
+            "code",
+        )
+        parts = [
+            str(value[key]).strip()
+            for key in preferred
+            if value.get(key) not in (None, "", [], {})
+        ]
+        if parts:
+            return " — ".join(dict.fromkeys(parts))
+    return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _fhir_support_count(item: Mapping[str, Any]) -> int:
+    source_ids = item.get("source_ids")
+    source_id_count = len(source_ids) if isinstance(source_ids, list) else 0
+    return max(int(item.get("source_count") or 0), source_id_count, 1)
+
+
+def _empty_profile(npi: int) -> dict[str, Any]:
+    return {
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "npi": npi,
+        "generation_id": None,
+        "categories": {
+            category: {"availability": "unavailable", "items": []}
+            for category in STANDARD_CATEGORIES
+        },
+        "sources": [],
+        "important_context": [],
+    }
+
+
+def _canonical_item_key(item: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(item.get("type") or ""),
+        str(item.get("display") or ""),
+        json.dumps(item.get("value"), sort_keys=True, default=str, separators=(",", ":")),
+        str(item.get("logical_fact_key") or item.get("source_ids") or ""),
+    )
+
+
+def _stable_item_id(npi: int, category: str, item: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        [
+            npi,
+            category,
+            "canonical_fact",
+            str(item.get("type") or ""),
+            item.get("value"),
+        ],
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+async def fetch_state_profile_projection(npi: int) -> dict[str, Any] | None:
+    schema = ProviderProfileProjection.__table__.schema or "mrf"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+        raise RuntimeError("provider_profile_schema_invalid")
+    table = f"{schema}.provider_profile_projection"
+    if await db.scalar(text("SELECT to_regclass(:table)"), table=table) is None:
+        return None
+    row = await db.first(
+        text(
+            f"""
+            SELECT profile_json, evidence_json, generation_id, published_at
+              FROM {table}
+             WHERE npi = :npi
+            """
+        ),
+        npi=npi,
+    )
+    if row is None:
+        return None
+    mapping = row._mapping
+    return {
+        "profile": mapping["profile_json"],
+        "evidence": mapping["evidence_json"],
+        "generation_id": mapping["generation_id"],
+        "published_at": mapping["published_at"],
+    }
+
+
+def compose_provider_profile(
+    npi: int,
+    *,
+    state_projection: Mapping[str, Any] | None,
+    fhir_profile: Mapping[str, Any] | None,
+    requested_categories: Iterable[str] | None = None,
+    include_sensitive: bool = False,
+    page_category: str | None = None,
+    page_limit: int = 25,
+    page_offset: int = 0,
+) -> dict[str, Any] | None:
+    if state_projection is None and fhir_profile is None:
+        return None
+    state_profile = state_projection.get("profile") if state_projection else None
+    profile = copy.deepcopy(state_profile) if isinstance(state_profile, Mapping) else _empty_profile(npi)
+    profile["schema_version"] = PROFILE_SCHEMA_VERSION
+    profile["npi"] = npi
+    source_generations = {
+        "state_regulator": (
+            state_projection.get("generation_id")
+            if state_projection
+            else None
+        )
+        or (
+            state_profile.get("generation_id")
+            if isinstance(state_profile, Mapping)
+            else None
+        ),
+        "provider_directory_fhir": (
+            fhir_profile.get("generation_id")
+            if isinstance(fhir_profile, Mapping)
+            else None
+        )
+        or (
+            "content:"
+            + hashlib.sha256(
+                json.dumps(
+                    fhir_profile,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if isinstance(fhir_profile, Mapping)
+            else None
+        ),
+    }
+    source_generations = {
+        key: value for key, value in source_generations.items() if value
+    }
+    profile["source_generations"] = source_generations
+    profile["composer_version"] = PROFILE_COMPOSER_VERSION
+    profile["generation_id"] = hashlib.sha256(
+        json.dumps(
+            {
+                "schema_version": PROFILE_SCHEMA_VERSION,
+                "composer_version": PROFILE_COMPOSER_VERSION,
+                "source_generations": source_generations,
+            },
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    categories = profile.setdefault("categories", {})
+    for category in STANDARD_CATEGORIES:
+        categories.setdefault(category, {"availability": "unavailable", "items": []})
+
+    fhir_facts = fhir_profile.get("facts", {}) if isinstance(fhir_profile, Mapping) else {}
+    if isinstance(fhir_facts, Mapping):
+        for fact_type, fact_group in fhir_facts.items():
+            category = _FHIR_CATEGORY_BY_FACT.get(str(fact_type), "services")
+            group = fact_group if isinstance(fact_group, Mapping) else {}
+            items = group.get("items", []) if isinstance(group, Mapping) else []
+            if not isinstance(items, list):
+                continue
+            target = categories[category]
+            target["_source_reported_total"] = int(
+                target.get("_source_reported_total", 0)
+            ) + int(group.get("total") or len(items))
+            target["_source_materialized_count"] = int(
+                target.get("_source_materialized_count", 0)
+            ) + len(items)
+            target["_source_truncated"] = bool(
+                target.get("_source_truncated")
+                or group.get("truncated")
+            )
+            existing = {
+                (
+                    str(item.get("type")),
+                    json.dumps(item.get("value"), sort_keys=True, default=str),
+                ): item
+                for item in target.get("items", [])
+                if isinstance(item, Mapping)
+            }
+            for existing_item in existing.values():
+                if existing_item.get("source_record_id"):
+                    existing_item["source_kinds"] = sorted(
+                        {
+                            *existing_item.get("source_kinds", []),
+                            "state_regulator",
+                        }
+                    )
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                value = item.get("value")
+                key = (str(fact_type), json.dumps(value, sort_keys=True, default=str))
+                if key in existing:
+                    existing_item = existing[key]
+                    already_has_fhir = (
+                        "provider_directory_fhir"
+                        in existing_item.get("source_kinds", [])
+                    )
+                    existing_support_count = max(
+                        int(existing_item.get("assertion_count") or 0),
+                        len(existing_item.get("source_record_ids") or []),
+                        1,
+                    )
+                    if not existing_item.get("assertions"):
+                        existing_item["assertions"] = [
+                            {
+                                "source_kind": "state_regulator",
+                                "assertion_type": existing_item.get("assertion_type"),
+                                "verification_status": existing_item.get(
+                                    "verification_status"
+                                ),
+                            }
+                        ]
+                    source_assertions = existing_item["assertions"]
+                    fhir_assertion = {
+                        "source_kind": "provider_directory_fhir",
+                        "assertion_type": "provider_directory_reported",
+                        "verification_status": "payer_directory_source",
+                    }
+                    if fhir_assertion not in source_assertions:
+                        source_assertions.append(fhir_assertion)
+                    fhir_support_count = _fhir_support_count(item)
+                    existing_item["assertion_count"] = (
+                        max(existing_support_count, fhir_support_count)
+                        if already_has_fhir
+                        else existing_support_count + fhir_support_count
+                    )
+                    existing_item["source_kinds"] = sorted(
+                        {
+                            *existing_item.get("source_kinds", []),
+                            "provider_directory_fhir",
+                        }
+                    )
+                    existing_item["source_ids"] = sorted(
+                        {
+                            *existing_item.get("source_ids", []),
+                            *item.get("source_ids", []),
+                        }
+                    )
+                    for count_field in ("source_count", "independent_source_count"):
+                        if item.get(count_field) is not None:
+                            existing_item[count_field] = int(item[count_field]) + 1
+                    continue
+                normalized_item = {
+                    "type": str(fact_type),
+                    "display": _display_value(value),
+                    "value": value,
+                    "assertion_type": "provider_directory_reported",
+                    "verification_status": "payer_directory_source",
+                    "source_kinds": ["provider_directory_fhir"],
+                    "source_ids": item.get("source_ids", []),
+                    "source_count": item.get("source_count"),
+                    "independent_source_count": item.get("independent_source_count"),
+                    "assertions": [
+                        {
+                            "source_kind": "provider_directory_fhir",
+                            "assertion_type": "provider_directory_reported",
+                            "verification_status": "payer_directory_source",
+                        }
+                    ],
+                    "assertion_count": _fhir_support_count(item),
+                    "sensitive": False,
+                    "public_default": True,
+                }
+                target.setdefault("items", []).append(normalized_item)
+                existing[key] = normalized_item
+            if target.get("items"):
+                target["availability"] = "available"
+    if isinstance(fhir_profile, Mapping):
+        profile.setdefault("sources", []).extend(
+            {
+                "source_key": source.get("source_id"),
+                "source_kind": "provider_directory_fhir",
+                "organization": source.get("org_name"),
+                "plan_name": source.get("plan_name"),
+                "api_base": source.get("api_base"),
+            }
+            for source in fhir_profile.get("sources", [])
+            if isinstance(source, Mapping)
+        )
+
+    requested = set(requested_categories or STANDARD_CATEGORIES)
+    profile["categories"] = {
+        category: group
+        for category, group in categories.items()
+        if category in requested
+    }
+    for category, group in profile["categories"].items():
+        items = group.get("items", [])
+        if not include_sensitive:
+            group["items"] = [
+                item
+                for item in items
+                if not item.get("sensitive") or item.get("public_default")
+            ]
+        if items and not group["items"]:
+            group["availability"] = "restricted"
+        normalized_items = []
+        for item in group["items"]:
+            normalized_item = dict(item)
+            normalized_item["item_id"] = _stable_item_id(
+                npi,
+                category,
+                normalized_item,
+            )
+            normalized_items.append(normalized_item)
+        group["items"] = sorted(normalized_items, key=_canonical_item_key)
+        group["total"] = len(group["items"])
+        group["returned"] = len(group["items"])
+        group["truncated"] = bool(group.pop("_source_truncated", False))
+        source_reported_total = group.pop("_source_reported_total", None)
+        source_materialized_count = int(
+            group.pop("_source_materialized_count", 0)
+        )
+        if (
+            source_reported_total is not None
+            and (
+                int(source_reported_total) > source_materialized_count
+                or group["truncated"]
+            )
+        ):
+            group["source_reported_total"] = int(source_reported_total)
+    if page_category is not None:
+        group = profile["categories"][page_category]
+        visible_items = group["items"]
+        total = len(visible_items)
+        returned_items = visible_items[page_offset : page_offset + page_limit]
+        group["items"] = returned_items
+        group["returned"] = len(returned_items)
+        profile["category_pagination"] = {
+            "category": page_category,
+            "total": total,
+            "returned": len(returned_items),
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(returned_items) < total,
+        }
+    profile["sources"] = list(
+        {
+            json.dumps(source, sort_keys=True, default=str): source
+            for source in profile.get("sources", [])
+            if isinstance(source, Mapping)
+        }.values()
+    )
+    return profile
+
+
+def compose_provider_profile_evidence(
+    *,
+    state_projection: Mapping[str, Any] | None,
+    fhir_evidence: Mapping[str, Any] | None,
+    provider_profile: Mapping[str, Any] | None = None,
+    page_category: str | None = None,
+) -> dict[str, Any] | None:
+    evidence: dict[str, Any] = {"schema_version": PROFILE_SCHEMA_VERSION, "sources": {}}
+    returned_items: list[Mapping[str, Any]] = []
+    if provider_profile:
+        categories = provider_profile.get("categories", {})
+        if isinstance(categories, Mapping):
+            returned_items = [
+                item
+                for group in categories.values()
+                if isinstance(group, Mapping)
+                for item in group.get("items", [])
+                if isinstance(item, Mapping)
+            ]
+    returned_record_ids = {
+        str(item.get("source_record_id"))
+        for item in returned_items
+        if item.get("source_record_id")
+    }
+    returned_record_ids.update(
+        str(record_id)
+        for item in returned_items
+        for record_id in item.get("source_record_ids", [])
+        if record_id
+    )
+    state_evidence = state_projection.get("evidence") if state_projection else None
+    if isinstance(state_evidence, Mapping):
+        state_payload = copy.deepcopy(state_evidence)
+        if provider_profile:
+            state_payload["records"] = [
+                record
+                for record in state_payload.get("records", [])
+                if isinstance(record, Mapping)
+                and str(record.get("source_record_id")) in returned_record_ids
+            ]
+        evidence["sources"]["state_regulator"] = state_payload
+    if isinstance(fhir_evidence, Mapping):
+        fhir_payload = copy.deepcopy(fhir_evidence)
+        if provider_profile:
+            returned_fhir_keys = {
+                (
+                    str(item.get("type") or ""),
+                    json.dumps(
+                        item.get("value"),
+                        sort_keys=True,
+                        default=str,
+                        separators=(",", ":"),
+                    ),
+                )
+                for item in returned_items
+                if (
+                    "provider_directory_fhir" in item.get("source_kinds", [])
+                    or not item.get("source_record_id")
+                )
+            }
+            facts = fhir_payload.get("facts", {})
+            if isinstance(facts, Mapping):
+                filtered_facts: dict[str, Any] = {}
+                for fact_type, fact_group in facts.items():
+                    group = fact_group if isinstance(fact_group, Mapping) else {}
+                    items = [
+                        item
+                        for item in group.get("items", [])
+                        if isinstance(item, Mapping)
+                        and (
+                            str(fact_type),
+                            json.dumps(
+                                item.get("value"),
+                                sort_keys=True,
+                                default=str,
+                                separators=(",", ":"),
+                            ),
+                        )
+                        in returned_fhir_keys
+                    ]
+                    if items:
+                        filtered_group = dict(group)
+                        filtered_group["items"] = items
+                        filtered_group["total"] = len(items)
+                        filtered_group["truncated"] = False
+                        filtered_facts[str(fact_type)] = filtered_group
+                fhir_payload["facts"] = filtered_facts
+        evidence["sources"]["provider_directory_fhir"] = fhir_payload
+    return evidence if evidence["sources"] else None

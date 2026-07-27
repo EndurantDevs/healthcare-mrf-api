@@ -55,6 +55,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:ProviderQuality", "process.ProviderQuality", ("provider-quality",)),
     WorkerSpec("arq:ProviderEnrichment", "process.ProviderEnrichment", ("provider-enrichment",)),
     WorkerSpec("arq:ProviderDirectoryFHIR", "process.ProviderDirectoryFHIR", ("provider-directory-fhir",)),
+    WorkerSpec("arq:FloridaMQAProfile", "process.FloridaMQAProfile", ("florida-mqa-profile",)),
     WorkerSpec("arq:PartDFormularyNetwork", "process.PartDFormularyNetwork", ("partd-formulary-network",)),
     WorkerSpec("arq:PharmacyLicense", "process.PharmacyLicense", ("pharmacy-license",)),
     WorkerSpec("arq:PlacesZcta", "process.PlacesZcta", ("places-zcta",)),
@@ -645,7 +646,7 @@ def _worker_job_manifest(
                 "value": target_job_id,
             }
         )
-    env_list.extend(_worker_job_secret_env())
+    env_list.extend(_worker_job_secret_env(spec.worker_class))
 
     container_dict: dict[str, Any] = {
         "name": "worker",
@@ -743,7 +744,9 @@ def _worker_job_env_from() -> list[dict[str, Any]]:
     return env_from_list
 
 
-def _worker_job_secret_env() -> list[dict[str, Any]]:
+def _worker_job_secret_env(
+    worker_class: str | None = None,
+) -> list[dict[str, Any]]:
     """Build explicitly named worker environment values from secret keys."""
 
     raw = os.getenv("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", "").strip()
@@ -759,6 +762,8 @@ def _worker_job_secret_env() -> list[dict[str, Any]]:
     environment_by_name: dict[str, dict[str, Any]] = {}
     for secret_env_spec in secret_env_spec_list:
         if not isinstance(secret_env_spec, dict):
+            continue
+        if not _is_worker_class_selected(secret_env_spec, worker_class):
             continue
         environment_name = str(secret_env_spec.get("name") or "").strip()
         secret_name = str(
@@ -900,17 +905,17 @@ def _worker_job_pvc_volumes() -> list[dict[str, Any]]:
     ]
 
 
-def _is_secret_mount_selected(
-    mount_spec: dict[str, Any],
-    worker_class: str,
+def _is_worker_class_selected(
+    selection_spec: dict[str, Any],
+    worker_class: str | None,
 ) -> bool:
-    has_worker_classes = "workerClasses" in mount_spec
-    has_worker_classes_alias = "worker_classes" in mount_spec
+    has_worker_classes = "workerClasses" in selection_spec
+    has_worker_classes_alias = "worker_classes" in selection_spec
     if has_worker_classes and has_worker_classes_alias:
         return False
     if not has_worker_classes and not has_worker_classes_alias:
         return True
-    selected_worker_classes = mount_spec[
+    selected_worker_classes = selection_spec[
         "workerClasses" if has_worker_classes else "worker_classes"
     ]
     if (
@@ -922,7 +927,7 @@ def _is_secret_mount_selected(
         )
     ):
         return False
-    return worker_class in {
+    return bool(worker_class) and worker_class in {
         selected_class.strip() for selected_class in selected_worker_classes
     }
 
@@ -971,7 +976,7 @@ def _worker_job_secret_volumes(spec: WorkerSpec) -> list[dict[str, Any]]:
     for index, mount_spec in enumerate(mount_specs):
         if not isinstance(mount_spec, dict):
             continue
-        if not _is_secret_mount_selected(mount_spec, spec.worker_class):
+        if not _is_worker_class_selected(mount_spec, spec.worker_class):
             continue
         secret_name = str(mount_spec.get("secretName") or mount_spec.get("secret_name") or "").strip()
         mount_path = str(mount_spec.get("mountPath") or mount_spec.get("mount_path") or "").strip()
