@@ -811,6 +811,333 @@ def _promote_address_provenance_fields(item: dict[str, Any], address_payload: di
             item[key] = value
 
 
+@dataclass(frozen=True)
+class _AddressEvidenceContext:
+    """Normalized address provenance inputs used for one evidence decision."""
+
+    location_source: Any
+    location_confidence_code: Any
+    address_sources: list[str]
+    address_precision: Any
+    source_count: int | None
+    source_mask: int
+    address_source_mask: int
+    is_multi_source_confirmed: bool
+    is_direct_ptg_location: bool
+    is_provider_directory_address: bool
+    provider_directory_network_name_matches: list[dict[str, Any]]
+    provider_directory_evidence: dict[str, Any] | None
+    is_provider_directory_network_location: bool
+    has_direct_mrf_address: bool
+    has_nppes_address: bool
+
+
+@dataclass(frozen=True)
+class _AddressEvidenceDecision:
+    """Public evidence classification and confirmation requirement."""
+
+    evidence_level: str
+    network_binding: str
+    requires_confirmation: bool
+    reason: str
+
+
+def _address_source_markers(
+    provider_item_by_field: Mapping[str, Any],
+    location_data_by_field: Mapping[str, Any],
+    address_payload: Mapping[str, Any],
+) -> tuple[Any, Any, list[str], set[str], set[str]]:
+    """Normalize address source markers without changing provenance priority."""
+
+    location_source = provider_item_by_field.get(
+        "location_source"
+    ) or location_data_by_field.get("location_source")
+    location_confidence_code = provider_item_by_field.get(
+        "location_confidence_code"
+    ) or location_data_by_field.get("location_confidence_code")
+    source_markers = {
+        str(source_marker or "").strip().lower()
+        for source_marker in (
+            location_source,
+            location_confidence_code,
+            provider_item_by_field.get("address_network_binding"),
+            location_data_by_field.get("address_network_binding"),
+            address_payload.get("address_network_binding"),
+            address_payload.get("location_source"),
+            address_payload.get("location_confidence_code"),
+        )
+    }
+    address_sources = _coerce_str_list_payload(
+        _first_payload_value(
+            provider_item_by_field.get("address_sources"),
+            address_payload.get("address_sources"),
+        )
+    )
+    normalized_sources = {
+        address_source.lower().replace("-", "_")
+        for address_source in address_sources
+    }
+    return (
+        location_source,
+        location_confidence_code,
+        address_sources,
+        source_markers,
+        normalized_sources,
+    )
+
+
+def _address_source_counts(
+    provider_item_by_field: Mapping[str, Any],
+    address_payload: Mapping[str, Any],
+) -> tuple[int | None, int, int, bool]:
+    """Normalize source counts, masks, and multi-source confirmation."""
+
+    source_count = _coerce_int_payload(
+        _first_payload_value(
+            provider_item_by_field.get("source_count"),
+            address_payload.get("source_count"),
+        )
+    )
+    source_mask = _coerce_int_payload(
+        _first_payload_value(
+            provider_item_by_field.get("source_mask"),
+            address_payload.get("source_mask"),
+        )
+    ) or 0
+    address_source_mask = _coerce_int_payload(
+        _first_payload_value(
+            provider_item_by_field.get("address_source_mask"),
+            address_payload.get("address_source_mask"),
+        )
+    ) or 0
+    is_multi_source = _is_truthy_payload(
+        _first_payload_value(
+            provider_item_by_field.get("multi_source_confirmed"),
+            address_payload.get("multi_source_confirmed"),
+        )
+    ) or bool(source_count is not None and source_count > 1)
+    return source_count, source_mask, address_source_mask, is_multi_source
+
+
+def _provider_directory_evidence_context(
+    provider_item_by_field: dict[str, Any],
+    address_payload: dict[str, Any],
+    markers: set[str],
+    normalized_sources: set[str],
+) -> tuple[bool, list[dict[str, Any]], dict[str, Any] | None, bool]:
+    """Resolve payer-directory address and network-context evidence."""
+
+    network_matches = _provider_directory_network_name_matches(
+        provider_item_by_field,
+        address_payload,
+    )
+    is_directory_address = bool(
+        markers
+        & {
+            "provider_directory_fhir",
+            "provider_directory_address",
+            "payer_provider_directory",
+            "payer_directory_corroborated_location",
+        }
+        or normalized_sources
+        & {
+            "provider_directory",
+            "provider_directory_fhir",
+            "payer_provider_directory",
+        }
+    )
+    evidence = _provider_directory_address_verification_evidence(
+        address_payload,
+        network_matches,
+    )
+    has_network_location = bool(
+        is_directory_address
+        or markers
+        & {
+            "payer_directory_corroborated_location",
+            "provider_directory_network_location",
+            "provider_directory_plan_network_location",
+        }
+    ) and _has_network_context_match(provider_item_by_field, address_payload)
+    return is_directory_address, network_matches, evidence, has_network_location
+
+
+def _address_evidence_context(
+    provider_item_by_field: dict[str, Any],
+    location_data_by_field: dict[str, Any],
+    address_payload: dict[str, Any],
+) -> _AddressEvidenceContext:
+    """Collect normalized evidence before applying precedence rules."""
+
+    location_source, confidence_code, address_sources, markers, normalized_sources = (
+        _address_source_markers(
+            provider_item_by_field,
+            location_data_by_field,
+            address_payload,
+        )
+    )
+    source_count, source_mask, address_source_mask, is_multi_source = (
+        _address_source_counts(provider_item_by_field, address_payload)
+    )
+    (
+        is_directory_address,
+        network_matches,
+        directory_evidence,
+        has_directory_network_location,
+    ) = _provider_directory_evidence_context(
+        provider_item_by_field,
+        address_payload,
+        markers,
+        normalized_sources,
+    )
+    return _AddressEvidenceContext(
+        location_source=location_source,
+        location_confidence_code=confidence_code,
+        address_sources=address_sources,
+        address_precision=provider_item_by_field.get("address_precision")
+        or address_payload.get("address_precision")
+        or ("street" if address_payload.get("first_line") else None),
+        source_count=source_count,
+        source_mask=source_mask,
+        address_source_mask=address_source_mask,
+        is_multi_source_confirmed=is_multi_source,
+        is_direct_ptg_location=bool(
+            markers
+            & {
+                "payer_confirmed_location",
+                "payer_provider_group_location",
+                "ptg_provider_group_location",
+                "tic_provider_group_location",
+            }
+            and _has_direct_payer_location_record_evidence(address_payload)
+            and _has_source_file_version_trace(provider_item_by_field)
+        ),
+        is_provider_directory_address=is_directory_address,
+        provider_directory_network_name_matches=network_matches,
+        provider_directory_evidence=directory_evidence,
+        is_provider_directory_network_location=has_directory_network_location,
+        has_direct_mrf_address=bool(address_source_mask & 2)
+        or "mrf" in normalized_sources,
+        has_nppes_address=bool(address_source_mask & 1)
+        or "nppes" in normalized_sources,
+    )
+
+
+def _payer_address_evidence_decision(
+    context: _AddressEvidenceContext,
+) -> _AddressEvidenceDecision | None:
+    """Classify payer-confirmed and payer-directory address evidence."""
+
+    if context.is_direct_ptg_location:
+        return _AddressEvidenceDecision(
+            "payer_confirmed_location",
+            "payer_confirmed_location",
+            False,
+            "The payer/PTG source supplied the provider location used for this result.",
+        )
+    if context.is_provider_directory_network_location:
+        return _AddressEvidenceDecision(
+            "payer_directory_network_location",
+            "payer_directory_corroborated_location",
+            False,
+            "A payer Provider Directory record links this provider, network or plan context, and displayed address.",
+        )
+    if context.is_provider_directory_address:
+        return _AddressEvidenceDecision(
+            "provider_directory_address",
+            "inferred_from_provider_identity",
+            True,
+            "A payer Provider Directory record corroborates the displayed provider address, but the PTG rate file did not supply it.",
+        )
+    return None
+
+
+def _inferred_address_evidence_decision(
+    context: _AddressEvidenceContext,
+) -> _AddressEvidenceDecision:
+    """Classify non-network-bound provider address evidence."""
+
+    binding = "inferred_from_provider_identity"
+    if context.address_precision == "city_zip":
+        return _AddressEvidenceDecision(
+            "city_zip_fallback", binding, True,
+            "PTG proves the provider identity is in network, but only city/ZIP address evidence is available.",
+        )
+    if context.has_direct_mrf_address and context.is_multi_source_confirmed:
+        return _AddressEvidenceDecision(
+            "multi_source_direct_mrf_address", binding, True,
+            "The street address is corroborated by MRF and another source, but not by this PTG rate file.",
+        )
+    if context.has_direct_mrf_address:
+        return _AddressEvidenceDecision(
+            "direct_mrf_address", binding, True,
+            "The street address came from MRF provider-address evidence, but not from this PTG rate file.",
+        )
+    if context.is_multi_source_confirmed:
+        return _AddressEvidenceDecision(
+            "multi_source_provider_address", binding, True,
+            "The street address is corroborated by multiple provider-address sources, but not by this PTG rate file.",
+        )
+    normalized_source = str(context.location_source or "").strip().lower()
+    if context.has_nppes_address or normalized_source == "npi_address":
+        return _AddressEvidenceDecision(
+            "nppes_provider_address", binding, True,
+            "PTG proves the NPI/TIN is in network; the displayed address comes from NPPES/provider enrichment.",
+        )
+    if normalized_source == "entity_address_unified":
+        return _AddressEvidenceDecision(
+            "unified_provider_address", binding, True,
+            "PTG proves the provider identity is in network; the displayed address comes from unified address evidence.",
+        )
+    return _AddressEvidenceDecision(
+        "unknown", binding, True,
+        "PTG proves the provider identity is in network, but address provenance is weak or unavailable.",
+    )
+
+
+def _address_verification_optional_values(
+    context: _AddressEvidenceContext,
+    address_payload: dict[str, Any],
+    has_displayed_address: bool | None,
+) -> dict[str, Any]:
+    """Shape optional provenance fields without emitting empty values."""
+
+    network_matches = context.provider_directory_network_name_matches
+    return {
+        "displayed_address_present": has_displayed_address,
+        "location_source": context.location_source,
+        "location_confidence_code": context.location_confidence_code,
+        "address_precision": context.address_precision,
+        "source_count": context.source_count,
+        "multi_source_confirmed": context.is_multi_source_confirmed,
+        "source_mask": context.source_mask or None,
+        "address_source_mask": context.address_source_mask or None,
+        "provider_directory_source_id": address_payload.get("provider_directory_source_id"),
+        "provider_directory_org_name": address_payload.get("provider_directory_org_name"),
+        "provider_directory_plan_name": address_payload.get("provider_directory_plan_name"),
+        "provider_directory_location_resource_id": address_payload.get("provider_directory_location_resource_id"),
+        "provider_directory_location_name": address_payload.get("provider_directory_location_name"),
+        "provider_directory_plan_context_matched": (
+            True
+            if _has_plan_context_match(address_payload)
+            else _optional_bool_payload(
+                address_payload.get("provider_directory_plan_context_matched")
+            )
+        ),
+        "provider_directory_network_name_matched": bool(network_matches) or None,
+        "provider_directory_network_context_present": _optional_bool_payload(
+            address_payload.get("provider_directory_network_context_present")
+        ),
+        "provider_directory_network_refs": _coerce_str_list_payload(address_payload.get("provider_directory_network_refs")),
+        "provider_directory_network_names": _coerce_str_list_payload(address_payload.get("provider_directory_network_names")),
+        "provider_directory_network_matches": network_matches,
+        "provider_directory_insurance_plan_refs": _coerce_str_list_payload(address_payload.get("provider_directory_insurance_plan_refs")),
+        "provider_directory_insurance_plan_matches": _coerce_str_list_payload(address_payload.get("provider_directory_insurance_plan_matches")),
+        "provider_directory_match_type": address_payload.get("provider_directory_match_type"),
+        "address_verification_evidence": context.provider_directory_evidence,
+    }
+
+
 def _address_verification_payload(
     provider_item_by_field: dict[str, Any],
     location_data_by_field: dict[str, Any],
@@ -833,225 +1160,39 @@ def _address_verification_payload(
             "network_bound_address": False,
         }
 
-    location_source = provider_item_by_field.get(
-        "location_source"
-    ) or location_data_by_field.get("location_source")
-    location_confidence_code = provider_item_by_field.get(
-        "location_confidence_code"
-    ) or location_data_by_field.get("location_confidence_code")
-    address_sources = _coerce_str_list_payload(
-        _first_payload_value(
-            provider_item_by_field.get("address_sources"),
-            address_payload.get("address_sources"),
-        )
+    context = _address_evidence_context(
+        provider_item_by_field, location_data_by_field, address_payload
     )
-    address_precision = (
-        provider_item_by_field.get("address_precision")
-        or address_payload.get("address_precision")
-        or ("street" if address_payload.get("first_line") else None)
-    )
-    source_count = _coerce_int_payload(
-        _first_payload_value(
-            provider_item_by_field.get("source_count"),
-            address_payload.get("source_count"),
-        )
-    )
-    source_mask = (
-        _coerce_int_payload(
-            _first_payload_value(
-                provider_item_by_field.get("source_mask"),
-                address_payload.get("source_mask"),
-            )
-        )
-        or 0
-    )
-    address_source_mask = (
-        _coerce_int_payload(
-            _first_payload_value(
-                provider_item_by_field.get("address_source_mask"),
-                address_payload.get("address_source_mask"),
-            )
-        )
-        or 0
-    )
-    is_multi_source_confirmed = _is_truthy_payload(
-        _first_payload_value(
-            provider_item_by_field.get("multi_source_confirmed"),
-            address_payload.get("multi_source_confirmed"),
-        )
-    )
-    if not is_multi_source_confirmed and source_count is not None:
-        is_multi_source_confirmed = source_count > 1
-
-    source_markers = {
-        str(source_marker or "").strip().lower()
-        for source_marker in (
-            location_source,
-            location_confidence_code,
-            provider_item_by_field.get("address_network_binding"),
-            location_data_by_field.get("address_network_binding"),
-            address_payload.get("address_network_binding"),
-            address_payload.get("location_source"),
-            address_payload.get("location_confidence_code"),
-        )
-    }
-    direct_ptg_location = bool(
-        source_markers
-        & {
-            "payer_confirmed_location",
-            "payer_provider_group_location",
-            "ptg_provider_group_location",
-            "tic_provider_group_location",
-        }
-    ) and _has_direct_payer_location_record_evidence(
-        address_payload
-    ) and _has_source_file_version_trace(provider_item_by_field)
-    normalized_sources = {
-        address_source.lower().replace("-", "_")
-        for address_source in address_sources
-    }
-    provider_directory_address = bool(
-        source_markers
-        & {
-            "provider_directory_fhir",
-            "provider_directory_address",
-            "payer_provider_directory",
-            "payer_directory_corroborated_location",
-        }
-    ) or bool(normalized_sources & {"provider_directory", "provider_directory_fhir", "payer_provider_directory"})
-    provider_directory_network_name_matches = (
-        _provider_directory_network_name_matches(
-            provider_item_by_field,
-            address_payload,
-        )
-    )
-    provider_directory_evidence = _provider_directory_address_verification_evidence(
-        address_payload,
-        provider_directory_network_name_matches,
-    )
-    provider_directory_network_location = bool(
-        provider_directory_address
-        or source_markers
-        & {
-            "payer_directory_corroborated_location",
-            "provider_directory_network_location",
-            "provider_directory_plan_network_location",
-        }
-    ) and _has_network_context_match(
-        provider_item_by_field,
-        address_payload,
-    )
-    direct_mrf_address = bool(address_source_mask & 2) or "mrf" in normalized_sources
-    nppes_address = bool(address_source_mask & 1) or "nppes" in normalized_sources
-    if direct_ptg_location:
-        address_evidence_level = "payer_confirmed_location"
-        address_network_binding = "payer_confirmed_location"
-        is_location_confirmation_required = False
-        reason = "The payer/PTG source supplied the provider location used for this result."
-    elif provider_directory_network_location:
-        address_evidence_level = "payer_directory_network_location"
-        address_network_binding = "payer_directory_corroborated_location"
-        is_location_confirmation_required = False
-        reason = "A payer Provider Directory record links this provider, network or plan context, and displayed address."
-    elif provider_directory_address:
-        address_evidence_level = "provider_directory_address"
-        address_network_binding = "inferred_from_provider_identity"
-        is_location_confirmation_required = True
-        reason = "A payer Provider Directory record corroborates the displayed provider address, but the PTG rate file did not supply it."
-    elif address_precision == "city_zip":
-        address_evidence_level = "city_zip_fallback"
-        address_network_binding = "inferred_from_provider_identity"
-        is_location_confirmation_required = True
-        reason = "PTG proves the provider identity is in network, but only city/ZIP address evidence is available."
-    elif direct_mrf_address and is_multi_source_confirmed:
-        address_evidence_level = "multi_source_direct_mrf_address"
-        address_network_binding = "inferred_from_provider_identity"
-        is_location_confirmation_required = True
-        reason = "The street address is corroborated by MRF and another source, but not by this PTG rate file."
-    elif direct_mrf_address:
-        address_evidence_level = "direct_mrf_address"
-        address_network_binding = "inferred_from_provider_identity"
-        is_location_confirmation_required = True
-        reason = "The street address came from MRF provider-address evidence, but not from this PTG rate file."
-    elif is_multi_source_confirmed:
-        address_evidence_level = "multi_source_provider_address"
-        address_network_binding = "inferred_from_provider_identity"
-        is_location_confirmation_required = True
-        reason = "The street address is corroborated by multiple provider-address sources, but not by this PTG rate file."
-    elif nppes_address or str(location_source or "").strip().lower() == "npi_address":
-        address_evidence_level = "nppes_provider_address"
-        address_network_binding = "inferred_from_provider_identity"
-        is_location_confirmation_required = True
-        reason = "PTG proves the NPI/TIN is in network; the displayed address comes from NPPES/provider enrichment."
-    elif str(location_source or "").strip().lower() == "entity_address_unified":
-        address_evidence_level = "unified_provider_address"
-        address_network_binding = "inferred_from_provider_identity"
-        is_location_confirmation_required = True
-        reason = "PTG proves the provider identity is in network; the displayed address comes from unified address evidence."
-    else:
-        address_evidence_level = "unknown"
-        address_network_binding = "inferred_from_provider_identity"
-        is_location_confirmation_required = True
-        reason = "PTG proves the provider identity is in network, but address provenance is weak or unavailable."
-
-    response_address_sources = list(address_sources)
-    if address_network_binding != "payer_confirmed_location":
+    decision = _payer_address_evidence_decision(
+        context
+    ) or _inferred_address_evidence_decision(context)
+    response_address_sources = list(context.address_sources)
+    if decision.network_binding != "payer_confirmed_location":
         response_address_sources = [
             address_source
             for address_source in response_address_sources
             if address_source.lower().replace("-", "_")
             not in {"ptg", "tic", "tic_provider_group"}
         ]
-    provider_directory_plan_context = (
-        True
-        if _has_plan_context_match(address_payload)
-        else _optional_bool_payload(address_payload.get("provider_directory_plan_context_matched"))
-    )
-    provider_directory_network_context_present = _optional_bool_payload(
-        address_payload.get("provider_directory_network_context_present")
-    )
-
     verification_by_field = {
         "rate_network_binding": "tic_provider_group_npi_tin",
-        "address_network_binding": address_network_binding,
-        "address_evidence_level": address_evidence_level,
-        "requires_location_confirmation": is_location_confirmation_required,
-        "reason": reason,
-        "network_bound_address": address_network_binding in {
+        "address_network_binding": decision.network_binding,
+        "address_evidence_level": decision.evidence_level,
+        "requires_location_confirmation": decision.requires_confirmation,
+        "reason": decision.reason,
+        "network_bound_address": decision.network_binding in {
             "payer_confirmed_location",
             "payer_directory_corroborated_location",
         },
     }
-    optional_values_by_field = {
-        "displayed_address_present": has_displayed_address,
-        "location_source": location_source,
-        "location_confidence_code": location_confidence_code,
-        "address_precision": address_precision,
+    optional_values_by_field = _address_verification_optional_values(
+        context,
+        address_payload,
+        has_displayed_address,
+    )
+    optional_values_by_field.update({
         "address_sources": response_address_sources,
-        "source_count": source_count,
-        "multi_source_confirmed": is_multi_source_confirmed,
-        "source_mask": source_mask or None,
-        "address_source_mask": address_source_mask or None,
-        "provider_directory_source_id": address_payload.get("provider_directory_source_id"),
-        "provider_directory_org_name": address_payload.get("provider_directory_org_name"),
-        "provider_directory_plan_name": address_payload.get("provider_directory_plan_name"),
-        "provider_directory_location_resource_id": address_payload.get("provider_directory_location_resource_id"),
-        "provider_directory_location_name": address_payload.get("provider_directory_location_name"),
-        "provider_directory_plan_context_matched": provider_directory_plan_context,
-        "provider_directory_network_name_matched": bool(provider_directory_network_name_matches) or None,
-        "provider_directory_network_context_present": provider_directory_network_context_present,
-        "provider_directory_network_refs": _coerce_str_list_payload(address_payload.get("provider_directory_network_refs")),
-        "provider_directory_network_names": _coerce_str_list_payload(address_payload.get("provider_directory_network_names")),
-        "provider_directory_network_matches": provider_directory_network_name_matches,
-        "provider_directory_insurance_plan_refs": _coerce_str_list_payload(
-            address_payload.get("provider_directory_insurance_plan_refs")
-        ),
-        "provider_directory_insurance_plan_matches": _coerce_str_list_payload(
-            address_payload.get("provider_directory_insurance_plan_matches")
-        ),
-        "provider_directory_match_type": address_payload.get("provider_directory_match_type"),
-        "address_verification_evidence": provider_directory_evidence,
-    }
+    })
     for field_name, field_value in optional_values_by_field.items():
         if field_value not in (None, "", []):
             verification_by_field[field_name] = field_value
@@ -1185,6 +1326,210 @@ async def _ptg2_provider_directory_corroboration_table(session) -> str | None:
     return None
 
 
+_PTG2_PROVIDER_DIRECTORY_CORROBORATION_SQL = """
+    SELECT DISTINCT ON (npi, address_key::text)
+        npi, address_key::text AS address_key, source_key, snapshot_id,
+        plan_id, ptg_plan_id, provider_directory_source_id,
+        provider_directory_org_name, provider_directory_plan_name,
+        provider_directory_provider_resource_id, provider_directory_provider_name,
+        provider_directory_role_resource_id, provider_directory_location_resource_id,
+        provider_directory_location_name, provider_directory_telephone_number,
+        provider_directory_phone_number, provider_directory_phone_extension,
+        provider_directory_fax_number, provider_directory_fax_number_digits,
+        provider_directory_fax_extension, provider_directory_network_refs,
+        provider_directory_insurance_plan_refs, provider_directory_network_names,
+        provider_directory_network_matches, provider_directory_plan_context_matched,
+        provider_directory_network_context_present,
+        provider_directory_insurance_plan_matches, provider_directory_match_type,
+        provider_directory_observed_at, address_network_binding,
+        address_verification_evidence
+    FROM {corroboration_table}
+    WHERE provider_directory_active_match IS TRUE
+      AND npi = ANY(CAST(:npis AS bigint[]))
+      AND address_key = ANY(CAST(:address_keys AS uuid[]))
+      AND (:source_key IS NULL OR source_key IS NULL OR source_key = :source_key)
+      AND (:snapshot_id IS NULL OR snapshot_id IS NULL OR snapshot_id = :snapshot_id)
+      AND (
+            :plan_id IS NULL
+         OR (plan_id IS NULL AND ptg_plan_id IS NULL)
+         OR plan_id = :plan_id
+         OR ptg_plan_id = :plan_id
+      )
+    ORDER BY npi, address_key::text,
+             provider_directory_observed_at DESC NULLS LAST,
+             provider_directory_source_id
+"""
+
+
+def _provider_directory_lookup_pairs(
+    provider_rows: Iterable[dict[str, Any]],
+) -> list[tuple[int, str]]:
+    """Collect valid NPI and address-key lookup identities."""
+
+    lookup_pairs: list[tuple[int, str]] = []
+    for provider_row in provider_rows:
+        npi = provider_row.get("npi")
+        address_key = _ptg2_row_address_key(provider_row)
+        if npi in (None, "") or not address_key:
+            continue
+        try:
+            lookup_pairs.append((int(npi), address_key))
+        except (TypeError, ValueError):
+            continue
+    return lookup_pairs
+
+
+async def _provider_directory_corroboration_by_key(
+    session,
+    corroboration_table: str,
+    lookup_pairs: Iterable[tuple[int, str]],
+    *,
+    plan_id: str | None,
+    snapshot_id: str | None,
+    source_key: str | None,
+) -> dict[tuple[int, str], dict[str, Any]] | None:
+    """Read the newest active corroboration for each provider address."""
+
+    try:
+        query = await session.execute(
+            text(
+                _PTG2_PROVIDER_DIRECTORY_CORROBORATION_SQL.format(
+                    corroboration_table=corroboration_table
+                )
+            ),
+            {
+                "npis": sorted({npi for npi, _ in lookup_pairs}),
+                "address_keys": sorted({key for _, key in lookup_pairs}),
+                "source_key": source_key,
+                "snapshot_id": snapshot_id,
+                "plan_id": plan_id,
+            },
+        )
+    except Exception:
+        await _rollback_optional_ptg2_query(session)
+        return None
+    return {
+        (int(fields["npi"]), str(fields["address_key"])): fields
+        for fields in (
+            _row_mapping(corroboration_record)
+            for corroboration_record in query
+        )
+        if fields.get("npi") is not None and fields.get("address_key")
+    }
+
+
+def _directory_address_binding(corroboration: Mapping[str, Any]) -> str:
+    """Downgrade network binding when plan-context proof is absent."""
+
+    binding = str(
+        corroboration.get("address_network_binding")
+        or "payer_directory_corroborated_location"
+    ).strip()
+    if (
+        binding == "payer_directory_corroborated_location"
+        and not _is_truthy_payload(
+            corroboration.get("provider_directory_plan_context_matched")
+        )
+    ):
+        return "provider_directory_address"
+    return binding
+
+
+def _overlay_directory_contact_fields(
+    provider_fields: dict[str, Any],
+    corroboration: Mapping[str, Any],
+) -> None:
+    """Copy non-empty payer-directory contact fields."""
+
+    for field_name in (
+        "telephone_number",
+        "phone_number",
+        "phone_extension",
+        "fax_number",
+        "fax_number_digits",
+        "fax_extension",
+    ):
+        corroboration_value = corroboration.get(
+            f"provider_directory_{field_name}"
+        )
+        if corroboration_value:
+            provider_fields[field_name] = corroboration_value
+
+
+def _directory_address_payload(
+    provider_fields: dict[str, Any],
+    corroboration: Mapping[str, Any],
+    address_network_binding: str,
+) -> dict[str, Any]:
+    """Merge directory provenance into an owned address payload."""
+
+    address_by_field = _coerce_json_payload(
+        provider_fields.get("address_payload")
+        or provider_fields.get("address"),
+        {},
+    )
+    if not isinstance(address_by_field, dict):
+        address_by_field = {}
+    address_sources = _coerce_str_list_payload(
+        address_by_field.get("address_sources")
+    )
+    if "provider_directory_fhir" not in address_sources:
+        address_sources.append("provider_directory_fhir")
+    directory_fields = (
+        "source_id", "org_name", "plan_name", "provider_resource_id",
+        "provider_name", "role_resource_id", "location_resource_id",
+        "location_name", "network_refs", "insurance_plan_refs",
+        "network_names", "network_matches", "plan_context_matched",
+        "network_context_present", "insurance_plan_matches", "match_type",
+    )
+    address_by_field.update(
+        {
+            "address_sources": address_sources,
+            "address_network_binding": address_network_binding,
+            **{
+                f"provider_directory_{field_name}": corroboration.get(
+                    f"provider_directory_{field_name}"
+                )
+                for field_name in directory_fields
+            },
+            "address_verification_evidence": corroboration.get(
+                "address_verification_evidence"
+            ),
+        }
+    )
+    for contact_field in (
+        "telephone_number", "phone_number", "phone_extension",
+        "fax_number", "fax_number_digits", "fax_extension",
+    ):
+        if provider_fields.get(contact_field):
+            address_by_field[contact_field] = provider_fields[contact_field]
+    return address_by_field
+
+
+def _overlay_provider_directory_row(
+    provider_row: dict[str, Any],
+    corroboration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply one exact provider-directory corroboration row."""
+
+    address_network_binding = _directory_address_binding(corroboration)
+    updated_provider_by_field = dict(provider_row)
+    updated_provider_by_field["location_source"] = "provider_directory_fhir"
+    updated_provider_by_field["location_confidence_code"] = (
+        address_network_binding
+    )
+    _overlay_directory_contact_fields(
+        updated_provider_by_field,
+        corroboration,
+    )
+    updated_provider_by_field["address_payload"] = _directory_address_payload(
+        updated_provider_by_field,
+        corroboration,
+        address_network_binding,
+    )
+    return updated_provider_by_field
+
+
 async def _overlay_provider_directory_corroboration(
     session,
     provider_rows: list[dict[str, Any]],
@@ -1197,100 +1542,22 @@ async def _overlay_provider_directory_corroboration(
 
     if not provider_rows or not (plan_id or snapshot_id or source_key):
         return provider_rows
-    lookup_pairs: list[tuple[int, str]] = []
-    for provider_row in provider_rows:
-        npi = provider_row.get("npi")
-        address_key = _ptg2_row_address_key(provider_row)
-        if npi in (None, "") or not address_key:
-            continue
-        try:
-            lookup_pairs.append((int(npi), address_key))
-        except (TypeError, ValueError):
-            continue
+    lookup_pairs = _provider_directory_lookup_pairs(provider_rows)
     if not lookup_pairs:
         return provider_rows
     corroboration_table = await _ptg2_provider_directory_corroboration_table(session)
     if not corroboration_table:
         return provider_rows
-    npis = sorted({npi for npi, _address_key in lookup_pairs})
-    address_keys = sorted({address_key for _npi, address_key in lookup_pairs})
-    try:
-        corroboration_query = await session.execute(
-            text(
-                f"""
-                SELECT DISTINCT ON (npi, address_key::text)
-                    npi,
-                    address_key::text AS address_key,
-                    source_key,
-                    snapshot_id,
-                    plan_id,
-                    ptg_plan_id,
-                    provider_directory_source_id,
-                    provider_directory_org_name,
-                    provider_directory_plan_name,
-                    provider_directory_provider_resource_id,
-                    provider_directory_provider_name,
-                    provider_directory_role_resource_id,
-                    provider_directory_location_resource_id,
-                    provider_directory_location_name,
-                    provider_directory_telephone_number,
-                    provider_directory_phone_number,
-                    provider_directory_phone_extension,
-                    provider_directory_fax_number,
-                    provider_directory_fax_number_digits,
-                    provider_directory_fax_extension,
-                    provider_directory_network_refs,
-                    provider_directory_insurance_plan_refs,
-                    provider_directory_network_names,
-                    provider_directory_network_matches,
-                    provider_directory_plan_context_matched,
-                    provider_directory_network_context_present,
-                    provider_directory_insurance_plan_matches,
-                    provider_directory_match_type,
-                    provider_directory_observed_at,
-                    address_network_binding,
-                    address_verification_evidence
-                FROM {corroboration_table}
-                WHERE provider_directory_active_match IS TRUE
-                  AND npi = ANY(CAST(:npis AS bigint[]))
-                  AND address_key = ANY(CAST(:address_keys AS uuid[]))
-                  AND (:source_key IS NULL OR source_key IS NULL OR source_key = :source_key)
-                  AND (:snapshot_id IS NULL OR snapshot_id IS NULL OR snapshot_id = :snapshot_id)
-                  AND (
-                        :plan_id IS NULL
-                     OR (plan_id IS NULL AND ptg_plan_id IS NULL)
-                     OR plan_id = :plan_id
-                     OR ptg_plan_id = :plan_id
-                  )
-                ORDER BY npi,
-                         address_key::text,
-                         provider_directory_observed_at DESC NULLS LAST,
-                         provider_directory_source_id
-                """
-            ),
-            {
-                "npis": npis,
-                "address_keys": address_keys,
-                "source_key": source_key,
-                "snapshot_id": snapshot_id,
-                "plan_id": plan_id,
-            },
-        )
-    except Exception:
-        await _rollback_optional_ptg2_query(session)
+    corroboration_by_key = await _provider_directory_corroboration_by_key(
+        session,
+        corroboration_table,
+        lookup_pairs,
+        plan_id=plan_id,
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+    )
+    if corroboration_by_key is None:
         return provider_rows
-    corroboration_by_key = {
-        (
-            int(corroboration_by_field.get("npi")),
-            str(corroboration_by_field.get("address_key")),
-        ): corroboration_by_field
-        for corroboration_by_field in (
-            _row_mapping(corroboration_record)
-            for corroboration_record in corroboration_query
-        )
-        if corroboration_by_field.get("npi") is not None
-        and corroboration_by_field.get("address_key")
-    }
     if not corroboration_by_key:
         return provider_rows
     overlaid_provider_rows: list[dict[str, Any]] = []
@@ -1307,102 +1574,9 @@ async def _overlay_provider_directory_corroboration(
         if not corroboration:
             overlaid_provider_rows.append(provider_row)
             continue
-        address_network_binding = (
-            str(corroboration.get("address_network_binding") or "payer_directory_corroborated_location").strip()
+        overlaid_provider_rows.append(
+            _overlay_provider_directory_row(provider_row, corroboration)
         )
-        if (
-            address_network_binding == "payer_directory_corroborated_location"
-            and not _is_truthy_payload(corroboration.get("provider_directory_plan_context_matched"))
-        ):
-            address_network_binding = "provider_directory_address"
-        updated_provider_by_field = dict(provider_row)
-        updated_provider_by_field["location_source"] = "provider_directory_fhir"
-        updated_provider_by_field["location_confidence_code"] = address_network_binding
-        if corroboration.get("provider_directory_telephone_number"):
-            updated_provider_by_field["telephone_number"] = corroboration.get(
-                "provider_directory_telephone_number"
-            )
-        if corroboration.get("provider_directory_phone_number"):
-            updated_provider_by_field["phone_number"] = corroboration.get(
-                "provider_directory_phone_number"
-            )
-        if corroboration.get("provider_directory_phone_extension"):
-            updated_provider_by_field["phone_extension"] = corroboration.get(
-                "provider_directory_phone_extension"
-            )
-        if corroboration.get("provider_directory_fax_number"):
-            updated_provider_by_field["fax_number"] = corroboration.get(
-                "provider_directory_fax_number"
-            )
-        if corroboration.get("provider_directory_fax_number_digits"):
-            updated_provider_by_field["fax_number_digits"] = corroboration.get(
-                "provider_directory_fax_number_digits"
-            )
-        if corroboration.get("provider_directory_fax_extension"):
-            updated_provider_by_field["fax_extension"] = corroboration.get(
-                "provider_directory_fax_extension"
-            )
-        address_by_field = _coerce_json_payload(
-            updated_provider_by_field.get("address_payload")
-            or updated_provider_by_field.get("address"),
-            {},
-        )
-        if not isinstance(address_by_field, dict):
-            address_by_field = {}
-        address_sources = _coerce_str_list_payload(
-            address_by_field.get("address_sources")
-        )
-        if "provider_directory_fhir" not in address_sources:
-            address_sources.append("provider_directory_fhir")
-        address_by_field.update(
-            {
-                "address_sources": address_sources,
-                "address_network_binding": address_network_binding,
-                "provider_directory_source_id": corroboration.get("provider_directory_source_id"),
-                "provider_directory_org_name": corroboration.get("provider_directory_org_name"),
-                "provider_directory_plan_name": corroboration.get("provider_directory_plan_name"),
-                "provider_directory_provider_resource_id": corroboration.get("provider_directory_provider_resource_id"),
-                "provider_directory_provider_name": corroboration.get("provider_directory_provider_name"),
-                "provider_directory_role_resource_id": corroboration.get("provider_directory_role_resource_id"),
-                "provider_directory_location_resource_id": corroboration.get("provider_directory_location_resource_id"),
-                "provider_directory_location_name": corroboration.get("provider_directory_location_name"),
-                "provider_directory_network_refs": corroboration.get("provider_directory_network_refs"),
-                "provider_directory_insurance_plan_refs": corroboration.get("provider_directory_insurance_plan_refs"),
-                "provider_directory_network_names": corroboration.get("provider_directory_network_names"),
-                "provider_directory_network_matches": corroboration.get("provider_directory_network_matches"),
-                "provider_directory_plan_context_matched": corroboration.get("provider_directory_plan_context_matched"),
-                "provider_directory_network_context_present": corroboration.get("provider_directory_network_context_present"),
-                "provider_directory_insurance_plan_matches": corroboration.get("provider_directory_insurance_plan_matches"),
-                "provider_directory_match_type": corroboration.get("provider_directory_match_type"),
-                "address_verification_evidence": corroboration.get("address_verification_evidence"),
-            }
-        )
-        if updated_provider_by_field.get("telephone_number"):
-            address_by_field["telephone_number"] = updated_provider_by_field.get(
-                "telephone_number"
-            )
-        if updated_provider_by_field.get("phone_number"):
-            address_by_field["phone_number"] = updated_provider_by_field.get(
-                "phone_number"
-            )
-        if updated_provider_by_field.get("phone_extension"):
-            address_by_field["phone_extension"] = updated_provider_by_field.get(
-                "phone_extension"
-            )
-        if updated_provider_by_field.get("fax_number"):
-            address_by_field["fax_number"] = updated_provider_by_field.get(
-                "fax_number"
-            )
-        if updated_provider_by_field.get("fax_number_digits"):
-            address_by_field["fax_number_digits"] = updated_provider_by_field.get(
-                "fax_number_digits"
-            )
-        if updated_provider_by_field.get("fax_extension"):
-            address_by_field["fax_extension"] = updated_provider_by_field.get(
-                "fax_extension"
-            )
-        updated_provider_by_field["address_payload"] = address_by_field
-        overlaid_provider_rows.append(updated_provider_by_field)
     return overlaid_provider_rows
 
 
@@ -2402,79 +2576,50 @@ async def _version_three_forward_page_rows(
     )
 
 
+@dataclass(frozen=True)
+class _SharedCodeRowsRequest:
+    """Immutable selectors for one shared forward-code read."""
+
+    code_data: Mapping[str, Any]
+    provider_set_keys: Iterable[int] | None
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None = None
+    limit: int | None = None
+    offset: int = 0
+    descending: bool = False
+    scan_budget: ForwardReadBudget | None = None
+
+
 async def _shared_rows_for_code(
     session,
     serving_tables: PTG2ServingTables,
-    *,
-    code_data: Mapping[str, Any],
-    provider_set_keys: Iterable[int] | None,
-    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None = None,
-    source_trace_set_hash: str | None,
-    network_names: list[str],
-    limit: int | None = None,
-    offset: int = 0,
-    descending: bool = False,
-    scan_budget: ForwardReadBudget | None = None,
+    **request_options: Any,
 ) -> list[dict[str, Any]] | None:
     """Read strict shared code rows and materialize only one page."""
+    request = _SharedCodeRowsRequest(**request_options)
+    code_data = request.code_data
+    provider_set_keys = request.provider_set_keys
+    provider_pages_by_key = request.provider_pages_by_key
+    source_trace_set_hash = request.source_trace_set_hash
+    network_names = request.network_names
+    limit = request.limit
+    offset = request.offset
+    descending = request.descending
+    scan_budget = request.scan_budget
     code_key = code_data.get("code_key")
     if code_key is None:
         return None
     _require_strict_shared_v3(serving_tables)
     if provider_set_keys is None and limit is not None:
-        page_rows = await _version_three_forward_page_rows(
+        prefix_rows = await _shared_code_prefix_rows(
             session,
             serving_tables,
-            code_metadata=code_data,
-            source_trace_set_hash=source_trace_set_hash,
-            network_names=network_names,
-            limit=limit,
-            offset=offset,
-            descending=descending,
+            request,
+            int(code_key),
         )
-        if page_rows is not None:
-            return page_rows
-        prefix_end = max(int(offset), 0) + max(int(limit), 0)
-        if prefix_end > 0:
-            prefix_rows = await lookup_code_prefix_rows_from_db(
-                session,
-                int(code_key),
-                limit=prefix_end,
-                descending=descending,
-                shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
-                source_count=_required_source_count(serving_tables),
-                scan_budget=scan_budget,
-                **_version_three_forward_lookup_hints(serving_tables),
-                schema_name=PTG2_SCHEMA,
-            )
-            if not prefix_rows:
-                await _raise_missing_v3_block(session, serving_tables, int(code_key))
-                return []
-            selected_rows = prefix_rows[max(int(offset), 0) : prefix_end]
-            provider_set_ids_by_key = await _provider_set_ids_for_keys(
-                session,
-                serving_tables,
-                [
-                    selected_row.provider_set_key
-                    for selected_row in selected_rows
-                ],
-            )
-            if set(provider_set_ids_by_key) != {
-                selected_row.provider_set_key for selected_row in selected_rows
-            }:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 v3 provider-set dictionary is missing a prefix-referenced key"
-                )
-            return [
-                _shared_forward_response_row(
-                    selected_row,
-                    provider_set_ids_by_key[selected_row.provider_set_key],
-                    code_data,
-                    source_trace_set_hash,
-                    network_names,
-                )
-                for selected_row in selected_rows
-            ]
+        if prefix_rows is not None:
+            return prefix_rows
     return await _full_shared_code_rows(
         session,
         serving_tables,
@@ -2488,6 +2633,68 @@ async def _shared_rows_for_code(
         descending=descending,
         scan_budget=scan_budget,
     )
+
+
+async def _shared_code_prefix_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _SharedCodeRowsRequest,
+    code_key: int,
+) -> list[dict[str, Any]] | None:
+    """Read one bounded forward prefix before falling back to the full block."""
+
+    page_rows = await _version_three_forward_page_rows(
+        session,
+        serving_tables,
+        code_metadata=request.code_data,
+        source_trace_set_hash=request.source_trace_set_hash,
+        network_names=request.network_names,
+        limit=int(request.limit or 0),
+        offset=request.offset,
+        descending=request.descending,
+    )
+    if page_rows is not None:
+        return page_rows
+    prefix_end = max(int(request.offset), 0) + max(int(request.limit or 0), 0)
+    if prefix_end == 0:
+        return None
+    prefix_rows = await lookup_code_prefix_rows_from_db(
+        session,
+        code_key,
+        limit=prefix_end,
+        descending=request.descending,
+        shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
+        source_count=_required_source_count(serving_tables),
+        scan_budget=request.scan_budget,
+        **_version_three_forward_lookup_hints(serving_tables),
+        schema_name=PTG2_SCHEMA,
+    )
+    if not prefix_rows:
+        await _raise_missing_v3_block(session, serving_tables, code_key)
+        return []
+    selected_rows = prefix_rows[max(int(request.offset), 0) : prefix_end]
+    provider_ids_by_key = await _provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        [selected_row.provider_set_key for selected_row in selected_rows],
+    )
+    selected_keys = {
+        selected_row.provider_set_key for selected_row in selected_rows
+    }
+    if set(provider_ids_by_key) != selected_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-set dictionary is missing a prefix-referenced key"
+        )
+    return [
+        _shared_forward_response_row(
+            selected_row,
+            provider_ids_by_key[selected_row.provider_set_key],
+            request.code_data,
+            request.source_trace_set_hash,
+            request.network_names,
+        )
+        for selected_row in selected_rows
+    ]
 
 
 def _manifest_response_row_order(row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -2818,22 +3025,38 @@ def _manifest_code_merge_window(
     return combined_rows[start : start + max(int(limit), 0)]
 
 
+@dataclass(frozen=True)
+class _ManifestCodeVariantRequest:
+    """Immutable selectors for one ordered multi-code merge."""
+
+    code_rows: list[Mapping[str, Any]]
+    provider_set_keys: Iterable[int] | None
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    limit: int | None
+    offset: int
+    descending: bool = False
+    scan_budget: ForwardReadBudget | None = None
+    retained_row_count: int = 0
+
+
 async def _merge_manifest_code_variant_rows(
     session,
     serving_tables: PTG2ServingTables,
-    *,
-    code_rows: list[Mapping[str, Any]],
-    provider_set_keys: Iterable[int] | None,
-    source_trace_set_hash: str | None,
-    network_names: list[str],
-    limit: int | None,
-    offset: int,
-    descending: bool = False,
-    scan_budget: ForwardReadBudget | None = None,
-    retained_row_count: int = 0,
+    **request_options: Any,
 ) -> list[dict[str, Any]] | None:
     """Merge one ordered serving window across compatible persisted code forms."""
 
+    request = _ManifestCodeVariantRequest(**request_options)
+    code_rows = request.code_rows
+    provider_set_keys = request.provider_set_keys
+    source_trace_set_hash = request.source_trace_set_hash
+    network_names = request.network_names
+    limit = request.limit
+    offset = request.offset
+    descending = request.descending
+    scan_budget = request.scan_budget
+    retained_row_count = request.retained_row_count
     start = max(int(offset), 0)
     if limit is not None and max(int(limit), 0) == 0:
         return []
@@ -2959,19 +3182,20 @@ async def _selected_shared_forward_rows(
 async def _full_shared_code_rows(
     session,
     serving_tables: PTG2ServingTables,
-    *,
-    code_data: Mapping[str, Any],
-    provider_set_keys: Iterable[int] | None,
-    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage] | None,
-    source_trace_set_hash: str | None,
-    network_names: list[str],
-    limit: int | None,
-    offset: int,
-    descending: bool,
-    scan_budget: ForwardReadBudget | None,
+    **request_options: Any,
 ) -> list[dict[str, Any]]:
     """Read and materialize an authoritative complete by-code block."""
 
+    request = _SharedCodeRowsRequest(**request_options)
+    code_data = request.code_data
+    provider_set_keys = request.provider_set_keys
+    provider_pages_by_key = request.provider_pages_by_key
+    source_trace_set_hash = request.source_trace_set_hash
+    network_names = request.network_names
+    limit = request.limit
+    offset = request.offset
+    descending = request.descending
+    scan_budget = request.scan_budget
     code_key = int(code_data["code_key"])
     projected_rows, provider_counts_by_key = await _version_three_projected_code_rows(
         session, serving_tables, code_data, provider_pages_by_key,
@@ -3170,31 +3394,59 @@ class _VersionThreeReverseQuery:
     plan_market_type: str = ""
 
 
+@dataclass(frozen=True)
+class _ManifestReverseCodeRequest:
+    """Normalized metadata filters and window for one reverse-code read."""
+
+    requested_plan: str
+    code_value: str
+    code_system: Any
+    q_text: str
+    code_context: dict[str, Any] | None
+    code_keys: Iterable[int] | None = None
+    limit_rows: int | None = None
+    offset_rows: int = 0
+    plan_market_type: str = ""
+
+    @classmethod
+    def from_options(cls, options: Mapping[str, Any]) -> "_ManifestReverseCodeRequest":
+        """Build one immutable request from the compatibility keyword API."""
+
+        return cls(
+            requested_plan=str(options["requested_plan"]),
+            code_value=str(options["code_value"]),
+            code_system=options.get("code_system"),
+            q_text=str(options["q_text"]),
+            code_context=options.get("code_context"),
+            code_keys=options.get("code_keys"),
+            limit_rows=options.get("limit_rows"),
+            offset_rows=int(options.get("offset_rows", 0)),
+            plan_market_type=str(options.get("plan_market_type", "")),
+        )
+
+
 async def _manifest_reverse_code_rows(
     session,
     serving_tables: PTG2ServingTables,
-    *,
-    requested_plan: str,
-    code_value: str,
-    code_system: Any,
-    q_text: str,
-    code_context: dict[str, Any] | None,
-    code_keys: Iterable[int] | None = None,
-    limit_rows: int | None = None,
-    offset_rows: int = 0,
-    plan_market_type: str = "",
+    **request_options: Any,
 ) -> list[dict[str, Any]] | None:
     """Query strict V3 code metadata for a provider-reverse selection window."""
+
+    request = _ManifestReverseCodeRequest.from_options(request_options)
     _require_strict_shared_v3(serving_tables)
     scope_join_sql, filters, params, plan_order = _shared_v3_code_scope_sql(
         serving_tables,
-        requested_plan=requested_plan,
-        plan_market_type=plan_market_type,
+        requested_plan=request.requested_plan,
+        plan_market_type=request.plan_market_type,
     )
     filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
     params["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
     normalized_code_keys = sorted(
-        {int(code_key_value) for code_key_value in code_keys or () if code_key_value is not None}
+        {
+            int(code_key_value)
+            for code_key_value in request.code_keys or ()
+            if code_key_value is not None
+        }
     )
     if normalized_code_keys:
         filters.append("code_metadata.code_key = ANY(CAST(:code_keys AS integer[]))")
@@ -3202,17 +3454,38 @@ async def _manifest_reverse_code_rows(
     _append_manifest_reported_code_filter(
         filters,
         params,
-        code=code_value,
-        code_system=code_system,
-        code_context=code_context,
+        code=request.code_value,
+        code_system=request.code_system,
+        code_context=request.code_context,
     )
-    _append_provider_reverse_text_filter(filters, params, q_text)
+    _append_provider_reverse_text_filter(filters, params, request.q_text)
     where_sql = "WHERE " + " AND ".join(filters) if filters else ""
     window_sql = ""
-    if limit_rows is not None:
+    if request.limit_rows is not None:
         window_sql = "LIMIT :code_row_limit OFFSET :code_row_offset"
-        params["code_row_limit"] = max(int(limit_rows), 0)
-        params["code_row_offset"] = max(int(offset_rows or 0), 0)
+        params["code_row_limit"] = max(int(request.limit_rows), 0)
+        params["code_row_offset"] = max(int(request.offset_rows or 0), 0)
+    return await _execute_manifest_reverse_code_rows(
+        session,
+        scope_join_sql=scope_join_sql,
+        where_sql=where_sql,
+        window_sql=window_sql,
+        plan_order=plan_order,
+        params=params,
+    )
+
+
+async def _execute_manifest_reverse_code_rows(
+    session,
+    *,
+    scope_join_sql: str,
+    where_sql: str,
+    window_sql: str,
+    plan_order: str,
+    params: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Execute the fixed reverse-code metadata projection."""
+
     code_row_result = await session.execute(
         text(
             f"""
@@ -3955,6 +4228,99 @@ class _VersionThreeFilteredReverseSelection:
     total_row_count: int | None = None
 
 
+@dataclass
+class _FilteredReversePageState:
+    """Mutable page window for one sequential filtered reverse traversal."""
+
+    requested_offset: int
+    requested_limit: int
+    selected_rows: list[dict[str, Any]] = field(default_factory=list)
+    selected_prices_by_set: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    matched_rows_seen: int = 0
+
+    def is_full_after_consuming(
+        self,
+        filtered_candidates: Iterable[
+            tuple[dict[str, Any], str, list[dict[str, Any]]]
+        ],
+    ) -> bool:
+        """Consume filtered candidates and report when the sentinel is full."""
+
+        for candidate_row, price_set_id, prices in filtered_candidates:
+            self.matched_rows_seen += 1
+            if self.matched_rows_seen <= self.requested_offset:
+                continue
+            if len(self.selected_rows) < self.requested_limit:
+                self.selected_rows.append(candidate_row)
+                self.selected_prices_by_set[price_set_id] = prices
+            if len(self.selected_rows) >= self.requested_limit:
+                return True
+        return False
+
+    def selection(
+        self,
+        *,
+        exhausted: bool,
+        has_exact_total: bool = False,
+    ) -> _VersionThreeFilteredReverseSelection:
+        """Freeze the current page with honest traversal cardinality."""
+
+        return _VersionThreeFilteredReverseSelection(
+            rows=tuple(self.selected_rows),
+            prices_by_price_set=self.selected_prices_by_set,
+            exhausted=exhausted,
+            matched_rows_seen=self.matched_rows_seen,
+            total_row_count=(
+                self.matched_rows_seen if has_exact_total else None
+            ),
+        )
+
+
+async def _filtered_reverse_candidates(
+    session,
+    serving_tables: PTG2ServingTables,
+    candidate_row_groups: Iterable[Iterable[dict[str, Any]]],
+    filter_args_by_name: Mapping[str, Any],
+) -> list[tuple[dict[str, Any], str, list[dict[str, Any]]]]:
+    """Hydrate and retain price-matching candidates from one metadata batch."""
+
+    candidate_rows = [
+        candidate_row
+        for row_group in candidate_row_groups
+        for candidate_row in row_group
+    ]
+    price_key_by_set_id = {
+        _ptg2_manifest_id(
+            candidate_row.get("price_set_global_id_128")
+        ): int(candidate_row["price_key"])
+        for candidate_row in candidate_rows
+        if candidate_row.get("price_key") is not None
+        and _ptg2_manifest_id(candidate_row.get("price_set_global_id_128"))
+    }
+    prices_by_price_set = await _prices_for_price_sets(
+        session,
+        serving_tables,
+        tuple(price_key_by_set_id),
+        price_key_by_set_id=price_key_by_set_id,
+    )
+    filtered_candidates = []
+    for candidate_row in candidate_rows:
+        price_set_id = _ptg2_manifest_id(
+            candidate_row.get("price_set_global_id_128")
+        )
+        prices = _ptg2_manifest_filter_prices(
+            prices_by_price_set.get(price_set_id, []),
+            dict(filter_args_by_name),
+        )
+        if prices:
+            filtered_candidates.append(
+                (candidate_row, price_set_id, prices)
+            )
+    return filtered_candidates
+
+
 async def _version_three_filtered_reverse_selection(
     session,
     serving_tables: PTG2ServingTables,
@@ -3965,7 +4331,6 @@ async def _version_three_filtered_reverse_selection(
     limit: int,
 ) -> _VersionThreeFilteredReverseSelection:
     """Read ordered batches until a filtered page sentinel or exhaustion."""
-
     reverse_scope = await _version_three_reverse_scope(session, serving_tables, reverse_query)
     if reverse_scope is None:
         return _VersionThreeFilteredReverseSelection(
@@ -3975,12 +4340,10 @@ async def _version_three_filtered_reverse_selection(
             matched_rows_seen=0,
             total_row_count=0,
         )
-    requested_offset = max(int(offset), 0)
-    requested_limit = max(int(limit), 0)
-    filter_args_by_name = dict(args)
-    selected_rows: list[dict[str, Any]] = []
-    selected_prices_by_set: dict[str, list[dict[str, Any]]] = {}
-    matched_rows_seen = 0
+    page_state = _FilteredReversePageState(
+        requested_offset=max(int(offset), 0),
+        requested_limit=max(int(limit), 0),
+    )
     metadata_offset = 0
     metadata_batch_size = (
         None
@@ -4000,64 +4363,22 @@ async def _version_three_filtered_reverse_selection(
             raise PTG2ManifestArtifactError("PTG2 v3 reverse metadata is unavailable")
         candidate_row_groups, code_metadata_count = candidate_batch
         if code_metadata_count == 0:
-            return _VersionThreeFilteredReverseSelection(
-                rows=tuple(selected_rows),
-                prices_by_price_set=selected_prices_by_set,
+            return page_state.selection(
                 exhausted=True,
-                matched_rows_seen=matched_rows_seen,
-                total_row_count=matched_rows_seen,
+                has_exact_total=True,
             )
-        candidate_rows = [
-            candidate_row
-            for row_group in candidate_row_groups
-            for candidate_row in row_group
-        ]
-        price_key_by_set_id = {
-            _ptg2_manifest_id(
-                candidate_row.get("price_set_global_id_128")
-            ): int(candidate_row["price_key"])
-            for candidate_row in candidate_rows
-            if candidate_row.get("price_key") is not None
-            and _ptg2_manifest_id(
-                candidate_row.get("price_set_global_id_128")
-            )
-        }
-        prices_by_price_set = await _prices_for_price_sets(
+        filtered_candidates = await _filtered_reverse_candidates(
             session,
             serving_tables,
-            tuple(price_key_by_set_id),
-            price_key_by_set_id=price_key_by_set_id,
+            candidate_row_groups,
+            args,
         )
-        for candidate_row in candidate_rows:
-            price_set_id = _ptg2_manifest_id(
-                candidate_row.get("price_set_global_id_128")
-            )
-            prices = _ptg2_manifest_filter_prices(
-                prices_by_price_set.get(price_set_id, []),
-                filter_args_by_name,
-            )
-            if not prices:
-                continue
-            matched_rows_seen += 1
-            if matched_rows_seen <= requested_offset:
-                continue
-            if len(selected_rows) < requested_limit:
-                selected_rows.append(candidate_row)
-                selected_prices_by_set[price_set_id] = prices
-            if len(selected_rows) >= requested_limit:
-                return _VersionThreeFilteredReverseSelection(
-                    rows=tuple(selected_rows),
-                    prices_by_price_set=selected_prices_by_set,
-                    exhausted=False,
-                    matched_rows_seen=matched_rows_seen,
-                )
+        if page_state.is_full_after_consuming(filtered_candidates):
+            return page_state.selection(exhausted=False)
         if metadata_batch_size is None or code_metadata_count < metadata_batch_size:
-            return _VersionThreeFilteredReverseSelection(
-                rows=tuple(selected_rows),
-                prices_by_price_set=selected_prices_by_set,
+            return page_state.selection(
                 exhausted=True,
-                matched_rows_seen=matched_rows_seen,
-                total_row_count=matched_rows_seen,
+                has_exact_total=True,
             )
         metadata_offset += code_metadata_count
 
@@ -4292,6 +4613,87 @@ async def _load_v4_source_groups(
     return groups_by_pattern, groups_by_component
 
 
+def _projected_members_by_owner(
+    owner_keys: tuple[int, ...],
+    projections_by_owner: Mapping[int, tuple[int, ...]],
+    members_by_projection: Mapping[int, tuple[int, ...]],
+    member_budget: int | None,
+) -> dict[int, tuple[int, ...]]:
+    """Flatten selected projection members while enforcing the request budget."""
+
+    members_by_owner: dict[int, tuple[int, ...]] = {}
+    returned_member_count = 0
+    for owner_key in owner_keys:
+        members = tuple(
+            sorted(
+                {
+                    int(member_key)
+                    for projection_key in projections_by_owner.get(owner_key, ())
+                    for member_key in members_by_projection.get(
+                        int(projection_key), ()
+                    )
+                }
+            )
+        )
+        returned_member_count += len(members)
+        if member_budget is not None and (
+            len(members) > member_budget
+            or returned_member_count > member_budget
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 graph selection exceeds max_members"
+            )
+        members_by_owner[owner_key] = members
+    return members_by_owner
+
+
+async def _v4_members_via_projection(
+    session,
+    *,
+    snapshot_key: int,
+    owner_keys: tuple[int, ...],
+    projection_relation: str,
+    projected_member_relation: str,
+    member_budget: int | None,
+) -> dict[int, tuple[int, ...]]:
+    """Load and flatten one factored V4 relation."""
+
+    projection_budget = (
+        member_budget if projection_relation == "set_patterns" else None
+    )
+    projections_by_owner = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation=projection_relation,
+        owner_keys=owner_keys,
+        schema_name=PTG2_SCHEMA,
+        max_members=projection_budget,
+    )
+    projection_keys = tuple(
+        sorted(
+            {
+                int(projection_key)
+                for projection_members in projections_by_owner.values()
+                for projection_key in projection_members
+            }
+        )
+    )
+    members_by_projection = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation=projected_member_relation,
+        owner_keys=projection_keys,
+        schema_name=PTG2_SCHEMA,
+        max_members=member_budget,
+    )
+    return _projected_members_by_owner(
+        owner_keys,
+        projections_by_owner,
+        members_by_projection,
+        member_budget,
+    )
+
+
 async def _v4_members_through_projection(
     session,
     serving_tables: PTG2ServingTables,
@@ -4340,61 +4742,14 @@ async def _v4_members_through_projection(
                 hot_limits.maximum_components_per_fallback_set
             ),
         )
-    # The set-to-pattern count lower-bounds final group occurrences because
-    # every selected pattern owns a non-empty, disjoint group partition. The
-    # group-to-pattern direction remains uncapped here: an exact orphan group
-    # may map to the snapshot's empty-set pattern. Caller input limits bound
-    # that scalar first hop; the unique pattern-to-set hop and final returned
-    # total remain budgeted below.
-    projection_budget = member_budget if projection_relation == "set_patterns" else None
-    projections_by_owner = await lookup_v4_relation_members(
+    return await _v4_members_via_projection(
         session,
         snapshot_key=snapshot_key,
-        relation=projection_relation,
         owner_keys=normalized_owner_keys,
-        schema_name=PTG2_SCHEMA,
-        max_members=projection_budget,
+        projection_relation=projection_relation,
+        projected_member_relation=projected_member_relation,
+        member_budget=member_budget,
     )
-    projection_keys = tuple(
-        sorted(
-            {
-                int(projection_key)
-                for projection_members in projections_by_owner.values()
-                for projection_key in projection_members
-            }
-        )
-    )
-    members_by_projection = await lookup_v4_relation_members(
-        session,
-        snapshot_key=snapshot_key,
-        relation=projected_member_relation,
-        owner_keys=projection_keys,
-        schema_name=PTG2_SCHEMA,
-        # Each unique projection is used by at least one requested owner. Its
-        # loaded members therefore form a lower bound on the returned total.
-        max_members=member_budget,
-    )
-    members_by_owner: dict[int, tuple[int, ...]] = {}
-    returned_member_count = 0
-    for owner_key in normalized_owner_keys:
-        members = tuple(
-            sorted(
-                {
-                    int(member_key)
-                    for projection_key in projections_by_owner.get(owner_key, ())
-                    for member_key in members_by_projection.get(
-                        int(projection_key), ()
-                    )
-                }
-            )
-        )
-        if member_budget is not None and len(members) > member_budget:
-            raise PTG2ManifestArtifactError("PTG2 V4 graph selection exceeds max_members")
-        returned_member_count += len(members)
-        if member_budget is not None and returned_member_count > member_budget:
-            raise PTG2ManifestArtifactError("PTG2 V4 graph selection exceeds max_members")
-        members_by_owner[owner_key] = members
-    return members_by_owner
 
 
 def _is_v4_reverse_scope_cheaper(
@@ -4756,6 +5111,36 @@ def _normalized_optional_integer_keys(
     return tuple(sorted({int(value) for value in values}))
 
 
+async def _v4_sets_from_projection(
+    session,
+    *,
+    snapshot_key: int,
+    projection: _V4NpiProjection,
+    allowed_provider_sets: tuple[int, ...] | None,
+    read_bounds: _V4GraphReadBounds,
+) -> Mapping[int, tuple[int, ...]]:
+    """Read the second NPI projection with an optional exact set scope."""
+
+    if allowed_provider_sets is None:
+        return await lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation=projection.second_relation,
+            owner_keys=projection.first_member_keys,
+            schema_name=read_bounds.schema_name,
+            max_members=read_bounds.max_members,
+        )
+    return await lookup_v4_relation_intersections(
+        session,
+        snapshot_key=snapshot_key,
+        relation=projection.second_relation,
+        owner_keys=projection.first_member_keys,
+        allowed_member_keys=allowed_provider_sets,
+        schema_name=read_bounds.schema_name,
+        max_members=read_bounds.max_members,
+    )
+
+
 async def _v4_sets_by_npi(
     session,
     serving_tables: PTG2ServingTables,
@@ -4794,27 +5179,13 @@ async def _v4_sets_by_npi(
         )
         if reverse_sets is not None:
             return reverse_sets
-        if allowed_provider_sets is None:
-            provider_sets_by_first_member = await lookup_v4_relation_members(
-                session,
-                snapshot_key=snapshot_key,
-                relation=projection.second_relation,
-                owner_keys=projection.first_member_keys,
-                schema_name=schema_name,
-                max_members=max_members,
-            )
-        else:
-            provider_sets_by_first_member = (
-                await lookup_v4_relation_intersections(
-                    session,
-                    snapshot_key=snapshot_key,
-                    relation=projection.second_relation,
-                    owner_keys=projection.first_member_keys,
-                    allowed_member_keys=allowed_provider_sets,
-                    schema_name=schema_name,
-                    max_members=max_members,
-                )
-            )
+        provider_sets_by_first_member = await _v4_sets_from_projection(
+            session,
+            snapshot_key=snapshot_key,
+            projection=projection,
+            allowed_provider_sets=allowed_provider_sets,
+            read_bounds=read_bounds,
+        )
     return _v4_sets_from_first_members(
         normalized_npis,
         projection.npi_key_by_value,
@@ -4823,6 +5194,199 @@ async def _v4_sets_by_npi(
         allowed_provider_sets,
         max_members=max_members,
     )
+
+
+async def _v4_npi_groups(
+    session,
+    serving_tables: PTG2ServingTables,
+    snapshot_key: int,
+    owner_ids: list[str],
+    max_members: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Translate NPI owner IDs to exact provider-group IDs."""
+
+    npi_by_owner_id = {
+        owner_id: npi
+        for owner_id in owner_ids
+        if (npi := _ptg2_npi_from_member_id(owner_id)) is not None
+    }
+    if len(npi_by_owner_id) != len(owner_ids):
+        raise PTG2ManifestArtifactError("PTG2 V4 NPI graph owner is malformed")
+    npi_key_by_value = await v4_npi_keys_for_values(
+        session,
+        snapshot_key=snapshot_key,
+        npis=npi_by_owner_id.values(),
+        schema_name=PTG2_SCHEMA,
+    )
+    group_keys_by_npi_key = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation="npi_groups_exact",
+        owner_keys=npi_key_by_value.values(),
+        schema_name=PTG2_SCHEMA,
+        max_members=max_members,
+    )
+    group_keys = {
+        int(group_key)
+        for members in group_keys_by_npi_key.values()
+        for group_key in members
+    }
+    group_id_by_key = await _shared_provider_group_ids_for_keys(
+        session, serving_tables, group_keys
+    )
+    if set(group_id_by_key) != group_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 graph references a missing provider-group key"
+        )
+    return {
+        owner_id: tuple(
+            group_id_by_key[group_key]
+            for group_key in group_keys_by_npi_key.get(
+                npi_key_by_value.get(npi_by_owner_id[owner_id], -1), ()
+            )
+        )
+        for owner_id in owner_ids
+    }
+
+
+async def _v4_group_npis(
+    session,
+    serving_tables: PTG2ServingTables,
+    snapshot_key: int,
+    owner_ids: list[str],
+    max_members: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Translate provider-group owner IDs to exact NPI member IDs."""
+
+    owner_key_by_id = await _shared_provider_group_keys_for_ids(
+        session, serving_tables, owner_ids
+    )
+    npi_keys_by_group = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation="group_npis_exact",
+        owner_keys=owner_key_by_id.values(),
+        schema_name=PTG2_SCHEMA,
+        max_members=max_members,
+    )
+    npi_keys = {
+        int(npi_key)
+        for members in npi_keys_by_group.values()
+        for npi_key in members
+    }
+    npi_by_key = await v4_npi_values_for_keys(
+        session,
+        snapshot_key=snapshot_key,
+        npi_keys=npi_keys,
+        schema_name=PTG2_SCHEMA,
+    )
+    if set(npi_by_key) != npi_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 graph references a missing NPI dictionary key"
+        )
+    return {
+        owner_id: tuple(
+            _ptg2_npi_member_id(npi_by_key[npi_key])
+            for npi_key in npi_keys_by_group.get(
+                owner_key_by_id.get(owner_id, -1), ()
+            )
+        )
+        for owner_id in owner_ids
+    }
+
+
+async def _v4_projected_graph_identity_maps(
+    session,
+    serving_tables: PTG2ServingTables,
+    name: str,
+    owner_ids: list[str],
+    max_members: int | None,
+) -> tuple[Mapping[str, int], Mapping[int, tuple[int, ...]], Mapping[int, str]]:
+    if name == "provider_inverted":
+        owner_key_by_id = await _shared_provider_group_keys_for_ids(
+            session, serving_tables, owner_ids
+        )
+        members_by_owner_key = await _v4_members_through_projection(
+            session,
+            serving_tables,
+            owner_keys=owner_key_by_id.values(),
+            direct_relation="group_sets_direct",
+            projection_relation="group_patterns",
+            projected_member_relation="pattern_sets",
+            max_members=max_members,
+        )
+        member_id_by_key = await _provider_set_ids_for_keys(
+            session,
+            serving_tables,
+            {
+                int(member_key)
+                for members in members_by_owner_key.values()
+                for member_key in members
+            },
+        )
+        return (owner_key_by_id, members_by_owner_key, member_id_by_key)
+    if name != "provider_forward":
+        raise PTG2ManifestArtifactError(
+            f"unsupported PTG V4 shared graph artifact: {name}"
+        )
+    owner_key_by_id = await _provider_set_keys_for_ids(
+        session, serving_tables, owner_ids
+    )
+    members_by_owner_key = await _v4_members_through_projection(
+        session,
+        serving_tables,
+        owner_keys=owner_key_by_id.values(),
+        direct_relation="set_groups_direct",
+        projection_relation="set_patterns",
+        projected_member_relation="pattern_groups",
+        max_members=max_members,
+    )
+    member_id_by_key = await _shared_provider_group_ids_for_keys(
+        session,
+        serving_tables,
+        {
+            int(member_key)
+            for members in members_by_owner_key.values()
+            for member_key in members
+        },
+    )
+    return (owner_key_by_id, members_by_owner_key, member_id_by_key)
+
+
+def _translated_graph_members(
+    owner_ids: Iterable[str],
+    owner_key_by_id: Mapping[str, int],
+    members_by_owner_key: Mapping[int, tuple[int, ...]],
+    member_id_by_key: Mapping[int, str],
+    max_members: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Validate and translate dense graph keys to stable identifiers."""
+
+    expected_member_keys = {
+        int(member_key)
+        for members in members_by_owner_key.values()
+        for member_key in members
+    }
+    if set(member_id_by_key) != expected_member_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 graph references a missing support dictionary key"
+        )
+    total_member_count = sum(
+        len(members) for members in members_by_owner_key.values()
+    )
+    if max_members is not None and total_member_count > int(max_members):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 graph selection exceeds max_members"
+        )
+    return {
+        owner_id: tuple(
+            member_id_by_key[member_key]
+            for member_key in members_by_owner_key.get(
+                owner_key_by_id.get(owner_id, -1), ()
+            )
+        )
+        for owner_id in owner_ids
+    }
 
 
 async def _v4_shared_graph_members_many(
@@ -4838,155 +5402,94 @@ async def _v4_shared_graph_members_many(
     snapshot_key = _required_shared_snapshot_key(serving_tables)
     with v4_graph_request_scope():
         if name == "provider_npi_group":
-            npi_by_owner_id = {
-                owner_id: npi
-                for owner_id in owner_ids
-                if (npi := _ptg2_npi_from_member_id(owner_id)) is not None
-            }
-            if len(npi_by_owner_id) != len(owner_ids):
-                raise PTG2ManifestArtifactError("PTG2 V4 NPI graph owner is malformed")
-            npi_key_by_value = await v4_npi_keys_for_values(
+            return await _v4_npi_groups(
                 session,
-                snapshot_key=snapshot_key,
-                npis=npi_by_owner_id.values(),
-                schema_name=PTG2_SCHEMA,
+                serving_tables,
+                snapshot_key,
+                owner_ids,
+                max_members,
             )
-            group_keys_by_npi_key = await lookup_v4_relation_members(
-                session,
-                snapshot_key=snapshot_key,
-                relation="npi_groups_exact",
-                owner_keys=npi_key_by_value.values(),
-                schema_name=PTG2_SCHEMA,
-                max_members=max_members,
-            )
-            group_keys = {
-                int(group_key)
-                for members in group_keys_by_npi_key.values()
-                for group_key in members
-            }
-            group_id_by_key = await _shared_provider_group_ids_for_keys(
-                session, serving_tables, group_keys
-            )
-            if set(group_id_by_key) != group_keys:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 V4 graph references a missing provider-group key"
-                )
-            return {
-                owner_id: tuple(
-                    group_id_by_key[group_key]
-                    for group_key in group_keys_by_npi_key.get(
-                        npi_key_by_value.get(npi_by_owner_id[owner_id], -1), ()
-                    )
-                )
-                for owner_id in owner_ids
-            }
-
         if name == "provider_group_npi":
-            owner_key_by_id = await _shared_provider_group_keys_for_ids(
-                session, serving_tables, owner_ids
-            )
-            npi_keys_by_group = await lookup_v4_relation_members(
+            return await _v4_group_npis(
                 session,
-                snapshot_key=snapshot_key,
-                relation="group_npis_exact",
-                owner_keys=owner_key_by_id.values(),
-                schema_name=PTG2_SCHEMA,
-                max_members=max_members,
+                serving_tables,
+                snapshot_key,
+                owner_ids,
+                max_members,
             )
-            npi_keys = {
-                int(npi_key)
-                for members in npi_keys_by_group.values()
-                for npi_key in members
-            }
-            npi_by_key = await v4_npi_values_for_keys(
-                session,
-                snapshot_key=snapshot_key,
-                npi_keys=npi_keys,
-                schema_name=PTG2_SCHEMA,
-            )
-            if set(npi_by_key) != npi_keys:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 V4 graph references a missing NPI dictionary key"
-                )
-            return {
-                owner_id: tuple(
-                    _ptg2_npi_member_id(npi_by_key[npi_key])
-                    for npi_key in npi_keys_by_group.get(
-                        owner_key_by_id.get(owner_id, -1), ()
-                    )
-                )
-                for owner_id in owner_ids
-            }
+        identity_maps = await _v4_projected_graph_identity_maps(
+            session,
+            serving_tables,
+            name,
+            owner_ids,
+            max_members,
+        )
+        return _translated_graph_members(
+            owner_ids,
+            *identity_maps,
+            max_members,
+        )
 
-        if name == "provider_inverted":
-            owner_key_by_id = await _shared_provider_group_keys_for_ids(
-                session, serving_tables, owner_ids
-            )
-            members_by_owner_key = await _v4_members_through_projection(
-                session,
-                serving_tables,
-                owner_keys=owner_key_by_id.values(),
-                direct_relation="group_sets_direct",
-                projection_relation="group_patterns",
-                projected_member_relation="pattern_sets",
-                max_members=max_members,
-            )
-            member_id_by_key = await _provider_set_ids_for_keys(
-                session,
-                serving_tables,
-                {
-                    int(member_key)
-                    for members in members_by_owner_key.values()
-                    for member_key in members
-                },
-            )
-        elif name == "provider_forward":
-            owner_key_by_id = await _provider_set_keys_for_ids(
-                session, serving_tables, owner_ids
-            )
-            members_by_owner_key = await _v4_members_through_projection(
-                session,
-                serving_tables,
-                owner_keys=owner_key_by_id.values(),
-                direct_relation="set_groups_direct",
-                projection_relation="set_patterns",
-                projected_member_relation="pattern_groups",
-                max_members=max_members,
-            )
-            member_id_by_key = await _shared_provider_group_ids_for_keys(
-                session,
-                serving_tables,
-                {
-                    int(member_key)
-                    for members in members_by_owner_key.values()
-                    for member_key in members
-                },
-            )
-        else:
-            raise PTG2ManifestArtifactError(
-                f"unsupported PTG V4 shared graph artifact: {name}"
-            )
-        expected_member_keys = {
-            int(member_key)
-            for members in members_by_owner_key.values()
-            for member_key in members
-        }
-        if set(member_id_by_key) != expected_member_keys:
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 graph references a missing support dictionary key"
-            )
-        total_member_count = sum(len(members) for members in members_by_owner_key.values())
-        if max_members is not None and total_member_count > int(max_members):
-            raise PTG2ManifestArtifactError("PTG2 V4 graph selection exceeds max_members")
-        return {
-            owner_id: tuple(
-                member_id_by_key[member_key]
-                for member_key in members_by_owner_key.get(
-                    owner_key_by_id.get(owner_id, -1), ()
-                )
-            )
+
+async def _legacy_graph_owner_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    direction: str,
+    owner_ids: list[str],
+) -> Mapping[str, int]:
+    """Translate legacy graph owner IDs to dense relation keys."""
+
+    if direction == PTG2_V3_GRAPH_NPI_TO_GROUP:
+        owner_key_by_id = {
+            owner_id: npi
             for owner_id in owner_ids
+            if (npi := _ptg2_npi_from_member_id(owner_id)) is not None
         }
+        if len(owner_key_by_id) != len(owner_ids):
+            raise PTG2ManifestArtifactError(
+                "PTG2 shared NPI graph owner is malformed"
+            )
+        return owner_key_by_id
+    if direction == PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP:
+        return await _provider_set_keys_for_ids(
+            session,
+            serving_tables,
+            owner_ids,
+        )
+    return await _shared_provider_group_keys_for_ids(
+        session,
+        serving_tables,
+        owner_ids,
+    )
+
+
+async def _legacy_graph_member_ids(
+    session,
+    serving_tables: PTG2ServingTables,
+    direction: str,
+    member_keys: set[int],
+) -> Mapping[int, str]:
+    """Translate legacy dense member keys to stable relation IDs."""
+
+    if direction in {
+        PTG2_V3_GRAPH_NPI_TO_GROUP,
+        PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+    }:
+        return await _shared_provider_group_ids_for_keys(
+            session,
+            serving_tables,
+            member_keys,
+        )
+    if direction == PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET:
+        return await _provider_set_ids_for_keys(
+            session,
+            serving_tables,
+            member_keys,
+        )
+    return {
+        npi: _ptg2_npi_member_id(npi)
+        for npi in member_keys
+    }
 
 
 async def _shared_graph_members_many(
@@ -5015,26 +5518,12 @@ async def _shared_graph_members_many(
     direction = direction_by_name.get(name)
     if direction is None:
         raise PTG2ManifestArtifactError(f"unsupported PTG2 shared graph artifact: {name}")
-    if direction == PTG2_V3_GRAPH_NPI_TO_GROUP:
-        owner_key_by_id = {
-            owner_id: npi
-            for owner_id in owner_ids
-            if (npi := _ptg2_npi_from_member_id(owner_id)) is not None
-        }
-        if len(owner_key_by_id) != len(owner_ids):
-            raise PTG2ManifestArtifactError("PTG2 shared NPI graph owner is malformed")
-    elif direction == PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP:
-        owner_key_by_id = await _provider_set_keys_for_ids(
-            session,
-            serving_tables,
-            owner_ids,
-        )
-    else:
-        owner_key_by_id = await _shared_provider_group_keys_for_ids(
-            session,
-            serving_tables,
-            owner_ids,
-        )
+    owner_key_by_id = await _legacy_graph_owner_keys(
+        session,
+        serving_tables,
+        direction,
+        owner_ids,
+    )
     members_by_owner_key = await lookup_shared_graph_members_from_db(
         session,
         _required_shared_snapshot_key(serving_tables),
@@ -5048,23 +5537,12 @@ async def _shared_graph_members_many(
         for members in members_by_owner_key.values()
         for member_key in members
     }
-    if direction in {PTG2_V3_GRAPH_NPI_TO_GROUP, PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP}:
-        member_id_by_key = await _shared_provider_group_ids_for_keys(
-            session,
-            serving_tables,
-            member_keys,
-        )
-    elif direction == PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET:
-        member_id_by_key = await _provider_set_ids_for_keys(
-            session,
-            serving_tables,
-            member_keys,
-        )
-    else:
-        member_id_by_key = {
-            npi: _ptg2_npi_member_id(npi)
-            for npi in member_keys
-        }
+    member_id_by_key = await _legacy_graph_member_ids(
+        session,
+        serving_tables,
+        direction,
+        member_keys,
+    )
     if set(member_id_by_key) != member_keys:
         raise PTG2ManifestArtifactError("PTG2 shared graph references a missing support dictionary key")
     return {
@@ -5182,6 +5660,36 @@ async def _shared_forward_entries_for_code_rows(
     return forward_entries
 
 
+async def _provider_group_ids_for_key_members(
+    session,
+    serving_tables: PTG2ServingTables,
+    groups_by_provider_set: Mapping[int, tuple[int, ...]],
+    *,
+    graph_label: str,
+) -> tuple[str, ...]:
+    """Validate dense provider-group keys and return stable IDs."""
+
+    group_keys = tuple(
+        sorted(
+            {
+                int(group_key)
+                for provider_set_group_keys in groups_by_provider_set.values()
+                for group_key in provider_set_group_keys
+            }
+        )
+    )
+    group_id_by_key = await _shared_provider_group_ids_for_keys(
+        session,
+        serving_tables,
+        group_keys,
+    )
+    if set(group_id_by_key) != set(group_keys):
+        raise PTG2ManifestArtifactError(
+            f"{graph_label} references a missing provider-group dictionary key"
+        )
+    return tuple(group_id_by_key[group_key] for group_key in group_keys)
+
+
 async def _shared_group_ids_for_set_keys(
     session,
     serving_tables: PTG2ServingTables,
@@ -5204,25 +5712,12 @@ async def _shared_group_ids_for_set_keys(
                 projection_relation="set_patterns",
                 projected_member_relation="pattern_groups",
             )
-        group_keys = tuple(
-            sorted(
-                {
-                    int(group_key)
-                    for provider_set_group_keys in groups_by_provider_set.values()
-                    for group_key in provider_set_group_keys
-                }
-            )
-        )
-        group_id_by_key = await _shared_provider_group_ids_for_keys(
+        return await _provider_group_ids_for_key_members(
             session,
             serving_tables,
-            group_keys,
+            groups_by_provider_set,
+            graph_label="PTG2 V4 graph",
         )
-        if set(group_id_by_key) != set(group_keys):
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 graph references a missing provider-group dictionary key"
-            )
-        return tuple(group_id_by_key[group_key] for group_key in group_keys)
     groups_by_provider_set = await lookup_shared_graph_members_from_db(
         session,
         _required_shared_snapshot_key(serving_tables),
@@ -5230,25 +5725,12 @@ async def _shared_group_ids_for_set_keys(
         normalized_provider_set_keys,
         schema_name=PTG2_SCHEMA,
     )
-    group_keys = tuple(
-        sorted(
-            {
-                int(group_key)
-                for provider_set_group_keys in groups_by_provider_set.values()
-                for group_key in provider_set_group_keys
-            }
-        )
-    )
-    group_id_by_key = await _shared_provider_group_ids_for_keys(
+    return await _provider_group_ids_for_key_members(
         session,
         serving_tables,
-        group_keys,
+        groups_by_provider_set,
+        graph_label="PTG2 shared graph",
     )
-    if set(group_id_by_key) != set(group_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared graph references a missing provider-group dictionary key"
-        )
-    return tuple(group_id_by_key[group_key] for group_key in group_keys)
 
 
 async def _shared_rate_provider_groups(
@@ -7409,6 +7891,159 @@ async def _taxonomy_rows_for_npis(
     return taxonomy_by_npi
 
 
+_PROVIDER_ENRICHMENT_SQL = """
+    WITH source_npis AS MATERIALIZED (
+        SELECT UNNEST(CAST(:npis AS bigint[])) AS npi
+    )
+    {fallback_cte}
+    SELECT
+        source_npis.npi,
+        {location_hash_sql} AS location_hash,
+        {eff_state_name} AS state,
+        {eff_city_name} AS city,
+        LEFT(COALESCE({eff_postal_code}, ''), 5) AS zip5,
+        '{location_source}' AS location_source,
+        '{location_source}' AS location_confidence_code,
+        jsonb_build_object(
+            'npi', source_npis.npi, 'type', addr.type,
+            'checksum', addr.checksum, 'first_line', {eff_first_line},
+            'second_line', {eff_second_line}, 'city_name', {eff_city_name},
+            'state_name', {eff_state_name}, 'city', {eff_city_name},
+            'state', {eff_state_name}, 'postal_code', {eff_postal_code},
+            'country_code', {eff_country_code},
+            'telephone_number', {eff_telephone_number},
+            'fax_number', {eff_fax_number},
+            'phone_number', {eff_phone_number},
+            'phone_extension', {eff_phone_extension},
+            'fax_number_digits', {eff_fax_number_digits},
+            'fax_extension', {eff_fax_extension},
+            'address_key', addr.address_key::text,
+            'address_site_key', addr.premise_key::text,
+            'lat', {eff_lat}, 'long', {eff_long}
+        )::text AS address_payload,
+        {eff_telephone_number} AS telephone_number,
+        {eff_fax_number} AS fax_number,
+        {eff_phone_number} AS phone_number,
+        {eff_phone_extension} AS phone_extension,
+        {eff_fax_number_digits} AS fax_number_digits,
+        {eff_fax_extension} AS fax_extension,
+        COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
+        COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
+        COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
+        COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
+        tax.primary_specialty, tax.primary_specialization,
+        n.provider_sex_code, {provider_name_sql} AS provider_name
+    FROM source_npis
+    LEFT JOIN {npi_data_table} n ON n.npi = source_npis.npi
+    LEFT JOIN LATERAL (
+        SELECT addr.*
+          FROM {npi_address_table} addr
+         WHERE addr.npi = source_npis.npi
+         ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
+         LIMIT 1
+    ) addr ON TRUE
+    {fallback_join}
+    {taxonomy_lateral_sql}
+    ORDER BY provider_name, source_npis.npi
+"""
+
+
+async def _provider_enrichment_address_sql(
+    session,
+    npi_address_table: str,
+) -> tuple[str, str, Callable[[str], str]]:
+    """Build address fallback fragments and effective-column expressions."""
+
+    if not _is_unified_address_table(npi_address_table):
+        return "", "", lambda column: f"addr.{column}"
+    fallback_columns = set(
+        await _ptg2_table_columns(session, f"{PTG2_SCHEMA}.npi_address")
+    )
+
+    def fallback_column(column: str, sql_type: str = "varchar") -> str:
+        """Select an available legacy column or a typed null."""
+
+        if column in fallback_columns:
+            return f"na.{column}"
+        return f"NULL::{sql_type} AS {column}"
+
+    fallback_cte = f"""
+        , fallback_addresses AS MATERIALIZED (
+            SELECT DISTINCT ON (na.npi)
+                   na.npi, na.first_line, na.second_line, na.city_name,
+                   na.state_name, na.postal_code, na.country_code,
+                   {fallback_column('telephone_number')},
+                   {fallback_column('fax_number')},
+                   {fallback_column('phone_number')},
+                   {fallback_column('phone_extension')},
+                   {fallback_column('fax_number_digits')},
+                   {fallback_column('fax_extension')},
+                   na.lat, na.long
+              FROM {PTG2_SCHEMA}.npi_address na
+              JOIN source_npis source_filter ON source_filter.npi = na.npi
+             WHERE NULLIF(BTRIM(na.first_line), '') IS NOT NULL
+             ORDER BY na.npi,
+                      CASE na.type WHEN 'primary' THEN 0
+                           WHEN 'practice' THEN 1
+                           WHEN 'secondary' THEN 2 ELSE 3 END,
+                      na.checksum
+        )"""
+    fallback_join = """
+        LEFT JOIN fallback_addresses na
+          ON na.npi = source_npis.npi
+         AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
+
+    def effective_column(column: str) -> str:
+        """Prefer legacy street data only when unified street data is absent."""
+
+        cast_suffix = "::numeric" if column in {"lat", "long"} else ""
+        return (
+            "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
+            f"AND na.first_line IS NOT NULL THEN na.{column}{cast_suffix} "
+            f"ELSE addr.{column}{cast_suffix} END"
+        )
+
+    return fallback_cte, fallback_join, effective_column
+
+
+async def _provider_enrichment_statement(
+    session,
+    npi_data_table: str,
+    npi_address_table: str,
+):
+    """Build the bounded provider enrichment statement."""
+
+    fallback_cte, fallback_join, effective_column = (
+        await _provider_enrichment_address_sql(session, npi_address_table)
+    )
+    columns = (
+        "state_name", "city_name", "postal_code", "first_line",
+        "second_line", "country_code", "telephone_number", "fax_number",
+        "phone_number", "phone_extension", "fax_number_digits",
+        "fax_extension", "lat", "long",
+    )
+    effective_fields_by_name = {
+        f"eff_{column}": effective_column(column) for column in columns
+    }
+    return text(
+        _PROVIDER_ENRICHMENT_SQL.format(
+            fallback_cte=fallback_cte,
+            fallback_join=fallback_join,
+            location_hash_sql=_ptg2_address_location_hash_sql(
+                "addr", npi_address_table
+            ),
+            location_source=_ptg2_address_location_source(npi_address_table),
+            provider_name_sql=_ptg2_provider_name_sql("n"),
+            npi_data_table=npi_data_table,
+            npi_address_table=npi_address_table,
+            taxonomy_lateral_sql=_provider_taxonomy_summary_lateral_sql(
+                "source_npis.npi"
+            ),
+            **effective_fields_by_name,
+        )
+    )
+
+
 async def _enriched_provider_rows_for_npis(
     session,
     *,
@@ -7444,122 +8079,10 @@ async def _enriched_provider_rows_for_npis(
             }
             for npi in npis
         ]
-    address_location_source = _ptg2_address_location_source(npi_address_table)
-    address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
-    is_using_unified_enrichment = _is_unified_address_table(npi_address_table)
-    # Same street-fill as the location search: when the unified row has no
-    # first_line (or no row at all), fall back to the NPPES npi_address row.
-    if is_using_unified_enrichment:
-        fallback_columns = set(
-            await _ptg2_table_columns(session, f"{PTG2_SCHEMA}.npi_address")
-        )
-
-        def _fallback_column(column: str, sql_type: str = "varchar") -> str:
-            return f"na.{column}" if column in fallback_columns else f"NULL::{sql_type} AS {column}"
-
-        enrich_address_fallback_cte = f"""
-            , fallback_addresses AS MATERIALIZED (
-                SELECT DISTINCT ON (na.npi)
-                       na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
-                       na.postal_code, na.country_code,
-                       {_fallback_column('telephone_number')},
-                       {_fallback_column('fax_number')},
-                       {_fallback_column('phone_number')},
-                       {_fallback_column('phone_extension')},
-                       {_fallback_column('fax_number_digits')},
-                       {_fallback_column('fax_extension')},
-                       na.lat, na.long
-                  FROM {PTG2_SCHEMA}.npi_address na
-                  JOIN source_npis source_filter ON source_filter.npi = na.npi
-                 WHERE NULLIF(BTRIM(na.first_line), '') IS NOT NULL
-                 ORDER BY na.npi,
-                          CASE na.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1
-                                       WHEN 'secondary' THEN 2 ELSE 3 END,
-                          na.checksum
-            )"""
-        enrich_address_fallback_join = """
-            LEFT JOIN fallback_addresses na
-              ON na.npi = source_npis.npi
-             AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
-
-        def _eff_enrich(column: str) -> str:
-            cast_suffix = "::numeric" if column in {"lat", "long"} else ""
-            return (
-                "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
-                f"AND na.first_line IS NOT NULL THEN na.{column}{cast_suffix} ELSE addr.{column}{cast_suffix} END"
-            )
-    else:
-        enrich_address_fallback_cte = ""
-        enrich_address_fallback_join = ""
-
-        def _eff_enrich(column: str) -> str:
-            return f"addr.{column}"
-    enrich_stmt = (
-        text(
-            f"""
-            WITH source_npis AS MATERIALIZED (
-                SELECT UNNEST(CAST(:npis AS bigint[])) AS npi
-            )
-            {enrich_address_fallback_cte}
-            SELECT
-                source_npis.npi,
-                {address_location_hash_sql} AS location_hash,
-                {_eff_enrich('state_name')} AS state,
-                {_eff_enrich('city_name')} AS city,
-                LEFT(COALESCE({_eff_enrich('postal_code')}, ''), 5) AS zip5,
-                '{address_location_source}' AS location_source,
-                '{address_location_source}' AS location_confidence_code,
-                jsonb_build_object(
-                    'npi', source_npis.npi,
-                    'type', addr.type,
-                    'checksum', addr.checksum,
-                    'first_line', {_eff_enrich('first_line')},
-                    'second_line', {_eff_enrich('second_line')},
-                    'city_name', {_eff_enrich('city_name')},
-                    'state_name', {_eff_enrich('state_name')},
-                    'city', {_eff_enrich('city_name')},
-                    'state', {_eff_enrich('state_name')},
-                    'postal_code', {_eff_enrich('postal_code')},
-                    'country_code', {_eff_enrich('country_code')},
-                    'telephone_number', {_eff_enrich('telephone_number')},
-                    'fax_number', {_eff_enrich('fax_number')},
-                    'phone_number', {_eff_enrich('phone_number')},
-                    'phone_extension', {_eff_enrich('phone_extension')},
-                    'fax_number_digits', {_eff_enrich('fax_number_digits')},
-                    'fax_extension', {_eff_enrich('fax_extension')},
-                    'address_key', addr.address_key::text,
-                    'address_site_key', addr.premise_key::text,
-                    'lat', {_eff_enrich('lat')},
-                    'long', {_eff_enrich('long')}
-                )::text AS address_payload,
-                {_eff_enrich('telephone_number')} AS telephone_number,
-                {_eff_enrich('fax_number')} AS fax_number,
-                {_eff_enrich('phone_number')} AS phone_number,
-                {_eff_enrich('phone_extension')} AS phone_extension,
-                {_eff_enrich('fax_number_digits')} AS fax_number_digits,
-                {_eff_enrich('fax_extension')} AS fax_extension,
-                COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
-                COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
-                COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
-                COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
-                tax.primary_specialty,
-                tax.primary_specialization,
-                n.provider_sex_code,
-                {_ptg2_provider_name_sql("n")} AS provider_name
-            FROM source_npis
-            LEFT JOIN {npi_data_table} n ON n.npi = source_npis.npi
-            LEFT JOIN LATERAL (
-                SELECT addr.*
-                  FROM {npi_address_table} addr
-                 WHERE addr.npi = source_npis.npi
-                 ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
-                 LIMIT 1
-            ) addr ON TRUE
-            {enrich_address_fallback_join}
-            {_provider_taxonomy_summary_lateral_sql("source_npis.npi")}
-            ORDER BY provider_name, source_npis.npi
-            """
-        )
+    enrich_stmt = await _provider_enrichment_statement(
+        session,
+        npi_data_table,
+        npi_address_table,
     )
     # PostgreSQL can grossly overestimate the unified-address lateral fanout
     # and spend hundreds of milliseconds compiling JIT code for this tiny,
@@ -7728,6 +8251,52 @@ def _ptg2_address_verification_sort_value(item: dict[str, Any]) -> int:
     return 2
 
 
+def _ptg2_cost_sort_key(
+    provider_item: dict[str, Any],
+    *,
+    is_descending: bool,
+) -> tuple[Any, ...]:
+    """Order one provider by price with deterministic tie breakers."""
+
+    price = _ptg2_provider_price_sort_value(provider_item)
+    ordered_price = -price if is_descending and price.is_finite() else price
+    return (
+        ordered_price,
+        int(
+            provider_item["_ptg_price_key"]
+            if provider_item.get("_ptg_price_key") is not None
+            else 2**32
+        ),
+        _ptg2_provider_distance_sort_value(provider_item),
+        str(provider_item.get("provider_name") or ""),
+        int(provider_item.get("npi") or 2**63 - 1),
+    )
+
+
+def _ptg2_distance_sort_key(
+    provider_item: dict[str, Any],
+    *,
+    is_descending: bool,
+) -> tuple[Any, ...]:
+    """Order one provider by distance with deterministic tie breakers."""
+
+    distance = _ptg2_provider_distance_sort_value(provider_item)
+    ordered_distance = (
+        -distance if is_descending and math.isfinite(distance) else distance
+    )
+    return (
+        ordered_distance,
+        int(provider_item.get("npi") or 2**63 - 1),
+        _ptg2_provider_price_sort_value(provider_item),
+        str(provider_item.get("provider_name") or ""),
+        int(
+            provider_item["_ptg_price_key"]
+            if provider_item.get("_ptg_price_key") is not None
+            else 2**32
+        ),
+    )
+
+
 def _sort_ptg2_manifest_provider_items(
     provider_items: list[dict[str, Any]],
     args: dict[str, Any],
@@ -7751,45 +8320,17 @@ def _sort_ptg2_manifest_provider_items(
     if order_by in _PTG2_COST_ORDER_FIELDS:
         return sorted(
             provider_items,
-            key=lambda provider_item: (
-                (
-                    -_ptg2_provider_price_sort_value(provider_item)
-                    if is_descending
-                    and _ptg2_provider_price_sort_value(
-                        provider_item
-                    ).is_finite()
-                    else _ptg2_provider_price_sort_value(provider_item)
-                ),
-                int(
-                    provider_item["_ptg_price_key"]
-                    if provider_item.get("_ptg_price_key") is not None
-                    else 2**32
-                ),
-                _ptg2_provider_distance_sort_value(provider_item),
-                str(provider_item.get("provider_name") or ""),
-                int(provider_item.get("npi") or 2**63 - 1),
+            key=lambda provider_item: _ptg2_cost_sort_key(
+                provider_item,
+                is_descending=is_descending,
             ),
         )
     if order_by in distance_order_fields:
         return sorted(
             provider_items,
-            key=lambda provider_item: (
-                (
-                    -_ptg2_provider_distance_sort_value(provider_item)
-                    if is_descending
-                    and math.isfinite(
-                        _ptg2_provider_distance_sort_value(provider_item)
-                    )
-                    else _ptg2_provider_distance_sort_value(provider_item)
-                ),
-                int(provider_item.get("npi") or 2**63 - 1),
-                _ptg2_provider_price_sort_value(provider_item),
-                str(provider_item.get("provider_name") or ""),
-                int(
-                    provider_item["_ptg_price_key"]
-                    if provider_item.get("_ptg_price_key") is not None
-                    else 2**32
-                ),
+            key=lambda provider_item: _ptg2_distance_sort_key(
+                provider_item,
+                is_descending=is_descending,
             ),
         )
     return sorted(
@@ -7804,6 +8345,79 @@ def _sort_ptg2_manifest_provider_items(
     )
 
 
+def _manifest_provider_source_fields(
+    serving_data: Mapping[str, Any],
+    args: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Shape source identity fields for one provider procedure item."""
+
+    source_artifact_key = serving_data.get("source_artifact_key")
+    if source_artifact_key is None:
+        source_artifact_key = serving_data.get("source_key")
+    return {
+        "source_key": serving_data.get("logical_source_key")
+        or args.get("source_key"),
+        "source_artifact_key": source_artifact_key,
+        "source_type": serving_data.get("source_type"),
+        "identity_kind": serving_data.get("identity_kind"),
+        "identity_sha256": serving_data.get("identity_sha256"),
+        "raw_container_sha256": serving_data.get("raw_container_sha256"),
+        "logical_json_sha256": serving_data.get("logical_json_sha256"),
+        "logical_hash_deferred": serving_data.get("logical_hash_deferred"),
+        "source_trace_set_hash": serving_data.get("source_trace_set_hash"),
+        "source_trace": serving_data.get("source_trace"),
+    }
+
+
+def _manifest_provider_procedure_fields(
+    serving_data: Mapping[str, Any],
+    procedure_detail: Mapping[str, Any],
+    *,
+    npi: int,
+    is_exact_source_mode: bool,
+) -> dict[str, Any]:
+    """Shape procedure and provider-set identity fields."""
+
+    reported_code = serving_data.get("reported_code")
+    source_name = serving_data.get("source_procedure_name")
+    source_description = serving_data.get("source_procedure_description")
+    provider_set_hash = _ptg2_manifest_id(
+        serving_data.get("provider_set_global_id_128")
+    )
+    return {
+        "npi": npi,
+        "plan_id": serving_data.get("plan_id"),
+        "plan_market_type": serving_data.get("plan_market_type"),
+        "provider_set_hash": provider_set_hash,
+        "provider_count": serving_data.get("provider_count") or 0,
+        "provider_set_count": 1 if provider_set_hash else 0,
+        "procedure_code": reported_code,
+        "procedure_name": (
+            source_name
+            if is_exact_source_mode
+            else source_name or procedure_detail.get("procedure_name")
+        ),
+        "procedure_description": (
+            source_description
+            if is_exact_source_mode
+            else source_description
+            or procedure_detail.get("procedure_description")
+        ),
+        "catalog_procedure_name": procedure_detail.get("procedure_name"),
+        "catalog_procedure_description": procedure_detail.get(
+            "procedure_description"
+        ),
+        "billing_code": reported_code,
+        "billing_code_type": serving_data.get("reported_code_system"),
+        "price_set_hash": _ptg2_manifest_id(
+            serving_data.get("price_set_global_id_128")
+        ),
+        "rate_pack_hash": _ptg2_manifest_id(
+            serving_data.get("serving_content_hash_128")
+        ),
+    }
+
+
 def _ptg2_manifest_provider_procedure_item(
     *,
     npi: int,
@@ -7816,18 +8430,6 @@ def _ptg2_manifest_provider_procedure_item(
     """Shape one provider and negotiated-price match into an API result item."""
     reported_code = serving_data.get("reported_code")
     reported_system = serving_data.get("reported_code_system")
-    provider_set_hash = _ptg2_manifest_id(
-        serving_data.get("provider_set_global_id_128")
-    )
-    price_set_hash = _ptg2_manifest_id(
-        serving_data.get("price_set_global_id_128")
-    )
-    rate_pack_hash = _ptg2_manifest_id(
-        serving_data.get("serving_content_hash_128")
-    )
-    source_artifact_key = serving_data.get("source_artifact_key")
-    if source_artifact_key is None:
-        source_artifact_key = serving_data.get("source_key")
     is_exact_source_mode = (
         normalize_ptg2_mode(args.get("mode")) == PTG2_MODE_EXACT_SOURCE
     )
@@ -7850,42 +8452,14 @@ def _ptg2_manifest_provider_procedure_item(
     provider_item_by_field = dict(provider_context or {})
     provider_item_by_field.update(
         {
-            "npi": npi,
-            "plan_id": serving_data.get("plan_id"),
-            "plan_market_type": serving_data.get("plan_market_type"),
-            "provider_set_hash": provider_set_hash,
-            "provider_count": serving_data.get("provider_count") or 0,
-            "provider_set_count": 1 if provider_set_hash else 0,
-            "procedure_code": reported_code,
+            **_manifest_provider_procedure_fields(
+                serving_data,
+                procedure_detail,
+                npi=npi,
+                is_exact_source_mode=is_exact_source_mode,
+            ),
             **exact_source_fields,
-            "procedure_name": (
-                source_procedure_name
-                if is_exact_source_mode
-                else source_procedure_name or procedure_detail.get("procedure_name")
-            ),
-            "procedure_description": (
-                source_procedure_description
-                if is_exact_source_mode
-                else source_procedure_description
-                or procedure_detail.get("procedure_description")
-            ),
-            "catalog_procedure_name": procedure_detail.get("procedure_name"),
-            "catalog_procedure_description": procedure_detail.get("procedure_description"),
-            "billing_code": reported_code,
-            "billing_code_type": reported_system,
-            "price_set_hash": price_set_hash,
-            "rate_pack_hash": rate_pack_hash,
-            "source_key": serving_data.get("logical_source_key")
-            or args.get("source_key"),
-            "source_artifact_key": source_artifact_key,
-            "source_type": serving_data.get("source_type"),
-            "identity_kind": serving_data.get("identity_kind"),
-            "identity_sha256": serving_data.get("identity_sha256"),
-            "raw_container_sha256": serving_data.get("raw_container_sha256"),
-            "logical_json_sha256": serving_data.get("logical_json_sha256"),
-            "logical_hash_deferred": serving_data.get("logical_hash_deferred"),
-            "source_trace_set_hash": serving_data.get("source_trace_set_hash"),
-            "source_trace": serving_data.get("source_trace"),
+            **_manifest_provider_source_fields(serving_data, args),
         }
     )
     return _compact_item_from_row(provider_item_by_field, args)
@@ -8023,6 +8597,101 @@ def _ensure_provider_rate_price_fields(item: dict[str, Any]) -> None:
     item.update(_price_response_fields(prices))
 
 
+def _initialize_provider_rate_group(
+    provider_rate: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, set[str]]]:
+    """Own mutable payload lists for the first row in one merge group."""
+
+    merged_rate_by_field = dict(provider_rate)
+    _ensure_provider_rate_price_fields(merged_rate_by_field)
+    owned_prices = list(merged_rate_by_field.get("prices") or [])
+    merged_rate_by_field["prices"] = owned_prices
+    merged_rate_by_field["tic_prices"] = owned_prices
+    list_fields = (
+        "price_set_hashes",
+        "rate_pack_hashes",
+        "provider_set_hashes",
+        "source_trace",
+    )
+    for list_field in list_fields:
+        merged_rate_by_field[list_field] = list(
+            merged_rate_by_field.get(list_field) or []
+        )
+    seen_payload_keys_by_field = {
+        list_field: {
+            _payload_merge_key(payload_value)
+            for payload_value in merged_rate_by_field[list_field]
+        }
+        for list_field in list_fields
+    }
+    for hash_field in (
+        "price_set_hash",
+        "rate_pack_hash",
+        "provider_set_hash",
+    ):
+        hash_list_field = f"{hash_field}es"
+        _append_unique_payload_value(
+            merged_rate_by_field[hash_list_field],
+            provider_rate.get(hash_field),
+            seen_payload_keys_by_field[hash_list_field],
+        )
+    return merged_rate_by_field, seen_payload_keys_by_field
+
+
+def _merge_provider_rate_group(
+    merged_rate: dict[str, Any],
+    provider_rate: dict[str, Any],
+    seen_payload_keys_by_field: dict[str, set[str]],
+) -> None:
+    """Merge one equivalent rate row into an owned group payload."""
+
+    incoming_prices = provider_rate.get("prices")
+    normalized_prices = (
+        list(incoming_prices)
+        if isinstance(incoming_prices, list)
+        and "price_summary" in provider_rate
+        else _normalize_price_payload(incoming_prices)
+    )
+    merged_rate["prices"].extend(normalized_prices)
+    merged_rate["tic_prices"] = merged_rate["prices"]
+    existing_price_key = merged_rate.get("_ptg_price_key")
+    incoming_price_key = provider_rate.get("_ptg_price_key")
+    if incoming_price_key is not None and (
+        existing_price_key is None
+        or int(incoming_price_key) < int(existing_price_key)
+    ):
+        merged_rate["_ptg_price_key"] = int(incoming_price_key)
+    for hash_field in (
+        "price_set_hash",
+        "rate_pack_hash",
+        "provider_set_hash",
+    ):
+        hash_list_field = f"{hash_field}es"
+        _append_unique_payload_value(
+            merged_rate[hash_list_field],
+            provider_rate.get(hash_field),
+            seen_payload_keys_by_field[hash_list_field],
+        )
+    for list_field in (
+        "price_set_hashes",
+        "rate_pack_hashes",
+        "provider_set_hashes",
+        "source_trace",
+    ):
+        _merge_unique_payload_list(
+            merged_rate,
+            list_field,
+            provider_rate.get(list_field),
+            seen_payload_keys=seen_payload_keys_by_field[list_field],
+        )
+    merged_rate["price_set_count"] = len(
+        merged_rate.get("price_set_hashes") or []
+    )
+    merged_rate["rate_pack_count"] = len(
+        merged_rate.get("rate_pack_hashes") or []
+    )
+
+
 def _merge_ptg2_provider_rate_items(
     provider_rate_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -8041,99 +8710,20 @@ def _merge_ptg2_provider_rate_items(
             continue
         merged_provider_rate_by_field = provider_rate_by_group_key.get(group_key)
         if merged_provider_rate_by_field is None:
-            merged_provider_rate_by_field = dict(provider_rate)
-            _ensure_provider_rate_price_fields(merged_provider_rate_by_field)
-            owned_prices = list(merged_provider_rate_by_field.get("prices") or [])
-            merged_provider_rate_by_field["prices"] = owned_prices
-            merged_provider_rate_by_field["tic_prices"] = owned_prices
-            for list_field in (
-                "price_set_hashes",
-                "rate_pack_hashes",
-                "provider_set_hashes",
-                "source_trace",
-            ):
-                merged_provider_rate_by_field[list_field] = list(
-                    merged_provider_rate_by_field.get(list_field) or []
-                )
-            seen_payload_keys_by_field = {
-                list_field: {
-                    _payload_merge_key(payload_value)
-                    for payload_value in (
-                        merged_provider_rate_by_field[list_field]
-                    )
-                }
-                for list_field in (
-                    "price_set_hashes",
-                    "rate_pack_hashes",
-                    "provider_set_hashes",
-                    "source_trace",
-                )
-            }
-            for hash_field in (
-                "price_set_hash",
-                "rate_pack_hash",
-                "provider_set_hash",
-            ):
-                hash_list_field = f"{hash_field}es"
-                _append_unique_payload_value(
-                    merged_provider_rate_by_field[hash_list_field],
-                    provider_rate.get(hash_field),
-                    seen_payload_keys_by_field[hash_list_field],
-                )
+            (
+                merged_provider_rate_by_field,
+                seen_payload_keys_by_field,
+            ) = _initialize_provider_rate_group(provider_rate)
             provider_rate_by_group_key[group_key] = merged_provider_rate_by_field
-            seen_payload_keys_by_group[group_key] = (
-                seen_payload_keys_by_field
-            )
+            seen_payload_keys_by_group[group_key] = seen_payload_keys_by_field
             merged_provider_rates.append(merged_provider_rate_by_field)
             continue
 
-        incoming_prices = provider_rate.get("prices")
-        normalized_incoming_prices = (
-            list(incoming_prices)
-            if isinstance(incoming_prices, list) and "price_summary" in provider_rate
-            else _normalize_price_payload(incoming_prices)
-        )
-        combined_prices = merged_provider_rate_by_field["prices"]
-        combined_prices.extend(normalized_incoming_prices)
-        merged_provider_rate_by_field["tic_prices"] = combined_prices
         price_dirty_group_keys.add(group_key)
-        existing_price_key = merged_provider_rate_by_field.get("_ptg_price_key")
-        item_price_key = provider_rate.get("_ptg_price_key")
-        if item_price_key is not None and (
-            existing_price_key is None or int(item_price_key) < int(existing_price_key)
-        ):
-            merged_provider_rate_by_field["_ptg_price_key"] = int(item_price_key)
-        seen_payload_keys_by_field = seen_payload_keys_by_group[group_key]
-        for hash_field in (
-            "price_set_hash",
-            "rate_pack_hash",
-            "provider_set_hash",
-        ):
-            hash_list_field = f"{hash_field}es"
-            _append_unique_payload_value(
-                merged_provider_rate_by_field[hash_list_field],
-                provider_rate.get(hash_field),
-                seen_payload_keys_by_field[hash_list_field],
-            )
-        for hash_list_field in (
-            "price_set_hashes",
-            "rate_pack_hashes",
-            "provider_set_hashes",
-            "source_trace",
-        ):
-            _merge_unique_payload_list(
-                merged_provider_rate_by_field,
-                hash_list_field,
-                provider_rate.get(hash_list_field),
-                seen_payload_keys=seen_payload_keys_by_field[
-                    hash_list_field
-                ],
-            )
-        merged_provider_rate_by_field["price_set_count"] = len(
-            merged_provider_rate_by_field.get("price_set_hashes") or []
-        )
-        merged_provider_rate_by_field["rate_pack_count"] = len(
-            merged_provider_rate_by_field.get("rate_pack_hashes") or []
+        _merge_provider_rate_group(
+            merged_provider_rate_by_field,
+            provider_rate,
+            seen_payload_keys_by_group[group_key],
         )
     for group_key in price_dirty_group_keys:
         grouped_provider_rate = provider_rate_by_group_key[group_key]
@@ -8757,33 +9347,14 @@ class _GraphLocationCandidates:
     taxonomy_filtered: bool = False
 
 
-async def _shared_provider_set_keys_by_npi(
+async def _legacy_set_keys_by_npi(
     session,
     serving_tables: PTG2ServingTables,
-    candidate_npis: Iterable[int],
-    rate_provider_set_keys: Iterable[int],
+    normalized_npis: tuple[int, ...],
+    allowed_provider_set_keys: frozenset[int],
 ) -> dict[int, set[int]]:
-    """Intersect candidate NPIs with a rate scope using dense graph keys."""
+    """Intersect legacy NPI groups with one exact provider-set scope."""
 
-    normalized_npis = tuple(sorted({int(npi) for npi in candidate_npis}))
-    allowed_provider_set_keys = frozenset(
-        int(provider_set_key) for provider_set_key in rate_provider_set_keys
-    )
-    if not normalized_npis or not allowed_provider_set_keys:
-        return {}
-    if serving_tables.uses_v4_graph:
-        return {
-            npi: set(provider_set_keys)
-            for npi, provider_set_keys in (
-                await _v4_sets_by_npi(
-                    session,
-                    serving_tables,
-                    normalized_npis,
-                    allowed_provider_set_keys=allowed_provider_set_keys,
-                )
-            ).items()
-            if provider_set_keys
-        }
     shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
     group_keys_by_npi = await lookup_shared_graph_members_from_db(
         session,
@@ -8814,19 +9385,55 @@ async def _shared_provider_set_keys_by_npi(
         raise PTG2ManifestArtifactError(
             "PTG2 shared graph is missing a group-to-provider-set owner"
         )
-    matches_by_npi: dict[int, set[int]] = {}
-    for npi in normalized_npis:
-        matches = {
-            int(provider_set_key)
-            for group_key in group_keys_by_npi.get(npi, ())
-            for provider_set_key in provider_set_keys_by_group.get(
-                int(group_key), ()
-            )
-            if int(provider_set_key) in allowed_provider_set_keys
+    return {
+        npi: matches
+        for npi in normalized_npis
+        if (
+            matches := {
+                int(provider_set_key)
+                for group_key in group_keys_by_npi.get(npi, ())
+                for provider_set_key in provider_set_keys_by_group.get(
+                    int(group_key), ()
+                )
+                if int(provider_set_key) in allowed_provider_set_keys
+            }
+        )
+    }
+
+
+async def _shared_provider_set_keys_by_npi(
+    session,
+    serving_tables: PTG2ServingTables,
+    candidate_npis: Iterable[int],
+    rate_provider_set_keys: Iterable[int],
+) -> dict[int, set[int]]:
+    """Intersect candidate NPIs with a rate scope using dense graph keys."""
+
+    normalized_npis = tuple(sorted({int(npi) for npi in candidate_npis}))
+    allowed_provider_set_keys = frozenset(
+        int(provider_set_key) for provider_set_key in rate_provider_set_keys
+    )
+    if not normalized_npis or not allowed_provider_set_keys:
+        return {}
+    if serving_tables.uses_v4_graph:
+        return {
+            npi: set(provider_set_keys)
+            for npi, provider_set_keys in (
+                await _v4_sets_by_npi(
+                    session,
+                    serving_tables,
+                    normalized_npis,
+                    allowed_provider_set_keys=allowed_provider_set_keys,
+                )
+            ).items()
+            if provider_set_keys
         }
-        if matches:
-            matches_by_npi[npi] = matches
-    return matches_by_npi
+    return await _legacy_set_keys_by_npi(
+        session,
+        serving_tables,
+        normalized_npis,
+        allowed_provider_set_keys,
+    )
 
 
 async def _append_rate_matched_locations(
@@ -9245,48 +9852,53 @@ class _ExplicitNpiGraphScope:
     provider_set_keys: tuple[int, ...]
 
 
-async def _version_three_explicit_npi_graph_scope(
+async def _v4_explicit_npi_scope(
     session,
     serving_tables: PTG2ServingTables,
     args: Mapping[str, Any],
-) -> _ExplicitNpiGraphScope | None:
-    """Resolve one NPI to dense provider-set keys before reading a code block."""
+    requested_npi: int,
+) -> _ExplicitNpiGraphScope:
+    """Resolve one exact NPI against an optional plan/code provider-set scope."""
 
-    _require_strict_shared_v3(serving_tables)
-    requested_npi = _normalize_npi(args.get("npi"))
-    if requested_npi is None:
-        return None
-    if serving_tables.uses_v4_graph:
-        allowed_provider_set_keys: frozenset[int] | None = None
-        requested_plan_code = _ptg2_manifest_plan_code_values(dict(args))
-        if requested_plan_code is not None:
-            requested_plan, requested_system, requested_code = requested_plan_code
-            allowed_provider_set_keys = frozenset(
-                await _shared_rate_provider_set_keys(
-                    session,
-                    serving_tables,
-                    plan_id=requested_plan,
-                    plan_market_type=str(
-                        args.get("plan_market_type")
-                        or args.get("market_type")
-                        or ""
-                    ),
-                    reported_code=requested_code,
-                    code_system=requested_system,
-                )
+    allowed_provider_set_keys: frozenset[int] | None = None
+    requested_plan_code = _ptg2_manifest_plan_code_values(dict(args))
+    if requested_plan_code is not None:
+        requested_plan, requested_system, requested_code = requested_plan_code
+        allowed_provider_set_keys = frozenset(
+            await _shared_rate_provider_set_keys(
+                session,
+                serving_tables,
+                plan_id=requested_plan,
+                plan_market_type=str(
+                    args.get("plan_market_type")
+                    or args.get("market_type")
+                    or ""
+                ),
+                reported_code=requested_code,
+                code_system=requested_system,
             )
-            if not allowed_provider_set_keys:
-                return _ExplicitNpiGraphScope(requested_npi, ())
-        provider_set_keys_by_npi = await _v4_sets_by_npi(
-            session,
-            serving_tables,
-            (requested_npi,),
-            allowed_provider_set_keys=allowed_provider_set_keys,
         )
-        return _ExplicitNpiGraphScope(
-            requested_npi,
-            provider_set_keys_by_npi.get(requested_npi, ()),
-        )
+        if not allowed_provider_set_keys:
+            return _ExplicitNpiGraphScope(requested_npi, ())
+    provider_set_keys_by_npi = await _v4_sets_by_npi(
+        session,
+        serving_tables,
+        (requested_npi,),
+        allowed_provider_set_keys=allowed_provider_set_keys,
+    )
+    return _ExplicitNpiGraphScope(
+        requested_npi,
+        provider_set_keys_by_npi.get(requested_npi, ()),
+    )
+
+
+async def _legacy_explicit_npi_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    requested_npi: int,
+) -> _ExplicitNpiGraphScope:
+    """Resolve one exact NPI through the legacy two-hop shared graph."""
+
     shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
     group_keys_by_npi = await lookup_shared_graph_members_from_db(
         session,
@@ -9318,9 +9930,31 @@ async def _version_three_explicit_npi_graph_scope(
             }
         )
     )
-    return _ExplicitNpiGraphScope(
+    return _ExplicitNpiGraphScope(requested_npi, provider_set_keys)
+
+
+async def _version_three_explicit_npi_graph_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+) -> _ExplicitNpiGraphScope | None:
+    """Resolve one NPI to dense provider-set keys before reading a code block."""
+
+    _require_strict_shared_v3(serving_tables)
+    requested_npi = _normalize_npi(args.get("npi"))
+    if requested_npi is None:
+        return None
+    if serving_tables.uses_v4_graph:
+        return await _v4_explicit_npi_scope(
+            session,
+            serving_tables,
+            args,
+            requested_npi,
+        )
+    return await _legacy_explicit_npi_scope(
+        session,
+        serving_tables,
         requested_npi,
-        provider_set_keys,
     )
 
 
@@ -9389,16 +10023,16 @@ async def _graph_candidates_for_request(
     session,
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
-    *,
-    requested_code: str,
-    requested_system: str | None,
-    plan_id: str,
-    candidate_limit: int,
-    provider_set_keys: Iterable[int] | None = None,
-    explicit_npi_scope: _ExplicitNpiGraphScope | None = None,
+    **request_options: Any,
 ) -> _GraphLocationCandidates | None:
     """Resolve a code scope, preferring exact-NPI traversal for v3 snapshots."""
 
+    requested_code = request_options["requested_code"]
+    requested_system = request_options.get("requested_system")
+    plan_id = request_options["plan_id"]
+    candidate_limit = request_options["candidate_limit"]
+    provider_set_keys = request_options.get("provider_set_keys")
+    explicit_npi_scope = request_options.get("explicit_npi_scope")
     if explicit_npi_scope is None:
         explicit_npi_scope = await _version_three_explicit_npi_graph_scope(
             session,
@@ -9448,15 +10082,15 @@ async def _graph_location_matches(
     session,
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
-    *,
-    candidate_limit: int,
-    plan_id: str,
-    snapshot_id: str | None = None,
-    source_key: str | None = None,
-    provider_set_keys: Iterable[int] | None = None,
-    explicit_npi_scope: _ExplicitNpiGraphScope | None = None,
+    **request_options: Any,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     """Resolve geo-filtered provider sets through normalized membership artifacts."""
+    candidate_limit = request_options["candidate_limit"]
+    plan_id = request_options["plan_id"]
+    snapshot_id = request_options.get("snapshot_id")
+    source_key = request_options.get("source_key")
+    provider_set_keys = request_options.get("provider_set_keys")
+    explicit_npi_scope = request_options.get("explicit_npi_scope")
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
     requested_code = (
         canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
@@ -9495,17 +10129,17 @@ async def _ptg2_manifest_location_provider_matches(
     session,
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
-    *,
-    candidate_limit: int | None = None,
-    plan_id: str | None = None,
-    snapshot_id: str | None = None,
-    source_key: str | None = None,
-    provider_set_keys: Iterable[int] | None = None,
-    explicit_npi_scope: _ExplicitNpiGraphScope | None = None,
-    require_exhaustive: bool = False,
+    **request_options: Any,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     """Resolve location-filtered provider sets through the strict shared graph."""
 
+    candidate_limit = request_options.get("candidate_limit")
+    plan_id = request_options.get("plan_id")
+    snapshot_id = request_options.get("snapshot_id")
+    source_key = request_options.get("source_key")
+    provider_set_keys = request_options.get("provider_set_keys")
+    explicit_npi_scope = request_options.get("explicit_npi_scope")
+    require_exhaustive = bool(request_options.get("require_exhaustive", False))
     _require_strict_shared_v3(serving_tables)
     configured_match_limit = _ptg2_manifest_location_match_limit()
     graph_candidate_limit = configured_match_limit
@@ -9558,53 +10192,33 @@ async def _provider_rows_for_sets(
     if not provider_set_ids:
         return {}
     args = args or {}
-    is_provider_filter_requested = _is_ptg2_provider_filter_requested(args)
-    candidate_limit_per_set = (
-        max(int(limit_per_set), 1) if limit_per_set is not None else None
-    )
-    if is_provider_filter_requested:
-        candidate_limit_per_set = (
-            max(candidate_limit_per_set * 200, 1000)
-            if candidate_limit_per_set is not None
-            else None
-        )
-
-    npis_by_set = await _provider_npis_for_sets(
+    npis_by_set = await _provider_npis_by_set_for_request(
         session,
         serving_tables,
         provider_set_ids,
-        limit_per_set=candidate_limit_per_set,
+        args,
+        limit_per_set,
     )
-    if is_provider_filter_requested:
-        filtered_npis_by_set: dict[str, tuple[int, ...]] = {}
-        for provider_set_id in provider_set_ids:
-            provider_npis = npis_by_set.get(provider_set_id, ())
-            filtered_npis_by_set[provider_set_id] = await _filter_npis_by_taxonomy(
-                session,
-                args,
-                provider_npis,
-                limit=(
-                    max(int(limit_per_set), 1)
-                    if limit_per_set is not None
-                    else max(len(provider_npis), 1)
-                ),
-            )
-        npis_by_set = filtered_npis_by_set
-
-    def selected_npis(provider_set_id: str) -> tuple[int, ...]:
-        """Return provider-set NPIs capped by the optional per-set limit."""
-        provider_npis = npis_by_set.get(provider_set_id, ())
-        return (
-            provider_npis[: max(int(limit_per_set), 1)]
-            if limit_per_set is not None
-            else provider_npis
+    if _is_ptg2_provider_filter_requested(args):
+        npis_by_set = await _filtered_provider_npis_by_set(
+            session,
+            args,
+            provider_set_ids,
+            npis_by_set,
+            limit_per_set,
         )
-
+    selected_npis_by_set = {
+        provider_set_id: _limited_provider_npis(
+            npis_by_set.get(provider_set_id, ()),
+            limit_per_set,
+        )
+        for provider_set_id in provider_set_ids
+    }
     all_npis = tuple(
         dict.fromkeys(
             npi
-            for provider_set_id in provider_set_ids
-            for npi in selected_npis(provider_set_id)
+            for provider_npis in selected_npis_by_set.values()
+            for npi in provider_npis
         )
     )
     provider_rows = await _enriched_provider_rows_for_npis(
@@ -9622,12 +10236,84 @@ async def _provider_rows_for_sets(
         for provider_row in provider_rows
         if provider_row.get("npi") is not None
     }
+    return _provider_rows_by_set(selected_npis_by_set, providers_by_npi)
+
+
+async def _provider_npis_by_set_for_request(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_ids: tuple[str, ...],
+    args: Mapping[str, Any],
+    limit_per_set: int | None,
+) -> dict[str, tuple[int, ...]]:
+    """Read provider memberships with headroom for exact provider filters."""
+
+    candidate_limit = (
+        max(int(limit_per_set), 1) if limit_per_set is not None else None
+    )
+    if _is_ptg2_provider_filter_requested(dict(args)):
+        candidate_limit = (
+            max(candidate_limit * 200, 1000)
+            if candidate_limit is not None
+            else None
+        )
+    return await _provider_npis_for_sets(
+        session,
+        serving_tables,
+        provider_set_ids,
+        limit_per_set=candidate_limit,
+    )
+
+
+def _limited_provider_npis(
+    provider_npis: tuple[int, ...],
+    limit_per_set: int | None,
+) -> tuple[int, ...]:
+    """Apply the optional positive per-set response limit."""
+
+    if limit_per_set is None:
+        return provider_npis
+    return provider_npis[: max(int(limit_per_set), 1)]
+
+
+async def _filtered_provider_npis_by_set(
+    session,
+    args: dict[str, Any],
+    provider_set_ids: tuple[str, ...],
+    npis_by_set: Mapping[str, tuple[int, ...]],
+    limit_per_set: int | None,
+) -> dict[str, tuple[int, ...]]:
+    """Apply exact provider predicates independently to each provider set."""
+
+    filtered_npis_by_set: dict[str, tuple[int, ...]] = {}
+    for provider_set_id in provider_set_ids:
+        provider_npis = npis_by_set.get(provider_set_id, ())
+        filtered_npis_by_set[provider_set_id] = await _filter_npis_by_taxonomy(
+            session,
+            args,
+            provider_npis,
+            limit=(
+                max(int(limit_per_set), 1)
+                if limit_per_set is not None
+                else max(len(provider_npis), 1)
+            ),
+        )
+    return filtered_npis_by_set
+
+
+def _provider_rows_by_set(
+    selected_npis_by_set: Mapping[str, tuple[int, ...]],
+    providers_by_npi: Mapping[int, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Shape provider-set rows while retaining sparse fallback identities."""
+
     return {
         provider_set_id: [
-            providers_by_npi.get(npi) or {"npi": npi, "provider_name": "TiC provider"}
-            for npi in selected_npis(provider_set_id)
+            providers_by_npi.get(npi)
+            or {"npi": npi, "provider_name": "TiC provider"}
+            for npi in selected_npis
         ]
-        for provider_set_id in provider_set_ids
+        for provider_set_id, selected_npis in selected_npis_by_set.items()
     }
 
 
@@ -10329,99 +11015,87 @@ def _cache_provider_set_ids_for_npis(
             _PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE.popitem(last=False)
 
 
-async def _provider_set_ids_for_selected_npis(
+async def _scoped_v4_provider_set_ids(
     session,
     serving_tables: PTG2ServingTables,
     npis: tuple[int, ...],
-    *,
-    allowed_provider_set_keys: frozenset[int] | None = None,
+    allowed_provider_set_keys: frozenset[int],
 ) -> dict[int, tuple[str, ...]]:
-    """Resolve provider-set memberships for selected NPIs with sealed caching."""
+    """Resolve code-scoped V4 memberships without populating the global cache."""
 
-    if not npis:
-        return {}
-    normalized_allowed_keys = (
-        None
-        if allowed_provider_set_keys is None
-        else frozenset(
-            int(provider_set_key)
-            for provider_set_key in allowed_provider_set_keys
-        )
+    if not allowed_provider_set_keys:
+        return {npi: () for npi in npis}
+    scoped_keys_by_npi = await _v4_sets_by_npi(
+        session,
+        serving_tables,
+        npis,
+        allowed_provider_set_keys=allowed_provider_set_keys,
     )
-    if serving_tables.uses_v4_graph and normalized_allowed_keys is not None:
-        if not normalized_allowed_keys:
-            return {npi: () for npi in npis}
-        scoped_keys_by_npi = await _v4_sets_by_npi(
-            session,
-            serving_tables,
-            npis,
-            allowed_provider_set_keys=normalized_allowed_keys,
-        )
-        referenced_keys = {
-            int(provider_set_key)
-            for provider_set_keys in scoped_keys_by_npi.values()
-            for provider_set_key in provider_set_keys
-        }
-        provider_set_id_by_key = await _provider_set_ids_for_keys(
-            session,
-            serving_tables,
-            referenced_keys,
-        )
-        if set(provider_set_id_by_key) != referenced_keys:
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 graph references a missing provider-set dictionary key"
-            )
-        # Scoped membership is specific to this CPT/rate set. It must never
-        # satisfy the snapshot-wide reverse-membership cache.
-        return {
-            npi: tuple(
-                provider_set_id_by_key[provider_set_key]
-                for provider_set_key in scoped_keys_by_npi.get(npi, ())
-            )
-            for npi in npis
-        }
-    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
-    provider_set_ids_by_npi, uncached_npis = (
-        _cached_provider_set_ids_for_npis(
-            shared_snapshot_key,
-            npis,
-        )
+    referenced_keys = {
+        int(provider_set_key)
+        for provider_set_keys in scoped_keys_by_npi.values()
+        for provider_set_key in provider_set_keys
+    }
+    provider_set_id_by_key = await _provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        referenced_keys,
     )
-    if not uncached_npis:
-        return provider_set_ids_by_npi
-    if serving_tables.uses_v4_graph:
-        provider_set_keys_by_npi = await _v4_sets_by_npi(
-            session,
-            serving_tables,
-            uncached_npis,
+    if set(provider_set_id_by_key) != referenced_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 graph references a missing provider-set dictionary key"
         )
-        all_provider_set_keys = {
-            int(provider_set_key)
-            for provider_set_keys in provider_set_keys_by_npi.values()
-            for provider_set_key in provider_set_keys
-        }
-        provider_set_id_by_key = await _provider_set_ids_for_keys(
-            session,
-            serving_tables,
-            all_provider_set_keys,
+    return {
+        npi: tuple(
+            provider_set_id_by_key[provider_set_key]
+            for provider_set_key in scoped_keys_by_npi.get(npi, ())
         )
-        if set(provider_set_id_by_key) != all_provider_set_keys:
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 graph references a missing provider-set dictionary key"
-            )
-        resolved_provider_set_ids_by_npi = {
-            npi: tuple(
-                provider_set_id_by_key[provider_set_key]
-                for provider_set_key in provider_set_keys_by_npi.get(npi, ())
-            )
-            for npi in uncached_npis
-        }
-        provider_set_ids_by_npi.update(resolved_provider_set_ids_by_npi)
-        _cache_provider_set_ids_for_npis(
-            shared_snapshot_key,
-            resolved_provider_set_ids_by_npi,
+        for npi in npis
+    }
+
+
+async def _unscoped_v4_provider_set_ids(
+    session,
+    serving_tables: PTG2ServingTables,
+    uncached_npis: tuple[int, ...],
+) -> dict[int, tuple[str, ...]]:
+    """Resolve snapshot-wide V4 memberships for uncached NPIs."""
+
+    provider_set_keys_by_npi = await _v4_sets_by_npi(
+        session,
+        serving_tables,
+        uncached_npis,
+    )
+    all_provider_set_keys = {
+        int(provider_set_key)
+        for provider_set_keys in provider_set_keys_by_npi.values()
+        for provider_set_key in provider_set_keys
+    }
+    provider_set_id_by_key = await _provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        all_provider_set_keys,
+    )
+    if set(provider_set_id_by_key) != all_provider_set_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 graph references a missing provider-set dictionary key"
         )
-        return provider_set_ids_by_npi
+    return {
+        npi: tuple(
+            provider_set_id_by_key[provider_set_key]
+            for provider_set_key in provider_set_keys_by_npi.get(npi, ())
+        )
+        for npi in uncached_npis
+    }
+
+
+async def _legacy_provider_set_ids_for_npis(
+    session,
+    serving_tables: PTG2ServingTables,
+    uncached_npis: tuple[int, ...],
+) -> dict[int, tuple[str, ...]]:
+    """Resolve legacy snapshot-wide NPI memberships through stable IDs."""
+
     member_id_by_npi = {
         npi: _ptg2_npi_member_id(npi)
         for npi in uncached_npis
@@ -10444,7 +11118,7 @@ async def _provider_set_ids_for_selected_npis(
         serving_tables,
         group_ids,
     )
-    resolved_provider_set_ids_by_npi = {
+    return {
         npi: tuple(
             dict.fromkeys(
                 provider_set_id
@@ -10454,6 +11128,59 @@ async def _provider_set_ids_for_selected_npis(
         )
         for npi, member_id in member_id_by_npi.items()
     }
+
+
+async def _provider_set_ids_for_selected_npis(
+    session,
+    serving_tables: PTG2ServingTables,
+    npis: tuple[int, ...],
+    *,
+    allowed_provider_set_keys: frozenset[int] | None = None,
+) -> dict[int, tuple[str, ...]]:
+    """Resolve provider-set memberships for selected NPIs with sealed caching."""
+
+    if not npis:
+        return {}
+    normalized_allowed_keys = (
+        None
+        if allowed_provider_set_keys is None
+        else frozenset(
+            int(provider_set_key)
+            for provider_set_key in allowed_provider_set_keys
+        )
+    )
+    if serving_tables.uses_v4_graph and normalized_allowed_keys is not None:
+        return await _scoped_v4_provider_set_ids(
+            session,
+            serving_tables,
+            npis,
+            normalized_allowed_keys,
+        )
+    shared_snapshot_key = _required_shared_snapshot_key(serving_tables)
+    provider_set_ids_by_npi, uncached_npis = (
+        _cached_provider_set_ids_for_npis(
+            shared_snapshot_key,
+            npis,
+        )
+    )
+    if not uncached_npis:
+        return provider_set_ids_by_npi
+    if serving_tables.uses_v4_graph:
+        resolved_provider_set_ids_by_npi = (
+            await _unscoped_v4_provider_set_ids(
+                session,
+                serving_tables,
+                uncached_npis,
+            )
+        )
+    else:
+        resolved_provider_set_ids_by_npi = (
+            await _legacy_provider_set_ids_for_npis(
+                session,
+                serving_tables,
+                uncached_npis,
+            )
+        )
     provider_set_ids_by_npi.update(resolved_provider_set_ids_by_npi)
     _cache_provider_set_ids_for_npis(
         shared_snapshot_key,
@@ -11787,6 +12514,35 @@ class _V4PatternCompletionRequest:
     scan_budget: ForwardReadBudget
 
 
+@dataclass(frozen=True)
+class _ProviderExpansionRequest:
+    """Shared immutable inputs for one cost-ordered provider expansion."""
+
+    code_rows: list[Mapping[str, Any]]
+    args: Mapping[str, Any]
+    snapshot_id: str
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    target_count: int
+    descending: bool
+
+
+@dataclass(frozen=True)
+class _V4PatternTaxonomyRequest(_ProviderExpansionRequest):
+    """Inputs for an exact pattern-quotient taxonomy expansion."""
+
+    projection_rule: V4InferredTaxonomyProjectionRule
+    candidates: Any
+
+
+@dataclass(frozen=True)
+class _V4TaxonomyRequest(_ProviderExpansionRequest):
+    """Inputs for an exact inferred-taxonomy expansion."""
+
+    projection_manifest: Mapping[str, Any]
+    projection_rule: V4InferredTaxonomyProjectionRule
+
+
 async def _v4_pattern_completion_rate_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -11864,19 +12620,32 @@ async def _v4_pattern_completion_rows(
 async def _select_v4_pattern_taxonomy_expansion(
     session,
     serving_tables: PTG2ServingTables,
-    *,
-    code_rows: list[Mapping[str, Any]],
-    args: Mapping[str, Any],
-    snapshot_id: str,
-    source_trace_set_hash: str | None,
-    network_names: list[str],
-    target_count: int,
-    descending: bool,
-    projection_rule: V4InferredTaxonomyProjectionRule,
-    candidates: Any,
+    **request_options: Any,
 ) -> _ProviderExpansionSelection:
     """Serve one exact pattern quotient with bounded, target-first work."""
 
+    request = _V4PatternTaxonomyRequest(**request_options)
+    (
+        code_rows,
+        args,
+        snapshot_id,
+        source_trace_set_hash,
+        network_names,
+        target_count,
+        descending,
+        projection_rule,
+        candidates,
+    ) = (
+        request.code_rows,
+        request.args,
+        request.snapshot_id,
+        request.source_trace_set_hash,
+        request.network_names,
+        request.target_count,
+        request.descending,
+        request.projection_rule,
+        request.candidates,
+    )
     normalized_target_count = max(int(target_count), 1)
     _v4_provider_expansion_request_caps(
         serving_tables,
@@ -12157,19 +12926,32 @@ _select_v4_pattern_inferred_taxonomy_provider_expansion = (
 async def _select_v4_taxonomy_expansion(
     session,
     serving_tables: PTG2ServingTables,
-    *,
-    code_rows: list[Mapping[str, Any]],
-    args: Mapping[str, Any],
-    snapshot_id: str,
-    source_trace_set_hash: str | None,
-    network_names: list[str],
-    target_count: int,
-    descending: bool,
-    projection_manifest: Mapping[str, Any],
-    projection_rule: V4InferredTaxonomyProjectionRule,
+    **request_options: Any,
 ) -> _ProviderExpansionSelection:
     """Serve one inferred-only CPT page through exact scoped reverse edges."""
 
+    request = _V4TaxonomyRequest(**request_options)
+    (
+        code_rows,
+        args,
+        snapshot_id,
+        source_trace_set_hash,
+        network_names,
+        target_count,
+        descending,
+        projection_manifest,
+        projection_rule,
+    ) = (
+        request.code_rows,
+        request.args,
+        request.snapshot_id,
+        request.source_trace_set_hash,
+        request.network_names,
+        request.target_count,
+        request.descending,
+        request.projection_manifest,
+        request.projection_rule,
+    )
     normalized_target_count = max(int(target_count), 1)
     maximum_code_sets = int(
         projection_rule.max_online_filtered_reverse_code_sets
@@ -12370,16 +13152,27 @@ _select_v4_inferred_taxonomy_provider_expansion = _select_v4_taxonomy_expansion
 async def _strict_cost_provider_expansion_selection(
     session,
     serving_tables: PTG2ServingTables,
-    *,
-    code_rows: list[Mapping[str, Any]],
-    args: Mapping[str, Any],
-    snapshot_id: str,
-    source_trace_set_hash: str | None,
-    network_names: list[str],
-    target_count: int,
-    descending: bool,
+    **request_options: Any,
 ) -> _ProviderExpansionSelection | None:
     """Expand cost-ordered rates until the requested provider prefix is complete."""
+    request = _ProviderExpansionRequest(**request_options)
+    (
+        code_rows,
+        args,
+        snapshot_id,
+        source_trace_set_hash,
+        network_names,
+        target_count,
+        descending,
+    ) = (
+        request.code_rows,
+        request.args,
+        request.snapshot_id,
+        request.source_trace_set_hash,
+        request.network_names,
+        request.target_count,
+        request.descending,
+    )
     cache_key = _provider_expansion_selection_cache_key(
         serving_tables,
         code_rows=code_rows,
@@ -13574,6 +14367,195 @@ def _row_price_response_fields(
     return _price_response_fields(serving_row_by_field.get("prices") or [])
 
 
+def _compact_provider_identity_fields(
+    serving_row: Mapping[str, Any],
+    args: Mapping[str, Any],
+    address_payload: dict[str, Any],
+    provider_set_hash: Any,
+    specialties: list[Any],
+    classifications: list[Any],
+    specializations: list[Any],
+) -> dict[str, Any]:
+    """Shape provider identity, taxonomy, and address fields."""
+
+    primary_specialty = serving_row.get("primary_specialty") or (
+        specialties[0] if specialties else None
+    )
+    primary_specialization = serving_row.get("primary_specialization") or (
+        specializations[0] if specializations else None
+    )
+    return {
+        "npi": serving_row.get("npi") or args.get("npi"),
+        "provider_ordinal": serving_row.get("provider_ordinal")
+        or serving_row.get("npi")
+        or provider_set_hash,
+        "provider_name": serving_row.get("provider_name"),
+        "plan_id": serving_row.get("plan_id"),
+        "plan_market_type": serving_row.get("plan_market_type"),
+        "state": serving_row.get("state"),
+        "city": serving_row.get("city"),
+        "zip5": serving_row.get("zip5"),
+        "location_hash": serving_row.get("location_hash"),
+        "location_source": serving_row.get("location_source"),
+        "location_confidence_code": serving_row.get(
+            "location_confidence_code"
+        ),
+        "address": address_payload,
+        "taxonomy_codes": _coerce_json_payload(
+            serving_row.get("taxonomy_codes"), []
+        ),
+        "specialties": specialties,
+        "primary_specialty": primary_specialty,
+        "classification": classifications[0] if classifications else None,
+        "classifications": classifications,
+        "specialization": primary_specialization,
+        "primary_specialization": primary_specialization,
+        "specializations": specializations,
+    }
+
+
+def _compact_procedure_rate_fields(
+    serving_row: Mapping[str, Any],
+    provider_set_hash: Any,
+    provider_set_hashes: list[Any],
+) -> dict[str, Any]:
+    """Shape procedure identity and negotiated-rate reference fields."""
+
+    billing_code = serving_row.get("billing_code") or serving_row.get(
+        "reported_code"
+    )
+    billing_system = serving_row.get("billing_code_type") or serving_row.get(
+        "reported_code_system"
+    )
+    return {
+        "procedure_code": serving_row.get("procedure_code"),
+        "hp_procedure_code": serving_row.get("procedure_code"),
+        "procedure_name": (
+            serving_row.get("procedure_name")
+            if "procedure_name" in serving_row
+            else serving_row.get("procedure_display_name")
+        ),
+        "procedure_description": serving_row.get("procedure_description"),
+        "billing_code_type_version": serving_row.get(
+            "billing_code_type_version"
+        ),
+        "source_procedure_name": serving_row.get("source_procedure_name"),
+        "source_procedure_description": serving_row.get(
+            "source_procedure_description"
+        ),
+        "catalog_procedure_name": serving_row.get("catalog_procedure_name"),
+        "catalog_procedure_description": serving_row.get(
+            "catalog_procedure_description"
+        ),
+        "service_code": billing_code,
+        "service_code_system": billing_system,
+        "reported_code": serving_row.get("reported_code"),
+        "reported_code_system": serving_row.get("reported_code_system"),
+        "negotiation_arrangement": serving_row.get(
+            "negotiation_arrangement"
+        ),
+        "billing_code": billing_code,
+        "billing_code_type": billing_system,
+        "provider_set_hash": provider_set_hash,
+        "provider_set_hashes": provider_set_hashes
+        or ([provider_set_hash] if provider_set_hash else []),
+        "provider_count": serving_row.get("provider_count"),
+        "provider_set_count": serving_row.get("provider_set_count"),
+        "price_set_hash": serving_row.get("price_set_hash"),
+        "rate_pack_hash": serving_row.get("rate_pack_hash")
+        or serving_row.get("serving_rate_id"),
+    }
+
+
+def _compact_source_fields(
+    serving_row: Mapping[str, Any],
+    args: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Shape source provenance and request snapshot fields."""
+
+    return {
+        "source_key": serving_row.get("source_key") or args.get("source_key"),
+        "source_artifact_key": serving_row.get("source_artifact_key"),
+        "source_type": serving_row.get("source_type"),
+        "identity_kind": serving_row.get("identity_kind"),
+        "identity_sha256": serving_row.get("identity_sha256"),
+        "raw_container_sha256": serving_row.get("raw_container_sha256"),
+        "logical_json_sha256": serving_row.get("logical_json_sha256"),
+        "logical_hash_deferred": serving_row.get("logical_hash_deferred"),
+        "source_trace_set_hash": serving_row.get("source_trace_set_hash"),
+        "snapshot_id": serving_row.get("snapshot_id")
+        or args.get("snapshot_id"),
+        "network_names": _coerce_str_list_payload(
+            serving_row.get("network_names")
+        ),
+        "source_trace": _coerce_json_payload(
+            _first_payload_value(
+                serving_row.get("hydrated_source_trace"),
+                serving_row.get("source_trace"),
+            ),
+            [],
+        ),
+        "confidence": serving_row.get("confidence")
+        or {"network": "tic_rate_npi_tin"},
+    }
+
+
+def _apply_compact_location_fields(
+    provider_item_by_field: dict[str, Any],
+    serving_row_by_field: dict[str, Any],
+    address_payload: dict[str, Any],
+    args: dict[str, Any],
+) -> None:
+    """Attach optional geography, phones, and address verification."""
+
+    for field_name in (
+        "distance_miles",
+        "zip_match_type",
+        "anchor_zip5",
+        "zip_radius_miles",
+    ):
+        field_value = serving_row_by_field.get(field_name)
+        if field_value is not None:
+            provider_item_by_field[field_name] = field_value
+    _add_location_phone_fields(
+        provider_item_by_field,
+        serving_row_by_field,
+        address_payload,
+    )
+    _promote_address_provenance_fields(provider_item_by_field, address_payload)
+    provider_item_by_field["address_verification"] = (
+        _address_verification_payload(
+            provider_item_by_field,
+            serving_row_by_field,
+            address_payload,
+        )
+    )
+    _apply_address_display_policy(provider_item_by_field, args)
+
+
+def _finalize_compact_item(
+    provider_item_by_field: dict[str, Any],
+    args: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Remove nulls while retaining explicit exact-source fields."""
+
+    compact_item_by_field = {
+        field_name: field_value
+        for field_name, field_value in provider_item_by_field.items()
+        if field_value is not None
+    }
+    if normalize_ptg2_mode(args.get("mode")) == "exact_source":
+        for field_name in (
+            "billing_code_type_version",
+            "procedure_name",
+            "procedure_description",
+        ):
+            compact_item_by_field[field_name] = provider_item_by_field[
+                field_name
+            ]
+    return compact_item_by_field
+
+
 def _compact_item_from_row(
     serving_row_by_field: dict[str, Any],
     args: dict[str, Any],
@@ -13600,169 +14582,35 @@ def _compact_item_from_row(
         serving_row_by_field.get("classifications"),
         [],
     )
-    primary_specialty = serving_row_by_field.get("primary_specialty") or (
-        specialties[0] if specialties else None
-    )
-    primary_specialization = serving_row_by_field.get(
-        "primary_specialization"
-    ) or (specializations[0] if specializations else None)
     address_payload = _coerce_json_payload(
         serving_row_by_field.get("address_payload"),
         {},
     )
     provider_item_by_field = {
-        "npi": serving_row_by_field.get("npi") or args.get("npi"),
-        "provider_ordinal": serving_row_by_field.get("provider_ordinal")
-        or serving_row_by_field.get("npi")
-        or provider_set_hash,
-        "provider_name": serving_row_by_field.get("provider_name"),
-        "plan_id": serving_row_by_field.get("plan_id"),
-        "plan_market_type": serving_row_by_field.get("plan_market_type"),
-        "state": serving_row_by_field.get("state"),
-        "city": serving_row_by_field.get("city"),
-        "zip5": serving_row_by_field.get("zip5"),
-        "location_hash": serving_row_by_field.get("location_hash"),
-        "location_source": serving_row_by_field.get("location_source"),
-        "location_confidence_code": serving_row_by_field.get(
-            "location_confidence_code"
+        **_compact_provider_identity_fields(
+            serving_row_by_field,
+            args,
+            address_payload,
+            provider_set_hash,
+            specialties,
+            classifications,
+            specializations,
         ),
-        "address": address_payload,
-        "taxonomy_codes": _coerce_json_payload(
-            serving_row_by_field.get("taxonomy_codes"),
-            [],
+        **_compact_procedure_rate_fields(
+            serving_row_by_field,
+            provider_set_hash,
+            provider_set_hashes,
         ),
-        "specialties": specialties,
-        "primary_specialty": primary_specialty,
-        "classification": classifications[0] if classifications else None,
-        "classifications": classifications,
-        "specialization": primary_specialization,
-        "primary_specialization": primary_specialization,
-        "specializations": specializations,
-        "procedure_code": serving_row_by_field.get("procedure_code"),
-        "hp_procedure_code": serving_row_by_field.get("procedure_code"),
-        "procedure_name": (
-            serving_row_by_field.get("procedure_name")
-            if "procedure_name" in serving_row_by_field
-            else serving_row_by_field.get("procedure_display_name")
-        ),
-        "procedure_description": serving_row_by_field.get(
-            "procedure_description"
-        ),
-        "billing_code_type_version": serving_row_by_field.get(
-            "billing_code_type_version"
-        ),
-        "source_procedure_name": serving_row_by_field.get(
-            "source_procedure_name"
-        ),
-        "source_procedure_description": serving_row_by_field.get(
-            "source_procedure_description"
-        ),
-        "catalog_procedure_name": serving_row_by_field.get(
-            "catalog_procedure_name"
-        ),
-        "catalog_procedure_description": serving_row_by_field.get(
-            "catalog_procedure_description"
-        ),
-        "service_code": serving_row_by_field.get("billing_code")
-        or serving_row_by_field.get("reported_code"),
-        "service_code_system": serving_row_by_field.get("billing_code_type")
-        or serving_row_by_field.get("reported_code_system"),
-        "reported_code": serving_row_by_field.get("reported_code"),
-        "reported_code_system": serving_row_by_field.get(
-            "reported_code_system"
-        ),
-        "negotiation_arrangement": serving_row_by_field.get(
-            "negotiation_arrangement"
-        ),
-        "billing_code": serving_row_by_field.get("billing_code")
-        or serving_row_by_field.get("reported_code"),
-        "billing_code_type": serving_row_by_field.get("billing_code_type")
-        or serving_row_by_field.get("reported_code_system"),
-        "provider_set_hash": provider_set_hash,
-        "provider_set_hashes": provider_set_hashes
-        or ([provider_set_hash] if provider_set_hash else []),
-        "provider_count": serving_row_by_field.get("provider_count"),
-        "provider_set_count": serving_row_by_field.get("provider_set_count"),
-        "price_set_hash": serving_row_by_field.get("price_set_hash"),
-        "rate_pack_hash": serving_row_by_field.get("rate_pack_hash")
-        or serving_row_by_field.get("serving_rate_id"),
-        "source_key": serving_row_by_field.get("source_key")
-        or args.get("source_key"),
-        "source_artifact_key": serving_row_by_field.get("source_artifact_key"),
-        "source_type": serving_row_by_field.get("source_type"),
-        "identity_kind": serving_row_by_field.get("identity_kind"),
-        "identity_sha256": serving_row_by_field.get("identity_sha256"),
-        "raw_container_sha256": serving_row_by_field.get(
-            "raw_container_sha256"
-        ),
-        "logical_json_sha256": serving_row_by_field.get(
-            "logical_json_sha256"
-        ),
-        "logical_hash_deferred": serving_row_by_field.get(
-            "logical_hash_deferred"
-        ),
-        "source_trace_set_hash": serving_row_by_field.get(
-            "source_trace_set_hash"
-        ),
-        "snapshot_id": serving_row_by_field.get("snapshot_id")
-        or args.get("snapshot_id"),
-        "network_names": _coerce_str_list_payload(
-            serving_row_by_field.get("network_names")
-        ),
+        **_compact_source_fields(serving_row_by_field, args),
         **price_response_by_field,
-        "source_trace": _coerce_json_payload(
-            _first_payload_value(
-                serving_row_by_field.get("hydrated_source_trace"),
-                serving_row_by_field.get("source_trace"),
-            ),
-            [],
-        ),
-        "confidence": serving_row_by_field.get("confidence")
-        or {"network": "tic_rate_npi_tin"},
     }
-    if serving_row_by_field.get("distance_miles") is not None:
-        provider_item_by_field["distance_miles"] = serving_row_by_field.get(
-            "distance_miles"
-        )
-    if serving_row_by_field.get("zip_match_type") is not None:
-        provider_item_by_field["zip_match_type"] = serving_row_by_field.get(
-            "zip_match_type"
-        )
-    if serving_row_by_field.get("anchor_zip5") is not None:
-        provider_item_by_field["anchor_zip5"] = serving_row_by_field.get(
-            "anchor_zip5"
-        )
-    if serving_row_by_field.get("zip_radius_miles") is not None:
-        provider_item_by_field["zip_radius_miles"] = serving_row_by_field.get(
-            "zip_radius_miles"
-        )
-    _add_location_phone_fields(
+    _apply_compact_location_fields(
         provider_item_by_field,
         serving_row_by_field,
         address_payload,
+        args,
     )
-    _promote_address_provenance_fields(provider_item_by_field, address_payload)
-    provider_item_by_field["address_verification"] = (
-        _address_verification_payload(
-            provider_item_by_field,
-            serving_row_by_field,
-            address_payload,
-        )
-    )
-    _apply_address_display_policy(provider_item_by_field, args)
-    compact_item_by_field = {
-        field_name: field_value
-        for field_name, field_value in provider_item_by_field.items()
-        if field_value is not None
-    }
-    if normalize_ptg2_mode(args.get("mode")) == "exact_source":
-        for field_name in (
-            "billing_code_type_version",
-            "procedure_name",
-            "procedure_description",
-        ):
-            compact_item_by_field[field_name] = provider_item_by_field[field_name]
-    return compact_item_by_field
+    return _finalize_compact_item(provider_item_by_field, args)
 
 
 async def search_ptg2_serving_table(
@@ -14820,17 +15668,7 @@ async def _search_multi_ptg2_snapshots(
     *,
     release_selection: PlanReleaseServingSelection | None = None,
 ) -> dict[str, Any] | None:
-    """Search every network's snapshot for a plan and combine the results.
-
-    A plan can be served by multiple networks/sources at once, each with its own
-    snapshot. We query each independently with the caller's filters/sort, then
-    re-sort the union on the same key (so the merged page is globally ordered,
-    not network-blocked) and slice to the requested window. Items are *unioned,
-    not deduplicated*: a provider present in two networks is genuinely two priced
-    options (rates are network-specific), and a procedure priced in only one
-    network has no overlap to collapse. Each item is tagged with the originating
-    network (``source_key``) so a combined result stays attributable.
-    """
+    """Union attributable network rows into one globally ordered plan page."""
     # Pull enough from each network to fill the requested page after the merge:
     # the global window [offset, offset+limit) could be satisfied entirely by a
     # single network, so fetch (offset+limit) rows from each, merge, then slice.
@@ -14863,40 +15701,66 @@ async def _search_multi_ptg2_snapshots(
         # the single-snapshot path returning no match.
         return None
 
-    combined_provider_items = _sort_ptg2_manifest_provider_items(
+    response_by_field = _multi_snapshot_response(
+        combined_provider_items,
+        base_query_by_field,
+        network_snapshots,
+        matched_networks,
+        args,
+        pagination,
+        total,
+    )
+    if release_selection is not None:
+        return annotate_plan_release_response(
+            response_by_field, release_selection
+        )
+    return response_by_field
+
+
+def _multi_snapshot_response(
+    combined_provider_items: list[dict[str, Any]],
+    base_query_by_field: Mapping[str, Any],
+    network_snapshots: Sequence[tuple[str, str]],
+    matched_networks: list[dict[str, str]],
+    args: Mapping[str, Any],
+    pagination,
+    total: int,
+) -> dict[str, Any]:
+    """Shape one globally ordered page from immutable network responses."""
+
+    ordered_items = _sort_ptg2_manifest_provider_items(
         combined_provider_items,
         args,
         location_filter_requested=_has_location_filter(args),
     )
     start = max(int(pagination.offset), 0)
     end = start + max(int(pagination.limit), 0)
-    page_items = combined_provider_items[start:end]
-
-    query_by_field = dict(base_query_by_field)
-    query_by_field["source_key"] = None
-    query_by_field["snapshot_id"] = None
-    query_by_field["snapshots"] = [
-        snapshot_id for _, snapshot_id in network_snapshots
-    ]
-    query_by_field["networks"] = matched_networks
-    query_by_field["combined"] = True
-
-    response_by_field = {
+    page_items = ordered_items[start:end]
+    query_by_field = {
+        **base_query_by_field,
+        "source_key": None,
+        "snapshot_id": None,
+        "snapshots": [
+            snapshot_id for _, snapshot_id in network_snapshots
+        ],
+        "networks": matched_networks,
+        "combined": True,
+    }
+    return {
         "items": page_items,
         "pagination": {
             "total": total,
             "limit": pagination.limit,
             "offset": pagination.offset,
-            "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+            "page": (
+                (pagination.offset // pagination.limit) + 1
+                if pagination.limit
+                else 1
+            ),
             "has_more": (int(pagination.offset) + len(page_items)) < total,
         },
         "query": query_by_field,
     }
-    if release_selection is not None:
-        return annotate_plan_release_response(
-            response_by_field, release_selection
-        )
-    return response_by_field
 
 
 def _combine_ptg2_network_results(
