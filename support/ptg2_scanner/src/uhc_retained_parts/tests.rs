@@ -496,4 +496,5 @@ mod tests {
     }
 
     include!("publication_tests.rs");
+    include!("publication_margin_tests.rs");
 }

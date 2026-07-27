@@ -654,6 +654,10 @@ mod tests {
         for invalid in [json!("7"), json!(true), json!({}), json!([]), json!(7.5)] {
             assert!(strict_integer(&invalid, "id").is_err());
         }
+        assert!(strict_integer(&json!(u64::MAX), "id").is_err());
+        let unbounded_integer =
+            serde_json::from_str("121591448686103182592848195376305442061").unwrap();
+        assert!(strict_integer(&unbounded_integer, "id").is_err());
 
         assert_eq!(
             strict_npi_list(Some(&json!([1234567890, 1234567890.0]))).unwrap(),

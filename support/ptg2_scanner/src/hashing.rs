@@ -241,6 +241,22 @@ mod tests {
             provider_group_member_key(12, 34)
         );
         assert_ne!(price_set_entry_key("a", "b"), price_set_entry_key("b", "a"));
+        assert_ne!(
+            provider_entry_component_key(12, 34),
+            provider_entry_component_key(34, 12)
+        );
+
+        let checksum_payload = vec![json!({"b": 2, "a": 1})];
+        assert_eq!(
+            make_checksum(checksum_payload.clone()),
+            make_checksum(checksum_payload)
+        );
+
+        let mut present = Xxh3::new();
+        update_hash_optional_str(&mut present, Some("value"));
+        let mut absent = Xxh3::new();
+        update_hash_optional_str(&mut absent, None);
+        assert_ne!(finish_hash_hex(present), finish_hash_hex(absent));
     }
 
     #[test]

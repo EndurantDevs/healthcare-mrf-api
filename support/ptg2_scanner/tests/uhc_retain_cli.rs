@@ -2,6 +2,7 @@ use ptg2_scanner::uhc_retained::{retain_uhc_artifact, UHCRetainRequest};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -55,6 +56,20 @@ fn summary_from_success(completed: std::process::Output) -> Value {
     let stdout = String::from_utf8(completed.stdout).expect("UTF-8 CLI summary");
     assert_eq!(stdout.lines().count(), 1);
     serde_json::from_str(stdout.trim_end()).expect("JSON CLI summary")
+}
+
+fn overwrite_preserving_mode(path: &Path, payload: &[u8]) {
+    let metadata = fs::metadata(path).expect("retained artifact metadata");
+    let original_mode = metadata.permissions().mode();
+    let mut writable = metadata.permissions();
+    writable.set_mode(0o600);
+    fs::set_permissions(path, writable).expect("make retained artifact writable");
+    fs::write(path, payload).expect("replace retained artifact fixture");
+    let mut restored = fs::metadata(path)
+        .expect("replaced retained artifact metadata")
+        .permissions();
+    restored.set_mode(original_mode);
+    fs::set_permissions(path, restored).expect("restore retained artifact mode");
 }
 
 #[test]
@@ -130,6 +145,59 @@ fn uhc_retain_cli_reuses_verified_artifacts_without_the_source() {
     assert_eq!(reused.record_count, 4);
     assert!(reused.raw_reused);
     assert!(reused.manifest_reused);
+}
+
+#[test]
+fn retained_reuse_rejects_changed_raw_bytes() {
+    let fixture = br#"[
+{"id":1,"active":true,"score":1.25},
+{"id":2,"active":false,"score":2.5},
+{"id":3,"active":true,"score":3.75},
+{"id":4,"active":false,"score":4.125}
+]"#;
+    let directory = tempfile::tempdir().expect("temporary changed-raw root");
+    let source = directory.path().join("source.json");
+    let retained = directory.path().join("retained");
+    fs::write(&source, fixture).expect("write changed-raw fixture");
+    fs::create_dir(&retained).expect("create retained root");
+    let request = request(&source, &retained, fixture, 4);
+    let published = retain_uhc_artifact(&request).expect("publish retained fixture");
+    let mut changed = fixture.to_vec();
+    let changed_index = changed
+        .iter()
+        .position(|byte| *byte == b'1')
+        .expect("fixture contains a replaceable digit");
+    changed[changed_index] = b'9';
+    overwrite_preserving_mode(Path::new(&published.raw_artifact_path), &changed);
+
+    let error = retain_uhc_artifact(&request).expect_err("changed raw bytes rejected");
+    assert!(
+        error.to_string().contains("SHA-256 does not match"),
+        "{error}"
+    );
+}
+
+#[test]
+fn retained_reuse_rejects_both_manifest_parse_failures() {
+    for invalid_manifest in [b"{".as_slice(), b"{}".as_slice()] {
+        let fixture = br#"[
+{"id":1,"active":true,"score":1.25},
+{"id":2,"active":false,"score":2.5},
+{"id":3,"active":true,"score":3.75},
+{"id":4,"active":false,"score":4.125}
+]"#;
+        let directory = tempfile::tempdir().expect("temporary corrupt-manifest root");
+        let source = directory.path().join("source.json");
+        let retained = directory.path().join("retained");
+        fs::write(&source, fixture).expect("write corrupt-manifest fixture");
+        fs::create_dir(&retained).expect("create retained root");
+        let request = request(&source, &retained, fixture, 4);
+        let published = retain_uhc_artifact(&request).expect("publish retained fixture");
+        overwrite_preserving_mode(Path::new(&published.manifest_path), invalid_manifest);
+
+        let error = retain_uhc_artifact(&request).expect_err("corrupt manifest rejected");
+        assert!(error.to_string().contains("manifest is invalid"));
+    }
 }
 
 #[test]

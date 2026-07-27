@@ -13,13 +13,15 @@ use ptg2_scanner::input::open_plain_range_json_reader;
 use ptg2_scanner::manifest::{DenseIdMap, GlobalId128};
 use ptg2_scanner::normalize::{
     int_list, normalize_catalog_code, normalize_money_text, normalized_scalar_from_reader,
-    normalized_string_list_from_reader, strict_integer, strict_integer_text, strict_money_number,
+    normalized_string_list_from_reader, npi_list, strict_integer, strict_integer_text,
+    strict_money_number,
 };
 use ptg2_scanner::progress::{
     emit_progress, ScannerSemanticProgress, ScannerSemanticProgressReporter,
     SEMANTIC_PROGRESS_INTERVAL,
 };
 use ptg2_scanner::v3_dense::DenseIdentityMap;
+use ptg2_scanner::{decode_u32_le, intersect_sorted_unique_u32};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
@@ -173,6 +175,28 @@ fn v4_coordinate_helpers_cover_empty_invalid_and_escaped_inputs() {
 
 #[test]
 fn v4_normalization_rejects_ambiguous_numeric_and_json_shapes() {
+    // Exercise the public crate boundary so coverage includes the integration
+    // instantiations used by scanner consumers, not only private unit paths.
+    assert_eq!(
+        intersect_sorted_unique_u32(&[1, 3, 7], &[2, 3, 7]).unwrap(),
+        vec![3, 7]
+    );
+    assert!(intersect_sorted_unique_u32(&[1, 1], &[1]).is_err());
+    assert!(intersect_sorted_unique_u32(&[2, 1], &[1]).is_err());
+    assert_eq!(
+        decode_u32_le(&[1, 0, 0, 0, 255, 0, 0, 0]).unwrap(),
+        vec![1, 255]
+    );
+    assert!(decode_u32_le(&[1, 0, 0]).is_err());
+    assert_eq!(
+        npi_list(Some(&json!([
+            1_234_567_890_u64,
+            "1234567890",
+            123_456_789_u64,
+            10_000_000_000_u64
+        ]))),
+        vec![1_234_567_890]
+    );
     assert_eq!(
         normalize_catalog_code(Some(&json!("ABC")), Some("RC")),
         Some("ABC".to_owned())
