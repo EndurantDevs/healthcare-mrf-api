@@ -15,6 +15,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
 from process.ptg_parts.source_snapshot_shared_layout import (
     _row_mapping,
     bound_shared_layout_keys,
+    validate_retirement_shared_layout,
 )
 
 
@@ -84,17 +85,18 @@ async def test_rejects_unsupported_storage_generation_before_querying() -> None:
 
 
 @pytest.mark.asyncio
-async def test_returns_empty_when_snapshot_has_no_shared_binding() -> None:
+async def test_rejects_v3_snapshot_without_shared_binding() -> None:
     session = _Session([])
 
-    assert (
+    with pytest.raises(
+        ValueError,
+        match="snapshot is missing its shared layout binding",
+    ):
         await _bound_keys(
             session,
             generation=PTG2_V3_SHARED_GENERATION,
-            snapshot_key=None,
+            snapshot_key=11,
         )
-        == ()
-    )
     assert session.calls[0][1] == {"snapshot_id": "snapshot-a"}
 
 
@@ -104,7 +106,7 @@ async def test_rejects_v4_snapshot_without_shared_binding() -> None:
 
     with pytest.raises(
         ValueError,
-        match="missing its shared layout binding",
+        match="snapshot is missing its shared layout binding",
     ):
         await _bound_keys(session)
 
@@ -148,22 +150,15 @@ async def test_rejects_unsealed_shared_layout() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "manifest_snapshot_key",
-    [
-        None,
-        "not-a-number",
-        0,
-        -1,
-        True,
-        False,
-        11.0,
-        11.9,
-        "011",
-        " 11 ",
-        "+11",
-    ],
+    "generation",
+    [PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION],
 )
-async def test_rejects_missing_or_nonpositive_v4_manifest_key(
+@pytest.mark.parametrize(
+    "manifest_snapshot_key",
+    [None, "not-a-number", 0, -1, True, False, 11.0, 11.9, "011", " 11 ", "+11"],
+)
+async def test_rejects_missing_or_nonpositive_manifest_key_for_every_generation(
+    generation: str,
     manifest_snapshot_key: Any,
 ) -> None:
     session = _Session([_layout()])
@@ -174,6 +169,7 @@ async def test_rejects_missing_or_nonpositive_v4_manifest_key(
     ):
         await _bound_keys(
             session,
+            generation=generation,
             snapshot_key=manifest_snapshot_key,
         )
 
@@ -181,14 +177,26 @@ async def test_rejects_missing_or_nonpositive_v4_manifest_key(
 
 
 @pytest.mark.asyncio
-async def test_rejects_v4_manifest_key_that_differs_from_binding() -> None:
-    session = _Session([_layout(snapshot_key=11)])
+@pytest.mark.parametrize(
+    "generation",
+    [PTG2_V3_SHARED_GENERATION, PTG2_V4_SHARED_GENERATION],
+)
+async def test_rejects_manifest_key_that_differs_from_binding(
+    generation: str,
+) -> None:
+    session = _Session(
+        [_layout(snapshot_key=11, generation=generation)]
+    )
 
     with pytest.raises(
         ValueError,
         match="manifest does not match its shared layout binding",
     ):
-        await _bound_keys(session, snapshot_key=12)
+        await _bound_keys(
+            session,
+            generation=generation,
+            snapshot_key=12,
+        )
 
     assert len(session.calls) == 1
 
@@ -250,8 +258,44 @@ async def test_accepts_one_sealed_v3_layout_without_querying_v4_root() -> None:
         await _bound_keys(
             session,
             generation=PTG2_V3_SHARED_GENERATION,
-            snapshot_key=None,
+            snapshot_key=11,
         )
         == (11,)
     )
     assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_retirement_skips_layout_query_for_absent_snapshot() -> None:
+    session = _Session()
+
+    await validate_retirement_shared_layout(
+        session,
+        schema="mrf",
+        snapshot_id="missing",
+        snapshot={},
+    )
+
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_retirement_validates_manifest_against_bound_layout() -> None:
+    session = _Session([_layout(generation=PTG2_V3_SHARED_GENERATION)])
+
+    await validate_retirement_shared_layout(
+        session,
+        schema="mrf",
+        snapshot_id="snapshot-a",
+        snapshot={
+            "manifest": {
+                "serving_index": {
+                    "storage_generation": PTG2_V3_SHARED_GENERATION,
+                    "shared_snapshot_key": 11,
+                }
+            }
+        },
+    )
+
+    assert len(session.calls) == 1
+    assert session.calls[0][1] == {"snapshot_id": "snapshot-a"}

@@ -1608,7 +1608,7 @@ def _observe_logical_artifact_stage(
     )
 
 
-def _download_ptg_job_artifact_sync_from_facade(job: dict[str, object], **kwargs) -> PTG2DownloadedJob:
+def _download_ptg_artifact_sync(job: dict[str, object], **kwargs) -> PTG2DownloadedJob:
     live_progress_context = kwargs.pop("live_progress_context", None)
     artifact_lease_id = kwargs.pop("artifact_lease_id", None)
     ptg_module = sys.modules.get("process.ptg")
@@ -1621,6 +1621,9 @@ def _download_ptg_job_artifact_sync_from_facade(job: dict[str, object], **kwargs
             finally:
                 reset_live_progress_context(token)
         return downloader(job, **kwargs)
+
+
+_download_ptg_job_artifact_sync_from_facade = _download_ptg_artifact_sync
 
 
 async def _download_ptg_job_artifact(

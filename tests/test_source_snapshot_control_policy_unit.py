@@ -27,11 +27,13 @@ def _serving_index(
     *,
     generation: str = PTG2_V4_SHARED_GENERATION,
     source_key: str | None = "source-a",
+    shared_snapshot_key: Any = 11,
     arch_version: str = "postgres_binary_v3",
 ) -> dict[str, Any]:
     serving_index: dict[str, Any] = {
         "arch_version": arch_version,
         "storage_generation": generation,
+        "shared_snapshot_key": shared_snapshot_key,
     }
     if source_key is not None:
         serving_index["source_key"] = source_key
@@ -42,6 +44,7 @@ def _snapshot(
     *,
     generation: str = PTG2_V4_SHARED_GENERATION,
     source_key: str | None = "source-a",
+    shared_snapshot_key: Any = 11,
     status: str = "failed",
     manifest: Any = None,
 ) -> dict[str, Any]:
@@ -50,6 +53,7 @@ def _snapshot(
             "serving_index": _serving_index(
                 generation=generation,
                 source_key=source_key,
+                shared_snapshot_key=shared_snapshot_key,
             )
         }
         if manifest is None
@@ -95,6 +99,7 @@ def test_snapshot_remove_reasons_is_empty_for_matching_validated_snapshot() -> N
     assert snapshot_remove_reasons(
         source_key="source-a",
         manifest_source_key="source-a",
+        manifest_snapshot_key=11,
         snapshot_status=" VALIDATED ",
         references={},
     ) == []
@@ -109,12 +114,14 @@ def test_snapshot_remove_reasons_reports_mismatch_inflight_and_all_references() 
         "previous_source_keys": ["source-a"],
         "previous_plan_source_keys": ["plan-a"],
         "plan_release_pins": ["release-a"],
+        "plan_release_bindings": ["revision-a:in_network:0"],
         "unknown_reference": ["ignored"],
     }
 
     assert snapshot_remove_reasons(
         source_key="source-b",
         manifest_source_key="source-a",
+        manifest_snapshot_key=11,
         snapshot_status="BUILDING",
         references=references_by_name,
     ) == [
@@ -127,23 +134,50 @@ def test_snapshot_remove_reasons_reports_mismatch_inflight_and_all_references() 
         "snapshot is referenced by previous source pointer",
         "snapshot is referenced by previous plan pointer",
         "snapshot is referenced by plan release pin pointer",
+        "snapshot is referenced by plan release binding pointer",
     ]
 
 
 @pytest.mark.parametrize(
-    ("source_key", "manifest_source_key"),
-    [(None, "source-a"), ("source-a", None)],
+    ("source_key", "manifest_source_key", "expected"),
+    [
+        (None, "source-a", ["requested source_key is required"]),
+        ("source-a", None, ["snapshot manifest is missing source_key"]),
+        (
+            None,
+            None,
+            [
+                "requested source_key is required",
+                "snapshot manifest is missing source_key",
+            ],
+        ),
+    ],
 )
-def test_snapshot_remove_reasons_ignores_partial_source_identity(
+def test_snapshot_remove_reasons_rejects_partial_source_identity(
     source_key: str | None,
     manifest_source_key: str | None,
+    expected: list[str],
 ) -> None:
     assert snapshot_remove_reasons(
         source_key=source_key,
         manifest_source_key=manifest_source_key,
+        manifest_snapshot_key=11,
         snapshot_status="failed",
         references={},
-    ) == []
+    ) == expected
+
+
+@pytest.mark.parametrize("manifest_snapshot_key", [None, 0, "011", True])
+def test_snapshot_remove_reasons_rejects_invalid_layout_identity(
+    manifest_snapshot_key: Any,
+) -> None:
+    assert snapshot_remove_reasons(
+        source_key="source-a",
+        manifest_source_key="source-a",
+        manifest_snapshot_key=manifest_snapshot_key,
+        snapshot_status="failed",
+        references={},
+    ) == ["snapshot manifest is missing its shared snapshot key"]
 
 
 def test_retirement_manifest_source_key_returns_none_for_missing_snapshot() -> None:
@@ -196,35 +230,40 @@ def test_retirement_rejects_requested_source_mismatch() -> None:
         )
 
 
+@pytest.mark.parametrize("shared_snapshot_key", [None, 0, "011", True])
+def test_retirement_rejects_invalid_layout_identity(
+    shared_snapshot_key: Any,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="manifest is missing its shared snapshot key",
+    ):
+        retirement_manifest_source_key(
+            _snapshot(shared_snapshot_key=shared_snapshot_key),
+            "source-a",
+        )
+
+
 @pytest.mark.parametrize(
-    ("generation", "manifest_source_key", "requested_source_key", "expected"),
+    ("generation", "manifest_source_key", "requested_source_key"),
     [
         (
             PTG2_V3_SHARED_GENERATION,
             " source-a ",
-            None,
             "source-a",
         ),
         (
             PTG2_V4_SHARED_GENERATION,
             "source-a",
             "source-a",
-            "source-a",
-        ),
-        (
-            PTG2_V4_SHARED_GENERATION,
-            None,
-            "source-a",
-            None,
         ),
     ],
-    ids=["v3-no-request", "v4-matching-request", "v4-no-manifest-source"],
+    ids=["v3", "v4"],
 )
 def test_retirement_accepts_supported_terminal_snapshot(
     generation: str,
     manifest_source_key: str | None,
     requested_source_key: str | None,
-    expected: str | None,
 ) -> None:
     assert (
         retirement_manifest_source_key(
@@ -234,8 +273,27 @@ def test_retirement_accepts_supported_terminal_snapshot(
             ),
             requested_source_key,
         )
-        == expected
+        == "source-a"
     )
+
+
+@pytest.mark.parametrize(
+    ("manifest_source_key", "requested_source_key", "message"),
+    [
+        ("source-a", None, "requested source_key is required"),
+        (None, "source-a", "snapshot manifest is missing source_key"),
+    ],
+)
+def test_retirement_rejects_partial_source_identity(
+    manifest_source_key: str | None,
+    requested_source_key: str | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        retirement_manifest_source_key(
+            _snapshot(source_key=manifest_source_key),
+            requested_source_key,
+        )
 
 
 @pytest.mark.parametrize(

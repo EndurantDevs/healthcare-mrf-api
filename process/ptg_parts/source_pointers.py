@@ -1313,7 +1313,7 @@ def _candidate_activation_result(
     return result_by_field
 
 
-async def _activate_ptg2_source_candidate_in_transaction(
+async def _activate_source_candidate_tx(
     session: Any,
     *,
     schema_name: str,
@@ -1356,6 +1356,9 @@ async def _activate_ptg2_source_candidate_in_transaction(
         activation_context=activation_context,
         allowed_pointer_by_field=allowed_pointer_by_field,
     )
+
+
+_activate_ptg2_source_candidate_in_transaction = _activate_source_candidate_tx
 
 
 async def _publish_ptg2_source_pointers(

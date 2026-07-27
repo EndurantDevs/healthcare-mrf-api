@@ -35,6 +35,43 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE __SCHEMA__.plan_release_serving_revision (
+        serving_revision_id varchar(64) PRIMARY KEY,
+        plan_release_id varchar(64) NOT NULL,
+        healthporta_plan_id varchar(64) NOT NULL,
+        plan_version_id varchar(64),
+        release_month varchar(7) NOT NULL,
+        release_status varchar(16) NOT NULL,
+        serving_status varchar(16) NOT NULL,
+        is_current boolean NOT NULL DEFAULT false,
+        expected_binding_count integer NOT NULL CHECK (expected_binding_count > 0),
+        binding_set_digest varchar(64) NOT NULL,
+        source_manifest jsonb NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+        published_at timestamptz,
+        retired_at timestamptz
+    )
+    """,
+    """
+    CREATE TABLE __SCHEMA__.plan_release_snapshot_binding (
+        serving_revision_id varchar(64) NOT NULL REFERENCES
+            __SCHEMA__.plan_release_serving_revision(serving_revision_id)
+            ON DELETE CASCADE,
+        binding_ordinal integer NOT NULL CHECK (binding_ordinal >= 0),
+        snapshot_id varchar(128) NOT NULL,
+        source_key varchar(128) NOT NULL CHECK (btrim(source_key) <> ''),
+        plan_id varchar(128) NOT NULL CHECK (btrim(plan_id) <> ''),
+        plan_market_type varchar(64),
+        role varchar(32) NOT NULL CHECK (
+            role IN ('in_network', 'allowed_amounts')
+        ),
+        required boolean NOT NULL DEFAULT true,
+        metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+        created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+        PRIMARY KEY (serving_revision_id, role, binding_ordinal)
+    )
+    """,
+    """
     CREATE TABLE __SCHEMA__.ptg2_current_snapshot (
         slot varchar(32) PRIMARY KEY,
         snapshot_id varchar(96),
@@ -324,6 +361,107 @@ async def insert_shared_snapshots(database: Any, schema_name: str) -> None:
                 snapshot_id,
                 source_key,
             )
+
+
+async def insert_release_binding(
+    database: Any,
+    schema_name: str,
+    *,
+    snapshot_id: str,
+    source_key: str,
+    serving_revision_id: str = "hpserve-fixture",
+) -> None:
+    """Insert one direct release binding without its parallel snapshot pin."""
+
+    schema = f'"{schema_name}"'
+    async with database.acquire() as connection:
+        await _insert_release_revision(
+            connection,
+            schema,
+            serving_revision_id=serving_revision_id,
+        )
+        await _insert_direct_release_binding(
+            connection,
+            schema,
+            serving_revision_id=serving_revision_id,
+            snapshot_id=snapshot_id,
+            source_key=source_key,
+        )
+
+
+async def _insert_release_revision(
+    connection: Any,
+    schema: str,
+    *,
+    serving_revision_id: str,
+) -> None:
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.plan_release_serving_revision (
+            serving_revision_id,
+            plan_release_id,
+            healthporta_plan_id,
+            release_month,
+            release_status,
+            serving_status,
+            is_current,
+            expected_binding_count,
+            binding_set_digest,
+            source_manifest
+        )
+        VALUES (
+            :serving_revision_id,
+            'hprelease-fixture',
+            'hpplan-fixture',
+            '2026-07',
+            'published',
+            'published',
+            true,
+            1,
+            :binding_set_digest,
+            '{{}}'::jsonb
+        )
+        """,
+        serving_revision_id=serving_revision_id,
+        binding_set_digest="a" * 64,
+    )
+
+
+async def _insert_direct_release_binding(
+    connection: Any,
+    schema: str,
+    *,
+    serving_revision_id: str,
+    snapshot_id: str,
+    source_key: str,
+) -> None:
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.plan_release_snapshot_binding (
+            serving_revision_id,
+            binding_ordinal,
+            snapshot_id,
+            source_key,
+            plan_id,
+            plan_market_type,
+            role,
+            required
+        )
+        VALUES (
+            :serving_revision_id,
+            0,
+            :snapshot_id,
+            :source_key,
+            'plan-fixture',
+            'group',
+            'in_network',
+            true
+        )
+        """,
+        serving_revision_id=serving_revision_id,
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+    )
 
 
 async def count_rows(

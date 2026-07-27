@@ -29,8 +29,13 @@ from process.ptg_parts.source_snapshot_control_results import (
     supported_snapshot_remove_plan as _supported_snapshot_remove_plan,
     unsupported_snapshot_remove_plan as _unsupported_snapshot_remove_plan,
 )
+from process.ptg_parts.source_snapshot_references import (
+    load_snapshot_reference_rows,
+    reference_string_values,
+)
 from process.ptg_parts.source_snapshot_shared_layout import (
     bound_shared_layout_keys,
+    validate_retirement_shared_layout,
 )
 
 
@@ -130,6 +135,7 @@ async def build_source_snapshot_remove_plan(
     reasons = snapshot_remove_reasons(
         source_key=source_key,
         manifest_source_key=manifest_source_key,
+        manifest_snapshot_key=serving_index.get("shared_snapshot_key"),
         snapshot_status=snapshot_status,
         references=references,
     )
@@ -286,6 +292,12 @@ async def retire_ptg2_source_snapshot(
         await _lock_source_pointer_gc(session)
         snapshot = await _snapshot_row(schema, snapshot_id)
         manifest_source_key = retirement_manifest_source_key(snapshot, source_key)
+        await validate_retirement_shared_layout(
+            session,
+            schema=schema,
+            snapshot_id=snapshot_id,
+            snapshot=snapshot,
+        )
         before = await _current_references(schema, snapshot_id)
         if before.get("global_slots"):
             raise ValueError("snapshot is referenced by current global pointer")
@@ -298,24 +310,12 @@ async def retire_ptg2_source_snapshot(
             )
         ):
             raise ValueError("snapshot is referenced by a previous snapshot pointer")
-        query_param_map: dict[str, Any] = {"snapshot_id": snapshot_id}
-        source_filter = ""
-        if source_key:
-            query_param_map["source_key"] = source_key
-            source_filter = " AND source_key = :source_key"
-        deleted_plan_pointers = await db.status(
-            f"""
-            DELETE FROM {_quote_ident(schema)}.ptg2_current_plan_source
-             WHERE snapshot_id = :snapshot_id{source_filter}
-            """,
-            **query_param_map,
-        )
-        deleted_source_pointers = await db.status(
-            f"""
-            DELETE FROM {_quote_ident(schema)}.ptg2_current_source_snapshot
-             WHERE snapshot_id = :snapshot_id{source_filter}
-            """,
-            **query_param_map,
+        deleted_plan_pointers, deleted_source_pointers = (
+            await _delete_retired_source_pointers(
+                schema,
+                snapshot_id=snapshot_id,
+                source_key=source_key,
+            )
         )
         after = await _current_references(schema, snapshot_id)
     _clear_ptg2_snapshot_cache()
@@ -329,6 +329,34 @@ async def retire_ptg2_source_snapshot(
         "previous_current_references": before,
         "current_references": after,
     }
+
+
+async def _delete_retired_source_pointers(
+    schema: str,
+    *,
+    snapshot_id: str,
+    source_key: str | None,
+) -> tuple[int, int]:
+    query_param_map: dict[str, Any] = {"snapshot_id": snapshot_id}
+    source_filter = ""
+    if source_key:
+        query_param_map["source_key"] = source_key
+        source_filter = " AND source_key = :source_key"
+    table_names = (
+        "ptg2_current_plan_source",
+        "ptg2_current_source_snapshot",
+    )
+    deleted_counts = []
+    for table_name in table_names:
+        deleted_count = await db.status(
+            f"""
+            DELETE FROM {_quote_ident(schema)}.{table_name}
+             WHERE snapshot_id = :snapshot_id{source_filter}
+            """,
+            **query_param_map,
+        )
+        deleted_counts.append(int(deleted_count or 0))
+    return deleted_counts[0], deleted_counts[1]
 
 
 async def _snapshot_row(schema: str, snapshot_id: str) -> dict[str, Any]:
@@ -375,59 +403,48 @@ async def _snapshot_reference_rows(
 async def _current_references(schema: str, snapshot_id: str) -> dict[str, list[str]]:
     """Return every current pointer or release pin retaining a snapshot."""
 
-    global_rows = await _snapshot_reference_rows(
-        schema, snapshot_id, table="ptg2_current_snapshot", selected_fields="slot"
-    )
-    source_rows = await _snapshot_reference_rows(
-        schema, snapshot_id, table="ptg2_current_source_snapshot", selected_fields="source_key"
-    )
-    plan_rows = await _snapshot_reference_rows(
-        schema, snapshot_id, table="ptg2_current_plan_source", selected_fields="plan_source_key"
-    )
-    previous_global_rows = await _snapshot_reference_rows(
-        schema, snapshot_id, table="ptg2_current_snapshot", selected_fields="slot",
-        reference_field="previous_snapshot_id",
-    )
-    previous_source_rows = await _snapshot_reference_rows(
-        schema, snapshot_id, table="ptg2_current_source_snapshot", selected_fields="source_key",
-        reference_field="previous_snapshot_id",
-    )
-    previous_plan_rows = await _snapshot_reference_rows(
-        schema, snapshot_id, table="ptg2_current_plan_source", selected_fields="plan_source_key",
-        reference_field="previous_snapshot_id",
-    )
-    pin_rows = await _snapshot_reference_rows(
-        schema, snapshot_id, table="ptg2_snapshot_pin", selected_fields="owner_type, owner_id"
+    reference_rows_by_kind = await load_snapshot_reference_rows(
+        schema,
+        snapshot_id,
+        _snapshot_reference_rows,
     )
     return {
-        "global_slots": [
-            str(_row_mapping(reference_row).get("slot"))
-            for reference_row in global_rows
-        ],
-        "source_keys": [
-            str(_row_mapping(reference_row).get("source_key"))
-            for reference_row in source_rows
-        ],
-        "plan_source_keys": [
-            str(_row_mapping(reference_row).get("plan_source_key"))
-            for reference_row in plan_rows
-        ],
-        "previous_global_slots": [
-            str(_row_mapping(reference_row).get("slot"))
-            for reference_row in previous_global_rows
-        ],
-        "previous_source_keys": [
-            str(_row_mapping(reference_row).get("source_key"))
-            for reference_row in previous_source_rows
-        ],
-        "previous_plan_source_keys": [
-            str(_row_mapping(reference_row).get("plan_source_key"))
-            for reference_row in previous_plan_rows
-        ],
+        "global_slots": reference_string_values(
+            reference_rows_by_kind["global"], "slot", _row_mapping
+        ),
+        "source_keys": reference_string_values(
+            reference_rows_by_kind["source"], "source_key", _row_mapping
+        ),
+        "plan_source_keys": reference_string_values(
+            reference_rows_by_kind["plan"],
+            "plan_source_key",
+            _row_mapping,
+        ),
+        "previous_global_slots": reference_string_values(
+            reference_rows_by_kind["previous_global"],
+            "slot",
+            _row_mapping,
+        ),
+        "previous_source_keys": reference_string_values(
+            reference_rows_by_kind["previous_source"],
+            "source_key",
+            _row_mapping,
+        ),
+        "previous_plan_source_keys": reference_string_values(
+            reference_rows_by_kind["previous_plan"],
+            "plan_source_key",
+            _row_mapping,
+        ),
         "plan_release_pins": [
             f"{_row_mapping(reference_row).get('owner_type')}:"
             f"{_row_mapping(reference_row).get('owner_id')}"
-            for reference_row in pin_rows
+            for reference_row in reference_rows_by_kind["pin"]
+        ],
+        "plan_release_bindings": [
+            f"{_row_mapping(reference_row).get('serving_revision_id')}:"
+            f"{_row_mapping(reference_row).get('role')}:"
+            f"{_row_mapping(reference_row).get('binding_ordinal')}"
+            for reference_row in reference_rows_by_kind["release_binding"]
         ],
     }
 

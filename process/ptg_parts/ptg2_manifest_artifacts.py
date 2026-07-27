@@ -738,7 +738,7 @@ async def write_serving_by_code_sidecar_async(
     )
 
 
-async def write_serving_by_provider_set_sidecar_async(
+async def write_provider_set_sidecar_async(
     path: str | Path,
     serving_rows: AsyncIterable[Iterable[Any]],
     *,
@@ -879,6 +879,9 @@ async def write_serving_by_provider_set_sidecar_async(
         record_format=PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
         metadata=metadata,
     )
+
+
+write_serving_by_provider_set_sidecar_async = write_provider_set_sidecar_async
 
 
 def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> dict[str, Any]:

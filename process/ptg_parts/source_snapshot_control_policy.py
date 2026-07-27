@@ -42,18 +42,54 @@ def _is_remove_blocked(snapshot_status: Any) -> bool:
     )
 
 
+def strict_shared_snapshot_key(value: Any) -> int:
+    """Return one exact positive manifest layout coordinate."""
+
+    if isinstance(value, bool):
+        raise ValueError(
+            "snapshot manifest is missing its shared snapshot key"
+        )
+    if isinstance(value, int):
+        snapshot_key = value
+    elif (
+        isinstance(value, str)
+        and value.isascii()
+        and value.isdecimal()
+        and not value.startswith("0")
+    ):
+        snapshot_key = int(value)
+    else:
+        raise ValueError(
+            "snapshot manifest is missing its shared snapshot key"
+        )
+    if snapshot_key <= 0:
+        raise ValueError(
+            "snapshot manifest is missing its shared snapshot key"
+        )
+    return snapshot_key
+
+
 def snapshot_remove_reasons(
     *,
     source_key: str | None,
     manifest_source_key: str | None,
+    manifest_snapshot_key: Any,
     snapshot_status: str,
     references: dict[str, list[str]],
 ) -> list[str]:
     """Describe every current or rollback reference that prevents removal."""
 
     reasons: list[str] = []
-    if source_key and manifest_source_key and source_key != manifest_source_key:
+    if not source_key:
+        reasons.append("requested source_key is required")
+    if not manifest_source_key:
+        reasons.append("snapshot manifest is missing source_key")
+    elif source_key and source_key != manifest_source_key:
         reasons.append("snapshot source_key does not match requested source_key")
+    try:
+        strict_shared_snapshot_key(manifest_snapshot_key)
+    except ValueError as exc:
+        reasons.append(str(exc))
     if _is_remove_blocked(snapshot_status):
         reasons.append(f"snapshot is in-flight (status: {snapshot_status})")
     label_by_reference_name = {
@@ -64,6 +100,7 @@ def snapshot_remove_reasons(
         "previous_source_keys": "previous source",
         "previous_plan_source_keys": "previous plan",
         "plan_release_pins": "plan release pin",
+        "plan_release_bindings": "plan release binding",
     }
     reasons.extend(
         f"snapshot is referenced by {label} pointer"
@@ -97,10 +134,13 @@ def retirement_manifest_source_key(
     snapshot_status = str(snapshot.get("status") or "").strip().lower()
     if _is_ptg2_snapshot_in_flight(snapshot_status):
         raise ValueError(f"snapshot is in-flight (status: {snapshot_status})")
-    if (
-        requested_source_key
-        and manifest_source_key
-        and requested_source_key != manifest_source_key
-    ):
+    strict_shared_snapshot_key(
+        serving_index_by_field.get("shared_snapshot_key")
+    )
+    if not requested_source_key:
+        raise ValueError("requested source_key is required")
+    if not manifest_source_key:
+        raise ValueError("snapshot manifest is missing source_key")
+    if requested_source_key != manifest_source_key:
         raise ValueError("snapshot source_key does not match requested source_key")
     return manifest_source_key

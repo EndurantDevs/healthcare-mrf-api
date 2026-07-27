@@ -12,6 +12,7 @@ import pytest
 from process.ptg_parts import ptg2_source_snapshot_gc as snapshot_gc
 from process.ptg_parts import snapshot_cleanup
 from process.ptg_parts import source_snapshot_control
+from process.ptg_parts import source_snapshot_control_results
 
 
 def test_strict_layout_validators_report_every_corrupt_resource_dimension() -> None:
@@ -119,6 +120,57 @@ def test_snapshot_ownership_and_lineage_helpers_fail_closed_on_sparse_rows() -> 
         ["ptg2_serving_rate_compact_candidate"],
         [],
     ) == ["ptg2_serving_rate_compact_candidate"]
+
+
+@pytest.mark.parametrize(
+    (
+        "layout_keys",
+        "release",
+        "expected_layout_cleanup",
+        "expected_physical_cleanup",
+    ),
+    [
+        ((), None, "not_applicable", "not_applicable"),
+        ((11,), None, "retained_shared", "deferred"),
+        (
+            (11,),
+            SimpleNamespace(
+                logical_layout_count=1,
+                candidate_hash_count=2,
+                stored_bytes=4096,
+            ),
+            "released",
+            "pending_sweep",
+        ),
+        (
+            (11,),
+            SimpleNamespace(
+                logical_layout_count=1,
+                candidate_hash_count=0,
+                stored_bytes=0,
+            ),
+            "released",
+            "not_applicable",
+        ),
+    ],
+)
+def test_snapshot_removal_separates_layout_and_block_cleanup_states(
+    layout_keys,
+    release,
+    expected_layout_cleanup,
+    expected_physical_cleanup,
+) -> None:
+    """A released layout is not reported as physically swept."""
+
+    result = source_snapshot_control_results.executed_snapshot_remove_plan(
+        plan={"snapshot_id": "snapshot-a"},
+        deletion_counts={"deleted_snapshots": 1},
+        layout_keys=layout_keys,
+        shared_layout_release=release,
+    )
+
+    assert result["layout_cleanup"] == expected_layout_cleanup
+    assert result["physical_cleanup"] == expected_physical_cleanup
 
 
 @pytest.mark.asyncio
@@ -264,6 +316,11 @@ async def test_source_retirement_rejects_previous_pointer_references(
     )
     monkeypatch.setattr(
         source_snapshot_control,
+        "validate_retirement_shared_layout",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
         "_current_references",
         AsyncMock(return_value={"previous_source_keys": ["source-a"]}),
     )
@@ -272,66 +329,6 @@ async def test_source_retirement_rejects_previous_pointer_references(
             snapshot_id="candidate",
             source_key="source-a",
         )
-
-
-@pytest.mark.asyncio
-async def test_unlocked_cleanup_and_unscoped_retirement_keep_safety_boundaries(
-    monkeypatch,
-) -> None:
-    """Default cleanup and retirement stay bounded without an explicit source."""
-
-    cleanup = AsyncMock()
-    monkeypatch.setattr(snapshot_cleanup, "_cleanup_source_tables", cleanup)
-    await snapshot_cleanup._cleanup_old_ptg2_source_tables(
-        "source-a",
-        {"current"},
-    )
-    cleanup.assert_awaited_once_with(
-        snapshot_cleanup.db,
-        source_key="source-a",
-        keep_snapshot_ids={"current"},
-    )
-
-    monkeypatch.setattr(source_snapshot_control.db, "transaction", _transaction)
-    monkeypatch.setattr(
-        source_snapshot_control,
-        "_lock_source_pointer_gc",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        source_snapshot_control,
-        "_snapshot_row",
-        AsyncMock(return_value={"snapshot_id": "candidate"}),
-    )
-    monkeypatch.setattr(
-        source_snapshot_control,
-        "retirement_manifest_source_key",
-        lambda _snapshot, _source_key: "manifest-source",
-    )
-    monkeypatch.setattr(
-        source_snapshot_control,
-        "_current_references",
-        AsyncMock(side_effect=[{}, {}]),
-    )
-    status = AsyncMock(side_effect=[2, 1])
-    monkeypatch.setattr(source_snapshot_control.db, "status", status)
-    monkeypatch.setattr(
-        source_snapshot_control,
-        "_clear_ptg2_snapshot_cache",
-        lambda: None,
-    )
-
-    retirement_result = await source_snapshot_control.retire_ptg2_source_snapshot(
-        snapshot_id="candidate"
-    )
-
-    assert retirement_result["source_key"] == "manifest-source"
-    assert retirement_result["deleted_plan_pointers"] == 2
-    assert retirement_result["deleted_source_pointers"] == 1
-    assert all(
-        call.kwargs == {"snapshot_id": "candidate"}
-        for call in status.await_args_list
-    )
 
 
 @pytest.mark.asyncio

@@ -172,7 +172,7 @@ def test_gc_plan_additively_selects_unreferenced_strict_v4_snapshots():
     assert plan.tables == ()
 
 
-def test_gc_protected_set_unions_owner_qualified_snapshot_pins():
+def test_gc_protected_set_unions_pins_and_direct_release_bindings():
     executor = _Executor(
         [
             {
@@ -201,6 +201,7 @@ def test_gc_protected_set_unions_owner_qualified_snapshot_pins():
         if "SELECT DISTINCT snapshot_id" in statement
     )
     assert "ptg2_snapshot_pin" in pointer_sql
+    assert "plan_release_snapshot_binding" in pointer_sql
     assert plan.current_snapshot_ids == ("release-pinned",)
     assert plan.candidate_snapshot_ids == ("unreferenced",)
 

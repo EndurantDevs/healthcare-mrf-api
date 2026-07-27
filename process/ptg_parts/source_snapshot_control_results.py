@@ -39,6 +39,7 @@ def executed_empty_remove_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "released_shared_layouts": 0,
         "queued_shared_block_candidates": 0,
         "queued_shared_block_bytes": 0,
+        "layout_cleanup": "not_applicable",
         "physical_cleanup": "not_applicable",
     }
 
@@ -115,6 +116,17 @@ def executed_snapshot_remove_plan(
         getattr(shared_layout_release, "candidate_hash_count", 0) or 0
     )
     queued_bytes = int(getattr(shared_layout_release, "stored_bytes", 0) or 0)
+    if released_layouts:
+        layout_cleanup = "released"
+        physical_cleanup = (
+            "pending_sweep" if queued_candidates else "not_applicable"
+        )
+    elif layout_keys:
+        layout_cleanup = "retained_shared"
+        physical_cleanup = "deferred"
+    else:
+        layout_cleanup = "not_applicable"
+        physical_cleanup = "not_applicable"
     return {
         **plan,
         "executed": True,
@@ -123,9 +135,6 @@ def executed_snapshot_remove_plan(
         "released_shared_layouts": released_layouts,
         "queued_shared_block_candidates": queued_candidates,
         "queued_shared_block_bytes": queued_bytes,
-        "physical_cleanup": (
-            "released"
-            if released_layouts
-            else ("deferred" if layout_keys else "not_applicable")
-        ),
+        "layout_cleanup": layout_cleanup,
+        "physical_cleanup": physical_cleanup,
     }

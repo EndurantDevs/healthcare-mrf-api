@@ -34,23 +34,24 @@ def _mutate_first_api_sample(measurement, class_name, **updates):
     _resign_api_row(api_sample)
 
 
-def test_http_distinctness_semantics_and_selection_are_verified_from_rows():
-    """Reject duplicated, overlapping, or misclassified HTTP observations."""
-    def duplicate_query(measurement):
-        samples = measurement["raw_samples"]["http_random"]
-        samples[1]["semantic_query_digest"] = samples[0]["semantic_query_digest"]
-        _resign_api_row(samples[1])
+def _duplicate_query(measurement):
+    samples = measurement["raw_samples"]["http_random"]
+    samples[1]["semantic_query_digest"] = samples[0]["semantic_query_digest"]
+    _resign_api_row(samples[1])
 
-    def overlap_query(measurement):
-        raw_samples = measurement["raw_samples"]
-        source = raw_samples["http_matched_positive"][0]
-        target = raw_samples["http_negative"][0]
-        target["semantic_query_digest"] = source["semantic_query_digest"]
-        _resign_api_row(target)
 
-    cases = (
-        (duplicate_query, "duplicate_query_key"),
-        (overlap_query, "cross_class_query_overlap"),
+def _overlap_query(measurement):
+    raw_samples = measurement["raw_samples"]
+    source = raw_samples["http_matched_positive"][0]
+    target = raw_samples["http_negative"][0]
+    target["semantic_query_digest"] = source["semantic_query_digest"]
+    _resign_api_row(target)
+
+
+def _http_distinctness_cases():
+    return (
+        (_duplicate_query, "duplicate_query_key"),
+        (_overlap_query, "cross_class_query_overlap"),
         (
             lambda measurement: _mutate_first_api_sample(
                 measurement, "matched_positive", result_count=0
@@ -91,7 +92,12 @@ def test_http_distinctness_semantics_and_selection_are_verified_from_rows():
             "stale_process",
         ),
     )
-    for mutate, code in cases:
+
+
+def test_http_distinctness_semantics_and_selection_are_verified_from_rows():
+    """Reject duplicated, overlapping, or misclassified HTTP observations."""
+
+    for mutate, code in _http_distinctness_cases():
         measurement = _record()
         mutate(measurement)
         assert _evaluation_error(measurement).code == code

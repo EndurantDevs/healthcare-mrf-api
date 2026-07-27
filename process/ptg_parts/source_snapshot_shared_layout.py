@@ -12,6 +12,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     PTG2_V4_SHARED_GENERATION,
 )
+from process.ptg_parts.source_snapshot_control_policy import (
+    manifest_dict,
+    strict_shared_snapshot_key,
+)
 
 
 def _row_mapping(row: Any) -> dict[str, Any]:
@@ -47,33 +51,6 @@ async def _lock_snapshot_layout(
     if len(binding_rows) != 1:
         raise RuntimeError("snapshot has multiple shared layout bindings")
     return _row_mapping(binding_rows[0])
-
-
-def _v4_manifest_snapshot_key(expected_snapshot_key: Any) -> int:
-    """Return the required positive V4 layout coordinate from the manifest."""
-
-    if isinstance(expected_snapshot_key, bool):
-        raise ValueError(
-            "PTG V4 snapshot manifest is missing its shared snapshot key"
-        )
-    if isinstance(expected_snapshot_key, int):
-        snapshot_key = expected_snapshot_key
-    elif (
-        isinstance(expected_snapshot_key, str)
-        and expected_snapshot_key.isascii()
-        and expected_snapshot_key.isdecimal()
-        and not expected_snapshot_key.startswith("0")
-    ):
-        snapshot_key = int(expected_snapshot_key)
-    else:
-        raise ValueError(
-            "PTG V4 snapshot manifest is missing its shared snapshot key"
-        )
-    if snapshot_key <= 0:
-        raise ValueError(
-            "PTG V4 snapshot manifest is missing its shared snapshot key"
-        )
-    return snapshot_key
 
 
 async def _require_complete_v4_root(
@@ -122,22 +99,14 @@ async def bound_shared_layout_keys(
     }
     if expected_generation not in supported_generations:
         raise ValueError("snapshot removal plan has an unsupported storage generation")
-    expected_v4_snapshot_key = (
-        _v4_manifest_snapshot_key(expected_snapshot_key)
-        if expected_generation == PTG2_V4_SHARED_GENERATION
-        else None
-    )
+    expected_layout_key = strict_shared_snapshot_key(expected_snapshot_key)
     layout_by_field = await _lock_snapshot_layout(
         session,
         schema=schema,
         snapshot_id=snapshot_id,
     )
     if not layout_by_field:
-        if expected_generation == PTG2_V4_SHARED_GENERATION:
-            raise ValueError(
-                "PTG V4 snapshot is missing its shared layout binding"
-            )
-        return ()
+        raise ValueError("snapshot is missing its shared layout binding")
     snapshot_key = int(layout_by_field.get("snapshot_key"))
     layout_generation = str(
         layout_by_field.get("generation") or ""
@@ -146,14 +115,41 @@ async def bound_shared_layout_keys(
         raise ValueError("snapshot binding storage generation does not match manifest")
     if str(layout_by_field.get("state") or "").strip().lower() != "sealed":
         raise ValueError("snapshot binding does not reference a sealed shared layout")
+    if expected_layout_key != snapshot_key:
+        raise ValueError(
+            "snapshot manifest does not match its shared layout binding"
+        )
     if expected_generation == PTG2_V4_SHARED_GENERATION:
-        if expected_v4_snapshot_key != snapshot_key:
-            raise ValueError(
-                "PTG V4 snapshot manifest does not match its shared layout binding"
-            )
         await _require_complete_v4_root(
             session,
             schema=schema,
             snapshot_key=snapshot_key,
         )
     return (snapshot_key,)
+
+
+async def validate_retirement_shared_layout(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_id: str,
+    snapshot: dict[str, Any],
+) -> None:
+    """Require exact manifest-to-layout identity before pointer retirement."""
+
+    if not snapshot:
+        return
+    manifest = manifest_dict(snapshot.get("manifest"))
+    serving_index_value = manifest.get("serving_index")
+    serving_index = (
+        serving_index_value if isinstance(serving_index_value, dict) else {}
+    )
+    await bound_shared_layout_keys(
+        session,
+        schema=schema,
+        snapshot_id=snapshot_id,
+        expected_generation=str(
+            serving_index.get("storage_generation") or ""
+        ).strip().lower(),
+        expected_snapshot_key=serving_index.get("shared_snapshot_key"),
+    )

@@ -1483,7 +1483,7 @@ async def _reject_v4_dictionary_extra_keys(
         raise RuntimeError("PTG V4 persisted dictionary rows changed")
 
 
-async def _publish_v4_sparse_dictionary_stage_ranges(
+async def _publish_v4_sparse_ranges(
     session: Any,
     *,
     schema: str,
@@ -1579,6 +1579,9 @@ async def _publish_v4_sparse_dictionary_stage_ranges(
         or int(target_count or 0) != int(stage.expected_count)
     ):
         raise RuntimeError("PTG V4 persisted dictionary rows changed")
+
+
+_publish_v4_sparse_dictionary_stage_ranges = _publish_v4_sparse_ranges
 
 
 def _v4_tax_length_prefixed_digest(

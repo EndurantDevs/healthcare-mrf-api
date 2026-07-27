@@ -115,6 +115,11 @@ SELECT DISTINCT snapshot_id
           JOIN __SCHEMA__.ptg2_snapshot AS snapshot
             ON snapshot.snapshot_id = pin.snapshot_id
          WHERE snapshot.manifest->'serving_index'->>'source_key' = :source_key
+        UNION ALL
+        SELECT binding.snapshot_id
+          FROM __SCHEMA__.plan_release_snapshot_binding AS binding
+         WHERE binding.source_key = :source_key
+           AND binding.snapshot_id IS NOT NULL
   ) current_refs
 """
 

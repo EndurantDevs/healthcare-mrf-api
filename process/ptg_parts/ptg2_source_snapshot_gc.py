@@ -56,6 +56,9 @@ SELECT DISTINCT snapshot_id
         SELECT previous_snapshot_id AS snapshot_id FROM __SCHEMA__.ptg2_current_plan_source WHERE previous_snapshot_id IS NOT NULL
         UNION ALL
         SELECT snapshot_id FROM __SCHEMA__.ptg2_snapshot_pin WHERE snapshot_id IS NOT NULL
+        UNION ALL
+        SELECT snapshot_id FROM __SCHEMA__.plan_release_snapshot_binding
+         WHERE snapshot_id IS NOT NULL
   ) refs
  ORDER BY snapshot_id
 """

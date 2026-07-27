@@ -363,6 +363,7 @@
         "process/ptg_parts/source_snapshot_control.py",
         "process/ptg_parts/source_snapshot_control_policy.py",
         "process/ptg_parts/source_snapshot_control_results.py",
+        "process/ptg_parts/source_snapshot_references.py",
         "process/ptg_parts/source_snapshot_rollback.py",
         "process/ptg_parts/source_snapshot_rollback_allowed.py",
         "process/ptg_parts/source_snapshot_rollback_relations.py",
@@ -410,12 +411,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 33333,
-          "total": 38724
+          "covered": 33358,
+          "total": 38742
         },
         "lines": {
-          "covered": 106386,
-          "total": 114927
+          "covered": 106463,
+          "total": 114991
         }
       },
       "one_time_floor_reset": {

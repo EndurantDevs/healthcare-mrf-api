@@ -492,6 +492,21 @@ def _ptg2_plan_rows(
         "canonical_payload": _canonicalize_for_json(plan_identity_by_field),
         "created_at": _utcnow(),
     }
+    alias_rows = _ptg2_plan_alias_rows(plan_hash, plan_identity_by_field)
+    plan_month_row_by_field = _ptg2_plan_month_row(
+        plan_hash,
+        snapshot_id,
+        import_month,
+    )
+    return plan_row_by_field, alias_rows, plan_month_row_by_field
+
+
+def _ptg2_plan_alias_rows(
+    plan_hash: str,
+    plan_identity_by_field: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build the deterministic alternate identifiers for one plan."""
+
     alias_rows: list[dict[str, Any]] = []
     for alias_type, alias_value in (
         ("plan_id", plan_identity_by_field.get("plan_id")),
@@ -514,6 +529,16 @@ def _ptg2_plan_rows(
                 "created_at": _utcnow(),
             }
         )
+    return alias_rows
+
+
+def _ptg2_plan_month_row(
+    plan_hash: str,
+    snapshot_id: str,
+    import_month: datetime.date,
+) -> dict[str, Any]:
+    """Build one logical plan-month scope row."""
+
     plan_month_identity_by_field = {
         "snapshot_id": snapshot_id,
         "plan_hash": plan_hash,
@@ -530,4 +555,4 @@ def _ptg2_plan_rows(
         "import_month": import_month,
         "created_at": _utcnow(),
     }
-    return plan_row_by_field, alias_rows, plan_month_row_by_field
+    return plan_month_row_by_field

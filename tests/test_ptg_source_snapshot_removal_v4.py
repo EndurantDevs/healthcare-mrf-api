@@ -13,6 +13,7 @@ import pytest
 from db.connection import Database
 from process.ptg_parts import source_snapshot_control
 from process.ptg_parts.ptg2_shared_blocks import SharedBlock
+from process.ptg_parts.ptg2_shared_gc import sweep_ptg2_shared_blocks
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_MAP_BLOCK_KIND,
     PTG2_V4_SHARED_GENERATION,
@@ -329,6 +330,7 @@ async def _assert_first_removal_preserves_layout(
     assert first["storage_generation"] == PTG2_V4_SHARED_GENERATION
     assert first["released_shared_layouts"] == 0
     assert first["queued_shared_block_candidates"] == 0
+    assert first["layout_cleanup"] == "retained_shared"
     assert first["physical_cleanup"] == "deferred"
     assert await _count(database, schema_name, "ptg2_v3_snapshot_layout") == 1
     assert await _count(database, schema_name, "ptg2_v4_snapshot_map_root") == 1
@@ -346,7 +348,8 @@ async def _assert_second_removal_releases_layout(
     assert second["released_shared_layouts"] == 1
     assert second["queued_shared_block_candidates"] == 2
     assert second["queued_shared_block_bytes"] == stored_bytes
-    assert second["physical_cleanup"] == "released"
+    assert second["layout_cleanup"] == "released"
+    assert second["physical_cleanup"] == "pending_sweep"
     assert await _count(database, schema_name, "ptg2_snapshot") == 0
     assert await _count(database, schema_name, "ptg2_v3_snapshot_layout") == 0
     assert await _count(database, schema_name, "ptg2_v4_snapshot_map_root") == 0
@@ -354,6 +357,37 @@ async def _assert_second_removal_releases_layout(
     assert set((await _sidecar_counts(database, schema_name)).values()) == {0}
     assert await _count(database, schema_name, "ptg2_v3_gc_candidate") == 2
     assert await _count(database, schema_name, "ptg2_v3_block") == 2
+
+
+async def _assert_initial_sidecars(
+    database: Database,
+    schema_name: str,
+) -> dict[str, int]:
+    initial_sidecar_counts = await _sidecar_counts(database, schema_name)
+    assert initial_sidecar_counts == {
+        "ptg2_provider_tax_identity_legacy_layout": 1,
+        "ptg2_provider_tax_identity_manifest": 1,
+        "ptg2_provider_tax_identity": 1,
+        "ptg2_provider_group_tax_identity": 4,
+    }
+    return initial_sidecar_counts
+
+
+async def _sweep_released_blocks(
+    database: Database,
+    schema_name: str,
+    stored_bytes: int,
+) -> None:
+    async with database.acquire() as connection:
+        swept = await sweep_ptg2_shared_blocks(
+            schema_name=schema_name,
+            executor=connection,
+            require_shared=True,
+        )
+    assert swept.selected_hash_count == 2
+    assert swept.stored_bytes == stored_bytes
+    assert await _count(database, schema_name, "ptg2_v3_gc_candidate") == 0
+    assert await _count(database, schema_name, "ptg2_v3_block") == 0
 
 
 @pytest.mark.asyncio
@@ -374,18 +408,12 @@ async def test_targeted_v4_removal_cascades_sidecars_only_after_last_binding(
     await database.connect()
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
     monkeypatch.setenv("DB_SCHEMA", schema_name)
+    monkeypatch.setenv("HLTHPRT_PTG2_V3_BLOCK_GC_GRACE_SECONDS", "0")
     monkeypatch.setattr(source_snapshot_control, "db", database)
     try:
         await _create_production_shaped_schema(database, schema_name)
         stored_bytes = await _install_v4_layout_fixture(database, schema_name)
-        initial_sidecar_counts = await _sidecar_counts(database, schema_name)
-        assert initial_sidecar_counts == {
-            "ptg2_provider_tax_identity_legacy_layout": 1,
-            "ptg2_provider_tax_identity_manifest": 1,
-            "ptg2_provider_tax_identity": 1,
-            "ptg2_provider_group_tax_identity": 4,
-        }
-
+        initial_sidecar_counts = await _assert_initial_sidecars(database, schema_name)
         first = await source_snapshot_control.remove_ptg2_source_snapshot(
             snapshot_id=" shared-a ",
             source_key=" source_a ",
@@ -408,6 +436,7 @@ async def test_targeted_v4_removal_cascades_sidecars_only_after_last_binding(
             second,
             stored_bytes,
         )
+        await _sweep_released_blocks(database, schema_name, stored_bytes)
     finally:
         try:
             async with database.acquire() as connection:

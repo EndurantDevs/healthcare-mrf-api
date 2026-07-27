@@ -44,6 +44,13 @@ async def _create_gc_pointer_tables(connection, schema: str) -> None:
         )
         """
     )
+    await connection.status(
+        f"""
+        CREATE TABLE {schema}.plan_release_snapshot_binding (
+            snapshot_id varchar(96) PRIMARY KEY
+        )
+        """
+    )
 
 
 async def _create_gc_lifecycle_tables(connection, schema: str) -> None:
@@ -115,6 +122,24 @@ async def _assert_stale_cutoff(connection, schema: str, schema_name: str) -> Non
         UPDATE {schema}.ptg2_snapshot
            SET created_at = timezone('UTC', transaction_timestamp())
                             - INTERVAL '2 hours'
+         WHERE snapshot_id = 'fresh-building'
+        """
+    )
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.plan_release_snapshot_binding (snapshot_id)
+        VALUES ('fresh-building')
+        """
+    )
+    protected_plan = await snapshot_gc.build_ptg2_source_snapshot_gc_plan(
+        schema_name=schema_name,
+        executor=connection,
+        stale_build_seconds=3_600,
+    )
+    assert protected_plan.candidate_snapshot_ids == ()
+    await connection.status(
+        f"""
+        DELETE FROM {schema}.plan_release_snapshot_binding
          WHERE snapshot_id = 'fresh-building'
         """
     )
