@@ -42,8 +42,12 @@ OTHER_SUFFIX = "2" * 32
 class _ResultSetExecutor:
     def __init__(self, result_sets: list[list[dict[str, object]]]) -> None:
         self.result_sets = list(result_sets)
+        self.statements: list[str] = []
+        self.parameters: list[dict[str, object]] = []
 
-    async def all(self, _statement: str, **_parameters):
+    async def all(self, statement: str, **parameters):
+        self.statements.append(statement)
+        self.parameters.append(parameters)
         return self.result_sets.pop(0)
 
 
@@ -398,6 +402,8 @@ async def test_empty_replay_state_skips_relation_and_snapshot_queries() -> None:
 
 @pytest.mark.asyncio
 async def test_schema_catalog_boundaries_fail_closed(monkeypatch) -> None:
+    """Reject invalid authority, audit, and base catalog identities."""
+
     monkeypatch.setattr(schema_store, "_MRF_REQUIRED_TABLES", ("snapshot",))
     monkeypatch.setattr(schema_store, "_CONTROL_REQUIRED_TABLES", ())
     with pytest.raises(RuntimeError, match="authority_catalog_invalid"):
@@ -423,13 +429,6 @@ async def test_schema_catalog_boundaries_fail_closed(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="snapshot_catalog_missing"):
         await schema_store._base_catalog_identity(
             _MissingBaseExecutor(),
-            "mrf",
-        )
-
-    monkeypatch.setattr(schema_store, "LEGACY_SWEEP_MAX_RELATIONS", 0)
-    with pytest.raises(RuntimeError, match="relation_catalog_limit_exceeded"):
-        await schema_store._relation_catalog_rows(
-            _ResultSetExecutor([[{"relation_oid": 1}]]),
             "mrf",
         )
 

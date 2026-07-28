@@ -18,9 +18,10 @@ from arq import create_pool
 from db.models import DoctorClinicianAddress, db
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
+from process.cms_doctors_rows import doctor_address_row
 from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import (ensure_database, make_class, my_init_db,
-                               print_time_info, push_objects, return_checksum)
+                               print_time_info, push_objects)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -173,7 +174,106 @@ async def _fetch_doctors_download_url(client) -> str:
     raise ValueError("Could not find CMS Doctors CSV/ZIP download URL in dataset.")
 
 
-async def process_data(ctx, task=None):
+async def _consume_doctors_reader(
+    reader,
+    *,
+    ctx,
+    task,
+    stage_cls,
+    batch_size: int,
+    test_mode: bool,
+    test_row_limit: int,
+) -> int:
+    """Normalize reader rows and persist bounded, deduplicated batches."""
+    accepted_rows = 0
+    provider_batch_rows = []
+    seen_checksums: set[int] = set()
+    now = datetime.datetime.utcnow()
+    for provider_row in reader:
+        address_row = doctor_address_row(provider_row, now)
+        if address_row is None:
+            continue
+        address_checksum = address_row["address_checksum"]
+        if address_checksum in seen_checksums:
+            continue
+        seen_checksums.add(address_checksum)
+        provider_batch_rows.append(address_row)
+        if len(provider_batch_rows) >= batch_size:
+            await raise_if_cancelled(ctx, task)
+            await push_objects(provider_batch_rows, stage_cls)
+            accepted_rows += len(provider_batch_rows)
+            provider_batch_rows.clear()
+        if test_mode and accepted_rows + len(provider_batch_rows) >= test_row_limit:
+            break
+    if provider_batch_rows:
+        await raise_if_cancelled(ctx, task)
+        await push_objects(provider_batch_rows, stage_cls)
+        accepted_rows += len(provider_batch_rows)
+    return accepted_rows
+
+
+async def _import_doctors_source(
+    source_path: str,
+    *,
+    ctx,
+    task,
+    stage_cls,
+    batch_size: int,
+    test_mode: bool,
+    test_row_limit: int,
+) -> int:
+    """Open a downloaded CSV or ZIP and stream its rows through one importer."""
+    reader_kwargs_by_name = {
+        "ctx": ctx,
+        "task": task,
+        "stage_cls": stage_cls,
+        "batch_size": batch_size,
+        "test_mode": test_mode,
+        "test_row_limit": test_row_limit,
+    }
+    if source_path.lower().endswith(".zip"):
+        with zipfile.ZipFile(source_path) as archive:
+            csv_filename = next(
+                (name for name in archive.namelist() if name.lower().endswith(".csv")),
+                None,
+            )
+            if not csv_filename:
+                raise ValueError("No CSV inside the CMS Doctors ZIP")
+            logger.info("Streaming CSV from ZIP: %s", csv_filename)
+            with archive.open(csv_filename) as raw_file:
+                text_file = TextIOWrapper(
+                    raw_file,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                return await _consume_doctors_reader(
+                    csv.DictReader(text_file),
+                    **reader_kwargs_by_name,
+                )
+    logger.info("Streaming CSV: %s", os.path.basename(source_path))
+    with open(
+        source_path,
+        "r",
+        encoding="utf-8",
+        errors="replace",
+        newline="",
+    ) as raw_file:
+        return await _consume_doctors_reader(
+            csv.DictReader(raw_file),
+            **reader_kwargs_by_name,
+        )
+
+
+async def _download_doctors_source(client, url: str, source_path: str) -> None:
+    """Stream one CMS Doctors source into a temporary local file."""
+    async with client.get(url, timeout=600) as response:
+        response.raise_for_status()
+        with open(source_path, "wb") as destination:
+            async for chunk in response.content.iter_chunked(10 * 1024 * 1024):
+                destination.write(chunk)
+
+
+async def import_cms_doctors_data(ctx, task=None):
     """Download and import the current CMS doctors address dataset."""
 
     task = task or {}
@@ -204,93 +304,25 @@ async def process_data(ctx, task=None):
             source_ext = ".zip" if url.lower().endswith(".zip") else ".csv"
             source_path = os.path.join(tmpdir, f"cms_doctors{source_ext}")
 
-            async with client.get(url, timeout=600) as response:
-                response.raise_for_status()
-                with open(source_path, "wb") as fh:
-                    async for chunk in response.content.iter_chunked(10 * 1024 * 1024):
-                        fh.write(chunk)
-
-            async def _consume_reader(reader):
-                """Normalize reader rows and persist bounded batches."""
-
-                nonlocal accepted_rows
-                provider_batch_rows = []
-                seen_keys: set[int] = set()
-                now = datetime.datetime.utcnow()
-
-                for provider_row in reader:
-                    npi_str = provider_row.get("NPI") or provider_row.get("npi")
-                    if not npi_str:
-                        continue
-
-                    try:
-                        npi = int(npi_str)
-                    except ValueError:
-                        continue
-
-                    addr1 = provider_row.get("Line 1 Street Address") or provider_row.get("adr_ln_1")
-                    addr2 = provider_row.get("Line 2 Street Address") or provider_row.get("adr_ln_2")
-                    city = provider_row.get("City") or provider_row.get("City/Town") or provider_row.get("citytown")
-                    state = provider_row.get("State") or provider_row.get("state")
-                    zip_code = str(provider_row.get("Zip Code") or provider_row.get("ZIP Code") or provider_row.get("zip_code") or "")[:5]
-                    provider_type = provider_row.get("Primary specialty") or provider_row.get("pri_spec")
-                    if not addr1 or not zip_code or len(zip_code) < 5:
-                        continue
-                    address_checksum = return_checksum([
-                        npi,
-                        addr1 or "",
-                        addr2 or "",
-                        city or "",
-                        state or "",
-                        zip_code or "",
-                        provider_type or "",
-                    ])
-                    if address_checksum in seen_keys:
-                        continue
-                    seen_keys.add(address_checksum)
-                    provider_batch_rows.append({
-                        "npi": npi,
-                        "address_checksum": address_checksum,
-                        "address_line1": addr1,
-                        "address_line2": addr2,
-                        "city": city,
-                        "state": state,
-                        "zip_code": zip_code,
-                        "provider_type": provider_type,
-                        "updated_at": now,
-                    })
-                    if len(provider_batch_rows) >= batch_size:
-                        await raise_if_cancelled(ctx, task)
-                        await push_objects(provider_batch_rows, stage_cls)
-                        accepted_rows += len(provider_batch_rows)
-                        provider_batch_rows.clear()
-                    if test_mode and accepted_rows + len(provider_batch_rows) >= test_row_limit:
-                        break
-                if provider_batch_rows:
-                    await raise_if_cancelled(ctx, task)
-                    await push_objects(provider_batch_rows, stage_cls)
-                    accepted_rows += len(provider_batch_rows)
-
-            if source_path.lower().endswith(".zip"):
-                with zipfile.ZipFile(source_path) as zf:
-                    csv_filename = next((n for n in zf.namelist() if n.lower().endswith(".csv")), None)
-                    if not csv_filename:
-                        raise ValueError("No CSV inside the CMS Doctors ZIP")
-                    logger.info("Streaming CSV from ZIP: %s", csv_filename)
-                    with zf.open(csv_filename) as raw_f:
-                        text_f = TextIOWrapper(raw_f, encoding="utf-8", errors="replace")
-                        reader = csv.DictReader(text_f)
-                        await _consume_reader(reader)
-            else:
-                logger.info("Streaming CSV: %s", os.path.basename(source_path))
-                with open(source_path, "r", encoding="utf-8", errors="replace", newline="") as raw_f:
-                    reader = csv.DictReader(raw_f)
-                    await _consume_reader(reader)
+            await _download_doctors_source(client, url, source_path)
+            accepted_rows += await _import_doctors_source(
+                source_path,
+                ctx=ctx,
+                task=task,
+                stage_cls=stage_cls,
+                batch_size=batch_size,
+                test_mode=test_mode,
+                test_row_limit=test_row_limit,
+            )
     finally:
         await client.close()
 
     ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
     logger.info("CMS Doctors import done: %d rows accepted", accepted_rows)
+
+
+process_data = import_cms_doctors_data
+process_data.__name__ = "process_data"
 
 
 async def startup(ctx):

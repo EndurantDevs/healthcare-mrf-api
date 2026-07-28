@@ -161,7 +161,50 @@ async def _flush_places_rows(
     return len(rows)
 
 
-async def process_data(ctx, task=None):  # pragma: no cover
+async def _read_places_rows(
+    csv_path: str,
+    *,
+    latest_year: int,
+    target_cls,
+    batch_size: int,
+    test_mode: bool,
+    test_row_limit: int,
+    ctx,
+    task,
+) -> tuple[int, int]:
+    """Read, deduplicate, and persist the selected PLACES year."""
+    place_by_key: dict[tuple[str, int, str], dict[str, Any]] = {}
+    processed_rows = 0
+    accepted_rows = 0
+    matched_rows = 0
+    async with async_open(csv_path, "r", encoding="utf-8-sig") as handle:
+        reader = AsyncDictReader(handle, delimiter=",")
+        async for source_row in reader:
+            processed_rows += 1
+            place_record = _build_places_record(source_row, latest_year)
+            if not place_record:
+                continue
+            matched_rows += 1
+            key = (
+                place_record["zcta"],
+                place_record["year"],
+                place_record["measure_id"],
+            )
+            place_by_key[key] = place_record
+            if len(place_by_key) >= batch_size:
+                await raise_if_cancelled(ctx, task)
+                accepted_rows += await _flush_places_rows(
+                    place_by_key,
+                    target_cls,
+                )
+            if test_mode and matched_rows >= test_row_limit:
+                break
+    await raise_if_cancelled(ctx, task)
+    accepted_rows += await _flush_places_rows(place_by_key, target_cls)
+    return processed_rows, accepted_rows
+
+
+async def import_places_zcta_data(ctx, task=None):
     """Process one queued places-to-ZCTA import task."""
     task = task or {}
     await raise_if_cancelled(ctx, task)
@@ -190,39 +233,16 @@ async def process_data(ctx, task=None):  # pragma: no cover
         )
 
         latest_year = await _detect_latest_year(tmp_filename)
-        place_by_key: dict[tuple[str, int, str], dict[str, Any]] = {}
-        processed_rows = 0
-        accepted_rows = 0
-        matched_rows = 0
-
-        async with async_open(tmp_filename, "r", encoding="utf-8-sig") as handle:
-            reader = AsyncDictReader(handle, delimiter=",")
-            async for source_row in reader:
-                processed_rows += 1
-                place_record = _build_places_record(source_row, latest_year)
-                if not place_record:
-                    continue
-
-                matched_rows += 1
-                key = (
-                    place_record["zcta"],
-                    place_record["year"],
-                    place_record["measure_id"],
-                )
-                place_by_key[key] = place_record
-
-                if len(place_by_key) >= batch_size:
-                    await raise_if_cancelled(ctx, task)
-                    accepted_rows += await _flush_places_rows(
-                        place_by_key,
-                        target_cls,
-                    )
-
-                if test_mode and matched_rows >= test_row_limit:
-                    break
-
-        await raise_if_cancelled(ctx, task)
-        accepted_rows += await _flush_places_rows(place_by_key, target_cls)
+        processed_rows, accepted_rows = await _read_places_rows(
+            tmp_filename,
+            latest_year=latest_year,
+            target_cls=target_cls,
+            batch_size=batch_size,
+            test_mode=test_mode,
+            test_row_limit=test_row_limit,
+            ctx=ctx,
+            task=task,
+        )
 
     if accepted_rows <= 0:
         raise RuntimeError(
@@ -241,6 +261,10 @@ async def process_data(ctx, task=None):  # pragma: no cover
         "PLACES ZCTA import done: "
         f"latest_year={latest_year} processed={processed_rows:,} accepted={accepted_rows:,}"
     )
+
+
+process_data = import_places_zcta_data
+process_data.__name__ = "process_data"
 
 
 async def startup(ctx):  # pragma: no cover
@@ -281,20 +305,8 @@ async def _is_table_available(schema: str, table_name: str) -> bool:
     return bool(exists)
 
 
-async def shutdown(ctx):  # pragma: no cover
-    """Finalize the places run and publish its archive indexes."""
-    import_date = ctx.get("import_date")
-    context = ctx.get("context") or {}
-
-    if not context.get("run"):
-        print("No PLACES ZCTA jobs ran in this worker session; skipping shutdown finalization.")
-        return
-
-    await ensure_database(bool(context.get("test_mode")))
-
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
-    stage_cls = make_class(PricingPlacesZcta, import_date)
-
+async def _validated_places_stage_rows(stage_cls, db_schema: str, context) -> int:
+    """Require the expected stage and its minimum viable row count."""
     if not await _is_table_available(db_schema, stage_cls.__tablename__):
         raise RuntimeError(
             f"Staging table {db_schema}.{stage_cls.__tablename__} is missing; cannot finalize PLACES publish."
@@ -314,16 +326,11 @@ async def shutdown(ctx):  # pragma: no cover
         raise RuntimeError(
             f"PLACES ZCTA stage row count {stage_rows:,} is below minimum {min_rows:,}; aborting publish."
         )
+    return stage_rows
 
-    async def archive_index(index_name: str) -> str:
-        """Build the places archive lookup index."""
-        archived_name = _archived_identifier(index_name)
-        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_name};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{index_name} RENAME TO {archived_name};"
-        )
-        return archived_name
 
+async def _create_places_stage_indexes(stage_cls, db_schema: str) -> None:
+    """Create the configured additional indexes before PLACES cutover."""
     async with db.transaction():
         if (
             hasattr(PricingPlacesZcta, "__my_additional_indexes__")
@@ -341,7 +348,29 @@ async def shutdown(ctx):  # pragma: no cover
                 print(create_index_sql)
                 await db.status(create_index_sql)
 
+
+async def publish_places_zcta_generation(ctx):
+    """Finalize the places run and publish its archive indexes."""
+    import_date = ctx.get("import_date")
+    context = ctx.get("context") or {}
+    if not context.get("run"):
+        print("No PLACES ZCTA jobs ran in this worker session; skipping shutdown finalization.")
+        return
+    await ensure_database(bool(context.get("test_mode")))
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
+    stage_cls = make_class(PricingPlacesZcta, import_date)
+    await _validated_places_stage_rows(stage_cls, db_schema, context)
+    await _create_places_stage_indexes(stage_cls, db_schema)
     await db.execute_ddl(f"ANALYZE {db_schema}.{stage_cls.__tablename__};")
+
+    async def archive_index(index_name: str) -> str:
+        """Archive one canonical index before renaming its staged replacement."""
+        archived_name = _archived_identifier(index_name)
+        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_name};")
+        await db.status(
+            f"ALTER INDEX IF EXISTS {db_schema}.{index_name} RENAME TO {archived_name};"
+        )
+        return archived_name
 
     async with db.transaction():
         table = stage_cls.__main_table__
@@ -366,6 +395,10 @@ async def shutdown(ctx):  # pragma: no cover
             )
 
     print_time_info(context.get("start"))
+
+
+shutdown = publish_places_zcta_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(test_mode: bool = False):  # pragma: no cover

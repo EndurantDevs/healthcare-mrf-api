@@ -9,6 +9,7 @@ import pytest
 
 from process.ptg_parts import ptg2_legacy_orphan_store_ownership as ownership_store
 from process.ptg_parts import ptg2_legacy_orphan_store_catalog as catalog_store
+from process.ptg_parts import ptg2_legacy_orphan_store_window as window_store
 from process.ptg_parts.ptg2_legacy_orphan_contract import (
     canonical_sha256,
     legacy_sweep_audit_id,
@@ -31,6 +32,9 @@ from process.ptg_parts.ptg2_legacy_orphan_store_ownership import (
 )
 from process.ptg_parts.ptg2_legacy_orphan_store_references import (
     _attach_raw_snapshot_owner_conflicts,
+)
+from process.ptg_parts.ptg2_legacy_orphan_store_window import (
+    LegacyCatalogRelationKey,
 )
 
 
@@ -316,9 +320,13 @@ async def test_root_discovery_ceiling_fails_before_row_probes(
     async def unexpected_probe(*_arguments, **_parameters):
         raise AssertionError("row probes must not run after discovery overflow")
 
-    monkeypatch.setattr(catalog_store, "LEGACY_SWEEP_MAX_TABLES", 1)
+    monkeypatch.setattr(window_store, "LEGACY_SWEEP_MAX_TABLES", 1)
     monkeypatch.setattr(catalog_store, "_base_catalog_identity", base_identity)
-    monkeypatch.setattr(catalog_store, "_relation_catalog_rows", relation_rows)
+    monkeypatch.setattr(
+        catalog_store,
+        "relation_catalog_window_rows",
+        relation_rows,
+    )
     monkeypatch.setattr(
         catalog_store,
         "_relation_build_context",
@@ -333,4 +341,16 @@ async def test_root_discovery_ceiling_fails_before_row_probes(
             object(),
             schema_name="mrf",
             probe_rows=True,
+            relation_keys=(
+                LegacyCatalogRelationKey(
+                    1,
+                    f"ptg_file_{SUFFIX}",
+                    (SUFFIX,),
+                ),
+                LegacyCatalogRelationKey(
+                    2,
+                    f"ptg_file_{OTHER_ID}",
+                    (OTHER_ID,),
+                ),
+            ),
         )

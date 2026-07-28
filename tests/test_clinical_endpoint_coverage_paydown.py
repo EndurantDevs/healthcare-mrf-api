@@ -135,12 +135,12 @@ async def test_list_codes_filters_and_clinical_area_delegation(monkeypatch):
     )
     assert delegated == "area-response"
     assert area_call_by_name == {
-        "clinical_area_id": "mesh:C14",
-        "mapping_kind": "condition",
-        "system": "RXNORM",
-        "q": "heart",
-        "require_area": False,
-    }
+            "clinical_area_id": "mesh:C14",
+            "mapping_kind": "condition",
+            "system": "RXNORM",
+            "query_text": "heart",
+            "require_area": False,
+        }
 
     session = _Session(
         _Result(scalar=2),
@@ -193,7 +193,7 @@ async def test_clinical_area_payload_and_mapping_boundaries():
             clinical_area_id="missing",
             mapping_kind="condition",
             system="",
-            q="",
+            query_text="",
             require_area=True,
         )
 
@@ -218,7 +218,7 @@ async def test_clinical_area_concept_list_boundaries(monkeypatch):
         clinical_area_id="mesh:C14",
         mapping_kind="condition",
         system="ICD10CM",
-        q="pressure",
+        query_text="pressure",
         require_area=True,
     )
     listed_payload = _payload(listed)
@@ -231,7 +231,7 @@ async def test_clinical_area_concept_list_boundaries(monkeypatch):
         clinical_area_id="mesh:C14",
         mapping_kind="treatment",
         system="",
-        q="",
+        query_text="",
         require_area=False,
     )
     assert _payload(unfiltered)["items"] == []

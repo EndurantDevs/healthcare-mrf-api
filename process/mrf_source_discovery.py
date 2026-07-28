@@ -6514,6 +6514,203 @@ def _filter_crawl_targets_by_resolver_patterns(
     return targets
 
 
+def _crawl_target_with_context(
+    crawl_target: CrawlTarget,
+    **context: str,
+) -> CrawlTarget:
+    """Copy one crawl target while attaching directory or frame provenance."""
+    return CrawlTarget(
+        source=crawl_target.source,
+        url=crawl_target.url,
+        label=crawl_target.label,
+        resolved_from_url=crawl_target.resolved_from_url,
+        metadata={
+            **dict(crawl_target.metadata or {}),
+            **context,
+        },
+    )
+
+
+async def _nested_html_directory_targets(
+    source_row: dict[str, Any],
+    directory_url: str,
+    directory_html: str,
+    *,
+    resolver: dict[str, Any],
+    target_max_bytes: int | None,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve the bounded second level of one HTML MRF directory."""
+    nested_targets: list[CrawlTarget] = []
+    nested_directory_urls = _html_mrf_directory_urls(
+        directory_html,
+        base_url=directory_url,
+    )
+    max_nested_directories = (
+        _as_int(resolver.get("max_nested_directories_per_directory")) or 5
+    )
+    directory_max_bytes = int(
+        resolver.get("directory_max_bytes")
+        or resolver.get("max_bytes")
+        or 5 * 1024 * 1024
+    )
+    for nested_directory_url in nested_directory_urls[:max_nested_directories]:
+        try:
+            nested_directory_html = await _fetch_text(
+                nested_directory_url,
+                max_bytes=directory_max_bytes,
+                session=session,
+            )
+        except Exception:
+            continue
+        crawl_targets = _crawl_targets_from_html_mrf_links(
+            source_row,
+            nested_directory_html,
+            base_url=nested_directory_url,
+            resolver="html_mrf_nested_directory_link",
+            target_max_bytes=target_max_bytes,
+        )
+        nested_targets.extend(
+            _crawl_target_with_context(
+                crawl_target,
+                directory_url=directory_url,
+                nested_directory_url=nested_directory_url,
+            )
+            for crawl_target in crawl_targets
+        )
+    return nested_targets
+
+
+async def _html_directory_targets(
+    source_row: dict[str, Any],
+    html_text: str,
+    *,
+    url: str,
+    resolver: dict[str, Any],
+    target_max_bytes: int | None,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve the bounded directory links advertised by one landing page."""
+    crawl_targets: list[CrawlTarget] = []
+    directory_urls = _html_mrf_directory_urls(html_text, base_url=url)
+    max_directories = _as_int(resolver.get("max_directories")) or 10
+    directory_max_bytes = int(
+        resolver.get("directory_max_bytes")
+        or resolver.get("max_bytes")
+        or 5 * 1024 * 1024
+    )
+    for directory_url in directory_urls[:max_directories]:
+        try:
+            directory_html = await _fetch_text(
+                directory_url,
+                max_bytes=directory_max_bytes,
+                session=session,
+            )
+        except Exception:
+            continue
+        directory_targets = _crawl_targets_from_html_mrf_links(
+            source_row,
+            directory_html,
+            base_url=directory_url,
+            resolver="html_mrf_directory_link",
+            target_max_bytes=target_max_bytes,
+        )
+        if not directory_targets:
+            crawl_targets.extend(
+                await _nested_html_directory_targets(
+                    source_row,
+                    directory_url,
+                    directory_html,
+                    resolver=resolver,
+                    target_max_bytes=target_max_bytes,
+                    session=session,
+                )
+            )
+        crawl_targets.extend(
+            _crawl_target_with_context(
+                crawl_target,
+                directory_url=directory_url,
+            )
+            for crawl_target in directory_targets
+        )
+    return crawl_targets
+
+
+async def _html_frame_targets(
+    source_row: dict[str, Any],
+    html_text: str,
+    *,
+    url: str,
+    resolver: dict[str, Any],
+    target_max_bytes: int | None,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve bounded iframe links when a landing page has no direct targets."""
+    crawl_targets: list[CrawlTarget] = []
+    frame_urls = _html_mrf_frame_urls(html_text, base_url=url)
+    max_frames = _as_int(resolver.get("max_frames")) or 5
+    frame_max_bytes = int(
+        resolver.get("frame_max_bytes")
+        or resolver.get("directory_max_bytes")
+        or resolver.get("max_bytes")
+        or 5 * 1024 * 1024
+    )
+    for frame_url in frame_urls[:max_frames]:
+        try:
+            frame_html = await _fetch_text(
+                frame_url,
+                max_bytes=frame_max_bytes,
+                session=session,
+            )
+        except Exception:
+            continue
+        frame_targets = _crawl_targets_from_html_mrf_links(
+            source_row,
+            frame_html,
+            base_url=frame_url,
+            resolver="html_mrf_frame_link",
+            target_max_bytes=target_max_bytes,
+        )
+        crawl_targets.extend(
+            _crawl_target_with_context(crawl_target, frame_url=frame_url)
+            for crawl_target in frame_targets
+        )
+    return crawl_targets
+
+
+def _finalize_html_mrf_targets(
+    crawl_targets: list[CrawlTarget],
+    source_row: dict[str, Any],
+    resolver: dict[str, Any],
+    *,
+    url: str,
+) -> list[CrawlTarget]:
+    """Apply resolver filters, payer matching, and the final target bound."""
+    crawl_targets = _filter_crawl_targets_by_resolver_patterns(
+        crawl_targets,
+        resolver,
+    )
+    target_query = _source_target_payer_query(source_row)
+    if target_query:
+        crawl_targets = [
+            matched
+            for crawl_target in crawl_targets
+            if (
+                matched := _matched_query_expansion_target(
+                    crawl_target,
+                    target_query,
+                )
+            )
+            is not None
+        ]
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        crawl_targets = crawl_targets[:max_targets]
+    if not crawl_targets:
+        raise ValueError(f"no direct HTML MRF links found for {url}")
+    return crawl_targets
+
+
 async def _resolve_html_mrf_links(
     source_row: dict[str, Any],
     url: str,
@@ -6538,140 +6735,35 @@ async def _resolve_html_mrf_links(
         not crawl_targets or bool(resolver.get("follow_directory_links_when_targets"))
     )
     if follow_directory_links:
-        directory_urls = _html_mrf_directory_urls(html_text, base_url=url)
-        max_directories = _as_int(resolver.get("max_directories")) or 10
-        directory_max_bytes = int(
-            resolver.get("directory_max_bytes")
-            or resolver.get("max_bytes")
-            or 5 * 1024 * 1024
-        )
-        for directory_url in directory_urls[:max_directories]:
-            try:
-                directory_html = await _fetch_text(
-                    directory_url,
-                    max_bytes=directory_max_bytes,
-                    session=session,
-                )
-            except Exception:
-                continue
-            directory_targets = _crawl_targets_from_html_mrf_links(
+        crawl_targets.extend(
+            await _html_directory_targets(
                 source_row,
-                directory_html,
-                base_url=directory_url,
-                resolver="html_mrf_directory_link",
+                html_text,
+                url=url,
+                resolver=resolver,
                 target_max_bytes=target_max_bytes,
+                session=session,
             )
-            if not directory_targets:
-                nested_directory_urls = _html_mrf_directory_urls(
-                    directory_html, base_url=directory_url
-                )
-                max_nested_directories = (
-                    _as_int(resolver.get("max_nested_directories_per_directory")) or 5
-                )
-                for nested_directory_url in nested_directory_urls[
-                    :max_nested_directories
-                ]:
-                    try:
-                        nested_directory_html = await _fetch_text(
-                            nested_directory_url,
-                            max_bytes=directory_max_bytes,
-                            session=session,
-                        )
-                    except Exception:
-                        continue
-                    for crawl_target in _crawl_targets_from_html_mrf_links(
-                        source_row,
-                        nested_directory_html,
-                        base_url=nested_directory_url,
-                        resolver="html_mrf_nested_directory_link",
-                        target_max_bytes=target_max_bytes,
-                    ):
-                        metadata = {
-                            **dict(crawl_target.metadata or {}),
-                            "directory_url": directory_url,
-                            "nested_directory_url": nested_directory_url,
-                        }
-                        crawl_targets.append(
-                            CrawlTarget(
-                                source=source_row,
-                                url=crawl_target.url,
-                                label=crawl_target.label,
-                                resolved_from_url=crawl_target.resolved_from_url,
-                                metadata=metadata,
-                            )
-                        )
-            for crawl_target in directory_targets:
-                metadata = {
-                    **dict(crawl_target.metadata or {}),
-                    "directory_url": directory_url,
-                }
-                crawl_targets.append(
-                    CrawlTarget(
-                        source=source_row,
-                        url=crawl_target.url,
-                        label=crawl_target.label,
-                        resolved_from_url=crawl_target.resolved_from_url,
-                        metadata=metadata,
-                    )
-                )
+        )
         crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     if not crawl_targets and resolver.get("follow_iframe_links", True):
-        frame_urls = _html_mrf_frame_urls(html_text, base_url=url)
-        max_frames = _as_int(resolver.get("max_frames")) or 5
-        frame_max_bytes = int(
-            resolver.get("frame_max_bytes")
-            or resolver.get("directory_max_bytes")
-            or resolver.get("max_bytes")
-            or 5 * 1024 * 1024
-        )
-        for frame_url in frame_urls[:max_frames]:
-            try:
-                frame_html = await _fetch_text(
-                    frame_url,
-                    max_bytes=frame_max_bytes,
-                    session=session,
-                )
-            except Exception:
-                continue
-            frame_targets = _crawl_targets_from_html_mrf_links(
+        crawl_targets.extend(
+            await _html_frame_targets(
                 source_row,
-                frame_html,
-                base_url=frame_url,
-                resolver="html_mrf_frame_link",
+                html_text,
+                url=url,
+                resolver=resolver,
                 target_max_bytes=target_max_bytes,
+                session=session,
             )
-            for crawl_target in frame_targets:
-                metadata = {
-                    **dict(crawl_target.metadata or {}),
-                    "frame_url": frame_url,
-                }
-                crawl_targets.append(
-                    CrawlTarget(
-                        source=source_row,
-                        url=crawl_target.url,
-                        label=crawl_target.label,
-                        resolved_from_url=crawl_target.resolved_from_url,
-                        metadata=metadata,
-                    )
-                )
+        )
         crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
-    crawl_targets = _filter_crawl_targets_by_resolver_patterns(crawl_targets, resolver)
-    target_query = _source_target_payer_query(source_row)
-    if target_query:
-        crawl_targets = [
-            matched
-            for crawl_target in crawl_targets
-            if (
-                matched := _matched_query_expansion_target(crawl_target, target_query)
-            )
-            is not None
-        ]
-    max_targets = _as_int(resolver.get("max_targets"))
-    if max_targets and max_targets > 0:
-        crawl_targets = crawl_targets[:max_targets]
-    if not crawl_targets:
-        raise ValueError(f"no direct HTML MRF links found for {url}")
-    return crawl_targets
+    return _finalize_html_mrf_targets(
+        crawl_targets,
+        source_row,
+        resolver,
+        url=url,
+    )
 
 
 def _wordpress_elfinder_js_string(value: str | None) -> str:
@@ -8172,25 +8264,11 @@ def _webtpa_record_target(
     )
 
 
-async def _resolve_webtpa_mrf_api(
-    source_row_dict: dict[str, Any],
-    url: str,
+def _webtpa_endpoint_specs(
     resolver: dict[str, Any],
-    session: aiohttp.ClientSession,
-) -> list[CrawlTarget]:
-    """Resolve WebTPA API responses into crawl targets."""
-    base_url = _webtpa_api_base_url(url)
-    plans_url = urljoin(base_url, str(resolver.get("plans_path") or ""))
-    plans = await _fetch_json_value(
-        plans_url,
-        max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
-        session=session,
-    )
-    if not isinstance(plans, list):
-        raise ValueError(f"WebTPA plans endpoint did not return a list: {plans_url}")
-    max_plans = _as_int(resolver.get("max_plans")) or len(plans)
-    crawl_targets: list[CrawlTarget] = []
-    endpoint_specs = (
+) -> tuple[tuple[str, str, str], ...]:
+    """Return the configured WebTPA file-list and location routes."""
+    return (
         (
             "in-network",
             str(
@@ -8211,55 +8289,128 @@ async def _resolve_webtpa_mrf_api(
             "",
         ),
     )
-    for plan in [api_entry for api_entry in plans if isinstance(api_entry, dict)][:max_plans]:
-        plan_id = _webtpa_plan_id(plan)
-        if not plan_id:
+
+
+async def _webtpa_file_location(
+    file_record: dict[str, Any],
+    *,
+    file_type: str,
+    base_url: str,
+    location_template: str,
+    list_url: str,
+    session: aiohttp.ClientSession,
+) -> tuple[str | None, str]:
+    """Resolve one WebTPA file record to its direct download location."""
+    file_url = _webtpa_record_location(file_record)
+    file_id = _webtpa_file_id(file_record, file_type)
+    if file_url or file_type != "in-network" or not file_id:
+        return file_url, list_url
+    location_url = urljoin(
+        base_url,
+        location_template.format(file_id=quote(file_id)),
+    )
+    try:
+        location_by_field = await _fetch_json(
+            location_url,
+            max_bytes=1024 * 1024,
+            session=session,
+        )
+    except Exception:
+        location_by_field = {}
+    if not isinstance(location_by_field, dict):
+        return None, location_url
+    return _webtpa_record_location(location_by_field), location_url
+
+
+async def _webtpa_targets_for_plan(
+    source_row_dict: dict[str, Any],
+    plan: dict[str, Any],
+    *,
+    base_url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+    target_limit: int | None = None,
+) -> list[CrawlTarget]:
+    """Resolve supported targets, stopping before unnecessary API requests."""
+    plan_id = _webtpa_plan_id(plan)
+    if not plan_id:
+        return []
+    crawl_targets: list[CrawlTarget] = []
+    for file_type, list_template, location_template in _webtpa_endpoint_specs(
+        resolver
+    ):
+        list_url = urljoin(base_url, list_template.format(plan_id=quote(plan_id)))
+        file_records = await _fetch_json_value(
+            list_url,
+            max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+            session=session,
+        )
+        if not isinstance(file_records, list):
             continue
-        for file_type, list_template, location_template in endpoint_specs:
-            list_url = urljoin(base_url, list_template.format(plan_id=quote(plan_id)))
-            file_records = await _fetch_json_value(
-                list_url,
-                max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+        for file_record in (
+            api_entry for api_entry in file_records if isinstance(api_entry, dict)
+        ):
+            file_url, resolved_from_url = await _webtpa_file_location(
+                file_record,
+                file_type=file_type,
+                base_url=base_url,
+                location_template=location_template,
+                list_url=list_url,
                 session=session,
             )
-            if not isinstance(file_records, list):
+            if not file_url:
                 continue
-            for file_record in [api_entry for api_entry in file_records if isinstance(api_entry, dict)]:
-                file_url = _webtpa_record_location(file_record)
-                file_id = _webtpa_file_id(file_record, file_type)
-                resolved_from_url = list_url
-                if not file_url and file_type == "in-network" and file_id:
-                    location_url = urljoin(
-                        base_url, location_template.format(file_id=quote(file_id))
-                    )
-                    try:
-                        location_by_field = await _fetch_json(
-                            location_url,
-                            max_bytes=1024 * 1024,
-                            session=session,
-                        )
-                    except Exception:
-                        location_by_field = {}
-                    if isinstance(location_by_field, dict):
-                        file_url = _webtpa_record_location(location_by_field)
-                        resolved_from_url = location_url
-                if not file_url:
-                    continue
-                crawl_target = _webtpa_record_target(
-                    source_row_dict,
-                    plan=plan,
-                    file_record=file_record,
-                    file_type=file_type,
-                    file_url=file_url,
-                    resolved_from_url=resolved_from_url,
-                )
-                if crawl_target:
-                    crawl_targets.append(crawl_target)
-                max_targets = _as_int(resolver.get("max_targets"))
-                if max_targets and len(crawl_targets) >= max_targets:
-                    return _dedupe_crawl_targets_by_url(crawl_targets)[:max_targets]
-    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
+            crawl_target = _webtpa_record_target(
+                source_row_dict,
+                plan=plan,
+                file_record=file_record,
+                file_type=file_type,
+                file_url=file_url,
+                resolved_from_url=resolved_from_url,
+            )
+            if crawl_target:
+                crawl_targets.append(crawl_target)
+            if target_limit and len(crawl_targets) >= target_limit:
+                return crawl_targets
+    return crawl_targets
+
+
+async def _resolve_webtpa_mrf_api(
+    source_row_dict: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve WebTPA API responses into crawl targets."""
+    base_url = _webtpa_api_base_url(url)
+    plans_url = urljoin(base_url, str(resolver.get("plans_path") or ""))
+    plans = await _fetch_json_value(
+        plans_url,
+        max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+        session=session,
+    )
+    if not isinstance(plans, list):
+        raise ValueError(f"WebTPA plans endpoint did not return a list: {plans_url}")
+    max_plans = _as_int(resolver.get("max_plans")) or len(plans)
     max_targets = _as_int(resolver.get("max_targets"))
+    crawl_targets: list[CrawlTarget] = []
+    for plan in [api_entry for api_entry in plans if isinstance(api_entry, dict)][:max_plans]:
+        remaining_targets = (
+            max_targets - len(crawl_targets) if max_targets else None
+        )
+        crawl_targets.extend(
+            await _webtpa_targets_for_plan(
+                source_row_dict,
+                plan,
+                base_url=base_url,
+                resolver=resolver,
+                session=session,
+                target_limit=remaining_targets,
+            )
+        )
+        if max_targets and len(crawl_targets) >= max_targets:
+            return _dedupe_crawl_targets_by_url(crawl_targets)[:max_targets]
+    crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     if max_targets and max_targets > 0:
         crawl_targets = crawl_targets[:max_targets]
     if not crawl_targets:
@@ -9241,6 +9392,98 @@ def _mrf_type_from_html_link_context(
 _mrf_file_type_from_html_link_context = _mrf_type_from_html_link_context
 
 
+def _html_mrf_target_identity(
+    url: str,
+    label: str,
+    *,
+    html_text: str,
+    html_start: int | None,
+    html_end: int | None,
+    section_file_type: str | None,
+) -> tuple[str, str, str, str] | None:
+    """Classify one HTML link as a supported MRF target."""
+    path = urlsplit(url).path.lower()
+    label_or_path = f"{path} {label}".lower()
+    query_file_name = _query_mrf_file_name(url)
+    direct_body = _is_direct_mrf_body_url(url) or bool(query_file_name)
+    link_file_type = _mrf_file_type_from_html_link_context(
+        html_text,
+        html_start,
+        html_end,
+    )
+    if path.endswith(".txt") and any(
+        token in label_or_path
+        for token in ("meta", "mrf", "machine-readable", "transparency")
+    ):
+        return "metadata_text", "metadata-index", "html_metadata_text", label
+    if _is_html_mrf_toc_url(url, label):
+        return "toc_json", "table-of-contents", "html_mrf_link", label
+    is_body_reference = _is_html_mrf_body_reference(url, label) or (
+        direct_body
+        and (link_file_type or section_file_type)
+        and not _is_non_tic_mrf_reference(url, label)
+    )
+    if not is_body_reference:
+        return None
+    target_file_type = _mrf_body_file_type_from_text(url, label) or (
+        (link_file_type or section_file_type) if direct_body else None
+    )
+    if not target_file_type:
+        return None
+    inferred_label = _mrf_file_plan_label(path)
+    if (
+        _is_direct_mrf_body_url(url)
+        and inferred_label
+        and _is_html_label_fileish(label, path)
+    ):
+        label = inferred_label
+    return "file_reference", target_file_type, "html_file_reference", label
+
+
+def _parsed_html_mrf_link(
+    candidate: dict[str, Any],
+    *,
+    html_text: str,
+    section_file_type: str | None,
+) -> tuple[tuple[str, str], dict[str, Any]] | None:
+    """Normalize one candidate HTML link into its deduplication key and row."""
+    url = str(candidate["url"])
+    path = urlsplit(url).path.lower()
+    label = (
+        _clean_text(candidate.get("label"))
+        or Path(urlsplit(url).path).name
+        or "MRF file"
+    )
+    html_start = candidate.get("html_start")
+    html_end = candidate.get("html_end")
+    target_identity = _html_mrf_target_identity(
+        url,
+        label,
+        html_text=html_text,
+        html_start=html_start if isinstance(html_start, int) else None,
+        html_end=html_end if isinstance(html_end, int) else None,
+        section_file_type=section_file_type,
+    )
+    if target_identity is None:
+        return None
+    target_kind, target_file_type, resolver, label = target_identity
+    parsed_link_dict = {
+        "url": url,
+        "label": label,
+        "resolver": resolver,
+        "target_kind": target_kind,
+        "target_file_type": target_file_type,
+        "container_format": _container_format(url),
+        "html_attr": str(candidate.get("attr") or ""),
+    }
+    if target_kind == "file_reference" and (
+        _is_html_label_fileish(candidate.get("label"), path)
+        or (target_file_type == "in-network" and _is_html_label_planish(label))
+    ):
+        parsed_link_dict["plan_info"] = _plan_info_from_label(label)
+    return (target_kind, _canonical_or_none(url) or url), parsed_link_dict
+
+
 def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     """Extract normalized MRF links and file types from HTML."""
     links_by_key: dict[tuple[str, str], dict[str, Any]] = {}
@@ -9257,76 +9500,14 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
             html_end = candidate.get("html_end")
             if isinstance(html_end, int):
                 last_html_position = max(last_html_position, html_end)
-        url = str(candidate["url"])
-        label = (
-            _clean_text(candidate.get("label"))
-            or Path(urlsplit(url).path).name
-            or "MRF file"
+        parsed_link = _parsed_html_mrf_link(
+            candidate,
+            html_text=html_text,
+            section_file_type=section_file_type,
         )
-        attr = str(candidate.get("attr") or "")
-        path = urlsplit(url).path.lower()
-        label_or_path = f"{path} {label}".lower()
-        target_kind: str | None = None
-        target_file_type: str | None = None
-        resolver = "html_mrf_link"
-        query_file_name = _query_mrf_file_name(url)
-        direct_body = _is_direct_mrf_body_url(url) or bool(query_file_name)
-        link_file_type = _mrf_file_type_from_html_link_context(
-            html_text,
-            html_start if isinstance(html_start, int) else None,
-            candidate.get("html_end")
-            if isinstance(candidate.get("html_end"), int)
-            else None,
-        )
-        if path.endswith(".txt") and any(
-            token in label_or_path
-            for token in ("meta", "mrf", "machine-readable", "transparency")
-        ):
-            target_kind = "metadata_text"
-            target_file_type = "metadata-index"
-            resolver = "html_metadata_text"
-        elif _is_html_mrf_toc_url(url, label):
-            target_kind = "toc_json"
-            target_file_type = "table-of-contents"
-        elif _is_html_mrf_body_reference(url, label) or (
-            direct_body
-            and (link_file_type or section_file_type)
-            and not _is_non_tic_mrf_reference(url, label)
-        ):
-            target_kind = "file_reference"
-            target_file_type = _mrf_body_file_type_from_text(url, label) or (
-                (link_file_type or section_file_type) if direct_body else None
-            )
-            if not target_file_type:
-                continue
-            resolver = "html_file_reference"
-            inferred_label = _mrf_file_plan_label(path)
-            if (
-                _is_direct_mrf_body_url(url)
-                and inferred_label
-                and _is_html_label_fileish(label, path)
-            ):
-                label = inferred_label
-        if not target_kind or not target_file_type:
+        if parsed_link is None:
             continue
-        plan_info_rows = []
-        if target_kind == "file_reference":
-            if _is_html_label_fileish(candidate.get("label"), path) or (
-                target_file_type == "in-network" and _is_html_label_planish(label)
-            ):
-                plan_info_rows = _plan_info_from_label(label)
-        key = (target_kind, _canonical_or_none(url) or url)
-        parsed_link_dict = {
-            "url": url,
-            "label": label,
-            "resolver": resolver,
-            "target_kind": target_kind,
-            "target_file_type": target_file_type,
-            "container_format": _container_format(url),
-            "html_attr": attr,
-        }
-        if plan_info_rows:
-            parsed_link_dict["plan_info"] = plan_info_rows
+        key, parsed_link_dict = parsed_link
         existing = links_by_key.get(key)
         if existing is None or (
             existing.get("html_attr") == "text"

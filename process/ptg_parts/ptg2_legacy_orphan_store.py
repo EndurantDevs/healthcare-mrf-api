@@ -30,6 +30,9 @@ from process.ptg_parts.ptg2_legacy_orphan_store_references import (
 from process.ptg_parts.ptg2_legacy_orphan_store_schema import (
     require_legacy_sweep_schema,
 )
+from process.ptg_parts.ptg2_legacy_orphan_store_window import (
+    load_legacy_catalog_inventory,
+)
 
 __all__ = [
     "LegacySweepAuditRecord",
@@ -38,6 +41,7 @@ __all__ = [
     "insert_legacy_sweep_audit",
     "load_legacy_ownership",
     "load_legacy_relation_catalog",
+    "load_legacy_catalog_inventory",
     "load_legacy_sweep_audit",
     "lock_legacy_root_relations",
     "lock_legacy_sweep_authority",

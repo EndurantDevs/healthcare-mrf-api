@@ -151,6 +151,109 @@ def _normalize_plan_ids(standard_id, full_id):
     return (standard or None, full)
 
 
+def _attribute_objects_from_row(
+    attribute_row,
+    *,
+    plan_id: str,
+    full_plan_id: str,
+    year: int,
+    attribute_name_by_label=None,
+):
+    """Expand one wide attributes row into normalized key/value records."""
+    attribute_objects = []
+    for key, raw_value in attribute_row.items():
+        if key == "StandardComponentId" and raw_value is None:
+            continue
+        text_value = str(raw_value).strip()
+        if not text_value:
+            continue
+        attribute_name = (
+            attribute_name_by_label[key]
+            if attribute_name_by_label is not None
+            else key
+        )
+        attribute_objects.append(
+            {
+                "plan_id": plan_id,
+                "full_plan_id": full_plan_id,
+                "year": year,
+                "attr_name": re.sub(latin_pattern, r"", attribute_name),
+                "attr_value": text_value,
+            }
+        )
+    return attribute_objects
+
+
+def _benefit_object_from_row(benefit_row, plan_id: str, full_plan_id: str):
+    """Normalize one plan-benefit row, returning None for an invalid year."""
+    benefit_by_field = {
+        "year": None,
+        "plan_id": plan_id,
+        "full_plan_id": full_plan_id,
+        "benefit_name": benefit_row["BenefitName"],
+        "copay_inn_tier1": benefit_row["CopayInnTier1"],
+        "copay_inn_tier2": benefit_row["CopayInnTier2"],
+        "copay_outof_net": benefit_row["CopayOutofNet"],
+        "coins_inn_tier1": benefit_row["CoinsInnTier1"],
+        "coins_inn_tier2": benefit_row["CoinsInnTier2"],
+        "coins_outof_net": benefit_row["CoinsOutofNet"],
+        "is_ehb": _parse_flag(benefit_row.get("IsEHB"), ("yes", "y"), ("no", "n")),
+        "is_covered": _parse_flag(
+            benefit_row.get("IsCovered"), ("covered",), ("not covered",)
+        ),
+        "quant_limit_on_svc": _parse_flag(
+            benefit_row.get("QuantLimitOnSvc"), ("yes", "y"), ("no", "n")
+        ),
+        "limit_qty": None,
+        "limit_unit": benefit_row["LimitUnit"],
+        "exclusions": benefit_row["Exclusions"],
+        "explanation": benefit_row["Explanation"],
+        "ehb_var_reason": benefit_row["EHBVarReason"],
+        "is_excl_from_inn_mo": _parse_flag(
+            benefit_row.get("IsExclFromInnMOOP"), ("yes", "y"), ("no", "n")
+        ),
+        "is_excl_from_oon_mo": _parse_flag(
+            benefit_row.get("IsExclFromOonMOOP"), ("yes", "y"), ("no", "n")
+        ),
+    }
+    if benefit_row["LimitQty"]:
+        try:
+            benefit_by_field["limit_qty"] = float(benefit_row["LimitQty"])
+        except ValueError:
+            benefit_by_field["limit_qty"] = None
+    try:
+        if benefit_row["BusinessYear"]:
+            benefit_by_field["year"] = int(benefit_row["BusinessYear"])
+    except ValueError:
+        return None
+    except KeyError:
+        print(benefit_row)
+        sys.exit(1)
+    return benefit_by_field
+
+
+async def _enqueue_attribute_batch(
+    redis,
+    attribute_objects,
+    *,
+    test_mode: bool,
+    record_type: str | None = None,
+) -> None:
+    """Queue one normalized attribute batch and release its local storage."""
+    payload = {
+        "attr_obj_list": attribute_objects,
+        "context": {"test_mode": test_mode},
+    }
+    if record_type is not None:
+        payload["type"] = record_type
+    await redis.enqueue_job(
+        "save_attributes",
+        payload,
+        _queue_name=ATTRIBUTES_QUEUE_NAME,
+    )
+    attribute_objects.clear()
+
+
 async def startup(ctx):
     """Initialize attribute-worker context and database access."""
 
@@ -315,7 +418,6 @@ async def process_attributes(ctx, task):
         await _safe_unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
-        total_count = 0
         attr_obj_list = []
 
         count = 0
@@ -328,33 +430,21 @@ async def process_attributes(ctx, task):
                 if not plan_id or not full_plan_id:
                     continue
                 count += 1
-                for key in attribute_row:
-                    if not (
-                        (key in ("StandardComponentId",))
-                        and (attribute_row[key] is None)
-                    ) and (text_value := str(attribute_row[key]).strip()):
-                        attribute_dict = {
-                            "plan_id": plan_id,
-                            "full_plan_id": full_plan_id,
-                            "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
-                            "attr_name": re.sub(latin_pattern, r"", key),
-                            "attr_value": text_value,
-                        }
-
-                        attr_obj_list.append(attribute_dict)
+                attr_obj_list.extend(
+                    _attribute_objects_from_row(
+                        attribute_row,
+                        plan_id=plan_id,
+                        full_plan_id=full_plan_id,
+                        year=int(task["year"]),
+                    )
+                )
 
                 if count > 10000:
-                    # int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
-                    total_count += count
-                    await redis.enqueue_job(
-                        "save_attributes",
-                        {
-                            "attr_obj_list": attr_obj_list,
-                            "context": {"test_mode": test_mode},
-                        },
-                        _queue_name=ATTRIBUTES_QUEUE_NAME,
+                    await _enqueue_attribute_batch(
+                        redis,
+                        attr_obj_list,
+                        test_mode=test_mode,
                     )
-                    attr_obj_list.clear()
                     count = 0
                 else:
                     count += 1
@@ -387,7 +477,6 @@ async def process_benefits(ctx, task):
         await _safe_unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
-        total_count = 0
         attr_obj_list = []
 
         count = 0
@@ -399,81 +488,23 @@ async def process_benefits(ctx, task):
                 if not plan_id or not full_plan_id:
                     continue
 
-                benefit_dict = {
-                    "year": None,
-                    "plan_id": plan_id,
-                    "full_plan_id": full_plan_id,
-                    "benefit_name": benefit_row["BenefitName"],
-                    "copay_inn_tier1": benefit_row["CopayInnTier1"],
-                    "copay_inn_tier2": benefit_row["CopayInnTier2"],
-                    "copay_outof_net": benefit_row["CopayOutofNet"],
-                    "coins_inn_tier1": benefit_row["CoinsInnTier1"],
-                    "coins_inn_tier2": benefit_row["CoinsInnTier2"],
-                    "coins_outof_net": benefit_row["CoinsOutofNet"],
-                    "is_ehb": None,
-                    "is_covered": None,
-                    "quant_limit_on_svc": None,
-                    "limit_qty": None,
-                    "limit_unit": benefit_row["LimitUnit"],
-                    "exclusions": benefit_row["Exclusions"],
-                    "explanation": benefit_row["Explanation"],
-                    "ehb_var_reason": benefit_row["EHBVarReason"],
-                    "is_excl_from_inn_mo": None,
-                    "is_excl_from_oon_mo": None,
-                }
-
-                benefit_dict["is_ehb"] = _parse_flag(
-                    benefit_row.get("IsEHB"), ("yes", "y"), ("no", "n")
+                benefit_dict = _benefit_object_from_row(
+                    benefit_row,
+                    plan_id,
+                    full_plan_id,
                 )
-                benefit_dict["is_covered"] = _parse_flag(
-                    benefit_row.get("IsCovered"), ("covered",), ("not covered",)
-                )
-                benefit_dict["quant_limit_on_svc"] = _parse_flag(
-                    benefit_row.get("QuantLimitOnSvc"),
-                    ("yes", "y"),
-                    ("no", "n"),
-                )
-                benefit_dict["is_excl_from_inn_mo"] = _parse_flag(
-                    benefit_row.get("IsExclFromInnMOOP"),
-                    ("yes", "y"),
-                    ("no", "n"),
-                )
-                benefit_dict["is_excl_from_oon_mo"] = _parse_flag(
-                    benefit_row.get("IsExclFromOonMOOP"),
-                    ("yes", "y"),
-                    ("no", "n"),
-                )
-
-                if benefit_row["LimitQty"]:
-                    try:
-                        benefit_dict["limit_qty"] = float(benefit_row["LimitQty"])
-                    except ValueError:
-                        benefit_dict["limit_qty"] = None
-
-                try:
-                    if benefit_row["BusinessYear"]:
-                        try:
-                            benefit_dict["year"] = int(benefit_row["BusinessYear"])
-                        except ValueError:
-                            continue
-                except KeyError:
-                    print(benefit_row)
-                    sys.exit(1)
+                if benefit_dict is None:
+                    continue
 
                 attr_obj_list.append(benefit_dict)
 
                 if count > 50000:
-                    total_count += count
-                    await redis.enqueue_job(
-                        "save_attributes",
-                        {
-                            "type": "PlanBenefits",
-                            "attr_obj_list": attr_obj_list,
-                            "context": {"test_mode": test_mode},
-                        },
-                        _queue_name=ATTRIBUTES_QUEUE_NAME,
+                    await _enqueue_attribute_batch(
+                        redis,
+                        attr_obj_list,
+                        test_mode=test_mode,
+                        record_type="PlanBenefits",
                     )
-                    attr_obj_list.clear()
                     count = 0
                 else:
                     count += 1
@@ -535,7 +566,6 @@ async def process_prices(ctx, task):
         await _safe_unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
-        total_count = 0
         attr_obj_list = []
 
         count = 0
@@ -785,35 +815,22 @@ async def process_state_attributes(ctx, task):
                 if not plan_id or not full_plan_id:
                     continue
                 count += 1
-                for key in attribute_row:
-                    if not (
-                        (key in ("StandardComponentId",))
-                        and (attribute_row[key] is None)
-                    ) and (text_value := str(attribute_row[key]).strip()):
-                        attribute_dict = {
-                            "plan_id": plan_id,
-                            "full_plan_id": full_plan_id,
-                            "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
-                            "attr_name": re.sub(
-                                latin_pattern, r"", plan_attributes_labels_to_key[key]
-                            ),
-                            "attr_value": text_value,
-                        }
-
-                        attr_obj_list.append(attribute_dict)
+                attr_obj_list.extend(
+                    _attribute_objects_from_row(
+                        attribute_row,
+                        plan_id=plan_id,
+                        full_plan_id=full_plan_id,
+                        year=int(task["year"]),
+                        attribute_name_by_label=plan_attributes_labels_to_key,
+                    )
+                )
 
                 if count > 10000:
-                    # int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
-                    total_count += count
-                    await redis.enqueue_job(
-                        "save_attributes",
-                        {
-                            "attr_obj_list": attr_obj_list,
-                            "context": {"test_mode": test_mode},
-                        },
-                        _queue_name=ATTRIBUTES_QUEUE_NAME,
+                    await _enqueue_attribute_batch(
+                        redis,
+                        attr_obj_list,
+                        test_mode=test_mode,
                     )
-                    attr_obj_list.clear()
                     count = 0
                 else:
                     count += 1

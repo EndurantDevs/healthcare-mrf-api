@@ -23,7 +23,29 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
-def _plan_summary(plan: object, *, state: str) -> dict[str, object]:
+def _blocked_reason_counts(plan: object) -> dict[str, int]:
+    counts_by_reason: dict[str, int] = {}
+    for blocked_suffix in getattr(plan, "blocked"):
+        for reason in blocked_suffix.reasons:
+            counts_by_reason[reason] = counts_by_reason.get(reason, 0) + 1
+    return dict(sorted(counts_by_reason.items()))
+
+
+def _limit_summary(limits: LegacySweepLimits) -> dict[str, int]:
+    return {
+        "max_suffixes": limits.max_suffixes,
+        "max_tables": limits.max_tables,
+        "max_relations": limits.max_relations,
+        "max_bytes": limits.max_bytes,
+    }
+
+
+def _plan_summary(
+    plan: object,
+    *,
+    state: str,
+    limits: LegacySweepLimits,
+) -> dict[str, object]:
     return {
         "contract": "ptg2_legacy_orphan_sweep_v1",
         "state": state,
@@ -40,7 +62,12 @@ def _plan_summary(plan: object, *, state: str) -> dict[str, object]:
             plan,
             "remaining_eligible_suffix_count",
         ),
+        "catalog_suffixes": getattr(plan, "catalog_suffix_count"),
+        "scanned_suffixes": getattr(plan, "scanned_suffix_count"),
+        "unscanned_suffixes": getattr(plan, "unscanned_suffix_count"),
         "blocked_suffixes": len(getattr(plan, "blocked")),
+        "blocked_reason_counts": _blocked_reason_counts(plan),
+        "limits": _limit_summary(limits),
     }
 
 
@@ -98,7 +125,7 @@ async def _amain(argv: Iterable[str] | None = None) -> None:
         )
         print(
             json.dumps(
-                _plan_summary(plan, state="dry_run"),
+                _plan_summary(plan, state="dry_run", limits=limits),
                 sort_keys=True,
             )
         )
@@ -125,6 +152,7 @@ async def _amain(argv: Iterable[str] | None = None) -> None:
         "selected_bytes": execution.selected_bytes,
         "selected_snapshots": execution.selected_snapshots,
         "audit_id": execution.audit_id,
+        "limits": _limit_summary(limits),
     }
     print(json.dumps(summary_by_field, sort_keys=True))
 

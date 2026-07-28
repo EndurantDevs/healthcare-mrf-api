@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from process.ptg_parts import ptg2_legacy_orphan_sweeper_cli as cli
+from process.ptg_parts.ptg2_legacy_orphan_contract import LegacySweepLimits
 
 
 def _conflicting_schema_environment(monkeypatch) -> None:
@@ -74,6 +75,9 @@ async def test_explicit_schema_intentionally_overrides_conflicting_env(
             snapshot_ids=(),
             eligible_suffix_count=0,
             remaining_eligible_suffix_count=0,
+            catalog_suffix_count=0,
+            scanned_suffix_count=0,
+            unscanned_suffix_count=0,
             blocked=(),
         )
 
@@ -83,3 +87,44 @@ async def test_explicit_schema_intentionally_overrides_conflicting_env(
 
     assert observed_schema_names == ["reviewed_schema"]
     assert '"state": "dry_run"' in capsys.readouterr().out
+
+
+def test_plan_summary_records_limits_and_neutral_blocked_reasons() -> None:
+    limits = LegacySweepLimits(
+        max_suffixes=7,
+        max_tables=8,
+        max_relations=9,
+        max_bytes=10,
+    )
+    plan = SimpleNamespace(
+        plan_digest="a" * 64,
+        authority_digest="b" * 64,
+        catalog_digest="c" * 64,
+        candidates=(),
+        table_count=0,
+        relation_count=0,
+        total_bytes=0,
+        snapshot_ids=(),
+        eligible_suffix_count=0,
+        remaining_eligible_suffix_count=0,
+        catalog_suffix_count=2,
+        scanned_suffix_count=2,
+        unscanned_suffix_count=0,
+        blocked=(
+            SimpleNamespace(reasons=("active_reference", "oversized")),
+            SimpleNamespace(reasons=("oversized",)),
+        ),
+    )
+
+    summary = cli._plan_summary(plan, state="dry_run", limits=limits)
+
+    assert summary["limits"] == {
+        "max_suffixes": 7,
+        "max_tables": 8,
+        "max_relations": 9,
+        "max_bytes": 10,
+    }
+    assert summary["blocked_reason_counts"] == {
+        "active_reference": 1,
+        "oversized": 2,
+    }

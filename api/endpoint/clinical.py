@@ -98,6 +98,26 @@ def _json_safe_row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: _json_safe(value) for key, value in row.items()}
 
 
+def _code_filters(code_type: str, system: str, query_text: str):
+    """Build the terminology-safe filters for one clinical code list."""
+    filters = [code_table.c.code_type == code_type]
+    restricted_filter = _restricted_public_filter(code_table.c.code_system)
+    if restricted_filter is not None:
+        filters.append(restricted_filter)
+    if system:
+        filters.append(func.upper(code_table.c.code_system) == system)
+    if query_text:
+        query_like = f"%{query_text}%"
+        filters.append(
+            or_(
+                func.lower(code_table.c.code).like(query_like),
+                func.lower(code_table.c.display_name).like(query_like),
+                func.lower(code_table.c.short_description).like(query_like),
+            )
+        )
+    return filters
+
+
 async def _resolve_code(session, system: str, code: str, code_type: str | None = None) -> tuple[str, str]:
     _raise_if_restricted_public(system)
     direct_filters = [
@@ -145,26 +165,11 @@ async def _list_codes(request, code_type: str):
             clinical_area_id=clinical_area_id,
             mapping_kind=code_type,
             system=system,
-            q=query_text,
+            query_text=query_text,
             require_area=False,
         )
 
-    filters = [code_table.c.code_type == code_type]
-    restricted_filter = _restricted_public_filter(code_table.c.code_system)
-    if restricted_filter is not None:
-        filters.append(restricted_filter)
-    if system:
-        filters.append(func.upper(code_table.c.code_system) == system)
-    if query_text:
-        q_like = f"%{query_text}%"
-        filters.append(
-            or_(
-                func.lower(code_table.c.code).like(q_like),
-                func.lower(code_table.c.display_name).like(q_like),
-                func.lower(code_table.c.short_description).like(q_like),
-            )
-        )
-
+    filters = _code_filters(code_type, system, query_text)
     where_clause = and_(*filters)
     count_result = await session.execute(select(func.count()).select_from(code_table).where(where_clause))
     total = int(count_result.scalar() or 0)
@@ -227,13 +232,71 @@ def _area_mapping_columns(mapping_kind: str):
     raise ValueError(f"Unsupported clinical area mapping kind: {mapping_kind}")
 
 
+def _area_concepts_payload(
+    concept_rows,
+    count_result,
+    pagination,
+    *,
+    clinical_area_id: str,
+    mapping_kind: str,
+    system: str,
+    query_text: str,
+) -> dict[str, Any]:
+    """Build the stable response contract for one mapped concept page."""
+    return {
+        "items": [
+            _json_safe_row(_row_to_dict(concept_row))
+            for concept_row in concept_rows
+        ],
+        "pagination": {
+            "total": int(count_result.scalar() or 0),
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "page": pagination.page,
+        },
+        "query": {
+            "clinical_area_id": clinical_area_id,
+            "mapping_kind": mapping_kind,
+            "system": system or None,
+            "q": query_text or None,
+        },
+    }
+
+
+def _area_concept_filters(
+    mapping_table,
+    system_col,
+    *,
+    clinical_area_id: str,
+    system: str,
+    query_text: str,
+):
+    """Build the terminology-safe filters for one clinical-area mapping."""
+    filters = [mapping_table.c.clinical_area_id == clinical_area_id]
+    restricted_filter = _restricted_public_filter(system_col)
+    if restricted_filter is not None:
+        filters.append(restricted_filter)
+    if system:
+        filters.append(func.upper(system_col) == system)
+    if query_text:
+        query_like = f"%{query_text}%"
+        filters.append(
+            or_(
+                func.lower(code_table.c.code).like(query_like),
+                func.lower(code_table.c.display_name).like(query_like),
+                func.lower(code_table.c.short_description).like(query_like),
+            )
+        )
+    return filters
+
+
 async def _list_area_concepts_response(
     request,
     *,
     clinical_area_id: str,
     mapping_kind: str,
     system: str,
-    q: str,
+    query_text: str,
     require_area: bool,
 ):
     """Return paginated concepts mapped to one clinical area."""
@@ -249,22 +312,13 @@ async def _list_area_concepts_response(
         if not area_exists.first():
             raise sanic.exceptions.NotFound
 
-    filters = [mapping_table.c.clinical_area_id == clinical_area_id]
-    restricted_filter = _restricted_public_filter(system_col)
-    if restricted_filter is not None:
-        filters.append(restricted_filter)
-    if system:
-        filters.append(func.upper(system_col) == system)
-    if q:
-        q_like = f"%{q}%"
-        filters.append(
-            or_(
-                func.lower(code_table.c.code).like(q_like),
-                func.lower(code_table.c.display_name).like(q_like),
-                func.lower(code_table.c.short_description).like(q_like),
-            )
-        )
-
+    filters = _area_concept_filters(
+        mapping_table,
+        system_col,
+        clinical_area_id=clinical_area_id,
+        system=system,
+        query_text=query_text,
+    )
     where_clause = and_(*filters)
     joined = mapping_table.join(
         code_table,
@@ -283,24 +337,15 @@ async def _list_area_concepts_response(
         .offset(pagination.offset)
     )
     return response.json(
-        {
-            "items": [
-                _json_safe_row(_row_to_dict(concept_row))
-                for concept_row in concept_rows
-            ],
-            "pagination": {
-                "total": int(count_result.scalar() or 0),
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {
-                "clinical_area_id": clinical_area_id,
-                "mapping_kind": mapping_kind,
-                "system": system or None,
-                "q": q or None,
-            },
-        }
+        _area_concepts_payload(
+            concept_rows,
+            count_result,
+            pagination,
+            clinical_area_id=clinical_area_id,
+            mapping_kind=mapping_kind,
+            system=system,
+            query_text=query_text,
+        )
     )
 
 
@@ -588,7 +633,7 @@ async def list_clinical_area_conditions(request, clinical_area_id: str):
         clinical_area_id=_decode_path_value(clinical_area_id),
         mapping_kind="condition",
         system=_normalize_system(args.get("system") or args.get("code_system")),
-        q=str(args.get("q") or "").strip().lower(),
+        query_text=str(args.get("q") or "").strip().lower(),
         require_area=True,
     )
 
@@ -603,7 +648,7 @@ async def list_clinical_area_treatments(request, clinical_area_id: str):
         clinical_area_id=_decode_path_value(clinical_area_id),
         mapping_kind="treatment",
         system=_normalize_system(args.get("system") or args.get("code_system")),
-        q=str(args.get("q") or "").strip().lower(),
+        query_text=str(args.get("q") or "").strip().lower(),
         require_area=True,
     )
 

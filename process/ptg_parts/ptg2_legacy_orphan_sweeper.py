@@ -8,13 +8,13 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from db.connection import db
+from process.ptg_parts.ptg2_legacy_orphan_catalog_scan import (
+    scan_legacy_catalog,
+)
 from process.ptg_parts.ptg2_legacy_orphan_contract import (
-    LegacyBlockedSuffix,
-    LegacySweepCandidate,
     LegacySweepLimits,
     LegacySweepPlan,
     build_bounded_legacy_sweep_plan,
-    classify_legacy_suffix,
     legacy_sweep_audit_id,
 )
 from process.ptg_parts.ptg2_legacy_orphan_store import (
@@ -22,8 +22,6 @@ from process.ptg_parts.ptg2_legacy_orphan_store import (
     delete_legacy_snapshot_metadata,
     drop_legacy_root_relations,
     insert_legacy_sweep_audit,
-    load_legacy_ownership,
-    load_legacy_relation_catalog,
     load_legacy_sweep_audit,
     lock_legacy_root_relations,
     lock_legacy_sweep_authority,
@@ -76,40 +74,22 @@ async def build_legacy_orphan_sweep_plan(
         schema_name=resolved_schema,
         control_schema_name=resolved_control_schema,
     )
-    catalog = await load_legacy_relation_catalog(
-        executor,
-        schema_name=resolved_schema,
-        probe_rows=True,
-    )
-    ownership_by_suffix = await load_legacy_ownership(
+    catalog_scan = await scan_legacy_catalog(
         executor,
         schema_name=resolved_schema,
         control_schema_name=resolved_control_schema,
-        catalog=catalog,
-        present_optional_table_names=frozenset(
-            authority.present_optional_table_names
-        ),
+        authority=authority,
+        limits=limits,
     )
-    candidates: list[LegacySweepCandidate] = []
-    blocked_suffixes: list[LegacyBlockedSuffix] = []
-    for suffix in sorted(catalog.relations_by_suffix):
-        classified = classify_legacy_suffix(
-            suffix,
-            catalog.relations_by_suffix[suffix],
-            ownership_by_suffix[suffix],
-        )
-        if isinstance(classified, LegacySweepCandidate):
-            candidates.append(classified)
-        else:
-            blocked_suffixes.append(classified)
     return build_bounded_legacy_sweep_plan(
         schema_name=resolved_schema,
         control_schema_name=resolved_control_schema,
         authority_digest=authority.catalog_digest,
-        catalog_digest=catalog.catalog_digest,
-        eligible_candidates=candidates,
-        blocked=blocked_suffixes,
+        catalog_digest=catalog_scan.catalog_digest,
+        eligible_candidates=catalog_scan.candidates,
+        blocked=catalog_scan.blocked_suffixes,
         limits=limits,
+        catalog_progress=catalog_scan.progress,
     )
 
 
