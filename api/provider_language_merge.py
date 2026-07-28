@@ -180,6 +180,8 @@ def _apply_provenance(
     assertions = _unique_assertions(language_facts)
     if assertions:
         merged_fact_by_field["assertions"] = assertions
+    else:
+        merged_fact_by_field.pop("assertions", None)
 
 
 def _independent_source_count(

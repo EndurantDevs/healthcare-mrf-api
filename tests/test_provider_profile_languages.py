@@ -5,6 +5,7 @@
 from pathlib import Path
 
 from api.provider_language import normalize_language_value
+from api.provider_language_merge import canonical_language_items
 from api.provider_profile import (
     compose_provider_profile,
     compose_provider_profile_evidence,
@@ -271,6 +272,85 @@ def test_language_normalizer_marks_incompatible_source_representations():
     assert mixed_conflict_by_field["normalization_warning"] == (
         "multiple_source_language_codes"
     )
+
+
+def test_language_normalizer_and_merge_cover_supported_edge_shapes():
+    assert normalize_language_value(
+        {"codes": [{"system": "urn:ietf:bcp:47", "code": "sl-rozaj-rozaj"}]}
+    ) is None
+    assert normalize_language_value({"coding": {"code": "French"}})[0] == (
+        "code",
+        "fr",
+    )
+    assert normalize_language_value({"code": "fr"})[0] == ("code", "fr")
+    assert normalize_language_value("French")[0] == ("code", "fr")
+    assert normalize_language_value(42) is None
+    assert normalize_language_value(
+        {"codes": [{"system": "urn:ietf:bcp:47", "code": "qaa"}]}
+    )[1]["codes"][0]["display"] == "qaa"
+    assert normalize_language_value(
+        {
+            "codes": [
+                {
+                    "system": "urn:ietf:bcp:47",
+                    "code": "qaa",
+                    "display": "SOME LANGUAGE",
+                }
+            ]
+        }
+    )[1]["codes"][0]["display"] == "Some Language"
+    assert normalize_language_value({"text": "Creole", "preferred": True})[1][
+        "preferred"
+    ] is True
+    assert normalize_language_value({"code": "fr", "preferred": True})[1][
+        "preferred"
+    ] is True
+
+    merged_items = canonical_language_items(
+        [
+            {
+                "value": {
+                    "codes": [
+                        {"code": "fr", "display": "French"},
+                        {"code": "es", "display": "Spanish"},
+                    ]
+                },
+            },
+            {
+                "value": {"text": "French", "preferred": True},
+                "assertions": [
+                    42,
+                    {
+                        "source_kind": "state_regulator",
+                        "assertion_type": "self_reported",
+                    },
+                ],
+            },
+            {
+                "value": {"text": "German"},
+                "assertions": "not-a-list",
+            },
+        ],
+        fhir_source_rows=[],
+    )
+    french_item = next(
+        item for item in merged_items if item["display"] == "French (fr)"
+    )
+    assert french_item["value"]["preferred"] is True
+    assert (
+        french_item["value"]["normalization_warning"]
+        == "multiple_source_language_codes"
+    )
+    assert french_item["assertions"] == [
+        {
+            "source_kind": "state_regulator",
+            "assertion_type": "self_reported",
+        }
+    ]
+    german_item = next(
+        item for item in merged_items if item["display"] == "German (de)"
+    )
+    assert "assertions" not in german_item
 
 
 def test_language_composer_keeps_ambiguous_labels_as_readable_text():
