@@ -916,7 +916,7 @@ async def test_acquisition_closes_owned_session_and_rejects_bad_totals(
 ):
     catalog_file = _catalog_file("JSON_Providers_ALIEX.json")
     session = _FakeSession()
-    client_session_kwargs = {}
+    client_session_kwargs_by_name = {}
     monkeypatch.setattr(
         acquisition,
         "_selected_catalog_files",
@@ -924,7 +924,7 @@ async def test_acquisition_closes_owned_session_and_rejects_bad_totals(
     )
 
     def fake_client_session(**kwargs):
-        client_session_kwargs.update(kwargs)
+        client_session_kwargs_by_name.update(kwargs)
         return session
 
     monkeypatch.setattr(
@@ -946,8 +946,8 @@ async def test_acquisition_closes_owned_session_and_rejects_bad_totals(
             "a" * 64,
         )
     assert session.closed is True
-    assert client_session_kwargs["auto_decompress"] is False
-    assert client_session_kwargs["headers"] == {
+    assert client_session_kwargs_by_name["auto_decompress"] is False
+    assert client_session_kwargs_by_name["headers"] == {
         "User-Agent": "HealthPorta-Official-Provider-Files/1.0",
         "Accept-Encoding": "identity",
     }
