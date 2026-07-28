@@ -322,6 +322,49 @@ async def test_copy_unavailable_falls_back_to_original_sqlalchemy_batches(
 
 
 @pytest.mark.asyncio
+async def test_values_upsert_coalesces_duplicate_conflict_keys(monkeypatch):
+    fallback = AsyncMock()
+    monkeypatch.setattr(florida, "_upsert_rows_values", fallback)
+    monkeypatch.setenv("HLTHPRT_FL_MQA_COPY_UPSERT", "0")
+    first = _source_record("a" * 64)
+    final_row_by_key = {**first, "row_number": 322_147}
+
+    await florida._upsert_rows(
+        ProviderProfileSourceRecord,
+        [first, final_row_by_key],
+        "record_id",
+    )
+
+    fallback.assert_awaited_once_with(
+        ProviderProfileSourceRecord,
+        [final_row_by_key],
+        "record_id",
+    )
+
+
+@pytest.mark.asyncio
+async def test_copy_upsert_coalesces_duplicate_conflict_keys(monkeypatch):
+    copy_upsert = AsyncMock()
+    monkeypatch.setattr(florida, "_copy_upsert_chunk", copy_upsert)
+    monkeypatch.setenv("HLTHPRT_FL_MQA_COPY_UPSERT", "1")
+    monkeypatch.setenv("HLTHPRT_FL_MQA_COPY_UPSERT_MIN_ROWS", "1")
+    first = _source_record("a" * 64)
+    final_row_by_key = {**first, "row_number": 322_147}
+
+    await florida._upsert_rows(
+        ProviderProfileSourceRecord,
+        [first, final_row_by_key],
+        "record_id",
+    )
+
+    copy_upsert.assert_awaited_once_with(
+        ProviderProfileSourceRecord,
+        [final_row_by_key],
+        "record_id",
+    )
+
+
+@pytest.mark.asyncio
 async def test_copy_data_error_is_not_hidden_by_sqlalchemy_fallback(monkeypatch):
     copy_error = RuntimeError("synthetic COPY failure")
     connection = _RecordingConnection(_RecordingDriver(copy_error))

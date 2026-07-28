@@ -12,8 +12,10 @@ from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 
+from api.provider_profile_display import display_value
 from db.models import ProviderProfileProjection, db
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION, STANDARD_CATEGORIES
+from process.provider_profile_reported_range import normalize_projected_state_facts
 
 _FHIR_CATEGORY_BY_FACT = {
     "name": "identity",
@@ -38,29 +40,7 @@ _FHIR_CATEGORY_BY_FACT = {
     "telehealth": "telehealth",
     "accepting_medicaid": "network_participation",
 }
-PROFILE_COMPOSER_VERSION = "provider-profile-composer/v1"
-
-
-def _display_value(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, Mapping):
-        preferred = (
-            "display",
-            "text",
-            "name",
-            "value",
-            "description",
-            "code",
-        )
-        parts = [
-            str(value[key]).strip()
-            for key in preferred
-            if value.get(key) not in (None, "", [], {})
-        ]
-        if parts:
-            return " — ".join(dict.fromkeys(parts))
-    return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+PROFILE_COMPOSER_VERSION = "provider-profile-composer/v2"
 
 
 def _fhir_support_count(item: Mapping[str, Any]) -> int:
@@ -153,6 +133,7 @@ def compose_provider_profile(
         return None
     state_profile = state_projection.get("profile") if state_projection else None
     profile = copy.deepcopy(state_profile) if isinstance(state_profile, Mapping) else _empty_profile(npi)
+    normalize_projected_state_facts(profile)
     profile["schema_version"] = PROFILE_SCHEMA_VERSION
     profile["npi"] = npi
     source_generations_by_key = {
@@ -299,7 +280,7 @@ def compose_provider_profile(
                     continue
                 normalized_item_by_key = {
                     "type": str(fact_type),
-                    "display": _display_value(field_value),
+                    "display": display_value(str(fact_type), field_value),
                     "value": field_value,
                     "assertion_type": "provider_directory_reported",
                     "verification_status": "payer_directory_source",

@@ -47,6 +47,7 @@
         "api/provider_directory_source_summary_outcome.py",
         "api/provider_directory_sources.py",
         "api/provider_profile.py",
+        "api/provider_profile_display.py",
         "api/provider_specialty_cache_entries.py",
         "api/provider_specialty_filters.py",
         "api/ptg2_address_policy.py",
@@ -241,6 +242,7 @@
         "process/provider_directory_time_partition.py",
         "process/provider_directory_time_partition_primitives.py",
         "process/provider_enrichment.py",
+        "process/provider_profile_reported_range.py",
         "process/provider_quality.py",
         "process/provider_quality_parts/__init__.py",
         "process/provider_quality_parts/cohort_context.py",
@@ -437,12 +439,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 34906,
-          "total": 39900
+          "covered": 35094,
+          "total": 40016
         },
         "lines": {
-          "covered": 111224,
-          "total": 118944
+          "covered": 111567,
+          "total": 119198
         }
       },
       "one_time_floor_reset": {

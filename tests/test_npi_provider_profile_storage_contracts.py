@@ -7,6 +7,7 @@ import pytest
 
 from api import provider_profile as profile_api
 from api.endpoint import npi as npi_module
+from api.provider_profile_display import display_value
 
 
 VALID_NPI = "1000000004"
@@ -237,8 +238,8 @@ def test_evidence_composer_preserves_source_payloads_without_profile_filter():
 
 
 def test_profile_composer_handles_nonmapping_display_and_unkeyed_state_fact():
-    assert profile_api._display_value(["unstructured", "value"]) == (
-        '["unstructured","value"]'
+    assert display_value("provider_detail", ["unstructured", "value"]) == (
+        "unstructured; value"
     )
     profile = profile_api.compose_provider_profile(
         int(VALID_NPI),

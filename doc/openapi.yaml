@@ -9042,7 +9042,9 @@ components:
           type: string
         display:
           type: string
-          description: Concise human-readable rendering of the normalized fact.
+          description: |
+            Concise human-readable rendering of the normalized fact. Structured
+            details stay in `value`; this field never contains serialized JSON.
         value:
           type: object
           additionalProperties: true
@@ -9149,7 +9151,7 @@ components:
           enum: [provider-profile/v1]
         composer_version:
           type: string
-          example: provider-profile-composer/v1
+          example: provider-profile-composer/v2
         npi:
           type: integer
           minimum: 1000000000

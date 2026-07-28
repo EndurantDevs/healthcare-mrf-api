@@ -65,6 +65,18 @@ def _configure_import_runtime(
         "_apply_post_success_retention",
         AsyncMock(side_effect=lambda **kwargs: kwargs["metrics"]),
     )
+    monkeypatch.setattr(
+        florida,
+        "_retained_import_counts",
+        AsyncMock(
+            return_value={
+                "retained_source_records": 0,
+                "retained_facts": 0,
+                "retained_matched_records": 0,
+                "retained_non_projectable_records": 0,
+            }
+        ),
+    )
     monkeypatch.setattr(florida, "_mark_failed_run_status", AsyncMock())
     monkeypatch.setattr(florida, "enqueue_live_progress", lambda **_kwargs: None)
     monkeypatch.setattr(florida.db, "scalar", AsyncMock(return_value=scalar_result))
