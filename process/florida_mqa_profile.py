@@ -47,8 +47,10 @@ from db.models import (
     db,
 )
 from process.live_progress import enqueue_live_progress
+from process.provider_profile_reported_range import normalize_reported_range
 
 PROFILE_SCHEMA_VERSION = "provider-profile/v1"
+SOURCE_RECORD_IDENTITY_VERSION = "source-field-row-sha256/v1"
 FL_MQA_SOURCE_KEY = "florida-mqa"
 FL_MQA_AGENCY = "Florida Department of Health, Medical Quality Assurance"
 DEFAULT_BASE_URL = "https://data-download.mqa.flhealthsource.gov"
@@ -1880,10 +1882,21 @@ def _record_key(source: FloridaSource, row: Mapping[str, str], row_number: int) 
         _first(row, "rec_id", "record_id"),
     ]
     if not parts[-1]:
+        source_fields_by_key = {
+            field_name: field_value
+            for field_name, field_value in row.items()
+            if not field_name.startswith("_source_")
+        }
         row_hash = hashlib.sha256(
-            json.dumps(row, sort_keys=True).encode()
-        ).hexdigest()[:16]
-        parts[-1] = f"{row_hash}:{row_number}"
+            json.dumps(
+                source_fields_by_key,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        if row.get("_source_parse_quarantine"):
+            return f"{source.key}:quarantine:{row_hash}:{row_number}"
+        return f"{source.key}:row-sha256:{row_hash}"
     return ":".join(parts)
 
 
@@ -1906,6 +1919,7 @@ def _fact_payload(
     verification_status: str | None = None,
     sensitive: bool | None = None,
     public_default: bool | None = None,
+    infer_effective_period: bool = True,
 ) -> dict[str, Any]:
     """Build the reviewed public and restricted payloads for one source fact."""
     resolved_category = category or profile_source.category
@@ -1934,16 +1948,6 @@ def _fact_payload(
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
-    source_json_by_key = {
-        "source_key": FL_MQA_SOURCE_KEY,
-        "dataset": profile_source.key,
-        "agency": FL_MQA_AGENCY,
-        "jurisdiction": "FL",
-        "artifact_id": artifact["artifact_id"],
-        "content_sha256": artifact["content_sha256"],
-        "source_url": artifact["source_url"],
-        "source_record_id": record_id,
-    }
     return {
         "fact_id": hashlib.sha256(
             f"{run_id}:{record_id}:{logical_fact_key}".encode()
@@ -1960,12 +1964,29 @@ def _fact_payload(
         "assertion_type": assertion_type or profile_source.assertion_type,
         "verification_status": verification_status or profile_source.verification_status,
         "effective_start": effective_start
-        or _first(source_row, "effective_date", "action_date", "orig_dte", "issue_date")
+        or (
+            _first(source_row, "effective_date", "action_date", "orig_dte", "issue_date")
+            if infer_effective_period
+            else None
+        )
         or None,
         "effective_end": effective_end
-        or _first(source_row, "expiration_date", "expr_dte", "end_date")
+        or (
+            _first(source_row, "expiration_date", "expr_dte", "end_date")
+            if infer_effective_period
+            else None
+        )
         or None,
-        "source_json": source_json_by_key,
+        "source_json": {
+            "source_key": FL_MQA_SOURCE_KEY,
+            "dataset": profile_source.key,
+            "agency": FL_MQA_AGENCY,
+            "jurisdiction": "FL",
+            "artifact_id": artifact["artifact_id"],
+            "content_sha256": artifact["content_sha256"],
+            "source_url": artifact["source_url"],
+            "source_record_id": record_id,
+        },
         "sensitive": profile_source.sensitive if sensitive is None else sensitive,
         "public_default": (
             profile_source.public_default
@@ -2324,22 +2345,22 @@ def _profile_master_facts(
                 fact_key={"name": name},
                 assertion_type="state_reported",
                 verification_status="government_source",
+                infer_effective_period=False,
             )
         )
     birth_year_range = source_row.get("birth_year_range", "")
-    if birth_year_range:
-        birth_years = re.findall(r"\b(?:19|20)\d{2}\b", birth_year_range)
-        birth_value_by_key = {"source_text": birth_year_range, "precision": "range"}
-        if birth_years:
-            birth_value_by_key["start_year"] = int(birth_years[0])
-            birth_value_by_key["end_year"] = int(birth_years[-1])
+    reported_range = normalize_reported_range(birth_year_range)
+    if reported_range:
+        range_value_by_key = reported_range["value"]
         facts.append(
             _fact_payload(
                 profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact, category="demographics", fact_type="birth_year_range",
-                display=f"Birth year range: {birth_year_range}",
-                value_json=birth_value_by_key,
-                fact_key={"birth_year_range": birth_value_by_key},
+                artifact=artifact, category="demographics",
+                fact_type=reported_range["fact_type"],
+                display=reported_range["display"],
+                value_json=range_value_by_key,
+                fact_key={reported_range["fact_type"]: range_value_by_key},
+                infer_effective_period=False,
             )
         )
     rank_effective_date, _ = _normalize_source_date(source_row.get("rank_efct_dte", ""))
@@ -2407,6 +2428,7 @@ def _profile_master_facts(
                 display=other_license_display,
                 value_json=other_license_value,
                 fact_key={"other_state_license_indicator": other_license_value},
+                infer_effective_period=False,
             )
         )
     practice_start = source_row.get("yr_began_practice", "")
@@ -2425,6 +2447,7 @@ def _profile_master_facts(
                 value_json=practice_start_value_by_key,
                 effective_start=normalized_practice_start,
                 fact_key={"practice_start": practice_start_value_by_key},
+                infer_effective_period=False,
             )
         )
     nica_code = source_row.get("nica_payment", "").upper()
@@ -2442,6 +2465,7 @@ def _profile_master_facts(
                 fact_type="nica_assessment_status", display=nica_status[1],
                 value_json=nica_value_by_key,
                 fact_key={"nica_assessment_status": nica_value_by_key},
+                infer_effective_period=False,
             )
         )
     addresses_by_key: dict[str, dict[str, Any]] = {}
@@ -2471,6 +2495,7 @@ def _profile_master_facts(
                 artifact=artifact, category="locations", fact_type="provider_address",
                 display=_address_display(address), value_json=address,
                 fact_key=hashlib.sha256(address_key.encode()).hexdigest()[:16],
+                infer_effective_period=False,
             )
         )
     return facts
@@ -3316,9 +3341,21 @@ async def _upsert_rows_values(
         ).status()
 
 
+def _coalesced_upsert_rows(
+    rows: Iterable[dict[str, Any]],
+    key: str,
+) -> list[dict[str, Any]]:
+    """Keep the final payload for each conflict key in one bounded batch."""
+    row_by_conflict_key: dict[Any, dict[str, Any]] = {}
+    for row in rows:
+        row_by_conflict_key[row[key]] = row
+    return list(row_by_conflict_key.values())
+
+
 async def _upsert_rows(model: Any, rows: list[dict[str, Any]], key: str) -> None:
     if not rows:
         return
+    rows = _coalesced_upsert_rows(rows, key)
     table_name = _validated_identifier(model.__table__.name)
     if (
         table_name not in _COPY_UPSERT_TABLES
@@ -3339,6 +3376,43 @@ async def _upsert_rows(model: Any, rows: list[dict[str, Any]], key: str) -> None
             except _CopyUpsertUnavailable:
                 is_copy_available = False
         await _upsert_rows_values(model, chunk, key)
+
+
+async def _retained_import_counts(run_id: str) -> dict[str, int]:
+    """Count unique rows retained after content-key conflict resolution."""
+    retained_counts = await db.first(
+        select(
+            func.count().label("source_records"),
+            func.count()
+            .filter(ProviderProfileSourceRecord.match_status == "deterministic")
+            .label("matched_records"),
+            func.count()
+            .filter(
+                ProviderProfileSourceRecord.match_status == "deterministic",
+                ProviderProfileSourceRecord.matched_npi.is_not(None),
+            )
+            .label("projectable_records"),
+            (
+                select(func.count())
+                .select_from(ProviderProfileFact)
+                .where(ProviderProfileFact.run_id == run_id)
+                .scalar_subquery()
+            ).label("facts"),
+        )
+        .select_from(ProviderProfileSourceRecord)
+        .where(ProviderProfileSourceRecord.run_id == run_id)
+    )
+    retained_counts_by_key = retained_counts._mapping
+    retained_source_records = int(retained_counts_by_key["source_records"] or 0)
+    return {
+        "retained_source_records": retained_source_records,
+        "retained_facts": int(retained_counts_by_key["facts"] or 0),
+        "retained_matched_records": int(
+            retained_counts_by_key["matched_records"] or 0
+        ),
+        "retained_non_projectable_records": retained_source_records
+        - int(retained_counts_by_key["projectable_records"] or 0),
+    }
 
 
 async def _claim_import_run(run_row: Mapping[str, Any]) -> None:
@@ -3681,7 +3755,11 @@ async def _publish_projection_swap(
                 else None
             )
             if isinstance(previous_metrics, Mapping):
-                previous_source_records = previous_metrics.get("source_records")
+                previous_source_records = previous_metrics.get(
+                    "physical_source_records"
+                )
+                if not isinstance(previous_source_records, int):
+                    previous_source_records = previous_metrics.get("source_records")
                 if isinstance(previous_source_records, int):
                     previous_source_record_count = previous_source_records
             if _is_generation_newer(
@@ -3736,11 +3814,14 @@ async def _publish_projection_swap(
                 "provider_profile_source_volume_guard:"
                 + ",".join(source_ratio_reasons)
             )
+        candidate_physical_source_records = int(
+            completion_metrics.get("physical_source_records")
+            or completion_metrics.get("source_records")
+            or 0
+        )
         guard_reasons = _publication_guard_reasons(
             candidate_provider_count=stage_count,
-            candidate_source_record_count=int(
-                completion_metrics.get("source_records") or 0
-            ),
+            candidate_source_record_count=candidate_physical_source_records,
             current_provider_count=current_provider_count,
             previous_source_record_count=previous_source_record_count,
             min_first_publish_providers=min_first_publish_providers,
@@ -3750,9 +3831,8 @@ async def _publish_projection_swap(
             "allow_volume_drop": allow_volume_drop,
             "candidate_providers": stage_count,
             "current_providers": current_provider_count,
-            "candidate_source_records": int(
-                completion_metrics.get("source_records") or 0
-            ),
+            "source_record_counter_semantics": "physical_input",
+            "candidate_source_records": candidate_physical_source_records,
             "previous_source_records": previous_source_record_count,
             "min_first_publish_providers": min_first_publish_providers,
             "min_publish_ratio": min_publish_ratio,
@@ -4332,6 +4412,14 @@ def _projection(
         category_facts = grouped[fact["category"]]
         profile_item_by_key = category_facts.get(logical_key)
         if profile_item_by_key is None:
+            effective_period_by_key = {
+                field_name: field_value
+                for field_name, field_value in (
+                    ("start", fact.get("effective_start")),
+                    ("end", fact.get("effective_end")),
+                )
+                if field_value
+            }
             profile_item_by_key = {
                 "type": fact["fact_type"],
                 "logical_fact_key": logical_key,
@@ -4339,10 +4427,6 @@ def _projection(
                 "value": fact["value_json"],
                 "assertion_type": fact["assertion_type"],
                 "verification_status": fact["verification_status"],
-                "effective_period": {
-                    "start": fact.get("effective_start"),
-                    "end": fact.get("effective_end"),
-                },
                 "sensitive": bool(fact["sensitive"]),
                 "public_default": bool(fact["public_default"]),
                 "source_record_id": fact["source_record_id"],
@@ -4357,6 +4441,8 @@ def _projection(
                 ],
                 "assertion_count": 1,
             }
+            if effective_period_by_key:
+                profile_item_by_key["effective_period"] = effective_period_by_key
             category_facts[logical_key] = profile_item_by_key
         elif fact["source_record_id"] not in profile_item_by_key["source_record_ids"]:
             profile_item_by_key["source_record_ids"].append(fact["source_record_id"])
@@ -4535,6 +4621,7 @@ async def import_florida_mqa_profile(
         "status": "running",
         "source_manifest": {
             "sources": list(selected_keys),
+            "source_record_identity_version": SOURCE_RECORD_IDENTITY_VERSION,
             "control_run_id": control_run_id,
             "publish_partial": publish_partial,
             "allow_volume_drop": allow_volume_drop,
@@ -4630,6 +4717,7 @@ async def import_florida_mqa_profile(
             header_seen = _artifact_header(path, profile_source)
             missing = sorted(set(profile_source.required_fields) - set(header_seen))
             source_metric_by_key = {
+                "counter_semantics": "physical_input",
                 "rows": 0,
                 "matched": 0,
                 "facts": 0,
@@ -4684,10 +4772,15 @@ async def import_florida_mqa_profile(
                     ]
                     run_row_by_key["metrics"] = {
                         "artifacts": len(artifacts_by_key),
+                        "counter_semantics": "physical_input",
                         "source_records": source_record_count,
                         "facts": fact_count,
                         "matched_records": matched_record_count,
                         "non_projectable_records": non_projectable_record_count,
+                        "physical_source_records": source_record_count,
+                        "physical_facts": fact_count,
+                        "physical_matched_records": matched_record_count,
+                        "physical_non_projectable_records": non_projectable_record_count,
                         "source_metrics": source_metrics_by_key,
                     }
                     await _upsert_rows(
@@ -4803,7 +4896,7 @@ async def import_florida_mqa_profile(
                         match_row,
                         license_index,
                     )
-                source_record_key = _record_key(profile_source, source_row, row_number)
+                source_record_key = _record_key(profile_source, raw_row, row_number)
                 record_id = hashlib.sha256(f"{run_id}:{source_record_key}".encode()).hexdigest()
                 identity = master_identities_by_key.get(join_key)
                 identity_license_number = identity[2] if identity else ""
@@ -4877,10 +4970,15 @@ async def import_florida_mqa_profile(
             )
             run_row_by_key["metrics"] = {
                 "artifacts": len(artifacts_by_key),
+                "counter_semantics": "physical_input",
                 "source_records": source_record_count,
                 "facts": fact_count,
                 "matched_records": matched_record_count,
                 "non_projectable_records": non_projectable_record_count,
+                "physical_source_records": source_record_count,
+                "physical_facts": fact_count,
+                "physical_matched_records": matched_record_count,
+                "physical_non_projectable_records": non_projectable_record_count,
                 "source_metrics": source_metrics_by_key,
             }
             await _upsert_rows(
@@ -4896,10 +4994,15 @@ async def import_florida_mqa_profile(
                 file_count=len(selected_keys),
                 file_name=profile_source.filename,
                 counters={
+                    "counter_semantics": "physical_input",
                     "source_records": source_record_count,
                     "facts": fact_count,
                     "matched_records": matched_record_count,
                     "non_projectable_records": non_projectable_record_count,
+                    "physical_source_records": source_record_count,
+                    "physical_facts": fact_count,
+                    "physical_matched_records": matched_record_count,
+                    "physical_non_projectable_records": non_projectable_record_count,
                 },
             )
 
@@ -4909,6 +5012,7 @@ async def import_florida_mqa_profile(
         facts.clear()
         await _upsert_rows(ProviderProfileArtifact, list(artifacts_by_key.values()), "artifact_id")
         loaded_categories = _validated_loaded_categories(source_metrics_by_key)
+        retained_counts_by_key = await _retained_import_counts(run_id)
         projected_provider_count = int(
             await db.scalar(
                 select(func.count(func.distinct(ProviderProfileFact.npi))).where(
@@ -4918,30 +5022,52 @@ async def import_florida_mqa_profile(
             )
             or 0
         )
-        run_row_by_key.update(status="validating")
+        completion_metrics_by_key = {
+            "artifacts": len(artifacts_by_key),
+            "counter_semantics": {
+                "source_records": "physical_input",
+                "facts": "physical_input",
+                "matched_records": "physical_input",
+                "non_projectable_records": "physical_input",
+                "physical_prefix": "physical_input_alias",
+                "retained_prefix": "retained_unique",
+                "source_metrics": "physical_input",
+            },
+            **retained_counts_by_key,
+            "source_records": source_record_count,
+            "facts": fact_count,
+            "matched_records": matched_record_count,
+            "non_projectable_records": non_projectable_record_count,
+            "physical_source_records": source_record_count,
+            "physical_facts": fact_count,
+            "physical_matched_records": matched_record_count,
+            "physical_non_projectable_records": non_projectable_record_count,
+            "projected_providers": projected_provider_count,
+            "selected_sources": list(selected_keys),
+            "source_metrics": source_metrics_by_key,
+        }
+        run_row_by_key.update(
+            status="validating",
+            metrics=completion_metrics_by_key,
+        )
         await _upsert_rows(ProviderProfileImportRun, [run_row_by_key], "run_id")
         enqueue_live_progress(
             phase="validating",
             pct=88,
             message="Validating complete provider profile generation",
             counters={
+                **retained_counts_by_key,
                 "source_records": source_record_count,
                 "facts": fact_count,
                 "matched_records": matched_record_count,
                 "non_projectable_records": non_projectable_record_count,
+                "physical_source_records": source_record_count,
+                "physical_facts": fact_count,
+                "physical_matched_records": matched_record_count,
+                "physical_non_projectable_records": non_projectable_record_count,
                 "projected_providers": projected_provider_count,
             },
         )
-        completion_metrics_by_key = {
-            "artifacts": len(artifacts_by_key),
-            "source_records": source_record_count,
-            "facts": fact_count,
-            "matched_records": matched_record_count,
-            "non_projectable_records": non_projectable_record_count,
-            "projected_providers": projected_provider_count,
-            "selected_sources": list(selected_keys),
-            "source_metrics": source_metrics_by_key,
-        }
         if publish_enabled:
             source_validation_reasons = _source_validation_guard_reasons(
                 source_metrics_by_key,
@@ -5002,10 +5128,15 @@ async def import_florida_mqa_profile(
                 else "Partial provider profile run completed without publication"
             ),
             counters={
+                **retained_counts_by_key,
                 "source_records": source_record_count,
                 "facts": fact_count,
                 "matched_records": matched_record_count,
                 "non_projectable_records": non_projectable_record_count,
+                "physical_source_records": source_record_count,
+                "physical_facts": fact_count,
+                "physical_matched_records": matched_record_count,
+                "physical_non_projectable_records": non_projectable_record_count,
                 "projected_providers": projected_provider_count,
                 "published_providers": int(metrics_by_key["published_providers"]),
             },

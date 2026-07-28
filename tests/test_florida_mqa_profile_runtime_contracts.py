@@ -175,6 +175,37 @@ async def test_empty_upsert_is_a_noop_and_invalid_run_ids_are_rejected(
 
 
 @pytest.mark.asyncio
+async def test_retained_counts_distinguish_unique_rows_from_physical_input(
+    monkeypatch,
+):
+    database = type(
+        "RetainedCountDb",
+        (),
+        {
+            "first": AsyncMock(
+                return_value=_Row(
+                    source_records=1,
+                    facts=7,
+                    matched_records=1,
+                    projectable_records=1,
+                )
+            )
+        },
+    )()
+    monkeypatch.setattr(florida, "db", database)
+
+    retained_counts_by_key = await florida._retained_import_counts("run-1")
+
+    assert retained_counts_by_key == {
+        "retained_source_records": 1,
+        "retained_facts": 7,
+        "retained_matched_records": 1,
+        "retained_non_projectable_records": 0,
+    }
+    database.first.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_projection_batches_page_distinct_npis_and_preserve_provenance(
     monkeypatch,
 ):

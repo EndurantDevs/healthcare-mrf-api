@@ -284,6 +284,105 @@ def test_profile_master_expands_biography_into_distinct_categories():
     assert all(fact["value_json"] != source_row_by_key for fact in facts)
 
 
+def _age_band_profile_master_facts():
+    """Return representative profile-master facts with license dates present."""
+    source_row_by_key = {
+        "pro_cde": "1501",
+        "lic_id": "42",
+        "lic_nbr": "ME12345",
+        "f_name": "Alex",
+        "l_name": "Example",
+        "birth_year_range": "80 - 90",
+        "other_license": "N",
+        "yr_began_practice": "1973",
+        "nica_payment": "E",
+        "orig_dte": "12/31/1973",
+        "expr_dte": "01/31/2027",
+        "addr_line1": "100 Example Ave",
+        "addr_city": "Example City",
+        "addr_state": "FL",
+        "addr_zip": "32000",
+    }
+    return _facts_for_row(
+        FLORIDA_SOURCES["profile_master"],
+        source_row_by_key,
+        run_id="synthetic-run",
+        record_id="synthetic-record",
+        npi=1295763977,
+        artifact={
+            "artifact_id": "synthetic-artifact",
+            "content_sha256": "0" * 64,
+            "source_url": "https://example.invalid/profile",
+        },
+    )
+
+
+def test_profile_master_age_band_does_not_inherit_license_period():
+    facts = _age_band_profile_master_facts()
+    facts_by_type = {fact["fact_type"]: fact for fact in facts}
+
+    assert facts_by_type["age_range"]["display"] == (
+        "Reported age range: 80–90 years"
+    )
+    assert facts_by_type["age_range"]["value_json"] == {
+        "minimum_years": 80,
+        "maximum_years": 90,
+        "precision": "range",
+        "source_text": "80 - 90",
+    }
+    assert facts_by_type["state_license"]["effective_start"] == "1973-12-31"
+    assert facts_by_type["state_license"]["effective_end"] == "2027-01-31"
+    assert facts_by_type["practice_start"]["effective_start"] == "1973"
+    assert facts_by_type["practice_start"]["effective_end"] is None
+    non_license_types = {
+        "name",
+        "age_range",
+        "other_state_license_indicator",
+        "nica_assessment_status",
+        "provider_address",
+    }
+    assert all(
+        facts_by_type[fact_type]["effective_start"] is None
+        and facts_by_type[fact_type]["effective_end"] is None
+        for fact_type in non_license_types
+    )
+
+
+def test_profile_master_projection_omits_empty_effective_periods():
+    facts = _age_band_profile_master_facts()
+    profile, _evidence = _projection(
+        1295763977,
+        "synthetic-generation",
+        facts,
+        set(STANDARD_CATEGORIES),
+    )
+    age_item = profile["categories"]["demographics"]["items"][0]
+    practice_item = profile["categories"]["professional_experience"]["items"][0]
+    assert "effective_period" not in age_item
+    assert practice_item["effective_period"] == {"start": "1973"}
+
+
+def test_profile_master_skips_not_applicable_age_band():
+    facts = _facts_for_row(
+        FLORIDA_SOURCES["profile_master"],
+        {
+            "pro_cde": "1501",
+            "lic_nbr": "ME12345",
+            "birth_year_range": "N/A",
+        },
+        run_id="synthetic-run",
+        record_id="synthetic-record",
+        npi=1295763977,
+        artifact={
+            "artifact_id": "synthetic-artifact",
+            "content_sha256": "0" * 64,
+            "source_url": "https://example.invalid/profile",
+        },
+    )
+
+    assert not [fact for fact in facts if fact["category"] == "demographics"]
+
+
 def test_profile_master_does_not_publish_county_only_location():
     facts = _facts_for_row(
         FLORIDA_SOURCES["profile_master"],
@@ -779,15 +878,36 @@ def test_empty_artifact_fails_header_validation(tmp_path):
         _artifact_header(path, source)
 
 
-def test_duplicate_rows_receive_distinct_record_keys():
-    source = FLORIDA_SOURCES["education"]
+def test_duplicate_rows_share_content_record_identity():
+    profile_source = FLORIDA_SOURCES["education"]
     row_by_key = {
         "pro_cde": "1501",
         "lic_id": "42",
         "school_name": "Synthetic Medical College",
     }
 
-    assert _record_key(source, row_by_key, 2) != _record_key(source, row_by_key, 3)
+    record_key = _record_key(profile_source, row_by_key, 2)
+    assert record_key == _record_key(profile_source, row_by_key, 3)
+    assert record_key.startswith("education:row-sha256:")
+    assert record_key != _record_key(
+        profile_source,
+        {**row_by_key, "school_name": "Different Medical College"},
+        3,
+    )
+    assert record_key != _record_key(
+        profile_source,
+        {**row_by_key, "school_name": "Synthetic Medical College "},
+        3,
+    )
+    quarantined_row_by_key = {
+        "_source_parse_quarantine": "field_count_mismatch",
+        "_physical_field_count": "2",
+    }
+    assert _record_key(profile_source, quarantined_row_by_key, 2) != _record_key(
+        profile_source,
+        quarantined_row_by_key,
+        3,
+    )
 
 
 def test_source_selection_is_deduplicated_and_master_first():
@@ -1169,21 +1289,27 @@ class _ImportWorkflowClient:
 
     def download(self, source, target):
         payload = _profile_master_artifact(source)
+        header, source_row = payload.strip().splitlines()
+        payload = "\n".join((header, source_row, source_row)) + "\n"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(payload, encoding="utf-8")
         return "a" * 64, len(payload.encode())
 
 
-@pytest.mark.asyncio
-async def test_partial_import_retains_evidence_but_cannot_publish(monkeypatch, tmp_path):
-    upserts = []
+def _configure_duplicate_import_runtime(monkeypatch):
+    captured_upserts = []
+    progress_events = []
 
     async def capture_upsert(model, rows, conflict_column):
-        upserts.append((model, list(rows), conflict_column))
+        captured_upserts.append((model, list(rows), conflict_column))
 
     monkeypatch.setenv("HLTHPRT_FL_MQA_USERNAME", "test")
     monkeypatch.setenv("HLTHPRT_FL_MQA_PASSWORD", "x")
-    monkeypatch.setattr(florida_mqa_profile_module, "FloridaMQAClient", _ImportWorkflowClient)
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "FloridaMQAClient",
+        _ImportWorkflowClient,
+    )
     monkeypatch.setattr(florida_mqa_profile_module, "_ensure_tables", AsyncMock())
     monkeypatch.setattr(
         florida_mqa_profile_module,
@@ -1199,10 +1325,26 @@ async def test_partial_import_retains_evidence_but_cannot_publish(monkeypatch, t
     monkeypatch.setattr(florida_mqa_profile_module, "_upsert_rows", capture_upsert)
     monkeypatch.setattr(
         florida_mqa_profile_module,
+        "_retained_import_counts",
+        AsyncMock(
+            return_value={
+                "retained_source_records": 1,
+                "retained_facts": 0,
+                "retained_matched_records": 0,
+                "retained_non_projectable_records": 1,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
         "_apply_post_success_retention",
         AsyncMock(side_effect=lambda **kwargs: kwargs["metrics"]),
     )
-    monkeypatch.setattr(florida_mqa_profile_module, "enqueue_live_progress", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "enqueue_live_progress",
+        lambda **progress_by_key: progress_events.append(progress_by_key),
+    )
     monkeypatch.setattr(
         florida_mqa_profile_module.db,
         "scalar",
@@ -1212,6 +1354,18 @@ async def test_partial_import_retains_evidence_but_cannot_publish(monkeypatch, t
     disconnect = AsyncMock()
     monkeypatch.setattr(florida_mqa_profile_module.db, "connect", connect)
     monkeypatch.setattr(florida_mqa_profile_module.db, "disconnect", disconnect)
+    return captured_upserts, progress_events, connect, disconnect
+
+
+@pytest.mark.asyncio
+async def test_partial_import_deduplicates_evidence_but_cannot_publish(
+    monkeypatch,
+    tmp_path,
+):
+    """Keep physical counters while duplicate evidence retains one identity."""
+    upserts, progress_events, connect, disconnect = (
+        _configure_duplicate_import_runtime(monkeypatch)
+    )
 
     operation_result = await florida_mqa_profile_module.import_florida_mqa_profile(
         source_keys=["profile_master"],
@@ -1227,9 +1381,36 @@ async def test_partial_import_retains_evidence_but_cannot_publish(monkeypatch, t
         ],
         "published_rows": 0,
     }
-    assert operation_result["source_records"] == 1
+    assert operation_result["source_records"] == 2
+    assert operation_result["retained_source_records"] == 1
+    assert operation_result["physical_source_records"] == 2
+    assert operation_result["counter_semantics"]["source_records"] == "physical_input"
+    assert operation_result["counter_semantics"]["retained_prefix"] == (
+        "retained_unique"
+    )
+    assert operation_result["source_metrics"]["profile_master"]["rows"] == 2
+    assert (
+        operation_result["source_metrics"]["profile_master"]["counter_semantics"]
+        == "physical_input"
+    )
     assert operation_result["published_providers"] == 0
-    assert any(model.__name__ == "ProviderProfileSourceRecord" for model, _rows, _key in upserts)
+    physical_source_rows = [
+        source_row
+        for model, source_rows, _key in upserts
+        if model.__name__ == "ProviderProfileSourceRecord"
+        for source_row in source_rows
+    ]
+    assert len(physical_source_rows) == 2
+    assert len({source_row["record_id"] for source_row in physical_source_rows}) == 1
+    counters_by_phase = {
+        progress_event["phase"]: progress_event.get("counters", {})
+        for progress_event in progress_events
+    }
+    for phase in ("validating", "completed"):
+        assert counters_by_phase[phase]["source_records"] == 2
+        assert counters_by_phase[phase]["physical_source_records"] == 2
+        assert counters_by_phase[phase]["retained_source_records"] == 1
+        assert counters_by_phase[phase]["retained_non_projectable_records"] == 1
     connect.assert_awaited_once()
     disconnect.assert_awaited_once()
 
@@ -1327,6 +1508,18 @@ async def test_complete_catalog_import_requires_every_validated_source_before_pu
         lambda *_args, **_kwargs: (1000000004, "deterministic", {"method": "fixture"}),
     )
     monkeypatch.setattr(florida_mqa_profile_module, "_upsert_rows", capture_upsert)
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_retained_import_counts",
+        AsyncMock(
+            return_value={
+                "retained_source_records": len(DEFAULT_SOURCE_KEYS),
+                "retained_facts": len(DEFAULT_SOURCE_KEYS),
+                "retained_matched_records": len(DEFAULT_SOURCE_KEYS),
+                "retained_non_projectable_records": 0,
+            }
+        ),
+    )
     monkeypatch.setattr(florida_mqa_profile_module, "_publish_projection_swap", published)
     monkeypatch.setattr(
         florida_mqa_profile_module,
@@ -1351,6 +1544,9 @@ async def test_complete_catalog_import_requires_every_validated_source_before_pu
     published.assert_awaited_once()
     completion_metrics = published.await_args.kwargs["completion_metrics"]
     assert completion_metrics["source_records"] == len(DEFAULT_SOURCE_KEYS)
+    assert completion_metrics["physical_source_records"] == len(
+        DEFAULT_SOURCE_KEYS
+    )
     assert completion_metrics["selected_sources"] == list(DEFAULT_SOURCE_KEYS)
 
 

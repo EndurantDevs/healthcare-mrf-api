@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from api.provider_profile_display import display_value
 from db.models import ProviderProfileProjection
 
 profile_api = importlib.import_module("api.provider_profile")
@@ -71,8 +72,8 @@ def test_composer_handles_empty_and_non_display_values():
         state_projection=None,
         fhir_profile=None,
     ) is None
-    assert profile_api._display_value("plain text") == "plain text"
-    assert profile_api._display_value({"other": 7}) == '{"other":7}'
+    assert display_value("description", "plain text") == "plain text"
+    assert display_value("description", {"other": 7}) == "Other: 7"
 
 
 def test_composer_tolerates_unmaterialized_fhir_groups_and_items():
