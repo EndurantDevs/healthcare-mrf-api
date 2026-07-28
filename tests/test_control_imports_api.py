@@ -3413,11 +3413,11 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     runnable_items = [entry for entry in catalog["items"] if entry["runnable"]]
     probe_items = [entry for entry in catalog["items"] if not entry["runnable"]]
 
-    assert catalog["entry_count"] == 37
-    assert catalog["runnable_count"] == 23
-    assert catalog["profile_source_count"] == 23
+    assert catalog["entry_count"] == 38
+    assert catalog["runnable_count"] == 24
+    assert catalog["profile_source_count"] == 24
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 23
+    assert len(runnable_items) == 24
     assert all(entry["profile_enabled"] for entry in runnable_items)
     assert all(
         entry["supported_resources"] == entry["resources"]
@@ -3442,6 +3442,15 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     assert len(runnable_by_id["simpra-advantage"]["resources"]) == 6
     assert len(runnable_by_id["san-bernardino-county-dbh"]["resources"]) == 8
     assert len(runnable_by_id["san-mateo-county-bhrs"]["resources"]) == 8
+    assert runnable_by_id["uhc-provider-files"]["resource_profile"] == "A6"
+    assert runnable_by_id["uhc-provider-files"]["resources"] == [
+        "InsurancePlan",
+        "Location",
+        "Organization",
+        "OrganizationAffiliation",
+        "Practitioner",
+        "PractitionerRole",
+    ]
     assert probe_by_id["michigan"]["resources"] == []
     assert probe_by_id["michigan"]["supported_resources"] == [
         "Location",

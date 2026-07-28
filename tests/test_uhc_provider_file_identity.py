@@ -119,7 +119,7 @@ def _replace_ifp_paired_state(census_document):
     census_document["ifp_paired_states"] = sorted(states)
 
 
-def test_corporate_source_identity_is_source_neutral_and_manifest_stays_louisiana():
+def test_corporate_source_identity_is_distinct_from_louisiana_manifest_entry():
     official_files = source_identity.source_identity_from_registry()
     manifest = json.loads(
         (
@@ -128,18 +128,31 @@ def test_corporate_source_identity_is_source_neutral_and_manifest_stays_louisian
         ).read_text()
     )
     uhc_entry = next(entry for entry in manifest["entries"] if entry["entry_id"] == "uhc")
+    official_entry = next(
+        entry
+        for entry in manifest["entries"]
+        if entry["entry_id"] == "uhc-provider-files"
+    )
 
     assert official_files.entry_id == "uhc-provider-files"
     assert official_files.display_name == "UnitedHealthcare Official Provider Files"
     assert official_files.owner_id == "unitedhealthcare"
     assert official_files.portal_base != uhc_entry["canonical_base"]
     assert official_files.catalog_base != uhc_entry["canonical_base"]
-    assert official_files.registered_source_id is None
-    assert official_files.acquisition_manifest_entry_id is None
-    assert official_files.acquisition_runnable is False
-    assert official_files.profile_eligible is False
-    assert official_files.publication_ready is False
-    assert all(entry["entry_id"] != official_files.entry_id for entry in manifest["entries"])
+    assert official_files.registered_source_id == (
+        source_identity.UHC_PROVIDER_FILE_SOURCE_ID
+    )
+    assert official_files.acquisition_manifest_entry_id == (
+        source_identity.UHC_PROVIDER_FILE_ACQUISITION_MANIFEST_ENTRY_ID
+    )
+    assert official_files.acquisition_runnable is True
+    assert official_files.profile_eligible is True
+    assert official_files.publication_ready is True
+    assert official_entry["source_ids"] == [
+        source_identity.UHC_PROVIDER_FILE_SOURCE_ID
+    ]
+    assert official_entry["classification"] == "acquisition"
+    assert official_entry["canonical_base"] == official_files.catalog_base
     assert uhc_entry == {
         "entry_id": "uhc",
         "display_name": "UHC",
@@ -255,7 +268,7 @@ def test_cs_products_remain_product_scoped_without_inferred_jurisdiction():
     ("mutation", "message"),
     [
         (lambda registry: registry["entries"][0].update({"registered_source_id": "pdfhir_" + "a" * 24}), "gates"),
-        (lambda registry: registry["entries"][0].update({"profile_eligible": True}), "gates"),
+        (lambda registry: registry["entries"][0].update({"profile_eligible": False}), "gates"),
         (lambda registry: registry["entries"][0].update({"enabling_gate": "later"}), "gates"),
         (lambda registry: registry["entries"][0].update({"owner_id": "unitedhealthcare-community-plan-louisiana"}), "identity"),
     ],

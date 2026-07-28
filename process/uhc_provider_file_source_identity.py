@@ -16,15 +16,16 @@ UHC_PROVIDER_FILE_ENTRY_ID = "uhc-provider-files"
 UHC_PROVIDER_FILE_DISPLAY_NAME = "UnitedHealthcare Official Provider Files"
 UHC_PROVIDER_FILE_OWNER_ID = "unitedhealthcare"
 UHC_PROVIDER_FILE_CATALOG_SOURCE_ID = "uhc_provider_files"
+UHC_PROVIDER_FILE_SOURCE_ID = "pdfhir_2754e999dd691175821ec26e"
+UHC_PROVIDER_FILE_ACQUISITION_MANIFEST_ENTRY_ID = "uhc-provider-files"
 UHC_PROVIDER_FILE_ADAPTER_ID = "uhc-provider-file-catalog"
 UHC_PROVIDER_FILE_ADAPTER_CONTRACT = "healthporta-uhc-provider-file-catalog-v1"
 UHC_PROVIDER_FILE_PORTAL_BASE = "https://www.uhc.com/legal/interoperability-apis"
 UHC_PROVIDER_FILE_CATALOG_BASE = "https://providermrf.uhc.com"
 UHC_PROVIDER_FILE_ENABLING_GATE = (
-    "Register a corporate official-file source without FHIR endpoint semantics, "
-    "establish authoritative product jurisdiction metadata, then prove a complete "
-    "reproducible build and reviewed publication contract before enabling acquisition "
-    "or Profile selection."
+    "Complete: the corporate source has a distinct registered identity, exact reviewed "
+    "file scopes, reproducible retained-byte and semantic proofs, atomic source-local "
+    "publication, and Profile selection without borrowing FHIR endpoint semantics."
 )
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -47,8 +48,8 @@ class UHCOfficialFileSourceIdentity:
     catalog_base: str
     adapter_id: str
     adapter_contract: str
-    registered_source_id: None
-    acquisition_manifest_entry_id: None
+    registered_source_id: str
+    acquisition_manifest_entry_id: str
     acquisition_runnable: bool
     profile_eligible: bool
     publication_ready: bool
@@ -164,11 +165,12 @@ def _validate_source_registry_entry(entry: dict[str, Any]) -> None:
         "catalog_base",
     )
     if (
-        entry["registered_source_id"] is not None
-        or entry["acquisition_manifest_entry_id"] is not None
-        or entry["acquisition_runnable"] is not False
-        or entry["profile_eligible"] is not False
-        or entry["publication_ready"] is not False
+        entry["registered_source_id"] != UHC_PROVIDER_FILE_SOURCE_ID
+        or entry["acquisition_manifest_entry_id"]
+        != UHC_PROVIDER_FILE_ACQUISITION_MANIFEST_ENTRY_ID
+        or entry["acquisition_runnable"] is not True
+        or entry["profile_eligible"] is not True
+        or entry["publication_ready"] is not True
         or entry["enabling_gate"] != UHC_PROVIDER_FILE_ENABLING_GATE
     ):
         raise UHCProviderFileIdentityError("source-neutral UHC gates are invalid")
@@ -179,11 +181,13 @@ __all__ = [
     "UHCOfficialFileSourceIdentity",
     "UHCProviderFileIdentityError",
     "UHC_PROVIDER_FILE_ADAPTER_ID",
+    "UHC_PROVIDER_FILE_ACQUISITION_MANIFEST_ENTRY_ID",
     "UHC_PROVIDER_FILE_CATALOG_SOURCE_ID",
     "UHC_PROVIDER_FILE_DISPLAY_NAME",
     "UHC_PROVIDER_FILE_ENABLING_GATE",
     "UHC_PROVIDER_FILE_ENTRY_ID",
     "UHC_PROVIDER_FILE_OWNER_ID",
     "UHC_PROVIDER_FILE_PORTAL_BASE",
+    "UHC_PROVIDER_FILE_SOURCE_ID",
     "source_identity_from_registry",
 ]

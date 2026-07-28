@@ -745,7 +745,7 @@ async def test_bounded_profile_build_matches_monolithic_sql_exactly(monkeypatch)
 async def test_bounded_build_populates_an_initial_empty_serving_pair(
     monkeypatch,
 ):
-    """Treat an existing empty table pair as a valid incremental baseline."""
+    """Treat an empty serving pair as a fresh, complete global rebuild."""
     async with _profile_database(monkeypatch) as (database, schema):
         monkeypatch.setattr(importer, "db", database)
         await database.status(
@@ -794,9 +794,9 @@ async def test_bounded_build_populates_an_initial_empty_serving_pair(
             build_id=build.build_id,
         )
         assert checkpoint_record is not None
-        assert checkpoint_record.has_existing_artifacts is True
+        assert checkpoint_record.has_existing_artifacts is False
         assert checkpoint_record.state == "ready"
-        assert metrics["incremental"] is True
+        assert metrics["incremental"] is False
 
         await _build_profile_artifacts(database, schema)
         baseline_evidence_ref = profile.qualified_table(
@@ -1008,7 +1008,7 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
                 f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
                 and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
             ):
-                if len(fact_statement_starts) == 6:
+                if len(fact_statement_starts) == 1:
                     raise RuntimeError("forced resumable interruption")
                 fact_statement_starts.append(None)
             return await original_status(sql, **params)
@@ -1032,7 +1032,7 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         )
         assert interrupted_checkpoint is not None
         assert interrupted_checkpoint.state == "failed"
-        assert interrupted_checkpoint.evidence_next_batch == 6
+        assert interrupted_checkpoint.evidence_next_batch == 1
         assert interrupted_checkpoint.profile_next_batch == 0
         interrupted_evidence_count = int(
             await database.scalar(
@@ -1055,7 +1055,7 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
                 f'INSERT INTO "{schema}"."{build.profile_stage}"' in str(sql)
                 and "ON CONFLICT (npi) DO NOTHING" in str(sql)
             ):
-                if len(compact_statement_starts) == 120:
+                if len(compact_statement_starts) == 0:
                     raise RuntimeError("forced compact interruption")
                 compact_statement_starts.append(None)
             return await original_status(sql, **params)
@@ -1083,9 +1083,9 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
             compact_checkpoint.evidence_next_batch
             == compact_checkpoint.evidence_total_batches
         )
-        assert compact_checkpoint.profile_next_batch == 120
+        assert compact_checkpoint.profile_next_batch == 0
         assert len(resumed_fact_statements) == (
-            compact_checkpoint.evidence_total_batches - 6
+            compact_checkpoint.evidence_total_batches - 1
         )
 
         evidence_population = (
@@ -1174,7 +1174,7 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
             boundary_checkpoint.evidence_next_batch
             == boundary_checkpoint.evidence_total_batches
         )
-        assert boundary_checkpoint.profile_next_batch == 120
+        assert boundary_checkpoint.profile_next_batch == 0
         assert await stage_oids() == stage_oids_before_interrupt
         monkeypatch.setattr(
             importer,
@@ -1238,7 +1238,7 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         assert last_batch_checkpoint is not None
         assert last_batch_evidence_statements == []
         assert len(last_batch_profile_statements) == (
-            last_batch_checkpoint.profile_total_batches - 120
+            last_batch_checkpoint.profile_total_batches
         )
         assert last_batch_checkpoint.state == "failed"
         assert (

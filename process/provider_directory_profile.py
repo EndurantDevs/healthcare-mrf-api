@@ -194,11 +194,15 @@ def profile_index_name(table_name: str, suffix: str) -> str:
 def load_profile_source_spec(path: Path | None = None) -> dict[str, Any]:
     """Load and validate the reviewed insurer profile-source contract."""
     spec_path = path or PROFILE_SPEC_PATH
-    payload = json.loads(spec_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    source_spec_map = json.loads(spec_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(source_spec_map, dict)
+        or source_spec_map.get("schema_version") != 1
+    ):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
-    source_ids = payload.get("source_ids")
-    entry_ids = payload.get("entry_ids")
+    source_ids = source_spec_map.get("source_ids")
+    entry_ids = source_spec_map.get("entry_ids")
+    retained_entry_ids = source_spec_map.get("retained_entry_ids", [])
     if (
         not isinstance(source_ids, list)
         or not source_ids
@@ -213,14 +217,50 @@ def load_profile_source_spec(path: Path | None = None) -> dict[str, Any]:
         or not entry_ids
         or len(entry_ids) != len(set(entry_ids))
         or not all(isinstance(entry_id, str) and entry_id for entry_id in entry_ids)
+        or not isinstance(retained_entry_ids, list)
+        or len(retained_entry_ids) != len(set(retained_entry_ids))
+        or not all(
+            isinstance(entry_id, str) and entry_id in entry_ids
+            for entry_id in retained_entry_ids
+        )
     ):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
-    return payload
+    return source_spec_map
 
 
 def configured_profile_source_ids(path: Path | None = None) -> tuple[str, ...]:
     """Return reviewed source IDs in stable order."""
     return tuple(sorted(load_profile_source_spec(path)["source_ids"]))
+
+
+def configured_retained_profile_source_ids(
+    path: Path | None = None,
+) -> tuple[str, ...]:
+    """Return sources admitted through reviewed retained-file transports."""
+
+    source_spec = load_profile_source_spec(path)
+    retained_entry_ids = set(source_spec["retained_entry_ids"])
+    matrix = source_spec.get("verification_matrix")
+    source_rows = matrix.get("sources") if isinstance(matrix, dict) else None
+    if not isinstance(source_rows, list) or any(
+        not isinstance(source_row, dict) for source_row in source_rows
+    ):
+        raise RuntimeError("provider_directory_profile_source_spec_invalid")
+    retained_source_ids = [
+        source_row.get("source_id")
+        for source_row in source_rows
+        if source_row.get("entry_id") in retained_entry_ids
+    ]
+    if (
+        len(retained_source_ids) != len(retained_entry_ids)
+        or not all(
+            isinstance(source_id, str)
+            and source_id in source_spec["source_ids"]
+            for source_id in retained_source_ids
+        )
+    ):
+        raise RuntimeError("provider_directory_profile_source_spec_invalid")
+    return tuple(sorted(retained_source_ids))
 
 
 def profile_table_sql(

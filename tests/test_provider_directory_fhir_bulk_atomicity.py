@@ -286,6 +286,16 @@ async def test_terminal_repair_fails_closed_when_checkpoint_changes(monkeypatch)
         )
 
 
+def _atomic_fetch_options():
+    return importer.BulkExportFetchOptions(
+        timeout=3,
+        run_id="run-atomic",
+        row_batch_handler=AsyncMock(return_value=0),
+        row_batch_size=1,
+        retain_rows=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_terminal_reload_repairs_capability_scrubbing(monkeypatch):
     """Terminal reload repairs without requiring ownership of the old run."""
@@ -329,19 +339,11 @@ async def test_terminal_reload_repairs_capability_scrubbing(monkeypatch):
         "_load_bulk_export_checkpoint",
         AsyncMock(return_value=repaired_checkpoint_by_field),
     )
-    fetch_options = importer.BulkExportFetchOptions(
-        timeout=3,
-        run_id="run-atomic",
-        row_batch_handler=AsyncMock(return_value=0),
-        row_batch_size=1,
-        retain_rows=False,
-    )
-
     fetch_result = await importer._fetch_owned_checkpointed_bulk_resource_rows(
         {"source_id": "aetna-provider-directory-data"},
         _retry_identity(),
         ProviderDirectoryPractitioner,
-        fetch_options,
+        _atomic_fetch_options(),
         ownership_probe,
     )
 

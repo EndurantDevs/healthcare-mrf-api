@@ -17,6 +17,7 @@ pub mod rate_schedule_observe;
 pub mod shared_graph;
 pub mod tax_identity;
 pub mod uhc_retained;
+pub mod uhc_semantic;
 pub mod v3_dense;
 pub mod v3_runs;
 

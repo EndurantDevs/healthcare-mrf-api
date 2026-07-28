@@ -260,7 +260,7 @@ def test_matrix_fails_all_http_checks_when_latency_exceeds_slo():
     assert {checks[code]["state"] for code in ("A", "P", "G", "F", "V")} == {"fail"}
 
 
-def test_profile_source_matrix_selects_all_23_and_expresses_alohr_graphql_contract():
+def test_profile_source_matrix_selects_all_24_and_expresses_special_contracts():
     root = Path(__file__).resolve().parents[1]
     manifest = json.loads(
         (root / "specs/provider_directory_endpoint_acquisition_manifest.json").read_text()
@@ -268,7 +268,7 @@ def test_profile_source_matrix_selects_all_23_and_expresses_alohr_graphql_contra
     profile_spec = matrix.load_matrix_source_spec()
     selections = matrix.resolve_matrix_source_selection(manifest, profile_spec)
 
-    assert len(selections) == 23
+    assert len(selections) == 24
     alohr = next(selection for selection in selections if selection.entry_id == "alohr")
     assert alohr.resource_profile == "ALOHR_GRAPHQL_R4"
     assert alohr.resources == (
@@ -278,6 +278,20 @@ def test_profile_source_matrix_selects_all_23_and_expresses_alohr_graphql_contra
         "PractitionerRole",
     )
     assert "OrganizationAffiliation" not in alohr.resources
+    uhc = next(
+        selection
+        for selection in selections
+        if selection.entry_id == "uhc-provider-files"
+    )
+    assert uhc.resource_profile == "A6"
+    assert uhc.resources == (
+        "InsurancePlan",
+        "Location",
+        "Organization",
+        "OrganizationAffiliation",
+        "Practitioner",
+        "PractitionerRole",
+    )
     assert all(selection.matrix_checks == ("A", "P", "G", "F", "V") for selection in selections)
 
 

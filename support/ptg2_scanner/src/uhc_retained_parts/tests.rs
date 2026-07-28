@@ -145,6 +145,9 @@ mod tests {
         for invalid in [
             br#"{"a":1,"a":2}"#.as_slice(),
             br#"{"nested":{"a":1,"a":2}}"#.as_slice(),
+            br#"{"array":[}"#.as_slice(),
+            br#"{"missing":}"#.as_slice(),
+            br#"{"unfinished":1,"#.as_slice(),
             br#"{"number":NaN}"#.as_slice(),
             br#"{"number":Infinity}"#.as_slice(),
             br#"{"number":-Infinity}"#.as_slice(),
@@ -261,6 +264,107 @@ mod tests {
         assert!(limited
             .feed(br#"[{"too":"large"}]"#, |_, _, _| Ok(()))
             .is_err());
+    }
+
+    #[test]
+    fn framing_overflow_and_mismatched_delimiters_fail_closed() {
+        let mut record_overflow = JsonObjectFramer::fragment(0, usize::MAX);
+        record_overflow.in_record = true;
+        record_overflow.record_size = usize::MAX;
+        assert!(record_overflow
+            .append_record_byte(b'x')
+            .unwrap_err()
+            .to_string()
+            .contains("byte count overflowed"));
+
+        let mut offset_overflow = JsonObjectFramer::array(true, 1024);
+        offset_overflow.absolute_offset = u64::MAX;
+        assert!(offset_overflow
+            .feed(b" ", |_, _, _| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("source offset overflowed"));
+
+        let mut leading_space = JsonObjectFramer::array(true, 1024);
+        leading_space
+            .feed(b" \n[]", |_, _, _| Ok(()))
+            .expect("leading JSON whitespace");
+        leading_space.finish().expect("empty array is complete");
+
+        let mut depth_overflow = JsonObjectFramer::fragment(0, 1024);
+        depth_overflow.in_record = true;
+        depth_overflow.depth = i64::MAX;
+        assert!(depth_overflow
+            .feed(b"{", |_, _, _| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("nesting overflowed"));
+
+        let mut negative_depth = JsonObjectFramer::fragment(0, 1024);
+        negative_depth.in_record = true;
+        negative_depth.depth = 0;
+        assert!(negative_depth
+            .feed(b"}", |_, _, _| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("frame is invalid"));
+
+        let mut non_object_close = JsonObjectFramer::fragment(0, 1024);
+        non_object_close.in_record = true;
+        non_object_close.depth = 1;
+        assert!(non_object_close
+            .feed(b"]", |_, _, _| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("must be JSON objects"));
+    }
+
+    #[test]
+    fn descriptor_roots_and_partition_arithmetic_reject_drift() {
+        let fixture = Fixture::new(FIXTURE);
+        assert!(RootDirectory::open(&fixture.source).is_err());
+        assert!(c_string("bad\0name", "test value").is_err());
+
+        let root = RootDirectory::open(&fixture.output).expect("open retained root");
+        let mut wrong_descriptor_identity = root.identity;
+        wrong_descriptor_identity.inode = wrong_descriptor_identity.inode.wrapping_add(1);
+        let drifted_descriptor = RootDirectory {
+            supplied_path: root.supplied_path.clone(),
+            path: root.path.clone(),
+            directory: root.directory.try_clone().expect("clone root descriptor"),
+            identity: wrong_descriptor_identity,
+        };
+        assert!(drifted_descriptor
+            .verify_path_identity()
+            .unwrap_err()
+            .to_string()
+            .contains("identity changed"));
+
+        let other = tempfile::tempdir().expect("alternate retained root");
+        let drifted_path = RootDirectory {
+            supplied_path: other.path().to_path_buf(),
+            path: other.path().to_path_buf(),
+            directory: root.directory.try_clone().expect("clone root descriptor"),
+            identity: root.identity,
+        };
+        assert!(drifted_path
+            .verify_path_identity()
+            .unwrap_err()
+            .to_string()
+            .contains("path changed"));
+
+        assert!(ceil_partition_boundary(2, usize::MAX, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds u64"));
+        let mut offsets = tempfile::tempfile().expect("partition offsets");
+        for value in [0u64, 2, 3, 5, 6, 8, 9, 11] {
+            offsets.write_all(&value.to_be_bytes()).expect("write offset");
+        }
+        assert!(build_range_boundaries(&offsets, 4, 5)
+            .unwrap_err()
+            .to_string()
+            .contains("records for 5 ranges"));
     }
 
     #[test]
@@ -497,4 +601,738 @@ mod tests {
 
     include!("publication_tests.rs");
     include!("publication_margin_tests.rs");
+
+    #[test]
+    fn verified_replay_visits_descriptor_bound_records_without_whole_file_read() {
+        let fixture = Fixture::new(FIXTURE);
+        let summary = retain_uhc_artifact(&fixture.request(4)).expect("retain replay fixture");
+        let manifest_bytes = fs::read(&summary.manifest_path).expect("read replay manifest");
+        let manifest = parse_strict_manifest(&manifest_bytes).expect("parse replay manifest");
+        let source = open_verified_uhc_replay(&UHCVerifiedReplayRequest {
+            raw_path: PathBuf::from(&summary.raw_artifact_path),
+            manifest_path: PathBuf::from(&summary.manifest_path),
+            expected_artifact_sha256: summary.raw_artifact_sha256.clone(),
+            expected_artifact_byte_count: summary.raw_artifact_byte_count,
+            expected_manifest_sha256: summary.manifest_sha256.clone(),
+            expected_range_set_sha256: manifest.range_set_sha256.clone(),
+            expected_record_count: summary.record_count,
+            expected_range_count: summary.range_count as usize,
+        })
+        .expect("open verified replay");
+
+        let mut ordinals = Vec::new();
+        for ordinal in 0..source.manifest().ranges.len() {
+            source
+                .visit_verified_range_records(ordinal, |record_ordinal, record| {
+                    let value: serde_json::Value =
+                        serde_json::from_slice(record).expect("decode replayed object");
+                    assert!(value.is_object());
+                    ordinals.push(record_ordinal);
+                    Ok(())
+                })
+                .expect("visit verified range");
+        }
+        assert_eq!(ordinals, (0..summary.record_count).collect::<Vec<_>>());
+        assert_eq!(source.manifest_sha256(), summary.manifest_sha256);
+    }
+
+    #[test]
+    fn verified_replay_rejects_path_replacement_after_open() {
+        let fixture = Fixture::new(FIXTURE);
+        let summary = retain_uhc_artifact(&fixture.request(4)).expect("retain replay fixture");
+        let manifest_bytes = fs::read(&summary.manifest_path).expect("read replay manifest");
+        let manifest = parse_strict_manifest(&manifest_bytes).expect("parse replay manifest");
+        let raw_path = PathBuf::from(&summary.raw_artifact_path);
+        let source = open_verified_uhc_replay(&UHCVerifiedReplayRequest {
+            raw_path: raw_path.clone(),
+            manifest_path: PathBuf::from(&summary.manifest_path),
+            expected_artifact_sha256: summary.raw_artifact_sha256,
+            expected_artifact_byte_count: summary.raw_artifact_byte_count,
+            expected_manifest_sha256: summary.manifest_sha256,
+            expected_range_set_sha256: manifest.range_set_sha256,
+            expected_record_count: summary.record_count,
+            expected_range_count: summary.range_count as usize,
+        })
+        .expect("open verified replay");
+        let moved_path = raw_path.with_extension("moved");
+        fs::rename(&raw_path, &moved_path).expect("move admitted raw path");
+        fs::write(&raw_path, FIXTURE).expect("replace admitted raw path");
+
+        let error = source
+            .visit_verified_range_records(0, |_ordinal, _record| Ok(()))
+            .expect_err("replaced path must fail");
+        assert!(error
+            .to_string()
+            .contains("identity or permissions changed"));
+    }
+
+    #[test]
+    fn streaming_ranges_workers_and_verifiers_reject_internal_boundary_drift() {
+        let mut record_end_overflow = StreamingRangeBoundary::new(0, u64::MAX, 0);
+        assert!(record_end_overflow.add_record(1).is_err());
+        let mut record_count_overflow = StreamingRangeBoundary::new(0, 0, 0);
+        record_count_overflow.record_count = u64::MAX;
+        assert!(record_count_overflow.add_record(1).is_err());
+        assert!(StreamingRangeBoundary::new(0, 0, 0).finish().is_err());
+
+        let worker_input = Arc::new(tempfile::tempfile().expect("worker input"));
+        let (sender, receiver) = sync_channel(1);
+        drop(sender);
+        assert!(run_range_worker(Arc::clone(&worker_input), receiver)
+            .expect("closed worker")
+            .is_none());
+
+        let (sender, receiver) = sync_channel(1);
+        sender
+            .send(RangeWorkerMessage::Finish(RawRangeBoundary {
+                range_ordinal: 0,
+                raw_byte_start: 0,
+                raw_byte_end: 1,
+                record_start: 0,
+                record_end: 1,
+            }))
+            .expect("send incomplete boundary");
+        assert!(run_range_worker(Arc::clone(&worker_input), receiver)
+            .unwrap_err()
+            .to_string()
+            .contains("proof is incomplete"));
+
+        let (sender, receiver) = sync_channel(1);
+        sender
+            .send(RangeWorkerMessage::Finish(RawRangeBoundary {
+                range_ordinal: 0,
+                raw_byte_start: 0,
+                raw_byte_end: 1,
+                record_start: 2,
+                record_end: 1,
+            }))
+            .expect("send underflow boundary");
+        assert!(run_range_worker(Arc::clone(&worker_input), receiver)
+            .unwrap_err()
+            .to_string()
+            .contains("underflowed"));
+
+        let mut workers =
+            ConcurrentRangeWorkers::spawn(Arc::clone(&worker_input), 1).expect("spawn worker");
+        assert!(workers.send_record(1, b"{}").is_err());
+        workers.pending[0].byte_count = usize::MAX;
+        assert!(workers.send_record(0, b"{}").is_err());
+        workers.pending[0] = PendingRecordBatch::default();
+        assert!(workers.flush(1).is_err());
+        let (stopped_sender, stopped_receiver) = sync_channel(1);
+        drop(stopped_receiver);
+        workers.senders[0] = stopped_sender;
+        workers.pending[0].records.push(b"{}".to_vec());
+        assert!(workers
+            .flush(0)
+            .unwrap_err()
+            .to_string()
+            .contains("stopped unexpectedly"));
+        drop(workers);
+
+        let empty_offsets = tempfile::tempfile().expect("empty offsets");
+        assert!(build_range_boundaries(&empty_offsets, u64::MAX, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("offset spool size overflowed"));
+
+        let mut invalid_offsets = tempfile::tempfile().expect("invalid offsets");
+        for value in [5u64, 4, 10, 20, 21, 30, 31, 40] {
+            invalid_offsets
+                .write_all(&value.to_be_bytes())
+                .expect("write offset");
+        }
+        assert!(build_range_boundaries(&invalid_offsets, 4, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid byte boundaries"));
+
+        let mut overlapping_offsets = tempfile::tempfile().expect("overlap offsets");
+        for value in [0u64, 10, 9, 20, 21, 30, 31, 40] {
+            overlapping_offsets
+                .write_all(&value.to_be_bytes())
+                .expect("write overlap offset");
+        }
+        assert!(build_range_boundaries(&overlapping_offsets, 4, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("not ordered and disjoint"));
+
+        let short_input = tempfile::tempfile().expect("short input");
+        assert!(hash_raw_range(
+            &short_input,
+            RawRangeBoundary {
+                range_ordinal: 0,
+                raw_byte_start: 2,
+                raw_byte_end: 1,
+                record_start: 0,
+                record_end: 1,
+            },
+        )
+        .is_err());
+        assert!(hash_raw_range(
+            &short_input,
+            RawRangeBoundary {
+                range_ordinal: 0,
+                raw_byte_start: 1,
+                raw_byte_end: 1,
+                record_start: 0,
+                record_end: 1,
+            },
+        )
+        .is_err());
+        assert!(hash_raw_range(
+            &short_input,
+            RawRangeBoundary {
+                range_ordinal: 0,
+                raw_byte_start: 0,
+                raw_byte_end: 1,
+                record_start: 0,
+                record_end: 1,
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ended before"));
+
+        let mut one_record = tempfile::tempfile().expect("one record");
+        one_record.write_all(b"{}").expect("write record");
+        assert!(verify_raw_range(
+            &one_record,
+            RawRangeBoundary {
+                range_ordinal: 0,
+                raw_byte_start: 0,
+                raw_byte_end: 2,
+                record_start: 0,
+                record_end: 2,
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("record count changed"));
+
+        let extra_fixture = Fixture::new(FIXTURE);
+        let input = File::open(&extra_fixture.source).expect("open extra-byte fixture");
+        let range_input = Arc::new(
+            File::open(&extra_fixture.source).expect("open extra-byte range fixture"),
+        );
+        let mut offsets = tempfile::tempfile().expect("extra-byte offsets");
+        assert!(scan_raw_and_build_ranges(
+            &input,
+            range_input,
+            None,
+            &mut offsets,
+            &parse_sha256_hex(&extra_fixture.sha256).expect("fixture digest"),
+            extra_fixture.byte_count - 1,
+            4,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exceeds its expected byte count"));
+    }
+
+    fn replay_request(
+        summary: &UHCRetainSummary,
+        manifest: &UHCRetainedManifest,
+    ) -> UHCVerifiedReplayRequest {
+        UHCVerifiedReplayRequest {
+            raw_path: PathBuf::from(&summary.raw_artifact_path),
+            manifest_path: PathBuf::from(&summary.manifest_path),
+            expected_artifact_sha256: summary.raw_artifact_sha256.clone(),
+            expected_artifact_byte_count: summary.raw_artifact_byte_count,
+            expected_manifest_sha256: summary.manifest_sha256.clone(),
+            expected_range_set_sha256: manifest.range_set_sha256.clone(),
+            expected_record_count: summary.record_count,
+            expected_range_count: summary.range_count as usize,
+        }
+    }
+
+    #[test]
+    fn replay_request_manifest_range_and_descriptor_proofs_fail_independently() {
+        let fixture = Fixture::new(FIXTURE);
+        let summary = retain_uhc_artifact(&fixture.request(4)).expect("retain replay fixture");
+        let manifest = parse_strict_manifest(
+            &fs::read(&summary.manifest_path).expect("read replay manifest"),
+        )
+        .expect("parse replay manifest");
+
+        let mut invalid_counts = replay_request(&summary, &manifest);
+        invalid_counts.expected_record_count = 0;
+        assert!(open_verified_uhc_replay(&invalid_counts)
+            .err()
+            .expect("invalid replay counts")
+            .to_string()
+            .contains("expected counts are invalid"));
+
+        let mut wrong_manifest_hash = replay_request(&summary, &manifest);
+        wrong_manifest_hash.expected_manifest_sha256 = "0".repeat(64);
+        assert!(open_verified_uhc_replay(&wrong_manifest_hash)
+            .err()
+            .expect("manifest digest mismatch")
+            .to_string()
+            .contains("manifest SHA-256 does not match"));
+
+        let mut wrong_identity = replay_request(&summary, &manifest);
+        wrong_identity.expected_record_count += 1;
+        assert!(open_verified_uhc_replay(&wrong_identity)
+            .err()
+            .expect("manifest identity mismatch")
+            .to_string()
+            .contains("manifest identity does not match"));
+
+        let mut changed_manifest = manifest.clone();
+        changed_manifest.ranges[0].raw_sha256 = "f".repeat(64);
+        let changed_bytes = encode_manifest(&changed_manifest).expect("encode changed manifest");
+        let changed_path = fixture._directory.path().join("changed.manifest.json");
+        fs::write(&changed_path, &changed_bytes).expect("write changed manifest");
+        let mut permissions = fs::metadata(&changed_path)
+            .expect("changed manifest metadata")
+            .permissions();
+        permissions.set_mode(0o400);
+        fs::set_permissions(&changed_path, permissions).expect("seal changed manifest");
+        let mut wrong_range_set = replay_request(&summary, &changed_manifest);
+        wrong_range_set.manifest_path = changed_path;
+        wrong_range_set.expected_manifest_sha256 =
+            sha256_hex(&Sha256::digest(&changed_bytes));
+        assert!(open_verified_uhc_replay(&wrong_range_set)
+            .err()
+            .expect("range-set mismatch")
+            .to_string()
+            .contains("range-set proof does not match"));
+
+        let mut invalid_sequence_manifest = manifest.clone();
+        invalid_sequence_manifest.ranges[0].record_count = 0;
+        let invalid_sequence_bytes =
+            encode_manifest(&invalid_sequence_manifest).expect("encode invalid sequence manifest");
+        let invalid_sequence_path = fixture
+            ._directory
+            .path()
+            .join("invalid-sequence.manifest.json");
+        fs::write(&invalid_sequence_path, &invalid_sequence_bytes)
+            .expect("write invalid sequence manifest");
+        let mut invalid_sequence_permissions = fs::metadata(&invalid_sequence_path)
+            .expect("invalid sequence manifest metadata")
+            .permissions();
+        invalid_sequence_permissions.set_mode(0o400);
+        fs::set_permissions(&invalid_sequence_path, invalid_sequence_permissions)
+            .expect("seal invalid sequence manifest");
+        let mut invalid_sequence_request = replay_request(&summary, &invalid_sequence_manifest);
+        invalid_sequence_request.manifest_path = invalid_sequence_path;
+        invalid_sequence_request.expected_manifest_sha256 =
+            sha256_hex(&Sha256::digest(&invalid_sequence_bytes));
+        assert!(open_verified_uhc_replay(&invalid_sequence_request)
+            .err()
+            .expect("invalid range sequence")
+            .to_string()
+            .contains("invalid logical range"));
+
+        let wrong_raw_path = fixture.output.join("wrong-identity.raw.json");
+        fs::copy(&summary.raw_artifact_path, &wrong_raw_path).expect("copy wrong-identity raw");
+        let mut wrong_raw_permissions = fs::metadata(&wrong_raw_path)
+            .expect("wrong-identity raw metadata")
+            .permissions();
+        wrong_raw_permissions.set_mode(0o400);
+        fs::set_permissions(&wrong_raw_path, wrong_raw_permissions)
+            .expect("seal wrong-identity raw");
+        let wrong_raw_digest = [0u8; SHA256_BYTES];
+        let wrong_raw_sha256 = sha256_hex(&wrong_raw_digest);
+        let mut wrong_raw_manifest = manifest.clone();
+        wrong_raw_manifest.raw_artifact.file_name = "wrong-identity.raw.json".to_owned();
+        wrong_raw_manifest.raw_artifact.sha256 = wrong_raw_sha256.clone();
+        wrong_raw_manifest.range_set_sha256 = range_set_sha256(
+            &wrong_raw_digest,
+            summary.raw_artifact_byte_count,
+            summary.record_count,
+            &wrong_raw_manifest.ranges,
+        )
+        .expect("wrong-identity range-set proof");
+        let wrong_raw_manifest_bytes =
+            encode_manifest(&wrong_raw_manifest).expect("encode wrong-identity manifest");
+        let wrong_raw_manifest_path = fixture
+            ._directory
+            .path()
+            .join("wrong-identity.manifest.json");
+        fs::write(&wrong_raw_manifest_path, &wrong_raw_manifest_bytes)
+            .expect("write wrong-identity manifest");
+        let mut wrong_manifest_permissions = fs::metadata(&wrong_raw_manifest_path)
+            .expect("wrong-identity manifest metadata")
+            .permissions();
+        wrong_manifest_permissions.set_mode(0o400);
+        fs::set_permissions(&wrong_raw_manifest_path, wrong_manifest_permissions)
+            .expect("seal wrong-identity manifest");
+        let wrong_raw_request = UHCVerifiedReplayRequest {
+            raw_path: wrong_raw_path,
+            manifest_path: wrong_raw_manifest_path,
+            expected_artifact_sha256: wrong_raw_sha256,
+            expected_artifact_byte_count: summary.raw_artifact_byte_count,
+            expected_manifest_sha256: sha256_hex(&Sha256::digest(&wrong_raw_manifest_bytes)),
+            expected_range_set_sha256: wrong_raw_manifest.range_set_sha256,
+            expected_record_count: summary.record_count,
+            expected_range_count: summary.range_count as usize,
+        };
+        assert!(open_verified_uhc_replay(&wrong_raw_request)
+            .err()
+            .expect("wrong raw whole-file digest")
+            .to_string()
+            .contains("SHA-256 does not match"));
+
+        let mut out_of_bounds =
+            open_verified_uhc_replay(&replay_request(&summary, &manifest)).expect("open replay");
+        assert!(out_of_bounds
+            .visit_verified_range_records(99, |_ordinal, _record| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("out of bounds"));
+        out_of_bounds.manifest.ranges[0].record_count += 1;
+        assert!(out_of_bounds
+            .visit_verified_range_records(0, |_ordinal, _record| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("proof does not match"));
+
+        let raw_path = PathBuf::from(&summary.raw_artifact_path);
+        let mut writable = fs::metadata(&raw_path)
+            .expect("raw metadata")
+            .permissions();
+        writable.set_mode(0o600);
+        fs::set_permissions(&raw_path, writable).expect("make raw writable");
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&raw_path)
+            .expect("truncate raw");
+        let mut sealed = fs::metadata(&raw_path)
+            .expect("truncated raw metadata")
+            .permissions();
+        sealed.set_mode(0o400);
+        fs::set_permissions(&raw_path, sealed).expect("reseal raw");
+        out_of_bounds.raw_identity =
+            FileIdentity::from_file(&out_of_bounds.raw_file).expect("refresh raw identity");
+        assert!(out_of_bounds
+            .visit_verified_range_records(0, |_ordinal, _record| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("ended before its boundary"));
+    }
+
+    #[test]
+    fn replay_propagates_visitors_and_rechecks_both_descriptor_paths() {
+        let visitor_fixture = Fixture::new(FIXTURE);
+        let visitor_summary =
+            retain_uhc_artifact(&visitor_fixture.request(4)).expect("retain visitor fixture");
+        let visitor_manifest = parse_strict_manifest(
+            &fs::read(&visitor_summary.manifest_path).expect("read visitor manifest"),
+        )
+        .expect("parse visitor manifest");
+        let mut visitor_source =
+            open_verified_uhc_replay(&replay_request(&visitor_summary, &visitor_manifest))
+                .expect("open visitor replay");
+        assert!(visitor_source
+            .visit_verified_range_records(0, |_ordinal, _record| {
+                Err(io::Error::other("injected visitor failure"))
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("injected visitor failure"));
+
+        visitor_source.manifest.ranges[0].record_start = u64::MAX;
+        assert!(visitor_source
+            .visit_verified_range_records(0, |_ordinal, _record| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("occurrence ordinal overflowed"));
+
+        let precheck_fixture = Fixture::new(FIXTURE);
+        let precheck_summary =
+            retain_uhc_artifact(&precheck_fixture.request(4)).expect("retain precheck fixture");
+        let precheck_manifest = parse_strict_manifest(
+            &fs::read(&precheck_summary.manifest_path).expect("read precheck manifest"),
+        )
+        .expect("parse precheck manifest");
+        let precheck_source =
+            open_verified_uhc_replay(&replay_request(&precheck_summary, &precheck_manifest))
+                .expect("open precheck replay");
+        let manifest_path = PathBuf::from(&precheck_summary.manifest_path);
+        let moved_manifest = manifest_path.with_extension("moved");
+        fs::rename(&manifest_path, &moved_manifest).expect("move replay manifest");
+        fs::write(&manifest_path, b"replacement").expect("replace replay manifest");
+        assert!(precheck_source
+            .visit_verified_range_records(0, |_ordinal, _record| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("identity or permissions changed"));
+
+        let postcheck_fixture = Fixture::new(FIXTURE);
+        let postcheck_summary =
+            retain_uhc_artifact(&postcheck_fixture.request(4)).expect("retain postcheck fixture");
+        let postcheck_manifest = parse_strict_manifest(
+            &fs::read(&postcheck_summary.manifest_path).expect("read postcheck manifest"),
+        )
+        .expect("parse postcheck manifest");
+        let postcheck_source =
+            open_verified_uhc_replay(&replay_request(&postcheck_summary, &postcheck_manifest))
+                .expect("open postcheck replay");
+        let postcheck_manifest_path = PathBuf::from(&postcheck_summary.manifest_path);
+        let moved_postcheck = postcheck_manifest_path.with_extension("moved");
+        let mut replaced = false;
+        assert!(postcheck_source
+            .visit_verified_range_records(0, |_ordinal, _record| {
+                if !replaced {
+                    fs::rename(&postcheck_manifest_path, &moved_postcheck)?;
+                    fs::write(&postcheck_manifest_path, b"replacement")?;
+                    replaced = true;
+                }
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("identity or permissions changed"));
+
+        let raw_postcheck_fixture = Fixture::new(FIXTURE);
+        let raw_postcheck_summary = retain_uhc_artifact(&raw_postcheck_fixture.request(4))
+            .expect("retain raw postcheck fixture");
+        let raw_postcheck_manifest = parse_strict_manifest(
+            &fs::read(&raw_postcheck_summary.manifest_path)
+                .expect("read raw postcheck manifest"),
+        )
+        .expect("parse raw postcheck manifest");
+        let raw_postcheck_source = open_verified_uhc_replay(&replay_request(
+            &raw_postcheck_summary,
+            &raw_postcheck_manifest,
+        ))
+        .expect("open raw postcheck replay");
+        let raw_postcheck_path = PathBuf::from(&raw_postcheck_summary.raw_artifact_path);
+        let moved_raw_postcheck = raw_postcheck_path.with_extension("moved");
+        let mut raw_replaced = false;
+        assert!(raw_postcheck_source
+            .visit_verified_range_records(0, |_ordinal, _record| {
+                if !raw_replaced {
+                    fs::rename(&raw_postcheck_path, &moved_raw_postcheck)?;
+                    fs::write(&raw_postcheck_path, b"replacement")?;
+                    raw_replaced = true;
+                }
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("identity or permissions changed"));
+    }
+
+    #[test]
+    fn verification_replay_filesystem_and_worker_fault_boundaries_are_explicit() {
+        let two_bytes = Fixture::new(b"{}");
+        let input = File::open(&two_bytes.source).expect("open two-byte fixture");
+        let boundary = RawRangeBoundary {
+            range_ordinal: 0,
+            raw_byte_start: 0,
+            raw_byte_end: 2,
+            record_start: 0,
+            record_end: 1,
+        };
+        assert!(verify_raw_range(
+            &input,
+            RawRangeBoundary {
+                raw_byte_start: 2,
+                raw_byte_end: 1,
+                ..boundary
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("byte count underflowed"));
+        assert!(verify_raw_range(
+            &input,
+            RawRangeBoundary {
+                record_start: 2,
+                record_end: 1,
+                ..boundary
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("record count underflowed"));
+        assert!(verify_raw_range(
+            &input,
+            RawRangeBoundary {
+                raw_byte_end: 3,
+                ..boundary
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ended before"));
+        assert!(verify_raw_range(
+            &input,
+            RawRangeBoundary {
+                range_ordinal: i64::MAX as u64 + 1,
+                ..boundary
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("signed 64-bit"));
+        assert!(verify_ranges_parallel(
+            Arc::new(input.try_clone().expect("clone verification input")),
+            vec![RawRangeBoundary {
+                raw_byte_end: 3,
+                ..boundary
+            }],
+        )
+        .is_err());
+
+        let root = RootDirectory::open(&two_bytes.output).expect("open filesystem test root");
+        fs::create_dir(two_bytes.output.join("directory")).expect("create final directory");
+        assert!(root
+            .open_existing_regular("directory")
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+        root.unlink("already-absent").expect("absent unlink is idempotent");
+        let mut temporary = root.create_temporary("link-failure").expect("temporary file");
+        assert!(temporary.publish_noclobber("missing/child").is_err());
+        let original_permissions = fs::metadata(&two_bytes.output)
+            .expect("filesystem root metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o500);
+        fs::set_permissions(&two_bytes.output, read_only_permissions)
+            .expect("make filesystem root read-only");
+        let create_failure = root.create_temporary("permission-failure");
+        fs::set_permissions(&two_bytes.output, original_permissions)
+            .expect("restore filesystem root permissions");
+        assert!(matches!(
+            create_failure,
+            Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+
+        let (sender, receiver) = sync_channel(1);
+        let mut automatic_flush = ConcurrentRangeWorkers {
+            senders: vec![sender],
+            pending: vec![PendingRecordBatch::default()],
+            handles: Vec::new(),
+        };
+        automatic_flush
+            .send_record(0, &vec![b'x'; RANGE_RECORD_BATCH_BYTES])
+            .expect("full record batch is flushed");
+        assert!(automatic_flush.pending[0].records.is_empty());
+        assert!(matches!(
+            receiver.recv().expect("automatic flush message"),
+            RangeWorkerMessage::Records(_)
+        ));
+
+        let truncated = Fixture::new(b"");
+        let truncated_input = File::open(&truncated.source).expect("open truncated input");
+        let mut offsets = tempfile::tempfile().expect("truncated offsets");
+        assert!(scan_raw_and_build_ranges(
+            &truncated_input,
+            Arc::new(truncated_input.try_clone().expect("clone truncated input")),
+            None,
+            &mut offsets,
+            &[0u8; SHA256_BYTES],
+            1,
+            4,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ended before"));
+
+        let empty_array = Fixture::new(b"[]");
+        let empty_array_input =
+            File::open(&empty_array.source).expect("open empty-array input");
+        let mut empty_offsets = tempfile::tempfile().expect("empty-array offsets");
+        assert!(scan_raw_and_build_ranges(
+            &empty_array_input,
+            Arc::new(
+                empty_array_input
+                    .try_clone()
+                    .expect("clone empty-array input"),
+            ),
+            None,
+            &mut empty_offsets,
+            &Sha256::digest(b"[]").into(),
+            2,
+            4,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("contains no records"));
+
+        #[cfg(target_os = "linux")]
+        {
+            let retained = Fixture::new(FIXTURE);
+            let summary =
+                retain_uhc_artifact(&retained.request(4)).expect("retain replay fixture");
+            let manifest = parse_strict_manifest(
+                &fs::read(&summary.manifest_path).expect("read replay manifest"),
+            )
+            .expect("parse replay manifest");
+            let invalid_name = retained.output.join(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![0xff]),
+            );
+            fs::copy(&summary.raw_artifact_path, &invalid_name).expect("copy invalid-name raw");
+            let mut invalid_name_permissions = fs::metadata(&invalid_name)
+                .expect("invalid-name raw metadata")
+                .permissions();
+            invalid_name_permissions.set_mode(0o400);
+            fs::set_permissions(&invalid_name, invalid_name_permissions)
+                .expect("seal invalid-name raw");
+            let mut invalid_name_request = replay_request(&summary, &manifest);
+            invalid_name_request.raw_path = invalid_name;
+            assert!(open_verified_uhc_replay(&invalid_name_request)
+                .err()
+                .expect("non-UTF-8 raw file name rejected")
+                .to_string()
+                .contains("file name is invalid"));
+        }
+    }
+
+    #[test]
+    fn every_manifest_range_sequence_coordinate_fails_independently() {
+        let fixture = Fixture::new(FIXTURE);
+        let summary = retain_uhc_artifact(&fixture.request(4)).expect("retain sequence fixture");
+        let manifest = parse_strict_manifest(
+            &fs::read(&summary.manifest_path).expect("read sequence manifest"),
+        )
+        .expect("parse sequence manifest");
+        let ranges = manifest.ranges;
+
+        assert!(validate_range_sequence(&ranges, summary.record_count, ranges.len() + 1).is_err());
+        for mutation in 0..10 {
+            let mut malformed = ranges.clone();
+            match mutation {
+                0 => malformed[0].range_ordinal += 1,
+                1 => malformed[0].record_start += 1,
+                2 => malformed[0].record_end = 0,
+                3 => malformed[0].record_count += 1,
+                4 => malformed[0].record_count = 0,
+                5 => malformed[0].raw_byte_end = malformed[0].raw_byte_start,
+                6 => malformed[0].raw_byte_count += 1,
+                7 => malformed[0].raw_byte_count = 0,
+                8 => malformed[0].canonical_byte_count = 0,
+                9 => malformed[0].raw_sha256 = "invalid".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(validate_range_sequence(&malformed, summary.record_count, malformed.len())
+                .is_err());
+        }
+        let mut bad_canonical_sha = ranges.clone();
+        bad_canonical_sha[0].canonical_sha256 = "invalid".to_owned();
+        assert!(validate_range_sequence(
+            &bad_canonical_sha,
+            summary.record_count,
+            bad_canonical_sha.len(),
+        )
+        .is_err());
+        let mut overlapping = ranges.clone();
+        overlapping[1].raw_byte_start = overlapping[0].raw_byte_end;
+        overlapping[1].raw_byte_count =
+            overlapping[1].raw_byte_end - overlapping[1].raw_byte_start;
+        assert!(validate_range_sequence(
+            &overlapping,
+            summary.record_count,
+            overlapping.len(),
+        )
+        .is_err());
+        assert!(validate_range_sequence(&ranges, summary.record_count + 1, ranges.len()).is_err());
+    }
 }

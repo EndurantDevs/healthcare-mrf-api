@@ -85,6 +85,7 @@ ENV HLTHPRT_REDIS_ADDRESS=${HLTHPRT_REDIS_ADDRESS}
 ENV HLTHPRT_SAVE_PER_PACK=${HLTHPRT_SAVE_PER_PACK}
 ENV HLTHPRT_PTG2_RUST_SCANNER_BIN=/opt/support/ptg2_scanner/target/release/ptg2_scanner
 ENV HLTHPRT_PTG2_PROVIDER_GRAPH_V4_BIN=/opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
+ENV HLTHPRT_UHC_SEMANTIC_BIN=/opt/support/ptg2_scanner/target/release/uhc_semantic_facts
 ENV HLTHPRT_PTG2_RUST_REQUIRE_RELEASE=true
 ENV PYTHONDONTWRITEBYTECODE=1
 
@@ -108,6 +109,9 @@ COPY --from=ptg2-scanner-builder \
 COPY --from=ptg2-scanner-builder \
     /build/support/ptg2_scanner/target/release/ptg2_provider_graph_v4 \
     /opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
+COPY --from=ptg2-scanner-builder \
+    /build/support/ptg2_scanner/target/release/uhc_semantic_facts \
+    /opt/support/ptg2_scanner/target/release/uhc_semantic_facts
 COPY --from=ptg2-scanner-builder /build/wheels/ /tmp/ptg2-address-canon-wheels/
 RUN . /opt/venv/bin/activate \
     && pip install --no-compile /tmp/ptg2-address-canon-wheels/*.whl \

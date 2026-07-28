@@ -78,7 +78,7 @@ DEFAULT_OUTPUT = ROOT / "docs/imports/provider-directory-endpoint-support.md"
 DEFAULT_BLOCKER_REGISTRY = ROOT / "specs/provider_directory_blocker_registry.json"
 DEFAULT_VERIFICATION_SNAPSHOT = ROOT / "specs/provider_directory_endpoint_verification.json"
 DEFAULT_CURRENT_DATASET_AUDIT = ROOT / "specs/provider_directory_current_dataset_audit.json"
-METHODS = {"rest", "bulk", "graphql", "probe"}
+METHODS = {"rest", "bulk", "graphql", "official-files", "probe"}
 DISPLAY_VALUES = {
     "supported": "Supported",
     "externally-supported": "Externally supported",
@@ -96,6 +96,7 @@ DISPLAY_VALUES = {
     "rest": "REST",
     "bulk": "Bulk",
     "graphql": "GraphQL",
+    "official-files": "Official files",
     "probe": "Probe",
     "not-importable": "Not importable",
 }
@@ -130,7 +131,6 @@ def _entry_ids(entries: Any) -> list[str]:
     if len(entry_ids) != len(entries) or not all(entry_ids) or len(set(entry_ids)) != len(entry_ids):
         raise SupportDocumentationError("entries must have unique non-empty entry_id values")
     return entry_ids
-
 
 def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
     entry_id = str(entry["entry_id"])

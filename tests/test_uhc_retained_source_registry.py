@@ -443,6 +443,44 @@ def test_durable_root_rejects_missing_temp_root_and_symlinked_child(
         source_registry.uhc_retained_artifact_root()
 
 
+def test_durable_root_maps_storage_failure_and_escape(
+    tmp_path,
+    monkeypatch,
+):
+    base_root = tmp_path / "durable"
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT",
+        str(base_root),
+    )
+    monkeypatch.setattr(
+        source_registry.tempfile,
+        "gettempdir",
+        lambda: str(tmp_path / "separate-temp"),
+    )
+    original_mkdir = Path.mkdir
+
+    def unavailable_mkdir(self, *args, **kwargs):
+        if self.name == "uhc-provider-files":
+            raise OSError("unavailable")
+        return original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", unavailable_mkdir)
+    with pytest.raises(UHCRetainedAdmissionError, match="unavailable"):
+        source_registry.uhc_retained_artifact_root()
+
+    monkeypatch.setattr(Path, "mkdir", original_mkdir)
+    original_resolve = Path.resolve
+
+    def escaping_resolve(self, *args, **kwargs):
+        if self.name == "uhc-provider-files":
+            return Path("/durable-root-escape")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", escaping_resolve)
+    with pytest.raises(UHCRetainedAdmissionError, match="escapes"):
+        source_registry.uhc_retained_artifact_root()
+
+
 @pytest.mark.asyncio
 async def test_registry_rejects_noncanonical_descendant_of_durable_root(
     tmp_path,

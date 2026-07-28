@@ -128,11 +128,17 @@ impl<'de> Deserialize<'de> for StrictObject {
 
 fn validate_strict_json_object(bytes: &[u8]) -> io::Result<()> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    StrictObject::deserialize(&mut deserializer)
-        .map_err(|error| invalid_data(format!("retained UHC record is invalid JSON: {error}")))?;
-    deserializer
-        .end()
-        .map_err(|error| invalid_data(format!("retained UHC record is invalid JSON: {error}")))
+    if let Err(error) = StrictObject::deserialize(&mut deserializer) {
+        return Err(invalid_data(format!(
+            "retained UHC record is invalid JSON: {error}"
+        )));
+    }
+    match deserializer.end() {
+        Ok(()) => Ok(()),
+        Err(error) => Err(invalid_data(format!(
+            "retained UHC record is invalid JSON: {error}"
+        ))),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

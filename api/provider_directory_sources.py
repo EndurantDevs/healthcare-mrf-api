@@ -92,6 +92,9 @@ def provider_directory_source_catalog(
         raise RuntimeError("provider_directory_source_manifest_invalid")
 
     profile_source_ids = set(profile_artifact.configured_profile_source_ids())
+    retained_profile_source_ids = set(
+        profile_artifact.configured_retained_profile_source_ids()
+    ).intersection(profile_source_ids)
     support_documentation = manifest.get("support_documentation")
     support_by_entry = (
         support_documentation.get("entry_support", {})
@@ -114,7 +117,7 @@ def provider_directory_source_catalog(
         )
         catalog_items.append(catalog_entry_by_field)
 
-    if runnable_source_ids != profile_source_ids:
+    if runnable_source_ids | retained_profile_source_ids != profile_source_ids:
         raise RuntimeError("provider_directory_profile_source_catalog_drift")
     return {
         "schema_version": 1,

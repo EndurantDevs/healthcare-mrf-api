@@ -106,10 +106,10 @@ def _checkpoint(
         "evidence_target_oid": None,
         "profile_target_oid": None,
         "has_existing_artifacts": False,
-        "evidence_next_batch": 52,
-        "evidence_total_batches": 52,
-        "profile_next_batch": 120,
-        "profile_total_batches": 400,
+        "evidence_next_batch": 1,
+        "evidence_total_batches": 1,
+        "profile_next_batch": 0,
+        "profile_total_batches": 1,
         "state": "building_profile",
     }
 
@@ -117,10 +117,9 @@ def _checkpoint(
 def _patch_one_evidence_batch(monkeypatch) -> AsyncMock:
     """Install one conflict-safe evidence batch and mocked finalization."""
     batch = importer._ProviderDirectoryProfileEvidenceBatch(
-        kind="fact",
+        kind="source",
         source_id="source-a",
         dataset_id="dataset-a",
-        fact_type="name",
     )
     monkeypatch.setattr(
         importer,
@@ -244,8 +243,8 @@ async def test_same_name_replacement_oid_is_never_reused_or_deleted(
             None
         ),
         profile_build_fence=importer.ProviderDirectoryArtifactBuildFence(None),
-        evidence_total_batches=52,
-        profile_total_batches=400,
+        evidence_total_batches=1,
+        profile_total_batches=1,
     )
     assert reusable is False
 
@@ -389,3 +388,63 @@ async def test_ambiguous_checkpoint_advance_skips_committed_batch_on_retry(
 
     assert state.committed_next_batch == 1
     assert state.insert_count == 1
+
+
+@pytest.mark.asyncio
+async def test_source_failure_stops_later_sources_and_preserves_checkpoint(
+    monkeypatch,
+):
+    """Fail fast so a later retry resumes the failed source, never skips it."""
+    build = replace(
+        _build(),
+        source_ids=("source-a", "source-b", "source-c"),
+        retained_source_ids=("source-a", "source-b", "source-c"),
+        dataset_ids=("dataset-a", "dataset-b", "dataset-c"),
+    )
+    visited_dataset_ids: list[str] = []
+
+    async def status(_sql, **params):
+        dataset_ids = params.get("dataset_ids")
+        if dataset_ids:
+            visited_dataset_ids.extend(dataset_ids)
+            if dataset_ids == ["dataset-b"]:
+                raise RuntimeError("source-b failed")
+        return 1
+
+    advance = AsyncMock()
+    mark_state = AsyncMock()
+    create_indexes = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_advance_provider_directory_profile_build_checkpoint",
+        advance,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_mark_profile_build_checkpoint_state",
+        mark_state,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_create_provider_directory_profile_indexes",
+        create_indexes,
+    )
+
+    with pytest.raises(RuntimeError, match="source-b failed"):
+        await importer._populate_provider_directory_profile_evidence_stage(
+            build,
+            has_evidence_target=False,
+            bounded=True,
+            checkpointed=True,
+        )
+
+    assert visited_dataset_ids == ["dataset-a", "dataset-b"]
+    advance.assert_awaited_once_with(
+        build,
+        phase="evidence",
+        expected_batch=0,
+        total_batches=3,
+    )
+    mark_state.assert_not_awaited()
+    create_indexes.assert_not_awaited()

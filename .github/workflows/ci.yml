@@ -572,6 +572,28 @@ jobs:
             --username "$HLTHPRT_DB_USER" \
             ptg_frozen_binding_test_ci_runner
           python -m pytest -q tests/test_ptg_frozen_binding_postgres.py
+      - name: Run retained UHC semantic publication PostgreSQL gate
+        env:
+          HLTHPRT_DB_DATABASE: uhc_semantic_test_ci_runner
+          HLTHPRT_UHC_SEMANTIC_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/uhc_semantic_test_ci_runner"
+          PGPASSWORD: ${{ env.HLTHPRT_DB_PASSWORD }}
+        run: |
+          cleanup_database() {
+            dropdb --if-exists \
+              --host "$HLTHPRT_DB_HOST" \
+              --port "$HLTHPRT_DB_PORT" \
+              --username "$HLTHPRT_DB_USER" \
+              uhc_semantic_test_ci_runner
+          }
+          trap cleanup_database EXIT
+          createdb \
+            --host "$HLTHPRT_DB_HOST" \
+            --port "$HLTHPRT_DB_PORT" \
+            --username "$HLTHPRT_DB_USER" \
+            uhc_semantic_test_ci_runner
+          python -m pytest -q \
+            tests/test_uhc_semantic_build_postgres.py \
+            tests/test_uhc_retained_dataset_postgres.py
       - name: Run strict shared PTG PostgreSQL publish, graph, and cold-read smoke
         env:
           HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST: "1"

@@ -18,7 +18,7 @@ SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID = (
     "healthporta.provider-directory.fhir-normalized-resource.v1"
 )
 SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID = (
-    "healthporta.uhc.semantic-facts.v1"
+    "healthporta.uhc.semantic-facts.v2"
 )
 SOURCE_SUMMARY_UHC_SELECTED_RESOURCES = (
     "InsurancePlan",
@@ -187,6 +187,20 @@ SOURCE_SUMMARY_UHC_REQUIRED_IDENTITY_FIELDS = (
     "layout_set_sha256",
     "encoder_digest",
 )
+SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY = (
+    "ifp_unpaired_retained_only_provider_records"
+)
+SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS = {
+    "ifp_unpaired_retained_only_provider_records": "raw_provider_records",
+    "ifp_unpaired_retained_only_individual_records": (
+        "raw_individual_records"
+    ),
+    "ifp_unpaired_retained_only_facility_records": "raw_facility_records",
+    "ifp_unpaired_retained_only_address_rows": "raw_address_rows",
+    "ifp_unpaired_retained_only_provider_plan_rows": (
+        "raw_provider_plan_rows"
+    ),
+}
 
 
 class ProviderDirectorySourceSummaryError(ValueError):
@@ -539,6 +553,7 @@ def _validate_semantic_metric_fields(
     summary_map: dict[str, Any],
     semantic_contract_id: str,
 ) -> None:
+    """Require exactly the metric fields defined by the semantic contract."""
     required_count_fields = set(
         SOURCE_SUMMARY_SEMANTIC_COUNT_FIELDS[semantic_contract_id]
     )
@@ -572,7 +587,7 @@ def _validate_semantic_metric_fields(
         )
     if semantic_contract_id == SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID and (
         summary_map["unknown_field_counts"]
-        or summary_map["intentional_drop_counts"]
+        or not _is_uhc_drop_count_map_valid(summary_map)
     ):
         raise ProviderDirectorySourceSummaryError(
             "provider_directory_source_summary_uhc_unaccounted_fields"
@@ -590,6 +605,19 @@ def _validate_semantic_metric_fields(
         _validate_fhir_semantic_relationships(summary_map)
     if semantic_contract_id == SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID:
         _validate_uhc_semantic_relationships(summary_map)
+
+
+def _is_uhc_drop_count_map_valid(summary_map: Mapping[str, Any]) -> bool:
+    """Accept no drops or the sole retained-only UHC_EX_HIX drop."""
+    drop_count_by_field = summary_map.get("intentional_drop_counts", {})
+    return not drop_count_by_field or (
+        set(drop_count_by_field)
+        == set(SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS)
+        and drop_count_by_field[
+            SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY
+        ]
+        > 0
+    )
 
 
 def _validate_fhir_semantic_relationships(

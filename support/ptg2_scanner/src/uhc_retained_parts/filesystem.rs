@@ -68,7 +68,10 @@ fn open_regular_nofollow(path: &Path, label: &str) -> io::Result<File> {
 }
 
 fn c_string(value: &str, label: &str) -> io::Result<CString> {
-    CString::new(value).map_err(|_| invalid_input(format!("{label} contains a NUL byte")))
+    match CString::new(value) {
+        Ok(value) => Ok(value),
+        Err(_) => Err(invalid_input(format!("{label} contains a NUL byte"))),
+    }
 }
 
 struct RootDirectory {

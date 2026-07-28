@@ -3,6 +3,8 @@ import pytest
 from process.provider_directory_source_summary import (
     ProviderDirectorySourceSummaryError,
     ProviderDirectorySourceSummaryBinding,
+    SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
+    SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY,
     SOURCE_SUMMARY_UHC_SELECTED_RESOURCES,
     SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
     build_source_summary,
@@ -73,7 +75,14 @@ def _uhc_summary():
         count_by_field=UHC_COUNT_BY_FIELD,
         count_by_category={
             "conflict_counts": {"name": 5},
-            "intentional_drop_counts": {},
+            "intentional_drop_counts": {
+                drop_key: (
+                    17
+                    if drop_key == SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY
+                    else 0
+                )
+                for drop_key in SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS
+            },
             "unknown_field_counts": {},
         },
         identity_by_field={
@@ -86,6 +95,9 @@ def _uhc_summary():
 
 
 def test_validate_semantic_source_summary_dispatches_complete_uhc_facts():
+    assert SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID == (
+        "healthporta.uhc.semantic-facts.v2"
+    )
     summary = _uhc_summary()
 
     assert validate_semantic_source_summary(

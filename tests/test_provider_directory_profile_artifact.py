@@ -147,8 +147,8 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
     assert stage_identity.await_count == 2
 
 
-def test_profile_source_spec_matches_all_reviewed_acquisition_entries():
-    """Require every importable source and exclude every probe-only source."""
+def test_profile_source_spec_matches_reviewed_and_retained_entries():
+    """Require every importable source plus explicit retained-only sources."""
     source_spec = profile.load_profile_source_spec()
     manifest = json.loads(
         (
@@ -159,15 +159,29 @@ def test_profile_source_spec_matches_all_reviewed_acquisition_entries():
     entries_by_id = {
         entry["entry_id"]: entry for entry in manifest["entries"]
     }
-    expected_profile_entry_ids = {
+    retained_registry = json.loads(
+        (
+            REPO_ROOT
+            / "specs/provider_directory_source_neutral_registry.json"
+        ).read_text(encoding="utf-8")
+    )
+    retained_entries_by_id = {
+        entry["entry_id"]: entry for entry in retained_registry["entries"]
+    }
+    retained_entry_ids = set(source_spec.get("retained_entry_ids", ()))
+    importable_entry_ids = {
         entry_id
         for entry_id, entry in entries_by_id.items()
         if entry["classification"] in PROFILE_SOURCE_CLASSIFICATIONS
     }
+    expected_profile_entry_ids = retained_entry_ids | importable_entry_ids
     expected_source_ids = {
         source_id
-        for entry_id in expected_profile_entry_ids
+        for entry_id in importable_entry_ids
         for source_id in entries_by_id[entry_id]["source_ids"]
+    } | {
+        retained_entries_by_id[entry_id]["registered_source_id"]
+        for entry_id in retained_entry_ids
     }
 
     assert set(source_spec["entry_ids"]) == expected_profile_entry_ids
@@ -175,7 +189,13 @@ def test_profile_source_spec_matches_all_reviewed_acquisition_entries():
     assert all(
         entries_by_id[entry_id]["classification"]
         in PROFILE_SOURCE_CLASSIFICATIONS
-        for entry_id in source_spec["entry_ids"]
+        for entry_id in importable_entry_ids
+    )
+    assert all(
+        retained_entries_by_id[entry_id]["acquisition_runnable"] is True
+        and retained_entries_by_id[entry_id]["profile_eligible"] is True
+        and retained_entries_by_id[entry_id]["publication_ready"] is True
+        for entry_id in retained_entry_ids
     )
 
 
@@ -646,11 +666,11 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
 
 
 @pytest.mark.asyncio
-async def test_profile_evidence_population_batches_source_fact_and_affiliation(
+async def test_profile_evidence_population_scans_each_source_once(
     monkeypatch,
     caplog,
 ):
-    """Expose source, fact, bucket, row, and elapsed progress per batch."""
+    """Emit every fact branch in one checkpointed scan per source."""
     status = AsyncMock(return_value=1)
     create_indexes = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
@@ -682,34 +702,17 @@ async def test_profile_evidence_population_batches_source_fact_and_affiliation(
         for call in status.await_args_list
         if "dataset_ids" in call.kwargs
     ]
-    expected_per_source = (
-        len(profile.PROFILE_EVIDENCE_FACT_TYPES)
-        - 1
-        + profile.PROFILE_AFFILIATION_ROLE_BUCKETS
-    )
-    assert len(insert_calls) == len(build.source_ids) * expected_per_source
+    assert len(insert_calls) == len(build.source_ids)
     assert all(len(call.kwargs["source_ids"]) == 1 for call in insert_calls)
     assert {
         (call.kwargs["source_ids"][0], call.kwargs["dataset_ids"][0])
         for call in insert_calls
     } == {("source_a", "dataset_a"), ("source_b", "dataset_b")}
-    affiliation_calls = [
-        call
-        for call in insert_calls
-        if "fact_type = 'affiliation'" in call.args[0]
-    ]
-    assert {
-        call.kwargs["profile_role_bucket"]
-        for call in affiliation_calls
-        if call.kwargs["source_ids"] == ["source_a"]
-    } == set(range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS))
+    assert all("profile_role_bucket" not in call.kwargs for call in insert_calls)
+    assert all("'affiliation'" in call.args[0] for call in insert_calls)
     log_messages = [log_record.getMessage() for log_record in caplog.records]
     assert any(
-        "source_id=source_a fact_type=name role_bucket=1/1" in message
-        for message in log_messages
-    )
-    assert any(
-        "source_id=source_a fact_type=affiliation role_bucket=32/32"
+        "kind=source source_id=source_a fact_type=- role_bucket=1/1"
         in message
         for message in log_messages
     )
@@ -725,7 +728,66 @@ async def test_profile_evidence_population_batches_source_fact_and_affiliation(
 
 
 @pytest.mark.asyncio
-async def test_profile_compact_population_batches_npi_ranges(
+async def test_profile_refresh_copies_unaffected_global_rows_before_source(
+    monkeypatch,
+):
+    """Incremental rebuilds retain every reviewed source outside the refresh."""
+    status = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_create_provider_directory_profile_indexes",
+        AsyncMock(),
+    )
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation",
+        source_ids=("source_a",),
+        retained_source_ids=("source_a", "source_b"),
+        dataset_ids=("dataset_a",),
+        profile_as_of="2026-07-19",
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+
+    await importer._populate_provider_directory_profile_evidence_stage(
+        build,
+        has_evidence_target=True,
+        bounded=True,
+    )
+
+    write_calls = [
+        call
+        for call in status.await_args_list
+        if "ANALYZE" not in str(call.args[0])
+    ]
+    assert len(write_calls) == 2
+    assert "source_id <> ALL" in write_calls[0].args[0]
+    assert write_calls[0].kwargs["retained_source_ids"] == [
+        "source_a",
+        "source_b",
+    ]
+    assert write_calls[1].kwargs["dataset_ids"] == ["dataset_a"]
+
+    status.reset_mock()
+    await importer._populate_provider_directory_profile_compact_stage(
+        build,
+        has_existing_artifacts=True,
+        npi_batch_size=profile.PROFILE_NPI_BATCH_SIZE,
+    )
+    write_calls = [
+        call
+        for call in status.await_args_list
+        if "ANALYZE" not in str(call.args[0])
+    ]
+    assert len(write_calls) == 2
+    assert "affected_npis" in write_calls[0].args[0]
+    assert "generation_id" in write_calls[1].kwargs
+    assert "profile_npi_start" not in write_calls[1].kwargs
+
+
+@pytest.mark.asyncio
+async def test_profile_compact_population_scans_affected_npis_once(
     monkeypatch,
     caplog,
 ):
@@ -757,20 +819,14 @@ async def test_profile_compact_population_batches_npi_ranges(
     batch_calls = [
         call
         for call in status.await_args_list
-        if "profile_npi_start" in call.kwargs
+        if "generation_id" in call.kwargs
     ]
-    assert [
-        (call.kwargs["profile_npi_start"], call.kwargs["profile_npi_end"])
-        for call in batch_calls
-    ] == [
-        (1_000_000_000, 1_500_000_000),
-        (1_500_000_000, 2_000_000_000),
-        (2_000_000_000, 2_500_000_000),
-        (2_500_000_000, 3_000_000_000),
-    ]
+    assert len(batch_calls) == 1
+    assert "profile_npi_start" not in batch_calls[0].kwargs
+    assert "profile_npi_end" not in batch_calls[0].kwargs
     log_messages = [log_record.getMessage() for log_record in caplog.records]
     assert any(
-        "npi_start=1000000000 npi_end=1500000000" in message
+        "kind=affected npi_start=- npi_end=-" in message
         for message in log_messages
     )
     assert any(
@@ -806,9 +862,9 @@ async def test_profile_population_failure_is_retained_in_checkpoint(
         AsyncMock(
             return_value=importer._ProviderDirectoryProfileBuildCheckpointState(
                 evidence_next_batch=0,
-                evidence_total_batches=52,
+                evidence_total_batches=1,
                 profile_next_batch=0,
-                profile_total_batches=400,
+                profile_total_batches=1,
                 state="building_evidence",
             )
         ),
@@ -841,11 +897,8 @@ async def test_profile_population_failure_is_retained_in_checkpoint(
     assert isinstance(mark_failed.await_args.args[1], RuntimeError)
 
 
-@pytest.mark.asyncio
-async def test_profile_resume_does_not_reopen_completed_evidence_phase(
-    monkeypatch,
-):
-    """Start the next compact batch without rewriting phase state first."""
+def _completed_evidence_profile_fixture():
+    """Build a profile checkpoint whose evidence phase is complete."""
     build = importer._ProviderDirectoryProfileBuild(
         schema="mrf",
         generation_id="generation",
@@ -857,12 +910,21 @@ async def test_profile_resume_does_not_reopen_completed_evidence_phase(
         profile_stage="profile_stage",
     )
     checkpoint_state = importer._ProviderDirectoryProfileBuildCheckpointState(
-        evidence_next_batch=52,
-        evidence_total_batches=52,
-        profile_next_batch=120,
-        profile_total_batches=400,
+        evidence_next_batch=1,
+        evidence_total_batches=1,
+        profile_next_batch=0,
+        profile_total_batches=1,
         state="building_profile",
     )
+    return build, checkpoint_state
+
+
+@pytest.mark.asyncio
+async def test_profile_resume_does_not_reopen_completed_evidence_phase(
+    monkeypatch,
+):
+    """Start the next compact batch without rewriting phase state first."""
+    build, checkpoint_state = _completed_evidence_profile_fixture()
     evidence_population = AsyncMock(
         side_effect=AssertionError("completed evidence phase was reopened")
     )
@@ -908,7 +970,7 @@ async def test_profile_resume_does_not_reopen_completed_evidence_phase(
         )
 
     evidence_population.assert_not_awaited()
-    assert compact_population.await_args.kwargs["start_batch"] == 120
+    assert compact_population.await_args.kwargs["start_batch"] == 0
     mark_failed.assert_awaited_once()
 
 
@@ -965,3 +1027,27 @@ async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
             await importer.publish_provider_directory_profile()
     finally:
         importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
+
+
+def test_retained_profile_source_spec_rejects_missing_rows_and_mapping(
+    tmp_path,
+):
+    spec = profile.load_profile_source_spec()
+    missing_matrix_by_field = {
+        **spec,
+        "verification_matrix": None,
+    }
+    missing_path = tmp_path / "missing-matrix.json"
+    missing_path.write_text(
+        json.dumps(missing_matrix_by_field),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="source_spec_invalid"):
+        profile.configured_retained_profile_source_ids(missing_path)
+
+    incomplete = json.loads(json.dumps(spec))
+    incomplete["verification_matrix"]["sources"] = []
+    incomplete_path = tmp_path / "incomplete-matrix.json"
+    incomplete_path.write_text(json.dumps(incomplete), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="source_spec_invalid"):
+        profile.configured_retained_profile_source_ids(incomplete_path)
