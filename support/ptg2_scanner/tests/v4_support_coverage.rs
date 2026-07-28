@@ -214,6 +214,7 @@ fn v4_normalization_rejects_ambiguous_numeric_and_json_shapes() {
     assert!(strict_integer(&json!(1.5), "field").is_err());
     let excessive_exponent: serde_json::Value =
         serde_json::from_str("1e999999").expect("arbitrary-precision JSON number");
+    assert!(strict_integer_text(&excessive_exponent, "field").is_err());
     assert!(strict_money_number(&excessive_exponent).is_err());
     assert_eq!(
         normalize_money_text("1e2e3".to_owned()),

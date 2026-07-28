@@ -30,7 +30,8 @@ const MAX_RANGE_COUNT: usize = 256;
 const MAX_RANGE_WORKERS: usize = 8;
 const RANGE_RECORD_BATCH_BYTES: usize = 512 * 1024;
 const RANGE_BATCH_QUEUE_DEPTH: usize = 8;
-const PUBLICATION_LINK_RETRIES: usize = 101;
+// NFS attribute caching can outlive the publishing process's final unlink by several seconds.
+const PUBLICATION_LINK_RETRIES: usize = 501;
 const PUBLICATION_LINK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MAX_RECORD_COUNT: u64 = 250_000_000;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
