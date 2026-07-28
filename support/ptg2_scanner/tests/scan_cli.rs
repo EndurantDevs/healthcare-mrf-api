@@ -144,6 +144,7 @@ fn v4_provider_membership_cli_emits_exact_bidirectional_sidecars() {
         .arg(&npi_group)
         .arg(&npi_scope)
         .arg(&input)
+        .env("HLTHPRT_PTG2_MANIFEST_SIDECAR_SORT_CHUNK_BYTES", "32")
         .output()
         .unwrap();
     assert!(
