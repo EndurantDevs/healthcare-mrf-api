@@ -575,15 +575,15 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3339,
+          "covered": 3343,
           "total": 3787
         },
         "lines": {
-          "covered": 51520,
+          "covered": 51548,
           "total": 58698
         },
         "regions": {
-          "covered": 76078,
+          "covered": 76104,
           "total": 86753
         }
       },

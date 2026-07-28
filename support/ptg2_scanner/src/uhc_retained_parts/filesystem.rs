@@ -170,7 +170,7 @@ impl RootDirectory {
                 && attempt + 1 < PUBLICATION_LINK_RETRIES
             {
                 drop(file);
-                thread::sleep(Duration::from_micros(50));
+                thread::sleep(PUBLICATION_LINK_RETRY_DELAY);
                 continue;
             }
             return Err(invalid_data(format!(

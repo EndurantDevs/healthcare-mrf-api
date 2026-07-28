@@ -162,4 +162,22 @@ fn raw_claim_check_rejects_incomplete_arguments_and_malformed_inputs() {
     assert!(!invalid_targets.status.success());
     assert!(String::from_utf8_lossy(&invalid_targets.stderr)
         .contains("target CSV is missing column code_system"));
+
+    let empty_targets = directory.path().join("empty-targets.csv");
+    fs::write(&empty_targets, "").expect("write empty targets");
+    let missing_header = run_raw_claim_check(&empty_targets, &[&malformed]);
+    assert!(!missing_header.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_header.stderr).contains("target CSV is missing a header")
+    );
+
+    let invalid_npi_targets = directory.path().join("invalid-npi-targets.csv");
+    fs::write(
+        &invalid_npi_targets,
+        "npi,code,code_system,pos,api_status\nnot-an-npi,99213,CPT,11,api_found\n",
+    )
+    .expect("write invalid NPI targets");
+    let invalid_npi = run_raw_claim_check(&invalid_npi_targets, &[&malformed]);
+    assert!(!invalid_npi.status.success());
+    assert!(String::from_utf8_lossy(&invalid_npi.stderr).contains("invalid NPI row"));
 }
