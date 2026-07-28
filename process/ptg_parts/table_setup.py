@@ -366,10 +366,11 @@ async def _ensure_ptg2_price_atom_columns(db_schema: str) -> None:
 async def _drop_ptg2_columns(db_schema: str, table_name: str, column_names: tuple[str, ...]) -> None:
     for column_name in column_names:
         try:
-            await db.status(
-                f"ALTER TABLE {_quote_ident(db_schema)}.{_quote_ident(table_name)} "
-                f"DROP COLUMN IF EXISTS {_quote_ident(column_name)};"
-            )
+            async with db.transaction():
+                await db.status(
+                    f"ALTER TABLE {_quote_ident(db_schema)}.{_quote_ident(table_name)} "
+                    f"DROP COLUMN IF EXISTS {_quote_ident(column_name)};"
+                )
         except Exception as exc:
             logger.debug("Skipping %s column %s drop: %s", table_name, column_name, exc)
 
@@ -388,18 +389,20 @@ async def _ensure_price_stage_table_locked(db_schema: str) -> None:
     await _drop_ptg2_columns(db_schema, "ptg2_price_set_stage", ("hash_prefix", "price_atom_hashes", "canonical_payload"))
     if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True):
         try:
-            await db.status(f"ALTER TABLE {db_schema}.ptg2_price_set_stage SET UNLOGGED;")
+            async with db.transaction():
+                await db.status(f"ALTER TABLE {db_schema}.ptg2_price_set_stage SET UNLOGGED;")
         except Exception as exc:
             logger.debug("Skipping ptg2_price_set_stage unlogged ensure: %s", exc)
     if not _env_bool(PTG2_STAGE_INDEXES_ENV, False):
         return
     try:
-        await db.status(
-            f"""
-            CREATE INDEX IF NOT EXISTS ptg2_price_set_stage_snapshot_idx
-            ON {db_schema}.ptg2_price_set_stage (snapshot_id, price_set_hash);
-            """
-        )
+        async with db.transaction():
+            await db.status(
+                f"""
+                CREATE INDEX IF NOT EXISTS ptg2_price_set_stage_snapshot_idx
+                ON {db_schema}.ptg2_price_set_stage (snapshot_id, price_set_hash);
+                """
+            )
     except Exception as exc:
         logger.debug("Skipping ptg2_price_set_stage index ensure: %s", exc)
 
@@ -456,7 +459,8 @@ async def _ensure_rate_stage_table_locked(db_schema: str) -> None:
     )
     if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True):
         try:
-            await db.status(f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage SET UNLOGGED;")
+            async with db.transaction():
+                await db.status(f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage SET UNLOGGED;")
         except Exception as exc:
             logger.debug("Skipping ptg2_serving_rate_stage unlogged ensure: %s", exc)
     column_types_by_name = {
@@ -490,28 +494,31 @@ async def _ensure_rate_stage_table_locked(db_schema: str) -> None:
     }
     for column_name, column_type in column_types_by_name.items():
         try:
-            await db.status(
-                f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage "
-                f"ADD COLUMN IF NOT EXISTS {column_name} {column_type};"
-            )
+            async with db.transaction():
+                await db.status(
+                    f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage "
+                    f"ADD COLUMN IF NOT EXISTS {column_name} {column_type};"
+                )
         except Exception as exc:
             logger.debug("Skipping ptg2_serving_rate_stage column %s ensure: %s", column_name, exc)
     try:
-        await db.status(
-            f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage "
-            "ALTER COLUMN canonical_payload DROP NOT NULL;"
-        )
+        async with db.transaction():
+            await db.status(
+                f"ALTER TABLE {db_schema}.ptg2_serving_rate_stage "
+                "ALTER COLUMN canonical_payload DROP NOT NULL;"
+            )
     except Exception as exc:
         logger.debug("Skipping ptg2_serving_rate_stage canonical_payload nullable ensure: %s", exc)
     if not _env_bool(PTG2_STAGE_INDEXES_ENV, False):
         return
     try:
-        await db.status(
-            f"""
-            CREATE INDEX IF NOT EXISTS ptg2_serving_rate_stage_snapshot_idx
-            ON {db_schema}.ptg2_serving_rate_stage (snapshot_id, serving_rate_id);
-            """
-        )
+        async with db.transaction():
+            await db.status(
+                f"""
+                CREATE INDEX IF NOT EXISTS ptg2_serving_rate_stage_snapshot_idx
+                ON {db_schema}.ptg2_serving_rate_stage (snapshot_id, serving_rate_id);
+                """
+            )
     except Exception as exc:
         logger.debug("Skipping ptg2_serving_rate_stage index ensure: %s", exc)
 

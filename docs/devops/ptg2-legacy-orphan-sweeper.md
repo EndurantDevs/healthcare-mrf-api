@@ -62,8 +62,9 @@ The sweeper:
 - serializes with the shared PTG lifecycle lock and rechecks the complete plan
   after acquiring exact locks on every present authority table; application
   setup for both optional stage relations acquires the same lifecycle lock
-  before any `CREATE`, `ALTER`, or index DDL, while the final recheck still
-  binds optional absence or exact OID/schema/shape when present;
+  before DDL, keeps required `CREATE` fail-fast, and isolates each tolerated
+  `ALTER` or index statement in its own savepoint, while the final recheck
+  still binds optional absence or exact OID/schema/shape when present;
 - caps suffixes, root tables, dependent relations, and bytes with hard
   non-overridable ceilings;
 - skips and explicitly classifies an individually oversized lexical family so
