@@ -308,7 +308,7 @@ def _age_band_profile_master_facts():
         source_row_by_key,
         run_id="synthetic-run",
         record_id="synthetic-record",
-        npi=1295763977,
+        npi=1234567893,
         artifact={
             "artifact_id": "synthetic-artifact",
             "content_sha256": "0" * 64,
@@ -351,7 +351,7 @@ def test_profile_master_age_band_does_not_inherit_license_period():
 def test_profile_master_projection_omits_empty_effective_periods():
     facts = _age_band_profile_master_facts()
     profile, _evidence = _projection(
-        1295763977,
+        1234567893,
         "synthetic-generation",
         facts,
         set(STANDARD_CATEGORIES),
@@ -372,7 +372,7 @@ def test_profile_master_skips_not_applicable_age_band():
         },
         run_id="synthetic-run",
         record_id="synthetic-record",
-        npi=1295763977,
+        npi=1234567893,
         artifact={
             "artifact_id": "synthetic-artifact",
             "content_sha256": "0" * 64,

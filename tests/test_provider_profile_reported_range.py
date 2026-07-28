@@ -112,7 +112,7 @@ def test_composer_upgrades_existing_state_projection_without_reimport():
     }
 
     profile = compose_provider_profile(
-        1295763977,
+        1234567893,
         state_projection={
             "generation_id": "state-generation",
             "profile": state_profile_by_key,

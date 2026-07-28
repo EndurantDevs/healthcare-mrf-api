@@ -143,6 +143,7 @@ from api.provider_profile_display import display_value
         ),
         ("specialty", {"display": "Family Medicine", "code": "207Q00000X"}, "Family Medicine (207Q00000X)"),
         ("role", {"code": "doctor"}, "doctor"),
+        ("specialty", {}, "Specialty"),
         (
             "new_patient_acceptance",
             {"code": "existptonly"},
@@ -158,6 +159,7 @@ from api.provider_profile_display import display_value
             {"code": "source-specific"},
             "source-specific",
         ),
+        ("new_patient_acceptance", {}, "New patient acceptance"),
         (
             "organization",
             {"name": "Example Clinic", "code": "ORG"},
@@ -234,7 +236,7 @@ def _structured_fhir_profile_by_key():
 def test_composer_formats_fhir_facts_for_people():
     fhir_profile_by_key = _structured_fhir_profile_by_key()
     profile = compose_provider_profile(
-        1295763977,
+        1234567893,
         state_projection=None,
         fhir_profile=fhir_profile_by_key,
     )
@@ -261,12 +263,12 @@ def test_composer_formats_fhir_facts_for_people():
 def test_composer_preserves_values_and_stable_item_ids():
     fhir_profile_by_key = _structured_fhir_profile_by_key()
     profile = compose_provider_profile(
-        1295763977,
+        1234567893,
         state_projection=None,
         fhir_profile=fhir_profile_by_key,
     )
     repeated_profile = compose_provider_profile(
-        1295763977,
+        1234567893,
         state_projection=None,
         fhir_profile=fhir_profile_by_key,
     )
