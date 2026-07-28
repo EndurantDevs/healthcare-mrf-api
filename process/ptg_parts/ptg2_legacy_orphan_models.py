@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Mapping
 
 
@@ -17,6 +17,9 @@ LEGACY_SWEEP_MAX_TABLES = 1_000
 LEGACY_SWEEP_MAX_RELATIONS = 5_000
 LEGACY_SWEEP_MAX_BYTES = 10 * 1024 * 1024 * 1024
 LEGACY_SWEEP_MAX_OWNERSHIP_ROWS = 50_000
+LEGACY_SWEEP_MAX_CATALOG_SUFFIXES = 50_000
+LEGACY_SWEEP_MAX_CATALOG_RELATIONS = 250_000
+LEGACY_SWEEP_CATALOG_WINDOW_SUFFIXES = 100
 LEGACY_ROOT_PREFIXES = (
     "log",
     "ptg_allowed_item",
@@ -74,10 +77,24 @@ def legacy_root_identity(relation_name: str) -> tuple[str, str] | None:
 def embedded_legacy_suffix(relation_name: str) -> str | None:
     """Return one embedded legacy suffix from a dependent relation name."""
 
-    matches = _EMBEDDED_SUFFIX_PATTERN.findall(str(relation_name or ""))
-    if len(set(matches)) != 1:
+    suffixes = legacy_relation_suffixes(relation_name)
+    if len(suffixes) != 1:
         return None
-    return matches[0]
+    return suffixes[0]
+
+
+def legacy_relation_suffixes(relation_name: str) -> tuple[str, ...]:
+    """Return every distinct embedded legacy suffix in lexical order."""
+
+    return tuple(
+        sorted(
+            set(
+                _EMBEDDED_SUFFIX_PATTERN.findall(
+                    str(relation_name or "")
+                )
+            )
+        )
+    )
 
 
 def canonical_sha256(payload: Mapping[str, Any] | list[Any]) -> str:
@@ -349,6 +366,11 @@ class LegacySweepLimits:
     max_relations: int
     max_bytes: int
 
+    def payload(self) -> dict[str, int]:
+        """Return the exact operator bounds bound into one plan."""
+
+        return asdict(self)
+
     def validate(self) -> None:
         """Reject negative or above-ceiling execution limits."""
 
@@ -366,6 +388,23 @@ class LegacySweepLimits:
 
 
 @dataclass(frozen=True)
+class LegacyCatalogProgress:
+    """Aggregate progress through one bounded legacy catalog scan."""
+
+    catalog_suffix_count: int
+    scanned_suffix_count: int
+
+    def validate(self, *, classified_suffix_count: int) -> None:
+        """Reject progress that omits classified or scanned suffixes."""
+
+        if (
+            self.scanned_suffix_count < classified_suffix_count
+            or self.catalog_suffix_count < self.scanned_suffix_count
+        ):
+            raise ValueError("legacy sweep catalog counts are invalid")
+
+
+@dataclass(frozen=True)
 class LegacySweepPlan:
     """Deterministic bounded cleanup plan."""
 
@@ -376,7 +415,10 @@ class LegacySweepPlan:
     candidates: tuple[LegacySweepCandidate, ...]
     blocked: tuple[LegacyBlockedSuffix, ...]
     eligible_suffix_count: int
+    limits: LegacySweepLimits
     plan_digest: str
+    catalog_suffix_count: int = 0
+    scanned_suffix_count: int = 0
 
     @property
     def table_count(self) -> int:
@@ -432,6 +474,12 @@ class LegacySweepPlan:
 
         return self.eligible_suffix_count - len(self.candidates)
 
+    @property
+    def unscanned_suffix_count(self) -> int:
+        """Count catalog suffixes deferred to a later bounded scan."""
+
+        return max(0, self.catalog_suffix_count - self.scanned_suffix_count)
+
     def audit_payload(self) -> dict[str, Any]:
         """Return the canonical plan payload persisted in the audit."""
 
@@ -441,6 +489,9 @@ class LegacySweepPlan:
             "control_schema_name": self.control_schema_name,
             "authority_digest": self.authority_digest,
             "catalog_digest": self.catalog_digest,
+            "catalog_suffix_count": self.catalog_suffix_count,
+            "scanned_suffix_count": self.scanned_suffix_count,
+            "limits": self.limits.payload(),
             "candidates": [
                 candidate.payload() for candidate in self.candidates
             ],

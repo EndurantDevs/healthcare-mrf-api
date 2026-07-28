@@ -11,11 +11,8 @@ from process.ptg_parts.ptg2_legacy_orphan_contract import (
     LEGACY_ROOT_PREFIXES,
     LegacyRootRelation,
     canonical_sha256,
-    embedded_legacy_suffix,
+    legacy_relation_suffixes,
     legacy_root_identity,
-)
-from process.ptg_parts.ptg2_legacy_orphan_models import (
-    LEGACY_SWEEP_MAX_TABLES,
 )
 from process.ptg_parts.ptg2_legacy_orphan_store_common import (
     _catalog_json_value,
@@ -26,7 +23,11 @@ from process.ptg_parts.ptg2_legacy_orphan_store_common import (
 )
 from process.ptg_parts.ptg2_legacy_orphan_store_schema import (
     _base_catalog_identity,
-    _relation_catalog_rows,
+)
+from process.ptg_parts.ptg2_legacy_orphan_store_window import (
+    LegacyCatalogRelationKey,
+    relation_catalog_window_rows,
+    require_catalog_discovery_bounds,
 )
 
 from process.ptg_parts.ptg2_legacy_orphan_store_catalog_sql import (
@@ -61,18 +62,6 @@ class _RelationBuildContext:
     row_presence_by_table: Mapping[str, bool]
     schema: _RootSchemaCatalog
     dependencies: _DependencyCatalog
-
-
-def _require_catalog_discovery_bounds(
-    raw_relation_rows: Iterable[Mapping[str, Any]],
-) -> None:
-    root_count = sum(
-        legacy_root_identity(str(relation_row["relname"])) is not None
-        for relation_row in raw_relation_rows
-    )
-    if root_count > LEGACY_SWEEP_MAX_TABLES:
-        raise RuntimeError("legacy_sweep_root_catalog_limit_exceeded")
-
 
 async def _root_schema_catalog(
     executor: Any,
@@ -234,15 +223,18 @@ def _record_catalog_ambiguity(
                 "external_relation_dependency"
             )
     root_oids = set(suffix_by_root_oid)
+    root_suffixes = frozenset(suffix_by_root_oid.values())
     for relation_row in raw_relation_rows:
         relation_oid = int(relation_row["relation_oid"])
         if relation_oid in root_oids or relation_oid in dependencies.accepted_oids:
             continue
-        suffix = embedded_legacy_suffix(str(relation_row["relname"]))
-        if suffix is not None:
-            ambiguity_by_suffix.setdefault(suffix, set()).add(
-                "unexpected_relation_catalog_entry"
-            )
+        for suffix in legacy_relation_suffixes(
+            str(relation_row["relname"])
+        ):
+            if suffix in root_suffixes:
+                ambiguity_by_suffix.setdefault(suffix, set()).add(
+                    "unexpected_relation_catalog_entry"
+                )
 
 
 def _root_schema_payload(
@@ -449,15 +441,20 @@ async def load_legacy_relation_catalog(
     *,
     schema_name: str,
     probe_rows: bool,
+    relation_keys: tuple[LegacyCatalogRelationKey, ...],
 ) -> LegacyRelationCatalog:
-    """Load and validate every table carrying a legacy 32-hex suffix."""
+    """Load and validate one bounded legacy suffix catalog window."""
 
     namespace_oid, owner_oid = await _base_catalog_identity(
         executor,
         schema_name,
     )
-    raw_relation_rows = await _relation_catalog_rows(executor, schema_name)
-    _require_catalog_discovery_bounds(raw_relation_rows)
+    raw_relation_rows = await relation_catalog_window_rows(
+        executor,
+        schema_name,
+        relation_keys=relation_keys,
+    )
+    require_catalog_discovery_bounds(raw_relation_rows)
     valid_root_rows, ambiguity_by_suffix = _validated_root_rows(
         raw_relation_rows,
         namespace_oid=namespace_oid,

@@ -18,6 +18,7 @@ from process.ptg_parts.ptg2_legacy_orphan_models import (
     _AUTHORITATIVE_OWNER_KINDS,
     _HEX_32_PATTERN,
     _HEX_64_PATTERN,
+    LegacyCatalogProgress,
     LegacyBlockedSuffix,
     LegacyRootRelation,
     LegacySuffixOwnership,
@@ -26,6 +27,7 @@ from process.ptg_parts.ptg2_legacy_orphan_models import (
     LegacySweepPlan,
     canonical_sha256,
     embedded_legacy_suffix,
+    legacy_relation_suffixes,
     legacy_root_identity,
 )
 
@@ -289,6 +291,24 @@ def _select_candidates_within_limits(
     return tuple(selected_candidates), tuple(oversized_candidates)
 
 
+def _resolved_catalog_progress(
+    candidate_count: int,
+    blocked_count: int,
+    supplied_progress: LegacyCatalogProgress | None,
+) -> LegacyCatalogProgress:
+    classified_count = candidate_count + blocked_count
+    resolved_progress = supplied_progress or LegacyCatalogProgress(
+        catalog_suffix_count=classified_count,
+        scanned_suffix_count=classified_count,
+    )
+    resolved_progress.validate(classified_suffix_count=classified_count)
+    return resolved_progress
+
+
+def _is_catalog_digest_set_valid(*digests: str) -> bool:
+    return all(_HEX_64_PATTERN.fullmatch(digest) for digest in digests)
+
+
 def build_bounded_legacy_sweep_plan(
     *,
     schema_name: str,
@@ -298,17 +318,19 @@ def build_bounded_legacy_sweep_plan(
     eligible_candidates: Iterable[LegacySweepCandidate],
     blocked: Iterable[LegacyBlockedSuffix],
     limits: LegacySweepLimits,
+    catalog_progress: LegacyCatalogProgress | None = None,
 ) -> LegacySweepPlan:
     """Select a deterministic prefix that fits every execution bound."""
 
     limits.validate()
-    if not all(
-        _HEX_64_PATTERN.fullmatch(digest)
-        for digest in (authority_digest, catalog_digest)
-    ):
+    if not _is_catalog_digest_set_valid(authority_digest, catalog_digest):
         raise ValueError("legacy sweep catalog digest is invalid")
     ordered_candidates = tuple(
         sorted(eligible_candidates, key=lambda candidate: candidate.suffix)
+    )
+    blocked_suffixes = tuple(blocked)
+    resolved_progress = _resolved_catalog_progress(
+        len(ordered_candidates), len(blocked_suffixes), catalog_progress
     )
     selected_candidates, oversized_candidates = _select_candidates_within_limits(
         ordered_candidates,
@@ -320,6 +342,9 @@ def build_bounded_legacy_sweep_plan(
         "control_schema_name": control_schema_name,
         "authority_digest": authority_digest,
         "catalog_digest": catalog_digest,
+        "catalog_suffix_count": resolved_progress.catalog_suffix_count,
+        "scanned_suffix_count": resolved_progress.scanned_suffix_count,
+        "limits": limits.payload(),
         "candidates": [
             candidate.payload() for candidate in selected_candidates
         ],
@@ -332,12 +357,15 @@ def build_bounded_legacy_sweep_plan(
         candidates=selected_candidates,
         blocked=tuple(
             sorted(
-                (*blocked, *oversized_candidates),
+                (*blocked_suffixes, *oversized_candidates),
                 key=lambda item: item.suffix,
             )
         ),
         eligible_suffix_count=len(ordered_candidates),
+        limits=limits,
         plan_digest=canonical_sha256(base_payload_by_field),
+        catalog_suffix_count=resolved_progress.catalog_suffix_count,
+        scanned_suffix_count=resolved_progress.scanned_suffix_count,
     )
 
 

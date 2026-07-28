@@ -132,6 +132,7 @@
         "process/clinical_reference_sources.py",
         "process/clinical_reference_umls_parsers.py",
         "process/cms_doctors.py",
+        "process/cms_doctors_rows.py",
         "process/code_sets.py",
         "process/control_cancel.py",
         "process/control_lifecycle.py",
@@ -293,6 +294,7 @@
         "process/ptg_parts/ptg2_fast_candidate_audit.py",
         "process/ptg_parts/ptg2_fast_candidate_audit_report.py",
         "process/ptg_parts/ptg2_input_artifact_gc.py",
+        "process/ptg_parts/ptg2_legacy_orphan_catalog_scan.py",
         "process/ptg_parts/ptg2_legacy_orphan_contract.py",
         "process/ptg_parts/ptg2_legacy_orphan_models.py",
         "process/ptg_parts/ptg2_legacy_orphan_store.py",
@@ -304,6 +306,7 @@
         "process/ptg_parts/ptg2_legacy_orphan_store_references.py",
         "process/ptg_parts/ptg2_legacy_orphan_store_replay.py",
         "process/ptg_parts/ptg2_legacy_orphan_store_schema.py",
+        "process/ptg_parts/ptg2_legacy_orphan_store_window.py",
         "process/ptg_parts/ptg2_legacy_orphan_sweeper.py",
         "process/ptg_parts/ptg2_legacy_orphan_sweeper_cli.py",
         "process/ptg_parts/ptg2_lifecycle_lock.py",
@@ -434,12 +437,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 34771,
-          "total": 39828
+          "covered": 34906,
+          "total": 39900
         },
         "lines": {
-          "covered": 110744,
-          "total": 118585
+          "covered": 111224,
+          "total": 118944
         }
       },
       "one_time_floor_reset": {

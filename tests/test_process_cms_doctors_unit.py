@@ -96,6 +96,8 @@ class _CatalogClient:
 def test_cms_doctor_identifiers_and_schema_names_are_bounded(cms_doctors_module):
     """Identifiers remain deterministic, valid, and inside PostgreSQL limits."""
 
+    assert cms_doctors_module.process_data.__name__ == "process_data"
+    assert cms_doctors_module.shutdown.__name__ == "shutdown"
     assert cms_doctors_module._stage_index_name("stage", "primary") == "stage_idx_primary"
     assert cms_doctors_module._normalize_import_id(" run-ABC_123 ") == "runABC123"
     fallback_import_id = cms_doctors_module._normalize_import_id("---")

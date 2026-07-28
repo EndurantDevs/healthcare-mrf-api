@@ -167,6 +167,109 @@ async def _is_table_available(db_schema: str, table_name: str) -> bool:
 _table_exists = _is_table_available
 
 
+def _has_loaded_local_tract_crosswalk(
+    crosswalk_file: str,
+    zip_by_tract_geoid: dict[str, str],
+) -> bool:
+    """Load a local tract-to-ZIP CSV and report whether it is usable."""
+    logger.info("Loading local crosswalk file: %s", crosswalk_file)
+    with open(crosswalk_file, "r", encoding="utf-8") as handle:
+        for local_crosswalk_row in csv.DictReader(handle):
+            tract = (
+                local_crosswalk_row.get("TRACT")
+                or local_crosswalk_row.get("tract")
+                or ""
+            )
+            zip_code = (
+                local_crosswalk_row.get("ZIP")
+                or local_crosswalk_row.get("zip")
+                or ""
+            )
+            _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zip_code)
+    return _is_usable_tract_crosswalk(zip_by_tract_geoid)
+
+
+async def _has_loaded_hud_tract_crosswalk(
+    client,
+    hud_token: str,
+    zip_by_tract_geoid: dict[str, str],
+) -> bool:
+    """Load the authenticated HUD crosswalk into the shared mapping."""
+    request_headers_by_name = {"Authorization": f"Bearer {hud_token}"}
+    try:
+        async with client.get(
+            HUD_CROSSWALK_URL,
+            headers=request_headers_by_name,
+            timeout=120,
+        ) as response:
+            if response.status != 200:
+                return False
+            hud_payload = await response.json(content_type=None)
+            hud_results = hud_payload.get("data", {}).get(
+                "results",
+                hud_payload if isinstance(hud_payload, list) else [],
+            )
+            for hud_result in hud_results:
+                _has_added_tract_zip_mapping(
+                    zip_by_tract_geoid,
+                    str(hud_result.get("geoid", "")),
+                    str(hud_result.get("zip", "")),
+                )
+            return _is_usable_tract_crosswalk(zip_by_tract_geoid)
+    except Exception as exc:
+        logger.warning(
+            "HUD crosswalk API failed (%s); trying Census fallback",
+            exc,
+        )
+        return False
+
+
+async def _has_loaded_census_tract_crosswalk(
+    client,
+    zip_by_tract_geoid: dict[str, str],
+) -> bool:
+    """Load the public Census tract/ZCTA relationship fallback."""
+    try:
+        async with client.get(CENSUS_TRACT_ZCTA_REL_URL, timeout=300) as response:
+            if response.status != 200:
+                logger.warning(
+                    "Census tract/ZCTA fallback fetch failed with HTTP %s",
+                    response.status,
+                )
+                return False
+            content = (await response.read()).decode(
+                "utf-8-sig",
+                errors="replace",
+            )
+        best_by_tract: dict[str, tuple[int, str]] = {}
+        for relationship_row in csv.DictReader(
+            content.splitlines(),
+            delimiter="|",
+        ):
+            tract = (relationship_row.get("GEOID_TRACT_20") or "").strip()
+            zcta = (relationship_row.get("GEOID_ZCTA5_20") or "").strip()
+            if not tract or len(zcta) != 5:
+                continue
+            try:
+                area = int(
+                    float(
+                        (relationship_row.get("AREALAND_PART") or "0").strip()
+                        or "0"
+                    )
+                )
+            except ValueError:
+                area = 0
+            previous = best_by_tract.get(tract)
+            if previous is None or area > previous[0]:
+                best_by_tract[tract] = (area, zcta)
+        for tract, (_area, zcta) in best_by_tract.items():
+            _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zcta)
+        return _is_usable_tract_crosswalk(zip_by_tract_geoid)
+    except Exception as exc:
+        logger.warning("Census tract/ZCTA fallback failed (%s)", exc)
+        return False
+
+
 async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
     """Download HUD USPS crosswalk to map Census Tract → ZIP code.
 
@@ -174,21 +277,11 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
     """
     zip_by_tract_geoid: dict[str, str] = {}
 
-    # The HUD crosswalk API requires a token; fall back to the publicly
-    # available crosswalk CSV when the env var is set.
     hud_token = os.getenv("HLTHPRT_HUD_API_TOKEN")
     crosswalk_file = os.getenv("HLTHPRT_LODES_CROSSWALK_FILE")
 
     if crosswalk_file and os.path.exists(crosswalk_file):
-        # Local crosswalk CSV: columns TRACT, ZIP
-        logger.info("Loading local crosswalk file: %s", crosswalk_file)
-        with open(crosswalk_file, "r", encoding="utf-8") as fh:
-            reader = csv.DictReader(fh)
-            for local_crosswalk_row in reader:
-                tract = local_crosswalk_row.get("TRACT") or local_crosswalk_row.get("tract") or ""
-                zip_code = local_crosswalk_row.get("ZIP") or local_crosswalk_row.get("zip") or ""
-                _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zip_code)
-        if _is_usable_tract_crosswalk(zip_by_tract_geoid):
+        if _has_loaded_local_tract_crosswalk(crosswalk_file, zip_by_tract_geoid):
             logger.info("Loaded %d tract→zip mappings from file", len(zip_by_tract_geoid))
             return zip_by_tract_geoid
         logger.warning(
@@ -199,70 +292,30 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
         zip_by_tract_geoid.clear()
 
     if hud_token:
-        try:
-            request_headers_by_name = {"Authorization": f"Bearer {hud_token}"}
-            async with client.get(HUD_CROSSWALK_URL, headers=request_headers_by_name, timeout=120) as resp:
-                if resp.status == 200:
-                    hud_payload = await resp.json(content_type=None)
-                    hud_results = hud_payload.get("data", {}).get(
-                        "results",
-                        hud_payload if isinstance(hud_payload, list) else [],
-                    )
-                    for hud_result in hud_results:
-                        tract = str(hud_result.get("geoid", ""))
-                        zip_code = str(hud_result.get("zip", ""))
-                        _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zip_code)
-                    if _is_usable_tract_crosswalk(zip_by_tract_geoid):
-                        logger.info("Loaded %d tract→zip mappings from HUD API", len(zip_by_tract_geoid))
-                        return zip_by_tract_geoid
-                    logger.warning(
-                        "HUD crosswalk API produced only %d valid 11-digit tract mappings; "
-                        "trying Census fallback",
-                        len(zip_by_tract_geoid),
-                    )
-                    zip_by_tract_geoid.clear()
-        except Exception as e:
-            logger.warning("HUD crosswalk API failed (%s); trying Census fallback", e)
+        if await _has_loaded_hud_tract_crosswalk(
+            client,
+            hud_token,
+            zip_by_tract_geoid,
+        ):
+            logger.info("Loaded %d tract→zip mappings from HUD API", len(zip_by_tract_geoid))
+            return zip_by_tract_geoid
+        logger.warning(
+            "HUD crosswalk API produced only %d valid 11-digit tract mappings; "
+            "trying Census fallback",
+            len(zip_by_tract_geoid),
+        )
+        zip_by_tract_geoid.clear()
 
-    # Public Census fallback: map GEOID_TRACT_20 -> GEOID_ZCTA5_20 by max AREALAND_PART.
-    # This preserves real ZIP/ZCTA granularity without requiring HUD credentials.
-    try:
-        async with client.get(CENSUS_TRACT_ZCTA_REL_URL, timeout=300) as resp:
-            if resp.status == 200:
-                content = (await resp.read()).decode("utf-8-sig", errors="replace")
-                reader = csv.DictReader(content.splitlines(), delimiter="|")
-                best_by_tract: dict[str, tuple[int, str]] = {}
-                for relationship_row in reader:
-                    tract = (relationship_row.get("GEOID_TRACT_20") or "").strip()
-                    zcta = (relationship_row.get("GEOID_ZCTA5_20") or "").strip()
-                    if not tract or not zcta or len(zcta) != 5:
-                        continue
-                    try:
-                        area = int(float((relationship_row.get("AREALAND_PART") or "0").strip() or "0"))
-                    except ValueError:
-                        area = 0
-                    prev = best_by_tract.get(tract)
-                    if prev is None or area > prev[0]:
-                        best_by_tract[tract] = (area, zcta)
-                for tract, (_area, zcta) in best_by_tract.items():
-                    _has_added_tract_zip_mapping(zip_by_tract_geoid, tract, zcta)
-                if _is_usable_tract_crosswalk(zip_by_tract_geoid):
-                    logger.info(
-                        "Loaded %d tract→zip mappings from Census tract/ZCTA relationship file",
-                        len(zip_by_tract_geoid),
-                    )
-                    return zip_by_tract_geoid
-                logger.warning(
-                    "Census tract/ZCTA fallback produced only %d valid 11-digit tract mappings",
-                    len(zip_by_tract_geoid),
-                )
-            else:
-                logger.warning(
-                    "Census tract/ZCTA fallback fetch failed with HTTP %s",
-                    resp.status,
-                )
-    except Exception as e:
-        logger.warning("Census tract/ZCTA fallback failed (%s)", e)
+    if await _has_loaded_census_tract_crosswalk(client, zip_by_tract_geoid):
+        logger.info(
+            "Loaded %d tract→zip mappings from Census tract/ZCTA relationship file",
+            len(zip_by_tract_geoid),
+        )
+        return zip_by_tract_geoid
+    logger.warning(
+        "Census tract/ZCTA fallback produced only %d valid 11-digit tract mappings",
+        len(zip_by_tract_geoid),
+    )
 
     logger.warning(
         "No tract→ZIP crosswalk available (set HLTHPRT_HUD_API_TOKEN or "

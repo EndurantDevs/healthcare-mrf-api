@@ -35,6 +35,11 @@ def test_normalize_zcta(value, expected, places_module):
     assert places_module._normalize_zcta(value) == expected
 
 
+def test_worker_aliases_preserve_registered_function_names(places_module):
+    assert places_module.process_data.__name__ == "process_data"
+    assert places_module.shutdown.__name__ == "shutdown"
+
+
 def test_build_places_record_filters_latest_year(places_module):
     place_by_field = {
         "Year": "2025",

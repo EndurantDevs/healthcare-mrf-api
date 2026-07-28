@@ -601,6 +601,7 @@ jobs:
           tests/test_ptg2_stage_ddl_savepoints_postgres.py
           tests/test_ptg2_legacy_orphan_sweeper_postgres.py
           tests/test_ptg2_legacy_orphan_safety_postgres.py
+          tests/test_ptg2_legacy_orphan_window_postgres.py
           tests/test_ptg2_source_snapshot_gc_postgres.py
           tests/test_ptg_source_snapshot_predecessor_retirement_postgres.py
           tests/test_ptg_source_snapshot_predecessor_retirement_concurrency_postgres.py

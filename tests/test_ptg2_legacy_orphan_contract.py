@@ -17,6 +17,7 @@ from process.ptg_parts.ptg2_legacy_orphan_contract import (
     canonical_sha256,
     classify_legacy_suffix,
     embedded_legacy_suffix,
+    legacy_relation_suffixes,
     legacy_root_identity,
     legacy_sweep_audit_id,
 )
@@ -100,6 +101,9 @@ def test_embedded_suffix_requires_one_unambiguous_lowercase_identity() -> None:
     assert embedded_legacy_suffix(
         f"ptg_file_{SUFFIX_A}_{SUFFIX_B}_idx"
     ) is None
+    assert legacy_relation_suffixes(
+        f"ptg_file_{SUFFIX_A}_{SUFFIX_B}_idx"
+    ) == (SUFFIX_A, SUFFIX_B)
 
 
 @pytest.mark.parametrize(
@@ -362,6 +366,41 @@ def test_plan_digest_binds_relation_oid_and_schema_digest() -> None:
     )
 
     assert first_plan.plan_digest != second_plan.plan_digest
+
+
+def test_plan_digest_binds_effective_limits_even_when_selection_is_equal() -> None:
+    candidate = classify_legacy_suffix(
+        SUFFIX_A,
+        (_relation(total_bytes=10),),
+        LegacySuffixOwnership(),
+    )
+    assert isinstance(candidate, LegacySweepCandidate)
+    plan_parameters_by_field = {
+        "schema_name": "mrf",
+        "control_schema_name": "control",
+        "authority_digest": "1" * 64,
+        "catalog_digest": "2" * 64,
+        "eligible_candidates": (candidate,),
+        "blocked": (),
+    }
+
+    narrow_plan = build_bounded_legacy_sweep_plan(
+        **plan_parameters_by_field,
+        limits=LegacySweepLimits(1, 1, 2, 10),
+    )
+    wider_plan = build_bounded_legacy_sweep_plan(
+        **plan_parameters_by_field,
+        limits=LegacySweepLimits(2, 2, 2, 20),
+    )
+
+    assert narrow_plan.candidates == wider_plan.candidates
+    assert narrow_plan.plan_digest != wider_plan.plan_digest
+    assert narrow_plan.audit_payload()["limits"] == {
+        "max_suffixes": 1,
+        "max_tables": 1,
+        "max_relations": 2,
+        "max_bytes": 10,
+    }
 
 
 def test_execution_bounds_have_non_overridable_hard_ceilings() -> None:

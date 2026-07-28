@@ -239,17 +239,26 @@ def test_catalog_ambiguity_records_every_dependency_boundary() -> None:
         (),
         ({"root_oid": 11},),
     )
+    other_suffix = "2" * 32
     raw_rows = [
         _root_row(),
+        _root_row(
+            relname=f"ptg_file_{other_suffix}",
+            relation_oid=12,
+        ),
         {
             "relname": f"unexpected_{SUFFIX}_idx",
             "relation_oid": 99,
+        },
+        {
+            "relname": f"synthetic_{SUFFIX}_{other_suffix}",
+            "relation_oid": 100,
         },
     ]
     ambiguity_by_suffix = {}
     catalog_store._record_catalog_ambiguity(
         raw_relation_rows=raw_rows,
-        root_relation_rows=[raw_rows[0]],
+        root_relation_rows=raw_rows[:2],
         schema=schema,
         dependencies=dependencies,
         ambiguity_by_suffix=ambiguity_by_suffix,
@@ -257,6 +266,9 @@ def test_catalog_ambiguity_records_every_dependency_boundary() -> None:
     assert ambiguity_by_suffix[SUFFIX] == {
         "dependent_relation_catalog_invalid",
         "external_relation_dependency",
+        "unexpected_relation_catalog_entry",
+    }
+    assert ambiguity_by_suffix[other_suffix] == {
         "unexpected_relation_catalog_entry",
     }
 

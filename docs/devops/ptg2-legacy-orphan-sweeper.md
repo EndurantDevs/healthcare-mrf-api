@@ -22,6 +22,17 @@ environment-specific built-in default.
 
 Dry-run prints an aggregate JSON summary and a `plan_digest`. It does not print
 source, plan, payer, employer, snapshot, import, or relation identities.
+`catalog_suffixes`, `scanned_suffixes`, and `unscanned_suffixes` show progress
+through large legacy catalogs. Each plan construction scans legacy-shaped
+relation identities once under a separate hard ceiling, then loads catalog
+detail by exact indexed OID for windows bounded by both 100 suffixes and 5,000
+unique relations until the requested cleanup batch is full. The in-memory
+suffix-to-relation index is built once; neither PostgreSQL nor that inventory
+is rescanned for each window. Dry-run constructs one plan. The first apply
+constructs it once before and once after acquiring exact root locks so drift
+fails closed; an exact audit replay does not rebuild the catalog. A later
+invocation starts from the remaining lexical catalog after the prior batch is
+removed.
 
 Applying a plan requires the exact reviewed digest and an auditable actor:
 
@@ -31,7 +42,11 @@ python -m process.ptg_parts.ptg2_legacy_orphan_sweeper \
   --control-schema <control-plane-schema> \
   --apply \
   --expected-plan-digest <64-lowercase-hex> \
-  --actor <maintenance-actor>
+  --actor <maintenance-actor> \
+  --max-suffixes <dry-run-value> \
+  --max-tables <dry-run-value> \
+  --max-relations <dry-run-value> \
+  --max-bytes <dry-run-value>
 ```
 
 ## Safety contract
@@ -65,12 +80,15 @@ The sweeper:
   before DDL, keeps required `CREATE` fail-fast, and isolates each tolerated
   `ALTER` or index statement in its own savepoint, while the final recheck
   still binds optional absence or exact OID/schema/shape when present;
-- caps suffixes, root tables, dependent relations, and bytes with hard
-  non-overridable ceilings;
+- caps the read-only relation/suffix inventory and every indexed catalog
+  detail window separately from the lower transaction ceilings for suffixes,
+  root tables, dependent relations, and bytes; every ceiling is hard and
+  non-overridable;
 - skips and explicitly classifies an individually oversized lexical family so
-  it cannot starve smaller later families; a family above the 10 GiB hard
-  ceiling requires a separately designed, reviewed large-family cleanup path
-  and is never split or dropped by this command;
+  it cannot starve smaller later families; a family above either the
+  5,000-relation inspection ceiling or 10 GiB transaction ceiling requires a
+  separately designed, reviewed large-family cleanup path and is never split
+  or dropped by this command;
 - deletes only exact owned snapshot scope/source and retained-artifact
   metadata, then drops exact root tables without `CASCADE`;
 - writes one immutable audit row in the same transaction; a failure rolls back
@@ -89,9 +107,13 @@ the first cleanup record exists.
    release, cleanup, Alembic migration, or manual DDL operation is in flight.
    Alembic and manual DDL are a trusted operator boundary: they must never run
    concurrently with either dry-run review or apply.
-2. Run dry-run with conservative limits and retain its aggregate output.
-3. Review blocked counts and the exact `plan_digest`.
-4. Apply that digest once. Any catalog or lifecycle drift fails closed.
+2. Run dry-run with conservative limits and retain its aggregate output,
+   including all four values under `limits`.
+3. Review `blocked_reason_counts`, selected counts, and the exact
+   `plan_digest`. Block reasons are neutral aggregates; identities remain out
+   of the command output.
+4. Apply that digest once with the exact same four `--max-*` values. Any
+   catalog, lifecycle, or limit drift fails closed.
 5. Replay the same command only to prove idempotency.
 6. Re-run dry-run and storage inventory. Continue in bounded batches.
 
