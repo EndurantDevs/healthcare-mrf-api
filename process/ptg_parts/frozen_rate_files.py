@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import re
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
@@ -14,15 +15,22 @@ from process.ptg_parts.canonical import canonical_json_dumps, canonicalize_url
 
 FROZEN_RATE_FILE_SET_CONTRACT = "ptg_frozen_rate_file_set_v1"
 FROZEN_RATE_FILE_PROOF_CONTRACT = "ptg_frozen_rate_file_proof_v1"
+FROZEN_RATE_FILE_PROOF_SET_CONTRACT = (
+    "ptg_frozen_rate_file_proof_set_v1"
+)
 FROZEN_RATE_FILE_SET_MIN_FILES = 2
 FROZEN_RATE_FILE_SET_MAX_FILES = 128
 FROZEN_RATE_FILE_SET_MAX_CANONICAL_BYTES = 256 * 1024
 FROZEN_RATE_FILE_MAX_URL_BYTES = 4096
 FROZEN_RATE_FILE_MAX_VALIDATOR_BYTES = 1024
+FROZEN_RATE_FILE_TOTAL_MAX_BYTES_ENV = "HLTHPRT_PTG2_FROZEN_TOTAL_MAX_BYTES"
+FROZEN_RATE_FILE_TOTAL_MAX_BYTES_DEFAULT = 512 * 1024 * 1024 * 1024
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
-_ENGINE_ID_PATTERN = re.compile(r"[0-9a-f]{16}")
-_SOURCE_TYPES = frozenset({"in_network", "allowed_amounts"})
+_ENGINE_ID_PATTERN = re.compile(
+    r"(?:[0-9a-f]{16}|[0-9a-f]{32}|[0-9a-f]{64})"
+)
+_FROZEN_SOURCE_TYPE = "in_network"
 _DESCRIPTOR_KEYS = frozenset(
     {
         "source_type",
@@ -127,9 +135,9 @@ def _normalize_descriptor(raw_descriptor: Any) -> dict[str, Any]:
             "frozen rate file descriptor fields do not match the v1 contract"
         )
     source_type = raw_descriptor.get("source_type")
-    if source_type not in _SOURCE_TYPES:
+    if source_type != _FROZEN_SOURCE_TYPE:
         raise FrozenRateFileValidationError(
-            "frozen rate file source_type is invalid"
+            "frozen multipart supports only in_network source_type"
         )
     etag, last_modified = _normalized_http_validators(raw_descriptor)
     logical_sha256, logical_hash_deferred = _normalized_logical_hash(
@@ -238,7 +246,39 @@ def _normalized_descriptors(
         key=lambda descriptor: descriptor["ordinal"],
     )
     _assert_frozen_set_relationships(normalized, file_count)
+    _assert_frozen_set_byte_budget(normalized)
     return normalized
+
+
+def _frozen_total_max_bytes() -> int:
+    raw_limit = os.getenv(FROZEN_RATE_FILE_TOTAL_MAX_BYTES_ENV)
+    if raw_limit is None or not raw_limit.strip():
+        return FROZEN_RATE_FILE_TOTAL_MAX_BYTES_DEFAULT
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise FrozenRateFileValidationError(
+            f"{FROZEN_RATE_FILE_TOTAL_MAX_BYTES_ENV} must be a positive integer"
+        ) from exc
+    if limit <= 0:
+        raise FrozenRateFileValidationError(
+            f"{FROZEN_RATE_FILE_TOTAL_MAX_BYTES_ENV} must be a positive integer"
+        )
+    return limit
+
+
+def _assert_frozen_set_byte_budget(
+    normalized_files: Sequence[Mapping[str, Any]],
+) -> None:
+    aggregate_bytes = sum(
+        int(descriptor["content_length"])
+        for descriptor in normalized_files
+    )
+    if aggregate_bytes > _frozen_total_max_bytes():
+        raise FrozenRateFileValidationError(
+            "frozen rate file aggregate content length exceeds the configured "
+            "byte budget"
+        )
 
 
 def _assert_frozen_set_relationships(
@@ -360,6 +400,35 @@ def normalize_frozen_rate_file_set(
     return normalized, actual_digest
 
 
+def frozen_rate_file_proof_sha256(proof_rows: Any) -> str:
+    """Hash a complete ordinal-ordered proof set for candidate revalidation."""
+
+    if not isinstance(proof_rows, list) or not proof_rows:
+        raise FrozenRateFileValidationError(
+            "frozen rate file proof must be a non-empty array"
+        )
+    normalized_rows: list[dict[str, Any]] = []
+    for proof_row in proof_rows:
+        if (
+            not isinstance(proof_row, Mapping)
+            or proof_row.get("contract")
+            != FROZEN_RATE_FILE_PROOF_CONTRACT
+        ):
+            raise FrozenRateFileValidationError(
+                "frozen rate file proof contract is invalid"
+            )
+        normalized_rows.append(dict(proof_row))
+    normalized_rows.sort(key=lambda row: row.get("ordinal", 0))
+    return hashlib.sha256(
+        canonical_json_dumps(
+            {
+                "contract": FROZEN_RATE_FILE_PROOF_SET_CONTRACT,
+                "proof": normalized_rows,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 from process.ptg_parts.frozen_rate_runtime import (
     assert_frozen_input_compatibility,
     bind_frozen_rate_set_to_scope,
@@ -372,10 +441,13 @@ from process.ptg_parts.frozen_rate_runtime import (
 
 __all__ = [
     "FROZEN_RATE_FILE_PROOF_CONTRACT",
+    "FROZEN_RATE_FILE_PROOF_SET_CONTRACT",
     "FROZEN_RATE_FILE_SET_CONTRACT",
     "FROZEN_RATE_FILE_SET_MAX_CANONICAL_BYTES",
     "FROZEN_RATE_FILE_SET_MAX_FILES",
     "FROZEN_RATE_FILE_SET_MIN_FILES",
+    "FROZEN_RATE_FILE_TOTAL_MAX_BYTES_DEFAULT",
+    "FROZEN_RATE_FILE_TOTAL_MAX_BYTES_ENV",
     "FrozenRateFileMismatchError",
     "FrozenRateFileValidationError",
     "assert_frozen_input_compatibility",
@@ -383,6 +455,7 @@ __all__ = [
     "build_frozen_rate_jobs",
     "canonical_frozen_rate_file_set_json",
     "frozen_rate_file_set_sha256",
+    "frozen_rate_file_proof_sha256",
     "normalize_frozen_rate_file_set",
     "validate_frozen_artifacts",
     "validate_frozen_head",

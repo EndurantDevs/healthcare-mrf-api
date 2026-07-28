@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from process.ptg_parts.canonical import canonical_json_dumps, canonicalize_url
@@ -98,54 +97,52 @@ def validate_frozen_head(
     descriptor: Mapping[str, Any],
     raw_artifact: PTG2RawArtifact,
 ) -> None:
-    """Verify final HEAD/body validators carried by one acquired raw artifact."""
+    """Verify available live evidence without requiring origin HEAD support."""
 
     head = raw_artifact.head
     if head is None:
+        if raw_artifact.reused:
+            return
         raise FrozenRateFileMismatchError(
-            "frozen rate file HEAD metadata is unavailable"
+            "frozen rate file final GET metadata is unavailable"
+        )
+    if head.url and canonicalize_url(head.url) != descriptor.get(
+        "canonical_url"
+    ):
+        raise FrozenRateFileMismatchError(
+            "frozen rate file resolved to a different canonical URL"
         )
     expected_etag = descriptor.get("etag")
-    if expected_etag is not None and head.etag != expected_etag:
+    if (
+        expected_etag is not None
+        and (not raw_artifact.reused or head.etag is not None)
+        and head.etag != expected_etag
+    ):
         raise FrozenRateFileMismatchError(
             "frozen rate file ETag changed before acquisition"
         )
     expected_last_modified = descriptor.get("last_modified")
     if (
         expected_last_modified is not None
+        and (not raw_artifact.reused or head.last_modified is not None)
         and head.last_modified != expected_last_modified
     ):
         raise FrozenRateFileMismatchError(
             "frozen rate file Last-Modified changed before acquisition"
         )
-    if head.content_length != descriptor.get("content_length"):
-        raise FrozenRateFileMismatchError(
-            "frozen rate file HEAD content length changed before acquisition"
-        )
     if (
-        not head.supports_head
-        or head.status is None
-        or not 200 <= head.status < 300
+        (not raw_artifact.reused or head.content_length is not None)
+        and head.content_length != descriptor.get("content_length")
     ):
         raise FrozenRateFileMismatchError(
-            "frozen rate file HEAD validator is unavailable"
+            "frozen rate file live content length changed before acquisition"
         )
-    if head.url and canonicalize_url(head.url) != descriptor.get(
-        "canonical_url"
+    if not raw_artifact.reused and (
+        head.status is None or not 200 <= head.status < 300
     ):
         raise FrozenRateFileMismatchError(
-            "frozen rate file HEAD resolved to a different canonical URL"
+            "frozen rate file final GET evidence is unavailable"
         )
-
-
-def _cleanup_fresh_artifacts(
-    raw_artifact: PTG2RawArtifact,
-    logical_artifact: PTG2LogicalArtifact,
-) -> None:
-    if not logical_artifact.reused:
-        Path(logical_artifact.logical_path).unlink(missing_ok=True)
-    if not raw_artifact.reused:
-        Path(raw_artifact.raw_path).unlink(missing_ok=True)
 
 
 def validate_frozen_artifacts(
@@ -155,34 +152,30 @@ def validate_frozen_artifacts(
 ) -> None:
     """Fail closed when retained or downloaded bytes differ from frozen proof."""
 
-    try:
-        validate_frozen_head(descriptor, raw_artifact)
-        if raw_artifact.canonical_url != descriptor.get("canonical_url"):
-            raise FrozenRateFileMismatchError(
-                "frozen rate file canonical URL changed during acquisition"
-            )
-        if raw_artifact.byte_count != descriptor.get("content_length"):
-            raise FrozenRateFileMismatchError(
-                "frozen rate file body content length does not match"
-            )
-        if not hmac.compare_digest(
-            raw_artifact.raw_sha256,
-            str(descriptor.get("raw_sha256") or ""),
+    validate_frozen_head(descriptor, raw_artifact)
+    if raw_artifact.canonical_url != descriptor.get("canonical_url"):
+        raise FrozenRateFileMismatchError(
+            "frozen rate file canonical URL changed during acquisition"
+        )
+    if raw_artifact.byte_count != descriptor.get("content_length"):
+        raise FrozenRateFileMismatchError(
+            "frozen rate file body content length does not match"
+        )
+    if not hmac.compare_digest(
+        raw_artifact.raw_sha256,
+        str(descriptor.get("raw_sha256") or ""),
+    ):
+        raise FrozenRateFileMismatchError(
+            "frozen rate file raw SHA-256 does not match"
+        )
+    if not descriptor.get("logical_hash_deferred"):
+        if logical_artifact.logical_hash_deferred or not hmac.compare_digest(
+            logical_artifact.logical_sha256,
+            str(descriptor.get("logical_sha256") or ""),
         ):
             raise FrozenRateFileMismatchError(
-                "frozen rate file raw SHA-256 does not match"
+                "frozen rate file logical SHA-256 does not match"
             )
-        if not descriptor.get("logical_hash_deferred"):
-            if logical_artifact.logical_hash_deferred or not hmac.compare_digest(
-                logical_artifact.logical_sha256,
-                str(descriptor.get("logical_sha256") or ""),
-            ):
-                raise FrozenRateFileMismatchError(
-                    "frozen rate file logical SHA-256 does not match"
-                )
-    except FrozenRateFileMismatchError:
-        _cleanup_fresh_artifacts(raw_artifact, logical_artifact)
-        raise
 
 
 def _processed_result_by_url(

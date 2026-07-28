@@ -1,0 +1,133 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Retry contract for exact frozen-file GET evidence."""
+
+from __future__ import annotations
+
+import importlib
+from contextlib import asynccontextmanager
+
+import pytest
+
+from process.ptg_parts.domain import PTG2HeadMetadata
+
+
+source_download = importlib.import_module(
+    "process.ptg_parts.source_download"
+)
+
+
+class _FakeSession:
+    def __init__(self, **_kwargs) -> None:
+        self.is_open = False
+
+    async def __aenter__(self):
+        self.is_open = True
+        return self
+
+    async def __aexit__(self, *_args):
+        self.is_open = False
+        return None
+
+
+class _TransientContent:
+    def __init__(self, *, should_fail: bool) -> None:
+        self.should_fail = should_fail
+
+    async def iter_chunked(self, _chunk_size):
+        yield b"{"
+        if self.should_fail:
+            raise RuntimeError("transient body interruption")
+        yield b"}"
+
+
+class _ExactGetResponse:
+    status = 200
+
+    def __init__(self, url: str, *, should_fail: bool) -> None:
+        self.url = url
+        self.headers = {
+            "Content-Length": "2",
+            "ETag": '"exact-get"',
+            "Last-Modified": "Mon, 27 Jul 2026 10:00:00 GMT",
+            "Content-Type": "application/json",
+        }
+        self.content = _TransientContent(should_fail=should_fail)
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _ExactGetRetryHarness:
+    def __init__(self, partial_path) -> None:
+        self.partial_path = partial_path
+        self.request_headers: list[dict[str, str] | None] = []
+        self.pre_request_bytes: list[bytes | None] = []
+
+    @asynccontextmanager
+    async def validated_request(
+        self,
+        _session,
+        _method,
+        url,
+        *,
+        headers=None,
+    ):
+        self.request_headers.append(headers)
+        self.pre_request_bytes.append(
+            self.partial_path.read_bytes()
+            if self.partial_path.exists()
+            else None
+        )
+        should_fail = len(self.request_headers) == 1
+        yield _ExactGetResponse(url, should_fail=should_fail)
+
+
+@pytest.mark.asyncio
+async def test_exact_get_retry_discards_sidecar_and_partial_prefix(
+    monkeypatch,
+    tmp_path,
+):
+    """Every frozen retry is a full GET with no retained partial prefix."""
+
+    partial_path = tmp_path / "artifact.part"
+    partial_path.write_bytes(b"stale-prefix")
+    sidecar_path = source_download._range_sidecar_path(partial_path)
+    sidecar_path.write_text('{"stale": true}', encoding="utf-8")
+    harness = _ExactGetRetryHarness(partial_path)
+    canonical_url = "https://rates.example.test/part.json"
+    monkeypatch.setattr(
+        source_download.aiohttp,
+        "ClientSession",
+        _FakeSession,
+    )
+    monkeypatch.setattr(
+        source_download,
+        "_validated_request",
+        harness.validated_request,
+    )
+    monkeypatch.setattr(source_download, "_download_retry_count", lambda: 1)
+    monkeypatch.setattr(
+        source_download,
+        "_download_retry_delay_seconds",
+        lambda: 0,
+    )
+
+    download_result = await source_download._download_raw_artifact_single_get(
+        url=canonical_url,
+        path=partial_path,
+        head=PTG2HeadMetadata(
+            url=canonical_url,
+            etag='"stale"',
+            content_length=12,
+            supports_head=False,
+        ),
+        max_bytes=None,
+        started_at=0,
+        allow_resume=False,
+    )
+
+    assert harness.request_headers == [None, None]
+    assert harness.pre_request_bytes == [None, None]
+    assert download_result[1] == 2
+    assert partial_path.read_bytes() == b"{}"
+    assert not sidecar_path.exists()

@@ -43,10 +43,11 @@ from process.ptg_parts.config import (
     PTG2_RUST_WORK_QUEUE_ENV,
     PTG2_RUST_WORKERS_ENV,
 )
-from process.ptg_parts.ptg2_source_witness_contract import (
-    WitnessPayloadLimitError,
+from process.ptg_frozen_control import (
+    frozen_rate_main_kwargs,
+    validated_worker_frozen_rate_params,
 )
-from process.ptg_frozen_control import frozen_rate_failure_payload, frozen_rate_main_kwargs, validated_frozen_rate_params as _validated_frozen_rate_params
+from process.ptg_control_failures import ptg_failure_error
 from process.ptg_control_runtime import (
     PTG_CONTROL_HEARTBEAT_SOURCE,
     _stale_ptg_job_result,
@@ -56,77 +57,17 @@ from process.ptg_control_runtime import (
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
 _FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
-_PROVIDER_GROUP_DEFINITION_ERROR_MARKERS = (
-    "conflicting provider_group_id definition:",
-    "duplicate provider_group_id definition:",
-)
-
-
-def _exception_leaves(error: BaseException) -> tuple[BaseException, ...]:
-    if isinstance(error, BaseExceptionGroup):
-        return tuple(
-            leaf
-            for nested_error in error.exceptions
-            for leaf in _exception_leaves(nested_error)
-        )
-    return (error,)
-
-
-def _ptg_failure_error(error: BaseException) -> dict[str, Any]:
-    leaves = _exception_leaves(error)
-    witness_budget_error = next(
-        (
-            leaf
-            for leaf in leaves
-            if isinstance(leaf, WitnessPayloadLimitError)
-        ),
-        None,
-    )
-    if witness_budget_error is not None:
-        return {
-            "code": "ptg_source_witness_payload_budget_exceeded",
-            "message": str(witness_budget_error),
-            "retryable": False,
-        }
-    provider_group_error = next(
-        (
-            leaf
-            for leaf in leaves
-            if any(
-                marker in str(leaf)
-                for marker in _PROVIDER_GROUP_DEFINITION_ERROR_MARKERS
-            )
-        ),
-        None,
-    )
-    if provider_group_error is not None:
-        return {
-            "code": "ptg_provider_group_definition_conflict",
-            "message": str(provider_group_error),
-        }
-    frozen_failure = frozen_rate_failure_payload(leaves)
-    if frozen_failure is not None:
-        return frozen_failure
-    leaf_messages = tuple(
-        dict.fromkeys(str(leaf).strip() for leaf in leaves if str(leaf).strip())
-    )
-    return {
-        "code": "ptg_import_failed",
-        "message": "; ".join(leaf_messages) if leaf_messages else str(error),
-    }
-
-
 async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     """Run one PTG control task with cancellation and heartbeat handling."""
     bind_status_event_loop()
     task_payload = task if isinstance(task, dict) else {}
     run_id = str(task_payload.get("run_id") or "").strip()
-    params = (
+    params_by_name = (
         task_payload.get("params")
         if isinstance(task_payload.get("params"), dict)
         else task_payload
     )
-    params = _validated_frozen_rate_params(dict(params))
+    params_by_name = dict(params_by_name)
     attempt_started_at = dt.datetime.now(dt.UTC).isoformat(
         timespec="microseconds"
     )
@@ -181,40 +122,67 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 attempt_started_at,
                 attempt_id=attempt_id,
             )
+        params_by_name = await validated_worker_frozen_rate_params(
+            task_payload,
+            params_by_name,
+        )
         full_rebuild_scope_digest = _full_rebuild_scope_digest(
-            params,
+            params_by_name,
         )
         full_rebuild_proof_metrics_by_name = (
             _full_rebuild_proof_metrics_by_name(full_rebuild_scope_digest)
         )
         should_reuse_raw_artifacts = bool(
-            params.get("reuse_raw_artifacts", True)
+            params_by_name.get("reuse_raw_artifacts", True)
         )
-        should_keep_partial_artifacts = params.get("keep_partial_artifacts")
+        should_keep_partial_artifacts = params_by_name.get(
+            "keep_partial_artifacts"
+        )
         if full_rebuild_scope_digest is not None:
             should_reuse_raw_artifacts = False
             should_keep_partial_artifacts = False
         await raise_if_cancelled(ctx, task_payload)
-        _assert_expected_lane(params)
-        with _ptg_lane_environment(params):
+        _assert_expected_lane(params_by_name)
+        with _ptg_lane_environment(params_by_name):
             import_result = await ptg_main(
-                test_mode=bool(params.get("test_mode", params.get("test", False))),
-                toc_urls=_string_list(params.get("toc_urls") or params.get("toc_url")),
-                toc_list=params.get("toc_list"),
-                in_network_url=params.get("in_network_url"),
-                allowed_url=params.get("allowed_url"),
-                **frozen_rate_main_kwargs(params),
-                provider_ref_url=params.get("provider_ref_url"),
-                import_id=params.get("import_id"),
-                source_key=params.get("source_key"),
-                import_month=params.get("import_month"),
-                max_files=_optional_int(params.get("max_files")),
-                max_items=_optional_int(params.get("max_items")),
-                plan_ids=_string_list(params.get("plan_ids") or params.get("plan_id")),
-                plan_name_contains=_string_list(params.get("plan_name_contains")),
-                plan_market_types=_string_list(params.get("plan_market_types") or params.get("plan_market_type")),
-                file_url_contains=_string_list(params.get("file_url_contains")),
-                source_network_names=_string_list(params.get("source_network_names") or params.get("source_network_name")),
+                test_mode=bool(
+                    params_by_name.get(
+                        "test_mode",
+                        params_by_name.get("test", False),
+                    )
+                ),
+                toc_urls=_string_list(
+                    params_by_name.get("toc_urls")
+                    or params_by_name.get("toc_url")
+                ),
+                toc_list=params_by_name.get("toc_list"),
+                in_network_url=params_by_name.get("in_network_url"),
+                allowed_url=params_by_name.get("allowed_url"),
+                **frozen_rate_main_kwargs(params_by_name),
+                provider_ref_url=params_by_name.get("provider_ref_url"),
+                import_id=params_by_name.get("import_id"),
+                source_key=params_by_name.get("source_key"),
+                import_month=params_by_name.get("import_month"),
+                max_files=_optional_int(params_by_name.get("max_files")),
+                max_items=_optional_int(params_by_name.get("max_items")),
+                plan_ids=_string_list(
+                    params_by_name.get("plan_ids")
+                    or params_by_name.get("plan_id")
+                ),
+                plan_name_contains=_string_list(
+                    params_by_name.get("plan_name_contains")
+                ),
+                plan_market_types=_string_list(
+                    params_by_name.get("plan_market_types")
+                    or params_by_name.get("plan_market_type")
+                ),
+                file_url_contains=_string_list(
+                    params_by_name.get("file_url_contains")
+                ),
+                source_network_names=_string_list(
+                    params_by_name.get("source_network_names")
+                    or params_by_name.get("source_network_name")
+                ),
                 reuse_raw_artifacts=should_reuse_raw_artifacts,
                 keep_partial_artifacts=should_keep_partial_artifacts,
                 control_run_id=run_id,
@@ -301,7 +269,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 "message": "controlled PTG full rebuild failed",
             }
             if full_rebuild_proof_metrics_by_name
-            else _ptg_failure_error(exc)
+            else ptg_failure_error(exc)
         )
         await mark_control_run(
             run_id,

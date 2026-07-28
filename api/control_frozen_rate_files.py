@@ -5,8 +5,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from process.ptg_parts.frozen_rate_files import (
-    normalize_frozen_rate_file_set,
+from process.ptg_parts.frozen_rate_binding import (
+    FROZEN_RATE_FILE_PROTECTED_FIELDS,
+    normalize_protected_frozen_rate_params,
+    protected_frozen_tuple_presence,
 )
 
 
@@ -14,15 +16,14 @@ def ptg_import_file_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
     """Map the scalar route while refusing the private multipart envelope."""
 
     supplied_params = request_payload.get("params")
-    if (
-        "frozen_rate_files" in request_payload
-        or "frozen_rate_file_set_sha256" in request_payload
-        or (
-            isinstance(supplied_params, dict)
-            and (
-                "frozen_rate_files" in supplied_params
-                or "frozen_rate_file_set_sha256" in supplied_params
-            )
+    if any(
+        field_name in request_payload
+        for field_name in FROZEN_RATE_FILE_PROTECTED_FIELDS
+    ) or (
+        isinstance(supplied_params, dict)
+        and any(
+            field_name in supplied_params
+            for field_name in FROZEN_RATE_FILE_PROTECTED_FIELDS
         )
     ):
         raise ValueError(
@@ -69,21 +70,30 @@ def validated_control_import_payload(
         return request_payload
     raw_params = request_payload.get("params")
     params_by_name = dict(raw_params) if isinstance(raw_params, dict) else {}
-    has_files = "frozen_rate_files" in params_by_name
-    has_digest = "frozen_rate_file_set_sha256" in params_by_name
-    if not has_files and not has_digest:
+    supplied_fields = protected_frozen_tuple_presence(params_by_name)
+    if not supplied_fields:
         return request_payload
-    if not has_files or not has_digest:
-        raise ValueError(
-            "frozen_rate_files and frozen_rate_file_set_sha256 are required together"
-        )
-    normalized_files, set_digest = normalize_frozen_rate_file_set(
-        params_by_name["frozen_rate_files"],
-        params_by_name["frozen_rate_file_set_sha256"],
+    params_by_name = normalize_protected_frozen_rate_params(params_by_name)
+    nested_source_file_import_id = params_by_name["source_file_import_id"]
+    outer_ids = (
+        request_payload.get("source_file_import_id"),
+        request_payload.get("import_id"),
     )
-    params_by_name["frozen_rate_files"] = normalized_files
-    params_by_name["frozen_rate_file_set_sha256"] = set_digest
-    return {**request_payload, "params": params_by_name}
+    if any(
+        not isinstance(raw_id, str)
+        or raw_id.strip() != nested_source_file_import_id
+        for raw_id in outer_ids
+    ):
+        raise ValueError(
+            "protected outer and nested source_file_import_id and import_id "
+            "must all match"
+        )
+    return {
+        **request_payload,
+        "source_file_import_id": nested_source_file_import_id,
+        "import_id": nested_source_file_import_id,
+        "params": params_by_name,
+    }
 
 
 __all__ = [

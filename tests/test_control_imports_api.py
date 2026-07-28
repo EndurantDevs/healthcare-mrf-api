@@ -83,6 +83,11 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
         "publish_partial",
         "allow_volume_drop",
     }
+
+
+def test_importer_registry_exposes_provider_directory_params():
+    importer_by_name = {entry["name"]: entry for entry in importer_registry()}
+
     resources_param = next(
         param
         for param in importer_by_name["provider-directory-fhir"]["params_schema"]
@@ -121,6 +126,11 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "timeout" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "open_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "include_auth_required" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+
+
+def test_importer_registry_exposes_reference_and_discovery_params():
+    importer_by_name = {entry["name"]: entry for entry in importer_registry()}
+
     assert importer_by_name["code-sets"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["ms-drg"]["family"] == "reference"
     assert importer_by_name["ms-drg"]["enqueue_adapter"] == "arq_single_job"
@@ -154,6 +164,11 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "file_probe_types" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "file_probe_entity_types" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "file_probe_payer_query" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+
+
+def test_importer_registry_exposes_archive_and_address_params():
+    importer_by_name = {entry["name"]: entry for entry in importer_registry()}
+
     assert any(param["name"] == "include_relationships" and param["type"] == "boolean" for param in importer_by_name["ms-drg"]["params_schema"])
     assert any(param["name"] == "relationship_page_limit" and param["type"] == "integer" for param in importer_by_name["ms-drg"]["params_schema"])
     assert any(param["name"] == "dry_run" and param["is_flag"] for param in importer_by_name["address-archive-v2-migrate"]["params_schema"])
@@ -167,6 +182,11 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "import_id" and param["type"] == "text" for param in importer_by_name["openaddresses"]["params_schema"])
     assert any(param["name"] == "local_files" and param["multiple"] for param in importer_by_name["openaddresses"]["params_schema"])
     assert any(param["name"] == "resume_stage" and param["is_flag"] for param in importer_by_name["openaddresses"]["params_schema"])
+
+
+def test_importer_registry_exposes_entity_address_params():
+    importer_by_name = {entry["name"]: entry for entry in importer_registry()}
+
     assert any(
         param["name"] == "limit_per_source" and param["type"] == "integer"
         for param in importer_by_name["entity-address-unified"]["params_schema"]
@@ -1647,23 +1667,37 @@ async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
     assert created_run_map == active_run_map
 
 
-@pytest.mark.asyncio
-async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
-    statements = []
-    importer_checks = []
+class _ParallelPTGConnection:
+    def __init__(self, harness):
+        self.harness = harness
 
-    class FakeDb:
-        async def execute(self, statement):
-            statements.append(statement)
+    async def scalar(self, *_args, **_kwargs):
+        return 1
 
-    async def fake_find_idem(_idempotency_key):
+    async def status(self, statement):
+        self.harness.statements.append(statement)
+
+
+class _ParallelPTGRunHarness:
+    def __init__(self):
+        self.statements = []
+        self.importer_checks = []
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield _ParallelPTGConnection(self)
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+
+    async def no_idempotent_run(self, _idempotency_key):
         return None
 
-    async def fail_find_importer(importer):
-        importer_checks.append(importer)
+    async def reject_importer_singleton(self, importer):
+        self.importer_checks.append(importer)
         raise AssertionError("source-file PTG runs should not use the importer-wide singleton")
 
-    async def fake_enqueue(source_row):
+    async def enqueue(self, source_row):
         return {
             "status": "queued",
             "phase_detail": "enqueued",
@@ -1673,10 +1707,48 @@ async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
             "error": None,
         }
 
-    monkeypatch.setattr(control_imports, "db", FakeDb())
-    monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
-    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", fail_find_importer)
-    monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
+    async def bind(self, _connection, _params_by_name):
+        return None
+
+    async def no_active_idempotency(
+        self,
+        _connection,
+        _idempotency_key,
+    ):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
+    """Source-file PTG admission bypasses only the importer-wide singleton."""
+
+    harness = _ParallelPTGRunHarness()
+    monkeypatch.setattr(control_imports, "db", harness)
+    monkeypatch.setattr(
+        control_imports,
+        "find_active_run_by_idempotency_key",
+        harness.no_idempotent_run,
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "find_earliest_active_run_by_importer",
+        harness.reject_importer_singleton,
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "_enqueue_import_start",
+        harness.enqueue,
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "insert_or_compare_frozen_binding",
+        harness.bind,
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "_active_idempotency_run",
+        harness.no_active_idempotency,
+    )
 
     source_row, created = await create_import_run(
         {
@@ -1691,8 +1763,8 @@ async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
     assert source_row["run_id"] == "run_ptg_source_file"
     assert source_row["metrics"]["queue"] == "arq:PTG"
     assert source_row["source_file_import_id"] == "source-file-1"
-    assert importer_checks == []
-    assert len(statements) == 2
+    assert harness.importer_checks == []
+    assert len(harness.statements) == 2
 
 
 @pytest.mark.asyncio
@@ -3577,6 +3649,38 @@ async def test_control_ptg_source_snapshot_promote_endpoint(monkeypatch):
     ]
 
 
+def _assert_address_refresh_calls(
+    promote_calls: list[dict[str, object]],
+    import_calls: list[dict[str, object]],
+) -> None:
+    assert promote_calls == [
+        {
+            "source_key": "source_a",
+            "snapshot_id": "snap_new",
+            "expected_current_snapshot_id": "snap_old",
+        }
+    ]
+    assert import_calls == [
+        {
+            "run_id": None,
+            "importer": "entity-address-unified",
+            "params": {
+                "test_mode": True,
+                "limit_per_source": 25,
+                "publish": True,
+                "refresh_mode": "full",
+                "trigger_source_key": "source_a",
+                "trigger_snapshot_id": "snap_new",
+            },
+            "idempotency_key": "idem-refresh",
+            "triggered_by": "ptg_source_snapshot_promote",
+            "schedule_id": None,
+            "subscription_id": None,
+            "import_id": None,
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_control_ptg_source_snapshot_promote_endpoint_can_enqueue_address_refresh(monkeypatch):
     """Verify control ptg source snapshot promote endpoint can enqueue address refresh."""
@@ -3621,32 +3725,7 @@ async def test_control_ptg_source_snapshot_promote_endpoint_can_enqueue_address_
     assert response_by_field["snapshot_id"] == "snap_new"
     assert response_by_field["address_refresh"]["created"] is True
     assert response_by_field["address_refresh"]["run"]["run_id"] == "run_refresh"
-    assert promote_calls == [
-        {
-            "source_key": "source_a",
-            "snapshot_id": "snap_new",
-            "expected_current_snapshot_id": "snap_old",
-        }
-    ]
-    assert import_calls == [
-        {
-            "run_id": None,
-            "importer": "entity-address-unified",
-            "params": {
-                "test_mode": True,
-                "limit_per_source": 25,
-                "publish": True,
-                "refresh_mode": "full",
-                "trigger_source_key": "source_a",
-                "trigger_snapshot_id": "snap_new",
-            },
-            "idempotency_key": "idem-refresh",
-            "triggered_by": "ptg_source_snapshot_promote",
-            "schedule_id": None,
-            "subscription_id": None,
-            "import_id": None,
-        }
-    ]
+    _assert_address_refresh_calls(promote_calls, import_calls)
 
 
 @pytest.mark.asyncio

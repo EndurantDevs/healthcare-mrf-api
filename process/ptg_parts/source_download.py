@@ -22,7 +22,7 @@ import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import aiohttp
@@ -82,7 +82,10 @@ from process.ptg_parts.input_artifact_retention import (
     publish_artifact_file,
     publish_verified_artifact_stage,
 )
-from process.ptg_parts.frozen_rate_files import validate_frozen_artifacts
+from process.ptg_parts.frozen_rate_files import (
+    FrozenRateFileMismatchError,
+    validate_frozen_artifacts,
+)
 from process.ptg_parts.progress import _scale_stage_progress_pct
 from process.ptg_parts.screen import _emit_screen_line
 from process.url_security import UnsafeUrlError, assert_safe_url
@@ -95,6 +98,17 @@ PTG2_DEFAULT_MAX_BYTES = 64 * 1024 * 1024 * 1024
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 10
 _GZIP_INTEGRITY_CHUNK_BYTES = 8 * 1024 * 1024
+_SingleGetResult = tuple[
+    Any,
+    int,
+    str | None,
+    int | None,
+    str | None,
+    str | None,
+    int | None,
+    str | None,
+    str | None,
+]
 _GZIP_REUSE_VALIDATE_MAX_BYTES_ENV = "HLTHPRT_PTG2_REUSE_GZIP_VALIDATE_MAX_BYTES"
 _GZIP_VALIDATE_FRESH_ENV = "HLTHPRT_PTG2_VALIDATE_FRESH_GZIP"
 INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
@@ -490,43 +504,62 @@ def _format_eta_seconds(seconds: float | None) -> str:
     return f"{seconds:.0f}"
 
 
-def _emit_download_progress(
+@dataclass(frozen=True)
+class _DownloadProgressMetrics:
+    elapsed: float
+    mib_per_second: float
+    percent: float
+    eta_seconds: float
+    total_text: str
+    eta_text: str
+
+
+def _download_progress_metrics(
+    *,
+    bytes_read: int,
+    total_bytes: int | None,
+    started_at: float,
+) -> _DownloadProgressMetrics:
+    elapsed = max(time.monotonic() - started_at, 0.0)
+    mib_per_second = (
+        (bytes_read / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
+    )
+    if total_bytes and total_bytes > 0:
+        percent = min((bytes_read / total_bytes) * 100, 100.0)
+        eta_seconds = (
+            ((total_bytes - bytes_read) / (1024 * 1024))
+            / mib_per_second
+            if mib_per_second > 0 and total_bytes > bytes_read
+            else 0.0
+        )
+        return _DownloadProgressMetrics(
+            elapsed,
+            mib_per_second,
+            percent,
+            eta_seconds,
+            str(total_bytes),
+            _format_eta_seconds(eta_seconds),
+        )
+    return _DownloadProgressMetrics(
+        elapsed,
+        mib_per_second,
+        0.0,
+        0.0,
+        "unknown",
+        "unknown",
+    )
+
+
+def _publish_download_live_progress(
     *,
     url: str,
     bytes_read: int,
     total_bytes: int | None,
-    started_at: float,
-    done: bool,
+    metrics: _DownloadProgressMetrics,
+    live_context: Mapping[str, Any],
 ) -> None:
-    """Publish one weighted compressed-download progress observation."""
-
-    elapsed = max(time.monotonic() - started_at, 0.0)
-    mib_s = (bytes_read / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
-    if total_bytes and total_bytes > 0:
-        percent = min((bytes_read / total_bytes) * 100, 100.0)
-        eta = ((total_bytes - bytes_read) / (1024 * 1024)) / mib_s if mib_s > 0 and total_bytes > bytes_read else 0.0
-        total_text = str(total_bytes)
-        eta_text = _format_eta_seconds(eta)
-    else:
-        percent = 0.0
-        total_text = "unknown"
-        eta_text = "unknown"
-    line = (
-        "PTG2_DOWNLOAD_PROGRESS"
-        f"\turl={url}"
-        f"\tbytes={bytes_read}"
-        f"\ttotal_bytes={total_text}"
-        f"\tpercent={percent:.2f}"
-        f"\tmib_s={mib_s:.2f}"
-        f"\telapsed_seconds={elapsed:.0f}"
-        f"\teta_seconds={eta_text}"
-        f"\tdone={'true' if done else 'false'}"
-    )
-    _emit_screen_line(line, stderr=True)
-    logger.info(line)
-    live_context = current_live_progress_context()
     overall_pct = _scale_stage_progress_pct(
-        percent,
+        metrics.percent,
         live_context.get("overall_progress_start_pct"),
         live_context.get("overall_progress_end_pct"),
     )
@@ -534,12 +567,13 @@ def _emit_download_progress(
     pct = (
         held_run_pct
         if held_run_pct is not None
-        else overall_pct if overall_pct is not None else percent
+        else overall_pct if overall_pct is not None else metrics.percent
     )
-    aggregate_stage_pct = 0.0 if held_run_pct is not None else percent
+    aggregate_stage_pct = 0.0 if held_run_pct is not None else metrics.percent
     phase_detail = (
-        f"download {percent:.2f}% "
-        f"({bytes_read / (1024 ** 2):.1f} MiB/{(total_bytes or 0) / (1024 ** 2):.1f} MiB)"
+        f"download {metrics.percent:.2f}% "
+        f"({bytes_read / (1024 ** 2):.1f} MiB/"
+        f"{(total_bytes or 0) / (1024 ** 2):.1f} MiB)"
         if total_bytes and total_bytes > 0
         else f"downloaded {bytes_read / (1024 ** 2):.1f} MiB"
     )
@@ -556,16 +590,60 @@ def _emit_download_progress(
         work_done=bytes_read,
         work_total=total_bytes,
         pct=pct,
-        phase_pct=percent,
-        rate={"mib_s": mib_s},
-        throughput={"unit": "mib_per_second", "value": mib_s},
-        eta_seconds=eta if total_bytes and total_bytes > 0 else None,
+        phase_pct=metrics.percent,
+        rate={"mib_s": metrics.mib_per_second},
+        throughput={
+            "unit": "mib_per_second",
+            "value": metrics.mib_per_second,
+        },
+        eta_seconds=(
+            metrics.eta_seconds
+            if total_bytes and total_bytes > 0
+            else None
+        ),
         message=f"downloading {_safe_download_label(url)}",
         detail=phase_detail,
         label=url,
         file_index=live_context.get("file_index"),
         file_count=live_context.get("file_count"),
         file_name=live_context.get("file_name"),
+    )
+
+
+def _emit_download_progress(
+    *,
+    url: str,
+    bytes_read: int,
+    total_bytes: int | None,
+    started_at: float,
+    done: bool,
+) -> None:
+    """Publish one weighted compressed-download progress observation."""
+
+    metrics = _download_progress_metrics(
+        bytes_read=bytes_read,
+        total_bytes=total_bytes,
+        started_at=started_at,
+    )
+    line = (
+        "PTG2_DOWNLOAD_PROGRESS"
+        f"\turl={url}"
+        f"\tbytes={bytes_read}"
+        f"\ttotal_bytes={metrics.total_text}"
+        f"\tpercent={metrics.percent:.2f}"
+        f"\tmib_s={metrics.mib_per_second:.2f}"
+        f"\telapsed_seconds={metrics.elapsed:.0f}"
+        f"\teta_seconds={metrics.eta_text}"
+        f"\tdone={'true' if done else 'false'}"
+    )
+    _emit_screen_line(line, stderr=True)
+    logger.info(line)
+    _publish_download_live_progress(
+        url=url,
+        bytes_read=bytes_read,
+        total_bytes=total_bytes,
+        metrics=metrics,
+        live_context=current_live_progress_context(),
     )
 
 
@@ -655,7 +733,173 @@ async def _probe_http_range_support(
         return False, None, None, None
 
 
-async def _download_raw_artifact_ranges(
+@dataclass
+class _RangeTransfer:
+    received_bytes: int = 0
+    counted_bytes: int = 0
+
+
+@dataclass
+class _RangeDownloadContext:
+    url: str
+    partial_path: Path
+    total_bytes: int
+    etag: str
+    started_at: float
+    sidecar_path: Path
+    completed_ranges: set[tuple[int, int]]
+    progress: RangeDownloadProgress
+    lock: asyncio.Lock
+    semaphore: asyncio.Semaphore
+
+    async def _record_chunk(self, chunk_bytes: int) -> None:
+        async with self.lock:
+            self.progress.completed_bytes += chunk_bytes
+            if (
+                self.progress.completed_bytes
+                < self.progress.next_progress_bytes
+            ):
+                return
+            _emit_download_progress(
+                url=self.url,
+                bytes_read=min(
+                    self.progress.completed_bytes,
+                    self.total_bytes,
+                ),
+                total_bytes=self.total_bytes,
+                started_at=self.started_at,
+                done=False,
+            )
+            interval = _download_progress_interval_bytes()
+            while (
+                self.progress.completed_bytes
+                >= self.progress.next_progress_bytes
+            ):
+                self.progress.next_progress_bytes += interval
+
+    async def _rollback_progress(self, counted_bytes: int) -> None:
+        if not counted_bytes:
+            return
+        interval = _download_progress_interval_bytes()
+        async with self.lock:
+            self.progress.completed_bytes = max(
+                0,
+                self.progress.completed_bytes - counted_bytes,
+            )
+            while (
+                self.progress.next_progress_bytes > interval
+                and self.progress.completed_bytes
+                < self.progress.next_progress_bytes - interval
+            ):
+                self.progress.next_progress_bytes -= interval
+
+    async def _mark_completed(
+        self,
+        byte_range: tuple[int, int],
+    ) -> None:
+        async with self.lock:
+            self.completed_ranges.add(byte_range)
+            _write_completed_ranges(
+                self.sidecar_path,
+                total_bytes=self.total_bytes,
+                etag=self.etag,
+                completed=self.completed_ranges,
+            )
+
+    async def _stream_response(
+        self,
+        response: aiohttp.ClientResponse,
+        *,
+        start: int,
+        transfer: _RangeTransfer,
+    ) -> None:
+        offset = start
+        descriptor = os.open(self.partial_path, os.O_WRONLY)
+        try:
+            async for chunk in response.content.iter_chunked(1024 * 1024):
+                if not chunk:
+                    continue
+                os.pwrite(descriptor, chunk, offset)
+                offset += len(chunk)
+                transfer.received_bytes += len(chunk)
+                transfer.counted_bytes += len(chunk)
+                await self._record_chunk(len(chunk))
+        finally:
+            os.close(descriptor)
+
+    async def _fetch_range(
+        self,
+        session: aiohttp.ClientSession,
+        byte_range: tuple[int, int],
+    ) -> None:
+        start, end = byte_range
+        headers_by_name = {
+            "Range": f"bytes={start}-{end}",
+            "If-Match": self.etag,
+        }
+        transfer = _RangeTransfer()
+        is_completed = False
+        try:
+            async with _validated_request(
+                session,
+                "GET",
+                self.url,
+                headers=headers_by_name,
+            ) as response:
+                _validate_range_response(
+                    response,
+                    url=self.url,
+                    expected_start=start,
+                    expected_end=end,
+                    expected_total=self.total_bytes,
+                    expected_etag=self.etag,
+                )
+                await self._stream_response(
+                    response,
+                    start=start,
+                    transfer=transfer,
+                )
+                expected_length = end - start + 1
+                if transfer.received_bytes != expected_length:
+                    raise RuntimeError(
+                        f"Range download for {self.url} returned "
+                        f"{transfer.received_bytes} bytes, expected "
+                        f"{expected_length}"
+                    )
+                is_completed = True
+                await self._mark_completed(byte_range)
+        finally:
+            if not is_completed:
+                await self._rollback_progress(transfer.counted_bytes)
+
+    async def _bounded_fetch(
+        self,
+        session: aiohttp.ClientSession,
+        byte_range: tuple[int, int],
+    ) -> None:
+        async with self.semaphore:
+            retries = _download_retry_count()
+            for attempt in range(retries + 1):
+                try:
+                    await self._fetch_range(session, byte_range)
+                    return
+                except Exception as exc:
+                    if attempt >= retries:
+                        raise
+                    delay = _download_retry_delay_seconds() * (2 ** attempt)
+                    message = (
+                        f"PTG2_DOWNLOAD_RETRY url={self.url} "
+                        f"range={byte_range[0]}-{byte_range[1]} "
+                        f"attempt={attempt + 1} next_attempt={attempt + 2} "
+                        f"delay_seconds={delay:.2f} error={exc}"
+                    )
+                    _emit_screen_line(message, stderr=True)
+                    logger.debug(message)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+
+def _prepare_range_download(
     *,
     url: str,
     partial_path: Path,
@@ -663,8 +907,7 @@ async def _download_raw_artifact_ranges(
     etag: str | None,
     max_bytes: int | None,
     started_at: float,
-) -> None:
-    """Download a raw artifact through bounded byte ranges."""
+) -> tuple[_RangeDownloadContext, list[tuple[int, int]]]:
     if not _is_strong_etag(etag):
         raise RuntimeError(f"Range download for {url} requires a strong ETag")
     if max_bytes is not None and total_bytes > max_bytes:
@@ -685,121 +928,46 @@ async def _download_raw_artifact_ranges(
         sidecar_path.unlink(missing_ok=True)
         completed_ranges = set()
     partial_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(partial_path, "ab") as fp:
-        fp.truncate(total_bytes)
-    completed_bytes = sum(end - start + 1 for start, end in completed_ranges)
+    with open(partial_path, "ab") as partial_file:
+        partial_file.truncate(total_bytes)
+    completed_bytes = sum(
+        end - start + 1 for start, end in completed_ranges
+    )
     next_progress_bytes = _download_progress_interval_bytes()
     while completed_bytes >= next_progress_bytes:
         next_progress_bytes += _download_progress_interval_bytes()
-    progress = RangeDownloadProgress(completed_bytes, next_progress_bytes)
-    lock = asyncio.Lock()
+    context = _RangeDownloadContext(
+        url=url,
+        partial_path=partial_path,
+        total_bytes=total_bytes,
+        etag=str(etag),
+        started_at=started_at,
+        sidecar_path=sidecar_path,
+        completed_ranges=completed_ranges,
+        progress=RangeDownloadProgress(
+            completed_bytes,
+            next_progress_bytes,
+        ),
+        lock=asyncio.Lock(),
+        semaphore=asyncio.Semaphore(_range_download_tasks()),
+    )
+    return context, [
+        byte_range
+        for byte_range in ranges
+        if byte_range not in completed_ranges
+    ]
+
+
+async def _run_range_download_tasks(
+    context: _RangeDownloadContext,
+    pending_ranges: list[tuple[int, int]],
+) -> None:
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
-    pending_ranges = [byte_range for byte_range in ranges if byte_range not in completed_ranges]
-
-    async def fetch_range(
-        session: aiohttp.ClientSession,
-        byte_range: tuple[int, int],
-    ) -> None:
-        """Fetch and persist one pending byte range."""
-        start, end = byte_range
-        request_headers_by_name = {"Range": f"bytes={start}-{end}"}
-        if etag:
-            request_headers_by_name["If-Match"] = etag
-        expected_length = end - start + 1
-        received = 0
-        counted = 0
-        is_completed_ok = False
-        try:
-            async with _validated_request(
-                session,
-                "GET",
-                url,
-                headers=request_headers_by_name,
-            ) as response:
-                _validate_range_response(
-                    response,
-                    url=url,
-                    expected_start=start,
-                    expected_end=end,
-                    expected_total=total_bytes,
-                    expected_etag=str(etag),
-                )
-                offset = start
-                fd = os.open(partial_path, os.O_WRONLY)
-                try:
-                    async for chunk in response.content.iter_chunked(1024 * 1024):
-                        if not chunk:
-                            continue
-                        os.pwrite(fd, chunk, offset)
-                        offset += len(chunk)
-                        received += len(chunk)
-                        async with lock:
-                            progress.completed_bytes += len(chunk)
-                            counted += len(chunk)
-                            if progress.completed_bytes >= progress.next_progress_bytes:
-                                _emit_download_progress(
-                                    url=url,
-                                    bytes_read=min(progress.completed_bytes, total_bytes),
-                                    total_bytes=total_bytes,
-                                    started_at=started_at,
-                                    done=False,
-                                )
-                                interval = _download_progress_interval_bytes()
-                                while progress.completed_bytes >= progress.next_progress_bytes:
-                                    progress.next_progress_bytes += interval
-                finally:
-                    os.close(fd)
-                if received != expected_length:
-                    raise RuntimeError(
-                        f"Range download for {url} returned {received} bytes, expected {expected_length}"
-                    )
-                is_completed_ok = True
-                async with lock:
-                    completed_ranges.add(byte_range)
-                    _write_completed_ranges(
-                        sidecar_path,
-                        total_bytes=total_bytes,
-                        etag=etag,
-                        completed=completed_ranges,
-                    )
-        finally:
-            if not is_completed_ok and counted:
-                async with lock:
-                    progress.completed_bytes = max(0, progress.completed_bytes - counted)
-                    while progress.next_progress_bytes > _download_progress_interval_bytes() and (
-                        progress.completed_bytes < progress.next_progress_bytes - _download_progress_interval_bytes()
-                    ):
-                        progress.next_progress_bytes -= _download_progress_interval_bytes()
-
-    semaphore = asyncio.Semaphore(_range_download_tasks())
-
-    async def bounded_fetch(
-        session: aiohttp.ClientSession,
-        byte_range: tuple[int, int],
-    ) -> None:
-        """Fetch one byte range while applying retry and concurrency limits."""
-        async with semaphore:
-            retries = _download_retry_count()
-            for attempt in range(retries + 1):
-                try:
-                    await fetch_range(session, byte_range)
-                    return
-                except Exception as exc:
-                    if attempt >= retries:
-                        raise
-                    delay = _download_retry_delay_seconds() * (2 ** attempt)
-                    message = (
-                        f"PTG2_DOWNLOAD_RETRY url={url} range={byte_range[0]}-{byte_range[1]} "
-                        f"attempt={attempt + 1} next_attempt={attempt + 2} delay_seconds={delay:.2f} error={exc}"
-                    )
-                    _emit_screen_line(message, stderr=True)
-                    logger.debug(message)
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-
     async with aiohttp.ClientSession(timeout=timeout) as session:
         range_tasks = [
-            asyncio.create_task(bounded_fetch(session, byte_range))
+            asyncio.create_task(
+                context._bounded_fetch(session, byte_range)
+            )
             for byte_range in pending_ranges
         ]
         try:
@@ -809,7 +977,29 @@ async def _download_raw_artifact_ranges(
                 range_task.cancel()
             await asyncio.gather(*range_tasks, return_exceptions=True)
             raise
-    sidecar_path.unlink(missing_ok=True)
+
+
+async def _download_raw_artifact_ranges(
+    *,
+    url: str,
+    partial_path: Path,
+    total_bytes: int,
+    etag: str | None,
+    max_bytes: int | None,
+    started_at: float,
+) -> None:
+    """Download a raw artifact through bounded byte ranges."""
+
+    context, pending_ranges = _prepare_range_download(
+        url=url,
+        partial_path=partial_path,
+        total_bytes=total_bytes,
+        etag=etag,
+        max_bytes=max_bytes,
+        started_at=started_at,
+    )
+    await _run_range_download_tasks(context, pending_ranges)
+    context.sidecar_path.unlink(missing_ok=True)
     _emit_download_progress(
         url=url,
         bytes_read=total_bytes,
@@ -828,6 +1018,10 @@ class _SingleGetDownloadState:
     validator: str | None
     last_modified: str | None
     next_progress_bytes: int
+    response_url: str | None = None
+    response_status: int | None = None
+    content_encoding: str | None = None
+    content_type: str | None = None
 
 
 class _DownloadSizeLimitError(RuntimeError):
@@ -875,6 +1069,10 @@ def _prepare_single_get_response(
     url: str,
     is_resume_request: bool,
 ) -> str:
+    state.response_url = str(getattr(response, "url", None) or url)
+    state.response_status = int(response.status)
+    state.content_encoding = response.headers.get("Content-Encoding")
+    state.content_type = response.headers.get("Content-Type")
     if is_resume_request:
         if response.status != 206:
             raise _UnsafeRangeResponseError(
@@ -946,8 +1144,11 @@ async def _run_single_get_attempt(
     max_bytes: int | None,
     started_at: float,
     timeout: aiohttp.ClientTimeout,
+    allow_resume: bool = True,
 ) -> None:
-    is_resume_request = _can_resume_single_get_download(state)
+    is_resume_request = (
+        allow_resume and _can_resume_single_get_download(state)
+    )
     request_headers_by_name = None
     if is_resume_request:
         request_headers_by_name = {
@@ -998,13 +1199,35 @@ def _preserve_single_get_partial(state: _SingleGetDownloadState, error: Exceptio
             completed={(0, state.byte_count - 1)},
         )
         return
+    _discard_single_get_partial(state)
+
+
+def _discard_single_get_partial(state: _SingleGetDownloadState) -> None:
     _reset_partial_download(state.path)
     state.digest = hashlib.sha256()
     state.byte_count = 0
     state.total_bytes = None
     state.validator = None
     state.last_modified = None
+    state.response_url = None
+    state.response_status = None
+    state.content_encoding = None
+    state.content_type = None
     state.next_progress_bytes = _download_progress_interval_bytes()
+
+
+def _single_get_result(state: _SingleGetDownloadState) -> _SingleGetResult:
+    return (
+        state.digest,
+        state.byte_count,
+        state.validator,
+        state.total_bytes,
+        state.last_modified,
+        state.response_url,
+        state.response_status,
+        state.content_encoding,
+        state.content_type,
+    )
 
 
 async def _download_raw_artifact_single_get(
@@ -1014,7 +1237,12 @@ async def _download_raw_artifact_single_get(
     head: PTG2HeadMetadata,
     max_bytes: int | None,
     started_at: float,
-) -> tuple[Any, int, str | None, int | None, str | None]:
+    allow_resume: bool = True,
+) -> _SingleGetResult:
+    """Download one artifact with retry-safe exact response evidence."""
+
+    if not allow_resume:
+        _reset_partial_download(path)
     state = _single_get_download_state(path, head)
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
     retries = _download_retry_count()
@@ -1026,15 +1254,22 @@ async def _download_raw_artifact_single_get(
                 max_bytes=max_bytes,
                 started_at=started_at,
                 timeout=timeout,
+                allow_resume=allow_resume,
             )
-            return state.digest, state.byte_count, state.validator, state.total_bytes, state.last_modified
+            return _single_get_result(state)
         except UnsafeUrlError:
             raise
         except _DownloadSizeLimitError as exc:
-            _preserve_single_get_partial(state, exc)
+            if allow_resume:
+                _preserve_single_get_partial(state, exc)
+            else:
+                _discard_single_get_partial(state)
             raise
         except Exception as exc:
-            _preserve_single_get_partial(state, exc)
+            if allow_resume:
+                _preserve_single_get_partial(state, exc)
+            else:
+                _discard_single_get_partial(state)
             if attempt >= retries:
                 raise
             delay = _download_retry_delay_seconds() * (2 ** attempt)
@@ -1056,6 +1291,7 @@ async def download_raw_artifact(
     reuse_raw_artifacts: bool = True,
     max_bytes: int | None = None,
     keep_partial_artifacts: bool | None = None,
+    exact_get_evidence: bool = False,
 ) -> PTG2RawArtifact:
     """Download or reuse one raw artifact under a URL-scoped cross-process lock."""
 
@@ -1071,6 +1307,7 @@ async def download_raw_artifact(
             reuse_raw_artifacts=reuse_raw_artifacts,
             max_bytes=max_bytes,
             keep_partial_artifacts=keep_partial_artifacts,
+            exact_get_evidence=exact_get_evidence,
         )
 
 
@@ -1113,6 +1350,7 @@ async def _download_raw_artifact_locked(
     reuse_raw_artifacts: bool,
     max_bytes: int | None,
     keep_partial_artifacts: bool | None,
+    exact_get_evidence: bool = False,
 ) -> PTG2RawArtifact:
     """Run one raw download after this canonical URL has been serialized."""
 
@@ -1227,6 +1465,10 @@ async def _download_raw_artifact_locked(
     download_etag = head.etag
     download_content_length = head.content_length
     download_last_modified = head.last_modified
+    download_final_url: str | None = None
+    download_status: int | None = None
+    download_content_encoding: str | None = None
+    download_content_type: str | None = None
     _emit_download_progress(
         url=url,
         bytes_read=0,
@@ -1261,6 +1503,8 @@ async def _download_raw_artifact_locked(
             use_range_download = False
             range_total = head.content_length if head and head.content_length else None
             if (
+                not exact_get_evidence
+                and
                 _env_bool(PTG2_RANGE_DOWNLOADS_ENV, True)
                 and range_total
                 and range_total >= _range_download_min_bytes()
@@ -1300,19 +1544,28 @@ async def _download_raw_artifact_locked(
                         download_last_modified = head.last_modified if probed_etag == head.etag else None
                         use_range_download = True
             if not use_range_download:
+                single_get_result = await _download_raw_artifact_single_get(
+                    url=url,
+                    path=tmp_path,
+                    head=head,
+                    max_bytes=max_bytes,
+                    started_at=progress_started_at,
+                    allow_resume=not exact_get_evidence,
+                )
                 (
                     digest,
                     byte_count,
                     download_etag,
                     download_content_length,
                     download_last_modified,
-                ) = await _download_raw_artifact_single_get(
-                    url=url,
-                    path=tmp_path,
-                    head=head,
-                    max_bytes=max_bytes,
-                    started_at=progress_started_at,
-                )
+                ) = single_get_result[:5]
+                if len(single_get_result) >= 9:
+                    (
+                        download_final_url,
+                        download_status,
+                        download_content_encoding,
+                        download_content_type,
+                    ) = single_get_result[5:9]
         if should_validate_downloaded_gzip:
             gzip_error = _gzip_integrity_error(url, tmp_path, max_bytes=None)
             if gzip_error:
@@ -1367,13 +1620,19 @@ async def _download_raw_artifact_locked(
         }
         store.record_manifest(raw_artifact_manifest_map)
         verified_head = PTG2HeadMetadata(
-            url=head.url,
-            status=head.status,
+            url=download_final_url or head.url,
+            status=(
+                download_status
+                if download_status is not None
+                else head.status
+            ),
             etag=download_etag,
             content_length=download_content_length or actual_size,
             last_modified=download_last_modified,
-            content_encoding=head.content_encoding,
-            content_type=head.content_type,
+            content_encoding=(
+                download_content_encoding or head.content_encoding
+            ),
+            content_type=download_content_type or head.content_type,
             supports_head=head.supports_head,
         )
         return PTG2RawArtifact(
@@ -1460,6 +1719,120 @@ def _retained_logical_artifact_dir(store: PTG2ArtifactStore, raw_artifact: PTG2R
     return path
 
 
+def _reusable_logical_candidate(
+    store: PTG2ArtifactStore,
+    raw_artifact: PTG2RawArtifact,
+    candidate_by_name: Mapping[str, Any],
+) -> PTG2LogicalArtifact | None:
+    logical_uri = (
+        candidate_by_name.get("logical_storage_uri")
+        or candidate_by_name.get("storage_uri")
+    )
+    logical_sha256 = str(
+        candidate_by_name.get("logical_sha256") or ""
+    )
+    if (
+        not logical_uri
+        or re.fullmatch(r"[0-9a-f]{64}", logical_sha256) is None
+    ):
+        return None
+    logical_path = store.path_from_uri(str(logical_uri))
+    try:
+        expected_size = int(candidate_by_name.get("byte_count"))
+        is_size_matching = logical_path.stat().st_size == expected_size
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        is_protected = is_size_matching and protect_existing_artifact(
+            store,
+            logical_path,
+        )
+    except ValueError:
+        return None
+    if not is_protected:
+        return None
+    actual_sha256, _actual_size = sha256_file(logical_path)
+    if actual_sha256 != logical_sha256:
+        store.record_manifest(
+            {
+                "artifact_kind": "logical_json",
+                "raw_sha256": raw_artifact.raw_sha256,
+                "logical_sha256": logical_sha256,
+                "logical_storage_uri": store.storage_uri(logical_path),
+                "status": "corrupt",
+                "actual_sha256": actual_sha256,
+            }
+        )
+        return None
+    return PTG2LogicalArtifact(
+        logical_path=str(logical_path),
+        logical_sha256=logical_sha256,
+        byte_count=expected_size,
+        compression=candidate_by_name.get("compression"),
+        member_name=candidate_by_name.get("member_name"),
+        reused=True,
+    )
+
+
+def _materialize_retained_logical_artifact(
+    store: PTG2ArtifactStore,
+    raw_artifact: PTG2RawArtifact,
+    logical_dir: Path,
+    *,
+    reuse_retained_logical_artifacts: bool,
+) -> PTG2LogicalArtifact:
+    with tempfile.TemporaryDirectory(
+        prefix=f"logical-{raw_artifact.raw_sha256[:12]}-",
+        dir=store.tmp_dir,
+    ) as temporary_dir:
+        staged_artifact = stream_logical_artifact(
+            raw_artifact.raw_path,
+            output_dir=temporary_dir,
+        )
+        final_path = (
+            logical_dir / f"{staged_artifact.logical_sha256}.json"
+        )
+        if reuse_retained_logical_artifacts:
+            publish_artifact_file(
+                store,
+                staged_artifact.logical_path,
+                final_path,
+                expected_sha256=staged_artifact.logical_sha256,
+            )
+        else:
+            with _capture_streamed_artifact_stage(
+                store,
+                staged_artifact.logical_path,
+                streamed_sha256=staged_artifact.logical_sha256,
+                streamed_byte_count=staged_artifact.byte_count,
+            ) as verified_stage:
+                final_path = publish_verified_artifact_stage(
+                    store,
+                    verified_stage,
+                    artifact_kind="logical",
+                    suffix=".json",
+                    namespace_sha256=raw_artifact.raw_sha256,
+                )
+    retained_artifact = replace(
+        staged_artifact,
+        logical_path=str(final_path),
+        reused=False,
+    )
+    store.record_manifest(
+        {
+            "artifact_kind": "logical_json",
+            "raw_sha256": raw_artifact.raw_sha256,
+            "logical_sha256": retained_artifact.logical_sha256,
+            "logical_storage_uri": store.storage_uri(final_path),
+            "byte_count": retained_artifact.byte_count,
+            "compression": retained_artifact.compression,
+            "member_name": retained_artifact.member_name,
+            "status": "available",
+        }
+    )
+    return retained_artifact
+
+
 async def _retained_logical_artifact(
     store: PTG2ArtifactStore,
     raw_artifact: PTG2RawArtifact,
@@ -1479,96 +1852,22 @@ async def _retained_logical_artifact(
             if reuse_retained_logical_artifacts
             else ()
         )
-        for candidate in logical_candidates:
-            logical_uri = candidate.get("logical_storage_uri") or candidate.get("storage_uri")
-            logical_sha256 = str(candidate.get("logical_sha256") or "")
-            if not logical_uri or re.fullmatch(r"[0-9a-f]{64}", logical_sha256) is None:
-                continue
-            logical_path = store.path_from_uri(str(logical_uri))
-            try:
-                expected_size = int(candidate.get("byte_count"))
-                is_size_matching = logical_path.stat().st_size == expected_size
-            except (OSError, TypeError, ValueError):
-                is_size_matching = False
-            try:
-                is_protected = is_size_matching and protect_existing_artifact(
-                    store,
-                    logical_path,
-                )
-            except ValueError:
-                # Ignore migrated logical records outside this managed store.
-                is_protected = False
-            if is_protected:
-                actual_sha256, _actual_size = sha256_file(logical_path)
-                if actual_sha256 != logical_sha256:
-                    store.record_manifest(
-                        {
-                            "artifact_kind": "logical_json",
-                            "raw_sha256": raw_artifact.raw_sha256,
-                            "logical_sha256": logical_sha256,
-                            "logical_storage_uri": store.storage_uri(logical_path),
-                            "status": "corrupt",
-                            "actual_sha256": actual_sha256,
-                        }
-                    )
-                    continue
-                return PTG2LogicalArtifact(
-                    logical_path=str(logical_path),
-                    logical_sha256=logical_sha256,
-                    byte_count=expected_size,
-                    compression=candidate.get("compression"),
-                    member_name=candidate.get("member_name"),
-                    reused=True,
-                )
-
-        with tempfile.TemporaryDirectory(
-            prefix=f"logical-{raw_artifact.raw_sha256[:12]}-",
-            dir=store.tmp_dir,
-        ) as temporary_dir:
-            staged = stream_logical_artifact(
-                raw_artifact.raw_path,
-                output_dir=temporary_dir,
+        for candidate_by_name in logical_candidates:
+            reusable_artifact = _reusable_logical_candidate(
+                store,
+                raw_artifact,
+                candidate_by_name,
             )
-            final_path = logical_dir / f"{staged.logical_sha256}.json"
-            if reuse_retained_logical_artifacts:
-                publish_artifact_file(
-                    store,
-                    staged.logical_path,
-                    final_path,
-                    expected_sha256=staged.logical_sha256,
-                )
-            else:
-                with _capture_streamed_artifact_stage(
-                    store,
-                    staged.logical_path,
-                    streamed_sha256=staged.logical_sha256,
-                    streamed_byte_count=staged.byte_count,
-                ) as verified_stage:
-                    final_path = publish_verified_artifact_stage(
-                        store,
-                        verified_stage,
-                        artifact_kind="logical",
-                        suffix=".json",
-                        namespace_sha256=raw_artifact.raw_sha256,
-                    )
-        retained = replace(
-            staged,
-            logical_path=str(final_path),
-            reused=False,
+            if reusable_artifact is not None:
+                return reusable_artifact
+        return _materialize_retained_logical_artifact(
+            store,
+            raw_artifact,
+            logical_dir,
+            reuse_retained_logical_artifacts=(
+                reuse_retained_logical_artifacts
+            ),
         )
-        store.record_manifest(
-            {
-                "artifact_kind": "logical_json",
-                "raw_sha256": raw_artifact.raw_sha256,
-                "logical_sha256": retained.logical_sha256,
-                "logical_storage_uri": store.storage_uri(final_path),
-                "byte_count": retained.byte_count,
-                "compression": retained.compression,
-                "member_name": retained.member_name,
-                "status": "available",
-            }
-        )
-        return retained
 
 
 def _materialize_json_source_from_facade():
@@ -1637,12 +1936,14 @@ async def _download_ptg_job_artifact(
 ) -> PTG2DownloadedJob:
     try:
         store = PTG2ArtifactStore()
+        frozen_descriptor = job.get("_frozen_rate_file")
         raw_artifact = await download_raw_artifact(
             job["url"],
             store=store,
             reuse_raw_artifacts=reuse_raw_artifacts,
             max_bytes=max_bytes,
             keep_partial_artifacts=keep_partial_artifacts,
+            exact_get_evidence=isinstance(frozen_descriptor, dict),
         )
         _observe_raw_artifact_stage(artifact_stage_observer, raw_artifact)
         logical_artifact = (
@@ -1659,7 +1960,6 @@ async def _download_ptg_job_artifact(
                 allow_deferred=True,
             )
         )
-        frozen_descriptor = job.get("_frozen_rate_file")
         if isinstance(frozen_descriptor, dict):
             validate_frozen_artifacts(
                 frozen_descriptor,
@@ -1671,7 +1971,7 @@ async def _download_ptg_job_artifact(
             logical_artifact,
         )
         return PTG2DownloadedJob(job=job, raw_artifact=raw_artifact, logical_artifact=logical_artifact)
-    except PTG2ArtifactStageFreshnessError:
+    except (PTG2ArtifactStageFreshnessError, FrozenRateFileMismatchError):
         raise
     except Exception as exc:
         return PTG2DownloadedJob(job=job, error=str(exc))
@@ -1696,6 +1996,93 @@ def _download_ptg_job_artifact_sync(
     )
 
 
+@dataclass
+class _DownloadQueueState:
+    executor: concurrent.futures.ThreadPoolExecutor
+    pending_tasks: set[asyncio.Future[PTG2DownloadedJob]]
+    job_iterator: Any
+    download_tasks: int
+    base_live_progress_context: Mapping[str, Any]
+    artifact_lease_id: str | None
+    job_count: int
+    scheduled_job_indexes: Any
+    reuse_raw_artifacts: bool
+    max_bytes: int | None
+    keep_partial_artifacts: bool | None
+    artifact_stage_observer: PTG2ArtifactStageObserver | None
+    progress_start_pct: float
+    progress_end_pct: float
+
+    def _job_progress_context(
+        self,
+        job_by_name: Mapping[str, Any],
+        scheduled_job_index: int,
+    ) -> dict[str, Any]:
+        job_index = (
+            _progress_job_index(dict(job_by_name))
+            if "_ptg_progress_index" in job_by_name
+            else scheduled_job_index
+        )
+        job_total = max(
+            _progress_job_total(dict(job_by_name), self.job_count),
+            1,
+        )
+        has_single_progress_span = (
+            self.job_count == 1
+            and self.progress_end_pct > self.progress_start_pct
+        )
+        return {
+            **self.base_live_progress_context,
+            "overall_progress_start_pct": self.progress_start_pct,
+            "overall_progress_end_pct": (
+                self.progress_end_pct
+                if has_single_progress_span
+                else self.progress_start_pct
+            ),
+            "run_progress_hold_pct": (
+                None if has_single_progress_span else self.progress_start_pct
+            ),
+            "file_index": job_index + 1,
+            "file_count": job_total,
+            "file_name": _safe_download_label(
+                str(job_by_name.get("url") or "")
+            ),
+        }
+
+    def schedule_more(self) -> None:
+        """Start downloads up to the configured in-flight task limit."""
+
+        while len(self.pending_tasks) < self.download_tasks:
+            try:
+                job_by_name = next(self.job_iterator)
+            except StopIteration:
+                return
+            job_progress_context = self._job_progress_context(
+                job_by_name,
+                next(self.scheduled_job_indexes),
+            )
+            download_options_by_name = {
+                "reuse_raw_artifacts": self.reuse_raw_artifacts,
+                "max_bytes": self.max_bytes,
+                "keep_partial_artifacts": self.keep_partial_artifacts,
+                "live_progress_context": job_progress_context,
+                "artifact_lease_id": self.artifact_lease_id,
+            }
+            if self.artifact_stage_observer is not None:
+                download_options_by_name["artifact_stage_observer"] = (
+                    self.artifact_stage_observer
+                )
+            self.pending_tasks.add(
+                asyncio.wrap_future(
+                    self.executor.submit(
+                        _download_ptg_job_artifact_sync_from_facade,
+                        job_by_name,
+                        **download_options_by_name,
+                    )
+                )
+            )
+
+
 async def _iter_downloaded_ptg_jobs(
     jobs: list[dict[str, Any]],
     *,
@@ -1712,81 +2099,41 @@ async def _iter_downloaded_ptg_jobs(
         max_workers=download_tasks,
         thread_name_prefix="ptg2-download",
     )
-    pending_tasks: set[asyncio.Future[PTG2DownloadedJob]] = set()
-    job_iter = iter(jobs)
-    base_live_progress_context = current_live_progress_context()
-    artifact_lease_id = current_artifact_lease_id()
-    job_count = max(len(jobs), 1)
-    scheduled_job_indexes = itertools.count()
-
-    def schedule_more() -> None:
-        """Start downloads until the configured in-flight task limit is reached."""
-        while len(pending_tasks) < download_tasks:
-            try:
-                job = next(job_iter)
-            except StopIteration:
-                return
-            scheduled_job_index = next(scheduled_job_indexes)
-            job_index = (
-                _progress_job_index(job)
-                if "_ptg_progress_index" in job
-                else scheduled_job_index
-            )
-            job_total = max(_progress_job_total(job, job_count), 1)
-            if job_count == 1 and progress_end_pct > progress_start_pct:
-                progress_start = progress_start_pct
-                progress_end = progress_end_pct
-                hold_pct = None
-            else:
-                progress_start = progress_start_pct
-                progress_end = progress_start_pct
-                hold_pct = progress_start_pct
-            job_live_progress_context_map = {
-                **base_live_progress_context,
-                "overall_progress_start_pct": progress_start,
-                "overall_progress_end_pct": progress_end,
-                "run_progress_hold_pct": hold_pct,
-                "file_index": job_index + 1,
-                "file_count": job_total,
-                "file_name": _safe_download_label(str(job.get("url") or "")),
-            }
-            download_options_by_name = {
-                "reuse_raw_artifacts": reuse_raw_artifacts,
-                "max_bytes": max_bytes,
-                "keep_partial_artifacts": keep_partial_artifacts,
-                "live_progress_context": job_live_progress_context_map,
-                "artifact_lease_id": artifact_lease_id,
-            }
-            if artifact_stage_observer is not None:
-                download_options_by_name["artifact_stage_observer"] = (
-                    artifact_stage_observer
-                )
-            pending_tasks.add(
-                asyncio.wrap_future(
-                    executor.submit(
-                        _download_ptg_job_artifact_sync_from_facade,
-                        job,
-                        **download_options_by_name,
-                    )
-                )
-            )
-
-    schedule_more()
+    queue_state = _DownloadQueueState(
+        executor=executor,
+        pending_tasks=set(),
+        job_iterator=iter(jobs),
+        download_tasks=download_tasks,
+        base_live_progress_context=current_live_progress_context(),
+        artifact_lease_id=current_artifact_lease_id(),
+        job_count=max(len(jobs), 1),
+        scheduled_job_indexes=itertools.count(),
+        reuse_raw_artifacts=reuse_raw_artifacts,
+        max_bytes=max_bytes,
+        keep_partial_artifacts=keep_partial_artifacts,
+        artifact_stage_observer=artifact_stage_observer,
+        progress_start_pct=progress_start_pct,
+        progress_end_pct=progress_end_pct,
+    )
+    queue_state.schedule_more()
     try:
-        while pending_tasks:
-            done_tasks, pending_tasks = await asyncio.wait(
-                pending_tasks,
+        while queue_state.pending_tasks:
+            done_tasks, queue_state.pending_tasks = await asyncio.wait(
+                queue_state.pending_tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             completed_downloads = [task.result() for task in done_tasks]
-            schedule_more()
+            queue_state.schedule_more()
             for downloaded in completed_downloads:
                 yield downloaded
     finally:
-        for task in pending_tasks:
+        for task in queue_state.pending_tasks:
             task.cancel()
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        if queue_state.pending_tasks:
+            await asyncio.gather(
+                *queue_state.pending_tasks,
+                return_exceptions=True,
+            )
         # Running thread-pool calls cannot be cancelled by their asyncio
         # wrappers. Wait for them before the import-level artifact lease is
         # released, otherwise GC could reclaim a file a worker still uses.

@@ -3,13 +3,19 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
+from process.ptg_parts.frozen_rate_binding import (
+    normalize_protected_frozen_rate_params,
+    protected_frozen_tuple_presence,
+)
+from process.ptg_parts.frozen_rate_binding_store import (
+    recheck_frozen_binding,
+)
 from process.ptg_parts.frozen_rate_files import (
     FrozenRateFileMismatchError,
     FrozenRateFileValidationError,
     assert_frozen_input_compatibility,
-    normalize_frozen_rate_file_set,
 )
 
 
@@ -41,38 +47,52 @@ def frozen_rate_failure_payload(
 def validated_frozen_rate_params(
     params_by_name: dict[str, Any],
 ) -> dict[str, Any]:
-    """Authenticate the bounded multipart envelope before claiming a run."""
+    """Authenticate and normalize one bounded multipart envelope."""
 
-    has_files = "frozen_rate_files" in params_by_name
-    has_digest = "frozen_rate_file_set_sha256" in params_by_name
-    if not has_files and not has_digest:
+    normalized_params = normalize_protected_frozen_rate_params(
+        params_by_name
+    )
+    if not protected_frozen_tuple_presence(normalized_params):
         return params_by_name
-    if not has_files or not has_digest:
-        raise FrozenRateFileValidationError(
-            "frozen_rate_files and frozen_rate_file_set_sha256 are required together"
-        )
-    normalized_files, set_digest = normalize_frozen_rate_file_set(
-        params_by_name["frozen_rate_files"],
-        params_by_name["frozen_rate_file_set_sha256"],
-    )
     assert_frozen_input_compatibility(
-        normalized_files,
-        in_network_url=params_by_name.get("in_network_url"),
-        allowed_url=params_by_name.get("allowed_url"),
+        normalized_params["frozen_rate_files"],
+        in_network_url=normalized_params.get("in_network_url"),
+        allowed_url=normalized_params.get("allowed_url"),
         toc_urls=_normalized_string_list(
-            params_by_name.get("toc_urls") or params_by_name.get("toc_url")
+            normalized_params.get("toc_urls")
+            or normalized_params.get("toc_url")
         ),
-        toc_list=params_by_name.get("toc_list"),
+        toc_list=normalized_params.get("toc_list"),
         file_url_contains=_normalized_string_list(
-            params_by_name.get("file_url_contains")
+            normalized_params.get("file_url_contains")
         ),
-        max_files=_normalized_optional_int(params_by_name.get("max_files")),
+        max_files=_normalized_optional_int(
+            normalized_params.get("max_files")
+        ),
     )
-    return {
-        **params_by_name,
-        "frozen_rate_files": normalized_files,
-        "frozen_rate_file_set_sha256": set_digest,
-    }
+    return normalized_params
+
+
+async def validated_worker_frozen_rate_params(
+    task_payload: Mapping[str, Any],
+    params_by_name: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate outer IDs and recheck immutable admission after claim."""
+
+    normalized_params = validated_frozen_rate_params(params_by_name)
+    if protected_frozen_tuple_presence(normalized_params):
+        protected_id = normalized_params["source_file_import_id"]
+        outer_ids = (
+            str(task_payload.get("source_file_import_id") or "").strip(),
+            str(task_payload.get("import_id") or "").strip(),
+        )
+        if any(outer_id != protected_id for outer_id in outer_ids):
+            raise FrozenRateFileValidationError(
+                "protected outer and nested source_file_import_id and "
+                "import_id must all match"
+            )
+    await recheck_frozen_binding(normalized_params)
+    return normalized_params
 
 
 def frozen_rate_main_kwargs(
@@ -80,15 +100,21 @@ def frozen_rate_main_kwargs(
 ) -> dict[str, Any]:
     """Select only private multipart arguments for the PTG engine call."""
 
-    if (
-        "frozen_rate_files" not in params_by_name
-        and "frozen_rate_file_set_sha256" not in params_by_name
-    ):
+    if not protected_frozen_tuple_presence(params_by_name):
         return {}
     return {
+        "source_file_import_id": params_by_name.get(
+            "source_file_import_id"
+        ),
+        "frozen_rate_file_set_contract": params_by_name.get(
+            "frozen_rate_file_set_contract"
+        ),
         "frozen_rate_files": params_by_name.get("frozen_rate_files"),
         "frozen_rate_file_set_sha256": params_by_name.get(
             "frozen_rate_file_set_sha256"
+        ),
+        "frozen_rate_file_count": params_by_name.get(
+            "frozen_rate_file_count"
         ),
     }
 
@@ -119,4 +145,5 @@ __all__ = [
     "frozen_rate_failure_payload",
     "frozen_rate_main_kwargs",
     "validated_frozen_rate_params",
+    "validated_worker_frozen_rate_params",
 ]

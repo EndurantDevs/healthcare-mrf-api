@@ -64,12 +64,16 @@ def test_retired_importer_modules_and_entry_points_are_absent():
     assert not [path for path in retired_paths if (root / path).exists()]
 
     process_names = set(process_ptg._process_in_network_file.__code__.co_names)
-    assert "_parse_in_network_file_strict_v3" in process_names
+    parser_boundary_names = set(
+        process_ptg._parse_in_network_artifact.__code__.co_names
+    )
+    assert "_parse_in_network_artifact" in process_names
+    assert "_parse_in_network_file_strict_v3" in parser_boundary_names
     assert not {
         "_parse_in_network_file_serving_only",
         "_parse_in_network_file_single_pass",
         "_parse_in_network_file_compact",
-    } & process_names
+    } & (process_names | parser_boundary_names)
     assert not hasattr(
         importlib.import_module("process.ptg_parts.ptg2_manifest_publish"),
         "_publish_ptg2_manifest_serving_snapshot",
