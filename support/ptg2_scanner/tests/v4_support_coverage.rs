@@ -139,7 +139,7 @@ fn v4_coordinate_helpers_cover_empty_invalid_and_escaped_inputs() {
             snapshot_id: "snapshot",
             plan_id: "plan",
             procedure_hash: "procedure",
-            procedure_code: None,
+            procedure_code: Some(42),
             reported_code_system: None,
             reported_code: Some("code"),
             provider_set_hash: "provider",
@@ -212,6 +212,9 @@ fn v4_normalization_rejects_ambiguous_numeric_and_json_shapes() {
     );
     assert!(strict_integer(&json!(u64::MAX), "field").is_err());
     assert!(strict_integer(&json!(1.5), "field").is_err());
+    let excessive_exponent: serde_json::Value =
+        serde_json::from_str("1e999999").expect("arbitrary-precision JSON number");
+    assert!(strict_money_number(&excessive_exponent).is_err());
     assert_eq!(
         normalize_money_text("1e2e3".to_owned()),
         Some("1e2e3".to_owned())

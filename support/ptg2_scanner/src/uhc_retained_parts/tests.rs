@@ -561,6 +561,36 @@ mod tests {
     }
 
     #[test]
+    fn accepts_retained_file_after_publication_link_settles() {
+        let fixture = Fixture::new(FIXTURE);
+        let raw_path = fixture.raw_path();
+        fs::write(&raw_path, FIXTURE).expect("preseed raw artifact");
+        let alias = fixture._directory.path().join("transient-publication-link.json");
+        fs::hard_link(&raw_path, &alias).expect("link retained raw during publication");
+        let alias_for_removal = alias.clone();
+        let remover = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            fs::remove_file(alias_for_removal).expect("settle publication link");
+        });
+
+        let root = RootDirectory::open(&fixture.output).expect("open retained root");
+        let raw_name = raw_file_name(&fixture.sha256);
+        let retained_file = root
+            .open_existing_regular(&raw_name)
+            .expect("open settled retained file")
+            .expect("retained file exists");
+        remover.join().expect("publication link remover");
+
+        assert_eq!(
+            FileIdentity::from_file(&retained_file)
+                .expect("settled retained identity")
+                .link_count,
+            1
+        );
+        assert!(!alias.exists());
+    }
+
+    #[test]
     fn concurrent_admission_never_clobbers_final_artifacts() {
         let fixture = Fixture::new(FIXTURE);
         let request = Arc::new(fixture.request(4));
