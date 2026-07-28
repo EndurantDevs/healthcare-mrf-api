@@ -709,7 +709,10 @@ async def acquire_complete_uhc_catalog_set(
     active_session = session or aiohttp.ClientSession(
         timeout=timeout,
         auto_decompress=False,
-        headers={"User-Agent": "HealthPorta-Official-Provider-Files/1.0"},
+        headers={
+            "User-Agent": "HealthPorta-Official-Provider-Files/1.0",
+            "Accept-Encoding": "identity",
+        },
     )
     try:
         downloaded_count, reused_count, downloaded_bytes = (
