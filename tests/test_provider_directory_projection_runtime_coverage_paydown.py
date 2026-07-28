@@ -46,6 +46,16 @@ def test_materializer_worker_count_is_bounded(worker_count) -> None:
         config.projection_materializer_worker_count(worker_count)
 
 
+def test_materializer_worker_count_uses_bounded_environment_value(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_WORKERS",
+        "3",
+    )
+    assert config.projection_materializer_worker_count() == 3
+
+
 @pytest.mark.parametrize("timeout", (object(), "long", 29, 3601, True))
 def test_native_timeout_is_numeric_and_bounded(timeout) -> None:
     with pytest.raises(ProviderDirectoryProjectionError, match="timeout_invalid"):
