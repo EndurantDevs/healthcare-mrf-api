@@ -326,7 +326,7 @@ fn canonical_address_and_version_cli_emit_production_contracts() {
     let output = temporary.path().join("canonical.copy");
     fs::write(
         &input,
-        "1\t(0,1)\t\\N\t27 Dr Mellichamp Dr Ste 100\t\\N\tBLUFFTON\tSC\t29910\tUS\n",
+        "1\t(0,1)\ta\\tb\\nc\\rd\\\\e\\qf\\\t27 Dr Mellichamp Dr Ste 100\t\\N\tBLUFFTON\tSC\t29910\tUS\n",
     )
     .unwrap();
 
@@ -350,6 +350,17 @@ fn canonical_address_and_version_cli_emit_production_contracts() {
     let payload: serde_json::Value = serde_json::from_slice(&version.stdout).unwrap();
     assert_eq!(payload["identity_version"], 2);
     assert_eq!(payload["pub28_sha256"].as_str().unwrap().len(), 64);
+
+    let invalid_input = temporary.path().join("invalid-addresses.copy");
+    fs::write(&invalid_input, "too\tfew\n").unwrap();
+    let invalid = scanner()
+        .arg("--address-canonicalize-copy")
+        .arg(&invalid_input)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("expected 9"));
 }
 
 #[test]
