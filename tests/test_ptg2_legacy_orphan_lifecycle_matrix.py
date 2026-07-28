@@ -215,6 +215,40 @@ async def test_present_optional_stage_residue_blocks_exact_owner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_internal_run_residue_blocks_only_its_exact_owner() -> None:
+    exact_owner = _OwnershipAccumulator()
+    foreign_owner = _OwnershipAccumulator()
+    exact_owner.internal_run_statuses.add((f"ptg2:{SUFFIX}", "failed"))
+    executor = _ResultSetExecutor(
+        [
+            [
+                {
+                    "attachment_name": "ptg2_v4_attempt_stage",
+                    "snapshot_id": None,
+                    "internal_run_id": f"ptg2:{SUFFIX}",
+                }
+            ]
+        ]
+    )
+
+    await _attach_blocking_residue(
+        executor,
+        schema_name="mrf",
+        accumulators={
+            SUFFIX: exact_owner,
+            OTHER_SUFFIX: foreign_owner,
+        },
+        suffixes_by_snapshot={},
+        present_optional_table_names=frozenset(),
+    )
+
+    assert exact_owner.active_references == {
+        "nonserving_residue:ptg2_v4_attempt_stage"
+    }
+    assert foreign_owner.active_references == set()
+
+
+@pytest.mark.asyncio
 async def test_serving_and_fence_evidence_attach_to_exact_owner(
     monkeypatch,
 ) -> None:
@@ -253,6 +287,32 @@ async def test_serving_and_fence_evidence_attach_to_exact_owner(
     assert accumulator.active_references == {"route"}
     assert accumulator.ambiguity_reasons == {"attempt_fence_owner_conflict"}
     assert accumulator.fence_states == {("snapshot", "active")}
+
+
+@pytest.mark.asyncio
+async def test_matching_attempt_fence_preserves_exact_owner_evidence() -> None:
+    accumulator = _OwnershipAccumulator()
+    accumulator.declared_snapshot_ids.add("snapshot")
+
+    await _attach_attempt_fences(
+        _ResultSetExecutor(
+            [
+                [
+                    {
+                        "snapshot_id": "snapshot",
+                        "internal_run_id": f"ptg2:{SUFFIX}",
+                        "state": "reconciled",
+                    }
+                ]
+            ]
+        ),
+        schema_name="mrf",
+        accumulators={SUFFIX: accumulator},
+        suffixes_by_snapshot={"snapshot": {SUFFIX}},
+    )
+
+    assert accumulator.ambiguity_reasons == set()
+    assert accumulator.fence_states == {("snapshot", "reconciled")}
 
 
 def _relation_proof(
@@ -370,5 +430,39 @@ async def test_schema_catalog_boundaries_fail_closed(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="relation_catalog_limit_exceeded"):
         await schema_store._relation_catalog_rows(
             _ResultSetExecutor([[{"relation_oid": 1}]]),
+            "mrf",
+        )
+
+
+def _audit_trigger_row(name: str, trigger_type: int) -> dict[str, object]:
+    return {
+        "tgname": name,
+        "tgtype": trigger_type,
+        "tgenabled": "A",
+        "proname": "guard_ptg2_legacy_orphan_sweep_audit",
+        "function_schema": "mrf",
+        "prosrc": schema_store._EXPECTED_AUDIT_TRIGGER_BODY,
+    }
+
+
+def test_audit_trigger_catalog_rejects_tamper_and_duplicate_guards() -> None:
+    row_guard = _audit_trigger_row(
+        "ptg2_legacy_orphan_sweep_audit_row_guard",
+        27,
+    )
+    truncate_guard = _audit_trigger_row(
+        "ptg2_legacy_orphan_sweep_audit_truncate_guard",
+        34,
+    )
+
+    with pytest.raises(RuntimeError, match="audit_guard_invalid"):
+        schema_store._validated_audit_triggers(
+            [{**row_guard, "tgenabled": "D"}, truncate_guard],
+            "mrf",
+        )
+
+    with pytest.raises(RuntimeError, match="audit_guard_invalid"):
+        schema_store._validated_audit_triggers(
+            [row_guard, dict(row_guard)],
             "mrf",
         )

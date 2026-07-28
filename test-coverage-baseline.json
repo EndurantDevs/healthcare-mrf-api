@@ -434,12 +434,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 34711,
-          "total": 39810
+          "covered": 34771,
+          "total": 39828
         },
         "lines": {
-          "covered": 110563,
-          "total": 118527
+          "covered": 110744,
+          "total": 118585
         }
       },
       "one_time_floor_reset": {

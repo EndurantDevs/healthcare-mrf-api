@@ -77,3 +77,39 @@ async def test_optional_stage_ddl_error_rolls_back_only_its_savepoint(
         assert len(failed_statements) == 1
         assert has_table is True
         assert has_later_index is True
+
+
+@pytest.mark.asyncio
+async def test_price_stage_logged_mode_skips_optional_index(
+    monkeypatch,
+) -> None:
+    """Honor logged/no-index settings under the shared lifecycle lock."""
+
+    async with _prepared_case(monkeypatch) as case:
+        await _drop_optional_stage_tables(case)
+        monkeypatch.setattr(table_setup, "db", case.database)
+        monkeypatch.setenv(table_setup.PTG2_UNLOGGED_STAGE_ENV, "false")
+        monkeypatch.setenv(table_setup.PTG2_STAGE_INDEXES_ENV, "false")
+
+        await table_setup._ensure_ptg2_price_set_stage_table(case.mrf_schema)
+
+        async with case.database.acquire() as connection:
+            persistence = await connection.scalar(
+                """
+                SELECT relation_record.relpersistence
+                  FROM pg_catalog.pg_class AS relation_record
+                  JOIN pg_catalog.pg_namespace AS namespace_record
+                    ON namespace_record.oid = relation_record.relnamespace
+                 WHERE namespace_record.nspname = :schema_name
+                   AND relation_record.relname = 'ptg2_price_set_stage'
+                """,
+                schema_name=case.mrf_schema,
+            )
+            has_optional_index = await _has_relation(
+                connection,
+                case.mrf_schema,
+                "ptg2_price_set_stage_snapshot_idx",
+            )
+
+        assert persistence == b"p"
+        assert has_optional_index is False
