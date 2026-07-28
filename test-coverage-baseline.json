@@ -47,6 +47,8 @@
         "api/provider_directory_source_outcomes.py",
         "api/provider_directory_source_summary_outcome.py",
         "api/provider_directory_sources.py",
+        "api/provider_language.py",
+        "api/provider_language_merge.py",
         "api/provider_profile.py",
         "api/provider_profile_display.py",
         "api/provider_specialty_cache_entries.py",
@@ -451,12 +453,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 35578,
-          "total": 40382
+          "covered": 35734,
+          "total": 40480
         },
         "lines": {
-          "covered": 112964,
-          "total": 120407
+          "covered": 113341,
+          "total": 120663
         }
       },
       "one_time_floor_reset": {
