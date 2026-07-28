@@ -457,6 +457,29 @@ fn compiler_cli_rejects_missing_extra_and_malformed_manifests() {
     assert!(!no_arguments.status.success());
     assert!(String::from_utf8_lossy(&no_arguments.stderr).contains("usage:"));
 
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary non-UTF-8 program fixture");
+        let non_utf8_program = temporary
+            .path()
+            .join(OsString::from_vec(b"graph-\xff".to_vec()));
+        symlink(
+            env!("CARGO_BIN_EXE_ptg2_provider_graph_v4"),
+            &non_utf8_program,
+        )
+        .expect("link compiler under non-UTF-8 name");
+        let fallback_program = Command::new(&non_utf8_program)
+            .output()
+            .expect("run compiler under non-UTF-8 name");
+        assert!(!fallback_program.status.success());
+        assert!(String::from_utf8_lossy(&fallback_program.stderr)
+            .contains("usage: ptg2_provider_graph_v4"));
+    }
+
     let extra_arguments = run(&["one", "two"]);
     assert!(!extra_arguments.status.success());
     assert!(String::from_utf8_lossy(&extra_arguments.stderr).contains("usage:"));
