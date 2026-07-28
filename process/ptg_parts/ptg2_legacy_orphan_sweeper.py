@@ -27,6 +27,7 @@ from process.ptg_parts.ptg2_legacy_orphan_store import (
     load_legacy_sweep_audit,
     lock_legacy_root_relations,
     lock_legacy_sweep_authority,
+    lock_legacy_sweep_lifecycle,
     require_legacy_sweep_schema,
     verify_applied_audit_state,
 )
@@ -85,6 +86,9 @@ async def build_legacy_orphan_sweep_plan(
         schema_name=resolved_schema,
         control_schema_name=resolved_control_schema,
         catalog=catalog,
+        present_optional_table_names=frozenset(
+            authority.present_optional_table_names
+        ),
     )
     candidates: list[LegacySweepCandidate] = []
     blocked_suffixes: list[LegacyBlockedSuffix] = []
@@ -273,6 +277,10 @@ async def execute_legacy_orphan_sweep(
     resolved_control_schema = _resolve_control_schema(control_schema_name)
     audit_id = legacy_sweep_audit_id(expected_plan_digest)
     async with database.acquire() as connection:
+        await lock_legacy_sweep_lifecycle(
+            connection,
+            lock_timeout=lock_timeout,
+        )
         authority_before_lock = await require_legacy_sweep_schema(
             connection,
             schema_name=resolved_schema,
@@ -283,6 +291,8 @@ async def execute_legacy_orphan_sweep(
             schema_name=resolved_schema,
             control_schema_name=resolved_control_schema,
             lock_timeout=lock_timeout,
+            present_optional_table_names=authority_before_lock.present_optional_table_names,
+            lifecycle_locked=True,
         )
         authority_after_lock = await require_legacy_sweep_schema(
             connection,

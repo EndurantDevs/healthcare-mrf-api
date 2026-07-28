@@ -958,9 +958,8 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
 
 
-def test_midlandschoice_resolver_preserves_network_labels():
-    """Verify this source-discovery regression contract."""
-    html = """
+def _midlandschoice_catalog_html() -> str:
+    return """
     <table>
       <tr>
         <th>Network</th><th>Name</th><th>File Name</th><th>File Type</th><th>Download</th>
@@ -985,6 +984,11 @@ def test_midlandschoice_resolver_preserves_network_labels():
       </tr>
     </table>
     """
+
+
+def test_midlandschoice_resolver_preserves_network_labels():
+    """Verify this source-discovery regression contract."""
+    html = _midlandschoice_catalog_html()
     catalog_source_dict = {"source_id": "src-midlands", "display_name": "Synthetic Midlands"}
 
     network_targets = discovery._parse_midlandschoice_mrf_rows(
@@ -2150,19 +2154,8 @@ async def test_query_filtered_toc_stream_enforces_byte_limit(monkeypatch):
         )
 
 
-def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plans():
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {
-        "source_id": "src_aetna",
-        "display_name": "Aetna",
-        "metadata_json": {
-            "raw": {
-                "target_payer_query": "Example Packaging",
-                "query_expansion_source": True,
-            }
-        },
-    }
-    metadata_response_dict = {
+def _healthsparq_query_expansion_metadata() -> dict:
+    return {
         "files": [
             {
                 "reportingEntityName": "Example Reporting Entity",
@@ -2202,6 +2195,21 @@ def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plan
             },
         ]
     }
+
+
+def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plans():
+    """Verify this source-discovery regression contract."""
+    catalog_source_dict = {
+        "source_id": "src_aetna",
+        "display_name": "Aetna",
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Packaging",
+                "query_expansion_source": True,
+            }
+        },
+    }
+    metadata_response_dict = _healthsparq_query_expansion_metadata()
 
     matching_targets = discovery._healthsparq_targets_from_metadata(
         catalog_source_dict,
@@ -7257,17 +7265,8 @@ async def test_mymedicalshopper_ddp_receive_normalizes_frame_timeout(
         )
 
 
-def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {"source_id": "source_varipro", "payer_id": "payer_varipro"}
-    employer_dict = {
-        "slug": "sample-employer-network-varipro-77100",
-        "name": "Sample Employer - Network A",
-        "tpaSlug": "varipro",
-        "groupId": "77100",
-        "ein": "111222333",
-    }
-    generated_plan_records = [
+def _mymedicalshopper_generated_plan_records() -> list[dict]:
+    return [
         {
             "planId": "4907",
             "planName": "Sample Employer In Network 01/01/2023",
@@ -7300,6 +7299,19 @@ def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
             ],
         },
     ]
+
+
+def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
+    """Verify this source-discovery regression contract."""
+    catalog_source_dict = {"source_id": "source_varipro", "payer_id": "payer_varipro"}
+    employer_dict = {
+        "slug": "sample-employer-network-varipro-77100",
+        "name": "Sample Employer - Network A",
+        "tpaSlug": "varipro",
+        "groupId": "77100",
+        "ein": "111222333",
+    }
+    generated_plan_records = _mymedicalshopper_generated_plan_records()
 
     toc_targets = discovery._mymedicalshopper_targets_from_generated(
         catalog_source_dict,
@@ -7917,6 +7929,29 @@ def test_magnacare_result_rows_extract_download_metadata():
     assert rows[2]["external_url"].startswith("https://health1.firsthealth.com/")
 
 
+def _assert_magnacare_crawl_target(crawl_target) -> None:
+    assert crawl_target.url.endswith("MagnaCarePPO_In-Network.zip?sv=2023&se=2026&sig=secret")
+    assert crawl_target.resolved_from_url == "https://clm.magnacare.com/transparency/"
+    assert crawl_target.metadata["target_kind"] == "file_reference"
+    assert crawl_target.metadata["target_file_type"] == "in-network"
+    assert crawl_target.metadata["run_history_id"] == "339"
+    assert crawl_target.metadata["size_bytes"] == 24_000_000
+    assert crawl_target.metadata["plan_info"] == [
+        {
+            "plan_id": "TESTPLAN001",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+            "plan_name": "Example Employer Health Benefit Plan - HRA Plan",
+        },
+        {
+            "plan_id": "TESTPLAN001",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+            "plan_name": "Example Employer Health Benefit Plan - Standard PPO Plan",
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_magnacare_resolver_refreshes_download_urls_and_aggregates_plans(
     monkeypatch,
@@ -7963,27 +7998,7 @@ async def test_magnacare_resolver_refreshes_download_urls_and_aggregates_plans(
     assert "filters=search-by%3Amagna" in fetched_result_urls[0]
     assert len(fetched_download_urls) in {1}
     assert len(crawl_targets) in {1}
-    crawl_target = crawl_targets[0]
-    assert crawl_target.url.endswith("MagnaCarePPO_In-Network.zip?sv=2023&se=2026&sig=secret")
-    assert crawl_target.resolved_from_url == "https://clm.magnacare.com/transparency/"
-    assert crawl_target.metadata["target_kind"] == "file_reference"
-    assert crawl_target.metadata["target_file_type"] == "in-network"
-    assert crawl_target.metadata["run_history_id"] == "339"
-    assert crawl_target.metadata["size_bytes"] == 24_000_000
-    assert crawl_target.metadata["plan_info"] == [
-        {
-            "plan_id": "TESTPLAN001",
-            "plan_id_type": "EIN",
-            "plan_market_type": "group",
-            "plan_name": "Example Employer Health Benefit Plan - HRA Plan",
-        },
-        {
-            "plan_id": "TESTPLAN001",
-            "plan_id_type": "EIN",
-            "plan_market_type": "group",
-            "plan_name": "Example Employer Health Benefit Plan - Standard PPO Plan",
-        },
-    ]
+    _assert_magnacare_crawl_target(crawl_targets[0])
 
 
 @pytest.mark.asyncio
@@ -8140,14 +8155,8 @@ async def test_uhc_blob_query_finds_late_match_before_target_limit(monkeypatch):
     )
 
 
-def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {
-        "source_id": "source_1",
-        "payer_id": "payer_1",
-        "display_name": "UnitedHealthcare IFP",
-    }
-    listing_response_dict = {
+def _uhc_provider_listing_response() -> dict:
+    return {
         "providers": [
             {
                 "name": "providers",
@@ -8182,6 +8191,16 @@ def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():
             }
         ],
     }
+
+
+def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():
+    """Verify this source-discovery regression contract."""
+    catalog_source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "UnitedHealthcare IFP",
+    }
+    listing_response_dict = _uhc_provider_listing_response()
 
     file_targets = discovery._uhc_provider_mrf_targets_from_payload(
         catalog_source_dict,
@@ -8511,13 +8530,8 @@ def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
     assert file_rows[0]["metadata_json"]["plan_info"][0]["engine_plan_hash"]
 
 
-def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {"source_id": "source_1", "payer_id": "payer_1"}
-    metadata_url = (
-        "https://mrf.healthsparq.com/example/prd/mrf/UNVRA_I/UNVRA/latest_metadata.json"
-    )
-    metadata_response_dict = {
+def _healthsparq_direct_file_metadata() -> dict:
+    return {
         "files": [
             {
                 "reportingEntityName": "Univera Healthcare",
@@ -8546,6 +8560,15 @@ def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
             },
         ]
     }
+
+
+def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
+    """Verify this source-discovery regression contract."""
+    catalog_source_dict = {"source_id": "source_1", "payer_id": "payer_1"}
+    metadata_url = (
+        "https://mrf.healthsparq.com/example/prd/mrf/UNVRA_I/UNVRA/latest_metadata.json"
+    )
+    metadata_response_dict = _healthsparq_direct_file_metadata()
 
     metadata_targets = discovery._healthsparq_targets_from_metadata(
         catalog_source_dict,
@@ -8812,15 +8835,8 @@ async def test_hs_metadata_fallback_landing(
     )
 
 
-@pytest.mark.asyncio
-async def test_providence_resolver_reads_config_and_expands_group_tocs(monkeypatch):
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {
-        "source_id": "source_1",
-        "payer_id": "payer_1",
-        "display_name": "Providence Health Plan",
-    }
-    json_by_url = {
+def _providence_group_toc_responses() -> dict:
+    return {
         "https://mrfhub.providencehealthplan.com/config.json": {
             "X_API_KEY": "public_key",
             "API_ENDPOINT": "https://api.example.test/PROD/",
@@ -8851,6 +8867,17 @@ async def test_providence_resolver_reads_config_and_expands_group_tocs(monkeypat
             ]
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_providence_resolver_reads_config_and_expands_group_tocs(monkeypatch):
+    """Verify this source-discovery regression contract."""
+    catalog_source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Providence Health Plan",
+    }
+    json_by_url = _providence_group_toc_responses()
 
     async def fake_fetch_json(url, **_kwargs):
         return json_by_url[url]
@@ -9222,8 +9249,7 @@ def test_parse_html_mrf_metadata_links_extracts_meta_txt_files():
     ]
 
 
-def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
-    """Verify this source-discovery regression contract."""
+def _parse_toc_and_body_reference_fixture() -> list[dict]:
     html = """
     <a href="/mrf/2026-06-01_example_index.json">TOC</a>
     <a href="/mrf/hmo_ha_hii_arkbluecross_index">No-extension TOC</a>
@@ -9235,11 +9261,14 @@ def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
       In-network rates schema
     </a>
     """
-
-    crawl_targets = discovery._parse_html_mrf_links(
+    return discovery._parse_html_mrf_links(
         html, base_url="https://example.com/machine-readable-files"
     )
 
+
+def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
+    """Verify this source-discovery regression contract."""
+    crawl_targets = _parse_toc_and_body_reference_fixture()
     assert crawl_targets == [
         {
             "url": "https://example.com/mrf/2026-06-01_example_index.json",
@@ -9663,8 +9692,7 @@ def test_html_mrf_links_accept_plan_named_tic_index():
     ]
 
 
-def test_parse_html_mrf_links_uses_section_context_for_split_body_files():
-    """Verify this source-discovery regression contract."""
+def _parse_section_context_fixture() -> list[dict]:
     html = """
     <h2>Alliance Group Care Price Transparency Machine-Readable Files</h2>
     <p>The files below detail costs for items and services.</p>
@@ -9691,11 +9719,14 @@ def test_parse_html_mrf_links_uses_section_context_for_split_body_files():
       </tr>
     </table>
     """
-
-    crawl_targets = discovery._parse_html_mrf_links(
+    return discovery._parse_html_mrf_links(
         html, base_url="https://alamedaalliance.org/about/pricing-transparency/"
     )
 
+
+def test_parse_html_mrf_links_uses_section_context_for_split_body_files():
+    """Verify this source-discovery regression contract."""
+    crawl_targets = _parse_section_context_fixture()
     assert crawl_targets == [
         {
             "url": "https://cmspt.blob.core.windows.net/cms-pricing/1-1000000_output.json.gz",
@@ -9937,8 +9968,7 @@ def test_parse_html_mrf_links_extracts_price_transparency_index_suffix():
     ]
 
 
-def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
-    """Verify this source-discovery regression contract."""
+def _parse_sharp_direct_zip_fixture() -> list[dict]:
     html = """
     <a href="/docs/default-source/price-transparency/2026-06-tableofcontents.zip">
       Table of Contents
@@ -9953,11 +9983,14 @@ def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
       In-Network - FFS
     </a>
     """
-
-    crawl_targets = discovery._parse_html_mrf_links(
+    return discovery._parse_html_mrf_links(
         html, base_url="https://www.sharphealthplan.com/api-access-for-developers"
     )
 
+
+def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
+    """Verify this source-discovery regression contract."""
+    crawl_targets = _parse_sharp_direct_zip_fixture()
     assert crawl_targets == [
         {
             "url": "https://www.sharphealthplan.com/docs/default-source/price-transparency/2026-06-allowed_amounts.zip",
@@ -10005,8 +10038,7 @@ def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
     ]
 
 
-def test_parse_html_mrf_links_extracts_group_health_eau_claire_json_files():
-    """Verify this source-discovery regression contract."""
+def _parse_group_health_json_fixture() -> list[dict]:
     html = """
     <p>
       <a href="/getmedia/fa7482cb-b902-415a-8779-f4abfa2f6bd5/2024-06-03_group-health-cooperative-of-eau-claire_medicaid_in-network-rates.json">
@@ -10023,11 +10055,14 @@ def test_parse_html_mrf_links_extracts_group_health_eau_claire_json_files():
       </a>
     </p>
     """
-
-    crawl_targets = discovery._parse_html_mrf_links(
+    return discovery._parse_html_mrf_links(
         html, base_url="https://group-health.com/price-transparency"
     )
 
+
+def test_parse_html_mrf_links_extracts_group_health_eau_claire_json_files():
+    """Verify this source-discovery regression contract."""
+    crawl_targets = _parse_group_health_json_fixture()
     assert [crawl_target["target_file_type"] for crawl_target in crawl_targets] == [
         "in-network",
         "in-network",
@@ -10696,14 +10731,8 @@ def test_healthspace_session_id_from_html_extracts_public_session():
     assert discovery._healthspace_session_id_from_html(html) == "123456789-987654321"
 
 
-def test_healthspace_soap_targets_extract_mrf_files_only():
-    """Verify this source-discovery regression contract."""
-    source_dict = {
-        "source_id": "source_1",
-        "payer_id": "payer_1",
-        "display_name": "90 Degree Benefits",
-    }
-    soap_text = """
+def _healthspace_mixed_file_soap_response() -> str:
+    return """
     <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
       <s:Body>
         <ExecuteResponse xmlns="https://www.p2phealthcare.com">
@@ -10736,6 +10765,16 @@ def test_healthspace_soap_targets_extract_mrf_files_only():
     </s:Envelope>
     """
 
+
+def test_healthspace_soap_targets_extract_mrf_files_only():
+    """Verify this source-discovery regression contract."""
+    source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "90 Degree Benefits",
+    }
+    soap_text = _healthspace_mixed_file_soap_response()
+
     mrf_targets = discovery._healthspace_mrf_targets_from_soap(
         source_dict,
         soap_text,
@@ -10766,20 +10805,8 @@ def test_healthspace_soap_targets_extract_mrf_files_only():
     assert mrf_targets[2].metadata["plan_info"] == []
 
 
-@pytest.mark.asyncio
-async def test_healthspace_resolver_posts_execute_soap_and_caps_targets(monkeypatch):
-    """Verify this source-discovery regression contract."""
-    source_dict = {
-        "source_id": "source_1",
-        "payer_id": "payer_1",
-        "display_name": "90 Degree Benefits",
-    }
-    page_html = """
-    <script>
-      window.sessionStorage.setItem('HealthspaceSessionId', '123456789-987654321');
-    </script>
-    """
-    soap_text = """
+def _healthspace_capped_file_soap_response() -> str:
+    return """
     <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
       <s:Body>
         <ExecuteResponse xmlns="https://www.p2phealthcare.com">
@@ -10801,6 +10828,22 @@ async def test_healthspace_resolver_posts_execute_soap_and_caps_targets(monkeypa
       </s:Body>
     </s:Envelope>
     """
+
+
+@pytest.mark.asyncio
+async def test_healthspace_resolver_posts_execute_soap_and_caps_targets(monkeypatch):
+    """Verify this source-discovery regression contract."""
+    source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "90 Degree Benefits",
+    }
+    page_html = """
+    <script>
+      window.sessionStorage.setItem('HealthspaceSessionId', '123456789-987654321');
+    </script>
+    """
+    soap_text = _healthspace_capped_file_soap_response()
     post_calls = []
 
     async def fake_fetch_text(*_args, **_kwargs):
@@ -11737,80 +11780,88 @@ def test_bcbs_global_solutions_extracts_toc_links():
     )
 
 
+_BCBS_GLOBAL_PUBLIC_LANDING = (
+    "https://bcbsglobalsolutions.com/transparency-in-coverage/"
+)
+_BCBS_GLOBAL_GROUP_LANDING = (
+    "https://groupadmin.bcbsglobalsolutions.com/transparency-in-coverage.cfm"
+)
+_BCBS_GLOBAL_LIVE_TOC = (
+    "https://groupadmin.bcbsglobalsolutions.com/"
+    "transparency-in-coverage-toc-json.cfm?planType=4EverLife"
+)
+_BCBS_GLOBAL_STALE_TOC = (
+    "https://groupadmin.bcbsglobalsolutions.com/"
+    "transparency-in-coverage-toc-json.cfm?planType=GeoBlue"
+)
+_BCBS_GLOBAL_ALLOWED_ONLY_TOC = (
+    "https://groupadmin.bcbsglobalsolutions.com/"
+    "transparency-in-coverage-toc-json.cfm?planType=AllowedOnly"
+)
+
+
+async def _bcbs_global_landing_response(url, **_kwargs):
+    if url == _BCBS_GLOBAL_PUBLIC_LANDING:
+        return (
+            f'<a href="{_BCBS_GLOBAL_GROUP_LANDING}">'
+            "MRF table of contents</a>"
+        )
+    if url == _BCBS_GLOBAL_GROUP_LANDING:
+        return f"""
+        <a href="{_BCBS_GLOBAL_LIVE_TOC}">4 Ever Life</a>
+        <a href="{_BCBS_GLOBAL_STALE_TOC}">GeoBlue</a>
+        <a href="{_BCBS_GLOBAL_ALLOWED_ONLY_TOC}">Allowed only</a>
+        """
+    raise AssertionError(f"unexpected fetch_text URL: {url}")
+
+
+async def _bcbs_global_toc_response(url, **_kwargs):
+    if url == _BCBS_GLOBAL_STALE_TOC:
+        raise ValueError("response body is not JSON")
+    if url == _BCBS_GLOBAL_ALLOWED_ONLY_TOC:
+        return {
+            "reporting_entity_name": "Example Reporting Entity",
+            "reporting_entity_type": "third-party administrator",
+            "reporting_structure": [
+                {
+                    "reporting_plans": [
+                        {"reporting_entity_name": "Allowed Only Plan"}
+                    ],
+                    "allowed_amount_file": {
+                        "description": "allowed",
+                        "location": "https://example.test/allowed.json.gz",
+                    },
+                }
+            ],
+        }
+    if url == _BCBS_GLOBAL_LIVE_TOC:
+        return {
+            "reporting_entity_name": "Example Reporting Entity",
+            "reporting_entity_type": "third-party administrator",
+            "reporting_structure": [
+                {
+                    "reporting_plans": [
+                        {"reporting_entity_name": "Example Live Plan"}
+                    ],
+                    "in_network_files": [
+                        {
+                            "description": "in_network_files",
+                            "location": "https://example.test/in-network.json.gz",
+                        }
+                    ],
+                }
+            ],
+        }
+    raise AssertionError(f"unexpected fetch_json URL: {url}")
+
+
 @pytest.mark.asyncio
 async def test_bcbs_global_solutions_resolver_follows_landing_and_skips_stale_tocs(
     monkeypatch,
 ):
     """Verify this source-discovery regression contract."""
-    public_landing = "https://bcbsglobalsolutions.com/transparency-in-coverage/"
-    group_landing = (
-        "https://groupadmin.bcbsglobalsolutions.com/transparency-in-coverage.cfm"
-    )
-    live_toc = (
-        "https://groupadmin.bcbsglobalsolutions.com/"
-        "transparency-in-coverage-toc-json.cfm?planType=4EverLife"
-    )
-    stale_toc = (
-        "https://groupadmin.bcbsglobalsolutions.com/"
-        "transparency-in-coverage-toc-json.cfm?planType=GeoBlue"
-    )
-    allowed_only_toc = (
-        "https://groupadmin.bcbsglobalsolutions.com/"
-        "transparency-in-coverage-toc-json.cfm?planType=AllowedOnly"
-    )
-
-    async def fake_fetch_text(url, **_kwargs):
-        if url == public_landing:
-            return f'<a href="{group_landing}">MRF table of contents</a>'
-        if url == group_landing:
-            return f"""
-            <a href="{live_toc}">4 Ever Life</a>
-            <a href="{stale_toc}">GeoBlue</a>
-            <a href="{allowed_only_toc}">Allowed only</a>
-            """
-        raise AssertionError(f"unexpected fetch_text URL: {url}")
-
-    async def fake_fetch_json_value(url, **_kwargs):
-        if url == stale_toc:
-            raise ValueError("response body is not JSON")
-        if url == allowed_only_toc:
-            return {
-                "reporting_entity_name": "Example Reporting Entity",
-                "reporting_entity_type": "third-party administrator",
-                "reporting_structure": [
-                    {
-                        "reporting_plans": [
-                            {"reporting_entity_name": "Allowed Only Plan"}
-                        ],
-                        "allowed_amount_file": {
-                            "description": "allowed",
-                            "location": "https://example.test/allowed.json.gz",
-                        },
-                    }
-                ],
-            }
-        if url == live_toc:
-            return {
-                "reporting_entity_name": "Example Reporting Entity",
-                "reporting_entity_type": "third-party administrator",
-                "reporting_structure": [
-                    {
-                        "reporting_plans": [
-                            {"reporting_entity_name": "Example Live Plan"}
-                        ],
-                        "in_network_files": [
-                            {
-                                "description": "in_network_files",
-                                "location": "https://example.test/in-network.json.gz",
-                            }
-                        ],
-                    }
-                ],
-            }
-        raise AssertionError(f"unexpected fetch_json URL: {url}")
-
-    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
-    monkeypatch.setattr(discovery, "_fetch_json_value", fake_fetch_json_value)
+    monkeypatch.setattr(discovery, "_fetch_text", _bcbs_global_landing_response)
+    monkeypatch.setattr(discovery, "_fetch_json_value", _bcbs_global_toc_response)
 
     crawl_targets = await discovery._resolve_bcbs_global_solutions_mrf(
         {
@@ -11818,12 +11869,14 @@ async def test_bcbs_global_solutions_resolver_follows_landing_and_skips_stale_to
             "payer_id": "payer_1",
             "display_name": "BCBS Global Solutions",
         },
-        public_landing,
+        _BCBS_GLOBAL_PUBLIC_LANDING,
         {"type": "bcbs_global_solutions_mrf", "toc_max_bytes": 12345},
         session=None,
     )
 
-    assert [crawl_target.url for crawl_target in crawl_targets] == [live_toc]
+    assert [crawl_target.url for crawl_target in crawl_targets] == [
+        _BCBS_GLOBAL_LIVE_TOC
+    ]
     assert crawl_targets[0].metadata["target_file_type"] == "table-of-contents"
     assert crawl_targets[0].metadata["target_max_bytes"] == 12345
     assert crawl_targets[0].metadata["plan_type"] == "4EverLife"
@@ -12362,14 +12415,8 @@ def test_azure_mrf_listing_targets_from_xml_extracts_group_health_coop_files():
     assert mrf_targets[0].metadata["target_kind"] == "toc_json"
 
 
-def test_triples_mtt_targets_keep_latest_month_files():
-    """Verify this source-discovery regression contract."""
-    source_dict = {
-        "source_id": "source_1",
-        "payer_id": "payer_1",
-        "display_name": "Triple-S Salud",
-    }
-    response_by_key = {
+def _triples_mtt_monthly_file_response() -> dict:
+    return {
         "list": [
             {
                 "id": "old",
@@ -12409,6 +12456,16 @@ def test_triples_mtt_targets_keep_latest_month_files():
             },
         ]
     }
+
+
+def test_triples_mtt_targets_keep_latest_month_files():
+    """Verify this source-discovery regression contract."""
+    source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Triple-S Salud",
+    }
+    response_by_key = _triples_mtt_monthly_file_response()
 
     file_targets = discovery._triples_mtt_targets_from_payload(
         source_dict,
@@ -12488,18 +12545,7 @@ async def test_resolve_triples_mtt_api_fetches_latest_select_month(monkeypatch):
     assert crawl_target.metadata["target_file_type"] == "in-network"
 
 
-def test_payercompass_targets_from_structure_use_file_list_download_ids():
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {
-        "source_id": "source_1",
-        "payer_id": "payer_1",
-        "display_name": "PayerCompass Plan",
-    }
-    resolver_config_dict = {
-        "type": "payercompass_mrf",
-        "download_path": "/api/File/Download",
-        "max_timeframes": 2,
-    }
+def _payercompass_file_list_fixture() -> tuple[dict, dict]:
     structure_response_dict = {
         "mrfConfig": {
             "timeFrames": [
@@ -12534,6 +12580,22 @@ def test_payercompass_targets_from_structure_use_file_list_download_ids():
             }
         ],
     }
+    return structure_response_dict, files_by_timeframe
+
+
+def test_payercompass_targets_from_structure_use_file_list_download_ids():
+    """Verify this source-discovery regression contract."""
+    catalog_source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "PayerCompass Plan",
+    }
+    resolver_config_dict = {
+        "type": "payercompass_mrf",
+        "download_path": "/api/File/Download",
+        "max_timeframes": 2,
+    }
+    structure_response_dict, files_by_timeframe = _payercompass_file_list_fixture()
 
     download_targets = discovery._payercompass_targets_from_structure(
         catalog_source_dict,
@@ -13133,11 +13195,43 @@ async def test_resolve_crawl_targets_times_out_slow_source(monkeypatch):
     assert observations[0]["status"] == "crawl_failed"
 
 
+async def _expanded_source_crawl_targets(rows, **_kwargs):
+    return [
+        discovery.CrawlTarget(
+            source=rows[0],
+            url="https://example.com/source-1/in-network-1.json",
+            metadata={
+                "target_kind": "file_reference",
+                "target_file_type": "in-network",
+            },
+        ),
+        discovery.CrawlTarget(
+            source=rows[0],
+            url="https://example.com/source-1/in-network-2.json",
+            metadata={
+                "target_kind": "file_reference",
+                "target_file_type": "in-network",
+            },
+        ),
+        discovery.CrawlTarget(
+            source=rows[1],
+            url="https://example.com/source-2/in-network-1.json",
+            metadata={
+                "target_kind": "file_reference",
+                "target_file_type": "in-network",
+            },
+        ),
+    ], []
+
+
+async def _accept_crawl_row_batches(*_args, **_kwargs):
+    return None
+
+
 @pytest.mark.asyncio
 async def test_crawl_toc_metadata_reports_expanded_target_count(monkeypatch):
     """Verify this source-discovery regression contract."""
     progress = []
-
     source_rows = [
         {
             "source_id": "source_1",
@@ -13150,41 +13244,11 @@ async def test_crawl_toc_metadata_reports_expanded_target_count(monkeypatch):
             "index_url": "https://example.com/source-2",
         },
     ]
-
-    async def fake_resolve_crawl_targets(rows, **_kwargs):
-        return [
-            discovery.CrawlTarget(
-                source=rows[0],
-                url="https://example.com/source-1/in-network-1.json",
-                metadata={
-                    "target_kind": "file_reference",
-                    "target_file_type": "in-network",
-                },
-            ),
-            discovery.CrawlTarget(
-                source=rows[0],
-                url="https://example.com/source-1/in-network-2.json",
-                metadata={
-                    "target_kind": "file_reference",
-                    "target_file_type": "in-network",
-                },
-            ),
-            discovery.CrawlTarget(
-                source=rows[1],
-                url="https://example.com/source-2/in-network-1.json",
-                metadata={
-                    "target_kind": "file_reference",
-                    "target_file_type": "in-network",
-                },
-            ),
-        ], []
-
-    async def fake_push_crawl_row_batches(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
     monkeypatch.setattr(
-        discovery, "_push_crawl_row_batches", fake_push_crawl_row_batches
+        discovery, "_resolve_crawl_targets", _expanded_source_crawl_targets
+    )
+    monkeypatch.setattr(
+        discovery, "_push_crawl_row_batches", _accept_crawl_row_batches
     )
     monkeypatch.setattr(
         discovery, "enqueue_live_progress", lambda **payload: progress.append(payload)

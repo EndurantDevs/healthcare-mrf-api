@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -208,13 +209,91 @@ async def test_rust_stage_merge_covers_insert_drop_and_fast_rebuild(
     assert not any("INSERT INTO" in statement for statement in statements)
 
 
+def _recording_transaction(
+    transaction_events: list[str],
+):
+    transaction_state_by_field = {"depth": 0}
+
+    @asynccontextmanager
+    async def transaction():
+        is_nested_transaction = transaction_state_by_field["depth"] > 0
+        transaction_events.append(
+            "SAVEPOINT" if is_nested_transaction else "BEGIN"
+        )
+        transaction_state_by_field["depth"] += 1
+        try:
+            yield SimpleNamespace(
+                execute=AsyncMock(
+                    side_effect=lambda statement, _parameters: (
+                        transaction_events.append(str(statement))
+                    )
+                )
+            )
+        except Exception:
+            transaction_events.append(
+                "ROLLBACK TO SAVEPOINT"
+                if is_nested_transaction
+                else "ROLLBACK"
+            )
+            raise
+        else:
+            transaction_events.append(
+                "RELEASE SAVEPOINT" if is_nested_transaction else "COMMIT"
+            )
+        finally:
+            transaction_state_by_field["depth"] -= 1
+
+    return transaction
+
+
+@pytest.mark.asyncio
+async def test_price_stage_ensure_tolerates_optional_ddl_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_statements: list[str] = []
+    transaction_events: list[str] = []
+
+    async def status(statement: str) -> None:
+        seen_statements.append(statement)
+        if (
+            "DROP COLUMN IF EXISTS \"hash_prefix\"" in statement
+            or "SET UNLOGGED" in statement
+            or "CREATE INDEX" in statement
+        ):
+            raise RuntimeError("optional DDL unavailable")
+
+    monkeypatch.setattr(table_setup.db, "status", status)
+    monkeypatch.setattr(
+        table_setup.db,
+        "transaction",
+        _recording_transaction(transaction_events),
+    )
+    monkeypatch.setenv(table_setup.PTG2_UNLOGGED_STAGE_ENV, "true")
+    monkeypatch.setenv(table_setup.PTG2_STAGE_INDEXES_ENV, "true")
+
+    await table_setup._ensure_ptg2_price_set_stage_table(
+        "candidate_schema"
+    )
+
+    assert any("CREATE UNLOGGED TABLE" in sql for sql in seen_statements)
+    assert any(
+        "DROP COLUMN IF EXISTS \"canonical_payload\"" in sql
+        for sql in seen_statements
+    )
+    assert any("CREATE INDEX" in sql for sql in seen_statements)
+    assert transaction_events.count("ROLLBACK TO SAVEPOINT") == 3
+    assert transaction_events[-1] == "COMMIT"
+
+
 @pytest.mark.asyncio
 async def test_serving_stage_ensure_tolerates_optional_ddl_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen_statements: list[str] = []
+    transaction_events: list[str] = []
 
     async def status(statement: str) -> None:
+        transaction_events.append(statement)
         seen_statements.append(statement)
         if (
             "SET UNLOGGED" in statement
@@ -225,21 +304,70 @@ async def test_serving_stage_ensure_tolerates_optional_ddl_failures(
             raise RuntimeError("optional DDL unavailable")
 
     monkeypatch.setattr(table_setup.db, "status", status)
+    monkeypatch.setattr(
+        table_setup.db,
+        "transaction",
+        _recording_transaction(transaction_events),
+    )
     monkeypatch.setenv(table_setup.PTG2_UNLOGGED_STAGE_ENV, "true")
     monkeypatch.setenv(table_setup.PTG2_STAGE_INDEXES_ENV, "true")
 
     await table_setup._ensure_ptg2_serving_rate_stage_table("candidate_schema")
 
+    assert transaction_events[0] == "BEGIN"
+    assert "pg_advisory_xact_lock" in transaction_events[1]
+    assert "CREATE UNLOGGED TABLE" in transaction_events[2]
+    assert transaction_events[-1] == "COMMIT"
     assert any("CREATE UNLOGGED TABLE" in statement for statement in seen_statements)
     assert any("ADD COLUMN IF NOT EXISTS confidence" in statement for statement in seen_statements)
     assert any("CREATE INDEX" in statement for statement in seen_statements)
+    assert transaction_events.count("ROLLBACK TO SAVEPOINT") == 4
 
     seen_statements.clear()
     monkeypatch.setenv(table_setup.PTG2_UNLOGGED_STAGE_ENV, "false")
     monkeypatch.setenv(table_setup.PTG2_STAGE_INDEXES_ENV, "false")
     await table_setup._ensure_ptg2_serving_rate_stage_table("candidate_schema")
+    assert transaction_events[-1] == "COMMIT"
     assert not any("SET UNLOGGED" in statement for statement in seen_statements)
     assert not any("CREATE INDEX" in statement for statement in seen_statements)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entrypoint_name,locked_helper_name",
+    (
+        ("_ensure_ptg2_price_set_stage_table", "_ensure_price_stage_table_locked"),
+        ("_ensure_ptg2_serving_rate_stage_table", "_ensure_rate_stage_table_locked"),
+    ),
+)
+async def test_stage_ddl_acquires_lifecycle_lock_before_locked_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint_name: str,
+    locked_helper_name: str,
+) -> None:
+    events: list[str] = []
+
+    class Session:
+        async def execute(self, statement, _parameters) -> None:
+            events.append(str(statement))
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("BEGIN")
+        yield Session()
+        events.append("COMMIT")
+
+    async def locked_helper(schema_name: str) -> None:
+        events.append(f"DDL:{schema_name}")
+
+    monkeypatch.setattr(table_setup.db, "transaction", transaction)
+    monkeypatch.setattr(table_setup, locked_helper_name, locked_helper)
+
+    await getattr(table_setup, entrypoint_name)("candidate_schema")
+
+    assert events[0] == "BEGIN"
+    assert "pg_advisory_xact_lock" in events[1]
+    assert events[2:] == ["DDL:candidate_schema", "COMMIT"]
 
 
 def test_ptg_helpers_cover_money_and_lean_source_guard(

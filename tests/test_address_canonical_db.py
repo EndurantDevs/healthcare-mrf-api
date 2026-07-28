@@ -72,6 +72,47 @@ def _resolve_stats_projection(stats):
     }
 
 
+def _canonical_stage_field_map():
+    return {
+        "first_line": "first_line",
+        "second_line": "second_line",
+        "city": "city",
+        "state": "state",
+        "zip": "zip_code",
+        "country": "COALESCE(NULLIF(country, ''), 'US')",
+    }
+
+
+async def _reset_canonical_stage(schema, stage_table, values_sql):
+    await db.status(f"CREATE SCHEMA IF NOT EXISTS {schema};")
+    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
+    await db.status(
+        f"""
+        CREATE TABLE {schema}.{stage_table} (
+            address_key uuid,
+            first_line text,
+            second_line text,
+            city text,
+            state text,
+            zip_code text,
+            country text
+        );
+        """
+    )
+    await db.status(
+        f"TRUNCATE TABLE {schema}.address_checksum_map, "
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.{stage_table}
+            (first_line, second_line, city, state, zip_code, country)
+        VALUES
+            {values_sql};
+        """
+    )
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_checksum_bridge_primary_key_is_checksum_only():
     _requires_test_database()
@@ -549,45 +590,18 @@ async def test_rust_materialized_resolve_matches_sql_resolve(monkeypatch):
 
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_rust_materialize_test"
-    field_map = {
-        "first_line": "first_line",
-        "second_line": "second_line",
-        "city": "city",
-        "state": "state",
-        "zip": "zip_code",
-        "country": "COALESCE(NULLIF(country, ''), 'US')",
-    }
-
-    await db.status(f"CREATE SCHEMA IF NOT EXISTS {schema};")
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
-    await db.status(
-        f"""
-        CREATE TABLE {schema}.{stage_table} (
-            address_key uuid,
-            first_line text,
-            second_line text,
-            city text,
-            state text,
-            zip_code text,
-            country text
-        );
+    field_map = _canonical_stage_field_map()
+    await _reset_canonical_stage(
+        schema,
+        stage_table,
         """
-    )
-    await db.status(
-        f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
-    )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{stage_table} (first_line, second_line, city, state, zip_code, country)
-        VALUES
-            ('27 Dr Mellichamp Dr' || chr(160) || 'Ste 100', NULL, 'BLUFFTON', 'SC', '29910', 'US'),
-            ('123 Main Street', 'Suite 200', 'Miami', 'Florida', '33156-2814', 'US'),
-            ('123 MAIN ST STE 200', NULL, 'MIAMI', 'FL', '33156', 'US'),
-            ('123 Main Street', 'Suite 310', 'Miami', 'FL', '33156', 'US'),
-            ('No State Road', NULL, 'Austin', NULL, '78701', 'US'),
-            ('Foreign Road', NULL, 'Vancouver', 'British Columbia', 'V6B 2W9', 'Canada');
-        """
+        ('27 Dr Mellichamp Dr' || chr(160) || 'Ste 100', NULL, 'BLUFFTON', 'SC', '29910', 'US'),
+        ('123 Main Street', 'Suite 200', 'Miami', 'Florida', '33156-2814', 'US'),
+        ('123 MAIN ST STE 200', NULL, 'MIAMI', 'FL', '33156', 'US'),
+        ('123 Main Street', 'Suite 310', 'Miami', 'FL', '33156', 'US'),
+        ('No State Road', NULL, 'Austin', NULL, '78701', 'US'),
+        ('Foreign Road', NULL, 'Vancouver', 'British Columbia', 'V6B 2W9', 'Canada')
+        """,
     )
     await stamp_address_keys(stage_table, field_map, schema=schema, shards=2)
 
@@ -854,6 +868,72 @@ async def test_resolve_reports_gate_warning_for_eligible_unstamped_rows(monkeypa
     )
 
 
+def _python_canonical_projection(case):
+    values_by_field = {
+        "first_line": case.get("first_line"),
+        "second_line": case.get("second_line"),
+        "city": case.get("city"),
+        "state": case.get("state"),
+        "zip": case.get("zip"),
+        "country": case.get("country"),
+    }
+    arguments = tuple(values_by_field.values())
+    identity = address_canon.identity_key_v1(*arguments)
+    address_key = address_canon.address_key_v1(*arguments)
+    premise_identity = address_canon.premise_identity_key_v1(*arguments)
+    return (
+        values_by_field,
+        identity,
+        address_key,
+        premise_identity,
+        address_canon.key_from_identity(premise_identity),
+    )
+
+
+async def _sql_canonical_projection(schema, values_by_field):
+    source_row = await db.first(
+        f"""
+        SELECT
+            {schema}.addr_identity_key_v1(
+                :first_line, :second_line, :city, :state, :zip, :country
+            ) AS identity_key,
+            {schema}.addr_key_v1(
+                :first_line, :second_line, :city, :state, :zip, :country
+            )::text AS address_key,
+            {schema}.addr_key_from_identity_v1(
+                {schema}.addr_identity_key_v1(
+                    :first_line, :second_line, :city, :state, :zip, :country
+                )
+            )::text AS address_key_from_identity,
+            {schema}.addr_premise_identity_key_v1(
+                :first_line, :second_line, :city, :state, :zip, :country
+            ) AS premise_identity_key,
+            {schema}.addr_premise_key_v1(
+                :first_line, :second_line, :city, :state, :zip, :country
+            )::text AS premise_key;
+        """,
+        **values_by_field,
+    )
+    return source_row._mapping
+
+
+def _assert_canonical_projection(case, sql_values, python_values, group_key_by_name):
+    _, identity, address_key, premise_identity, premise_key = python_values
+    assert sql_values["identity_key"] == identity, case["id"]
+    assert sql_values["address_key"] == (str(address_key) if address_key else None), case["id"]
+    assert sql_values["address_key_from_identity"] == sql_values["address_key"], case["id"]
+    assert sql_values["premise_identity_key"] == premise_identity, case["id"]
+    assert sql_values["premise_key"] == (str(premise_key) if premise_key else None), case["id"]
+    assert sql_values["identity_key"] == case["expected_identity_key"], case["id"]
+    assert sql_values["address_key"] == case["expected_address_key"], case["id"]
+    assert sql_values["premise_identity_key"] == case["expected_premise_identity_key"], case["id"]
+    assert sql_values["premise_key"] == case["expected_premise_key"], case["id"]
+    if group := case.get("equivalence_group"):
+        current = (sql_values["identity_key"], sql_values["address_key"])
+        group_key_by_name.setdefault(group, current)
+        assert group_key_by_name[group] == current, case["id"]
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_python_and_sql_address_canonical_golden_corpus_match():
     """Verify python and sql address canonical golden corpus match."""
@@ -861,82 +941,16 @@ async def test_python_and_sql_address_canonical_golden_corpus_match():
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     cases = _golden_cases()
     assert len(cases) >= 200
-
     group_key_by_name: dict[str, tuple[str | None, str | None]] = {}
     for case in cases:
-        canonical_value_by_field = {
-            "first_line": case.get("first_line"),
-            "second_line": case.get("second_line"),
-            "city": case.get("city"),
-            "state": case.get("state"),
-            "zip": case.get("zip"),
-            "country": case.get("country"),
-        }
-        py_identity = address_canon.identity_key_v1(
-            canonical_value_by_field["first_line"],
-            canonical_value_by_field["second_line"],
-            canonical_value_by_field["city"],
-            canonical_value_by_field["state"],
-            canonical_value_by_field["zip"],
-            canonical_value_by_field["country"],
+        python_values = _python_canonical_projection(case)
+        sql_values = await _sql_canonical_projection(schema, python_values[0])
+        _assert_canonical_projection(
+            case,
+            sql_values,
+            python_values,
+            group_key_by_name,
         )
-        py_key = address_canon.address_key_v1(
-            canonical_value_by_field["first_line"],
-            canonical_value_by_field["second_line"],
-            canonical_value_by_field["city"],
-            canonical_value_by_field["state"],
-            canonical_value_by_field["zip"],
-            canonical_value_by_field["country"],
-        )
-        py_premise_identity = address_canon.premise_identity_key_v1(
-            canonical_value_by_field["first_line"],
-            canonical_value_by_field["second_line"],
-            canonical_value_by_field["city"],
-            canonical_value_by_field["state"],
-            canonical_value_by_field["zip"],
-            canonical_value_by_field["country"],
-        )
-        py_premise_key = address_canon.key_from_identity(py_premise_identity)
-
-        source_row = await db.first(
-            f"""
-            SELECT
-                {schema}.addr_identity_key_v1(
-                    :first_line, :second_line, :city, :state, :zip, :country
-                ) AS identity_key,
-                {schema}.addr_key_v1(
-                    :first_line, :second_line, :city, :state, :zip, :country
-                )::text AS address_key,
-                {schema}.addr_key_from_identity_v1(
-                    {schema}.addr_identity_key_v1(
-                        :first_line, :second_line, :city, :state, :zip, :country
-                    )
-                )::text AS address_key_from_identity,
-                {schema}.addr_premise_identity_key_v1(
-                    :first_line, :second_line, :city, :state, :zip, :country
-                ) AS premise_identity_key,
-                {schema}.addr_premise_key_v1(
-                    :first_line, :second_line, :city, :state, :zip, :country
-                )::text AS premise_key;
-            """,
-            **canonical_value_by_field,
-        )
-        canonical_data_by_case = source_row._mapping
-
-        assert canonical_data_by_case["identity_key"] == py_identity, case["id"]
-        assert canonical_data_by_case["address_key"] == (str(py_key) if py_key else None), case["id"]
-        assert canonical_data_by_case["address_key_from_identity"] == canonical_data_by_case["address_key"], case["id"]
-        assert canonical_data_by_case["premise_identity_key"] == py_premise_identity, case["id"]
-        assert canonical_data_by_case["premise_key"] == (str(py_premise_key) if py_premise_key else None), case["id"]
-        assert canonical_data_by_case["identity_key"] == case["expected_identity_key"], case["id"]
-        assert canonical_data_by_case["address_key"] == case["expected_address_key"], case["id"]
-        assert canonical_data_by_case["premise_identity_key"] == case["expected_premise_identity_key"], case["id"]
-        assert canonical_data_by_case["premise_key"] == case["expected_premise_key"], case["id"]
-
-        if group := case.get("equivalence_group"):
-            current = (canonical_data_by_case["identity_key"], canonical_data_by_case["address_key"])
-            group_key_by_name.setdefault(group, current)
-            assert group_key_by_name[group] == current, case["id"]
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -1060,61 +1074,7 @@ async def test_resolve_reason_buckets_and_collision_abort(monkeypatch):
     assert stats.inserted == 3
 
 
-@pytest.mark.asyncio(loop_scope="session")
-async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(monkeypatch):
-    """Verify resolve aliases missing suffix and direction only when unique."""
-    _requires_test_database()
-    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-    stage_table = "address_canon_stage_completion_alias_test"
-    monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "false")
-
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
-    await db.status(
-        f"""
-        CREATE TABLE {schema}.{stage_table} (
-            address_key uuid,
-            first_line text,
-            second_line text,
-            city text,
-            state text,
-            zip_code text,
-            country text
-        );
-        """
-    )
-    await db.status(
-        f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
-    )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{stage_table} (first_line, second_line, city, state, zip_code, country)
-        VALUES
-            ('10 Holcombe Blvd', NULL, 'Houston', 'TX', '77030', 'US'),
-            ('10 Holcombe', NULL, 'Houston', 'TX', '77030', 'US'),
-            ('30 N Main St', NULL, 'Austin', 'TX', '78701', 'US'),
-            ('30 Main St', NULL, 'Austin', 'TX', '78701', 'US'),
-            ('20 Ambiguous Rd', NULL, 'Austin', 'TX', '78701', 'US'),
-            ('20 Ambiguous Ave', NULL, 'Austin', 'TX', '78701', 'US'),
-            ('20 Ambiguous', NULL, 'Austin', 'TX', '78701', 'US');
-        """
-    )
-
-    stats = await resolve_into_archive(
-        stage_table,
-        {
-            "first_line": "first_line",
-            "second_line": "second_line",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "COALESCE(NULLIF(country, ''), 'US')",
-        },
-        source_bit=2,
-        priority=1,
-        schema=schema,
-    )
-
+async def _completion_alias_keys(schema, stage_table):
     holcombe_target = await db.scalar(
         f"SELECT {schema}.addr_key_v1('10 Holcombe Blvd', NULL, 'Houston', 'TX', '77030', 'US');"
     )
@@ -1141,7 +1101,53 @@ async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(mon
         """,
         address_key=ambiguous_original,
     )
+    return (
+        holcombe_target,
+        holcombe_alias,
+        directional_target,
+        directional_alias,
+        ambiguous_original,
+        ambiguous_alias,
+        ambiguous_archive_key,
+    )
 
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(monkeypatch):
+    """Verify resolve aliases missing suffix and direction only when unique."""
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    stage_table = "address_canon_stage_completion_alias_test"
+    monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "false")
+    await _reset_canonical_stage(
+        schema,
+        stage_table,
+        """
+        ('10 Holcombe Blvd', NULL, 'Houston', 'TX', '77030', 'US'),
+        ('10 Holcombe', NULL, 'Houston', 'TX', '77030', 'US'),
+        ('30 N Main St', NULL, 'Austin', 'TX', '78701', 'US'),
+        ('30 Main St', NULL, 'Austin', 'TX', '78701', 'US'),
+        ('20 Ambiguous Rd', NULL, 'Austin', 'TX', '78701', 'US'),
+        ('20 Ambiguous Ave', NULL, 'Austin', 'TX', '78701', 'US'),
+        ('20 Ambiguous', NULL, 'Austin', 'TX', '78701', 'US')
+        """,
+    )
+    stats = await resolve_into_archive(
+        stage_table,
+        _canonical_stage_field_map(),
+        source_bit=2,
+        priority=1,
+        schema=schema,
+    )
+    (
+        holcombe_target,
+        holcombe_alias,
+        directional_target,
+        directional_alias,
+        ambiguous_original,
+        ambiguous_alias,
+        ambiguous_archive_key,
+    ) = await _completion_alias_keys(schema, stage_table)
     assert holcombe_alias == holcombe_target
     assert directional_alias == directional_target
     assert ambiguous_alias is None
@@ -1159,46 +1165,21 @@ async def test_resolve_leaves_missing_zip_unkeyed_without_coordinate_restore(mon
     stage_table = "address_canon_stage_missing_zip_repair_test"
     monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "false")
 
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
-    await db.status(
-        f"""
-        CREATE TABLE {schema}.{stage_table} (
-            address_key uuid,
-            first_line text,
-            second_line text,
-            city text,
-            state text,
-            zip_code text,
-            country text
-        );
+    await _reset_canonical_stage(
+        schema,
+        stage_table,
         """
-    )
-    await db.status(
-        f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
-    )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{stage_table} (first_line, second_line, city, state, zip_code, country)
-        VALUES
-            ('10 Zip Repair Road', NULL, 'Austin', 'TX', '78701', 'US'),
-            ('10 Zip Repair Road', NULL, 'Austin', 'TX', NULL, 'US'),
-            ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', '78701', 'US'),
-            ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', '78702', 'US'),
-            ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', NULL, 'US');
-        """
+        ('10 Zip Repair Road', NULL, 'Austin', 'TX', '78701', 'US'),
+        ('10 Zip Repair Road', NULL, 'Austin', 'TX', NULL, 'US'),
+        ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', '78701', 'US'),
+        ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', '78702', 'US'),
+        ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', NULL, 'US')
+        """,
     )
 
     stats = await resolve_into_archive(
         stage_table,
-        {
-            "first_line": "first_line",
-            "second_line": "second_line",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "COALESCE(NULLIF(country, ''), 'US')",
-        },
+        _canonical_stage_field_map(),
         source_bit=2,
         priority=1,
         schema=schema,
@@ -1238,23 +1219,13 @@ async def test_resolve_aborts_same_batch_identity_collision(monkeypatch):
     monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "false")
     monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: progress_events.append(payload))
 
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
-    await db.status(
-        f"""
-        CREATE TABLE {schema}.{stage_table} (
-            address_key uuid,
-            first_line text,
-            second_line text,
-            city text,
-            state text,
-            zip_code text,
-            country text
-        );
+    await _reset_canonical_stage(
+        schema,
+        stage_table,
         """
-    )
-    await db.status(
-        f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        ('10 Collision Road', 'Suite 1', 'Austin', 'TX', '78701', 'US'),
+        ('20 Collision Road', 'Suite 1', 'Austin', 'TX', '78701', 'US')
+        """,
     )
     forged_key = "00000000-0000-0000-0000-000000000001"
     original_key_sql = address_canon._key_from_identity_sql
@@ -1268,26 +1239,11 @@ async def test_resolve_aborts_same_batch_identity_collision(monkeypatch):
         )
 
     monkeypatch.setattr(address_canon, "_key_from_identity_sql", fake_key_from_identity_sql)
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{stage_table} (first_line, second_line, city, state, zip_code, country)
-        VALUES
-            ('10 Collision Road', 'Suite 1', 'Austin', 'TX', '78701', 'US'),
-            ('20 Collision Road', 'Suite 1', 'Austin', 'TX', '78701', 'US');
-        """
-    )
 
     with pytest.raises(RuntimeError, match="Canonical address key collision"):
         await resolve_into_archive(
             stage_table,
-            {
-                "first_line": "first_line",
-                "second_line": "second_line",
-                "city": "city",
-                "state": "state",
-                "zip": "zip_code",
-                "country": "COALESCE(NULLIF(country, ''), 'US')",
-            },
+            _canonical_stage_field_map(),
             source_bit=2,
             priority=1,
             schema=schema,
@@ -1414,14 +1370,7 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
     assert float(unchanged.long) == pytest.approx(-97.7431)
 
 
-@pytest.mark.asyncio(loop_scope="session")
-async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_key():
-    """Verify entity address unified rebuild includes mrf source with address key."""
-    _requires_test_database()
-    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-    stage_cls = make_class(EntityAddressUnified, "mrf_source_fixture")
-    stage_table = stage_cls.__tablename__
-
+async def _prepare_mrf_address_source(schema, stage_table):
     await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
     await db.status(f"DROP TABLE IF EXISTS {schema}.mrf_address;")
     await db.status(
@@ -1463,6 +1412,16 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
         );
         """
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_key():
+    """Verify entity address unified rebuild includes mrf source with address key."""
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    stage_cls = make_class(EntityAddressUnified, "mrf_source_fixture")
+    stage_table = stage_cls.__tablename__
+    await _prepare_mrf_address_source(schema, stage_table)
     await db.create_table(stage_cls.__table__, checkfirst=True)
 
     source_selects = entity_address_unified._source_selects(

@@ -9,6 +9,7 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_legacy_orphan_contract import LegacySuffixOwnership
 from process.ptg_parts.ptg2_legacy_orphan_store_common import (
     _BLOCKING_ATTACHMENTS,
+    _MRF_OPTIONAL_TABLES,
     _OwnershipAccumulator,
     _bare_control_suffix,
     _internal_run_suffix,
@@ -63,9 +64,20 @@ def _attach_raw_snapshot_owner_conflicts(
             )
 
 
-def _blocking_attachment_statements(schema_name: str) -> list[str]:
+def _blocking_attachment_statements(
+    schema_name: str,
+    *,
+    present_optional_table_names: frozenset[str],
+) -> list[str]:
+    if not present_optional_table_names.issubset(_MRF_OPTIONAL_TABLES):
+        raise ValueError("legacy sweep optional authority is invalid")
     statements = []
     for table_name, snapshot_columns, run_columns in _BLOCKING_ATTACHMENTS:
+        if (
+            table_name in _MRF_OPTIONAL_TABLES
+            and table_name not in present_optional_table_names
+        ):
+            continue
         table = _schema_table(schema_name, table_name)
         statements.extend(
             (
@@ -98,6 +110,7 @@ async def _attach_blocking_residue(
     schema_name: str,
     accumulators: Mapping[str, _OwnershipAccumulator],
     suffixes_by_snapshot: Mapping[str, set[str]],
+    present_optional_table_names: frozenset[str],
 ) -> None:
     snapshot_ids = sorted(suffixes_by_snapshot)
     internal_run_ids = sorted(
@@ -107,7 +120,10 @@ async def _attach_blocking_residue(
             for run_id, _status in accumulator.internal_run_statuses
         }
     )
-    statements = _blocking_attachment_statements(schema_name)
+    statements = _blocking_attachment_statements(
+        schema_name,
+        present_optional_table_names=present_optional_table_names,
+    )
     if not statements:
         return
     residue_rows = await executor.all(
@@ -256,6 +272,7 @@ async def _attach_references_and_fences(
     schema_name: str,
     control_schema_name: str,
     accumulators: Mapping[str, _OwnershipAccumulator],
+    present_optional_table_names: frozenset[str],
 ) -> None:
     suffixes_by_snapshot = _suffixes_by_snapshot(accumulators)
     await _attach_reverse_owner_conflicts(
@@ -277,6 +294,7 @@ async def _attach_references_and_fences(
         schema_name=schema_name,
         accumulators=accumulators,
         suffixes_by_snapshot=suffixes_by_snapshot,
+        present_optional_table_names=present_optional_table_names,
     )
     await _attach_attempt_fences(
         executor,
@@ -292,6 +310,7 @@ async def load_legacy_ownership(
     schema_name: str,
     control_schema_name: str,
     catalog: LegacyRelationCatalog,
+    present_optional_table_names: frozenset[str],
 ) -> Mapping[str, LegacySuffixOwnership]:
     """Collect all ownership and serving references for catalog suffixes."""
 
@@ -337,6 +356,7 @@ async def load_legacy_ownership(
         schema_name=schema_name,
         control_schema_name=control_schema_name,
         accumulators=accumulators,
+        present_optional_table_names=present_optional_table_names,
     )
     _attach_declared_snapshot_conflicts(accumulators)
     return {

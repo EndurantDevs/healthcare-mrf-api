@@ -43,8 +43,10 @@ The sweeper:
 - validates schema, owner, OID, relation kind, persistence, columns, indexes,
   sequences, inheritance, user-trigger definitions/enabled state, and generic
   PostgreSQL dependencies before probing rows;
-- binds every lifecycle-authority OID and column shape, plus the immutable
-  audit trigger, into the reviewed plan;
+- binds every required lifecycle-authority OID and column shape, the exact
+  present/absent state of optional transient stage relations (plus their OID
+  and shape when present), and the immutable audit trigger into the reviewed
+  plan;
 - blocks building, running, validated-without-owner, active/unknown placement,
   current/previous pointer, route, release, pin, shared-binding, attempt-fence,
   cross-owner, serving-row, allowed-amount, candidate-audit, and stage residue;
@@ -58,7 +60,11 @@ The sweeper:
 - permits ownerless relations only when every allowed root table is proven
   empty;
 - serializes with the shared PTG lifecycle lock and rechecks the complete plan
-  after acquiring exact table locks;
+  after acquiring exact locks on every present authority table; application
+  setup for both optional stage relations acquires the same lifecycle lock
+  before DDL, keeps required `CREATE` fail-fast, and isolates each tolerated
+  `ALTER` or index statement in its own savepoint, while the final recheck
+  still binds optional absence or exact OID/schema/shape when present;
 - caps suffixes, root tables, dependent relations, and bytes with hard
   non-overridable ceilings;
 - skips and explicitly classifies an individually oversized lexical family so
@@ -80,7 +86,9 @@ the first cleanup record exists.
 ## Operating sequence
 
 1. Confirm the migration is applied and no import, audit, publication, route,
-   release, or cleanup operation is in flight.
+   release, cleanup, Alembic migration, or manual DDL operation is in flight.
+   Alembic and manual DDL are a trusted operator boundary: they must never run
+   concurrently with either dry-run review or apply.
 2. Run dry-run with conservative limits and retain its aggregate output.
 3. Review blocked counts and the exact `plan_digest`.
 4. Apply that digest once. Any catalog or lifecycle drift fails closed.

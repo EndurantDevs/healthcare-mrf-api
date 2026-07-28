@@ -180,8 +180,7 @@ def test_reference_commands_preserve_download_and_relationship_controls(monkeypa
     )
 
 
-def test_audit_and_source_discovery_preserve_public_run_controls(monkeypatch) -> None:
-    """Verify audit and source discovery preserve public run controls."""
+def _assert_candidate_audit_run_controls(monkeypatch) -> None:
     _assert_cli_forwards(
         monkeypatch,
         command=process_cli.ptg_candidate_audit,
@@ -200,6 +199,9 @@ def test_audit_and_source_discovery_preserve_public_run_controls(monkeypatch) ->
             "import_id": "import-1",
         },
     )
+
+
+def _assert_source_discovery_run_controls(monkeypatch) -> None:
     _assert_cli_forwards(
         monkeypatch,
         command=process_cli.mrf_source_discovery_command,
@@ -254,8 +256,13 @@ def test_audit_and_source_discovery_preserve_public_run_controls(monkeypatch) ->
     )
 
 
-def test_address_import_commands_preserve_staging_and_migration_controls(monkeypatch) -> None:
-    """Verify address import commands preserve staging and migration controls."""
+def test_audit_and_source_discovery_preserve_public_run_controls(monkeypatch) -> None:
+    """Verify audit and source discovery preserve public run controls."""
+    _assert_candidate_audit_run_controls(monkeypatch)
+    _assert_source_discovery_run_controls(monkeypatch)
+
+
+def _assert_openaddresses_import_controls(monkeypatch) -> None:
     _assert_cli_forwards(
         monkeypatch,
         command=process_cli.openaddresses,
@@ -305,6 +312,9 @@ def test_address_import_commands_preserve_staging_and_migration_controls(monkeyp
             "zip_restore_shards": 6,
         },
     )
+
+
+def _assert_address_archive_migration_controls(monkeypatch) -> None:
     _assert_cli_forwards(
         monkeypatch,
         command=process_cli.address_archive_v2_migrate,
@@ -335,3 +345,9 @@ def test_address_import_commands_preserve_staging_and_migration_controls(monkeyp
             "test_mode": True,
         },
     )
+
+
+def test_address_import_commands_preserve_staging_and_migration_controls(monkeypatch) -> None:
+    """Verify address import commands preserve staging and migration controls."""
+    _assert_openaddresses_import_controls(monkeypatch)
+    _assert_address_archive_migration_controls(monkeypatch)

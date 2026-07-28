@@ -297,9 +297,7 @@ async def test_plan_get_plan_success():
     assert response_payload["formulary_uri"] == "P123/2024"
 
 
-@pytest.mark.asyncio
-async def test_plan_find_plan_success():
-    """Verify plan find plan success."""
+def _find_plan_success_request():
     plan_entry_by_field = {
         "plan_id": "P123",
         "year": 2024,
@@ -309,7 +307,7 @@ async def test_plan_find_plan_success():
         "max_rate": 200.0,
         "rate_expiration_date": datetime.datetime(2025, 6, 4),
     }
-    request = make_request(
+    return make_request(
         [
             FakeResult(rows=[(1,)], scalar=1),
             *make_facet_results(),
@@ -352,6 +350,12 @@ async def test_plan_find_plan_success():
         ],
         args={"year": "2024", "age": "30", "rating_area": "A", "limit": "1", "page": "1"},
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_find_plan_success():
+    """Verify plan find plan success."""
+    request = _find_plan_success_request()
     response = await find_a_plan(request)
     response_payload = json.loads(response.body)
     assert response_payload["total"] == 1

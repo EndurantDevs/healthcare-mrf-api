@@ -43,10 +43,8 @@ _MRF_REQUIRED_TABLES = (
     "ptg2_import_job",
     "ptg2_import_run",
     "ptg2_plan_month",
-    "ptg2_price_set_stage",
     "ptg2_serving_rate",
     "ptg2_serving_rate_compact",
-    "ptg2_serving_rate_stage",
     "ptg2_snapshot",
     "ptg2_snapshot_pin",
     "ptg2_source_catalog",
@@ -58,6 +56,10 @@ _MRF_REQUIRED_TABLES = (
     "ptg2_v4_attempt_fence",
     "ptg2_v4_attempt_stage",
     LEGACY_SWEEP_AUDIT_TABLE,
+)
+_MRF_OPTIONAL_TABLES = (
+    "ptg2_price_set_stage",
+    "ptg2_serving_rate_stage",
 )
 _CONTROL_REQUIRED_TABLES = (
     "hp_plan_release_binding",
@@ -189,6 +191,7 @@ class LegacyAuthorityCatalog:
 
     catalog_digest: str
     relation_oids: tuple[int, ...]
+    present_optional_table_names: tuple[str, ...]
 
 
 @dataclass

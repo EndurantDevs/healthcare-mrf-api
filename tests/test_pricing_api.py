@@ -1464,10 +1464,29 @@ async def test_get_pricing_provider_score_defaults_to_most_local_mode():
     assert pricing_response["scores_by_benchmark_mode"]["state"] is None
 
 
-@pytest.mark.asyncio
-async def test_get_pricing_provider_score_live_override_path():
-    """Prefer a qualifying live score over the stored score."""
-    request = make_request(
+def _live_override_cohort_row():
+    return {
+        "row_data": {
+            "year": 2023,
+            "benchmark_mode": "zip",
+            "geography_scope": "zip",
+            "geography_value": "20850",
+            "cohort_level": "L0",
+            "peer_count": 44,
+            "specialty_key": "cardiology",
+            "taxonomy_code": "207RC0000X",
+            "procedure_bucket": "100,200",
+            "target_appropriateness": 2.0408163265306123,
+            "target_rx_appropriateness": 2.0,
+            "target_effectiveness": 80.0,
+            "target_qpp_cost": 70.0,
+            "target_cost": 24489.795918367346,
+        }
+    }
+
+
+def _live_override_request():
+    return make_request(
         [
             FakeResult(
                 rows=[
@@ -1500,26 +1519,7 @@ async def test_get_pricing_provider_score_live_override_path():
             ),
             FakeResult(scalar=0.4),
             FakeResult(
-                rows=[
-                    {
-                        "row_data": {
-                            "year": 2023,
-                            "benchmark_mode": "zip",
-                            "geography_scope": "zip",
-                            "geography_value": "20850",
-                            "cohort_level": "L0",
-                            "peer_count": 44,
-                            "specialty_key": "cardiology",
-                            "taxonomy_code": "207RC0000X",
-                            "procedure_bucket": "100,200",
-                            "target_appropriateness": 2.0408163265306123,
-                            "target_rx_appropriateness": 2.0,
-                            "target_effectiveness": 80.0,
-                            "target_qpp_cost": 70.0,
-                            "target_cost": 24489.795918367346,
-                        }
-                    }
-                ]
+                rows=[_live_override_cohort_row()]
             ),
         ],
         args={
@@ -1531,6 +1531,11 @@ async def test_get_pricing_provider_score_live_override_path():
         },
     )
 
+
+@pytest.mark.asyncio
+async def test_get_pricing_provider_score_live_override_path():
+    """Prefer a qualifying live score over the stored score."""
+    request = _live_override_request()
     response = await get_pricing_provider_score(request, "1003000126")
     pricing_response = json.loads(response.body)
     assert pricing_response["benchmark_mode"] == "zip"
@@ -1725,74 +1730,84 @@ async def test_load_provider_quality_profile_sql_has_no_trailing_cte_comma(monke
     }
 
 
+async def _estimated_score_profile(_session, *, npi, year):
+    assert npi == 1003000126
+    assert year == 2023
+    return {
+        "npi": npi,
+        "specialty_key": "cardiology",
+        "taxonomy_code": "207RC0000X",
+        "zip5": "20850",
+        "state_key": "MD",
+        "provider_class": "clinician",
+        "location_source": "doctor_clinician_address",
+        "has_enrollment": True,
+        "has_medicare_claims": False,
+    }
+
+
+async def _estimated_quality_modes(_session, **_kwargs):
+    return {
+        "zip": pricing_module._build_quality_mode_payload(
+            {
+                "model_version": "v2",
+                "benchmark_mode": "zip",
+                "tier": "acceptable",
+                "borderline_status": False,
+                "score_0_100": 57.4,
+                "estimated_cost_level": "$$$",
+                "score_method": "estimated",
+                "confidence_0_100": 43.0,
+                "confidence_band": "low",
+                "cost_source": "peer_estimated",
+                "data_coverage_0_100": 46.0,
+                "provider_class": "clinician",
+                "location_source": "doctor_clinician_address",
+                "has_claims": False,
+                "has_qpp": False,
+                "has_rx": False,
+                "has_enrollment": True,
+                "has_medicare_claims": False,
+                "risk_ratio_point": 0.94,
+                "ci75_low": 0.88,
+                "ci75_high": 1.01,
+                "ci90_low": 0.84,
+                "ci90_high": 1.05,
+                "low_score_threshold_failed": False,
+                "low_confidence_threshold_failed": False,
+                "high_score_threshold_passed": False,
+                "high_confidence_threshold_passed": False,
+            },
+            pricing_module._empty_domain_payloads_by_name(),
+            cohort_context={
+                "selected_geography": "zip:20850",
+                "selected_cohort_level": None,
+                "peer_count": 84,
+                "specialty_key": "cardiology",
+                "taxonomy_code": "207RC0000X",
+                "procedure_bucket": None,
+                "computed_live": False,
+                "procedure_match_threshold": None,
+            },
+        ),
+        "state": None,
+        "national": None,
+    }
+
+
 @pytest.mark.asyncio
 async def test_get_pricing_provider_score_estimated_fallback(monkeypatch):
     """Estimate a provider score when direct score evidence is absent."""
-    async def _fake_profile(_session, *, npi, year):
-        assert npi == 1003000126
-        assert year == 2023
-        return {
-            "npi": npi,
-            "specialty_key": "cardiology",
-            "taxonomy_code": "207RC0000X",
-            "zip5": "20850",
-            "state_key": "MD",
-            "provider_class": "clinician",
-            "location_source": "doctor_clinician_address",
-            "has_enrollment": True,
-            "has_medicare_claims": False,
-        }
-
-    async def _fake_estimated_modes(_session, **_kwargs):
-        return {
-            "zip": pricing_module._build_quality_mode_payload(
-                {
-                    "model_version": "v2",
-                    "benchmark_mode": "zip",
-                    "tier": "acceptable",
-                    "borderline_status": False,
-                    "score_0_100": 57.4,
-                    "estimated_cost_level": "$$$",
-                    "score_method": "estimated",
-                    "confidence_0_100": 43.0,
-                    "confidence_band": "low",
-                    "cost_source": "peer_estimated",
-                    "data_coverage_0_100": 46.0,
-                    "provider_class": "clinician",
-                    "location_source": "doctor_clinician_address",
-                    "has_claims": False,
-                    "has_qpp": False,
-                    "has_rx": False,
-                    "has_enrollment": True,
-                    "has_medicare_claims": False,
-                    "risk_ratio_point": 0.94,
-                    "ci75_low": 0.88,
-                    "ci75_high": 1.01,
-                    "ci90_low": 0.84,
-                    "ci90_high": 1.05,
-                    "low_score_threshold_failed": False,
-                    "low_confidence_threshold_failed": False,
-                    "high_score_threshold_passed": False,
-                    "high_confidence_threshold_passed": False,
-                },
-                pricing_module._empty_domain_payloads_by_name(),
-                cohort_context={
-                    "selected_geography": "zip:20850",
-                    "selected_cohort_level": None,
-                    "peer_count": 84,
-                    "specialty_key": "cardiology",
-                    "taxonomy_code": "207RC0000X",
-                    "procedure_bucket": None,
-                    "computed_live": False,
-                    "procedure_match_threshold": None,
-                },
-            ),
-            "state": None,
-            "national": None,
-        }
-
-    monkeypatch.setattr(pricing_module, "_load_provider_quality_profile", _fake_profile)
-    monkeypatch.setattr(pricing_module, "_load_estimated_quality_modes", _fake_estimated_modes)
+    monkeypatch.setattr(
+        pricing_module,
+        "_load_provider_quality_profile",
+        _estimated_score_profile,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_load_estimated_quality_modes",
+        _estimated_quality_modes,
+    )
 
     request = make_request(
         [
@@ -4602,10 +4617,48 @@ async def test_postal_radius_cache_avoids_repeated_geo_lookup(monkeypatch):
     pricing_module._ZIP_RADIUS_ROWS_CACHE.clear()
 
 
-@pytest.mark.asyncio
-async def test_list_providers_by_procedure_cost_index_enriched_from_peer_stats():
-    """Enrich procedure provider results with peer cost statistics."""
-    request = make_request(
+def _procedure_cost_profile_row(
+    *,
+    geography_scope="zip5",
+    geography_value="20814",
+):
+    return {
+        "npi": 1003000126,
+        "year": 2023,
+        "procedure_code": 123,
+        "geography_scope": geography_scope,
+        "geography_value": geography_value,
+        "specialty_key": "diagnostic radiology",
+        "setting_key": "all",
+        "claim_count": 42.0,
+        "avg_submitted_charge": 415.0,
+        "total_submitted_charge": 17430.0,
+    }
+
+
+def _procedure_peer_stats_row(*, geography_scope="zip5", geography_value="20814"):
+    return {
+        "procedure_code": 123,
+        "year": 2023,
+        "geography_scope": geography_scope,
+        "geography_value": geography_value,
+        "specialty_key": "diagnostic radiology",
+        "setting_key": "all",
+        "provider_count": 250,
+        "min_claim_count": 11.0,
+        "max_claim_count": 900.0,
+        "p10": 150.0,
+        "p20": 250.0,
+        "p40": 350.0,
+        "p50": 425.0,
+        "p60": 500.0,
+        "p80": 700.0,
+        "p90": 900.0,
+    }
+
+
+def _procedure_provider_cost_request():
+    return make_request(
         [
             FakeResult(scalar=1),
             FakeResult(
@@ -4628,44 +4681,8 @@ async def test_list_providers_by_procedure_cost_index_enriched_from_peer_stats()
             ),
             FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
             FakeResult(scalar="mrf.pricing_procedure_peer_stats"),
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "procedure_code": 123,
-                        "geography_scope": "zip5",
-                        "geography_value": "20814",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "claim_count": 42.0,
-                        "avg_submitted_charge": 415.0,
-                        "total_submitted_charge": 17430.0,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "procedure_code": 123,
-                        "year": 2023,
-                        "geography_scope": "zip5",
-                        "geography_value": "20814",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "provider_count": 250,
-                        "min_claim_count": 11.0,
-                        "max_claim_count": 900.0,
-                        "p10": 150.0,
-                        "p20": 250.0,
-                        "p40": 350.0,
-                        "p50": 425.0,
-                        "p60": 500.0,
-                        "p80": 700.0,
-                        "p90": 900.0,
-                    }
-                ]
-            ),
+            FakeResult(rows=[_procedure_cost_profile_row()]),
+            FakeResult(rows=[_procedure_peer_stats_row()]),
         ],
         args={
             "code": "123",
@@ -4677,6 +4694,11 @@ async def test_list_providers_by_procedure_cost_index_enriched_from_peer_stats()
         },
     )
 
+
+@pytest.mark.asyncio
+async def test_list_providers_by_procedure_cost_index_enriched_from_peer_stats():
+    """Enrich procedure provider results with peer cost statistics."""
+    request = _procedure_provider_cost_request()
     response = await list_providers_by_procedure(request)
     pricing_response = json.loads(response.body)
     pricing_item = pricing_response["items"][0]
@@ -4768,49 +4790,25 @@ async def test_list_providers_by_prescription_with_q():
     assert pricing_response["query"]["q"] == "atorvastatin"
 
 
-@pytest.mark.asyncio
-async def test_get_provider_procedure_estimated_cost_level_success():
-    """Return an estimated cost level from available benchmark data."""
-    request = make_request(
+def _national_procedure_cost_request():
+    return make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
             FakeResult(scalar="mrf.pricing_procedure_peer_stats"),
             FakeResult(
                 rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "procedure_code": 123,
-                        "geography_scope": "national",
-                        "geography_value": "US",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "claim_count": 42,
-                        "avg_submitted_charge": 415.0,
-                        "total_submitted_charge": 17430.0,
-                    }
+                    _procedure_cost_profile_row(
+                        geography_scope="national",
+                        geography_value="US",
+                    )
                 ]
             ),
             FakeResult(
                 rows=[
-                    {
-                        "procedure_code": 123,
-                        "year": 2023,
-                        "geography_scope": "national",
-                        "geography_value": "US",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "provider_count": 250,
-                        "min_claim_count": 11.0,
-                        "max_claim_count": 900.0,
-                        "p10": 150.0,
-                        "p20": 250.0,
-                        "p40": 350.0,
-                        "p50": 425.0,
-                        "p60": 500.0,
-                        "p80": 700.0,
-                        "p90": 900.0,
-                    }
+                    _procedure_peer_stats_row(
+                        geography_scope="national",
+                        geography_value="US",
+                    )
                 ]
             ),
             FakeResult(
@@ -4825,6 +4823,11 @@ async def test_get_provider_procedure_estimated_cost_level_success():
         args={"year": "2023", "state": "MD"},
     )
 
+
+@pytest.mark.asyncio
+async def test_get_provider_procedure_estimated_cost_level_success():
+    """Return an estimated cost level from available benchmark data."""
+    request = _national_procedure_cost_request()
     response = await get_provider_procedure_estimated_cost_level_internal(request, "1003000126", "123")
     pricing_response = json.loads(response.body)
     assert pricing_response["npi"] == 1003000126
@@ -4843,10 +4846,8 @@ async def test_get_provider_procedure_estimated_cost_level_success():
     assert pricing_response["procedure"]["reported_code_system"] == "CPT"
 
 
-@pytest.mark.asyncio
-async def test_get_provider_procedure_estimated_cost_level_zip_ring_fallback():
-    """Use the ZIP-ring fallback when local benchmark data is sparse."""
-    request = make_request(
+def _zip_ring_procedure_cost_request():
+    return make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
             FakeResult(scalar="mrf.pricing_procedure_peer_stats"),
@@ -4863,18 +4864,10 @@ async def test_get_provider_procedure_estimated_cost_level_zip_ring_fallback():
             ),
             FakeResult(
                 rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "procedure_code": 123,
-                        "geography_scope": "national",
-                        "geography_value": "US",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "claim_count": 42,
-                        "avg_submitted_charge": 415.0,
-                        "total_submitted_charge": 17430.0,
-                    }
+                    _procedure_cost_profile_row(
+                        geography_scope="national",
+                        geography_value="US",
+                    )
                 ]
             ),
             FakeResult(
@@ -4884,26 +4877,7 @@ async def test_get_provider_procedure_estimated_cost_level_zip_ring_fallback():
                 ]
             ),
             FakeResult(
-                rows=[
-                    {
-                        "procedure_code": 123,
-                        "year": 2023,
-                        "geography_scope": "zip5",
-                        "geography_value": "20816",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "provider_count": 250,
-                        "min_claim_count": 11.0,
-                        "max_claim_count": 900.0,
-                        "p10": 150.0,
-                        "p20": 250.0,
-                        "p40": 350.0,
-                        "p50": 425.0,
-                        "p60": 500.0,
-                        "p80": 700.0,
-                        "p90": 900.0,
-                    }
-                ]
+                rows=[_procedure_peer_stats_row(geography_value="20816")]
             ),
             FakeResult(
                 rows=[
@@ -4917,6 +4891,11 @@ async def test_get_provider_procedure_estimated_cost_level_zip_ring_fallback():
         args={"year": "2023", "zip5": "20814", "zip_radius_miles": "30"},
     )
 
+
+@pytest.mark.asyncio
+async def test_get_provider_procedure_estimated_cost_level_zip_ring_fallback():
+    """Use the ZIP-ring fallback when local benchmark data is sparse."""
+    request = _zip_ring_procedure_cost_request()
     response = await get_provider_procedure_estimated_cost_level_internal(request, "1003000126", "123")
     pricing_response = json.loads(response.body)
     assert pricing_response["peer_group"]["geography_scope"] == "zip5"

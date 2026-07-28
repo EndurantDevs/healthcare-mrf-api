@@ -22,6 +22,7 @@ from process.ptg_parts.ptg2_legacy_orphan_store import (
     verify_applied_audit_state,
 )
 from process.ptg_parts.ptg2_legacy_orphan_store_common import (
+    _MRF_OPTIONAL_TABLES,
     _OwnershipAccumulator,
 )
 from process.ptg_parts.ptg2_legacy_orphan_store_ownership import (
@@ -55,7 +56,7 @@ def test_authority_inventory_covers_frozen_v4_attachment_surface() -> None:
     assert {
         attachment.table_name
         for attachment in migration.ATTEMPT_ATTACHMENTS
-    }.issubset(_MRF_REQUIRED_TABLES)
+    }.issubset((*_MRF_REQUIRED_TABLES, *_MRF_OPTIONAL_TABLES))
 
 
 def test_manifest_owner_ignores_unrelated_32_hex_values() -> None:

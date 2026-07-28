@@ -16,6 +16,7 @@ from process.ptg_parts.ptg2_legacy_orphan_contract import (
 )
 from process.ptg_parts.ptg2_legacy_orphan_store_common import (
     _CONTROL_REQUIRED_TABLES,
+    _MRF_OPTIONAL_TABLES,
     _MRF_REQUIRED_TABLES,
     _row_mapping,
     _schema_table,
@@ -26,14 +27,12 @@ from process.ptg_parts.ptg2_lifecycle_lock import (
 )
 
 
-async def lock_legacy_sweep_authority(
+async def lock_legacy_sweep_lifecycle(
     executor: Any,
     *,
-    schema_name: str,
-    control_schema_name: str,
     lock_timeout: str,
 ) -> None:
-    """Serialize lifecycle changes while an apply plan is recomputed."""
+    """Acquire the shared lifecycle lock before any authority snapshot."""
 
     await executor.status(
         "SELECT set_config('lock_timeout', :lock_timeout, true)",
@@ -43,11 +42,32 @@ async def lock_legacy_sweep_authority(
         "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
         lock_key=PTG2_SOURCE_POINTER_GC_LOCK_KEY,
     )
+
+
+async def lock_legacy_sweep_authority(
+    executor: Any,
+    *,
+    schema_name: str,
+    control_schema_name: str,
+    lock_timeout: str,
+    present_optional_table_names: tuple[str, ...],
+    lifecycle_locked: bool = False,
+) -> None:
+    """Serialize lifecycle changes and lock the resolved authority tables."""
+
+    if not lifecycle_locked:
+        await lock_legacy_sweep_lifecycle(
+            executor,
+            lock_timeout=lock_timeout,
+        )
+    optional_names = tuple(sorted(set(present_optional_table_names)))
+    if not set(optional_names).issubset(_MRF_OPTIONAL_TABLES):
+        raise ValueError("legacy sweep optional authority is invalid")
     await executor.status(
         "LOCK TABLE "
         + ", ".join(
             _schema_table(schema_name, table_name)
-            for table_name in _MRF_REQUIRED_TABLES
+            for table_name in (*_MRF_REQUIRED_TABLES, *optional_names)
         )
         + " IN SHARE MODE"
     )
