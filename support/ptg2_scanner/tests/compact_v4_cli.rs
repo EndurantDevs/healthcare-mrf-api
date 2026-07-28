@@ -323,7 +323,15 @@ fn run_v3_finalizer(
         .args(["--total-sort-memory-bytes", "33554432"])
         .args(["--scratch-durability", "ephemeral"])
         .arg(manifest)
-        .env("HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION", "none")
+        .env("HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION", "zlib")
+        .env(
+            "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES",
+            "1",
+        )
+        .env(
+            "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT",
+            "0",
+        )
         .env("HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES", "65536")
         .env("HLTHPRT_PTG2_RATE_SCHEDULE_OBSERVE", "true")
         .output()
@@ -474,6 +482,37 @@ fn compact_cli_reports_provider_reference_worker_failures() {
 }
 
 #[test]
+fn compact_cli_reports_primary_producer_failures() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    fs::create_dir(&output).expect("create output directory");
+    fs::write(
+        &source,
+        br#"{
+          "provider_references":[{
+            "provider_group_id":7,
+            "provider_groups":[{
+              "tin":{"type":"ein","value":"111223333"},
+              "npi":[1234567890]
+            }]
+          }],
+          "in_network":[{
+            "billing_code_type":"CPT",
+            "billing_code":"99213",
+            "negotiated_rates":[}
+        }"#,
+    )
+    .expect("write malformed rate fixture");
+
+    let completed = run_compact_v4(&source, &output);
+    assert!(!completed.status.success());
+    let stderr = String::from_utf8_lossy(&completed.stderr);
+    assert!(stderr.contains("PTG2_SCANNER_PRIMARY_FAILED"), "{stderr}");
+    assert!(stderr.contains("producer_error"), "{stderr}");
+}
+
+#[test]
 fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
     let temporary = tempfile::tempdir().expect("temporary fixture root");
     let source = temporary.path().join("rates.json");
@@ -589,6 +628,13 @@ fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
         "pair_spool_sort_v1"
     );
     assert_eq!(finalizer_summary["rate_schedule_observe"]["enabled"], true);
+    assert!(
+        finalizer_summary
+            .pointer("/blocks/assigned_encoder/provider_set_codes/storage/compressed_records")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0),
+        "{finalizer_summary:#}"
+    );
     for name in [
         "summary.json",
         "shared_serving_blocks.copy",
