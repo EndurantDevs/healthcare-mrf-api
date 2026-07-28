@@ -19,6 +19,23 @@ from scripts.ptg_v4_dev_canary_storage_sql import owned_row_bytes
 
 STORAGE_BASELINE_CONTRACT = "ptg_v4_physical_storage_baseline_v1"
 MAP_OBJECT_KIND = "snapshot_coordinate_map_v1"
+
+
+@dataclass(frozen=True)
+class PhysicalStorageRequest:
+    """Immutable inputs for one whole-snapshot physical measurement."""
+
+    schema_name: str
+    snapshot_id: str
+    snapshot_key: int
+    import_run_id: str
+    relation_manifests: Sequence[Mapping[str, Any]]
+    baseline: Mapping[str, Any]
+    import_started_at: datetime
+    import_finished_at: datetime
+    retained_raw_artifacts: Mapping[str, Any]
+
+
 @dataclass(frozen=True)
 class _StorageAttributionScope:
     """Snapshot ownership and timing inputs shared across relation attribution."""
@@ -26,10 +43,24 @@ class _StorageAttributionScope:
     schema_name: str
     snapshot_id: str
     snapshot_key: int
+    import_run_id: str
     baseline_bytes: Mapping[str, int]
     import_started_at: datetime
     import_finished_at: datetime
     cas_evidence: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _StorageReportContext:
+    """Precomputed sections used to shape the final storage report."""
+
+    storage_records: Sequence[Mapping[str, Any]]
+    totals_by_field: Mapping[str, int]
+    object_kind_evidence: Mapping[str, Any]
+    cas_record: Mapping[str, Any]
+    cas_reference_source: str
+    cas_reference_population: str
+    retained_raw_artifacts: Mapping[str, Any]
 
 
 async def relation_size_rows(
@@ -77,35 +108,20 @@ async def relation_size_rows(
 
 async def collect_physical_storage(
     connection: asyncpg.Connection,
-    *,
-    schema_name: str,
-    snapshot_id: str,
-    snapshot_key: int,
-    relation_manifests: Sequence[Mapping[str, Any]],
-    baseline: Mapping[str, Any],
-    import_started_at: datetime,
-    import_finished_at: datetime,
+    request: PhysicalStorageRequest,
 ) -> dict[str, Any]:
     """Allocate physical bytes to a snapshot and reconcile shared CAS blocks."""
 
     relation_names = sorted(WHOLE_SNAPSHOT_PHYSICAL_RELATIONS)
-    size_rows = await relation_size_rows(connection, schema_name, relation_names)
-    baseline_bytes = _baseline_bytes(baseline, schema_name, relation_names)
-    cas_evidence = await collect_cas_evidence(
+    size_rows = await relation_size_rows(
         connection,
-        schema_name=schema_name,
-        snapshot_key=snapshot_key,
-        import_started_at=import_started_at,
-        import_finished_at=import_finished_at,
+        request.schema_name,
+        relation_names,
     )
-    attribution_scope = _StorageAttributionScope(
-        schema_name=schema_name,
-        snapshot_id=snapshot_id,
-        snapshot_key=snapshot_key,
-        baseline_bytes=baseline_bytes,
-        import_started_at=import_started_at,
-        import_finished_at=import_finished_at,
-        cas_evidence=cas_evidence,
+    attribution_scope = await _storage_attribution_scope(
+        connection,
+        request,
+        relation_names=relation_names,
     )
     storage_records = await _build_storage_records(
         connection,
@@ -113,24 +129,66 @@ async def collect_physical_storage(
         size_rows=size_rows,
     )
     object_kind_evidence = _object_kind_evidence(
-        cas_evidence,
-        relation_manifests=relation_manifests,
+        attribution_scope.cas_evidence,
+        relation_manifests=request.relation_manifests,
     )
-    totals_by_field = _storage_totals(storage_records, baseline_bytes)
+    totals_by_field = _storage_totals(
+        storage_records,
+        attribution_scope.baseline_bytes,
+        retained_raw_artifacts=request.retained_raw_artifacts,
+    )
     cas_record = next(
         storage_record
         for storage_record in storage_records
         if storage_record["relation"] == "ptg2_v3_block"
     )
     return _storage_report(
-        storage_records,
-        totals_by_field=totals_by_field,
-        object_kind_evidence=object_kind_evidence,
-        cas_record=cas_record,
-        cas_reference_source=str(cas_evidence.get("reference_source") or ""),
-        cas_reference_population=str(
-            cas_evidence.get("reference_population") or ""
+        _StorageReportContext(
+            storage_records=storage_records,
+            totals_by_field=totals_by_field,
+            object_kind_evidence=object_kind_evidence,
+            cas_record=cas_record,
+            cas_reference_source=str(
+                attribution_scope.cas_evidence.get("reference_source") or ""
+            ),
+            cas_reference_population=str(
+                attribution_scope.cas_evidence.get("reference_population")
+                or ""
+            ),
+            retained_raw_artifacts=request.retained_raw_artifacts,
         ),
+    )
+
+
+async def _storage_attribution_scope(
+    connection: asyncpg.Connection,
+    request: PhysicalStorageRequest,
+    *,
+    relation_names: Sequence[str],
+) -> _StorageAttributionScope:
+    """Load the baseline and CAS population shared by relation attribution."""
+
+    baseline_bytes = _baseline_bytes(
+        request.baseline,
+        request.schema_name,
+        relation_names,
+    )
+    cas_evidence = await collect_cas_evidence(
+        connection,
+        schema_name=request.schema_name,
+        snapshot_key=request.snapshot_key,
+        import_started_at=request.import_started_at,
+        import_finished_at=request.import_finished_at,
+    )
+    return _StorageAttributionScope(
+        schema_name=request.schema_name,
+        snapshot_id=request.snapshot_id,
+        snapshot_key=request.snapshot_key,
+        import_run_id=request.import_run_id,
+        baseline_bytes=baseline_bytes,
+        import_started_at=request.import_started_at,
+        import_finished_at=request.import_finished_at,
+        cas_evidence=cas_evidence,
     )
 
 
@@ -174,6 +232,7 @@ async def _measure_relation_attribution(
             relation_name,
             attribution_scope.snapshot_id,
             attribution_scope.snapshot_key,
+            attribution_scope.import_run_id,
         )
     total_bytes = int(size_row["total_bytes"])
     allocated_by_field = {
@@ -233,6 +292,8 @@ def _object_kind_evidence(
 def _storage_totals(
     storage_records: Sequence[Mapping[str, Any]],
     baseline_bytes: Mapping[str, int],
+    *,
+    retained_raw_artifacts: Mapping[str, Any],
 ) -> dict[str, int]:
     """Calculate attributed bytes and positive global growth for both scopes."""
 
@@ -245,7 +306,10 @@ def _storage_totals(
         int(storage_record["attributed_bytes"])
         for storage_record in graph_records
     )
-    snapshot_attributed_total = sum(
+    retained_raw_physical_bytes = int(
+        retained_raw_artifacts.get("referenced_physical_bytes") or 0
+    )
+    snapshot_attributed_total = retained_raw_physical_bytes + sum(
         int(storage_record["attributed_bytes"])
         for storage_record in storage_records
     )
@@ -267,25 +331,23 @@ def _storage_totals(
         "graph_growth": max(graph_after_total - graph_before_total, 0),
         "snapshot_attributed": snapshot_attributed_total,
         "snapshot_growth": max(snapshot_after_total - snapshot_before_total, 0),
+        "retained_raw_physical": retained_raw_physical_bytes,
     }
 
 
 def _storage_report(
-    storage_records: Sequence[Mapping[str, Any]],
-    *,
-    totals_by_field: Mapping[str, int],
-    object_kind_evidence: Mapping[str, Any],
-    cas_record: Mapping[str, Any],
-    cas_reference_source: str,
-    cas_reference_population: str,
+    context: _StorageReportContext,
 ) -> dict[str, Any]:
     """Shape the final physical-storage evidence contract."""
 
+    totals_by_field = context.totals_by_field
     return {
         "contract": STORAGE_EVIDENCE_CONTRACT,
         "baseline_captured": True,
-        "relations": list(storage_records),
-        "storage_claim_scope": "whole_snapshot_and_v4_graph",
+        "relations": list(context.storage_records),
+        "storage_claim_scope": (
+            "whole_snapshot_v4_graph_and_retained_raw"
+        ),
         "graph_attributed_physical_bytes": totals_by_field["graph_attributed"],
         "graph_positive_import_delta_bytes": totals_by_field["graph_growth"],
         "graph_gate_bytes": max(
@@ -296,35 +358,55 @@ def _storage_report(
             "snapshot_attributed"
         ],
         "snapshot_positive_import_delta_bytes": totals_by_field["snapshot_growth"],
+        "retained_raw_artifact_physical_bytes": totals_by_field[
+            "retained_raw_physical"
+        ],
+        "retained_raw_artifacts": dict(context.retained_raw_artifacts),
         "snapshot_gate_bytes": max(
             totals_by_field["snapshot_attributed"],
             totals_by_field["snapshot_growth"],
         ),
-        "allocation_reconciled": all(
-            int(storage_record["row_reconciliation_delta_bytes"]) == 0
-            and abs(
-                int(storage_record["allocation_reconciliation_delta_bytes"])
-            )
-            <= 1
-            for storage_record in storage_records
+        "allocation_reconciled": _is_allocation_reconciled(
+            context.storage_records
         ),
-        "object_kind_counts": object_kind_evidence["counts"],
-        "missing_required_object_kinds": object_kind_evidence["missing"],
-        "map_cas_block_count": object_kind_evidence["map_cas_block_count"],
-        "cas": {
-            "reference_source": cas_reference_source,
-            "reference_population": cas_reference_population,
-            **{
-                field_name: cas_record[field_name]
-                for field_name in (
-                    "distinct_referenced_block_count",
-                    "new_during_import_block_count",
-                    "preexisting_reused_block_count",
-                    "shared_block_count",
-                )
-            },
-        },
+        "object_kind_counts": context.object_kind_evidence["counts"],
+        "missing_required_object_kinds": context.object_kind_evidence["missing"],
+        "map_cas_block_count": context.object_kind_evidence[
+            "map_cas_block_count"
+        ],
+        "cas": _cas_storage_summary(context),
         "shared_cas_accounting": "weighted_by_distinct_snapshot_reference_count",
+    }
+
+
+def _is_allocation_reconciled(
+    storage_records: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return whether row and allocated-byte attribution fully reconcile."""
+
+    return all(
+        int(storage_record["row_reconciliation_delta_bytes"]) == 0
+        and abs(int(storage_record["allocation_reconciliation_delta_bytes"]))
+        <= 1
+        for storage_record in storage_records
+    )
+
+
+def _cas_storage_summary(context: _StorageReportContext) -> dict[str, Any]:
+    """Shape authenticated shared-CAS reference accounting."""
+
+    return {
+        "reference_source": context.cas_reference_source,
+        "reference_population": context.cas_reference_population,
+        **{
+            field_name: context.cas_record[field_name]
+            for field_name in (
+                "distinct_referenced_block_count",
+                "new_during_import_block_count",
+                "preexisting_reused_block_count",
+                "shared_block_count",
+            )
+        },
     }
 
 

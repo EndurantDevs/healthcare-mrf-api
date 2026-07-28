@@ -207,15 +207,22 @@ async def test_failure_persistence_records_stage_release_and_final_timings(monke
     monkeypatch.setattr(process_ptg, "_ptg2_monotonic", lambda: next(monotonic_values))
 
     report = await process_ptg._mark_ptg2_import_failed(
-        "run-one",
-        "snapshot-one",
-        datetime.date(2026, 7, 1),
-        datetime.datetime(2026, 7, 1),
-        "scan failed",
-        report={"timings": {"total_seconds": 999, "download_seconds": 2}},
-        manifest_stage_table="candidate",
-        import_started_monotonic=5.0,
-        failure_handling_started_monotonic=10.0,
+        process_ptg._FailedImportPersistence(
+            import_run_id="run-one",
+            snapshot_id="snapshot-one",
+            import_month=datetime.date(2026, 7, 1),
+            started_at=datetime.datetime(2026, 7, 1),
+            error="scan failed",
+            report={
+                "timings": {
+                    "total_seconds": 999,
+                    "download_seconds": 2,
+                }
+            },
+            manifest_stage_table="candidate",
+            import_started_monotonic=5.0,
+            failure_handling_started_monotonic=10.0,
+        )
     )
 
     assert [table for table, _row in pushed_batches] == [
@@ -245,12 +252,14 @@ async def test_failure_persistence_can_preserve_a_published_snapshot(monkeypatch
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", record_push)
 
     report = await process_ptg._mark_ptg2_import_failed(
-        "run-one",
-        "snapshot-one",
-        datetime.date(2026, 7, 1),
-        datetime.datetime(2026, 7, 1),
-        "late failure",
-        should_preserve_published_snapshot=True,
+        process_ptg._FailedImportPersistence(
+            import_run_id="run-one",
+            snapshot_id="snapshot-one",
+            import_month=datetime.date(2026, 7, 1),
+            started_at=datetime.datetime(2026, 7, 1),
+            error="late failure",
+            should_preserve_published_snapshot=True,
+        )
     )
 
     assert pushed_classes == [process_ptg.PTG2ImportRun]
@@ -279,11 +288,13 @@ async def test_failure_persistence_distinguishes_storage_errors_from_fences(
     )
 
     call = process_ptg._mark_ptg2_import_failed(
-        "run-one",
-        "snapshot-one",
-        datetime.date(2026, 7, 1),
-        datetime.datetime(2026, 7, 1),
-        "failure",
+        process_ptg._FailedImportPersistence(
+            import_run_id="run-one",
+            snapshot_id="snapshot-one",
+            import_month=datetime.date(2026, 7, 1),
+            started_at=datetime.datetime(2026, 7, 1),
+            error="failure",
+        )
     )
     if fenced:
         with pytest.raises(process_ptg.StaleMetadataFenceError, match="durably fenced"):

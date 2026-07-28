@@ -33,6 +33,9 @@ from process.live_progress import (
     set_live_progress_context,
     write_live_progress,
 )
+from process.ptg_parts.frozen_rate_privacy import (
+    project_frozen_status_event,
+)
 from process.redis_config import build_redis_settings
 
 
@@ -646,7 +649,7 @@ async def mark_control_run(
         "snapshot_id": snapshot_id,
         "publish_event": False,
     }
-    status_event_by_field = {
+    status_event_by_field = project_frozen_status_event({
         "run_id": run_id,
         "status": status,
         "phase_detail": phase_detail,
@@ -661,7 +664,13 @@ async def mark_control_run(
             if live_finished_at
             else None
         ),
-    }
+    })
+    public_progress_by_field = status_event_by_field.get("progress")
+    if isinstance(public_progress_by_field, dict):
+        live_update_by_field["message"] = (
+            public_progress_by_field.get("message")
+            or live_update_by_field["message"]
+        )
     await asyncio.to_thread(
         write_live_progress,
         **live_update_by_field,

@@ -25,6 +25,7 @@ from api.endpoint import pricing
 from api.ptg2_candidate_audit import PTG2_CANDIDATE_AUDIT_HEADER
 from db.connection import db
 from process.ptg import (
+    _FailedImportPersistence,
     _mark_ptg2_import_failed,
     _ptg2_manifest_stage_table_names,
     _reused_shared_v3_serving_index,
@@ -1209,11 +1210,18 @@ async def test_v3_lifecycle_fails_closed(
             rate=125.5,
         )
         await _mark_ptg2_import_failed(
-            f"run-{snapshot_b}",
-            snapshot_b,
-            datetime.date(2026, 7, 1),
-            datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
-            "intentional terminal state for shared-layout removal coverage",
+            _FailedImportPersistence(
+                import_run_id=f"run-{snapshot_b}",
+                snapshot_id=snapshot_b,
+                import_month=datetime.date(2026, 7, 1),
+                started_at=datetime.datetime.now(
+                    datetime.timezone.utc
+                ).replace(tzinfo=None),
+                error=(
+                    "intentional terminal state for shared-layout "
+                    "removal coverage"
+                ),
+            )
         )
         assert await db.scalar(
             f"""

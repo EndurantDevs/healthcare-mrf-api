@@ -4648,10 +4648,15 @@ def test_ptg2_in_network_download_failure_returns_failed_result(monkeypatch, tmp
 
     result = asyncio.run(
         process_ptg._process_in_network_file(
-            {"type": "in_network", "url": "https://example.test/rates.json.gz"},
-            {"PTGFile": "files", "ImportLog": "log"},
-            False,
-            coverage_scope_id="a" * 64,
+            process_ptg._InNetworkFileContext(
+                job={
+                    "type": "in_network",
+                    "url": "https://example.test/rates.json.gz",
+                },
+                classes={"PTGFile": "files", "ImportLog": "log"},
+                test_mode=False,
+                coverage_scope_id="a" * 64,
+            )
         )
     )
 
@@ -4661,23 +4666,34 @@ def test_ptg2_in_network_download_failure_returns_failed_result(monkeypatch, tmp
     assert "download failed" in result.error
 
 
-def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(monkeypatch, tmp_path):
+def _in_network_test_artifacts(
+    tmp_path,
+) -> tuple[
+    process_ptg.PTG2RawArtifact,
+    process_ptg.PTG2LogicalArtifact,
+]:
     artifact = tmp_path / "rates.json.gz"
     artifact.write_bytes(b"{}")
-    raw_artifact = process_ptg.PTG2RawArtifact(
-        original_url="https://example.test/rates.json.gz",
-        canonical_url="https://example.test/rates.json.gz",
-        raw_path=str(artifact),
-        raw_storage_uri=str(artifact),
-        raw_sha256="raw",
-        byte_count=2,
-        head=None,
+    return (
+        process_ptg.PTG2RawArtifact(
+            original_url="https://example.test/rates.json.gz",
+            canonical_url="https://example.test/rates.json.gz",
+            raw_path=str(artifact),
+            raw_storage_uri=str(artifact),
+            raw_sha256="raw",
+            byte_count=2,
+            head=None,
+        ),
+        process_ptg.PTG2LogicalArtifact(
+            logical_path=str(artifact),
+            logical_sha256="logical",
+            byte_count=2,
+        ),
     )
-    logical_artifact = process_ptg.PTG2LogicalArtifact(
-        logical_path=str(artifact),
-        logical_sha256="logical",
-        byte_count=2,
-    )
+
+
+def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(monkeypatch, tmp_path):
+    raw_artifact, logical_artifact = _in_network_test_artifacts(tmp_path)
 
     async def fake_materialize(*_args, **_kwargs):
         return raw_artifact, logical_artifact
@@ -4702,10 +4718,18 @@ def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(monkeypat
 
     serving_result = asyncio.run(
         process_ptg._process_in_network_file(
-            {"type": "in_network", "url": "https://example.test/rates.json.gz"},
-            {"PTGFile": SimpleNamespace(__name__="PTGFile"), "ImportLog": "log"},
-            False,
-            coverage_scope_id="a" * 64,
+            process_ptg._InNetworkFileContext(
+                job={
+                    "type": "in_network",
+                    "url": "https://example.test/rates.json.gz",
+                },
+                classes={
+                    "PTGFile": SimpleNamespace(__name__="PTGFile"),
+                    "ImportLog": "log",
+                },
+                test_mode=False,
+                coverage_scope_id="a" * 64,
+            )
         )
     )
 
@@ -4812,7 +4836,8 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
         for job in jobs:
             yield _strict_v3_downloaded_job(job)
 
-    async def fake_process(job, *_args, **_kwargs):
+    async def fake_process(context, *_args, **_kwargs):
+        job = context.job
         processed_jobs.append(dict(job))
         concurrency_map["active"] += 1
         concurrency_map["max_active"] = max(concurrency_map["max_active"], concurrency_map["active"])
@@ -6115,7 +6140,8 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
             {"type": "in_network", "url": "https://example.test/rates-failed.json.gz"},
         ]
 
-    async def fake_in_network(job, *_args, **_kwargs):
+    async def fake_in_network(context, *_args, **_kwargs):
+        job = context.job
         if "failed" in job["url"]:
             return process_ptg.PTG2FileProcessResult(
                 "in_network",
@@ -9159,9 +9185,8 @@ def test_reused_v3_mixed_auto_activation_publishes_allowed_evidence(
             "source_file_versions"
         ]
     } == {"in_network", "allowed_amounts"}
-    completion_report = lifecycle.persist_completion.await_args.kwargs[
-        "report_payload"
-    ]
+    completion_state = lifecycle.persist_completion.await_args.args[0]
+    completion_report = completion_state.report_payload
     assert completion_report["allowed_amount_pointer"]["status"] == (
         "promoted"
     )
@@ -9829,9 +9854,9 @@ def _manifest_download_mock(download_options_by_name):
 
 
 def _manifest_process_mock(create_stage_mock):
-    async def fake_process(*_args, **kwargs):
+    async def fake_process(context, *_args, **_kwargs):
         stage_token = create_stage_mock.await_args.args[0]
-        assert kwargs.get("ptg2_manifest_stage_table") == (
+        assert context.ptg2_manifest_stage_table == (
             process_ptg._ptg2_manifest_stage_table_name(stage_token)
         )
         return process_ptg.PTG2FileProcessResult(

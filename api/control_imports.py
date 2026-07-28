@@ -24,6 +24,19 @@ from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionError,
     validated_profile_execution,
 )
+from process.ptg_parts.frozen_rate_binding import (
+    FROZEN_RATE_FILE_PROTECTED_FIELDS,
+    normalize_protected_frozen_rate_params,
+    protected_frozen_tuple_presence,
+)
+from process.ptg_parts.frozen_rate_binding_store import (
+    insert_or_compare_frozen_binding,
+)
+from process.ptg_parts.frozen_rate_privacy import (
+    frozen_private_scalar_values,
+    has_frozen_private_evidence,
+    redact_frozen_public_values,
+)
 
 from db.models import ImportRun, db
 from process.import_status_events import enqueue_status_event, isoformat_utc
@@ -677,23 +690,40 @@ def _serialize_run_timestamps(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def normalize_run(row: Any) -> dict[str, Any]:
+def normalize_run(import_run: Any) -> dict[str, Any]:
     """Convert an import-run model or mapping to its API representation."""
 
-    if row is None:
+    if import_run is None:
         return {}
-    if hasattr(row, "to_json_dict"):
-        data = row.to_json_dict()
-    elif isinstance(row, dict):
-        data = dict(row)
+    if hasattr(import_run, "to_json_dict"):
+        run_by_field = import_run.to_json_dict()
+    elif isinstance(import_run, dict):
+        run_by_field = dict(import_run)
     else:
-        data = {name: getattr(row, name) for name in ImportRun.__table__.columns.keys() if hasattr(row, name)}
-    if isinstance(data.get("params"), dict):
-        data["params"] = _params_for_import_run_storage(
-            str(data.get("importer") or ""),
-            data["params"],
+        run_by_field = {
+            field_name: getattr(import_run, field_name)
+            for field_name in ImportRun.__table__.columns.keys()
+            if hasattr(import_run, field_name)
+        }
+    has_private_frozen_evidence = has_frozen_private_evidence(run_by_field)
+    private_frozen_values: frozenset[str] = frozenset()
+    if isinstance(run_by_field.get("params"), dict):
+        if str(run_by_field.get("importer") or "") == "ptg":
+            private_frozen_values = frozen_private_scalar_values(
+                run_by_field["params"]
+            )
+        run_by_field["params"] = _params_for_import_run_response(
+            str(run_by_field.get("importer") or ""),
+            run_by_field["params"],
         )
-    return _overlay_live_progress(_serialize_run_timestamps(data))
+    normalized_data = _overlay_live_progress(
+        _serialize_run_timestamps(run_by_field)
+    )
+    return redact_frozen_public_values(
+        normalized_data,
+        private_frozen_values,
+        strip_evidence=has_private_frozen_evidence,
+    )
 
 
 def _params_for_import_run_storage(
@@ -711,6 +741,32 @@ def _params_for_import_run_storage(
         for name, param_value in params_by_name.items()
         if name not in ephemeral_param_names
     }
+
+
+def _params_for_import_run_response(
+    importer: str,
+    params_by_name: dict[str, Any],
+) -> dict[str, Any]:
+    """Project private multipart coordinates to an opaque public run marker."""
+
+    stored_params_by_name = _params_for_import_run_storage(
+        importer,
+        params_by_name,
+    )
+    if importer != "ptg" or not protected_frozen_tuple_presence(
+        stored_params_by_name
+    ):
+        return stored_params_by_name
+    public_params_by_name = {
+        name: param_value
+        for name, param_value in stored_params_by_name.items()
+        if name not in FROZEN_RATE_FILE_PROTECTED_FIELDS
+    }
+    public_params_by_name["frozen_rate_file_set_protected"] = True
+    public_params_by_name["frozen_rate_file_count"] = int(
+        stored_params_by_name["frozen_rate_file_count"]
+    )
+    return public_params_by_name
 
 
 @dataclass(frozen=True)
@@ -867,19 +923,29 @@ def _finish_params_for(
 def _finish_function(importer: str):
     if importer in {"claims-pricing", "claims-procedures"}:
         from process.claims_pricing import finish_main
-    elif importer == "drug-claims":
+
+        return finish_main
+    if importer == "drug-claims":
         from process.drug_claims import finish_main
-    elif importer == "provider-quality":
+
+        return finish_main
+    if importer == "provider-quality":
         from process.provider_quality import finish_main
-    elif importer == "partd-formulary-network":
+
+        return finish_main
+    if importer == "partd-formulary-network":
         from process.partd_formulary_network import finish_main
-    elif importer == "pharmacy-license":
+
+        return finish_main
+    if importer == "pharmacy-license":
         from process.pharmacy_license import finish_main
-    elif importer == "mrf":
+
+        return finish_main
+    if importer == "mrf":
         from process.initial import finish_main
-    else:
-        raise ValueError(f"importer does not support finalize: {importer}")
-    return finish_main
+
+        return finish_main
+    raise ValueError(f"importer does not support finalize: {importer}")
 
 
 async def list_import_runs(
@@ -1137,6 +1203,7 @@ async def find_active_runs_by_importer(importer: str) -> list[dict[str, Any]]:
 
 
 _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY = "import-run-admission:provider-directory-fhir"
+_PTG_SOURCE_FILE_ADMISSION_LOCK_KEY = "import-run-admission:ptg-source-file"
 _PROVIDER_DIRECTORY_ACQUISITION = "acquisition"
 _PROVIDER_DIRECTORY_SCOPED_ARTIFACT = "scoped_artifact"
 _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT = "scoped_relation_artifact"
@@ -1372,6 +1439,82 @@ def _provider_directory_operation(
     return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
 
 
+def _classified_provider_directory_runs(
+    active_runs: list[dict[str, Any]],
+) -> tuple[
+    dict[str, Any] | None,
+    list[
+        tuple[
+            dict[str, Any],
+            tuple[str, frozenset[str], str | None],
+        ]
+    ],
+]:
+    classified_runs = []
+    for active_run in active_runs:
+        active_params = active_run.get("params")
+        if not isinstance(active_params, dict):
+            return active_run, []
+        active_metrics = active_run.get("metrics")
+        if not isinstance(active_metrics, dict):
+            active_metrics = None
+        operation = _provider_directory_operation(
+            active_params,
+            active_metrics,
+        )
+        if operation[0] == _PROVIDER_DIRECTORY_EXCLUSIVE:
+            return active_run, []
+        classified_runs.append((active_run, operation))
+    return None, classified_runs
+
+
+def _has_provider_directory_operation_conflict(
+    requested_operation: tuple[str, frozenset[str], str | None],
+    active_operation: tuple[str, frozenset[str], str | None],
+) -> bool:
+    requested_kind, requested_source_ids, requested_endpoint = (
+        requested_operation
+    )
+    active_kind, active_source_ids, active_endpoint = active_operation
+    scoped_artifact_kinds = {
+        _PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
+        _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
+    }
+    profile_conflict_kinds = {
+        _PROVIDER_DIRECTORY_GLOBAL_PROFILE,
+        *scoped_artifact_kinds,
+        _PROVIDER_DIRECTORY_SCOPED_SEED,
+    }
+    if requested_kind == _PROVIDER_DIRECTORY_GLOBAL_PROFILE:
+        return active_kind in profile_conflict_kinds
+    if active_kind == _PROVIDER_DIRECTORY_GLOBAL_PROFILE:
+        return requested_kind in {
+            *scoped_artifact_kinds,
+            _PROVIDER_DIRECTORY_SCOPED_SEED,
+        }
+    if requested_kind == _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT:
+        return (
+            active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT
+            or not requested_source_ids.isdisjoint(active_source_ids)
+        )
+    if requested_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+        return (
+            active_kind in scoped_artifact_kinds
+            or not requested_source_ids.isdisjoint(active_source_ids)
+        )
+    if requested_kind == _PROVIDER_DIRECTORY_SCOPED_SEED:
+        return not requested_source_ids.isdisjoint(active_source_ids)
+    if active_kind in {
+        *scoped_artifact_kinds,
+        _PROVIDER_DIRECTORY_SCOPED_SEED,
+    }:
+        return not requested_source_ids.isdisjoint(active_source_ids)
+    return (
+        not requested_source_ids.isdisjoint(active_source_ids)
+        or requested_endpoint == active_endpoint
+    )
+
+
 def _provider_directory_blocking_run(
     params: dict[str, Any],
     active_runs: list[dict[str, Any]],
@@ -1382,19 +1525,11 @@ def _provider_directory_blocking_run(
     requested_kind, requested_source_ids, requested_endpoint = _provider_directory_operation(params)
     if requested_kind == _PROVIDER_DIRECTORY_EXCLUSIVE:
         return active_runs[0]
-    classified_active_runs = []
-    for active_run in active_runs:
-        active_params = active_run.get("params")
-        if not isinstance(active_params, dict):
-            return active_run
-        active_metrics = active_run.get("metrics")
-        if not isinstance(active_metrics, dict):
-            active_metrics = None
-        active_operation = _provider_directory_operation(active_params, active_metrics)
-        if active_operation[0] == _PROVIDER_DIRECTORY_EXCLUSIVE:
-            return active_run
-        classified_active_runs.append((active_run, active_operation))
-
+    blocking_run, classified_active_runs = (
+        _classified_provider_directory_runs(active_runs)
+    )
+    if blocking_run is not None:
+        return blocking_run
     active_acquisitions = [
         (active_run, operation)
         for active_run, operation in classified_active_runs
@@ -1406,56 +1541,16 @@ def _provider_directory_blocking_run(
     ):
         return active_acquisitions[0][0]
 
-    for active_run, (active_kind, active_source_ids, active_endpoint) in classified_active_runs:
-        if requested_kind == _PROVIDER_DIRECTORY_GLOBAL_PROFILE:
-            if active_kind in {
-                _PROVIDER_DIRECTORY_GLOBAL_PROFILE,
-                _PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
-                _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
-                _PROVIDER_DIRECTORY_SCOPED_SEED,
-            }:
-                return active_run
-            continue
-        if active_kind == _PROVIDER_DIRECTORY_GLOBAL_PROFILE:
-            if requested_kind in {
-                _PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
-                _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
-                _PROVIDER_DIRECTORY_SCOPED_SEED,
-            }:
-                return active_run
-            continue
-        if requested_kind == _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT:
-            if active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
-                return active_run
-            if not requested_source_ids.isdisjoint(active_source_ids):
-                return active_run
-            continue
-        if requested_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
-            if active_kind in {
-                _PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
-                _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT,
-            }:
-                return active_run
-            if not requested_source_ids.isdisjoint(active_source_ids):
-                return active_run
-            continue
-        if requested_kind == _PROVIDER_DIRECTORY_SCOPED_SEED:
-            if not requested_source_ids.isdisjoint(active_source_ids):
-                return active_run
-            continue
-        if active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
-            if not requested_source_ids.isdisjoint(active_source_ids):
-                return active_run
-            continue
-        if active_kind == _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT:
-            if not requested_source_ids.isdisjoint(active_source_ids):
-                return active_run
-            continue
-        if active_kind == _PROVIDER_DIRECTORY_SCOPED_SEED:
-            if not requested_source_ids.isdisjoint(active_source_ids):
-                return active_run
-            continue
-        if not requested_source_ids.isdisjoint(active_source_ids) or requested_endpoint == active_endpoint:
+    requested_operation = (
+        requested_kind,
+        requested_source_ids,
+        requested_endpoint,
+    )
+    for active_run, active_operation in classified_active_runs:
+        if _has_provider_directory_operation_conflict(
+            requested_operation,
+            active_operation,
+        ):
             return active_run
     return None
 
@@ -1530,6 +1625,47 @@ async def _admit_provider_directory_run(import_row: dict[str, Any]) -> dict[str,
     return None
 
 
+async def _admit_ptg_source_file_run(
+    import_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Bind immutable input and insert control lifecycle state atomically."""
+
+    async with db.acquire() as connection:
+        await connection.scalar(
+            text(
+                "SELECT pg_advisory_xact_lock("
+                "hashtextextended(:lock_key, 0))"
+            ),
+            lock_key=_PTG_SOURCE_FILE_ADMISSION_LOCK_KEY,
+        )
+        await insert_or_compare_frozen_binding(
+            connection,
+            import_row["params"],
+        )
+        idempotency_key = import_row.get("idempotency_key")
+        if idempotency_key:
+            active_run = await _active_idempotency_run(
+                connection,
+                str(idempotency_key),
+            )
+            if active_run:
+                return active_run
+        if not _is_parallel_active_importer_run_allowed(
+            "ptg",
+            import_row,
+            (
+                str(idempotency_key)
+                if idempotency_key is not None
+                else None
+            ),
+        ):
+            active_runs = await _active_importer_runs(connection, "ptg")
+            if active_runs:
+                return active_runs[0]
+        await connection.status(insert(ImportRun).values(**import_row))
+    return None
+
+
 async def create_import_run(
     request_payload_map: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
@@ -1538,34 +1674,74 @@ async def create_import_run(
     importer = str(request_payload_map.get("importer") or "").strip()
     if importer not in importer_names():
         raise ValueError(f"unknown importer: {importer}")
-    _assert_ptg_rebuild_request_params(
-        importer,
+    raw_params_by_name = (
         request_payload_map.get("params")
         if isinstance(request_payload_map.get("params"), dict)
-        else {},
+        else {}
+    )
+    _assert_ptg_rebuild_request_params(
+        importer,
+        raw_params_by_name,
     )
     _validate_provider_directory_profile_execution_params(
         importer,
-        request_payload_map.get("params")
-        if isinstance(request_payload_map.get("params"), dict)
-        else {},
+        raw_params_by_name,
+    )
+    normalized_params_by_name = (
+        normalize_protected_frozen_rate_params(raw_params_by_name)
+        if importer == "ptg"
+        else dict(raw_params_by_name)
+    )
+    if importer == "ptg" and protected_frozen_tuple_presence(
+        normalized_params_by_name
+    ):
+        protected_id = normalized_params_by_name[
+            "source_file_import_id"
+        ]
+        if (
+            str(request_payload_map.get("source_file_import_id") or "").strip()
+            != protected_id
+            or str(request_payload_map.get("import_id") or "").strip()
+            != protected_id
+        ):
+            raise ValueError(
+                "protected outer and nested source_file_import_id and "
+                "import_id must all match"
+            )
+    request_payload_map = {
+        **request_payload_map,
+        "params": normalized_params_by_name,
+    }
+    is_ptg_source_file_admission = bool(
+        importer == "ptg"
+        and str(
+            request_payload_map.get("source_file_import_id") or ""
+        ).strip()
     )
 
     idempotency_key = (
         str(request_payload_map.get("idempotency_key") or "").strip() or None
     )
-    if idempotency_key and importer != "provider-directory-fhir":
+    if (
+        idempotency_key
+        and importer != "provider-directory-fhir"
+        and not is_ptg_source_file_admission
+    ):
         active = await find_active_run_by_idempotency_key(idempotency_key)
         if active:
-            return active, False
-    if importer != "provider-directory-fhir" and not _is_parallel_active_importer_run_allowed(
-        importer,
-        request_payload_map,
-        idempotency_key,
+            return normalize_run(active), False
+    if (
+        importer != "provider-directory-fhir"
+        and not is_ptg_source_file_admission
+        and not _is_parallel_active_importer_run_allowed(
+            importer,
+            request_payload_map,
+            idempotency_key,
+        )
     ):
         active_importer = await find_earliest_active_run_by_importer(importer)
         if active_importer:
-            return active_importer, False
+            return normalize_run(active_importer), False
 
     now = utc_now()
     run_id = str(request_payload_map.get("run_id") or "").strip() or _new_run_id()
@@ -1612,7 +1788,13 @@ async def create_import_run(
                 import_run_values_by_name
             )
             if blocking_run:
-                return blocking_run, False
+                return normalize_run(blocking_run), False
+        elif is_ptg_source_file_admission:
+            blocking_run = await _admit_ptg_source_file_run(
+                import_run_values_by_name
+            )
+            if blocking_run:
+                return normalize_run(blocking_run), False
         else:
             await db.execute(
                 insert(ImportRun).values(**import_run_values_by_name)
@@ -1621,7 +1803,7 @@ async def create_import_run(
         if idempotency_key:
             active = await find_active_run_by_idempotency_key(idempotency_key)
             if active:
-                return active, False
+                return normalize_run(active), False
         raise
     enqueue_result = await _enqueue_import_start(
         {
@@ -1645,9 +1827,118 @@ async def create_import_run(
     import_run_values_by_name = _serialize_run_timestamps(
         import_run_values_by_name
     )
-    enqueue_status_event(import_run_values_by_name)
-    _write_run_live_progress(import_run_values_by_name, publish_event=False)
-    return import_run_values_by_name, True
+    public_run_by_name = normalize_run(import_run_values_by_name)
+    enqueue_status_event(public_run_by_name)
+    _write_run_live_progress(public_run_by_name, publish_event=False)
+    return public_run_by_name, True
+
+
+def _enqueue_progress(message: str) -> dict[str, Any]:
+    return {
+        "unit": "run",
+        "total": 1,
+        "done": 0,
+        "pct": 0,
+        "message": message,
+    }
+
+
+def _invalid_enqueue_adapter_result(
+    *,
+    now: dt.datetime,
+    params: dict[str, Any],
+    error: ValueError,
+) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "phase_detail": "enqueue failed",
+        "heartbeat_at": now,
+        "progress": _enqueue_progress("enqueue failed"),
+        "metrics": {
+            "enqueue_adapter": "arq_single_job",
+            **_ptg_lane_metrics(params),
+        },
+        "error": {
+            "code": "invalid_enqueue_adapter",
+            "message": str(error),
+        },
+    }
+
+
+def _pending_enqueue_adapter_result(
+    now: dt.datetime,
+) -> dict[str, Any]:
+    return {
+        "status": "queued",
+        "phase_detail": "created; enqueue adapter pending",
+        "heartbeat_at": now,
+        "progress": _enqueue_progress("queued; enqueue adapter pending"),
+        "metrics": {"enqueue_adapter": "pending"},
+        "error": None,
+    }
+
+
+def _failed_enqueue_result(
+    *,
+    importer: str,
+    params: dict[str, Any],
+    adapter: dict[str, Any],
+    error: Exception,
+) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "phase_detail": "enqueue failed",
+        "heartbeat_at": utc_now(),
+        "progress": _enqueue_progress("enqueue failed"),
+        "metrics": {
+            "enqueue_adapter": "arq_single_job",
+            "queue": adapter["queue"],
+            "function": adapter["function"],
+            **_ptg_lane_metrics(params),
+        },
+        "error": {
+            "code": "enqueue_failed",
+            "message": _safe_enqueue_error_message(
+                importer,
+                params,
+                error,
+            ),
+        },
+    }
+
+
+def _successful_enqueue_result(
+    *,
+    params: dict[str, Any],
+    adapter: dict[str, Any],
+    job_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "status": "queued",
+        "phase_detail": "enqueued",
+        "heartbeat_at": utc_now(),
+        "progress": _enqueue_progress("queued"),
+        "metrics": {
+            "enqueue_adapter": "arq_single_job",
+            "queue": adapter["queue"],
+            "function": adapter["function"],
+            "job_id": job_id,
+            **_ptg_lane_metrics(params),
+        },
+        "error": None,
+    }
+
+
+def _enqueue_job_options(
+    adapter: dict[str, Any],
+    import_run_values_by_name: dict[str, Any],
+) -> dict[str, str]:
+    options_by_name = {"_queue_name": str(adapter["queue"])}
+    if adapter.get("job_prefix"):
+        options_by_name["_job_id"] = (
+            f"{adapter['job_prefix']}_{import_run_values_by_name['run_id']}"
+        )
+    return options_by_name
 
 
 async def _enqueue_import_start(
@@ -1665,34 +1956,23 @@ async def _enqueue_import_start(
     try:
         adapter = _adapter_for_import_row(import_run_values_by_name)
     except ValueError as exc:
-        return {
-            "status": "failed",
-            "phase_detail": "enqueue failed",
-            "heartbeat_at": now,
-            "progress": {"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "enqueue failed"},
-            "metrics": {"enqueue_adapter": "arq_single_job", **_ptg_lane_metrics(params)},
-            "error": {"code": "invalid_enqueue_adapter", "message": str(exc)},
-        }
+        return _invalid_enqueue_adapter_result(
+            now=now,
+            params=params,
+            error=exc,
+        )
     if adapter is None:
-        return {
-            "status": "queued",
-            "phase_detail": "created; enqueue adapter pending",
-            "heartbeat_at": now,
-            "progress": {"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "queued; enqueue adapter pending"},
-            "metrics": {"enqueue_adapter": "pending"},
-            "error": None,
-        }
+        return _pending_enqueue_adapter_result(now)
 
     job_payload = _adapter_payload(
         adapter,
         import_run_values_by_name,
         params,
     )
-    enqueue_options_by_name = {"_queue_name": adapter["queue"]}
-    if adapter.get("job_prefix"):
-        enqueue_options_by_name["_job_id"] = (
-            f"{adapter['job_prefix']}_{import_run_values_by_name['run_id']}"
-        )
+    enqueue_options_by_name = _enqueue_job_options(
+        adapter,
+        import_run_values_by_name,
+    )
     try:
         redis = await create_pool(
             build_redis_settings(),
@@ -1705,46 +1985,23 @@ async def _enqueue_import_start(
             **enqueue_options_by_name,
         )
     except Exception as exc:
-        return {
-            "status": "failed",
-            "phase_detail": "enqueue failed",
-            "heartbeat_at": utc_now(),
-            "progress": {"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "enqueue failed"},
-            "metrics": {
-                "enqueue_adapter": "arq_single_job",
-                "queue": adapter["queue"],
-                "function": adapter["function"],
-                **_ptg_lane_metrics(params),
-            },
-            "error": {
-                "code": "enqueue_failed",
-                "message": _safe_enqueue_error_message(
-                    importer,
-                    params,
-                    exc,
-                ),
-            },
-        }
+        return _failed_enqueue_result(
+            importer=importer,
+            params=params,
+            adapter=adapter,
+            error=exc,
+        )
     job_id = _safe_enqueued_job_id(
         importer,
         params,
         job,
         requested_job_id=enqueue_options_by_name.get("_job_id"),
     )
-    return {
-        "status": "queued",
-        "phase_detail": "enqueued",
-        "heartbeat_at": utc_now(),
-        "progress": {"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "queued"},
-        "metrics": {
-            "enqueue_adapter": "arq_single_job",
-            "queue": adapter["queue"],
-            "function": adapter["function"],
-            "job_id": job_id,
-            **_ptg_lane_metrics(params),
-        },
-        "error": None,
-    }
+    return _successful_enqueue_result(
+        params=params,
+        adapter=adapter,
+        job_id=job_id,
+    )
 
 
 def _adapter_for_import_row(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -1853,6 +2110,7 @@ def _adapter_payload(
             "source_file_import_id": import_run_values_by_name.get(
                 "source_file_import_id"
             ),
+            "import_id": import_run_values_by_name.get("import_id"),
             "params": dict(params),
         }
     return dict(params)
@@ -2238,6 +2496,10 @@ def _retry_child_params(
         if isinstance(current_run_map.get("params"), dict)
         else {}
     )
+    if current_params_by_name.get("frozen_rate_file_set_protected") is True:
+        raise ValueError(
+            "protected frozen runs cannot be retried through the public API"
+        )
     if current_run_map.get("importer") == "ptg" and (
         _has_ptg_full_rebuild_control(current_params_by_name)
         or _has_ptg_full_rebuild_control(retry_params_by_name)

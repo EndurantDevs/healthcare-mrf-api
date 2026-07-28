@@ -6,6 +6,7 @@
         "api/code_systems.py",
         "api/control.py",
         "api/control_auth.py",
+        "api/control_frozen_rate_files.py",
         "api/control_imports.py",
         "api/control_ptg2_v4_stale_metadata.py",
         "api/control_ptg_v4.py",
@@ -104,6 +105,7 @@
         "db/migration_expression_adoption.py",
         "db/migration_index_adoption.py",
         "db/migration_index_catalog.py",
+        "db/migration_ptg2_frozen_source_file_binding.py",
         "db/migration_ptg2_predecessor_retirement_audit.py",
         "db/migration_ptg2_v4_attempt_audit.py",
         "db/migration_ptg2_v4_attempt_catalog.py",
@@ -260,7 +262,9 @@
         "process/ptg.py",
         "process/ptg_candidate_audit.py",
         "process/ptg_control.py",
+        "process/ptg_control_failures.py",
         "process/ptg_control_runtime.py",
+        "process/ptg_frozen_control.py",
         "process/ptg_parts/__init__.py",
         "process/ptg_parts/address_assurance.py",
         "process/ptg_parts/allowed_amounts.py",
@@ -271,6 +275,14 @@
         "process/ptg_parts/copy_load.py",
         "process/ptg_parts/db_tables.py",
         "process/ptg_parts/domain.py",
+        "process/ptg_parts/frozen_rate_binding.py",
+        "process/ptg_parts/frozen_rate_binding_store.py",
+        "process/ptg_parts/frozen_rate_candidate.py",
+        "process/ptg_parts/frozen_rate_candidate_sources.py",
+        "process/ptg_parts/frozen_rate_files.py",
+        "process/ptg_parts/frozen_rate_privacy.py",
+        "process/ptg_parts/frozen_rate_runtime.py",
+        "process/ptg_parts/frozen_rate_storage.py",
         "process/ptg_parts/healthsparq_source_jobs.py",
         "process/ptg_parts/import_rows.py",
         "process/ptg_parts/input_artifact_retention.py",
@@ -439,12 +451,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 35094,
-          "total": 40016
+          "covered": 35578,
+          "total": 40382
         },
         "lines": {
-          "covered": 111567,
-          "total": 119198
+          "covered": 112964,
+          "total": 120407
         }
       },
       "one_time_floor_reset": {
@@ -550,16 +562,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3183,
-          "total": 3661
+          "covered": 3188,
+          "total": 3663
         },
         "lines": {
-          "covered": 48530,
-          "total": 55879
+          "covered": 48557,
+          "total": 55893
         },
         "regions": {
-          "covered": 71904,
-          "total": 82702
+          "covered": 71941,
+          "total": 82724
         }
       },
       "one_time_floor_reset": {

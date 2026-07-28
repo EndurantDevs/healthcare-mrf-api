@@ -15,6 +15,10 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from process.ptg_parts.frozen_rate_privacy import (
+    project_frozen_status_event,
+)
+
 ENGINE_NAME = "healthcare-mrf-api"
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 _TIMESTAMP_KEYS = ("created_at", "started_at", "finished_at", "heartbeat_at")
@@ -79,7 +83,7 @@ def enqueue_status_event(status_payload: dict[str, Any]) -> None:
     run_id = str(status_payload.get("run_id") or "").strip()
     if not run_id:
         return
-    event = _event_payload(status_payload)
+    event = _event_payload(project_frozen_status_event(status_payload))
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:

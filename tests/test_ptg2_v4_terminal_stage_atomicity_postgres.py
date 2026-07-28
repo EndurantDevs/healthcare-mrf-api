@@ -307,13 +307,17 @@ async def _mark_failed_attempt(
     manifest_stage_table: str,
 ) -> dict | None:
     return await process_ptg._mark_ptg2_import_failed(
-        INTERNAL_RUN_ID,
-        SNAPSHOT_ID,
-        datetime.date(2026, 7, 1),
-        datetime.datetime(2026, 7, 1),
-        "synthetic failure",
-        options={"storage_generation": PTG2_V4_SHARED_GENERATION},
-        manifest_stage_table=manifest_stage_table,
+        process_ptg._FailedImportPersistence(
+            import_run_id=INTERNAL_RUN_ID,
+            snapshot_id=SNAPSHOT_ID,
+            import_month=datetime.date(2026, 7, 1),
+            started_at=datetime.datetime(2026, 7, 1),
+            error="synthetic failure",
+            options={
+                "storage_generation": PTG2_V4_SHARED_GENERATION
+            },
+            manifest_stage_table=manifest_stage_table,
+        )
     )
 
 

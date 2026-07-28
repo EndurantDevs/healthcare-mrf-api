@@ -24816,6 +24816,24 @@ mod tests {
     }
 
     #[test]
+    fn raw_chunk_blocked_send_count_saturates() {
+        let mut chunk_stats = RawChunkStats::default();
+        chunk_stats.record_queue_blocked();
+        assert_eq!(chunk_stats.queue_blocked_sends, 1);
+        chunk_stats.queue_blocked_sends = u64::MAX;
+        chunk_stats.record_queue_blocked();
+        assert_eq!(chunk_stats.queue_blocked_sends, u64::MAX);
+    }
+
+    #[test]
+    fn recycled_rate_vector_retains_requested_capacity() {
+        let mut rate_values = Vec::<RateLite>::with_capacity(4);
+        let taken_values = take_vec_replacing_with_capacity(&mut rate_values, 2);
+        assert!(taken_values.capacity() >= 4);
+        assert!(rate_values.capacity() >= 2);
+    }
+
+    #[test]
     fn compact_producer_failure_precedes_secondary_worker_failure() {
         let error = compact_pipeline_error(
             Some(io::Error::new(

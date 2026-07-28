@@ -329,7 +329,9 @@ async def test_table_of_contents_failure_records_terminal_failure(monkeypatch):
             **import_arguments(toc_urls=["https://example.test/toc.json"])
         )
 
-    persisted = process_ptg._mark_ptg2_import_failed.await_args.kwargs["report"]
+    persisted = (
+        process_ptg._mark_ptg2_import_failed.await_args.args[0].report
+    )
     assert persisted["toc_failures"] == [
         {
             "url": "https://example.test/toc.json",
@@ -355,7 +357,9 @@ async def test_empty_table_of_contents_is_not_a_successful_import(monkeypatch):
             **import_arguments(toc_urls=["https://example.test/toc.json"])
         )
 
-    persisted = process_ptg._mark_ptg2_import_failed.await_args.kwargs["report"]
+    persisted = (
+        process_ptg._mark_ptg2_import_failed.await_args.args[0].report
+    )
     assert persisted["jobs_discovered"] == 0
     assert persisted["files_processed"] == 0
 

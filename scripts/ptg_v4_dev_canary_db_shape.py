@@ -29,6 +29,9 @@ def shape_snapshot_and_root(
     snapshot_by_field["layout_manifest"] = json.loads(
         fields_by_name["layout_manifest_text"]
     )
+    snapshot_by_field["snapshot_manifest"] = json.loads(
+        fields_by_name["snapshot_manifest_text"]
+    )
     root_by_field = {
         field_name.removeprefix("root_"): field_value
         for field_name, field_value in fields_by_name.items()

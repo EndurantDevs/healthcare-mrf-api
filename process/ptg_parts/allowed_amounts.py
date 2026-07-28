@@ -616,9 +616,14 @@ def _allowed_amount_file_summary(
             "canonical_url": source_version.canonical_url,
             "raw_sha256": source_version.raw_sha256,
             "logical_sha256": source_version.logical_sha256,
+            "logical_hash_deferred": (
+                source_version.logical_hash_deferred
+            ),
             "content_length": source_version.content_length,
+            "raw_byte_count": source_version.raw_byte_count,
             "etag": source_version.etag,
             "last_modified": source_version.last_modified,
+            "verification_mode": source_version.verification_mode,
         }
     file_summary_by_field.update(import_outcome.metrics_by_name)
     file_summary_by_field["allowed_amount_evidence"] = bool(

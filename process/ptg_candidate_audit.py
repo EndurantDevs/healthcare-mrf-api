@@ -61,6 +61,13 @@ from process.ptg_parts.ptg2_source_witness import (
     source_set_digest,
 )
 from process.ptg_parts.ptg2_source_witness_store import load_shared_source_witness
+from process.ptg_parts.frozen_rate_candidate import (
+    validate_frozen_candidate_evidence,
+)
+from process.ptg_parts.frozen_rate_files import (
+    FrozenRateFileMismatchError,
+    FrozenRateFileValidationError,
+)
 from process.ptg_parts.source_snapshot_control import promote_ptg2_source_snapshot
 from scripts.validation import ptg2_v3_source_api_audit
 
@@ -97,6 +104,7 @@ _CANDIDATE_TARGET_SQL = """
            attestation.report_digest AS audit_report_digest,
            attestation.report AS audit_report,
            attestation.activated_at AS audit_activated_at,
+           frozen_binding.binding_payload AS frozen_binding_payload,
            current_snapshot.import_run_id AS current_import_run_id,
            current_snapshot.status AS current_status,
            current_snapshot.previous_snapshot_id AS current_previous_snapshot_id,
@@ -112,7 +120,9 @@ _CANDIDATE_TARGET_SQL = """
            current_v4_root.map_digest AS current_v4_root_map_digest,
            current_attestation.report_digest AS current_audit_report_digest,
            current_attestation.report AS current_audit_report,
-           current_attestation.activated_at AS current_audit_activated_at
+           current_attestation.activated_at AS current_audit_activated_at,
+           current_frozen_binding.binding_payload
+               AS current_frozen_binding_payload
       FROM {schema}.ptg2_snapshot AS snapshot
       JOIN {schema}.ptg2_v3_snapshot_binding AS binding
         ON binding.snapshot_id = snapshot.snapshot_id
@@ -144,6 +154,12 @@ _CANDIDATE_TARGET_SQL = """
        AND current_attestation.contract = ANY(
            CAST(:supported_contracts AS text[])
        )
+      LEFT JOIN {schema}.ptg2_frozen_source_file_binding AS frozen_binding
+        ON frozen_binding.internal_run_id = snapshot.import_run_id
+      LEFT JOIN {schema}.ptg2_frozen_source_file_binding
+           AS current_frozen_binding
+        ON current_frozen_binding.internal_run_id =
+           current_snapshot.import_run_id
      WHERE snapshot.import_run_id = :candidate_run_id
      ORDER BY snapshot.snapshot_id
 """
@@ -172,6 +188,49 @@ class CandidateAuditTarget:
     equivalent_current_import_run_id: str | None = None
     equivalent_audit_report: Mapping[str, Any] | None = None
     equivalent_audit_report_digest: str | None = None
+    frozen_candidate_identity: str | None = None
+
+
+@dataclass(frozen=True)
+class _SealedCandidateEvidence:
+    snapshot_id: str
+    activation_by_name: Mapping[str, Any]
+    provider_identifier_quarantine: Mapping[str, Any]
+    source_witness: Mapping[str, Any]
+    audit_sample: Mapping[str, Any]
+    storage_generation: str
+    frozen_candidate_identity: str | None
+
+
+@dataclass(frozen=True)
+class _CandidateActivationState:
+    source_key: str
+    plan_id: str
+    plan_market_type: str
+    expected_current_snapshot_id: str | None
+    current_snapshot_id: str | None
+    snapshot_status: str
+    is_activated: bool
+    audit_report: Mapping[str, Any] | None
+    audit_report_digest: str | None
+
+
+@dataclass(frozen=True)
+class _CandidateManifestState:
+    snapshot_id: str
+    manifest_by_name: Mapping[str, Any]
+    serving_index_by_name: Mapping[str, Any]
+    activation_by_name: Mapping[str, Any]
+    layout_serving_index_by_name: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _CandidateScopeState:
+    source_key: str
+    plan_id: str
+    plan_market_type: str
+    expected_current_snapshot_id: str | None
+    current_snapshot_id: str | None
 
 
 class CandidateAuditReleaseGateError(RuntimeError):
@@ -253,33 +312,395 @@ async def _candidate_rows(candidate_run_id: str) -> list[dict[str, Any]]:
     return [_row_mapping(candidate_row) for candidate_row in candidate_rows]
 
 
+class _CandidateRawSources(tuple[str, ...]):
+    """Tuple-compatible raw hashes carrying detailed DB corroboration."""
+
+    source_records: tuple[dict[str, Any], ...]
+
+    def __new__(
+        cls,
+        raw_digest_values: Sequence[str],
+        source_records: Sequence[Mapping[str, Any]],
+    ):
+        instance = super().__new__(cls, tuple(raw_digest_values))
+        instance.source_records = tuple(
+            dict(source_record) for source_record in source_records
+        )
+        return instance
+
+
+_CANDIDATE_RAW_SOURCES_SQL = """
+    SELECT source.source_key,
+           source.raw_container_sha256,
+           trace_binding.source_file_version_count,
+           trace_binding.source_file_version_id,
+           version.source_identity_hash AS version_source_identity_hash,
+           source_identity.source_type AS version_source_type,
+           source_identity.canonical_url AS version_canonical_url,
+           version.raw_sha256 AS version_raw_sha256,
+           version.logical_sha256 AS version_logical_sha256,
+           version.content_length AS version_content_length,
+           version.etag AS version_etag,
+           version.last_modified AS version_last_modified,
+           version.verification_mode AS version_verification_mode,
+           version.payload AS version_payload
+      FROM {schema}.ptg2_v3_snapshot_source AS source
+      JOIN {schema}.ptg2_source_trace_set AS trace_set
+        ON trace_set.source_trace_set_hash = source.source_trace_set_hash
+      LEFT JOIN LATERAL (
+          SELECT count(DISTINCT trace.source_file_version_id)::integer
+                     AS source_file_version_count,
+                 min(trace.source_file_version_id)
+                     AS source_file_version_id
+            FROM unnest(trace_set.source_trace_hashes)
+                 AS trace_hash(source_trace_hash)
+            JOIN {schema}.ptg2_source_trace AS trace
+              ON trace.source_trace_hash = trace_hash.source_trace_hash
+      ) AS trace_binding ON TRUE
+      LEFT JOIN {schema}.ptg2_source_file_version AS version
+        ON version.source_file_version_id =
+           trace_binding.source_file_version_id
+      LEFT JOIN {schema}.ptg2_source_identity AS source_identity
+        ON source_identity.source_identity_hash = version.source_identity_hash
+     WHERE source.snapshot_id = :snapshot_id
+     ORDER BY source.source_key
+"""
+
+
 async def _candidate_raw_sources(snapshot_id: str) -> tuple[str, ...]:
+    """Load dense candidate sources with their complete version identities."""
+
     schema = _quote_ident(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    rows = await db.all(
-        f"""
-        SELECT source_key, raw_container_sha256
-          FROM {schema}.ptg2_v3_snapshot_source
-         WHERE snapshot_id = :snapshot_id
-         ORDER BY source_key
-        """,
+    database_source_rows = await db.all(
+        _CANDIDATE_RAW_SOURCES_SQL.format(schema=schema),
         snapshot_id=snapshot_id,
     )
-    source_rows = [_row_mapping(row) for row in rows]
+    source_records = [
+        _row_mapping(database_source_row)
+        for database_source_row in database_source_rows
+    ]
     try:
-        source_keys = [int(row.get("source_key")) for row in source_rows]
+        source_ordinals = [
+            int(source_record.get("source_key"))
+            for source_record in source_records
+        ]
     except (TypeError, ValueError) as exc:
-        raise ValueError("candidate source scope contains an invalid ordinal") from exc
-    if source_keys != list(range(len(source_rows))):
+        raise ValueError(
+            "candidate source scope contains an invalid ordinal"
+        ) from exc
+    if source_ordinals != list(range(len(source_records))):
         raise ValueError("candidate source scope is not dense")
-    digests = tuple(
-        _normalized_digest(row.get("raw_container_sha256"), field="raw container digest")
-        for row in source_rows
+    raw_digest_values = tuple(
+        _normalized_digest(
+            source_record.get("raw_container_sha256"),
+            field="raw container digest",
+        )
+        for source_record in source_records
     )
-    if not digests:
+    if not raw_digest_values:
         raise ValueError("candidate has no public raw source bindings")
-    if len(digests) != len(set(digests)):
+    if len(raw_digest_values) != len(set(raw_digest_values)):
         raise ValueError("candidate raw source bindings are ambiguous")
-    return digests
+    return _CandidateRawSources(raw_digest_values, source_records)
+
+
+def _validated_candidate_quarantine(
+    serving_index_by_name: Mapping[str, Any],
+    layout_serving_index_by_name: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    try:
+        quarantine_by_name = validate_provider_identifier_quarantine(
+            serving_index_by_name.get("provider_identifier_quarantine")
+        )
+        layout_quarantine_by_name = (
+            validate_provider_identifier_quarantine(
+                layout_serving_index_by_name.get(
+                    "provider_identifier_quarantine"
+                )
+            )
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "candidate provider identifier quarantine is invalid"
+        ) from exc
+    if quarantine_by_name != layout_quarantine_by_name:
+        raise ValueError(
+            "candidate provider identifier quarantine changed after "
+            "layout sealing"
+        )
+    return quarantine_by_name
+
+
+def _validated_candidate_witness(
+    serving_index_by_name: Mapping[str, Any],
+    layout_serving_index_by_name: Mapping[str, Any],
+    raw_container_sha256: tuple[str, ...],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    source_set_by_name = _mapping(
+        serving_index_by_name.get("source_set")
+    )
+    source_witness_by_name = _mapping(
+        serving_index_by_name.get("source_witness")
+    )
+    layout_witness_by_name = _mapping(
+        layout_serving_index_by_name.get("source_witness")
+    )
+    audit_sample_by_name = _mapping(
+        serving_index_by_name.get("audit_sample")
+    )
+    layout_sample_by_name = _mapping(
+        layout_serving_index_by_name.get("audit_sample")
+    )
+    expected_digest = source_set_digest(raw_container_sha256)
+    if (
+        source_witness_by_name != layout_witness_by_name
+        or audit_sample_by_name != layout_sample_by_name
+        or source_witness_by_name.get("contract")
+        != PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT
+        or int(source_witness_by_name.get("source_count") or -1)
+        != len(raw_container_sha256)
+        or source_witness_by_name.get("source_set_digest")
+        != expected_digest
+        or source_set_by_name.get("raw_container_sha256_digest")
+        != expected_digest
+    ):
+        raise ValueError(
+            "candidate source witness changed after layout sealing"
+        )
+    return source_witness_by_name, audit_sample_by_name
+
+
+def _validated_frozen_candidate_identity(
+    manifest_by_name: Mapping[str, Any],
+    candidate_row: Mapping[str, Any],
+    *,
+    candidate_run_id: str,
+    raw_container_sha256: tuple[str, ...],
+) -> str | None:
+    try:
+        return validate_frozen_candidate_evidence(
+            manifest_by_name,
+            candidate_run_id=candidate_run_id,
+            database_binding=_mapping(
+                candidate_row.get("frozen_binding_payload")
+            )
+            or None,
+            database_sources=getattr(
+                raw_container_sha256,
+                "source_records",
+                None,
+            ),
+        )
+    except (
+        FrozenRateFileMismatchError,
+        FrozenRateFileValidationError,
+    ) as exc:
+        raise CandidateAuditReleaseGateError(str(exc)) from exc
+
+
+def _candidate_manifest_state(
+    candidate_row: Mapping[str, Any],
+    *,
+    candidate_run_id: str,
+) -> _CandidateManifestState:
+    observed_run_id = str(candidate_row.get("import_run_id") or "").strip()
+    if observed_run_id != candidate_run_id:
+        raise ValueError("candidate run binding changed during resolution")
+    manifest_by_name = _mapping(candidate_row.get("manifest"))
+    layout_manifest_by_name = _mapping(candidate_row.get("layout_manifest"))
+    return _CandidateManifestState(
+        snapshot_id=str(candidate_row.get("snapshot_id") or "").strip(),
+        manifest_by_name=manifest_by_name,
+        serving_index_by_name=_mapping(
+            manifest_by_name.get("serving_index")
+        ),
+        activation_by_name=_mapping(manifest_by_name.get("activation")),
+        layout_serving_index_by_name=_mapping(
+            layout_manifest_by_name.get("serving_index")
+        ),
+    )
+
+
+def _sealed_candidate_evidence(
+    candidate_row: Mapping[str, Any],
+    *,
+    candidate_run_id: str,
+    raw_container_sha256: tuple[str, ...],
+) -> _SealedCandidateEvidence:
+    manifest_state = _candidate_manifest_state(
+        candidate_row,
+        candidate_run_id=candidate_run_id,
+    )
+    quarantine_by_name = _validated_candidate_quarantine(
+        manifest_state.serving_index_by_name,
+        manifest_state.layout_serving_index_by_name,
+    )
+    source_witness_by_name, audit_sample_by_name = (
+        _validated_candidate_witness(
+            manifest_state.serving_index_by_name,
+            manifest_state.layout_serving_index_by_name,
+            raw_container_sha256,
+        )
+    )
+    storage_generation = validate_candidate_layout_identity(
+        candidate_row,
+        manifest_state.serving_index_by_name,
+        manifest_state.layout_serving_index_by_name,
+    )
+    frozen_candidate_identity = _validated_frozen_candidate_identity(
+        manifest_state.manifest_by_name,
+        candidate_row,
+        candidate_run_id=candidate_run_id,
+        raw_container_sha256=raw_container_sha256,
+    )
+    if (
+        not manifest_state.snapshot_id
+        or manifest_state.activation_by_name.get("contract")
+        != PTG2_CANDIDATE_ACTIVATION_CONTRACT
+    ):
+        raise ValueError(
+            "candidate is not an exact strict shared snapshot"
+        )
+    return _SealedCandidateEvidence(
+        snapshot_id=manifest_state.snapshot_id,
+        activation_by_name=manifest_state.activation_by_name,
+        provider_identifier_quarantine=quarantine_by_name,
+        source_witness=source_witness_by_name,
+        audit_sample=audit_sample_by_name,
+        storage_generation=storage_generation,
+        frozen_candidate_identity=frozen_candidate_identity,
+    )
+
+
+def _candidate_scope_state(
+    candidate_row: Mapping[str, Any],
+    activation_by_name: Mapping[str, Any],
+) -> _CandidateScopeState:
+    source_key = str(
+        activation_by_name.get("source_key") or ""
+    ).strip().lower()
+    plan_id = str(candidate_row.get("plan_id") or "").strip()
+    plan_market_type = str(
+        candidate_row.get("plan_market_type") or ""
+    ).strip().lower()
+    expected_current = str(
+        activation_by_name.get("expected_previous_snapshot_id") or ""
+    ).strip() or None
+    row_previous = str(
+        candidate_row.get("previous_snapshot_id") or ""
+    ).strip() or None
+    current_snapshot = str(
+        candidate_row.get("current_snapshot_id") or ""
+    ).strip() or None
+    if not source_key or not plan_id or not plan_market_type:
+        raise ValueError("candidate public source scope is incomplete")
+    if row_previous != expected_current:
+        raise ValueError("candidate predecessor binding is inconsistent")
+    return _CandidateScopeState(
+        source_key=source_key,
+        plan_id=plan_id,
+        plan_market_type=plan_market_type,
+        expected_current_snapshot_id=expected_current,
+        current_snapshot_id=current_snapshot,
+    )
+
+
+def _validated_activation_status(
+    candidate_row: Mapping[str, Any],
+    evidence: _SealedCandidateEvidence,
+    scope_state: _CandidateScopeState,
+    *,
+    allow_superseded: bool,
+) -> tuple[str, bool]:
+    status = str(candidate_row.get("status") or "").strip().lower()
+    activation_state = str(
+        evidence.activation_by_name.get("state") or ""
+    ).strip().lower()
+    is_activated = status == "published" and activation_state == "activated"
+    if is_activated:
+        if (
+            evidence.activation_by_name.get("mode") != "audited_control"
+            or scope_state.current_snapshot_id != evidence.snapshot_id
+            or candidate_row.get("audit_activated_at") is None
+        ):
+            raise ValueError("activated candidate cannot be corroborated")
+    elif (
+        status != "validated"
+        or activation_state != "validated"
+        or scope_state.current_snapshot_id == evidence.snapshot_id
+        or (
+            scope_state.current_snapshot_id
+            != scope_state.expected_current_snapshot_id
+            and (
+                not allow_superseded
+                or scope_state.current_snapshot_id is None
+            )
+        )
+    ):
+        raise ValueError(
+            "candidate is not validated with deferred activation"
+        )
+    return status, is_activated
+
+
+def _candidate_audit_report(
+    candidate_row: Mapping[str, Any],
+    *,
+    is_activated: bool,
+) -> tuple[Mapping[str, Any] | None, str | None]:
+    audit_report = (
+        _mapping(candidate_row.get("audit_report"))
+        if is_activated
+        else None
+    )
+    audit_report_digest = (
+        _normalized_digest(
+            candidate_row.get("audit_report_digest"),
+            field="audit report digest",
+        )
+        if is_activated
+        else None
+    )
+    if is_activated and not audit_report:
+        raise ValueError(
+            "activated candidate has no corroborating audit report"
+        )
+    return audit_report, audit_report_digest
+
+
+def _candidate_activation_state(
+    candidate_row: Mapping[str, Any],
+    evidence: _SealedCandidateEvidence,
+    *,
+    allow_superseded: bool,
+) -> _CandidateActivationState:
+    scope_state = _candidate_scope_state(
+        candidate_row,
+        evidence.activation_by_name,
+    )
+    status, is_activated = _validated_activation_status(
+        candidate_row,
+        evidence,
+        scope_state,
+        allow_superseded=allow_superseded,
+    )
+    audit_report, audit_report_digest = _candidate_audit_report(
+        candidate_row,
+        is_activated=is_activated,
+    )
+    return _CandidateActivationState(
+        source_key=scope_state.source_key,
+        plan_id=scope_state.plan_id,
+        plan_market_type=scope_state.plan_market_type,
+        expected_current_snapshot_id=(
+            scope_state.expected_current_snapshot_id
+        ),
+        current_snapshot_id=scope_state.current_snapshot_id,
+        snapshot_status=status,
+        is_activated=is_activated,
+        audit_report=audit_report,
+        audit_report_digest=audit_report_digest,
+    )
 
 
 def _candidate_target_from_row(
@@ -291,127 +712,39 @@ def _candidate_target_from_row(
 ) -> CandidateAuditTarget:
     """Validate a resolved candidate row and return its exact audit target."""
 
-    observed_run_id = str(candidate_row.get("import_run_id") or "").strip()
-    if observed_run_id != candidate_run_id:
-        raise ValueError("candidate run binding changed during resolution")
-    snapshot_id = str(candidate_row.get("snapshot_id") or "").strip()
-    manifest = _mapping(candidate_row.get("manifest"))
-    serving_index = _mapping(manifest.get("serving_index"))
-    activation = _mapping(manifest.get("activation"))
-    layout_manifest = _mapping(candidate_row.get("layout_manifest"))
-    layout_serving_index = _mapping(layout_manifest.get("serving_index"))
-    source_set = _mapping(serving_index.get("source_set"))
-    source_witness = _mapping(serving_index.get("source_witness"))
-    layout_source_witness = _mapping(
-        layout_serving_index.get("source_witness")
-    )
-    audit_sample = _mapping(serving_index.get("audit_sample"))
-    layout_audit_sample = _mapping(layout_serving_index.get("audit_sample"))
-    try:
-        provider_identifier_quarantine = (
-            validate_provider_identifier_quarantine(
-                serving_index.get("provider_identifier_quarantine")
-            )
-        )
-        layout_provider_identifier_quarantine = (
-            validate_provider_identifier_quarantine(
-                layout_serving_index.get("provider_identifier_quarantine")
-            )
-        )
-    except ValueError as exc:
-        raise ValueError(
-            "candidate provider identifier quarantine is invalid"
-        ) from exc
-    if provider_identifier_quarantine != layout_provider_identifier_quarantine:
-        raise ValueError(
-            "candidate provider identifier quarantine changed after layout sealing"
-        )
-    storage_generation = validate_candidate_layout_identity(
+    evidence = _sealed_candidate_evidence(
         candidate_row,
-        serving_index,
-        layout_serving_index,
+        candidate_run_id=candidate_run_id,
+        raw_container_sha256=raw_container_sha256,
     )
-    expected_source_set_digest = source_set_digest(raw_container_sha256)
-    if (
-        source_witness != layout_source_witness
-        or audit_sample != layout_audit_sample
-        or source_witness.get("contract")
-        != PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT
-        or int(source_witness.get("source_count") or -1)
-        != len(raw_container_sha256)
-        or source_witness.get("source_set_digest") != expected_source_set_digest
-        or source_set.get("raw_container_sha256_digest")
-        != expected_source_set_digest
-    ):
-        raise ValueError(
-            "candidate source witness changed after layout sealing"
-        )
-    if (
-        not snapshot_id
-        or activation.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
-    ):
-        raise ValueError("candidate is not an exact strict shared snapshot")
-
-    source_key = str(activation.get("source_key") or "").strip().lower()
-    plan_id = str(candidate_row.get("plan_id") or "").strip()
-    plan_market_type = str(candidate_row.get("plan_market_type") or "").strip().lower()
-    expected_current = str(
-        activation.get("expected_previous_snapshot_id") or ""
-    ).strip() or None
-    row_previous = str(candidate_row.get("previous_snapshot_id") or "").strip() or None
-    current_snapshot = str(candidate_row.get("current_snapshot_id") or "").strip() or None
-    if not source_key or not plan_id or not plan_market_type:
-        raise ValueError("candidate public source scope is incomplete")
-    if row_previous != expected_current:
-        raise ValueError("candidate predecessor binding is inconsistent")
-
-    status = str(candidate_row.get("status") or "").strip().lower()
-    activation_state = str(activation.get("state") or "").strip().lower()
-    is_activated = status == "published" and activation_state == "activated"
-    if is_activated:
-        if (
-            activation.get("mode") != "audited_control"
-            or current_snapshot != snapshot_id
-            or candidate_row.get("audit_activated_at") is None
-        ):
-            raise ValueError("activated candidate cannot be corroborated")
-    elif status != "validated" or activation_state != "validated":
-        raise ValueError("candidate is not validated with deferred activation")
-    elif current_snapshot == snapshot_id:
-        raise ValueError("candidate is not validated with deferred activation")
-    elif current_snapshot != expected_current and (
-        not allow_superseded or current_snapshot is None
-    ):
-        raise ValueError("candidate is not validated with deferred activation")
-
-    report = _mapping(candidate_row.get("audit_report")) if is_activated else None
-    report_digest = (
-        _normalized_digest(
-            candidate_row.get("audit_report_digest"), field="audit report digest"
-        )
-        if is_activated
-        else None
+    activation_state = _candidate_activation_state(
+        candidate_row,
+        evidence,
+        allow_superseded=allow_superseded,
     )
-    if is_activated and not report:
-        raise ValueError("activated candidate has no corroborating audit report")
     return CandidateAuditTarget(
         candidate_run_id=candidate_run_id,
-        snapshot_id=snapshot_id,
-        snapshot_status=status,
+        snapshot_id=evidence.snapshot_id,
+        snapshot_status=activation_state.snapshot_status,
         snapshot_key=int(candidate_row["snapshot_key"]),
-        source_key=source_key,
-        plan_id=plan_id,
-        plan_market_type=plan_market_type,
-        expected_current_snapshot_id=expected_current,
-        current_snapshot_id=current_snapshot,
+        source_key=activation_state.source_key,
+        plan_id=activation_state.plan_id,
+        plan_market_type=activation_state.plan_market_type,
+        expected_current_snapshot_id=(
+            activation_state.expected_current_snapshot_id
+        ),
+        current_snapshot_id=activation_state.current_snapshot_id,
         raw_container_sha256=raw_container_sha256,
-        provider_identifier_quarantine=provider_identifier_quarantine,
-        source_witness=source_witness,
-        audit_sample=audit_sample,
-        activated=is_activated,
-        storage_generation=storage_generation,
-        audit_report=report,
-        audit_report_digest=report_digest,
+        provider_identifier_quarantine=(
+            evidence.provider_identifier_quarantine
+        ),
+        source_witness=evidence.source_witness,
+        audit_sample=evidence.audit_sample,
+        activated=activation_state.is_activated,
+        storage_generation=evidence.storage_generation,
+        audit_report=activation_state.audit_report,
+        audit_report_digest=activation_state.audit_report_digest,
+        frozen_candidate_identity=evidence.frozen_candidate_identity,
     )
 
 
@@ -446,6 +779,9 @@ def _current_snapshot_row(candidate_row: Mapping[str, Any]) -> dict[str, Any] | 
         ),
         "audit_report": candidate_row.get("current_audit_report"),
         "audit_activated_at": candidate_row.get("current_audit_activated_at"),
+        "frozen_binding_payload": candidate_row.get(
+            "current_frozen_binding_payload"
+        ),
     }
 
 
@@ -476,6 +812,7 @@ async def _reuse_equivalent_current_target(
         dict(candidate_target.provider_identifier_quarantine),
         dict(candidate_target.source_witness),
         dict(candidate_target.audit_sample),
+        candidate_target.frozen_candidate_identity,
     )
     current_identity = (
         current_target.snapshot_key,
@@ -487,6 +824,7 @@ async def _reuse_equivalent_current_target(
         dict(current_target.provider_identifier_quarantine),
         dict(current_target.source_witness),
         dict(current_target.audit_sample),
+        current_target.frozen_candidate_identity,
     )
     if not current_target.activated or equivalent_identity != current_identity:
         raise ValueError("candidate was superseded by a non-equivalent snapshot")
@@ -1099,6 +1437,54 @@ async def _audit_and_activate(
     )
 
 
+async def _audit_candidate_under_guard(
+    normalized_candidate_run_id: str,
+    *,
+    snapshot_id: str | None,
+    import_id: str | None,
+    run_id: str | None,
+) -> dict[str, Any]:
+    await _progress(
+        run_id,
+        snapshot_id=None,
+        phase="candidate resolution",
+        message="loading candidate from PostgreSQL",
+        pct=10,
+    )
+    candidate_target = await load_candidate_audit_target(
+        candidate_run_id=normalized_candidate_run_id,
+        snapshot_id=snapshot_id,
+        import_id=import_id,
+    )
+    if candidate_target.activated:
+        assert candidate_target.audit_report is not None
+        assert candidate_target.audit_report_digest is not None
+        return _success_result(
+            candidate_target,
+            report=candidate_target.audit_report,
+            report_digest=candidate_target.audit_report_digest,
+            idempotent=True,
+        )
+    if candidate_target.equivalent_current_snapshot_id is not None:
+        assert candidate_target.equivalent_audit_report is not None
+        assert candidate_target.equivalent_audit_report_digest is not None
+        return _success_result(
+            candidate_target,
+            report=candidate_target.equivalent_audit_report,
+            report_digest=candidate_target.equivalent_audit_report_digest,
+            idempotent=True,
+        )
+    http_config = _audit_configuration(
+        candidate_target.snapshot_id,
+        batch_writer=PTG2_BATCH_AUDIT_WRITER_ENABLED,
+    )
+    return await _audit_and_activate(
+        candidate_target,
+        control_run_id=run_id,
+        http_config=http_config,
+    )
+
+
 async def run_ptg_candidate_audit_command(
     *,
     candidate_run_id: str,
@@ -1112,45 +1498,11 @@ async def run_ptg_candidate_audit_command(
     if not normalized_candidate_run_id:
         raise ValueError("candidate_run_id is required")
     async with candidate_audit_guard(normalized_candidate_run_id):
-        await _progress(
-            run_id,
-            snapshot_id=None,
-            phase="candidate resolution",
-            message="loading candidate from PostgreSQL",
-            pct=10,
-        )
-        candidate_target = await load_candidate_audit_target(
-            candidate_run_id=normalized_candidate_run_id,
+        return await _audit_candidate_under_guard(
+            normalized_candidate_run_id,
             snapshot_id=snapshot_id,
             import_id=import_id,
-        )
-        if candidate_target.activated:
-            assert candidate_target.audit_report is not None
-            assert candidate_target.audit_report_digest is not None
-            return _success_result(
-                candidate_target,
-                report=candidate_target.audit_report,
-                report_digest=candidate_target.audit_report_digest,
-                idempotent=True,
-            )
-        if candidate_target.equivalent_current_snapshot_id is not None:
-            assert candidate_target.equivalent_audit_report is not None
-            assert candidate_target.equivalent_audit_report_digest is not None
-            return _success_result(
-                candidate_target,
-                report=candidate_target.equivalent_audit_report,
-                report_digest=candidate_target.equivalent_audit_report_digest,
-                idempotent=True,
-            )
-
-        http_config = _audit_configuration(
-            candidate_target.snapshot_id,
-            batch_writer=PTG2_BATCH_AUDIT_WRITER_ENABLED,
-        )
-        return await _audit_and_activate(
-            candidate_target,
-            control_run_id=run_id,
-            http_config=http_config,
+            run_id=run_id,
         )
 
 
