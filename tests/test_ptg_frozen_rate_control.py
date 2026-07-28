@@ -365,6 +365,9 @@ def test_worker_revalidates_envelope_and_mutual_exclusion_before_run_claim():
 
 def test_set_digest_and_count_bind_import_and_snapshot_identities():
     files, digest = _frozen_set(2)
+    protected_params = _protected_payload()["params"]
+    binding = frozen_rate_binding_from_params(protected_params)
+    assert binding is not None
     import_id = ptg._frozen_ptg2_import_id(
         ptg.normalize_import_month("2026-07"),
         "source-a",
@@ -384,6 +387,7 @@ def test_set_digest_and_count_bind_import_and_snapshot_identities():
             "frozen_rate_files": files,
             "frozen_rate_file_set_sha256": digest,
             "frozen_rate_file_count": 2,
+            FROZEN_RATE_FILE_BINDING_OPTION: binding,
         }
     )
 
@@ -391,6 +395,45 @@ def test_set_digest_and_count_bind_import_and_snapshot_identities():
     assert snapshot_options["frozen_rate_file_set_sha256"] == digest
     assert snapshot_options["frozen_rate_file_count"] == 2
     assert "frozen_rate_files" not in snapshot_options
+
+
+def test_legacy_snapshot_identity_omits_absent_frozen_coordinates():
+    legacy_options_by_name = {
+        "toc_urls": ["https://rates.example.com/index.json"],
+        "toc_list": None,
+        "in_network_url": None,
+        "allowed_url": None,
+        "source_key": "source-a",
+        "plan_ids": [],
+        "plan_name_contains": [],
+        "plan_market_types": [],
+        "file_url_contains": [],
+        "source_network_names": [],
+        "max_files": 1,
+        "snapshot_arch": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v4",
+        "test_mode": False,
+        "source_file_import_id": "legacy-source-file",
+        "frozen_rate_file_set_contract": None,
+        "frozen_rate_file_set_sha256": None,
+        "frozen_rate_file_count": 0,
+    }
+
+    content_options = ptg._ptg2_snapshot_content_options(
+        legacy_options_by_name
+    )
+
+    assert set(content_options) == set(
+        ptg._PTG2_SNAPSHOT_CONTENT_OPTION_KEYS
+    )
+    assert not set(ptg._PTG2_FROZEN_SNAPSHOT_CONTENT_OPTION_KEYS).intersection(
+        content_options
+    )
+    assert ptg._ptg2_deterministic_snapshot_id(
+        import_month=dt.date(2026, 7, 1),
+        import_id="legacy-import",
+        option_by_name=legacy_options_by_name,
+    ) == "ptg2:202607:4a1a9d98fa40"
 
 
 def test_candidate_redelivery_keeps_complete_set_proof_for_v4_audit():

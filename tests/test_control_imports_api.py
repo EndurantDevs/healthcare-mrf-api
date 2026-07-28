@@ -622,7 +622,14 @@ def test_ram_status_uses_sysconf_when_proc_meminfo_is_unavailable(monkeypatch):
     }
 
 
-def test_normalize_run_accepts_plain_dict():
+def test_normalize_run_accepts_plain_dict(monkeypatch):
+    """A plain row stays stable without unrelated live-progress evidence."""
+
+    monkeypatch.setattr(
+        control_imports,
+        "read_live_progress",
+        lambda _run_id: None,
+    )
     run_row_map = {"run_id": "run_1", "status": "queued"}
 
     assert normalize_run(run_row_map) == run_row_map

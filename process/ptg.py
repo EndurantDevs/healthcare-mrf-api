@@ -3859,6 +3859,34 @@ def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[st
     }
 
 
+def _raw_job_dedupe_screen_line(
+    job: Mapping[str, Any],
+    downloaded: PTG2DownloadedJob,
+) -> str:
+    """Render duplicate evidence without exposing protected source identities."""
+
+    display_label = _ptg_job_display_label(job)
+    line = (
+        "PTG2_RAW_JOB_DEDUPE"
+        f"\ttype={job.get('type')}"
+        f"\ttarget={display_label}"
+    )
+    if not job.get("_ptg_progress_private"):
+        line += (
+            f"\traw_sha256={downloaded.raw_artifact.raw_sha256}"
+            f"\tlogical_sha256={downloaded.logical_artifact.logical_sha256}"
+        )
+    return line + "\treason=duplicate_logical_artifact"
+
+
+def _ptg_job_display_label(job: Mapping[str, Any]) -> str:
+    return str(
+        job.get("_ptg_progress_label")
+        or job.get("url")
+        or "PTG file"
+    )
+
+
 def _source_file_versions_from_results(
     files: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -4089,11 +4117,6 @@ _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS = (
     "toc_list",
     "in_network_url",
     "allowed_url",
-    "source_file_import_id",
-    "frozen_rate_file_set_contract",
-    "frozen_rate_file_set_sha256",
-    "frozen_rate_file_count",
-    FROZEN_RATE_FILE_BINDING_OPTION,
     "source_key",
     *_PTG2_SNAPSHOT_SET_OPTION_KEYS,
     "source_network_names",
@@ -4103,12 +4126,30 @@ _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS = (
     "test_mode",
 )
 
+_PTG2_FROZEN_SNAPSHOT_CONTENT_OPTION_KEYS = (
+    "source_file_import_id",
+    "frozen_rate_file_set_contract",
+    "frozen_rate_file_set_sha256",
+    "frozen_rate_file_count",
+    FROZEN_RATE_FILE_BINDING_OPTION,
+)
+
 
 def _ptg2_snapshot_content_options(option_by_name: dict[str, Any]) -> dict[str, Any]:
     content_option_by_name = {
         key: option_by_name.get(key)
         for key in _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS
     }
+    if isinstance(
+        option_by_name.get(FROZEN_RATE_FILE_BINDING_OPTION),
+        Mapping,
+    ):
+        content_option_by_name.update(
+            {
+                key: option_by_name.get(key)
+                for key in _PTG2_FROZEN_SNAPSHOT_CONTENT_OPTION_KEYS
+            }
+        )
     rebuild_scope_digest = normalized_full_rebuild_scope_digest(
         option_by_name.get("full_rebuild_scope_digest")
     )
@@ -4118,9 +4159,11 @@ def _ptg2_snapshot_content_options(option_by_name: dict[str, Any]) -> dict[str, 
         )
     content_option_by_name["toc_urls"] = _dedupe_preserve(
         [
-            str(value).strip()
-            for value in _as_list(option_by_name.get("toc_urls"))
-            if str(value).strip()
+            str(toc_url_value).strip()
+            for toc_url_value in _as_list(
+                option_by_name.get("toc_urls")
+            )
+            if str(toc_url_value).strip()
         ]
     )
     for key in _PTG2_SNAPSHOT_SET_OPTION_KEYS:
@@ -6631,10 +6674,11 @@ async def _main_with_artifact_lease(
         await source_import_lock.__aenter__()
         has_source_import_lock = True
         setup_stage_timer.mark("source_import_lock")
-        await insert_or_compare_frozen_binding_transaction(
-            normalized_direct_frozen_params_by_name
-        )
-        setup_stage_timer.mark("frozen_source_file_binding")
+        if normalized_direct_frozen_params_by_name:
+            await insert_or_compare_frozen_binding_transaction(
+                normalized_direct_frozen_params_by_name
+            )
+            setup_stage_timer.mark("frozen_source_file_binding")
         observed_source_snapshot_id = await _current_source_snapshot_id(source_key_val)
         observed_allowed_snapshot_id = await _current_allowed_snapshot_id(
             source_key_val
@@ -7314,7 +7358,14 @@ async def _main_with_artifact_lease(
                 **current_live_progress_context(),
                 "file_index": job_index + 1,
                 "file_count": attempted_files,
-                "file_name": str(job.get("url") or ""),
+                "file_name": str(
+                    job.get("_ptg_progress_label")
+                    or job.get("url")
+                    or ""
+                ),
+                "private_source": bool(
+                    job.get("_ptg_progress_private")
+                ),
             }
 
         async def process_downloaded_job(
@@ -7585,7 +7636,11 @@ async def _main_with_artifact_lease(
                     )
                 )
                 progress_labels[progress_index] = (
-                    str(buffered_download.job.get("url") or "PTG file")
+                    str(
+                        buffered_download.job.get("_ptg_progress_label")
+                        or buffered_download.job.get("url")
+                        or "PTG file"
+                    )
                 )
                 if not duplicate_physical_input:
                     unique_downloads_by_logical_hash.setdefault(
@@ -7611,7 +7666,12 @@ async def _main_with_artifact_lease(
                 job = downloaded.job
                 file_result: PTG2FileProcessResult | None = None
                 if downloaded.error:
-                    logger.warning("Failed to download %s file from %s: %s", job.get("type"), job.get("url"), downloaded.error)
+                    logger.warning(
+                        "Failed to download %s file %s: %s",
+                        job.get("type"),
+                        _ptg_job_display_label(job),
+                        downloaded.error,
+                    )
                     file_result = PTG2FileProcessResult(
                         str(job.get("type") or "unknown"),
                         str(job.get("url") or ""),
@@ -7641,12 +7701,7 @@ async def _main_with_artifact_lease(
                         import_run_id=import_run_id,
                     )
                     _emit_screen_line(
-                        "PTG2_RAW_JOB_DEDUPE"
-                        f"\ttype={job.get('type')}"
-                        f"\turl={job.get('url')}"
-                        f"\traw_sha256={downloaded.raw_artifact.raw_sha256}"
-                        f"\tlogical_sha256={downloaded.logical_artifact.logical_sha256}"
-                        "\treason=duplicate_logical_artifact"
+                        _raw_job_dedupe_screen_line(job, downloaded)
                     )
                     file_result = PTG2FileProcessResult(
                         str(job.get("type") or "unknown"),

@@ -24,6 +24,9 @@ from process.ptg_parts.frozen_rate_binding import (
 from process.ptg_parts.frozen_rate_files import (
     FROZEN_RATE_FILE_SET_CONTRACT,
 )
+from process.ptg_parts.frozen_rate_storage import (
+    frozen_rate_storage_measurement,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 
 
@@ -278,8 +281,39 @@ async def insert_or_compare_frozen_binding_transaction(
         )
 
 
+async def measure_frozen_binding_storage(
+    connection: Any,
+) -> dict[str, Any]:
+    """Measure only the durable metadata relation owned by this feature."""
+
+    storage_rows = await connection.all(
+        db.text(
+            f"""
+            SELECT count(*)::bigint AS binding_rows,
+                   pg_total_relation_size(
+                       CAST(:binding_table AS regclass)
+                   )::bigint AS binding_relation_bytes
+              FROM {_binding_table()}
+            """
+        ),
+        binding_table=_binding_table(),
+    )
+    if len(storage_rows) != 1:
+        raise FrozenRateFileBindingMismatchError(
+            "frozen binding storage measurement is unavailable"
+        )
+    storage_row_by_name = _row_as_mapping(storage_rows[0])
+    return frozen_rate_storage_measurement(
+        binding_rows=int(storage_row_by_name["binding_rows"]),
+        binding_relation_bytes=int(
+            storage_row_by_name["binding_relation_bytes"]
+        ),
+    )
+
+
 __all__ = [
     "insert_or_compare_frozen_binding",
     "insert_or_compare_frozen_binding_transaction",
+    "measure_frozen_binding_storage",
     "recheck_frozen_binding",
 ]

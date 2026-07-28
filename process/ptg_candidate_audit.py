@@ -329,36 +329,50 @@ class _CandidateRawSources(tuple[str, ...]):
         return instance
 
 
+_CANDIDATE_RAW_SOURCES_SQL = """
+    SELECT source.source_key,
+           source.raw_container_sha256,
+           trace_binding.source_file_version_count,
+           trace_binding.source_file_version_id,
+           version.source_identity_hash AS version_source_identity_hash,
+           source_identity.source_type AS version_source_type,
+           source_identity.canonical_url AS version_canonical_url,
+           version.raw_sha256 AS version_raw_sha256,
+           version.logical_sha256 AS version_logical_sha256,
+           version.content_length AS version_content_length,
+           version.etag AS version_etag,
+           version.last_modified AS version_last_modified,
+           version.verification_mode AS version_verification_mode,
+           version.payload AS version_payload
+      FROM {schema}.ptg2_v3_snapshot_source AS source
+      JOIN {schema}.ptg2_source_trace_set AS trace_set
+        ON trace_set.source_trace_set_hash = source.source_trace_set_hash
+      LEFT JOIN LATERAL (
+          SELECT count(DISTINCT trace.source_file_version_id)::integer
+                     AS source_file_version_count,
+                 min(trace.source_file_version_id)
+                     AS source_file_version_id
+            FROM unnest(trace_set.source_trace_hashes)
+                 AS trace_hash(source_trace_hash)
+            JOIN {schema}.ptg2_source_trace AS trace
+              ON trace.source_trace_hash = trace_hash.source_trace_hash
+      ) AS trace_binding ON TRUE
+      LEFT JOIN {schema}.ptg2_source_file_version AS version
+        ON version.source_file_version_id =
+           trace_binding.source_file_version_id
+      LEFT JOIN {schema}.ptg2_source_identity AS source_identity
+        ON source_identity.source_identity_hash = version.source_identity_hash
+     WHERE source.snapshot_id = :snapshot_id
+     ORDER BY source.source_key
+"""
+
+
 async def _candidate_raw_sources(snapshot_id: str) -> tuple[str, ...]:
+    """Load dense candidate sources with their complete version identities."""
+
     schema = _quote_ident(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     database_source_rows = await db.all(
-        f"""
-        SELECT source.source_key,
-               source.raw_container_sha256,
-               trace_binding.source_file_version_count,
-               trace_binding.source_file_version_id,
-               version.raw_sha256 AS version_raw_sha256
-          FROM {schema}.ptg2_v3_snapshot_source AS source
-          JOIN {schema}.ptg2_source_trace_set AS trace_set
-            ON trace_set.source_trace_set_hash =
-               source.source_trace_set_hash
-          LEFT JOIN LATERAL (
-              SELECT count(DISTINCT trace.source_file_version_id)::integer
-                         AS source_file_version_count,
-                     min(trace.source_file_version_id)
-                         AS source_file_version_id
-                FROM unnest(trace_set.source_trace_hashes)
-                     AS trace_hash(source_trace_hash)
-                JOIN {schema}.ptg2_source_trace AS trace
-                  ON trace.source_trace_hash =
-                     trace_hash.source_trace_hash
-          ) AS trace_binding ON TRUE
-          LEFT JOIN {schema}.ptg2_source_file_version AS version
-            ON version.source_file_version_id =
-               trace_binding.source_file_version_id
-         WHERE source.snapshot_id = :snapshot_id
-         ORDER BY source.source_key
-        """,
+        _CANDIDATE_RAW_SOURCES_SQL.format(schema=schema),
         snapshot_id=snapshot_id,
     )
     source_records = [
@@ -371,7 +385,9 @@ async def _candidate_raw_sources(snapshot_id: str) -> tuple[str, ...]:
             for source_record in source_records
         ]
     except (TypeError, ValueError) as exc:
-        raise ValueError("candidate source scope contains an invalid ordinal") from exc
+        raise ValueError(
+            "candidate source scope contains an invalid ordinal"
+        ) from exc
     if source_ordinals != list(range(len(source_records))):
         raise ValueError("candidate source scope is not dense")
     raw_digest_values = tuple(

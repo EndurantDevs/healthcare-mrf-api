@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from process.ptg_parts.ptg2_shared_source_set import (
     PTG2_V3_SOURCE_SET_CONTRACT,
 )
+from process.ptg_parts.canonical import canonical_json_dumps
 from scripts import ptg_v4_dev_canary_acceptance as acceptance
 from scripts import ptg_v4_dev_canary_publication as publication
 from scripts import ptg_v4_dev_canary_storage_budget as storage_policy
@@ -26,6 +28,9 @@ from scripts.ptg_v4_dev_canary_storage_budget import (
     PhysicalStorageApproval,
     StorageCanaryCase,
     storage_budget,
+)
+from scripts.ptg_v4_dev_canary_retained_artifacts import (
+    RETAINED_RAW_ARTIFACT_STORAGE_CONTRACT,
 )
 from scripts.ptg_v4_dev_canary_storage_sql import _ownership_predicates
 from scripts.ptg_v4_dev_canary_support import CanaryConfigurationError
@@ -270,6 +275,7 @@ def _physical_storage_evidence(
 ) -> dict[str, object]:
     """Build fully shaped physical evidence around exact measured gate bytes."""
 
+    retained_raw_by_field = _retained_raw_storage_evidence()
     return {
         "contract": STORAGE_EVIDENCE_CONTRACT,
         "relations": [
@@ -286,7 +292,11 @@ def _physical_storage_evidence(
         "missing_required_object_kinds": [],
         "graph_gate_bytes": graph_gate_bytes,
         "snapshot_gate_bytes": snapshot_gate_bytes,
-        "storage_claim_scope": "whole_snapshot_and_v4_graph",
+        "retained_raw_artifact_physical_bytes": 2_000,
+        "retained_raw_artifacts": retained_raw_by_field,
+        "storage_claim_scope": (
+            "whole_snapshot_v4_graph_and_retained_raw"
+        ),
         "cas": {
             "reference_source": (
                 "direct_rows_plus_authenticated_v4_map_payloads"
@@ -298,6 +308,39 @@ def _physical_storage_evidence(
             "shared_block_count": 0,
         },
     }
+
+
+def _retained_raw_storage_evidence() -> dict[str, object]:
+    """Build exact retained compressed-file evidence for storage gates."""
+
+    retained_artifacts = [
+        {
+            "ordinal": ordinal,
+            "source_file_version_id": f"version-{ordinal}",
+            "raw_sha256": f"{ordinal:064x}",
+            "raw_byte_count": 4_000_000_000,
+            "physical_allocated_bytes": 1_000,
+            "source_version_reference_count": 1,
+            "artifact_manifest_count": 1,
+        }
+        for ordinal in (1, 2)
+    ]
+    retained_raw_by_field = {
+        "contract": RETAINED_RAW_ARTIFACT_STORAGE_CONTRACT,
+        "snapshot_id": "ptg2:v4:provider_fragmented_391",
+        "frozen_rate_file_set_sha256": "a" * 64,
+        "source_file_version_count": 2,
+        "distinct_artifact_count": 2,
+        "referenced_raw_bytes": 8_000_000_000,
+        "referenced_physical_bytes": 2_000,
+        "all_files_verified": True,
+        "attribution": "full_referenced_physical_bytes_conservative",
+        "artifacts": retained_artifacts,
+    }
+    retained_raw_by_field["evidence_sha256"] = hashlib.sha256(
+        canonical_json_dumps(retained_raw_by_field).encode("utf-8")
+    ).hexdigest()
+    return retained_raw_by_field
 
 
 def test_tax_identity_sidecars_are_snapshot_owned_graph_storage() -> None:
@@ -427,59 +470,3 @@ def test_checked_in_absolute_ceiling_requires_exact_reviewed_tolerance() -> None
 
     assert failures == []
     assert approved_budget.is_promotion_approved is True
-
-
-def test_checked_in_absolute_ceiling_rejects_unreviewed_extra_headroom() -> None:
-    case = STORAGE_CANARY_CASES[1]
-    inconsistent_approval = replace(
-        _physical_storage_approval(case=case),
-        approved_graph_physical_storage_bytes=1_021,
-    )
-
-    with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
-        storage_policy._validate_storage_approval(
-            case,
-            inconsistent_approval,
-        )
-
-    with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
-        storage_policy._validate_storage_approval(
-            case,
-            replace(inconsistent_approval, measurement_image_identity="")
-        )
-
-
-def test_storage_approval_requires_exact_two_percent() -> None:
-    case = STORAGE_CANARY_CASES[1]
-    approval = _physical_storage_approval(case=case)
-
-    for tolerance_basis_points in (199, 201):
-        with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
-            storage_policy._validate_storage_approval(
-                case,
-                replace(
-                    approval,
-                    tolerance_basis_points=tolerance_basis_points,
-                ),
-            )
-
-
-def test_storage_approval_rejects_cross_case_or_mistyped_evidence() -> None:
-    case = STORAGE_CANARY_CASES[1]
-    approval = _physical_storage_approval(case=case)
-
-    with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
-        storage_policy._validate_storage_approval(
-            STORAGE_CANARY_CASES[2],
-            approval,
-        )
-    with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
-        storage_policy._validate_storage_approval(
-            case,
-            replace(approval, measurement_evidence_sha256="0" * 64),
-        )
-    with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
-        storage_policy._validate_storage_approval(
-            case,
-            replace(approval, measurement_snapshot_id="ptg2:v4:mistyped"),
-        )

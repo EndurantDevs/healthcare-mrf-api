@@ -25,6 +25,14 @@ FROZEN_RATE_FILE_MAX_URL_BYTES = 4096
 FROZEN_RATE_FILE_MAX_VALIDATOR_BYTES = 1024
 FROZEN_RATE_FILE_TOTAL_MAX_BYTES_ENV = "HLTHPRT_PTG2_FROZEN_TOTAL_MAX_BYTES"
 FROZEN_RATE_FILE_TOTAL_MAX_BYTES_DEFAULT = 512 * 1024 * 1024 * 1024
+FROZEN_RATE_FILE_VERIFICATION_MODES = frozenset(
+    {
+        "downloaded",
+        "length_last_modified",
+        "strong_etag_length",
+        "verified_local_sha256",
+    }
+)
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _ENGINE_ID_PATTERN = re.compile(
@@ -54,6 +62,29 @@ class FrozenRateFileValidationError(ValueError):
 
 class FrozenRateFileMismatchError(RuntimeError):
     """Raised when acquired or processed evidence differs from the frozen set."""
+
+
+def normalize_frozen_verification_mode(value: Any) -> str:
+    """Return one explicit byte-verification mode accepted by frozen proof."""
+
+    if (
+        not isinstance(value, str)
+        or value not in FROZEN_RATE_FILE_VERIFICATION_MODES
+    ):
+        raise FrozenRateFileMismatchError(
+            "frozen rate file verification_mode is invalid"
+        )
+    return value
+
+
+def frozen_observed_logical_sha256(
+    descriptor: Mapping[str, Any],
+) -> str:
+    """Return the persisted logical identity for one frozen declaration."""
+
+    if descriptor.get("logical_hash_deferred") is True:
+        return str(descriptor.get("raw_sha256") or "")
+    return str(descriptor.get("logical_sha256") or "")
 
 
 def _canonical_https_url(raw_url: Any) -> str:
@@ -448,8 +479,10 @@ __all__ = [
     "FROZEN_RATE_FILE_SET_MIN_FILES",
     "FROZEN_RATE_FILE_TOTAL_MAX_BYTES_DEFAULT",
     "FROZEN_RATE_FILE_TOTAL_MAX_BYTES_ENV",
+    "FROZEN_RATE_FILE_VERIFICATION_MODES",
     "FrozenRateFileMismatchError",
     "FrozenRateFileValidationError",
+    "frozen_observed_logical_sha256",
     "assert_frozen_input_compatibility",
     "bind_frozen_rate_set_to_scope",
     "build_frozen_rate_jobs",
@@ -457,6 +490,7 @@ __all__ = [
     "frozen_rate_file_set_sha256",
     "frozen_rate_file_proof_sha256",
     "normalize_frozen_rate_file_set",
+    "normalize_frozen_verification_mode",
     "validate_frozen_artifacts",
     "validate_frozen_head",
     "validate_frozen_processed_results",

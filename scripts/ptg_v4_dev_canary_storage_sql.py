@@ -23,9 +23,24 @@ async def owned_row_bytes(
     relation_name: str,
     snapshot_id: str,
     snapshot_key: int,
+    import_run_id: str,
 ) -> dict[str, int]:
     """Measure global and snapshot-owned tuple bytes for an ordinary relation."""
 
+    if relation_name == "ptg2_artifact_manifest":
+        return await _artifact_manifest_row_bytes(
+            connection,
+            schema_name,
+            snapshot_id,
+            import_run_id,
+        )
+    if relation_name == "ptg2_artifact_blob_chunk":
+        return await _artifact_blob_row_bytes(
+            connection,
+            schema_name,
+            snapshot_id,
+            import_run_id,
+        )
     target_filter, owned_filter, ownership_value = _ownership_predicates(
         relation_name,
         snapshot_id,
@@ -51,6 +66,88 @@ async def owned_row_bytes(
         """,
         ownership_value,
     )
+    return _normalized_byte_record(byte_record)
+
+
+async def _artifact_manifest_row_bytes(
+    connection: asyncpg.Connection,
+    schema_name: str,
+    snapshot_id: str,
+    import_run_id: str,
+) -> dict[str, int]:
+    schema = quote_identifier(schema_name)
+    relation = quote_identifier("ptg2_artifact_manifest")
+    byte_record = await connection.fetchrow(
+        f"""
+        SELECT COALESCE(SUM(pg_column_size(item)), 0)::bigint
+                   AS global_row_bytes,
+               COALESCE(SUM(pg_column_size(item)) FILTER (
+                   WHERE item.snapshot_id = $1::text
+                      OR item.import_run_id = $2::text
+               ), 0)::bigint AS snapshot_weighted_row_bytes,
+               COUNT(*) FILTER (
+                   WHERE item.snapshot_id = $1::text
+                      OR item.import_run_id = $2::text
+               )::bigint AS snapshot_row_count,
+               COALESCE(SUM(pg_column_size(item)) FILTER (
+                   WHERE item.snapshot_id IS NOT NULL
+                      OR item.import_run_id IS NOT NULL
+               ), 0)::bigint AS allocated_all_snapshot_row_bytes,
+               COALESCE(SUM(pg_column_size(item)) FILTER (
+                   WHERE item.snapshot_id IS NULL
+                     AND item.import_run_id IS NULL
+               ), 0)::bigint AS unallocated_row_bytes
+          FROM {schema}.{relation} AS item
+        """,
+        snapshot_id,
+        import_run_id,
+    )
+    return _normalized_byte_record(byte_record)
+
+
+async def _artifact_blob_row_bytes(
+    connection: asyncpg.Connection,
+    schema_name: str,
+    snapshot_id: str,
+    import_run_id: str,
+) -> dict[str, int]:
+    schema = quote_identifier(schema_name)
+    chunks = quote_identifier("ptg2_artifact_blob_chunk")
+    manifest = quote_identifier("ptg2_artifact_manifest")
+    byte_record = await connection.fetchrow(
+        f"""
+        SELECT COALESCE(SUM(pg_column_size(item)), 0)::bigint
+                   AS global_row_bytes,
+               COALESCE(SUM(pg_column_size(item)) FILTER (
+                   WHERE owner.snapshot_id = $1::text
+                      OR owner.import_run_id = $2::text
+               ), 0)::bigint AS snapshot_weighted_row_bytes,
+               COUNT(*) FILTER (
+                   WHERE owner.snapshot_id = $1::text
+                      OR owner.import_run_id = $2::text
+               )::bigint AS snapshot_row_count,
+               COALESCE(SUM(pg_column_size(item)) FILTER (
+                   WHERE owner.snapshot_id IS NOT NULL
+                      OR owner.import_run_id IS NOT NULL
+               ), 0)::bigint AS allocated_all_snapshot_row_bytes,
+               COALESCE(SUM(pg_column_size(item)) FILTER (
+                   WHERE owner.artifact_id IS NULL
+                      OR (
+                          owner.snapshot_id IS NULL
+                          AND owner.import_run_id IS NULL
+                      )
+               ), 0)::bigint AS unallocated_row_bytes
+          FROM {schema}.{chunks} AS item
+          LEFT JOIN {schema}.{manifest} AS owner
+            ON owner.artifact_id = item.artifact_id
+        """,
+        snapshot_id,
+        import_run_id,
+    )
+    return _normalized_byte_record(byte_record)
+
+
+def _normalized_byte_record(byte_record: Any) -> dict[str, int]:
     bytes_by_field = {
         field_name: int(byte_count or 0)
         for field_name, byte_count in dict(byte_record).items()

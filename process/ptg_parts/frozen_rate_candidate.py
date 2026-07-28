@@ -12,12 +12,17 @@ from process.ptg_parts.frozen_rate_binding import (
     FrozenRateFileBindingMismatchError,
     frozen_internal_run_id,
 )
+from process.ptg_parts.frozen_rate_candidate_sources import (
+    validate_frozen_candidate_database_sources,
+)
 from process.ptg_parts.frozen_rate_files import (
     FROZEN_RATE_FILE_PROOF_CONTRACT,
     FROZEN_RATE_FILE_SET_CONTRACT,
     FrozenRateFileMismatchError,
+    frozen_observed_logical_sha256,
     frozen_rate_file_proof_sha256,
     normalize_frozen_rate_file_set,
+    normalize_frozen_verification_mode,
 )
 
 
@@ -50,6 +55,7 @@ def _descriptor_from_proof(proof_row: Mapping[str, Any]) -> dict[str, Any]:
         raise FrozenRateFileMismatchError(
             "candidate frozen proof byte count changed"
         )
+    normalize_frozen_verification_mode(proof_row.get("verification_mode"))
     return {
         field_name: field_value
         for field_name, field_value in proof_row.items()
@@ -138,65 +144,6 @@ def _version_by_id(
     return version_by_id
 
 
-def _validate_database_sources(
-    database_sources: Sequence[Mapping[str, Any]],
-    descriptors: Sequence[Mapping[str, Any]],
-) -> None:
-    if len(database_sources) != len(descriptors):
-        raise FrozenRateFileMismatchError(
-            "candidate frozen database source cardinality changed"
-        )
-    observed_source_keys: set[int] = set()
-    observed_version_ids: set[str] = set()
-    observed_raw_hashes: set[str] = set()
-    observed_identities: set[tuple[str, str]] = set()
-    for database_source in database_sources:
-        source_key = database_source.get("source_key")
-        version_count = database_source.get("source_file_version_count")
-        version_id = str(
-            database_source.get("source_file_version_id") or ""
-        )
-        raw_sha256 = str(
-            database_source.get("raw_container_sha256") or ""
-        )
-        version_raw_sha256 = str(
-            database_source.get("version_raw_sha256") or ""
-        )
-        if (
-            type(source_key) is not int
-            or type(version_count) is not int
-            or version_count != 1
-            or not version_id
-            or not raw_sha256
-            or raw_sha256 != version_raw_sha256
-            or source_key in observed_source_keys
-            or version_id in observed_version_ids
-            or raw_sha256 in observed_raw_hashes
-        ):
-            raise FrozenRateFileMismatchError(
-                "candidate frozen database source evidence changed"
-            )
-        observed_source_keys.add(source_key)
-        observed_version_ids.add(version_id)
-        observed_raw_hashes.add(raw_sha256)
-        observed_identities.add((version_id, raw_sha256))
-    expected_source_keys = set(range(len(descriptors)))
-    expected_identities = {
-        (
-            str(descriptor["engine_source_file_version_id"]),
-            str(descriptor["raw_sha256"]),
-        )
-        for descriptor in descriptors
-    }
-    if (
-        observed_source_keys != expected_source_keys
-        or observed_identities != expected_identities
-    ):
-        raise FrozenRateFileMismatchError(
-            "candidate frozen database source evidence changed"
-        )
-
-
 def _validated_candidate_marker_tuple(
     manifest: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], str, int]:
@@ -256,19 +203,42 @@ def _validated_candidate_proof(
     return proof_digest
 
 
+def _proof_by_version_id(
+    manifest: Mapping[str, Any],
+    file_count: int,
+) -> dict[str, Mapping[str, Any]]:
+    proof_rows = manifest.get("frozen_rate_file_proof")
+    if not isinstance(proof_rows, list):
+        raise FrozenRateFileMismatchError(
+            "candidate frozen proof cardinality changed"
+        )
+    proof_by_version_id = {
+        str(proof_row.get("engine_source_file_version_id") or ""): proof_row
+        for proof_row in proof_rows
+        if isinstance(proof_row, Mapping)
+    }
+    if len(proof_by_version_id) != file_count:
+        raise FrozenRateFileMismatchError(
+            "candidate frozen proof source versions are ambiguous"
+        )
+    return proof_by_version_id
+
+
 def _validate_candidate_source_versions(
     manifest: Mapping[str, Any],
     descriptors: Sequence[Mapping[str, Any]],
     file_count: int,
 ) -> None:
+    """Require every manifest source version to match its byte proof."""
+
     source_versions_by_id = _version_by_id(
         manifest.get("source_file_versions"),
         expected_count=file_count,
     )
-    exact_fields = (
+    proof_by_version_id = _proof_by_version_id(manifest, file_count)
+    exact_source_fields = (
         "canonical_url",
         "raw_sha256",
-        "logical_sha256",
         "logical_hash_deferred",
         "content_length",
         "etag",
@@ -280,12 +250,31 @@ def _validate_candidate_source_versions(
         version = source_versions_by_id.get(
             str(descriptor["engine_source_file_version_id"])
         )
+        proof = proof_by_version_id.get(
+            str(descriptor["engine_source_file_version_id"])
+        )
         if version is None or any(
             version.get(field_name) != descriptor.get(field_name)
-            for field_name in exact_fields
-        ):
+            for field_name in exact_source_fields
+        ) or version.get(
+            "logical_sha256"
+        ) != frozen_observed_logical_sha256(descriptor):
             raise FrozenRateFileMismatchError(
                 "candidate frozen source-version evidence changed"
+            )
+        if (
+            proof is None
+            or version.get("raw_byte_count") != descriptor["content_length"]
+            or version.get("raw_byte_count") != proof.get("raw_byte_count")
+            or normalize_frozen_verification_mode(
+                version.get("verification_mode")
+            )
+            != normalize_frozen_verification_mode(
+                proof.get("verification_mode")
+            )
+        ):
+            raise FrozenRateFileMismatchError(
+                "candidate frozen source-version byte proof changed"
             )
 
 
@@ -378,7 +367,11 @@ def validate_frozen_candidate_evidence(
         raise FrozenRateFileMismatchError(
             "candidate frozen database source evidence is unavailable"
         )
-    _validate_database_sources(database_sources, descriptors)
+    validate_frozen_candidate_database_sources(
+        database_sources,
+        descriptors,
+        _proof_by_version_id(manifest, file_count),
+    )
     frozen_binding_by_name = _validated_candidate_binding(
         manifest,
         database_binding,

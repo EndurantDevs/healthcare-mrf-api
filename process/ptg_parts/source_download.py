@@ -558,6 +558,7 @@ def _publish_download_live_progress(
     metrics: _DownloadProgressMetrics,
     live_context: Mapping[str, Any],
 ) -> None:
+    display_label = _download_progress_target(url, live_context)
     overall_pct = _scale_stage_progress_pct(
         metrics.percent,
         live_context.get("overall_progress_start_pct"),
@@ -601,9 +602,9 @@ def _publish_download_live_progress(
             if total_bytes and total_bytes > 0
             else None
         ),
-        message=f"downloading {_safe_download_label(url)}",
+        message=f"downloading {display_label}",
         detail=phase_detail,
-        label=url,
+        label=display_label,
         file_index=live_context.get("file_index"),
         file_count=live_context.get("file_count"),
         file_name=live_context.get("file_name"),
@@ -625,9 +626,16 @@ def _emit_download_progress(
         total_bytes=total_bytes,
         started_at=started_at,
     )
+    live_context = current_live_progress_context()
+    display_target = _download_progress_target(url, live_context)
+    target_field = (
+        "label"
+        if live_context.get("private_source")
+        else "url"
+    )
     line = (
         "PTG2_DOWNLOAD_PROGRESS"
-        f"\turl={url}"
+        f"\t{target_field}={display_target}"
         f"\tbytes={bytes_read}"
         f"\ttotal_bytes={metrics.total_text}"
         f"\tpercent={metrics.percent:.2f}"
@@ -643,7 +651,7 @@ def _emit_download_progress(
         bytes_read=bytes_read,
         total_bytes=total_bytes,
         metrics=metrics,
-        live_context=current_live_progress_context(),
+        live_context=live_context,
     )
 
 
@@ -661,6 +669,30 @@ def _safe_download_label(url: str) -> str:
         tail = parsed.path.rsplit("/", 1)[-1]
         return f"{parsed.netloc}/{tail}" if tail else parsed.netloc
     return str(url)[:128]
+
+
+def _download_progress_target(
+    url: str,
+    live_context: Mapping[str, Any] | None = None,
+) -> str:
+    """Return a private opaque label or the ordinary safe URL label."""
+
+    context = (
+        live_context
+        if isinstance(live_context, Mapping)
+        else current_live_progress_context()
+    )
+    if context.get("private_source"):
+        return str(context.get("file_name") or "frozen-part")[:128]
+    return _safe_download_label(url)
+
+
+def _download_retry_error_label(error: Exception) -> str:
+    """Return an opaque private-source retry reason or the ordinary detail."""
+
+    if current_live_progress_context().get("private_source"):
+        return type(error).__name__
+    return str(error)
 
 
 def _progress_job_index(job: dict[str, Any]) -> int:
@@ -1273,16 +1305,21 @@ async def _download_raw_artifact_single_get(
             if attempt >= retries:
                 raise
             delay = _download_retry_delay_seconds() * (2 ** attempt)
+            display_target = _download_progress_target(url)
             message = (
-                f"PTG2_DOWNLOAD_RETRY url={url} bytes={state.byte_count} "
+                f"PTG2_DOWNLOAD_RETRY target={display_target} "
+                f"bytes={state.byte_count} "
                 f"attempt={attempt + 1} next_attempt={attempt + 2} "
-                f"delay_seconds={delay:.2f} error={exc}"
+                f"delay_seconds={delay:.2f} "
+                f"error={_download_retry_error_label(exc)}"
             )
             _emit_screen_line(message, stderr=True)
             logger.debug(message)
             if delay > 0:
                 await asyncio.sleep(delay)
-    raise RuntimeError(f"Download retries exhausted for {url}")
+    raise RuntimeError(
+        f"Download retries exhausted for {_download_progress_target(url)}"
+    )
 
 
 async def download_raw_artifact(
@@ -1926,6 +1963,21 @@ def _download_ptg_artifact_sync(job: dict[str, object], **kwargs) -> PTG2Downloa
 _download_ptg_job_artifact_sync_from_facade = _download_ptg_artifact_sync
 
 
+def _download_failure(
+    job: dict[str, Any],
+    error: Exception,
+) -> PTG2DownloadedJob:
+    if not isinstance(job.get("_frozen_rate_file"), dict):
+        return PTG2DownloadedJob(job=job, error=str(error))
+    safe_label = str(
+        job.get("_ptg_progress_label") or "frozen-part"
+    )[:128]
+    return PTG2DownloadedJob(
+        job=job,
+        error=f"{safe_label} acquisition failed ({type(error).__name__})",
+    )
+
+
 async def _download_ptg_job_artifact(
     job: dict[str, Any],
     *,
@@ -1934,6 +1986,8 @@ async def _download_ptg_job_artifact(
     keep_partial_artifacts: bool | None,
     artifact_stage_observer: PTG2ArtifactStageObserver | None = None,
 ) -> PTG2DownloadedJob:
+    """Acquire and validate one job without leaking protected failures."""
+
     try:
         store = PTG2ArtifactStore()
         frozen_descriptor = job.get("_frozen_rate_file")
@@ -1974,7 +2028,7 @@ async def _download_ptg_job_artifact(
     except (PTG2ArtifactStageFreshnessError, FrozenRateFileMismatchError):
         raise
     except Exception as exc:
-        return PTG2DownloadedJob(job=job, error=str(exc))
+        return _download_failure(job, exc)
 
 
 def _download_ptg_job_artifact_sync(
@@ -2031,6 +2085,9 @@ class _DownloadQueueState:
             self.job_count == 1
             and self.progress_end_pct > self.progress_start_pct
         )
+        is_private_source = bool(
+            job_by_name.get("_ptg_progress_private")
+        )
         return {
             **self.base_live_progress_context,
             "overall_progress_start_pct": self.progress_start_pct,
@@ -2044,9 +2101,14 @@ class _DownloadQueueState:
             ),
             "file_index": job_index + 1,
             "file_count": job_total,
-            "file_name": _safe_download_label(
-                str(job_by_name.get("url") or "")
+            "file_name": (
+                str(job_by_name.get("_ptg_progress_label") or "")
+                if is_private_source
+                else _safe_download_label(
+                    str(job_by_name.get("url") or "")
+                )
             ),
+            "private_source": is_private_source,
         }
 
     def schedule_more(self) -> None:

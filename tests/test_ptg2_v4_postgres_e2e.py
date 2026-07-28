@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import copy
 from dataclasses import dataclass
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -13,6 +15,7 @@ from pathlib import Path
 import statistics
 import struct
 import time
+from typing import Awaitable, Callable
 import uuid
 
 import asyncpg
@@ -26,8 +29,39 @@ from api.ptg2_candidate_audit_capacity import (
 )
 from api.ptg2_types import PTG2ServingTables
 from db.connection import Database
-from process.ptg_parts import ptg2_shared_publish, ptg2_v4_audit
+from db.migration_ptg2_frozen_source_file_binding import (
+    install_frozen_source_file_binding,
+)
+from process.ptg_parts import (
+    frozen_rate_binding_store,
+    ptg2_shared_publish,
+    ptg2_v4_audit,
+    source_download,
+)
 from process.ptg_parts import ptg2_shared_snapshot_publish as snapshot_publish
+from process.ptg_parts.domain import (
+    PTG2DownloadedJob,
+    PTG2HeadMetadata,
+    PTG2RawArtifact,
+)
+from process.ptg_parts.frozen_rate_binding import (
+    FROZEN_RATE_FILE_BINDING_OPTION,
+    frozen_rate_binding_from_params,
+    normalize_protected_frozen_rate_params,
+)
+from process.ptg_parts.frozen_rate_binding_store import (
+    insert_or_compare_frozen_binding,
+)
+from process.ptg_parts.frozen_rate_files import (
+    FROZEN_RATE_FILE_SET_CONTRACT,
+    frozen_rate_file_proof_sha256,
+    frozen_rate_file_set_sha256,
+    normalize_frozen_rate_file_set,
+)
+from process.ptg_parts.frozen_rate_runtime import (
+    build_frozen_rate_jobs,
+    validate_frozen_processed_results,
+)
 from process.ptg_parts import ptg2_v4_failed_layout_recovery as recovery
 from process.ptg_parts.ptg2_shared_blocks import SharedBlock
 from process.ptg_parts.ptg2_shared_gc import (
@@ -50,9 +84,11 @@ from tests.ptg2_v4_migration_catalog_support import (
 )
 from tests.ptg2_v4_graph_compiler_test_support import _write_tax_identity
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
+from tests import test_ptg2_scanner_v3_runs as scanner_support
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ptg_candidate_audit = importlib.import_module("process.ptg_candidate_audit")
 MIGRATION_PATH = (
     ROOT
     / "alembic"
@@ -257,6 +293,362 @@ def _direct_factor_fixture(
     return artifacts, provider_map
 
 
+@dataclass(frozen=True)
+class _FrozenScanBatch:
+    descriptors: list[dict[str, object]]
+    set_digest: str
+    proof_rows: list[dict[str, object]]
+    scans: tuple[dict[str, object], ...]
+
+
+def _multipart_scanner_payloads() -> tuple[dict[str, object], ...]:
+    first_payload = scanner_support._fixture_payload(
+        provider_references_first=True
+    )
+    second_payload = copy.deepcopy(first_payload)
+    second_payload["provider_references"][0]["provider_group_id"] = 2
+    second_payload["provider_references"][0]["provider_groups"][0]["npi"] = [
+        1234567892,
+        1234567893,
+    ]
+    second_payload["provider_references"][0]["provider_groups"][0]["tin"] = {
+        "type": "ein",
+        "value": "98-7654321",
+    }
+    second_payload["in_network"][0]["billing_code"] = "99214"
+    second_payload["in_network"][0]["negotiated_rates"][0][
+        "provider_references"
+    ] = [2]
+    return first_payload, second_payload
+
+
+def _frozen_descriptor(
+    *,
+    artifact_path: Path,
+    ordinal: int,
+) -> dict[str, object]:
+    raw_payload = artifact_path.read_bytes()
+    canonical_url = (
+        "https://rates.example.test/frozen/"
+        f"part-{ordinal:03d}.json"
+    )
+    raw_sha256 = hashlib.sha256(raw_payload).hexdigest()
+    return {
+        "source_type": "in_network",
+        "canonical_url": canonical_url,
+        "content_length": len(raw_payload),
+        "etag": f'"frozen-part-{ordinal:03d}"',
+        "last_modified": None,
+        "raw_sha256": raw_sha256,
+        "logical_sha256": raw_sha256,
+        "logical_hash_deferred": False,
+        "engine_source_identity_hash": hashlib.blake2b(
+            f"identity:{canonical_url}".encode(),
+            digest_size=8,
+        ).hexdigest(),
+        "engine_source_file_version_id": hashlib.blake2b(
+            f"version:{canonical_url}:{raw_sha256}".encode(),
+            digest_size=8,
+        ).hexdigest(),
+        "ordinal": ordinal,
+    }
+
+
+async def _acquire_and_scan_frozen_parts(
+    tmp_path: Path,
+    monkeypatch,
+) -> _FrozenScanBatch:
+    """Acquire two deterministic files, then scan those exact local bytes."""
+
+    artifact_paths, descriptors = _write_frozen_rate_inputs(tmp_path)
+    set_digest = frozen_rate_file_set_sha256(descriptors)
+    normalized_descriptors, normalized_digest = (
+        normalize_frozen_rate_file_set(descriptors, set_digest)
+    )
+    raw_artifacts_by_url = _frozen_raw_artifacts_by_url(
+        normalized_descriptors,
+        artifact_paths,
+    )
+
+    async def download_local_artifact(url: str, **options):
+        assert options["exact_get_evidence"] is True
+        return raw_artifacts_by_url[url]
+
+    monkeypatch.setattr(
+        source_download,
+        "download_raw_artifact",
+        download_local_artifact,
+    )
+    downloaded_jobs = await _download_frozen_jobs(normalized_descriptors)
+    scans = _scan_downloaded_frozen_parts(
+        tmp_path,
+        downloaded_jobs,
+    )
+    return _FrozenScanBatch(
+        descriptors=normalized_descriptors,
+        set_digest=normalized_digest,
+        proof_rows=validate_frozen_processed_results(
+            normalized_descriptors,
+            _processed_frozen_results(normalized_descriptors),
+        ),
+        scans=scans,
+    )
+
+
+def _write_frozen_rate_inputs(
+    tmp_path: Path,
+) -> tuple[list[Path], list[dict[str, object]]]:
+    acquired_directory = tmp_path / "frozen-acquired"
+    acquired_directory.mkdir()
+    artifact_paths: list[Path] = []
+    descriptors: list[dict[str, object]] = []
+    for ordinal, rate_payload in enumerate(
+        _multipart_scanner_payloads(),
+        start=1,
+    ):
+        artifact_path = acquired_directory / f"part-{ordinal:03d}.json"
+        artifact_path.write_text(
+            json.dumps(rate_payload, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        artifact_paths.append(artifact_path)
+        descriptors.append(
+            _frozen_descriptor(
+                artifact_path=artifact_path,
+                ordinal=ordinal,
+            )
+        )
+    return artifact_paths, descriptors
+
+
+def _frozen_raw_artifacts_by_url(
+    descriptors: list[dict[str, object]],
+    artifact_paths: list[Path],
+) -> dict[str, PTG2RawArtifact]:
+    return {
+        str(descriptor["canonical_url"]): PTG2RawArtifact(
+            original_url=str(descriptor["canonical_url"]),
+            canonical_url=str(descriptor["canonical_url"]),
+            raw_path=str(artifact_path),
+            raw_storage_uri=str(artifact_path),
+            raw_sha256=str(descriptor["raw_sha256"]),
+            byte_count=int(descriptor["content_length"]),
+            head=PTG2HeadMetadata(
+                url=str(descriptor["canonical_url"]),
+                status=200,
+                etag=str(descriptor["etag"]),
+                content_length=int(descriptor["content_length"]),
+                content_type="application/json",
+                supports_head=True,
+            ),
+            verification_mode="downloaded",
+        )
+        for descriptor, artifact_path in zip(
+            descriptors,
+            artifact_paths,
+            strict=True,
+        )
+    }
+
+
+async def _download_frozen_jobs(
+    descriptors: list[dict[str, object]],
+) -> list[PTG2DownloadedJob]:
+    jobs = build_frozen_rate_jobs(
+        descriptors,
+        plan_info=(),
+        source_network_names=(),
+    )
+    downloaded_jobs = [
+        await source_download._download_ptg_job_artifact(
+            job,
+            reuse_raw_artifacts=False,
+            max_bytes=None,
+            keep_partial_artifacts=False,
+        )
+        for job in jobs
+    ]
+    assert all(downloaded_job.error is None for downloaded_job in downloaded_jobs)
+    return downloaded_jobs
+
+
+def _scan_downloaded_frozen_parts(
+    tmp_path: Path,
+    downloaded_jobs: list[PTG2DownloadedJob],
+) -> tuple[dict[str, object], ...]:
+    scanner_binary = scanner_support._built_scanner_binary()
+    scans = tuple(
+        scanner_support._run_scanner(
+            scanner_binary,
+            tmp_path,
+            f"frozen-scanner-{ordinal:03d}",
+            arch="postgres_binary_v3",
+            provider_references_first=True,
+            grouped=False,
+            input_artifact=Path(downloaded_job.raw_artifact.raw_path),
+        )
+        for ordinal, downloaded_job in enumerate(downloaded_jobs, start=1)
+    )
+    assert [
+        scanner_support._single_frame(
+            scan["frames"],
+            "scanner_summary",
+        )["serving_run_rows"]
+        for scan in scans
+    ] == [1, 1]
+    return scans
+
+
+def _processed_frozen_results(
+    descriptors: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "success": True,
+            "source_type": descriptor["source_type"],
+            "url": descriptor["canonical_url"],
+            "summary": {
+                **descriptor,
+                "raw_byte_count": descriptor["content_length"],
+                "verification_mode": "downloaded",
+            },
+        }
+        for descriptor in descriptors
+    ]
+
+
+def _write_provider_graph_artifacts(
+    tmp_path: Path,
+    *,
+    set_component_pairs,
+    component_group_pairs,
+    group_npi_pairs,
+    npi_group_pairs,
+    tax_observations,
+) -> list[dict[str, object]]:
+    return [
+        _write_membership(
+            tmp_path / "frozen-set-component.sidecar",
+            name="provider_set_component",
+            pairs=set_component_pairs,
+        ),
+        _write_membership(
+            tmp_path / "frozen-component-group.sidecar",
+            name="provider_component_group",
+            pairs=component_group_pairs,
+        ),
+        _write_membership(
+            tmp_path / "frozen-group-npi.sidecar",
+            name="provider_group_npi",
+            pairs=group_npi_pairs,
+        ),
+        _write_membership(
+            tmp_path / "frozen-npi-group.sidecar",
+            name="provider_npi_group",
+            pairs=npi_group_pairs,
+        ),
+        _write_tax_identity(
+            tmp_path / "frozen-group-tax-identity.sidecar",
+            shard_id="postgres-e2e",
+            tax_observations=tax_observations,
+        ),
+    ]
+
+
+def _provider_graph_identities(
+    scan: dict[str, object],
+) -> tuple[bytes, bytes, list[bytes]]:
+    serving_records = [
+        scanner_support._SERVING_RECORD.unpack_from(
+            scan["partition_bytes"],
+            offset,
+        )
+        for offset in range(
+            0,
+            len(scan["partition_bytes"]),
+            scanner_support._SERVING_RECORD.size,
+        )
+    ]
+    assert len(serving_records) == 1
+    member_records = [
+        member_line.split(b"\t", 1)
+        for frame in scan["provider_group_member_frames"]
+        for member_line in Path(frame["path"]).read_bytes().splitlines()
+    ]
+    provider_group_ids = {
+        bytes.fromhex(member_record[0].decode("ascii"))
+        for member_record in member_records
+    }
+    assert len(provider_group_ids) == 1
+    return (
+        serving_records[0][1],
+        next(iter(provider_group_ids)),
+        [_npi(int(raw_npi)) for _group_hex, raw_npi in member_records],
+    )
+
+
+def _write_provider_set_map(
+    tmp_path: Path,
+    provider_sets_by_key: dict[int, bytes],
+) -> Path:
+    provider_map = tmp_path / "frozen-provider-set-map.tsv"
+    provider_map.write_text(
+        "".join(
+            f"{provider_set_id.hex()}\t{provider_set_key}\n"
+            for provider_set_key, provider_set_id in sorted(
+                provider_sets_by_key.items()
+            )
+        ),
+        encoding="ascii",
+    )
+    return provider_map
+
+
+def _scan_provider_graph_fixture(
+    tmp_path: Path,
+    scans: tuple[dict[str, object], ...],
+) -> tuple[list[dict[str, object]], Path, dict[int, bytes]]:
+    """Convert the two scanner identities into the V4 compiler input."""
+
+    provider_sets_by_key: dict[int, bytes] = {}
+    set_component_pairs = []
+    component_group_pairs = []
+    group_npi_pairs = []
+    npi_group_pairs = []
+    tax_observations = []
+    for provider_set_key, scan in enumerate(scans):
+        provider_set_id, provider_group_id, npi_ids = (
+            _provider_graph_identities(scan)
+        )
+        provider_sets_by_key[provider_set_key] = provider_set_id
+        component_id = hashlib.blake2b(
+            b"frozen-component:" + provider_group_id,
+            digest_size=16,
+        ).digest()
+        set_component_pairs.append((provider_set_id, component_id))
+        component_group_pairs.append((component_id, provider_group_id))
+        group_npi_pairs.extend(
+            (provider_group_id, npi_id) for npi_id in npi_ids
+        )
+        npi_group_pairs.extend(
+            (npi_id, provider_group_id) for npi_id in npi_ids
+        )
+        tax_observations.append((provider_group_id, 2, None))
+    artifacts = _write_provider_graph_artifacts(
+        tmp_path,
+        set_component_pairs=set_component_pairs,
+        component_group_pairs=component_group_pairs,
+        group_npi_pairs=group_npi_pairs,
+        npi_group_pairs=npi_group_pairs,
+        tax_observations=tax_observations,
+    )
+    provider_map = _write_provider_set_map(
+        tmp_path,
+        provider_sets_by_key,
+    )
+    return artifacts, provider_map, provider_sets_by_key
+
+
 async def _insert_provider_set_rows(
     session,
     *,
@@ -448,6 +840,300 @@ async def _create_v4_test_schema(
         connection = await session.connection()
         for statement in tax_recorder.executed:
             await connection.exec_driver_sql(statement)
+
+
+async def _install_frozen_candidate_test_schema(
+    database: Database,
+    *,
+    schema_name: str,
+) -> None:
+    """Install the real binding DDL plus source rows read by candidate audit."""
+
+    recorder = _OpRecorder()
+    install_frozen_source_file_binding(recorder, schema_name)
+    for statement in recorder.executed:
+        await database.execute_ddl(statement)
+    schema = _quoted(schema_name)
+    for statement in (
+        f"""
+        CREATE TABLE {schema}.ptg2_source_identity (
+            source_identity_hash varchar(64) PRIMARY KEY,
+            source_type varchar(64) NOT NULL,
+            canonical_url text NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_source_file_version (
+            source_file_version_id varchar(64) PRIMARY KEY,
+            source_identity_hash varchar(64) NOT NULL,
+            raw_sha256 varchar(64) NOT NULL,
+            logical_sha256 varchar(64) NOT NULL,
+            content_length bigint NOT NULL,
+            etag text,
+            last_modified text,
+            verification_mode varchar(64) NOT NULL,
+            payload jsonb NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_source_trace (
+            source_trace_hash varchar(64) PRIMARY KEY,
+            source_file_version_id varchar(64) NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_source_trace_set (
+            source_trace_set_hash varchar(64) PRIMARY KEY,
+            source_trace_hashes varchar(64)[] NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_v3_snapshot_source (
+            snapshot_id varchar(96) NOT NULL,
+            source_key smallint NOT NULL,
+            raw_container_sha256 varchar(64) NOT NULL,
+            source_trace_set_hash varchar(64) NOT NULL,
+            PRIMARY KEY (snapshot_id, source_key)
+        )
+        """,
+    ):
+        await database.execute_ddl(statement)
+
+
+async def _seed_frozen_candidate_sources(
+    database: Database,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    descriptors: list[dict[str, object]],
+) -> None:
+    """Persist exact source-version chains for candidate-audit replay."""
+
+    schema = _quoted(schema_name)
+    for source_key, descriptor in enumerate(descriptors):
+        trace_hash = hashlib.sha256(
+            f"trace:{source_key}".encode()
+        )
+        trace_set_hash = hashlib.sha256(
+            f"trace-set:{source_key}".encode()
+        )
+        await _seed_frozen_source_trace(
+            database,
+            schema=schema,
+            descriptor=descriptor,
+            trace_hash=trace_hash.hexdigest(),
+        )
+        await _seed_frozen_snapshot_source(
+            database,
+            schema=schema,
+            snapshot_id=snapshot_id,
+            source_key=source_key,
+            descriptor=descriptor,
+            trace_hash=trace_hash.hexdigest(),
+            trace_set_hash=trace_set_hash.hexdigest(),
+        )
+
+
+async def _seed_frozen_source_trace(
+    database: Database,
+    *,
+    schema: str,
+    descriptor: dict[str, object],
+    trace_hash: str,
+) -> None:
+    """Persist one exact source identity, version, and trace chain."""
+
+    source_file_version_id = str(
+        descriptor["engine_source_file_version_id"]
+    )
+    source_identity_hash = str(
+        descriptor["engine_source_identity_hash"]
+    )
+    await _insert_frozen_source_identity(
+        database,
+        schema=schema,
+        descriptor=descriptor,
+        source_identity_hash=source_identity_hash,
+    )
+    await _insert_frozen_source_version(
+        database,
+        schema=schema,
+        descriptor=descriptor,
+        source_file_version_id=source_file_version_id,
+        source_identity_hash=source_identity_hash,
+    )
+    await _insert_frozen_source_trace(
+        database,
+        schema=schema,
+        source_file_version_id=source_file_version_id,
+        trace_hash=trace_hash,
+    )
+
+
+async def _insert_frozen_source_identity(
+    database: Database,
+    *,
+    schema: str,
+    descriptor: dict[str, object],
+    source_identity_hash: str,
+) -> None:
+    """Insert the canonical source identity used by frozen evidence."""
+
+    await database.status(
+        f"""
+        INSERT INTO {schema}.ptg2_source_identity
+            (source_identity_hash, source_type, canonical_url)
+        VALUES (
+            :source_identity_hash, :source_type, :canonical_url
+        )
+        """,
+        source_identity_hash=source_identity_hash,
+        source_type=str(descriptor["source_type"]),
+        canonical_url=str(descriptor["canonical_url"]),
+    )
+
+
+async def _insert_frozen_source_version(
+    database: Database,
+    *,
+    schema: str,
+    descriptor: dict[str, object],
+    source_file_version_id: str,
+    source_identity_hash: str,
+) -> None:
+    """Insert the exact retained source-version byte declaration."""
+
+    await database.status(
+        f"""
+        INSERT INTO {schema}.ptg2_source_file_version
+            (source_file_version_id, source_identity_hash, raw_sha256,
+             logical_sha256, content_length, etag, last_modified,
+             verification_mode, payload)
+        VALUES (
+            :source_file_version_id, :source_identity_hash, :raw_sha256,
+            :logical_sha256, :content_length, :etag, :last_modified,
+            :verification_mode, CAST(:payload AS jsonb)
+        )
+        """,
+        source_file_version_id=source_file_version_id,
+        source_identity_hash=source_identity_hash,
+        raw_sha256=str(descriptor["raw_sha256"]),
+        logical_sha256=str(descriptor["logical_sha256"]),
+        content_length=int(descriptor["content_length"]),
+        etag=descriptor["etag"],
+        last_modified=descriptor["last_modified"],
+        verification_mode="downloaded",
+        payload=json.dumps(
+            {
+                "raw_byte_count": descriptor["content_length"],
+                "logical_hash_deferred": descriptor[
+                    "logical_hash_deferred"
+                ],
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+async def _insert_frozen_source_trace(
+    database: Database,
+    *,
+    schema: str,
+    source_file_version_id: str,
+    trace_hash: str,
+) -> None:
+    """Bind the source-version row to its immutable trace hash."""
+
+    await database.status(
+        f"""
+        INSERT INTO {schema}.ptg2_source_trace
+            (source_trace_hash, source_file_version_id)
+        VALUES (:source_trace_hash, :source_file_version_id)
+        """,
+        source_trace_hash=trace_hash,
+        source_file_version_id=source_file_version_id,
+    )
+
+
+async def _seed_frozen_snapshot_source(
+    database: Database,
+    *,
+    schema: str,
+    snapshot_id: str,
+    source_key: int,
+    descriptor: dict[str, object],
+    trace_hash: str,
+    trace_set_hash: str,
+) -> None:
+    await database.status(
+        f"""
+        INSERT INTO {schema}.ptg2_source_trace_set
+            (source_trace_set_hash, source_trace_hashes)
+        VALUES (
+            :source_trace_set_hash,
+            CAST(:source_trace_hashes AS varchar[])
+        )
+        """,
+        source_trace_set_hash=trace_set_hash,
+        source_trace_hashes=[trace_hash],
+    )
+    await database.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_snapshot_source
+            (snapshot_id, source_key, raw_container_sha256,
+             source_trace_set_hash)
+        VALUES (
+            :snapshot_id, :source_key, :raw_sha256,
+            :source_trace_set_hash
+        )
+        """,
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+        raw_sha256=str(descriptor["raw_sha256"]),
+        source_trace_set_hash=trace_set_hash,
+    )
+
+
+def _frozen_candidate_params(batch: _FrozenScanBatch) -> dict[str, object]:
+    return normalize_protected_frozen_rate_params(
+        {
+            "source_file_import_id": "frozen-multipart-e2e-001",
+            "import_id": "frozen-multipart-e2e-001",
+            "source_key": "synthetic-source",
+            "import_month": "2026-07",
+            "plan_ids": ["synthetic-plan"],
+            "plan_market_types": ["group"],
+            "frozen_rate_file_set_contract": FROZEN_RATE_FILE_SET_CONTRACT,
+            "frozen_rate_files": batch.descriptors,
+            "frozen_rate_file_set_sha256": batch.set_digest,
+            "frozen_rate_file_count": len(batch.descriptors),
+        }
+    )
+
+
+def _frozen_candidate_manifest(
+    batch: _FrozenScanBatch,
+    binding: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "source_file_import_id": binding["source_file_import_id"],
+        "frozen_rate_file_set_contract": FROZEN_RATE_FILE_SET_CONTRACT,
+        "frozen_rate_files": batch.descriptors,
+        "frozen_rate_file_set_sha256": batch.set_digest,
+        "frozen_rate_file_count": len(batch.descriptors),
+        "frozen_rate_file_proof": batch.proof_rows,
+        "frozen_rate_file_proof_sha256": frozen_rate_file_proof_sha256(
+            batch.proof_rows
+        ),
+        "source_file_versions": [
+            {
+                **proof_row,
+                "url": proof_row["canonical_url"],
+            }
+            for proof_row in batch.proof_rows
+        ],
+        FROZEN_RATE_FILE_BINDING_OPTION: binding,
+    }
 
 
 async def _complete_shared_gc_test_schema(
@@ -1277,6 +1963,428 @@ async def test_owned_v4_build_abandons_before_lease_without_deleting_cas(
     finally:
         try:
             await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            await database.disconnect()
+
+
+async def _compile_frozen_provider_graph(
+    tmp_path: Path,
+    batch: _FrozenScanBatch,
+):
+    artifacts, provider_map, provider_sets_by_key = (
+        _scan_provider_graph_fixture(tmp_path, batch.scans)
+    )
+    binary_path = _compiler_binary()
+    assert binary_path.is_file(), f"missing V4 compiler binary: {binary_path}"
+    compilation = await compile_provider_graph_v4_rust(
+        graph_artifact_entries=artifacts,
+        provider_set_key_map_path=provider_map,
+        output_directory=tmp_path / "compiled-frozen-v4",
+        binary_path=binary_path,
+    )
+    assert compilation.observe["provider_set_count"] == 2
+    assert compilation.observe["group_count"] == 2
+    return compilation, provider_sets_by_key
+
+
+async def _publish_frozen_provider_graph_with_patches(
+    database: Database,
+    *,
+    schema_name: str,
+    schema: str,
+    batch: _FrozenScanBatch,
+    compilation,
+    provider_sets_by_key: dict[int, bytes],
+    monkeypatch,
+) -> None:
+    await _create_v4_test_schema(
+        database,
+        schema_name=schema_name,
+        monkeypatch=monkeypatch,
+    )
+    await _install_frozen_candidate_test_schema(
+        database,
+        schema_name=schema_name,
+    )
+    build_token = f"frozen-v4-e2e-{uuid.uuid4().hex}"
+    snapshot_key = await _reserve_frozen_layout(
+        database,
+        schema_name=schema_name,
+        build_token=build_token,
+        provider_sets_by_key=provider_sets_by_key,
+    )
+    publication = await snapshot_publish._publish_v4_graph(
+        compilation,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        build_token=build_token,
+        compressed_acquisition_bytes=sum(
+            int(descriptor["content_length"])
+            for descriptor in batch.descriptors
+        ),
+        empty_npi_tin_only_normalization_count=0,
+    )
+    await _seal_frozen_publication(
+        database,
+        schema_name=schema_name,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        build_token=build_token,
+        publication=publication,
+    )
+
+
+async def _reserve_frozen_layout(
+    database: Database,
+    *,
+    schema_name: str,
+    build_token: str,
+    provider_sets_by_key: dict[int, bytes],
+) -> int:
+    async with database.transaction() as session:
+        reservation = await reserve_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            semantic_fingerprint=hashlib.sha256(
+                build_token.encode()
+            ).digest(),
+            build_token=build_token,
+        )
+        await _insert_provider_set_rows(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            provider_sets_by_key=provider_sets_by_key,
+        )
+    return reservation.snapshot_key
+
+
+async def _seal_frozen_publication(
+    database: Database,
+    *,
+    schema_name: str,
+    schema: str,
+    snapshot_key: int,
+    build_token: str,
+    publication,
+) -> None:
+    async with database.transaction() as session:
+        sealed = await seal_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+            expected_summary=publication.map_summary,
+            support_digest=publication.support_digest,
+            layout_manifest=_base_layout_manifest(),
+        )
+    assert publication.representation == "direct_v1"
+    assert await database.scalar(
+        f"SELECT state FROM {schema}.ptg2_v4_snapshot_map_root "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=sealed.snapshot_key,
+    ) == "complete"
+
+
+async def _store_frozen_candidate_binding(
+    database: Database,
+    *,
+    schema: str,
+    batch: _FrozenScanBatch,
+) -> tuple[dict[str, object], dict[str, object]]:
+    params_by_name = _frozen_candidate_params(batch)
+    expected_binding = frozen_rate_binding_from_params(params_by_name)
+    assert expected_binding is not None
+    async with database.acquire() as connection:
+        assert (
+            await insert_or_compare_frozen_binding(
+                connection,
+                params_by_name,
+            )
+            == expected_binding
+        )
+    stored_binding = await database.scalar(
+        f"""
+        SELECT binding_payload
+          FROM {schema}.ptg2_frozen_source_file_binding
+         WHERE source_file_import_id = :source_file_import_id
+        """,
+        source_file_import_id="frozen-multipart-e2e-001",
+    )
+    if isinstance(stored_binding, str):
+        stored_binding = json.loads(stored_binding)
+    assert dict(stored_binding) == expected_binding
+    return params_by_name, dict(stored_binding)
+
+
+async def _assert_frozen_candidate_replay(
+    *,
+    snapshot_id: str,
+    candidate_run_id: str,
+    manifest: dict[str, object],
+    stored_binding: dict[str, object],
+) -> None:
+    raw_sources = await ptg_candidate_audit._candidate_raw_sources(
+        snapshot_id
+    )
+    identity = ptg_candidate_audit._validated_frozen_candidate_identity(
+        manifest,
+        {"frozen_binding_payload": stored_binding},
+        candidate_run_id=candidate_run_id,
+        raw_container_sha256=raw_sources,
+    )
+    replayed_identity = (
+        ptg_candidate_audit._validated_frozen_candidate_identity(
+            manifest,
+            {"frozen_binding_payload": stored_binding},
+            candidate_run_id=candidate_run_id,
+            raw_container_sha256=(
+                await ptg_candidate_audit._candidate_raw_sources(
+                    snapshot_id
+                )
+            ),
+        )
+    )
+    assert identity == replayed_identity
+    assert "ptg_frozen_candidate_identity_v1" in str(identity)
+
+
+async def _assert_frozen_candidate_drift_rejected(
+    database: Database,
+    *,
+    schema: str,
+    snapshot_id: str,
+    candidate_run_id: str,
+    manifest: dict[str, object],
+    stored_binding: dict[str, object],
+    drifted_descriptor: dict[str, object],
+) -> None:
+    """Prove live source-version and identity drift fail the audit gate."""
+
+    async def assert_rejected() -> None:
+        with pytest.raises(
+            ptg_candidate_audit.CandidateAuditReleaseGateError,
+            match="database source evidence changed",
+        ):
+            ptg_candidate_audit._validated_frozen_candidate_identity(
+                manifest,
+                {"frozen_binding_payload": stored_binding},
+                candidate_run_id=candidate_run_id,
+                raw_container_sha256=(
+                    await ptg_candidate_audit._candidate_raw_sources(
+                        snapshot_id
+                    )
+                ),
+            )
+
+    await _assert_candidate_version_length_drift(
+        database,
+        schema=schema,
+        drifted_descriptor=drifted_descriptor,
+        assert_rejected=assert_rejected,
+    )
+    await _assert_candidate_source_url_drift(
+        database,
+        schema=schema,
+        drifted_descriptor=drifted_descriptor,
+        assert_rejected=assert_rejected,
+    )
+    await _assert_candidate_raw_hash_drift(
+        database,
+        schema=schema,
+        drifted_descriptor=drifted_descriptor,
+        assert_rejected=assert_rejected,
+    )
+
+
+async def _assert_candidate_version_length_drift(
+    database: Database,
+    *,
+    schema: str,
+    drifted_descriptor: dict[str, object],
+    assert_rejected: Callable[[], Awaitable[None]],
+) -> None:
+    """Change and restore a frozen source-version content length."""
+
+    drifted_version_id = str(
+        drifted_descriptor["engine_source_file_version_id"]
+    )
+    await database.status(
+        f"""
+        UPDATE {schema}.ptg2_source_file_version
+           SET content_length = :content_length
+         WHERE source_file_version_id = :source_file_version_id
+        """,
+        content_length=int(drifted_descriptor["content_length"]) + 1,
+        source_file_version_id=drifted_version_id,
+    )
+    await assert_rejected()
+    await database.status(
+        f"""
+        UPDATE {schema}.ptg2_source_file_version
+           SET content_length = :content_length
+         WHERE source_file_version_id = :source_file_version_id
+        """,
+        content_length=int(drifted_descriptor["content_length"]),
+        source_file_version_id=drifted_version_id,
+    )
+
+
+async def _assert_candidate_source_url_drift(
+    database: Database,
+    *,
+    schema: str,
+    drifted_descriptor: dict[str, object],
+    assert_rejected: Callable[[], Awaitable[None]],
+) -> None:
+    """Change and restore the canonical URL behind a frozen source."""
+
+    source_identity_hash = str(
+        drifted_descriptor["engine_source_identity_hash"]
+    )
+    await database.status(
+        f"""
+        UPDATE {schema}.ptg2_source_identity
+           SET canonical_url = :canonical_url
+         WHERE source_identity_hash = :source_identity_hash
+        """,
+        canonical_url="https://rates.example.test/changed.json.gz",
+        source_identity_hash=source_identity_hash,
+    )
+    await assert_rejected()
+    await database.status(
+        f"""
+        UPDATE {schema}.ptg2_source_identity
+           SET canonical_url = :canonical_url
+         WHERE source_identity_hash = :source_identity_hash
+        """,
+        canonical_url=drifted_descriptor["canonical_url"],
+        source_identity_hash=source_identity_hash,
+    )
+
+
+async def _assert_candidate_raw_hash_drift(
+    database: Database,
+    *,
+    schema: str,
+    drifted_descriptor: dict[str, object],
+    assert_rejected: Callable[[], Awaitable[None]],
+) -> None:
+    """Change the retained raw hash and require candidate rejection."""
+
+    drifted_version_id = str(
+        drifted_descriptor["engine_source_file_version_id"]
+    )
+    await database.status(
+        f"""
+        UPDATE {schema}.ptg2_source_file_version
+           SET raw_sha256 = :raw_sha256
+         WHERE source_file_version_id = :source_file_version_id
+        """,
+        raw_sha256="f" * 64,
+        source_file_version_id=drifted_version_id,
+    )
+    await assert_rejected()
+
+
+def _configure_frozen_e2e_database(
+    monkeypatch,
+    database: Database,
+    schema_name: str,
+) -> None:
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    monkeypatch.setenv("DB_SCHEMA", schema_name)
+    monkeypatch.setattr(ptg2_shared_publish, "db", database)
+    monkeypatch.setattr(snapshot_publish, "db", database)
+    monkeypatch.setattr(frozen_rate_binding_store, "db", database)
+    monkeypatch.setattr(ptg_candidate_audit, "db", database)
+    _isolate_graph_caches(monkeypatch)
+
+
+async def _assert_frozen_candidate_sequence(
+    database: Database,
+    *,
+    schema_name: str,
+    schema: str,
+    batch: _FrozenScanBatch,
+) -> None:
+    snapshot_id = "candidate-frozen-v4"
+    candidate_run_id = "ptg2:frozen-multipart-e2e-001"
+    _, stored_binding = await _store_frozen_candidate_binding(
+        database,
+        schema=schema,
+        batch=batch,
+    )
+    await _seed_frozen_candidate_sources(
+        database,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        descriptors=batch.descriptors,
+    )
+    manifest = _frozen_candidate_manifest(batch, stored_binding)
+    await _assert_frozen_candidate_replay(
+        snapshot_id=snapshot_id,
+        candidate_run_id=candidate_run_id,
+        manifest=manifest,
+        stored_binding=stored_binding,
+    )
+    await _assert_frozen_candidate_drift_rejected(
+        database,
+        schema=schema,
+        snapshot_id=snapshot_id,
+        candidate_run_id=candidate_run_id,
+        manifest=manifest,
+        stored_binding=stored_binding,
+        drifted_descriptor=batch.descriptors[1],
+    )
+
+
+@pytest.mark.asyncio
+async def test_frozen_multipart_scans_publish_and_candidate_audit_exactly(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Prove two acquired files through Rust, V4, and the DB audit gate."""
+
+    if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
+
+    batch = await _acquire_and_scan_frozen_parts(tmp_path, monkeypatch)
+    compilation, provider_sets_by_key = await _compile_frozen_provider_graph(
+        tmp_path,
+        batch,
+    )
+    schema_name = f"ptg2_frozen_v4_e2e_{uuid.uuid4().hex}"
+    schema = _quoted(schema_name)
+    database = Database()
+    await database.connect()
+    _configure_frozen_e2e_database(
+        monkeypatch,
+        database,
+        schema_name,
+    )
+    try:
+        await _publish_frozen_provider_graph_with_patches(
+            database,
+            schema_name=schema_name,
+            schema=schema,
+            batch=batch,
+            compilation=compilation,
+            provider_sets_by_key=provider_sets_by_key,
+            monkeypatch=monkeypatch,
+        )
+        await _assert_frozen_candidate_sequence(
+            database,
+            schema_name=schema_name,
+            schema=schema,
+            batch=batch,
+        )
+    finally:
+        compilation.cleanup()
+        try:
+            await database.execute_ddl(
+                f"DROP SCHEMA IF EXISTS {schema} CASCADE"
+            )
         finally:
             await database.disconnect()
 

@@ -13,6 +13,8 @@ from process.ptg_parts.frozen_rate_files import (
     FROZEN_RATE_FILE_PROOF_CONTRACT,
     FrozenRateFileMismatchError,
     FrozenRateFileValidationError,
+    frozen_observed_logical_sha256,
+    normalize_frozen_verification_mode,
 )
 
 
@@ -67,10 +69,41 @@ def build_frozen_rate_jobs(
             "source_network_names": list(source_network_names),
             "_ptg_progress_index": index,
             "_ptg_progress_total": file_count,
+            "_ptg_progress_label": _frozen_progress_label(
+                descriptor,
+                file_count=file_count,
+            ),
+            "_ptg_progress_private": True,
             "_frozen_rate_file": dict(descriptor),
         }
         for index, descriptor in enumerate(normalized_files)
     ]
+
+
+def _frozen_progress_label(
+    descriptor: Mapping[str, Any],
+    *,
+    file_count: int,
+) -> str:
+    """Return an ordinal plus a domain-separated, non-reversible label."""
+
+    ordinal = int(descriptor["ordinal"])
+    opaque_digest = hashlib.sha256(
+        canonical_json_dumps(
+            {
+                "contract": "ptg_frozen_progress_label_v1",
+                "ordinal": ordinal,
+                "raw_sha256": descriptor["raw_sha256"],
+                "source_file_version_id": descriptor[
+                    "engine_source_file_version_id"
+                ],
+            }
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+    return (
+        f"frozen-part-{ordinal:03d}-of-{file_count:03d}-"
+        f"{opaque_digest}"
+    )
 
 
 def bind_frozen_rate_set_to_scope(
@@ -237,7 +270,6 @@ def _frozen_result_proof(
     exact_fields = (
         "canonical_url",
         "raw_sha256",
-        "logical_sha256",
         "logical_hash_deferred",
         "content_length",
         "engine_source_identity_hash",
@@ -254,15 +286,24 @@ def _frozen_result_proof(
             raise FrozenRateFileMismatchError(
                 f"frozen processed {field_name} does not match"
             )
+    if summary_by_field.get(
+        "logical_sha256"
+    ) != frozen_observed_logical_sha256(descriptor):
+        raise FrozenRateFileMismatchError(
+            "frozen processed logical_sha256 does not match"
+        )
     if summary_by_field.get("raw_byte_count") != descriptor["content_length"]:
         raise FrozenRateFileMismatchError(
             "frozen processed raw_byte_count does not match"
         )
+    verification_mode = normalize_frozen_verification_mode(
+        summary_by_field.get("verification_mode")
+    )
     return {
         "contract": FROZEN_RATE_FILE_PROOF_CONTRACT,
         **dict(descriptor),
         "raw_byte_count": summary_by_field["raw_byte_count"],
-        "verification_mode": summary_by_field.get("verification_mode"),
+        "verification_mode": verification_mode,
     }
 
 

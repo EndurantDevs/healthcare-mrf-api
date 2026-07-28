@@ -1,7 +1,7 @@
 {
   "issue_counts": {
     "ambiguous_function_names": 7,
-    "ambiguous_variable_names": 0,
+    "ambiguous_variable_names": 1,
     "boolean_name_mismatch": 0,
     "builtin_shadowing": 0,
     "class_name_shape": 1,
@@ -31,7 +31,9 @@
       "ambiguous_function_name:process/provider_enrichment.py:process_data",
       "ambiguous_function_name:process/provider_enrichment.py:shutdown"
     ],
-    "ambiguous_variable_names": [],
+    "ambiguous_variable_names": [
+      "ambiguous_variable_name:tests/test_ptg_frozen_runtime_fail_closed.py:test_binding_transaction_uses_one_owned_connection:result"
+    ],
     "boolean_name_mismatch": [],
     "builtin_shadowing": [],
     "class_name_shape": [

@@ -20,6 +20,7 @@ from process.ptg_parts.frozen_rate_files import (
     FROZEN_RATE_FILE_PROOF_CONTRACT,
     FROZEN_RATE_FILE_SET_CONTRACT,
     FrozenRateFileMismatchError,
+    frozen_observed_logical_sha256,
     frozen_rate_file_proof_sha256,
     frozen_rate_file_set_sha256,
 )
@@ -88,6 +89,9 @@ def _source_version_rows(
         {
             **descriptor,
             "url": descriptor["canonical_url"],
+            "logical_sha256": frozen_observed_logical_sha256(
+                descriptor
+            ),
             "raw_byte_count": descriptor["content_length"],
             "verification_mode": "downloaded",
         }
@@ -106,13 +110,34 @@ def _database_source_rows(
             "source_file_version_id": descriptor[
                 "engine_source_file_version_id"
             ],
+            "version_source_identity_hash": descriptor[
+                "engine_source_identity_hash"
+            ],
+            "version_source_type": descriptor["source_type"],
+            "version_canonical_url": descriptor["canonical_url"],
             "version_raw_sha256": descriptor["raw_sha256"],
+            "version_logical_sha256": (
+                frozen_observed_logical_sha256(descriptor)
+            ),
+            "version_content_length": descriptor["content_length"],
+            "version_etag": descriptor["etag"],
+            "version_last_modified": descriptor["last_modified"],
+            "version_verification_mode": "downloaded",
+            "version_payload": {
+                "raw_byte_count": descriptor["content_length"],
+                "logical_hash_deferred": descriptor[
+                    "logical_hash_deferred"
+                ],
+            },
         }
         for zero_based_ordinal, descriptor in enumerate(frozen_rate_files)
     ]
 
 
-def _candidate_fixture() -> tuple[
+def _candidate_fixture(
+    *,
+    deferred_first: bool = False,
+) -> tuple[
     dict[str, object],
     dict[str, object],
     list[dict[str, object]],
@@ -120,6 +145,9 @@ def _candidate_fixture() -> tuple[
     """Build one internally consistent manifest, binding, and DB source set."""
 
     frozen_rate_files = [_descriptor(1), _descriptor(2)]
+    if deferred_first:
+        frozen_rate_files[0]["logical_sha256"] = None
+        frozen_rate_files[0]["logical_hash_deferred"] = True
     frozen_set_digest = frozen_rate_file_set_sha256(frozen_rate_files)
     frozen_binding_by_name = _frozen_binding(
         frozen_rate_files,
@@ -193,6 +221,42 @@ def _drift_database_raw_identity(
 ):
     database_source_rows[1]["raw_container_sha256"] = "f" * 64
     database_source_rows[1]["version_raw_sha256"] = "f" * 64
+
+
+def _drift_database_source_identity(
+    _manifest_by_name,
+    _binding,
+    database_source_rows,
+):
+    database_source_rows[1]["version_source_identity_hash"] = "f" * 16
+
+
+def _drift_database_canonical_url(
+    _manifest_by_name,
+    _binding,
+    database_source_rows,
+):
+    database_source_rows[1]["version_canonical_url"] = (
+        "https://rates.example.test/changed.json.gz"
+    )
+
+
+def _drift_database_content_length(
+    _manifest_by_name,
+    _binding,
+    database_source_rows,
+):
+    database_source_rows[1]["version_content_length"] += 1
+
+
+def _drift_database_verification_mode(
+    _manifest_by_name,
+    _binding,
+    database_source_rows,
+):
+    database_source_rows[1]["version_verification_mode"] = (
+        "verified_local_sha256"
+    )
 
 
 def _drift_database_identity_pairs(
@@ -299,6 +363,10 @@ def test_candidate_accepts_database_source_identity_order_independently():
         _drift_database_version,
         _drift_database_hash,
         _drift_database_raw_identity,
+        _drift_database_source_identity,
+        _drift_database_canonical_url,
+        _drift_database_content_length,
+        _drift_database_verification_mode,
         _drift_database_identity_pairs,
         _drift_database_source_density,
         _drift_database_source_key_type,
@@ -371,3 +439,50 @@ def test_candidate_frozen_identity_changes_when_complete_tuple_changes():
     )
 
     assert changed_identity != first_identity
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    [
+        ("raw_byte_count", 1),
+        ("verification_mode", "verified_local_sha256"),
+        ("verification_mode", ""),
+    ],
+)
+def test_candidate_requires_exact_source_version_byte_corroboration(
+    field_name,
+    changed_value,
+):
+    """Candidate proof and stored source-version byte evidence must agree."""
+
+    manifest, binding, database_sources = _candidate_fixture()
+    manifest["source_file_versions"][0][field_name] = changed_value
+
+    with pytest.raises(
+        FrozenRateFileMismatchError,
+        match="byte proof|verification_mode",
+    ):
+        _validate(manifest, binding, database_sources)
+
+
+@pytest.mark.parametrize("verification_mode", [None, "", "head_only"])
+def test_candidate_rejects_unimplemented_proof_verification_modes(
+    verification_mode,
+):
+    """A proof digest cannot legitimize an empty or unknown verifier name."""
+
+    manifest, binding, database_sources = _candidate_fixture()
+    manifest["frozen_rate_file_proof"][0][
+        "verification_mode"
+    ] = verification_mode
+    manifest["frozen_rate_file_proof_sha256"] = (
+        frozen_rate_file_proof_sha256(
+            manifest["frozen_rate_file_proof"]
+        )
+    )
+
+    with pytest.raises(
+        FrozenRateFileMismatchError,
+        match="verification_mode",
+    ):
+        _validate(manifest, binding, database_sources)

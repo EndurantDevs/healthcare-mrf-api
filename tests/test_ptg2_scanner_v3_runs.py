@@ -375,27 +375,35 @@ def _run_scanner(
     repeated_rate_occurrences: bool = False,
     fixture_payload: dict | None = None,
     top_level_byte_scan: bool = True,
+    input_artifact: Path | None = None,
 ) -> dict:
     """Support the run scanner test fixture."""
     run_directory = tmp_path / label
     run_directory.mkdir()
-    artifact = run_directory / "input.json"
+    artifact = (
+        Path(input_artifact).resolve()
+        if input_artifact is not None
+        else run_directory / "input.json"
+    )
     # Keep the default scanner parity fixture one-record wide; the PostgreSQL
     # publication smoke opts into multiple dense price keys.
-    source_document = (
-        fixture_payload
-        if fixture_payload is not None
-        else _fixture_payload(
-            provider_references_first=provider_references_first,
-            multiple_prices=multiple_prices,
-            duplicate_first_price=duplicate_first_price,
-            repeated_rate_occurrences=repeated_rate_occurrences,
+    if input_artifact is None:
+        source_document = (
+            fixture_payload
+            if fixture_payload is not None
+            else _fixture_payload(
+                provider_references_first=provider_references_first,
+                multiple_prices=multiple_prices,
+                duplicate_first_price=duplicate_first_price,
+                repeated_rate_occurrences=repeated_rate_occurrences,
+            )
         )
-    )
-    artifact.write_text(
-        json.dumps(source_document, separators=(",", ":")),
-        encoding="utf-8",
-    )
+        artifact.write_text(
+            json.dumps(source_document, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    else:
+        assert fixture_payload is None
     lean_copy_path = run_directory / "manifest-lean.copy"
     compact_copy_path = run_directory / "compact.copy"
     price_atom_copy_path = run_directory / "manifest-price-atom.copy"

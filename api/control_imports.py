@@ -25,11 +25,17 @@ from process.provider_directory_profile_selection import (
     validated_profile_execution,
 )
 from process.ptg_parts.frozen_rate_binding import (
+    FROZEN_RATE_FILE_PROTECTED_FIELDS,
     normalize_protected_frozen_rate_params,
     protected_frozen_tuple_presence,
 )
 from process.ptg_parts.frozen_rate_binding_store import (
     insert_or_compare_frozen_binding,
+)
+from process.ptg_parts.frozen_rate_privacy import (
+    frozen_private_scalar_values,
+    has_frozen_private_evidence,
+    redact_frozen_public_values,
 )
 
 from db.models import ImportRun, db
@@ -684,23 +690,40 @@ def _serialize_run_timestamps(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def normalize_run(row: Any) -> dict[str, Any]:
+def normalize_run(import_run: Any) -> dict[str, Any]:
     """Convert an import-run model or mapping to its API representation."""
 
-    if row is None:
+    if import_run is None:
         return {}
-    if hasattr(row, "to_json_dict"):
-        data = row.to_json_dict()
-    elif isinstance(row, dict):
-        data = dict(row)
+    if hasattr(import_run, "to_json_dict"):
+        run_by_field = import_run.to_json_dict()
+    elif isinstance(import_run, dict):
+        run_by_field = dict(import_run)
     else:
-        data = {name: getattr(row, name) for name in ImportRun.__table__.columns.keys() if hasattr(row, name)}
-    if isinstance(data.get("params"), dict):
-        data["params"] = _params_for_import_run_storage(
-            str(data.get("importer") or ""),
-            data["params"],
+        run_by_field = {
+            field_name: getattr(import_run, field_name)
+            for field_name in ImportRun.__table__.columns.keys()
+            if hasattr(import_run, field_name)
+        }
+    has_private_frozen_evidence = has_frozen_private_evidence(run_by_field)
+    private_frozen_values: frozenset[str] = frozenset()
+    if isinstance(run_by_field.get("params"), dict):
+        if str(run_by_field.get("importer") or "") == "ptg":
+            private_frozen_values = frozen_private_scalar_values(
+                run_by_field["params"]
+            )
+        run_by_field["params"] = _params_for_import_run_response(
+            str(run_by_field.get("importer") or ""),
+            run_by_field["params"],
         )
-    return _overlay_live_progress(_serialize_run_timestamps(data))
+    normalized_data = _overlay_live_progress(
+        _serialize_run_timestamps(run_by_field)
+    )
+    return redact_frozen_public_values(
+        normalized_data,
+        private_frozen_values,
+        strip_evidence=has_private_frozen_evidence,
+    )
 
 
 def _params_for_import_run_storage(
@@ -718,6 +741,32 @@ def _params_for_import_run_storage(
         for name, param_value in params_by_name.items()
         if name not in ephemeral_param_names
     }
+
+
+def _params_for_import_run_response(
+    importer: str,
+    params_by_name: dict[str, Any],
+) -> dict[str, Any]:
+    """Project private multipart coordinates to an opaque public run marker."""
+
+    stored_params_by_name = _params_for_import_run_storage(
+        importer,
+        params_by_name,
+    )
+    if importer != "ptg" or not protected_frozen_tuple_presence(
+        stored_params_by_name
+    ):
+        return stored_params_by_name
+    public_params_by_name = {
+        name: param_value
+        for name, param_value in stored_params_by_name.items()
+        if name not in FROZEN_RATE_FILE_PROTECTED_FIELDS
+    }
+    public_params_by_name["frozen_rate_file_set_protected"] = True
+    public_params_by_name["frozen_rate_file_count"] = int(
+        stored_params_by_name["frozen_rate_file_count"]
+    )
+    return public_params_by_name
 
 
 @dataclass(frozen=True)
@@ -1680,7 +1729,7 @@ async def create_import_run(
     ):
         active = await find_active_run_by_idempotency_key(idempotency_key)
         if active:
-            return active, False
+            return normalize_run(active), False
     if (
         importer != "provider-directory-fhir"
         and not is_ptg_source_file_admission
@@ -1692,7 +1741,7 @@ async def create_import_run(
     ):
         active_importer = await find_earliest_active_run_by_importer(importer)
         if active_importer:
-            return active_importer, False
+            return normalize_run(active_importer), False
 
     now = utc_now()
     run_id = str(request_payload_map.get("run_id") or "").strip() or _new_run_id()
@@ -1739,13 +1788,13 @@ async def create_import_run(
                 import_run_values_by_name
             )
             if blocking_run:
-                return blocking_run, False
+                return normalize_run(blocking_run), False
         elif is_ptg_source_file_admission:
             blocking_run = await _admit_ptg_source_file_run(
                 import_run_values_by_name
             )
             if blocking_run:
-                return blocking_run, False
+                return normalize_run(blocking_run), False
         else:
             await db.execute(
                 insert(ImportRun).values(**import_run_values_by_name)
@@ -1754,7 +1803,7 @@ async def create_import_run(
         if idempotency_key:
             active = await find_active_run_by_idempotency_key(idempotency_key)
             if active:
-                return active, False
+                return normalize_run(active), False
         raise
     enqueue_result = await _enqueue_import_start(
         {
@@ -1778,9 +1827,10 @@ async def create_import_run(
     import_run_values_by_name = _serialize_run_timestamps(
         import_run_values_by_name
     )
-    enqueue_status_event(import_run_values_by_name)
-    _write_run_live_progress(import_run_values_by_name, publish_event=False)
-    return import_run_values_by_name, True
+    public_run_by_name = normalize_run(import_run_values_by_name)
+    enqueue_status_event(public_run_by_name)
+    _write_run_live_progress(public_run_by_name, publish_event=False)
+    return public_run_by_name, True
 
 
 def _enqueue_progress(message: str) -> dict[str, Any]:
@@ -2446,6 +2496,10 @@ def _retry_child_params(
         if isinstance(current_run_map.get("params"), dict)
         else {}
     )
+    if current_params_by_name.get("frozen_rate_file_set_protected") is True:
+        raise ValueError(
+            "protected frozen runs cannot be retried through the public API"
+        )
     if current_run_map.get("importer") == "ptg" and (
         _has_ptg_full_rebuild_control(current_params_by_name)
         or _has_ptg_full_rebuild_control(retry_params_by_name)

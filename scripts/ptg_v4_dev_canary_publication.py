@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
 )
+from process.ptg_parts.canonical import canonical_json_dumps
 from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     PTG2_V4_INFERRED_TAXONOMY_DIRECT_REPRESENTATION,
     PTG2_V4_INFERRED_TAXONOMY_PATTERN_REPRESENTATION,
@@ -23,6 +24,9 @@ from scripts.ptg_v4_dev_canary_cas import REFERENCE_POPULATION
 from scripts.ptg_v4_dev_canary_storage_budget import (
     UNAPPROVED_STORAGE_CEILING_FAILURE,
     StorageBudget,
+)
+from scripts.ptg_v4_dev_canary_retained_artifacts import (
+    RETAINED_RAW_ARTIFACT_STORAGE_CONTRACT,
 )
 
 
@@ -82,6 +86,8 @@ WHOLE_SNAPSHOT_PHYSICAL_RELATIONS = frozenset(
         "ptg2_v3_source_audit_witness",
         "ptg2_v3_candidate_audit_attestation",
         "ptg2_v3_gc_candidate",
+        "ptg2_artifact_manifest",
+        "ptg2_artifact_blob_chunk",
         "ptg2_provider_tax_identity_legacy_layout",
         *REQUIRED_PHYSICAL_RELATIONS,
     }
@@ -578,9 +584,23 @@ def _validate_physical_storage(
     storage_budget: StorageBudget,
     failures: list[str],
 ) -> None:
+    """Validate complete physical relations, attribution, and storage gates."""
+
     if storage.get("contract") != STORAGE_EVIDENCE_CONTRACT:
         failures.append("physical storage evidence contract is missing")
         return
+    _validate_physical_relations(storage, failures)
+    _validate_cas_attribution(storage, failures)
+    _validate_retained_raw_artifacts(storage, storage_budget, failures)
+    _validate_storage_gate_limits(storage, storage_budget, failures)
+
+
+def _validate_physical_relations(
+    storage: Mapping[str, Any],
+    failures: list[str],
+) -> None:
+    """Require every whole-snapshot relation and reconciled allocation."""
+
     relation_records = _mapping_rows(storage.get("relations"))
     relation_by_name = {
         str(relation_record.get("relation") or ""): relation_record
@@ -603,7 +623,15 @@ def _validate_physical_storage(
         failures.append("physical allocation does not reconcile to global size")
     if storage.get("missing_required_object_kinds"):
         failures.append("owner, locator, or coordinate-map CAS blocks are missing")
-    _validate_cas_attribution(storage, failures)
+
+
+def _validate_storage_gate_limits(
+    storage: Mapping[str, Any],
+    storage_budget: StorageBudget,
+    failures: list[str],
+) -> None:
+    """Apply approved graph and whole-snapshot physical ceilings."""
+
     graph_gate_bytes = _optional_int(storage.get("graph_gate_bytes"))
     snapshot_gate_bytes = _optional_int(storage.get("snapshot_gate_bytes"))
     if graph_gate_bytes is None:
@@ -629,8 +657,151 @@ def _validate_physical_storage(
         failures.append(
             "whole-snapshot physical storage exceeds its source-controlled maximum"
         )
-    if storage.get("storage_claim_scope") != "whole_snapshot_and_v4_graph":
+    if storage.get("storage_claim_scope") != (
+        "whole_snapshot_v4_graph_and_retained_raw"
+    ):
         failures.append("physical storage evidence is graph-only or ambiguously scoped")
+
+
+def _validate_retained_raw_artifacts(
+    storage: Mapping[str, Any],
+    storage_budget: StorageBudget,
+    failures: list[str],
+) -> None:
+    """Validate retained compressed files and their physical allocation."""
+
+    evidence_by_field = _mapping(storage.get("retained_raw_artifacts"))
+    artifact_records = _mapping_rows(evidence_by_field.get("artifacts"))
+    evidence_by_field_without_digest = {
+        field_name: field_value
+        for field_name, field_value in evidence_by_field.items()
+        if field_name != "evidence_sha256"
+    }
+    expected_digest = hashlib.sha256(
+        canonical_json_dumps(evidence_by_field_without_digest).encode("utf-8")
+    ).hexdigest()
+    version_ids = {
+        str(artifact.get("source_file_version_id") or "")
+        for artifact in artifact_records
+    }
+    raw_hashes = {
+        str(artifact.get("raw_sha256") or "")
+        for artifact in artifact_records
+    }
+    ordinals = {
+        _optional_int(artifact.get("ordinal"))
+        for artifact in artifact_records
+    }
+    referenced_raw_bytes = sum(
+        _optional_int(artifact.get("raw_byte_count")) or 0
+        for artifact in artifact_records
+    )
+    physical_bytes = sum(
+        _optional_int(artifact.get("physical_allocated_bytes")) or 0
+        for artifact in artifact_records
+    )
+    artifact_count = len(artifact_records)
+    if not _is_valid_retained_identity(
+        evidence_by_field,
+        storage_budget=storage_budget,
+        expected_digest=expected_digest,
+        artifact_count=artifact_count,
+        version_ids=version_ids,
+        raw_hashes=raw_hashes,
+        ordinals=ordinals,
+    ):
+        failures.append("retained raw-artifact identity evidence is invalid")
+    _validate_retained_raw_storage_totals(
+        storage,
+        storage_budget,
+        evidence_by_field,
+        referenced_raw_bytes=referenced_raw_bytes,
+        physical_bytes=physical_bytes,
+        failures=failures,
+    )
+    _validate_retained_artifact_records(artifact_records, failures)
+
+
+def _validate_retained_raw_storage_totals(
+    storage: Mapping[str, Any],
+    storage_budget: StorageBudget,
+    evidence_by_field: Mapping[str, Any],
+    *,
+    referenced_raw_bytes: int,
+    physical_bytes: int,
+    failures: list[str],
+) -> None:
+    """Reconcile retained-file bytes with acquisition and snapshot storage."""
+
+    if (
+        referenced_raw_bytes != storage_budget.compressed_acquisition_bytes
+        or _optional_int(evidence_by_field.get("referenced_raw_bytes"))
+        != referenced_raw_bytes
+        or _optional_int(evidence_by_field.get("referenced_physical_bytes"))
+        != physical_bytes
+        or _optional_int(storage.get("retained_raw_artifact_physical_bytes"))
+        != physical_bytes
+        or (
+            _optional_int(storage.get("snapshot_gate_bytes")) or 0
+        )
+        < physical_bytes
+        or physical_bytes <= 0
+    ):
+        failures.append("retained raw-artifact physical storage is invalid")
+
+
+def _validate_retained_artifact_records(
+    artifact_records: Sequence[Mapping[str, Any]],
+    failures: list[str],
+) -> None:
+    """Require every retained file to have one manifest and live reference."""
+
+    if any(
+        (_optional_int(artifact.get("raw_byte_count")) or 0) <= 0
+        or (_optional_int(artifact.get("physical_allocated_bytes")) or 0) <= 0
+        or _optional_int(artifact.get("artifact_manifest_count")) != 1
+        or (_optional_int(artifact.get("source_version_reference_count")) or 0)
+        < 1
+        for artifact in artifact_records
+    ):
+        failures.append("retained raw-artifact file evidence is incomplete")
+
+
+def _is_valid_retained_identity(
+    evidence_by_field: Mapping[str, Any],
+    *,
+    storage_budget: StorageBudget,
+    expected_digest: str,
+    artifact_count: int,
+    version_ids: set[str],
+    raw_hashes: set[str],
+    ordinals: set[int | None],
+) -> bool:
+    """Return whether retained-file identity and cardinality are exact."""
+
+    return not (
+        evidence_by_field.get("contract")
+        != RETAINED_RAW_ARTIFACT_STORAGE_CONTRACT
+        or evidence_by_field.get("snapshot_id") != storage_budget.snapshot_id
+        or evidence_by_field.get("all_files_verified") is not True
+        or evidence_by_field.get("attribution")
+        != "full_referenced_physical_bytes_conservative"
+        or evidence_by_field.get("evidence_sha256") != expected_digest
+        or _optional_int(
+            evidence_by_field.get("source_file_version_count")
+        )
+        != artifact_count
+        or _optional_int(
+            evidence_by_field.get("distinct_artifact_count")
+        )
+        != artifact_count
+        or artifact_count < 2
+        or len(version_ids) != artifact_count
+        or len(raw_hashes) != artifact_count
+        or "" in version_ids
+        or "" in raw_hashes
+        or ordinals != set(range(1, artifact_count + 1))
+    )
 
 
 def _validate_provider_tax_identity(

@@ -27,7 +27,11 @@ from scripts.ptg_v4_dev_canary_db_shape import shape_snapshot_and_root
 from scripts.ptg_v4_dev_canary_publication import (
     WHOLE_SNAPSHOT_PHYSICAL_RELATIONS,
 )
+from scripts.ptg_v4_dev_canary_retained_artifacts import (
+    collect_retained_raw_artifact_storage,
+)
 from scripts.ptg_v4_dev_canary_storage import (
+    PhysicalStorageRequest,
     STORAGE_BASELINE_CONTRACT,
     collect_physical_storage,
     relation_size_rows,
@@ -139,6 +143,26 @@ async def _collect_v4_database_rows(
         scope.schema_name,
         snapshot_key,
     )
+    retained_raw_artifacts = await collect_retained_raw_artifact_storage(
+        connection,
+        schema_name=scope.schema_name,
+        snapshot_id=scope.snapshot_id,
+        snapshot_manifest=snapshot_by_field["snapshot_manifest"],
+    )
+    physical_storage = await collect_physical_storage(
+        connection,
+        PhysicalStorageRequest(
+            schema_name=scope.schema_name,
+            snapshot_id=scope.snapshot_id,
+            snapshot_key=snapshot_key,
+            import_run_id=str(snapshot_by_field["import_run_id"]),
+            relation_manifests=relation_rows,
+            baseline=scope.storage_baseline,
+            import_started_at=scope.import_started_at,
+            import_finished_at=scope.import_finished_at,
+            retained_raw_artifacts=retained_raw_artifacts,
+        ),
+    )
     return {
         "snapshot": snapshot_by_field,
         "root": root_by_field,
@@ -165,16 +189,7 @@ async def _collect_v4_database_rows(
                 rollback_owner_id=scope.rollback_owner_id,
             ),
         ),
-        "physical_storage": await collect_physical_storage(
-            connection,
-            schema_name=scope.schema_name,
-            snapshot_id=scope.snapshot_id,
-            snapshot_key=snapshot_key,
-            relation_manifests=relation_rows,
-            baseline=scope.storage_baseline,
-            import_started_at=scope.import_started_at,
-            import_finished_at=scope.import_finished_at,
-        ),
+        "physical_storage": physical_storage,
     }
 
 
@@ -192,6 +207,7 @@ async def _snapshot_and_root(
                snapshot.import_run_id,
                snapshot.status AS snapshot_status,
                snapshot.published_at,
+               snapshot.manifest::text AS snapshot_manifest_text,
                binding.snapshot_key,
                layout.state AS layout_state,
                layout.generation AS layout_generation,

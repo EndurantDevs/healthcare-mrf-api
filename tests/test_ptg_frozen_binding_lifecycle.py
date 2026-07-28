@@ -246,8 +246,12 @@ async def test_worker_rejected_claim_skips_before_frozen_validation(
 
 
 class _DirectEngineOrderHarness:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        expected_import_run_id: str = "ptg2:source-file-import-001",
+    ) -> None:
         self.event_names: list[str] = []
+        self.expected_import_run_id = expected_import_run_id
 
     async def ensure_database(self, _test_mode):
         self.event_names.append("database")
@@ -268,8 +272,9 @@ class _DirectEngineOrderHarness:
         assert params_by_name["source_file_import_id"] == (
             "source-file-import-001"
         )
-        assert ptg.current_live_progress_context()["import_run_id"] == (
-            "ptg2:source-file-import-001"
+        assert (
+            ptg.current_live_progress_context()["import_run_id"]
+            == self.expected_import_run_id
         )
 
     async def stop_at_snapshot_lookup(self, _source_key):
@@ -325,6 +330,92 @@ async def test_direct_engine_binding_precedes_snapshot_lookup(monkeypatch):
             frozen_rate_file_count=params_by_name[
                 "frozen_rate_file_count"
             ],
+        )
+
+    assert harness.event_names == [
+        "database",
+        "schema",
+        "source_lock",
+        "binding_cas",
+        "snapshot_lookup",
+        "source_unlock",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_anonymous_import_skips_frozen_binding_store(monkeypatch):
+    """Imports without a control identity need no frozen-binding lookup."""
+
+    harness = _DirectEngineOrderHarness()
+    monkeypatch.setattr(ptg, "ensure_database", harness.ensure_database)
+    monkeypatch.setattr(ptg, "ensure_ptg2_tables", harness.ensure_tables)
+    monkeypatch.setattr(
+        ptg,
+        "_ptg2_source_import_lock",
+        harness.source_lock,
+    )
+    monkeypatch.setattr(
+        ptg,
+        "insert_or_compare_frozen_binding_transaction",
+        pytest.fail,
+    )
+    monkeypatch.setattr(
+        ptg,
+        "_current_source_snapshot_id",
+        harness.stop_at_snapshot_lookup,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after ordering proof"):
+        await ptg._main_with_artifact_lease(
+            test_mode=True,
+            import_id="markerless-import",
+            source_key="markerless-source",
+            import_month="2026-07",
+        )
+
+    assert harness.event_names == [
+        "database",
+        "schema",
+        "source_lock",
+        "snapshot_lookup",
+        "source_unlock",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_markerless_control_import_checks_frozen_binding_store(
+    monkeypatch,
+):
+    """A control identity still checks for prohibited frozen downgrades."""
+
+    harness = _DirectEngineOrderHarness(
+        expected_import_run_id="ptg2:markerless_import",
+    )
+    monkeypatch.setattr(ptg, "ensure_database", harness.ensure_database)
+    monkeypatch.setattr(ptg, "ensure_ptg2_tables", harness.ensure_tables)
+    monkeypatch.setattr(
+        ptg,
+        "_ptg2_source_import_lock",
+        harness.source_lock,
+    )
+    monkeypatch.setattr(
+        ptg,
+        "insert_or_compare_frozen_binding_transaction",
+        harness.bind,
+    )
+    monkeypatch.setattr(
+        ptg,
+        "_current_source_snapshot_id",
+        harness.stop_at_snapshot_lookup,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after ordering proof"):
+        await ptg._main_with_artifact_lease(
+            test_mode=True,
+            source_file_import_id="source-file-import-001",
+            import_id="markerless-import",
+            source_key="markerless-source",
+            import_month="2026-07",
         )
 
     assert harness.event_names == [

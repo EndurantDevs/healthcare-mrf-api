@@ -106,7 +106,12 @@ then recomputes the set and proof digests and requires all of the following:
 - database source version IDs and raw container digests are unique and exactly
   equal the frozen descriptor sets; and
 - file, version, raw-hash, and database-source cardinalities remain exact and
-  unambiguous.
+  unambiguous;
+- `raw_byte_count` equals the descriptor `content_length` in both the proof and
+  source-version row; and
+- both rows carry the same nonempty implemented `verification_mode`:
+  `downloaded`, `strong_etag_length`, `length_last_modified`, or
+  `verified_local_sha256`.
 
 Any validation or mismatch exception becomes
 `ptg_frozen_rate_file_contract_failed` with `retryable: false`. Candidate audit
@@ -123,10 +128,56 @@ identify the one-based file index, total file count, safe file label, file
 weight, and whether it is the dominant file. `files_completed` advances only
 after successful processing; counters are aggregated across files.
 
+For the protected path, the safe label is only
+`frozen-part-<ordinal>-of-<count>-<opaque-digest-prefix>`. Download logs, screen
+output, live progress, acquisition errors, and public run responses do not
+render URLs, validators, content hashes, or engine source identities. Public
+run responses expose only the protected marker and part count; the complete
+descriptor tuple remains internal to admission, the worker, and candidate
+audit.
+
 The scan stage occupies its assigned run interval and cannot reach its endpoint
 until all files complete. A very large part can therefore dominate the
 percentage and ETA without making smaller parts appear to represent equal
 work.
+
+## Storage attribution and measurement
+
+Frozen multipart is a control and evidence projection over the normal shared
+PTG publication path. It owns zero serving, rate, provider-graph,
+snapshot-map, logical-snapshot, or CAS-block bytes. It does retain the exact
+compressed source artifacts required by the sealed snapshot. Those files are
+not attributed to the control projection, but they are real snapshot storage
+and must be measured once by the whole-snapshot canary.
+
+The feature retains its immutable binding rows and the ordinary candidate-audit
+metadata separately. `measure_frozen_binding_storage()` reports
+`ptg_frozen_rate_storage_attribution_v2`, six explicit zero owned-payload
+fields, the binding row count, and
+`pg_total_relation_size(mrf.ptg2_frozen_source_file_binding)`. Candidate-audit
+metadata continues through the existing candidate-audit storage gate.
+
+For each release canary, record both:
+
+1. this control-metadata measurement; and
+2. the whole-snapshot/shared-layout measurement, including every referenced
+   compressed artifact and the PostgreSQL artifact-manifest/blob relations.
+
+The first is retained evidence overhead. The second is the only source of
+serving, graph, map, rate, snapshot, raw-artifact, and CAS payload bytes. The
+whole-snapshot gate reconciles each descriptor to one source-version row and
+one artifact-manifest row, requires the content-addressed file below
+`HLTHPRT_PTG2_ARTIFACT_DIR`, and reports both exact file length and allocated
+filesystem bytes. The compressed acquisition total must match the manifest
+storage budget. The import does not blanket-gzip or recompress source data.
+
+Run the retained-artifact storage gate inside the exact deployed healthcare
+container or a disposable pod using the same image and mounted artifact PVC.
+It must see the same `HLTHPRT_PTG2_ARTIFACT_DIR` as the importer. A workstation
+or DB-only execution without that mounted volume is not acceptable evidence
+and fails closed. Record the deployed source SHA, image digest, pod/PVC
+identity, snapshot/import identity, and canonical evidence digest with the
+canary result.
 
 ## Operator response
 
