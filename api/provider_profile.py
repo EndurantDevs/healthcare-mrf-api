@@ -12,6 +12,12 @@ from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 
+from api.provider_language import language_identity
+from api.provider_language_merge import (
+    canonicalize_language_category,
+    evidence_value_key,
+    fhir_support_count,
+)
 from api.provider_profile_display import display_value
 from db.models import ProviderProfileProjection, db
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION, STANDARD_CATEGORIES
@@ -40,14 +46,7 @@ _FHIR_CATEGORY_BY_FACT = {
     "telehealth": "telehealth",
     "accepting_medicaid": "network_participation",
 }
-PROFILE_COMPOSER_VERSION = "provider-profile-composer/v2"
-
-
-def _fhir_support_count(item: Mapping[str, Any]) -> int:
-    source_ids = item.get("source_ids")
-    source_id_count = len(source_ids) if isinstance(source_ids, list) else 0
-    return max(int(item.get("source_count") or 0), source_id_count, 1)
-
+PROFILE_COMPOSER_VERSION = "provider-profile-composer/v3"
 
 def _empty_profile(npi: int) -> dict[str, Any]:
     return {
@@ -73,13 +72,16 @@ def _canonical_item_key(item: Mapping[str, Any]) -> tuple[str, str, str, str]:
 
 
 def _stable_item_id(npi: int, category: str, item: Mapping[str, Any]) -> str:
+    stable_value: Any = item.get("value")
+    if category == "languages" and str(item.get("type")) == "language":
+        stable_value = language_identity(stable_value)
     payload = json.dumps(
         [
             npi,
             category,
             "canonical_fact",
             str(item.get("type") or ""),
-            item.get("value"),
+            stable_value,
         ],
         sort_keys=True,
         default=str,
@@ -186,6 +188,15 @@ def compose_provider_profile(
     categories = profile.setdefault("categories", {})
     for category in STANDARD_CATEGORIES:
         categories.setdefault(category, {"availability": "unavailable", "items": []})
+    language_fallback_availability = str(
+        categories["languages"].get("availability") or "unavailable"
+    )
+    if (
+        isinstance(fhir_profile, Mapping)
+        and isinstance(fhir_profile.get("facts"), Mapping)
+        and language_fallback_availability == "unavailable"
+    ):
+        language_fallback_availability = "not_reported"
 
     fhir_facts = fhir_profile.get("facts", {}) if isinstance(fhir_profile, Mapping) else {}
     if isinstance(fhir_facts, Mapping):
@@ -256,11 +267,11 @@ def compose_provider_profile(
                     }
                     if fhir_assertion_by_key not in source_assertions:
                         source_assertions.append(fhir_assertion_by_key)
-                    fhir_support_count = _fhir_support_count(profile_item)
+                    fhir_support_total = fhir_support_count(profile_item)
                     existing_item["assertion_count"] = (
-                        max(existing_support_count, fhir_support_count)
+                        max(existing_support_count, fhir_support_total)
                         if is_already_has_fhir
-                        else existing_support_count + fhir_support_count
+                        else existing_support_count + fhir_support_total
                     )
                     existing_item["source_kinds"] = sorted(
                         {
@@ -295,7 +306,7 @@ def compose_provider_profile(
                             "verification_status": "payer_directory_source",
                         }
                     ],
-                    "assertion_count": _fhir_support_count(profile_item),
+                    "assertion_count": fhir_support_count(profile_item),
                     "sensitive": False,
                     "public_default": True,
                 }
@@ -315,6 +326,19 @@ def compose_provider_profile(
             for profile_source in fhir_profile.get("sources", [])
             if isinstance(profile_source, Mapping)
         )
+    canonicalize_language_category(
+        categories["languages"],
+        fhir_source_rows=(
+            profile_source
+            for profile_source in (
+                fhir_profile.get("sources", [])
+                if isinstance(fhir_profile, Mapping)
+                else []
+            )
+            if isinstance(profile_source, Mapping)
+        ),
+        fallback_availability=language_fallback_availability,
+    )
 
     requested_items = set(requested_categories or STANDARD_CATEGORIES)
     profile["categories"] = {
@@ -430,11 +454,9 @@ def compose_provider_profile_evidence(
             returned_fhir_keys = {
                 (
                     str(profile_item.get("type") or ""),
-                    json.dumps(
+                    evidence_value_key(
+                        str(profile_item.get("type") or ""),
                         profile_item.get("value"),
-                        sort_keys=True,
-                        default=str,
-                        separators=(",", ":"),
                     ),
                 )
                 for profile_item in returned_items
@@ -454,11 +476,9 @@ def compose_provider_profile_evidence(
                         if isinstance(profile_item, Mapping)
                         and (
                             str(fact_type),
-                            json.dumps(
+                            evidence_value_key(
+                                str(fact_type),
                                 profile_item.get("value"),
-                                sort_keys=True,
-                                default=str,
-                                separators=(",", ":"),
                             ),
                         )
                         in returned_fhir_keys

@@ -2518,6 +2518,22 @@ paths:
         Potentially sensitive public-record categories are excluded unless
         `include_sensitive=true`. Administrative complaints remain explicitly
         labeled as allegations rather than final actions.
+
+        `category=languages` is the canonical provider-level language list. It
+        semantically deduplicates reviewed state-regulator and Provider Directory
+        FHIR assertions. Confident values use normalized BCP 47 language tags;
+        ambiguous source labels remain readable `text` and are never assigned a
+        guessed code. A source code takes precedence over a contradictory display
+        and emits `normalization_warning`; incompatible recognized codes in one
+        source concept also emit a warning. `include_evidence=true` retains every
+        raw source representation supporting each returned canonical item.
+        Different language items are a union, not a conflict. `not_reported`,
+        `unavailable`, and an empty item list all mean unknown, never that the
+        provider speaks only English.
+
+        The `languages` arrays on `/npi/plans_by_npi/{npi}` are raw,
+        plan/network-scoped hints. They are not normalized provider facts and
+        must not replace this category.
       parameters:
         - name: npi
           in: path
@@ -2599,6 +2615,13 @@ paths:
     get:
       operationId: getNpiPlansByNpiNpi
       summary: Retrieve plan associations for an NPI
+      description: |
+        Returns issuer- and network-scoped plan rows. A row's `npi_info.languages`
+        is preserved source text for that plan context; it can be empty,
+        duplicated, coded, or inconsistently formatted. These are not normalized
+        provider facts. Use
+        `/npi/id/{npi}/profile?category=languages` for the canonical,
+        source-aware provider-level language list.
       parameters:
         - name: npi
           in: path
@@ -9020,6 +9043,48 @@ components:
         - prescribing_authorizations
         - pharmacy_relationships
         - program_reports
+    ProviderLanguageValue:
+      type: object
+      description: |
+        Canonical provider-level language value. Confident source codes and
+        conservatively mapped unambiguous labels use one BCP 47 code. Ambiguous
+        labels use `text` without a fabricated code. Valid regional and script
+        subtags are preserved; every original label remains available in opt-in
+        evidence.
+      oneOf:
+        - required: [codes]
+        - required: [text]
+      properties:
+        codes:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            type: object
+            required: [system, code, display]
+            properties:
+              system:
+                type: string
+                enum: ['urn:ietf:bcp:47']
+              code:
+                type: string
+                pattern: '^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$'
+              display:
+                type: string
+            additionalProperties: false
+        text:
+          type: string
+          minLength: 1
+        preferred:
+          type: boolean
+          description: Present and true when at least one source marks the language preferred.
+        normalization_warning:
+          type: string
+          enum:
+            - source_code_display_mismatch
+            - multiple_source_language_codes
+          description: Source language representations conflict; inspect evidence.
+      additionalProperties: false
     ProviderProfileFact:
       type: object
       required:
@@ -9047,6 +9112,9 @@ components:
             details stay in `value`; this field never contains serialized JSON.
         value:
           type: object
+          description: |
+            Category-specific structured value. A fact in `languages` uses
+            `ProviderLanguageValue`.
           additionalProperties: true
         assertion_type:
           type: string
@@ -9066,6 +9134,21 @@ components:
           type: boolean
         public_default:
           type: boolean
+        source_record_id:
+          type: string
+          description: Representative state-regulator source record identifier.
+        source_record_ids:
+          type: array
+          uniqueItems: true
+          description: State-regulator source records supporting this normalized fact.
+          items:
+            type: string
+        source_ids:
+          type: array
+          uniqueItems: true
+          description: Logical Provider Directory feed identifiers supporting this fact.
+          items:
+            type: string
         source_kinds:
           type: array
           uniqueItems: true
@@ -9084,8 +9167,21 @@ components:
           type: integer
           minimum: 1
           description: |
-            Total supporting source records across all composed source kinds.
-            This is not the number of entries in the `assertions` summary.
+            Strongest available lower bound for distinct supporting source
+            records/resources across composed source kinds. This is not the
+            number of entries in the `assertions` summary.
+        source_count:
+          type: integer
+          minimum: 1
+          description: |
+            Number of represented logical Provider Directory feeds, plus one
+            state-regulator source when present.
+        independent_source_count:
+          type: integer
+          minimum: 1
+          description: |
+            Number of independent FHIR endpoints, plus one independent
+            state-regulator assertion when present.
       additionalProperties: true
     ProviderProfileCategoryResult:
       type: object
@@ -9151,7 +9247,7 @@ components:
           enum: [provider-profile/v1]
         composer_version:
           type: string
-          example: provider-profile-composer/v2
+          example: provider-profile-composer/v3
         npi:
           type: integer
           minimum: 1000000000
