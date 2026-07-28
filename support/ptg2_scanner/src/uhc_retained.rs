@@ -12,4 +12,5 @@ include!("uhc_retained_parts/range_build.rs");
 include!("uhc_retained_parts/verification.rs");
 include!("uhc_retained_parts/publication.rs");
 include!("uhc_retained_parts/retain.rs");
+include!("uhc_retained_parts/replay.rs");
 include!("uhc_retained_parts/tests.rs");

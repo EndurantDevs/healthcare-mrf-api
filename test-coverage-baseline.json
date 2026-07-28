@@ -214,6 +214,7 @@
         "process/provider_directory_projection_types.py",
         "process/provider_directory_projection_worker_admission.py",
         "process/provider_directory_projection_workset.py",
+        "process/provider_directory_proof_store.py",
         "process/provider_directory_retained_artifact_base.py",
         "process/provider_directory_retained_artifact_contract.py",
         "process/provider_directory_retained_artifact_keys.py",
@@ -422,6 +423,8 @@
         "process/serialization.py",
         "process/terminology_synonym_sources.py",
         "process/terminology_synonyms.py",
+        "process/uhc_canonical_proof.py",
+        "process/uhc_official_file_acquisition.py",
         "process/uhc_provider_file_catalog.py",
         "process/uhc_provider_file_catalog_artifacts.py",
         "process/uhc_provider_file_catalog_contract.py",
@@ -430,6 +433,8 @@
         "process/uhc_provider_file_identity.py",
         "process/uhc_provider_file_semantic_identity.py",
         "process/uhc_provider_file_source_identity.py",
+        "process/uhc_publication_sql.py",
+        "process/uhc_retained_dataset.py",
         "process/uhc_retained_locks.py",
         "process/uhc_retained_native.py",
         "process/uhc_retained_native_process.py",
@@ -440,6 +445,9 @@
         "process/uhc_retained_registry_store_names.py",
         "process/uhc_retained_source_registry.py",
         "process/uhc_retained_types.py",
+        "process/uhc_semantic_build_store.py",
+        "process/uhc_semantic_evidence.py",
+        "process/uhc_semantic_stage_verifier.py",
         "process/url_security.py"
       ],
       "format": "coverage.py",
@@ -453,12 +461,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 35734,
-          "total": 40480
+          "covered": 36710,
+          "total": 41408
         },
         "lines": {
-          "covered": 113341,
-          "total": 120663
+          "covered": 116489,
+          "total": 123736
         }
       },
       "one_time_floor_reset": {
@@ -514,6 +522,7 @@
         "support/ptg2_scanner/src/address_canon.rs",
         "support/ptg2_scanner/src/bin/ptg2_provider_graph_v4.rs",
         "support/ptg2_scanner/src/bin/raw_claim_check.rs",
+        "support/ptg2_scanner/src/bin/uhc_semantic_facts.rs",
         "support/ptg2_scanner/src/config.rs",
         "support/ptg2_scanner/src/contact_canon.rs",
         "support/ptg2_scanner/src/copy_format.rs",
@@ -547,8 +556,10 @@
         "support/ptg2_scanner/src/uhc_retained_parts/json_framing.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/publication.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/range_build.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/replay.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/retain.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/verification.rs",
+        "support/ptg2_scanner/src/uhc_semantic.rs",
         "support/ptg2_scanner/src/v3_dense.rs",
         "support/ptg2_scanner/src/v3_runs.rs"
       ],
@@ -564,16 +575,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3188,
-          "total": 3663
+          "covered": 3339,
+          "total": 3787
         },
         "lines": {
-          "covered": 48557,
-          "total": 55893
+          "covered": 51520,
+          "total": 58698
         },
         "regions": {
-          "covered": 71941,
-          "total": 82724
+          "covered": 76078,
+          "total": 86753
         }
       },
       "one_time_floor_reset": {

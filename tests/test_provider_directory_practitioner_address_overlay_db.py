@@ -187,6 +187,29 @@ async def _insert_practitioner_rows(database: Database, schema: str) -> None:
         )
 
 
+def _assert_practitioner_overlay_row(
+    overlay_stage_mapping,
+    expected_address_key,
+) -> None:
+    """Assert the normalized practitioner overlay fixture."""
+    assert overlay_stage_mapping["source_record_id"] == (
+        "provider_directory_fhir:practitioner_address:"
+        "source-target:practitioner-good:1"
+    )
+    assert overlay_stage_mapping["source_id"] == "source-target"
+    assert overlay_stage_mapping["last_seen_run_id"] == "run-current"
+    assert overlay_stage_mapping["resource_type"] == "Practitioner"
+    assert overlay_stage_mapping["resource_id"] == "practitioner-good"
+    assert overlay_stage_mapping["npi"] == 1234567890
+    assert overlay_stage_mapping["address_key"] == expected_address_key
+    assert overlay_stage_mapping["state_code"] == "TX"
+    assert overlay_stage_mapping["country_code"] == "US"
+    assert overlay_stage_mapping["telephone_number"] == "(312) 555-1212"
+    assert overlay_stage_mapping["fax_number"] == "+1 (312) 555-0199"
+    assert overlay_stage_mapping["phone_number"] == "3125551212"
+    assert overlay_stage_mapping["fax_number_digits"] == "3125550199"
+
+
 @pytest.mark.asyncio
 async def test_practitioner_address_overlay_executes_scoped_sql_in_isolated_schema(
     monkeypatch,
@@ -239,19 +262,7 @@ async def test_practitioner_address_overlay_executes_scoped_sql_in_isolated_sche
             )::text;
             """
         )
-        assert overlay_stage_mapping["source_record_id"] == (
-            "provider_directory_fhir:practitioner_address:"
-            "source-target:practitioner-good:1"
+        _assert_practitioner_overlay_row(
+            overlay_stage_mapping,
+            expected_address_key,
         )
-        assert overlay_stage_mapping["source_id"] == "source-target"
-        assert overlay_stage_mapping["last_seen_run_id"] == "run-current"
-        assert overlay_stage_mapping["resource_type"] == "Practitioner"
-        assert overlay_stage_mapping["resource_id"] == "practitioner-good"
-        assert overlay_stage_mapping["npi"] == 1234567890
-        assert overlay_stage_mapping["address_key"] == expected_address_key
-        assert overlay_stage_mapping["state_code"] == "TX"
-        assert overlay_stage_mapping["country_code"] == "US"
-        assert overlay_stage_mapping["telephone_number"] == "(312) 555-1212"
-        assert overlay_stage_mapping["fax_number"] == "+1 (312) 555-0199"
-        assert overlay_stage_mapping["phone_number"] == "3125551212"
-        assert overlay_stage_mapping["fax_number_digits"] == "3125550199"

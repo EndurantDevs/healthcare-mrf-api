@@ -365,3 +365,26 @@ fn finalizer_and_merge_cli_reject_incomplete_requests() {
         assert!(error.contains("usage") || error.contains("merge kind"));
     }
 }
+
+#[test]
+fn scanner_mode_dispatch_rejects_every_missing_or_extra_coordinate() {
+    for arguments in [
+        vec!["--canon-version", "extra"],
+        vec!["--compact-serving"],
+        vec!["--serving-binary-copy-from-key-copy-stdio"],
+        vec!["--merge-manifest-copy", "manifest_serving"],
+        vec!["--provider-membership-sidecars"],
+        vec!["--provider-membership-sidecars", "group"],
+        vec!["--provider-membership-sidecars", "group", "npi"],
+        vec!["--address-canonicalize-copy"],
+        vec!["--address-canonicalize-copy", "input"],
+        vec!["--address-canonicalize-copy", "input", "output", "extra"],
+    ] {
+        let completed = scanner().args(&arguments).output().unwrap();
+        assert!(
+            !completed.status.success(),
+            "accepted invalid scanner coordinates: {arguments:?}",
+        );
+        assert!(String::from_utf8_lossy(&completed.stderr).contains("usage"));
+    }
+}

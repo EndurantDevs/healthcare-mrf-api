@@ -31,11 +31,15 @@ class _CatalogDB:
         self.file_records = catalog_store._file_parameters(catalog)
         self.first_parameters = []
 
-    async def first(self, _statement, **parameters):
+    async def first(self, statement, **parameters):
+        if "provider_directory_endpoint_dataset" in statement:
+            return None
         self.first_parameters.append(parameters)
         return self.observation_fields
 
-    async def all(self, _statement, **_parameters):
+    async def all(self, statement, **_parameters):
+        if "provider_directory_uhc_source_binding" in statement:
+            return []
         return self.file_records
 
 
@@ -52,15 +56,19 @@ def _assert_catalog_only_inventory(catalog_document):
     assert catalog_document["entry_id"] == "uhc"
     assert catalog_document["source_entry_id"] == "uhc-provider-files"
     assert catalog_document["owner_id"] == "unitedhealthcare"
-    assert catalog_document["source_ids"] == []
-    assert catalog_document["registered_source_id"] is None
+    assert catalog_document["source_ids"] == [
+        catalog_module.UHC_PROVIDER_FILE_SOURCE_ID
+    ]
+    assert catalog_document["registered_source_id"] == (
+        catalog_module.UHC_PROVIDER_FILE_SOURCE_ID
+    )
     assert catalog_document["profile_eligible"] is False
     assert summary_by_collection[("cs", "provider_membership")]["file_count"] == 53
     assert summary_by_collection[("cs", "plan_reference")]["file_count"] == 0
     assert summary_by_collection[("ifp", "provider_membership")]["file_count"] == 25
     assert summary_by_collection[("ifp", "plan_reference")]["file_count"] == 24
+    assert catalog_document["acquisition_runnable"] is True
     for capability_flag in (
-        "acquisition_runnable",
         "provider_directory_current",
         "fhir_publication_ready",
         "reference_aware_gc_ready",
@@ -108,7 +116,7 @@ async def test_empty_and_unknown_historical_catalogs_are_distinct(monkeypatch):
     monkeypatch.setattr(catalog_module, "db", _EmptyDB())
     empty_catalog = await catalog_module.uhc_provider_file_catalog()
     assert empty_catalog["catalog_observed"] is False
-    assert empty_catalog["acquisition_runnable"] is False
+    assert empty_catalog["acquisition_runnable"] is True
     with pytest.raises(catalog_types.UHCFileCatalogNotFound):
         await catalog_module.uhc_provider_file_catalog(raw_set_sha256="c" * 64)
 
@@ -126,8 +134,8 @@ def test_catalog_wire_preserves_current_downstream_fixed_contract():
     assert catalog_document["latest_file_outcomes_reason"] == (
         "catalog_only_not_imported"
     )
+    assert catalog_document["acquisition_runnable"] is True
     for capability_flag in (
-        "acquisition_runnable",
         "provider_directory_current",
         "fhir_publication_ready",
         "reference_aware_gc_ready",

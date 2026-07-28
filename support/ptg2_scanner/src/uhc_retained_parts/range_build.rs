@@ -209,17 +209,29 @@ impl ConcurrentRangeWorkers {
         }
         let records = std::mem::take(&mut batch.records);
         batch.byte_count = 0;
-        self.senders[range_ordinal]
+        if self.senders[range_ordinal]
             .send(RangeWorkerMessage::Records(records))
-            .map_err(|_| invalid_data("retained UHC range worker stopped unexpectedly"))
+            .is_err()
+        {
+            return Err(invalid_data(
+                "retained UHC range worker stopped unexpectedly",
+            ));
+        }
+        Ok(())
     }
 
     fn finish_range(&mut self, boundary: RawRangeBoundary) -> io::Result<()> {
         let range_ordinal = boundary.range_ordinal as usize;
         self.flush(range_ordinal)?;
-        self.senders[range_ordinal]
+        if self.senders[range_ordinal]
             .send(RangeWorkerMessage::Finish(boundary))
-            .map_err(|_| invalid_data("retained UHC range worker stopped unexpectedly"))
+            .is_err()
+        {
+            return Err(invalid_data(
+                "retained UHC range worker stopped unexpectedly",
+            ));
+        }
+        Ok(())
     }
 
     fn finish(mut self) -> io::Result<(Vec<UHCRawRangeManifest>, Duration)> {
@@ -227,9 +239,14 @@ impl ConcurrentRangeWorkers {
         let mut ranges = Vec::with_capacity(self.handles.len());
         let mut worker_max = Duration::ZERO;
         for handle in self.handles.drain(..) {
-            let (result, elapsed) = handle
-                .join()
-                .map_err(|_| io::Error::other("UHC concurrent range worker panicked"))?;
+            let (result, elapsed) = match handle.join() {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(io::Error::other(
+                        "UHC concurrent range worker panicked",
+                    ))
+                }
+            };
             worker_max = worker_max.max(elapsed);
             if let Some(range) = result? {
                 ranges.push(range);
@@ -287,8 +304,7 @@ fn scan_raw_and_build_ranges(
 
     while absolute_offset < expected_byte_count {
         let remaining =
-            usize::try_from((expected_byte_count - absolute_offset).min(READ_BUFFER_BYTES as u64))
-                .map_err(|_| invalid_data("UHC retained raw read size overflowed"))?;
+            (expected_byte_count - absolute_offset).min(READ_BUFFER_BYTES as u64) as usize;
         let started = Instant::now();
         let bytes_read = input.read_at(&mut buffer[..remaining], absolute_offset)?;
         if bytes_read == 0 {
@@ -343,10 +359,7 @@ fn scan_raw_and_build_ranges(
             Ok(())
         })?;
         frame_offset_index += frame_started.elapsed();
-        absolute_offset = some_or_invalid_data(
-            absolute_offset.checked_add(bytes_read as u64),
-            "UHC retained raw byte count overflowed",
-        )?;
+        absolute_offset += bytes_read as u64;
     }
     let mut extra = [0u8; 1];
     if input.read_at(&mut extra, expected_byte_count)? != 0 {
@@ -391,9 +404,10 @@ fn scan_raw_and_build_ranges(
     };
     let range_verification_tail = range_tail_started.elapsed();
     let raw_fsync = if let Some(handle) = raw_sync {
-        let (result, elapsed) = handle
-            .join()
-            .map_err(|_| io::Error::other("UHC retained raw fsync worker panicked"))?;
+        let (result, elapsed) = match handle.join() {
+            Ok(result) => result,
+            Err(_) => return Err(io::Error::other("UHC retained raw fsync worker panicked")),
+        };
         result?;
         elapsed
     } else {

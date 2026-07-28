@@ -153,7 +153,11 @@ def _validate_endpoint_classification(
     classification = entry.get("classification")
     resources = entry.get("resources")
     expected_support = {
-        "acquisition": ("acquisition-configured", {"graphql", "rest"}, True),
+        "acquisition": (
+            "acquisition-configured",
+            {"graphql", "official-files", "rest"},
+            True,
+        ),
         "bulk_acquisition": ("acquisition-configured", {"bulk"}, True),
         "probe_only": ("probe-only", {"probe"}, False),
         "external": ("externally-supported", {"graphql"}, False),

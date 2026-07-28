@@ -1211,6 +1211,20 @@ fingerprint twice before publication. Metrics report `plan_graph_complete`
 separately from `collection_complete`; the latter remains false so clients and
 operators cannot mistake the curated plan graph for exhaustive raw collections.
 
+The corporate UnitedHealthcare official-file source is a distinct
+acquisition-configured source at `https://providermrf.uhc.com`, with source ID
+`pdfhir_2754e999dd691175821ec26e`. It enters the same source resolution, probe,
+grouping, progress, completion, artifact, Profile-follow-up, and cleanup
+lifecycle as FHIR REST and connector-backed sources. Its source-group adapter
+refreshes and optionally pins the official catalog, downloads missing objects
+with bounded parallelism, verifies retained bytes, builds semantic facts with
+bounded file-level and native range-level parallelism, and atomically
+materializes InsurancePlan, Location, Organization,
+OrganizationAffiliation, Practitioner, and PractitionerRole. It never
+constructs `/metadata` or resource-search URLs for the file source. The
+Louisiana `flex.optum.com` FHIR source remains probe-only and keeps its separate
+identity.
+
 Capital Blue Cross publishes seven populated Plan-Net collections and an empty
 `Endpoint` collection at `https://providerdirectory-api.capbluecross.com/r4`.
 US-dev probes succeed over normal verified TLS, but broad exact census requests

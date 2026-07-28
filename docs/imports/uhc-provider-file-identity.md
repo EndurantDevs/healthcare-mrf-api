@@ -6,7 +6,7 @@ This contract names UnitedHealthcare's corporate official provider-file surface 
 
 The maintained Provider Directory acquisition manifest entry `uhc` remains unchanged: it is the probe-only `unitedhealthcare-community-plan-louisiana` owner, bound to source `pdfhir_0b5cfd565c53364a73981dcb` at the canonical `flex.optum.com` FHIR base. That source ID must not identify nationwide official files.
 
-The separate source-neutral registry entry is:
+The corporate source is registered independently from that Louisiana endpoint:
 
 - entry: `uhc-provider-files`
 - display name: `UnitedHealthcare Official Provider Files`
@@ -15,8 +15,30 @@ The separate source-neutral registry entry is:
 - portal: the public UHC interoperability portal
 - catalog: the `providermrf.uhc.com` official-file surface
 - adapter: `uhc-provider-file-catalog`
+- Provider Directory source ID: `pdfhir_2754e999dd691175821ec26e`
+- acquisition manifest entry: `uhc-provider-files`
 
-It has no registered `pdfhir_*` source ID and no acquisition-manifest entry. Acquisition, Profile eligibility, and publication readiness are all false. The enabling gate is to register a corporate official-file source without FHIR endpoint semantics, establish authoritative product jurisdiction metadata, then prove a complete reproducible build and reviewed publication contract. Until that gate is met, this identity is not selectable by the FHIR acquisition or Profile paths.
+It is an acquisition-configured transport adapter in the normal
+`provider-directory-fhir` lifecycle. Source resolution, probe accounting,
+grouping, concurrency control, progress, failure isolation, completion
+tracking, artifact publication, Profile follow-up, and cleanup are shared with
+the other Provider Directory sources. The adapter replaces only the transport
+and atomic candidate build: it reads official catalog files instead of FHIR
+REST pages.
+
+The normal CLI selects it with `--import-resources --source-id
+pdfhir_2754e999dd691175821ec26e`. `--uhc-catalog-set-sha256` is an optional
+exact-current-catalog assertion, not a separate execution mode.
+
+Missing official files download concurrently with a default bound of four and
+a hard cap of eight. Native retention/admission and independent semantic files
+each use a default bound of two and a hard cap of four; every worker owns its
+database connection, and each native encoder also uses bounded range workers.
+Environment overrides are
+`HLTHPRT_UHC_PROVIDER_FILE_DOWNLOAD_CONCURRENCY` and
+`HLTHPRT_UHC_PROVIDER_FILE_ADMISSION_CONCURRENCY` and
+`HLTHPRT_UHC_SEMANTIC_FILE_CONCURRENCY`. Admission, canonical merge, proof
+sealing, and source-local cutover remain deterministic and fail closed.
 
 The existing healthcare read-model wire field remains `entry_id: "uhc"` for downstream compatibility. Its additive `source_entry_id: "uhc-provider-files"` identifies this registry contract. The current downstream controller ignores extra fields but rejects any replacement of the legacy `entry_id`.
 
@@ -35,9 +57,10 @@ The live census proved the 53 Community & State product tokens, but not authorit
 
 Parsing is census-closed. The public API always loads the repository census and verifies its frozen semantic digest; callers cannot substitute a census object or alternate path. Unknown names, case drift, unsafe paths, duplicates, missing files, wrong family or collection assignments, and broken IFP pairs fail the contract.
 
-## Future semantic identity
+## Semantic and publication identity
 
-The pure identity module defines no acquisition or materialization path. It reserves deterministic keys so later work cannot collapse unlike plans or networks:
+The identity module reserves deterministic keys so acquisition and
+materialization cannot collapse unlike plans or networks:
 
 - plan identity binds logical scope, family, market, plan ID type, plan ID, and plan year;
 - network identity binds the same fields plus network tier;
@@ -45,4 +68,8 @@ The pure identity module defines no acquisition or materialization path. It rese
 
 A plan key retains the complete canonical logical-scope value rather than copying caller-controlled scope strings. Every consumer revalidates that scope against the frozen census, validates plan dimensions independently, and then verifies the digest. Network keys retain that validated plan key. Explicit validators provide the same boundary for directly constructed plan, network, and dataset-build dataclasses; a matching hash alone is not treated as authority.
 
-This slice intentionally adds no download, reader, materializer, migration, publication, Profile selection, PTG crosswalk, or source summary behavior.
+The implementation admits exact retained bytes, seals native semantic facts,
+materializes the six registered resource families, stores content-proof shards,
+and atomically promotes one source-local dataset. Runtime success and
+downstream readiness remain separate evidence and must be verified after
+deployment.

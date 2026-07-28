@@ -11,12 +11,12 @@
       "catalog_base": "https://providermrf.uhc.com",
       "adapter_id": "uhc-provider-file-catalog",
       "adapter_contract": "healthporta-uhc-provider-file-catalog-v1",
-      "registered_source_id": null,
-      "acquisition_manifest_entry_id": null,
-      "acquisition_runnable": false,
-      "profile_eligible": false,
-      "publication_ready": false,
-      "enabling_gate": "Register a corporate official-file source without FHIR endpoint semantics, establish authoritative product jurisdiction metadata, then prove a complete reproducible build and reviewed publication contract before enabling acquisition or Profile selection."
+      "registered_source_id": "pdfhir_2754e999dd691175821ec26e",
+      "acquisition_manifest_entry_id": "uhc-provider-files",
+      "acquisition_runnable": true,
+      "profile_eligible": true,
+      "publication_ready": true,
+      "enabling_gate": "Complete: the corporate source has a distinct registered identity, exact reviewed file scopes, reproducible retained-byte and semantic proofs, atomic source-local publication, and Profile selection without borrowing FHIR endpoint semantics."
     }
   ]
 }

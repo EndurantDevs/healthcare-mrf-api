@@ -50,14 +50,16 @@ from process.uhc_provider_file_source_identity import (
     UHC_PROVIDER_FILE_ENTRY_ID,
     UHC_PROVIDER_FILE_OWNER_ID,
     UHC_PROVIDER_FILE_PORTAL_BASE,
+    UHC_PROVIDER_FILE_SOURCE_ID,
 )
+from process.uhc_retained_registry_store_names import table_name as _retained_table
 
 
 DEFAULT_STALE_SECONDS = 24 * 60 * 60
 UHC_ENTRY_ID = "uhc"
 UHC_SOURCE_ENTRY_ID = UHC_PROVIDER_FILE_ENTRY_ID
 UHC_CATALOG_SOURCE_ID = UHC_PROVIDER_FILE_CATALOG_SOURCE_ID
-UHC_PROFILE_SOURCE_IDS: tuple[str, ...] = ()
+UHC_PROFILE_SOURCE_IDS: tuple[str, ...] = (UHC_PROVIDER_FILE_SOURCE_ID,)
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -189,11 +191,11 @@ def _empty_catalog_payload() -> dict[str, Any]:
         "catalog_source_id": UHC_CATALOG_SOURCE_ID,
         "portal_base": UHC_PROVIDER_FILE_PORTAL_BASE,
         "adapter_id": UHC_PROVIDER_FILE_ADAPTER_ID,
-        "registered_source_id": None,
+        "registered_source_id": UHC_PROVIDER_FILE_SOURCE_ID,
         "source_ids": list(UHC_PROFILE_SOURCE_IDS),
         "catalog_mode": "catalog_only",
         "catalog_observed": False,
-        "acquisition_runnable": False,
+        "acquisition_runnable": True,
         "profile_eligible": False,
         "provider_directory_current": False,
         "fhir_publication_ready": False,
@@ -263,6 +265,85 @@ async def _catalog_file_records(
     return [_row_fields(database_record) for database_record in database_records]
 
 
+async def _catalog_import_state(
+    selected_catalog_hash: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    binding_rows = await db.all(
+        f"""
+        SELECT binding.source_file_id, binding.artifact_sha256,
+               raw.byte_count, raw.verified_at
+          FROM {_retained_table("provider_directory_uhc_source_binding")} AS binding
+          JOIN {_retained_table("provider_directory_uhc_raw_artifact")} AS raw
+            ON raw.artifact_sha256=binding.artifact_sha256
+         WHERE binding.catalog_set_sha256=:catalog_set_sha256
+           AND binding.released_at IS NULL
+           AND raw.status='verified';
+        """,
+        catalog_set_sha256=selected_catalog_hash,
+    )
+    bindings_by_file_id = {
+        str(fields["source_file_id"]): fields
+        for binding_record in binding_rows
+        if (fields := _row_fields(binding_record))
+    }
+    dataset_fields = _row_fields(
+        await db.first(
+            f"""
+            SELECT source.source_id, dataset.dataset_id,
+                   dataset.resource_count, dataset.published_at,
+                   dataset.publication_metadata_json
+              FROM {_table("provider_directory_source")} AS source
+              JOIN {_table("provider_directory_endpoint_dataset")} AS dataset
+                ON dataset.endpoint_id=source.endpoint_id
+             WHERE source.source_id=:source_id
+               AND dataset.status='published'
+               AND dataset.is_current=true
+             LIMIT 1;
+            """,
+            source_id=UHC_PROVIDER_FILE_SOURCE_ID,
+        )
+    )
+    return bindings_by_file_id, dataset_fields
+
+
+def _current_publication_state(
+    selected_catalog_hash: str,
+    file_records: list[dict[str, Any]],
+    bindings_by_file_id: Mapping[str, Mapping[str, Any]],
+    dataset_fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = _json_value(dataset_fields.get("publication_metadata_json") or {})
+    summary_input = (
+        metadata.get("uhc_retained_summary_input_v1")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    binding_complete = (
+        len(bindings_by_file_id) == len(file_records)
+        and all(
+            str(file_record["file_id"]) in bindings_by_file_id
+            for file_record in file_records
+        )
+    )
+    dataset_current = bool(
+        dataset_fields.get("source_id") == UHC_PROVIDER_FILE_SOURCE_ID
+        and dataset_fields.get("dataset_id")
+        and isinstance(summary_input, Mapping)
+        and summary_input.get("complete") is True
+        and summary_input.get("catalog_set_sha256")
+        == selected_catalog_hash
+    )
+    provider_directory_current = binding_complete and dataset_current
+    return {
+        "binding_complete": binding_complete,
+        "dataset_current": dataset_current,
+        "provider_directory_current": provider_directory_current,
+        "dataset_id": dataset_fields.get("dataset_id"),
+        "resource_count": int(dataset_fields.get("resource_count") or 0),
+        "published_at": _iso_utc(dataset_fields.get("published_at")),
+    }
+
+
 def _validated_persisted_catalog(
     observation_fields: Mapping[str, Any],
     file_records: list[dict[str, Any]],
@@ -307,18 +388,35 @@ async def _validated_persisted_raw_proof(
 def _public_catalog_files(
     file_records: list[dict[str, Any]],
     catalog_files: tuple[UHCFileCatalogItem, ...],
+    bindings_by_file_id: Mapping[str, Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     public_files: list[dict[str, Any]] = []
     for file_record, catalog_file in zip(file_records, catalog_files, strict=True):
+        binding = bindings_by_file_id.get(catalog_file.file_id)
+        is_imported = binding is not None
         public_files.append(
             {
                 **catalog_file.identity_payload(),
                 "availability": file_record["availability"],
                 "catalog_support": file_record["catalog_support"],
-                "imported": False,
-                "data_file_raw_sha256": None,
-                "latest_file_outcome": None,
-                "latest_file_outcome_reason": "catalog_only_not_imported",
+                "imported": is_imported,
+                "data_file_raw_sha256": (
+                    binding.get("artifact_sha256") if binding else None
+                ),
+                "latest_file_outcome": (
+                    {
+                        "status": "verified",
+                        "byte_count": int(binding.get("byte_count") or 0),
+                        "verified_at": _iso_utc(binding.get("verified_at")),
+                    }
+                    if binding
+                    else None
+                ),
+                "latest_file_outcome_reason": (
+                    "retained_and_verified"
+                    if binding
+                    else "not_imported_for_selected_catalog"
+                ),
             }
         )
     return public_files
@@ -330,29 +428,15 @@ def _observed_catalog_document(
     catalog_counts_by_name: dict[str, int],
     raw_proof: dict[str, Any],
     public_files: list[dict[str, Any]],
+    publication_state: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Build the public catalog document from verified persisted evidence."""
+
     observed_at = observation_fields.get("observation_last_observed_at")
     stale_seconds = _stale_seconds()
     return {
-        "schema_version": CATALOG_SCHEMA_VERSION,
-        "catalog_contract": CATALOG_CONTRACT,
-        "catalog_limits": dict(CATALOG_CONTRACT_LIMITS),
-        "entry_id": UHC_ENTRY_ID,
-        "source_entry_id": UHC_SOURCE_ENTRY_ID,
-        "display_name": UHC_PROVIDER_FILE_DISPLAY_NAME,
-        "owner_id": UHC_PROVIDER_FILE_OWNER_ID,
-        "catalog_source_id": UHC_CATALOG_SOURCE_ID,
-        "portal_base": UHC_PROVIDER_FILE_PORTAL_BASE,
-        "adapter_id": UHC_PROVIDER_FILE_ADAPTER_ID,
-        "registered_source_id": None,
-        "source_ids": list(UHC_PROFILE_SOURCE_IDS),
-        "catalog_mode": "catalog_only",
-        "catalog_observed": True,
-        "acquisition_runnable": False,
-        "profile_eligible": False,
-        "provider_directory_current": False,
-        "fhir_publication_ready": False,
-        "reference_aware_gc_ready": False,
+        **_catalog_identity_document(),
+        **_catalog_publication_document(publication_state),
         "catalog_set_sha256": persisted_catalog.catalog_set_sha256,
         "raw_set_sha256": raw_proof["raw_set_sha256"],
         "catalog_file_count": catalog_counts_by_name["file_count"],
@@ -372,8 +456,60 @@ def _observed_catalog_document(
             observed_at,
         ),
         "items": public_files,
-        "latest_file_outcomes_available": False,
-        "latest_file_outcomes_reason": "catalog_only_not_imported",
+        "latest_file_outcomes_available": any(
+            catalog_item["imported"] for catalog_item in public_files
+        ),
+        "latest_file_outcomes_reason": (
+            "verified_retained_bindings"
+            if any(
+                catalog_item["imported"] for catalog_item in public_files
+            )
+            else "not_imported_for_selected_catalog"
+        ),
+    }
+
+
+def _catalog_identity_document() -> dict[str, Any]:
+    """Return stable source and adapter identity fields."""
+
+    return {
+        "schema_version": CATALOG_SCHEMA_VERSION,
+        "catalog_contract": CATALOG_CONTRACT,
+        "catalog_limits": dict(CATALOG_CONTRACT_LIMITS),
+        "entry_id": UHC_ENTRY_ID,
+        "source_entry_id": UHC_SOURCE_ENTRY_ID,
+        "display_name": UHC_PROVIDER_FILE_DISPLAY_NAME,
+        "owner_id": UHC_PROVIDER_FILE_OWNER_ID,
+        "catalog_source_id": UHC_CATALOG_SOURCE_ID,
+        "portal_base": UHC_PROVIDER_FILE_PORTAL_BASE,
+        "adapter_id": UHC_PROVIDER_FILE_ADAPTER_ID,
+        "registered_source_id": UHC_PROVIDER_FILE_SOURCE_ID,
+        "source_ids": list(UHC_PROFILE_SOURCE_IDS),
+    }
+
+
+def _catalog_publication_document(
+    publication_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return derived readiness fields for the selected catalog."""
+
+    is_current = publication_state["provider_directory_current"]
+    has_bindings = publication_state["binding_complete"]
+    return {
+        "catalog_mode": (
+            "imported_current"
+            if is_current
+            else ("retained_complete" if has_bindings else "catalog_only")
+        ),
+        "catalog_observed": True,
+        "acquisition_runnable": True,
+        "profile_eligible": is_current,
+        "provider_directory_current": is_current,
+        "fhir_publication_ready": is_current,
+        "reference_aware_gc_ready": has_bindings,
+        "published_dataset_id": publication_state["dataset_id"],
+        "published_resource_count": publication_state["resource_count"],
+        "published_at": publication_state["published_at"],
     }
 
 
@@ -397,13 +533,27 @@ async def uhc_provider_file_catalog(
         raise UHCFileCatalogError(
             "UHC retained raw catalog does not match persisted semantics"
         )
-    public_files = _public_catalog_files(file_records, persisted_catalog.files)
+    bindings_by_file_id, dataset_fields = await _catalog_import_state(
+        persisted_catalog.catalog_set_sha256
+    )
+    publication_state = _current_publication_state(
+        persisted_catalog.catalog_set_sha256,
+        file_records,
+        bindings_by_file_id,
+        dataset_fields,
+    )
+    public_files = _public_catalog_files(
+        file_records,
+        persisted_catalog.files,
+        bindings_by_file_id,
+    )
     return _observed_catalog_document(
         observation,
         persisted_catalog,
         catalog_counts_by_name,
         raw_proof,
         public_files,
+        publication_state,
     )
 
 

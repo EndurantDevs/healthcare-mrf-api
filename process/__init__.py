@@ -1271,6 +1271,10 @@ def provider_enrichment(test: bool):
     default=None,
     help="Fetch resources from importable FHIR endpoints.",
 )
+@click.option(
+    "--uhc-catalog-set-sha256",
+    help="Require this exact current catalog when importing the UHC source.",
+)
 @click.option("--dataset-rehydrate-only", is_flag=True, help="Rebuild typed rows from one retained current dataset without network calls.")
 @click.option("--rehydrate-dataset-id", help="Exact current immutable dataset id to rehydrate.")
 @click.option("--rehydrate-acquisition-root-run-id", help="Exact acquisition root run id recorded by the dataset.")
@@ -1368,6 +1372,7 @@ def provider_directory_fhir(
     seed_only: bool,
     no_probe: bool,
     import_resources: bool,
+    uhc_catalog_set_sha256: str | None,
     dataset_rehydrate_only: bool,
     rehydrate_dataset_id: str | None,
     rehydrate_acquisition_root_run_id: str | None,
@@ -1415,6 +1420,7 @@ def provider_directory_fhir(
             seed_only=seed_only,
             probe=not no_probe,
             import_resources=import_resources,
+            uhc_catalog_set_sha256=uhc_catalog_set_sha256,
             dataset_rehydrate_only=dataset_rehydrate_only,
             rehydrate_dataset_id=rehydrate_dataset_id,
             rehydrate_acquisition_root_run_id=rehydrate_acquisition_root_run_id,

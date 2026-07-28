@@ -16,14 +16,11 @@ fn read_u64_at(file: &File, offset: u64) -> io::Result<u64> {
 }
 
 fn ceil_partition_boundary(total: u64, ordinal: usize, count: usize) -> io::Result<u64> {
-    let numerator = some_or_invalid_data(
-        u128::from(total)
-            .checked_mul(ordinal as u128)
-            .and_then(|value| value.checked_add(count as u128 - 1)),
-        "retained UHC range boundary overflowed",
-    )?;
-    u64::try_from(numerator / count as u128)
-        .map_err(|_| invalid_data("retained UHC range boundary exceeds u64"))
+    let numerator = u128::from(total) * ordinal as u128 + count as u128 - 1;
+    match u64::try_from(numerator / count as u128) {
+        Ok(boundary) => Ok(boundary),
+        Err(_) => Err(invalid_data("retained UHC range boundary exceeds u64")),
+    }
 }
 
 fn build_range_boundaries(
@@ -49,20 +46,8 @@ fn build_range_boundaries(
     for ordinal in 0..range_count {
         let record_start = ceil_partition_boundary(record_count, ordinal, range_count)?;
         let record_end = ceil_partition_boundary(record_count, ordinal + 1, range_count)?;
-        if record_start >= record_end {
-            return Err(invalid_data("retained UHC logical range would be empty"));
-        }
-        let first_offset = some_or_invalid_data(
-            record_start.checked_mul(16),
-            "retained UHC range offset overflowed",
-        )?;
-        let last_offset = some_or_invalid_data(
-            record_end
-                .checked_sub(1)
-                .and_then(|value| value.checked_mul(16))
-                .and_then(|value| value.checked_add(8)),
-            "retained UHC range offset overflowed",
-        )?;
+        let first_offset = record_start * 16;
+        let last_offset = (record_end - 1) * 16 + 8;
         let raw_byte_start = read_u64_at(offsets_file, first_offset)?;
         let raw_byte_end = read_u64_at(offsets_file, last_offset)?;
         if raw_byte_start >= raw_byte_end {
@@ -102,10 +87,8 @@ fn hash_raw_range(input: &File, boundary: RawRangeBoundary) -> io::Result<(Strin
     let mut buffer = vec![0u8; READ_BUFFER_BYTES];
     let mut absolute_offset = boundary.raw_byte_start;
     while absolute_offset < boundary.raw_byte_end {
-        let remaining = usize::try_from(
-            (boundary.raw_byte_end - absolute_offset).min(READ_BUFFER_BYTES as u64),
-        )
-        .map_err(|_| invalid_data("retained UHC range read size overflowed"))?;
+        let remaining =
+            (boundary.raw_byte_end - absolute_offset).min(READ_BUFFER_BYTES as u64) as usize;
         let bytes_read = input.read_at(&mut buffer[..remaining], absolute_offset)?;
         if bytes_read == 0 {
             return Err(invalid_data(
@@ -113,10 +96,7 @@ fn hash_raw_range(input: &File, boundary: RawRangeBoundary) -> io::Result<(Strin
             ));
         }
         digest.update(&buffer[..bytes_read]);
-        absolute_offset = some_or_invalid_data(
-            absolute_offset.checked_add(bytes_read as u64),
-            "retained UHC range offset overflowed",
-        )?;
+        absolute_offset += bytes_read as u64;
     }
     Ok((sha256_hex(&finalize_sha256(digest)), raw_byte_count))
 }
@@ -139,10 +119,8 @@ fn verify_raw_range(input: &File, boundary: RawRangeBoundary) -> io::Result<UHCR
     let mut buffer = vec![0u8; READ_BUFFER_BYTES];
     let mut absolute_offset = boundary.raw_byte_start;
     while absolute_offset < boundary.raw_byte_end {
-        let remaining = usize::try_from(
-            (boundary.raw_byte_end - absolute_offset).min(READ_BUFFER_BYTES as u64),
-        )
-        .map_err(|_| invalid_data("retained UHC range read size overflowed"))?;
+        let remaining =
+            (boundary.raw_byte_end - absolute_offset).min(READ_BUFFER_BYTES as u64) as usize;
         let bytes_read = input.read_at(&mut buffer[..remaining], absolute_offset)?;
         if bytes_read == 0 {
             return Err(invalid_data(
@@ -172,10 +150,7 @@ fn verify_raw_range(input: &File, boundary: RawRangeBoundary) -> io::Result<UHCR
             )?;
             Ok(())
         })?;
-        absolute_offset = some_or_invalid_data(
-            absolute_offset.checked_add(bytes_read as u64),
-            "retained UHC range offset overflowed",
-        )?;
+        absolute_offset += bytes_read as u64;
     }
     framer.finish()?;
     if observed_record_count != expected_record_count {
@@ -220,11 +195,14 @@ fn verify_ranges_parallel(
         .min(MAX_RANGE_WORKERS)
         .min(boundaries.len())
         .max(1);
-    let pool = rayon::ThreadPoolBuilder::new()
+    let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(worker_count)
         .thread_name(|index| format!("uhc-retain-{index}"))
         .build()
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    {
+        Ok(pool) => pool,
+        Err(error) => return Err(io::Error::other(error.to_string())),
+    };
     let results = pool.install(|| {
         boundaries
             .into_par_iter()
@@ -247,8 +225,7 @@ fn verify_whole_file_sha256(
     let mut absolute_offset = 0u64;
     while absolute_offset < expected_byte_count {
         let remaining =
-            usize::try_from((expected_byte_count - absolute_offset).min(READ_BUFFER_BYTES as u64))
-                .map_err(|_| invalid_data("retained UHC verification read size overflowed"))?;
+            (expected_byte_count - absolute_offset).min(READ_BUFFER_BYTES as u64) as usize;
         let bytes_read = file.read_at(&mut buffer[..remaining], absolute_offset)?;
         if bytes_read == 0 {
             return Err(invalid_data(format!(
@@ -293,15 +270,21 @@ fn validate_range_sequence(
                 "retained UHC manifest contains an invalid logical range",
             ));
         }
-        if previous_raw_end.is_some_and(|end| end >= range.raw_byte_start) {
+        if matches!(previous_raw_end, Some(end) if end >= range.raw_byte_start) {
             return Err(invalid_data(
                 "retained UHC manifest raw ranges overlap or are unordered",
             ));
         }
-        parse_sha256_hex(&range.raw_sha256)
-            .map_err(|_| invalid_data("retained UHC range raw SHA-256 is invalid"))?;
-        parse_sha256_hex(&range.canonical_sha256)
-            .map_err(|_| invalid_data("retained UHC range canonical SHA-256 is invalid"))?;
+        if parse_sha256_hex(&range.raw_sha256).is_err() {
+            return Err(invalid_data(
+                "retained UHC range raw SHA-256 is invalid",
+            ));
+        }
+        if parse_sha256_hex(&range.canonical_sha256).is_err() {
+            return Err(invalid_data(
+                "retained UHC range canonical SHA-256 is invalid",
+            ));
+        }
         next_record = range.record_end;
         previous_raw_end = Some(range.raw_byte_end);
     }
@@ -343,14 +326,12 @@ fn range_set_sha256(
         ] {
             digest.update(value.to_be_bytes());
         }
-        digest.update(
-            parse_sha256_hex(&range.raw_sha256)
-                .map_err(|_| invalid_data("retained UHC range raw SHA-256 is invalid"))?,
-        );
-        digest.update(
-            parse_sha256_hex(&range.canonical_sha256)
-                .map_err(|_| invalid_data("retained UHC range canonical SHA-256 is invalid"))?,
-        );
+        let raw_sha256 =
+            parse_sha256_hex(&range.raw_sha256).expect("range sequence validated raw SHA-256");
+        digest.update(raw_sha256);
+        let canonical_sha256 = parse_sha256_hex(&range.canonical_sha256)
+            .expect("range sequence validated canonical SHA-256");
+        digest.update(canonical_sha256);
     }
     Ok(sha256_hex(&finalize_sha256(digest)))
 }

@@ -354,10 +354,10 @@ def _profile_checkpoint_by_name(
     build: importer._ProviderDirectoryProfileBuild,
     *,
     state: str = "building_profile",
-    evidence_next_batch: int = 52,
-    evidence_total_batches: int = 52,
-    profile_next_batch: int = 1,
-    profile_total_batches: int = 400,
+    evidence_next_batch: int = 1,
+    evidence_total_batches: int = 1,
+    profile_next_batch: int = 0,
+    profile_total_batches: int = 1,
 ) -> dict[str, object]:
     return {
         "build_id": importer._provider_directory_profile_build_id(build),
@@ -383,41 +383,8 @@ def _profile_checkpoint_by_name(
     }
 
 
-def test_profile_batch_and_checkpoint_value_contracts():
-    """Cover bounded batch construction and strict checkpoint decoding."""
-    build = _profile_build()
-    assert importer._provider_directory_profile_build_id(build) == (
-        build.generation_id
-    )
-    explicit_build = importer.replace(build, build_id="profile-build")
-    assert importer._provider_directory_profile_build_id(explicit_build) == (
-        "profile-build"
-    )
-    evidence_batches = importer._provider_directory_profile_evidence_batches(
-        build,
-        has_existing_artifacts=True,
-    )
-    assert evidence_batches[0].kind == "copy"
-    affiliation_batches = [
-        batch
-        for batch in evidence_batches
-        if batch.fact_type == "affiliation"
-    ]
-    assert len(affiliation_batches) == profile.PROFILE_AFFILIATION_ROLE_BUCKETS
-    assert affiliation_batches[-1].role_bucket == (
-        profile.PROFILE_AFFILIATION_ROLE_BUCKETS - 1
-    )
-    compact_batches = importer._provider_directory_profile_compact_batches(
-        has_existing_artifacts=True,
-        npi_batch_size=500_000_000,
-    )
-    assert compact_batches[0].kind == "copy"
-    assert compact_batches[-1].npi_end == profile.NPI_MAX + 1
-    with pytest.raises(ValueError, match="batch size must be positive"):
-        importer._provider_directory_profile_compact_batches(
-            has_existing_artifacts=False,
-            npi_batch_size=0,
-        )
+def _assert_profile_checkpoint_value_contracts(build):
+    """Assert strict checkpoint array and state decoding."""
     assert importer._provider_directory_profile_checkpoint_array(
         '["source_a", "source_b"]'
     ) == ("source_a", "source_b")
@@ -442,6 +409,59 @@ def test_profile_batch_and_checkpoint_value_contracts():
             state="failed",
         )
     )
+
+
+def test_profile_batch_and_checkpoint_value_contracts():
+    """Cover bounded batch construction and strict checkpoint decoding."""
+    build = _profile_build()
+    assert importer._provider_directory_profile_build_id(build) == (
+        build.generation_id
+    )
+    explicit_build = importer.replace(build, build_id="profile-build")
+    assert importer._provider_directory_profile_build_id(explicit_build) == (
+        "profile-build"
+    )
+    evidence_batches = importer._provider_directory_profile_evidence_batches(
+        build,
+        has_existing_artifacts=True,
+    )
+    assert [batch.kind for batch in evidence_batches] == ["copy", "source"]
+    assert evidence_batches[1].source_id == "source_a"
+    assert evidence_batches[1].dataset_id == "dataset_a"
+    assert evidence_batches[1].fact_type is None
+    compact_batches = importer._provider_directory_profile_compact_batches(
+        has_existing_artifacts=True,
+        npi_batch_size=500_000_000,
+    )
+    assert [batch.kind for batch in compact_batches] == ["copy", "affected"]
+    assert compact_batches[-1].npi_start is None
+    assert compact_batches[-1].npi_end is None
+    source_ids = tuple(f"source_{index:02d}" for index in range(18))
+    dataset_ids = tuple(f"dataset_{index:02d}" for index in range(18))
+    global_build = importer.replace(
+        build,
+        source_ids=source_ids,
+        retained_source_ids=source_ids,
+        dataset_ids=dataset_ids,
+    )
+    assert len(
+        importer._provider_directory_profile_evidence_batches(
+            global_build,
+            has_existing_artifacts=True,
+        )
+    ) == 19
+    assert len(
+        importer._provider_directory_profile_compact_batches(
+            has_existing_artifacts=True,
+            npi_batch_size=profile.PROFILE_NPI_BATCH_SIZE,
+        )
+    ) == 2
+    with pytest.raises(ValueError, match="batch size must be positive"):
+        importer._provider_directory_profile_compact_batches(
+            has_existing_artifacts=False,
+            npi_batch_size=0,
+        )
+    _assert_profile_checkpoint_value_contracts(build)
 
 
 @pytest.mark.asyncio
@@ -568,10 +588,10 @@ async def test_profile_checkpoint_rejects_compact_progress_before_evidence(
         "evidence_target_oid": None,
         "profile_target_oid": None,
         "has_existing_artifacts": False,
-        "evidence_next_batch": 51,
-        "evidence_total_batches": 52,
+        "evidence_next_batch": 0,
+        "evidence_total_batches": 1,
         "profile_next_batch": 1,
-        "profile_total_batches": 400,
+        "profile_total_batches": 1,
         "state": "building_profile",
     }
     fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
@@ -582,8 +602,45 @@ async def test_profile_checkpoint_rejects_compact_progress_before_evidence(
         has_existing_artifacts=False,
         evidence_build_fence=fence,
         profile_build_fence=fence,
-        evidence_total_batches=52,
-        profile_total_batches=400,
+        evidence_total_batches=1,
+        profile_total_batches=1,
+    )
+    stage_identity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_profile_strategy_bump_invalidates_source_fact_checkpoint(
+    monkeypatch,
+):
+    """The interrupted 937/401 lineage cannot resume under the 19/2 plan."""
+    build = _profile_build()
+    checkpoint_by_name = _profile_checkpoint_by_name(build)
+    checkpoint_by_name.update(
+        {
+            "strategy_version": "source-fact-role32-npi5m-v1",
+            "evidence_next_batch": 14,
+            "evidence_total_batches": 937,
+            "profile_next_batch": 0,
+            "profile_total_batches": 401,
+            "state": "failed",
+        }
+    )
+    stage_identity = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_relation_identity",
+        stage_identity,
+    )
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+
+    assert not await importer._is_profile_build_checkpoint_reusable(
+        build,
+        checkpoint_by_name,
+        has_existing_artifacts=False,
+        evidence_build_fence=fence,
+        profile_build_fence=fence,
+        evidence_total_batches=1,
+        profile_total_batches=1,
     )
     stage_identity.assert_not_awaited()
 
@@ -655,13 +712,13 @@ async def test_profile_checkpoint_claim_initializes_and_reclaims_logged_stages(
         )
     )
     assert reclaimed_state.state == "building_profile"
-    assert reclaimed_state.profile_next_batch == 1
+    assert reclaimed_state.profile_next_batch == 0
     assert status.await_count == 1
 
     checkpoint_by_name.update(
         {
             "state": "failed",
-            "profile_next_batch": 400,
+            "profile_next_batch": 1,
         }
     )
     ready_state = (
@@ -697,16 +754,16 @@ async def test_profile_checkpoint_mutations_fail_closed(monkeypatch):
     await importer._advance_provider_directory_profile_build_checkpoint(
         build,
         phase="evidence",
-        expected_batch=2,
-        total_batches=52,
+        expected_batch=0,
+        total_batches=1,
     )
     await importer._advance_provider_directory_profile_build_checkpoint(
         build,
         phase="profile",
-        expected_batch=3,
-        total_batches=400,
+        expected_batch=0,
+        total_batches=1,
     )
-    assert status.await_args_list[0].kwargs["next_batch"] == 3
+    assert status.await_args_list[0].kwargs["next_batch"] == 1
     assert status.await_args_list[1].kwargs["state"] == "building_profile"
     with pytest.raises(ValueError, match="unsupported profile checkpoint"):
         await importer._advance_provider_directory_profile_build_checkpoint(
@@ -738,7 +795,7 @@ async def test_profile_checkpoint_mutations_fail_closed(monkeypatch):
             build,
             phase="evidence",
             expected_batch=0,
-            total_batches=52,
+            total_batches=1,
         )
     with pytest.raises(
         RuntimeError,
@@ -897,12 +954,9 @@ async def test_profile_bounded_population_checkpoints_copy_and_range_batches(
         lambda *_args, **_params: (
             importer._ProviderDirectoryProfileEvidenceBatch(kind="copy"),
             importer._ProviderDirectoryProfileEvidenceBatch(
-                kind="fact",
+                kind="source",
                 source_id="source_a",
                 dataset_id="dataset_a",
-                fact_type="affiliation",
-                role_bucket_count=2,
-                role_bucket=1,
             ),
         ),
     )
@@ -916,7 +970,7 @@ async def test_profile_bounded_population_checkpoints_copy_and_range_batches(
         0,
         1,
     ]
-    assert status.await_args_list[1].kwargs["profile_role_bucket"] == 1
+    assert "profile_role_bucket" not in status.await_args_list[1].kwargs
     mark_state.assert_awaited_once_with(build, "evidence_complete")
 
     status.reset_mock()
@@ -928,9 +982,7 @@ async def test_profile_bounded_population_checkpoints_copy_and_range_batches(
         lambda **_params: (
             importer._ProviderDirectoryProfileCompactBatch(kind="copy"),
             importer._ProviderDirectoryProfileCompactBatch(
-                kind="npi",
-                npi_start=1_000_000_000,
-                npi_end=1_005_000_000,
+                kind="affected",
             ),
         ),
     )
@@ -944,9 +996,7 @@ async def test_profile_bounded_population_checkpoints_copy_and_range_batches(
         0,
         1,
     ]
-    assert status.await_args_list[1].kwargs["profile_npi_start"] == (
-        1_000_000_000
-    )
+    assert "profile_npi_start" not in status.await_args_list[1].kwargs
     mark_state.assert_awaited_once_with(build, "ready")
 
 
@@ -1186,6 +1236,33 @@ async def test_profile_stage_identity_and_stale_reaper_are_oid_fenced(
         )
 
 
+async def _assert_profile_artifact_pair_contract(monkeypatch):
+    """Assert absent, complete, and partial serving-table pair behavior."""
+    table_exists = AsyncMock(side_effect=[False, False])
+    monkeypatch.setattr(importer, "_is_table_present", table_exists)
+    assert not await importer._has_provider_directory_profile_artifacts("mrf")
+    table_exists.side_effect = [True, True]
+    profile_has_rows = AsyncMock(side_effect=[False, False])
+    monkeypatch.setattr(importer.db, "scalar", profile_has_rows)
+    assert not await importer._has_provider_directory_profile_artifacts("mrf")
+    table_exists.side_effect = [True, True]
+    profile_has_rows.side_effect = [True, True]
+    assert await importer._has_provider_directory_profile_artifacts("mrf")
+    table_exists.side_effect = [True, True]
+    profile_has_rows.side_effect = [True, False]
+    with pytest.raises(
+        RuntimeError,
+        match="profile_artifact_pair_empty_incomplete",
+    ):
+        await importer._has_provider_directory_profile_artifacts("mrf")
+    table_exists.side_effect = [True, False]
+    with pytest.raises(
+        RuntimeError,
+        match="profile_artifact_pair_incomplete",
+    ):
+        await importer._has_provider_directory_profile_artifacts("mrf")
+
+
 @pytest.mark.asyncio
 async def test_profile_stage_preparation_metrics_and_pair_contract(
     monkeypatch,
@@ -1206,9 +1283,7 @@ async def test_profile_stage_preparation_metrics_and_pair_contract(
         assert_ready,
     )
     stages = await importer._prepare_provider_directory_profile_stages(
-        build,
-        fence,
-        fence,
+        build, fence, fence
     )
     assert [stage.stage_table for stage in stages] == [
         build.evidence_stage,
@@ -1221,32 +1296,18 @@ async def test_profile_stage_preparation_metrics_and_pair_contract(
     )
     assert assert_logged.await_count == 2
     assert_ready.assert_awaited_once_with(build, fence, fence)
-
-    stage_metrics = AsyncMock(return_value={"profile_rows": 4})
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_metrics",
-        stage_metrics,
+        AsyncMock(return_value={"profile_rows": 4}),
     )
     metrics = await importer._provider_directory_profile_metrics(
-        build,
-        should_rebuild_all_profiles=False,
+        build, should_rebuild_all_profiles=False
     )
     assert metrics["generation_id"] == build.generation_id
     assert metrics["dataset_ids"] == ["dataset_a"]
     assert metrics["incremental"] is True
-
-    table_exists = AsyncMock(side_effect=[False, False])
-    monkeypatch.setattr(importer, "_is_table_present", table_exists)
-    assert not await importer._has_provider_directory_profile_artifacts("mrf")
-    table_exists.side_effect = [True, True]
-    assert await importer._has_provider_directory_profile_artifacts("mrf")
-    table_exists.side_effect = [True, False]
-    with pytest.raises(
-        RuntimeError,
-        match="profile_artifact_pair_incomplete",
-    ):
-        await importer._has_provider_directory_profile_artifacts("mrf")
+    await _assert_profile_artifact_pair_contract(monkeypatch)
 
 
 @pytest.mark.asyncio
@@ -1708,10 +1769,10 @@ async def test_profile_stage_build_retains_checkpointed_stage_after_failure(
         "_claim_provider_directory_profile_build_checkpoint",
         AsyncMock(
             return_value=importer._ProviderDirectoryProfileBuildCheckpointState(
-                evidence_next_batch=52,
-                evidence_total_batches=52,
-                profile_next_batch=9,
-                profile_total_batches=400,
+                evidence_next_batch=1,
+                evidence_total_batches=1,
+                profile_next_batch=0,
+                profile_total_batches=1,
                 state="building_profile",
             )
         ),
@@ -2490,8 +2551,8 @@ async def test_profile_checkpoint_reuse_requires_both_logged_stages(
         has_existing_artifacts=False,
         evidence_build_fence=importer.ProviderDirectoryArtifactBuildFence(None),
         profile_build_fence=importer.ProviderDirectoryArtifactBuildFence(None),
-        evidence_total_batches=52,
-        profile_total_batches=400,
+        evidence_total_batches=1,
+        profile_total_batches=1,
     )
 
 

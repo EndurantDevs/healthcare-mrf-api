@@ -1,8 +1,8 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 fn encode_manifest(manifest: &UHCRetainedManifest) -> io::Result<Vec<u8>> {
-    let mut encoded = serde_json::to_vec(manifest)
-        .map_err(|error| invalid_data(format!("unable to encode UHC manifest: {error}")))?;
+    let mut encoded =
+        serde_json::to_vec(manifest).expect("retained UHC manifest serialization is infallible");
     encoded.push(b'\n');
     if encoded.len() as u64 > MAX_MANIFEST_BYTES {
         return Err(invalid_data("retained UHC manifest exceeds its byte limit"));
@@ -26,8 +26,10 @@ fn read_bounded_file_from_identity(
             "UHC retained {label} has an invalid byte count"
         )));
     }
-    let byte_count = usize::try_from(before.byte_count)
-        .map_err(|_| invalid_data(format!("UHC retained {label} is too large")))?;
+    let byte_count = match usize::try_from(before.byte_count) {
+        Ok(byte_count) => byte_count,
+        Err(_) => return Err(invalid_data(format!("UHC retained {label} is too large"))),
+    };
     let mut payload = vec![0u8; byte_count];
     let mut consumed = 0usize;
     while consumed < payload.len() {
@@ -48,10 +50,19 @@ fn read_bounded_file_from_identity(
 }
 
 fn parse_strict_manifest(bytes: &[u8]) -> io::Result<UHCRetainedManifest> {
-    validate_strict_json_object(bytes)
-        .map_err(|error| invalid_data(format!("retained UHC manifest is invalid: {error}")))?;
-    let manifest: UHCRetainedManifest = serde_json::from_slice(bytes)
-        .map_err(|error| invalid_data(format!("retained UHC manifest is invalid: {error}")))?;
+    if let Err(error) = validate_strict_json_object(bytes) {
+        return Err(invalid_data(format!(
+            "retained UHC manifest is invalid: {error}"
+        )));
+    }
+    let manifest: UHCRetainedManifest = match serde_json::from_slice(bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(invalid_data(format!(
+                "retained UHC manifest is invalid: {error}"
+            )))
+        }
+    };
     validate_build_id(&manifest.producer_build_id)?;
     if encode_manifest(&manifest)? != bytes {
         return Err(invalid_data(
@@ -84,8 +95,14 @@ fn validate_existing_manifest(
         manifest.raw_artifact.record_count,
         manifest.range_count as usize,
     )?;
-    let raw_sha = parse_sha256_hex(&manifest.raw_artifact.sha256)
-        .map_err(|_| invalid_data("retained UHC manifest raw SHA-256 is invalid"))?;
+    let raw_sha = match parse_sha256_hex(&manifest.raw_artifact.sha256) {
+        Ok(raw_sha) => raw_sha,
+        Err(_) => {
+            return Err(invalid_data(
+                "retained UHC manifest raw SHA-256 is invalid",
+            ))
+        }
+    };
     if range_set_sha256(
         &raw_sha,
         manifest.raw_artifact.byte_count,
@@ -144,9 +161,12 @@ fn verify_existing_raw_file(
 }
 
 fn path_text(path: &Path, label: &str) -> io::Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| invalid_data(format!("UHC retained {label} path is not UTF-8")))
+    match path.to_str() {
+        Some(path) => Ok(path.to_owned()),
+        None => Err(invalid_data(format!(
+            "UHC retained {label} path is not UTF-8"
+        ))),
+    }
 }
 
 fn raw_file_name(expected_sha256: &str) -> String {

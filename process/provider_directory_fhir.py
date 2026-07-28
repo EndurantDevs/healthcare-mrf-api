@@ -91,9 +91,12 @@ from process.provider_directory_dataset_rehydrate import (
     rehydrate_current_dataset,
 )
 from process.provider_directory_source_summary import (
+    SOURCE_SUMMARY_CONTRACT_ID,
+    SOURCE_SUMMARY_CONTRACT_VERSION,
     SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID,
     SOURCE_SUMMARY_METADATA_KEY,
     SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
+    SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
     ProviderDirectorySourceSummaryError,
     ProviderDirectorySourceSummaryBinding,
     build_source_summary,
@@ -101,6 +104,56 @@ from process.provider_directory_source_summary import (
 )
 from process.provider_directory_source_summary_sql import (
     source_summary_metrics_sql,
+)
+from process.provider_directory_proof_store import (
+    PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
+    PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
+    ProviderDirectoryProofStoreError,
+    build_stored_dataset_proof,
+    delete_dataset_resource_proof_shards,
+    delete_dataset_proof_shards,
+    ensure_dataset_proof_shard_table,
+    persist_dataset_proof_shard,
+    validate_stored_dataset_proof_metadata,
+)
+from process.uhc_retained_dataset import (
+    UHC_RETAINED_PUBLICATION_CONTRACT_ID,
+    UHC_RETAINED_PUBLICATION_METADATA_KEY,
+    UHC_RETAINED_SOURCE_ID,
+    UHC_RETAINED_SUMMARY_INPUT_CONTRACT_ID,
+    UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY,
+    UhcCanonicalStage,
+    UhcRetainedDatasetError,
+    build_uhc_canonical_stage,
+    cleanup_uhc_canonical_stage,
+    ensure_sealed_uhc_semantic_set,
+    load_complete_admitted_uhc_catalog_set,
+    publication_identity as uhc_publication_identity,
+    uhc_semantic_file_concurrency,
+    validate_uhc_summary_input,
+)
+from process.uhc_official_file_acquisition import (
+    UHCOfficialFileAcquisitionResult,
+    acquire_complete_uhc_catalog_set,
+    uhc_provider_file_admission_concurrency,
+    uhc_provider_file_download_concurrency,
+)
+from process.uhc_provider_file_catalog import (
+    refresh_uhc_provider_file_catalog,
+)
+from process.uhc_provider_file_source_identity import (
+    UHC_PROVIDER_FILE_ADAPTER_CONTRACT,
+    UHC_PROVIDER_FILE_ADAPTER_ID,
+    UHC_PROVIDER_FILE_CATALOG_BASE,
+    UHC_PROVIDER_FILE_DISPLAY_NAME,
+    UHC_PROVIDER_FILE_ENTRY_ID,
+    UHC_PROVIDER_FILE_PORTAL_BASE,
+)
+from process.uhc_canonical_proof import (
+    UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
+    UhcCanonicalProofError,
+    bind_uhc_canonical_content_proof,
+    validate_uhc_canonical_content_proof,
 )
 from process.provider_directory_time_partition import (
     CountKind,
@@ -1652,6 +1705,8 @@ class EndpointDatasetContentProof:
     resource_count: int
     resource_hashes: dict[str, str]
     resource_counts: dict[str, int]
+    source_metrics: dict[str, int] | None = None
+    proof_metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -4385,24 +4440,15 @@ def _oauth2_cache_key(oauth2: dict[str, Any]) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
-def _fetch_oauth2_client_token_sync(
-    oauth2: dict[str, Any],
-    *,
-    timeout: int = 15,
-) -> str | None:
-    """Fetch oauth2 client credentials token sync for provider-directory ingestion."""
+def _oauth2_token_request(
+    oauth2: Mapping[str, Any],
+) -> urllib.request.Request | None:
+    """Build one client-credentials token request from resolved secrets."""
     token_url = _resolve_secret_text(oauth2.get("token_url") or oauth2.get("tokenUrl"))
     client_id = _resolve_secret_text(oauth2.get("client_id") or oauth2.get("clientId"))
     client_secret = _resolve_secret_text(oauth2.get("client_secret") or oauth2.get("clientSecret"))
     if not token_url or not client_id or not client_secret:
         return None
-
-    cache_key = _oauth2_cache_key(oauth2)
-    cached = _OAUTH_TOKEN_CACHE.get(cache_key)
-    now = time.time()
-    if cached and cached[1] > now:
-        return cached[0]
-
     form_by_name: dict[str, str] = {"grant_type": "client_credentials"}
     for field in ("scope", "audience", "resource"):
         resolved = _resolve_secret_text(oauth2.get(field))
@@ -4426,12 +4472,28 @@ def _fetch_oauth2_client_token_sync(
         token = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
         headers_by_name["Authorization"] = f"Basic {token}"
 
-    request = urllib.request.Request(
+    return urllib.request.Request(
         token_url,
         data=urllib.parse.urlencode(form_by_name).encode("utf-8"),
         headers=headers_by_name,
         method="POST",
     )
+
+
+def _fetch_oauth2_client_token_sync(
+    oauth2: dict[str, Any],
+    *,
+    timeout: int = 15,
+) -> str | None:
+    """Fetch oauth2 client credentials token sync for provider-directory ingestion."""
+    request = _oauth2_token_request(oauth2)
+    if request is None:
+        return None
+    cache_key = _oauth2_cache_key(oauth2)
+    cached = _OAUTH_TOKEN_CACHE.get(cache_key)
+    now = time.time()
+    if cached and cached[1] > now:
+        return cached[0]
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
             payload_by_field = _decode_json_body(response.read(1024 * 1024))
@@ -4524,6 +4586,76 @@ def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
     }
 
 
+@dataclass(frozen=True)
+class ResourceImportSourceDecision:
+    skip_metric: str | None
+    blocked_reason: str | None
+    validation: str
+    is_live_probe_valid: bool
+    is_checkpoint_retry: bool
+
+
+def _resource_import_source_decision(
+    source_record: Mapping[str, Any],
+    *,
+    valid_source_ids: set[str] | None,
+    open_only: bool,
+    include_auth_required: bool,
+    checkpoint_retry_ids: set[str],
+    requested_resource_types: list[str] | None,
+) -> ResourceImportSourceDecision:
+    if not _canonical_base(source_record.get("api_base")):
+        return ResourceImportSourceDecision(
+            "source_import_skipped_missing_api_base", None, "", False, False
+        )
+    blocked_reason = _resource_acquisition_blocked_reason(
+        source_record,
+        requested_resource_types,
+    )
+    if blocked_reason:
+        return ResourceImportSourceDecision(
+            "source_import_skipped_blocked_source",
+            blocked_reason,
+            "",
+            False,
+            False,
+        )
+    auth_type = (_clean_text(source_record.get("auth_type")) or "").lower()
+    validation = (
+        _clean_text(source_record.get("last_validated_status")) or ""
+    ).lower()
+    source_id = source_record["source_id"]
+    is_live_probe_valid = (
+        valid_source_ids is not None and source_id in valid_source_ids
+    )
+    is_checkpoint_retry = source_id in checkpoint_retry_ids
+    has_valid_probe = is_live_probe_valid or is_checkpoint_retry
+    skip_metric = None
+    if valid_source_ids is not None and not has_valid_probe:
+        skip_metric = "source_import_skipped_probe_not_valid"
+    elif (
+        open_only
+        and auth_type not in {"open", "none", ""}
+        and not has_valid_probe
+    ):
+        skip_metric = "source_import_skipped_open_only"
+    elif valid_source_ids is None and not is_checkpoint_retry:
+        if not include_auth_required and validation == "auth_required":
+            skip_metric = "source_import_skipped_auth_required_policy"
+        allowed_statuses = {"", "valid"}
+        if include_auth_required:
+            allowed_statuses.add("auth_required")
+        if skip_metric is None and validation not in allowed_statuses:
+            skip_metric = "source_import_skipped_validation_status"
+    return ResourceImportSourceDecision(
+        skip_metric,
+        None,
+        validation,
+        is_live_probe_valid,
+        is_checkpoint_retry,
+    )
+
+
 def _select_resource_import_sources(
     source_rows: list[dict[str, Any]],
     *,
@@ -4538,61 +4670,31 @@ def _select_resource_import_sources(
     metrics = _resource_import_selection_metrics(len(source_rows))
     checkpoint_retry_ids = checkpoint_retry_source_ids or set()
     for source_record in source_rows:
-        if not _canonical_base(source_record.get("api_base")):
-            metrics["source_import_skipped_missing_api_base"] += 1
-            continue
-        blocked_reason = _resource_acquisition_blocked_reason(
+        decision = _resource_import_source_decision(
             source_record,
-            requested_resource_types,
+            valid_source_ids=valid_source_ids,
+            open_only=open_only,
+            include_auth_required=include_auth_required,
+            checkpoint_retry_ids=checkpoint_retry_ids,
+            requested_resource_types=requested_resource_types,
         )
-        if blocked_reason:
-            metrics["source_import_skipped_blocked_source"] += 1
-            metrics[f"source_import_skipped_blocked_source_{blocked_reason}"] += 1
+        if decision.skip_metric:
+            metrics[decision.skip_metric] += 1
+            if decision.blocked_reason:
+                metrics[
+                    "source_import_skipped_blocked_source_"
+                    f"{decision.blocked_reason}"
+                ] += 1
             continue
-        auth_type = (
-            _clean_text(source_record.get("auth_type")) or ""
-        ).lower()
-        validation = (
-            _clean_text(source_record.get("last_validated_status")) or ""
-        ).lower()
-        is_live_probe_valid = (
-            valid_source_ids is not None
-            and source_record["source_id"] in valid_source_ids
-        )
-        is_checkpoint_retry = (
-            source_record["source_id"] in checkpoint_retry_ids
-        )
-        if valid_source_ids is not None and not (
-            is_live_probe_valid or is_checkpoint_retry
-        ):
-            metrics["source_import_skipped_probe_not_valid"] += 1
-            continue
-        if (
-            open_only
-            and auth_type not in {"open", "none", ""}
-            and not (is_live_probe_valid or is_checkpoint_retry)
-        ):
-            metrics["source_import_skipped_open_only"] += 1
-            continue
-        if valid_source_ids is None and not is_checkpoint_retry:
-            if not include_auth_required and validation == "auth_required":
-                metrics["source_import_skipped_auth_required_policy"] += 1
-                continue
-            allowed_statuses = {"", "valid"}
-            if include_auth_required:
-                allowed_statuses.add("auth_required")
-            if validation not in allowed_statuses:
-                metrics["source_import_skipped_validation_status"] += 1
-                continue
         selected_sources.append(source_record)
         metrics["source_import_sources_selected"] += 1
-        if is_live_probe_valid:
+        if decision.is_live_probe_valid:
             metrics["source_import_sources_selected_live_probe_valid"] += 1
-        if is_checkpoint_retry:
+        if decision.is_checkpoint_retry:
             metrics["source_import_sources_selected_checkpoint_retry"] += 1
         if _has_source_declared_credentialed_access(source_record):
             metrics["source_import_sources_selected_declared_credentialed"] += 1
-        if validation == "auth_required":
+        if decision.validation == "auth_required":
             metrics["source_import_sources_selected_auth_required_seed"] += 1
     return selected_sources, metrics
 
@@ -6841,12 +6943,10 @@ def _address(resource: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def parse_capability(
-    source_record: dict[str, Any],
-    capability_payload: dict[str, Any],
-    probe: dict[str, Any],
-) -> dict[str, Any]:
-    """Parse capability into normalized provider-directory records."""
+def _capability_resource_support(
+    capability_payload: Mapping[str, Any],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Extract advertised resource types and their search parameters."""
     rest_resources: list[str] = []
     search_params_by_resource: dict[str, list[str]] = {}
     for rest in capability_payload.get("rest") or []:
@@ -6866,6 +6966,18 @@ def parse_capability(
                 and _clean_text(search_parameter.get("name"))
             ]
             search_params_by_resource[resource_type] = names
+    return rest_resources, search_params_by_resource
+
+
+def parse_capability(
+    source_record: dict[str, Any],
+    capability_payload: dict[str, Any],
+    probe: dict[str, Any],
+) -> dict[str, Any]:
+    """Parse capability into normalized provider-directory records."""
+    rest_resources, search_params_by_resource = (
+        _capability_resource_support(capability_payload)
+    )
     software = (
         capability_payload.get("software")
         if isinstance(capability_payload.get("software"), dict)
@@ -8550,12 +8662,8 @@ async def _supersede_artifact_dataset_incumbent(
         )
 
 
-async def _publish_validated_artifact_dataset(
-    dataset: ProviderDirectoryArtifactDataset,
-) -> None:
-    promoted_count = await db.status(
-        f"""
-            UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+_PUBLISH_VALIDATED_ARTIFACT_DATASET_SQL = """
+            UPDATE __ENDPOINT_DATASET_TABLE__
                SET status = :published_status,
                    is_current = true,
                    published_at = now(),
@@ -8569,8 +8677,153 @@ async def _publish_validated_artifact_dataset(
                AND status = :validated_status
                AND is_current = false
                AND validated_at IS NOT NULL
-               AND superseded_at IS NULL;
-        """,
+               AND superseded_at IS NULL
+               AND (
+                    NOT (
+                        COALESCE(publication_metadata_json::jsonb, '{}'::jsonb)
+                            ? :uhc_publication_key
+                        OR COALESCE(
+                            publication_metadata_json::jsonb -> 'source_ids',
+                            '[]'::jsonb
+                        ) @> jsonb_build_array(CAST(:uhc_source_id AS text))
+                    )
+                    OR (
+                        publication_metadata_json::jsonb
+                            -> :uhc_publication_key ->> 'contract_id'
+                            = :uhc_publication_contract_id
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_publication_key -> 'complete'
+                            = 'true'::jsonb
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_publication_key ->> 'source_id'
+                            = :uhc_source_id
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_publication_key ->> 'dataset_id'
+                            = dataset_id
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_publication_key
+                            ->> 'acquisition_root_run_id'
+                            = acquisition_root_run_id
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_publication_key
+                            ->> 'semantic_contract_id'
+                            = :uhc_semantic_contract_id
+                        AND publication_metadata_json::jsonb -> 'source_ids'
+                            = jsonb_build_array(CAST(:uhc_source_id AS text))
+                        AND publication_metadata_json::jsonb
+                            -> 'selected_resources'
+                            = CAST(:uhc_selected_resources AS jsonb)
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_summary_input_key -> 'complete'
+                            = 'true'::jsonb
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_summary_input_key ->> 'contract_id'
+                            = :uhc_summary_input_contract_id
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_summary_input_key ->> 'source_id'
+                            = :uhc_source_id
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_summary_input_key
+                            ->> 'semantic_contract_id'
+                            = :uhc_semantic_contract_id
+                        AND publication_metadata_json::jsonb
+                            -> :uhc_summary_input_key ->> 'input_sha256'
+                            = publication_metadata_json::jsonb
+                                -> :uhc_publication_key
+                                ->> 'summary_input_sha256'
+                        AND publication_metadata_json::jsonb
+                            -> :outcome_key -> 'complete'
+                            = 'true'::jsonb
+                        AND CAST(
+                            publication_metadata_json::jsonb
+                                -> :outcome_key ->> 'version'
+                            AS integer
+                        ) = 1
+                        AND publication_metadata_json::jsonb
+                            -> :outcome_key ->> 'dataset_id'
+                            = dataset_id
+                        AND publication_metadata_json::jsonb
+                            -> :outcome_key ->> 'endpoint_id'
+                            = endpoint_id
+                        AND publication_metadata_json::jsonb
+                            -> :outcome_key
+                            ->> 'acquisition_root_run_id'
+                            = acquisition_root_run_id
+                        AND publication_metadata_json::jsonb
+                            -> :outcome_key ->> 'dataset_hash'
+                            = dataset_hash
+                        AND CAST(
+                            publication_metadata_json::jsonb
+                                -> :outcome_key ->> 'resource_count'
+                            AS bigint
+                        ) = resource_count
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key ->> 'dataset_id'
+                            = dataset_id
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key ->> 'endpoint_id'
+                            = endpoint_id
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key -> 'complete'
+                            = 'true'::jsonb
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key ->> 'contract_id'
+                            = :source_summary_contract_id
+                        AND CAST(
+                            publication_metadata_json::jsonb
+                                -> :source_summary_key ->> 'contract_version'
+                            AS integer
+                        ) = :source_summary_contract_version
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key
+                            ->> 'acquisition_root_run_id'
+                            = acquisition_root_run_id
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key ->> 'dataset_hash'
+                            = dataset_hash
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key
+                            ->> 'semantic_contract_id'
+                            = :uhc_semantic_contract_id
+                        AND CAST(
+                            publication_metadata_json::jsonb
+                                -> :source_summary_key ->> 'total_resources'
+                            AS bigint
+                        ) = resource_count
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key -> 'resource_counts'
+                            = publication_metadata_json::jsonb
+                                -> :outcome_key -> 'resource_counts'
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key -> 'source_ids'
+                            = publication_metadata_json::jsonb
+                                -> :outcome_key -> 'source_ids'
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key -> 'source_ids'
+                            = publication_metadata_json::jsonb -> 'source_ids'
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key -> 'selected_resources'
+                            = publication_metadata_json::jsonb
+                                -> :outcome_key -> 'selected_resources'
+                        AND publication_metadata_json::jsonb
+                            -> :source_summary_key -> 'selected_resources'
+                            = publication_metadata_json::jsonb
+                                -> 'selected_resources'
+                    )
+               );
+"""
+
+
+async def _publish_validated_artifact_dataset(
+    dataset: ProviderDirectoryArtifactDataset,
+) -> None:
+    """Publish one validated artifact dataset under its immutable identity."""
+    publish_sql = _PUBLISH_VALIDATED_ARTIFACT_DATASET_SQL.replace(
+        "__ENDPOINT_DATASET_TABLE__",
+        _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__),
+    )
+    promoted_count = await db.status(
+        publish_sql,
         dataset_id=dataset.dataset_id,
         endpoint_id=dataset.endpoint_id,
         evidence_run_id=dataset.evidence_run_id,
@@ -8578,6 +8831,21 @@ async def _publish_validated_artifact_dataset(
         dataset_hash=dataset.dataset_hash,
         validated_status=ENDPOINT_DATASET_VALIDATED,
         published_status=ENDPOINT_DATASET_PUBLISHED,
+        uhc_publication_key=UHC_RETAINED_PUBLICATION_METADATA_KEY,
+        uhc_publication_contract_id=UHC_RETAINED_PUBLICATION_CONTRACT_ID,
+        uhc_summary_input_key=UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY,
+        uhc_summary_input_contract_id=(
+            UHC_RETAINED_SUMMARY_INPUT_CONTRACT_ID
+        ),
+        uhc_source_id=UHC_RETAINED_SOURCE_ID,
+        uhc_selected_resources=json.dumps(
+            sorted(UHC_SUPPORTED_RESOURCES)
+        ),
+        uhc_semantic_contract_id=SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
+        outcome_key=PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
+        source_summary_key=SOURCE_SUMMARY_METADATA_KEY,
+        source_summary_contract_id=SOURCE_SUMMARY_CONTRACT_ID,
+        source_summary_contract_version=SOURCE_SUMMARY_CONTRACT_VERSION,
     )
     if _coerce_rowcount(promoted_count) != 1:
         raise ProviderDirectoryArtifactBuildStale(
@@ -12782,6 +13050,83 @@ def _aggregate_dataset_serving_relation_proofs(
     return aggregate_by_relation
 
 
+def _uhc_artifact_content_proof(
+    dataset: ProviderDirectoryArtifactDataset,
+    publication_metadata: dict[str, Any],
+) -> EndpointDatasetContentProof:
+    try:
+        uhc_proof = validate_uhc_canonical_content_proof(
+            publication_metadata.get(
+                UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY
+            ),
+            dataset_id=dataset.dataset_id,
+            endpoint_id=dataset.endpoint_id,
+            acquisition_root_run_id=dataset.evidence_run_id,
+        )
+    except UhcCanonicalProofError as error:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_uhc_canonical_proof_invalid"
+        ) from error
+    return EndpointDatasetContentProof(
+        dataset_hash=uhc_proof["dataset_hash"],
+        resource_count=uhc_proof["resource_count"],
+        resource_hashes=dict(uhc_proof["resource_hashes"]),
+        resource_counts=dict(uhc_proof["resource_counts"]),
+    )
+
+
+async def _generic_artifact_content_proof(
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: EndpointDatasetCandidate,
+    publication_metadata: dict[str, Any],
+) -> EndpointDatasetContentProof:
+    raw_content_proof = publication_metadata.get(
+        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    )
+    if raw_content_proof is None:
+        return await _endpoint_dataset_content_proof(
+            db,
+            dataset.dataset_id,
+            dataset.selected_resources,
+            verify_payload_hashes=True,
+        )
+    try:
+        stored_proof = validate_stored_dataset_proof_metadata(
+            raw_content_proof,
+            dataset_id=dataset.dataset_id,
+            endpoint_id=dataset.endpoint_id,
+            acquisition_root_run_id=dataset.evidence_run_id,
+            source_ids=candidate.source_ids,
+            selected_resources=dataset.selected_resources,
+        )
+    except ProviderDirectoryProofStoreError as error:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_content_proof_invalid"
+        ) from error
+    return EndpointDatasetContentProof(
+        dataset_hash=stored_proof["dataset_hash"],
+        resource_count=stored_proof["resource_count"],
+        resource_hashes=dict(stored_proof["resource_hashes"]),
+        resource_counts=dict(stored_proof["resource_counts"]),
+        source_metrics=dict(stored_proof["source_metrics"]),
+        proof_metadata=stored_proof,
+    )
+
+
+async def _artifact_content_proof(
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: EndpointDatasetCandidate,
+    publication_metadata: dict[str, Any],
+) -> EndpointDatasetContentProof:
+    if dataset.source_id == UHC_RETAINED_SOURCE_ID:
+        return _uhc_artifact_content_proof(dataset, publication_metadata)
+    return await _generic_artifact_content_proof(
+        dataset,
+        candidate,
+        publication_metadata,
+    )
+
+
 async def _refresh_current_artifact_dataset_source_summary(
     dataset: ProviderDirectoryArtifactDataset,
     candidate: EndpointDatasetCandidate,
@@ -12797,11 +13142,10 @@ async def _refresh_current_artifact_dataset_source_summary(
     )
     if source_summary is not None:
         return source_summary
-    content_proof = await _endpoint_dataset_content_proof(
-        db,
-        dataset.dataset_id,
-        dataset.selected_resources,
-        verify_payload_hashes=True,
+    content_proof = await _artifact_content_proof(
+        dataset,
+        candidate,
+        publication_metadata,
     )
     _assert_artifact_dataset_content_proof(dataset, content_proof)
     await _record_current_dataset_publication_proof(
@@ -12879,6 +13223,27 @@ async def _rebuild_one_current_dataset_artifacts(
         return relation_proof_by_name, source_summary
 
 
+def _attach_aggregate_source_summary_proof(
+    aggregate_proof_by_name: dict[str, dict[str, Any]],
+    source_summaries: list[dict[str, Any]],
+) -> None:
+    """Attach the aggregate identity of rebuilt dataset source summaries."""
+    if not source_summaries:
+        return
+    aggregate_proof_by_name[SOURCE_SUMMARY_METADATA_KEY] = {
+        "complete": True,
+        "version": 1,
+        "dataset_count": len(source_summaries),
+        "dataset_ids": [
+            summary["dataset_id"] for summary in source_summaries
+        ],
+        "summary_sha256_by_dataset": {
+            summary["dataset_id"]: summary["summary_sha256"]
+            for summary in source_summaries
+        },
+    }
+
+
 async def _rebuild_current_dataset_serving_relations(
     fence: ProviderDirectoryArtifactDatasetFence,
     *,
@@ -12928,19 +13293,10 @@ async def _rebuild_current_dataset_serving_relations(
         proof_list_by_relation,
         build_run_id=build_run_id,
     )
-    if source_summaries:
-        aggregate_proof_by_name[SOURCE_SUMMARY_METADATA_KEY] = {
-            "complete": True,
-            "version": 1,
-            "dataset_count": len(source_summaries),
-            "dataset_ids": [
-                summary["dataset_id"] for summary in source_summaries
-            ],
-            "summary_sha256_by_dataset": {
-                summary["dataset_id"]: summary["summary_sha256"]
-                for summary in source_summaries
-            },
-        }
+    _attach_aggregate_source_summary_proof(
+        aggregate_proof_by_name,
+        source_summaries,
+    )
     return aggregate_proof_by_name
 
 
@@ -13052,8 +13408,25 @@ async def _publish_provider_directory_dataset_artifacts(
     source_ids: list[str] | tuple[str, ...] | None,
     publish_corroboration: bool,
     publish_artifacts_targets: set[str] | None,
+    require_complete_global_profile_fence: bool = False,
 ) -> dict[str, Any]:
     """Build one selected dataset bundle and atomically publish its pointers."""
+    if require_complete_global_profile_fence and not (
+        is_provider_directory_publish_target_enabled(
+            publish_artifacts_targets,
+            "profile",
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_global_target_required"
+        )
+    if (
+        require_complete_global_profile_fence
+        and _clean_source_id_list(source_ids)
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_global_fence_required"
+        )
     should_select_validated_candidates = (
         _should_select_validated_artifacts(publish_artifacts_targets)
     )
@@ -14078,23 +14451,13 @@ def _provider_directory_profile_evidence_batches(
         build.dataset_ids,
         strict=True,
     ):
-        for fact_type in profile_artifact.PROFILE_EVIDENCE_FACT_TYPES:
-            role_bucket_count = (
-                profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS
-                if fact_type == "affiliation"
-                else 1
+        batches.append(
+            _ProviderDirectoryProfileEvidenceBatch(
+                kind="source",
+                source_id=source_id,
+                dataset_id=dataset_id,
             )
-            batches.extend(
-                _ProviderDirectoryProfileEvidenceBatch(
-                    kind="fact",
-                    source_id=source_id,
-                    dataset_id=dataset_id,
-                    fact_type=fact_type,
-                    role_bucket_count=role_bucket_count,
-                    role_bucket=role_bucket,
-                )
-                for role_bucket in range(role_bucket_count)
-            )
+        )
     return tuple(batches)
 
 
@@ -14108,20 +14471,8 @@ def _provider_directory_profile_compact_batches(
     batches: list[_ProviderDirectoryProfileCompactBatch] = []
     if has_existing_artifacts:
         batches.append(_ProviderDirectoryProfileCompactBatch(kind="copy"))
-    batches.extend(
-        _ProviderDirectoryProfileCompactBatch(
-            kind="npi",
-            npi_start=npi_start,
-            npi_end=min(
-                npi_start + npi_batch_size,
-                profile_artifact.NPI_MAX + 1,
-            ),
-        )
-        for npi_start in range(
-            profile_artifact.NPI_MIN,
-            profile_artifact.NPI_MAX + 1,
-            npi_batch_size,
-        )
+    batches.append(
+        _ProviderDirectoryProfileCompactBatch(kind="affected")
     )
     return tuple(batches)
 
@@ -15094,6 +15445,52 @@ async def _reap_stale_provider_directory_profile_builds(
     return reaped_count
 
 
+async def _execute_profile_evidence_batch(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+    copy_evidence_sql: Any,
+    evidence_sql_refs_by_name: Mapping[str, str],
+) -> int:
+    """Execute one bounded evidence batch and return its affected rows."""
+    if batch.kind == "copy":
+        return _coerce_rowcount(
+            await db.status(
+                copy_evidence_sql,
+                source_ids=list(build.source_ids),
+                retained_source_ids=list(build.retained_source_ids),
+                profile_as_of=build.profile_as_of,
+            )
+        )
+    if (
+        batch.kind != "source"
+        or not batch.source_id
+        or not batch.dataset_id
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_evidence_batch_invalid"
+        )
+    insert_params_by_name = {
+        "source_ids": [batch.source_id],
+        "dataset_ids": [batch.dataset_id],
+        "profile_as_of": build.profile_as_of,
+    }
+    if batch.role_bucket_count > 1:
+        insert_params_by_name.update(
+            {
+                "profile_role_bucket_count": batch.role_bucket_count,
+                "profile_role_bucket": batch.role_bucket,
+            }
+        )
+    return _coerce_rowcount(
+        await db.status(
+            profile_artifact.profile_evidence_insert_sql(
+                **evidence_sql_refs_by_name,
+            ),
+            **insert_params_by_name,
+        )
+    )
+
+
 async def _populate_provider_directory_profile_evidence_stage(
     build: _ProviderDirectoryProfileBuild,
     *,
@@ -15188,45 +15585,12 @@ async def _populate_provider_directory_profile_evidence_stage(
                 batch.role_bucket + 1,
                 batch.role_bucket_count,
             )
-            if batch.kind == "copy":
-                affected_rows = _coerce_rowcount(
-                    await db.status(
-                        copy_evidence_sql,
-                        source_ids=list(build.source_ids),
-                        retained_source_ids=list(build.retained_source_ids),
-                        profile_as_of=build.profile_as_of,
-                    )
-                )
-            else:
-                if not batch.source_id or not batch.dataset_id or not batch.fact_type:
-                    raise RuntimeError(
-                        "provider_directory_profile_evidence_batch_invalid"
-                    )
-                insert_params_by_name = {
-                    "source_ids": [batch.source_id],
-                    "dataset_ids": [batch.dataset_id],
-                    "profile_as_of": build.profile_as_of,
-                }
-                if batch.role_bucket_count > 1:
-                    insert_params_by_name.update(
-                        {
-                            "profile_role_bucket_count": (
-                                batch.role_bucket_count
-                            ),
-                            "profile_role_bucket": batch.role_bucket,
-                        }
-                    )
-                affected_rows = _coerce_rowcount(
-                    await db.status(
-                        profile_artifact.profile_evidence_insert_sql(
-                            **evidence_sql_refs_by_name,
-                            fact_type=batch.fact_type,
-                            role_bucket_count=batch.role_bucket_count,
-                            role_bucket=batch.role_bucket,
-                        ),
-                        **insert_params_by_name,
-                    )
-                )
+            affected_rows = await _execute_profile_evidence_batch(
+                build,
+                batch,
+                copy_evidence_sql,
+                evidence_sql_refs_by_name,
+            )
             if checkpointed:
                 await _advance_provider_directory_profile_build_checkpoint(
                     build,
@@ -15355,22 +15719,18 @@ async def _populate_provider_directory_profile_compact_stage(
                         profile_as_of=build.profile_as_of,
                     )
                 )
-            else:
-                if batch.npi_start is None or batch.npi_end is None:
-                    raise RuntimeError(
-                        "provider_directory_profile_compact_batch_invalid"
-                    )
+            elif batch.kind == "affected":
                 affected_rows = _coerce_rowcount(
                     await db.status(
                         profile_artifact.profile_insert_sql(
                             **profile_sql_args_by_name,
-                            npi_start=batch.npi_start,
-                            npi_end=batch.npi_end,
                         ),
                         **profile_params_by_name,
-                        profile_npi_start=batch.npi_start,
-                        profile_npi_end=batch.npi_end,
                     )
+                )
+            else:
+                raise RuntimeError(
+                    "provider_directory_profile_compact_batch_invalid"
                 )
             if checkpointed:
                 await _advance_provider_directory_profile_build_checkpoint(
@@ -15502,10 +15862,8 @@ async def _finalize_provider_directory_profile_stages(
 ]:
     if defer_cutover:
         return metrics, stages
-    is_promoted = False
+    await _retry_provider_directory_artifact_bundle_promotion(stages)
     try:
-        await _retry_provider_directory_artifact_bundle_promotion(stages)
-        is_promoted = True
         for schema, build_id in sorted(
             {
                     stage.resume_checkpoint
@@ -15518,9 +15876,11 @@ async def _finalize_provider_directory_profile_stages(
                 build_id,
             )
     finally:
-        if is_promoted:
-            for stage in reversed(stages):
-                await _remove_provider_directory_artifact_stage(stage)
+        for stage in reversed(stages):
+            await _remove_provider_directory_artifact_stage(stage)
+    # Promotion failures leave stages intact for retry. After promotion,
+    # cleanup still runs when checkpoint retirement raises.
+    # Returned metrics therefore describe a completed cutover.
     return metrics
 
 
@@ -15535,7 +15895,71 @@ async def _has_provider_directory_profile_artifacts(schema: str) -> bool:
     )
     if has_evidence_target != has_profile_target:
         raise RuntimeError("provider_directory_profile_artifact_pair_incomplete")
-    return has_evidence_target
+    if not has_evidence_target:
+        return False
+    has_evidence_rows = bool(
+        await db.scalar(
+            f"SELECT EXISTS (SELECT 1 FROM "
+            f"{_unscoped_qt(schema, profile_artifact.PROFILE_EVIDENCE_TABLE)} "
+            "LIMIT 1);"
+        )
+    )
+    has_profile_rows = bool(
+        await db.scalar(
+            f"SELECT EXISTS (SELECT 1 FROM "
+            f"{_unscoped_qt(schema, profile_artifact.PROFILE_TABLE)} "
+            "LIMIT 1);"
+        )
+    )
+    if has_evidence_rows != has_profile_rows:
+        raise RuntimeError(
+            "provider_directory_profile_artifact_pair_empty_incomplete"
+        )
+    return has_evidence_rows
+
+
+async def _populate_claimed_provider_directory_profile_stages(
+    build: _ProviderDirectoryProfileBuild,
+    checkpoint_state: _ProviderDirectoryProfileBuildCheckpointState,
+    has_existing_artifacts: bool,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> tuple[
+    dict[str, Any],
+    tuple[
+        ProviderDirectoryPreparedArtifactStage,
+        ProviderDirectoryPreparedArtifactStage,
+    ],
+]:
+    """Populate and prepare both stages from one claimed checkpoint."""
+    if (
+        checkpoint_state.evidence_next_batch
+        < checkpoint_state.evidence_total_batches
+    ):
+        await _populate_provider_directory_profile_evidence_stage(
+            build,
+            has_evidence_target=has_existing_artifacts,
+            bounded=True,
+            start_batch=checkpoint_state.evidence_next_batch,
+            checkpointed=True,
+        )
+    await _populate_provider_directory_profile_compact_stage(
+        build,
+        has_existing_artifacts=has_existing_artifacts,
+        npi_batch_size=profile_artifact.PROFILE_NPI_BATCH_SIZE,
+        start_batch=checkpoint_state.profile_next_batch,
+        checkpointed=True,
+    )
+    metrics = await _provider_directory_profile_metrics(
+        build,
+        should_rebuild_all_profiles=not has_existing_artifacts,
+    )
+    stages = await _prepare_provider_directory_profile_stages(
+        build,
+        evidence_build_fence,
+        profile_build_fence,
+    )
+    return metrics, stages
 
 
 async def _build_provider_directory_profile_stages(
@@ -15549,6 +15973,7 @@ async def _build_provider_directory_profile_stages(
         ProviderDirectoryPreparedArtifactStage,
     ],
 ]:
+    """Build the bounded profile evidence and compact stages."""
     has_existing_artifacts = await _has_provider_directory_profile_artifacts(
         build.schema
     )
@@ -15561,32 +15986,13 @@ async def _build_provider_directory_profile_stages(
         )
     )
     try:
-        if checkpoint_state.profile_next_batch == 0:
-            await _populate_provider_directory_profile_evidence_stage(
-                build,
-                has_evidence_target=has_existing_artifacts,
-                bounded=True,
-                start_batch=checkpoint_state.evidence_next_batch,
-                checkpointed=True,
-            )
-        should_rebuild_all_profiles = not has_existing_artifacts
-        await _populate_provider_directory_profile_compact_stage(
+        return await _populate_claimed_provider_directory_profile_stages(
             build,
-            has_existing_artifacts=has_existing_artifacts,
-            npi_batch_size=profile_artifact.PROFILE_NPI_BATCH_SIZE,
-            start_batch=checkpoint_state.profile_next_batch,
-            checkpointed=True,
-        )
-        metrics = await _provider_directory_profile_metrics(
-            build,
-            should_rebuild_all_profiles=should_rebuild_all_profiles,
-        )
-        stages = await _prepare_provider_directory_profile_stages(
-            build,
+            checkpoint_state,
+            has_existing_artifacts,
             evidence_build_fence,
             profile_build_fence,
         )
-        return metrics, stages
     except BaseException as exc:
         with contextlib.suppress(BaseException):
             await asyncio.shield(
@@ -16777,6 +17183,11 @@ async def _ensure_provider_directory_tables() -> None:
             )
             existing_index_names.add(name)
     await _ensure_provider_directory_import_seen_table(schema)
+    if not await _is_table_present(
+        schema,
+        PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
+    ):
+        await ensure_dataset_proof_shard_table(db, schema)
 
 
 async def _provider_directory_existing_index_names(schema: str) -> set[str]:
@@ -17766,6 +18177,70 @@ async def _copy_upsert_connection(transaction_session: Any | None):
     yield ConnectionProxy(db, transaction_connection, raw_connection)
 
 
+def _copy_upsert_conflict_sql(
+    table: Any,
+    columns: list[str],
+    primary_keys: list[str],
+    *,
+    skip_unchanged: bool,
+) -> str:
+    update_columns = [column for column in columns if column not in primary_keys]
+    if update_columns:
+        target_table = _q(table.name)
+        conflict_sql = (
+            "DO UPDATE SET "
+            + ", ".join(
+                f"{_q(column)} = "
+                f"{_effective_update_sql(table, column, target_prefix=target_table, incoming_prefix='EXCLUDED')}"
+                for column in update_columns
+            )
+        )
+        update_where = _copy_upsert_changed_where_sql(table, columns, primary_keys) if skip_unchanged else ""
+        if update_where:
+            conflict_sql = f"{conflict_sql} WHERE {update_where}"
+        return conflict_sql
+    return "DO NOTHING"
+
+
+def _copy_upsert_select_sql(
+    table: Any,
+    columns: list[str],
+    primary_keys: list[str],
+    *,
+    quoted_stage: str,
+    target_ref: str,
+    skip_unchanged: bool,
+) -> str:
+    quoted_columns = ", ".join(_q(column) for column in columns)
+    select_sql = f"SELECT {quoted_columns}\n            FROM {quoted_stage}"
+    if not skip_unchanged:
+        return select_sql
+    stage_alias = "stage_row"
+    target_alias = "target_row"
+    changed_where = _copy_stage_changed_where_sql(
+        table,
+        columns,
+        primary_keys,
+        target_alias=target_alias,
+        stage_alias=stage_alias,
+    )
+    primary_key_join = _copy_stage_primary_key_join_sql(
+        primary_keys,
+        target_alias=target_alias,
+        stage_alias=stage_alias,
+    )
+    select_columns = ", ".join(
+        f"{stage_alias}.{_q(column)}" for column in columns
+    )
+    return f"""
+        SELECT {select_columns}
+        FROM {quoted_stage} AS {stage_alias}
+        LEFT JOIN {target_ref} AS {target_alias}
+          ON {primary_key_join}
+        WHERE {changed_where}
+        """
+
+
 async def _copy_upsert_rows(
     model,
     normalized_rows: list[dict[str, Any]],
@@ -17783,52 +18258,25 @@ async def _copy_upsert_rows(
     quoted_stage = _q(stage_table)
     quoted_columns = ", ".join(_q(column) for column in columns)
     quoted_conflict = ", ".join(_q(column) for column in primary_keys)
-    update_columns = [column for column in columns if column not in primary_keys]
-    if update_columns:
-        target_table = _q(table.name)
-        conflict_sql = (
-            "DO UPDATE SET "
-            + ", ".join(
-                f"{_q(column)} = "
-                f"{_effective_update_sql(table, column, target_prefix=target_table, incoming_prefix='EXCLUDED')}"
-                for column in update_columns
-            )
-        )
-        update_where = _copy_upsert_changed_where_sql(table, columns, primary_keys) if skip_unchanged else ""
-        if update_where:
-            conflict_sql = f"{conflict_sql} WHERE {update_where}"
-    else:
-        conflict_sql = "DO NOTHING"
-
+    conflict_sql = _copy_upsert_conflict_sql(
+        table,
+        columns,
+        primary_keys,
+        skip_unchanged=skip_unchanged,
+    )
+    select_sql = _copy_upsert_select_sql(
+        table,
+        columns,
+        primary_keys,
+        quoted_stage=quoted_stage,
+        target_ref=target_ref,
+        skip_unchanged=skip_unchanged,
+    )
     json_columns = _json_columns(table)
     copy_records = [
         _copy_record(normalized_row, columns, json_columns)
         for normalized_row in normalized_rows
     ]
-    select_sql = f"SELECT {quoted_columns}\n            FROM {quoted_stage}"
-    if skip_unchanged:
-        stage_alias = "stage_row"
-        target_alias = "target_row"
-        changed_where = _copy_stage_changed_where_sql(
-            table,
-            columns,
-            primary_keys,
-            target_alias=target_alias,
-            stage_alias=stage_alias,
-        )
-        primary_key_join = _copy_stage_primary_key_join_sql(
-            primary_keys,
-            target_alias=target_alias,
-            stage_alias=stage_alias,
-        )
-        select_columns = ", ".join(f"{stage_alias}.{_q(column)}" for column in columns)
-        select_sql = f"""
-            SELECT {select_columns}
-            FROM {quoted_stage} AS {stage_alias}
-            LEFT JOIN {target_ref} AS {target_alias}
-              ON {primary_key_join}
-            WHERE {changed_where}
-            """
     async with _copy_upsert_connection(transaction_session) as conn:
         await conn.status(
             f"""
@@ -19067,6 +19515,55 @@ def _reviewed_provider_directory_candidate_seed_rows(
     ]
 
 
+def _loaded_supplemental_catalog(
+    loader: Callable[[], tuple[list[dict[str, Any]], dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    try:
+        return loader()
+    except Exception as failure:
+        return [], {"rows": 0, "error": _short_error(failure)}
+
+
+def _remote_supplemental_catalogs(
+    *,
+    source_query: str | None,
+    timeout: int,
+    amerihealth_catalog_path: str | None,
+    amerihealth_catalog_url: str | None,
+    contra_costa_catalog_path: str | None,
+    contra_costa_catalog_url: str | None,
+    cms_catalog_path: str | None,
+    cms_catalog_url: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    remote_rows: list[dict[str, Any]] = []
+    metrics_by_catalog: dict[str, Any] = {}
+    loaders_by_catalog = {
+        "amerihealth_caritas": lambda: _seed_rows_from_amerihealth_caritas_catalog(
+            source_query=source_query,
+            timeout=timeout,
+            catalog_path=amerihealth_catalog_path,
+            catalog_url=amerihealth_catalog_url,
+        ),
+        "contra_costa": lambda: _seed_rows_from_contra_costa_catalog(
+            source_query=source_query,
+            timeout=timeout,
+            catalog_path=contra_costa_catalog_path,
+            catalog_url=contra_costa_catalog_url,
+        ),
+        "cms_sma_endpoint_directory": lambda: _cms_sma_seed_rows(
+            source_query=source_query,
+            timeout=timeout,
+            catalog_path=cms_catalog_path,
+            catalog_url=cms_catalog_url,
+        ),
+    }
+    for catalog_name, loader in loaders_by_catalog.items():
+        catalog_rows, catalog_metrics = _loaded_supplemental_catalog(loader)
+        remote_rows.extend(catalog_rows)
+        metrics_by_catalog[catalog_name] = catalog_metrics
+    return remote_rows, metrics_by_catalog
+
+
 def _seed_rows_from_supplemental_catalogs(
     *,
     source_query: str | None = None,
@@ -19089,48 +19586,18 @@ def _seed_rows_from_supplemental_catalogs(
         "source": REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE,
         "rows": len(candidate_rows),
     }
-    try:
-        catalog_rows, catalog_metrics = _seed_rows_from_amerihealth_caritas_catalog(
-            source_query=source_query,
-            timeout=timeout,
-            catalog_path=amerihealth_caritas_catalog_path,
-            catalog_url=amerihealth_caritas_catalog_url,
-        )
-        supplemental_rows.extend(catalog_rows)
-        metrics_by_name["catalogs"]["amerihealth_caritas"] = catalog_metrics
-    except Exception as exc:
-        metrics_by_name["catalogs"]["amerihealth_caritas"] = {
-            "rows": 0,
-            "error": _short_error(exc),
-        }
-    try:
-        catalog_rows, catalog_metrics = _seed_rows_from_contra_costa_catalog(
-            source_query=source_query,
-            timeout=timeout,
-            catalog_path=contra_costa_catalog_path,
-            catalog_url=contra_costa_catalog_url,
-        )
-        supplemental_rows.extend(catalog_rows)
-        metrics_by_name["catalogs"]["contra_costa"] = catalog_metrics
-    except Exception as exc:
-        metrics_by_name["catalogs"]["contra_costa"] = {
-            "rows": 0,
-            "error": _short_error(exc),
-        }
-    try:
-        catalog_rows, catalog_metrics = _cms_sma_seed_rows(
-            source_query=source_query,
-            timeout=timeout,
-            catalog_path=cms_sma_endpoint_directory_path,
-            catalog_url=cms_sma_endpoint_directory_url,
-        )
-        supplemental_rows.extend(catalog_rows)
-        metrics_by_name["catalogs"]["cms_sma_endpoint_directory"] = catalog_metrics
-    except Exception as exc:
-        metrics_by_name["catalogs"]["cms_sma_endpoint_directory"] = {
-            "rows": 0,
-            "error": _short_error(exc),
-        }
+    remote_rows, remote_metrics_by_catalog = _remote_supplemental_catalogs(
+        source_query=source_query,
+        timeout=timeout,
+        amerihealth_catalog_path=amerihealth_caritas_catalog_path,
+        amerihealth_catalog_url=amerihealth_caritas_catalog_url,
+        contra_costa_catalog_path=contra_costa_catalog_path,
+        contra_costa_catalog_url=contra_costa_catalog_url,
+        cms_catalog_path=cms_sma_endpoint_directory_path,
+        cms_catalog_url=cms_sma_endpoint_directory_url,
+    )
+    supplemental_rows.extend(remote_rows)
+    metrics_by_name["catalogs"].update(remote_metrics_by_catalog)
     catalog_rows = _health_partners_plans_seed_rows(source_query=source_query)
     supplemental_rows.extend(catalog_rows)
     metrics_by_name["catalogs"]["health_partners_plans"] = {
@@ -19153,8 +19620,10 @@ def _seed_rows_from_supplemental_catalogs(
     return supplemental_rows, metrics_by_name
 
 
-def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = None) -> list[dict[str, Any]]:
-    """Load normalized Provider Directory seed rows from a retest report."""
+def _read_provider_directory_retest_results(
+    path: Path,
+) -> tuple[Any, list[Any]]:
+    """Read and validate the outer shape of a retest report."""
     try:
         retest_document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -19166,6 +19635,14 @@ def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = Non
     )
     if not isinstance(retest_results, list):
         raise RuntimeError(f"Provider Directory retest results at {path} must be a JSON object/list with results.")
+    return retest_document, retest_results
+
+
+def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = None) -> list[dict[str, Any]]:
+    """Load normalized Provider Directory seed rows from a retest report."""
+    retest_document, retest_results = (
+        _read_provider_directory_retest_results(path)
+    )
     seed_rows: list[dict[str, Any]] = []
     allowed_classifications = {"valid", "valid_non_fhir", "auth_required"}
     for index, result_record in enumerate(retest_results):
@@ -19273,9 +19750,9 @@ def _dedupe_source_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any
             _merge_skipped_source_row_metadata(rows_by_source_id[source_id], source_row_by_field)
             continue
         if is_retest and (source_key in seen_source_keys or org_base_key in seen_org_base_keys):
-            retained = rows_by_source_key.get(source_key) or rows_by_org_base_key.get(org_base_key)
-            if retained is not None:
-                _merge_skipped_source_row_metadata(retained, source_row_by_field)
+            # The duplicate-key guard guarantees one retained row.
+            retained = rows_by_source_key.get(source_key) or rows_by_org_base_key[org_base_key]
+            _merge_skipped_source_row_metadata(retained, source_row_by_field)
             continue
         if source_id:
             seen_source_ids.add(source_id)
@@ -20471,6 +20948,40 @@ async def _probe_alohr_graphql_connector(
     )
 
 
+async def _probe_uhc_official_file_connector(
+    source_record: dict[str, Any],
+    *,
+    timeout: int,
+    run_id: str | None,
+) -> tuple[dict[str, Any], None]:
+    """Probe the official catalog transport without inventing FHIR metadata."""
+
+    started = time.monotonic()
+    catalog = await asyncio.wait_for(
+        refresh_uhc_provider_file_catalog(),
+        timeout=max(timeout, 30),
+    )
+    catalog_set_sha256 = _clean_text(catalog.get("catalog_set_sha256"))
+    file_count = int(catalog.get("catalog_file_count") or 0)
+    is_valid = bool(catalog_set_sha256 and file_count > 0)
+    return (
+        {
+            "status": "valid" if is_valid else "catalog_error",
+            "http_status": 200 if is_valid else None,
+            "response_time_ms": int((time.monotonic() - started) * 1000),
+            "url": UHC_PROVIDER_FILE_CATALOG_BASE,
+            "api_base": UHC_PROVIDER_FILE_CATALOG_BASE,
+            "error": None if is_valid else "official provider-file catalog is empty",
+            "run_id": run_id,
+            "credential": None,
+            "catalog_set_sha256": catalog_set_sha256,
+            "catalog_file_count": file_count,
+            "transport": "official_provider_files",
+        },
+        None,
+    )
+
+
 def _credential_probe_short_circuit(
     source_record: dict[str, Any],
     metadata_urls: list[tuple[str, str]],
@@ -20509,6 +21020,12 @@ def _credential_probe_short_circuit(
 
 async def _probe_source(source_record: dict[str, Any], *, timeout: int, run_id: str | None) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Probe the source's actual acquisition transport and return normalized status."""
+    if _uses_uhc_official_file_connector(source_record):
+        return await _probe_uhc_official_file_connector(
+            source_record,
+            timeout=timeout,
+            run_id=run_id,
+        )
     if _uses_alohr_graphql_connector(source_record):
         return await _probe_alohr_graphql_connector(source_record, timeout=timeout, run_id=run_id)
     metadata_urls = _candidate_metadata_urls(source_record)
@@ -20550,6 +21067,8 @@ async def _probe_source(source_record: dict[str, Any], *, timeout: int, run_id: 
 
 
 def _source_probe_hard_timeout_seconds(source: dict[str, Any], *, timeout: int) -> int:
+    if _uses_uhc_official_file_connector(source):
+        return max(timeout + 1, 35)
     candidate_count = max(1, len(_candidate_metadata_urls(source)))
     request_count = candidate_count * 2
     env_value = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PROBE_HARD_TIMEOUT")
@@ -20714,7 +21233,10 @@ async def _run_source_probe_batch(
                 )
                 if (
                     probe_map["status"] == "valid"
-                    and _uses_alohr_graphql_connector(source_row)
+                    and (
+                        _uses_alohr_graphql_connector(source_row)
+                        or _uses_uhc_official_file_connector(source_row)
+                    )
                 ):
                     probe_counts_by_name["valid"] += 1
                     valid_source_ids.add(source_row["source_id"])
@@ -22522,6 +23044,25 @@ async def _bulk_checkpoint_runtime_probe(
     await _bulk_cancel_probe(cancel_ctx, cancel_task, deadline_at)
 
 
+def _bulk_export_poll_timeout(
+    source_record: Mapping[str, Any],
+    resource_type: str,
+    max_polls: int,
+    status_url: str,
+) -> tuple[None, str, int]:
+    """Log and return the terminal Bulk Data poll-timeout result."""
+    final_poll_count = max(1, max_polls)
+    _bulk_export_log(
+        "poll_timeout",
+        source_id=source_record.get("source_id"),
+        resource=resource_type,
+        polls=final_poll_count,
+        max_polls=max_polls,
+        status_url=_bulk_capability_log_identity(status_url),
+    )
+    return None, "bulk_export_timeout", final_poll_count
+
+
 async def _bulk_export_poll_outputs(
     session: aiohttp.ClientSession,
     source_record: dict[str, Any],
@@ -22553,13 +23094,8 @@ async def _bulk_export_poll_outputs(
             return None, error, poll
         if status_code == 202:
             await _bulk_export_sleep_after_poll_wait(
-                source_record,
-                resource_type,
-                poll,
-                max_polls,
-                headers,
-                poll_seconds,
-                status_url,
+                source_record, resource_type, poll, max_polls,
+                headers, poll_seconds, status_url,
             )
             if cancel_probe is not None:
                 await cancel_probe()
@@ -22579,15 +23115,12 @@ async def _bulk_export_poll_outputs(
             status_code,
         )
         return None, f"bulk_export_status_http_{status_code}", poll
-    _bulk_export_log(
-        "poll_timeout",
-        source_id=source_record.get("source_id"),
-        resource=resource_type,
-        polls=max(1, max_polls),
-        max_polls=max_polls,
-        status_url=_bulk_capability_log_identity(status_url),
+    return _bulk_export_poll_timeout(
+        source_record,
+        resource_type,
+        max_polls,
+        status_url,
     )
-    return None, "bulk_export_timeout", max(1, max_polls)
 
 
 def _bulk_export_pending_poll_times(
@@ -25353,6 +25886,28 @@ async def _resume_checkpointed_bulk_outputs(
     )
 
 
+async def _prepare_checkpointed_output_validators(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+    options: BulkExportStreamOptions,
+    output_checkpoints: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Prepare resumable range validators when that mode is enabled."""
+    if not options.range_resume_enabled:
+        return output_checkpoints, None
+    return await _prepare_bulk_output_validators(
+        session,
+        source_record,
+        identity,
+        manifest,
+        output_checkpoints,
+        timeout=options.timeout,
+        ownership_probe=options.ownership_probe,
+    )
+
+
 async def _stream_checkpointed_bulk_outputs(
     session: aiohttp.ClientSession,
     source_record: dict[str, Any],
@@ -25375,23 +25930,19 @@ async def _stream_checkpointed_bulk_outputs(
             output_checkpoints,
             error=checkpoint_error,
         )
-    if options.range_resume_enabled:
-        output_checkpoints, validator_error = await _prepare_bulk_output_validators(
-            session,
-            source_record,
-            identity,
-            manifest,
-            output_checkpoints,
-            timeout=options.timeout,
-            ownership_probe=options.ownership_probe,
+    output_checkpoints, validator_error = (
+        await _prepare_checkpointed_output_validators(
+            session, source_record, identity, manifest,
+            options, output_checkpoints,
         )
-        if validator_error:
-            return _checkpointed_bulk_stream_result(
-                options,
-                BulkExportStreamState(),
-                output_checkpoints,
-                error=validator_error,
-            )
+    )
+    if validator_error:
+        return _checkpointed_bulk_stream_result(
+            options,
+            BulkExportStreamState(),
+            output_checkpoints,
+            error=validator_error,
+        )
     stream_state, output_error = await _resume_checkpointed_bulk_outputs(
         session,
         source_record,
@@ -25412,11 +25963,7 @@ async def _stream_checkpointed_bulk_outputs(
         )
     output_checkpoints = await _load_bulk_output_checkpoints(identity.checkpoint_id)
     return await _finalize_checkpointed_bulk_outputs(
-        identity,
-        manifest,
-        options,
-        stream_state,
-        output_checkpoints,
+        identity, manifest, options, stream_state, output_checkpoints,
     )
 
 
@@ -25657,6 +26204,21 @@ async def _load_active_bulk_checkpoint(
     return checkpoint, initial_status_payload, None
 
 
+def _bulk_manifest_failure_result(
+    model: type,
+    checkpoint: Mapping[str, Any],
+    polls: int,
+    manifest_error: str | None,
+) -> ResourceFetchResult:
+    """Build the terminal fetch result for an unavailable manifest."""
+    return _checkpointed_bulk_fetch_result(
+        model,
+        rows_fetched=max(0, int(checkpoint.get("rows_written") or 0)),
+        polls=polls,
+        error=manifest_error or "bulk_export_manifest_unavailable",
+    )
+
+
 async def _fetch_owned_checkpointed_bulk_resource_rows(
     source_record: dict[str, Any], identity: BulkExportCheckpointIdentity,
     model: type, fetch_options: BulkExportFetchOptions,
@@ -25686,30 +26248,19 @@ async def _fetch_owned_checkpointed_bulk_resource_rows(
             return None
         await runtime_probe()
         manifest, manifest_error, polls = await _checkpointed_bulk_export_manifest(
-            session,
-            source_record,
-            identity,
-            checkpoint,
+            session, source_record, identity, checkpoint,
             initial_status_payload=initial_status_payload,
             timeout=fetch_options.timeout,
             max_pending_seconds=fetch_options.bulk_export_max_pending_seconds,
             runtime_probe=runtime_probe,
         )
         if manifest_error or manifest is None:
-            return _checkpointed_bulk_fetch_result(
-                model,
-                rows_fetched=max(0, int(checkpoint.get("rows_written") or 0)),
-                polls=polls,
-                error=manifest_error or "bulk_export_manifest_unavailable",
+            return _bulk_manifest_failure_result(
+                model, checkpoint, polls, manifest_error
             )
         stream_options, configuration_result = await _configured_bulk_stream_options(
-            identity,
-            model,
-            fetch_options,
-            polls,
-            runtime_probe,
-            source_record,
-            checkpoint,
+            identity, model, fetch_options, polls, runtime_probe,
+            source_record, checkpoint,
         )
         if configuration_result is not None:
             return configuration_result
@@ -27810,13 +28361,15 @@ def _partition_fingerprint_rows(
 
 async def _upsert_dataset_resource_rows_on_connection(
     connection: Any,
-    rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    resource_rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    persist_content_proof: bool = False,
 ) -> None:
-    if not rows:
+    if not resource_rows:
         return
     table = ProviderDirectoryDatasetResource.__table__
     primary_keys = ["dataset_id", "resource_type", "resource_id"]
-    row_list = list(rows)
+    row_list = list(resource_rows)
     await _lock_mutable_endpoint_dataset_resource_parents(
         connection,
         _endpoint_dataset_resource_parent_ids(row_list),
@@ -27834,6 +28387,31 @@ async def _upsert_dataset_resource_rows_on_connection(
             },
         )
         await connection.status(statement)
+    if not persist_content_proof:
+        return
+    proof_rows_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for dataset_resource_row in row_list:
+        resource_type = (
+            _clean_text(dataset_resource_row.get("resource_type")) or ""
+        )
+        dataset_id = (
+            _clean_text(dataset_resource_row.get("dataset_id")) or ""
+        )
+        if dataset_id and not resource_type.startswith("LU:"):
+            proof_rows_by_dataset.setdefault(dataset_id, []).append(
+                dataset_resource_row
+            )
+    if not proof_rows_by_dataset:
+        raise RuntimeError(
+            "provider_directory_dataset_resource_proof_rows_missing"
+        )
+    for dataset_id, proof_rows in sorted(proof_rows_by_dataset.items()):
+        await persist_dataset_proof_shard(
+            connection,
+            _schema(),
+            proof_rows,
+            dataset_id=dataset_id,
+        )
 
 
 async def _store_partition_pass_proof(
@@ -28690,6 +29268,7 @@ async def _persist_partition_pass(
                 await _upsert_dataset_resource_rows_on_connection(
                     connection,
                     candidate_stage.rows,
+                    persist_content_proof=True,
                 )
             await _store_partition_pass_proof(
                 state.context,
@@ -29311,8 +29890,8 @@ def _caresource_proof_failure(proof_by_field: dict[str, Any]) -> str | None:
         return "duplicate_resource_ids"
     if rows_processed != pre_count:
         return "processed_count_mismatch"
-    if unique_candidate_rows != pre_count:
-        return "candidate_count_mismatch"
+    # The equality checks above also prove the candidate count.
+    # No independent candidate-count branch remains reachable here.
     return None
 
 
@@ -30510,6 +31089,86 @@ def _reference_resource_key(reference: str | None, expected_type: str) -> tuple[
     return None
 
 
+def _absolute_linked_reference_url(reference: str | None) -> str | None:
+    cleaned_reference = _clean_text(reference)
+    if not cleaned_reference:
+        return None
+    parsed_reference = urllib.parse.urlsplit(cleaned_reference)
+    if not (parsed_reference.scheme and parsed_reference.netloc):
+        return None
+    return urllib.parse.urlunsplit(
+        (
+            parsed_reference.scheme,
+            parsed_reference.netloc,
+            parsed_reference.path,
+            "",
+            "",
+        )
+    )
+
+
+def _linked_resource_endpoint(
+    source_record: Mapping[str, Any],
+    resource_type: str,
+    reference_field: str | None,
+) -> str | None:
+    if resource_type == "Organization" and reference_field == "network_refs":
+        return _clean_text(source_record.get("endpoint_network"))
+    endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
+    return (
+        _clean_text(source_record.get(endpoint_field))
+        if endpoint_field
+        else None
+    )
+
+
+def _linked_endpoint_candidate_urls(
+    endpoint: str | None,
+    api_base: str,
+    resource_id: str,
+) -> list[str]:
+    if not endpoint or _is_placeholder_url(endpoint):
+        return []
+    endpoint_url = endpoint
+    parsed_endpoint = urllib.parse.urlsplit(endpoint)
+    if not (parsed_endpoint.scheme and parsed_endpoint.netloc):
+        endpoint_url = (
+            urllib.parse.urljoin(api_base.rstrip("/") + "/", endpoint)
+            if api_base
+            else ""
+        )
+    if not endpoint_url:
+        return []
+    endpoint_with_count = _url_with_count(endpoint_url, 1)
+    parsed_endpoint = urllib.parse.urlsplit(endpoint_with_count)
+    endpoint_query = urllib.parse.parse_qsl(
+        parsed_endpoint.query,
+        keep_blank_values=True,
+    )
+    if not any(key == "_id" for key, _value in endpoint_query):
+        endpoint_query.append(("_id", resource_id))
+    search_url = urllib.parse.urlunsplit(
+        (
+            parsed_endpoint.scheme,
+            parsed_endpoint.netloc,
+            parsed_endpoint.path,
+            urllib.parse.urlencode(endpoint_query, doseq=True),
+            parsed_endpoint.fragment,
+        )
+    )
+    path_base = urllib.parse.urlunsplit(
+        (
+            parsed_endpoint.scheme,
+            parsed_endpoint.netloc,
+            parsed_endpoint.path.rstrip("/") + "/",
+            "",
+            "",
+        )
+    )
+    encoded_id = urllib.parse.quote(resource_id, safe="")
+    return [search_url, urllib.parse.urljoin(path_base, encoded_id)]
+
+
 def _linked_resource_candidate_urls(
     source_record: dict[str, Any],
     resource_type: str,
@@ -30518,68 +31177,32 @@ def _linked_resource_candidate_urls(
     reference: str | None = None,
     reference_field: str | None = None,
 ) -> list[str]:
-    """Run the linked resource candidate urls step within provider-directory ingestion."""
-    urls: list[str] = []
-    reference = _clean_text(reference)
-    if reference:
-        parsed_ref = urllib.parse.urlsplit(reference)
-        if parsed_ref.scheme and parsed_ref.netloc:
-            urls.append(urllib.parse.urlunsplit((parsed_ref.scheme, parsed_ref.netloc, parsed_ref.path, "", "")))
+    """Build ordered, unique URLs for one linked resource."""
+    candidate_urls: list[str] = []
+    absolute_reference = _absolute_linked_reference_url(reference)
+    if absolute_reference:
+        candidate_urls.append(absolute_reference)
     api_base = _canonical_base(source_record.get("api_base"))
-    endpoint = None
-    if resource_type == "Organization" and reference_field == "network_refs":
-        endpoint = _clean_text(source_record.get("endpoint_network"))
-    if not endpoint:
-        endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
-        endpoint = (
-            _clean_text(source_record.get(endpoint_field))
-            if endpoint_field
-            else None
+    candidate_urls.extend(
+        _linked_endpoint_candidate_urls(
+            _linked_resource_endpoint(
+                source_record,
+                resource_type,
+                reference_field,
+            ),
+            api_base,
+            resource_id,
         )
-    if endpoint and not _is_placeholder_url(endpoint):
-        encoded_id = urllib.parse.quote(resource_id, safe="")
-        parsed_endpoint = urllib.parse.urlsplit(endpoint)
-        endpoint_url = endpoint if parsed_endpoint.scheme and parsed_endpoint.netloc else None
-        if not endpoint_url and api_base:
-            endpoint_url = urllib.parse.urljoin(api_base.rstrip("/") + "/", endpoint)
-        if endpoint_url:
-            endpoint_with_count = _url_with_count(endpoint_url, 1)
-            parsed_endpoint = urllib.parse.urlsplit(endpoint_with_count)
-            endpoint_query = urllib.parse.parse_qsl(parsed_endpoint.query, keep_blank_values=True)
-            if not any(key == "_id" for key, _value in endpoint_query):
-                endpoint_query.append(("_id", resource_id))
-            urls.append(
-                urllib.parse.urlunsplit(
-                    (
-                        parsed_endpoint.scheme,
-                        parsed_endpoint.netloc,
-                        parsed_endpoint.path,
-                        urllib.parse.urlencode(endpoint_query, doseq=True),
-                        parsed_endpoint.fragment,
-                    )
-                )
-            )
-            endpoint_path_base = urllib.parse.urlunsplit(
-                (
-                    parsed_endpoint.scheme,
-                    parsed_endpoint.netloc,
-                    parsed_endpoint.path.rstrip("/") + "/",
-                    "",
-                    "",
-                )
-            )
-            urls.append(urllib.parse.urljoin(endpoint_path_base, encoded_id))
+    )
     if api_base:
         encoded_id = urllib.parse.quote(resource_id, safe="")
-        urls.append(f"{api_base}/{resource_type}/{encoded_id}")
-        urls.append(f"{api_base}/{resource_type}?_id={encoded_id}&_count=1")
-    deduped_urls: list[str] = []
-    seen_urls: set[str] = set()
-    for url in urls:
-        if url not in seen_urls:
-            deduped_urls.append(url)
-            seen_urls.add(url)
-    return deduped_urls
+        candidate_urls.extend(
+            (
+                f"{api_base}/{resource_type}/{encoded_id}",
+                f"{api_base}/{resource_type}?_id={encoded_id}&_count=1",
+            )
+        )
+    return list(dict.fromkeys(candidate_urls))
 
 
 def _row_reference_values(row: dict[str, Any], fields: tuple[str, ...]) -> list[str]:
@@ -31923,6 +32546,45 @@ async def _update_source_resource_import_metadata(
         )
 
 
+async def _upsert_canonical_resource_edges(
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    *,
+    canonical_api_base: str,
+    source_ids: list[str],
+    run_id: str | None,
+    track_seen: bool,
+    store_payload: bool,
+) -> None:
+    """Persist canonical resources and their source edges."""
+    canonical_rows = _canonical_resource_rows(
+        model,
+        resource_rows,
+        canonical_api_base=canonical_api_base,
+        run_id=run_id,
+        store_payload=store_payload,
+    )
+    if canonical_rows:
+        await _upsert_rows(
+            ProviderDirectoryCanonicalResource,
+            canonical_rows,
+            skip_unchanged=track_seen and bool(run_id),
+        )
+    edge_rows = _source_resource_edge_rows(
+        model,
+        resource_rows,
+        canonical_api_base=canonical_api_base,
+        source_ids=source_ids,
+        run_id=run_id,
+    )
+    if edge_rows:
+        await _upsert_rows(
+            ProviderDirectorySourceResource,
+            edge_rows,
+            skip_unchanged=track_seen and bool(run_id),
+        )
+
+
 async def _upsert_resource_rows(
     model: type,
     resource_rows: list[dict[str, Any]],
@@ -31934,6 +32596,8 @@ async def _upsert_resource_rows(
     source_ids: list[str] | None = None,
     dataset_id: str | None = None,
 ) -> int:
+    """Persist one FHIR batch with its durable dataset proof shard."""
+
     if not resource_rows:
         return 0
     if model is ProviderDirectoryLocation and _has_missing_location_contact_fields(
@@ -31946,40 +32610,90 @@ async def _upsert_resource_rows(
         dataset_id=dataset_id,
     )
     if dataset_rows:
-        await _upsert_rows(ProviderDirectoryDatasetResource, dataset_rows)
-    if canonical_api_base and source_ids:
-        canonical_rows = _canonical_resource_rows(
-            model,
-            resource_rows,
-            canonical_api_base=canonical_api_base,
-            run_id=run_id,
-            store_payload=not bool(dataset_id),
-        )
-        if canonical_rows:
+        assert dataset_id is not None
+        async with db.transaction():
             await _upsert_rows(
-                ProviderDirectoryCanonicalResource,
-                canonical_rows,
-                skip_unchanged=track_seen and bool(run_id),
+                ProviderDirectoryDatasetResource,
+                dataset_rows,
             )
-        edge_rows = _source_resource_edge_rows(
+            await persist_dataset_proof_shard(
+                db,
+                _schema(),
+                dataset_rows,
+                dataset_id=dataset_id,
+            )
+    if canonical_api_base and source_ids:
+        await _upsert_canonical_resource_edges(
             model,
             resource_rows,
             canonical_api_base=canonical_api_base,
             source_ids=source_ids,
             run_id=run_id,
+            track_seen=track_seen,
+            store_payload=not bool(dataset_id),
         )
-        if edge_rows:
-            await _upsert_rows(
-                ProviderDirectorySourceResource,
-                edge_rows,
-                skip_unchanged=track_seen and bool(run_id),
-            )
     if track_seen:
         await _mark_resource_rows_seen(model, resource_rows, run_id, seen_table=seen_table)
     return await _upsert_rows(
         model,
         resource_rows,
         skip_unchanged=track_seen and bool(run_id),
+    )
+
+
+async def _delete_stale_rows_with_seen_table(
+    model: type,
+    source_id: str,
+    run_id: str,
+    resource_type: str,
+    seen_table: str | None,
+) -> int:
+    seen_ref = _qt(
+        _schema(),
+        seen_table or PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE,
+    )
+    run_filter = (
+        "AND seen.run_id = CAST(:run_id AS varchar)"
+        if not seen_table
+        else ""
+    )
+    await db.status(
+        f"""
+        DELETE FROM {_qt(_schema(), ProviderDirectorySourceResource.__tablename__)} AS edge
+         WHERE edge.source_id = :source_id
+           AND edge.resource_type = :resource_type
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {seen_ref} AS seen
+                 WHERE seen.resource_type = :resource_type
+                   {run_filter}
+                   AND seen.source_id = edge.source_id
+                   AND seen.resource_id = edge.resource_id
+           );
+        """,
+        source_id=source_id,
+        run_id=run_id,
+        resource_type=resource_type,
+    )
+    return int(
+        await db.status(
+            f"""
+            DELETE FROM {_qt(_schema(), model.__tablename__)} AS resource
+             WHERE resource.source_id = :source_id
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {seen_ref} AS seen
+                     WHERE seen.resource_type = :resource_type
+                       {run_filter}
+                       AND seen.source_id = resource.source_id
+                       AND seen.resource_id = resource.resource_id
+               );
+            """,
+            source_id=source_id,
+            run_id=run_id,
+            resource_type=resource_type,
+        )
+        or 0
     )
 
 
@@ -31995,48 +32709,14 @@ async def _delete_stale_resource_rows(
     if not run_id:
         return 0
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
-    if use_seen_table or seen_table:
-        if resource_type:
-            seen_ref = _qt(_schema(), seen_table or PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
-            run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if not seen_table else ""
-            await db.status(
-                f"""
-                DELETE FROM {_qt(_schema(), ProviderDirectorySourceResource.__tablename__)} AS edge
-                 WHERE edge.source_id = :source_id
-                   AND edge.resource_type = :resource_type
-                   AND NOT EXISTS (
-                        SELECT 1
-                          FROM {seen_ref} AS seen
-                         WHERE seen.resource_type = :resource_type
-                           {run_filter}
-                           AND seen.source_id = edge.source_id
-                           AND seen.resource_id = edge.resource_id
-                   );
-                """,
-                source_id=source_id,
-                run_id=run_id,
-                resource_type=resource_type,
-            )
-            return int(
-                await db.status(
-                    f"""
-                    DELETE FROM {_qt(_schema(), model.__tablename__)} AS resource
-                     WHERE resource.source_id = :source_id
-                       AND NOT EXISTS (
-                            SELECT 1
-                              FROM {seen_ref} AS seen
-                             WHERE seen.resource_type = :resource_type
-                               {run_filter}
-                               AND seen.source_id = resource.source_id
-                               AND seen.resource_id = resource.resource_id
-                       );
-                    """,
-                    source_id=source_id,
-                    run_id=run_id,
-                    resource_type=resource_type,
-                )
-                or 0
-            )
+    if (use_seen_table or seen_table) and resource_type:
+        return await _delete_stale_rows_with_seen_table(
+            model,
+            source_id,
+            run_id,
+            resource_type,
+            seen_table,
+        )
     if resource_type:
         await db.status(
             f"""
@@ -32454,6 +33134,25 @@ def _alohr_graphql_acquisition_contract(
     }
 
 
+def _uses_uhc_official_file_connector(source: Mapping[str, Any]) -> bool:
+    """Return whether one source is the exact official-file transport."""
+
+    metadata = _json_object(source.get("metadata_json"))
+    return bool(
+        _clean_text(source.get("source_id")) == UHC_RETAINED_SOURCE_ID
+        and _canonical_base(
+            source.get("canonical_api_base") or source.get("api_base")
+        )
+        == UHC_PROVIDER_FILE_CATALOG_BASE
+        and metadata.get("provider_directory_transport")
+        == "official_provider_files"
+        and metadata.get("provider_directory_adapter_id")
+        == UHC_PROVIDER_FILE_ADAPTER_ID
+        and metadata.get("provider_directory_adapter_contract")
+        == UHC_PROVIDER_FILE_ADAPTER_CONTRACT
+    )
+
+
 def _resource_endpoint_signature(source: dict[str, Any]) -> tuple[tuple[str, str], ...]:
     signature_items = tuple(
         (field, _clean_text(source.get(field)) or "")
@@ -32486,30 +33185,10 @@ def _identity_hash(value: Any) -> str:
     return hashlib.sha256(_stable_identity_json(value).encode("utf-8")).hexdigest()
 
 
-def _provider_directory_api_endpoint_row(
-    source_record: dict[str, Any],
-    *,
-    observed_at: datetime.datetime | None = None,
-) -> dict[str, Any] | None:
-    try:
-        api_base, credential_json, endpoint_signature_items = (
-            _resource_import_group_key(source_record)
-        )
-    except (TypeError, UnicodeError, ValueError):
-        return None
-    if not api_base or not endpoint_signature_items:
-        return None
-    try:
-        admitted_fields = _admit_provider_directory_endpoint_components(
-            canonical_api_base=api_base,
-            credential_descriptor_json=json.loads(credential_json or "{}"),
-            endpoint_signature_json=dict(endpoint_signature_items),
-        )
-    except (ProviderDirectoryEndpointIdentityError, TypeError, ValueError):
-        return None
-    endpoint_signature_map = admitted_fields["endpoint_signature_json"]
-    now = observed_at or _now()
-    connector_contract_json = endpoint_signature_map.get(
+def _provider_directory_endpoint_metadata(
+    endpoint_signature_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    connector_contract_json = endpoint_signature_by_field.get(
         "connector_acquisition_contract"
     )
     connector_contract = (
@@ -32528,6 +33207,36 @@ def _provider_directory_api_endpoint_row(
         endpoint_metadata_by_field["connector_acquisition_contract"] = (
             connector_contract
         )
+    return endpoint_metadata_by_field
+
+
+def _provider_directory_api_endpoint_row(
+    source_record: dict[str, Any],
+    *,
+    observed_at: datetime.datetime | None = None,
+) -> dict[str, Any] | None:
+    if _uses_uhc_official_file_connector(source_record):
+        return _uhc_official_file_endpoint_row(
+            observed_at=observed_at or _now(),
+        )
+    try:
+        api_base, credential_json, endpoint_signature_items = (
+            _resource_import_group_key(source_record)
+        )
+    except (TypeError, UnicodeError, ValueError):
+        return None
+    if not api_base or not endpoint_signature_items:
+        return None
+    try:
+        admitted_fields = _admit_provider_directory_endpoint_components(
+            canonical_api_base=api_base,
+            credential_descriptor_json=json.loads(credential_json or "{}"),
+            endpoint_signature_json=dict(endpoint_signature_items),
+        )
+    except (ProviderDirectoryEndpointIdentityError, TypeError, ValueError):
+        return None
+    endpoint_signature_by_field = admitted_fields["endpoint_signature_json"]
+    now = observed_at or _now()
     return {
         "endpoint_id": admitted_fields["endpoint_id"],
         "canonical_api_base": admitted_fields["canonical_api_base"],
@@ -32538,10 +33247,12 @@ def _provider_directory_api_endpoint_row(
         "credential_descriptor_json": admitted_fields[
             "credential_descriptor_json"
         ],
-        "endpoint_signature_json": endpoint_signature_map,
+        "endpoint_signature_json": endpoint_signature_by_field,
         "first_seen_at": now,
         "last_seen_at": now,
-        "metadata_json": endpoint_metadata_by_field,
+        "metadata_json": _provider_directory_endpoint_metadata(
+            endpoint_signature_by_field
+        ),
         "created_at": now,
         "updated_at": now,
     }
@@ -33543,6 +34254,56 @@ async def _lock_endpoint_dataset_candidate_admission(
     )
 
 
+async def _reset_new_endpoint_candidate(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    partition_initializations: tuple[
+        LastUpdatedPartitionInitialization,
+        ...,
+    ],
+) -> None:
+    if candidate.reused_from_checkpoint:
+        return
+    await _lock_mutable_endpoint_dataset_resource_parents(
+        connection,
+        [candidate.dataset_id],
+    )
+    await connection.status(
+        f"""
+        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+         USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+         WHERE resource.dataset_id = :dataset_id
+           AND dataset.dataset_id = resource.dataset_id
+           AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
+               :acquisition_root_run_id;
+        """,
+        dataset_id=candidate.dataset_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+    )
+    await delete_dataset_proof_shards(
+        connection,
+        _schema(),
+        candidate.dataset_id,
+    )
+    checkpoint_context = candidate.checkpoint_context
+    if partition_initializations and not isinstance(
+        checkpoint_context,
+        PaginationCheckpointContext,
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_checkpoint_context_missing"
+        )
+    for initialization in partition_initializations:
+        assert isinstance(checkpoint_context, PaginationCheckpointContext)
+        await _reset_pagination_checkpoint(
+            checkpoint_context,
+            initialization.checkpoint_resource_type,
+            initialization.checkpoint_payload,
+            initialization.start_url_hash,
+            database_connection=connection,
+        )
+
+
 async def _ensure_endpoint_dataset_candidate(
     candidate: EndpointDatasetCandidate,
     partition_initializations: tuple[
@@ -33562,43 +34323,11 @@ async def _ensure_endpoint_dataset_candidate(
         )
         metadata = _endpoint_dataset_candidate_metadata(candidate)
         await _upsert_endpoint_dataset_candidate(connection, candidate, metadata)
-        if not candidate.reused_from_checkpoint:
-            await _lock_mutable_endpoint_dataset_resource_parents(
-                connection,
-                [candidate.dataset_id],
-            )
-            await connection.status(
-                f"""
-                DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
-                 USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
-                 WHERE resource.dataset_id = :dataset_id
-                   AND dataset.dataset_id = resource.dataset_id
-                   AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
-                       :acquisition_root_run_id;
-                """,
-                dataset_id=candidate.dataset_id,
-                acquisition_root_run_id=candidate.acquisition_root_run_id,
-            )
-            checkpoint_context = candidate.checkpoint_context
-            if partition_initializations and not isinstance(
-                checkpoint_context,
-                PaginationCheckpointContext,
-            ):
-                raise RuntimeError(
-                    "provider_directory_last_updated_partition_checkpoint_context_missing"
-                )
-            for initialization in partition_initializations:
-                assert isinstance(
-                    checkpoint_context,
-                    PaginationCheckpointContext,
-                )
-                await _reset_pagination_checkpoint(
-                    checkpoint_context,
-                    initialization.checkpoint_resource_type,
-                    initialization.checkpoint_payload,
-                    initialization.start_url_hash,
-                    database_connection=connection,
-                )
+        await _reset_new_endpoint_candidate(
+            connection,
+            candidate,
+            partition_initializations,
+        )
     return candidate
 
 
@@ -33624,6 +34353,11 @@ async def _clear_uncheckpointed_endpoint_dataset_candidate(
             dataset_id=candidate.dataset_id,
             endpoint_id=candidate.endpoint_id,
             acquisition_root_run_id=candidate.acquisition_root_run_id,
+        )
+        await delete_dataset_proof_shards(
+            database_executor,
+            _schema(),
+            candidate.dataset_id,
         )
 
 
@@ -34881,6 +35615,12 @@ async def _clear_checkpoint_dataset_resource_type(
             resource_type=resource_type,
             acquisition_root_run_id=context.acquisition_root_run_id,
         )
+        await delete_dataset_resource_proof_shards(
+            database_executor,
+            _schema(),
+            context.dataset_id,
+            resource_type,
+        )
 
 
 async def _reset_pagination_checkpoint(
@@ -35842,26 +36582,9 @@ async def _finalize_alohr_checkpoints(import_state: AlohrGraphQLImportState) -> 
     await _clear_pagination_checkpoints(context, list(diagnostics_by_resource))
 
 
-async def _import_alohr_graphql_source_group(
-    source_group: list[dict[str, Any]],
-    resource_types: list[str],
+def _alohr_graphql_stream_specs(
     options: AlohrGraphQLImportOptions,
-) -> tuple[
-    list[str],
-    dict[str, dict[str, Any]],
-    dict[str, int],
-    dict[str, int],
-    dict[str, dict[str, Any]],
-    dict[str, int],
-    dict[str, list[str]],
-]:
-    """Import alohr graphql source group into the provider-directory snapshot."""
-    import_state = _initialize_alohr_graphql_import_state(
-        source_group,
-        resource_types,
-        options,
-    )
-
+) -> tuple[AlohrGraphQLStreamSpec, ...]:
     def append_provider(
         resource_rows_by_model: dict[type, list[dict[str, Any]]],
         source_id: str,
@@ -35888,7 +36611,7 @@ async def _import_alohr_graphql_source_group(
             run_id=options.run_id,
         )
 
-    stream_specs = (
+    return (
         AlohrGraphQLStreamSpec(
             ALOHR_PROVIDER_QUERY,
             ALOHR_PROVIDER_GRAPHQL_ROOT,
@@ -35906,6 +36629,28 @@ async def _import_alohr_graphql_source_group(
             ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE,
         ),
     )
+
+
+async def _import_alohr_graphql_source_group(
+    source_group: list[dict[str, Any]],
+    resource_types: list[str],
+    options: AlohrGraphQLImportOptions,
+) -> tuple[
+    list[str],
+    dict[str, dict[str, Any]],
+    dict[str, int],
+    dict[str, int],
+    dict[str, dict[str, Any]],
+    dict[str, int],
+    dict[str, list[str]],
+]:
+    """Import alohr graphql source group into the provider-directory snapshot."""
+    import_state = _initialize_alohr_graphql_import_state(
+        source_group,
+        resource_types,
+        options,
+    )
+    stream_specs = _alohr_graphql_stream_specs(options)
     for stream_spec in stream_specs:
         await _fetch_alohr_graphql_stream(import_state, stream_spec)
     _finalize_alohr_graphql_stats(import_state)
@@ -37159,14 +37904,86 @@ async def _endpoint_dataset_content_hash(
     return content_proof.dataset_hash, content_proof.resource_count
 
 
+async def _acquiring_uhc_metadata(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, Any]:
+    metadata_record = await connection.first(
+        f"""
+        SELECT publication_metadata_json
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND endpoint_id = :endpoint_id
+           AND acquisition_root_run_id IS NOT DISTINCT FROM
+               :acquisition_root_run_id
+           AND status = :acquiring_status
+           AND is_current = false;
+        """,
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+        acquiring_status=ENDPOINT_DATASET_ACQUIRING,
+    )
+    return _json_object(
+        _pagination_checkpoint_row_mapping(metadata_record).get(
+            "publication_metadata_json"
+        )
+    )
+
+
 async def _candidate_endpoint_dataset_content_proof(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> EndpointDatasetContentProof:
-    return await _endpoint_dataset_content_proof(
+    if candidate.source_ids == (UHC_RETAINED_SOURCE_ID,):
+        metadata = await _acquiring_uhc_metadata(connection, candidate)
+        try:
+            uhc_proof = validate_uhc_canonical_content_proof(
+                metadata.get(UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY),
+                dataset_id=candidate.dataset_id,
+                endpoint_id=candidate.endpoint_id,
+                acquisition_root_run_id=(
+                    candidate.acquisition_root_run_id or ""
+                ),
+            )
+        except UhcCanonicalProofError as error:
+            raise RuntimeError(
+                "provider_directory_uhc_canonical_proof_invalid"
+            ) from error
+        if (
+            tuple(sorted(uhc_proof["resource_counts"]))
+            != candidate.selected_resources
+        ):
+            raise RuntimeError(
+                "provider_directory_uhc_canonical_proof_scope_changed"
+            )
+        return EndpointDatasetContentProof(
+            dataset_hash=uhc_proof["dataset_hash"],
+            resource_count=uhc_proof["resource_count"],
+            resource_hashes=dict(uhc_proof["resource_hashes"]),
+            resource_counts=dict(uhc_proof["resource_counts"]),
+        )
+    acquisition_root_run_id = _clean_text(candidate.acquisition_root_run_id)
+    if acquisition_root_run_id is None:
+        raise RuntimeError(
+            "provider_directory_content_proof_acquisition_root_required"
+        )
+    stored_proof = await build_stored_dataset_proof(
         connection,
-        candidate.dataset_id,
-        candidate.selected_resources,
+        _schema(),
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=acquisition_root_run_id,
+        source_ids=candidate.source_ids,
+        selected_resources=candidate.selected_resources,
+    )
+    return EndpointDatasetContentProof(
+        dataset_hash=stored_proof.dataset_hash,
+        resource_count=stored_proof.resource_count,
+        resource_hashes=stored_proof.resource_hashes,
+        resource_counts=stored_proof.resource_counts,
+        source_metrics=stored_proof.source_metrics,
+        proof_metadata=stored_proof.metadata,
     )
 
 
@@ -37319,6 +38136,169 @@ def _build_endpoint_dataset_source_summary(
     )
 
 
+def _assert_uhc_canonical_summary_counts(
+    content_proof: EndpointDatasetContentProof,
+    count_by_field: dict[str, int],
+    intentional_drop_counts: Mapping[str, int],
+) -> None:
+    """Bind retained semantic counters to the six emitted resource families."""
+
+    resource_counts = content_proof.resource_counts
+    exact_field_by_resource_type = {
+        "Practitioner": (
+            "raw_individual_records",
+            "ifp_unpaired_retained_only_individual_records",
+        ),
+        "Organization": (
+            "raw_facility_records",
+            "ifp_unpaired_retained_only_facility_records",
+        ),
+        "Location": (
+            "raw_address_rows",
+            "ifp_unpaired_retained_only_address_rows",
+        ),
+    }
+    if any(
+        resource_counts.get(resource_type, 0)
+        != count_by_field[field_name]
+        - int(intentional_drop_counts.get(drop_key, 0))
+        for resource_type, (
+            field_name,
+            drop_key,
+        ) in exact_field_by_resource_type.items()
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_canonical_resource_counts_inconsistent"
+        )
+    if (
+        resource_counts.get("PractitionerRole", 0)
+        + resource_counts.get("OrganizationAffiliation", 0)
+        != count_by_field["raw_provider_plan_rows"]
+        - int(
+            intentional_drop_counts.get(
+                "ifp_unpaired_retained_only_provider_plan_rows",
+                0,
+            )
+        )
+        or resource_counts.get("InsurancePlan", 0)
+        != (
+            count_by_field["membership_plan_key_count"]
+            + count_by_field["orphan_plan_detail_count"]
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_canonical_relationship_counts_inconsistent"
+        )
+
+
+async def _uhc_candidate_summary_input(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, Any] | None:
+    """Load and validate retained semantic input for one UHC candidate."""
+    metadata_record = await connection.first(
+        f"""
+        SELECT publication_metadata_json
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND endpoint_id = :endpoint_id
+           AND acquisition_root_run_id IS NOT DISTINCT FROM
+               :acquisition_root_run_id;
+        """,
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+    )
+    metadata = _json_object(
+        _pagination_checkpoint_row_mapping(metadata_record).get(
+            "publication_metadata_json"
+        )
+    )
+    raw_summary_input = metadata.get(UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY)
+    if raw_summary_input is None:
+        return None
+    try:
+        summary_input = validate_uhc_summary_input(raw_summary_input)
+    except UhcRetainedDatasetError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_summary_input_invalid"
+        ) from error
+    except UhcCanonicalProofError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_final_content_proof_invalid"
+        ) from error
+    if (
+        candidate.source_ids != (UHC_RETAINED_SOURCE_ID,)
+        or candidate.selected_resources != tuple(
+            sorted(UHC_SUPPORTED_RESOURCES)
+        )
+        or candidate.expected_resources != tuple(sorted(UHC_SUPPORTED_RESOURCES))
+        or summary_input["semantic_contract_id"]
+        != SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_summary_candidate_identity_invalid"
+        )
+    return summary_input
+
+
+async def _uhc_endpoint_dataset_source_summary(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+) -> dict[str, Any] | None:
+    """Build UHC's v2 semantic summary from its durable candidate input."""
+
+    if candidate.source_ids != (UHC_RETAINED_SOURCE_ID,):
+        return None
+    summary_input = await _uhc_candidate_summary_input(
+        connection,
+        candidate,
+    )
+    if summary_input is None:
+        return None
+    count_by_field = dict(summary_input["count_by_field"])
+    intentional_drop_count_by_field = dict(
+        summary_input["count_by_category"]["intentional_drop_counts"]
+    )
+    if intentional_drop_count_by_field and set(
+        intentional_drop_count_by_field
+    ) != set(
+        SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_summary_drop_scope_invalid"
+        )
+    _assert_uhc_canonical_summary_counts(
+        content_proof,
+        count_by_field,
+        intentional_drop_count_by_field,
+    )
+    acquisition_root_run_id = _clean_text(candidate.acquisition_root_run_id)
+    if acquisition_root_run_id is None:
+        raise RuntimeError("provider_directory_uhc_acquisition_root_required")
+    return build_source_summary(
+        binding=ProviderDirectorySourceSummaryBinding(
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=acquisition_root_run_id,
+            dataset_hash=content_proof.dataset_hash,
+        ),
+        source_ids=candidate.source_ids,
+        selected_resources=candidate.selected_resources,
+        count_by_resource=content_proof.resource_counts,
+        hash_by_resource=content_proof.resource_hashes,
+        count_by_field=count_by_field,
+        count_by_category=summary_input["count_by_category"],
+        identity_by_field={
+            "semantic_contract_id": summary_input["semantic_contract_id"],
+            "input_set_sha256": summary_input["input_set_sha256"],
+            "layout_set_sha256": summary_input["layout_set_sha256"],
+            "encoder_digest": summary_input["encoder_digest"],
+        },
+    )
+
+
 async def _endpoint_dataset_source_summary(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -37331,28 +38311,42 @@ async def _endpoint_dataset_source_summary(
     )
     if acquisition_root_run_id is None:
         return None
-    metric_record = await connection.first(
-        _endpoint_dataset_source_summary_metrics_sql(),
-        dataset_id=candidate.dataset_id,
-        summary_resource_types=[
-            "HealthcareService",
-            "Location",
-            "Organization",
-            "Practitioner",
-            "PractitionerRole",
-        ],
-        npi_resource_types=[
-            "HealthcareService",
-            "Organization",
-            "Practitioner",
-            "PractitionerRole",
-        ],
-        normalized_address_resource_types=["Location", "Practitioner"],
+    uhc_summary = await _uhc_endpoint_dataset_source_summary(
+        connection,
+        candidate,
+        content_proof,
     )
+    if uhc_summary is not None:
+        return uhc_summary
+    metric_record = content_proof.source_metrics
+    if metric_record is None:
+        metric_record = _pagination_checkpoint_row_mapping(
+            await connection.first(
+                _endpoint_dataset_source_summary_metrics_sql(),
+                dataset_id=candidate.dataset_id,
+                summary_resource_types=[
+                    "HealthcareService",
+                    "Location",
+                    "Organization",
+                    "Practitioner",
+                    "PractitionerRole",
+                ],
+                npi_resource_types=[
+                    "HealthcareService",
+                    "Organization",
+                    "Practitioner",
+                    "PractitionerRole",
+                ],
+                normalized_address_resource_types=[
+                    "Location",
+                    "Practitioner",
+                ],
+            )
+        )
     count_by_field = _source_summary_counts(
         content_proof,
         relation_proof_by_name,
-        _pagination_checkpoint_row_mapping(metric_record),
+        metric_record,
     )
     return _build_endpoint_dataset_source_summary(
         candidate,
@@ -37976,11 +38970,75 @@ async def _endpoint_dataset_source_summary_metadata(
         content_proof,
         relation_proof_by_name,
     )
-    return (
-        {SOURCE_SUMMARY_METADATA_KEY: source_summary}
-        if source_summary is not None
-        else {}
+    if source_summary is None:
+        return {}
+    metadata = {SOURCE_SUMMARY_METADATA_KEY: source_summary}
+    if (
+        source_summary.get("semantic_contract_id")
+        != SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID
+    ):
+        return metadata
+    return await _validated_uhc_source_summary_metadata(
+        connection,
+        candidate,
+        content_proof,
+        source_summary,
     )
+
+
+async def _validated_uhc_source_summary_metadata(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+    source_summary: dict[str, Any],
+) -> dict[str, Any]:
+    retained_metadata = await _acquiring_uhc_metadata(connection, candidate)
+    try:
+        summary_input = validate_uhc_summary_input(
+            retained_metadata.get(UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY)
+        )
+        canonical_proof = validate_uhc_canonical_content_proof(
+            retained_metadata.get(UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY),
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=(
+                candidate.acquisition_root_run_id or ""
+            ),
+        )
+    except UhcRetainedDatasetError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_validation_lineage_invalid"
+        ) from error
+    except UhcCanonicalProofError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_validation_content_proof_invalid"
+        ) from error
+    expected_publication_identity = _expected_uhc_publication_identity(
+        summary_input,
+        dataset_id=candidate.dataset_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+    )
+    if (
+        retained_metadata.get(UHC_RETAINED_PUBLICATION_METADATA_KEY)
+        != expected_publication_identity
+        or canonical_proof["dataset_hash"] != content_proof.dataset_hash
+        or canonical_proof["resource_count"] != content_proof.resource_count
+        or canonical_proof["resource_hashes"]
+        != content_proof.resource_hashes
+        or canonical_proof["resource_counts"]
+        != content_proof.resource_counts
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_validation_lineage_changed"
+        )
+    return {
+        SOURCE_SUMMARY_METADATA_KEY: source_summary,
+        UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY: summary_input,
+        UHC_RETAINED_PUBLICATION_METADATA_KEY: (
+            expected_publication_identity
+        ),
+        UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY: canonical_proof,
+    }
 
 
 def _dataset_validation_metadata(
@@ -37992,6 +39050,40 @@ def _dataset_validation_metadata(
     verification_metadata: dict[str, Any],
     source_summary_metadata: dict[str, Any],
 ) -> dict[str, Any]:
+    content_proof_metadata_by_key: dict[str, Any] = {}
+    if content_proof.proof_metadata is not None:
+        acquisition_root_run_id = _clean_text(
+            candidate.acquisition_root_run_id
+        )
+        if acquisition_root_run_id is None:
+            raise RuntimeError(
+                "provider_directory_content_proof_acquisition_root_required"
+            )
+        validated_proof = validate_stored_dataset_proof_metadata(
+            content_proof.proof_metadata,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=acquisition_root_run_id,
+            source_ids=candidate.source_ids,
+            selected_resources=candidate.selected_resources,
+        )
+        if (
+            validated_proof["dataset_hash"] != content_proof.dataset_hash
+            or validated_proof["resource_count"]
+            != content_proof.resource_count
+            or validated_proof["resource_hashes"]
+            != content_proof.resource_hashes
+            or validated_proof["resource_counts"]
+            != content_proof.resource_counts
+            or validated_proof["source_metrics"]
+            != content_proof.source_metrics
+        ):
+            raise RuntimeError(
+                "provider_directory_content_proof_metadata_changed"
+            )
+        content_proof_metadata_by_key[
+            PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+        ] = validated_proof
     return _endpoint_dataset_publication_metadata(
         candidate,
         diagnostics,
@@ -38006,6 +39098,7 @@ def _dataset_validation_metadata(
         **relation_proof_by_name,
         **verification_metadata,
         **source_summary_metadata,
+        **content_proof_metadata_by_key,
     )
 
 
@@ -38033,6 +39126,12 @@ async def _store_dataset_validation_state(
     retired_row_count = await _retire_matched_twin_root_baseline_payload(
         connection, candidate, metadata, final_status
     )
+    if content_proof.proof_metadata is not None:
+        await delete_dataset_proof_shards(
+            connection,
+            _schema(),
+            candidate.dataset_id,
+        )
     return (
         previous_dataset_id,
         content_proof,
@@ -38483,6 +39582,25 @@ async def _mark_failed_endpoint_dataset_without_masking(
         )
 
 
+def _is_validated_uhc_official_source_group(
+    source_records: list[dict[str, Any]],
+) -> bool:
+    has_official_source = any(
+        _uses_uhc_official_file_connector(source_record)
+        for source_record in source_records
+    )
+    if not has_official_source:
+        return False
+    if (
+        len(source_records) != 1
+        or not _uses_uhc_official_file_connector(source_records[0])
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_official_file_group_invalid"
+        )
+    return True
+
+
 async def _import_resources(
     source_records: list[dict[str, Any]],
     *,
@@ -38729,6 +39847,31 @@ async def _import_resources(
                     dataset_id=partition_source.get("_endpoint_dataset_id"),
                 ),
             )
+        if _uses_uhc_official_file_connector(partition_source):
+            async with progress_lock:
+                active_group_by_key[group_key]["current_resource"] = (
+                    "Official provider files"
+                )
+                active_group_by_key[group_key]["resource_started_at"] = (
+                    _now().isoformat(timespec="seconds") + "Z"
+                )
+                active_group_by_key[group_key]["resource_started_monotonic"] = (
+                    time.monotonic()
+                )
+            await report_progress(force=True)
+            import_summary = await _import_uhc_official_file_source_group(
+                source_group,
+                resources,
+                ctx=cancel_ctx or {"context": {}},
+                task=cancel_task or {"run_id": run_id},
+                run_id=run_id,
+            )
+            _record_uhc_plan_graph_completion(
+                resource_completion,
+                import_summary[0],
+                import_summary[1],
+            )
+            return import_summary
         if _should_use_uhc_plan_graph(
             partition_source,
             resources,
@@ -39169,21 +40312,19 @@ async def _import_resources(
             candidate: EndpointDatasetCandidate | None = None
             diagnostics_by_resource: dict[str, dict[str, Any]] = {}
             prepared_source_records = source_records
-            checkpoint_guard_context = (
-                _resource_group_pagination_checkpoint_context(
-                    source_records,
-                    run_id=run_id,
-                    retry_of_run_id=retry_of_run_id,
-                    pagination_root_run_id=pagination_root_run_id,
-                    is_checkpointing_enabled=(
-                        is_pagination_checkpointing_enabled
-                    ),
-                )
+            checkpoint_guard_context = _resource_group_pagination_checkpoint_context(
+                source_records,
+                run_id=run_id,
+                retry_of_run_id=retry_of_run_id,
+                pagination_root_run_id=pagination_root_run_id,
+                is_checkpointing_enabled=is_pagination_checkpointing_enabled,
             )
             try:
                 async with _pagination_checkpoint_worker_guard(
                     checkpoint_guard_context
                 ):
+                    if _is_validated_uhc_official_source_group(source_records):
+                        return await import_one_group(source_records)
                     prepared_source_records, candidate = (
                         await _prepare_resource_import_source_group(
                             source_records,
@@ -39191,18 +40332,14 @@ async def _import_resources(
                             run_id=run_id,
                             retry_of_run_id=retry_of_run_id,
                             pagination_root_run_id=pagination_root_run_id,
-                            is_checkpointing_enabled=(
-                                is_pagination_checkpointing_enabled
-                            ),
+                            is_checkpointing_enabled=is_pagination_checkpointing_enabled,
                         )
                     )
                     if _is_finalized_endpoint_dataset_candidate(candidate):
                         assert candidate is not None
-                        return await (
-                            _replay_finalized_candidate_and_clear_checkpoints(
-                                candidate,
-                                resource_completion,
-                            )
+                        return await _replay_finalized_candidate_and_clear_checkpoints(
+                            candidate,
+                            resource_completion,
                         )
                     try:
                         import_summary = await import_one_group(
@@ -39442,6 +40579,1084 @@ def _dataset_rehydration_runtime(
     )
 
 
+def _uhc_official_file_endpoint_row(
+    *,
+    observed_at: datetime.datetime,
+) -> dict[str, Any]:
+    """Build the non-FHIR transport identity for the official file dataset."""
+
+    admitted = _admit_provider_directory_endpoint_components(
+        canonical_api_base=UHC_PROVIDER_FILE_CATALOG_BASE,
+        credential_descriptor_json={},
+        endpoint_signature_json={
+            "transport": "official_provider_files",
+            "adapter_id": UHC_PROVIDER_FILE_ADAPTER_ID,
+            "adapter_contract": UHC_PROVIDER_FILE_ADAPTER_CONTRACT,
+            "resource_types": sorted(UHC_SUPPORTED_RESOURCES),
+        },
+    )
+    return {
+        "endpoint_id": admitted["endpoint_id"],
+        "canonical_api_base": admitted["canonical_api_base"],
+        "credential_descriptor_hash": admitted[
+            "credential_descriptor_hash"
+        ],
+        "endpoint_signature_hash": admitted["endpoint_signature_hash"],
+        "credential_descriptor_json": admitted[
+            "credential_descriptor_json"
+        ],
+        "endpoint_signature_json": admitted["endpoint_signature_json"],
+        "first_seen_at": observed_at,
+        "last_seen_at": observed_at,
+        "metadata_json": {
+            "identity_version": "official-provider-files-v1",
+            "transport": "official_provider_files",
+            "source_entry_id": UHC_PROVIDER_FILE_ENTRY_ID,
+        },
+        "created_at": observed_at,
+        "updated_at": observed_at,
+    }
+
+
+def _uhc_official_file_source_row(
+    endpoint_id: str,
+    *,
+    observed_at: datetime.datetime,
+) -> dict[str, Any]:
+    """Build the distinct corporate source row without FHIR URL semantics."""
+
+    return {
+        "source_id": UHC_RETAINED_SOURCE_ID,
+        "org_name": UHC_PROVIDER_FILE_DISPLAY_NAME,
+        "plan_name": None,
+        "portal_url": UHC_PROVIDER_FILE_PORTAL_BASE,
+        "api_base": UHC_PROVIDER_FILE_CATALOG_BASE,
+        "canonical_api_base": UHC_PROVIDER_FILE_CATALOG_BASE,
+        "endpoint_id": endpoint_id,
+        "requires_registration": False,
+        "requires_api_key": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "compliance_flag": "official_provider_files",
+        "data_quality_flag": "retained_semantic_proof",
+        "seed_source": UHC_PROVIDER_FILE_ENTRY_ID,
+        "seed_source_detail": UHC_PROVIDER_FILE_ADAPTER_CONTRACT,
+        "seed_source_url": UHC_PROVIDER_FILE_CATALOG_BASE,
+        "metadata_json": {
+            "provider_directory_source_kind": "official_provider_files",
+            "provider_directory_transport": "official_provider_files",
+            "provider_directory_source_entry_id": UHC_PROVIDER_FILE_ENTRY_ID,
+            "provider_directory_adapter_id": UHC_PROVIDER_FILE_ADAPTER_ID,
+            "provider_directory_adapter_contract": (
+                UHC_PROVIDER_FILE_ADAPTER_CONTRACT
+            ),
+            "provider_directory_catalog_base": UHC_PROVIDER_FILE_CATALOG_BASE,
+            "provider_directory_supported_resources": sorted(
+                UHC_SUPPORTED_RESOURCES
+            ),
+            "provider_directory_acquisition_enabled": True,
+            "provider_directory_profile_eligible": True,
+            "provider_directory_fhir_endpoint": False,
+        },
+        "created_at": observed_at,
+        "updated_at": observed_at,
+    }
+
+
+def _should_add_uhc_official_file_source(
+    *,
+    requested_source_ids: list[str],
+    source_query: str | None,
+    test_mode: bool,
+    limit: int | None,
+) -> bool:
+    """Include UHC in normal catalog resolution when its scope matches."""
+
+    if requested_source_ids:
+        return UHC_RETAINED_SOURCE_ID in requested_source_ids
+    if source_query:
+        normalized_query = source_query.strip().casefold()
+        searchable_values = (
+            UHC_RETAINED_SOURCE_ID,
+            UHC_PROVIDER_FILE_DISPLAY_NAME,
+            UHC_PROVIDER_FILE_ENTRY_ID,
+            "uhc",
+            "optum",
+        )
+        return any(
+            normalized_query in value.casefold()
+            for value in searchable_values
+        )
+    return not test_mode and limit is None
+
+
+def _add_uhc_official_file_source(
+    source_rows: list[dict[str, Any]],
+    *,
+    requested_source_ids: list[str],
+    source_query: str | None,
+    test_mode: bool,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    """Add the official-file adapter to the ordinary source catalog."""
+
+    if not _should_add_uhc_official_file_source(
+        requested_source_ids=requested_source_ids,
+        source_query=source_query,
+        test_mode=test_mode,
+        limit=limit,
+    ):
+        return source_rows
+    observed_at = _now()
+    endpoint = _uhc_official_file_endpoint_row(observed_at=observed_at)
+    return _dedupe_source_rows(
+        [
+            *source_rows,
+            _uhc_official_file_source_row(
+                str(endpoint["endpoint_id"]),
+                observed_at=observed_at,
+            ),
+        ]
+    )
+
+
+def _uhc_retained_candidate_id(
+    endpoint_id: str,
+    acquisition_root_run_id: str,
+) -> str:
+    return _endpoint_dataset_candidate_id(
+        endpoint_id,
+        tuple(sorted(UHC_SUPPORTED_RESOURCES)),
+        acquisition_root_run_id,
+    )
+
+
+def _expected_uhc_publication_identity(
+    summary_input: dict[str, Any],
+    *,
+    dataset_id: str,
+    acquisition_root_run_id: str,
+) -> dict[str, Any]:
+    return uhc_publication_identity(
+        summary_input,
+        dataset_id=dataset_id,
+        acquisition_root_run_id=acquisition_root_run_id,
+    )
+
+
+def _assert_existing_uhc_candidate_identity(
+    state: dict[str, Any],
+    expected_publication_identity: dict[str, Any],
+    summary_input: dict[str, Any],
+) -> None:
+    metadata = _json_object(state.get("publication_metadata_json"))
+    raw_identity = metadata.get(UHC_RETAINED_PUBLICATION_METADATA_KEY)
+    raw_summary_input = metadata.get(UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY)
+    if raw_identity is None and not int(state.get("resource_count") or 0):
+        return
+    try:
+        persisted_summary_input = validate_uhc_summary_input(raw_summary_input)
+    except UhcRetainedDatasetError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_retained_candidate_lineage_invalid"
+        ) from error
+    if (
+        raw_identity != expected_publication_identity
+        or persisted_summary_input != summary_input
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_retained_candidate_lineage_changed"
+        )
+
+
+async def _uhc_candidate_from_state(
+    endpoint_id: str,
+    dataset_id: str,
+    run_id: str,
+    state: Mapping[str, Any],
+) -> EndpointDatasetCandidate:
+    """Build a candidate value from its current durable state."""
+    selected_resources = tuple(sorted(UHC_SUPPORTED_RESOURCES))
+    status = _clean_text(state.get("status"))
+    is_current = state.get("is_current") is True
+    metadata = _json_object(state.get("publication_metadata_json"))
+    return EndpointDatasetCandidate(
+        endpoint_id=endpoint_id,
+        dataset_id=dataset_id,
+        acquisition_root_run_id=run_id,
+        source_ids=(UHC_RETAINED_SOURCE_ID,),
+        selected_resources=selected_resources,
+        import_run_id=run_id,
+        previous_dataset_id=(
+            _clean_text(state.get("previous_dataset_id"))
+            if state
+            else await _current_endpoint_dataset_id(
+                endpoint_id,
+                exclude_dataset_id=dataset_id,
+            )
+        ),
+        expected_resources=selected_resources,
+        reused_from_checkpoint=bool(state),
+        already_validated=status == ENDPOINT_DATASET_VALIDATED,
+        validated_metadata=(
+            metadata if status == ENDPOINT_DATASET_VALIDATED else None
+        ),
+        already_published=(
+            status == ENDPOINT_DATASET_PUBLISHED and is_current
+        ),
+        published_metadata=(
+            metadata
+            if status == ENDPOINT_DATASET_PUBLISHED and is_current
+            else None
+        ),
+    )
+
+
+async def _persist_uhc_candidate_identity(
+    candidate: EndpointDatasetCandidate,
+    expected_publication_identity: Mapping[str, Any],
+    summary_input: Mapping[str, Any],
+) -> None:
+    """Persist the immutable UHC publication and summary identities."""
+    metadata_update_count = _coerce_rowcount(
+        await db.status(
+            f"""
+            UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+               SET publication_metadata_json =
+                   COALESCE(publication_metadata_json::jsonb, '{{}}'::jsonb)
+                   || jsonb_build_object(
+                        CAST(:publication_key AS text),
+                        CAST(:publication_identity AS jsonb),
+                        CAST(:summary_key AS text),
+                        CAST(:summary_input AS jsonb)
+                   )
+             WHERE dataset_id=:dataset_id
+               AND endpoint_id=:endpoint_id
+               AND acquisition_root_run_id=:acquisition_root_run_id
+               AND status=:acquiring_status
+               AND is_current=false;
+            """,
+            publication_key=UHC_RETAINED_PUBLICATION_METADATA_KEY,
+            publication_identity=json.dumps(
+                expected_publication_identity,
+                sort_keys=True,
+            ),
+            summary_key=UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY,
+            summary_input=json.dumps(summary_input, sort_keys=True),
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id,
+            acquiring_status=ENDPOINT_DATASET_ACQUIRING,
+        )
+    )
+    if metadata_update_count != 1:
+        raise RuntimeError(
+            "provider_directory_uhc_candidate_lineage_update_lost"
+        )
+
+
+async def _prepare_uhc_retained_candidate(
+    source_record: dict[str, Any],
+    *,
+    run_id: str,
+    summary_input: dict[str, Any],
+) -> EndpointDatasetCandidate:
+    """Create or resume the source-local UHC canonical dataset candidate."""
+    endpoint_id = _clean_text(source_record.get("endpoint_id"))
+    if endpoint_id is None:
+        raise RuntimeError("provider_directory_uhc_endpoint_id_missing")
+    dataset_id = _uhc_retained_candidate_id(endpoint_id, run_id)
+    state = await _endpoint_dataset_state(dataset_id)
+    expected_publication_identity = _expected_uhc_publication_identity(
+        summary_input,
+        dataset_id=dataset_id,
+        acquisition_root_run_id=run_id,
+    )
+    if state:
+        if (
+            _clean_text(state.get("endpoint_id")) != endpoint_id
+            or _clean_text(state.get("acquisition_root_run_id")) != run_id
+        ):
+            raise RuntimeError(
+                "provider_directory_uhc_retained_candidate_identity_collision"
+            )
+        _assert_existing_uhc_candidate_identity(
+            state,
+            expected_publication_identity,
+            summary_input,
+        )
+    candidate = await _uhc_candidate_from_state(
+        endpoint_id,
+        dataset_id,
+        run_id,
+        state,
+    )
+    if candidate.already_validated or candidate.already_published:
+        _assert_finalized_endpoint_dataset_replay(candidate)
+        return candidate
+    if (
+        state.get("is_current") is True
+        or _clean_text(state.get("status"))
+        in IMMUTABLE_ENDPOINT_DATASET_STATUSES
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_retained_candidate_finalized_invalid"
+        )
+    candidate = await _initialize_endpoint_dataset_candidate(candidate, ())
+    await _persist_uhc_candidate_identity(
+        candidate,
+        expected_publication_identity,
+        summary_input,
+    )
+    persisted_state = await _endpoint_dataset_state(dataset_id)
+    _assert_existing_uhc_candidate_identity(
+        persisted_state,
+        expected_publication_identity,
+        summary_input,
+    )
+    return candidate
+
+
+def _bound_uhc_stage_proof(
+    candidate: EndpointDatasetCandidate,
+    stage: UhcCanonicalStage,
+) -> tuple[str, dict[str, Any], int]:
+    acquisition_root_run_id = _clean_text(candidate.acquisition_root_run_id)
+    if acquisition_root_run_id is None:
+        raise RuntimeError(
+            "provider_directory_uhc_acquisition_root_required"
+        )
+    try:
+        bound_content_proof = bind_uhc_canonical_content_proof(
+            stage.content_proof,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=acquisition_root_run_id,
+        )
+    except UhcCanonicalProofError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_stage_content_proof_invalid"
+        ) from error
+    expected_count = sum(stage.resource_counts.values())
+    if (
+        bound_content_proof["resource_count"] != expected_count
+        or bound_content_proof["resource_counts"] != stage.resource_counts
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_stage_content_proof_changed"
+        )
+    return acquisition_root_run_id, bound_content_proof, expected_count
+
+
+async def _bind_uhc_candidate_content_proof(
+    executor: Any,
+    candidate: EndpointDatasetCandidate,
+    acquisition_root_run_id: str,
+    bound_content_proof: Mapping[str, Any],
+) -> int:
+    """Bind canonical content proof to one acquiring UHC candidate."""
+    return _coerce_rowcount(
+        await executor.status(
+            f"""
+            UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+               SET publication_metadata_json =
+                   COALESCE(publication_metadata_json::jsonb, '{{}}'::jsonb)
+                   || jsonb_build_object(
+                        CAST(:proof_key AS text),
+                        CAST(:proof_json AS jsonb)
+                   )
+             WHERE dataset_id=:dataset_id
+               AND endpoint_id=:endpoint_id
+               AND acquisition_root_run_id IS NOT DISTINCT FROM
+                   :acquisition_root_run_id
+               AND status=:acquiring_status
+               AND is_current=false;
+            """,
+            proof_key=UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
+            proof_json=json.dumps(bound_content_proof, sort_keys=True),
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=acquisition_root_run_id,
+            acquiring_status=ENDPOINT_DATASET_ACQUIRING,
+        )
+    )
+
+
+async def _replace_uhc_candidate_resources(
+    candidate: EndpointDatasetCandidate,
+    stage: UhcCanonicalStage,
+) -> int:
+    """Atomically replace one candidate and bind its independent proof."""
+
+    acquisition_root_run_id, bound_content_proof, expected_count = (
+        _bound_uhc_stage_proof(candidate, stage)
+    )
+    async with _mutable_endpoint_dataset_resource_mutation(
+        [candidate.dataset_id]
+    ) as executor:
+        await executor.status(
+            f"""
+            DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+             WHERE dataset_id=:dataset_id;
+            """,
+            dataset_id=candidate.dataset_id,
+        )
+        inserted = _coerce_rowcount(
+            await executor.status(
+                f"""
+                INSERT INTO {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} (
+                    dataset_id, resource_type, resource_id,
+                    payload_hash, payload_json
+                )
+                SELECT :dataset_id, resource_type, resource_id,
+                       payload_hash, payload_json
+                  FROM {stage.resource_ref}
+                 ORDER BY resource_type, resource_id;
+                """,
+                dataset_id=candidate.dataset_id,
+            )
+        )
+        proof_update_count = await _bind_uhc_candidate_content_proof(
+            executor,
+            candidate,
+            acquisition_root_run_id,
+            bound_content_proof,
+        )
+        if inserted != expected_count or proof_update_count != 1:
+            raise RuntimeError(
+                "provider_directory_uhc_candidate_copy_incomplete"
+            )
+    return expected_count
+
+
+def _uhc_resource_diagnostics(
+    resource_counts: dict[str, int],
+) -> dict[str, dict[str, Any]]:
+    return {
+        resource_type: {
+            "complete": True,
+            "rows": resource_counts[resource_type],
+            "pages": 0,
+            "next_url_remaining": False,
+            "retained_semantic_contract_id": (
+                SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID
+            ),
+        }
+        for resource_type in sorted(resource_counts)
+    }
+
+
+async def _assert_uhc_candidate_content(
+    candidate: EndpointDatasetCandidate,
+    stage: UhcCanonicalStage,
+) -> EndpointDatasetContentProof:
+    async with db.acquire() as connection:
+        proof = await _candidate_endpoint_dataset_content_proof(
+            connection,
+            candidate,
+        )
+    if (
+        proof.dataset_hash != stage.content_proof.get("dataset_hash")
+        or proof.resource_count != stage.content_proof.get("resource_count")
+        or proof.resource_counts != stage.resource_counts
+        or proof.resource_hashes
+        != stage.content_proof.get("resource_hashes")
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_candidate_content_proof_mismatch"
+        )
+    return proof
+
+
+def _validated_uhc_final_metadata(
+    candidate: EndpointDatasetCandidate,
+    metadata: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Validate and return summary input, source summary, and content proof."""
+    try:
+        summary_input = validate_uhc_summary_input(
+            metadata.get(UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY)
+        )
+        source_summary = validate_semantic_source_summary(
+            metadata.get(SOURCE_SUMMARY_METADATA_KEY),
+            expected_by_field={
+                "dataset_id": candidate.dataset_id,
+                "endpoint_id": candidate.endpoint_id,
+                "acquisition_root_run_id": candidate.acquisition_root_run_id,
+                "source_ids": list(candidate.source_ids),
+                "selected_resources": list(candidate.selected_resources),
+                "semantic_contract_id": (
+                    SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID
+                ),
+            },
+            expected_semantic_contract_id=(
+                SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID
+            ),
+        )
+        canonical_proof = validate_uhc_canonical_content_proof(
+            metadata.get(UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY),
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=(
+                candidate.acquisition_root_run_id or ""
+            ),
+        )
+    except ProviderDirectorySourceSummaryError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_final_source_summary_invalid"
+        ) from error
+    except UhcCanonicalProofError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_final_content_proof_invalid"
+        ) from error
+    except UhcRetainedDatasetError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_final_summary_input_invalid"
+        ) from error
+    return summary_input, source_summary, canonical_proof
+
+
+def _is_uhc_final_publication_consistent(
+    state: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    outcome: Any,
+    source_summary: Mapping[str, Any],
+    canonical_proof: Mapping[str, Any],
+    expected_publication_identity: Mapping[str, Any],
+) -> bool:
+    """Return whether all final UHC publication proofs agree."""
+    return bool(
+        _clean_text(state.get("status")) == ENDPOINT_DATASET_PUBLISHED
+        and state.get("is_current") is True
+        and isinstance(outcome, dict)
+        and outcome.get("complete") is True
+        and outcome.get("dataset_hash") == state.get("dataset_hash")
+        and outcome.get("resource_counts") == source_summary["resource_counts"]
+        and canonical_proof["dataset_hash"] == state.get("dataset_hash")
+        and canonical_proof["resource_counts"]
+        == source_summary["resource_counts"]
+        and canonical_proof["resource_hashes"]
+        == source_summary["resource_hashes"]
+        and metadata.get(UHC_RETAINED_PUBLICATION_METADATA_KEY)
+        == expected_publication_identity
+    )
+
+
+async def _assert_final_uhc_publication(
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, Any]:
+    """Prove the published UHC dataset matches its validated candidate."""
+    state = await _endpoint_dataset_state(candidate.dataset_id)
+    metadata = _json_object(state.get("publication_metadata_json"))
+    summary_input, source_summary, canonical_proof = (
+        _validated_uhc_final_metadata(candidate, metadata)
+    )
+    expected_publication_identity = _expected_uhc_publication_identity(
+        summary_input,
+        dataset_id=candidate.dataset_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+    )
+    outcome = metadata.get(
+        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
+    )
+    if not _is_uhc_final_publication_consistent(
+        state,
+        metadata,
+        outcome,
+        source_summary,
+        canonical_proof,
+        expected_publication_identity,
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_current_publication_proof_invalid"
+        )
+    return {
+        "dataset_id": candidate.dataset_id,
+        "dataset_hash": state.get("dataset_hash"),
+        "resource_count": int(state.get("resource_count") or 0),
+        "resource_counts": outcome["resource_counts"],
+        "source_summary": source_summary,
+        "status": ENDPOINT_DATASET_PUBLISHED,
+        "is_current": True,
+    }
+
+
+async def _publish_validated_uhc_dataset(
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    """Publish one proven UHC dataset without replacing global artifacts."""
+
+    fence = await _resolve_provider_directory_artifact_datasets(
+        [UHC_RETAINED_SOURCE_ID],
+        should_select_validated_candidates=True,
+    )
+    if (
+        len(fence.datasets) != 1
+        or len(fence.promotion_datasets) != 1
+        or fence.datasets[0].source_id != UHC_RETAINED_SOURCE_ID
+        or fence.datasets[0].dataset_id != candidate.dataset_id
+        or fence.datasets[0].endpoint_id != candidate.endpoint_id
+        or fence.datasets[0].evidence_run_id
+        != candidate.acquisition_root_run_id
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_source_local_fence_invalid"
+        )
+    async with db.transaction():
+        await db.status(
+            "SET LOCAL lock_timeout = "
+            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';"
+        )
+        await db.status(
+            "SET LOCAL statement_timeout = "
+            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
+        )
+        await _lock_and_verify_artifact_dataset_fence(fence)
+        await _promote_provider_directory_artifact_datasets(fence)
+
+
+def _uhc_acquisition_progress_callback(
+    run_id: str,
+    catalog_set_sha256: str,
+) -> Callable[[int, int, str, str], Awaitable[None]]:
+    """Create the durable per-file progress callback."""
+    async def report_file_progress(
+        done: int,
+        total: int,
+        file_name: str,
+        disposition: str,
+    ) -> None:
+        """Persist progress for one admitted or reused official file."""
+        await _mark_provider_directory_progress(
+            run_id,
+            phase="provider-directory official-file acquisition",
+            done=done,
+            total=total,
+            message=(
+                f"{disposition} official provider file "
+                f"{done}/{total}: {file_name}"
+            ),
+            details={
+                "catalog_set_sha256": catalog_set_sha256,
+                "file_name": file_name,
+                "disposition": disposition,
+            },
+        )
+    return report_file_progress
+
+
+def _uhc_acquisition_cancel_check(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+) -> Callable[[], Awaitable[None]]:
+    """Create a cancellation callback bound to the import task."""
+    async def check_cancelled() -> None:
+        """Raise promptly when import control has cancelled this run."""
+        await raise_if_cancelled(ctx, task)
+    return check_cancelled
+
+
+async def _acquire_current_uhc_official_file_set(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    run_id: str,
+) -> tuple[str, UHCOfficialFileAcquisitionResult]:
+    """Refresh, acquire, and recheck one unchanged official-file catalog."""
+
+    initial_catalog = await refresh_uhc_provider_file_catalog()
+    catalog_set_sha256 = _clean_text(
+        initial_catalog.get("catalog_set_sha256")
+    )
+    requested_catalog_hash = _clean_text(
+        task.get("uhc_catalog_set_sha256")
+    )
+    if not catalog_set_sha256 or (
+        requested_catalog_hash is not None
+        and requested_catalog_hash != catalog_set_sha256
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_catalog_selection_is_not_current"
+        )
+
+    async with db.acquire_driver() as driver_connection:
+        acquisition = await acquire_complete_uhc_catalog_set(
+            driver_connection,
+            catalog_set_sha256,
+            progress_callback=_uhc_acquisition_progress_callback(
+                run_id,
+                catalog_set_sha256,
+            ),
+            cancel_check=_uhc_acquisition_cancel_check(ctx, task),
+            connection_factory=db.acquire_driver,
+        )
+        await load_complete_admitted_uhc_catalog_set(
+            driver_connection,
+            catalog_set_sha256,
+        )
+
+    await raise_if_cancelled(ctx, task)
+    final_catalog = await refresh_uhc_provider_file_catalog()
+    if (
+        final_catalog.get("catalog_set_sha256") != catalog_set_sha256
+        or int(final_catalog.get("catalog_file_count") or 0)
+        != acquisition.file_count
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_catalog_changed_during_acquisition"
+        )
+    return catalog_set_sha256, acquisition
+
+
+async def _build_uhc_publication_stage(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    run_id: str,
+    catalog_set_sha256: str,
+) -> UhcCanonicalStage:
+    """Seal semantic files and build the canonical publication stage."""
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory UHC retained semantic build",
+        done=0,
+        total=4,
+        message="validating complete admitted UHC provider-file catalog",
+    )
+    async with db.acquire_driver() as driver_connection:
+        admitted_set = await load_complete_admitted_uhc_catalog_set(
+            driver_connection,
+            catalog_set_sha256,
+        )
+    await raise_if_cancelled(ctx, task)
+    sealed_files = await ensure_sealed_uhc_semantic_set(
+        None,
+        admitted_set,
+        connection_factory=db.acquire_driver,
+    )
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory UHC retained semantic sealed",
+        done=1,
+        total=4,
+        message=(
+            f"sealed {len(sealed_files)}/{len(admitted_set.files)} "
+            "admitted UHC files under semantic v2"
+        ),
+        details={
+            "semantic_file_concurrency": (
+                uhc_semantic_file_concurrency()
+            ),
+        },
+    )
+    await raise_if_cancelled(ctx, task)
+    async with db.acquire_driver() as driver_connection:
+        return await build_uhc_canonical_stage(
+            driver_connection,
+            admitted_set,
+            sealed_files,
+        )
+
+
+def _uhc_publication_result_details(
+    stage: UhcCanonicalStage,
+    catalog_set_sha256: str,
+    acquisition: UHCOfficialFileAcquisitionResult,
+    *,
+    replayed: bool,
+) -> dict[str, Any]:
+    """Build stable result details for a new or replayed publication."""
+    return {
+        "retained_catalog_set_sha256": catalog_set_sha256,
+        "acquisition": {
+            "file_count": acquisition.file_count,
+            "downloaded_file_count": acquisition.downloaded_file_count,
+            "reused_file_count": acquisition.reused_file_count,
+            "downloaded_byte_count": acquisition.downloaded_byte_count,
+        },
+        "semantic_build_ids": list(stage.semantic_build_ids),
+        "replayed": replayed,
+    }
+
+
+async def _validate_and_publish_uhc_candidate(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    run_id: str,
+    candidate: EndpointDatasetCandidate,
+    stage: UhcCanonicalStage,
+) -> None:
+    """Validate a new candidate and publish its immutable source dataset."""
+    if not candidate.already_validated:
+        copied_rows = await _replace_uhc_candidate_resources(
+            candidate,
+            stage,
+        )
+        await _assert_uhc_candidate_content(candidate, stage)
+        diagnostics = _uhc_resource_diagnostics(stage.resource_counts)
+        finalization = await _finalize_endpoint_dataset_candidate(
+            candidate,
+            diagnostics,
+        )
+        if not finalization or finalization.get("validated") is not True:
+            raise RuntimeError(
+                "provider_directory_uhc_candidate_validation_failed"
+            )
+    else:
+        copied_rows = int(
+            candidate.validated_metadata.get("resource_count")
+            if isinstance(candidate.validated_metadata, dict)
+            else 0
+        )
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory UHC retained dataset validated",
+        done=3,
+        total=4,
+        message=(
+            f"validated {copied_rows} canonical UHC resources; "
+            "publishing the source-local immutable dataset"
+        ),
+    )
+    await raise_if_cancelled(ctx, task)
+    await _publish_validated_uhc_dataset(candidate)
+
+
+async def _record_uhc_source_import_complete(
+    run_id: str,
+    candidate: EndpointDatasetCandidate,
+    publication_result: dict[str, Any],
+) -> None:
+    """Record source-local completion inside the shared import lifecycle."""
+
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory official-file source complete",
+        done=4,
+        total=4,
+        message=(
+            f"published current UHC dataset {candidate.dataset_id} "
+            f"with {publication_result['resource_count']} resources; "
+            "continuing shared Provider Directory completion"
+        ),
+        details={
+            "source_id": UHC_RETAINED_SOURCE_ID,
+            "dataset_id": candidate.dataset_id,
+        },
+    )
+
+
+def _required_uhc_source_import_run_id(
+    run_id: str | None,
+) -> str:
+    """Require the normal import run identity for atomic official files."""
+
+    if not run_id:
+        raise ValueError("UHC official-file source import requires run_id")
+    return run_id
+
+
+def _uhc_official_file_resource_stats(
+    resource_counts: Mapping[str, int],
+    publication_result: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Represent atomic file publication in common fetch statistics."""
+
+    stats_by_resource: dict[str, dict[str, Any]] = {}
+    acquisition = _json_object(publication_result.get("acquisition"))
+    performance = _json_object(publication_result.get("performance"))
+    for resource_type, row_count in resource_counts.items():
+        stats = _empty_resource_stats()
+        stats.update(
+            {
+                "sources_attempted": 1,
+                "sources_completed": 1,
+                "collection_complete_sources": 1,
+                "rows_fetched": int(row_count),
+                "official_provider_file_sources": 1,
+                "official_catalog_files": int(
+                    acquisition.get("file_count") or 0
+                ),
+                "official_files_downloaded": int(
+                    acquisition.get("downloaded_file_count") or 0
+                ),
+                "official_files_reused": int(
+                    acquisition.get("reused_file_count") or 0
+                ),
+                "official_acquisition_seconds": float(
+                    performance.get("acquisition_seconds") or 0
+                ),
+                "official_semantic_build_seconds": float(
+                    performance.get("semantic_build_seconds") or 0
+                ),
+            }
+        )
+        stats_by_resource[resource_type] = stats
+    return stats_by_resource
+
+
+def _uhc_import_performance(
+    acquisition_seconds: float,
+    semantic_build_seconds: float,
+) -> dict[str, Any]:
+    return {
+        "acquisition_seconds": round(acquisition_seconds, 3),
+        "semantic_build_seconds": round(semantic_build_seconds, 3),
+        "download_concurrency": uhc_provider_file_download_concurrency(),
+        "admission_concurrency": uhc_provider_file_admission_concurrency(),
+        "semantic_file_concurrency": uhc_semantic_file_concurrency(),
+    }
+
+
+async def _publish_or_replay_uhc_candidate(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    run_id: str,
+    candidate: EndpointDatasetCandidate,
+    stage: UhcCanonicalStage,
+) -> dict[str, Any]:
+    if not candidate.already_published:
+        await _validate_and_publish_uhc_candidate(
+            ctx,
+            task,
+            run_id,
+            candidate,
+            stage,
+        )
+    return await _assert_final_uhc_publication(candidate)
+
+
+def _uhc_source_group_result(
+    publication_result: Mapping[str, Any],
+) -> ResourceImportGroupResult:
+    resource_counts_by_type = dict(publication_result["resource_counts"])
+    return (
+        [UHC_RETAINED_SOURCE_ID],
+        _uhc_resource_diagnostics(resource_counts_by_type),
+        resource_counts_by_type,
+        {},
+        _uhc_official_file_resource_stats(
+            resource_counts_by_type,
+            publication_result,
+        ),
+        {},
+        {},
+    )
+
+
+def _validated_uhc_import_source(
+    source_group: list[dict[str, Any]],
+    resources: list[str],
+    run_id: str | None,
+) -> tuple[str, dict[str, Any]]:
+    required_run_id = _required_uhc_source_import_run_id(run_id)
+    if (
+        len(source_group) != 1
+        or not _uses_uhc_official_file_connector(source_group[0])
+    ):
+        raise ValueError("UHC official-file source group is invalid")
+    if not set(resources).intersection(UHC_SUPPORTED_RESOURCES):
+        raise ValueError(
+            "UHC official-file source import has no supported resources"
+        )
+    return required_run_id, source_group[0]
+
+
+async def _acquire_and_build_uhc_stage(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    run_id: str,
+) -> tuple[
+    str,
+    UHCOfficialFileAcquisitionResult,
+    UhcCanonicalStage,
+    float,
+    float,
+]:
+    acquisition_started = time.monotonic()
+    catalog_hash, acquisition = await _acquire_current_uhc_official_file_set(
+        ctx,
+        task,
+        run_id=run_id,
+    )
+    acquisition_seconds = time.monotonic() - acquisition_started
+    semantic_started = time.monotonic()
+    stage = await _build_uhc_publication_stage(
+        ctx,
+        task,
+        run_id,
+        catalog_hash,
+    )
+    return (
+        catalog_hash,
+        acquisition,
+        stage,
+        acquisition_seconds,
+        time.monotonic() - semantic_started,
+    )
+
+
+async def _import_uhc_official_file_source_group(
+    source_group: list[dict[str, Any]],
+    resources: list[str],
+    *,
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    run_id: str | None,
+) -> ResourceImportGroupResult:
+    """Import official files as one normal Provider Directory source group."""
+    required_run_id, source_record = _validated_uhc_import_source(
+        source_group,
+        resources,
+        run_id,
+    )
+    (
+        catalog_set_sha256,
+        acquisition,
+        stage,
+        acquisition_seconds,
+        semantic_build_seconds,
+    ) = await _acquire_and_build_uhc_stage(
+        ctx,
+        task,
+        required_run_id,
+    )
+    try:
+        candidate = await _prepare_uhc_retained_candidate(
+            source_record,
+            run_id=run_id,
+            summary_input=stage.summary_input,
+        )
+        publication_result = await _publish_or_replay_uhc_candidate(
+            ctx,
+            task,
+            required_run_id,
+            candidate,
+            stage,
+        )
+        publication_result.update(
+            _uhc_publication_result_details(
+                stage,
+                catalog_set_sha256,
+                acquisition,
+                replayed=candidate.already_published,
+            )
+        )
+        publication_result["performance"] = _uhc_import_performance(
+            acquisition_seconds,
+            semantic_build_seconds,
+        )
+        if not candidate.already_published:
+            await _record_uhc_source_import_complete(
+                required_run_id,
+                candidate,
+                publication_result,
+            )
+        return _uhc_source_group_result(publication_result)
+    finally:
+        async with db.acquire_driver() as cleanup_connection:
+            await cleanup_uhc_canonical_stage(cleanup_connection, stage)
+
+
 async def process_provider_directory_fhir_data(
     ctx: dict[str, Any],
     task: dict[str, Any] | None = None,
@@ -39601,6 +41816,9 @@ async def process_provider_directory_fhir_data(
                 source_ids=requested_source_ids,
                 publish_corroboration=should_publish_corroboration,
                 publish_artifacts_targets=publish_artifacts_targets,
+                require_complete_global_profile_fence=bool(
+                    task.get("require_complete_global_profile_fence")
+                ),
             )
         else:
             publish_metric_by_name = await _publish_attested_provider_directory_profile(
@@ -39675,7 +41893,16 @@ async def process_provider_directory_fhir_data(
         seed_rows.extend(supplemental_catalog_seed_rows)
 
     try:
-        source_rows = _dedupe_source_rows([_source_row_from_seed(seed_record) for seed_record in seed_rows])
+        source_rows = _dedupe_source_rows(
+            [_source_row_from_seed(seed_record) for seed_record in seed_rows]
+        )
+        source_rows = _add_uhc_official_file_source(
+            source_rows,
+            requested_source_ids=requested_source_ids,
+            source_query=source_query,
+            test_mode=test_mode,
+            limit=limit,
+        )
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
@@ -40069,6 +42296,7 @@ async def run_provider_directory_fhir_command(
     seed_only: bool = False,
     probe: bool = True,
     import_resources: bool = False,
+    uhc_catalog_set_sha256: str | None = None,
     dataset_rehydrate_only: bool = False,
     rehydrate_dataset_id: str | None = None,
     rehydrate_acquisition_root_run_id: str | None = None,
@@ -40123,6 +42351,7 @@ async def run_provider_directory_fhir_command(
         "seed_only": seed_only,
         "probe": probe,
         "import_resources": import_resources,
+        "uhc_catalog_set_sha256": uhc_catalog_set_sha256,
         "dataset_rehydrate_only": dataset_rehydrate_only,
         "rehydrate_dataset_id": rehydrate_dataset_id,
         "rehydrate_acquisition_root_run_id": rehydrate_acquisition_root_run_id,

@@ -233,12 +233,22 @@ pub fn run_uhc_retain_cli(arguments: &[String]) -> io::Result<()> {
             "usage: ptg2_scanner --uhc-retain <source_path> <output_root> <expected_sha256> <expected_byte_count> <range_count>",
         ));
     }
-    let expected_byte_count = arguments[3].parse::<u64>().map_err(|_| {
-        invalid_input("expected UHC retained byte count must be an unsigned integer")
-    })?;
-    let range_count = arguments[4]
-        .parse::<usize>()
-        .map_err(|_| invalid_input("UHC retained range count must be an unsigned integer"))?;
+    let expected_byte_count = match arguments[3].parse::<u64>() {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(invalid_input(
+                "expected UHC retained byte count must be an unsigned integer",
+            ))
+        }
+    };
+    let range_count = match arguments[4].parse::<usize>() {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(invalid_input(
+                "UHC retained range count must be an unsigned integer",
+            ))
+        }
+    };
     let summary = retain_uhc_artifact(&UHCRetainRequest {
         source_path: PathBuf::from(&arguments[0]),
         output_root: PathBuf::from(&arguments[1]),
@@ -248,8 +258,9 @@ pub fn run_uhc_retain_cli(arguments: &[String]) -> io::Result<()> {
     })?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, &summary)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    if let Err(error) = serde_json::to_writer(&mut output, &summary) {
+        return Err(io::Error::other(error.to_string()));
+    }
     output.write_all(b"\n")?;
     output.flush()
 }

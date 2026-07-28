@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
@@ -45,11 +45,33 @@ async def test_non_twin_candidate_preserves_full_resource_count_proof(
 ):
     candidate = _candidate()
     content_proof = _content_proof()
-    proof_builder = AsyncMock(return_value=content_proof)
+    proof_builder = AsyncMock(
+        return_value=Mock(
+            dataset_hash=content_proof.dataset_hash,
+            resource_count=content_proof.resource_count,
+            resource_hashes=content_proof.resource_hashes,
+            resource_counts=content_proof.resource_counts,
+            source_metrics={
+                "distinct_npis": 1,
+                "address_records": 0,
+                "addressed_locations": 0,
+                "geocoded_locations": 0,
+            },
+            metadata={"contract_id": "proof-v1"},
+        )
+    )
+    monkeypatch.setattr(
+        importer,
+        "build_stored_dataset_proof",
+        proof_builder,
+    )
+    legacy_builder = AsyncMock(
+        side_effect=AssertionError("candidate validation must not scan JSON")
+    )
     monkeypatch.setattr(
         importer,
         "_endpoint_dataset_content_proof",
-        proof_builder,
+        legacy_builder,
     )
 
     observed_proof = await importer._candidate_endpoint_dataset_content_proof(
@@ -57,12 +79,20 @@ async def test_non_twin_candidate_preserves_full_resource_count_proof(
         candidate,
     )
 
-    assert observed_proof is content_proof
+    assert observed_proof.dataset_hash == content_proof.dataset_hash
+    assert observed_proof.resource_counts == content_proof.resource_counts
+    assert observed_proof.source_metrics["distinct_npis"] == 1
+    assert observed_proof.proof_metadata == {"contract_id": "proof-v1"}
     proof_builder.assert_awaited_once_with(
         ANY,
-        candidate.dataset_id,
-        candidate.selected_resources,
+        "mrf",
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+        source_ids=candidate.source_ids,
+        selected_resources=candidate.selected_resources,
     )
+    legacy_builder.assert_not_awaited()
 
 
 def test_outcome_resource_count_proof_binds_exact_dataset_identity():

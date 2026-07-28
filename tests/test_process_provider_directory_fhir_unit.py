@@ -44,8 +44,1480 @@ from db.models import (
     ProviderDirectorySourceResource,
 )
 from scripts.research import provider_directory_fhir_harness as harness
+from process.provider_directory_proof_store import build_dataset_proof_shard
 
 importer = importlib.import_module("process.provider_directory_fhir")
+
+
+def _stub_uhc_normal_import_lifecycle(monkeypatch):
+    """Stub external dependencies for the normal UHC import lifecycle."""
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    import_resources = AsyncMock(return_value={"Practitioner": 1})
+    monkeypatch.setattr(importer, "ensure_database", no_op)
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", no_op)
+    monkeypatch.setattr(importer, "raise_if_cancelled", no_op)
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", no_op)
+    monkeypatch.setattr(
+        importer,
+        "_upsert_provider_directory_source_rows",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_run_source_probe_batch",
+        AsyncMock(
+            return_value=(
+                1,
+                1,
+                {importer.UHC_RETAINED_SOURCE_ID},
+            )
+        ),
+    )
+    monkeypatch.setattr(importer, "_import_resources", import_resources)
+    monkeypatch.setattr(
+        importer,
+        "_source_local_profile_followup_if_current",
+        AsyncMock(return_value=None),
+    )
+    return import_resources
+
+
+@pytest.mark.asyncio
+async def test_uhc_official_files_enter_normal_import_lifecycle(
+    monkeypatch,
+):
+    """Resolve, probe, select, and import UHC through the shared lifecycle."""
+    import_resources = _stub_uhc_normal_import_lifecycle(monkeypatch)
+
+    process_result = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "run_id": "uhc-root",
+            "source_ids": [importer.UHC_RETAINED_SOURCE_ID],
+            "import_resources": True,
+            "publish_artifacts": False,
+            "stale_cleanup": False,
+            "resources": list(importer.UHC_SUPPORTED_RESOURCES),
+            "uhc_catalog_set_sha256": "a" * 64,
+        },
+    )
+
+    assert process_result["sources_seeded"] == 1
+    assert process_result["sources_probed"] == 1
+    assert process_result["source_import_sources_selected"] == 1
+    assert process_result["resource_rows"] == {"Practitioner": 1}
+    import_resources.assert_awaited_once()
+    imported_source = import_resources.await_args.args[0][0]
+    assert imported_source["source_id"] == importer.UHC_RETAINED_SOURCE_ID
+    assert importer._uses_uhc_official_file_connector(imported_source)
+
+
+@pytest.mark.asyncio
+async def test_uhc_official_files_reject_invalid_endpoint_scope(monkeypatch):
+    """Record an invalid endpoint scope before starting UHC acquisition."""
+    import_resources = _stub_uhc_normal_import_lifecycle(monkeypatch)
+    invalid_scope_context_by_field = {"context": {}}
+    with pytest.raises(RuntimeError, match="endpoint_scope_mismatch"):
+        await importer.process_data(
+            invalid_scope_context_by_field,
+            {
+                "test": True,
+                "run_id": "uhc-invalid-scope",
+                "source_ids": [importer.UHC_RETAINED_SOURCE_ID],
+                "import_resources": True,
+                "publish_artifacts": False,
+                "stale_cleanup": False,
+                "resources": list(importer.UHC_SUPPORTED_RESOURCES),
+                "uhc_catalog_set_sha256": "a" * 64,
+                "provider_directory_endpoint_scope": "https://example.test/fhir",
+            },
+        )
+    audit_by_field = invalid_scope_context_by_field["context"]["audit"]
+    assert "endpoint_scope_mismatch" in audit_by_field[
+        "provider_directory_endpoint_scope_error"
+    ]
+    import_resources.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_uhc_probe_uses_official_catalog_transport(monkeypatch):
+    catalog_hash = "c" * 64
+    monkeypatch.setattr(
+        importer,
+        "refresh_uhc_provider_file_catalog",
+        AsyncMock(
+            return_value={
+                "catalog_set_sha256": catalog_hash,
+                "catalog_file_count": 102,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_candidate_metadata_urls",
+        Mock(
+            side_effect=AssertionError(
+                "official files must not construct FHIR metadata URLs"
+            )
+        ),
+    )
+    endpoint = importer._uhc_official_file_endpoint_row(
+        observed_at=datetime.datetime(2026, 7, 28),
+    )
+    official_source = importer._uhc_official_file_source_row(
+        endpoint["endpoint_id"],
+        observed_at=datetime.datetime(2026, 7, 28),
+    )
+
+    probe, capability = await importer._probe_source(
+        official_source,
+        timeout=15,
+        run_id="uhc-root",
+    )
+
+    assert capability is None
+    assert probe["status"] == "valid"
+    assert probe["catalog_set_sha256"] == catalog_hash
+    assert probe["catalog_file_count"] == 102
+    assert probe["transport"] == "official_provider_files"
+
+
+def _common_uhc_group_fixture():
+    endpoint = importer._uhc_official_file_endpoint_row(
+        observed_at=datetime.datetime(2026, 7, 28),
+    )
+    official_source = importer._uhc_official_file_source_row(
+        endpoint["endpoint_id"],
+        observed_at=datetime.datetime(2026, 7, 28),
+    )
+    diagnostics_by_resource = {
+        "Practitioner": {
+            "complete": True,
+            "collection_complete": True,
+            "bounded": False,
+            "error": None,
+            "next_url_remaining": False,
+        }
+    }
+    stats_by_resource = {
+        "Practitioner": {
+            **importer._empty_resource_stats(),
+            "sources_attempted": 1,
+            "sources_completed": 1,
+        }
+    }
+    group_result = (
+        [importer.UHC_RETAINED_SOURCE_ID],
+        diagnostics_by_resource,
+        {"Practitioner": 7},
+        {},
+        stats_by_resource,
+        {},
+        {},
+    )
+    return official_source, group_result
+
+
+def test_uhc_source_selection_and_group_guards():
+    """Validate the official source as one atomic normal import group."""
+    official_source, _group_result = _common_uhc_group_fixture()
+
+    assert importer._is_validated_uhc_official_source_group([]) is False
+    assert (
+        importer._is_validated_uhc_official_source_group([official_source])
+        is True
+    )
+    with pytest.raises(RuntimeError, match="group_invalid"):
+        importer._is_validated_uhc_official_source_group(
+            [official_source, official_source]
+        )
+
+    with pytest.raises(ValueError, match="source group is invalid"):
+        importer._validated_uhc_import_source(
+            [],
+            ["Practitioner"],
+            "uhc-root",
+        )
+    with pytest.raises(ValueError, match="no supported resources"):
+        importer._validated_uhc_import_source(
+            [official_source],
+            ["HealthcareService"],
+            "uhc-root",
+        )
+    assert importer._validated_uhc_import_source(
+        [official_source],
+        ["Practitioner"],
+        "uhc-root",
+    ) == ("uhc-root", official_source)
+
+
+@pytest.mark.parametrize(
+    (
+        "requested_source_ids",
+        "source_query",
+        "test_mode",
+        "limit",
+        "expected",
+    ),
+    (
+        ([importer.UHC_RETAINED_SOURCE_ID], None, True, 1, True),
+        (["source-other"], None, False, None, False),
+        ([], " optum ", True, 1, True),
+        ([], "unrelated", False, None, False),
+        ([], None, True, None, False),
+        ([], None, False, None, True),
+    ),
+)
+def test_uhc_source_scope_inclusion_is_explicit(
+    requested_source_ids,
+    source_query,
+    test_mode,
+    limit,
+    expected,
+):
+    """Include official files only when shared source scoping selects them."""
+    assert (
+        importer._should_add_uhc_official_file_source(
+            requested_source_ids=requested_source_ids,
+            source_query=source_query,
+            test_mode=test_mode,
+            limit=limit,
+        )
+        is expected
+    )
+
+
+def test_uhc_retest_source_dedupe_retains_first_identity():
+    """Collapse equivalent retest rows under the shared source deduper."""
+    retest_rows = [
+        {
+            "source_id": f"source-{ordinal}",
+            "org_name": "Example Organization",
+            "plan_name": "Example Plan",
+            "api_base": "https://example.test/fhir",
+            "seed_source": "provider-directory-db-retest",
+            "metadata_json": {},
+        }
+        for ordinal in ("a", "b")
+    ]
+    assert importer._dedupe_source_rows(retest_rows) == [retest_rows[0]]
+
+
+@pytest.mark.asyncio
+async def test_common_import_group_dispatches_uhc_adapter(monkeypatch):
+    """The shared import group delegates official files to the UHC adapter."""
+    official_source, group_result = _common_uhc_group_fixture()
+    official_import = AsyncMock(return_value=group_result)
+    monkeypatch.setattr(
+        importer,
+        "_import_uhc_official_file_source_group",
+        official_import,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_prepare_resource_import_source_group",
+        AsyncMock(
+            side_effect=AssertionError(
+                "official adapter owns its atomic candidate"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_resource_rows",
+        AsyncMock(
+            side_effect=AssertionError(
+                "official adapter must not enter generic FHIR fetch"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_update_source_resource_import_metadata",
+        AsyncMock(),
+    )
+    completed_source_ids_by_resource: dict[str, set[str]] = {}
+
+    counts = await importer._import_resources(
+        [official_source],
+        resources=["Practitioner"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=15,
+        run_id="uhc-root",
+        resource_completion=completed_source_ids_by_resource,
+        source_concurrency=2,
+    )
+
+    assert counts == {"Practitioner": 7}
+    assert completed_source_ids_by_resource == {
+        "Practitioner": {importer.UHC_RETAINED_SOURCE_ID}
+    }
+    official_import.assert_awaited_once()
+    assert official_import.await_args.args[:2] == (
+        [official_source],
+        ["Practitioner"],
+    )
+
+
+def _stub_uhc_build_dependencies(monkeypatch, stage, candidate):
+    """Stub acquisition, semantic sealing, and candidate preparation."""
+    @contextlib.asynccontextmanager
+    async def acquire_driver():
+        yield object()
+
+    monkeypatch.setattr(importer.db, "acquire_driver", acquire_driver)
+    monkeypatch.setattr(
+        importer,
+        "_acquire_current_uhc_official_file_set",
+        AsyncMock(
+            return_value=(
+                "f" * 64,
+                Mock(
+                    file_count=102,
+                    downloaded_file_count=0,
+                    reused_file_count=102,
+                    downloaded_byte_count=0,
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "load_complete_admitted_uhc_catalog_set",
+        AsyncMock(return_value=Mock(files=(Mock(),))),
+    )
+    monkeypatch.setattr(
+        importer,
+        "ensure_sealed_uhc_semantic_set",
+        AsyncMock(return_value=(Mock(),)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "build_uhc_canonical_stage",
+        AsyncMock(return_value=stage),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_prepare_uhc_retained_candidate",
+        AsyncMock(return_value=candidate),
+    )
+
+
+def _stub_uhc_publication_dependencies(monkeypatch, stage, candidate):
+    """Stub the retained UHC publication boundary."""
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    _stub_uhc_build_dependencies(monkeypatch, stage, candidate)
+    monkeypatch.setattr(importer, "raise_if_cancelled", no_op)
+    monkeypatch.setattr(importer, "_mark_provider_directory_progress", no_op)
+    publish_dataset = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_publish_validated_uhc_dataset",
+        publish_dataset,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_dataset_artifacts",
+        AsyncMock(
+            side_effect=AssertionError(
+                "global Profile must run as an independent job"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_final_uhc_publication",
+        AsyncMock(
+            side_effect=lambda _candidate: {
+                "dataset_id": "uhc-dataset",
+                "resource_count": 1,
+                "resource_counts": {"Practitioner": 1},
+                "status": "published",
+                "is_current": True,
+            }
+        ),
+    )
+    cleanup = AsyncMock()
+    monkeypatch.setattr(importer, "cleanup_uhc_canonical_stage", cleanup)
+    return publish_dataset, cleanup
+
+
+@pytest.mark.asyncio
+async def test_uhc_official_source_group_is_independent_from_global_profile(
+    monkeypatch,
+):
+    """The shared source group publishes locally and returns common metrics."""
+    stage = Mock(
+        summary_input={"input_sha256": "a" * 64},
+        resource_counts={"Practitioner": 1},
+        semantic_build_ids=("semantic-build",),
+        phase_metrics={},
+    )
+    candidate = Mock(
+        already_published=False,
+        already_validated=True,
+        validated_metadata={"resource_count": 1},
+        dataset_id="uhc-dataset",
+        acquisition_root_run_id="uhc-root",
+    )
+    publish_dataset, cleanup = _stub_uhc_publication_dependencies(
+        monkeypatch, stage, candidate
+    )
+
+    official_source = importer._uhc_official_file_source_row(
+        "endpoint-uhc",
+        observed_at=datetime.datetime(2026, 7, 28),
+    )
+    import_result = await importer._import_uhc_official_file_source_group(
+        [official_source],
+        list(importer.UHC_SUPPORTED_RESOURCES),
+        ctx={"context": {}},
+        task={"uhc_catalog_set_sha256": "f" * 64},
+        run_id="uhc-root",
+    )
+
+    assert import_result[0] == [importer.UHC_RETAINED_SOURCE_ID]
+    assert import_result[2] == {"Practitioner": 1}
+    assert import_result[4]["Practitioner"]["sources_completed"] == 1
+    assert (
+        import_result[4]["Practitioner"]["official_catalog_files"]
+        == 102
+    )
+    assert (
+        import_result[4]["Practitioner"][
+            "official_provider_file_sources"
+        ]
+        == 1
+    )
+    publish_dataset.assert_awaited_once_with(candidate)
+    candidate.already_published = True
+    publish_dataset.reset_mock()
+    replayed_result = await importer._import_uhc_official_file_source_group(
+        [official_source],
+        list(importer.UHC_SUPPORTED_RESOURCES),
+        ctx={"context": {}},
+        task={"uhc_catalog_set_sha256": "f" * 64},
+        run_id="uhc-root",
+    )
+    assert replayed_result[2] == import_result[2]
+    publish_dataset.assert_not_awaited()
+    assert cleanup.await_count == 2
+    assert cleanup.await_args.args[1] is stage
+
+
+@pytest.mark.asyncio
+async def test_global_profile_fence_rejects_explicit_source_scope(monkeypatch):
+    artifact_prepare = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_prepare_artifact_publication_fence",
+        artifact_prepare,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_profile_global_fence_required",
+    ):
+        await importer._publish_provider_directory_dataset_artifacts(
+            run_id="uhc-root",
+            metrics={},
+            source_ids=[importer.UHC_RETAINED_SOURCE_ID],
+            publish_corroboration=False,
+            publish_artifacts_targets=None,
+            require_complete_global_profile_fence=True,
+        )
+
+    artifact_prepare.assert_not_awaited()
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_profile_global_target_required",
+    ):
+        await importer._publish_provider_directory_dataset_artifacts(
+            run_id="uhc-root",
+            metrics={},
+            source_ids=None,
+            publish_corroboration=False,
+            publish_artifacts_targets={"network_catalog"},
+            require_complete_global_profile_fence=True,
+        )
+
+    artifact_prepare.assert_not_awaited()
+
+
+def _uhc_source_local_candidate_fence():
+    """Build the candidate and publication fence for source-local promotion."""
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint-uhc",
+        dataset_id="dataset-uhc",
+        acquisition_root_run_id="root-uhc",
+        source_ids=(importer.UHC_RETAINED_SOURCE_ID,),
+        selected_resources=tuple(sorted(importer.UHC_SUPPORTED_RESOURCES)),
+        import_run_id="root-uhc",
+        previous_dataset_id="dataset-old",
+        expected_resources=tuple(sorted(importer.UHC_SUPPORTED_RESOURCES)),
+        already_validated=True,
+    )
+    dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id=importer.UHC_RETAINED_SOURCE_ID,
+        endpoint_id=candidate.endpoint_id,
+        dataset_id=candidate.dataset_id,
+        evidence_run_id="root-uhc",
+        status=importer.ENDPOINT_DATASET_VALIDATED,
+        is_current=False,
+        promote_on_cutover=True,
+    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (dataset,),
+        should_select_validated_candidates=True,
+    )
+    return candidate, fence
+
+
+@pytest.mark.asyncio
+async def test_uhc_source_local_publication_uses_no_artifact_stage(
+    monkeypatch,
+):
+    """Source-local promotion must not enter the global artifact stage."""
+
+    candidate, fence = _uhc_source_local_candidate_fence()
+    events: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        events.append("transaction-start")
+        yield
+        events.append("transaction-commit")
+
+    async def lock_fence(actual_fence):
+        assert actual_fence is fence
+        events.append("lock")
+
+    async def promote(actual_fence):
+        assert actual_fence is fence
+        events.append("promote")
+
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        AsyncMock(return_value=fence),
+    )
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=1))
+    monkeypatch.setattr(
+        importer,
+        "_lock_and_verify_artifact_dataset_fence",
+        lock_fence,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_promote_provider_directory_artifact_datasets",
+        promote,
+    )
+    artifact_bundle = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_dataset_artifacts",
+        artifact_bundle,
+    )
+
+    await importer._publish_validated_uhc_dataset(candidate)
+
+    assert events == [
+        "transaction-start",
+        "lock",
+        "promote",
+        "transaction-commit",
+    ]
+    artifact_bundle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_common_source_upsert_preserves_uhc_transport_endpoint(
+    monkeypatch,
+):
+    """The ordinary source upsert retains the non-FHIR endpoint identity."""
+
+    upsert = AsyncMock()
+    monkeypatch.setattr(importer, "_upsert_rows", upsert)
+    observed_at = datetime.datetime(2026, 7, 28)
+    expected_endpoint = importer._uhc_official_file_endpoint_row(
+        observed_at=observed_at,
+    )
+    source_row = importer._uhc_official_file_source_row(
+        expected_endpoint["endpoint_id"],
+        observed_at=observed_at,
+    )
+
+    endpoint_count = await importer._upsert_provider_directory_source_rows(
+        [source_row]
+    )
+
+    assert endpoint_count == 1
+    assert upsert.await_count == 2
+    endpoint_row = upsert.await_args_list[0].args[1][0]
+    persisted_source = upsert.await_args_list[1].args[1][0]
+    assert endpoint_row["endpoint_id"] == expected_endpoint["endpoint_id"]
+    assert endpoint_row["metadata_json"]["transport"] == (
+        "official_provider_files"
+    )
+    assert persisted_source["endpoint_id"] == endpoint_row["endpoint_id"]
+    assert persisted_source["metadata_json"][
+        "provider_directory_fhir_endpoint"
+    ] is False
+
+
+def test_existing_uhc_candidate_identity_covers_empty_invalid_and_changed(
+    monkeypatch,
+):
+    """Candidate replay accepts only the exact durable publication lineage."""
+
+    expected_identity_by_field = {"catalog": "a" * 64}
+    summary_by_field = {"input_sha256": "b" * 64}
+    importer._assert_existing_uhc_candidate_identity(
+        {"resource_count": 0, "publication_metadata_json": {}},
+        expected_identity_by_field,
+        summary_by_field,
+    )
+
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_summary_input",
+        Mock(side_effect=importer.UhcRetainedDatasetError("invalid")),
+    )
+    with pytest.raises(RuntimeError, match="lineage_invalid"):
+        importer._assert_existing_uhc_candidate_identity(
+            {
+                "resource_count": 1,
+                "publication_metadata_json": {
+                    importer.UHC_RETAINED_PUBLICATION_METADATA_KEY: (
+                        expected_identity_by_field
+                    )
+                },
+            },
+            expected_identity_by_field,
+            summary_by_field,
+        )
+
+    importer.validate_uhc_summary_input.side_effect = None
+    importer.validate_uhc_summary_input.return_value = summary_by_field
+    importer._assert_existing_uhc_candidate_identity(
+        {
+            "resource_count": 1,
+            "publication_metadata_json": {
+                importer.UHC_RETAINED_PUBLICATION_METADATA_KEY: (
+                    expected_identity_by_field
+                )
+            },
+        },
+        expected_identity_by_field,
+        summary_by_field,
+    )
+    with pytest.raises(RuntimeError, match="lineage_changed"):
+        importer._assert_existing_uhc_candidate_identity(
+            {
+                "resource_count": 1,
+                "publication_metadata_json": {
+                    importer.UHC_RETAINED_PUBLICATION_METADATA_KEY: {
+                        "catalog": "changed"
+                    }
+                },
+            },
+            expected_identity_by_field,
+            summary_by_field,
+        )
+
+
+@pytest.mark.asyncio
+async def test_uhc_candidate_state_and_prepare_paths_fail_closed(
+    monkeypatch,
+):
+    """Candidate creation rejects absent and collided identities."""
+
+    with pytest.raises(RuntimeError, match="endpoint_id_missing"):
+        await importer._prepare_uhc_retained_candidate(
+            {},
+            run_id="run-root",
+            summary_input={},
+        )
+
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_state",
+        AsyncMock(
+            return_value={
+                "endpoint_id": "endpoint-other",
+                "acquisition_root_run_id": "run-root",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_expected_uhc_publication_identity",
+        Mock(return_value={}),
+    )
+    with pytest.raises(RuntimeError, match="identity_collision"):
+        await importer._prepare_uhc_retained_candidate(
+            {"endpoint_id": "endpoint-uhc"},
+            run_id="run-root",
+            summary_input={},
+        )
+
+
+def _stub_existing_uhc_candidate_state(monkeypatch):
+    candidate = _endpoint_candidate(
+        endpoint_id="endpoint-uhc",
+        acquisition_root_run_id="run-root",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_existing_uhc_candidate_identity",
+        Mock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_expected_uhc_publication_identity",
+        Mock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_uhc_candidate_from_state",
+        AsyncMock(return_value=candidate),
+    )
+    state_lookup = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_state",
+        state_lookup,
+    )
+    state_lookup.return_value = {
+        "endpoint_id": "endpoint-uhc",
+        "acquisition_root_run_id": "run-root",
+        "status": importer.ENDPOINT_DATASET_PUBLISHED,
+        "is_current": False,
+    }
+    return candidate, state_lookup
+
+
+@pytest.mark.asyncio
+async def test_existing_uhc_candidate_replay_and_initialize(monkeypatch):
+    """Existing candidate state is replayed or initialized exactly once."""
+    candidate, state_lookup = _stub_existing_uhc_candidate_state(monkeypatch)
+    with pytest.raises(RuntimeError, match="finalized_invalid"):
+        await importer._prepare_uhc_retained_candidate(
+            {"endpoint_id": "endpoint-uhc"},
+            run_id="run-root",
+            summary_input={},
+        )
+
+    finalized = dataclasses.replace(candidate, already_validated=True)
+    importer._uhc_candidate_from_state.return_value = finalized
+    replay_check = Mock()
+    monkeypatch.setattr(
+        importer,
+        "_assert_finalized_endpoint_dataset_replay",
+        replay_check,
+    )
+    assert await importer._prepare_uhc_retained_candidate(
+        {"endpoint_id": "endpoint-uhc"},
+        run_id="run-root",
+        summary_input={},
+    ) is finalized
+    replay_check.assert_called_once_with(finalized)
+
+    state_lookup.side_effect = [
+        {},
+        {"publication_metadata_json": {}},
+    ]
+    importer._uhc_candidate_from_state.return_value = candidate
+    initialize = AsyncMock(return_value=candidate)
+    persist = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_initialize_endpoint_dataset_candidate",
+        initialize,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_persist_uhc_candidate_identity",
+        persist,
+    )
+    assert await importer._prepare_uhc_retained_candidate(
+        {"endpoint_id": "endpoint-uhc"},
+        run_id="run-root",
+        summary_input={},
+    ) is candidate
+    initialize.assert_awaited_once()
+    persist.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_uhc_candidate_value_reflects_empty_validated_and_published_state(
+    monkeypatch,
+):
+    current_dataset = AsyncMock(return_value="dataset-old")
+    monkeypatch.setattr(
+        importer,
+        "_current_endpoint_dataset_id",
+        current_dataset,
+    )
+    empty = await importer._uhc_candidate_from_state(
+        "endpoint-uhc",
+        "dataset-uhc",
+        "run-root",
+        {},
+    )
+    assert empty.previous_dataset_id == "dataset-old"
+    assert empty.reused_from_checkpoint is False
+
+    validated = await importer._uhc_candidate_from_state(
+        "endpoint-uhc",
+        "dataset-uhc",
+        "run-root",
+        {
+            "status": importer.ENDPOINT_DATASET_VALIDATED,
+            "is_current": False,
+            "previous_dataset_id": "dataset-prior",
+            "publication_metadata_json": {"resource_count": 7},
+        },
+    )
+    assert validated.already_validated is True
+    assert validated.validated_metadata == {"resource_count": 7}
+
+    published = await importer._uhc_candidate_from_state(
+        "endpoint-uhc",
+        "dataset-uhc",
+        "run-root",
+        {
+            "status": importer.ENDPOINT_DATASET_PUBLISHED,
+            "is_current": True,
+            "publication_metadata_json": {"resource_count": 7},
+        },
+    )
+    assert published.already_published is True
+    assert published.published_metadata == {"resource_count": 7}
+
+
+@pytest.mark.asyncio
+async def test_uhc_candidate_identity_update_requires_one_owned_row(
+    monkeypatch,
+):
+    candidate = _endpoint_candidate()
+    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=0))
+    with pytest.raises(RuntimeError, match="lineage_update_lost"):
+        await importer._persist_uhc_candidate_identity(
+            candidate,
+            {"identity": True},
+            {"summary": True},
+        )
+    importer.db.status.return_value = 1
+    await importer._persist_uhc_candidate_identity(
+        candidate,
+        {"identity": True},
+        {"summary": True},
+    )
+    executor = SimpleNamespace(status=AsyncMock(return_value=1))
+    assert await importer._bind_uhc_candidate_content_proof(
+        executor,
+        candidate,
+        "run-root",
+        {"proof": True},
+    ) == 1
+
+
+def test_bound_uhc_stage_proof_rejects_missing_invalid_and_changed_lineage(
+    monkeypatch,
+):
+    stage = Mock(
+        content_proof={"dataset_hash": "a" * 64},
+        resource_counts={"Practitioner": 1},
+    )
+    with pytest.raises(RuntimeError, match="acquisition_root_required"):
+        importer._bound_uhc_stage_proof(
+            _endpoint_candidate(acquisition_root_run_id=None),
+            stage,
+        )
+
+    monkeypatch.setattr(
+        importer,
+        "bind_uhc_canonical_content_proof",
+        Mock(side_effect=importer.UhcCanonicalProofError("invalid")),
+    )
+    with pytest.raises(RuntimeError, match="stage_content_proof_invalid"):
+        importer._bound_uhc_stage_proof(_endpoint_candidate(), stage)
+
+    importer.bind_uhc_canonical_content_proof.side_effect = None
+    importer.bind_uhc_canonical_content_proof.return_value = {
+        "resource_count": 2,
+        "resource_counts": {"Practitioner": 2},
+    }
+    with pytest.raises(RuntimeError, match="stage_content_proof_changed"):
+        importer._bound_uhc_stage_proof(_endpoint_candidate(), stage)
+
+    importer.bind_uhc_canonical_content_proof.return_value = {
+        "resource_count": 1,
+        "resource_counts": {"Practitioner": 1},
+    }
+    assert importer._bound_uhc_stage_proof(
+        _endpoint_candidate(),
+        stage,
+    )[2] == 1
+
+
+@pytest.mark.asyncio
+async def test_uhc_candidate_copy_and_content_proof_require_exact_counts(
+    monkeypatch,
+):
+    """Candidate COPY checks reject every count mismatch."""
+    candidate = _endpoint_candidate()
+    stage = Mock(
+        resource_ref='"mrf"."stage"',
+        resource_counts={"Practitioner": 1},
+        content_proof={
+            "dataset_hash": "a" * 64,
+            "resource_count": 1,
+            "resource_hashes": {"Practitioner": "b" * 64},
+        },
+    )
+
+    executor = SimpleNamespace(status=AsyncMock(side_effect=[1, 0]))
+
+    @contextlib.asynccontextmanager
+    async def mutation(_dataset_ids):
+        yield executor
+
+    monkeypatch.setattr(
+        importer,
+        "_mutable_endpoint_dataset_resource_mutation",
+        mutation,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_bound_uhc_stage_proof",
+        Mock(return_value=("run-root", {}, 1)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_bind_uhc_candidate_content_proof",
+        AsyncMock(return_value=1),
+    )
+    with pytest.raises(RuntimeError, match="copy_incomplete"):
+        await importer._replace_uhc_candidate_resources(candidate, stage)
+    executor.status.side_effect = [1, 1]
+    assert await importer._replace_uhc_candidate_resources(
+        candidate,
+        stage,
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_uhc_candidate_content_proof_requires_exact_hashes(
+    monkeypatch,
+):
+    """Candidate content proof rejects changed hashes."""
+    candidate = _endpoint_candidate()
+    stage = Mock(
+        resource_counts={"Practitioner": 1},
+        content_proof={
+            "dataset_hash": "a" * 64,
+            "resource_count": 1,
+            "resource_hashes": {"Practitioner": "b" * 64},
+        },
+    )
+
+    @contextlib.asynccontextmanager
+    async def acquire():
+        yield object()
+
+    monkeypatch.setattr(importer.db, "acquire", acquire)
+    monkeypatch.setattr(
+        importer,
+        "_candidate_endpoint_dataset_content_proof",
+        AsyncMock(
+            return_value=importer.EndpointDatasetContentProof(
+                dataset_hash="changed",
+                resource_count=1,
+                resource_hashes={"Practitioner": "b" * 64},
+                resource_counts={"Practitioner": 1},
+            )
+        ),
+    )
+    with pytest.raises(RuntimeError, match="content_proof_mismatch"):
+        await importer._assert_uhc_candidate_content(candidate, stage)
+    expected_proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=1,
+        resource_hashes={"Practitioner": "b" * 64},
+        resource_counts={"Practitioner": 1},
+    )
+    importer._candidate_endpoint_dataset_content_proof.return_value = (
+        expected_proof
+    )
+    assert await importer._assert_uhc_candidate_content(
+        candidate,
+        stage,
+    ) == expected_proof
+
+
+def test_validated_uhc_metadata_maps_each_validation_failure(
+    monkeypatch,
+):
+    candidate = _endpoint_candidate()
+    metadata = {}
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_summary_input",
+        Mock(return_value={"summary": True}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_semantic_source_summary",
+        Mock(return_value={"resource_counts": {"Practitioner": 1}}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_canonical_content_proof",
+        Mock(return_value={"resource_counts": {"Practitioner": 1}}),
+    )
+    assert importer._validated_uhc_final_metadata(candidate, metadata)[0] == {
+        "summary": True
+    }
+
+    cases = (
+        (
+            "validate_semantic_source_summary",
+            importer.ProviderDirectorySourceSummaryError("invalid"),
+            "source_summary_invalid",
+        ),
+        (
+            "validate_uhc_canonical_content_proof",
+            importer.UhcCanonicalProofError("invalid"),
+            "content_proof_invalid",
+        ),
+        (
+            "validate_uhc_summary_input",
+            importer.UhcRetainedDatasetError("invalid"),
+            "summary_input_invalid",
+        ),
+    )
+    for validator_name, failure, message in cases:
+        validator = getattr(importer, validator_name)
+        validator.side_effect = failure
+        with pytest.raises(RuntimeError, match=message):
+            importer._validated_uhc_final_metadata(candidate, metadata)
+        validator.side_effect = None
+
+
+def test_uhc_final_publication_consistency_checks_every_proof_boundary():
+    state_by_field = {
+        "status": importer.ENDPOINT_DATASET_PUBLISHED,
+        "is_current": True,
+        "dataset_hash": "a" * 64,
+    }
+    identity_by_field = {"identity": True}
+    metadata = {
+        importer.UHC_RETAINED_PUBLICATION_METADATA_KEY: identity_by_field
+    }
+    outcome_by_field = {
+        "complete": True,
+        "dataset_hash": "a" * 64,
+        "resource_counts": {"Practitioner": 1},
+    }
+    source_summary_by_field = {"resource_counts": {"Practitioner": 1}}
+    canonical_by_field = {
+        "dataset_hash": "a" * 64,
+        "resource_counts": {"Practitioner": 1},
+        "resource_hashes": {"Practitioner": "b" * 64},
+    }
+    source_summary_by_field["resource_hashes"] = canonical_by_field[
+        "resource_hashes"
+    ]
+    arguments = (
+        state_by_field,
+        metadata,
+        outcome_by_field,
+        source_summary_by_field,
+        canonical_by_field,
+        identity_by_field,
+    )
+    assert importer._is_uhc_final_publication_consistent(*arguments)
+
+    invalid_arguments = []
+    for index, replacement in (
+        (0, {**state_by_field, "status": "validated"}),
+        (0, {**state_by_field, "is_current": False}),
+        (2, None),
+        (2, {**outcome_by_field, "complete": False}),
+        (2, {**outcome_by_field, "dataset_hash": "changed"}),
+        (2, {**outcome_by_field, "resource_counts": {}}),
+        (4, {**canonical_by_field, "dataset_hash": "changed"}),
+        (4, {**canonical_by_field, "resource_counts": {}}),
+        (4, {**canonical_by_field, "resource_hashes": {}}),
+        (1, {}),
+    ):
+        changed_arguments = list(arguments)
+        changed_arguments[index] = replacement
+        invalid_arguments.append(changed_arguments)
+    assert all(
+        not importer._is_uhc_final_publication_consistent(
+            *changed_arguments
+        )
+        for changed_arguments in invalid_arguments
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_source_local_fence_and_final_proof_fail_closed(
+    monkeypatch,
+):
+    """Source-local publication requires an exact dataset fence."""
+    candidate, _fence = _uhc_source_local_candidate_fence()
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        AsyncMock(
+            return_value=importer.ProviderDirectoryArtifactDatasetFence(
+                (),
+                should_select_validated_candidates=True,
+            )
+        ),
+    )
+    with pytest.raises(RuntimeError, match="source_local_fence_invalid"):
+        await importer._publish_validated_uhc_dataset(candidate)
+
+
+@pytest.mark.asyncio
+async def test_uhc_final_publication_proof_fails_closed(monkeypatch):
+    """Final UHC publication requires exact current proof metadata."""
+    candidate = _endpoint_candidate()
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_state",
+        AsyncMock(return_value={"publication_metadata_json": {}}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_validated_uhc_final_metadata",
+        Mock(
+            return_value=(
+                {},
+                {"resource_counts": {}, "resource_hashes": {}},
+                {
+                    "dataset_hash": "a" * 64,
+                    "resource_counts": {},
+                    "resource_hashes": {},
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_expected_uhc_publication_identity",
+        Mock(return_value={}),
+    )
+    with pytest.raises(RuntimeError, match="current_publication_proof_invalid"):
+        await importer._assert_final_uhc_publication(candidate)
+    state_by_field = {
+        "publication_metadata_json": {
+            importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY: {
+                "resource_counts": {}
+            }
+        },
+        "status": importer.ENDPOINT_DATASET_PUBLISHED,
+        "is_current": True,
+        "dataset_hash": "a" * 64,
+        "resource_count": 1,
+    }
+    importer._endpoint_dataset_state.return_value = state_by_field
+    monkeypatch.setattr(
+        importer,
+        "_is_uhc_final_publication_consistent",
+        Mock(return_value=True),
+    )
+    publication_result = await importer._assert_final_uhc_publication(
+        candidate
+    )
+    assert publication_result["resource_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_uhc_acquisition_callbacks_and_catalog_fences(monkeypatch):
+    """Acquisition reports progress and rejects an absent current catalog."""
+    progress = AsyncMock()
+    cancel = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_mark_provider_directory_progress",
+        progress,
+    )
+    monkeypatch.setattr(importer, "raise_if_cancelled", cancel)
+    await importer._uhc_acquisition_progress_callback(
+        "run-root",
+        "a" * 64,
+    )(1, 2, "provider.json", "reused")
+    await importer._uhc_acquisition_cancel_check({}, {})()
+    progress.assert_awaited_once()
+    cancel.assert_awaited_once()
+
+    refresh = AsyncMock(return_value={"catalog_set_sha256": None})
+    monkeypatch.setattr(
+        importer,
+        "refresh_uhc_provider_file_catalog",
+        refresh,
+    )
+    with pytest.raises(RuntimeError, match="selection_is_not_current"):
+        await importer._acquire_current_uhc_official_file_set(
+            {},
+            {},
+            run_id="run-root",
+        )
+
+
+@pytest.mark.asyncio
+async def test_uhc_acquisition_rejects_catalog_change_and_accepts_exact_set(
+    monkeypatch,
+):
+    """Acquisition rejects catalog drift and accepts an exact second read."""
+    catalog_hash = "a" * 64
+    acquisition = importer.UHCOfficialFileAcquisitionResult(
+        catalog_set_sha256=catalog_hash,
+        file_count=2,
+        downloaded_file_count=1,
+        reused_file_count=1,
+        downloaded_byte_count=10,
+    )
+
+    @contextlib.asynccontextmanager
+    async def acquire_driver():
+        yield object()
+
+    monkeypatch.setattr(importer.db, "acquire_driver", acquire_driver)
+    monkeypatch.setattr(
+        importer,
+        "acquire_complete_uhc_catalog_set",
+        AsyncMock(return_value=acquisition),
+    )
+    monkeypatch.setattr(
+        importer,
+        "load_complete_admitted_uhc_catalog_set",
+        AsyncMock(),
+    )
+    refresh = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "refresh_uhc_provider_file_catalog",
+        refresh,
+    )
+    refresh.side_effect = [
+        {"catalog_set_sha256": catalog_hash},
+        {"catalog_set_sha256": catalog_hash, "catalog_file_count": 1},
+    ]
+    with pytest.raises(RuntimeError, match="changed_during_acquisition"):
+        await importer._acquire_current_uhc_official_file_set(
+            {},
+            {},
+            run_id="run-root",
+        )
+
+    refresh.side_effect = [
+        {"catalog_set_sha256": catalog_hash},
+        {"catalog_set_sha256": catalog_hash, "catalog_file_count": 2},
+    ]
+    assert (
+        await importer._acquire_current_uhc_official_file_set(
+            {},
+            {"uhc_catalog_set_sha256": catalog_hash},
+            run_id="run-root",
+        )
+    ) == (catalog_hash, acquisition)
+
+
+@pytest.mark.asyncio
+async def test_uhc_candidate_validation_covers_new_and_failed_candidates(
+    monkeypatch,
+):
+    candidate = _endpoint_candidate(already_validated=False)
+    stage = Mock(resource_counts={"Practitioner": 1})
+    monkeypatch.setattr(
+        importer,
+        "_replace_uhc_candidate_resources",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_uhc_candidate_content",
+        AsyncMock(),
+    )
+    finalize = AsyncMock(return_value={"validated": True})
+    monkeypatch.setattr(
+        importer,
+        "_finalize_endpoint_dataset_candidate",
+        finalize,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_mark_provider_directory_progress",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(importer, "raise_if_cancelled", AsyncMock())
+    publish = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_publish_validated_uhc_dataset",
+        publish,
+    )
+    await importer._validate_and_publish_uhc_candidate(
+        {},
+        {},
+        "run-root",
+        candidate,
+        stage,
+    )
+    publish.assert_awaited_once_with(candidate)
+
+    finalize.return_value = None
+    with pytest.raises(RuntimeError, match="candidate_validation_failed"):
+        await importer._validate_and_publish_uhc_candidate(
+            {},
+            {},
+            "run-root",
+            candidate,
+            stage,
+        )
+
+
+def test_uhc_source_import_requires_run():
+    with pytest.raises(ValueError, match="requires run_id"):
+        importer._required_uhc_source_import_run_id(None)
+    assert (
+        importer._required_uhc_source_import_run_id("run-root")
+        == "run-root"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dataset_rehydration_runtime_callbacks(monkeypatch):
+    """Rehydration callbacks preserve scope, progress, and row counts."""
+    request = importer.RehydrationRequest(
+        source_id="source-a",
+        dataset_id="dataset-a",
+        acquisition_root_run_id="root-a",
+        owner_run_id="run-a",
+        resource_types=(),
+        batch_size=10,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_upsert_resource_rows",
+        AsyncMock(return_value=2),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_raise_if_resource_import_cancelled",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(importer, "mark_control_run", AsyncMock())
+    runtime = importer._dataset_rehydration_runtime({}, {}, request)
+    scope = importer.DatasetScope(
+        source_id="source-a",
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        acquisition_root_run_id="root-a",
+        canonical_api_base="https://example.test/fhir",
+        dataset_hash="a" * 64,
+        resource_count=1,
+        resource_types=("Organization",),
+        publication_metadata_hash="b" * 64,
+        published_at="2026-07-28T00:00:00Z",
+    )
+    assert await runtime.upsert_batch(
+        importer.ProviderDirectoryOrganization,
+        [{}],
+        scope,
+    ) == 2
+    await runtime.cancel_check()
+    await runtime.progress_callback({"phase": "copy"})
+    importer.mark_control_run.side_effect = RuntimeError("diagnostic only")
+    await runtime.progress_callback({"phase": "copy"})
+
+
+@pytest.mark.asyncio
+async def test_dataset_rehydration_runner_uses_resolved_request(monkeypatch):
+    """The rehydration runner executes one resolved source request."""
+    request = importer.RehydrationRequest(
+        source_id="source-a",
+        dataset_id="dataset-a",
+        acquisition_root_run_id="root-a",
+        owner_run_id="run-a",
+        resource_types=(),
+        batch_size=10,
+    )
+    runtime = Mock()
+    monkeypatch.setattr(
+        importer,
+        "_dataset_rehydration_request",
+        Mock(return_value=request),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_dataset_rehydration_runtime",
+        Mock(return_value=runtime),
+    )
+    monkeypatch.setattr(
+        importer,
+        "rehydrate_current_dataset",
+        AsyncMock(return_value={"resource_count": 2}),
+    )
+    execution_context_by_field = {"context": {}}
+    assert await importer._run_provider_directory_dataset_rehydrate(
+        execution_context_by_field,
+        {},
+        "run-a",
+        ["source-a"],
+    ) == {"resource_count": 2}
+    assert execution_context_by_field["context"]["run"] == 1
+
+
+def test_dataset_rehydration_request_rejects_ambiguous_inputs():
+    with pytest.raises(ValueError, match="exactly_one"):
+        importer._dataset_rehydration_request({}, "run-a", [])
+    with pytest.raises(ValueError, match="run_id_required"):
+        importer._dataset_rehydration_request({}, None, ["source-a"])
+    with pytest.raises(ValueError, match="dataset_and_root_required"):
+        importer._dataset_rehydration_request({}, "run-a", ["source-a"])
+    task_by_field = {
+        "rehydrate_dataset_id": "dataset-a",
+        "rehydrate_acquisition_root_run_id": "root-a",
+    }
+    request = importer._dataset_rehydration_request(
+        task_by_field,
+        "run-a",
+        ["source-a"],
+    )
+    assert request.dataset_id == "dataset-a"
+    with pytest.raises(ValueError, match="incompatible_parameters"):
+        importer._dataset_rehydration_request(
+            {**task_by_field, "full_refresh": True},
+            "run-a",
+            ["source-a"],
+        )
+
+
+def test_expected_uhc_publication_identity_delegates_exact_scope(monkeypatch):
+    identity = Mock(return_value={"identity": True})
+    monkeypatch.setattr(importer, "uhc_publication_identity", identity)
+    assert importer._expected_uhc_publication_identity(
+        {"summary": True},
+        dataset_id="dataset-a",
+        acquisition_root_run_id="root-a",
+    ) == {"identity": True}
 
 
 def _stub_resource_import_metadata(monkeypatch):
@@ -4318,18 +5790,57 @@ def test_provider_directory_cli_refresh_preset_leaves_defaults_unset_for_preset(
     monkeypatch.setattr(process_cli, "initiate_provider_directory_fhir", fake_initiate_provider_directory_fhir)
     monkeypatch.setattr(process_cli, "_run", lambda task: calls.append({"run": task}))
 
-    result = CliRunner().invoke(
+    cli_result = CliRunner().invoke(
         process_cli.provider_directory_fhir,
         ["--refresh-preset", "monthly-full", "--seed-only", "--no-probe"],
     )
 
-    assert result.exit_code == 0
+    assert cli_result.exit_code == 0
     assert calls[0]["refresh_preset"] == "monthly-full"
     assert calls[0]["import_resources"] is None
     assert calls[0]["full_refresh"] is None
     assert calls[0]["publish_after_acquisition"] is False
     assert calls[0]["seed_only"] is True
     assert calls[0]["probe"] is False
+
+
+def test_provider_directory_cli_routes_uhc_through_normal_import(monkeypatch):
+    calls = []
+
+    def fake_initiate_provider_directory_fhir(**kwargs):
+        calls.append(kwargs)
+        return "provider-directory-fhir-uhc-retained"
+
+    monkeypatch.setattr(
+        process_cli,
+        "initiate_provider_directory_fhir",
+        fake_initiate_provider_directory_fhir,
+    )
+    monkeypatch.setattr(
+        process_cli,
+        "_run",
+        lambda task: calls.append({"run": task}),
+    )
+    catalog_hash = "a" * 64
+
+    cli_result = CliRunner().invoke(
+        process_cli.provider_directory_fhir,
+        [
+            "--run-id",
+            "uhc-root",
+            "--source-id",
+            importer.UHC_RETAINED_SOURCE_ID,
+            "--import-resources",
+            "--uhc-catalog-set-sha256",
+            catalog_hash,
+        ],
+    )
+
+    assert cli_result.exit_code == 0, cli_result.output
+    assert calls[0]["import_resources"] is True
+    assert "uhc_retained_publish" not in calls[0]
+    assert calls[0]["uhc_catalog_set_sha256"] == catalog_hash
+    assert calls[0]["source_ids"] == [importer.UHC_RETAINED_SOURCE_ID]
 
 
 def test_provider_directory_refresh_preset_rejects_unknown_value():
@@ -4436,6 +5947,12 @@ async def test_delete_stale_resource_rows_prunes_canonical_source_edges(monkeypa
         "resource_type": "Location",
     }
     assert resource_params == edge_params
+
+    assert await importer._delete_stale_resource_rows(
+        ProviderDirectoryLocation,
+        "source_a",
+        "run_2",
+    ) == 4
 
 
 @pytest.mark.asyncio
@@ -4603,12 +6120,23 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
 @pytest.mark.asyncio
 async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(monkeypatch):
     upsert_calls = []
+    persisted_proof = AsyncMock()
+
+    @contextlib.asynccontextmanager
+    async def fake_transaction():
+        yield None
 
     async def fake_upsert(model, resource_rows, **kwargs):
         upsert_calls.append((model, resource_rows, kwargs))
         return len(resource_rows)
 
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+    monkeypatch.setattr(importer.db, "transaction", fake_transaction)
+    monkeypatch.setattr(
+        importer,
+        "persist_dataset_proof_shard",
+        persisted_proof,
+    )
 
     resource_rows = [
         {
@@ -4641,6 +6169,12 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
     assert canonical_call[1][0]["payload_json"] is None
     assert canonical_call[1][0]["payload_hash"] == dataset_call[1][0]["payload_hash"]
     assert upsert_calls[-1][0] is ProviderDirectoryPractitionerRole
+    persisted_proof.assert_awaited_once_with(
+        importer.db,
+        "mrf",
+        dataset_call[1],
+        dataset_id="dataset_1",
+    )
 
 
 def _alohr_graphql_fixture_page(root_key: str):
@@ -7984,7 +9518,17 @@ class _AliasImportCapture:
         return {"dataset_id": "dataset_1", "published": True}
 
     def install(self, monkeypatch):
+        @contextlib.asynccontextmanager
+        async def fake_transaction():
+            yield None
+
         monkeypatch.setattr(importer, "_upsert_rows", self.upsert)
+        monkeypatch.setattr(importer.db, "transaction", fake_transaction)
+        monkeypatch.setattr(
+            importer,
+            "persist_dataset_proof_shard",
+            AsyncMock(),
+        )
         monkeypatch.setattr(importer, "_fetch_resource_rows", self.fetch)
         monkeypatch.setattr(importer, "_mark_resource_rows_seen", self.mark_seen)
         monkeypatch.setattr(importer, "_delete_stale_resource_rows", self.delete_stale)
@@ -9921,13 +11465,61 @@ class _EndpointDatasetPromotionHarness:
             },
         }
         self.resources = [
-            {"resource_type": "Practitioner", "resource_id": "prac-2", "payload_hash": "hash-2"},
-            {"resource_type": "Organization", "resource_id": "org-1", "payload_hash": "hash-1"},
-            {"resource_type": "Practitioner", "resource_id": "prac-1", "payload_hash": "hash-3"},
+            self._resource("Practitioner", "prac-2", {"npi": "222"}),
+            self._resource("Organization", "org-1", {"npi": "111"}),
+            self._resource("Practitioner", "prac-1", {"npi": "111"}),
         ]
+        self.proof_rows = []
+        for resource_type in ("Organization", "Practitioner"):
+            descriptor, payload_bytes = build_dataset_proof_shard(
+                [
+                    resource_record
+                    for resource_record in self.resources
+                    if resource_record["resource_type"] == resource_type
+                ],
+                dataset_id="dataset_new",
+                endpoint_id="endpoint_1",
+                acquisition_root_run_id="run_2",
+                source_ids=("source_a", "source_b"),
+            )
+            self.proof_rows.append(
+                {
+                    "shard_id": descriptor["shard_id"],
+                    "endpoint_id": descriptor["endpoint_id"],
+                    "acquisition_root_run_id": descriptor[
+                        "acquisition_root_run_id"
+                    ],
+                    "source_ids_json": descriptor["source_ids"],
+                    "resource_count": descriptor["resource_count"],
+                    "resource_counts_json": descriptor["resource_counts"],
+                    "first_identity_json": descriptor["first_identity"],
+                    "last_identity_json": descriptor["last_identity"],
+                    "input_sha256": descriptor["input_sha256"],
+                    "artifact_sha256": descriptor["artifact_sha256"],
+                    "artifact_byte_count": descriptor[
+                        "artifact_byte_count"
+                    ],
+                    "payload_bytes": payload_bytes,
+                }
+            )
+        self.proof_rows.sort(
+            key=lambda proof_record: proof_record["shard_id"]
+        )
         self.events: list[str] = []
         self.committed = False
         self.max_batch_rows = 0
+
+    @staticmethod
+    def _resource(resource_type, resource_id, payload):
+        return {
+            "dataset_id": "dataset_new",
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "payload_hash": hashlib.sha256(
+                json.dumps(payload, sort_keys=True).encode()
+            ).hexdigest(),
+            "payload_json": payload,
+        }
 
     async def __aenter__(self):
         self.events.append("begin")
@@ -9958,6 +11550,12 @@ class _EndpointDatasetPromotionHarness:
     async def all(self, _sql, **params):
         if "provider_directory_bulk_acquisition_checkpoint" in _sql:
             return []
+        if "provider_directory_dataset_proof_shard" in _sql:
+            return [
+                row
+                for row in self.proof_rows
+                if row["shard_id"] > params["after_shard_id"]
+            ]
         ordered_resources = sorted(
             self.resources,
             key=lambda resource: (resource["resource_type"], resource["resource_id"]),
@@ -9980,6 +11578,9 @@ class _EndpointDatasetPromotionHarness:
         sql_text = str(sql)
         if sql_text.startswith("SET TRANSACTION"):
             self.events.append("set_snapshot")
+            return 1
+        if "provider_directory_dataset_proof_shard" in sql_text:
+            self.events.append("clear_content_proof")
             return 1
         if params.get("status") != importer.ENDPOINT_DATASET_VALIDATED:
             raise AssertionError(f"unexpected validation SQL: {sql_text}")
@@ -10037,10 +11638,8 @@ async def test_endpoint_dataset_completion_validates_without_superseding_current
         "lock_endpoint",
         "lock_candidate",
         "lock_current",
-        "read_resources",
-        "read_resources",
-        "summarize_resources",
         "validate",
+        "clear_content_proof",
         "commit",
     ]
     assert harness.datasets["dataset_old"] == {
@@ -10054,7 +11653,7 @@ async def test_endpoint_dataset_completion_validates_without_superseding_current
     assert validation_summary_map["resource_count"] == 3
     assert validation_summary_map["published"] is False
     assert validation_summary_map["validated"] is True
-    assert harness.max_batch_rows == 2
+    assert harness.max_batch_rows == 0
     expected_hash_input = "\n".join(
         importer._stable_identity_json(identity)
         for identity in sorted(
@@ -10111,7 +11710,11 @@ async def test_endpoint_dataset_validation_preserves_partition_state(
     assert harness.committed is True
     assert "clear_partition_proof" not in harness.events
     assert "clear_partition_checkpoint" not in harness.events
-    assert harness.events[-2:] == ["validate", "commit"]
+    assert harness.events[-3:] == [
+        "validate",
+        "clear_content_proof",
+        "commit",
+    ]
 
 
 @pytest.mark.asyncio
@@ -10220,6 +11823,8 @@ class _AtomicCandidateInitializationHarness:
                 raise RuntimeError("checkpoint_write_failed")
         elif "INSERT INTO" in sql_text and "endpoint_dataset" in sql_text:
             self.events.append("candidate_upsert")
+        elif "provider_directory_dataset_proof_shard" in sql_text:
+            self.events.append("content_proof_clear")
         else:
             self.events.append("candidate_rows_clear")
         return 1
@@ -10274,6 +11879,7 @@ async def test_partition_candidate_and_initial_checkpoint_share_transaction(
         "candidate_upsert",
         "dataset_resource_parent_lock",
         "candidate_rows_clear",
+        "content_proof_clear",
         "dataset_resource_parent_lock",
         "checkpoint_upsert",
         "rollback",
@@ -10349,9 +11955,15 @@ async def test_uncheckpointed_candidate_cleanup_is_root_fenced(monkeypatch):
 
     await importer._clear_uncheckpointed_endpoint_dataset_candidate(candidate)
 
-    cleanup_sql = status_mock.await_args.args[0]
+    cleanup_sql = status_mock.await_args_list[0].args[0]
     assert "acquisition_root_run_id IS NOT DISTINCT FROM" in cleanup_sql
-    assert status_mock.await_args.kwargs["acquisition_root_run_id"] == "run_root"
+    assert (
+        status_mock.await_args_list[0].kwargs["acquisition_root_run_id"]
+        == "run_root"
+    )
+    proof_cleanup = status_mock.await_args_list[1]
+    assert "provider_directory_dataset_proof_shard" in proof_cleanup.args[0]
+    assert proof_cleanup.kwargs == {"dataset_id": candidate.dataset_id}
 
 
 def _aetna_candidate_retry_context() -> importer.PaginationCheckpointContext:
@@ -11419,16 +13031,35 @@ def _zero_role_fetch_result(source_id: str, resource_type: str):
     return _complete_resource_fetch(model_by_resource[resource_type], rows)
 
 
+def _zero_role_fetcher(retry_is_missing: bool):
+    """Build a fetcher whose second role response is empty or absent."""
+    resource_calls: list[str] = []
+
+    async def fetch(source, resource_type, **_kwargs):
+        resource_calls.append(resource_type)
+        is_missing_retry = (
+            retry_is_missing
+            and resource_type == "PractitionerRole"
+            and resource_calls.count(resource_type) == 2
+        )
+        if is_missing_retry:
+            return None
+        return _zero_role_fetch_result(source["source_id"], resource_type)
+
+    return fetch
+
+
 @pytest.mark.asyncio
-async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_after_retry(monkeypatch):
+@pytest.mark.parametrize("retry_is_missing", [False, True])
+async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_after_retry(
+    monkeypatch,
+    retry_is_missing,
+):
     """Verify this provider-directory regression contract."""
     metadata_calls: list[dict[str, Any]] = []
 
     async def fake_update_metadata(_source_ids, **kwargs):
         metadata_calls.append(kwargs["diagnostics"])
-
-    async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
-        return _zero_role_fetch_result(source["source_id"], resource_type)
 
     async def fake_upsert(_model, rows, **_kwargs):
         return len(rows)
@@ -11444,7 +13075,11 @@ async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_afte
 
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE", "0")
     monkeypatch.setattr(importer, "_update_source_resource_import_metadata", fake_update_metadata)
-    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+    monkeypatch.setattr(
+        importer,
+        "_fetch_resource_rows",
+        _zero_role_fetcher(retry_is_missing),
+    )
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
     monkeypatch.setattr(importer, "_delete_stale_resource_rows", fake_delete_stale)
     monkeypatch.setattr(importer, "_mark_resource_rows_seen", fake_mark_seen)
@@ -12287,6 +13922,47 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
     corroboration_publish.assert_awaited_once()
     assert corroboration_publish.await_args.kwargs["refresh_network_catalog"] is False
     assert corroboration_publish.await_args.kwargs["defer_cutover"] is True
+
+
+@pytest.mark.asyncio
+async def test_profile_followup_forwards_global_fence_contract(monkeypatch):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_tables",
+        AsyncMock(),
+    )
+    publish = AsyncMock(return_value={"profile": {"profile_rows": 1}})
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_dataset_artifacts",
+        publish,
+    )
+
+    profile_result = await importer.process_data(
+        {"context": {}},
+        {
+            **importer._provider_directory_global_profile_followup(
+                source_id=importer.UHC_RETAINED_SOURCE_ID,
+                dataset_id="dataset-uhc",
+                parent_run_id="parent-run",
+            )["params"],
+            "run_id": "profile-followup-run",
+        },
+    )
+
+    assert profile_result == {"profile": {"profile_rows": 1}}
+    assert publish.await_args.kwargs["source_ids"] == []
+    assert publish.await_args.kwargs["publish_artifacts_targets"] == {
+        "profile"
+    }
+    assert (
+        publish.await_args.kwargs[
+            "require_complete_global_profile_fence"
+        ]
+        is True
+    )
+    assert publish.await_args.kwargs["publish_corroboration"] is False
 
 
 def test_provider_directory_publish_artifact_targets_parse_aliases():
@@ -13170,6 +14846,7 @@ async def test_provider_directory_table_ensure_current_schema_runs_no_ddl(
     ]
     status = AsyncMock()
     create_table = AsyncMock()
+    ensure_proof_table = AsyncMock()
     monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
     monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
     monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
@@ -13180,6 +14857,11 @@ async def test_provider_directory_table_ensure_current_schema_runs_no_ddl(
         AsyncMock(return_value=[{"indexname": name} for name in index_names]),
     )
     monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "ensure_dataset_proof_shard_table",
+        ensure_proof_table,
+    )
     monkeypatch.setattr(
         importer,
         "_ensure_provider_directory_model_columns",
@@ -13200,6 +14882,7 @@ async def test_provider_directory_table_ensure_current_schema_runs_no_ddl(
 
     status.assert_not_awaited()
     create_table.assert_not_awaited()
+    ensure_proof_table.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -13212,12 +14895,13 @@ async def test_provider_directory_table_ensure_repairs_missing_schema_and_table(
     ]
     status = AsyncMock()
     create_table = AsyncMock()
+    ensure_proof_table = AsyncMock()
     monkeypatch.setattr(importer, "SOURCE_MODELS", (ProviderDirectorySource,))
     monkeypatch.setattr(importer, "CANONICAL_RESOURCE_MODELS", ())
     monkeypatch.setattr(
         importer,
         "_is_table_present",
-        AsyncMock(side_effect=(False, False)),
+        AsyncMock(side_effect=(False, False, False)),
     )
     monkeypatch.setattr(importer.db, "create_table", create_table)
     monkeypatch.setattr(
@@ -13226,6 +14910,11 @@ async def test_provider_directory_table_ensure_repairs_missing_schema_and_table(
         AsyncMock(return_value=[{"indexname": name} for name in index_names]),
     )
     monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "ensure_dataset_proof_shard_table",
+        ensure_proof_table,
+    )
     monkeypatch.setattr(
         importer,
         "_ensure_provider_directory_model_columns",
@@ -13249,6 +14938,7 @@ async def test_provider_directory_table_ensure_repairs_missing_schema_and_table(
         ProviderDirectorySource.__table__,
         checkfirst=True,
     )
+    ensure_proof_table.assert_awaited_once_with(importer.db, "mrf")
 
 
 @pytest.mark.asyncio
@@ -16628,6 +18318,35 @@ def _bulk_test_identity(checkpoint_context, resource_type="Practitioner"):
     )
 
 
+@pytest.mark.asyncio
+async def test_bulk_checkpoint_worker_guard_locks_probes_and_unlocks(
+    monkeypatch,
+):
+    guard_connection = SimpleNamespace()
+    autocommit_connection = SimpleNamespace(
+        scalar=AsyncMock(side_effect=(True, True, True))
+    )
+    guard_connection.execution_options = Mock(
+        return_value=autocommit_connection
+    )
+
+    @contextlib.asynccontextmanager
+    async def connect():
+        yield guard_connection
+
+    monkeypatch.setattr(
+        importer.db,
+        "engine",
+        SimpleNamespace(connect=connect),
+    )
+    identity = _bulk_test_identity(_bulk_test_context())
+
+    async with importer._bulk_checkpoint_worker_guard(identity) as probe:
+        await probe()
+
+    assert autocommit_connection.scalar.await_count == 3
+
+
 def _bulk_test_source(api_base=importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE):
     return {
         "source_id": "aetna-commercial",
@@ -18664,6 +20383,20 @@ def test_caresource_completeness_proof_fails_closed(
     assert importer._caresource_proof_failure(proof_by_field) == expected_failure
 
 
+def test_caresource_completeness_proof_accepts_equal_counts():
+    assert (
+        importer._caresource_proof_failure(
+            {
+                "pre_count": 2,
+                "post_count": 2,
+                "processed_rows": 2,
+                "unique_candidate_rows": 2,
+            }
+        )
+        is None
+    )
+
+
 def _install_caresource_scan_callbacks(
     monkeypatch,
     start_url: str,
@@ -19186,7 +20919,12 @@ async def test_empty_checkpoint_restarts_after_page_size_change(monkeypatch):
     }
     status_mock = AsyncMock(return_value=1)
     first_mock = AsyncMock(return_value=checkpoint_by_name)
-    restart_connection = _stub_checkpoint_restart_connection(monkeypatch, 1, 0)
+    restart_connection = _stub_checkpoint_restart_connection(
+        monkeypatch,
+        1,
+        0,
+        0,
+    )
     monkeypatch.setattr(importer.db, "first", first_mock)
     monkeypatch.setattr(importer.db, "status", status_mock)
 
@@ -19210,6 +20948,8 @@ async def test_empty_checkpoint_restarts_after_page_size_change(monkeypatch):
     cleanup_call = restart_connection.status.await_args_list[1]
     assert "UPDATE" in restart_call.args[0]
     assert "DELETE FROM" in cleanup_call.args[0]
+    proof_cleanup_call = restart_connection.status.await_args_list[2]
+    assert "provider_directory_dataset_proof_shard" in proof_cleanup_call.args[0]
     status_mock.assert_not_awaited()
 
 
@@ -23067,7 +24807,7 @@ class _LastUpdatedPartitionFetchHarness:
             candidate_hashes_by_id=candidate_hashes_by_id,
         )
 
-    async def _stage_rows(self, _connection, staged_rows):
+    async def _stage_rows(self, _connection, staged_rows, **_kwargs):
         self.staged_resources_by_id.update(
             {
                 staged_row["resource_id"]: staged_row["payload_json"]
@@ -24768,7 +26508,7 @@ class _AtomicPartitionPassHarness:
         else:
             self.events.append("commit")
 
-    async def stage_rows(self, observed_connection, _rows):
+    async def stage_rows(self, observed_connection, _rows, **_kwargs):
         assert observed_connection is self.connection
         self.events.append("candidate_rows")
 
@@ -25372,6 +27112,14 @@ async def test_graphql_probe_and_timeout_configuration_fallbacks(monkeypatch):
     )
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PROBE_FLUSH_EVERY", "invalid")
     assert importer._source_probe_hard_timeout_seconds({}, timeout=3) == 8
+    official_source, _group_result = _common_uhc_group_fixture()
+    assert (
+        importer._source_probe_hard_timeout_seconds(
+            official_source,
+            timeout=3,
+        )
+        == 35
+    )
     assert importer._probe_flush_every() == 50
 
 
@@ -25641,6 +27389,7 @@ async def test_partition_bundle_validation_records_transport_and_shape_failures(
 
 @pytest.mark.asyncio
 async def test_linked_resource_import_is_bounded_and_cancels_deadline_work(monkeypatch):
+    """Bound linked-resource work and cancel work beyond its deadline."""
     assert (
         await importer._import_linked_resource_rows(
             {"source_id": "source-a"},
@@ -25692,6 +27441,44 @@ async def test_linked_resource_import_is_bounded_and_cancels_deadline_work(monke
         deadline_seconds=1,
     )
     assert import_counts == {}
+
+
+@pytest.mark.asyncio
+async def test_linked_resource_import_stops_after_wait_timeout(monkeypatch):
+    """Stop linked-resource work when the bounded wait times out."""
+    linked_references = [
+        ("Organization", "org-new", "Organization/org-new", "org_refs")
+    ]
+    monkeypatch.setattr(
+        importer,
+        "_linked_resource_refs",
+        lambda _rows: linked_references,
+    )
+    blocker = asyncio.Event()
+
+    async def blocked_fetch(*_args, **_kwargs):
+        await blocker.wait()
+
+    monkeypatch.setattr(importer, "_fetch_linked_resource_row", blocked_fetch)
+    monkeypatch.setattr(importer.asyncio, "as_completed", lambda tasks: tasks)
+    monotonic_values = iter((0.0, 0.0))
+    monkeypatch.setattr(
+        importer,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+    wait_for = AsyncMock(side_effect=TimeoutError)
+    monkeypatch.setattr(importer.asyncio, "wait_for", wait_for)
+    import_counts = await importer._import_linked_resource_rows(
+        {"source_id": "source-a", "api_base": "https://example.test/fhir"},
+        {},
+        per_source_limit=1,
+        timeout=1,
+        run_id="run",
+        deadline_seconds=1,
+    )
+    assert import_counts == {}
+    wait_for.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -26613,3 +28400,2219 @@ def test_partition_initializations_require_valid_config_and_checkpoint(monkeypat
     )
     with pytest.raises(RuntimeError, match="checkpoint_context_missing"):
         importer._candidate_partition_initializations(source_records, candidate)
+
+
+@pytest.mark.asyncio
+async def test_artifact_content_proof_failures_and_uhc_dispatch(monkeypatch):
+    """Artifact fence and UHC proof failures stay isolated."""
+    dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id=importer.UHC_RETAINED_SOURCE_ID,
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        evidence_run_id="root-a",
+        expected_resources=("Practitioner",),
+    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_expected_resources",
+        Mock(return_value=("Organization",)),
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="expected_metadata_changed",
+    ):
+        importer._assert_locked_artifact_fence_aliases(
+            fence,
+            [
+                {
+                    "source_id": importer.UHC_RETAINED_SOURCE_ID,
+                    "endpoint_id": "endpoint-a",
+                    "source_record_json": {},
+                }
+            ],
+        )
+
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_canonical_content_proof",
+        Mock(side_effect=importer.UhcCanonicalProofError("invalid")),
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="canonical_proof_invalid",
+    ):
+        importer._uhc_artifact_content_proof(dataset, {})
+
+
+def test_uhc_artifact_content_proof_accepts_canonical_counts(monkeypatch):
+    """Convert a validated official-file proof into the shared proof type."""
+    dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id=importer.UHC_RETAINED_SOURCE_ID,
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        evidence_run_id="root-a",
+        expected_resources=("Practitioner",),
+    )
+    expected_uhc_proof_by_field = {
+        "dataset_hash": "a" * 64,
+        "resource_count": 2,
+        "resource_hashes": {"Practitioner": "b" * 64},
+        "resource_counts": {"Practitioner": 2},
+    }
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_canonical_content_proof",
+        Mock(return_value=expected_uhc_proof_by_field),
+    )
+    content_proof = importer._uhc_artifact_content_proof(dataset, {})
+    assert content_proof.dataset_hash == expected_uhc_proof_by_field["dataset_hash"]
+    assert content_proof.resource_count == expected_uhc_proof_by_field["resource_count"]
+    assert (
+        content_proof.resource_hashes
+        == expected_uhc_proof_by_field["resource_hashes"]
+    )
+    assert (
+        content_proof.resource_counts
+        == expected_uhc_proof_by_field["resource_counts"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_artifact_proof_failure_and_uhc_dispatch(monkeypatch):
+    """Generic proof failure does not alter official UHC dispatch."""
+    dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id=importer.UHC_RETAINED_SOURCE_ID,
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        evidence_run_id="root-a",
+        expected_resources=("Practitioner",),
+    )
+    generic_dataset = dataclasses.replace(
+        dataset,
+        source_id="source-a",
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_stored_dataset_proof_metadata",
+        Mock(side_effect=importer.ProviderDirectoryProofStoreError("invalid")),
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="content_proof_invalid",
+    ):
+        await importer._generic_artifact_content_proof(
+            generic_dataset,
+            _endpoint_candidate(),
+            {importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: {}},
+        )
+
+    expected = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=0,
+        resource_hashes={},
+        resource_counts={},
+    )
+    monkeypatch.setattr(
+        importer,
+        "_uhc_artifact_content_proof",
+        Mock(return_value=expected),
+    )
+    assert await importer._artifact_content_proof(
+        dataset,
+        _endpoint_candidate(),
+        {},
+    ) is expected
+
+
+@pytest.mark.asyncio
+async def test_profile_bucket_and_promoted_stage_cleanup(monkeypatch):
+    """Publish evidence batches and clean stages after successful cutover."""
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation-a",
+        source_ids=("source-a",),
+        retained_source_ids=(),
+        dataset_ids=("dataset-a",),
+        profile_as_of="2026-07-28T00:00:00Z",
+        evidence_stage="evidence",
+        profile_stage="profile",
+    )
+    batch = importer._ProviderDirectoryProfileEvidenceBatch(
+        kind="source",
+        source_id="source-a",
+        dataset_id="dataset-a",
+        role_bucket_count=2,
+        role_bucket=1,
+    )
+    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=1))
+    monkeypatch.setattr(
+        importer.profile_artifact,
+        "profile_evidence_insert_sql",
+        Mock(return_value="INSERT"),
+    )
+    assert await importer._execute_profile_evidence_batch(
+        build,
+        batch,
+        "COPY",
+        {},
+    ) == 1
+    assert importer.db.status.await_args.kwargs[
+        "profile_role_bucket_count"
+    ] == 2
+
+    stages = (Mock(resume_checkpoint=None), Mock(resume_checkpoint=None))
+    monkeypatch.setattr(
+        importer,
+        "_retry_provider_directory_artifact_bundle_promotion",
+        AsyncMock(),
+    )
+    remove = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_remove_provider_directory_artifact_stage",
+        remove,
+    )
+    assert await importer._finalize_provider_directory_profile_stages(
+        {"rows": 1},
+        stages,
+        defer_cutover=False,
+    ) == {"rows": 1}
+    assert remove.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_profile_stage_promotion_failure_preserves_retry_stages(
+    monkeypatch,
+):
+    """Leave prepared stages intact when cutover promotion fails."""
+    stages = (Mock(resume_checkpoint=None), Mock(resume_checkpoint=None))
+    monkeypatch.setattr(
+        importer,
+        "_retry_provider_directory_artifact_bundle_promotion",
+        AsyncMock(side_effect=RuntimeError("promotion failed")),
+    )
+    remove = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_remove_provider_directory_artifact_stage",
+        remove,
+    )
+
+    with pytest.raises(RuntimeError, match="promotion failed"):
+        await importer._finalize_provider_directory_profile_stages(
+            {"rows": 1},
+            stages,
+            defer_cutover=False,
+        )
+    remove.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dataset_resource_proof_rejects_only_lookup_rows(monkeypatch):
+    connection = SimpleNamespace(status=AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_lock_mutable_endpoint_dataset_resource_parents",
+        AsyncMock(),
+    )
+    persist = AsyncMock()
+    monkeypatch.setattr(importer, "persist_dataset_proof_shard", persist)
+
+    with pytest.raises(RuntimeError, match="proof_rows_missing"):
+        await importer._upsert_dataset_resource_rows_on_connection(
+            connection,
+            [
+                {
+                    "dataset_id": "dataset-a",
+                    "resource_type": "LU:PractitionerRole:pass:1",
+                    "resource_id": "lookup-a",
+                    "payload_hash": "a" * 64,
+                    "payload_json": {},
+                }
+            ],
+            persist_content_proof=True,
+        )
+
+    connection.status.assert_awaited_once()
+    persist.assert_not_awaited()
+
+    await importer._upsert_dataset_resource_rows_on_connection(
+        connection,
+        [
+            {
+                "dataset_id": "dataset-a",
+                "resource_type": "Practitioner",
+                "resource_id": "practitioner-a",
+                "payload_hash": "b" * 64,
+                "payload_json": {},
+            }
+        ],
+        persist_content_proof=True,
+    )
+    persist.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_copy_upsert_transaction_and_changed_row_paths(monkeypatch):
+    assert importer._transaction_session_options(None) == {}
+
+    raw_connection = SimpleNamespace(driver_connection=object())
+    transaction_connection = SimpleNamespace(
+        get_raw_connection=AsyncMock(return_value=raw_connection)
+    )
+    transaction_session = SimpleNamespace(
+        connection=AsyncMock(return_value=transaction_connection)
+    )
+    async with importer._copy_upsert_connection(
+        transaction_session
+    ) as connection:
+        assert connection.raw_connection is raw_connection
+
+    copy_records = AsyncMock()
+    driver = SimpleNamespace(copy_records_to_table=copy_records)
+    copy_connection = SimpleNamespace(
+        raw_connection=SimpleNamespace(driver_connection=driver),
+        status=AsyncMock(),
+    )
+
+    @contextlib.asynccontextmanager
+    async def copy_upsert_connection(_transaction_session):
+        yield copy_connection
+
+    monkeypatch.setattr(
+        importer,
+        "_copy_upsert_connection",
+        copy_upsert_connection,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_copy_upsert_changed_where_sql",
+        Mock(return_value="target.changed IS DISTINCT FROM excluded.changed"),
+    )
+    assert await importer._copy_upsert_rows(
+        importer.ProviderDirectoryOrganization,
+        [{"source_id": "source-a", "resource_id": "organization-a"}],
+        ["source_id", "resource_id"],
+        ["source_id", "resource_id"],
+        skip_unchanged=True,
+    ) == 1
+    assert any(
+        "ANALYZE" in str(call.args[0])
+        for call in copy_connection.status.await_args_list
+    )
+
+
+def test_retest_dedupe_merges_metadata_into_retained_source(monkeypatch):
+    retained_source_by_field = {
+        "source_id": "source-a",
+        "org_name": "Example",
+        "plan_name": "",
+        "api_base": "https://example.test/fhir",
+        "seed_source": "catalog",
+    }
+    retest_source_by_field = {
+        "source_id": "source-b",
+        "org_name": "Example",
+        "plan_name": "",
+        "api_base": "https://example.test/fhir",
+        "seed_source": "provider-directory-db-retest",
+    }
+    merge = Mock()
+    monkeypatch.setattr(
+        importer,
+        "_merge_skipped_source_row_metadata",
+        merge,
+    )
+    assert importer._dedupe_source_rows(
+        [retained_source_by_field, retest_source_by_field]
+    ) == [
+        retained_source_by_field
+    ]
+    merge.assert_called_once_with(
+        retained_source_by_field,
+        retest_source_by_field,
+    )
+
+
+@pytest.mark.asyncio
+async def test_partition_worker_and_completion_terminal_paths(monkeypatch):
+    state = importer.PartitionFetchState(
+        result_model=importer.ProviderDirectoryOrganization,
+        retained_resource_rows=[],
+    )
+    state.stop_event.set()
+    await importer._run_partition_fetch_worker(
+        {},
+        "Organization",
+        asyncio.Queue(),
+        state,
+        Mock(),
+    )
+
+    queue = asyncio.Queue()
+    clear = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_prepare_partition_fetch",
+        AsyncMock(return_value=(queue, state)),
+    )
+    state.stop_event.clear()
+    monkeypatch.setattr(
+        importer,
+        "_execute_partition_fetch_workers",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_uhc_partition_residual_error",
+        Mock(return_value=None),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_uhc_partition_checkpoint_type",
+        Mock(return_value="seed"),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_clear_reverse_lookup_checkpoints",
+        clear,
+    )
+    partition_result = await importer._fetch_partitioned_resource_rows(
+        {},
+        "Organization",
+        importer.ProviderDirectoryOrganization,
+        [],
+        Mock(run_id="run-a"),
+    )
+    assert partition_result.complete is True
+    clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partition_resume_without_adoption_and_retry_guard(monkeypatch):
+    context = _checkpoint_context()
+    monkeypatch.setattr(
+        importer,
+        "_has_matching_pagination_checkpoint_identity",
+        Mock(return_value=True),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_resume_from_checkpoint",
+        Mock(return_value=importer.LastUpdatedPartitionResume(plan=Mock())),
+    )
+    adoption = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_adopt_pagination_checkpoint_owner",
+        adoption,
+    )
+    await importer._resume_partition_plan(
+        context,
+        "Organization",
+        Mock(),
+        {
+            "start_url_hash": "expected",
+            "owner_run_id": context.owner_run_id,
+        },
+        "expected",
+    )
+    adoption.assert_not_awaited()
+
+    retry_context = dataclasses.replace(
+        context,
+        retry_of_run_id="retry-a",
+        lineage_verified=False,
+    )
+    with pytest.raises(RuntimeError, match="retry_unverified"):
+        await importer._initialize_partition_plan(
+            retry_context,
+            "Organization",
+            Mock(),
+            "start-hash",
+        )
+
+
+@pytest.mark.asyncio
+async def test_partition_checkpoint_save_requires_owned_row(monkeypatch):
+    context = _checkpoint_context()
+    monkeypatch.setattr(
+        importer,
+        "_is_last_updated_partition_census_complete",
+        Mock(return_value=False),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_checkpoint_payload",
+        Mock(return_value="{}"),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_update_last_updated_partition_checkpoint",
+        AsyncMock(return_value=0),
+    )
+    with pytest.raises(RuntimeError, match="ownership_lost"):
+        await importer._save_last_updated_partition_plan(
+            context,
+            "Organization",
+            Mock(),
+            Mock(status=importer.PlanStatus.FAILED),
+            census=Mock(),
+            pages_processed=0,
+            rows_processed=0,
+        )
+    assert isinstance(importer._last_updated_partition_monotonic(), float)
+
+
+@pytest.mark.asyncio
+async def test_last_updated_window_validation_cancel_and_deadline_paths(
+    monkeypatch,
+):
+    """Window page fetching rejects malformed resources and next links."""
+    partition_source = _last_updated_partition_test_source()
+    window = _last_updated_partition_test_window()
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                {"resourceType": "Bundle", "type": "searchset"},
+                None,
+                1,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_validated_last_updated_page_resources",
+        Mock(return_value=((), "resource_invalid")),
+    )
+    assert (
+        await importer._fetch_last_updated_window_page(
+            partition_source,
+            "Practitioner",
+            "https://example.test/fhir/Practitioner",
+            window,
+            timeout=1,
+        )
+    ).error == "resource_invalid"
+
+    monkeypatch.setattr(
+        importer,
+        "_validated_last_updated_page_resources",
+        Mock(return_value=((), None)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resolved_fhir_next_url",
+        Mock(side_effect=ValueError("next_invalid")),
+    )
+    assert (
+        await importer._fetch_last_updated_window_page(
+            partition_source,
+            "Practitioner",
+            "https://example.test/fhir/Practitioner",
+            window,
+            timeout=1,
+        )
+    ).error == "next_invalid"
+
+
+@pytest.mark.asyncio
+async def test_last_updated_window_cancel_and_deadline_paths(monkeypatch):
+    """Window fetching honors missing counts, deadlines, and cancellation."""
+    partition_source = _last_updated_partition_test_source()
+    window = _last_updated_partition_test_window()
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_monotonic",
+        Mock(return_value=10.0),
+    )
+    assert importer._last_updated_window_stop_result(
+        [],
+        0,
+        10,
+        "https://example.test/page",
+        set(),
+        9.0,
+    ).deadline_reached is True
+
+    missing_count = dataclasses.replace(window, count=None)
+    assert (
+        await importer._fetch_last_updated_partition_window(
+            partition_source,
+            "Practitioner",
+            "https://example.test/page",
+            missing_count,
+            timeout=1,
+            cancel_ctx=None,
+            cancel_task=None,
+            deadline_at=None,
+        )
+    ).error == "window_count_missing"
+
+    cancel = AsyncMock(side_effect=RuntimeError("cancelled"))
+    monkeypatch.setattr(
+        importer,
+        "_raise_if_resource_import_cancelled",
+        cancel,
+    )
+    with pytest.raises(RuntimeError, match="cancelled"):
+        await importer._fetch_last_updated_partition_window(
+            partition_source,
+            "Practitioner",
+            "https://example.test/page",
+            window,
+            timeout=1,
+            cancel_ctx={},
+            cancel_task={},
+            deadline_at=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dataset_resource_proof_filters_fail_closed(monkeypatch):
+    connection = SimpleNamespace(status=AsyncMock())
+    await importer._upsert_dataset_resource_rows_on_connection(
+        connection,
+        [],
+    )
+    connection.status.assert_not_awaited()
+
+    monkeypatch.setattr(
+        importer,
+        "_lock_mutable_endpoint_dataset_resource_parents",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_max_rows_per_statement",
+        Mock(return_value=100),
+    )
+    with pytest.raises(RuntimeError, match="proof_rows_missing"):
+        await importer._upsert_dataset_resource_rows_on_connection(
+            connection,
+            [
+                {
+                    "dataset_id": "dataset-a",
+                    "resource_type": "LU:Organization:pass:1",
+                    "resource_id": "organization-a",
+                    "payload_hash": "a" * 64,
+                    "payload_json": {},
+                }
+            ],
+            persist_content_proof=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_saved_partition_failure_and_caresource_terminal_paths(
+    monkeypatch,
+):
+    """Saved partitions preserve their terminal failure."""
+    state = SimpleNamespace(
+        census=importer.LastUpdatedCompletenessCensus(),
+        context=_checkpoint_context(),
+        plan=Mock(),
+        pages_fetched=1,
+        rows_fetched=2,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_save_last_updated_partition_plan",
+        AsyncMock(),
+    )
+    expected = Mock()
+    monkeypatch.setattr(
+        importer,
+        "_partition_failure_from_state",
+        Mock(return_value=expected),
+    )
+    assert await importer._saved_partition_terminal_result(
+        importer.ProviderDirectoryOrganization,
+        "Organization",
+        Mock(),
+        state,
+        "terminal",
+    ) is expected
+    assert state.census.failure == "terminal"
+
+@pytest.mark.asyncio
+async def test_caresource_terminal_paths_reject_duplicate_resources(
+    monkeypatch,
+):
+    """Carrier census rejects absent datasets and duplicate resources."""
+    with pytest.raises(RuntimeError, match="dataset_id_missing"):
+        await importer._caresource_unique_candidate_count(
+            dataclasses.replace(_checkpoint_context(), dataset_id=None),
+            "PractitionerRole",
+        )
+
+    monkeypatch.setattr(
+        importer,
+        "_fetch_caresource_census_count",
+        AsyncMock(return_value=importer.CareSourceCensusFetch(count=2)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_caresource_unique_candidate_count",
+        AsyncMock(return_value=1),
+    )
+    save = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_save_pagination_checkpoint_completeness",
+        save,
+    )
+    outcome = await importer._finish_caresource_opaque_cursor_census(
+        {},
+        "PractitionerRole",
+        _checkpoint_context(),
+        "https://example.test/fhir/PractitionerRole",
+        {"pre_count": 2},
+        timeout=1,
+        rows_processed=2,
+    )
+    assert outcome.error == "duplicate_resource_ids"
+    assert outcome.proof["failure"] == "duplicate_resource_ids"
+
+
+def test_reverse_lookup_parser_skips_empty_and_keeps_roles(monkeypatch):
+    monkeypatch.setattr(
+        importer,
+        "_bundle_entries",
+        Mock(
+            return_value=[
+                {"resource": {}, "fullUrl": None},
+                {"resource": {}, "fullUrl": None},
+                {"resource": {}, "fullUrl": None},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "parse_fhir_resource",
+        Mock(
+            side_effect=[
+                None,
+                (
+                    importer.ProviderDirectoryOrganization,
+                    {"resource_id": "organization-a"},
+                ),
+                (
+                    importer.ProviderDirectoryPractitionerRole,
+                    {"resource_id": "role-a"},
+                ),
+            ]
+        ),
+    )
+    assert importer._parse_practitioner_role_reverse_lookup_rows(
+        "source-a",
+        {},
+        "run-a",
+        fetch_url="https://example.test/fhir/PractitionerRole",
+    ) == [{"resource_id": "role-a"}]
+
+    assert importer._row_reference_values(
+        {"reference": " Organization/org-a "},
+        ("reference",),
+    ) == ["Organization/org-a"]
+    refs = importer._linked_resource_refs(
+        {
+            "PractitionerRole": [
+                {
+                    "practitioner_ref": "invalid",
+                    "organization_ref": "Organization/org-a",
+                    "organization_refs": ["Organization/org-a"],
+                }
+            ]
+        }
+    )
+    assert [ref[:2] for ref in refs] == [("Organization", "org-a")]
+
+
+def _uhc_candidate_for_summary(**overrides):
+    candidate_fields_by_name = {
+        "source_ids": (importer.UHC_RETAINED_SOURCE_ID,),
+        "selected_resources": tuple(sorted(importer.UHC_SUPPORTED_RESOURCES)),
+        "expected_resources": tuple(sorted(importer.UHC_SUPPORTED_RESOURCES)),
+        "endpoint_id": "endpoint-uhc",
+        "dataset_id": "dataset-uhc",
+        "acquisition_root_run_id": "root-uhc",
+    }
+    candidate_fields_by_name.update(overrides)
+    return _endpoint_candidate(**candidate_fields_by_name)
+
+
+def _uhc_summary_count_fixture():
+    resource_counts_by_type = {
+        "Practitioner": 1,
+        "Organization": 1,
+        "Location": 1,
+        "PractitionerRole": 1,
+        "OrganizationAffiliation": 1,
+        "InsurancePlan": 1,
+    }
+    count_by_field = {
+        "raw_individual_records": 1,
+        "raw_facility_records": 1,
+        "raw_address_rows": 1,
+        "raw_provider_plan_rows": 2,
+        "membership_plan_key_count": 1,
+        "orphan_plan_detail_count": 0,
+    }
+    return resource_counts_by_type, count_by_field
+
+
+def test_uhc_summary_resource_relationship_guards():
+    resource_counts, count_by_field = _uhc_summary_count_fixture()
+    proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=6,
+        resource_hashes={},
+        resource_counts=resource_counts,
+    )
+    with pytest.raises(RuntimeError, match="resource_counts_inconsistent"):
+        importer._assert_uhc_canonical_summary_counts(
+            proof,
+            {**count_by_field, "raw_individual_records": 0},
+            {},
+        )
+    with pytest.raises(RuntimeError, match="relationship_counts_inconsistent"):
+        importer._assert_uhc_canonical_summary_counts(
+            proof,
+            {**count_by_field, "raw_provider_plan_rows": 1},
+            {},
+        )
+    importer._assert_uhc_canonical_summary_counts(
+        proof,
+        count_by_field,
+        {},
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_candidate_summary_input_maps_missing_invalid_and_identity(
+    monkeypatch,
+):
+    candidate = _uhc_candidate_for_summary()
+    connection = SimpleNamespace(
+        first=AsyncMock(return_value={"publication_metadata_json": {}})
+    )
+    assert await importer._uhc_candidate_summary_input(
+        connection,
+        candidate,
+    ) is None
+
+    connection.first.return_value = {
+        "publication_metadata_json": {
+            importer.UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY: {}
+        }
+    }
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_summary_input",
+        Mock(side_effect=importer.UhcRetainedDatasetError("invalid")),
+    )
+    with pytest.raises(RuntimeError, match="summary_input_invalid"):
+        await importer._uhc_candidate_summary_input(connection, candidate)
+
+    importer.validate_uhc_summary_input.side_effect = (
+        importer.UhcCanonicalProofError("invalid")
+    )
+    with pytest.raises(RuntimeError, match="content_proof_invalid"):
+        await importer._uhc_candidate_summary_input(connection, candidate)
+
+    importer.validate_uhc_summary_input.side_effect = None
+    importer.validate_uhc_summary_input.return_value = {
+        "semantic_contract_id": importer.SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID
+    }
+    with pytest.raises(RuntimeError, match="candidate_identity_invalid"):
+        await importer._uhc_candidate_summary_input(
+            connection,
+            dataclasses.replace(candidate, source_ids=("source-other",)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_uhc_endpoint_summary_requires_input_and_root(monkeypatch):
+    candidate = _uhc_candidate_for_summary()
+    proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=0,
+        resource_hashes={},
+        resource_counts={},
+    )
+    monkeypatch.setattr(
+        importer,
+        "_uhc_candidate_summary_input",
+        AsyncMock(return_value=None),
+    )
+    assert await importer._uhc_endpoint_dataset_source_summary(
+        object(),
+        candidate,
+        proof,
+    ) is None
+
+    importer._uhc_candidate_summary_input.return_value = {
+        "count_by_field": {},
+        "count_by_category": {
+            "intentional_drop_counts": {"unexpected_drop": 1}
+        },
+    }
+    with pytest.raises(RuntimeError, match="drop_scope_invalid"):
+        await importer._uhc_endpoint_dataset_source_summary(
+            object(),
+            candidate,
+            proof,
+        )
+
+    importer._uhc_candidate_summary_input.return_value = {
+        "count_by_field": {},
+        "count_by_category": {"intentional_drop_counts": {}},
+    }
+    monkeypatch.setattr(
+        importer,
+        "_assert_uhc_canonical_summary_counts",
+        Mock(),
+    )
+    with pytest.raises(RuntimeError, match="acquisition_root_required"):
+        await importer._uhc_endpoint_dataset_source_summary(
+            object(),
+            dataclasses.replace(candidate, acquisition_root_run_id=None),
+            proof,
+        )
+
+
+@pytest.mark.asyncio
+async def test_uhc_source_summary_metadata_absent_and_changed(monkeypatch):
+    candidate = _uhc_candidate_for_summary()
+    proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=1,
+        resource_hashes={"Practitioner": "b" * 64},
+        resource_counts={"Practitioner": 1},
+    )
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_source_summary",
+        AsyncMock(return_value=None),
+    )
+    assert await importer._endpoint_dataset_source_summary_metadata(
+        object(),
+        candidate,
+        proof,
+        {},
+        importer.ENDPOINT_DATASET_VALIDATED,
+    ) == {}
+
+    monkeypatch.setattr(
+        importer,
+        "_acquiring_uhc_metadata",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_summary_input",
+        Mock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_canonical_content_proof",
+        Mock(
+            return_value={
+                "dataset_hash": "changed",
+                "resource_count": 1,
+                "resource_hashes": proof.resource_hashes,
+                "resource_counts": proof.resource_counts,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_expected_uhc_publication_identity",
+        Mock(return_value={}),
+    )
+    with pytest.raises(RuntimeError, match="lineage_changed"):
+        await importer._validated_uhc_source_summary_metadata(
+            object(),
+            candidate,
+            proof,
+            {},
+        )
+
+
+@pytest.mark.asyncio
+async def test_uhc_proof_errors_are_translated_at_import_boundaries(
+    monkeypatch,
+):
+    candidate = _uhc_candidate_for_summary()
+    proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=1,
+        resource_hashes={"Practitioner": "b" * 64},
+        resource_counts={"Practitioner": 1},
+    )
+    monkeypatch.setattr(
+        importer,
+        "_acquiring_uhc_metadata",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_summary_input",
+        Mock(side_effect=importer.UhcRetainedDatasetError("invalid")),
+    )
+    with pytest.raises(RuntimeError, match="validation_lineage_invalid"):
+        await importer._validated_uhc_source_summary_metadata(
+            object(),
+            candidate,
+            proof,
+            {},
+        )
+
+    importer.validate_uhc_summary_input.side_effect = None
+    importer.validate_uhc_summary_input.return_value = {}
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_canonical_content_proof",
+        Mock(side_effect=importer.UhcCanonicalProofError("invalid")),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="validation_content_proof_invalid",
+    ):
+        await importer._validated_uhc_source_summary_metadata(
+            object(),
+            candidate,
+            proof,
+            {},
+        )
+    with pytest.raises(RuntimeError, match="canonical_proof_invalid"):
+        await importer._candidate_endpoint_dataset_content_proof(
+            object(),
+            candidate,
+        )
+
+
+def test_dataset_validation_proof_metadata_requires_root_and_identity(
+    monkeypatch,
+):
+    candidate = _endpoint_candidate(acquisition_root_run_id=None)
+    proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=1,
+        resource_hashes={"Organization": "b" * 64},
+        resource_counts={"Organization": 1},
+        source_metrics={},
+        proof_metadata={},
+    )
+    with pytest.raises(RuntimeError, match="acquisition_root_required"):
+        importer._dataset_validation_metadata(
+            candidate,
+            {},
+            proof,
+            {},
+            {},
+            {},
+            {},
+        )
+
+    candidate = dataclasses.replace(
+        candidate,
+        acquisition_root_run_id="root-a",
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_stored_dataset_proof_metadata",
+        Mock(
+            return_value={
+                "dataset_hash": "changed",
+                "resource_count": 1,
+                "resource_hashes": proof.resource_hashes,
+                "resource_counts": proof.resource_counts,
+                "source_metrics": {},
+            }
+        ),
+    )
+    with pytest.raises(RuntimeError, match="metadata_changed"):
+        importer._dataset_validation_metadata(
+            candidate,
+            {},
+            proof,
+            {},
+            {},
+            {},
+            {},
+        )
+
+
+@pytest.mark.asyncio
+async def test_overlay_and_startup_remaining_paths(monkeypatch):
+    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=0))
+    await importer._dedupe_address_overlay_stage(
+        '"mrf"."stage"',
+        source_ids=[],
+        resource_types=[],
+    )
+    assert "WHERE" not in importer.db.status.await_args.args[0].split(
+        "DELETE FROM", 1
+    )[0]
+
+    await importer._drop_address_overlay_stage_best_effort('"mrf"."stage"')
+    monkeypatch.setattr(
+        importer,
+        "_prepare_provider_directory_artifact_stage",
+        AsyncMock(),
+    )
+    overlay_result = await importer._prepared_address_overlay_result(
+        "mrf",
+        "stage",
+        {"rows": 1},
+        importer.ProviderDirectoryArtifactDatasetFence(()),
+    )
+    assert overlay_result[0] == {"rows": 1}
+
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_tables",
+        AsyncMock(),
+    )
+    startup_context_by_field = {}
+    await importer.startup(startup_context_by_field)
+    assert startup_context_by_field["context"]["run"] == 0
+    assert (
+        startup_context_by_field["context"][
+            "provider_directory_tables_ready"
+        ]
+        is True
+    )
+
+
+def test_locked_artifact_fence_accepts_matching_expected_resources(
+    monkeypatch,
+):
+    dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id="source-a",
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        evidence_run_id="root-a",
+        expected_resources=("Organization",),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_expected_resources",
+        Mock(return_value=("Organization",)),
+    )
+    importer._assert_locked_artifact_fence_aliases(
+        importer.ProviderDirectoryArtifactDatasetFence((dataset,)),
+        [
+            {
+                "source_id": "source-a",
+                "endpoint_id": "endpoint-a",
+                "source_record_json": {},
+            }
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_copy_upsert_without_changed_filter_or_analyze(monkeypatch):
+    copy_records = AsyncMock()
+    driver = SimpleNamespace(copy_records_to_table=copy_records)
+    connection = SimpleNamespace(
+        raw_connection=SimpleNamespace(driver_connection=driver),
+        status=AsyncMock(),
+    )
+
+    @contextlib.asynccontextmanager
+    async def copy_connection(_transaction_session):
+        yield connection
+
+    monkeypatch.setattr(
+        importer,
+        "_copy_upsert_connection",
+        copy_connection,
+    )
+    assert await importer._copy_upsert_rows(
+        importer.ProviderDirectoryOrganization,
+        [{"source_id": "source-a", "resource_id": "organization-a"}],
+        ["source_id", "resource_id"],
+        ["source_id", "resource_id"],
+        skip_unchanged=False,
+    ) == 1
+    assert not any(
+        "ANALYZE" in str(call.args[0])
+        for call in connection.status.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_partition_checkpoint_save_and_existing_failure_paths(
+    monkeypatch,
+):
+    context = _checkpoint_context()
+    monkeypatch.setattr(
+        importer,
+        "_is_last_updated_partition_census_complete",
+        Mock(return_value=False),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_checkpoint_payload",
+        Mock(return_value="{}"),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_update_last_updated_partition_checkpoint",
+        AsyncMock(return_value=1),
+    )
+    await importer._save_last_updated_partition_plan(
+        context,
+        "Organization",
+        Mock(),
+        Mock(status=importer.PlanStatus.FAILED),
+        census=Mock(),
+        pages_processed=0,
+        rows_processed=0,
+    )
+
+    state = SimpleNamespace(
+        census=importer.LastUpdatedCompletenessCensus(failure="prior"),
+        context=context,
+        plan=Mock(),
+        pages_fetched=0,
+        rows_fetched=0,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_save_last_updated_partition_plan",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_partition_failure_from_state",
+        Mock(return_value=Mock()),
+    )
+    await importer._saved_partition_terminal_result(
+        importer.ProviderDirectoryOrganization,
+        "Organization",
+        Mock(),
+        state,
+        "replacement",
+    )
+    assert state.census.failure == "prior"
+
+
+@pytest.mark.asyncio
+async def test_caresource_candidate_count_reads_valid_dataset(monkeypatch):
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(return_value={"unique_candidate_rows": 3}),
+    )
+    assert await importer._caresource_unique_candidate_count(
+        _checkpoint_context(),
+        "PractitionerRole",
+    ) == 3
+
+
+@pytest.mark.asyncio
+async def test_endpoint_content_and_candidate_proof_terminal_paths(
+    monkeypatch,
+):
+    connection = SimpleNamespace(all=AsyncMock(return_value=[]))
+    proof = await importer._endpoint_dataset_content_proof(
+        connection,
+        "dataset-a",
+    )
+    assert proof.resource_count == 0
+
+    candidate = _uhc_candidate_for_summary()
+    monkeypatch.setattr(
+        importer,
+        "_acquiring_uhc_metadata",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_uhc_canonical_content_proof",
+        Mock(
+            return_value={
+                "dataset_hash": "a" * 64,
+                "resource_count": 1,
+                "resource_hashes": {"Practitioner": "b" * 64},
+                "resource_counts": {"Practitioner": 1},
+            }
+        ),
+    )
+    with pytest.raises(RuntimeError, match="scope_changed"):
+        await importer._candidate_endpoint_dataset_content_proof(
+            object(),
+            candidate,
+        )
+
+    with pytest.raises(RuntimeError, match="acquisition_root_required"):
+        await importer._candidate_endpoint_dataset_content_proof(
+            object(),
+            _endpoint_candidate(acquisition_root_run_id=None),
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_graph_guard_checkpoint_adoption_and_query_root(
+    monkeypatch,
+):
+    """Plan graph guards accept one empty acquisition result."""
+    monkeypatch.setattr(
+        importer,
+        "_acquire_uhc_plan_graph",
+        AsyncMock(return_value=Mock()),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_write_uhc_plan_graph_resources",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_uhc_plan_graph_result_metadata",
+        Mock(return_value=([], {}, {})),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_finalize_uhc_plan_graph_stale_rows",
+        AsyncMock(return_value=({}, {})),
+    )
+    await importer._import_uhc_plan_graph_source_group(
+        {"source_id": "source-a"},
+        [],
+        page_count=1,
+        timeout=1,
+        run_id="run-a",
+        deadline_seconds=0,
+        stale_cleanup=False,
+        seen_table=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_guard_connection_uses_engine_url(monkeypatch):
+    """Checkpoint guard connection renders the configured engine URL."""
+    class URL:
+        def set(self, **_kwargs):
+            return self
+
+        def render_as_string(self, **_kwargs):
+            return "postgresql://example.test/database"
+
+    monkeypatch.setattr(importer.db, "engine", SimpleNamespace(url=URL()))
+    connect = AsyncMock(return_value=object())
+    monkeypatch.setattr(importer.asyncpg, "connect", connect)
+    await importer._open_pagination_checkpoint_guard_connection()
+    connect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_adoption_and_query_root(monkeypatch):
+    """Checkpoint adoption and serving queries retain ownership roots."""
+    context = _checkpoint_context()
+    checkpoint_by_field = {"owner_run_id": "prior"}
+    monkeypatch.setattr(
+        importer,
+        "_fetch_pagination_checkpoint",
+        AsyncMock(return_value=checkpoint_by_field),
+    )
+    resume = importer.PaginationResumeState("next", 0, 0, ())
+    monkeypatch.setattr(
+        importer,
+        "_compatible_pagination_resume_state",
+        Mock(return_value=resume),
+    )
+    adoption = AsyncMock(return_value=resume)
+    monkeypatch.setattr(
+        importer,
+        "_adopt_pagination_checkpoint_owner",
+        adoption,
+    )
+    assert await importer._load_or_initialize_pagination_checkpoint(
+        context,
+        "Organization",
+        "https://example.test/fhir/Organization",
+    ) is resume
+    adoption.assert_awaited_once()
+
+    assert importer._dataset_serving_relation_query_options(
+        "dataset-a",
+        "root-a",
+    ) == (
+        True,
+        {
+            "dataset_id": "dataset-a",
+            "acquisition_root_run_id": "root-a",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_reset_candidate_alohr_and_resume_required_guards(monkeypatch):
+    connection = SimpleNamespace(status=AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_lock_mutable_endpoint_dataset_resource_parents",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "delete_dataset_proof_shards",
+        AsyncMock(),
+    )
+    with pytest.raises(RuntimeError, match="checkpoint_context_missing"):
+        await importer._reset_new_endpoint_candidate(
+            connection,
+            _endpoint_candidate(
+                checkpoint_context=None,
+                repair_empty_orphan=True,
+            ),
+            [Mock()],
+        )
+
+    stream_state = SimpleNamespace(
+        current_locator="bad",
+        error=None,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_alohr_graphql_checkpoint_token",
+        Mock(side_effect=ValueError("locator_invalid")),
+    )
+    assert await importer._can_advance_alohr_graphql_stream_page(
+        Mock(),
+        Mock(root_key="items"),
+        stream_state,
+    ) is False
+    assert stream_state.error == "locator_invalid"
+
+    resume_required_entries = set()
+    import_state = SimpleNamespace(
+        options=SimpleNamespace(
+            checkpoint_context=_checkpoint_context(),
+            resume_required_entries=resume_required_entries,
+        ),
+        checkpoint_diagnostics_by_resource={
+            "Organization": {"complete": False}
+        },
+        source_ids=("source-a",),
+    )
+    await importer._finalize_alohr_checkpoints(import_state)
+    assert resume_required_entries == {"source-a:Organization"}
+
+
+@pytest.mark.asyncio
+async def test_remaining_partition_and_checkpoint_opposite_paths(monkeypatch):
+    """A pending partition count preserves its terminal result."""
+    window = Mock(window_id="root")
+    plan = Mock(
+        pending_count_windows=Mock(return_value=[window]),
+        status=importer.PlanStatus.FAILED,
+    )
+    state = SimpleNamespace(
+        plan=plan,
+        pages_fetched=0,
+        context=_checkpoint_context(),
+        census=Mock(),
+        rows_fetched=0,
+        start_url="https://example.test/fhir/Organization",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_last_updated_partition_count",
+        AsyncMock(
+            return_value=importer.LastUpdatedCountFetch(
+                importer.CountObservation.exact(1)
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_save_last_updated_partition_plan",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_partition_failure_from_state",
+        Mock(return_value=Mock()),
+    )
+    assert await importer._observe_next_partition_count(
+        {},
+        "Organization",
+        importer.ProviderDirectoryOrganization,
+        Mock(page_count=1),
+        state,
+        Mock(timeout=1),
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_remaining_plan_graph_partition_source_ids(monkeypatch):
+    """Plan graph results preserve explicit checkpoint source IDs."""
+    monkeypatch.setattr(
+        importer,
+        "_acquire_uhc_plan_graph",
+        AsyncMock(return_value=Mock()),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_write_uhc_plan_graph_resources",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_uhc_plan_graph_result_metadata",
+        Mock(return_value=([], {}, {})),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_finalize_uhc_plan_graph_stale_rows",
+        AsyncMock(return_value=({}, {})),
+    )
+    plan_graph_result = await importer._import_uhc_plan_graph_source_group(
+        {
+            "source_id": "source-a",
+            "_partition_checkpoint_source_ids": ["source-b"],
+        },
+        [],
+        page_count=1,
+        timeout=1,
+        run_id="run-a",
+        deadline_seconds=0,
+        stale_cleanup=False,
+        seen_table=None,
+    )
+    assert plan_graph_result[0] == ["source-b"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_opposite_paths_skip_adoption_and_resume_tracking(
+    monkeypatch,
+):
+    """Owned checkpoints skip adoption and optional resume tracking."""
+    context = _checkpoint_context()
+    resume = importer.PaginationResumeState("next", 0, 0, ())
+    monkeypatch.setattr(
+        importer,
+        "_fetch_pagination_checkpoint",
+        AsyncMock(return_value={"owner_run_id": context.owner_run_id}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_compatible_pagination_resume_state",
+        Mock(return_value=resume),
+    )
+    adoption = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_adopt_pagination_checkpoint_owner",
+        adoption,
+    )
+    assert await importer._load_or_initialize_pagination_checkpoint(
+        context,
+        "Organization",
+        "https://example.test/fhir/Organization",
+    ) is resume
+    adoption.assert_not_awaited()
+
+    no_resume_tracking = SimpleNamespace(
+        options=SimpleNamespace(
+            checkpoint_context=context,
+            resume_required_entries=None,
+        ),
+        checkpoint_diagnostics_by_resource={
+            "Organization": {"complete": False}
+        },
+        source_ids=("source-a",),
+    )
+    await importer._finalize_alohr_checkpoints(no_resume_tracking)
+    should_verify, params = importer._dataset_serving_relation_query_options(
+        "dataset-a",
+        importer._DATASET_SERVING_RELATION_ROOT_UNSET,
+    )
+    assert should_verify is False
+    assert params == {"dataset_id": "dataset-a"}
+
+
+@pytest.mark.asyncio
+async def test_role_lookup_result_without_checkpoint_cleanup(monkeypatch):
+    streamed = SimpleNamespace(flush=AsyncMock(), rows_written=0)
+    monkeypatch.setattr(
+        importer,
+        "_StreamedResourceRowBuffer",
+        Mock(return_value=streamed),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_new_role_lookup_state",
+        Mock(return_value=Mock()),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_new_role_lookup_request",
+        Mock(return_value=Mock()),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_run_role_lookup_tasks",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_build_role_lookup_result",
+        Mock(
+            return_value=_minimal_resource_fetch_result(
+                importer.ProviderDirectoryPractitionerRole,
+                complete=False,
+            )
+        ),
+    )
+    clear = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_clear_reverse_lookup_checkpoints",
+        clear,
+    )
+    await importer._fetch_scan_practitioner_role_rows_concurrent(
+        {},
+        {},
+        _scan_options(resume_completed_seeds=True),
+        concurrency=1,
+    )
+    clear.assert_not_awaited()
+
+    assert importer._row_reference_values(
+        {"a": "Organization/a", "b": "Organization/b"},
+        ("a", "b"),
+    ) == ["Organization/a", "Organization/b"]
+
+
+def _minimal_resource_fetch_result(
+    model,
+    *,
+    complete,
+    retry_not_before=None,
+):
+    return importer.ResourceFetchResult(
+        model=model,
+        rows=[],
+        rows_fetched=0,
+        rows_written=0,
+        pages_fetched=1,
+        complete=complete,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+        retry_not_before=retry_not_before,
+    )
+
+
+def _stub_minimal_role_import(monkeypatch, *, complete):
+    source_record_by_field = {
+        "source_id": "source-a",
+        "api_base": "https://example.test/fhir",
+    }
+    monkeypatch.setattr(
+        importer,
+        "_source_resource_fetch_order",
+        Mock(return_value=["PractitionerRole"]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_resource_rows",
+        AsyncMock(
+            return_value=_minimal_resource_fetch_result(
+                importer.ProviderDirectoryPractitionerRole,
+                complete=complete,
+            )
+        ),
+    )
+    for function_name, replacement in (
+        ("_finalize_source_pagination_checkpoints", AsyncMock()),
+        ("_update_source_resource_import_metadata", AsyncMock()),
+        (
+            "_ensure_import_seen_stage_table",
+            AsyncMock(return_value="seen_stage"),
+        ),
+        ("_drop_import_seen_stage_table", AsyncMock()),
+    ):
+        monkeypatch.setattr(importer, function_name, replacement)
+    return source_record_by_field
+
+
+@pytest.mark.asyncio
+async def test_import_resources_merges_empty_retry_and_postal_cleanup(
+    monkeypatch,
+):
+    """Shared imports merge retry metadata and postal cleanup state."""
+    source_record_by_field = _stub_minimal_role_import(
+        monkeypatch,
+        complete=False,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_is_uhc_role_postal_partition_enabled",
+        Mock(return_value=True),
+    )
+    postal_seen = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_mark_postal_checkpointed_roles_seen",
+        postal_seen,
+    )
+    retry_boundary_by_resource = {}
+    assert await importer._import_resources(
+        [source_record_by_field],
+        resources=["PractitionerRole"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=1,
+        timeout=1,
+        run_id="run-a",
+        stale_cleanup=True,
+        resource_retry_not_before=retry_boundary_by_resource,
+    ) == {"PractitionerRole": 0}
+    postal_seen.assert_awaited_once()
+    assert retry_boundary_by_resource == {}
+
+
+@pytest.mark.asyncio
+async def test_import_resources_defers_zero_role_stale_cleanup(
+    monkeypatch,
+):
+    """An empty role page defers stale cleanup until retry completes."""
+    source_record_by_field = _stub_minimal_role_import(
+        monkeypatch,
+        complete=True,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resource_start_url",
+        Mock(return_value="https://example.test/PractitionerRole"),
+    )
+    stale_delete = AsyncMock(return_value=0)
+    monkeypatch.setattr(
+        importer,
+        "_delete_stale_resource_rows",
+        stale_delete,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_prepare_import_seen_stage_lookup",
+        AsyncMock(),
+    )
+    await importer._import_resources(
+        [source_record_by_field],
+        resources=["PractitionerRole"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=1,
+        timeout=1,
+        run_id="run-a",
+        stale_cleanup=True,
+    )
+    stale_delete.assert_awaited_once()
+
+
+def _stub_seen_stage_profile_followup(monkeypatch):
+    prepare_seen = AsyncMock()
+    drop_seen = AsyncMock()
+    profile_followup = AsyncMock(return_value={"queued": True})
+    monkeypatch.setattr(
+        importer,
+        "_is_seen_stage_enabled",
+        Mock(return_value=True),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_prepare_import_seen_stage_lookup",
+        prepare_seen,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_drop_import_seen_stage_table",
+        drop_seen,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_source_local_profile_followup_if_current",
+        profile_followup,
+    )
+    return prepare_seen, drop_seen
+
+
+@pytest.mark.asyncio
+async def test_process_data_seen_stage_publish_and_profile_followup(monkeypatch):
+    """The normal process publishes seen-stage and profile follow-up state."""
+    import_resources = _stub_corroboration_publish_pipeline(monkeypatch)
+    source_id = importer._source_row_from_seed(
+        {
+            "id": "test-cigna",
+            "org_name": "Cigna",
+            "plan_name": "test open fhir",
+            "api_base": "https://fhir.cigna.com/ProviderDirectory/v1",
+            "auth_type": "open",
+            "last_validated_status": "valid",
+            "data_quality_flag": "VERIFIED_REAL",
+            "source": "test_fixture",
+        }
+    )["source_id"]
+    monkeypatch.setattr(
+        importer,
+        "_mark_provider_directory_progress",
+        AsyncMock(),
+    )
+    prepare_seen, drop_seen = _stub_seen_stage_profile_followup(
+        monkeypatch
+    )
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "run_id": "run_seen",
+            "source_id": source_id,
+            "probe": False,
+            "import_resources": True,
+            "resources": "Location",
+            "publish_artifacts": True,
+            "full_refresh": True,
+            "resource_limit": 0,
+            "page_limit": 0,
+            "stream_batch_size": 5_000,
+            "stale_cleanup": True,
+        },
+    )
+
+    import_resources.assert_awaited_once()
+    assert metrics["profile_followup"] == {"queued": True}
+    assert metrics["publishable_artifact_source_ids"] == [source_id]
+    prepare_seen.assert_awaited()
+    drop_seen.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_process_data_publish_artifacts_only_uses_attested_profile(
+    monkeypatch,
+):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_tables",
+        AsyncMock(),
+    )
+    execution = object()
+    monkeypatch.setattr(
+        importer,
+        "validated_profile_execution",
+        Mock(return_value=execution),
+    )
+    publish = AsyncMock(return_value={"profile": {"profile_rows": 2}})
+    monkeypatch.setattr(
+        importer,
+        "_publish_attested_provider_directory_profile",
+        publish,
+    )
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "publish_artifacts_only": True,
+            "provider_directory_profile_contract_id": "contract-a",
+        },
+    )
+
+    assert metrics == {"profile": {"profile_rows": 2}}
+    publish.assert_awaited_once_with(
+        run_id=None,
+        metrics={
+            "publish_artifacts": True,
+            "publish_artifacts_only": True,
+            "source_ids": [],
+        },
+        execution=execution,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_data_rejects_missing_seed_database(monkeypatch):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_tables",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resolve_seed_db",
+        Mock(return_value=(None, None)),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="seed database could not be resolved",
+    ):
+        await importer.process_data(
+            {"context": {}},
+            {"probe": False},
+        )
+
+
+def _stub_limited_process_data(monkeypatch):
+    seed_tmpdir = Mock()
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_tables",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resolve_seed_db",
+        Mock(return_value=("seed.db", seed_tmpdir)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_seed_rows_from_sqlite",
+        Mock(return_value=[{"id": "seed-a"}, {"id": "seed-b"}]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resolve_retest_results",
+        Mock(return_value=("retest.json", None)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_seed_rows_from_retest_results",
+        Mock(return_value=[{"id": "retest-a"}]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_source_row_from_seed",
+        Mock(
+            side_effect=lambda row: {
+                "source_id": row["id"],
+                "api_base": f"https://{row['id']}.example.test/fhir",
+            }
+        ),
+    )
+    upsert_sources = AsyncMock(return_value=1)
+    monkeypatch.setattr(
+        importer,
+        "_upsert_provider_directory_source_rows",
+        upsert_sources,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_mark_provider_directory_progress",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_clear_resource_rows_seen",
+        AsyncMock(),
+    )
+    return seed_tmpdir, upsert_sources
+
+
+@pytest.mark.asyncio
+async def test_process_data_limits_retest_rows_and_cleans_seed_tempdir(
+    monkeypatch,
+):
+    """Limited retests clean their temporary seed material."""
+    seed_tmpdir, upsert_sources = _stub_limited_process_data(
+        monkeypatch
+    )
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "seed_db_path": "seed.db",
+            "retest_results_path": "retest.json",
+            "limit": 1,
+            "seed_only": True,
+            "probe": False,
+        },
+    )
+
+    assert metrics["sources_seeded"] == 1
+    assert upsert_sources.await_args.args[0][0]["source_id"] == "seed-a"
+    seed_tmpdir.cleanup.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_process_data_skips_import_call_for_empty_unscoped_selection(
+    monkeypatch,
+):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_ensure_provider_directory_tables",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_upsert_provider_directory_source_rows",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_select_resource_import_sources",
+        Mock(return_value=([], {"source_import_sources_selected": 0})),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_group_resource_import_sources",
+        Mock(return_value=[]),
+    )
+    import_resources = AsyncMock()
+    monkeypatch.setattr(importer, "_import_resources", import_resources)
+    monkeypatch.setattr(
+        importer,
+        "_mark_provider_directory_progress",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_source_local_profile_followup_if_current",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_clear_resource_rows_seen",
+        AsyncMock(),
+    )
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "probe": False,
+            "import_resources": True,
+            "publish_artifacts": False,
+        },
+    )
+
+    assert metrics["sources_import_attempted"] == 0
+    import_resources.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_copy_upsert_skip_unchanged_accepts_empty_update_filter(
+    monkeypatch,
+):
+    copy_records = AsyncMock()
+    driver = SimpleNamespace(copy_records_to_table=copy_records)
+    connection = SimpleNamespace(
+        raw_connection=SimpleNamespace(driver_connection=driver),
+        status=AsyncMock(),
+    )
+
+    @contextlib.asynccontextmanager
+    async def copy_connection(_transaction_session):
+        yield connection
+
+    monkeypatch.setattr(
+        importer,
+        "_copy_upsert_connection",
+        copy_connection,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_copy_upsert_changed_where_sql",
+        Mock(return_value=""),
+    )
+
+    assert await importer._copy_upsert_rows(
+        importer.ProviderDirectoryOrganization,
+        [{"source_id": "source-a", "resource_id": "organization-a"}],
+        ["source_id", "resource_id"],
+        ["source_id"],
+        skip_unchanged=True,
+    ) == 1
+
+
+def test_row_reference_values_skips_blank_string():
+    assert importer._row_reference_values(
+        {"blank": " ", "value": "Organization/a"},
+        ("blank", "value"),
+    ) == ["Organization/a"]
+
+
+@pytest.mark.asyncio
+async def test_import_linked_resource_rows_ignores_zero_upsert(monkeypatch):
+    monkeypatch.setattr(
+        importer,
+        "_linked_resource_refs",
+        Mock(
+            return_value=[
+                ("Organization", "org-a", "Organization/org-a", "organization")
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_linked_resource_row",
+        AsyncMock(
+            return_value=(
+                importer.ProviderDirectoryOrganization,
+                {"resource_id": "org-a"},
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_upsert_resource_rows",
+        AsyncMock(return_value=0),
+    )
+
+    assert await importer._import_linked_resource_rows(
+        {"source_id": "source-a", "api_base": "https://example.test/fhir"},
+        {},
+        per_source_limit=1,
+        timeout=1,
+        run_id="run-a",
+        flush_rows=1,
+    ) == {}
+
+
+@pytest.mark.asyncio
+async def test_partition_fetch_workers_cancel_sibling_after_failure(monkeypatch):
+    release_worker = asyncio.Event()
+    worker_indexes = iter(range(2))
+
+    async def worker(*_args, **_kwargs):
+        worker_index = next(worker_indexes)
+        if worker_index == 0:
+            await asyncio.sleep(0)
+            raise RuntimeError("worker failed")
+        await release_worker.wait()
+
+    monkeypatch.setattr(
+        importer,
+        "_partition_fetch_concurrency",
+        Mock(return_value=2),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_run_partition_fetch_worker",
+        worker,
+    )
+    flush = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_flush_partition_checkpoints",
+        flush,
+    )
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        await importer._execute_partition_fetch_workers(
+            {},
+            "Organization",
+            asyncio.Queue(),
+            Mock(),
+            Mock(),
+            2,
+        )
+
+    flush.assert_awaited_once()
+
+
+def _scan_role_bundle(*, next_url=None):
+    links = [{"relation": "next", "url": next_url}] if next_url else []
+    return {
+        "resourceType": "Bundle",
+        "entry": [
+            {
+                "fullUrl": (
+                    "https://providerdirectory.scanhealthplan.com/"
+                    "PractitionerRole/role-limit"
+                ),
+                "resource": {
+                    "resourceType": "PractitionerRole",
+                    "id": "role-limit",
+                    "practitioner": {"reference": "Practitioner/prac-1"},
+                },
+            }
+        ],
+        "link": links,
+    }
+
+
+@pytest.mark.asyncio
+async def test_scan_role_lookup_stops_before_second_seed_at_row_limit(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(return_value=(200, _scan_role_bundle(), None, 1)),
+    )
+
+    fetch_result = await importer._fetch_scan_practitioner_role_rows(
+        _scan_reverse_lookup_source(),
+        {
+            "Practitioner": [
+                {"resource_id": "prac-1"},
+                {"resource_id": "prac-2"},
+            ]
+        },
+        importer.ScanPractitionerRoleFetchOptions(
+            per_resource_limit=1,
+            page_limit=0,
+            page_count=25,
+            timeout=1,
+            run_id="run-limit",
+        ),
+    )
+
+    assert fetch_result.rows_fetched == 1
+    importer._fetch_source_json.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scan_role_lookup_marks_remaining_next_page_as_bounded(
+    monkeypatch,
+):
+    next_url = (
+        "https://providerdirectory.scanhealthplan.com/"
+        "PractitionerRole?page=2"
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                _scan_role_bundle(next_url=next_url),
+                None,
+                1,
+            )
+        ),
+    )
+
+    fetch_result = await importer._fetch_scan_practitioner_role_rows(
+        _scan_reverse_lookup_source(),
+        {"Practitioner": [{"resource_id": "prac-1"}]},
+        importer.ScanPractitionerRoleFetchOptions(
+            per_resource_limit=1,
+            page_limit=0,
+            page_count=25,
+            timeout=1,
+            run_id="run-next-limit",
+        ),
+    )
+
+    assert fetch_result.row_limit_reached is True
+    assert fetch_result.next_url_remaining is True

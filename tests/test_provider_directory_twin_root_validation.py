@@ -220,6 +220,11 @@ async def _validate(
     )
     monkeypatch.setattr(importer.db, "acquire", lambda: harness)
     monkeypatch.setattr(
+        importer,
+        "_candidate_endpoint_dataset_content_proof",
+        AsyncMock(return_value=_content_proof(resource_rows)),
+    )
+    monkeypatch.setattr(
         importer, "_build_endpoint_dataset_serving_relations", relations
     )
     summary = await importer._validate_endpoint_dataset_candidate(

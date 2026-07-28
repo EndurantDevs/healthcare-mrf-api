@@ -35992,6 +35992,342 @@ mod tests {
             "scanner_failure",
         );
     }
+
+    #[test]
+    fn shared_graph_manifest_admission_rejects_every_incomplete_shape() {
+        assert!(shared_graph_required_object(&Value::Null, "value").is_err());
+
+        let mut object = Map::new();
+        assert!(shared_graph_required_string(&object, "text", "value").is_err());
+        object.insert("text".to_owned(), json!(1));
+        assert!(shared_graph_required_string(&object, "text", "value").is_err());
+        object.insert("text".to_owned(), json!(""));
+        assert!(shared_graph_required_string(&object, "text", "value").is_err());
+        object.insert("text".to_owned(), json!("ok"));
+        assert_eq!(
+            shared_graph_required_string(&object, "text", "value").unwrap(),
+            "ok"
+        );
+
+        assert!(shared_graph_required_u64(&object, "count", "value").is_err());
+        object.insert("count".to_owned(), json!(-1));
+        assert!(shared_graph_required_u64(&object, "count", "value").is_err());
+        object.insert("count".to_owned(), json!(4));
+        assert_eq!(
+            shared_graph_required_u64(&object, "count", "value").unwrap(),
+            4
+        );
+
+        assert_eq!(
+            shared_graph_optional_u64(&object, "optional_count", "value").unwrap(),
+            None
+        );
+        object.insert("optional_count".to_owned(), Value::Null);
+        assert_eq!(
+            shared_graph_optional_u64(&object, "optional_count", "value").unwrap(),
+            None
+        );
+        object.insert("optional_count".to_owned(), json!("four"));
+        assert!(shared_graph_optional_u64(&object, "optional_count", "value").is_err());
+        object.insert("optional_count".to_owned(), json!(4));
+        assert_eq!(
+            shared_graph_optional_u64(&object, "optional_count", "value").unwrap(),
+            Some(4)
+        );
+
+        assert_eq!(
+            shared_graph_optional_string(&object, "optional_text", "value").unwrap(),
+            None
+        );
+        object.insert("optional_text".to_owned(), Value::Null);
+        assert_eq!(
+            shared_graph_optional_string(&object, "optional_text", "value").unwrap(),
+            None
+        );
+        object.insert("optional_text".to_owned(), json!(4));
+        assert!(shared_graph_optional_string(&object, "optional_text", "value").is_err());
+        object.insert("optional_text".to_owned(), json!("text"));
+        assert_eq!(
+            shared_graph_optional_string(&object, "optional_text", "value").unwrap(),
+            Some("text".to_owned())
+        );
+
+        assert!(shared_graph_artifact_from_json(&Value::Null, "artifact").is_err());
+        assert!(shared_graph_artifact_from_json(&json!({}), "artifact").is_err());
+        assert!(shared_graph_artifact_from_json(&json!({"metadata": null}), "artifact").is_err());
+        let artifact = json!({
+            "path": "artifact.bin",
+            "metadata": {
+                "record_format": "test",
+                "sha256": "0",
+                "byte_count": 1,
+                "owner_count": 1,
+                "member_count": 1,
+                "member_global_count": null,
+                "name": "test",
+                "source_shard_id": null,
+                "shard_id": "shard"
+            }
+        });
+        assert!(shared_graph_artifact_from_json(&artifact, "artifact").is_ok());
+        assert!(shared_graph_shard_from_json(&Value::Null, 0).is_err());
+        assert!(shared_graph_shard_from_json(&json!({}), 0).is_err());
+        let shard = json!({
+            "shard_id": "shard",
+            "group_npi": artifact,
+            "npi_group": artifact,
+            "group_provider_set": artifact,
+            "provider_set_group": artifact
+        });
+        assert!(shared_graph_shard_from_json(&shard, 0).is_ok());
+
+        let invalid_utf8 = PathBuf::from(
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![0xff]),
+        );
+        assert!(shared_graph_summary_path(&invalid_utf8, "test").is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        assert!(run_shared_graph_converter(&[]).is_err());
+        assert!(run_shared_graph_converter(&[directory
+            .path()
+            .join("missing")
+            .to_string_lossy()
+            .into_owned()])
+        .is_err());
+        for (name, manifest) in [
+            ("invalid", b"not-json".as_slice()),
+            ("null", b"null".as_slice()),
+            ("missing-key-map", br#"{}"#.as_slice()),
+            (
+                "missing-output",
+                br#"{"provider_set_key_map_path":"map"}"#.as_slice(),
+            ),
+            (
+                "missing-shards",
+                br#"{"provider_set_key_map_path":"map","output_directory":"out"}"#.as_slice(),
+            ),
+            (
+                "empty-shards",
+                br#"{"provider_set_key_map_path":"map","output_directory":"out","shards":[]}"#
+                    .as_slice(),
+            ),
+        ] {
+            let path = directory.path().join(format!("{name}.json"));
+            std::fs::write(&path, manifest).unwrap();
+            assert!(
+                run_shared_graph_converter(&[path.to_string_lossy().into_owned()]).is_err(),
+                "accepted invalid shared graph manifest {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn copy_path_presence_and_v4_pairing_are_independently_admitted() {
+        let setters: &[fn(&mut CopyPathConfig)] = &[
+            |config| config.compact = Some("path".to_owned()),
+            |config| config.manifest_serving = Some("path".to_owned()),
+            |config| config.manifest_lean_serving = Some("path".to_owned()),
+            |config| config.v3_serving_run_directory = Some("path".to_owned()),
+            |config| config.manifest_provider_forward_sidecar = Some("path".to_owned()),
+            |config| config.manifest_provider_inverted_sidecar = Some("path".to_owned()),
+            |config| config.manifest_provider_set_component_sidecar = Some("path".to_owned()),
+            |config| config.manifest_provider_component_group_sidecar = Some("path".to_owned()),
+            |config| config.manifest_provider_group_tax_identity_sidecar = Some("path".to_owned()),
+            |config| config.manifest_provider_npi_sidecar = Some("path".to_owned()),
+            |config| config.manifest_price_forward_sidecar = Some("path".to_owned()),
+            |config| config.manifest_price_atom = Some("path".to_owned()),
+            |config| config.manifest_price_set_atom = Some("path".to_owned()),
+            |config| config.manifest_price_set_summary = Some("path".to_owned()),
+            |config| config.manifest_provider_group_member = Some("path".to_owned()),
+            |config| config.manifest_code_count = Some("path".to_owned()),
+            |config| config.manifest_provider_set_dictionary = Some("path".to_owned()),
+            |config| config.procedure = Some("path".to_owned()),
+            |config| config.price_code_set = Some("path".to_owned()),
+            |config| config.price_atom = Some("path".to_owned()),
+            |config| config.price_set_entry = Some("path".to_owned()),
+            |config| config.provider_set = Some("path".to_owned()),
+            |config| config.provider_set_component = Some("path".to_owned()),
+            |config| config.provider_set_entry = Some("path".to_owned()),
+            |config| config.provider_entry_component = Some("path".to_owned()),
+            |config| config.provider_group_member = Some("path".to_owned()),
+        ];
+        assert!(!CopyPathConfig::default().has_file_paths());
+        for set_path in setters {
+            let mut config = CopyPathConfig::default();
+            set_path(&mut config);
+            assert!(config.has_file_paths());
+        }
+
+        let _lock = scanner_env_lock().lock().unwrap();
+        let _disabled = TestEnvVar::set(PROVIDER_GRAPH_V4_ENV, "false");
+        let mismatched_pair = CopyPathConfig {
+            manifest_provider_set_component_sidecar: Some("set".to_owned()),
+            ..CopyPathConfig::default()
+        };
+        assert!(configured_v4_factor_mode(&mismatched_pair).is_err());
+
+        let disabled_tax = CopyPathConfig {
+            manifest_provider_group_tax_identity_sidecar: Some("tax".to_owned()),
+            ..CopyPathConfig::default()
+        };
+        assert!(configured_v4_factor_mode(&disabled_tax).is_err());
+
+        let _enabled = TestEnvVar::set(PROVIDER_GRAPH_V4_ENV, "true");
+        let missing_tax = CopyPathConfig {
+            manifest_provider_set_component_sidecar: Some("set".to_owned()),
+            manifest_provider_component_group_sidecar: Some("component".to_owned()),
+            ..CopyPathConfig::default()
+        };
+        assert!(configured_v4_factor_mode(&missing_tax).is_err());
+    }
+
+    #[test]
+    fn strict_copy_path_environment_reports_each_missing_root_coordinate() {
+        let _lock = scanner_env_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let _strict = strict_scan_env(directory.path());
+        {
+            let _missing = TestEnvVar::remove("HLTHPRT_PTG2_SNAPSHOT_ARCH");
+            assert!(CopyPathConfig::from_env().is_err());
+        }
+        {
+            let _invalid = TestEnvVar::set("HLTHPRT_PTG2_SNAPSHOT_ARCH", "x86_64");
+            assert!(CopyPathConfig::from_env().is_err());
+        }
+        {
+            let _missing = TestEnvVar::remove("HLTHPRT_PTG2_V3_SERVING_RUN_DIR");
+            assert!(CopyPathConfig::from_env().is_err());
+        }
+        {
+            let _missing = TestEnvVar::remove(V3_COVERAGE_SCOPE_ID_ENV);
+            assert!(CopyPathConfig::from_env().is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_worker_queue_delivery_covers_success_pressure_and_shutdown() {
+        let empty_job = || WorkerJob::Rates {
+            procedure: Map::new(),
+            rates: Vec::new(),
+        };
+        let empty_batch = || RawRateChunk::with_capacity(0, 0);
+        let (_event_tx, event_rx) = unbounded();
+        let mut writer = Vec::new();
+        let mut blocked_micros = 0;
+        let mut stats = RawChunkStats::default();
+
+        let (job_tx, job_rx) = bounded(1);
+        send_worker_job(
+            &job_tx,
+            &event_rx,
+            &mut writer,
+            None,
+            &mut blocked_micros,
+            &mut stats,
+            empty_job(),
+        )
+        .unwrap();
+        assert!(matches!(job_rx.recv().unwrap(), WorkerJob::Rates { .. }));
+
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            send_worker_job(
+                &job_tx,
+                &event_rx,
+                &mut writer,
+                Some(&cancelled),
+                &mut blocked_micros,
+                &mut stats,
+                empty_job(),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+
+        let (stopped_job_tx, stopped_job_rx) = bounded(1);
+        drop(stopped_job_rx);
+        assert_eq!(
+            send_worker_job(
+                &stopped_job_tx,
+                &event_rx,
+                &mut writer,
+                None,
+                &mut blocked_micros,
+                &mut stats,
+                empty_job(),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+
+        let (pressured_job_tx, pressured_job_rx) = bounded(1);
+        pressured_job_tx.send(empty_job()).unwrap();
+        let job_receiver = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            let _ = pressured_job_rx.recv().unwrap();
+            let _ = pressured_job_rx.recv().unwrap();
+        });
+        send_worker_job(
+            &pressured_job_tx,
+            &event_rx,
+            &mut writer,
+            None,
+            &mut blocked_micros,
+            &mut stats,
+            empty_job(),
+        )
+        .unwrap();
+        job_receiver.join().unwrap();
+        assert!(stats.queue_blocked_sends > 0);
+
+        let (batch_tx, batch_rx) = bounded(1);
+        send_provider_ref_batch(
+            &batch_tx,
+            &event_rx,
+            &mut writer,
+            &mut blocked_micros,
+            &mut stats,
+            empty_batch(),
+        )
+        .unwrap();
+        assert!(batch_rx.recv().unwrap().is_empty());
+
+        let (stopped_batch_tx, stopped_batch_rx) = bounded(1);
+        drop(stopped_batch_rx);
+        assert_eq!(
+            send_provider_ref_batch(
+                &stopped_batch_tx,
+                &event_rx,
+                &mut writer,
+                &mut blocked_micros,
+                &mut stats,
+                empty_batch(),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+
+        let (pressured_batch_tx, pressured_batch_rx) = bounded(1);
+        pressured_batch_tx.send(empty_batch()).unwrap();
+        let batch_receiver = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            let _ = pressured_batch_rx.recv().unwrap();
+            let _ = pressured_batch_rx.recv().unwrap();
+        });
+        send_provider_ref_batch(
+            &pressured_batch_tx,
+            &event_rx,
+            &mut writer,
+            &mut blocked_micros,
+            &mut stats,
+            empty_batch(),
+        )
+        .unwrap();
+        batch_receiver.join().unwrap();
+    }
 }
 
 fn shared_graph_manifest_error(message: impl Into<String>) -> io::Error {

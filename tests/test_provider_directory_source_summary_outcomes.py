@@ -95,7 +95,7 @@ def test_sealed_uhc_summary_dispatches_all_retained_fact_counts():
     )
 
     assert outcome_map["semantic_contract_id"] == (
-        "healthporta.uhc.semantic-facts.v1"
+        "healthporta.uhc.semantic-facts.v2"
     )
     assert outcome_map["raw_provider_records"] == 18_696
     assert outcome_map["raw_address_rows"] == 46_768

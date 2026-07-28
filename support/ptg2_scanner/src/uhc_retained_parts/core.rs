@@ -94,10 +94,10 @@ fn parse_sha256_hex(value: &str) -> io::Result<[u8; SHA256_BYTES]> {
 }
 
 fn hex_nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        _ => unreachable!("SHA-256 syntax is validated before decoding"),
+    if value.is_ascii_digit() {
+        value - b'0'
+    } else {
+        value - b'a' + 10
     }
 }
 

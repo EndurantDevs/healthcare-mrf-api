@@ -49,10 +49,10 @@ def _checkpoint_map(
         "evidence_target_oid": None,
         "profile_target_oid": None,
         "has_existing_artifacts": False,
-        "evidence_next_batch": 52,
-        "evidence_total_batches": 52,
-        "profile_next_batch": 120,
-        "profile_total_batches": 400,
+        "evidence_next_batch": 1,
+        "evidence_total_batches": 1,
+        "profile_next_batch": 0,
+        "profile_total_batches": 1,
         "state": "building_profile",
     }
 
@@ -83,7 +83,7 @@ async def test_ready_profile_checkpoint_requires_complete_logged_stage_pair(
     checkpoint_map = {
         **_checkpoint_map(build),
         "state": "ready",
-        "profile_next_batch": 400,
+        "profile_next_batch": 1,
     }
     monkeypatch.setattr(
         importer.db,
@@ -144,7 +144,7 @@ async def test_ready_profile_checkpoint_rejects_replaced_stage_oid(monkeypatch):
     checkpoint_map = {
         **_checkpoint_map(build),
         "state": "ready",
-        "profile_next_batch": 400,
+        "profile_next_batch": 1,
     }
     monkeypatch.setattr(
         importer.db,
