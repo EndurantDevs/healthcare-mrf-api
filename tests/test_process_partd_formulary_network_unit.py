@@ -13,7 +13,7 @@ module = importlib.import_module("process.partd_formulary_network")
 
 
 def test_partd_pure_parser_coverage_paydown(tmp_path):
-    expected_kinds = {
+    expected_kind_by_name = {
         "readme.pdf": "skip",
         "Plan Information File.csv": "plan_info",
         "Basic Drugs Formulary File.txt": "formulary_map",
@@ -24,8 +24,8 @@ def test_partd_pure_parser_coverage_paydown(tmp_path):
         "ordinary.csv": "unknown",
     }
     assert {
-        name: module._entry_kind(name) for name in expected_kinds
-    } == expected_kinds
+        name: module._entry_kind(name) for name in expected_kind_by_name
+    } == expected_kind_by_name
 
     nested = tmp_path / "nested.zip"
     with zipfile.ZipFile(nested, "w") as archive:
@@ -53,7 +53,7 @@ def test_partd_pure_parser_coverage_paydown(tmp_path):
     }
 
 
-def test_partd_maps_and_pricing_coverage_paydown(tmp_path):
+def test_partd_plan_and_formulary_map_coverage_paydown(tmp_path):
     plan_map_path = tmp_path / "Plan Information File.csv"
     plan_map_path.write_text(
         "Contract ID|Plan ID|Segment ID|Formulary ID\n"
@@ -63,7 +63,6 @@ def test_partd_maps_and_pricing_coverage_paydown(tmp_path):
     )
     plan_map = module._load_plan_formulary_map(plan_map_path)
     assert plan_map == {("S1234", "001", "000"): "FORM1"}
-
     formulary_path = tmp_path / "Basic Drugs Formulary File.csv"
     formulary_path.write_text(
         "Formulary ID,NDC11,RXCUI\n"
@@ -76,12 +75,17 @@ def test_partd_maps_and_pricing_coverage_paydown(tmp_path):
     assert ndc_map[("FORM1", "00000000001")] == "11"
     assert ndc_map[("*", "00000000001")] == "11"
 
-    common_args = {
+
+def test_partd_pricing_row_coverage_paydown():
+    common_arguments_by_name = {
         "snapshot_id": "monthly:test",
         "source_type": "monthly",
         "default_date": datetime.date(2026, 1, 1),
-        "plan_to_formulary": plan_map,
-        "formulary_ndc_to_rxnorm": ndc_map,
+        "plan_to_formulary": {("S1234", "001", "000"): "FORM1"},
+        "formulary_ndc_to_rxnorm": {
+            ("FORM1", "00000000001"): "11",
+            ("*", "00000000001"): "11",
+        },
     }
     ndc_rows = module._pricing_rows_from_source(
         {
@@ -93,7 +97,7 @@ def test_partd_maps_and_pricing_coverage_paydown(tmp_path):
             "Copay Amount": "5.50",
             "Coinsurance Cost": "2.25",
         },
-        **common_args,
+        **common_arguments_by_name,
     )
     assert len(ndc_rows) == 2
     assert ndc_rows[0]["rxnorm_id"] == "11"
@@ -101,20 +105,20 @@ def test_partd_maps_and_pricing_coverage_paydown(tmp_path):
 
     rxnorm_rows = module._pricing_rows_from_source(
         {"RXCUI": "22", "Unit Cost": "1.25"},
-        **common_args,
+        **common_arguments_by_name,
     )
     assert rxnorm_rows[0]["code_system"] == "RXNORM"
     assert (
         module._pricing_rows_from_source(
             {"Unit Cost": "1.25"},
-            **common_args,
+            **common_arguments_by_name,
         )
         == []
     )
     assert (
         module._pricing_rows_from_source(
             {"RXCUI": "22", "Name": "No cost"},
-            **common_args,
+            **common_arguments_by_name,
         )
         == []
     )
