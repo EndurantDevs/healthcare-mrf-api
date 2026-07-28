@@ -319,7 +319,7 @@ fn run_v3_finalizer(
         .args(["--price-key-map-input", price_key_map.to_str().unwrap()])
         .args(["--price-key-map-row-count", &price_key_count.to_string()])
         .args(["--workers", "2"])
-        .args(["--identity-map-max-bytes", "268435456"])
+        .args(["--identity-map-max-bytes", "55188180"])
         .args(["--total-sort-memory-bytes", "33554432"])
         .args(["--scratch-durability", "ephemeral"])
         .arg(manifest)
@@ -452,6 +452,28 @@ fn compact_cli_reuses_byte_identical_raw_inline_groups_before_deserialization() 
 }
 
 #[test]
+fn compact_cli_reports_provider_reference_worker_failures() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    fs::create_dir(&output).expect("create output directory");
+    fs::write(
+        &source,
+        br#"{
+          "provider_references":[{"provider_group_id":7,"provider_groups":"invalid"}],
+          "in_network":[]
+        }"#,
+    )
+    .expect("write malformed provider reference fixture");
+
+    let completed = run_compact_v4(&source, &output);
+    assert!(!completed.status.success());
+    let stderr = String::from_utf8_lossy(&completed.stderr);
+    assert!(stderr.contains("PTG2_SCANNER_WORKER_FAILED"), "{stderr}");
+    assert!(stderr.contains("provider_ref_error"), "{stderr}");
+}
+
+#[test]
 fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
     let temporary = tempfile::tempdir().expect("temporary fixture root");
     let source = temporary.path().join("rates.json");
@@ -561,6 +583,10 @@ fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
     assert_eq!(
         finalizer_summary["preservation"]["all_source_occurrences_preserved"],
         true
+    );
+    assert_eq!(
+        finalizer_summary["identity_maps"]["provider_code_bitmap_planned_mode"],
+        "pair_spool_sort_v1"
     );
     assert_eq!(finalizer_summary["rate_schedule_observe"]["enabled"], true);
     for name in [
