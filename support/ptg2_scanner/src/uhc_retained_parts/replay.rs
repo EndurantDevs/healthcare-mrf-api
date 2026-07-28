@@ -145,7 +145,7 @@ fn require_replay_path_identity(
     label: &str,
 ) -> io::Result<()> {
     let descriptor_metadata = file.metadata()?;
-    let descriptor_identity = FileIdentity::from_metadata(&descriptor_metadata);
+    let descriptor_identity = FileIdentity::from_file(file)?;
     let path_metadata = fs::symlink_metadata(path)?;
     let path_identity = FileIdentity::from_metadata(&path_metadata);
     if !descriptor_metadata.is_file()
@@ -153,8 +153,8 @@ fn require_replay_path_identity(
         || path_metadata.file_type().is_symlink()
         || descriptor_identity != expected
         || !same_inode(path_identity, expected)
-        || descriptor_metadata.nlink() != 1
-        || descriptor_metadata.mode() & 0o022 != 0
+        || descriptor_identity.link_count != 1
+        || descriptor_identity.mode & 0o022 != 0
     {
         return Err(invalid_data(format!(
             "UHC retained replay {label} identity or permissions changed"

@@ -28,6 +28,45 @@ impl FileIdentity {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn from_file(file: &File) -> io::Result<Self> {
+        let mut metadata = unsafe { std::mem::zeroed::<libc::statx>() };
+        let result = unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_STATX_FORCE_SYNC,
+                libc::STATX_BASIC_STATS,
+                &mut metadata,
+            )
+        };
+        Self::from_statx_result(result, &metadata)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_statx_result(result: libc::c_int, metadata: &libc::statx) -> io::Result<Self> {
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if metadata.stx_mask & libc::STATX_BASIC_STATS != libc::STATX_BASIC_STATS {
+            return Err(invalid_data(
+                "UHC retained forced file identity is incomplete",
+            ));
+        }
+        Ok(Self {
+            device: libc::makedev(metadata.stx_dev_major, metadata.stx_dev_minor),
+            inode: metadata.stx_ino,
+            byte_count: metadata.stx_size,
+            mode: u32::from(metadata.stx_mode),
+            link_count: u64::from(metadata.stx_nlink),
+            modified_seconds: metadata.stx_mtime.tv_sec,
+            modified_nanoseconds: i64::from(metadata.stx_mtime.tv_nsec),
+            changed_seconds: metadata.stx_ctime.tv_sec,
+            changed_nanoseconds: i64::from(metadata.stx_ctime.tv_nsec),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn from_file(file: &File) -> io::Result<Self> {
         Ok(Self::from_metadata(&file.metadata()?))
     }
@@ -45,7 +84,7 @@ fn require_stable_regular_file(
             "UHC retained {label} is not a regular file"
         )));
     }
-    let observed = FileIdentity::from_metadata(&metadata);
+    let observed = FileIdentity::from_file(file)?;
     if observed != identity || observed.byte_count != expected_byte_count {
         return Err(invalid_data(format!(
             "UHC retained {label} changed while it was being verified"
@@ -97,11 +136,12 @@ impl RootDirectory {
             return Err(invalid_input("UHC retained output root is not a directory"));
         }
         let canonical_path = supplied_path.canonicalize()?;
+        let identity = FileIdentity::from_file(&directory)?;
         let root = Arc::new(Self {
             supplied_path,
             path: canonical_path,
             directory,
-            identity: FileIdentity::from_metadata(&metadata),
+            identity,
         });
         root.verify_path_identity()?;
         Ok(root)
@@ -113,7 +153,7 @@ impl RootDirectory {
 
     fn verify_path_identity(&self) -> io::Result<()> {
         let descriptor_metadata = self.directory.metadata()?;
-        let descriptor_identity = FileIdentity::from_metadata(&descriptor_metadata);
+        let descriptor_identity = FileIdentity::from_file(&self.directory)?;
         if !descriptor_metadata.is_dir() || !same_inode(descriptor_identity, self.identity) {
             return Err(invalid_data(
                 "UHC retained output root identity changed during admission",
@@ -162,11 +202,12 @@ impl RootDirectory {
                     "UHC retained existing {name} is not a regular file"
                 )));
             }
-            if metadata.nlink() == 1 && metadata.mode() & 0o022 == 0 {
+            let identity = FileIdentity::from_file(&file)?;
+            if identity.link_count == 1 && identity.mode & 0o022 == 0 {
                 return Ok(Some(file));
             }
-            if metadata.nlink() == 2
-                && metadata.mode() & 0o022 == 0
+            if identity.link_count == 2
+                && identity.mode & 0o022 == 0
                 && attempt + 1 < PUBLICATION_LINK_RETRIES
             {
                 drop(file);
