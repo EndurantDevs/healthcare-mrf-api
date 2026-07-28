@@ -4,11 +4,124 @@ import datetime
 import importlib
 import types
 import asyncio
+import zipfile
 from pathlib import Path
 
 from sqlalchemy.dialects import postgresql
 
 module = importlib.import_module("process.partd_formulary_network")
+
+
+def test_partd_pure_parser_coverage_paydown(tmp_path):
+    expected_kind_by_name = {
+        "readme.pdf": "skip",
+        "Plan Information File.csv": "plan_info",
+        "Basic Drugs Formulary File.txt": "formulary_map",
+        "Pharmacy Networks File.csv": "activity",
+        "Pricing File.csv": "pricing",
+        "other pharmacy listing.csv": "activity",
+        "network notes.txt": "activity",
+        "ordinary.csv": "unknown",
+    }
+    assert {
+        name: module._entry_kind(name) for name in expected_kind_by_name
+    } == expected_kind_by_name
+
+    nested = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested, "w") as archive:
+        archive.writestr("Pharmacy Network File.txt", "NPI\n1234567890\n")
+        archive.writestr("unrelated.csv", "ignored\n")
+
+    outer = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer, "w") as archive:
+        archive.writestr("folder/", "")
+        archive.writestr("random.csv", "ignored\n")
+        archive.writestr("Plan Information File.csv", "contract\nS1234\n")
+        archive.writestr("Pricing File.csv", "cost\n1.00\n")
+        archive.writestr("Basic Drugs Formulary File.txt", "ndc\n123\n")
+        archive.writestr("Pharmacy Notes.json", "{}")
+        archive.write(nested, "Pharmacy Network bundle.zip")
+
+    extract_dir = tmp_path / "extracted"
+    extract_dir.mkdir()
+    extracted = module._extract_data_files(outer, extract_dir)
+    assert {module._entry_kind(name) for _path, name in extracted} == {
+        "plan_info",
+        "pricing",
+        "formulary_map",
+        "activity",
+    }
+
+
+def test_partd_plan_and_formulary_map_coverage_paydown(tmp_path):
+    plan_map_path = tmp_path / "Plan Information File.csv"
+    plan_map_path.write_text(
+        "Contract ID|Plan ID|Segment ID|Formulary ID\n"
+        "S1234|001|000|\n"
+        "S1234|001|000|FORM1\n",
+        encoding="utf-8",
+    )
+    plan_map = module._load_plan_formulary_map(plan_map_path)
+    assert plan_map == {("S1234", "001", "000"): "FORM1"}
+    formulary_path = tmp_path / "Basic Drugs Formulary File.csv"
+    formulary_path.write_text(
+        "Formulary ID,NDC11,RXCUI\n"
+        ",00000000001,11\n"
+        "FORM1,00000000001,11\n"
+        "FORM1,00000000001,22\n",
+        encoding="utf-8",
+    )
+    ndc_map = module._load_formulary_ndc_map(formulary_path)
+    assert ndc_map[("FORM1", "00000000001")] == "11"
+    assert ndc_map[("*", "00000000001")] == "11"
+
+
+def test_partd_pricing_row_coverage_paydown():
+    common_arguments_by_name = {
+        "snapshot_id": "monthly:test",
+        "source_type": "monthly",
+        "default_date": datetime.date(2026, 1, 1),
+        "plan_to_formulary": {("S1234", "001", "000"): "FORM1"},
+        "formulary_ndc_to_rxnorm": {
+            ("FORM1", "00000000001"): "11",
+            ("*", "00000000001"): "11",
+        },
+    }
+    ndc_rows = module._pricing_rows_from_source(
+        {
+            "Contract ID": "S1234",
+            "Plan ID": "001",
+            "Segment ID": "000",
+            "NDC11": "00000000001",
+            "Days Supply": "30",
+            "Copay Amount": "5.50",
+            "Coinsurance Cost": "2.25",
+        },
+        **common_arguments_by_name,
+    )
+    assert len(ndc_rows) == 2
+    assert ndc_rows[0]["rxnorm_id"] == "11"
+    assert ndc_rows[0]["cost_type"].endswith("_days_30")
+
+    rxnorm_rows = module._pricing_rows_from_source(
+        {"RXCUI": "22", "Unit Cost": "1.25"},
+        **common_arguments_by_name,
+    )
+    assert rxnorm_rows[0]["code_system"] == "RXNORM"
+    assert (
+        module._pricing_rows_from_source(
+            {"Unit Cost": "1.25"},
+            **common_arguments_by_name,
+        )
+        == []
+    )
+    assert (
+        module._pricing_rows_from_source(
+            {"RXCUI": "22", "Name": "No cost"},
+            **common_arguments_by_name,
+        )
+        == []
+    )
 
 
 def test_extract_dispensing_fee_fields_maps_known_headers():

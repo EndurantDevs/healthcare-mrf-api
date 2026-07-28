@@ -73,7 +73,8 @@ INSERT INTO {{TARGET_REF}} ("npi", "profile_json", "evidence_json", "source_ids"
                            'value', value_json,
                            'source_ids', to_jsonb(source_ids),
                            'source_count', source_count,
-                           'independent_source_count', independent_source_count
+                           'independent_source_count', independent_source_count,
+                           'evidence_count', evidence_count
                        )
                        ORDER BY independent_source_count DESC,
                                 source_count DESC, fact_key

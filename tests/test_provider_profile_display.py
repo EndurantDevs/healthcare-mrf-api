@@ -242,7 +242,7 @@ def test_composer_formats_fhir_facts_for_people():
     )
 
     assert profile is not None
-    assert PROFILE_COMPOSER_VERSION == "provider-profile-composer/v2"
+    assert PROFILE_COMPOSER_VERSION == "provider-profile-composer/v3"
     assert profile["composer_version"] == PROFILE_COMPOSER_VERSION
     expected_displays_by_category = {
         "certifications": ["Doctor of Medicine (MD)"],
@@ -285,9 +285,15 @@ def test_composer_preserves_values_and_stable_item_ids():
     assert profile["categories"]["certifications"]["items"][0]["value"] == (
         fhir_facts_by_type["credential"]["items"][0]["value"]
     )
-    assert profile["categories"]["languages"]["items"][0]["value"] == (
-        fhir_facts_by_type["language"]["items"][0]["value"]
-    )
+    assert profile["categories"]["languages"]["items"][0]["value"] == {
+        "codes": [
+            {
+                "system": "urn:ietf:bcp:47",
+                "code": "fr",
+                "display": "French",
+            }
+        ]
+    }
     assert profile["categories"]["services"]["items"][0]["value"] == (
         fhir_facts_by_type["role_context"]["items"][0]["value"]
     )

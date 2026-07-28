@@ -1799,7 +1799,7 @@ def test_composer_merges_fhir_and_state_facts_into_standard_categories():
     assert operation_result["composer_version"] == PROFILE_COMPOSER_VERSION
     assert operation_result["categories"]["licenses"]["items"][0]["display"] == "State license: active"
     language = operation_result["categories"]["languages"]["items"][0]
-    assert language["display"] == "Spanish"
+    assert language["display"] == "Spanish (es)"
     assert language["assertion_type"] == "provider_directory_reported"
     assert language["assertion_count"] == 2
     assert len(language["assertions"]) == 1
