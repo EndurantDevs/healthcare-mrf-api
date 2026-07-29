@@ -219,32 +219,12 @@ def _serving_tables_for_digest_rows(digest_rows):
     )
 
 
-@pytest.mark.asyncio
-async def test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences(
-    monkeypatch,
-):
-    """Ensure audit pages preserve ordering, duplicates, and source provenance."""
-
-    session = RecordingSession(
-        [
-            _row(OCCURRENCE_ONE, atom_ordinal=0),
-            _row(OCCURRENCE_TWO, atom_ordinal=1),
-        ]
-    )
-    atom_lookup = _patch_resolution(monkeypatch)
-
-    response_by_field = await audit_api.audit_occurrences_payload(session, _args())
-    encoded = orjson.dumps(response_by_field)
-    decoded = json.loads(encoded, parse_float=Decimal, parse_int=int)
-
+def _assert_exact_audit_items(decoded):
     assert [
         occurrence_by_field["occurrence_id"]
         for occurrence_by_field in decoded["items"]
-    ] == [
-        OCCURRENCE_ONE.hex(),
-        OCCURRENCE_TWO.hex(),
-    ]
-    assert decoded["items"][0]["tuple"] == {
+    ] == [OCCURRENCE_ONE.hex(), OCCURRENCE_TWO.hex()]
+    expected_tuple_by_field = {
         "code_system": "CPT",
         "code": "99213",
         "npi": 1234567890,
@@ -262,6 +242,7 @@ async def test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences(
         "billing_code_modifier": ["TC"],
         "additional_information": "exact text",
     }
+    assert decoded["items"][0]["tuple"] == expected_tuple_by_field
     assert decoded["items"][0]["tuple"] == decoded["items"][1]["tuple"]
     consumed = source_audit.extract_api_occurrence(decoded["items"][0])
     assert consumed.canonical_tuple.billing_code_type_version == "2026"
@@ -280,6 +261,9 @@ async def test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences(
         "atom_ordinal": 0,
         "atom_key": 9,
     }
+
+
+def _assert_exact_audit_metadata(decoded):
     expected_source_by_field = {
         **{
             source_field_name: source_field_value
@@ -326,16 +310,45 @@ async def test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences(
         "source_key": "logical-source",
     }
     assert decoded["source_set"] == SOURCE_SET
+
+
+def _assert_exact_audit_query(session, atom_lookup):
     sql, params = session.calls[0]
-    assert "mrf.ptg2_v3_audit_occurrence" in sql
-    assert "mrf.ptg2_v3_snapshot_scope" in sql
-    assert "mrf.ptg2_v3_provider_set" in sql
-    assert "provider_set.network_names" in sql
-    assert "ORDER BY audit.occurrence_id ASC" in sql
-    assert "audit.source_key" in sql
+    for required_sql in (
+        "mrf.ptg2_v3_audit_occurrence",
+        "mrf.ptg2_v3_snapshot_scope",
+        "mrf.ptg2_v3_provider_set",
+        "provider_set.network_names",
+        "ORDER BY audit.occurrence_id ASC",
+        "audit.source_key",
+    ):
+        assert required_sql in sql
     assert "search-by-procedure" not in sql
     assert params["plan_ids"] == [PLAN_ID, "123456789"]
     assert atom_lookup.await_args.kwargs["atom_keys"] == {9}
+
+
+@pytest.mark.asyncio
+async def test_audit_page_is_exact_ordered_and_preserves_duplicate_occurrences(
+    monkeypatch,
+):
+    """Ensure audit pages preserve ordering, duplicates, and source provenance."""
+
+    session = RecordingSession(
+        [
+            _row(OCCURRENCE_ONE, atom_ordinal=0),
+            _row(OCCURRENCE_TWO, atom_ordinal=1),
+        ]
+    )
+    atom_lookup = _patch_resolution(monkeypatch)
+
+    response_by_field = await audit_api.audit_occurrences_payload(session, _args())
+    encoded = orjson.dumps(response_by_field)
+    decoded = json.loads(encoded, parse_float=Decimal, parse_int=int)
+
+    _assert_exact_audit_items(decoded)
+    _assert_exact_audit_metadata(decoded)
+    _assert_exact_audit_query(session, atom_lookup)
 
 
 @pytest.mark.asyncio

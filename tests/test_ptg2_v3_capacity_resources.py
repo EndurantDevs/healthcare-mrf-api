@@ -192,23 +192,29 @@ def _maintenance_evidence(
                 "outcome": "completed",
             },
         ],
+        **_maintenance_event_counters(),
+    }
+
+
+def _maintenance_event_counters() -> dict[str, object]:
+    counter_by_field = {
+        "checkpoint_epoch_sha256": CHECKPOINT_EPOCH,
+        "checkpoint_requested": 10,
+        "autovacuum_epoch_sha256": AUTOVACUUM_EPOCH,
+        "autovacuum_cancelled": 5,
+    }
+    return {
         "event_counters_start": {
+            **counter_by_field,
             "observed_at": _timestamp(START),
-            "checkpoint_epoch_sha256": CHECKPOINT_EPOCH,
             "checkpoint_completed": 100,
-            "checkpoint_requested": 10,
-            "autovacuum_epoch_sha256": AUTOVACUUM_EPOCH,
             "autovacuum_completed": 200,
-            "autovacuum_cancelled": 5,
         },
         "event_counters_end": {
+            **counter_by_field,
             "observed_at": _timestamp(END),
-            "checkpoint_epoch_sha256": CHECKPOINT_EPOCH,
             "checkpoint_completed": 102,
-            "checkpoint_requested": 10,
-            "autovacuum_epoch_sha256": AUTOVACUUM_EPOCH,
             "autovacuum_completed": 201,
-            "autovacuum_cancelled": 5,
         },
     }
 

@@ -134,6 +134,40 @@ def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
             future.result(timeout=10)
 
 
+def _download_test_artifact(source_path, store):
+    return asyncio.run(
+        source_download._download_raw_artifact_locked(
+            source_path.as_uri(),
+            store=store,
+            canonical_url=source_path.as_uri(),
+            reuse_raw_artifacts=False,
+            max_bytes=None,
+            keep_partial_artifacts=False,
+        )
+    )
+
+
+
+def _assert_shared_artifact_survives(root, store, plain_source, gzip_source):
+    plain_lease = PTG2ArtifactLease(store=store, owner="plain-url-import", heartbeat_seconds=0).start()
+    gzip_lease = PTG2ArtifactLease(store=store, owner="gzip-url-import", heartbeat_seconds=0).start()
+    try:
+        with bind_artifact_lease(plain_lease.lease_id):
+            raw_artifact = _download_test_artifact(plain_source, store)
+        raw_path = Path(raw_artifact.raw_path)
+
+        with bind_artifact_lease(gzip_lease.lease_id):
+            with pytest.raises(RuntimeError, match="gzip header"):
+                _download_test_artifact(gzip_source, store)
+        retention_result = _collect(root)
+        assert retention_result.protected_files == (raw_path,)
+        assert retention_result.deleted_files == ()
+        return raw_path
+    finally:
+        gzip_lease.release()
+        plain_lease.release()
+
+
 def test_url_validation_failure_does_not_unlink_shared_raw_artifact(
     tmp_path,
     monkeypatch,
@@ -143,9 +177,7 @@ def test_url_validation_failure_does_not_unlink_shared_raw_artifact(
     store = PTG2ArtifactStore(root)
     source_bytes = b'{"in_network":[]}'
     plain_source = _make_file(tmp_path / "rates.json", source_bytes, age_hours=0)
-    gzip_named_source = _make_file(
-        tmp_path / "rates.json.gz", source_bytes, age_hours=0
-    )
+    gzip_source = _make_file(tmp_path / "rates.json.gz", source_bytes, age_hours=0)
 
     async def fake_head(url: str):
         return source_download.PTG2HeadMetadata(
@@ -156,50 +188,10 @@ def test_url_validation_failure_does_not_unlink_shared_raw_artifact(
         )
 
     monkeypatch.setattr(source_download, "fetch_head_metadata", fake_head)
-    plain_lease = PTG2ArtifactLease(
-        store=store,
-        owner="plain-url-import",
-        heartbeat_seconds=0,
-    ).start()
-    gzip_lease = PTG2ArtifactLease(
-        store=store,
-        owner="gzip-url-import",
-        heartbeat_seconds=0,
-    ).start()
-    try:
-        with bind_artifact_lease(plain_lease.lease_id):
-            raw_artifact = asyncio.run(
-                source_download._download_raw_artifact_locked(
-                    plain_source.as_uri(),
-                    store=store,
-                    canonical_url=plain_source.as_uri(),
-                    reuse_raw_artifacts=False,
-                    max_bytes=None,
-                    keep_partial_artifacts=False,
-                )
-            )
-        raw_path = Path(raw_artifact.raw_path)
-
-        with bind_artifact_lease(gzip_lease.lease_id):
-            with pytest.raises(RuntimeError, match="gzip header"):
-                asyncio.run(
-                    source_download._download_raw_artifact_locked(
-                        gzip_named_source.as_uri(),
-                        store=store,
-                        canonical_url=gzip_named_source.as_uri(),
-                        reuse_raw_artifacts=False,
-                        max_bytes=None,
-                        keep_partial_artifacts=False,
-                    )
-                )
-
-        assert raw_path.read_bytes() == source_bytes
-        retention_result = _collect(root)
-        assert retention_result.protected_files == (raw_path,)
-        assert retention_result.deleted_files == ()
-    finally:
-        gzip_lease.release()
-        plain_lease.release()
+    raw_path = _assert_shared_artifact_survives(
+        root, store, plain_source, gzip_source
+    )
+    assert raw_path.read_bytes() == source_bytes
 
 
 def test_active_lease_prevents_raw_and_logical_deletion(tmp_path):

@@ -162,6 +162,71 @@ async def _drop_disposable_schema(
         )
 
 
+_LEGACY_COLUMNS_SQL = """
+    SELECT relation.relname,
+           attribute.attname,
+           format_type(attribute.atttypid, attribute.atttypmod),
+           attribute.attnotnull,
+           pg_get_expr(default_value.adbin, default_value.adrelid)
+      FROM pg_class AS relation
+      JOIN pg_namespace AS namespace
+        ON namespace.oid = relation.relnamespace
+      JOIN pg_attribute AS attribute
+        ON attribute.attrelid = relation.oid
+      LEFT JOIN pg_attrdef AS default_value
+        ON default_value.adrelid = relation.oid
+       AND default_value.adnum = attribute.attnum
+     WHERE namespace.nspname = :schema_name
+       AND relation.relname IN ('ptg2_v3_npi_scope', 'ptg2_v3_npi_scope_p00')
+       AND attribute.attnum > 0
+       AND NOT attribute.attisdropped
+     ORDER BY relation.relname, attribute.attnum
+"""
+
+_LEGACY_INDEXES_SQL = """
+    SELECT table_record.relname,
+           index_record.relname,
+           index_catalog.indisvalid,
+           index_catalog.indisready,
+           pg_get_indexdef(index_record.oid)
+      FROM pg_index AS index_catalog
+      JOIN pg_class AS table_record
+        ON table_record.oid = index_catalog.indrelid
+      JOIN pg_class AS index_record
+        ON index_record.oid = index_catalog.indexrelid
+      JOIN pg_namespace AS namespace
+        ON namespace.oid = table_record.relnamespace
+     WHERE namespace.nspname = :schema_name
+       AND table_record.relname IN ('ptg2_v3_npi_scope', 'ptg2_v3_npi_scope_p00')
+     ORDER BY table_record.relname, index_record.relname
+"""
+
+_LEGACY_PHYSICAL_RELATIONS_SQL = """
+    WITH legacy_tables AS (
+        SELECT relation.oid
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = :schema_name
+           AND relation.relname IN ('ptg2_v3_npi_scope', 'ptg2_v3_npi_scope_p00')
+    ), legacy_relations AS (
+        SELECT oid FROM legacy_tables
+        UNION
+        SELECT indexrelid
+          FROM pg_index
+         WHERE indrelid IN (SELECT oid FROM legacy_tables)
+    )
+    SELECT relation.relname,
+           relation.relkind::text,
+           relation.oid::bigint,
+           pg_relation_filenode(relation.oid)::bigint
+      FROM legacy_relations
+      JOIN pg_class AS relation
+        ON relation.oid = legacy_relations.oid
+     ORDER BY relation.relname
+"""
+
+
 async def _legacy_npi_signature(
     engine: AsyncEngine,
     schema_name: str,
@@ -171,92 +236,19 @@ async def _legacy_npi_signature(
     async with engine.connect() as connection:
         columns = (
             await connection.execute(
-                sa.text(
-                    """
-                    SELECT relation.relname,
-                           attribute.attname,
-                           format_type(attribute.atttypid, attribute.atttypmod),
-                           attribute.attnotnull,
-                           pg_get_expr(default_value.adbin, default_value.adrelid)
-                      FROM pg_class AS relation
-                      JOIN pg_namespace AS namespace
-                        ON namespace.oid = relation.relnamespace
-                      JOIN pg_attribute AS attribute
-                        ON attribute.attrelid = relation.oid
-                      LEFT JOIN pg_attrdef AS default_value
-                        ON default_value.adrelid = relation.oid
-                       AND default_value.adnum = attribute.attnum
-                     WHERE namespace.nspname = :schema_name
-                       AND relation.relname IN (
-                           'ptg2_v3_npi_scope',
-                           'ptg2_v3_npi_scope_p00'
-                       )
-                       AND attribute.attnum > 0
-                       AND NOT attribute.attisdropped
-                     ORDER BY relation.relname, attribute.attnum
-                    """
-                ),
+                sa.text(_LEGACY_COLUMNS_SQL),
                 {"schema_name": schema_name},
             )
         ).all()
         indexes = (
             await connection.execute(
-                sa.text(
-                    """
-                    SELECT table_record.relname,
-                           index_record.relname,
-                           index_catalog.indisvalid,
-                           index_catalog.indisready,
-                           pg_get_indexdef(index_record.oid)
-                      FROM pg_index AS index_catalog
-                      JOIN pg_class AS table_record
-                        ON table_record.oid = index_catalog.indrelid
-                      JOIN pg_class AS index_record
-                        ON index_record.oid = index_catalog.indexrelid
-                      JOIN pg_namespace AS namespace
-                        ON namespace.oid = table_record.relnamespace
-                     WHERE namespace.nspname = :schema_name
-                       AND table_record.relname IN (
-                           'ptg2_v3_npi_scope',
-                           'ptg2_v3_npi_scope_p00'
-                       )
-                     ORDER BY table_record.relname, index_record.relname
-                    """
-                ),
+                sa.text(_LEGACY_INDEXES_SQL),
                 {"schema_name": schema_name},
             )
         ).all()
         physical_relations = (
             await connection.execute(
-                sa.text(
-                    """
-                    WITH legacy_tables AS (
-                        SELECT relation.oid
-                          FROM pg_class AS relation
-                          JOIN pg_namespace AS namespace
-                            ON namespace.oid = relation.relnamespace
-                         WHERE namespace.nspname = :schema_name
-                           AND relation.relname IN (
-                               'ptg2_v3_npi_scope',
-                               'ptg2_v3_npi_scope_p00'
-                           )
-                    ), legacy_relations AS (
-                        SELECT oid FROM legacy_tables
-                        UNION
-                        SELECT indexrelid
-                          FROM pg_index
-                         WHERE indrelid IN (SELECT oid FROM legacy_tables)
-                    )
-                    SELECT relation.relname,
-                           relation.relkind::text,
-                           relation.oid::bigint,
-                           pg_relation_filenode(relation.oid)::bigint
-                      FROM legacy_relations
-                      JOIN pg_class AS relation
-                        ON relation.oid = legacy_relations.oid
-                     ORDER BY relation.relname
-                    """
-                ),
+                sa.text(_LEGACY_PHYSICAL_RELATIONS_SQL),
                 {"schema_name": schema_name},
             )
         ).all()

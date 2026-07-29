@@ -128,6 +128,372 @@ class FilteredProviderExpansionHarness:
             monkeypatch.setattr(ptg2_serving, function_name, replacement)
 
 
+class CostProviderSelectionHarness:
+    """Model two provider sets while recording bounded prefix reads."""
+
+    def __init__(self):
+        self.first_provider_set_id = "01" * 16
+        self.second_provider_set_id = "02" * 16
+        self.rate_rows = [
+            {
+                "provider_set_global_id_128": (
+                    self.first_provider_set_id
+                    if index < 64
+                    else self.second_provider_set_id
+                ),
+                "serving_content_hash_128": f"{index + 1:032x}",
+                "reported_code_system": "CPT",
+                "reported_code": "99213",
+                "negotiation_arrangement": "FFS",
+                "source_key": 0,
+            }
+            for index in range(130)
+        ]
+        self.prefix_limits = []
+        self.completion_filters = []
+
+    async def merge_rates(self, *_args, limit, provider_set_keys, **_kwargs):
+        if provider_set_keys is None:
+            self.prefix_limits.append(limit)
+            return self.rate_rows[:limit]
+        self.completion_filters.append(tuple(sorted(provider_set_keys)))
+        return self.rate_rows
+
+    async def provider_npis(
+        self,
+        _session,
+        _tables,
+        provider_set_global_ids,
+        **_kwargs,
+    ):
+        npis_by_provider_set_id = {
+            self.first_provider_set_id: (1000000001, 1000000002),
+            self.second_provider_set_id: (1000000003, 1000000004, 1000000005),
+        }
+        return {
+            provider_set_id: npis_by_provider_set_id[provider_set_id]
+            for provider_set_id in provider_set_global_ids
+        }
+
+    async def reverse_sets(self, _session, _tables, npis):
+        return {
+            npi: (
+                (self.first_provider_set_id,)
+                if npi < 1000000003
+                else (self.second_provider_set_id,)
+            )
+            for npi in npis
+        }
+
+    async def provider_set_keys(self, _session, _tables, provider_set_ids):
+        return {
+            provider_set_id: (
+                1 if provider_set_id == self.first_provider_set_id else 2
+            )
+            for provider_set_id in provider_set_ids
+        }
+
+    async def provider_rows(
+        self,
+        *_args,
+        npis,
+        provider_set_ids_by_npi,
+        **_kwargs,
+    ):
+        provider_set_ids = {
+            provider_set_id
+            for npi in npis
+            for provider_set_id in provider_set_ids_by_npi[npi]
+        }
+        return {
+            provider_set_id: [
+                {"npi": npi, "provider_name": f"Provider {npi}"}
+                for npi in npis
+                if provider_set_id in provider_set_ids_by_npi[npi]
+            ]
+            for provider_set_id in provider_set_ids
+        }
+
+    def install(self, monkeypatch):
+        replacements_by_name = {
+            "_merge_manifest_code_variant_rows": self.merge_rates,
+            "_provider_npis_for_sets": self.provider_npis,
+            "_provider_set_ids_for_selected_npis": self.reverse_sets,
+            "_provider_set_keys_for_ids": self.provider_set_keys,
+            "_selected_provider_rows_by_set": self.provider_rows,
+        }
+        for function_name, replacement in replacements_by_name.items():
+            monkeypatch.setattr(ptg2_serving, function_name, replacement)
+
+
+class ProviderMembershipLoader:
+    """Record bounded provider membership reads for cache tests."""
+
+    def __init__(self, member_npis):
+        self.member_npis = member_npis
+        self.calls = []
+
+    async def load(
+        self,
+        _session,
+        _tables,
+        provider_set_ids,
+        *,
+        limit_per_set,
+    ):
+        self.calls.append((tuple(provider_set_ids), limit_per_set))
+        return {
+            provider_set_id: tuple(
+                ptg2_serving._ptg2_npi_member_id(npi)
+                for npi in self.member_npis[:limit_per_set]
+            )
+            for provider_set_id in provider_set_ids
+        }
+
+
+class ReversePriceFilterHarness:
+    """Provide paged reverse metadata with one late price match."""
+
+    def __init__(self):
+        self.nonmatching_rows = [
+            {
+                "price_set_global_id_128": f"{price_key:032x}",
+                "price_key": price_key,
+            }
+            for price_key in range(1, 502)
+        ]
+        self.matching_row_by_field = {
+            "price_set_global_id_128": f"{502:032x}",
+            "price_key": 502,
+        }
+        self.batch_offsets = []
+
+    async def reverse_scope(self, *_args, **_kwargs):
+        return ptg2_serving._VersionThreeReverseScope(
+            provider_set_id_by_key={1: "01" * 16},
+            candidate_code_keys=(1, 2),
+        )
+
+    async def candidate_batch(
+        self,
+        _session,
+        _tables,
+        _query,
+        _scope,
+        metadata_offset,
+        _metadata_batch_size,
+    ):
+        self.batch_offsets.append(metadata_offset)
+        if metadata_offset == 0:
+            return [self.nonmatching_rows], 128
+        if metadata_offset == 128:
+            return [[self.matching_row_by_field]], 1
+        raise AssertionError(f"unexpected metadata offset {metadata_offset}")
+
+    async def prices(self, _session, _tables, price_set_ids, **_kwargs):
+        return {
+            price_set_id: [
+                {
+                    "negotiated_rate": (
+                        "999" if int(price_set_id, 16) == 502 else "1"
+                    )
+                }
+            ]
+            for price_set_id in price_set_ids
+        }
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(
+            ptg2_serving,
+            "_version_three_reverse_scope",
+            self.reverse_scope,
+        )
+        monkeypatch.setattr(
+            ptg2_serving,
+            "_version_three_candidate_batch",
+            self.candidate_batch,
+        )
+        monkeypatch.setattr(
+            ptg2_serving,
+            "_prices_for_price_sets",
+            self.prices,
+        )
+
+
+class GeoPriceFilterHarness:
+    """Provide two priced sets with a location in only the matching set."""
+
+    def __init__(self):
+        self.first_provider_set_id = "01" * 16
+        self.matching_provider_set_id = "02" * 16
+        self.first_price_set_id = "03" * 16
+        self.matching_price_set_id = "04" * 16
+        self.serving_rows = self._serving_rows()
+        self.location_call_by_field = {}
+
+    def _serving_rows(self):
+        provider_price_values = (
+            (self.first_provider_set_id, 3, self.first_price_set_id, 0, "05"),
+            (self.matching_provider_set_id, 4, self.matching_price_set_id, 1, "06"),
+        )
+        return [
+            {
+                "serving_content_hash_128": hash_prefix * 16,
+                "plan_id": "TEST-PLAN-001",
+                "plan_market_type": "group",
+                "reported_code_system": "CPT",
+                "reported_code": "99213",
+                "negotiation_arrangement": "FFS",
+                "provider_set_global_id_128": provider_set_id,
+                "_ptg_provider_set_key": provider_set_key,
+                "provider_count": 1,
+                "price_set_global_id_128": price_set_id,
+                "price_key": price_key,
+                "source_key": 0,
+                "network_names": [],
+            }
+            for (
+                provider_set_id,
+                provider_set_key,
+                price_set_id,
+                price_key,
+                hash_prefix,
+            ) in provider_price_values
+        ]
+
+    async def merge_rates(self, *_args, **_kwargs):
+        return list(self.serving_rows)
+
+    async def noop(self, *_args, **_kwargs):
+        return None
+
+    async def prices(self, *_args, **_kwargs):
+        return {
+            self.first_price_set_id: [
+                {"negotiated_rate": "10", "service_code": ["11"]}
+            ],
+            self.matching_price_set_id: [
+                {"negotiated_rate": "20", "service_code": ["22"]}
+            ],
+        }
+
+    async def location(self, *_args, **kwargs):
+        self.location_call_by_field.update(kwargs)
+        return (
+            {self.matching_provider_set_id},
+            {
+                self.matching_provider_set_id: [
+                    {
+                        "npi": 1234567890,
+                        "provider_name": "Synthetic Clinician",
+                        "distance_miles": 2.0,
+                        "address_payload": {},
+                    }
+                ]
+            },
+        )
+
+    async def details(self, *_args, **_kwargs):
+        return {}
+
+    def install(self, monkeypatch):
+        replacements_by_name = {
+            "_merge_manifest_code_variant_rows": self.merge_rates,
+            "_hydrate_provider_set_network_names": self.noop,
+            "_prices_for_price_sets": self.prices,
+            "_ptg2_manifest_location_provider_matches": self.location,
+            "_procedure_details_for_rows": self.details,
+        }
+        for function_name, replacement in replacements_by_name.items():
+            monkeypatch.setattr(ptg2_serving, function_name, replacement)
+
+    def session(self):
+        return FakeSession(
+            [
+                FakeResult(
+                    result_rows=[
+                        {
+                            "code_key": 7,
+                            "plan_id": "TEST-PLAN-001",
+                            "plan_market_type": "group",
+                            "reported_code_system": "CPT",
+                            "reported_code": "99213",
+                            "negotiation_arrangement": "FFS",
+                            "rate_count": 2,
+                        }
+                    ]
+                )
+            ]
+        )
+
+
+class ProviderReverseResponseHarness:
+    """Provide a sentinel reverse page with exact lower-bound semantics."""
+
+    def __init__(self):
+        self.reverse_rows = tuple(
+            {
+                "reported_code_system": "CPT",
+                "reported_code": f"{99210 + index}",
+                "provider_set_global_id_128": "01" * 16,
+                "price_set_global_id_128": f"{index + 1:032x}",
+                "price_key": index,
+                "source_key": 0,
+            }
+            for index in range(3)
+        )
+
+    async def provider_sets(self, *_args, **_kwargs):
+        return ("01" * 16,)
+
+    async def code_context(self, *_args, **_kwargs):
+        return None
+
+    async def reverse_selection(self, *_args, **_kwargs):
+        query = _args[-1]
+        assert query.limit == 3
+        assert query.offset == 0
+        return ptg2_serving._VersionThreeReverseSelection(
+            rows=self.reverse_rows,
+            exhausted=False,
+        )
+
+    async def noop(self, *_args, **_kwargs):
+        return None
+
+    async def prices(self, _session, _tables, price_set_ids, **_kwargs):
+        return {
+            price_set_id: [{"negotiated_rate": str(index + 1)}]
+            for index, price_set_id in enumerate(price_set_ids)
+        }
+
+    async def details(self, *_args, **_kwargs):
+        return {}
+
+    async def provider_context(self, *_args, **_kwargs):
+        return []
+
+    def procedure_item(self, **kwargs):
+        return {
+            "reported_code": kwargs["serving_data"]["reported_code"],
+            "prices": kwargs["prices"],
+        }
+
+    def install(self, monkeypatch):
+        replacements_by_name = {
+            "_provider_sets_for_npi": self.provider_sets,
+            "_resolve_ptg2_code_search_context": self.code_context,
+            "_version_three_reverse_selection": self.reverse_selection,
+            "_hydrate_provider_set_network_names": self.noop,
+            "_prices_for_price_sets": self.prices,
+            "_procedure_details_for_rows": self.details,
+            "_enriched_provider_rows_for_npis": self.provider_context,
+            "_ptg2_manifest_provider_procedure_item": self.procedure_item,
+        }
+        for function_name, replacement in replacements_by_name.items():
+            monkeypatch.setattr(ptg2_serving, function_name, replacement)
+
+
 class ConcurrentSessionFactory:
     def __init__(self):
         self.active = 0
@@ -144,6 +510,196 @@ class ConcurrentSessionFactory:
             yield network_session
         finally:
             self.active -= 1
+
+
+def _provider_expansion_overlap_fixture():
+    provider_set_ids = ("01" * 16, "02" * 16, "03" * 16)
+    serving_hashes = ("11" * 16, "22" * 16, "33" * 16)
+    reported_codes = ("99213", "99213", "99214")
+    source_keys = (0, 0, 1)
+    rate_rows = [
+        {
+            "provider_set_global_id_128": provider_set_id,
+            "serving_content_hash_128": serving_hash,
+            "reported_code_system": "CPT",
+            "reported_code": reported_code,
+            "negotiation_arrangement": "ffs",
+            "source_key": source_key,
+        }
+        for provider_set_id, serving_hash, reported_code, source_key in zip(
+            provider_set_ids,
+            serving_hashes,
+            reported_codes,
+            source_keys,
+        )
+    ]
+    return rate_rows, {
+        provider_set_ids[0]: (1000000007, 1000000001, 1000000003),
+        provider_set_ids[1]: (1000000001, 1000000005, 1000000007),
+        provider_set_ids[2]: (1000000005, 1000000009),
+    }
+
+
+def _exhaustive_provider_expansion_prefix(rate_rows, npis_by_set, target_count):
+    exhaustive_keys = []
+    exhaustive_provider_set_ids = []
+    for rate_row in rate_rows:
+        provider_set_id = rate_row["provider_set_global_id_128"]
+        for npi in npis_by_set[provider_set_id]:
+            key = (
+                "npi",
+                str(npi),
+                rate_row["reported_code_system"],
+                rate_row["reported_code"],
+                rate_row["negotiation_arrangement"],
+                str(rate_row["source_key"]),
+            )
+            if key not in exhaustive_keys:
+                exhaustive_keys.append(key)
+                if provider_set_id not in exhaustive_provider_set_ids:
+                    exhaustive_provider_set_ids.append(provider_set_id)
+            if len(exhaustive_keys) >= target_count:
+                break
+        if len(exhaustive_keys) >= target_count:
+            break
+    return exhaustive_keys, exhaustive_provider_set_ids
+
+
+async def _exercise_provider_npi_prefix_cache(serving_tables, provider_set_id):
+    ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE.clear()
+    try:
+        prefixes = []
+        for limit_per_set in (32, 5, 64, 128):
+            npis_by_set = await ptg2_serving._provider_npis_for_sets(
+                object(),
+                serving_tables,
+                (provider_set_id,),
+                limit_per_set=limit_per_set,
+            )
+            prefixes.append(npis_by_set[provider_set_id])
+        return tuple(prefixes)
+    finally:
+        ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE.clear()
+
+
+async def _exercise_filtered_provider_prefix_cache(
+    serving_tables,
+    provider_set_id,
+    args_by_name,
+):
+    ptg2_serving._PTG2_FILTERED_PROVIDER_PREFIX_CACHE.clear()
+    try:
+        first_prefix = await ptg2_serving._filtered_provider_npis_for_expansion_set(
+            object(),
+            serving_tables,
+            provider_set_id,
+            args_by_name,
+            target_count=2,
+        )
+        cached_prefix = await ptg2_serving._filtered_provider_npis_for_expansion_set(
+            object(),
+            serving_tables,
+            provider_set_id,
+            args_by_name,
+            target_count=2,
+        )
+        return first_prefix, cached_prefix
+    finally:
+        ptg2_serving._PTG2_FILTERED_PROVIDER_PREFIX_CACHE.clear()
+
+
+async def _run_strict_cost_selection_twice(serving_tables, selection_args_by_name):
+    ptg2_serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
+    try:
+        first_selection = await ptg2_serving._strict_cost_provider_expansion_selection(
+            object(),
+            serving_tables,
+            **selection_args_by_name,
+        )
+        cached_selection = await ptg2_serving._strict_cost_provider_expansion_selection(
+            object(),
+            serving_tables,
+            **selection_args_by_name,
+        )
+        return first_selection, cached_selection
+    finally:
+        ptg2_serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
+
+
+def _provider_directory_corroboration_row(address_key):
+    return {
+        "npi": 1234567890,
+        "address_key": address_key,
+        "source_key": "synthetic-source",
+        "snapshot_id": "ptg2:209901:synthetic",
+        "plan_id": "SYNTHETIC-PLAN",
+        "ptg_plan_id": "synthetic-ptg-plan",
+        "provider_directory_source_id": "directory-fixture",
+        "provider_directory_org_name": "Synthetic Health",
+        "provider_directory_plan_name": "Synthetic Directory Plan",
+        "provider_directory_location_resource_id": "location-1",
+        "provider_directory_location_name": "Example Clinic",
+        "provider_directory_telephone_number": "312-555-0100",
+        "provider_directory_phone_number": "3125550100",
+        "provider_directory_phone_extension": "45",
+        "provider_directory_network_refs": ["Organization/network-1"],
+        "provider_directory_network_names": ["Synthetic Network"],
+        "provider_directory_network_matches": [],
+        "provider_directory_plan_context_matched": True,
+        "provider_directory_network_context_present": True,
+        "provider_directory_insurance_plan_matches": [],
+        "provider_directory_match_type": "npi_address_plan",
+        "address_network_binding": "payer_directory_corroborated_location",
+        "address_verification_evidence": {
+            "matched_on": "npi_address_key_role_location_plan"
+        },
+    }
+
+
+def _reverse_price_filter_query():
+    return ptg2_serving._VersionThreeReverseQuery(
+        provider_set_ids=("01" * 16,),
+        requested_plan="TEST-PLAN-001",
+        code_value="",
+        code_system=None,
+        q_text="",
+        code_context=None,
+        source_trace_set_hash=None,
+        network_names=[],
+        limit=None,
+        offset=0,
+        apply_window=False,
+    )
+
+
+async def _search_geo_price_response(session):
+    return await ptg2_serving._search_manifest_serving_table(
+        session,
+        "ptg2:209901:synthetic",
+        {
+            "plan_id": "TEST-PLAN-001",
+            "plan_market_type": "group",
+            "code_system": "CPT",
+            "code": "99213",
+            "state": "IL",
+            "pos": "22",
+            "include_providers": True,
+        },
+        SimpleNamespace(limit=25, offset=0),
+        _strict_v3_tables(),
+        "product_search",
+    )
+
+
+async def _search_provider_reverse_response():
+    return await ptg2_serving._search_ptg2_manifest_provider_procedures(
+        object(),
+        1234567890,
+        {"plan_id": "TEST-PLAN-001"},
+        SimpleNamespace(limit=2, offset=0),
+        snapshot_id="ptg2:209901:synthetic",
+        serving_tables=_strict_v3_tables(),
+    )
 
 
 def _strict_v3_tables(**overrides):
@@ -347,65 +903,14 @@ def test_provider_expansion_prefix_preserves_graph_member_ordinal():
 @pytest.mark.parametrize("target_count", range(1, 13))
 def test_provider_expansion_prefix_matches_exhaustive_overlap_order(target_count):
     """Verify provider expansion matches exhaustive overlap order at each target size."""
-    first_set = "01" * 16
-    second_set = "02" * 16
-    third_set = "03" * 16
-    rate_rows = [
-        {
-            "provider_set_global_id_128": first_set,
-            "serving_content_hash_128": "11" * 16,
-            "reported_code_system": "CPT",
-            "reported_code": "99213",
-            "negotiation_arrangement": "ffs",
-            "source_key": 0,
-        },
-        {
-            "provider_set_global_id_128": second_set,
-            "serving_content_hash_128": "22" * 16,
-            "reported_code_system": "CPT",
-            "reported_code": "99213",
-            "negotiation_arrangement": "ffs",
-            "source_key": 0,
-        },
-        {
-            "provider_set_global_id_128": third_set,
-            "serving_content_hash_128": "33" * 16,
-            "reported_code_system": "CPT",
-            "reported_code": "99214",
-            "negotiation_arrangement": "ffs",
-            "source_key": 1,
-        },
-    ]
-    npis_by_set = {
-        first_set: (1000000007, 1000000001, 1000000003),
-        second_set: (1000000001, 1000000005, 1000000007),
-        third_set: (1000000005, 1000000009),
-    }
-    exhaustive_keys = []
-    exhaustive_provider_set_ids = []
-    for rate_row in rate_rows:
-        for npi in npis_by_set[rate_row["provider_set_global_id_128"]]:
-            key = (
-                "npi",
-                str(npi),
-                rate_row["reported_code_system"],
-                rate_row["reported_code"],
-                rate_row["negotiation_arrangement"],
-                str(rate_row["source_key"]),
-            )
-            if key not in exhaustive_keys:
-                exhaustive_keys.append(key)
-                if (
-                    rate_row["provider_set_global_id_128"]
-                    not in exhaustive_provider_set_ids
-                ):
-                    exhaustive_provider_set_ids.append(
-                        rate_row["provider_set_global_id_128"]
-                    )
-            if len(exhaustive_keys) >= target_count:
-                break
-        if len(exhaustive_keys) >= target_count:
-            break
+    rate_rows, npis_by_set = _provider_expansion_overlap_fixture()
+    exhaustive_keys, exhaustive_provider_set_ids = (
+        _exhaustive_provider_expansion_prefix(
+            rate_rows,
+            npis_by_set,
+            target_count,
+        )
+    )
 
     rank_by_key, selected_npis, selected_provider_set_ids = (
         ptg2_serving._rank_provider_expansion_prefix(
@@ -456,87 +961,8 @@ async def test_strict_cost_provider_selection_grows_until_page_is_contained(
     monkeypatch,
 ):
     """Verify cost selection widens until the requested provider page is complete."""
-    first_set = "01" * 16
-    second_set = "02" * 16
-    rate_rows = [
-        {
-            "provider_set_global_id_128": first_set if index < 64 else second_set,
-            "serving_content_hash_128": f"{index + 1:032x}",
-            "reported_code_system": "CPT",
-            "reported_code": "99213",
-            "negotiation_arrangement": "FFS",
-            "source_key": 0,
-        }
-        for index in range(130)
-    ]
-    prefix_limits = []
-    completion_filters = []
-
-    async def fake_merge(*_args, limit, provider_set_keys, **_kwargs):
-        if provider_set_keys is None:
-            prefix_limits.append(limit)
-            return rate_rows[:limit]
-        completion_filters.append(tuple(sorted(provider_set_keys)))
-        return rate_rows
-
-    async def fake_npis(_session, _tables, provider_set_global_ids, **_kwargs):
-        return {
-            provider_set_id: (
-                (1000000001, 1000000002)
-                if provider_set_id == first_set
-                else (1000000003, 1000000004, 1000000005)
-            )
-            for provider_set_id in provider_set_global_ids
-        }
-
-    async def fake_reverse(_session, _tables, npis):
-        return {
-            npi: (first_set,) if npi < 1000000003 else (second_set,)
-            for npi in npis
-        }
-
-    async def fake_set_keys(_session, _tables, provider_set_ids):
-        return {
-            provider_set_id: 1 if provider_set_id == first_set else 2
-            for provider_set_id in provider_set_ids
-        }
-
-    async def fake_provider_rows(*_args, npis, provider_set_ids_by_npi, **_kwargs):
-        provider_sets = {
-            provider_set_id
-            for npi in npis
-            for provider_set_id in provider_set_ids_by_npi[npi]
-        }
-        return {
-            provider_set_id: [
-                {"npi": npi, "provider_name": f"Provider {npi}"}
-                for npi in npis
-                if provider_set_id in provider_set_ids_by_npi[npi]
-            ]
-            for provider_set_id in provider_sets
-        }
-
-    monkeypatch.setattr(ptg2_serving, "_merge_manifest_code_variant_rows", fake_merge)
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_provider_npis_for_sets",
-        fake_npis,
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_provider_set_ids_for_selected_npis",
-        fake_reverse,
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_provider_set_keys_for_ids",
-        fake_set_keys,
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_selected_provider_rows_by_set",
-        fake_provider_rows,
-    )
+    harness = CostProviderSelectionHarness()
+    harness.install(monkeypatch)
 
     selection = await ptg2_serving._strict_cost_provider_expansion_selection(
         object(),
@@ -551,8 +977,8 @@ async def test_strict_cost_provider_selection_grows_until_page_is_contained(
     )
 
     assert selection is not None
-    assert prefix_limits == [64, 130]
-    assert completion_filters == [(1, 2)]
+    assert harness.prefix_limits == [64, 130]
+    assert harness.completion_filters == [(1, 2)]
     assert selection.total_lower_bound == 5
     assert selection.exhausted is False
 
@@ -565,72 +991,26 @@ async def test_provider_npi_prefix_cache_reuses_and_grows_sealed_membership(
 
     provider_set_id = "01" * 16
     member_npis = tuple(range(1000000001, 1000000051))
-    membership_calls = []
-
-    async def load_member_ids(
-        _session,
-        _tables,
-        provider_set_ids,
-        *,
-        limit_per_set,
-    ):
-        membership_calls.append((tuple(provider_set_ids), limit_per_set))
-        return {
-            selected_provider_set_id: tuple(
-                ptg2_serving._ptg2_npi_member_id(npi)
-                for npi in member_npis[:limit_per_set]
-            )
-            for selected_provider_set_id in provider_set_ids
-        }
+    membership_loader = ProviderMembershipLoader(member_npis)
 
     monkeypatch.setattr(
         ptg2_serving,
         "_provider_npi_member_ids_by_set",
-        load_member_ids,
+        membership_loader.load,
     )
-    ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE.clear()
     serving_tables = _strict_v3_tables(shared_snapshot_key=91)
-    try:
-        first_prefix = (
-            await ptg2_serving._provider_npis_for_sets(
-                object(),
-                serving_tables,
-                (provider_set_id,),
-                limit_per_set=32,
-            )
-        )[provider_set_id]
-        cached_short_prefix = (
-            await ptg2_serving._provider_npis_for_sets(
-                object(),
-                serving_tables,
-                (provider_set_id,),
-                limit_per_set=5,
-            )
-        )[provider_set_id]
-        complete_prefix = (
-            await ptg2_serving._provider_npis_for_sets(
-                object(),
-                serving_tables,
-                (provider_set_id,),
-                limit_per_set=64,
-            )
-        )[provider_set_id]
-        cached_complete_prefix = (
-            await ptg2_serving._provider_npis_for_sets(
-                object(),
-                serving_tables,
-                (provider_set_id,),
-                limit_per_set=128,
-            )
-        )[provider_set_id]
-    finally:
-        ptg2_serving._PTG2_PROVIDER_NPI_PREFIX_CACHE.clear()
+    (
+        first_prefix,
+        cached_short_prefix,
+        complete_prefix,
+        cached_complete_prefix,
+    ) = await _exercise_provider_npi_prefix_cache(serving_tables, provider_set_id)
 
     assert first_prefix == member_npis[:32]
     assert cached_short_prefix == member_npis[:5]
     assert complete_prefix == member_npis
     assert cached_complete_prefix == member_npis
-    assert membership_calls == [
+    assert membership_loader.calls == [
         ((provider_set_id,), 32),
         ((provider_set_id,), 64),
     ]
@@ -682,23 +1062,11 @@ async def test_filtered_provider_prefix_cache_reuses_identical_filter(
         "plan_id": "synthetic-plan",
         "provider_sex_code": "F",
     }
-    try:
-        first_prefix = await ptg2_serving._filtered_provider_npis_for_expansion_set(
-            object(),
-            serving_tables,
-            provider_set_id,
-            args_by_name,
-            target_count=2,
-        )
-        cached_prefix = await ptg2_serving._filtered_provider_npis_for_expansion_set(
-            object(),
-            serving_tables,
-            provider_set_id,
-            args_by_name,
-            target_count=2,
-        )
-    finally:
-        ptg2_serving._PTG2_FILTERED_PROVIDER_PREFIX_CACHE.clear()
+    first_prefix, cached_prefix = await _exercise_filtered_provider_prefix_cache(
+        serving_tables,
+        provider_set_id,
+        args_by_name,
+    )
 
     assert first_prefix == member_npis[1:4:2]
     assert cached_prefix == first_prefix
@@ -748,24 +1116,10 @@ async def test_strict_cost_provider_selection_bounds_demographic_filter_expansio
         "target_count": 2,
         "descending": False,
     }
-    ptg2_serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
-    try:
-        selection = (
-            await ptg2_serving._strict_cost_provider_expansion_selection(
-                object(),
-                serving_tables,
-                **selection_args_by_name,
-            )
-        )
-        cached_selection = (
-            await ptg2_serving._strict_cost_provider_expansion_selection(
-                object(),
-                serving_tables,
-                **selection_args_by_name,
-            )
-        )
-    finally:
-        ptg2_serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
+    selection, cached_selection = await _run_strict_cost_selection_twice(
+        serving_tables,
+        selection_args_by_name,
+    )
 
     assert selection is not None
     assert cached_selection is not None
@@ -1421,35 +1775,7 @@ async def test_provider_directory_overlay_prefers_corroborated_contact():
         [
             "mrf.provider_directory_address_corroboration",
             FakeResult(
-                result_rows=[
-                    {
-                        "npi": 1234567890,
-                        "address_key": address_key,
-                        "source_key": "synthetic-source",
-                        "snapshot_id": "ptg2:209901:synthetic",
-                        "plan_id": "SYNTHETIC-PLAN",
-                        "ptg_plan_id": "synthetic-ptg-plan",
-                        "provider_directory_source_id": "directory-fixture",
-                        "provider_directory_org_name": "Synthetic Health",
-                        "provider_directory_plan_name": "Synthetic Directory Plan",
-                        "provider_directory_location_resource_id": "location-1",
-                        "provider_directory_location_name": "Example Clinic",
-                        "provider_directory_telephone_number": "312-555-0100",
-                        "provider_directory_phone_number": "3125550100",
-                        "provider_directory_phone_extension": "45",
-                        "provider_directory_network_refs": ["Organization/network-1"],
-                        "provider_directory_network_names": ["Synthetic Network"],
-                        "provider_directory_network_matches": [],
-                        "provider_directory_plan_context_matched": True,
-                        "provider_directory_network_context_present": True,
-                        "provider_directory_insurance_plan_matches": [],
-                        "provider_directory_match_type": "npi_address_plan",
-                        "address_network_binding": "payer_directory_corroborated_location",
-                        "address_verification_evidence": {
-                            "matched_on": "npi_address_key_role_location_plan"
-                        },
-                    }
-                ]
+                result_rows=[_provider_directory_corroboration_row(address_key)]
             ),
         ]
     )
@@ -2237,72 +2563,13 @@ def test_price_filters_preserve_only_matching_atoms():
 @pytest.mark.asyncio
 async def test_reverse_price_filter_scans_past_old_candidate_guess(monkeypatch):
     """Verify reverse price filtering scans beyond the former candidate guess."""
-    nonmatching_rows = [
-        {
-            "price_set_global_id_128": f"{price_key:032x}",
-            "price_key": price_key,
-        }
-        for price_key in range(1, 502)
-    ]
-    matching_row_by_field = {
-        "price_set_global_id_128": f"{502:032x}",
-        "price_key": 502,
-    }
-    batch_offsets = []
-
-    async def fake_reverse_scope(*_args, **_kwargs):
-        return ptg2_serving._VersionThreeReverseScope(
-            provider_set_id_by_key={1: "01" * 16},
-            candidate_code_keys=(1, 2),
-        )
-
-    async def fake_candidate_batch(
-        _session,
-        _tables,
-        _query,
-        _scope,
-        metadata_offset,
-        _metadata_batch_size,
-    ):
-        batch_offsets.append(metadata_offset)
-        if metadata_offset == 0:
-            return [nonmatching_rows], 128
-        if metadata_offset == 128:
-            return [[matching_row_by_field]], 1
-        raise AssertionError(f"unexpected metadata offset {metadata_offset}")
-
-    async def fake_prices(_session, _tables, price_set_ids, **_kwargs):
-        return {
-            price_set_id: [
-                {
-                    "negotiated_rate": (
-                        "999" if int(price_set_id, 16) == 502 else "1"
-                    )
-                }
-            ]
-            for price_set_id in price_set_ids
-        }
-
-    monkeypatch.setattr(ptg2_serving, "_version_three_reverse_scope", fake_reverse_scope)
-    monkeypatch.setattr(ptg2_serving, "_version_three_candidate_batch", fake_candidate_batch)
-    monkeypatch.setattr(ptg2_serving, "_prices_for_price_sets", fake_prices)
+    harness = ReversePriceFilterHarness()
+    harness.install(monkeypatch)
 
     selection = await ptg2_serving._version_three_filtered_reverse_selection(
         object(),
         _strict_v3_tables(),
-        ptg2_serving._VersionThreeReverseQuery(
-            provider_set_ids=("01" * 16,),
-            requested_plan="TEST-PLAN-001",
-            code_value="",
-            code_system=None,
-            q_text="",
-            code_context=None,
-            source_trace_set_hash=None,
-            network_names=[],
-            limit=None,
-            offset=0,
-            apply_window=False,
-        ),
+        _reverse_price_filter_query(),
         {"negotiated_rate": "999"},
         offset=0,
         limit=2,
@@ -2312,135 +2579,18 @@ async def test_reverse_price_filter_scans_past_old_candidate_guess(monkeypatch):
     assert selection.exhausted
     assert selection.total_row_count == 1
     assert selection.matched_rows_seen == 1
-    assert batch_offsets == [0, 128]
+    assert harness.batch_offsets == [0, 128]
 
 
 @pytest.mark.asyncio
 async def test_geo_price_filter_selects_locations_from_matching_provider_sets(monkeypatch):
     """Verify geo filtering selects locations from price-matching provider sets."""
-    first_provider_set_id = "01" * 16
-    matching_provider_set_id = "02" * 16
-    first_price_set_id = "03" * 16
-    matching_price_set_id = "04" * 16
-    serving_rows = [
-        {
-            "serving_content_hash_128": "05" * 16,
-            "plan_id": "TEST-PLAN-001",
-            "plan_market_type": "group",
-            "reported_code_system": "CPT",
-            "reported_code": "99213",
-            "negotiation_arrangement": "FFS",
-            "provider_set_global_id_128": first_provider_set_id,
-            "_ptg_provider_set_key": 3,
-            "provider_count": 1,
-            "price_set_global_id_128": first_price_set_id,
-            "price_key": 0,
-            "source_key": 0,
-            "network_names": [],
-        },
-        {
-            "serving_content_hash_128": "06" * 16,
-            "plan_id": "TEST-PLAN-001",
-            "plan_market_type": "group",
-            "reported_code_system": "CPT",
-            "reported_code": "99213",
-            "negotiation_arrangement": "FFS",
-            "provider_set_global_id_128": matching_provider_set_id,
-            "_ptg_provider_set_key": 4,
-            "provider_count": 1,
-            "price_set_global_id_128": matching_price_set_id,
-            "price_key": 1,
-            "source_key": 0,
-            "network_names": [],
-        },
-    ]
-    location_call_by_field = {}
+    harness = GeoPriceFilterHarness()
+    harness.install(monkeypatch)
+    response = await _search_geo_price_response(harness.session())
 
-    async def fake_merge(*_args, **_kwargs):
-        return list(serving_rows)
-
-    async def fake_noop(*_args, **_kwargs):
-        return None
-
-    async def fake_prices(*_args, **_kwargs):
-        return {
-            first_price_set_id: [
-                {"negotiated_rate": "10", "service_code": ["11"]}
-            ],
-            matching_price_set_id: [
-                {"negotiated_rate": "20", "service_code": ["22"]}
-            ],
-        }
-
-    async def fake_location(*_args, **kwargs):
-        location_call_by_field.update(kwargs)
-        return (
-            {matching_provider_set_id},
-            {
-                matching_provider_set_id: [
-                    {
-                        "npi": 1234567890,
-                        "provider_name": "Synthetic Clinician",
-                        "distance_miles": 2.0,
-                        "address_payload": {},
-                    }
-                ]
-            },
-        )
-
-    async def fake_details(*_args, **_kwargs):
-        return {}
-
-    monkeypatch.setattr(ptg2_serving, "_merge_manifest_code_variant_rows", fake_merge)
-    monkeypatch.setattr(ptg2_serving, "_hydrate_provider_set_network_names", fake_noop)
-    monkeypatch.setattr(ptg2_serving, "_prices_for_price_sets", fake_prices)
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_manifest_location_provider_matches",
-        fake_location,
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_procedure_details_for_rows",
-        fake_details,
-    )
-    session = FakeSession(
-        [
-            FakeResult(
-                result_rows=[
-                    {
-                        "code_key": 7,
-                        "plan_id": "TEST-PLAN-001",
-                        "plan_market_type": "group",
-                        "reported_code_system": "CPT",
-                        "reported_code": "99213",
-                        "negotiation_arrangement": "FFS",
-                        "rate_count": 2,
-                    }
-                ]
-            )
-        ]
-    )
-
-    response = await ptg2_serving._search_manifest_serving_table(
-        session,
-        "ptg2:209901:synthetic",
-        {
-            "plan_id": "TEST-PLAN-001",
-            "plan_market_type": "group",
-            "code_system": "CPT",
-            "code": "99213",
-            "state": "IL",
-            "pos": "22",
-            "include_providers": True,
-        },
-        SimpleNamespace(limit=25, offset=0),
-        _strict_v3_tables(),
-        "product_search",
-    )
-
-    assert location_call_by_field["provider_set_keys"] == {4}
-    assert location_call_by_field["require_exhaustive"] is False
+    assert harness.location_call_by_field["provider_set_keys"] == {4}
+    assert harness.location_call_by_field["require_exhaustive"] is False
     assert [provider_by_field["npi"] for provider_by_field in response["items"]] == [
         1234567890
     ]
@@ -2488,84 +2638,9 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
 @pytest.mark.asyncio
 async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(monkeypatch):
     """Verify reverse pagination uses a sentinel and reports a lower-bound total."""
-    reverse_rows = tuple(
-        {
-            "reported_code_system": "CPT",
-            "reported_code": f"{99210 + index}",
-            "provider_set_global_id_128": "01" * 16,
-            "price_set_global_id_128": f"{index + 1:032x}",
-            "price_key": index,
-            "source_key": 0,
-        }
-        for index in range(3)
-    )
-
-    async def fake_provider_sets(*_args, **_kwargs):
-        return ("01" * 16,)
-
-    async def fake_code_context(*_args, **_kwargs):
-        return None
-
-    async def fake_reverse_selection(*_args, **_kwargs):
-        query = _args[-1]
-        assert query.limit == 3
-        assert query.offset == 0
-        return ptg2_serving._VersionThreeReverseSelection(
-            rows=reverse_rows,
-            exhausted=False,
-        )
-
-    async def fake_noop(*_args, **_kwargs):
-        return None
-
-    async def fake_prices(_session, _tables, price_set_ids, **_kwargs):
-        return {
-            price_set_id: [{"negotiated_rate": str(index + 1)}]
-            for index, price_set_id in enumerate(price_set_ids)
-        }
-
-    async def fake_details(*_args, **_kwargs):
-        return {}
-
-    async def fake_provider_context(*_args, **_kwargs):
-        return []
-
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_provider_sets_for_npi",
-        fake_provider_sets,
-    )
-    monkeypatch.setattr(ptg2_serving, "_resolve_ptg2_code_search_context", fake_code_context)
-    monkeypatch.setattr(ptg2_serving, "_version_three_reverse_selection", fake_reverse_selection)
-    monkeypatch.setattr(ptg2_serving, "_hydrate_provider_set_network_names", fake_noop)
-    monkeypatch.setattr(ptg2_serving, "_prices_for_price_sets", fake_prices)
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_procedure_details_for_rows",
-        fake_details,
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_enriched_provider_rows_for_npis",
-        fake_provider_context,
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_manifest_provider_procedure_item",
-        lambda **kwargs: {
-            "reported_code": kwargs["serving_data"]["reported_code"],
-            "prices": kwargs["prices"],
-        },
-    )
-
-    response = await ptg2_serving._search_ptg2_manifest_provider_procedures(
-        object(),
-        1234567890,
-        {"plan_id": "TEST-PLAN-001"},
-        SimpleNamespace(limit=2, offset=0),
-        snapshot_id="ptg2:209901:synthetic",
-        serving_tables=_strict_v3_tables(),
-    )
+    harness = ProviderReverseResponseHarness()
+    harness.install(monkeypatch)
+    response = await _search_provider_reverse_response()
 
     assert [
         procedure_item["reported_code"] for procedure_item in response["items"]
