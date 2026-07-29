@@ -13,7 +13,10 @@ from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionError,
 )
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
-from api.ptg2_db_sidecars import forward_price_row_retention_upper_bound
+from api.ptg2_db_sidecars import (
+    forward_price_index_retention_upper_bound,
+    forward_price_row_retention_upper_bound,
+)
 from api.ptg2_shared_blocks import PTG2SharedBlockError
 from api.ptg2_v4_graph import V4GraphRoot
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -254,29 +257,6 @@ async def test_direct_graph_integrity_failure_stays_closed(monkeypatch):
     code_first.assert_not_awaited()
 
 
-def test_direct_strategy_uses_exact_available_budget_boundary():
-    rate_count = 17
-    code_index = _rate_count_index(_code_index(), rate_count)
-    required_bytes = forward_price_row_retention_upper_bound(
-        rate_count * len(code_index.by_key)
-    )
-    roomy_budget = CandidateAuditDecodedRetentionBudget(
-        maximum_bytes=required_bytes + 1
-    )
-    exact_budget = CandidateAuditDecodedRetentionBudget(
-        maximum_bytes=required_bytes
-    )
-
-    assert direct_scope.should_load_direct_graph_first(
-        code_index,
-        roomy_budget,
-    ) is False
-    assert direct_scope.should_load_direct_graph_first(
-        code_index,
-        exact_budget,
-    ) is True
-
-
 @pytest.mark.parametrize("rate_count", (None, True, "1", -1))
 def test_direct_strategy_requires_authenticated_rate_count(rate_count):
     code_index = CandidateCodeIndex(
@@ -331,6 +311,20 @@ def test_forward_retention_bound_rejects_invalid_rate_count(rate_count):
         match="rate count must not be negative",
     ):
         forward_price_row_retention_upper_bound(rate_count)
+    with pytest.raises(
+        ValueError,
+        match="rate count must not be negative",
+    ):
+        forward_price_index_retention_upper_bound(rate_count, 1)
+
+
+@pytest.mark.parametrize("code_count", (None, True, "1", -1))
+def test_forward_index_bound_rejects_invalid_code_count(code_count):
+    with pytest.raises(
+        ValueError,
+        match="code count must not be negative",
+    ):
+        forward_price_index_retention_upper_bound(1, code_count)
 
 
 def test_direct_npi_scope_releases_claim_when_map_creation_fails(

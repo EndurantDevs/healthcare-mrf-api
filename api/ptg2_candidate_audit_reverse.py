@@ -80,6 +80,68 @@ class _BudgetedCodeSourceNpis:
     retained_bytes: int
 
 
+def source_key_projection_retention_upper_bound(
+    code_count: int,
+    source_membership_count: int,
+) -> int:
+    """Bound the set-to-tuple peak of one candidate source projection."""
+
+    if type(code_count) is not int or code_count < 0:
+        raise ValueError("candidate source code count must not be negative")
+    if (
+        type(source_membership_count) is not int
+        or source_membership_count < 0
+    ):
+        raise ValueError(
+            "candidate source membership count must not be negative"
+        )
+    retained_set_bytes = (
+        _SOURCE_KEY_SET_MAP_BYTES
+        + code_count * _SOURCE_KEY_SET_BUCKET_BYTES
+        + source_membership_count * _SOURCE_KEY_SET_MEMBERSHIP_BYTES
+    )
+    retained_result_bytes = (
+        _SOURCE_KEY_RESULT_MAP_BYTES
+        + code_count * _SOURCE_KEY_RESULT_BUCKET_BYTES
+        + source_membership_count * _SOURCE_KEY_RESULT_MEMBERSHIP_BYTES
+    )
+    return retained_set_bytes + retained_result_bytes
+
+
+def provider_candidate_projection_retention_upper_bound(
+    code_source_pair_count: int,
+    code_source_npi_membership_count: int,
+    npi_count: int,
+    candidate_membership_count: int,
+) -> int:
+    """Bound code/source fanout plus its retained NPI provider map."""
+
+    counts = (
+        code_source_pair_count,
+        code_source_npi_membership_count,
+        npi_count,
+        candidate_membership_count,
+    )
+    if any(type(count) is not int or count < 0 for count in counts):
+        raise ValueError(
+            "candidate provider projection counts must not be negative"
+        )
+    code_source_bytes = (
+        _CODE_SOURCE_NPI_MAP_BYTES
+        + code_source_pair_count
+        * (_CODE_SOURCE_NPI_KEY_BYTES + _CODE_SOURCE_NPI_BUCKET_BYTES)
+        + code_source_npi_membership_count
+        * _CODE_SOURCE_NPI_MEMBERSHIP_BYTES
+    )
+    candidate_map_bytes = (
+        _NPI_PROVIDER_MAP_BYTES
+        + npi_count
+        * (_NPI_PROVIDER_MAP_ENTRY_BYTES + _NPI_PROVIDER_BUCKET_BYTES)
+        + candidate_membership_count * _NPI_PROVIDER_MEMBERSHIP_BYTES
+    )
+    return code_source_bytes + candidate_map_bytes
+
+
 def _retain_source_key(
     source_key_sets_by_code: dict[int, set[int]],
     code_key: int,

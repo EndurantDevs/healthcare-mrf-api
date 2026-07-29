@@ -53,7 +53,12 @@ async def _load_direct_v4_scope(
 ) -> reverse_scope.CandidateProviderScope:
     """Choose graph-first or code-first direct proof before forward I/O."""
 
-    if should_load_direct_graph_first(code_index, retention_budget):
+    if should_load_direct_graph_first(
+        code_index,
+        retention_budget,
+        challenges=challenges,
+        persisted_audit_occurrences=persisted_occurrences,
+    ):
         proven_npis: list[int] = []
         try:
             provider_sets_by_npi = await load_v4_direct_provider_scope(

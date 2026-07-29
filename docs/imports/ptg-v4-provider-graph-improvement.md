@@ -266,13 +266,27 @@ not switch to code/source-first after reading graph blocks.
 
 `direct_v1` is adaptive before forward I/O. The authenticated code dictionary
 supplies the exact sealed `rate_count` for every selected code key. The reader
-sums each distinct key once and applies the versioned decoded-row/index
-retention coefficients to that cardinality. If the broad code/source-first
-forward result cannot fit the remaining request budget, the audit proves the
-requested challenge and persisted-sample NPIs through the direct graph first,
-then supplies those exact provider-set and occurrence coordinates to one
-filtered forward read. Small direct partitions retain the existing
-code/source-first path.
+sums each distinct key once and applies a conservative full-peak bound, not
+only decoded-row/index coefficients. The bound includes code-key
+normalization, source projection, mandatory request and filter maps, and the
+worst-case sealed-rate allowance for discovered shards, fragment views,
+coordinate buckets, occurrence workspaces, mutable rows, and the frozen
+result. It also multiplies each code's rate count by the largest distinct-NPI
+fanout of any requested source, then includes the code/source-to-NPI map, NPI
+provider candidates, persisted-sample memberships, and the conservative V4
+result and coordinate-reservation workspace. Exact capacity selects
+code/source-first only when that complete peak fits; a one-byte-short budget
+selects graph-first before forward I/O. If the broad code/source-first path
+cannot fit, the audit proves the requested challenge and persisted-sample NPIs
+through the direct graph first, then supplies those exact provider-set and
+occurrence coordinates to one filtered forward read. Small direct partitions
+retain the existing code/source-first path.
+
+The same direct-layout rule applies to exact-NPI online serving. It resolves
+the requested NPI through the bounded direct graph first, then reads only that
+proved provider-set scope for the requested code. A heavy NPI that reaches the
+sealed graph-member cap falls back before forward I/O to the bounded
+code-first scope; it never pays for a failed broad forward read first.
 
 Only a typed graph-capacity outcome on the first requested NPI may fall back
 to one code/source-first attempt, and that decision occurs before any forward

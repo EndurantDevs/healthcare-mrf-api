@@ -16,6 +16,12 @@ from sqlalchemy import text
 
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
+    INTEGER_KEY_ORDERING_BYTES,
+    INTEGER_KEY_ORDERING_MEMBERSHIP_BYTES,
+    INTEGER_KEY_SET_BYTES,
+    INTEGER_KEY_SET_MEMBERSHIP_BYTES,
+    INTEGER_KEY_TUPLE_BYTES,
+    INTEGER_KEY_TUPLE_MEMBERSHIP_BYTES,
     retain_unique_integer_key_set,
     retain_unique_integer_keys,
 )
@@ -99,6 +105,100 @@ def forward_price_row_retention_upper_bound(rate_count: int) -> int:
     return _FORWARD_RESULT_MAP_RETAINED_BYTES + rate_count * max(
         parse_and_mutable_bytes,
         frozen_peak_bytes,
+    )
+
+
+def _forward_code_key_retention_peaks(
+    code_count: int,
+) -> tuple[int, int]:
+    """Return normalization and retained-tuple code-key peaks."""
+
+    normalized_peak_bytes = (
+        INTEGER_KEY_SET_BYTES
+        + code_count * INTEGER_KEY_SET_MEMBERSHIP_BYTES
+        + INTEGER_KEY_ORDERING_BYTES
+        + code_count * INTEGER_KEY_ORDERING_MEMBERSHIP_BYTES
+    )
+    retained_tuple_bytes = (
+        INTEGER_KEY_TUPLE_BYTES
+        + code_count * INTEGER_KEY_TUPLE_MEMBERSHIP_BYTES
+    )
+    return normalized_peak_bytes, retained_tuple_bytes
+
+
+def _forward_visit_retention_upper_bound(
+    rate_count: int,
+    code_count: int,
+    filter_coordinate_count: int,
+    retained_code_tuple_bytes: int,
+) -> int:
+    """Bound request, physical-fragment, and mutable-row workspace."""
+
+    request_workspace_bytes = (
+        _FORWARD_REQUEST_BASE_RETAINED_BYTES
+        + code_count
+        * (
+            _FORWARD_REQUEST_CODE_RETAINED_BYTES
+            + 2 * _FORWARD_FILTER_MAP_ENTRY_RETAINED_BYTES
+        )
+    )
+    physical_row_workspace_bytes = rate_count * (
+        _FORWARD_DISCOVERED_SHARD_RETAINED_BYTES
+        + _FORWARD_FRAGMENT_WORKSPACE_RETAINED_BYTES
+        + _FORWARD_COORDINATE_RETAINED_BYTES
+        + _FORWARD_FANOUT_ROW_RETAINED_BYTES
+        + _FORWARD_OCCURRENCE_RETAINED_BYTES
+        + _FORWARD_PRICE_KEY_RETAINED_BYTES
+    )
+    filter_workspace_bytes = filter_coordinate_count * (
+        _FORWARD_PROVIDER_FILTER_COPY_RETAINED_BYTES
+        + _FORWARD_SOURCE_FILTER_COPY_RETAINED_BYTES
+        + _FORWARD_OCCURRENCE_WORKSPACE_RETAINED_BYTES
+    )
+    return (
+        retained_code_tuple_bytes
+        + request_workspace_bytes
+        + _FORWARD_COORDINATE_MAP_RETAINED_BYTES
+        + _FORWARD_RESULT_MAP_RETAINED_BYTES
+        + physical_row_workspace_bytes
+        + filter_workspace_bytes
+    )
+
+
+def forward_price_index_retention_upper_bound(
+    rate_count: int,
+    code_count: int,
+    *,
+    filter_coordinate_count: int | None = None,
+) -> int:
+    """Bound the complete decoded peak of one broad forward price index."""
+
+    if type(code_count) is not int or code_count < 0:
+        raise ValueError("forward code count must not be negative")
+    retained_row_bytes = forward_price_row_retention_upper_bound(rate_count)
+    if filter_coordinate_count is None:
+        filter_coordinate_count = rate_count
+    if (
+        type(filter_coordinate_count) is not int
+        or filter_coordinate_count < 0
+    ):
+        raise ValueError(
+            "forward filter coordinate count must not be negative"
+        )
+    filter_coordinate_count = max(rate_count, filter_coordinate_count)
+    normalized_code_peak_bytes, retained_code_tuple_bytes = (
+        _forward_code_key_retention_peaks(code_count)
+    )
+    visit_peak_bytes = _forward_visit_retention_upper_bound(
+        rate_count,
+        code_count,
+        filter_coordinate_count,
+        retained_code_tuple_bytes,
+    )
+    return max(
+        normalized_code_peak_bytes,
+        retained_code_tuple_bytes + retained_row_bytes,
+        visit_peak_bytes,
     )
 
 

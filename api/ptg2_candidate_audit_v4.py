@@ -161,6 +161,30 @@ def _result_bytes_for_npis(npi_count: int) -> int:
     return _V4_RESULT_MAP_BYTES + int(npi_count) * _V4_RESULT_BUCKET_BYTES
 
 
+def v4_candidate_proof_memory_bound(
+    npi_count: int,
+    candidate_membership_count: int,
+) -> int:
+    """Bound final V4 results plus one worst-case coordinate reservation."""
+
+    counts = (npi_count, candidate_membership_count)
+    if any(type(count) is not int or count < 0 for count in counts):
+        raise ValueError("V4 candidate proof counts must not be negative")
+    result_bytes = (
+        _result_bytes_for_npis(npi_count)
+        + candidate_membership_count * _V4_RESULT_MEMBERSHIP_BYTES
+    )
+    if candidate_membership_count == 0:
+        return result_bytes
+    transient_bytes = (
+        _V4_GRAPH_TRANSIENT_MAP_BYTES
+        + (4 + candidate_membership_count)
+        * _V4_GRAPH_TRANSIENT_OWNER_BYTES
+        + candidate_membership_count * _V4_GRAPH_PEAK_MEMBER_BYTES
+    )
+    return result_bytes + transient_bytes
+
+
 def _filtered_v4_coordinate_provider_sets(
     raw_provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
     npi: int,
@@ -438,4 +462,5 @@ __all__ = [
     "load_v4_candidate_scope",
     "load_v4_pattern_provider_scope",
     "prove_v4_candidate_sets",
+    "v4_candidate_proof_memory_bound",
 ]
