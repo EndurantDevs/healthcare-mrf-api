@@ -11,8 +11,8 @@ from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
 PTG2_CANDIDATE_AUDIT_MAX_RETAINED_DECODED_BYTES = 64 * 1024 * 1024
-# A dense 50-item partition can retain the decoded group map and its per-NPI
-# projection together beyond 384 MiB. Keep that bounded with headroom while
+# A dense 50-item partition exceeded observed retention targets.
+# Current emitters use 25; the cap remains fail-closed while
 # the partition process gate accounts raw plus decoded capacity.
 PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES = 512 * 1024 * 1024
 PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES = 1024 * 1024 * 1024

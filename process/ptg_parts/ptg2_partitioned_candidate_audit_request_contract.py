@@ -412,7 +412,7 @@ def build_partitioned_candidate_audit_plan(
     source_challenges: Sequence[PartitionedSourceChallenge],
     persisted_occurrences: Sequence[PartitionedPersistedOccurrence],
 ) -> PartitionedCandidateAuditPlan:
-    """Build a code-aware, max-50, exact-once request plan."""
+    """Build a code-aware, max-25, exact-once request plan."""
 
     validated_binding = _validated_binding(binding)
     validated_challenges, validated_occurrences = (

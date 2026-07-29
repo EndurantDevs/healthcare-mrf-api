@@ -193,12 +193,13 @@ def _report(storage_generation="shared_blocks_v3"):
         plan,
         partition_results,
     )
+    request_count = plan.request_count
     metrics = audit.PartitionedAuditHttpMetrics(
-        planned_request_count=5,
-        started_request_count=5,
-        completed_request_count=5,
+        planned_request_count=request_count,
+        started_request_count=request_count,
+        completed_request_count=request_count,
         peak_in_flight=2,
-        start_times=[0.0, 0.5, 1.0, 1.5, 2.0],
+        start_times=[index * 0.5 for index in range(request_count)],
     )
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     return build_partitioned_audit_report(
@@ -227,7 +228,7 @@ def _report(storage_generation="shared_blocks_v3"):
                 "repeated_evidence_json_parses": 0,
             },
             event_loop_contract="uvloop",
-            started_at=completed_at - datetime.timedelta(seconds=2),
+            started_at=completed_at - datetime.timedelta(seconds=5),
             completed_at=completed_at,
         )
     )
@@ -244,10 +245,10 @@ def test_partitioned_report_validates_dynamic_request_count_and_wall_time():
         plan_market_type="group",
     )
 
-    assert report["checks"]["batch_requests_executed"] == 5
-    assert report["http"]["batch_api_actual_http_requests"] == 5
-    assert report["duration_seconds"] == 2
-    assert evidence["batch_api_actual_http_requests"] == 5
+    assert report["checks"]["batch_requests_executed"] == 9
+    assert report["http"]["batch_api_actual_http_requests"] == 9
+    assert report["duration_seconds"] == 5
+    assert evidence["batch_api_actual_http_requests"] == 9
 
 
 def test_partitioned_report_binds_v4_storage_generation():
@@ -298,7 +299,7 @@ def test_partitioned_report_validates_truthful_slow_start_span():
         plan_market_type="group",
     )
 
-    assert evidence["batch_api_actual_http_requests"] == 5
+    assert evidence["batch_api_actual_http_requests"] == 9
 
 
 def _partitioned_timing_report(
