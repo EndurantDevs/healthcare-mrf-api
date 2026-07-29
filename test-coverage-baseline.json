@@ -426,6 +426,21 @@
         "process/serialization.py",
         "process/terminology_synonym_sources.py",
         "process/terminology_synonyms.py",
+        "process/tin_npi_connector.py",
+        "process/tin_npi_connector_adapters.py",
+        "process/tin_npi_connector_build.py",
+        "process/tin_npi_connector_evidence.py",
+        "process/tin_npi_connector_extract.py",
+        "process/tin_npi_connector_generation.py",
+        "process/tin_npi_connector_lookup.py",
+        "process/tin_npi_connector_policy.py",
+        "process/tin_npi_connector_scan.py",
+        "process/tin_npi_connector_scan_build.py",
+        "process/tin_npi_connector_security.py",
+        "process/tin_npi_connector_source.py",
+        "process/tin_npi_connector_source_validation.py",
+        "process/tin_npi_connector_support.py",
+        "process/tin_npi_connector_temporal.py",
         "process/uhc_canonical_proof.py",
         "process/uhc_official_file_acquisition.py",
         "process/uhc_provider_file_catalog.py",
@@ -464,12 +479,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 37125,
-          "total": 41570
+          "covered": 37632,
+          "total": 42018
         },
         "lines": {
-          "covered": 117435,
-          "total": 124369
+          "covered": 119168,
+          "total": 125963
         }
       },
       "one_time_floor_reset": {

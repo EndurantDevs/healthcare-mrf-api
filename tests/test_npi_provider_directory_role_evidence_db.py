@@ -13,7 +13,9 @@ from db.models import db
 def _requires_test_database():
     database = os.getenv("HLTHPRT_DB_DATABASE", "")
     if "test" not in database.lower():
-        pytest.skip("DB-backed role-evidence SQL test requires a disposable test database")
+        pytest.skip(
+            "DB-backed role-evidence SQL test requires a disposable test database"
+        )
 
 
 async def _insert_dataset_resource(
@@ -58,7 +60,9 @@ async def _insert_dataset_resource(
         )
 
 
-async def _insert_endpoint_rows(session, schema: str, endpoint_rows: list[tuple[str, str]]) -> None:
+async def _insert_endpoint_rows(
+    session, schema: str, endpoint_rows: list[tuple[str, str]]
+) -> None:
     for endpoint_id, api_base in endpoint_rows:
         await session.execute(
             text(
@@ -76,7 +80,9 @@ async def _insert_endpoint_rows(session, schema: str, endpoint_rows: list[tuple[
         )
 
 
-async def _insert_source_rows(session, schema: str, source_rows: list[tuple[str, str]]) -> None:
+async def _insert_source_rows(
+    session, schema: str, source_rows: list[tuple[str, str]]
+) -> None:
     for source_id, endpoint_id in source_rows:
         await session.execute(
             text(
@@ -104,9 +110,9 @@ async def _insert_dataset_rows(
             text(
                 f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
                 "(dataset_id, endpoint_id, import_run_id, status, is_current, "
-                "resource_count, published_at, publication_metadata_json) "
-                "VALUES (:dataset_id, :endpoint_id, :run_id, 'published', true, "
-                "0, now(), CAST(:metadata AS jsonb))"
+                "resource_count, publication_metadata_json) "
+                "VALUES (:dataset_id, :endpoint_id, :run_id, 'acquiring', false, "
+                "0, CAST(:metadata AS jsonb))"
             ),
             {
                 "dataset_id": dataset_id,
@@ -114,6 +120,35 @@ async def _insert_dataset_rows(
                 "run_id": run_id,
                 "metadata": json.dumps(publication_metadata),
             },
+        )
+
+
+async def _publish_dataset_rows(
+    session,
+    schema: str,
+    dataset_rows: list[tuple[str, int]],
+) -> None:
+    for dataset_id, resource_count in dataset_rows:
+        await session.execute(
+            text(
+                f"UPDATE {schema}.provider_directory_endpoint_dataset "
+                "SET status = 'validated', resource_count = :resource_count, "
+                "validated_at = transaction_timestamp() "
+                "WHERE dataset_id = :dataset_id"
+            ),
+            {
+                "dataset_id": dataset_id,
+                "resource_count": resource_count,
+            },
+        )
+        await session.execute(
+            text(
+                f"UPDATE {schema}.provider_directory_endpoint_dataset "
+                "SET status = 'published', is_current = true, "
+                "published_at = transaction_timestamp() "
+                "WHERE dataset_id = :dataset_id"
+            ),
+            {"dataset_id": dataset_id},
         )
 
 
@@ -212,7 +247,11 @@ def _complete_resource_rows() -> list[tuple[str, str, dict]]:
 
 def _fallback_resource_rows() -> list[tuple[str, str, dict]]:
     return [
-        ("Organization", "network-fallback", {"active": True, "name": "Fallback Network"}),
+        (
+            "Organization",
+            "network-fallback",
+            {"active": True, "name": "Fallback Network"},
+        ),
         (
             "InsurancePlan",
             "plan-fallback",
@@ -333,66 +372,31 @@ async def _insert_relation_fixture(session, schema: str) -> dict[str, list[str]]
     """Insert mixed relation-ready and legacy-fallback datasets for execution tests."""
     fixture_ids = _relation_fixture_ids()
     dataset_ids = fixture_ids["dataset_ids"]
+    complete_resource_rows = _complete_resource_rows()
+    fallback_resource_rows = _fallback_resource_rows()
     await _insert_fixture_ownership_rows(session, schema, fixture_ids)
     await _insert_resource_rows(
         session,
         schema,
         dataset_ids[0],
-        _complete_resource_rows(),
+        complete_resource_rows,
     )
     await _insert_resource_rows(
         session,
         schema,
         dataset_ids[1],
-        _fallback_resource_rows(),
+        fallback_resource_rows,
     )
     await _insert_fixture_relation_rows(session, schema, fixture_ids)
+    await _publish_dataset_rows(
+        session,
+        schema,
+        [
+            (dataset_ids[0], len(complete_resource_rows)),
+            (dataset_ids[1], len(fallback_resource_rows)),
+        ],
+    )
     return fixture_ids
-
-
-async def _delete_relation_fixture(session, schema: str, fixture: dict[str, list[str]]) -> None:
-    await session.execute(
-        text(
-            f"DELETE FROM {schema}.provider_directory_dataset_network_plan "
-            "WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))"
-        ),
-        {"dataset_ids": fixture["dataset_ids"]},
-    )
-    await session.execute(
-        text(
-            f"DELETE FROM {schema}.provider_directory_dataset_resource "
-            "WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))"
-        ),
-        {"dataset_ids": fixture["dataset_ids"]},
-    )
-    await session.execute(
-        text(
-            f"DELETE FROM {schema}.provider_directory_endpoint_dataset "
-            "WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))"
-        ),
-        {"dataset_ids": fixture["dataset_ids"]},
-    )
-    await session.execute(
-        text(
-            f"DELETE FROM {schema}.provider_directory_network_catalog "
-            "WHERE source_id = ANY(CAST(:source_ids AS varchar[]))"
-        ),
-        {"source_ids": fixture["source_ids"]},
-    )
-    await session.execute(
-        text(
-            f"DELETE FROM {schema}.provider_directory_source "
-            "WHERE source_id = ANY(CAST(:source_ids AS varchar[]))"
-        ),
-        {"source_ids": fixture["source_ids"]},
-    )
-    await session.execute(
-        text(
-            f"DELETE FROM {schema}.provider_directory_api_endpoint "
-            "WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))"
-        ),
-        {"endpoint_ids": fixture["endpoint_ids"]},
-    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -449,8 +453,9 @@ async def test_role_evidence_executes_relation_fallback_and_zero_edge_contracts(
     )
 
     async with db.transaction() as session:
-        fixture = await _insert_relation_fixture(session, schema)
+        fixture_savepoint = await session.begin_nested()
         try:
+            fixture = await _insert_relation_fixture(session, schema)
             evidence_rows = await db.all(
                 sql,
                 source_ids=fixture["source_ids"],
@@ -490,4 +495,4 @@ async def test_role_evidence_executes_relation_fallback_and_zero_edge_contracts(
                 "network-edge",
             ) in evidence_key_set
         finally:
-            await _delete_relation_fixture(session, schema, fixture)
+            await fixture_savepoint.rollback()

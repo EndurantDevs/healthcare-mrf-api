@@ -96,8 +96,8 @@ async def _insert_current_dataset(session, schema: str, fixture: dict) -> None:
         text(
             f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
             "(dataset_id, endpoint_id, import_run_id, status, is_current, "
-            "resource_count, published_at) VALUES "
-            "(:dataset_id, :endpoint_id, :run_id, 'published', true, 1, now())"
+            "resource_count) VALUES "
+            "(:dataset_id, :endpoint_id, :run_id, 'acquiring', false, 1)"
         ),
         fixture,
     )
@@ -107,6 +107,23 @@ async def _insert_current_dataset(session, schema: str, fixture: dict) -> None:
             "(dataset_id, resource_type, resource_id, payload_hash, payload_json) "
             "VALUES (:dataset_id, 'Organization', 'shared-resource', "
             "'phone-membership-payload', CAST('{}' AS jsonb))"
+        ),
+        fixture,
+    )
+    await session.execute(
+        text(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET status = 'validated', validated_at = transaction_timestamp() "
+            "WHERE dataset_id = :dataset_id"
+        ),
+        fixture,
+    )
+    await session.execute(
+        text(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET status = 'published', is_current = true, "
+            "published_at = transaction_timestamp() "
+            "WHERE dataset_id = :dataset_id"
         ),
         fixture,
     )
@@ -142,31 +159,6 @@ async def _insert_overlay_rows(session, schema: str, fixture: dict) -> None:
         )
 
 
-async def _delete_phone_membership_fixture(session, schema: str, fixture: dict) -> None:
-    await session.execute(
-        text(
-            f"DELETE FROM {schema}.provider_directory_address_overlay "
-            "WHERE source_record_id = ANY(CAST(:record_ids AS varchar[]))"
-        ),
-        {
-            "record_ids": [
-                fixture["member_record_id"],
-                fixture["nonmember_record_id"],
-            ]
-        },
-    )
-    for table_name, key_name in (
-        ("provider_directory_dataset_resource", "dataset_id"),
-        ("provider_directory_endpoint_dataset", "dataset_id"),
-        ("provider_directory_source", "source_id"),
-        ("provider_directory_api_endpoint", "endpoint_id"),
-    ):
-        await session.execute(
-            text(f"DELETE FROM {schema}.{table_name} WHERE {key_name} = :key_value"),
-            {"key_value": fixture[key_name]},
-        )
-
-
 @pytest.mark.asyncio(loop_scope="session")
 async def test_phone_candidates_require_exact_current_dataset_membership():
     """A matching current run cannot admit a nonmember resource overlay."""
@@ -175,15 +167,18 @@ async def test_phone_candidates_require_exact_current_dataset_membership():
     fixture = _phone_membership_fixture()
 
     async with db.transaction() as session:
-        await _insert_endpoint_and_source(session, schema, fixture)
-        await _insert_current_dataset(session, schema, fixture)
-        await _insert_overlay_rows(session, schema, fixture)
+        fixture_savepoint = await session.begin_nested()
         try:
+            await _insert_endpoint_and_source(session, schema, fixture)
+            await _insert_current_dataset(session, schema, fixture)
+            await _insert_overlay_rows(session, schema, fixture)
             candidate_result = await session.execute(
                 text(_phone_candidate_membership_sql()),
                 {"phone_digits": fixture["phone_number"]},
             )
-            candidate_rows = [dict(candidate._mapping) for candidate in candidate_result.all()]
+            candidate_rows = [
+                dict(candidate._mapping) for candidate in candidate_result.all()
+            ]
 
             assert candidate_rows == [
                 {
@@ -193,4 +188,4 @@ async def test_phone_candidates_require_exact_current_dataset_membership():
                 }
             ]
         finally:
-            await _delete_phone_membership_fixture(session, schema, fixture)
+            await fixture_savepoint.rollback()

@@ -204,7 +204,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260729100000_ptg2_candidate_audit_hold"
+        "20260729110000_tin_npi_connector"
     ]
 
 
