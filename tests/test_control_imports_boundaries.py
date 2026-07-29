@@ -282,6 +282,15 @@ def test_acquisition_scope_rejects_source_and_discovered_endpoint_edges():
     assert control_imports._provider_directory_acquisition_scope(params) is None
 
     params = _acquisition_params()
+    assert (
+        control_imports._provider_directory_acquisition_scope(
+            params,
+            {"active_source_groups": {}},
+        )
+        is None
+    )
+
+    params = _acquisition_params()
     metrics_by_name = {
         "active_source_groups": ["invalid", {}, {"api_base": "http://bad"}]
     }
