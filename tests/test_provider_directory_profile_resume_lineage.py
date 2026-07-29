@@ -60,6 +60,8 @@ def _dataset(
 def _lineage_hash(
     dataset: importer.ProviderDirectoryArtifactDataset,
     source_context: importer._ProviderDirectoryProfileSourceContext,
+    *,
+    has_existing_artifacts: bool = False,
 ) -> str:
     return importer._provider_directory_profile_resume_lineage_hash(
         importer.ProviderDirectoryArtifactDatasetFence((dataset,)),
@@ -67,6 +69,7 @@ def _lineage_hash(
         ["source-a"],
         ["dataset-a"],
         (source_context,),
+        has_existing_artifacts=has_existing_artifacts,
     )
 
 
@@ -117,9 +120,10 @@ def _checkpoint(
 def _patch_one_evidence_batch(monkeypatch) -> AsyncMock:
     """Install one conflict-safe evidence batch and mocked finalization."""
     batch = importer._ProviderDirectoryProfileEvidenceBatch(
-        kind="source",
+        kind="fact",
         source_id="source-a",
         dataset_id="dataset-a",
+        fact_type="name",
     )
     monkeypatch.setattr(
         importer,
@@ -136,6 +140,11 @@ def _patch_one_evidence_batch(monkeypatch) -> AsyncMock:
         importer,
         "_mark_profile_build_checkpoint_state",
         mark_state,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_mark_provider_directory_profile_batch_progress",
+        AsyncMock(),
     )
     return mark_state
 
@@ -181,6 +190,22 @@ def test_resume_lineage_changes_for_emitted_source_context_drift(
     assert _lineage_hash(dataset, _source_context()) != _lineage_hash(
         dataset,
         changed_context,
+    )
+
+
+def test_resume_lineage_fences_existing_artifact_semantics():
+    """Global no-copy plans still distinguish fresh and incremental SQL."""
+    dataset = _dataset()
+    context = _source_context()
+
+    assert _lineage_hash(
+        dataset,
+        context,
+        has_existing_artifacts=False,
+    ) != _lineage_hash(
+        dataset,
+        context,
+        has_existing_artifacts=True,
     )
 
 
@@ -391,7 +416,7 @@ async def test_ambiguous_checkpoint_advance_skips_committed_batch_on_retry(
 
 
 @pytest.mark.asyncio
-async def test_source_failure_stops_later_sources_and_preserves_checkpoint(
+async def test_fact_failure_stops_later_sources_and_preserves_checkpoint(
     monkeypatch,
 ):
     """Fail fast so a later retry resumes the failed source, never skips it."""
@@ -439,12 +464,13 @@ async def test_source_failure_stops_later_sources_and_preserves_checkpoint(
             checkpointed=True,
         )
 
-    assert visited_dataset_ids == ["dataset-a", "dataset-b"]
-    advance.assert_awaited_once_with(
-        build,
-        phase="evidence",
-        expected_batch=0,
-        total_batches=3,
+    assert visited_dataset_ids == ["dataset-a"] * 83 + ["dataset-b"]
+    assert [
+        call.kwargs["expected_batch"] for call in advance.await_args_list
+    ] == list(range(83))
+    assert all(
+        call.kwargs["total_batches"] == 249
+        for call in advance.await_args_list
     )
     mark_state.assert_not_awaited()
     create_indexes.assert_not_awaited()

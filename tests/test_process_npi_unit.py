@@ -789,10 +789,19 @@ async def test_startup_honors_import_id_override(monkeypatch, npi_module):
     assert startup_context_map["import_date"] == "addrcanon_npi_timing"
 
 
-@pytest.mark.asyncio
-async def test_shutdown_handles_rotation(monkeypatch, npi_module):
+class _ShutdownDummyInsert:
+    def values(self, *_args, **_kwargs):
+        return self
 
-    """Verify shutdown handles rotation."""
+    def on_conflict_do_update(self, **_kwargs):
+        return self
+
+    async def status(self):
+        return None
+
+
+def _patch_npi_shutdown(monkeypatch, npi_module):
+    """Install deterministic database and archive collaborators for shutdown."""
     monkeypatch.setenv("DB_SCHEMA", "testschema")
     monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
     monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory("testschema"))
@@ -812,17 +821,11 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
 
     monkeypatch.setattr(npi_module.db, "transaction", lambda: dummy_tx())
 
-    class DummyInsert:
-        def values(self, *args, **kwargs):
-            return self
-
-        def on_conflict_do_update(self, **kwargs):
-            return self
-
-        async def status(self):
-            return None
-
-    monkeypatch.setattr(npi_module.db, "insert", lambda *args, **kwargs: DummyInsert())
+    monkeypatch.setattr(
+        npi_module.db,
+        "insert",
+        lambda *_args, **_kwargs: _ShutdownDummyInsert(),
+    )
     monkeypatch.setattr(npi_module.db, "func", SimpleNamespace(now=lambda: "NOW"))
     stamp_address_keys = AsyncMock()
     monkeypatch.setattr(npi_module, "stamp_address_keys", stamp_address_keys)
@@ -843,6 +846,29 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
         control_updates.append((run_id, kwargs))
 
     monkeypatch.setattr(npi_module, "mark_control_run", fake_mark_control_run)
+    return (
+        scalar_mock,
+        status_mock,
+        execute_mock,
+        stamp_address_keys,
+        openaddresses_backfill,
+        progress_events,
+        control_updates,
+    )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_handles_rotation(monkeypatch, npi_module):
+    """Verify shutdown handles rotation."""
+    (
+        scalar_mock,
+        status_mock,
+        execute_mock,
+        stamp_address_keys,
+        openaddresses_backfill,
+        progress_events,
+        control_updates,
+    ) = _patch_npi_shutdown(monkeypatch, npi_module)
 
     shutdown_context_map = {
         "context": {"run": 1, "start": datetime.datetime.utcnow(), "control_run_id": "npi-run-1"},

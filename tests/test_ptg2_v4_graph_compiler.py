@@ -42,6 +42,48 @@ def _progress_event(
     ).encode("ascii") + b"\n"
 
 
+class _HeartbeatProcess:
+    """Hold a fake compiler open until its wrapper publishes one heartbeat."""
+
+    def __init__(self, *, child_progress: bool, factor_edge_count: int) -> None:
+        self.pid = 99_999_998
+        self.returncode = None
+        self.stderr = asyncio.StreamReader()
+        if child_progress:
+            self.stderr.feed_data(
+                _progress_event(
+                    1,
+                    "derive_patterns",
+                    4,
+                    factor_edge_count,
+                    unit="groups",
+                )
+            )
+        self.finished = asyncio.Event()
+        self.observed_events: list[dict[str, object]] = []
+
+    async def wait(self):
+        await self.finished.wait()
+        return self.returncode
+
+    async def create_subprocess(self, *_args, **_kwargs):
+        return self
+
+    async def capture_progress(self, **progress_by_field):
+        self.observed_events.append(progress_by_field)
+        if str(progress_by_field.get("message", "")).endswith("; active"):
+            self.returncode = 1
+            self.stderr.feed_eof()
+            self.finished.set()
+
+    def active_heartbeat(self) -> dict[str, object]:
+        return next(
+            event
+            for event in self.observed_events
+            if str(event.get("message", "")).endswith("; active")
+        )
+
+
 def _assert_summary_rejected(
     summary_by_field: dict,
     validation_arguments_by_name: dict,
@@ -265,6 +307,54 @@ async def test_progress_heartbeat_preserves_last_real_child_counters(monkeypatch
     assert 92.0 < observed_events[0]["pct"] < 95.0
     assert observed_events[0]["compiler_progress_seq"] == 1
     assert observed_events[0]["message"].endswith("; active")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_progress", [False, True], ids=["fallback", "child"])
+async def test_wrapper_heartbeat_reports_current_compiler_progress(
+    tmp_path: Path,
+    monkeypatch,
+    child_progress: bool,
+) -> None:
+    """Heartbeat counters remain meaningful before and after child progress."""
+
+    artifacts, provider_map = _fixture(tmp_path)
+    factor_edge_count = sum(
+        int(artifact.get("member_count") or artifact.get("row_count") or 0)
+        for artifact in artifacts
+    )
+    output = tmp_path / "compiled"
+    binary = tmp_path / "fake-compiler"
+    binary.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+    binary.chmod(0o755)
+    fake_process = _HeartbeatProcess(
+        child_progress=child_progress,
+        factor_edge_count=factor_edge_count,
+    )
+
+    monkeypatch.setattr(
+        compiler.asyncio, "create_subprocess_exec", fake_process.create_subprocess
+    )
+    monkeypatch.setattr(
+        compiler,
+        "_emit_compile_progress",
+        fake_process.capture_progress,
+    )
+    monkeypatch.setattr(compiler, "PTG2_V4_GRAPH_HEARTBEAT_SECONDS", 0.05)
+
+    with pytest.raises(RuntimeError, match="exited with status 1"):
+        await compile_provider_graph_v4_rust(
+            graph_artifact_entries=artifacts,
+            provider_set_key_map_path=provider_map,
+            output_directory=output,
+            binary_path=binary,
+        )
+
+    heartbeat = fake_process.active_heartbeat()
+    assert heartbeat["done"] == (4 if child_progress else 0)
+    assert heartbeat["total"] == factor_edge_count
+    assert heartbeat["unit"] == ("groups" if child_progress else "factor_edges")
+    assert not output.exists()
 
 
 @pytest.mark.asyncio

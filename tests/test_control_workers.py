@@ -234,23 +234,8 @@ def test_ensure_worker_without_run_id_does_not_fabricate_run_identity(
     }
 
 
-def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
-    """Verify ensure worker can create kubernetes job."""
-    calls: list[tuple[str, str, dict[str, object] | None]] = []
-
-    def fake_request(method, path, body=None):
-        calls.append((method, path, body))
-        if method == "GET" and any(item[0] == "POST" for item in calls):
-            return {
-                "items": [
-                    {
-                        "metadata": {"name": "worker-job"},
-                        "status": {"active": 1},
-                    }
-                ]
-            }
-        return {"items": []}
-
+def _configure_kubernetes_worker_environment(monkeypatch) -> None:
+    """Configure the complete Kubernetes worker-job environment contract."""
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_ENV_FROM_CONFIGMAP", "mrf-api-config")
@@ -267,23 +252,10 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     )
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "43200")
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
-    monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
-    monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
-    monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    worker_response = control_workers.ensure_worker(
-        {"importer": "claims-pricing", "run_id": "run_123", "import_id": "import_123"}
-    )
 
-    assert worker_response["status"] == "started"
-    assert worker_response["contract_id"] == (
-        control_workers.WORKER_ENSURE_RUN_IDENTITY_CONTRACT
-    )
-    assert worker_response["run_id"] == "run_123"
-    assert worker_response["items"][0]["run_id"] == "run_123"
-    post = next(call for call in calls if call[0] == "POST")
-    job = post[2]
-    assert post[1] == "/apis/batch/v1/namespaces/healthporta-dev/jobs"
+def _assert_kubernetes_worker_job(job: dict[str, object]) -> None:
+    """Verify the generated job preserves secret and volume contracts."""
     assert job["kind"] == "Job"
     container = job["spec"]["template"]["spec"]["containers"][0]
     assert container["image"] == "ghcr.io/endurantdevs/healthcare-mrf-api:dev"
@@ -317,6 +289,38 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     assert "parallelism" not in job["spec"]
     assert "completions" not in job["spec"]
     assert job["spec"]["activeDeadlineSeconds"] == 43200
+
+
+def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
+    """Verify ensure worker can create kubernetes job."""
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_request(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET" and any(item[0] == "POST" for item in calls):
+            return {"items": [{"metadata": {"name": "worker-job"}, "status": {"active": 1}}]}
+        return {"items": []}
+
+    _configure_kubernetes_worker_environment(monkeypatch)
+    monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
+    monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
+
+    worker_response = control_workers.ensure_worker(
+        {"importer": "claims-pricing", "run_id": "run_123", "import_id": "import_123"}
+    )
+
+    assert worker_response["status"] == "started"
+    assert worker_response["contract_id"] == (
+        control_workers.WORKER_ENSURE_RUN_IDENTITY_CONTRACT
+    )
+    assert worker_response["run_id"] == "run_123"
+    assert worker_response["items"][0]["run_id"] == "run_123"
+    post = next(call for call in calls if call[0] == "POST")
+    job = post[2]
+    assert post[1] == "/apis/batch/v1/namespaces/healthporta-dev/jobs"
+    assert job is not None
+    _assert_kubernetes_worker_job(job)
 
 
 def test_worker_secret_env_rejects_invalid_specs_and_supports_optional_keys(

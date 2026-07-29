@@ -35,7 +35,6 @@ def _install_retry_discovery_fakes(monkeypatch) -> tuple[list[dict[str, Any]], d
         "metadata_json": {"discovery_run_id": "run_root"},
     }]
     captured_by_key: dict[str, Any] = {}
-
     class FakeCheckpointStore:
         async def resume_batch(self, root_run_id, owner_run_id, retry_of_run_id):
             captured_by_key["resume"] = (root_run_id, owner_run_id, retry_of_run_id)
@@ -73,7 +72,6 @@ def _install_retry_discovery_fakes(monkeypatch) -> tuple[list[dict[str, Any]], d
 async def test_retry_uses_frozen_source_set_and_publishes_exact_proof(monkeypatch):
     """Reuse the frozen source set and emit the exact completion proof."""
     source_records, captured_by_key = _install_retry_discovery_fakes(monkeypatch)
-
     discovery_summary = await discovery.main(
         provider="master-list",
         check_urls=True,

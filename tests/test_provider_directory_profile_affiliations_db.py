@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -30,6 +31,7 @@ SQL_FIXTURE_PATH = (
     FIXTURE_DIRECTORY / "provider_directory_profile_affiliations.sql"
 )
 importer = importlib.import_module("process.provider_directory_fhir")
+LOGGER = logging.getLogger(__name__)
 
 
 def _json_default(raw_value: Any) -> str:
@@ -70,6 +72,72 @@ def _plan_relation_nodes(
             for node in _plan_relation_nodes(child, relation_name)
         ]
     return []
+
+
+def _plan_index_nodes(
+    raw_plan: Any,
+    index_name: str,
+) -> list[dict[str, Any]]:
+    if isinstance(raw_plan, dict):
+        matches = (
+            [raw_plan] if raw_plan.get("Index Name") == index_name else []
+        )
+        return matches + [
+            node
+            for child in raw_plan.values()
+            for node in _plan_index_nodes(child, index_name)
+        ]
+    if isinstance(raw_plan, list):
+        return [
+            node
+            for child in raw_plan
+            for node in _plan_index_nodes(child, index_name)
+        ]
+    return []
+
+
+def _plan_metric_values(raw_plan: Any, metric_name: str) -> list[float]:
+    if isinstance(raw_plan, dict):
+        values = (
+            [float(raw_plan[metric_name])]
+            if raw_plan.get(metric_name) is not None
+            else []
+        )
+        return values + [
+            value
+            for child in raw_plan.values()
+            for value in _plan_metric_values(child, metric_name)
+        ]
+    if isinstance(raw_plan, list):
+        return [
+            value
+            for child in raw_plan
+            for value in _plan_metric_values(child, metric_name)
+        ]
+    return []
+
+
+def _plan_execution_ms(raw_plan: Any) -> float:
+    decoded_plan = _decoded(raw_plan)
+    if (
+        not isinstance(decoded_plan, list)
+        or not decoded_plan
+        or not isinstance(decoded_plan[0], dict)
+    ):
+        raise AssertionError("PostgreSQL EXPLAIN JSON root is invalid")
+    return float(decoded_plan[0]["Execution Time"])
+
+
+def _plan_temp_blocks(raw_plan: Any) -> int:
+    return int(
+        max(
+            [
+                *_plan_metric_values(raw_plan, "Temp Read Blocks"),
+                *_plan_metric_values(raw_plan, "Temp Written Blocks"),
+            ],
+            default=0,
+        )
+    )
 
 
 async def _require_profile_database(database: Database) -> None:
@@ -286,6 +354,135 @@ async def _profile_database(monkeypatch):
         await database.disconnect()
 
 
+async def _create_profile_bucket_probe_scopes(
+    database: Database,
+    schema: str,
+    *,
+    row_count: int,
+) -> tuple[str, str]:
+    """Create production-shaped scoped relations with high source fanout."""
+    role_relation = importer.ProviderDirectoryPractitionerRole.__tablename__
+    affiliation_relation = (
+        importer.ProviderDirectoryOrganizationAffiliation.__tablename__
+    )
+    role_scope = importer._provider_directory_artifact_scope_table_name(
+        role_relation,
+        "profile-bucket-probe",
+    )
+    affiliation_scope = (
+        importer._provider_directory_artifact_scope_table_name(
+            affiliation_relation,
+            "profile-bucket-probe",
+        )
+    )
+    await _create_profile_bucket_probe_tables(
+        database,
+        schema,
+        role_scope,
+        affiliation_scope,
+    )
+    await _seed_profile_bucket_probe_rows(
+        database,
+        schema,
+        role_scope,
+        affiliation_scope,
+        row_count=row_count,
+    )
+    for model, scope_table in (
+        (importer.ProviderDirectoryPractitionerRole, role_scope),
+        (
+            importer.ProviderDirectoryOrganizationAffiliation,
+            affiliation_scope,
+        ),
+    ):
+        await importer._build_artifact_scope_pk(model, schema, scope_table)
+        await database.status(
+            f"ANALYZE {profile.qualified_table(schema, scope_table)};"
+        )
+    return role_scope, affiliation_scope
+
+
+async def _create_profile_bucket_probe_tables(
+    database: Database,
+    schema: str,
+    role_scope: str,
+    affiliation_scope: str,
+) -> None:
+    """Create the two scoped relations used by the bucket-plan proof."""
+    for model, scope_table in (
+        (importer.ProviderDirectoryPractitionerRole, role_scope),
+        (
+            importer.ProviderDirectoryOrganizationAffiliation,
+            affiliation_scope,
+        ),
+    ):
+        await database.status(
+            importer._provider_directory_artifact_scope_table_sql(
+                model,
+                schema,
+                scope_table,
+            )
+        )
+
+
+async def _seed_profile_bucket_probe_rows(
+    database: Database,
+    schema: str,
+    role_scope: str,
+    affiliation_scope: str,
+    *,
+    row_count: int,
+) -> None:
+    """Populate production-shaped role and affiliation scope rows."""
+    role_scope_ref = profile.qualified_table(schema, role_scope)
+    affiliation_scope_ref = profile.qualified_table(
+        schema,
+        affiliation_scope,
+    )
+    await database.status(
+        f"""
+        INSERT INTO {role_scope_ref} (
+            source_id, resource_id, npi, active, organization_ref, updated_at
+        )
+        SELECT 'profile-source-a',
+               'bucket-role-' || generated.value,
+               1588616783,
+               true,
+               'Organization/clinic',
+               now()
+          FROM generate_series(1, :row_count) AS generated(value);
+        """,
+        row_count=row_count,
+    )
+    await database.status(
+        f"""
+        INSERT INTO {affiliation_scope_ref} (
+            source_id, resource_id, active, organization_ref,
+            participating_organization_ref, updated_at
+        ) VALUES (
+            'profile-source-a', 'aff-positive', true,
+            'Organization/parent', 'Organization/clinic', now()
+        );
+        """
+    )
+    await database.status(
+        f"""
+        INSERT INTO {affiliation_scope_ref} (
+            source_id, resource_id, active, organization_ref,
+            participating_organization_ref, updated_at
+        )
+        SELECT 'profile-source-a',
+               'bucket-affiliation-' || generated.value,
+               true,
+               'Organization/parent',
+               'Organization/clinic',
+               now()
+          FROM generate_series(1, :row_count) AS generated(value);
+        """,
+        row_count=row_count,
+    )
+
+
 async def _build_profile_artifacts(
     database: Database,
     schema: str,
@@ -316,6 +513,277 @@ async def _build_profile_artifacts(
         generation_id="profile-affiliation-test",
         profile_as_of="2026-07-19",
     )
+
+
+async def _seed_old_only_profile(
+    database: Database,
+    schema: str,
+) -> int:
+    """Add one serving NPI whose selected-source evidence later disappears."""
+    removed_npi = 1000000491
+    evidence_ref = profile.qualified_table(
+        schema,
+        profile.PROFILE_EVIDENCE_TABLE,
+    )
+    profile_ref = profile.qualified_table(schema, profile.PROFILE_TABLE)
+    await database.status(
+        f"""
+        INSERT INTO {evidence_ref} (
+            evidence_key, npi, fact_type, fact_key, value_json,
+            source_id, endpoint_id, dataset_id, canonical_api_base,
+            source_org_name, source_plan_name, resource_type,
+            resource_id, role_resource_id, active, effective_start,
+            effective_end, observed_at
+        ) VALUES (
+            md5('old-only-evidence'), :npi, 'specialty',
+            md5('old-only-fact'), '{{"code": "OLD-ONLY"}}'::jsonb,
+            'profile-source-a', 'profile-endpoint-1',
+            'profile-dataset-a', 'https://payer-1.test/fhir',
+            'Example Health Plan', 'Example Plan 1',
+            'PractitionerRole', 'old-only-role', 'old-only-role',
+            TRUE, '2026-01-01', '2026-12-31',
+            '2026-07-01'::timestamp
+        );
+        """,
+        npi=removed_npi,
+    )
+    await database.status(
+        profile.profile_insert_sql(
+            evidence_ref=evidence_ref,
+            target_ref=profile_ref,
+            old_evidence_ref=None,
+            rebuild_all=True,
+            npi_start=removed_npi,
+            npi_end=removed_npi + 1,
+        ),
+        generation_id="old-only-generation",
+        profile_as_of="2026-07-19",
+        profile_npi_start=removed_npi,
+        profile_npi_end=removed_npi + 1,
+    )
+    return removed_npi
+
+
+async def _install_fixture_as_serving_profile(
+    database: Database,
+    schema: str,
+) -> None:
+    """Copy the monolithic fixture into production-named serving tables."""
+    serving_evidence_ref = profile.qualified_table(
+        schema,
+        profile.PROFILE_EVIDENCE_TABLE,
+    )
+    serving_profile_ref = profile.qualified_table(
+        schema,
+        profile.PROFILE_TABLE,
+    )
+    await database.status(
+        profile.profile_evidence_table_sql(
+            schema,
+            profile.PROFILE_EVIDENCE_TABLE,
+            logged=True,
+        )
+    )
+    await database.status(
+        profile.profile_table_sql(
+            schema,
+            profile.PROFILE_TABLE,
+            logged=True,
+        )
+    )
+    await database.status(
+        f"INSERT INTO {serving_evidence_ref} "
+        f"SELECT * FROM {profile.qualified_table(schema, 'profile_evidence')};"
+    )
+    await database.status(
+        f"INSERT INTO {serving_profile_ref} "
+        f"SELECT * FROM {profile.qualified_table(schema, 'profile')};"
+    )
+
+
+async def _global_refresh_baseline(database: Database, schema: str):
+    """Capture changed, deleted, and unaffected serving evidence."""
+    evidence_ref = profile.qualified_table(
+        schema,
+        profile.PROFILE_EVIDENCE_TABLE,
+    )
+    changed = await database.first(
+        f"SELECT evidence_key, value_json FROM {evidence_ref} "
+        "WHERE source_id = 'profile-source-a' "
+        "AND fact_type = 'affiliation' "
+        "AND resource_id = 'aff-positive';"
+    )
+    removed = await database.first(
+        f"SELECT evidence_key FROM {evidence_ref} "
+        "WHERE source_id = 'profile-source-b' "
+        "AND fact_type = 'affiliation' "
+        "AND resource_id = 'aff-positive';"
+    )
+    stable = await database.first(
+        f"SELECT evidence_key, fact_key, value_json FROM {evidence_ref} "
+        "WHERE source_id = 'profile-source-b' "
+        "AND fact_type = 'role_identifier' AND resource_id = 'role-b';"
+    )
+    assert changed is not None
+    assert removed is not None
+    assert stable is not None
+    return SimpleNamespace(changed=changed, removed=removed, stable=stable)
+
+
+async def _mutate_global_profile_fixture(
+    database: Database,
+    schema: str,
+) -> None:
+    """Change one selected fact and delete another before a global refresh."""
+    await database.status(
+        f"UPDATE {schema}.provider_directory_organization_affiliation "
+        "SET network_refs = '[\"Organization/network-updated\"]'::jsonb "
+        "WHERE source_id = 'profile-source-a' "
+        "AND resource_id = 'aff-positive';"
+    )
+    await database.status(
+        f"DELETE FROM {schema}.provider_directory_organization_affiliation "
+        "WHERE source_id = 'profile-source-b' "
+        "AND resource_id = 'aff-positive';"
+    )
+
+
+def _existing_global_profile_build(schema: str):
+    """Return a selected-equals-retained build and its immutable plan."""
+    source_ids = ("profile-source-a", "profile-source-b")
+    dataset_ids = ("profile-dataset-a", "profile-dataset-b")
+    batch_plan = importer._provider_directory_profile_batch_plan(
+        source_ids,
+        source_ids,
+        dataset_ids,
+        has_existing_artifacts=True,
+    )
+    build = importer._ProviderDirectoryProfileBuild(
+        schema=schema,
+        generation_id="profile-global-refresh",
+        source_ids=source_ids,
+        retained_source_ids=source_ids,
+        dataset_ids=dataset_ids,
+        profile_as_of="2026-07-19",
+        evidence_stage="profile_evidence_global_refresh_stage",
+        profile_stage="profile_global_refresh_stage",
+        build_id="profile-global-refresh-build",
+        owner_run_id="profile-global-refresh-run",
+        batch_plan=batch_plan,
+    )
+    return build, batch_plan
+
+
+def _global_refresh_copy_statements(build) -> set[str]:
+    """Return the two physical copy statements forbidden for this plan."""
+    evidence_ref = profile.qualified_table(
+        build.schema,
+        profile.PROFILE_EVIDENCE_TABLE,
+    )
+    profile_ref = profile.qualified_table(
+        build.schema,
+        profile.PROFILE_TABLE,
+    )
+    evidence_stage_ref = profile.qualified_table(
+        build.schema,
+        build.evidence_stage,
+    )
+    profile_stage_ref = profile.qualified_table(
+        build.schema,
+        build.profile_stage,
+    )
+    return {
+        profile.copy_existing_evidence_sql(
+            source_ref=evidence_ref,
+            target_ref=evidence_stage_ref,
+        ),
+        profile.copy_unaffected_profiles_sql(
+            profile_source_ref=profile_ref,
+            evidence_source_ref=evidence_ref,
+            evidence_stage_ref=evidence_stage_ref,
+            profile_stage_ref=profile_stage_ref,
+        ),
+    }
+
+
+async def _assert_existing_global_refresh(
+    database: Database,
+    build,
+    baseline,
+    removed_npi: int,
+) -> None:
+    """Require changed, deleted, removed-NPI, and stable-row correctness."""
+    evidence_ref = profile.qualified_table(
+        build.schema,
+        build.evidence_stage,
+    )
+    profile_ref = profile.qualified_table(build.schema, build.profile_stage)
+    changed = await database.first(
+        f"SELECT evidence_key, value_json FROM {evidence_ref} "
+        "WHERE source_id = 'profile-source-a' "
+        "AND fact_type = 'affiliation' "
+        "AND resource_id = 'aff-positive';"
+    )
+    stable = await database.first(
+        f"SELECT evidence_key, fact_key, value_json FROM {evidence_ref} "
+        "WHERE source_id = 'profile-source-b' "
+        "AND fact_type = 'role_identifier' AND resource_id = 'role-b';"
+    )
+    stale_evidence_count = await database.scalar(
+        f"SELECT count(*) FROM {evidence_ref} "
+        "WHERE evidence_key = :changed_evidence_key "
+        "OR evidence_key = :removed_evidence_key "
+        "OR npi = :removed_npi;",
+        changed_evidence_key=baseline.changed.evidence_key,
+        removed_evidence_key=baseline.removed.evidence_key,
+        removed_npi=removed_npi,
+    )
+    removed_profile_count = await database.scalar(
+        f"SELECT count(*) FROM {profile_ref} WHERE npi = :removed_npi;",
+        removed_npi=removed_npi,
+    )
+    refreshed_profile = await database.first(
+        f"SELECT profile_json, source_ids FROM {profile_ref} "
+        "WHERE npi = 1588616783;"
+    )
+    _assert_refreshed_global_evidence(changed, stable, baseline)
+    assert stale_evidence_count == 0
+    assert removed_profile_count == 0
+    _assert_refreshed_global_profile(refreshed_profile)
+
+
+def _assert_refreshed_global_evidence(changed, stable, baseline) -> None:
+    """Require replacement plus byte-equivalent unaffected evidence."""
+    assert changed is not None
+    assert changed.evidence_key != baseline.changed.evidence_key
+    assert _decoded(changed.value_json) != _decoded(
+        baseline.changed.value_json
+    )
+    assert stable is not None
+    assert (
+        stable.evidence_key,
+        stable.fact_key,
+        _decoded(stable.value_json),
+    ) == (
+        baseline.stable.evidence_key,
+        baseline.stable.fact_key,
+        _decoded(baseline.stable.value_json),
+    )
+
+
+def _assert_refreshed_global_profile(refreshed_profile) -> None:
+    """Require the surviving NPI to use only refreshed evidence."""
+    assert refreshed_profile is not None
+    serialized_profile = json.dumps(
+        _decoded(refreshed_profile.profile_json),
+        sort_keys=True,
+    )
+    assert "network-updated" in serialized_profile
+    assert "Organization/network-1" not in serialized_profile
+    assert refreshed_profile.source_ids == [
+        "profile-source-a",
+        "profile-source-b",
+    ]
 
 
 def _attested_a_fence():
@@ -511,41 +979,21 @@ async def test_source_context_aba_is_rejected_before_profile_evidence(
         ) == 0
 
 
-async def _build_bounded_profile_artifacts(
+async def _populate_bounded_profile_evidence(
     database: Database,
-    schema: str,
-) -> tuple[str, str]:
-    """Build the same fixture through production-style bounded statements."""
-    table_ref = lambda table_name: profile.qualified_table(schema, table_name)
-    evidence_table = "profile_evidence_bounded"
-    profile_table = "profile_bounded"
-    evidence_ref = table_ref(evidence_table)
-    profile_ref = table_ref(profile_table)
-    await database.status(
-        profile.profile_evidence_table_sql(
-            schema,
-            evidence_table,
-            logged=True,
-        )
-    )
-    await database.status(
-        profile.profile_table_sql(schema, profile_table, logged=True)
-    )
-    evidence_sql_refs_by_name = {
-        "target_ref": evidence_ref,
-        "source_ref": table_ref("provider_directory_source"),
-        "practitioner_ref": table_ref("provider_directory_practitioner"),
-        "role_ref": table_ref("provider_directory_practitioner_role"),
-        "organization_ref": table_ref("provider_directory_organization"),
-        "service_ref": table_ref("provider_directory_healthcare_service"),
-        "endpoint_ref": table_ref("provider_directory_endpoint"),
-    }
+    evidence_sql_refs_by_name: dict[str, str],
+) -> None:
+    """Populate bounded evidence one source, fact, and role bucket at a time."""
     for source_id, dataset_id in (
         ("profile-source-a", "profile-dataset-a"),
         ("profile-source-b", "profile-dataset-b"),
     ):
         for fact_type in profile.PROFILE_EVIDENCE_FACT_TYPES:
-            role_bucket_count = 2 if fact_type == "affiliation" else 1
+            role_bucket_count = (
+                2
+                if fact_type in {"affiliation", "organization"}
+                else 1
+            )
             for role_bucket in range(role_bucket_count):
                 params_by_name = {
                     "source_ids": [source_id],
@@ -568,6 +1016,14 @@ async def _build_bounded_profile_artifacts(
                     ),
                     **params_by_name,
                 )
+
+
+async def _populate_bounded_profiles(
+    database: Database,
+    evidence_ref: str,
+    profile_ref: str,
+) -> None:
+    """Populate the compact profile table through deterministic NPI ranges."""
     for npi_start in (1_000_000_000, 2_000_000_000):
         await database.status(
             profile.profile_insert_sql(
@@ -583,6 +1039,41 @@ async def _build_bounded_profile_artifacts(
             profile_npi_start=npi_start,
             profile_npi_end=npi_start + 1_000_000_000,
         )
+
+
+async def _build_bounded_profile_artifacts(
+    database: Database,
+    schema: str,
+) -> tuple[str, str]:
+    """Build the same fixture through production-style bounded statements."""
+    table_ref = lambda table_name: profile.qualified_table(schema, table_name)
+    evidence_table = "profile_evidence_bounded"
+    profile_table = "profile_bounded"
+    evidence_ref = table_ref(evidence_table)
+    profile_ref = table_ref(profile_table)
+    await database.status(
+        profile.profile_evidence_table_sql(
+            schema,
+            evidence_table,
+            logged=True,
+        )
+    )
+    await database.status(
+        profile.profile_table_sql(schema, profile_table, logged=True)
+    )
+    await _populate_bounded_profile_evidence(
+        database,
+        {
+            "target_ref": evidence_ref,
+            "source_ref": table_ref("provider_directory_source"),
+            "practitioner_ref": table_ref("provider_directory_practitioner"),
+            "role_ref": table_ref("provider_directory_practitioner_role"),
+            "organization_ref": table_ref("provider_directory_organization"),
+            "service_ref": table_ref("provider_directory_healthcare_service"),
+            "endpoint_ref": table_ref("provider_directory_endpoint"),
+        },
+    )
+    await _populate_bounded_profiles(database, evidence_ref, profile_ref)
     return evidence_ref, profile_ref
 
 
@@ -742,40 +1233,145 @@ async def test_bounded_profile_build_matches_monolithic_sql_exactly(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_existing_global_refresh_replaces_without_copy_batches(
+    monkeypatch,
+):
+    """Rebuild selected-equals-retained artifacts without stale materialization."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        await _build_profile_artifacts(database, schema)
+        await _install_fixture_as_serving_profile(database, schema)
+        removed_npi = await _seed_old_only_profile(database, schema)
+        baseline = await _global_refresh_baseline(database, schema)
+        await _mutate_global_profile_fixture(database, schema)
+        build, batch_plan = _existing_global_profile_build(schema)
+        assert len(batch_plan.evidence_batches) == 166
+        assert len(batch_plan.compact_batches) == 400
+        assert {batch.kind for batch in batch_plan.evidence_batches} == {
+            "fact"
+        }
+        assert {batch.kind for batch in batch_plan.compact_batches} == {
+            "npi"
+        }
+        copy_statements = _global_refresh_copy_statements(build)
+        executed_copy_statements: list[str] = []
+        original_status = database.status
+
+        async def recording_status(sql: Any, **params: Any):
+            if str(sql) in copy_statements:
+                executed_copy_statements.append(str(sql))
+            return await original_status(sql, **params)
+
+        monkeypatch.setattr(database, "status", recording_status)
+        monkeypatch.setattr(importer, "db", database)
+        fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+        metrics, _stages = (
+            await importer._build_provider_directory_profile_stages(
+                build,
+                fence,
+                fence,
+                has_existing_artifacts=True,
+            )
+        )
+
+        assert metrics["incremental"] is True
+        assert executed_copy_statements == []
+        await _assert_existing_global_refresh(
+            database,
+            build,
+            baseline,
+            removed_npi,
+        )
+
+
+async def _create_empty_profile_targets(
+    database: Database,
+    schema: str,
+) -> None:
+    """Create an empty serving pair for the bounded first-build contract."""
+    await database.status(
+        profile.profile_evidence_table_sql(
+            schema,
+            profile.PROFILE_EVIDENCE_TABLE,
+            logged=True,
+        )
+    )
+    await database.status(
+        profile.profile_table_sql(
+            schema,
+            profile.PROFILE_TABLE,
+            logged=True,
+        )
+    )
+
+
+def _empty_target_profile_build(
+    schema: str,
+) -> importer._ProviderDirectoryProfileBuild:
+    """Return the deterministic build used against an empty serving pair."""
+    return importer._ProviderDirectoryProfileBuild(
+        schema=schema,
+        generation_id="profile-affiliation-test",
+        source_ids=("profile-source-a", "profile-source-b"),
+        retained_source_ids=("profile-source-a", "profile-source-b"),
+        dataset_ids=("profile-dataset-a", "profile-dataset-b"),
+        profile_as_of="2026-07-19",
+        evidence_stage="profile_evidence_empty_target_stage",
+        profile_stage="profile_empty_target_stage",
+        build_id="profile-empty-target-build",
+        owner_run_id="profile-empty-target-run",
+    )
+
+
+async def _profile_artifact_difference_counts(
+    database: Database,
+    schema: str,
+    build: importer._ProviderDirectoryProfileBuild,
+) -> tuple[int, int]:
+    """Compare bounded artifacts with the monolithic fixture outputs."""
+    evidence_ref = profile.qualified_table(schema, "profile_evidence")
+    bounded_evidence_ref = profile.qualified_table(schema, build.evidence_stage)
+    profile_ref = profile.qualified_table(schema, "profile")
+    bounded_profile_ref = profile.qualified_table(schema, build.profile_stage)
+    evidence_difference = await database.scalar(
+        f"""
+        SELECT count(*) FROM (
+            (SELECT * FROM {evidence_ref}
+             EXCEPT ALL SELECT * FROM {bounded_evidence_ref})
+            UNION ALL
+            (SELECT * FROM {bounded_evidence_ref}
+             EXCEPT ALL SELECT * FROM {evidence_ref})
+        ) AS difference;
+        """
+    )
+    profile_columns = (
+        "npi, profile_json, evidence_json, source_ids, endpoint_ids, "
+        "dataset_ids, source_count, independent_source_count, fact_count, "
+        "generation_id"
+    )
+    profile_difference = await database.scalar(
+        f"""
+        SELECT count(*) FROM (
+            (SELECT {profile_columns} FROM {profile_ref}
+             EXCEPT ALL SELECT {profile_columns} FROM {bounded_profile_ref})
+            UNION ALL
+            (SELECT {profile_columns} FROM {bounded_profile_ref}
+             EXCEPT ALL SELECT {profile_columns} FROM {profile_ref})
+        ) AS difference;
+        """
+    )
+    return int(evidence_difference or 0), int(profile_difference or 0)
+
+
+@pytest.mark.asyncio
 async def test_bounded_build_populates_an_initial_empty_serving_pair(
     monkeypatch,
 ):
     """Treat an empty serving pair as a fresh, complete global rebuild."""
     async with _profile_database(monkeypatch) as (database, schema):
         monkeypatch.setattr(importer, "db", database)
-        await database.status(
-            profile.profile_evidence_table_sql(
-                schema,
-                profile.PROFILE_EVIDENCE_TABLE,
-                logged=True,
-            )
-        )
-        await database.status(
-            profile.profile_table_sql(
-                schema,
-                profile.PROFILE_TABLE,
-                logged=True,
-            )
-        )
-        build = importer._ProviderDirectoryProfileBuild(
-            schema=schema,
-            generation_id="profile-affiliation-test",
-            source_ids=("profile-source-a", "profile-source-b"),
-            retained_source_ids=("profile-source-a", "profile-source-b"),
-            dataset_ids=("profile-dataset-a", "profile-dataset-b"),
-            profile_as_of="2026-07-19",
-            evidence_stage="profile_evidence_empty_target_stage",
-            profile_stage="profile_empty_target_stage",
-            build_id="profile-empty-target-build",
-            owner_run_id="profile-empty-target-run",
-        )
+        await _create_empty_profile_targets(database, schema)
+        build = _empty_target_profile_build(schema)
         fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
-
         metrics, _stages = (
             await importer._build_provider_directory_profile_stages(
                 build,
@@ -797,56 +1393,13 @@ async def test_bounded_build_populates_an_initial_empty_serving_pair(
         assert checkpoint_record.has_existing_artifacts is False
         assert checkpoint_record.state == "ready"
         assert metrics["incremental"] is False
-
         await _build_profile_artifacts(database, schema)
-        baseline_evidence_ref = profile.qualified_table(
-            schema,
-            "profile_evidence",
-        )
-        bounded_evidence_ref = profile.qualified_table(
-            schema,
-            build.evidence_stage,
-        )
-        baseline_profile_ref = profile.qualified_table(schema, "profile")
-        bounded_profile_ref = profile.qualified_table(
-            schema,
-            build.profile_stage,
-        )
-        evidence_difference = await database.scalar(
-            f"""
-            SELECT count(*) FROM (
-                (SELECT * FROM {baseline_evidence_ref}
-                 EXCEPT ALL SELECT * FROM {bounded_evidence_ref})
-                UNION ALL
-                (SELECT * FROM {bounded_evidence_ref}
-                 EXCEPT ALL SELECT * FROM {baseline_evidence_ref})
-            ) AS difference;
-            """
-        )
-        profile_difference = await database.scalar(
-            f"""
-            SELECT count(*) FROM (
-                (SELECT npi, profile_json, evidence_json, source_ids,
-                        endpoint_ids, dataset_ids, source_count,
-                        independent_source_count, fact_count, generation_id
-                   FROM {baseline_profile_ref}
-                 EXCEPT ALL
-                 SELECT npi, profile_json, evidence_json, source_ids,
-                        endpoint_ids, dataset_ids, source_count,
-                        independent_source_count, fact_count, generation_id
-                   FROM {bounded_profile_ref})
-                UNION ALL
-                (SELECT npi, profile_json, evidence_json, source_ids,
-                        endpoint_ids, dataset_ids, source_count,
-                        independent_source_count, fact_count, generation_id
-                   FROM {bounded_profile_ref}
-                 EXCEPT ALL
-                 SELECT npi, profile_json, evidence_json, source_ids,
-                        endpoint_ids, dataset_ids, source_count,
-                        independent_source_count, fact_count, generation_id
-                   FROM {baseline_profile_ref})
-            ) AS difference;
-            """
+        evidence_difference, profile_difference = (
+            await _profile_artifact_difference_counts(
+                database,
+                schema,
+                build,
+            )
         )
 
     assert evidence_difference == 0
@@ -903,74 +1456,252 @@ async def test_bounded_fact_plan_prunes_unrelated_resource_branches(monkeypatch)
         assert all(node["Shared Read Blocks"] == 0 for node in unused_nodes)
 
 
+def _profile_bucket_probe_evidence_sql(
+    schema: str,
+    role_scope: str,
+    affiliation_scope: str,
+) -> str:
+    """Return the exact bounded affiliation SQL used by the plan proof."""
+    table_ref = lambda table_name: profile.qualified_table(schema, table_name)
+    return profile.profile_evidence_insert_sql(
+        target_ref=table_ref("profile_evidence"),
+        source_ref=table_ref("provider_directory_source"),
+        practitioner_ref=table_ref("provider_directory_practitioner"),
+        role_ref=table_ref(role_scope),
+        organization_ref=table_ref("provider_directory_organization"),
+        affiliation_ref=table_ref(affiliation_scope),
+        affiliation_organization_ref=table_ref(
+            "provider_directory_dataset_affiliation_organization"
+        ),
+        service_ref=table_ref("provider_directory_healthcare_service"),
+        endpoint_ref=table_ref("provider_directory_endpoint"),
+        fact_type="affiliation",
+        role_bucket_count=profile.PROFILE_AFFILIATION_ROLE_BUCKETS,
+        role_bucket=7,
+    )
+
+
+async def _capture_profile_bucket_probe(
+    database: Database,
+    schema: str,
+    role_scope: str,
+    affiliation_scope: str,
+) -> SimpleNamespace:
+    """Capture before/after plans plus exact scoped-index metrics."""
+    table_ref = lambda table_name: profile.qualified_table(schema, table_name)
+    explain_sql = (
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+        + _profile_bucket_probe_evidence_sql(
+            schema,
+            role_scope,
+            affiliation_scope,
+        )
+    )
+    explain_params_by_name = {
+        "source_ids": ["profile-source-a"],
+        "dataset_ids": ["profile-dataset-a"],
+        "profile_as_of": "2026-07-19",
+        "profile_role_bucket_count": profile.PROFILE_AFFILIATION_ROLE_BUCKETS,
+        "profile_role_bucket": 7,
+    }
+    before_plan = await database.scalar(explain_sql, **explain_params_by_name)
+    await database.status(f"TRUNCATE TABLE {table_ref('profile_evidence')};")
+    role_metrics = await importer._prepare_provider_directory_profile_bucket_index(
+        schema,
+        importer.ProviderDirectoryPractitionerRole.__tablename__,
+    )
+    affiliation_metrics = (
+        await importer._prepare_provider_directory_profile_bucket_index(
+            schema,
+            importer.ProviderDirectoryOrganizationAffiliation.__tablename__,
+        )
+    )
+    after_plan = await database.scalar(explain_sql, **explain_params_by_name)
+    affiliation_plan = await database.scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+        f"SELECT resource_id FROM {table_ref(affiliation_scope)} "
+        "WHERE source_id = :source_id AND "
+        f"{importer._provider_directory_profile_bucket_expression()} "
+        "= CAST(:profile_role_bucket AS bigint);",
+        source_id="profile-source-a",
+        profile_role_bucket=7,
+    )
+    return SimpleNamespace(
+        role_scope=role_scope,
+        before_plan=before_plan,
+        after_plan=after_plan,
+        affiliation_plan=affiliation_plan,
+        role_metrics=role_metrics,
+        affiliation_metrics=affiliation_metrics,
+    )
+
+
+def _assert_profile_bucket_probe(probe: SimpleNamespace) -> None:
+    """Assert index use, bounded work, and spill-free execution."""
+    assert probe.role_metrics is not None
+    assert probe.affiliation_metrics is not None
+    role_index_name = str(probe.role_metrics["index_name"])
+    affiliation_index_name = str(probe.affiliation_metrics["index_name"])
+    assert not _plan_index_nodes(probe.before_plan, role_index_name)
+    role_index_nodes = _plan_index_nodes(probe.after_plan, role_index_name)
+    affiliation_index_nodes = _plan_index_nodes(
+        probe.affiliation_plan,
+        affiliation_index_name,
+    )
+    assert role_index_nodes
+    assert affiliation_index_nodes
+    assert all(
+        node["Node Type"] in {"Index Scan", "Bitmap Index Scan"}
+        for node in [*role_index_nodes, *affiliation_index_nodes]
+    )
+    before_role_nodes = _plan_relation_nodes(
+        probe.before_plan,
+        probe.role_scope,
+    )
+    after_role_nodes = _plan_relation_nodes(probe.after_plan, probe.role_scope)
+    before_rows_inspected = max(
+        int(node.get("Actual Rows", 0))
+        + int(node.get("Rows Removed by Filter", 0))
+        for node in before_role_nodes
+    )
+    after_rows_inspected = max(
+        int(node.get("Actual Rows", 0))
+        + int(node.get("Rows Removed by Filter", 0))
+        for node in after_role_nodes
+    )
+    assert before_rows_inspected >= 190_000
+    assert 0 < after_rows_inspected < before_rows_inspected // 8
+    assert _plan_temp_blocks(probe.after_plan) == 0
+    assert _plan_temp_blocks(probe.affiliation_plan) == 0
+    for metrics_by_name in (
+        probe.role_metrics,
+        probe.affiliation_metrics,
+    ):
+        assert int(metrics_by_name["index_bytes"]) > 0
+        assert float(metrics_by_name["elapsed_seconds"]) >= 0
+        assert metrics_by_name["temp_bytes_delta"] is None or (
+            int(metrics_by_name["temp_bytes_delta"]) >= 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_role_bucket_plan_uses_scoped_expression_indexes_without_spill(
+    monkeypatch,
+):
+    """Prove exact 32-way SQL avoids serial scoped-relation rescans."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        role_scope, affiliation_scope = (
+            await _create_profile_bucket_probe_scopes(
+                database,
+                schema,
+                row_count=200_000,
+            )
+        )
+        relation_scope_by_name = {
+            importer.ProviderDirectoryPractitionerRole.__tablename__: (
+                role_scope
+            ),
+            importer.ProviderDirectoryOrganizationAffiliation.__tablename__: (
+                affiliation_scope
+            ),
+        }
+        with importer._provider_directory_artifact_relation_scope(
+            relation_scope_by_name
+        ):
+            probe = await _capture_profile_bucket_probe(
+                database,
+                schema,
+                role_scope,
+                affiliation_scope,
+            )
+        _assert_profile_bucket_probe(probe)
+
+
+async def _seed_profile_evidence_plan(
+    database: Database,
+    schema: str,
+) -> tuple[str, str, str]:
+    """Create and index a broad evidence fixture for a late NPI range."""
+    evidence_table = "profile_evidence_plan"
+    profile_table = "profile_plan"
+    evidence_ref = profile.qualified_table(schema, evidence_table)
+    profile_ref = profile.qualified_table(schema, profile_table)
+    await database.status(
+        profile.profile_evidence_table_sql(schema, evidence_table, logged=True)
+    )
+    await database.status(
+        profile.profile_table_sql(schema, profile_table, logged=True)
+    )
+    await database.status(
+        f"""
+        INSERT INTO {evidence_ref} (
+            evidence_key, npi, fact_type, fact_key, value_json,
+            source_id, endpoint_id, dataset_id, canonical_api_base,
+            source_org_name, source_plan_name, resource_type,
+            resource_id, role_resource_id, active, effective_start,
+            effective_end, observed_at
+        )
+        SELECT md5(value::text), 1000000000 + value * 10000,
+               'name', md5(('fact-' || value)::text),
+               jsonb_build_object('text', 'Provider ' || value),
+               'profile-source-a', 'profile-endpoint-a',
+               'profile-dataset-a', 'https://payer.test/fhir',
+               'Example Health Plan', 'Example Plan', 'Practitioner',
+               'practitioner-' || value, NULL, true, NULL, NULL, now()
+          FROM generate_series(1, 100000) AS value;
+        """
+    )
+    for index_sql in profile.profile_index_statements(
+        schema,
+        evidence_table,
+        evidence=True,
+    ):
+        await database.status(index_sql)
+    await database.status(f"ANALYZE {evidence_ref};")
+    return evidence_table, evidence_ref, profile_ref
+
+
+async def _explain_late_profile_npi_range(
+    database: Database,
+    evidence_ref: str,
+    profile_ref: str,
+) -> Any:
+    """Explain one late bounded NPI insertion with broad joins disabled."""
+    npi_start = profile.NPI_MIN + 995_000_000
+    npi_end = npi_start + profile.PROFILE_NPI_BATCH_SIZE
+    async with database.transaction():
+        await database.status("SET LOCAL enable_nestloop = off;")
+        await database.status("SET LOCAL enable_hashjoin = off;")
+        return await database.scalar(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+            + profile.profile_insert_sql(
+                evidence_ref=evidence_ref,
+                target_ref=profile_ref,
+                old_evidence_ref=None,
+                rebuild_all=True,
+                npi_start=npi_start,
+                npi_end=npi_end,
+            ),
+            generation_id="profile-index-plan",
+            profile_as_of="2026-07-19",
+            profile_npi_start=npi_start,
+            profile_npi_end=npi_end,
+        )
+
+
 @pytest.mark.asyncio
 async def test_five_million_npi_batch_uses_evidence_range_indexes(monkeypatch):
     """Prevent every compact-profile range from rescanning all evidence."""
     async with _profile_database(monkeypatch) as (database, schema):
-        evidence_table = "profile_evidence_plan"
-        profile_table = "profile_plan"
-        evidence_ref = profile.qualified_table(schema, evidence_table)
-        profile_ref = profile.qualified_table(schema, profile_table)
-        await database.status(
-            profile.profile_evidence_table_sql(
-                schema,
-                evidence_table,
-                logged=True,
-            )
+        evidence_table, evidence_ref, profile_ref = (
+            await _seed_profile_evidence_plan(database, schema)
         )
-        await database.status(
-            profile.profile_table_sql(schema, profile_table, logged=True)
+        plan = await _explain_late_profile_npi_range(
+            database,
+            evidence_ref,
+            profile_ref,
         )
-        await database.status(
-            f"""
-            INSERT INTO {evidence_ref} (
-                evidence_key, npi, fact_type, fact_key, value_json,
-                source_id, endpoint_id, dataset_id, canonical_api_base,
-                source_org_name, source_plan_name, resource_type,
-                resource_id, role_resource_id, active, effective_start,
-                effective_end, observed_at
-            )
-            SELECT md5(value::text),
-                   1000000000 + value * 10000,
-                   'name', md5(('fact-' || value)::text),
-                   jsonb_build_object('text', 'Provider ' || value),
-                   'profile-source-a', 'profile-endpoint-a',
-                   'profile-dataset-a', 'https://payer.test/fhir',
-                   'Example Health Plan', 'Example Plan', 'Practitioner',
-                   'practitioner-' || value, NULL, true, NULL, NULL, now()
-              FROM generate_series(1, 100000) AS value;
-            """
-        )
-        for index_sql in profile.profile_index_statements(
-            schema,
-            evidence_table,
-            evidence=True,
-        ):
-            await database.status(index_sql)
-        await database.status(f"ANALYZE {evidence_ref};")
-        late_npi_start = profile.NPI_MIN + 995_000_000
-        async with database.transaction():
-            await database.status("SET LOCAL enable_nestloop = off;")
-            await database.status("SET LOCAL enable_hashjoin = off;")
-            plan = await database.scalar(
-                "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
-                + profile.profile_insert_sql(
-                    evidence_ref=evidence_ref,
-                    target_ref=profile_ref,
-                    old_evidence_ref=None,
-                    rebuild_all=True,
-                    npi_start=late_npi_start,
-                    npi_end=(
-                        late_npi_start + profile.PROFILE_NPI_BATCH_SIZE
-                    ),
-                ),
-                generation_id="profile-index-plan",
-                profile_as_of="2026-07-19",
-                profile_npi_start=late_npi_start,
-                profile_npi_end=(
-                    late_npi_start + profile.PROFILE_NPI_BATCH_SIZE
-                ),
-            )
 
     evidence_nodes = _plan_relation_nodes(plan, evidence_table)
     assert evidence_nodes
@@ -987,6 +1718,19 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
     async with _profile_database(monkeypatch) as (database, schema):
         await _build_profile_artifacts(database, schema)
         monkeypatch.setattr(importer, "db", database)
+        progress_events: list[tuple[str | None, dict[str, Any]]] = []
+
+        async def record_progress(
+            run_id: str | None,
+            **progress_by_name: Any,
+        ) -> None:
+            progress_events.append((run_id, progress_by_name))
+
+        monkeypatch.setattr(
+            importer,
+            "_mark_provider_directory_progress",
+            record_progress,
+        )
         build = importer._ProviderDirectoryProfileBuild(
             schema=schema,
             generation_id="profile-affiliation-test",
@@ -1034,6 +1778,21 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         assert interrupted_checkpoint.state == "failed"
         assert interrupted_checkpoint.evidence_next_batch == 1
         assert interrupted_checkpoint.profile_next_batch == 0
+        first_run_progress = [
+            progress
+            for progress_run_id, progress in progress_events
+            if progress_run_id == "profile-run-first"
+        ]
+        assert [
+            (progress["done"], progress["total"])
+            for progress in first_run_progress
+        ] == [(0, 166), (1, 166)]
+        assert {
+            progress["phase"] for progress in first_run_progress
+        } == {importer._PROFILE_EVIDENCE_PROGRESS_PHASE}
+        assert {
+            progress["unit"] for progress in first_run_progress
+        } == {"batches"}
         interrupted_evidence_count = int(
             await database.scalar(
                 f"SELECT count(*) FROM "
@@ -1087,6 +1846,27 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         assert len(resumed_fact_statements) == (
             compact_checkpoint.evidence_total_batches - 1
         )
+        retry_evidence_progress = [
+            progress
+            for progress_run_id, progress in progress_events
+            if progress_run_id == "profile-run-retry"
+            and progress["phase"]
+            == importer._PROFILE_EVIDENCE_PROGRESS_PHASE
+        ]
+        assert [
+            progress["done"] for progress in retry_evidence_progress
+        ] == list(range(1, 167))
+        retry_profile_progress = [
+            progress
+            for progress_run_id, progress in progress_events
+            if progress_run_id == "profile-run-retry"
+            and progress["phase"]
+            == importer._PROFILE_COMPACT_PROGRESS_PHASE
+        ]
+        assert [
+            (progress["done"], progress["total"])
+            for progress in retry_profile_progress
+        ] == [(0, 400)]
 
         evidence_population = (
             importer._populate_provider_directory_profile_evidence_stage
@@ -1287,6 +2067,22 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
             completed_checkpoint.profile_next_batch
             == completed_checkpoint.profile_total_batches
         )
+        last_batch_progress = [
+            progress["done"]
+            for progress_run_id, progress in progress_events
+            if progress_run_id == "profile-run-last-batch"
+            and progress["phase"]
+            == importer._PROFILE_COMPACT_PROGRESS_PHASE
+        ]
+        assert last_batch_progress == list(range(401))
+        final_progress = [
+            (progress["done"], progress["total"])
+            for progress_run_id, progress in progress_events
+            if progress_run_id == "profile-run-final"
+            and progress["phase"]
+            == importer._PROFILE_COMPACT_PROGRESS_PHASE
+        ]
+        assert final_progress == [(400, 400)]
         assert int(
             await database.scalar(
                 f"SELECT count(*) FROM "
@@ -1346,6 +2142,100 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         ) == 0
 
 
+def _reaper_profile_build(
+    schema: str,
+    build_id: str,
+    *,
+    source_id: str,
+    dataset_id: str,
+    owner_run_id: str,
+) -> importer._ProviderDirectoryProfileBuild:
+    """Return one deterministic build used by stale-stage reaper tests."""
+    return importer._ProviderDirectoryProfileBuild(
+        schema=schema,
+        generation_id=f"generation-{build_id[-4:]}",
+        source_ids=(source_id,),
+        retained_source_ids=(source_id,),
+        dataset_ids=(dataset_id,),
+        profile_as_of="2026-07-20",
+        evidence_stage=profile.profile_evidence_stage_table_name(build_id),
+        profile_stage=profile.profile_stage_table_name(build_id),
+        build_id=build_id,
+        owner_run_id=owner_run_id,
+    )
+
+
+async def _seed_stale_and_current_profile_builds(
+    schema: str,
+) -> tuple[
+    importer._ProviderDirectoryProfileBuild,
+    importer._ProviderDirectoryProfileBuild,
+]:
+    """Claim one failed build and one current build for reaper coverage."""
+    stale_build = _reaper_profile_build(
+        schema,
+        f"pdpb_{'1' * 32}",
+        source_id="profile-source-a",
+        dataset_id="profile-dataset-a",
+        owner_run_id="profile-run-stale",
+    )
+    current_build = _reaper_profile_build(
+        schema,
+        f"pdpb_{'2' * 32}",
+        source_id="profile-source-b",
+        dataset_id="profile-dataset-b",
+        owner_run_id="profile-run-current",
+    )
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    await importer._claim_provider_directory_profile_build_checkpoint(
+        stale_build,
+        has_existing_artifacts=False,
+        evidence_build_fence=fence,
+        profile_build_fence=fence,
+    )
+    await importer._mark_profile_build_checkpoint_failed(
+        stale_build,
+        RuntimeError("forced stale failure"),
+    )
+    await importer._claim_provider_directory_profile_build_checkpoint(
+        current_build,
+        has_existing_artifacts=False,
+        evidence_build_fence=fence,
+        profile_build_fence=fence,
+    )
+    return stale_build, current_build
+
+
+async def _assert_profile_build_relations_reaped(
+    database: Database,
+    schema: str,
+    stale_build: importer._ProviderDirectoryProfileBuild,
+    current_build: importer._ProviderDirectoryProfileBuild,
+) -> None:
+    """Require only the stale build's two stage relations to be removed."""
+    checkpoint_ref = profile.qualified_table(
+        schema,
+        "provider_directory_profile_build_checkpoint",
+    )
+    remaining_build_ids = {
+        checkpoint_record.build_id
+        for checkpoint_record in await database.all(
+            f"SELECT build_id FROM {checkpoint_ref};"
+        )
+    }
+    assert remaining_build_ids == {current_build.build_id}
+    for stage_table in (stale_build.evidence_stage, stale_build.profile_stage):
+        assert await database.scalar(
+            "SELECT to_regclass(:relation_name);",
+            relation_name=f"{schema}.{stage_table}",
+        ) is None
+    for stage_table in (current_build.evidence_stage, current_build.profile_stage):
+        assert await database.scalar(
+            "SELECT to_regclass(:relation_name);",
+            relation_name=f"{schema}.{stage_table}",
+        ) is not None
+
+
 @pytest.mark.asyncio
 async def test_profile_build_reaps_failed_stages_after_lineage_changes(
     monkeypatch,
@@ -1353,59 +2243,8 @@ async def test_profile_build_reaps_failed_stages_after_lineage_changes(
     """Drop only superseded logged stages when source/dataset scope changes."""
     async with _profile_database(monkeypatch) as (database, schema):
         monkeypatch.setattr(importer, "db", database)
-        stale_build_id = f"pdpb_{'1' * 32}"
-        current_build_id = f"pdpb_{'2' * 32}"
-
-        def build(
-            build_id: str,
-            *,
-            source_id: str,
-            dataset_id: str,
-            owner_run_id: str,
-        ) -> importer._ProviderDirectoryProfileBuild:
-            return importer._ProviderDirectoryProfileBuild(
-                schema=schema,
-                generation_id=f"generation-{build_id[-4:]}",
-                source_ids=(source_id,),
-                retained_source_ids=(source_id,),
-                dataset_ids=(dataset_id,),
-                profile_as_of="2026-07-20",
-                evidence_stage=(
-                    profile.profile_evidence_stage_table_name(build_id)
-                ),
-                profile_stage=profile.profile_stage_table_name(build_id),
-                build_id=build_id,
-                owner_run_id=owner_run_id,
-            )
-
-        stale_build = build(
-            stale_build_id,
-            source_id="profile-source-a",
-            dataset_id="profile-dataset-a",
-            owner_run_id="profile-run-stale",
-        )
-        current_build = build(
-            current_build_id,
-            source_id="profile-source-b",
-            dataset_id="profile-dataset-b",
-            owner_run_id="profile-run-current",
-        )
-        fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            stale_build,
-            has_existing_artifacts=False,
-            evidence_build_fence=fence,
-            profile_build_fence=fence,
-        )
-        await importer._mark_profile_build_checkpoint_failed(
-            stale_build,
-            RuntimeError("forced stale failure"),
-        )
-        await importer._claim_provider_directory_profile_build_checkpoint(
-            current_build,
-            has_existing_artifacts=False,
-            evidence_build_fence=fence,
-            profile_build_fence=fence,
+        stale_build, current_build = (
+            await _seed_stale_and_current_profile_builds(schema)
         )
         checkpoint_ref = profile.qualified_table(
             schema,
@@ -1418,7 +2257,7 @@ async def test_profile_build_reaps_failed_stages_after_lineage_changes(
             await database.status(
                 f"UPDATE {checkpoint_ref} SET profile_next_batch = 1 "
                 "WHERE build_id = :build_id;",
-                build_id=current_build_id,
+                build_id=current_build.build_id,
             )
         with pytest.raises(
             IntegrityError,
@@ -1429,34 +2268,16 @@ async def test_profile_build_reaps_failed_stages_after_lineage_changes(
                 "SET evidence_next_batch = evidence_total_batches, "
                 "profile_next_batch = 1, state = 'evidence_complete' "
                 "WHERE build_id = :build_id;",
-                build_id=current_build_id,
+                build_id=current_build.build_id,
             )
 
         assert await importer._reap_stale_provider_directory_profile_builds(
             schema,
-            current_build_id=current_build_id,
+            current_build_id=current_build.build_id,
         ) == 1
-
-        remaining_build_ids = {
-            checkpoint_record.build_id
-            for checkpoint_record in await database.all(
-                f"SELECT build_id FROM {checkpoint_ref};"
-            )
-        }
-        assert remaining_build_ids == {current_build_id}
-        for stage_table in (
-            stale_build.evidence_stage,
-            stale_build.profile_stage,
-        ):
-            assert await database.scalar(
-                "SELECT to_regclass(:relation_name);",
-                relation_name=f"{schema}.{stage_table}",
-            ) is None
-        for stage_table in (
-            current_build.evidence_stage,
-            current_build.profile_stage,
-        ):
-            assert await database.scalar(
-                "SELECT to_regclass(:relation_name);",
-                relation_name=f"{schema}.{stage_table}",
-            ) is not None
+        await _assert_profile_build_relations_reaped(
+            database,
+            schema,
+            stale_build,
+            current_build,
+        )

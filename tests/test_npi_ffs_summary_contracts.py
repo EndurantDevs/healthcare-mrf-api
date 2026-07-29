@@ -12,6 +12,33 @@ def _query_result(*rows):
     return SimpleNamespace(all=lambda: list(rows))
 
 
+def _ffs_summary_query_results():
+    """Return deterministic optional-table results for the summary fixture."""
+    return [
+        _query_result(
+            ("E1", 2000000001),
+            ("E1", 2000000001),
+            ("E2", None),
+            ("missing", 2999999999),
+        ),
+        _query_result(
+            ("E1", "12345", "Example City", "AA"),
+            ("E2", "12345", "Example City", "AA"),
+            ("E2", "54321", None, None),
+            ("E3", None, "Other City", "BB"),
+            ("missing", "99999", "Ignored", "ZZ"),
+        ),
+        _query_result(
+            ("E1", "01", "Synthetic Specialty"),
+            ("E2", "01", "Synthetic Specialty"),
+            ("E2", None, None),
+            ("missing", "99", "Ignored"),
+        ),
+        _query_result(("E1", 2), ("E2", None), ("missing", 8)),
+        _query_result(("E2", 3), ("E3", 1), ("missing", 8)),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_ffs_summary_aggregates_optional_detail_tables_by_enrollment(
     monkeypatch,
@@ -32,39 +59,7 @@ async def test_ffs_summary_aggregates_optional_detail_tables_by_enrollment(
         ],
     }
     table_available = AsyncMock(return_value=True)
-    execute = AsyncMock(
-        side_effect=[
-            _query_result(
-                ("E1", 2000000001),
-                ("E1", 2000000001),
-                ("E2", None),
-                ("missing", 2999999999),
-            ),
-            _query_result(
-                ("E1", "12345", "Example City", "AA"),
-                ("E2", "12345", "Example City", "AA"),
-                ("E2", "54321", None, None),
-                ("E3", None, "Other City", "BB"),
-                ("missing", "99999", "Ignored", "ZZ"),
-            ),
-            _query_result(
-                ("E1", "01", "Synthetic Specialty"),
-                ("E2", "01", "Synthetic Specialty"),
-                ("E2", None, None),
-                ("missing", "99", "Ignored"),
-            ),
-            _query_result(
-                ("E1", 2),
-                ("E2", None),
-                ("missing", 8),
-            ),
-            _query_result(
-                ("E2", 3),
-                ("E3", 1),
-                ("missing", 8),
-            ),
-        ]
-    )
+    execute = AsyncMock(side_effect=_ffs_summary_query_results())
     monkeypatch.setattr(npi_endpoint, "_is_table_available", table_available)
     monkeypatch.setattr(npi_endpoint, "_execute_stmt", execute)
     session = object()

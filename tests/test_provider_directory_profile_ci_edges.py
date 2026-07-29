@@ -227,6 +227,11 @@ async def test_profile_publish_returns_finalized_metrics(monkeypatch):
     )
     monkeypatch.setattr(
         importer,
+        "_has_provider_directory_profile_artifacts",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        importer,
         "_reap_stale_provider_directory_profile_builds",
         AsyncMock(return_value=0),
     )

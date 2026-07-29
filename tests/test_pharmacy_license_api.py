@@ -259,17 +259,9 @@ async def test_get_coverage_returns_items(monkeypatch):
     assert response_payload["unsupported_states"] == 1
 
 
-@pytest.mark.asyncio
-async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypatch):
-    """Verify get pharmacy license by npi returns summary and history."""
-    async def is_fake_table_present(_session, _table_name, schema="mrf"):
-        del schema
-        return True
-
-    monkeypatch.setattr(pharmacy_license, "_is_table_available", is_fake_table_present)
-
-    request = make_request(
-        [
+def _pharmacy_license_detail_results() -> list[FakeResult]:
+    """Return one current license row and its matching history row."""
+    return [
             FakeResult(
                 rows=[
                     MappingRow(
@@ -297,7 +289,17 @@ async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypat
                 ]
             ),
         ]
-    )
+
+
+@pytest.mark.asyncio
+async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypatch):
+    """Verify get pharmacy license by npi returns summary and history."""
+    async def is_fake_table_present(_session, _table_name, schema="mrf"):
+        del schema
+        return True
+
+    monkeypatch.setattr(pharmacy_license, "_is_table_available", is_fake_table_present)
+    request = make_request(_pharmacy_license_detail_results())
 
     response = await pharmacy_license.get_pharmacy_license_by_npi(request, "1518379601")
     response_payload = json.loads(response.body)

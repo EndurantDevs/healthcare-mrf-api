@@ -3407,6 +3407,26 @@ async def test_control_importers_endpoint(monkeypatch):
     assert payload == {"items": [{"name": "ptg", "engine": "healthcare-mrf-api"}], "next_cursor": None}
 
 
+_FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE = [
+    "InsurancePlan",
+    "PractitionerRole",
+    "Practitioner",
+    "Organization",
+    "Location",
+    "HealthcareService",
+    "OrganizationAffiliation",
+    "Endpoint",
+]
+_UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE = [
+    "InsurancePlan",
+    "Location",
+    "Organization",
+    "OrganizationAffiliation",
+    "Practitioner",
+    "PractitionerRole",
+]
+
+
 def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     """Expose every reviewed runnable and probe-only source exactly once."""
     catalog = provider_directory_source_catalog()
@@ -3430,35 +3450,29 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
     assert probe_by_id["capital-blue-cross"]["resources"] == []
-    assert probe_by_id["capital-blue-cross"]["supported_resources"] == [
-        "InsurancePlan", "PractitionerRole", "Practitioner", "Organization",
-        "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint",
-    ]
-    assert {
-        entry_id: len(runnable_by_id[entry_id]["resources"])
-        for entry_id in (
-            "devoted-health", "simpra-advantage", "san-bernardino-county-dbh",
-            "san-mateo-county-bhrs",
-        )
-    } == {
-        "devoted-health": 7, "simpra-advantage": 6,
-        "san-bernardino-county-dbh": 8, "san-mateo-county-bhrs": 8,
-    }
+    assert (
+        probe_by_id["capital-blue-cross"]["supported_resources"]
+        == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
+    )
+    assert len(runnable_by_id["devoted-health"]["resources"]) == 7
+    assert len(runnable_by_id["simpra-advantage"]["resources"]) == 6
+    assert len(runnable_by_id["san-bernardino-county-dbh"]["resources"]) == 8
+    assert len(runnable_by_id["san-mateo-county-bhrs"]["resources"]) == 8
     assert runnable_by_id["uhc-provider-files"]["resource_profile"] == "A6"
-    assert runnable_by_id["uhc-provider-files"]["resources"] == [
-        "InsurancePlan", "Location", "Organization", "OrganizationAffiliation",
-        "Practitioner", "PractitionerRole",
-    ]
+    assert (
+        runnable_by_id["uhc-provider-files"]["resources"]
+        == _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE
+    )
     assert probe_by_id["michigan"]["resources"] == []
     assert probe_by_id["michigan"]["supported_resources"] == [
         "Location", "Organization", "OrganizationAffiliation", "Practitioner",
         "PractitionerRole",
     ]
     assert probe_by_id["scan"]["resources"] == []
-    assert probe_by_id["scan"]["supported_resources"] == [
-        "InsurancePlan", "PractitionerRole", "Practitioner", "Organization",
-        "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint",
-    ]
+    assert (
+        probe_by_id["scan"]["supported_resources"]
+        == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
+    )
     assert {entry["entry_id"] for entry in runnable_items} >= {
         "aetna-commercial-medicare",
         "alohr",

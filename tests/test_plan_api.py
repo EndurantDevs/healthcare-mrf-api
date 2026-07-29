@@ -935,11 +935,9 @@ async def test_get_plan_with_variant(monkeypatch):
     assert response_payload["formulary_uri"] == "P1/2024"
 
 
-@pytest.mark.asyncio
-async def test_get_plan_normalizes_variant_identifiers():
-    """Verify get plan normalizes variant identifiers."""
-    request = make_request(
-        [
+def _variant_identifier_results() -> list[FakeResult]:
+    """Return plan-query results containing tuple-shaped variant IDs."""
+    return [
             FakeResult(rows=[{"plan_id": "P1", "year": 2024, "issuer_id": 7}]),
             FakeResult(rows=[("checksum", "TIER1")]),
             FakeResult(rows=[], scalar="Issuer"),
@@ -986,7 +984,12 @@ async def test_get_plan_normalizes_variant_identifiers():
                 ]
             ),
         ]
-    )
+
+
+@pytest.mark.asyncio
+async def test_get_plan_normalizes_variant_identifiers():
+    """Verify get plan normalizes variant identifiers."""
+    request = make_request(_variant_identifier_results())
     response = await get_plan(request, "P1", year="2024")
     response_payload = json.loads(response.body)
     assert response_payload["variants"] == ["P1-01", "P1-02", "P1-03", "P1-04"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import importlib
 import json
 from pathlib import Path
@@ -354,10 +355,10 @@ def _profile_checkpoint_by_name(
     build: importer._ProviderDirectoryProfileBuild,
     *,
     state: str = "building_profile",
-    evidence_next_batch: int = 1,
-    evidence_total_batches: int = 1,
+    evidence_next_batch: int = 83,
+    evidence_total_batches: int = 83,
     profile_next_batch: int = 0,
-    profile_total_batches: int = 1,
+    profile_total_batches: int = 400,
 ) -> dict[str, object]:
     return {
         "build_id": importer._provider_directory_profile_build_id(build),
@@ -411,6 +412,61 @@ def _assert_profile_checkpoint_value_contracts(build):
     )
 
 
+def _assert_single_source_profile_evidence_batches(evidence_batches):
+    """Require all 83 fact/role partitions for one source."""
+    assert evidence_batches[0].kind == "copy"
+    fact_batches = evidence_batches[1:]
+    assert len(fact_batches) == 83
+    assert {batch.kind for batch in fact_batches} == {"fact"}
+    assert {batch.source_id for batch in fact_batches} == {"source_a"}
+    assert {batch.dataset_id for batch in fact_batches} == {"dataset_a"}
+    assert {batch.fact_type for batch in fact_batches} == set(
+        profile.PROFILE_EVIDENCE_FACT_TYPES
+    )
+    affiliation_batches = [
+        batch for batch in fact_batches if batch.fact_type == "affiliation"
+    ]
+    assert len(affiliation_batches) == profile.PROFILE_AFFILIATION_ROLE_BUCKETS
+    assert [batch.role_bucket for batch in affiliation_batches] == list(
+        range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
+    )
+    organization_batches = [
+        batch for batch in fact_batches if batch.fact_type == "organization"
+    ]
+    assert len(organization_batches) == profile.PROFILE_AFFILIATION_ROLE_BUCKETS
+    assert [batch.role_bucket for batch in organization_batches] == list(
+        range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
+    )
+
+
+def _assert_global_profile_batch_plan(build):
+    """Require the exact global 19-source 1577/400 no-copy plan."""
+    source_ids = tuple(f"source_{index:02d}" for index in range(19))
+    global_build = importer.replace(
+        build,
+        source_ids=source_ids,
+        retained_source_ids=source_ids,
+        dataset_ids=tuple(
+            f"dataset_{index:02d}" for index in range(19)
+        ),
+    )
+    evidence_batches = importer._provider_directory_profile_evidence_batches(
+        global_build,
+        has_existing_artifacts=True,
+    )
+    compact_batches = importer._provider_directory_profile_compact_batches(
+        source_ids=global_build.source_ids,
+        retained_source_ids=global_build.retained_source_ids,
+        dataset_ids=global_build.dataset_ids,
+        has_existing_artifacts=True,
+        npi_batch_size=profile.PROFILE_NPI_BATCH_SIZE,
+    )
+    assert len(evidence_batches) == 1577
+    assert len(compact_batches) == 400
+    assert {batch.kind for batch in evidence_batches} == {"fact"}
+    assert {batch.kind for batch in compact_batches} == {"npi"}
+
+
 def test_profile_batch_and_checkpoint_value_contracts():
     """Cover bounded batch construction and strict checkpoint decoding."""
     build = _profile_build()
@@ -421,47 +477,478 @@ def test_profile_batch_and_checkpoint_value_contracts():
     assert importer._provider_directory_profile_build_id(explicit_build) == (
         "profile-build"
     )
-    evidence_batches = importer._provider_directory_profile_evidence_batches(
+    partial_build = importer.replace(
         build,
+        retained_source_ids=("source_a", "source_b"),
+    )
+    evidence_batches = importer._provider_directory_profile_evidence_batches(
+        partial_build,
         has_existing_artifacts=True,
     )
-    assert [batch.kind for batch in evidence_batches] == ["copy", "source"]
-    assert evidence_batches[1].source_id == "source_a"
-    assert evidence_batches[1].dataset_id == "dataset_a"
-    assert evidence_batches[1].fact_type is None
+    _assert_single_source_profile_evidence_batches(evidence_batches)
     compact_batches = importer._provider_directory_profile_compact_batches(
+        source_ids=("source_a",),
+        retained_source_ids=("source_a", "source_b"),
+        dataset_ids=("dataset_a",),
         has_existing_artifacts=True,
         npi_batch_size=500_000_000,
     )
-    assert [batch.kind for batch in compact_batches] == ["copy", "affected"]
-    assert compact_batches[-1].npi_start is None
-    assert compact_batches[-1].npi_end is None
-    source_ids = tuple(f"source_{index:02d}" for index in range(18))
-    dataset_ids = tuple(f"dataset_{index:02d}" for index in range(18))
-    global_build = importer.replace(
-        build,
-        source_ids=source_ids,
-        retained_source_ids=source_ids,
-        dataset_ids=dataset_ids,
-    )
-    assert len(
-        importer._provider_directory_profile_evidence_batches(
-            global_build,
-            has_existing_artifacts=True,
-        )
-    ) == 19
-    assert len(
-        importer._provider_directory_profile_compact_batches(
-            has_existing_artifacts=True,
-            npi_batch_size=profile.PROFILE_NPI_BATCH_SIZE,
-        )
-    ) == 2
+    assert [batch.kind for batch in compact_batches] == [
+        "copy",
+        "npi",
+        "npi",
+        "npi",
+        "npi",
+    ]
+    assert compact_batches[1].npi_start == profile.NPI_MIN
+    assert compact_batches[-1].npi_end == profile.NPI_MAX + 1
+    _assert_global_profile_batch_plan(build)
     with pytest.raises(ValueError, match="batch size must be positive"):
         importer._provider_directory_profile_compact_batches(
+            source_ids=(),
+            retained_source_ids=(),
+            dataset_ids=(),
             has_existing_artifacts=False,
             npi_batch_size=0,
         )
     _assert_profile_checkpoint_value_contracts(build)
+
+
+def test_profile_batch_plan_reserves_plan_membership_bucket_geometry(
+    monkeypatch,
+):
+    """Keep the pending membership fact inside the composite resume identity."""
+    build = _profile_build()
+    current_plan = importer._provider_directory_profile_batch_plan(
+        build.source_ids,
+        build.retained_source_ids,
+        build.dataset_ids,
+        has_existing_artifacts=False,
+    )
+    fact_types = tuple(
+        dict.fromkeys(
+            (*profile.PROFILE_EVIDENCE_FACT_TYPES, "plan_membership")
+        )
+    )
+    monkeypatch.setattr(
+        profile,
+        "PROFILE_EVIDENCE_FACT_TYPES",
+        fact_types,
+    )
+    batch_plan = importer._provider_directory_profile_batch_plan(
+        build.source_ids,
+        build.retained_source_ids,
+        build.dataset_ids,
+        has_existing_artifacts=False,
+    )
+    membership_batches = [
+        batch
+        for batch in batch_plan.evidence_batches
+        if batch.fact_type == "plan_membership"
+    ]
+
+    assert len(batch_plan.evidence_batches) == 115
+    assert batch_plan.fingerprint != current_plan.fingerprint
+    assert len(membership_batches) == (
+        profile.PROFILE_AFFILIATION_ROLE_BUCKETS
+    )
+    assert [batch.role_bucket for batch in membership_batches] == list(
+        range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
+    )
+    assert importer._provider_directory_profile_bucket_relations(
+        "plan_membership"
+    ) == (
+        importer.ProviderDirectoryOrganizationAffiliation.__tablename__,
+    )
+
+
+def test_profile_batch_plan_rejects_source_dataset_cardinality_drift():
+    """Fail closed before positional source/dataset pairing can truncate."""
+    with pytest.raises(RuntimeError, match="cardinality_changed"):
+        importer._provider_directory_profile_batch_plan(
+            ("source_a", "source_b"),
+            ("source_a", "source_b"),
+            ("dataset_a",),
+            has_existing_artifacts=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_ids", "retained_source_ids", "dataset_ids", "error"),
+    [
+        (
+            ("source_a", "source_a"),
+            ("source_a",),
+            ("dataset_a", "dataset_b"),
+            "selected_source_ids_not_unique",
+        ),
+        (
+            ("source_a",),
+            ("source_a", "source_a"),
+            ("dataset_a",),
+            "retained_source_ids_not_unique",
+        ),
+        (
+            ("source_a", "source_b"),
+            ("source_a", "source_b"),
+            ("dataset_a", "dataset_a"),
+            "selected_dataset_ids_not_unique",
+        ),
+        (
+            ("source_a",),
+            ("source_b",),
+            ("dataset_a",),
+            "selected_sources_not_retained",
+        ),
+    ],
+    ids=[
+        "duplicate-selected-source",
+        "duplicate-retained-source",
+        "ambiguous-selected-dataset",
+        "selected-source-not-retained",
+    ],
+)
+def test_profile_batch_plan_rejects_non_set_scope(
+    source_ids,
+    retained_source_ids,
+    dataset_ids,
+    error,
+):
+    """Reject duplicate or non-contained positional build scopes."""
+    with pytest.raises(RuntimeError, match=error):
+        importer._provider_directory_profile_batch_plan(
+            source_ids,
+            retained_source_ids,
+            dataset_ids,
+            has_existing_artifacts=True,
+        )
+
+
+def _profile_finalize_retry_checkpoint_states():
+    """Return pre- and post-last-batch evidence checkpoint states."""
+    return (
+        importer._ProviderDirectoryProfileBuildCheckpointState(
+            evidence_next_batch=0,
+            evidence_total_batches=1,
+            profile_next_batch=0,
+            profile_total_batches=1,
+            state="building_evidence",
+        ),
+        importer._ProviderDirectoryProfileBuildCheckpointState(
+            evidence_next_batch=1,
+            evidence_total_batches=1,
+            profile_next_batch=0,
+            profile_total_batches=1,
+            state="building_evidence",
+        ),
+    )
+
+
+def _profile_finalize_retry_batch_plan(fact_batch):
+    """Return the one-batch plan used to isolate finalization retries."""
+    return importer._ProviderDirectoryProfileBatchPlan(
+        has_existing_artifacts=False,
+        include_copy_batch=False,
+        evidence_batches=(fact_batch,),
+        compact_batches=(
+            importer._ProviderDirectoryProfileCompactBatch(
+                kind="npi",
+                npi_start=profile.NPI_MIN,
+                npi_end=profile.NPI_MAX + 1,
+            ),
+        ),
+        fingerprint="f" * 64,
+    )
+
+
+def _patch_profile_finalize_retry(monkeypatch, build):
+    """Install one fact batch and observable finalization dependencies."""
+    fact_batch = importer._ProviderDirectoryProfileEvidenceBatch(
+        kind="fact",
+        source_id="source_a",
+        dataset_id="dataset_a",
+        fact_type="name",
+    )
+    mark_state = AsyncMock()
+    advance = AsyncMock()
+    create_indexes = AsyncMock()
+    compact = AsyncMock()
+    mark_failed = AsyncMock()
+    prepared_stages = (SimpleNamespace(), SimpleNamespace())
+    batch_plan = _profile_finalize_retry_batch_plan(fact_batch)
+    patches_by_name = {
+        "_provider_directory_profile_build_plan": (
+            lambda *_args, **_params: batch_plan
+        ),
+        "_claim_provider_directory_profile_build_checkpoint": AsyncMock(
+            side_effect=_profile_finalize_retry_checkpoint_states()
+        ),
+        "_has_provider_directory_profile_artifacts": AsyncMock(return_value=False),
+        "_advance_provider_directory_profile_build_checkpoint": advance,
+        "_create_provider_directory_profile_indexes": create_indexes,
+        "_populate_provider_directory_profile_compact_stage": compact,
+        "_provider_directory_profile_metrics": AsyncMock(
+            return_value={"profile_rows": 1}
+        ),
+        "_prepare_provider_directory_profile_stages": AsyncMock(
+            return_value=prepared_stages
+        ),
+        "_mark_profile_build_checkpoint_failed": mark_failed,
+        "_mark_profile_build_checkpoint_state": mark_state,
+    }
+    for name, replacement in patches_by_name.items():
+        monkeypatch.setattr(importer, name, replacement)
+    attempts = SimpleNamespace(inserts=0, analyzes=0)
+
+    async def status(sql, **_params):
+        statement = str(sql)
+        attempts.inserts += int(
+            "ON CONFLICT (evidence_key) DO NOTHING" in statement
+        )
+        if statement.startswith("ANALYZE "):
+            attempts.analyzes += 1
+            if attempts.analyzes == 1:
+                raise RuntimeError("evidence analyze failed")
+        return 1
+
+    monkeypatch.setattr(importer.db, "status", status)
+    return SimpleNamespace(
+        advance=advance,
+        compact=compact,
+        create_indexes=create_indexes,
+        mark_failed=mark_failed,
+        mark_state=mark_state,
+        attempts=attempts,
+        prepared_stages=prepared_stages,
+    )
+
+
+def _assert_high_fanout_profile_calls(evidence_calls, profile_calls):
+    """Require 19-source fact fanout and complete 5M NPI geometry."""
+    assert len(evidence_calls) == 1577
+    for fact_type in ("affiliation", "organization"):
+        assert sum(
+            call["fact_type"] == fact_type for call in evidence_calls
+        ) == 19 * profile.PROFILE_AFFILIATION_ROLE_BUCKETS
+    assert len(profile_calls) == 400
+    assert (
+        profile_calls[0]["npi_start"],
+        profile_calls[-1]["npi_end"],
+    ) == (profile.NPI_MIN, profile.NPI_MAX + 1)
+    assert all(
+        call["npi_end"] - call["npi_start"]
+        == profile.PROFILE_NPI_BATCH_SIZE
+        for call in profile_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_bucket_index_is_limited_to_artifact_scope(
+    monkeypatch,
+):
+    """Never create the build-local expression index on a serving table."""
+    relation_name = (
+        importer.ProviderDirectoryPractitionerRole.__tablename__
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    assert (
+        await importer._prepare_provider_directory_profile_bucket_index(
+            "mrf",
+            relation_name,
+        )
+        is None
+    )
+    status.assert_not_awaited()
+
+    with importer._provider_directory_artifact_relation_scope(
+        {relation_name: f"{relation_name}_serving"}
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="provider_directory_profile_bucket_scope_relation_invalid",
+        ):
+            await importer._prepare_provider_directory_profile_bucket_index(
+                "mrf",
+                relation_name,
+            )
+    status.assert_not_awaited()
+
+    scope_table = (
+        importer._provider_directory_artifact_scope_table_name(
+            relation_name,
+            "bucket-index-contract",
+        )
+    )
+    index_name, index_sql = (
+        importer._provider_directory_profile_bucket_index_sql(
+            "mrf",
+            scope_table,
+        )
+    )
+    assert len(index_name) <= 63
+    assert "CREATE INDEX IF NOT EXISTS" in index_sql
+    assert '"source_id"' in index_sql
+    assert "hashtextextended(\"resource_id\", 0)" in index_sql
+    assert (
+        f", {profile.PROFILE_AFFILIATION_ROLE_BUCKETS})" in index_sql
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_evidence_batch_failure_retries_only_finalization(
+    monkeypatch,
+):
+    """Retry indexes, ANALYZE, and state after the last fact was committed."""
+    build = _profile_build()
+    controls = _patch_profile_finalize_retry(monkeypatch, build)
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+
+    with pytest.raises(RuntimeError, match="evidence analyze failed"):
+        await importer._build_provider_directory_profile_stages(
+            build,
+            fence,
+            fence,
+        )
+    build_result = await importer._build_provider_directory_profile_stages(
+        build,
+        fence,
+        fence,
+    )
+
+    assert build_result == (
+        {"profile_rows": 1},
+        controls.prepared_stages,
+    )
+    assert controls.attempts.inserts == 1
+    assert controls.attempts.analyzes == 2
+    assert controls.create_indexes.await_count == 2
+    controls.advance.assert_awaited_once_with(
+        build,
+        phase="evidence",
+        expected_batch=0,
+        total_batches=1,
+    )
+    controls.mark_failed.assert_awaited_once()
+    controls.mark_state.assert_awaited_once_with(
+        build,
+        "evidence_complete",
+    )
+    controls.compact.assert_awaited_once()
+
+
+def _bounded_evidence_sql_spy(evidence_calls):
+    """Return a strict bounded-evidence SQL spy."""
+    def bounded_evidence_sql(**params):
+        assert params["fact_type"] in profile.PROFILE_EVIDENCE_FACT_TYPES
+        assert params["role_bucket_count"] >= 1
+        assert 0 <= params["role_bucket"] < params["role_bucket_count"]
+        evidence_calls.append(params)
+        return f"BOUNDED EVIDENCE {len(evidence_calls)}"
+
+    return bounded_evidence_sql
+
+
+def _bounded_profile_sql_spy(profile_calls):
+    """Return a strict bounded-profile SQL spy."""
+    def bounded_profile_sql(**params):
+        assert params["npi_start"] is not None
+        assert params["npi_end"] is not None
+        profile_calls.append(params)
+        return f"BOUNDED PROFILE {len(profile_calls)}"
+
+    return bounded_profile_sql
+
+
+def _install_high_fanout_profile_spies(
+    monkeypatch,
+    evidence_calls,
+    profile_calls,
+) -> SimpleNamespace:
+    """Install SQL spies and return their async call trackers."""
+    status = AsyncMock(return_value=1)
+    prepare_bucket_index = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_create_provider_directory_profile_indexes",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_prepare_provider_directory_profile_bucket_index",
+        prepare_bucket_index,
+    )
+    profile_patches_by_name = {
+        "copy_existing_evidence_sql": lambda **_params: "COPY EVIDENCE",
+        "copy_unaffected_profiles_sql": lambda **_params: "COPY PROFILE",
+        "profile_evidence_insert_sql": _bounded_evidence_sql_spy(
+            evidence_calls
+        ),
+        "profile_insert_sql": _bounded_profile_sql_spy(profile_calls),
+    }
+    for name, replacement in profile_patches_by_name.items():
+        monkeypatch.setattr(profile, name, replacement)
+    return SimpleNamespace(
+        status=status,
+        prepare_bucket_index=prepare_bucket_index,
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_high_fanout_plan_never_builds_unbounded_statements(
+    monkeypatch,
+):
+    """Keep the global build fact-, role-, and NPI-bounded end to end."""
+    source_ids = tuple(f"source_{index:02d}" for index in range(19))
+    dataset_ids = tuple(f"dataset_{index:02d}" for index in range(19))
+    build = importer.replace(
+        _profile_build(),
+        source_ids=source_ids,
+        retained_source_ids=source_ids,
+        dataset_ids=dataset_ids,
+    )
+    evidence_calls = []
+    profile_calls = []
+    spies = _install_high_fanout_profile_spies(
+        monkeypatch,
+        evidence_calls,
+        profile_calls,
+    )
+
+    await importer._populate_provider_directory_profile_evidence_stage(
+        build,
+        has_evidence_target=True,
+        bounded=True,
+    )
+    await importer._populate_provider_directory_profile_compact_stage(
+        build,
+        has_existing_artifacts=True,
+        npi_batch_size=profile.PROFILE_NPI_BATCH_SIZE,
+    )
+
+    _assert_high_fanout_profile_calls(evidence_calls, profile_calls)
+    assert [
+        call.args for call in spies.prepare_bucket_index.await_args_list
+    ] == [
+        (
+            "mrf",
+            importer.ProviderDirectoryPractitionerRole.__tablename__,
+        ),
+        (
+            "mrf",
+            importer.ProviderDirectoryOrganizationAffiliation.__tablename__,
+        ),
+    ]
+    assert all(
+        call.args[0] != "COPY EVIDENCE"
+        for call in spies.status.await_args_list
+    )
+    assert all(
+        call.args[0] != "COPY PROFILE"
+        for call in spies.status.await_args_list
+    )
 
 
 async def _assert_logged_profile_retry_lineage(
@@ -624,19 +1111,19 @@ async def test_profile_checkpoint_rejects_compact_progress_before_evidence(
 
 
 @pytest.mark.asyncio
-async def test_profile_strategy_bump_invalidates_source_fact_checkpoint(
+async def test_profile_batch_total_mismatch_invalidates_incompatible_checkpoint(
     monkeypatch,
 ):
-    """The interrupted 937/401 lineage cannot resume under the 19/2 plan."""
+    """The v2 strategy rejects checkpoints from the regressed v1 geometry."""
     build = _profile_build()
     checkpoint_by_name = _profile_checkpoint_by_name(build)
     checkpoint_by_name.update(
         {
             "strategy_version": "source-fact-role32-npi5m-v1",
-            "evidence_next_batch": 14,
-            "evidence_total_batches": 937,
+            "evidence_next_batch": 1,
+            "evidence_total_batches": 1,
             "profile_next_batch": 0,
-            "profile_total_batches": 401,
+            "profile_total_batches": 1,
             "state": "failed",
         }
     )
@@ -654,10 +1141,300 @@ async def test_profile_strategy_bump_invalidates_source_fact_checkpoint(
         has_existing_artifacts=False,
         evidence_build_fence=fence,
         profile_build_fence=fence,
-        evidence_total_batches=1,
-        profile_total_batches=1,
+        evidence_total_batches=83,
+        profile_total_batches=400,
     )
     stage_identity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_profile_batch_total_mismatch_reinitializes_logged_stages(
+    monkeypatch,
+):
+    """Replace the regressed v1 checkpoint with the restored v1 batch totals."""
+    build = _profile_build()
+    checkpoint_by_name = _profile_checkpoint_by_name(build)
+    checkpoint_by_name.update(
+        {
+            "evidence_next_batch": 1,
+            "evidence_total_batches": 1,
+            "profile_total_batches": 1,
+            "state": "failed",
+        }
+    )
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    status = AsyncMock(return_value=1)
+    drop_stages = AsyncMock()
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(return_value=checkpoint_by_name),
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_drop_profile_stages_for_reinitialize",
+        drop_stages,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_relation_identity",
+        AsyncMock(side_effect=[(21, "r", "p"), (22, "r", "p")]),
+    )
+
+    initialized = (
+        await importer._claim_provider_directory_profile_build_checkpoint(
+            build,
+            has_existing_artifacts=False,
+            evidence_build_fence=(
+                importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+            ),
+            profile_build_fence=(
+                importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+            ),
+        )
+    )
+
+    drop_stages.assert_awaited_once_with(build, checkpoint_by_name)
+    assert initialized.evidence_total_batches == 83
+    assert initialized.profile_total_batches == 400
+    assert initialized.state == "building_evidence"
+
+
+def _global_profile_retry_scope():
+    """Return a synthetic 19-source global Profile scope."""
+    source_ids = tuple(f"source_{index:02d}" for index in range(19))
+    datasets = tuple(
+        importer.ProviderDirectoryArtifactDataset(
+            source_id=source_id,
+            endpoint_id=f"endpoint_{index:02d}",
+            dataset_id=f"dataset_{index:02d}",
+            evidence_run_id=f"run_{index:02d}",
+        )
+        for index, source_id in enumerate(source_ids)
+    )
+    source_contexts = tuple(
+        importer._ProviderDirectoryProfileSourceContext(
+            source_id=source_id,
+            endpoint_id=f"endpoint_{index:02d}",
+            canonical_api_base=f"https://example-{index:02d}.test/fhir",
+            org_name=f"Example {index:02d}",
+            plan_name=None,
+        )
+        for index, source_id in enumerate(source_ids)
+    )
+    return source_ids, datasets, source_contexts
+
+
+def _patch_global_profile_resolution(monkeypatch):
+    """Install deterministic global resolution dependencies."""
+    source_ids, datasets, source_contexts = _global_profile_retry_scope()
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_scope_source_ids",
+        AsyncMock(
+            return_value=(list(source_ids), list(source_ids), source_contexts)
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_now",
+        lambda: datetime.datetime(2026, 7, 29, tzinfo=datetime.UTC),
+    )
+    first = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer.db, "first", first)
+    return SimpleNamespace(
+        source_ids=source_ids,
+        datasets=datasets,
+        dataset_fence=importer.ProviderDirectoryArtifactDatasetFence(datasets),
+        evidence_fence=importer.ProviderDirectoryArtifactBuildFence(
+            target_oid=101
+        ),
+        profile_fence=importer.ProviderDirectoryArtifactBuildFence(
+            target_oid=102
+        ),
+        first=first,
+    )
+
+
+def _regressed_global_checkpoint_map(initial_build, source_ids, datasets):
+    """Describe the legacy collapsed 20/2 global checkpoint."""
+    return {
+        "build_id": initial_build.build_id,
+        "strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
+        "schema_version": profile.PROFILE_SCHEMA_VERSION,
+        "resume_lineage_hash": initial_build.resume_lineage_hash,
+        "profile_as_of": "2026-07-01",
+        "source_ids": list(source_ids),
+        "retained_source_ids": list(source_ids),
+        "dataset_ids": [dataset.dataset_id for dataset in datasets],
+        "evidence_stage": initial_build.evidence_stage,
+        "profile_stage": initial_build.profile_stage,
+        "evidence_stage_oid": 11,
+        "profile_stage_oid": 12,
+        "evidence_target_oid": 101,
+        "profile_target_oid": 102,
+        "has_existing_artifacts": True,
+        "evidence_next_batch": 20,
+        "evidence_total_batches": 20,
+        "profile_next_batch": 0,
+        "profile_total_batches": 2,
+        "state": "failed",
+    }
+
+
+async def _assert_global_profile_reinitialized(
+    monkeypatch,
+    resolved_build,
+    checkpoint_map,
+    evidence_fence,
+    profile_fence,
+):
+    """Require reinitialization with fresh as-of and restored totals."""
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    status = AsyncMock(return_value=1)
+    drop_stages = AsyncMock()
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_drop_profile_stages_for_reinitialize",
+        drop_stages,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_require_provider_directory_profile_stage_oid",
+        AsyncMock(side_effect=[21, 22]),
+    )
+    initialized = (
+        await importer._claim_provider_directory_profile_build_checkpoint(
+            resolved_build,
+            has_existing_artifacts=True,
+            evidence_build_fence=evidence_fence,
+            profile_build_fence=profile_fence,
+        )
+    )
+    drop_stages.assert_awaited_once_with(resolved_build, checkpoint_map)
+    assert initialized.evidence_total_batches == 1577
+    assert initialized.profile_total_batches == 400
+    insert_call = next(
+        call
+        for call in status.await_args_list
+        if "profile_build_checkpoint" in str(call.args[0])
+        and "INSERT INTO" in str(call.args[0])
+    )
+    assert insert_call.kwargs["profile_as_of"] == "2026-07-29"
+    assert insert_call.kwargs["evidence_total_batches"] == 1577
+    assert insert_call.kwargs["profile_total_batches"] == 400
+
+
+@pytest.mark.asyncio
+async def test_profile_resolve_reinitializes_regressed_global_checkpoint_as_of(
+    monkeypatch,
+):
+    """Give a 19-source 20/2 checkpoint fresh as-of and 1577/400 totals."""
+    controls = _patch_global_profile_resolution(monkeypatch)
+    initial_build = await importer._resolve_provider_directory_profile_build(
+        "mrf",
+        "initial-run",
+        controls.dataset_fence,
+        controls.evidence_fence,
+        controls.profile_fence,
+        has_existing_artifacts=True,
+    )
+    checkpoint_map = _regressed_global_checkpoint_map(
+        initial_build,
+        controls.source_ids,
+        controls.datasets,
+    )
+    controls.first.return_value = checkpoint_map
+    stage_identity = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_relation_identity",
+        stage_identity,
+    )
+
+    resolved_build = await importer._resolve_provider_directory_profile_build(
+        "mrf",
+        "retry-run",
+        controls.dataset_fence,
+        controls.evidence_fence,
+        controls.profile_fence,
+        has_existing_artifacts=True,
+    )
+
+    assert resolved_build.profile_as_of == "2026-07-29"
+    stage_identity.assert_not_awaited()
+    await _assert_global_profile_reinitialized(
+        monkeypatch,
+        resolved_build,
+        checkpoint_map,
+        controls.evidence_fence,
+        controls.profile_fence,
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_plan_order_change_reinitializes_same_geometry(
+    monkeypatch,
+):
+    """Reject same-total checkpoints when ordered fact execution changes."""
+    controls = _patch_global_profile_resolution(monkeypatch)
+    original_build = await importer._resolve_provider_directory_profile_build(
+        "mrf",
+        "initial-run",
+        controls.dataset_fence,
+        controls.evidence_fence,
+        controls.profile_fence,
+        has_existing_artifacts=True,
+    )
+    fact_types = profile.PROFILE_EVIDENCE_FACT_TYPES
+    monkeypatch.setattr(
+        profile,
+        "PROFILE_EVIDENCE_FACT_TYPES",
+        (fact_types[1], fact_types[0], *fact_types[2:]),
+    )
+    changed_build = await importer._resolve_provider_directory_profile_build(
+        "mrf",
+        "retry-run",
+        controls.dataset_fence,
+        controls.evidence_fence,
+        controls.profile_fence,
+        has_existing_artifacts=True,
+    )
+    assert changed_build.build_id != original_build.build_id
+    checkpoint_map = _profile_checkpoint_by_name(
+        changed_build,
+        state="failed",
+        evidence_next_batch=1577,
+        evidence_total_batches=1577,
+        profile_total_batches=400,
+    )
+    checkpoint_map.update(
+        {
+            "resume_lineage_hash": original_build.resume_lineage_hash,
+            "evidence_target_oid": 101,
+            "profile_target_oid": 102,
+            "has_existing_artifacts": True,
+        }
+    )
+    controls.first.return_value = checkpoint_map
+    await _assert_global_profile_reinitialized(
+        monkeypatch,
+        changed_build,
+        checkpoint_map,
+        controls.evidence_fence,
+        controls.profile_fence,
+    )
 
 
 async def _assert_reclaimed_profile_checkpoint_states(
@@ -691,7 +1468,7 @@ async def _assert_reclaimed_profile_checkpoint_states(
     checkpoint_by_name.update(
         {
             "state": "failed",
-            "profile_next_batch": 1,
+            "profile_next_batch": 400,
         }
     )
     ready_state = (
@@ -774,6 +1551,79 @@ async def test_profile_checkpoint_claim_initializes_and_reclaims_logged_stages(
         stage_identity,
         status,
     )
+
+
+def _failed_profile_checkpoint_maps(build):
+    """Return failures before and after evidence finalization."""
+    unfinalized_checkpoint_map = _profile_checkpoint_by_name(
+        build,
+        state="failed",
+    )
+    unfinalized_checkpoint_map["last_error"] = (
+        "RuntimeError: analyze failed [checkpoint_state=building_evidence]"
+    )
+    finalized_checkpoint_map = {
+        **unfinalized_checkpoint_map,
+        "last_error": (
+            "RuntimeError: compact failed "
+            "[checkpoint_state=evidence_complete]"
+        ),
+    }
+    return unfinalized_checkpoint_map, finalized_checkpoint_map
+
+
+@pytest.mark.asyncio
+async def test_profile_claim_reopens_only_unfinalized_failed_evidence(
+    monkeypatch,
+):
+    """Use the pre-failure state marker to resume the correct phase."""
+    build = _profile_build()
+    checkpoint_maps = _failed_profile_checkpoint_maps(build)
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(side_effect=checkpoint_maps),
+    )
+    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=1))
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_relation_identity",
+        AsyncMock(
+            side_effect=[
+                (11, "r", "p"),
+                (12, "r", "p"),
+                (11, "r", "p"),
+                (12, "r", "p"),
+            ]
+        ),
+    )
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+
+    unfinalized_claim = (
+        await importer._claim_provider_directory_profile_build_checkpoint(
+            build,
+            has_existing_artifacts=False,
+            evidence_build_fence=fence,
+            profile_build_fence=fence,
+        )
+    )
+    finalized_claim = (
+        await importer._claim_provider_directory_profile_build_checkpoint(
+            build,
+            has_existing_artifacts=False,
+            evidence_build_fence=fence,
+            profile_build_fence=fence,
+        )
+    )
+
+    assert unfinalized_claim.state == "building_evidence"
+    assert finalized_claim.state == "building_profile"
 
 
 async def _assert_profile_checkpoint_ownership_failures(build, status):
@@ -979,7 +1829,9 @@ async def _assert_bounded_profile_batch_checkpoints(
         lambda **_params: (
             importer._ProviderDirectoryProfileCompactBatch(kind="copy"),
             importer._ProviderDirectoryProfileCompactBatch(
-                kind="affected",
+                kind="npi",
+                npi_start=1_000_000_000,
+                npi_end=1_005_000_000,
             ),
         ),
     )
@@ -993,7 +1845,8 @@ async def _assert_bounded_profile_batch_checkpoints(
         0,
         1,
     ]
-    assert "profile_npi_start" not in status.await_args_list[1].kwargs
+    assert status.await_args_list[1].kwargs["profile_npi_start"] == 1_000_000_000
+    assert status.await_args_list[1].kwargs["profile_npi_end"] == 1_005_000_000
     mark_state.assert_awaited_once_with(build, "ready")
 
 
@@ -1028,9 +1881,12 @@ async def test_profile_bounded_population_checkpoints_copy_and_range_batches(
         lambda *_args, **_params: (
             importer._ProviderDirectoryProfileEvidenceBatch(kind="copy"),
             importer._ProviderDirectoryProfileEvidenceBatch(
-                kind="source",
+                kind="fact",
                 source_id="source_a",
                 dataset_id="dataset_a",
+                fact_type="affiliation",
+                role_bucket_count=2,
+                role_bucket=1,
             ),
         ),
     )
@@ -1044,7 +1900,7 @@ async def test_profile_bounded_population_checkpoints_copy_and_range_batches(
         0,
         1,
     ]
-    assert "profile_role_bucket" not in status.await_args_list[1].kwargs
+    assert status.await_args_list[1].kwargs["profile_role_bucket"] == 1
     mark_state.assert_awaited_once_with(build, "evidence_complete")
 
     status.reset_mock()
@@ -2738,6 +3594,9 @@ async def test_profile_unbounded_and_completed_batch_paths(monkeypatch):
         has_existing_artifacts=False,
     )
     compact_batches = importer._provider_directory_profile_compact_batches(
+        source_ids=build.source_ids,
+        retained_source_ids=build.retained_source_ids,
+        dataset_ids=build.dataset_ids,
         has_existing_artifacts=True,
         npi_batch_size=profile.PROFILE_NPI_BATCH_SIZE,
     )

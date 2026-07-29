@@ -1601,32 +1601,16 @@ def _audit_runner_dependencies(index, config, source_occurrences):
     )
 
 
-def test_runner_passes_independent_occurrence_checks_and_bounds_query_scans(tmp_path):
-    """Ensure independent occurrence checks pass with bounded source query scans."""
-
-    source_path = _write_source_fixture(
-        tmp_path / "sensitive-input.json.gz",
-        references_before=False,
-        duplicate_price=False,
-    )
-    raw_source_sha256 = audit.source_specs([source_path])[0].content_sha256
-    with _open_source_index(tmp_path, source_path) as index:
-        config = _audit_config()
-        source_occurrences = index.source_occurrences(3)
-        fetcher, api_occurrence_source = _audit_runner_dependencies(
-            index,
-            config,
-            source_occurrences,
-        )
-        scans_before = index.metrics["expected_tuple_query_scans"]
-        report = audit.AuditRunner(
-            index,
-            fetcher,
-            api_occurrence_source,
-            config,
-        ).execute_audit(started_at=dt.datetime.now(dt.timezone.utc))
-        scans_after = index.metrics["expected_tuple_query_scans"]
-
+def _assert_independent_occurrence_audit(
+    report,
+    fetcher,
+    api_occurrence_source,
+    config,
+    *,
+    query_scans: int,
+    raw_source_sha256: str,
+) -> None:
+    """Verify exact occurrence, bounded-scan, latency, and redaction contracts."""
     serialized = json.dumps(report, sort_keys=True)
     assert report["status"] == "pass"
     assert report["checks"]["source_occurrence_ids"] == 3
@@ -1636,10 +1620,10 @@ def test_runner_passes_independent_occurrence_checks_and_bounds_query_scans(tmp_
     assert report["api_audit_sample"] == {
         "contract": audit.AUDIT_SAMPLE_CONTRACT,
         "method": audit.AUDIT_SAMPLE_METHOD,
-            "sample_count": 3,
-            "complete_population": False,
-            "sample_digest": "ab" * 32,
-            "sample_digest_validated": True,
+        "sample_count": 3,
+        "complete_population": False,
+        "sample_digest": "ab" * 32,
+        "sample_digest_validated": True,
         "source_set_validated": True,
         "selected_occurrences": 3,
     }
@@ -1650,8 +1634,8 @@ def test_runner_passes_independent_occurrence_checks_and_bounds_query_scans(tmp_
         "complete served occurrence population" in limitation
         for limitation in report["limitations"]
     )
-    assert scans_after - scans_before >= report["checks"]["positive_queries"]
-    assert scans_after - scans_before <= (
+    assert query_scans >= report["checks"]["positive_queries"]
+    assert query_scans <= (
         report["checks"]["positive_queries"] + config.random_api_calls
     )
     expected_fetch_calls = (
@@ -1676,6 +1660,40 @@ def test_runner_passes_independent_occurrence_checks_and_bounds_query_scans(tmp_
     assert config.plan_id not in serialized
     assert config.snapshot_id not in serialized
     assert raw_source_sha256 not in serialized
+
+
+def test_runner_passes_independent_occurrence_checks_and_bounds_query_scans(tmp_path):
+    """Ensure independent occurrence checks pass with bounded source query scans."""
+    source_path = _write_source_fixture(
+        tmp_path / "sensitive-input.json.gz",
+        references_before=False,
+        duplicate_price=False,
+    )
+    raw_source_sha256 = audit.source_specs([source_path])[0].content_sha256
+    with _open_source_index(tmp_path, source_path) as index:
+        config = _audit_config()
+        source_occurrences = index.source_occurrences(3)
+        fetcher, api_occurrence_source = _audit_runner_dependencies(
+            index,
+            config,
+            source_occurrences,
+        )
+        scans_before = index.metrics["expected_tuple_query_scans"]
+        report = audit.AuditRunner(
+            index,
+            fetcher,
+            api_occurrence_source,
+            config,
+        ).execute_audit(started_at=dt.datetime.now(dt.timezone.utc))
+        query_scans = index.metrics["expected_tuple_query_scans"] - scans_before
+    _assert_independent_occurrence_audit(
+        report,
+        fetcher,
+        api_occurrence_source,
+        config,
+        query_scans=query_scans,
+        raw_source_sha256=raw_source_sha256,
+    )
 
 
 def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
