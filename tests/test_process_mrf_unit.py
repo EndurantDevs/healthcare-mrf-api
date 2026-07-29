@@ -1624,31 +1624,8 @@ def test_build_mrf_address_rows_creates_address_and_evidence():
     assert evidence_row["address_key"] == expected_address_key
 
 
-def test_build_mrf_address_rows_batches_contact_normalization(monkeypatch):
-    """Verify build mrf address rows batches contact normalization."""
-    seen_batches = []
-
-    def fake_canonicalize_contact_batch(rows):
-        rows = list(rows)
-        seen_batches.append(rows)
-        return [
-            {
-                "phone_number": "5125550000",
-                "phone_extension": None,
-                "fax_number_digits": "5125550199",
-                "fax_extension": None,
-            },
-            {
-                "phone_number": "5125550001",
-                "phone_extension": "12",
-                "fax_number_digits": None,
-                "fax_extension": None,
-            },
-        ]
-
-    monkeypatch.setattr(process_initial, "canonicalize_contact_batch", fake_canonicalize_contact_batch)
-
-    address_rows, _evidence_rows = process_initial._build_mrf_address_rows(
+def _mrf_contact_batch_fixture():
+    return (
         {
             "npi": "1234567890",
             "addresses": [
@@ -1677,6 +1654,37 @@ def test_build_mrf_address_rows_batches_contact_normalization(monkeypatch):
                 "network_tier": "PREFERRED",
             },
         },
+    )
+
+
+def test_build_mrf_address_rows_batches_contact_normalization(monkeypatch):
+    """Verify build mrf address rows batches contact normalization."""
+    seen_batches = []
+
+    def fake_canonicalize_contact_batch(rows):
+        rows = list(rows)
+        seen_batches.append(rows)
+        return [
+            {
+                "phone_number": "5125550000",
+                "phone_extension": None,
+                "fax_number_digits": "5125550199",
+                "fax_extension": None,
+            },
+            {
+                "phone_number": "5125550001",
+                "phone_extension": "12",
+                "fax_number_digits": None,
+                "fax_extension": None,
+            },
+        ]
+
+    monkeypatch.setattr(process_initial, "canonicalize_contact_batch", fake_canonicalize_contact_batch)
+
+    provider_payload, plan_lookup = _mrf_contact_batch_fixture()
+    address_rows, _evidence_rows = process_initial._build_mrf_address_rows(
+        provider_payload,
+        plan_lookup,
         "20260601000000",
         "https://example.test/provider.json",
         datetime.datetime(2026, 6, 1, 12, 0, 0),

@@ -50,13 +50,13 @@ async def test_binding_transaction_uses_one_owned_connection(monkeypatch):
         admit,
     )
 
-    result = (
+    binding_result = (
         await frozen_rate_binding_store.insert_or_compare_frozen_binding_transaction(
             {"source_file_import_id": "source-import"}
         )
     )
 
-    assert result == {"source_file_import_id": "source-import"}
+    assert binding_result == {"source_file_import_id": "source-import"}
     assert observed_calls == [
         (connection, {"source_file_import_id": "source-import"})
     ]

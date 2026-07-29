@@ -17,6 +17,11 @@ from api.ptg2_candidate_audit_v4 import (
     load_v4_candidate_scope,
     load_v4_pattern_provider_scope,
 )
+from api.ptg2_candidate_audit_v4_direct import (
+    is_direct_graph_capacity_failure,
+    load_v4_direct_provider_scope,
+    should_load_direct_graph_first,
+)
 from api.ptg2_serving import PTG2_SCHEMA, _required_shared_snapshot_key
 from api.ptg2_types import PTG2ServingTables
 from api.ptg2_v4_graph import load_v4_graph_root
@@ -25,7 +30,18 @@ from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
 )
 
 
-async def _load_v4_scope(
+def _provider_scope(
+    provider_set_keys_by_npi: dict[int, tuple[int, ...]],
+) -> reverse_scope.CandidateProviderScope:
+    """Shape one graph-first result for deferred exact forward loading."""
+
+    return reverse_scope.CandidateProviderScope(
+        provider_set_keys_by_npi=provider_set_keys_by_npi,
+        price_keys_by_occurrence=None,
+    )
+
+
+async def _load_direct_v4_scope(
     session: Any,
     serving_tables: PTG2ServingTables,
     challenges: Sequence[AuditBatchChallenge],
@@ -35,26 +51,30 @@ async def _load_v4_scope(
     schema_name: str,
     retention_budget: CandidateAuditDecodedRetentionBudget,
 ) -> reverse_scope.CandidateProviderScope:
-    """Select pattern graph-first or direct code-first V4 proof."""
+    """Choose graph-first or code-first direct proof before forward I/O."""
 
-    graph_root = await load_v4_graph_root(
-        session,
-        _required_shared_snapshot_key(serving_tables),
-        schema_name=schema_name,
-    )
-    if graph_root.representation == "pattern_v1":
-        provider_sets_by_npi = await load_v4_pattern_provider_scope(
-            session,
-            serving_tables,
-            challenges,
-            persisted_occurrences,
-            schema_name=schema_name,
-            retention_budget=retention_budget,
-        )
-        return reverse_scope.CandidateProviderScope(
-            provider_set_keys_by_npi=provider_sets_by_npi,
-            price_keys_by_occurrence=None,
-        )
+    if should_load_direct_graph_first(
+        code_index,
+        retention_budget,
+        challenges=challenges,
+        persisted_audit_occurrences=persisted_occurrences,
+    ):
+        proven_npis: list[int] = []
+        try:
+            provider_sets_by_npi = await load_v4_direct_provider_scope(
+                session,
+                serving_tables,
+                challenges,
+                persisted_occurrences,
+                schema_name=schema_name,
+                retention_budget=retention_budget,
+                coordinate_observer=proven_npis.append,
+            )
+        except Exception as exc:
+            if proven_npis or not is_direct_graph_capacity_failure(exc):
+                raise
+        else:
+            return _provider_scope(provider_sets_by_npi)
     direct_scope = await load_v4_candidate_scope(
         session,
         serving_tables,
@@ -71,6 +91,44 @@ async def _load_v4_scope(
     return reverse_scope.CandidateProviderScope(
         provider_set_keys_by_npi=direct_scope.provider_set_keys_by_npi,
         price_keys_by_occurrence=direct_scope.price_keys_by_occurrence,
+    )
+
+
+async def _load_v4_scope(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    challenges: Sequence[AuditBatchChallenge],
+    persisted_occurrences: Sequence[PersistedAuditOccurrence],
+    code_index: CandidateCodeIndex,
+    *,
+    schema_name: str,
+    retention_budget: CandidateAuditDecodedRetentionBudget,
+) -> reverse_scope.CandidateProviderScope:
+    """Select pattern graph-first or bounded direct V4 proof."""
+
+    graph_root = await load_v4_graph_root(
+        session,
+        _required_shared_snapshot_key(serving_tables),
+        schema_name=schema_name,
+    )
+    if graph_root.representation == "pattern_v1":
+        provider_sets_by_npi = await load_v4_pattern_provider_scope(
+            session,
+            serving_tables,
+            challenges,
+            persisted_occurrences,
+            schema_name=schema_name,
+            retention_budget=retention_budget,
+        )
+        return _provider_scope(provider_sets_by_npi)
+    return await _load_direct_v4_scope(
+        session,
+        serving_tables,
+        challenges,
+        persisted_occurrences,
+        code_index,
+        schema_name=schema_name,
+        retention_budget=retention_budget,
     )
 
 

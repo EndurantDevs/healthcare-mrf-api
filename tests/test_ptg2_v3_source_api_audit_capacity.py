@@ -1320,6 +1320,28 @@ def _sha256(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _candidate_attestation_target():
+    return {
+        "expected_architecture": "postgres_binary_v3",
+        "expected_storage_generation": "shared_blocks_v3",
+        "expected_database_backend": "postgresql",
+        "expected_snapshot_lifecycle": "validated",
+        "architecture_assertion": "required_postgresql_session_evidence",
+        "api_path_sha256": _sha256("/api/v1/pricing/providers/audit-search-by-procedure"),
+        "api_audit_path_sha256": _sha256(
+            "/api/v1/pricing/providers/audit-occurrences"
+        ),
+        "endpoint_contract": "pricing.providers.search_by_procedure",
+        "audit_endpoint_contract": "persisted_served_occurrence_sample_v2",
+        "snapshot_id_sha256": _sha256("snap_new"),
+        "source_key_sha256": _sha256("source_a"),
+        "plan_id_sha256": _sha256("12-3456789"),
+        "market_type_sha256": _sha256("group"),
+        "tls_verified": True,
+        "transport_contract": "verified_https_v1",
+    }
+
+
 def _candidate_attestation_fixture_report():
     """Build the release-audit fixture with capacity evidence for attestation."""
 
@@ -1335,23 +1357,7 @@ def _candidate_attestation_fixture_report():
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
         "duration_seconds": 600.0,
-        "target": {
-            "expected_architecture": "postgres_binary_v3",
-            "expected_storage_generation": "shared_blocks_v3",
-            "expected_database_backend": "postgresql",
-            "expected_snapshot_lifecycle": "validated",
-            "architecture_assertion": "required_postgresql_session_evidence",
-            "api_path_sha256": _sha256("/api/v1/pricing/providers/audit-search-by-procedure"),
-            "api_audit_path_sha256": _sha256("/api/v1/pricing/providers/audit-occurrences"),
-            "endpoint_contract": "pricing.providers.search_by_procedure",
-            "audit_endpoint_contract": "persisted_served_occurrence_sample_v2",
-            "snapshot_id_sha256": _sha256("snap_new"),
-            "source_key_sha256": _sha256("source_a"),
-            "plan_id_sha256": _sha256("12-3456789"),
-            "market_type_sha256": _sha256("group"),
-            "tls_verified": True,
-            "transport_contract": "verified_https_v1",
-        },
+        "target": _candidate_attestation_target(),
         "reproducibility": {},
         "source": {
             "provider_identifier_quarantine": (

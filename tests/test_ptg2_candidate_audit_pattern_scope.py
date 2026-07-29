@@ -285,6 +285,7 @@ def _final_parity_occurrence(npi):
 def _final_parity_code_index():
     code_fields_by_name = {
         "code_key": 7,
+        "rate_count": 1,
         "reported_code_system": "CPT",
         "reported_code": "99213",
         "negotiation_arrangement": "ffs",

@@ -217,14 +217,8 @@ async def _assert_shared_rate_provider_scope(monkeypatch) -> None:
     ) == {1_111_111_111: {7, 8}}
 
 
-async def _assert_explicit_npi_rate_scopes(monkeypatch) -> None:
-    monkeypatch.setattr(serving, "_require_strict_shared_v3", lambda _tables: None)
-    assert await serving._version_three_explicit_npi_graph_scope(
-        object(),
-        _tables(),
-        {"npi": None},
-    ) is None
-
+async def _assert_direct_npi_rate_scope(monkeypatch) -> None:
+    """Assert bounded graph-first intersection for a direct code request."""
     monkeypatch.setattr(
         serving,
         "_ptg2_manifest_plan_code_values",
@@ -232,9 +226,17 @@ async def _assert_explicit_npi_rate_scopes(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(17, "direct_v1", b"d" * 32)),
+    )
+    monkeypatch.setattr(
+        serving,
         "_shared_rate_provider_set_keys",
         AsyncMock(return_value=()),
     )
+    serving._v4_sets_by_npi.return_value = {
+        1_111_111_111: (7, 8),
+    }
     empty_scope = await serving._version_three_explicit_npi_graph_scope(
         object(),
         _tables(),
@@ -242,7 +244,7 @@ async def _assert_explicit_npi_rate_scopes(monkeypatch) -> None:
     )
     assert empty_scope == serving._ExplicitNpiGraphScope(1_111_111_111, ())
 
-    serving._shared_rate_provider_set_keys.return_value = (7, 8)
+    serving._shared_rate_provider_set_keys.return_value = (8,)
     serving._v4_sets_by_npi.return_value = {1_111_111_111: (8,)}
     scoped = await serving._version_three_explicit_npi_graph_scope(
         object(),
@@ -252,8 +254,22 @@ async def _assert_explicit_npi_rate_scopes(monkeypatch) -> None:
     assert scoped == serving._ExplicitNpiGraphScope(1_111_111_111, (8,))
     assert serving._v4_sets_by_npi.await_args.kwargs[
         "allowed_provider_set_keys"
-    ] == frozenset({7, 8})
+    ] is None
+    assert serving._v4_sets_by_npi.await_args.kwargs["max_members"] == 64
+    assert serving._shared_rate_provider_set_keys.await_args.kwargs[
+        "provider_set_keys"
+    ] == (8,)
 
+
+async def _assert_explicit_npi_rate_scopes(monkeypatch) -> None:
+    """Assert absent, code-scoped, and unscoped explicit-NPI requests."""
+    monkeypatch.setattr(serving, "_require_strict_shared_v3", lambda _tables: None)
+    assert await serving._version_three_explicit_npi_graph_scope(
+        object(),
+        _tables(),
+        {"npi": None},
+    ) is None
+    await _assert_direct_npi_rate_scope(monkeypatch)
     monkeypatch.setattr(
         serving,
         "_ptg2_manifest_plan_code_values",

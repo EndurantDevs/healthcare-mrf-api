@@ -8231,15 +8231,8 @@ def _install_candidate_stage_mock(monkeypatch):
     return stage
 
 
-def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
-    """Install a successful strict V3 publisher and return its async mock."""
-
-    monkeypatch.setattr(
-        process_ptg,
-        "_should_auto_activate_ptg2_candidates",
-        lambda: True,
-    )
-    publication = SimpleNamespace(
+def _strict_v3_publication(serving_rates):
+    return SimpleNamespace(
         snapshot_key=7,
         serving_index={
             "storage": "manifest_snapshot",
@@ -8251,6 +8244,17 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
         layout_reused_at_seal=False,
         stored_byte_count=128,
     )
+
+
+def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
+    """Install a successful strict V3 publisher and return its async mock."""
+
+    monkeypatch.setattr(
+        process_ptg,
+        "_should_auto_activate_ptg2_candidates",
+        lambda: True,
+    )
+    publication = _strict_v3_publication(serving_rates)
     publish = AsyncMock(return_value=publication)
 
     @asynccontextmanager

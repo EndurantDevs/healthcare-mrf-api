@@ -89,7 +89,8 @@ def _code_query_sql(scope_join_sql: str, code_filters: Sequence[str]) -> str:
                code_metadata.negotiation_arrangement,
                code_metadata.billing_code_type_version,
                code_metadata.source_name,
-               code_metadata.source_description
+               code_metadata.source_description,
+               code_metadata.rate_count
           FROM {_shared_v3_code_table()} code_metadata
           LEFT JOIN requested_code requested
             ON code_metadata.reported_code_system = requested.reported_system
