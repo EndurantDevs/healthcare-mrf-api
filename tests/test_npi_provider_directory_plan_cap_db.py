@@ -8,15 +8,14 @@ from sqlalchemy import text
 from api.endpoint import npi as npi_module
 from db.connection import Database
 from tests.test_npi_provider_directory_role_evidence_db import (
-    _delete_relation_fixture,
     _insert_catalog_rows,
     _insert_dataset_rows,
     _insert_endpoint_rows,
     _insert_resource_rows,
     _insert_source_rows,
+    _publish_dataset_rows,
     _requires_test_database,
 )
-
 
 ENDPOINT_ID = "pd-plan-cap"
 SOURCE_ID = "pdfhir_plan_cap_test"
@@ -100,8 +99,9 @@ async def _insert_plan_cap_ownership(session, schema: str) -> None:
 
 async def _insert_plan_cap_fixture(session, schema: str) -> None:
     """Materialize the ownership, resources, edges, and source catalog."""
+    resource_rows = _plan_resource_rows()
     await _insert_plan_cap_ownership(session, schema)
-    await _insert_resource_rows(session, schema, DATASET_ID, _plan_resource_rows())
+    await _insert_resource_rows(session, schema, DATASET_ID, resource_rows)
     await session.execute(
         text(
             f"INSERT INTO {schema}.provider_directory_dataset_network_plan "
@@ -118,6 +118,11 @@ async def _insert_plan_cap_fixture(session, schema: str) -> None:
         schema,
         [(SOURCE_ID, "network-cap", "Cap Network")],
     )
+    await _publish_dataset_rows(
+        session,
+        schema,
+        [(DATASET_ID, len(resource_rows))],
+    )
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -132,48 +137,42 @@ async def test_role_evidence_caps_payloads_but_keeps_exact_plan_total():
         has_dataset_insurance_plan=True,
         has_dataset_insurance_plan_scalars=True,
     )
-    cleanup_scope_by_field = {
-        "endpoint_ids": [ENDPOINT_ID],
-        "source_ids": [SOURCE_ID],
-        "dataset_ids": [DATASET_ID],
-    }
 
     database = Database()
     await database.connect()
     try:
         async with database.transaction() as session:
-            await _insert_plan_cap_fixture(session, schema)
-            evidence_result = await session.execute(
-                text(evidence_sql),
-                {
-                    "source_ids": [SOURCE_ID],
-                    "role_ids": [ROLE_ID],
-                },
-            )
-            evidence_rows = evidence_result.all()
-            role_evidence_by_field = next(
-                evidence_row._mapping
-                for evidence_row in evidence_rows
-                if evidence_row._mapping["evidence_type"] == "role"
-            )
-            returned_plan_id_set = {
-                evidence_row._mapping["resource_id"]
-                for evidence_row in evidence_rows
-                if evidence_row._mapping["evidence_type"] == "insurance_plan"
-            }
+            fixture_savepoint = await session.begin_nested()
+            try:
+                await _insert_plan_cap_fixture(session, schema)
+                evidence_result = await session.execute(
+                    text(evidence_sql),
+                    {
+                        "source_ids": [SOURCE_ID],
+                        "role_ids": [ROLE_ID],
+                    },
+                )
+                evidence_rows = evidence_result.all()
+                role_evidence_by_field = next(
+                    evidence_row._mapping
+                    for evidence_row in evidence_rows
+                    if evidence_row._mapping["evidence_type"] == "role"
+                )
+                returned_plan_id_set = {
+                    evidence_row._mapping["resource_id"]
+                    for evidence_row in evidence_rows
+                    if evidence_row._mapping["evidence_type"] == "insurance_plan"
+                }
 
-            assert role_evidence_by_field["plan_returned"] == 100
-            assert role_evidence_by_field["plan_total"] == 134
-            assert role_evidence_by_field["plan_truncated"] is True
-            assert len(returned_plan_id_set) == 100
-            assert set(DIRECT_PLAN_IDS) <= returned_plan_id_set
-            assert returned_plan_id_set & set(DERIVED_PLAN_IDS) == set(
-                DERIVED_PLAN_IDS[1:96]
-            )
-            await _delete_relation_fixture(
-                session,
-                schema,
-                cleanup_scope_by_field,
-            )
+                assert role_evidence_by_field["plan_returned"] == 100
+                assert role_evidence_by_field["plan_total"] == 134
+                assert role_evidence_by_field["plan_truncated"] is True
+                assert len(returned_plan_id_set) == 100
+                assert set(DIRECT_PLAN_IDS) <= returned_plan_id_set
+                assert returned_plan_id_set & set(DERIVED_PLAN_IDS) == set(
+                    DERIVED_PLAN_IDS[1:96]
+                )
+            finally:
+                await fixture_savepoint.rollback()
     finally:
         await database.disconnect()
