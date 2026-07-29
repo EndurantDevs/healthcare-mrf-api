@@ -18,6 +18,16 @@ ALLOWLISTED_REJECTION_REASONS = (
         "forward_occurrence_retention_limit_exceeded",
     ),
     (
+        "PTG2 candidate audit decoded retention exceeds the byte limit "
+        "while retaining the V4 pattern provider result",
+        "pattern_provider_result_retention_limit_exceeded",
+    ),
+    (
+        "PTG2 candidate audit decoded retention exceeds the byte limit "
+        "while retaining the batched V4 pattern graph projection",
+        "pattern_graph_projection_retention_limit_exceeded",
+    ),
+    (
         "PTG2 candidate exact provider-code matches exceed their bounded limit",
         "provider_code_matches_limit_exceeded",
     ),
@@ -202,6 +212,15 @@ def test_allowlisted_endpoint_message_adds_stable_rejection_detail(
         (
             b'{"message":"PTG2 candidate audit decoded retention exceeds the '
             b'byte limit while retaining a forward occurrence lookup: private"}'
+        ),
+        (
+            b'{"message":"PTG2 candidate audit decoded retention exceeds the '
+            b'byte limit while retaining the V4 pattern provider result: private"}'
+        ),
+        (
+            b'{"message":"PTG2 candidate audit decoded retention exceeds the '
+            b'byte limit while retaining the batched V4 pattern graph projection: '
+            b'private"}'
         ),
     ),
 )

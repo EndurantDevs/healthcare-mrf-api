@@ -1407,18 +1407,18 @@ async def test_partition_failure_progress_retains_authenticated_request_identity
     await ptg_candidate_audit._partition_failure_progress(
         "control-run",
         snapshot_id="candidate-snapshot",
-        completed=150,
+        completed=149,
         total=520,
         failure=failure,
     )
 
     assert mark_control_run.await_args.kwargs["progress"] == {
         "unit": "partition",
-        "done": 150,
+        "done": 149,
         "total": 520,
         "pct": 38,
         "message": (
-            "audit partition index 150 failed after 150 of 520 completed"
+            "audit partition index 150 failed after 149 of 520 completed"
         ),
         "phase": "candidate release audit",
         "failed_partition_index": 150,
