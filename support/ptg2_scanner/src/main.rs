@@ -28570,6 +28570,25 @@ mod tests {
         .unwrap();
 
         sinks.write_manifest_price_set_atoms(&price_set).unwrap();
+        sinks
+            .write_price_atoms(&price_set.atoms, &mut HashSet::new(), &mut HashSet::new())
+            .unwrap();
+        sinks.write_price_code_set("unused", &[]).unwrap();
+        sinks
+            .write_price_set_entries(GlobalId128([0; GLOBAL_ID_BYTES]), &[], &mut HashSet::new())
+            .unwrap();
+        sinks
+            .write_provider_set_entries("set", &[11], &mut HashSet::new())
+            .unwrap();
+        sinks
+            .write_provider_set_components("set", &[12], &mut HashSet::new())
+            .unwrap();
+        sinks
+            .write_provider_entry_components(11, &[12], &mut HashSet::new())
+            .unwrap();
+        sinks
+            .write_provider_group_members(&Value::Null, &mut HashSet::new())
+            .unwrap();
         let events = sinks.finish_silent().unwrap();
         let body = std::fs::read_to_string(&base).unwrap();
         let expected_price_set_id = price_set_global_id(&price_set).to_hex();
