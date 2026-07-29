@@ -9852,6 +9852,100 @@ class _ExplicitNpiGraphScope:
     provider_set_keys: tuple[int, ...]
 
 
+_V4_GRAPH_MEMBER_LIMIT_ERRORS = frozenset(
+    {
+        "PTG V4 graph selection exceeds max_members",
+        "PTG2 V4 graph selection exceeds max_members",
+    }
+)
+
+
+def _is_v4_member_limit(exc: Exception) -> bool:
+    """Recognize only the two exact bounded-reader limit failures."""
+
+    return str(exc) in _V4_GRAPH_MEMBER_LIMIT_ERRORS
+
+
+async def _v4_direct_npi_sets(
+    session,
+    serving_tables: PTG2ServingTables,
+    requested_npi: int,
+) -> tuple[int, ...] | None:
+    """Load one direct NPI membership within the sealed set limit."""
+    snapshot_key = _required_shared_snapshot_key(serving_tables)
+    root = await load_v4_graph_root(
+        session,
+        snapshot_key,
+        schema_name=PTG2_SCHEMA,
+    )
+    if root.representation != "direct_v1":
+        return None
+    maximum_provider_sets = (
+        _v4_hot_prefix_limits(
+            serving_tables
+        ).maximum_provider_expansion_provider_sets
+    )
+    try:
+        provider_set_keys_by_npi = await _v4_sets_by_npi(
+            session,
+            serving_tables,
+            (requested_npi,),
+            allowed_provider_set_keys=None,
+            max_members=maximum_provider_sets,
+        )
+    except (PTG2SharedBlockError, PTG2ManifestArtifactError) as exc:
+        if not _is_v4_member_limit(exc):
+            raise
+        return None
+    if set(provider_set_keys_by_npi) != {requested_npi}:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 exact-NPI projection is incomplete"
+        )
+    return tuple(provider_set_keys_by_npi[requested_npi])
+
+
+async def _bounded_direct_npi_code_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+    requested_npi: int,
+    requested_plan_code: tuple[str, str, str],
+) -> _ExplicitNpiGraphScope | None:
+    """Intersect a bounded direct NPI projection with one exact code."""
+
+    provider_set_keys = await _v4_direct_npi_sets(
+        session,
+        serving_tables,
+        requested_npi,
+    )
+    if provider_set_keys is None:
+        return None
+    if not provider_set_keys:
+        return _ExplicitNpiGraphScope(requested_npi, ())
+    requested_plan, requested_system, requested_code = requested_plan_code
+    rate_provider_set_keys = await _shared_rate_provider_set_keys(
+        session,
+        serving_tables,
+        plan_id=requested_plan,
+        plan_market_type=str(
+            args.get("plan_market_type")
+            or args.get("market_type")
+            or ""
+        ),
+        reported_code=requested_code,
+        code_system=requested_system,
+        provider_set_keys=provider_set_keys,
+    )
+    if not set(rate_provider_set_keys).issubset(provider_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 exact-NPI code scope escaped its bounded graph"
+        )
+    return _ExplicitNpiGraphScope(
+        requested_npi,
+        tuple(rate_provider_set_keys),
+    )
+
+
 async def _v4_explicit_npi_scope(
     session,
     serving_tables: PTG2ServingTables,
@@ -9863,6 +9957,15 @@ async def _v4_explicit_npi_scope(
     allowed_provider_set_keys: frozenset[int] | None = None
     requested_plan_code = _ptg2_manifest_plan_code_values(dict(args))
     if requested_plan_code is not None:
+        bounded_scope = await _bounded_direct_npi_code_scope(
+            session,
+            serving_tables,
+            args,
+            requested_npi,
+            requested_plan_code,
+        )
+        if bounded_scope is not None:
+            return bounded_scope
         requested_plan, requested_system, requested_code = requested_plan_code
         allowed_provider_set_keys = frozenset(
             await _shared_rate_provider_set_keys(
@@ -13540,6 +13643,10 @@ async def _select_v4_taxonomy_expansion(
     """Serve one inferred-only CPT page through exact scoped reverse edges."""
 
     request = _V4TaxonomyRequest(**request_options)
+    _v4_provider_expansion_request_caps(
+        serving_tables,
+        target_count=max(int(request.target_count), 1),
+    )
     snapshot_key = _required_shared_snapshot_key(serving_tables)
     candidates = await load_v4_inferred_taxonomy_candidates(
         session,

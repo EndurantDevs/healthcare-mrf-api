@@ -114,6 +114,55 @@ async def test_direct_selector_returns_empty_without_rate_or_graph_reads(
     graph_reader.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_direct_selector_rejects_target_above_sealed_prefix_before_io(
+    monkeypatch,
+) -> None:
+    """Apply the common target cap before loading direct candidates or rates."""
+
+    projection_manifest, _candidates = _projection_fixture_for((1,), {})
+    candidate_reader = AsyncMock()
+    rate_reader = AsyncMock()
+    graph_reader = AsyncMock()
+    monkeypatch.setattr(
+        serving,
+        "load_v4_inferred_taxonomy_candidates",
+        candidate_reader,
+    )
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        rate_reader,
+    )
+    monkeypatch.setattr(
+        serving,
+        "_v4_direct_set_candidates",
+        graph_reader,
+    )
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="exceeds the sealed hot-prefix target",
+    ):
+        await serving._select_v4_taxonomy_expansion(
+            object(),
+            _tables(projection_manifest),
+            code_rows=[{"code_key": 4, "rate_count": 31_916}],
+            args={"code_system": "CPT", "code": "70553"},
+            snapshot_id="snapshot",
+            source_trace_set_hash=None,
+            network_names=[],
+            target_count=202,
+            descending=False,
+            projection_manifest=projection_manifest,
+            projection_rule=_projection_rule(projection_manifest),
+        )
+
+    candidate_reader.assert_not_awaited()
+    rate_reader.assert_not_awaited()
+    graph_reader.assert_not_awaited()
+
+
 @dataclass(frozen=True)
 class _DensePrefixEvidence:
     merge_calls: list[tuple[int, int, tuple[int, ...] | None]]

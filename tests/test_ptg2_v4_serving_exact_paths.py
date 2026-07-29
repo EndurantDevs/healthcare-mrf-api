@@ -458,9 +458,13 @@ async def test_v4_explicit_npi_scope_handles_unscoped_and_empty_rate_scope(
         object(), _tables(), {"npi": "1234567890"}
     ) == serving._ExplicitNpiGraphScope(1234567890, (3, 5))
     assert graph_lookup.await_args.kwargs["allowed_provider_set_keys"] is None
-
     monkeypatch.setattr(
         serving, "_shared_rate_provider_set_keys", AsyncMock(return_value=())
+    )
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(17, "direct_v1", b"d" * 32)),
     )
     graph_lookup.reset_mock()
     assert await serving._version_three_explicit_npi_graph_scope(
@@ -468,7 +472,10 @@ async def test_v4_explicit_npi_scope_handles_unscoped_and_empty_rate_scope(
         _tables(),
         {"npi": "1234567890", "plan_id": "plan-1", "code": "70553"},
     ) == serving._ExplicitNpiGraphScope(1234567890, ())
-    graph_lookup.assert_not_awaited()
+    assert graph_lookup.await_args.kwargs["allowed_provider_set_keys"] is None
+    assert graph_lookup.await_args.kwargs["max_members"] == 64
+    rate_call = serving._shared_rate_provider_set_keys.await_args
+    assert rate_call.kwargs["provider_set_keys"] == (3, 5)
 
 
 @pytest.mark.asyncio
