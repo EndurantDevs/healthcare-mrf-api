@@ -3786,6 +3786,21 @@ mod tests {
     }
 
     #[test]
+    fn default_writer_and_fixed_record_helpers_are_exact() {
+        let base = TestDirectory::new("default-writer");
+        let writer = ServingRunPartitionWriter::new(base.join("runs"), 4, "worker-default")
+            .expect("default partition writer");
+        drop(writer);
+
+        let assigned = AssignedServingRecord([7; ASSIGNED_SERVING_RECORD_BYTES]);
+        assigned.validate_duplicate(&assigned).unwrap();
+
+        let error = to_invalid_data("invalid test value");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "invalid test value");
+    }
+
+    #[test]
     fn code_dictionary_roundtrips_nullable_tuple_and_rejects_corruption() {
         let base = TestDirectory::new("code-dictionary");
         let directory = base.join("runs");

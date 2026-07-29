@@ -367,6 +367,17 @@ mod tests {
             .contains("records for 5 ranges"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_identity_rejects_failed_and_incomplete_statx_results() {
+        let incomplete = unsafe { std::mem::zeroed::<libc::statx>() };
+        assert!(FileIdentity::from_statx_result(-1, &incomplete).is_err());
+        assert!(FileIdentity::from_statx_result(0, &incomplete)
+            .unwrap_err()
+            .to_string()
+            .contains("identity is incomplete"));
+    }
+
     #[test]
     fn trailing_padding_and_large_range_fanout_use_verified_fallback() {
         let mut padded = br#"[{"id":1},{"id":2},{"id":3},{"id":4}]"#.to_vec();
