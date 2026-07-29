@@ -24,6 +24,12 @@ from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionError,
     validated_profile_execution,
 )
+from process.provider_directory_refresh_preset import (
+    apply_provider_directory_refresh_preset,
+)
+from process.uhc_provider_file_admission import (
+    validate_uhc_official_file_admission,
+)
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_PROTECTED_FIELDS,
     normalize_protected_frozen_rate_params,
@@ -1679,18 +1685,25 @@ async def create_import_run(
         if isinstance(request_payload_map.get("params"), dict)
         else {}
     )
+    effective_params_by_name = (
+        apply_provider_directory_refresh_preset(raw_params_by_name)
+        if importer == "provider-directory-fhir"
+        else raw_params_by_name
+    )
     _assert_ptg_rebuild_request_params(
         importer,
-        raw_params_by_name,
+        effective_params_by_name,
     )
     _validate_provider_directory_profile_execution_params(
         importer,
-        raw_params_by_name,
+        effective_params_by_name,
     )
+    if importer == "provider-directory-fhir":
+        validate_uhc_official_file_admission(effective_params_by_name)
     normalized_params_by_name = (
-        normalize_protected_frozen_rate_params(raw_params_by_name)
+        normalize_protected_frozen_rate_params(effective_params_by_name)
         if importer == "ptg"
-        else dict(raw_params_by_name)
+        else dict(effective_params_by_name)
     )
     if importer == "ptg" and protected_frozen_tuple_presence(
         normalized_params_by_name
@@ -1948,11 +1961,8 @@ async def _enqueue_import_start(
 
     importer = str(import_run_values_by_name.get("importer") or "")
     now = utc_now()
-    params = (
-        import_run_values_by_name.get("params")
-        if isinstance(import_run_values_by_name.get("params"), dict)
-        else {}
-    )
+    raw_params = import_run_values_by_name.get("params")
+    params = raw_params if isinstance(raw_params, dict) else {}
     try:
         adapter = _adapter_for_import_row(import_run_values_by_name)
     except ValueError as exc:
@@ -1964,15 +1974,8 @@ async def _enqueue_import_start(
     if adapter is None:
         return _pending_enqueue_adapter_result(now)
 
-    job_payload = _adapter_payload(
-        adapter,
-        import_run_values_by_name,
-        params,
-    )
-    enqueue_options_by_name = _enqueue_job_options(
-        adapter,
-        import_run_values_by_name,
-    )
+    job_payload = _adapter_payload(adapter, import_run_values_by_name, params)
+    enqueue_options_by_name = _enqueue_job_options(adapter, import_run_values_by_name)
     try:
         redis = await create_pool(
             build_redis_settings(),

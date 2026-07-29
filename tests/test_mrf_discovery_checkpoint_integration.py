@@ -27,30 +27,18 @@ def _completed_summary() -> SourceBatchSummary:
     )
 
 
-@pytest.mark.asyncio
-async def test_retry_uses_frozen_source_set_and_publishes_exact_proof(monkeypatch):
-    """Reuse the frozen source set and emit the exact completion proof."""
-
-    source_records = [
-        {
-            "source_id": "source_alpha",
-            "payer_id": "payer_alpha",
-            "status": "active",
-            "index_url": "https://example.test/index.json",
-            "metadata_json": {"discovery_run_id": "run_root"},
-        }
-    ]
+def _install_retry_discovery_fakes(monkeypatch) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Install the isolated retry dependencies and return their observations."""
+    source_records = [{
+        "source_id": "source_alpha", "payer_id": "payer_alpha", "status": "active",
+        "index_url": "https://example.test/index.json",
+        "metadata_json": {"discovery_run_id": "run_root"},
+    }]
     captured_by_key: dict[str, Any] = {}
 
     class FakeCheckpointStore:
-        async def resume_batch(
-            self, root_run_id: str, owner_run_id: str, retry_of_run_id: str
-        ):
-            captured_by_key["resume"] = (
-                root_run_id,
-                owner_run_id,
-                retry_of_run_id,
-            )
+        async def resume_batch(self, root_run_id, owner_run_id, retry_of_run_id):
+            captured_by_key["resume"] = (root_run_id, owner_run_id, retry_of_run_id)
             return source_records
 
     async def no_op_async(*_args, **_kwargs):
@@ -71,17 +59,20 @@ async def test_retry_uses_frozen_source_set_and_publishes_exact_proof(monkeypatc
         yield object()
 
     monkeypatch.setattr(discovery, "DatabaseDiscoveryCheckpointStore", FakeCheckpointStore)
-    monkeypatch.setattr(discovery, "init_db", no_op_async)
-    monkeypatch.setattr(discovery, "ensure_database", no_op_async)
-    monkeypatch.setattr(discovery, "_ensure_catalog_tables", no_op_async)
-    monkeypatch.setattr(discovery, "push_objects", no_op_async)
+    for dependency_name in ("init_db", "ensure_database", "_ensure_catalog_tables", "push_objects"):
+        monkeypatch.setattr(discovery, dependency_name, no_op_async)
     monkeypatch.setattr(discovery, "_load_candidates", fail_if_candidates_load)
     monkeypatch.setattr(discovery, "_retag_sources_for_discovery_run", capture_retag)
-    monkeypatch.setattr(
-        discovery, "execute_checkpointed_source_batch", capture_execution
-    )
+    monkeypatch.setattr(discovery, "execute_checkpointed_source_batch", capture_execution)
     monkeypatch.setattr(discovery, "_discovery_http_session", fake_http_session)
     monkeypatch.setattr(discovery, "enqueue_live_progress", lambda **_kwargs: None)
+    return source_records, captured_by_key
+
+
+@pytest.mark.asyncio
+async def test_retry_uses_frozen_source_set_and_publishes_exact_proof(monkeypatch):
+    """Reuse the frozen source set and emit the exact completion proof."""
+    source_records, captured_by_key = _install_retry_discovery_fakes(monkeypatch)
 
     discovery_summary = await discovery.main(
         provider="master-list",

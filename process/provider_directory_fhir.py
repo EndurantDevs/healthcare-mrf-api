@@ -138,6 +138,10 @@ from process.uhc_official_file_acquisition import (
     uhc_provider_file_admission_concurrency,
     uhc_provider_file_download_concurrency,
 )
+from process.uhc_provider_file_admission import (
+    should_select_uhc_official_file_source,
+    validate_uhc_official_file_admission,
+)
 from process.uhc_provider_file_catalog import (
     refresh_uhc_provider_file_catalog,
 )
@@ -176,6 +180,10 @@ from process.provider_directory_profile_selection import (
 )
 from process.provider_directory_profile_selection_snapshot import (
     _source_context_digest,
+)
+from process.provider_directory_refresh_preset import (
+    PROVIDER_DIRECTORY_REFRESH_PRESETS,
+    apply_provider_directory_refresh_preset as _apply_provider_directory_refresh_preset,
 )
 from scripts.provider_directory_support_contract import (
     SupportDocumentationError,
@@ -668,19 +676,6 @@ DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE = 50000
 DEFAULT_LOCATION_COORDINATE_BATCH_SIZE = 50000
 PUBLISH_CORROBORATION_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION"
-PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL = "monthly-full"
-PROVIDER_DIRECTORY_REFRESH_PRESETS = (PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL,)
-PROVIDER_DIRECTORY_MONTHLY_FULL_DEFAULTS: dict[str, Any] = {
-    "import_resources": True,
-    "full_refresh": True,
-    "stale_cleanup": True,
-    "publish_artifacts": True,
-    "publish_corroboration": True,
-    "open_only": False,
-    "include_auth_required": True,
-    "bulk_export": True,
-    "include_supplemental_catalogs": True,
-}
 OAUTH_TOKEN_EXPIRY_SKEW_SECONDS = 60
 _OAUTH_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 FHIR_ONBOARDING_GATEWAY_HOSTS = {
@@ -14576,14 +14571,50 @@ async def _is_profile_stage_pair_matching(
     return True
 
 
-async def _resolve_provider_directory_profile_build(
-    schema: str,
-    run_id: str | None,
-    dataset_fence: ProviderDirectoryArtifactDatasetFence,
-    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
-    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+async def _profile_build_resume_as_of(
+    checkpoint_map: dict[str, Any],
+    *,
+    is_checkpoint_lineage_matching: bool,
+    build: _ProviderDirectoryProfileBuild,
+) -> str:
+    """Return the original as-of date only for a valid logged stage pair."""
+    checkpoint_as_of = _clean_text(checkpoint_map.get("profile_as_of"))
+    if not is_checkpoint_lineage_matching or not checkpoint_as_of:
+        return build.profile_as_of
+    try:
+        checkpoint_date = datetime.date.fromisoformat(checkpoint_as_of)
+    except ValueError:
+        return build.profile_as_of
+    is_stage_pair_logged = await _is_profile_stage_pair_matching(
+        build.schema,
+        checkpoint_map,
+        build.evidence_stage,
+        build.profile_stage,
+    )
+    return checkpoint_date.isoformat() if is_stage_pair_logged else build.profile_as_of
+
+
+def _profile_build_with_as_of(
+    build: _ProviderDirectoryProfileBuild,
+    profile_as_of: str,
 ) -> _ProviderDirectoryProfileBuild:
-    """Resolve a deterministic build and preserve a valid retry as-of date."""
+    """Attach the generation identifier derived from the selected as-of date."""
+    generation_identity = f"{build.build_id}:{profile_as_of}"
+    generation_id = "pdprofile_" + hashlib.sha256(
+        generation_identity.encode("utf-8")
+    ).hexdigest()[:32]
+    return replace(
+        build,
+        generation_id=generation_id,
+        profile_as_of=profile_as_of,
+    )
+
+
+async def _profile_build_identity_inputs(
+    schema: str,
+    dataset_fence: ProviderDirectoryArtifactDatasetFence,
+) -> tuple[list[str], list[str], list[str], str]:
+    """Resolve the stable source and dataset identity for one Profile build."""
     selected_source_ids, retained_source_ids, source_contexts = (
         await _provider_directory_profile_scope_source_ids(
             schema,
@@ -14601,6 +14632,64 @@ async def _resolve_provider_directory_profile_build(
         dataset_ids,
         source_contexts,
     )
+    return source_ids, retained_source_ids, dataset_ids, resume_lineage_hash
+
+
+def _is_profile_build_checkpoint_lineage_matching(
+    checkpoint_map: dict[str, Any],
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> bool:
+    """Return whether a checkpoint preserves this build's immutable lineage."""
+    return bool(checkpoint_map) and (
+        _clean_text(checkpoint_map.get("strategy_version"))
+        == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        and int(checkpoint_map.get("schema_version") or -1)
+        == profile_artifact.PROFILE_SCHEMA_VERSION
+        and _clean_text(checkpoint_map.get("resume_lineage_hash"))
+        == build.resume_lineage_hash
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("source_ids")
+        )
+        == build.source_ids
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("retained_source_ids")
+        )
+        == build.retained_source_ids
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("dataset_ids")
+        )
+        == build.dataset_ids
+        and _clean_text(checkpoint_map.get("evidence_stage"))
+        == build.evidence_stage
+        and _clean_text(checkpoint_map.get("profile_stage"))
+        == build.profile_stage
+        and _is_profile_target_oid_matching(
+            checkpoint_map.get("evidence_target_oid"),
+            evidence_build_fence.target_oid,
+        )
+        and _is_profile_target_oid_matching(
+            checkpoint_map.get("profile_target_oid"),
+            profile_build_fence.target_oid,
+        )
+    )
+
+
+async def _resolve_provider_directory_profile_build(
+    schema: str,
+    run_id: str | None,
+    dataset_fence: ProviderDirectoryArtifactDatasetFence,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> _ProviderDirectoryProfileBuild:
+    """Resolve a deterministic build and preserve a valid retry as-of date."""
+    source_ids, retained_source_ids, dataset_ids, resume_lineage_hash = (
+        await _profile_build_identity_inputs(
+            schema,
+            dataset_fence,
+        )
+    )
     build_id = "pdpb_" + resume_lineage_hash[:32]
     evidence_stage = profile_artifact.profile_evidence_stage_table_name(
         build_id
@@ -14617,61 +14706,9 @@ async def _resolve_provider_directory_profile_build(
         if checkpoint_row is not None
         else {}
     )
-    checkpoint_as_of = _clean_text(checkpoint_map.get("profile_as_of"))
-    is_checkpoint_lineage_matching = bool(checkpoint_map) and (
-        _clean_text(checkpoint_map.get("strategy_version"))
-        == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
-        and int(checkpoint_map.get("schema_version") or -1)
-        == profile_artifact.PROFILE_SCHEMA_VERSION
-        and _clean_text(checkpoint_map.get("resume_lineage_hash"))
-        == resume_lineage_hash
-        and _provider_directory_profile_checkpoint_array(
-            checkpoint_map.get("source_ids")
-        )
-        == tuple(source_ids)
-        and _provider_directory_profile_checkpoint_array(
-            checkpoint_map.get("retained_source_ids")
-        )
-        == tuple(retained_source_ids)
-        and _provider_directory_profile_checkpoint_array(
-            checkpoint_map.get("dataset_ids")
-        )
-        == tuple(dataset_ids)
-        and _clean_text(checkpoint_map.get("evidence_stage"))
-        == evidence_stage
-        and _clean_text(checkpoint_map.get("profile_stage"))
-        == profile_stage
-        and _is_profile_target_oid_matching(
-            checkpoint_map.get("evidence_target_oid"),
-            evidence_build_fence.target_oid,
-        )
-        and _is_profile_target_oid_matching(
-            checkpoint_map.get("profile_target_oid"),
-            profile_build_fence.target_oid,
-        )
-    )
-    if is_checkpoint_lineage_matching and checkpoint_as_of:
-        try:
-            checkpoint_date = datetime.date.fromisoformat(checkpoint_as_of)
-        except ValueError:
-            checkpoint_date = None
-        is_stage_pair_logged = checkpoint_date is not None and (
-            await _is_profile_stage_pair_matching(
-                schema,
-                checkpoint_map,
-                evidence_stage,
-                profile_stage,
-            )
-        )
-        if is_stage_pair_logged and checkpoint_date is not None:
-            profile_as_of = checkpoint_date.isoformat()
-    generation_identity = f"{build_id}:{profile_as_of}"
-    generation_id = "pdprofile_" + hashlib.sha256(
-        generation_identity.encode("utf-8")
-    ).hexdigest()[:32]
-    return _ProviderDirectoryProfileBuild(
+    candidate_build = _ProviderDirectoryProfileBuild(
         schema=schema,
-        generation_id=generation_id,
+        generation_id="",
         source_ids=tuple(source_ids),
         retained_source_ids=tuple(retained_source_ids),
         dataset_ids=tuple(dataset_ids),
@@ -14682,6 +14719,20 @@ async def _resolve_provider_directory_profile_build(
         build_id=build_id,
         owner_run_id=_clean_text(run_id),
     )
+    is_checkpoint_lineage_matching = (
+        _is_profile_build_checkpoint_lineage_matching(
+            checkpoint_map,
+            candidate_build,
+            evidence_build_fence,
+            profile_build_fence,
+        )
+    )
+    profile_as_of = await _profile_build_resume_as_of(
+        checkpoint_map,
+        is_checkpoint_lineage_matching=is_checkpoint_lineage_matching,
+        build=candidate_build,
+    )
+    return _profile_build_with_as_of(candidate_build, profile_as_of)
 
 
 def _provider_directory_profile_checkpoint_ref(schema: str) -> str:
@@ -14774,20 +14825,10 @@ async def _assert_provider_directory_profile_checkpoint_ready(
         )
 
 
-async def _is_profile_build_checkpoint_reusable(
-    build: _ProviderDirectoryProfileBuild,
-    checkpoint_map: dict[str, Any],
-    *,
-    has_existing_artifacts: bool,
-    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
-    profile_build_fence: ProviderDirectoryArtifactBuildFence,
-    evidence_total_batches: int,
-    profile_total_batches: int,
+def _is_profile_checkpoint_state_progress_valid(
+    checkpoint_state: _ProviderDirectoryProfileBuildCheckpointState,
 ) -> bool:
-    """Accept only a lineage-fenced, phase-consistent logged build."""
-    checkpoint_state = _provider_directory_profile_checkpoint_state(
-        checkpoint_map
-    )
+    """Return whether logged Profile build phases advance in a safe order."""
     is_phase_order_valid = (
         checkpoint_state.profile_next_batch == 0
         or checkpoint_state.evidence_next_batch
@@ -14829,57 +14870,68 @@ async def _is_profile_build_checkpoint_reusable(
             )
         )
     )
-    is_identity_matching = (
-        _clean_text(checkpoint_map.get("build_id"))
+    return is_phase_order_valid and is_state_progress_valid
+
+
+def _is_profile_checkpoint_reuse_identity_matching(
+    checkpoint_map: dict[str, Any],
+    checkpoint_state: _ProviderDirectoryProfileBuildCheckpointState,
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    *,
+    has_existing_artifacts: bool,
+    evidence_total_batches: int,
+    profile_total_batches: int,
+) -> bool:
+    """Return whether a checkpoint can resume the requested Profile build."""
+    return (
+        _is_profile_build_checkpoint_lineage_matching(
+            checkpoint_map,
+            build,
+            evidence_build_fence,
+            profile_build_fence,
+        )
+        and _clean_text(checkpoint_map.get("build_id"))
         == _provider_directory_profile_build_id(build)
-        and _clean_text(checkpoint_map.get("strategy_version"))
-        == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
-        and int(checkpoint_map.get("schema_version") or -1)
-        == profile_artifact.PROFILE_SCHEMA_VERSION
-        and _clean_text(checkpoint_map.get("resume_lineage_hash"))
-        == build.resume_lineage_hash
         and _clean_text(checkpoint_map.get("profile_as_of"))
         == build.profile_as_of
-        and _provider_directory_profile_checkpoint_array(
-            checkpoint_map.get("source_ids")
-        )
-        == build.source_ids
-        and _provider_directory_profile_checkpoint_array(
-            checkpoint_map.get("retained_source_ids")
-        )
-        == build.retained_source_ids
-        and _provider_directory_profile_checkpoint_array(
-            checkpoint_map.get("dataset_ids")
-        )
-        == build.dataset_ids
-        and _clean_text(checkpoint_map.get("evidence_stage"))
-        == build.evidence_stage
-        and _clean_text(checkpoint_map.get("profile_stage"))
-        == build.profile_stage
-        and _is_profile_target_oid_matching(
-            checkpoint_map.get("evidence_target_oid"),
-            evidence_build_fence.target_oid,
-        )
-        and _is_profile_target_oid_matching(
-            checkpoint_map.get("profile_target_oid"),
-            profile_build_fence.target_oid,
-        )
         and bool(checkpoint_map.get("has_existing_artifacts"))
         is has_existing_artifacts
         and checkpoint_state.evidence_total_batches
         == evidence_total_batches
         and checkpoint_state.profile_total_batches
         == profile_total_batches
-        and 0
-        <= checkpoint_state.evidence_next_batch
-        <= evidence_total_batches
-        and 0
-        <= checkpoint_state.profile_next_batch
-        <= profile_total_batches
-        and is_phase_order_valid
-        and is_state_progress_valid
+        and 0 <= checkpoint_state.evidence_next_batch <= evidence_total_batches
+        and 0 <= checkpoint_state.profile_next_batch <= profile_total_batches
+        and _is_profile_checkpoint_state_progress_valid(checkpoint_state)
     )
-    if not is_identity_matching:
+
+
+async def _is_profile_build_checkpoint_reusable(
+    build: _ProviderDirectoryProfileBuild,
+    checkpoint_map: dict[str, Any],
+    *,
+    has_existing_artifacts: bool,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    evidence_total_batches: int,
+    profile_total_batches: int,
+) -> bool:
+    """Accept only a lineage-fenced, phase-consistent logged build."""
+    checkpoint_state = _provider_directory_profile_checkpoint_state(
+        checkpoint_map
+    )
+    if not _is_profile_checkpoint_reuse_identity_matching(
+        checkpoint_map,
+        checkpoint_state,
+        build,
+        evidence_build_fence,
+        profile_build_fence,
+        has_existing_artifacts=has_existing_artifacts,
+        evidence_total_batches=evidence_total_batches,
+        profile_total_batches=profile_total_batches,
+    ):
         return False
     return await _is_profile_stage_pair_matching(
         build.schema,
@@ -33015,25 +33067,6 @@ def _provider_directory_publish_target_skipped() -> dict[str, Any]:
     return {"skipped": True, "reason": "target_not_requested"}
 
 
-def _apply_provider_directory_refresh_preset(task: dict[str, Any]) -> dict[str, Any]:
-    preset = _clean_text(task.get("refresh_preset") or task.get("preset"))
-    if not preset:
-        return task
-    normalized_preset = preset.strip().lower().replace("_", "-")
-    if normalized_preset not in PROVIDER_DIRECTORY_REFRESH_PRESETS:
-        raise ValueError(
-            "Unsupported Provider Directory refresh_preset "
-            f"{preset!r}; expected one of {', '.join(PROVIDER_DIRECTORY_REFRESH_PRESETS)}"
-        )
-    defaults = PROVIDER_DIRECTORY_MONTHLY_FULL_DEFAULTS
-    normalized_task_by_field = dict(task)
-    normalized_task_by_field["refresh_preset"] = normalized_preset
-    for key, value in defaults.items():
-        if normalized_task_by_field.get(key) in (None, ""):
-            normalized_task_by_field[key] = value
-    return normalized_task_by_field
-
-
 def _int_or_default(value: Any, default: int) -> int:
     if value is None or value == "":
         return default
@@ -40672,22 +40705,12 @@ def _should_add_uhc_official_file_source(
 ) -> bool:
     """Include UHC in normal catalog resolution when its scope matches."""
 
-    if requested_source_ids:
-        return UHC_RETAINED_SOURCE_ID in requested_source_ids
-    if source_query:
-        normalized_query = source_query.strip().casefold()
-        searchable_values = (
-            UHC_RETAINED_SOURCE_ID,
-            UHC_PROVIDER_FILE_DISPLAY_NAME,
-            UHC_PROVIDER_FILE_ENTRY_ID,
-            "uhc",
-            "optum",
-        )
-        return any(
-            normalized_query in value.casefold()
-            for value in searchable_values
-        )
-    return not test_mode and limit is None
+    return should_select_uhc_official_file_source(
+        requested_source_ids=set(requested_source_ids),
+        source_query=source_query,
+        test_mode=test_mode,
+        limit=limit,
+    )
 
 
 def _add_uhc_official_file_source(
@@ -41264,6 +41287,7 @@ async def _acquire_current_uhc_official_file_set(
 ) -> tuple[str, UHCOfficialFileAcquisitionResult]:
     """Refresh, acquire, and recheck one unchanged official-file catalog."""
 
+    validate_uhc_official_file_admission(task, required=True)
     initial_catalog = await refresh_uhc_provider_file_catalog()
     catalog_set_sha256 = _clean_text(
         initial_catalog.get("catalog_set_sha256")
@@ -41663,6 +41687,18 @@ async def process_provider_directory_fhir_data(
 ) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
     task = _apply_provider_directory_refresh_preset(task or {})
+    context = ctx.get("context")
+    context_test_mode = bool(
+        isinstance(context, dict) and context.get("test_mode")
+    )
+    validate_uhc_official_file_admission(
+        task,
+        test_mode=bool(
+            task.get("test")
+            or task.get("test_mode")
+            or context_test_mode
+        ),
+    )
     await _raise_if_resource_import_cancelled(ctx, task)
     ctx.setdefault("context", {})
     test_mode = bool(task.get("test") or task.get("test_mode") or ctx["context"].get("test_mode"))
@@ -42330,7 +42366,6 @@ async def run_provider_directory_fhir_command(
 ) -> dict[str, Any]:
     """Run the provider-directory import command."""
     runtime_context_by_key: dict[str, Any] = {"context": {"test_mode": test_mode}}
-    await startup(runtime_context_by_key)
     task_by_field = {
         "test_mode": test_mode,
         "seed_db_path": seed_db_path,
@@ -42383,6 +42418,12 @@ async def run_provider_directory_fhir_command(
         "concurrency": concurrency,
         "timeout": timeout,
     }
+    task_by_field = _apply_provider_directory_refresh_preset(task_by_field)
+    validate_uhc_official_file_admission(
+        task_by_field,
+        test_mode=test_mode,
+    )
+    await startup(runtime_context_by_key)
     import_result = await process_data(runtime_context_by_key, task_by_field)
     await shutdown(runtime_context_by_key)
     return import_result

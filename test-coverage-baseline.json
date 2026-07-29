@@ -479,12 +479,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 37632,
-          "total": 42018
+          "covered": 37703,
+          "total": 42034
         },
         "lines": {
-          "covered": 119168,
-          "total": 125963
+          "covered": 119308,
+          "total": 126032
         }
       },
       "one_time_floor_reset": {
@@ -593,16 +593,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3352,
-          "total": 3789
+          "covered": 3360,
+          "total": 3790
         },
         "lines": {
-          "covered": 51715,
-          "total": 58739
+          "covered": 51836,
+          "total": 58783
         },
         "regions": {
-          "covered": 76338,
-          "total": 86821
+          "covered": 76486,
+          "total": 86917
         }
       },
       "one_time_floor_reset": {

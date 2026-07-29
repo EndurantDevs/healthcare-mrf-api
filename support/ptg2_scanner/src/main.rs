@@ -28570,6 +28570,25 @@ mod tests {
         .unwrap();
 
         sinks.write_manifest_price_set_atoms(&price_set).unwrap();
+        sinks
+            .write_price_atoms(&price_set.atoms, &mut HashSet::new(), &mut HashSet::new())
+            .unwrap();
+        sinks.write_price_code_set("unused", &[]).unwrap();
+        sinks
+            .write_price_set_entries(GlobalId128([0; GLOBAL_ID_BYTES]), &[], &mut HashSet::new())
+            .unwrap();
+        sinks
+            .write_provider_set_entries("set", &[11], &mut HashSet::new())
+            .unwrap();
+        sinks
+            .write_provider_set_components("set", &[12], &mut HashSet::new())
+            .unwrap();
+        sinks
+            .write_provider_entry_components(11, &[12], &mut HashSet::new())
+            .unwrap();
+        sinks
+            .write_provider_group_members(&Value::Null, &mut HashSet::new())
+            .unwrap();
         let events = sinks.finish_silent().unwrap();
         let body = std::fs::read_to_string(&base).unwrap();
         let expected_price_set_id = price_set_global_id(&price_set).to_hex();
@@ -35921,6 +35940,80 @@ mod tests {
         );
         assert_eq!(pg_binary_negotiated_rate(b"12.50").unwrap(), "12.50");
         assert!(pg_binary_numeric_text(&[0; 7]).is_err());
+    }
+
+    #[test]
+    fn pg_binary_copy_header_accepts_extensions_and_rejects_invalid_boundaries() {
+        let mut with_extension = b"PGCOPY\n\xff\r\n\0".to_vec();
+        with_extension.extend_from_slice(&0i32.to_be_bytes());
+        with_extension.extend_from_slice(&2i32.to_be_bytes());
+        with_extension.extend_from_slice(b"ok");
+        read_pg_binary_copy_header(&mut Cursor::new(with_extension)).unwrap();
+
+        let invalid_signature = read_pg_binary_copy_header(&mut Cursor::new(b"not-pg-copy\n"));
+        assert!(invalid_signature
+            .unwrap_err()
+            .to_string()
+            .contains("invalid header"));
+
+        let mut negative_extension = b"PGCOPY\n\xff\r\n\0".to_vec();
+        negative_extension.extend_from_slice(&0i32.to_be_bytes());
+        negative_extension.extend_from_slice(&(-1i32).to_be_bytes());
+        assert!(
+            read_pg_binary_copy_header(&mut Cursor::new(negative_extension))
+                .unwrap_err()
+                .to_string()
+                .contains("negative extension length")
+        );
+
+        let mut truncated_extension = b"PGCOPY\n\xff\r\n\0".to_vec();
+        truncated_extension.extend_from_slice(&0i32.to_be_bytes());
+        truncated_extension.extend_from_slice(&2i32.to_be_bytes());
+        truncated_extension.push(b'o');
+        assert_eq!(
+            read_pg_binary_copy_header(&mut Cursor::new(truncated_extension))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn pg_binary_copy_rows_reject_truncated_and_invalid_boundaries() {
+        let partial_field = read_exact_optional(&mut Cursor::new(vec![b'x']), &mut [0_u8; 2]);
+        assert_eq!(
+            partial_field.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let missing_trailer =
+            read_pg_binary_copy_row(&mut Cursor::new(Vec::<u8>::new()), 1, "test");
+        assert_eq!(
+            missing_trailer.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let wrong_field_count =
+            read_pg_binary_copy_row(&mut Cursor::new(2i16.to_be_bytes().to_vec()), 1, "test");
+        assert!(wrong_field_count
+            .unwrap_err()
+            .to_string()
+            .contains("must have 1 fields, got 2"));
+
+        let mut invalid_length = 1i16.to_be_bytes().to_vec();
+        invalid_length.extend_from_slice(&(-2i32).to_be_bytes());
+        assert!(
+            read_pg_binary_copy_row(&mut Cursor::new(invalid_length), 1, "test")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid length")
+        );
+
+        assert_eq!(
+            read_pg_binary_copy_row(&mut Cursor::new((-1i16).to_be_bytes().to_vec()), 1, "test")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -946,10 +946,7 @@ async def test_get_plan_normalizes_variant_identifiers():
             FakeResult(rows=[]),
             FakeResult(rows=[], scalar=0),
             FakeResult(
-                rows=[
-                    ("P1-01",),
-                    ("('P1-02',)",),
-                ]
+                rows=[("P1-01",), ("('P1-02',)",)]
             ),
             FakeResult(
                 rows=[
@@ -959,15 +956,10 @@ async def test_get_plan_normalizes_variant_identifiers():
             FakeResult(
                 rows=[
                     {
-                        "full_plan_id": ("P1-04",),
-                        "benefit_name": "GeneralBenefit",
-                        "copay_inn_tier1": "$5",
-                        "coins_inn_tier1": "25%",
-                        "copay_inn_tier2": "Not Applicable",
-                        "coins_inn_tier2": None,
-                        "copay_outof_net": "$15",
-                        "coins_outof_net": "20%",
-                        "year": 2024,
+                        "full_plan_id": ("P1-04",), "benefit_name": "GeneralBenefit",
+                        "copay_inn_tier1": "$5", "coins_inn_tier1": "25%",
+                        "copay_inn_tier2": "Not Applicable", "coins_inn_tier2": None,
+                        "copay_outof_net": "$15", "coins_outof_net": "20%", "year": 2024,
                         "plan_id": "P1",
                     }
                 ]

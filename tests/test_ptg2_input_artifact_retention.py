@@ -59,21 +59,20 @@ def _collect(root: Path, **overrides):
     return collect_ptg2_input_artifacts(**collection_options_dict)
 
 
-def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
-    tmp_path,
-    monkeypatch,
-):
-    """Verify concurrent identical artifact has one logical file and two safe leases."""
+def _stored_zip_artifact(tmp_path):
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
     staged_zip = tmp_path / "rates.zip"
     with zipfile.ZipFile(staged_zip, "w") as archive:
-        archive.writestr("nested/rates.json", json.dumps({"in_network": [{"code": "99213"}]}))
+        archive.writestr(
+            "nested/rates.json",
+            json.dumps({"in_network": [{"code": "99213"}]}),
+        )
     raw_sha256, raw_size = sha256_file(staged_zip)
     raw_path = store.artifact_path(raw_sha256, suffix=".zip")
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staged_zip, raw_path)
-    raw_artifact = PTG2RawArtifact(
+    return root, raw_path, PTG2RawArtifact(
         original_url="https://example.test/rates.zip",
         canonical_url="https://example.test/rates.zip",
         raw_path=str(raw_path),
@@ -81,6 +80,14 @@ def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
         raw_sha256=raw_sha256,
         byte_count=raw_size,
     )
+
+
+def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
+    tmp_path,
+    monkeypatch,
+):
+    """Verify concurrent identical artifact has one logical file and two safe leases."""
+    root, raw_path, raw_artifact = _stored_zip_artifact(tmp_path)
     monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(root))
 
     async def fake_download(*_args, **_kwargs):
@@ -132,6 +139,52 @@ def test_concurrent_identical_artifact_has_one_logical_file_and_two_safe_leases(
         barrier.wait(timeout=10)
         for future in futures:
             future.result(timeout=10)
+
+
+def _manifest_compaction_fixture(root, store):
+    raw_path = _make_file(
+        store.artifact_path("f" * 64, suffix=".json"),
+        b"keep",
+        age_hours=0,
+    )
+    base_record_dict = {
+        "artifact_kind": "raw",
+        "canonical_url": "https://example.test/file.json",
+        "raw_storage_uri": store.storage_uri(raw_path),
+        "raw_sha256": "f" * 64,
+        "status": "available",
+    }
+    store.record_manifest({**base_record_dict, "etag": '"old"'})
+    store.record_manifest({**base_record_dict, "etag": '"new"'})
+    missing_path = store.artifact_path("1" * 64, suffix=".json")
+    store.record_manifest(
+        {
+            "artifact_kind": "raw",
+            "canonical_url": "https://example.test/missing.json",
+            "raw_storage_uri": store.storage_uri(missing_path),
+            "raw_sha256": "1" * 64,
+            "status": "available",
+        }
+    )
+    partial_path = store.partial_path("https://example.test/partial.json")
+    partial_path.write_bytes(b"partial")
+    partial_record_dict = {
+        "artifact_kind": "partial_raw",
+        "canonical_url": "https://example.test/partial.json",
+        "raw_storage_uri": store.storage_uri(partial_path),
+        "status": "partial",
+    }
+    store.record_manifest({**partial_record_dict, "partial_sha256": "2" * 64})
+    store.record_manifest({**partial_record_dict, "partial_sha256": "3" * 64})
+    orphan_temps = [
+        root / ".manifest.jsonl.crashed.tmp",
+        store.leases_dir / ".lease.json.crashed.tmp",
+        root / ".retention" / "unleased" / ".artifact.json.crashed.tmp",
+    ]
+    for orphan_temp in orphan_temps:
+        orphan_temp.parent.mkdir(parents=True, exist_ok=True)
+        orphan_temp.write_text("partial", encoding="utf-8")
+    return raw_path, base_record_dict, partial_record_dict, orphan_temps
 
 
 def _download_test_artifact(source_path, store):
@@ -546,48 +599,12 @@ def test_gc_compacts_manifest_and_drops_missing_artifact_records(tmp_path):
     """Verify gc compacts manifest and drops missing artifact records."""
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)
-    raw_path = _make_file(
-        store.artifact_path("f" * 64, suffix=".json"),
-        b"keep",
-        age_hours=0,
-    )
-    base_record_dict = {
-        "artifact_kind": "raw",
-        "canonical_url": "https://example.test/file.json",
-        "raw_storage_uri": store.storage_uri(raw_path),
-        "raw_sha256": "f" * 64,
-        "status": "available",
-    }
-    store.record_manifest({**base_record_dict, "etag": '"old"'})
-    store.record_manifest({**base_record_dict, "etag": '"new"'})
-    missing_path = store.artifact_path("1" * 64, suffix=".json")
-    store.record_manifest(
-        {
-            "artifact_kind": "raw",
-            "canonical_url": "https://example.test/missing.json",
-            "raw_storage_uri": store.storage_uri(missing_path),
-            "raw_sha256": "1" * 64,
-            "status": "available",
-        }
-    )
-    partial_path = store.partial_path("https://example.test/partial.json")
-    partial_path.write_bytes(b"partial")
-    partial_record_dict = {
-        "artifact_kind": "partial_raw",
-        "canonical_url": "https://example.test/partial.json",
-        "raw_storage_uri": store.storage_uri(partial_path),
-        "status": "partial",
-    }
-    store.record_manifest({**partial_record_dict, "partial_sha256": "2" * 64})
-    store.record_manifest({**partial_record_dict, "partial_sha256": "3" * 64})
-    orphan_temps = [
-        root / ".manifest.jsonl.crashed.tmp",
-        store.leases_dir / ".lease.json.crashed.tmp",
-        root / ".retention" / "unleased" / ".artifact.json.crashed.tmp",
-    ]
-    for orphan_temp in orphan_temps:
-        orphan_temp.parent.mkdir(parents=True, exist_ok=True)
-        orphan_temp.write_text("partial", encoding="utf-8")
+    (
+        raw_path,
+        base_record_dict,
+        partial_record_dict,
+        orphan_temps,
+    ) = _manifest_compaction_fixture(root, store)
 
     retention_result = _collect(
         root,

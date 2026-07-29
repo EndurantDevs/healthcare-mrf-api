@@ -208,13 +208,7 @@ def _wait_for_process_cleanup(process_ids: tuple[int, ...]) -> None:
     ]
 
 
-@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")
-def test_indexed_peer_failure_interrupts_blocked_decoder_and_descendants(tmp_path):
-    """A failed range must cancel a blocked peer and its descendant without hanging."""
-    real_rapidgzip = shutil.which("rapidgzip")
-    if real_rapidgzip is None:
-        pytest.skip("rapidgzip is not installed")
-
+def _blocked_decoder_scanner_input(tmp_path, real_rapidgzip):
     fixture = _SUPPORT._scanner_fixture_payload(procedure_count=96)
     artifact = tmp_path / "rates.json.gz"
     _SUPPORT._write_gzip_json(
@@ -244,6 +238,20 @@ def test_indexed_peer_failure_interrupts_blocked_decoder_and_descendants(tmp_pat
             "REAL_RAPIDGZIP": real_rapidgzip,
             "RAPIDGZIP_TEST_STATE": str(state_dir),
         }
+    )
+    return artifact, state_dir, scanner_environment
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")
+def test_indexed_peer_failure_interrupts_blocked_decoder_and_descendants(tmp_path):
+    """A failed range must cancel a blocked peer and its descendant without hanging."""
+    real_rapidgzip = shutil.which("rapidgzip")
+    if real_rapidgzip is None:
+        pytest.skip("rapidgzip is not installed")
+
+    artifact, state_dir, scanner_environment = _blocked_decoder_scanner_input(
+        tmp_path,
+        real_rapidgzip,
     )
     scanner_binary = _SUPPORT._built_scanner_binary()
     started_at = time.monotonic()

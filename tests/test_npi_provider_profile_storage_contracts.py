@@ -140,8 +140,8 @@ async def test_profile_fetch_skips_malformed_rows_and_accepts_mapping_rows(
     assert "evidence_json" not in str(execute.await_args.args[0])
 
 
-def test_evidence_composer_filters_to_returned_state_and_fhir_facts():
-    """Verify evidence composer filters to returned state and fhir facts."""
+def _filtered_evidence_composer_inputs():
+    """Build the source payloads for returned-state evidence filtering."""
     provider_profile_by_key = {
         "categories": {
             "identity": {
@@ -189,6 +189,16 @@ def test_evidence_composer_filters_to_returned_state_and_fhir_facts():
         }
     }
 
+    return provider_profile_by_key, state_projection_by_key, fhir_evidence_by_key
+
+
+def test_evidence_composer_filters_to_returned_state_and_fhir_facts():
+    """Verify evidence composer filters to returned state and fhir facts."""
+    (
+        provider_profile_by_key,
+        state_projection_by_key,
+        fhir_evidence_by_key,
+    ) = _filtered_evidence_composer_inputs()
     evidence = profile_api.compose_provider_profile_evidence(
         state_projection=state_projection_by_key,
         fhir_evidence=fhir_evidence_by_key,

@@ -49,6 +49,20 @@ from process.provider_directory_proof_store import build_dataset_proof_shard
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
+def _uhc_admission_params(**overrides):
+    """Return the exact typed profile required by the official connector."""
+    params_by_name = {
+        "uhc_catalog_set_sha256": "a" * 64,
+        "bulk_export": False,
+        "open_only": True,
+        "include_auth_required": False,
+        "concurrency": 1,
+        "linked_resource_deadline_seconds": 0,
+    }
+    params_by_name.update(overrides)
+    return params_by_name
+
+
 def _stub_uhc_normal_import_lifecycle(monkeypatch):
     """Stub external dependencies for the normal UHC import lifecycle."""
     async def no_op(*_args, **_kwargs):
@@ -94,6 +108,7 @@ async def test_uhc_official_files_enter_normal_import_lifecycle(
     process_result = await importer.process_data(
         {"context": {}},
         {
+            **_uhc_admission_params(),
             "test": True,
             "run_id": "uhc-root",
             "source_ids": [importer.UHC_RETAINED_SOURCE_ID],
@@ -101,7 +116,6 @@ async def test_uhc_official_files_enter_normal_import_lifecycle(
             "publish_artifacts": False,
             "stale_cleanup": False,
             "resources": list(importer.UHC_SUPPORTED_RESOURCES),
-            "uhc_catalog_set_sha256": "a" * 64,
         },
     )
 
@@ -124,6 +138,7 @@ async def test_uhc_official_files_reject_invalid_endpoint_scope(monkeypatch):
         await importer.process_data(
             invalid_scope_context_by_field,
             {
+                **_uhc_admission_params(),
                 "test": True,
                 "run_id": "uhc-invalid-scope",
                 "source_ids": [importer.UHC_RETAINED_SOURCE_ID],
@@ -131,7 +146,6 @@ async def test_uhc_official_files_reject_invalid_endpoint_scope(monkeypatch):
                 "publish_artifacts": False,
                 "stale_cleanup": False,
                 "resources": list(importer.UHC_SUPPORTED_RESOURCES),
-                "uhc_catalog_set_sha256": "a" * 64,
                 "provider_directory_endpoint_scope": "https://example.test/fhir",
             },
         )
@@ -1275,7 +1289,7 @@ async def test_uhc_acquisition_callbacks_and_catalog_fences(monkeypatch):
     with pytest.raises(RuntimeError, match="selection_is_not_current"):
         await importer._acquire_current_uhc_official_file_set(
             {},
-            {},
+            _uhc_admission_params(),
             run_id="run-root",
         )
 
@@ -1322,7 +1336,7 @@ async def test_uhc_acquisition_rejects_catalog_change_and_accepts_exact_set(
     with pytest.raises(RuntimeError, match="changed_during_acquisition"):
         await importer._acquire_current_uhc_official_file_set(
             {},
-            {},
+            _uhc_admission_params(),
             run_id="run-root",
         )
 
@@ -1333,7 +1347,9 @@ async def test_uhc_acquisition_rejects_catalog_change_and_accepts_exact_set(
     assert (
         await importer._acquire_current_uhc_official_file_set(
             {},
-            {"uhc_catalog_set_sha256": catalog_hash},
+            _uhc_admission_params(
+                uhc_catalog_set_sha256=catalog_hash,
+            ),
             run_id="run-root",
         )
     ) == (catalog_hash, acquisition)
@@ -4417,10 +4433,9 @@ def test_selection_blocks_non_acquisition_sources_after_live_probe(
     assert metrics[f"source_import_skipped_blocked_source_{expected_reason}"] == 1
 
 
-@pytest.mark.asyncio
-async def test_process_data_acquires_only_neutral_0900_without_alias_fanout(
-    monkeypatch,
-):
+def _amerihealth_shared_carrier_seed_rows() -> list[dict[str, str]]:
+    """Build the six reviewed plan aliases used by the carrier test."""
+
     plan_name_by_code = {
         "0500": "AmeriHealth Caritas PA",
         "0900": "AmeriHealth Caritas NH",
@@ -4429,17 +4444,28 @@ async def test_process_data_acquires_only_neutral_0900_without_alias_fanout(
         "5400": "AmeriHealth Caritas DC",
         "7100": "AmeriHealth Caritas DE",
     }
-    seed_rows = [
+    return [
         {
             "id": f"amerihealth-{plan_code}",
             "org_name": "AmeriHealth Caritas",
             "plan_name": plan_name_by_code[plan_code],
-            "api_base": importer._amerihealth_caritas_provider_directory_base(plan_code),
+            "api_base": importer._amerihealth_caritas_provider_directory_base(
+                plan_code
+            ),
             "auth_type": "none",
             "source": "provider-directory-db",
         }
         for plan_code in ("0500", "0900", "1200", "2100", "5400", "7100")
     ]
+
+
+@pytest.mark.asyncio
+async def test_process_data_acquires_only_neutral_0900_without_alias_fanout(
+    monkeypatch,
+):
+    """Bound a synthetic AmeriHealth import without selecting official UHC."""
+
+    seed_rows = _amerihealth_shared_carrier_seed_rows()
     resolved_rows = [importer._source_row_from_seed(seed) for seed in seed_rows]
     source_ids = {
         resolved_source["source_id"] for resolved_source in resolved_rows
@@ -4461,6 +4487,7 @@ async def test_process_data_acquires_only_neutral_0900_without_alias_fanout(
             "seed_db_path": "fixture.db",
             "probe": True,
             "import_resources": True,
+            "limit": len(seed_rows),
             "resources": ",".join(importer.AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES),
             "publish_artifacts": False,
             "provider_directory_endpoint_scope": importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE,
@@ -14592,6 +14619,7 @@ async def test_process_data_uses_live_probe_success_over_seed_auth_required_stat
             "seed_db_path": "/tmp/provider-directory.db",
             "probe": True,
             "import_resources": True,
+            "source_ids": ["source_a"],
             "resources": "Practitioner",
         },
     )

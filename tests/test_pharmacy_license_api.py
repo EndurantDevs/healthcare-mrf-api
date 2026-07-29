@@ -273,33 +273,15 @@ async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypat
             FakeResult(
                 rows=[
                     MappingRow(
-                        state_code="TX",
-                        state_name="Texas",
-                        board_url="https://example.com/tx",
-                        source_url="https://example.com/tx.csv",
-                        license_number="TX-123",
-                        license_type="Pharmacy",
-                        license_status="active",
-                        source_status_raw="ACTIVE",
-                        license_issue_date=None,
-                        license_effective_date=None,
-                        license_expiration_date=None,
-                        last_renewal_date=None,
-                        disciplinary_flag=False,
-                        disciplinary_summary=None,
-                        disciplinary_action_date=None,
-                        entity_name="Sample Pharmacy",
-                        dba_name=None,
-                        address_line1="100 Main",
-                        address_line2=None,
-                        city="Austin",
-                        state="TX",
-                        zip_code="78701",
-                        phone_number="555",
-                        source_record_id="r1",
-                        last_snapshot_id="snap_1",
-                        first_seen_at=None,
-                        last_seen_at=None,
+                        state_code="TX", state_name="Texas", board_url="https://example.com/tx",
+                        source_url="https://example.com/tx.csv", license_number="TX-123",
+                        license_type="Pharmacy", license_status="active", source_status_raw="ACTIVE",
+                        license_issue_date=None, license_effective_date=None, license_expiration_date=None,
+                        last_renewal_date=None, disciplinary_flag=False, disciplinary_summary=None,
+                        disciplinary_action_date=None, entity_name="Sample Pharmacy", dba_name=None,
+                        address_line1="100 Main", address_line2=None, city="Austin", state="TX",
+                        zip_code="78701", phone_number="555", source_record_id="r1",
+                        last_snapshot_id="snap_1", first_seen_at=None, last_seen_at=None,
                         last_verified_at=None,
                     )
                 ]
@@ -307,16 +289,10 @@ async def test_get_pharmacy_license_by_npi_returns_summary_and_history(monkeypat
             FakeResult(
                 rows=[
                     MappingRow(
-                        snapshot_id="snap_1",
-                        run_id="run_1",
-                        state_code="TX",
-                        license_number="TX-123",
-                        license_status="active",
-                        source_status_raw="ACTIVE",
-                        disciplinary_flag=False,
-                        disciplinary_summary=None,
-                        license_expiration_date=None,
-                        imported_at=None,
+                        snapshot_id="snap_1", run_id="run_1", state_code="TX",
+                        license_number="TX-123", license_status="active",
+                        source_status_raw="ACTIVE", disciplinary_flag=False,
+                        disciplinary_summary=None, license_expiration_date=None, imported_at=None,
                     )
                 ]
             ),
