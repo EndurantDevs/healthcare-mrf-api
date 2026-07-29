@@ -351,7 +351,7 @@ async def _load_postgres_partition_plan(
 
 
 def _assert_exact_partition_dispatch(plan) -> None:
-    assert plan.request_count == 4
+    assert plan.request_count == 6
     assert all(
         request.item_count <= PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS
         for request in plan.requests
@@ -406,7 +406,7 @@ async def _execute_postgres_partition_plan(
 
 
 def _assert_partition_aggregate(aggregate) -> None:
-    assert aggregate.request_count == 4
+    assert aggregate.request_count == 6
     assert aggregate.source_occurrence_count == 2
     assert aggregate.persisted_occurrence_count == 101
     assert aggregate.block_io["repeated_physical_reads"] == 0
@@ -462,7 +462,7 @@ async def _persist_multipart_witness(
 async def test_real_postgres_partition_plan_dispatches_every_item_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prove four bounded V2 requests over one worker-side PostgreSQL load."""
+    """Prove six bounded V2 requests over one worker-side PostgreSQL load."""
 
     if os.getenv("HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST=1")
@@ -487,7 +487,7 @@ async def test_real_postgres_partition_plan_dispatches_every_item_once(
             plan,
         )
         _assert_partition_aggregate(aggregate)
-        assert snapshot_descriptor.await_count == 4
+        assert snapshot_descriptor.await_count == 6
     finally:
         try:
             await db.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")

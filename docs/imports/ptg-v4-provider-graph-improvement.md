@@ -246,6 +246,17 @@ plane must verify that the engine advertises this mode before enqueueing work.
 Unknown modes, missing audit-only result markers, an activated import ID, or an
 equivalent-layout reuse fail closed.
 
+The partition request contract continues to accept at most 100 items for
+reader compatibility. Current writers emit deterministic, code-aware
+partitions targeting at most 25 items to reduce observed dense-provider-graph
+retention without raising the existing 512 MiB decoded-retention or default
+1 GiB per-process admission limits. Those caps remain fail-closed; only a
+complete candidate audit proves every emitted partition for a snapshot fits.
+Changing the partition boundary does not change the sealed plan digest,
+ordered item ordinals, or cohort counts. Progress reports the resulting
+dynamic `partition_count` and exact completed count; it must not assume the
+older 50-item target.
+
 The attestation persists `activation_intent` and a digest binding that intent
 to the audited report. Generic promotion and attestation consumption accept
 only `audit_and_activate`; an `audit_only` attestation is a durable hold and

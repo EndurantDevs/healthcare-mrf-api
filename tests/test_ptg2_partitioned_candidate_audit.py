@@ -164,7 +164,7 @@ async def test_partitioned_event_loop_contract():
 
 
 @pytest.mark.asyncio
-async def test_executes_five_requests_at_two_starts_per_second_with_overlap(
+async def test_executes_nine_requests_at_two_starts_per_second_with_overlap(
     unused_tcp_port,
 ):
     starts: list[float] = []
@@ -211,13 +211,13 @@ async def test_executes_five_requests_at_two_starts_per_second_with_overlap(
     finally:
         await runner.cleanup()
 
-    assert aggregate.request_count == 5
-    assert metrics.started_request_count == 5
-    assert metrics.completed_request_count == 5
+    assert aggregate.request_count == 9
+    assert metrics.started_request_count == 9
+    assert metrics.completed_request_count == 9
     assert metrics.failed_request_count == 0
     assert metrics.peak_in_flight >= 2
     assert counters_by_name["peak_active"] >= 2
-    assert len(starts) == 5
+    assert len(starts) == 9
     assert all(
         later - earlier >= 0.45
         for earlier, later in zip(starts, starts[1:])

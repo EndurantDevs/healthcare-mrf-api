@@ -1549,8 +1549,9 @@ async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
     expected_report = _passing_batch_report()
     batch_audit = AsyncMock(return_value=expected_report)
     partition_progress = AsyncMock()
+    progress = AsyncMock()
     witness_loader = AsyncMock()
-    monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", progress)
     monkeypatch.setattr(
         ptg_candidate_audit,
         "_partition_progress",
@@ -1574,6 +1575,10 @@ async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
     )
 
     assert report is expected_report
+    assert progress.await_args.kwargs["message"] == (
+        "submitting authenticated bounded API partitions for "
+        "10,000 sealed source occurrences"
+    )
     batch_audit.assert_awaited_once()
     progress_callback = batch_audit.await_args.kwargs["progress_callback"]
     await progress_callback(2, 4)

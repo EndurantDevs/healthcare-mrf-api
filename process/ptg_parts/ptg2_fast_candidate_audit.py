@@ -138,7 +138,8 @@ async def _request_json(
     url: str,
     params: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    for attempt in range(2):
+    attempt = 0
+    while True:
         async with semaphore:
             started = time.perf_counter()
             try:
@@ -154,6 +155,7 @@ async def _request_json(
                 metrics.latencies_ms.append((time.perf_counter() - started) * 1_000)
                 if attempt == 0:
                     metrics.retry_count += 1
+                    attempt = 1
                     continue
                 raise FastCandidateAuditError("api_request_timeout") from exc
             except aiohttp.ClientError as exc:
@@ -161,6 +163,7 @@ async def _request_json(
                 metrics.latencies_ms.append((time.perf_counter() - started) * 1_000)
                 if attempt == 0:
                     metrics.retry_count += 1
+                    attempt = 1
                     continue
                 raise FastCandidateAuditError("api_transport_failure") from exc
         metrics.request_count += 1
@@ -168,6 +171,7 @@ async def _request_json(
         if status_code in _RETRYABLE_STATUS and attempt == 0:
             metrics.retry_count += 1
             await asyncio.sleep(0.05)
+            attempt = 1
             continue
         if status_code < 200 or status_code >= 300:
             raise FastCandidateAuditError("api_non_success_status")
@@ -178,7 +182,6 @@ async def _request_json(
         if not isinstance(response_fields, Mapping):
             raise FastCandidateAuditError("api_response_not_object")
         return response_fields
-    raise FastCandidateAuditError("api_transport_failure")
 
 
 def _challenge_params(

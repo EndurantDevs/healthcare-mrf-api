@@ -17,8 +17,8 @@ PTG2_PARTITIONED_CANDIDATE_AUDIT_RESULT_CONTRACT = (
 )
 PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS = 100
 # Keep the public parser ceiling at 100 for compatibility, but emit smaller
-# partitions so dense provider graphs stay within the 512 MiB read-once budget.
-PTG2_PARTITIONED_CANDIDATE_AUDIT_TARGET_ITEMS = 50
+# partitions to reduce observed dense-graph pressure under the fail-closed cap.
+PTG2_PARTITIONED_CANDIDATE_AUDIT_TARGET_ITEMS = 25
 PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_NETWORK_DIGESTS = 64
 PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT = 2
 PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND = 2.0
