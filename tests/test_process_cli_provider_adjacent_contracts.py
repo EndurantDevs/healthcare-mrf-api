@@ -199,6 +199,27 @@ def _assert_candidate_audit_run_controls(monkeypatch) -> None:
             "import_id": "import-1",
         },
     )
+    _assert_cli_forwards(
+        monkeypatch,
+        command=process_cli.ptg_candidate_audit,
+        target_name="initiate_ptg_candidate_audit",
+        args=[
+            "--candidate-run-id",
+            "candidate-1",
+            "--snapshot-id",
+            "snapshot-1",
+            "--import-id",
+            "import-1",
+            "--candidate-audit-mode",
+            "audit_only",
+        ],
+        expected={
+            "candidate_run_id": "candidate-1",
+            "snapshot_id": "snapshot-1",
+            "import_id": "import-1",
+            "candidate_audit_mode": "audit_only",
+        },
+    )
 
 
 def _assert_source_discovery_run_controls(monkeypatch) -> None:

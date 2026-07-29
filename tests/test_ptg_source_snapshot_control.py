@@ -72,6 +72,7 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
     publish = publish_calls[0]
     assert publish["source_key"] == "source_a"
     assert publish["expected_current_snapshot_id"] == "snap_old"
+    assert publish["expected_audit_only_attestation_digest"] is None
     assert clear_calls == [True]
 
 

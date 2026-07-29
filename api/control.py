@@ -214,6 +214,18 @@ async def control_ptg_source_snapshot_promote(request):
                 if request_payload.get("expected_current_snapshot_id") is not None
                 else None
             ),
+            expected_audit_only_attestation_digest=(
+                str(
+                    request_payload.get(
+                        "expected_audit_only_attestation_digest"
+                    )
+                )
+                if request_payload.get(
+                    "expected_audit_only_attestation_digest"
+                )
+                is not None
+                else None
+            ),
         )
     except SourceSnapshotConflict as exc:
         raise SanicException(str(exc), status_code=409) from exc

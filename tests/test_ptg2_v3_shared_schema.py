@@ -42,6 +42,9 @@ from db.models._legacy import (
 from process.ptg_parts.ptg2_shared_gc import (
     require_migration_owned_tables,
 )
+from process.ptg_parts.ptg2_candidate_attestation import (
+    candidate_attestation_digest,
+)
 
 
 MIGRATION_PATH = (
@@ -55,6 +58,12 @@ FOLLOWUP_MIGRATION_PATH = (
     / "alembic"
     / "versions"
     / "20260714120000_ptg2_v3_schema_gc_consistency.py"
+)
+HOLD_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "20260729100000_ptg2_candidate_audit_hold.py"
 )
 
 
@@ -195,8 +204,23 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260728130000_provider_directory_content_proof_shards"
+        "20260729100000_ptg2_candidate_audit_hold"
     ]
+
+
+def test_candidate_audit_hold_migration_matches_runtime_digest():
+    migration = _load_migration(HOLD_MIGRATION_PATH)
+    report_digest = b"r" * 32
+
+    assert migration.down_revision == (
+        "20260728130000_provider_directory_content_proof_shards"
+    )
+    assert migration._attestation_digest(report_digest) == (
+        candidate_attestation_digest(
+            report_digest,
+            "audit_and_activate",
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -526,10 +550,12 @@ def test_v3_shared_models_define_exact_parent_columns_and_types():
             "source_witness_digest",
             "contract",
             "tool_name",
-            "tool_version",
-            "report_digest",
-            "report",
-            "attested_at",
+                "tool_version",
+                "report_digest",
+                "report",
+                "activation_intent",
+                "attestation_digest",
+                "attested_at",
             "expires_at",
             "activated_at",
         ),
@@ -993,8 +1019,10 @@ def test_v3_shared_models_define_checks_indexes_and_partition_intent():
             "ptg2_v3_candidate_audit_attestation_source_set_check",
             "ptg2_v3_candidate_audit_attestation_sample_check",
             "ptg2_v3_candidate_audit_attestation_witness_check",
-            "ptg2_v3_candidate_audit_attestation_report_check",
-            "ptg2_v3_candidate_audit_attestation_expiry_check",
+                "ptg2_v3_candidate_audit_attestation_report_check",
+                "ptg2_v3_candidate_audit_attestation_intent_check",
+                "ptg2_v3_candidate_audit_attestation_digest_check",
+                "ptg2_v3_candidate_audit_attestation_expiry_check",
         },
     }
     for model, expected_names in expected_check_names_by_model.items():

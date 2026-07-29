@@ -25,8 +25,11 @@ from process.ptg_parts.ptg2_candidate_layout_identity import (
 )
 from process.ptg_parts.ptg2_shared_blocks import bind_snapshot_to_shared_layout
 from process.ptg_parts.ptg2_candidate_attestation import (
+    PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE,
+    PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY,
     consume_candidate_audit_attestation_in_transaction,
     verify_candidate_audit_attestation_in_transaction,
+    verify_held_candidate_attestation_in_transaction,
 )
 from process.ptg_parts.ptg2_lifecycle_lock import (
     PTG2_SOURCE_POINTER_GC_LOCK_KEY,
@@ -317,6 +320,41 @@ async def _acquire_source_pointer_gc_lock(session: Any) -> None:
     await acquire_ptg2_lifecycle_lock(session)
 
 
+_SOURCE_POINTER_CAS_SQL = """
+WITH publish_lock AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))
+), updated_pointer AS (
+    UPDATE {schema}.ptg2_current_source_snapshot AS current_pointer
+       SET snapshot_id = :snapshot_id,
+           previous_snapshot_id = :previous_snapshot_id,
+           import_month = :import_month,
+           updated_at = :updated_at
+      FROM publish_lock
+     WHERE current_pointer.source_key = :source_key
+       AND (
+            current_pointer.snapshot_id IS NOT DISTINCT FROM :previous_snapshot_id
+            OR (
+                :allow_already_current
+                AND current_pointer.snapshot_id = :snapshot_id
+            )
+       )
+    RETURNING current_pointer.snapshot_id
+), inserted_pointer AS (
+    INSERT INTO {schema}.ptg2_current_source_snapshot
+        (source_key, snapshot_id, previous_snapshot_id, import_month, updated_at)
+    SELECT :source_key, :snapshot_id, :previous_snapshot_id, :import_month, :updated_at
+      FROM publish_lock
+     WHERE :previous_snapshot_id IS NULL
+    ON CONFLICT (source_key) DO NOTHING
+    RETURNING snapshot_id
+)
+SELECT snapshot_id FROM updated_pointer
+UNION ALL
+SELECT snapshot_id FROM inserted_pointer
+LIMIT 1
+"""
+
+
 async def _compare_and_swap_source_pointer(
     session: Any,
     *,
@@ -331,39 +369,9 @@ async def _compare_and_swap_source_pointer(
     """Atomically replace a source pointer at its expected value."""
     cas_query_result = await session.execute(
         db.text(
-            f"""
-            WITH publish_lock AS MATERIALIZED (
-                SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))
-            ), updated_pointer AS (
-                UPDATE {_quote_ident(schema_name)}.ptg2_current_source_snapshot AS current_pointer
-                   SET snapshot_id = :snapshot_id,
-                       previous_snapshot_id = :previous_snapshot_id,
-                       import_month = :import_month,
-                       updated_at = :updated_at
-                  FROM publish_lock
-                 WHERE current_pointer.source_key = :source_key
-                   AND (
-                        current_pointer.snapshot_id IS NOT DISTINCT FROM :previous_snapshot_id
-                        OR (
-                            :allow_already_current
-                            AND current_pointer.snapshot_id = :snapshot_id
-                        )
-                   )
-                RETURNING current_pointer.snapshot_id
-            ), inserted_pointer AS (
-                INSERT INTO {_quote_ident(schema_name)}.ptg2_current_source_snapshot
-                    (source_key, snapshot_id, previous_snapshot_id, import_month, updated_at)
-                SELECT :source_key, :snapshot_id, :previous_snapshot_id, :import_month, :updated_at
-                  FROM publish_lock
-                 WHERE :previous_snapshot_id IS NULL
-                ON CONFLICT (source_key) DO NOTHING
-                RETURNING snapshot_id
+            _SOURCE_POINTER_CAS_SQL.format(
+                schema=_quote_ident(schema_name)
             )
-            SELECT snapshot_id FROM updated_pointer
-            UNION ALL
-            SELECT snapshot_id FROM inserted_pointer
-            LIMIT 1
-            """
         ),
         {
             "publish_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY,
@@ -439,6 +447,55 @@ async def _stage_snapshot_in_pointer_transaction(
         )
 
 
+_AUDITED_CANDIDATE_PUBLICATION_SQL = """
+UPDATE {schema}.ptg2_snapshot
+   SET status = :status,
+       published_at = :published_at,
+       manifest = jsonb_set(
+           COALESCE(manifest::jsonb, '{{}}'::jsonb),
+           '{{activation}}',
+           CAST(:activation_json AS jsonb),
+           true
+       )::json
+ WHERE snapshot_id = :snapshot_id
+   AND status = 'validated'
+   AND previous_snapshot_id IS NOT DISTINCT FROM :previous_snapshot_id
+   AND manifest->'activation'->>'contract' = :candidate_activation_contract
+   AND manifest->'activation'->>'state' = 'validated'
+RETURNING status
+"""
+
+
+_LEGACY_SNAPSHOT_PUBLICATION_SQL = """
+WITH updated_snapshot AS (
+    UPDATE {schema}.ptg2_snapshot
+       SET import_run_id = :import_run_id,
+           import_month = :import_month,
+           status = :status,
+           created_at = :created_at,
+           validated_at = :validated_at,
+           published_at = :published_at,
+           previous_snapshot_id = :previous_snapshot_id,
+           manifest = CAST(:manifest_json AS json)
+     WHERE snapshot_id = :snapshot_id
+       AND status = 'validated'
+       AND COALESCE(manifest->'activation'->>'contract', '')
+           <> :candidate_activation_contract
+    RETURNING status
+)
+SELECT status FROM updated_snapshot
+UNION ALL
+SELECT status
+ FROM {schema}.ptg2_snapshot
+ WHERE snapshot_id = :snapshot_id
+   AND status = 'published'
+   AND COALESCE(manifest->'activation'->>'contract', '')
+       <> :candidate_activation_contract
+   AND NOT EXISTS (SELECT 1 FROM updated_snapshot)
+LIMIT 1
+"""
+
+
 async def _publish_snapshot_in_pointer_transaction(
     session: Any,
     *,
@@ -455,24 +512,9 @@ async def _publish_snapshot_in_pointer_transaction(
     if activation.get("contract") == PTG2_CANDIDATE_ACTIVATION_CONTRACT:
         publication_query_result = await session.execute(
             db.text(
-                f"""
-                UPDATE {_quote_ident(schema_name)}.ptg2_snapshot
-                   SET status = :status,
-                       published_at = :published_at,
-                       manifest = jsonb_set(
-                           COALESCE(manifest::jsonb, '{{}}'::jsonb),
-                           '{{activation}}',
-                           CAST(:activation_json AS jsonb),
-                           true
-                       )::json
-                 WHERE snapshot_id = :snapshot_id
-                   AND status = 'validated'
-                   AND previous_snapshot_id IS NOT DISTINCT FROM :previous_snapshot_id
-                   AND manifest->'activation'->>'contract'
-                       = :candidate_activation_contract
-                   AND manifest->'activation'->>'state' = 'validated'
-                RETURNING status
-                """
+                _AUDITED_CANDIDATE_PUBLICATION_SQL.format(
+                    schema=_quote_ident(schema_name)
+                )
             ),
             {
                 "snapshot_id": snapshot_attributes["snapshot_id"],
@@ -495,34 +537,9 @@ async def _publish_snapshot_in_pointer_transaction(
         return
     publication_query_result = await session.execute(
         db.text(
-            f"""
-            WITH updated_snapshot AS (
-                UPDATE {_quote_ident(schema_name)}.ptg2_snapshot
-                   SET import_run_id = :import_run_id,
-                       import_month = :import_month,
-                       status = :status,
-                       created_at = :created_at,
-                       validated_at = :validated_at,
-                       published_at = :published_at,
-                       previous_snapshot_id = :previous_snapshot_id,
-                       manifest = CAST(:manifest_json AS json)
-                 WHERE snapshot_id = :snapshot_id
-                   AND status = 'validated'
-                   AND COALESCE(manifest->'activation'->>'contract', '')
-                       <> :candidate_activation_contract
-                RETURNING status
+            _LEGACY_SNAPSHOT_PUBLICATION_SQL.format(
+                schema=_quote_ident(schema_name)
             )
-            SELECT status FROM updated_snapshot
-            UNION ALL
-            SELECT status
-             FROM {_quote_ident(schema_name)}.ptg2_snapshot
-             WHERE snapshot_id = :snapshot_id
-               AND status = 'published'
-               AND COALESCE(manifest->'activation'->>'contract', '')
-                   <> :candidate_activation_contract
-               AND NOT EXISTS (SELECT 1 FROM updated_snapshot)
-            LIMIT 1
-            """
         ),
         {
             **snapshot_attributes,
@@ -601,6 +618,103 @@ async def _replace_source_plan_pointers(
         )
 
 
+def _coverage_plan_identity(scope: Any) -> tuple[str, str]:
+    """Normalize one logical plan scope into its immutable identity."""
+
+    return (
+        str(
+            scope.get("plan_id")
+            if isinstance(scope, Mapping)
+            else getattr(scope, "plan_id", "")
+        ).strip(),
+        str(
+            scope.get("plan_market_type")
+            if isinstance(scope, Mapping)
+            else getattr(scope, "plan_market_type", "")
+        )
+        .strip()
+        .lower(),
+    )
+
+
+def _validated_coverage_plans(
+    *,
+    snapshot_id: str,
+    plan_pointer_entries: Sequence[Any],
+    coverage_plan_scopes: Sequence[Any] | None,
+) -> set[tuple[str, str]]:
+    """Cross-check pointer plans against the sealed coverage-plan set."""
+
+    distinct_plans = {
+        _coverage_plan_identity(entry)
+        for entry in plan_pointer_entries
+        if _coverage_plan_identity(entry)[0]
+    }
+    if not distinct_plans:
+        raise RuntimeError(
+            "strict V3 snapshot has no logical plan for its coverage scope"
+        )
+    expected_plans = (
+        {
+            _coverage_plan_identity(scope)
+            for scope in coverage_plan_scopes
+        }
+        if coverage_plan_scopes is not None
+        else set(distinct_plans)
+    )
+    expected_plans = {plan for plan in expected_plans if plan[0]}
+    if not expected_plans:
+        raise ValueError(
+            "strict V3 publication requires logical coverage plans"
+        )
+    if distinct_plans != expected_plans:
+        raise RuntimeError(
+            f"PTG snapshot {snapshot_id} plan pointers do not match its immutable coverage scope"
+        )
+    return expected_plans
+
+
+_SNAPSHOT_SCOPE_UPSERT_SQL = """
+INSERT INTO {schema}.ptg2_v3_snapshot_scope
+    (snapshot_id, plan_id, plan_market_type, coverage_scope_id)
+VALUES
+    (:snapshot_id, :plan_id, :plan_market_type, :coverage_scope_id)
+ON CONFLICT (snapshot_id) DO UPDATE SET
+    coverage_scope_id = EXCLUDED.coverage_scope_id
+WHERE {schema}.ptg2_v3_snapshot_scope.plan_id = EXCLUDED.plan_id
+  AND {schema}.ptg2_v3_snapshot_scope.plan_market_type
+      = EXCLUDED.plan_market_type
+  AND {schema}.ptg2_v3_snapshot_scope.coverage_scope_id
+      = EXCLUDED.coverage_scope_id
+RETURNING coverage_scope_id
+"""
+
+
+_SNAPSHOT_PLAN_SCOPE_INSERT_SQL = """
+INSERT INTO {schema}.ptg2_v3_snapshot_plan_scope
+    (snapshot_id, plan_id, plan_market_type)
+VALUES
+    (:snapshot_id, :plan_id, :plan_market_type)
+ON CONFLICT (snapshot_id, plan_id, plan_market_type) DO NOTHING
+"""
+
+
+_SNAPSHOT_PLAN_SCOPE_SELECT_SQL = """
+SELECT plan_id, plan_market_type
+  FROM {schema}.ptg2_v3_snapshot_plan_scope
+ WHERE snapshot_id = :snapshot_id
+"""
+
+
+def _observed_coverage_plans(
+    scope_records: Sequence[Any],
+) -> set[tuple[str, str]]:
+    return {
+        _coverage_plan_identity(_row_mapping(scope_record))
+        for scope_record in scope_records
+    }
+
+
 async def _bind_snapshot_coverage_scope(
     session: Any,
     *,
@@ -615,62 +729,16 @@ async def _bind_snapshot_coverage_scope(
     scope_id = bytes(coverage_scope_id)
     if len(scope_id) != 32:
         raise ValueError("strict V3 coverage scope id must contain exactly 32 bytes")
-    distinct_plans = {
-        (
-            str(entry.get("plan_id") or "").strip(),
-            str(entry.get("plan_market_type") or "").strip().lower(),
-        )
-        for entry in plan_pointer_entries
-        if str(entry.get("plan_id") or "").strip()
-    }
-    if not distinct_plans:
-        raise RuntimeError("strict V3 snapshot has no logical plan for its coverage scope")
-    expected_plans = (
-        {
-            (
-                str(
-                    scope.get("plan_id")
-                    if isinstance(scope, Mapping)
-                    else getattr(scope, "plan_id", "")
-                ).strip(),
-                str(
-                    scope.get("plan_market_type")
-                    if isinstance(scope, Mapping)
-                    else getattr(scope, "plan_market_type", "")
-                )
-                .strip()
-                .lower(),
-            )
-            for scope in coverage_plan_scopes
-        }
-        if coverage_plan_scopes is not None
-        else set(distinct_plans)
+    expected_plans = _validated_coverage_plans(
+        snapshot_id=snapshot_id,
+        plan_pointer_entries=plan_pointer_entries,
+        coverage_plan_scopes=coverage_plan_scopes,
     )
-    expected_plans = {plan for plan in expected_plans if plan[0]}
-    if not expected_plans:
-        raise ValueError("strict V3 publication requires logical coverage plans")
-    if distinct_plans != expected_plans:
-        raise RuntimeError(
-            f"PTG snapshot {snapshot_id} plan pointers do not match its immutable coverage scope"
-        )
     primary_plan_id, primary_plan_market_type = min(expected_plans)
+    schema = _quote_ident(schema_name)
     scope_upsert_query = await session.execute(
         db.text(
-            f"""
-            INSERT INTO {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope
-                (snapshot_id, plan_id, plan_market_type, coverage_scope_id)
-            VALUES
-                (:snapshot_id, :plan_id, :plan_market_type, :coverage_scope_id)
-            ON CONFLICT (snapshot_id) DO UPDATE SET
-                coverage_scope_id = EXCLUDED.coverage_scope_id
-            WHERE {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.plan_id
-                  = EXCLUDED.plan_id
-              AND {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.plan_market_type
-                  = EXCLUDED.plan_market_type
-              AND {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope.coverage_scope_id
-                  = EXCLUDED.coverage_scope_id
-            RETURNING coverage_scope_id
-            """
+            _SNAPSHOT_SCOPE_UPSERT_SQL.format(schema=schema)
         ),
         {
             "snapshot_id": snapshot_id,
@@ -685,13 +753,7 @@ async def _bind_snapshot_coverage_scope(
         )
     await session.execute(
         db.text(
-            f"""
-            INSERT INTO {_quote_ident(schema_name)}.ptg2_v3_snapshot_plan_scope
-                (snapshot_id, plan_id, plan_market_type)
-            VALUES
-                (:snapshot_id, :plan_id, :plan_market_type)
-            ON CONFLICT (snapshot_id, plan_id, plan_market_type) DO NOTHING
-            """
+            _SNAPSHOT_PLAN_SCOPE_INSERT_SQL.format(schema=schema)
         ),
         [
             {
@@ -704,25 +766,40 @@ async def _bind_snapshot_coverage_scope(
     )
     observed_scope_records = await session.execute(
         db.text(
-            f"""
-            SELECT plan_id, plan_market_type
-              FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_plan_scope
-             WHERE snapshot_id = :snapshot_id
-            """
+            _SNAPSHOT_PLAN_SCOPE_SELECT_SQL.format(schema=schema)
         ),
         {"snapshot_id": snapshot_id},
     )
-    observed_plans = {
-        (
-            str(_row_mapping(scope_record).get("plan_id") or ""),
-            str(_row_mapping(scope_record).get("plan_market_type") or ""),
-        )
-        for scope_record in observed_scope_records
-    }
+    observed_plans = _observed_coverage_plans(observed_scope_records)
     if observed_plans != expected_plans:
         raise RuntimeError(
             f"PTG snapshot {snapshot_id} has stale logical coverage-scope mappings"
         )
+
+
+def _candidate_stage_plan_entries(
+    coverage_plan_scopes: Sequence[Any],
+    *,
+    import_month: datetime.date,
+    source_key: str,
+    snapshot_id: str,
+    previous_snapshot_id: str | None,
+    updated_at: datetime.datetime,
+) -> list[dict[str, Any]]:
+    """Build logical plan entries staged with one immutable candidate."""
+
+    return [
+        _plan_pointer_entry(
+            plan_id=_coverage_plan_identity(scope)[0],
+            plan_market_type=_coverage_plan_identity(scope)[1],
+            import_month=import_month,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=previous_snapshot_id,
+            updated_at=updated_at,
+        )
+        for scope in coverage_plan_scopes
+    ]
 
 
 async def _stage_ptg2_source_candidate(
@@ -753,26 +830,14 @@ async def _stage_ptg2_source_candidate(
             snapshot_id=snapshot_id,
             snapshot_key=int(shared_snapshot_key),
         )
-        plan_pointer_entries = [
-            _plan_pointer_entry(
-                plan_id=str(
-                    scope.get("plan_id")
-                    if isinstance(scope, Mapping)
-                    else getattr(scope, "plan_id", "")
-                ),
-                plan_market_type=str(
-                    scope.get("plan_market_type")
-                    if isinstance(scope, Mapping)
-                    else getattr(scope, "plan_market_type", "")
-                ),
-                import_month=import_month,
-                source_key=source_key,
-                snapshot_id=snapshot_id,
-                previous_snapshot_id=previous_snapshot_id,
-                updated_at=updated_at,
-            )
-            for scope in coverage_plan_scopes
-        ]
+        plan_pointer_entries = _candidate_stage_plan_entries(
+            coverage_plan_scopes,
+            import_month=import_month,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=previous_snapshot_id,
+            updated_at=updated_at,
+        )
         await _bind_snapshot_coverage_scope(
             session,
             schema_name=schema_name,
@@ -1049,6 +1114,7 @@ async def activate_ptg2_source_candidate(
     source_key: str,
     snapshot_id: str,
     expected_current_snapshot_id: str | None = None,
+    expected_audit_only_attestation_digest: bytes | None = None,
 ) -> dict[str, Any]:
     """Audit and activate one authoritative candidate in a single transaction."""
 
@@ -1071,6 +1137,9 @@ async def activate_ptg2_source_candidate(
             source_key=normalized_source_key,
             snapshot_id=normalized_snapshot_id,
             expected_current_snapshot_id=expected_current_snapshot_id,
+            expected_audit_only_attestation_digest=(
+                expected_audit_only_attestation_digest
+            ),
         )
 
 
@@ -1178,18 +1247,44 @@ async def _activate_candidate_source_pointer(
     source_key: str,
     snapshot_id: str,
     activation_context: _CandidateActivationContext,
+    expected_audit_only_attestation_digest: bytes | None,
 ) -> bytes:
     activation_by_field = activation_context.activation_by_field
-    audit_report_digest = await verify_candidate_audit_attestation_in_transaction(
-        session,
-        schema_name=schema_name,
-        snapshot_id=snapshot_id,
-        snapshot_key=activation_by_field["snapshot_key"],
-        source_key=source_key,
-        plan_id=activation_by_field["plan_id"],
-        plan_market_type=activation_by_field["plan_market_type"],
-        coverage_scope_id=activation_by_field["coverage_scope_id"],
-    )
+    if expected_audit_only_attestation_digest is None:
+        audit_report_digest = (
+            await verify_candidate_audit_attestation_in_transaction(
+                session,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+                snapshot_key=activation_by_field["snapshot_key"],
+                source_key=source_key,
+                plan_id=activation_by_field["plan_id"],
+                plan_market_type=activation_by_field["plan_market_type"],
+                coverage_scope_id=activation_by_field["coverage_scope_id"],
+            )
+        )
+    else:
+        audit_report_digest = (
+            await verify_held_candidate_attestation_in_transaction(
+                session,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+                expected_identity_by_field={
+                    "snapshot_key": activation_by_field["snapshot_key"],
+                    "source_key": source_key,
+                    "plan_id": activation_by_field["plan_id"],
+                    "plan_market_type": activation_by_field[
+                        "plan_market_type"
+                    ],
+                    "coverage_scope_id": activation_by_field[
+                        "coverage_scope_id"
+                    ],
+                },
+                expected_attestation_digest=(
+                    expected_audit_only_attestation_digest
+                ),
+            )
+        )
     await _compare_and_swap_source_pointer(
         session,
         schema_name=schema_name,
@@ -1235,15 +1330,13 @@ async def _promote_allowed_amount_pointer(
     }
 
 
-async def _persist_candidate_activation(
-    session: Any,
-    *,
-    schema_name: str,
-    source_key: str,
-    snapshot_id: str,
+def _activated_candidate_attributes(
     activation_context: _CandidateActivationContext,
-    audit_report_digest: bytes,
-) -> None:
+    *,
+    activation_mode: str,
+) -> dict[str, Any]:
+    """Build the exact published snapshot attributes for activation."""
+
     candidate_attributes_by_field = {
         key: activation_context.candidate.get(key)
         for key in (
@@ -1258,13 +1351,39 @@ async def _persist_candidate_activation(
             "manifest",
         )
     }
+    return activated_snapshot_attributes(
+        candidate_attributes_by_field,
+        activated_at=activation_context.activated_at,
+        activation_mode=activation_mode,
+    )
+
+
+async def _persist_candidate_activation(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    activation_context: _CandidateActivationContext,
+    audit_report_digest: bytes,
+    expected_audit_only_attestation_digest: bytes | None,
+) -> None:
+    """Publish pointers and consume the exact attestation in one transaction."""
+
+    is_reviewed_audit_only = (
+        expected_audit_only_attestation_digest is not None
+    )
+    activation_mode = (
+        "reviewed_audit_only_control"
+        if is_reviewed_audit_only
+        else "audited_control"
+    )
     await _publish_snapshot_in_pointer_transaction(
         session,
         schema_name=schema_name,
-        snapshot_attributes=activated_snapshot_attributes(
-            candidate_attributes_by_field,
-            activated_at=activation_context.activated_at,
-            activation_mode="audited_control",
+        snapshot_attributes=_activated_candidate_attributes(
+            activation_context,
+            activation_mode=activation_mode,
         ),
     )
     await _reconcile_global_snapshot_pointer(
@@ -1285,6 +1404,14 @@ async def _persist_candidate_activation(
         snapshot_id=snapshot_id,
         report_digest=audit_report_digest,
         activated_at=activation_context.activated_at,
+        activation_intent=(
+            PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY
+            if is_reviewed_audit_only
+            else PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
+        ),
+        expected_attestation_digest=(
+            expected_audit_only_attestation_digest
+        ),
     )
 
 
@@ -1320,6 +1447,7 @@ async def _activate_source_candidate_tx(
     source_key: str,
     snapshot_id: str,
     expected_current_snapshot_id: str | None,
+    expected_audit_only_attestation_digest: bytes | None = None,
 ) -> dict[str, Any]:
     """Activate a source candidate within its pointer transaction."""
     activation_context = await _candidate_activation_context(
@@ -1335,6 +1463,9 @@ async def _activate_source_candidate_tx(
         source_key=source_key,
         snapshot_id=snapshot_id,
         activation_context=activation_context,
+        expected_audit_only_attestation_digest=(
+            expected_audit_only_attestation_digest
+        ),
     )
     allowed_pointer_by_field = await _promote_allowed_amount_pointer(
         session,
@@ -1349,6 +1480,9 @@ async def _activate_source_candidate_tx(
         snapshot_id=snapshot_id,
         activation_context=activation_context,
         audit_report_digest=audit_report_digest,
+        expected_audit_only_attestation_digest=(
+            expected_audit_only_attestation_digest
+        ),
     )
     return _candidate_activation_result(
         source_key=source_key,

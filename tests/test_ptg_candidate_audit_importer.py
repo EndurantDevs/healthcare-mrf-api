@@ -110,23 +110,34 @@ def _candidate_serving_index(
     return serving_index_by_field
 
 
-def _candidate_row(
-    *,
-    activated: bool = False,
-    provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
-    storage_generation: str = "shared_blocks_v3",
-) -> dict[str, object]:
-    """Build one sealed candidate database row fixture."""
+def _candidate_activation(
+    activated: bool,
+    activation_mode: str,
+) -> dict[str, str]:
+    """Build the exact sealed activation manifest fragment."""
 
-    snapshot_id = "candidate-snapshot"
-    activation_map = {
+    activation_by_field = {
         "contract": "ptg2_candidate_activation_v1",
         "state": "activated" if activated else "validated",
         "source_key": "derived-source",
         "expected_previous_snapshot_id": "previous-snapshot",
     }
     if activated:
-        activation_map["mode"] = "audited_control"
+        activation_by_field["mode"] = activation_mode
+    return activation_by_field
+
+
+def _candidate_row(
+    *,
+    activated: bool = False,
+    activation_mode: str = "audited_control",
+    activation_intent: str = "audit_and_activate",
+    provider_identifier_quarantine=EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+    storage_generation: str = "shared_blocks_v3",
+) -> dict[str, object]:
+    """Build one sealed candidate database row fixture."""
+
+    snapshot_id = "candidate-snapshot"
     serving_index_by_field = _candidate_serving_index(
         storage_generation,
         provider_identifier_quarantine,
@@ -137,7 +148,10 @@ def _candidate_row(
         "status": "published" if activated else "validated",
         "previous_snapshot_id": "previous-snapshot",
         "manifest": {
-            "activation": activation_map,
+            "activation": _candidate_activation(
+                activated,
+                activation_mode,
+            ),
             "serving_index": serving_index_by_field,
         },
         "snapshot_key": 17,
@@ -168,13 +182,29 @@ def _candidate_row(
             if activated
             else None
         ),
+        "audit_activation_intent": activation_intent if activated else None,
         "audit_activated_at": "2026-07-13T12:00:00+00:00" if activated else None,
     }
 
 
-def _candidate_row_with_equivalent_current() -> dict[str, object]:
+def _candidate_row_with_equivalent_current(
+    *,
+    reviewed_audit_only: bool = False,
+) -> dict[str, object]:
     candidate_row = _candidate_row()
-    current_row = _candidate_row(activated=True)
+    current_row = _candidate_row(
+        activated=True,
+        activation_mode=(
+            "reviewed_audit_only_control"
+            if reviewed_audit_only
+            else "audited_control"
+        ),
+        activation_intent=(
+            "audit_only"
+            if reviewed_audit_only
+            else "audit_and_activate"
+        ),
+    )
     candidate_row.update(
         {
             "current_snapshot_id": "active-snapshot",
@@ -190,6 +220,9 @@ def _candidate_row_with_equivalent_current() -> dict[str, object]:
             "current_layout_manifest": current_row["layout_manifest"],
             "current_audit_report_digest": current_row["audit_report_digest"],
             "current_audit_report": current_row["audit_report"],
+            "current_audit_activation_intent": current_row[
+                "audit_activation_intent"
+            ],
             "current_audit_activated_at": current_row["audit_activated_at"],
         }
     )
@@ -311,8 +344,14 @@ def test_registry_and_dedicated_worker_contract():
         "candidate_run_id",
         "snapshot_id",
         "import_id",
+        "candidate_audit_mode",
     ]
     assert item["params_schema"][0]["required"] is True
+    assert item["params_schema"][3]["default"] == "audit_and_activate"
+    assert item["params_schema"][3]["choices"] == [
+        "audit_and_activate",
+        "audit_only",
+    ]
     assert adapter["target_module"] == "process.ptg_candidate_audit"
     assert adapter["target_function"] == "main"
     assert adapter["job_prefix"] == "ptg_candidate_audit"
@@ -524,6 +563,96 @@ async def test_equivalent_current_snapshot_reuses_existing_attestation(monkeypat
     assert target.equivalent_audit_report_digest == "cd" * 32
     assert raw_sources.await_args_list[0].args == ("candidate-snapshot",)
     assert raw_sources.await_args_list[1].args == ("active-snapshot",)
+
+
+@pytest.mark.asyncio
+async def test_reviewed_audit_only_candidate_redelivery_is_corroborated(
+    monkeypatch,
+):
+    candidate_row = _candidate_row(
+        activated=True,
+        activation_mode="reviewed_audit_only_control",
+        activation_intent="audit_only",
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id="ptg2:derived-import",
+    )
+
+    assert target.activated is True
+    assert target.snapshot_id == "candidate-snapshot"
+    assert target.audit_report_digest == "cd" * 32
+
+
+@pytest.mark.asyncio
+async def test_reviewed_audit_only_equivalent_current_is_reused(monkeypatch):
+    candidate_row = _candidate_row_with_equivalent_current(
+        reviewed_audit_only=True
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(side_effect=[(RAW_DIGEST,), (RAW_DIGEST,)]),
+    )
+
+    target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id="ptg2:derived-import",
+    )
+
+    assert target.equivalent_current_snapshot_id == "active-snapshot"
+    assert target.equivalent_current_import_run_id == "ptg2:active-import"
+    assert target.equivalent_audit_report_digest == "cd" * 32
+
+
+@pytest.mark.parametrize(
+    ("activation_mode", "activation_intent"),
+    (
+        ("audited_control", "audit_only"),
+        ("reviewed_audit_only_control", "audit_and_activate"),
+        ("unknown_control", "audit_only"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_activated_candidate_rejects_uncorrelated_attestation_intent(
+    monkeypatch,
+    activation_mode,
+    activation_intent,
+):
+    candidate_row = _candidate_row(
+        activated=True,
+        activation_mode=activation_mode,
+        activation_intent=activation_intent,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    with pytest.raises(ValueError, match="cannot be corroborated"):
+        await ptg_candidate_audit.load_candidate_audit_target(
+            candidate_run_id="ptg2:derived-import",
+        )
 
 
 @pytest.mark.asyncio
@@ -1341,6 +1470,80 @@ async def test_default_v4_audit_attests_then_activates(
     witness_loader.assert_not_awaited()
 
 
+async def _record_audit_only_attestation(
+    events: list[str],
+    **_kwargs,
+) -> dict[str, str]:
+    events.append("attest")
+    return {
+        "status": "attested",
+        "report_digest": "ef" * 32,
+        "expires_at": "2026-07-30T00:00:00+00:00",
+    }
+
+
+@pytest.mark.asyncio
+async def test_audit_only_v4_audit_attests_without_promotion(monkeypatch):
+    """Attest an inactive V4 candidate without entering pointer promotion."""
+
+    events: list[str] = []
+    report = _passing_batch_report(
+        provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+    )
+    progress = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", progress)
+
+    async def audit(_target, *, http_config, progress_callback):
+        events.append("audit")
+        assert http_config is None
+        assert progress_callback is not None
+        return report
+
+    promote = AsyncMock(side_effect=AssertionError("audit-only must not promote"))
+    monkeypatch.setattr(ptg_candidate_audit, "run_batch_release_audit", audit)
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "record_candidate_audit_attestation",
+        lambda **kwargs: _record_audit_only_attestation(events, **kwargs),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit, "promote_ptg2_source_snapshot", promote
+    )
+
+    audit_only_result = await ptg_candidate_audit._audit_and_activate(
+        _target(
+            provider_identifier_quarantine=(
+                NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+            )
+        ),
+        control_run_id="control-run",
+        candidate_audit_mode="audit_only",
+    )
+
+    assert events == ["audit", "attest"]
+    assert audit_only_result["candidate_audit_mode"] == "audit_only"
+    assert audit_only_result["snapshot_status"] == "validated"
+    assert audit_only_result["activation_status"] == "deferred"
+    assert audit_only_result["activation_mode"] == "audit_only"
+    assert audit_only_result["attestation_status"] == "attested"
+    assert (
+        audit_only_result["attestation_expires_at"]
+        == "2026-07-30T00:00:00+00:00"
+    )
+    assert "activated_import_run_id" not in audit_only_result
+    assert all(
+        call.kwargs["phase"] != "candidate promotion"
+        for call in progress.await_args_list
+    )
+    assert progress.await_args_list[-1].kwargs == {
+        "snapshot_id": "candidate-snapshot",
+        "phase": "candidate audit-only complete",
+        "message": "retaining passing attestation without promotion",
+        "pct": 100,
+    }
+    promote.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
     expected_report = _passing_batch_report()
@@ -1464,6 +1667,11 @@ async def test_main_runs_new_candidate_with_partitioned_configuration(monkeypatc
         "load_candidate_audit_target",
         AsyncMock(return_value=candidate_target),
     )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_held_candidate_audit_attestation",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(ptg_candidate_audit, "_audit_configuration", configuration)
     monkeypatch.setattr(ptg_candidate_audit, "_audit_and_activate", audit)
 
@@ -1483,7 +1691,141 @@ async def test_main_runs_new_candidate_with_partitioned_configuration(monkeypatc
         candidate_target,
         control_run_id="control-run",
         http_config=http_config,
+        candidate_audit_mode="audit_and_activate",
     )
+
+
+@pytest.mark.asyncio
+async def test_main_forwards_explicit_audit_only_mode(monkeypatch):
+    @asynccontextmanager
+    async def guard(_candidate_run_id):
+        yield
+
+    candidate_target = _target()
+    audit = AsyncMock(return_value={"candidate_audit_mode": "audit_only"})
+    monkeypatch.setattr(ptg_candidate_audit, "candidate_audit_guard", guard)
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_candidate_audit_target",
+        AsyncMock(return_value=candidate_target),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_held_candidate_audit_attestation",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_audit_configuration",
+        Mock(return_value=None),
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "_audit_and_activate", audit)
+
+    audit_result_by_field = await ptg_candidate_audit.main(
+        candidate_run_id="ptg2:derived-import",
+        candidate_audit_mode="audit_only",
+    )
+
+    assert audit_result_by_field == {"candidate_audit_mode": "audit_only"}
+    audit.assert_awaited_once_with(
+        candidate_target,
+        control_run_id=None,
+        http_config=None,
+        candidate_audit_mode="audit_only",
+    )
+
+
+def _held_audit_only_attestation(report) -> dict[str, object]:
+    return {
+        "status": "attested",
+        "report": report,
+        "report_digest": "ef" * 32,
+        "activation_intent": "audit_only",
+        "attestation_digest": "ab" * 32,
+        "expires_at": "2026-07-30T00:00:00+00:00",
+    }
+
+
+@pytest.mark.asyncio
+async def test_audit_only_redelivery_reuses_held_attestation_without_io(
+    monkeypatch,
+):
+    """Reuse a durable hold without repeating audit or HTTP setup."""
+
+    @asynccontextmanager
+    async def guard(_candidate_run_id):
+        yield
+
+    candidate_target = _target()
+    report = _passing_batch_report()
+    held_attestation_by_field = _held_audit_only_attestation(report)
+    held_loader = AsyncMock(return_value=held_attestation_by_field)
+    audit = AsyncMock(side_effect=AssertionError("held replay must not audit"))
+    configuration = Mock(
+        side_effect=AssertionError("held replay must not configure HTTP")
+    )
+    progress = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "candidate_audit_guard", guard)
+    monkeypatch.setattr(ptg_candidate_audit, "_progress", progress)
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_candidate_audit_target",
+        AsyncMock(return_value=candidate_target),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_held_candidate_audit_attestation",
+        held_loader,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_audit_configuration",
+        configuration,
+    )
+    monkeypatch.setattr(ptg_candidate_audit, "_audit_and_activate", audit)
+
+    replay_result_by_field = await ptg_candidate_audit.main(
+        candidate_run_id="ptg2:derived-import",
+        run_id="control-run",
+        candidate_audit_mode="audit_only",
+    )
+
+    assert replay_result_by_field["idempotent"] is True
+    assert replay_result_by_field["activation_status"] == "deferred"
+    assert replay_result_by_field["attestation_digest"] == "ab" * 32
+    assert replay_result_by_field["terminal_progress"] == {
+        "unit": "audit_requests",
+        "done": 1,
+        "total": 1,
+        "pct": 100,
+        "message": "retained passing attestation without promotion",
+        "phase": "candidate audit-only complete",
+    }
+    held_loader.assert_awaited_once()
+    audit.assert_not_awaited()
+    configuration.assert_not_called()
+    assert progress.await_args_list[-1].kwargs["phase"] == (
+        "candidate audit-only complete"
+    )
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_unknown_candidate_audit_mode_before_loading(monkeypatch):
+    candidate_loader = AsyncMock()
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "load_candidate_audit_target",
+        candidate_loader,
+    )
+
+    with pytest.raises(ValueError, match="candidate_audit_mode is unsupported"):
+        await ptg_candidate_audit.main(
+            candidate_run_id="ptg2:derived-import",
+            candidate_audit_mode="activate_later",
+        )
+
+    candidate_loader.assert_not_awaited()
 
 
 @pytest.mark.asyncio

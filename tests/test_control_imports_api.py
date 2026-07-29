@@ -3661,8 +3661,61 @@ async def test_control_ptg_source_snapshot_promote_endpoint(monkeypatch):
             "source_key": "source_a",
             "snapshot_id": "snap_new",
             "expected_current_snapshot_id": "snap_old",
+            "expected_audit_only_attestation_digest": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_promote_threads_reviewed_hold_digest(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    promote = AsyncMock(return_value={"status": "promoted"})
+    monkeypatch.setattr(control, "promote_ptg2_source_snapshot", promote)
+    approval_digest = "ab" * 32
+
+    response = await control.control_ptg_source_snapshot_promote(
+        authed_request(
+            json={
+                "source_key": "source_a",
+                "snapshot_id": "snap_new",
+                "expected_audit_only_attestation_digest": approval_digest,
+            }
+        )
+    )
+
+    assert response.status == 200
+    assert promote.await_args.kwargs == {
+        "source_key": "source_a",
+        "snapshot_id": "snap_new",
+        "expected_current_snapshot_id": None,
+        "expected_audit_only_attestation_digest": approval_digest,
+    }
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_promote_maps_hold_conflict(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    promote = AsyncMock(
+        side_effect=control.SourceSnapshotConflict(
+            "candidate audit-only approval digest does not match"
+        )
+    )
+    monkeypatch.setattr(control, "promote_ptg2_source_snapshot", promote)
+
+    with pytest.raises(control.SanicException) as exc_info:
+        await control.control_ptg_source_snapshot_promote(
+            authed_request(
+                json={
+                    "source_key": "source_a",
+                    "snapshot_id": "snap_new",
+                    "expected_audit_only_attestation_digest": "ab" * 32,
+                }
+            )
+        )
+
+    assert exc_info.value.status_code == 409
 
 
 def _assert_address_refresh_calls(
@@ -3674,6 +3727,7 @@ def _assert_address_refresh_calls(
             "source_key": "source_a",
             "snapshot_id": "snap_new",
             "expected_current_snapshot_id": "snap_old",
+            "expected_audit_only_attestation_digest": None,
         }
     ]
     assert import_calls == [
@@ -3759,6 +3813,41 @@ async def test_control_ptg_source_snapshot_promote_endpoint_maps_stale_pointer_t
         )
 
     assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_promote_rejects_held_attestation(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    address_refresh = AsyncMock()
+
+    async def reject_held_attestation(**_kwargs):
+        raise ValueError(
+            "candidate audit attestation is held for audit-only review"
+        )
+
+    monkeypatch.setattr(
+        control,
+        "promote_ptg2_source_snapshot",
+        reject_held_attestation,
+    )
+    monkeypatch.setattr(control, "create_import_run", address_refresh)
+
+    with pytest.raises(control.SanicException) as exc_info:
+        await control.control_ptg_source_snapshot_promote(
+            authed_request(
+                json={
+                    "source_key": "source_a",
+                    "snapshot_id": "snap_new",
+                    "refresh_addresses": True,
+                }
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "held for audit-only review" in str(exc_info.value)
+    address_refresh.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 import asyncio
 import datetime as dt
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -138,6 +139,77 @@ async def test_control_target_progress_inherits_wrapper_attempt(monkeypatch):
         for progress in harness.progress_by_write
     }
     assert len(attempt_pairs) == 1
+
+
+def _audit_only_terminal_progress() -> dict[str, object]:
+    return {
+        "unit": "audit_requests",
+        "done": 26,
+        "total": 26,
+        "pct": 100,
+        "message": "retained passing attestation without promotion",
+        "phase": "candidate audit-only complete",
+    }
+
+
+@pytest.mark.asyncio
+async def test_audit_only_terminal_progress_survives_control_wrapper(
+    monkeypatch,
+):
+    """Retain the audit-only terminal phase through the outer wrapper."""
+
+    marks = []
+    terminal_progress_by_field = _audit_only_terminal_progress()
+
+    async def is_run_marked(run_id, **kwargs):
+        marks.append((run_id, kwargs))
+        return True
+
+    async def main():
+        return {
+            "candidate_audit_mode": "audit_only",
+            "activation_status": "deferred",
+            "count": 26,
+            "terminal_progress": terminal_progress_by_field,
+        }
+
+    monkeypatch.setenv(
+        "HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS",
+        "0",
+    )
+    monkeypatch.setattr(
+        control_lifecycle,
+        "mark_control_run",
+        is_run_marked,
+    )
+    monkeypatch.setattr(
+        control_lifecycle,
+        "_flush_terminal_status_events",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        control_lifecycle,
+        "import_module",
+        lambda _name: SimpleNamespace(main=main),
+    )
+
+    outcome = await control_single_job_start(
+        {},
+        {
+            "run_id": "run_audit_only",
+            "target_module": "fake.audit",
+            "target_function": "main",
+            "call_style": "kwargs",
+        },
+    )
+
+    assert outcome["status"] == "succeeded"
+    assert marks[-1][1]["phase_detail"] == "candidate audit-only complete"
+    assert marks[-1][1]["progress_message"] == (
+        "retained passing attestation without promotion"
+    )
+    assert marks[-1][1]["progress"] == terminal_progress_by_field
+    assert marks[-1][1]["metrics"]["count"] == 26
 
 
 @pytest.mark.asyncio

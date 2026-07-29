@@ -26,25 +26,27 @@ from tests.ptg2_attestation_compat_test_support import (
     writer_report_by_field as _writer_report,
 )
 
-
 async def _seed_writer_v3_attestation(quoted_schema: str) -> None:
     identity_by_field = _writer_identity()
     report_by_field = _writer_report(3)
     report_bytes = ptg2_candidate_attestation._canonical_report_bytes(
         report_by_field
     )
+    report_digest = hashlib.sha256(report_bytes).digest()
+    activation_intent = "audit_and_activate"
     await db.status(
         f"""INSERT INTO {quoted_schema}.ptg2_v3_candidate_audit_attestation
             (snapshot_id, snapshot_key, source_key, plan_id,
              plan_market_type, coverage_scope_id, source_set_digest,
              audit_sample_digest, source_witness_digest, contract,
              tool_name, tool_version, report_digest, report, attested_at,
-             expires_at, activated_at)
+             activation_intent, attestation_digest, expires_at, activated_at)
         VALUES
             ('writer-snapshot', 17, 'source-a', '12-3456789', 'group',
              :coverage_scope_id, :source_set_digest, :audit_sample_digest,
              :source_witness_digest, :contract, :tool_name, '3.0.0',
              :report_digest, CAST(:report_json AS jsonb), clock_timestamp(),
+             :activation_intent, :attestation_digest,
              clock_timestamp() + interval '1 hour', NULL)""",
         coverage_scope_id=identity_by_field["coverage_scope_id"],
         source_set_digest=identity_by_field["source_set_digest"],
@@ -54,8 +56,15 @@ async def _seed_writer_v3_attestation(quoted_schema: str) -> None:
             ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
         ),
         tool_name=ptg2_candidate_attestation.PTG2_FAST_AUDIT_TOOL,
-        report_digest=hashlib.sha256(report_bytes).digest(),
+        report_digest=report_digest,
         report_json=report_bytes.decode("utf-8"),
+        activation_intent=activation_intent,
+        attestation_digest=(
+            ptg2_candidate_attestation.candidate_attestation_digest(
+                report_digest,
+                activation_intent,
+            )
+        ),
     )
 
 
@@ -258,6 +267,9 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
                 contract text NOT NULL,
                 report_digest bytea NOT NULL,
                 report jsonb NOT NULL,
+                activation_intent text NOT NULL,
+                attestation_digest bytea NOT NULL,
+                attested_at timestamptz NOT NULL,
                 expires_at timestamptz NOT NULL,
                 activated_at timestamptz
             )""",
@@ -304,12 +316,15 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
                  source_set_digest, audit_sample_digest,
                  source_witness_digest, plan_id, plan_market_type,
                  source_key, contract, report_digest, report,
+                 activation_intent, attestation_digest, attested_at,
                  expires_at, activated_at)
             VALUES (:snapshot_id, 17, :coverage_scope_id,
                     :source_set_digest, :audit_sample_digest,
                     :source_witness_digest, '12-3456789', 'group',
                     'source-a', :contract, :report_digest,
                     CAST(:report_json AS jsonb),
+                    'audit_and_activate', :attestation_digest,
+                    clock_timestamp(),
                     clock_timestamp() + interval '1 hour', NULL)
             """,
             snapshot_id=snapshot_id,
@@ -321,6 +336,12 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
                 ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
             ),
             report_digest=report_digest,
+            attestation_digest=(
+                ptg2_candidate_attestation.candidate_attestation_digest(
+                    report_digest,
+                    "audit_and_activate",
+                )
+            ),
             report_json=json.dumps(report_by_field),
         )
 
@@ -342,12 +363,19 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
                    SET contract = :contract,
                        report_digest = :report_digest,
                        report = CAST(:report_json AS jsonb),
+                       attestation_digest = :attestation_digest,
                        activated_at = NULL
                  WHERE snapshot_id = :snapshot_id
                 """,
                 snapshot_id=snapshot_id,
                 contract=contract,
                 report_digest=supported_digest,
+                attestation_digest=(
+                    ptg2_candidate_attestation.candidate_attestation_digest(
+                        supported_digest,
+                        "audit_and_activate",
+                    )
+                ),
                 report_json=json.dumps(supported_report),
             )
             async with db.transaction() as session:
