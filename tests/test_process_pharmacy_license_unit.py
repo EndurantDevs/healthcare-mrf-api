@@ -8,6 +8,11 @@ import pytest
 
 pharmacy_license = importlib.import_module("process.pharmacy_license")
 
+_PHARMACY_SOURCE_HTML = (
+    "<h2>Board of Pharmacy License Databases by State</h2>"
+    '<a href="https://example.com/tx">Texas</a>'
+)
+
 
 def test_parse_fda_state_sources_extracts_known_states():
     html = """
@@ -51,23 +56,26 @@ async def test_materialize_snapshot_aborts_on_canonical_address_failure(monkeypa
         await pharmacy_license._materialize_snapshot("mrf", "snapshot_1", "run_1")
 
 
-@pytest.mark.asyncio
-async def test_start_marks_run_failed_on_canonical_address_failure(monkeypatch):
-    """Verify canonical-address failures terminalize all license run state."""
+class _FakeClientSession:
+    """Minimal async session used by pharmacy failure-path tests."""
 
-    run_updates = []
-    snapshot_updates = []
-    coverage_updates = []
-    control_updates = []
+    def __init__(self, *_args, **_kwargs):
+        self.closed = False
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+def _patch_failed_pharmacy_run(monkeypatch, updates_by_name):
+    """Install a complete import whose materialization fails canonically."""
     async def noop(*_args, **_kwargs):
         return None
 
     async def fake_download(*_args, **_kwargs):
-        return """
-        <h2>Board of Pharmacy License Databases by State</h2>
-        <a href="https://example.com/tx">Texas</a>
-        """
+        return _PHARMACY_SOURCE_HTML
 
     async def fake_import_state(*_args, **_kwargs):
         return pharmacy_license.StateImportStats(
@@ -86,43 +94,53 @@ async def test_start_marks_run_failed_on_canonical_address_failure(monkeypatch):
     async def fail_materialize(*_args, **_kwargs):
         raise pharmacy_license.PharmacyLicenseCanonicalAddressError("canonical collision")
 
-    class FakeClientSession:
-        def __init__(self, *_args, **_kwargs):
-            self.closed = False
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
     async def fake_upsert_run(payload):
-        run_updates.append(payload)
+        updates_by_name["run"].append(payload)
 
     async def fake_upsert_snapshot(payload):
-        snapshot_updates.append(payload)
+        updates_by_name["snapshot"].append(payload)
 
     async def fake_upsert_coverage(payload):
-        coverage_updates.append(payload)
+        updates_by_name["coverage"].append(payload)
 
     async def fake_mark_control_run(run_id, **payload):
-        control_updates.append({"run_id": run_id, **payload})
+        updates_by_name["control"].append({"run_id": run_id, **payload})
 
-    monkeypatch.setattr(pharmacy_license, "ensure_database", noop)
-    monkeypatch.setattr(pharmacy_license, "_ensure_tables", AsyncMock(return_value="mrf"))
-    monkeypatch.setattr(pharmacy_license, "_truncate_stage_table", noop)
-    monkeypatch.setattr(pharmacy_license, "_drop_secondary_indexes", noop)
-    monkeypatch.setattr(pharmacy_license, "_ensure_secondary_indexes", noop)
-    monkeypatch.setattr(pharmacy_license, "_analyze_tables", noop)
-    monkeypatch.setattr(pharmacy_license, "download_it", fake_download)
-    monkeypatch.setattr(pharmacy_license, "_import_state_source", fake_import_state)
-    monkeypatch.setattr(pharmacy_license, "_materialize_snapshot", fail_materialize)
-    monkeypatch.setattr(pharmacy_license, "_upsert_run", fake_upsert_run)
-    monkeypatch.setattr(pharmacy_license, "_upsert_snapshot", fake_upsert_snapshot)
-    monkeypatch.setattr(pharmacy_license, "_upsert_coverage", fake_upsert_coverage)
-    monkeypatch.setattr(pharmacy_license, "mark_control_run", fake_mark_control_run)
-    monkeypatch.setattr(pharmacy_license, "enqueue_live_progress", lambda **_payload: None)
-    monkeypatch.setattr(pharmacy_license.aiohttp, "ClientSession", FakeClientSession)
+    replacement_map = {
+        "ensure_database": noop,
+        "_ensure_tables": AsyncMock(return_value="mrf"),
+        "_truncate_stage_table": noop,
+        "_drop_secondary_indexes": noop,
+        "_ensure_secondary_indexes": noop,
+        "_analyze_tables": noop,
+        "download_it": fake_download,
+        "_import_state_source": fake_import_state,
+        "_materialize_snapshot": fail_materialize,
+        "_upsert_run": fake_upsert_run,
+        "_upsert_snapshot": fake_upsert_snapshot,
+        "_upsert_coverage": fake_upsert_coverage,
+        "mark_control_run": fake_mark_control_run,
+        "enqueue_live_progress": lambda **_payload: None,
+    }
+    for name, replacement in replacement_map.items():
+        monkeypatch.setattr(pharmacy_license, name, replacement)
+    monkeypatch.setattr(
+        pharmacy_license.aiohttp,
+        "ClientSession",
+        _FakeClientSession,
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_marks_run_failed_on_canonical_address_failure(monkeypatch):
+    """Verify canonical-address failures terminalize all license run state."""
+    updates_by_name = {
+        "run": [],
+        "snapshot": [],
+        "coverage": [],
+        "control": [],
+    }
+    _patch_failed_pharmacy_run(monkeypatch, updates_by_name)
 
     with pytest.raises(pharmacy_license.PharmacyLicenseCanonicalAddressError, match="canonical collision"):
         await pharmacy_license.pharmacy_license_start(
@@ -130,12 +148,12 @@ async def test_start_marks_run_failed_on_canonical_address_failure(monkeypatch):
             {"run_id": "run_1", "import_id": "import_1", "test_mode": True},
         )
 
-    assert run_updates[-1]["status"] == "failed"
-    assert run_updates[-1]["error_text"] == "canonical collision"
-    assert snapshot_updates[-1]["status"] == "failed"
-    assert coverage_updates[-1]["status"] == "failed"
-    assert control_updates[-1]["status"] == "failed"
-    assert control_updates[-1]["error"]["message"] == "canonical collision"
+    assert updates_by_name["run"][-1]["status"] == "failed"
+    assert updates_by_name["run"][-1]["error_text"] == "canonical collision"
+    assert updates_by_name["snapshot"][-1]["status"] == "failed"
+    assert updates_by_name["coverage"][-1]["status"] == "failed"
+    assert updates_by_name["control"][-1]["status"] == "failed"
+    assert updates_by_name["control"][-1]["error"]["message"] == "canonical collision"
 
 
 def test_normalize_stage_row_drops_missing_npi():

@@ -41,12 +41,6 @@ from process.ext.utils import make_class
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 
-def _assert_sql_contains(sql: str, expected_fragments: tuple[str, ...]) -> None:
-    """Assert every contract fragment is present in generated SQL."""
-    for expected_fragment in expected_fragments:
-        assert expected_fragment in sql
-
-
 def test_address_checksum_models_use_bigint():
     expected_columns_by_model = {
         AddressArchive: ("checksum",),
@@ -310,6 +304,56 @@ def test_facility_anchor_npi_candidate_model_supports_review_queue():
     assert columns["evidence"].nullable
 
 
+_FACILITY_SOURCE_SQL_FRAGMENTS = (
+    "fa.npi::bigint AS npi",
+    "WITH facility_ccn_npi_candidates AS",
+    "provider_enrollment_hospital AS h",
+    "h.cah_or_hospital_ccn",
+    "provider_enrollment_fqhc AS f",
+    "provider_enrollment_ffs_additional_npi AS a",
+    "HAVING COUNT(DISTINCT candidate_npi) = 1",
+    "WHEN COUNT(DISTINCT candidate_method) = 1 THEN MIN(candidate_method)",
+    "CASE WHEN fa.npi IS NULL THEN ccn_npi.npi",
+    "fqhc_pecos_ccn_unique",
+    "hospital_pecos_ccn_unique",
+    "fa.telephone_number::varchar AS telephone_number",
+)
+_FACILITY_INFERENCE_SQL_FRAGMENTS = (
+    "fa.medicare_ccn",
+    "facility_anchor_npi_override",
+    "h.cah_or_hospital_ccn = t.entity_id",
+    "hospital_nppes_other_identifier",
+    "hospital_nppes_name_address",
+    "hospital_nppes_address_key",
+    "f.ccn = fa.medicare_ccn",
+    "fqhc_ccn_match",
+    "fqhc_nppes_other_identifier",
+    "health_center_name",
+    "fqhc_parent_enrollment_exact_address",
+    "fqhc_parent_enrollment_name_state",
+    "fqhc_parent_enrollment_address",
+    "fqhc_parent_nppes_exact_address",
+    "fqhc_parent_nppes_exact_address_primary",
+    "fqhc_parent_nppes_name_state",
+    "fqhc_parent_nppes_name_state_primary",
+    "fqhc_parent_nppes_address",
+    "fqhc_parent_nppes_address_primary",
+    "fqhc_parent_nppes_exact_primary_candidates AS primary_candidates",
+    "fqhc_sibling_source_npi",
+    "fqhc_enrollment_exact_address",
+    "fqhc_enrollment_phone_zip",
+    "fqhc_enrollment_phone_name",
+    "npi_fqhc_exact_address",
+    "npi_fqhc_address_key",
+    "npi_fqhc_clinic_address_key",
+    "npi_fqhc_phone_zip",
+    "npi_fqhc_clinic_phone_zip",
+    "preselected_min_priorities",
+    "winner_priority = best_priority",
+    "preselected_candidate_counts",
+)
+
+
 def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
     """Verify entity address facility anchor uses source npi and ccn inference."""
     source_sql = "\n".join(
@@ -339,33 +383,10 @@ def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
         include_npi_other_identifier=True,
     )
 
-    _assert_sql_contains(source_sql, (
-        "fa.npi::bigint AS npi", "WITH facility_ccn_npi_candidates AS",
-        "provider_enrollment_hospital AS h", "h.cah_or_hospital_ccn",
-        "provider_enrollment_fqhc AS f", "provider_enrollment_ffs_additional_npi AS a",
-        "HAVING COUNT(DISTINCT candidate_npi) = 1",
-        "WHEN COUNT(DISTINCT candidate_method) = 1 THEN MIN(candidate_method)",
-        "CASE WHEN fa.npi IS NULL THEN ccn_npi.npi", "fqhc_pecos_ccn_unique",
-        "hospital_pecos_ccn_unique", "fa.telephone_number::varchar AS telephone_number",
-    ))
-    _assert_sql_contains(inference_sql, (
-        "fa.medicare_ccn", "facility_anchor_npi_override",
-        "h.cah_or_hospital_ccn = t.entity_id", "hospital_nppes_other_identifier",
-        "hospital_nppes_name_address", "hospital_nppes_address_key",
-        "f.ccn = fa.medicare_ccn", "fqhc_ccn_match", "fqhc_nppes_other_identifier",
-        "health_center_name", "fqhc_parent_enrollment_exact_address",
-        "fqhc_parent_enrollment_name_state", "fqhc_parent_enrollment_address",
-        "fqhc_parent_nppes_exact_address", "fqhc_parent_nppes_exact_address_primary",
-        "fqhc_parent_nppes_name_state", "fqhc_parent_nppes_name_state_primary",
-        "fqhc_parent_nppes_address", "fqhc_parent_nppes_address_primary",
-        "fqhc_parent_nppes_exact_primary_candidates AS primary_candidates",
-        "fqhc_sibling_source_npi", "fqhc_enrollment_exact_address",
-        "fqhc_enrollment_phone_zip", "fqhc_enrollment_phone_name",
-        "npi_fqhc_exact_address", "npi_fqhc_address_key",
-        "npi_fqhc_clinic_address_key", "npi_fqhc_phone_zip",
-        "npi_fqhc_clinic_phone_zip", "preselected_min_priorities",
-        "winner_priority = best_priority", "preselected_candidate_counts",
-    ))
+    for fragment in _FACILITY_SOURCE_SQL_FRAGMENTS:
+        assert fragment in source_sql
+    for fragment in _FACILITY_INFERENCE_SQL_FRAGMENTS:
+        assert fragment in inference_sql
 
 
 def _facility_source_sql(*, npi_taxonomy: bool) -> str:

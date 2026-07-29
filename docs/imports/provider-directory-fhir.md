@@ -591,6 +591,56 @@ profile item with bounded per-source evidence rather than duplicate public
 facts. Profile reads remain a single indexed lookup against the precomputed
 artifact and do not traverse the FHIR graph at request time.
 
+### Profile publication batching and recovery
+
+The `source-fact-role32-org32-npi5m-v3` build strategy is an
+executable resource bound, not only a label. Evidence publication uses 21
+fact branches per source, with the high-fanout `affiliation` and
+`organization` branches split
+into the same 32 deterministic role-hash buckets. This produces 83 bounded
+evidence statements per source. The composite geometry reserves the same
+32-way bucket implementation for a later reviewed `plan_membership` fact, but
+v3 does not advertise or execute that fact. Integrating `plan_membership` must
+advance the strategy to
+`source-fact-role32-org32-membership32-npi5m-v4`, producing 115 statements per
+source. The executable-plan fingerprint also changes, so an older checkpoint
+cannot resume under the expanded fact registry.
+Compact profile publication covers the full 10-digit NPI space in 400
+half-open ranges of 5,000,000 values. A partial refresh with retained sources
+outside the selected source set prepends one copy batch to each phase. A
+global refresh where selected and retained sources are identical omits both
+physical copy batches.
+
+Before the first bucketed statement, the build creates source-plus-hash
+expression indexes on the already materialized unlogged PractitionerRole and
+OrganizationAffiliation scope tables. The indexes never target serving tables,
+share the scope tables' bounded lifecycle, and are reused after a checkpointed
+resume. Worker logs report index bytes, elapsed build time, and the observed
+PostgreSQL temp-byte delta.
+
+The durable Profile checkpoint records the exact next and total batch for both
+phases. Its resume lineage includes a fingerprint of the ordered executable
+plan: source/dataset pairs, retained sources, copy decisions, evidence
+fact/bucket descriptors, and NPI ranges. A retry resumes only when the strategy,
+plan fingerprint, immutable input lineage, stage-relation identity, and both
+batch totals still match. A checkpoint from an incompatible execution shape is
+dropped with its failed stages and rebuilt; it is never relabeled as progress
+under the current geometry. Per-batch start, completion, row count, elapsed
+time, and phase totals are emitted to worker logs. At the initial or resumed
+checkpoint boundary and after each committed batch, the same worker also
+projects that durable offset through the existing control-run
+`progress`/`heartbeat_at` contract. The dashboard therefore exposes
+`provider-directory profile evidence batches` with the exact
+`83 * selected-source-count` total (plus an optional copy batch), followed by
+`provider-directory profile compact NPI batches` with 400 ranges (plus an
+optional copy batch). Progress uses `unit=batches`, carries the immutable
+profile build/generation identity and current source/fact/bucket or NPI-range
+descriptor, and restarts from the checkpoint's committed offset without
+regressing within a phase. Status writes occur only at batch boundaries, never
+per evidence row or NPI. The enclosing
+`provider-directory publishing artifacts` phase resumes after Profile
+publication completes.
+
 ## Provider Profile API Verification Matrix
 
 `scripts/research/provider_directory_api_evidence_harness.py` is the

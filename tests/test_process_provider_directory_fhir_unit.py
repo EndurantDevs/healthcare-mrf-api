@@ -28567,9 +28567,10 @@ async def test_profile_bucket_and_promoted_stage_cleanup(monkeypatch):
         profile_stage="profile",
     )
     batch = importer._ProviderDirectoryProfileEvidenceBatch(
-        kind="source",
+        kind="fact",
         source_id="source-a",
         dataset_id="dataset-a",
+        fact_type="affiliation",
         role_bucket_count=2,
         role_bucket=1,
     )

@@ -14399,6 +14399,7 @@ class _ProviderDirectoryProfileBuild:
     resume_lineage_hash: str = "0" * 64
     build_id: str | None = None
     owner_run_id: str | None = None
+    batch_plan: _ProviderDirectoryProfileBatchPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -14419,6 +14420,15 @@ class _ProviderDirectoryProfileCompactBatch:
 
 
 @dataclass(frozen=True)
+class _ProviderDirectoryProfileBatchPlan:
+    has_existing_artifacts: bool
+    include_copy_batch: bool
+    evidence_batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...]
+    compact_batches: tuple[_ProviderDirectoryProfileCompactBatch, ...]
+    fingerprint: str
+
+
+@dataclass(frozen=True)
 class _ProviderDirectoryProfileBuildCheckpointState:
     evidence_next_batch: int
     evidence_total_batches: int
@@ -14427,10 +14437,96 @@ class _ProviderDirectoryProfileBuildCheckpointState:
     state: str
 
 
+_PROFILE_EVIDENCE_PROGRESS_PHASE = (
+    "provider-directory profile evidence batches"
+)
+_PROFILE_COMPACT_PROGRESS_PHASE = (
+    "provider-directory profile compact NPI batches"
+)
+_PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES = (
+    "affiliation",
+    "organization",
+    "plan_membership",
+)
+
+
+def _profile_batch_detail_by_name(
+    batch: (
+        _ProviderDirectoryProfileEvidenceBatch
+        | _ProviderDirectoryProfileCompactBatch
+        | None
+    ),
+) -> dict[str, Any]:
+    if isinstance(batch, _ProviderDirectoryProfileEvidenceBatch):
+        return {
+            "batch_kind": batch.kind,
+            "source_id": batch.source_id,
+            "fact_type": batch.fact_type,
+            "role_bucket": batch.role_bucket,
+            "role_bucket_count": batch.role_bucket_count,
+        }
+    if isinstance(batch, _ProviderDirectoryProfileCompactBatch):
+        return {
+            "batch_kind": batch.kind,
+            "npi_start": batch.npi_start,
+            "npi_end": batch.npi_end,
+        }
+    return {}
+
+
 def _provider_directory_profile_build_id(
     build: _ProviderDirectoryProfileBuild,
 ) -> str:
     return build.build_id or build.generation_id
+
+
+async def _mark_provider_directory_profile_batch_progress(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    phase: str,
+    completed_batches: int,
+    total_batches: int,
+    resumed_from_batch: int,
+    batch: (
+        _ProviderDirectoryProfileEvidenceBatch
+        | _ProviderDirectoryProfileCompactBatch
+        | None
+    ) = None,
+) -> None:
+    """Project one checkpoint boundary through the existing run status path."""
+
+    phase_labels_by_name = {
+        "evidence": _PROFILE_EVIDENCE_PROGRESS_PHASE,
+        "profile": _PROFILE_COMPACT_PROGRESS_PHASE,
+    }
+    phase_label = phase_labels_by_name.get(phase)
+    if phase_label is None:
+        raise ValueError(
+            f"unsupported profile progress phase: {phase}"
+        )
+    details_by_name: dict[str, Any] = {
+        "profile_build_id": _provider_directory_profile_build_id(build),
+        "profile_generation_id": build.generation_id,
+        "profile_batch_phase": phase,
+        "completed_batches": completed_batches,
+        "total_batches": total_batches,
+        "resumed_from_batch": resumed_from_batch,
+    }
+    details_by_name.update(
+        _profile_batch_detail_by_name(batch)
+    )
+    await _mark_provider_directory_progress(
+        build.owner_run_id,
+        phase=phase_label,
+        done=completed_batches,
+        total=total_batches,
+        unit="batches",
+        message=(
+            f"{phase_label}; "
+            f"{completed_batches} of {total_batches} complete"
+        ),
+        details=details_by_name,
+    )
 
 
 def _provider_directory_profile_evidence_batches(
@@ -14438,38 +14534,279 @@ def _provider_directory_profile_evidence_batches(
     *,
     has_existing_artifacts: bool,
 ) -> tuple[_ProviderDirectoryProfileEvidenceBatch, ...]:
-    batches: list[_ProviderDirectoryProfileEvidenceBatch] = []
-    if has_existing_artifacts:
-        batches.append(_ProviderDirectoryProfileEvidenceBatch(kind="copy"))
-    for source_id, dataset_id in zip(
-        build.source_ids,
-        build.dataset_ids,
-        strict=True,
-    ):
-        batches.append(
-            _ProviderDirectoryProfileEvidenceBatch(
-                kind="source",
-                source_id=source_id,
-                dataset_id=dataset_id,
-            )
-        )
-    return tuple(batches)
+    return _provider_directory_profile_build_plan(
+        build,
+        has_existing_artifacts=has_existing_artifacts,
+    ).evidence_batches
 
 
 def _provider_directory_profile_compact_batches(
     *,
+    source_ids: Iterable[str],
+    retained_source_ids: Iterable[str],
+    dataset_ids: Iterable[str],
     has_existing_artifacts: bool,
     npi_batch_size: int,
 ) -> tuple[_ProviderDirectoryProfileCompactBatch, ...]:
+    return _provider_directory_profile_batch_plan(
+        source_ids,
+        retained_source_ids,
+        dataset_ids,
+        has_existing_artifacts=has_existing_artifacts,
+        npi_batch_size=npi_batch_size,
+    ).compact_batches
+
+
+def _provider_directory_profile_npi_ranges(
+    npi_batch_size: int,
+) -> tuple[tuple[int, int], ...]:
     if npi_batch_size < 1:
         raise ValueError("profile NPI batch size must be positive")
+    return tuple(
+        (
+            npi_start,
+            min(npi_start + npi_batch_size, profile_artifact.NPI_MAX + 1),
+        )
+        for npi_start in range(
+            profile_artifact.NPI_MIN,
+            profile_artifact.NPI_MAX + 1,
+            npi_batch_size,
+        )
+    )
+
+
+def _is_profile_copy_batch_required(
+    *,
+    source_ids: Iterable[str],
+    retained_source_ids: Iterable[str],
+    has_existing_artifacts: bool,
+) -> bool:
+    return has_existing_artifacts and bool(
+        set(retained_source_ids) - set(source_ids)
+    )
+
+
+def _provider_directory_profile_evidence_plan(
+    source_ids: tuple[str, ...],
+    dataset_ids: tuple[str, ...],
+    *,
+    include_copy_batch: bool,
+) -> tuple[_ProviderDirectoryProfileEvidenceBatch, ...]:
+    batches: list[_ProviderDirectoryProfileEvidenceBatch] = []
+    if include_copy_batch:
+        batches.append(_ProviderDirectoryProfileEvidenceBatch(kind="copy"))
+    for source_id, dataset_id in zip(source_ids, dataset_ids, strict=True):
+        for fact_type in profile_artifact.PROFILE_EVIDENCE_FACT_TYPES:
+            role_bucket_count = (
+                profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS
+                if fact_type
+                in _PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES
+                else 1
+            )
+            batches.extend(
+                _ProviderDirectoryProfileEvidenceBatch(
+                    kind="fact",
+                    source_id=source_id,
+                    dataset_id=dataset_id,
+                    fact_type=fact_type,
+                    role_bucket_count=role_bucket_count,
+                    role_bucket=role_bucket,
+                )
+                for role_bucket in range(role_bucket_count)
+            )
+    return tuple(batches)
+
+
+def _provider_directory_profile_compact_plan(
+    npi_batch_size: int,
+    *,
+    include_copy_batch: bool,
+) -> tuple[_ProviderDirectoryProfileCompactBatch, ...]:
     batches: list[_ProviderDirectoryProfileCompactBatch] = []
-    if has_existing_artifacts:
+    if include_copy_batch:
         batches.append(_ProviderDirectoryProfileCompactBatch(kind="copy"))
-    batches.append(
-        _ProviderDirectoryProfileCompactBatch(kind="affected")
+    batches.extend(
+        _ProviderDirectoryProfileCompactBatch(
+            kind="npi",
+            npi_start=npi_start,
+            npi_end=npi_end,
+        )
+        for npi_start, npi_end in _provider_directory_profile_npi_ranges(
+            npi_batch_size
+        )
     )
     return tuple(batches)
+
+
+def _validate_provider_directory_profile_batch_scope(
+    selected_sources: tuple[str, ...],
+    retained_sources: tuple[str, ...],
+    selected_datasets: tuple[str, ...],
+) -> None:
+    if len(selected_sources) != len(selected_datasets):
+        raise RuntimeError(
+            "provider_directory_profile_source_dataset_cardinality_changed"
+        )
+    if len(set(selected_sources)) != len(selected_sources):
+        raise RuntimeError(
+            "provider_directory_profile_selected_source_ids_not_unique"
+        )
+    if len(set(retained_sources)) != len(retained_sources):
+        raise RuntimeError(
+            "provider_directory_profile_retained_source_ids_not_unique"
+        )
+    if len(set(selected_datasets)) != len(selected_datasets):
+        raise RuntimeError(
+            "provider_directory_profile_selected_dataset_ids_not_unique"
+        )
+    if not set(selected_sources).issubset(retained_sources):
+        raise RuntimeError(
+            "provider_directory_profile_selected_sources_not_retained"
+        )
+
+
+def _provider_directory_profile_batch_plan(
+    source_ids: Iterable[str],
+    retained_source_ids: Iterable[str],
+    dataset_ids: Iterable[str],
+    *,
+    has_existing_artifacts: bool,
+    npi_batch_size: int = profile_artifact.PROFILE_NPI_BATCH_SIZE,
+) -> _ProviderDirectoryProfileBatchPlan:
+    selected_sources = tuple(source_ids)
+    retained_sources = tuple(retained_source_ids)
+    selected_datasets = tuple(dataset_ids)
+    _validate_provider_directory_profile_batch_scope(
+        selected_sources,
+        retained_sources,
+        selected_datasets,
+    )
+    include_copy_batch = _is_profile_copy_batch_required(
+        source_ids=selected_sources,
+        retained_source_ids=retained_sources,
+        has_existing_artifacts=has_existing_artifacts,
+    )
+    evidence_batches = _provider_directory_profile_evidence_plan(
+        selected_sources,
+        selected_datasets,
+        include_copy_batch=include_copy_batch,
+    )
+    compact_batches = _provider_directory_profile_compact_plan(
+        npi_batch_size,
+        include_copy_batch=include_copy_batch,
+    )
+    plan_payload_by_name = {
+        "contract": "provider-directory-profile-executable-plan-v1",
+        "has_existing_artifacts": has_existing_artifacts,
+        "include_copy_batch": include_copy_batch,
+        "role_bucket_scheme": (
+            "hashtextextended-role-resource-id-seed0-positive-mod-v1"
+        ),
+        "role_bucket_fact_types": (
+            _PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES
+        ),
+        "selected_source_dataset_pairs": [
+            {"source_id": source_id, "dataset_id": dataset_id}
+            for source_id, dataset_id in zip(
+                selected_sources,
+                selected_datasets,
+                strict=True,
+            )
+        ],
+        "retained_source_ids": retained_sources,
+        "evidence_batches": [asdict(batch) for batch in evidence_batches],
+        "compact_batches": [asdict(batch) for batch in compact_batches],
+    }
+    return _ProviderDirectoryProfileBatchPlan(
+        has_existing_artifacts=has_existing_artifacts,
+        include_copy_batch=include_copy_batch,
+        evidence_batches=evidence_batches,
+        compact_batches=compact_batches,
+        fingerprint=_identity_hash(plan_payload_by_name),
+    )
+
+
+def _provider_directory_profile_build_plan(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    has_existing_artifacts: bool,
+    npi_batch_size: int = profile_artifact.PROFILE_NPI_BATCH_SIZE,
+) -> _ProviderDirectoryProfileBatchPlan:
+    if (
+        build.batch_plan is not None
+        and npi_batch_size == profile_artifact.PROFILE_NPI_BATCH_SIZE
+    ):
+        if (
+            build.batch_plan.has_existing_artifacts
+            is not has_existing_artifacts
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_artifact_presence_changed"
+            )
+        return build.batch_plan
+    return _provider_directory_profile_batch_plan(
+        build.source_ids,
+        build.retained_source_ids,
+        build.dataset_ids,
+        has_existing_artifacts=has_existing_artifacts,
+        npi_batch_size=npi_batch_size,
+    )
+
+
+def _is_profile_checkpoint_geometry_matching(
+    checkpoint_map: Mapping[str, Any],
+    *,
+    source_count: int,
+) -> bool:
+    """Require checkpoint totals to match the active immutable strategy."""
+    has_existing_artifacts = bool(
+        checkpoint_map.get("has_existing_artifacts")
+    )
+    include_copy_batch_count = int(
+        _is_profile_copy_batch_required(
+            source_ids=_provider_directory_profile_checkpoint_array(
+                checkpoint_map.get("source_ids")
+            ),
+            retained_source_ids=(
+                _provider_directory_profile_checkpoint_array(
+                    checkpoint_map.get("retained_source_ids")
+                )
+            ),
+            has_existing_artifacts=has_existing_artifacts,
+        )
+    )
+    evidence_batches_per_source = sum(
+        (
+            profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS
+            if fact_type
+            in _PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES
+            else 1
+        )
+        for fact_type in profile_artifact.PROFILE_EVIDENCE_FACT_TYPES
+    )
+    compact_batch_count = len(
+        range(
+            profile_artifact.NPI_MIN,
+            profile_artifact.NPI_MAX + 1,
+            profile_artifact.PROFILE_NPI_BATCH_SIZE,
+        )
+    )
+    try:
+        evidence_total_batches = int(
+            checkpoint_map.get("evidence_total_batches")
+        )
+        profile_total_batches = int(
+            checkpoint_map.get("profile_total_batches")
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        evidence_total_batches
+        == include_copy_batch_count
+        + source_count * evidence_batches_per_source
+        and profile_total_batches
+        == include_copy_batch_count + compact_batch_count
+    )
 
 
 def _provider_directory_profile_build_ref(
@@ -14485,6 +14822,9 @@ def _provider_directory_profile_resume_lineage_hash(
     retained_source_ids: list[str],
     dataset_ids: list[str],
     source_contexts: tuple[_ProviderDirectoryProfileSourceContext, ...],
+    *,
+    has_existing_artifacts: bool = False,
+    batch_plan: _ProviderDirectoryProfileBatchPlan | None = None,
 ) -> str:
     """Hash every immutable input that can affect a resumed Profile build."""
     if tuple(context.source_id for context in source_contexts) != tuple(
@@ -14501,6 +14841,14 @@ def _provider_directory_profile_resume_lineage_hash(
         dataset_contracts = [asdict(dataset) for dataset in datasets]
         return sorted(dataset_contracts, key=_stable_identity_json)
 
+    resolved_batch_plan = batch_plan or (
+        _provider_directory_profile_batch_plan(
+            source_ids,
+            retained_source_ids,
+            dataset_ids,
+            has_existing_artifacts=has_existing_artifacts,
+        )
+    )
     return _identity_hash(
         {
             "contract": "provider-directory-profile-resume-lineage-v1",
@@ -14517,6 +14865,7 @@ def _provider_directory_profile_resume_lineage_hash(
             "emitted_source_contexts": [
                 asdict(source_context) for source_context in source_contexts
             ],
+            "executable_plan_hash": resolved_batch_plan.fingerprint,
             "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
             "retained_source_ids": retained_source_ids,
             "source_ids": source_ids,
@@ -14613,7 +14962,15 @@ def _profile_build_with_as_of(
 async def _profile_build_identity_inputs(
     schema: str,
     dataset_fence: ProviderDirectoryArtifactDatasetFence,
-) -> tuple[list[str], list[str], list[str], str]:
+    *,
+    has_existing_artifacts: bool = False,
+) -> tuple[
+    list[str],
+    list[str],
+    list[str],
+    str,
+    _ProviderDirectoryProfileBatchPlan,
+]:
     """Resolve the stable source and dataset identity for one Profile build."""
     selected_source_ids, retained_source_ids, source_contexts = (
         await _provider_directory_profile_scope_source_ids(
@@ -14625,14 +14982,28 @@ async def _profile_build_identity_inputs(
         dataset_fence.datasets,
         selected_source_ids,
     )
+    batch_plan = _provider_directory_profile_batch_plan(
+        source_ids,
+        retained_source_ids,
+        dataset_ids,
+        has_existing_artifacts=has_existing_artifacts,
+    )
     resume_lineage_hash = _provider_directory_profile_resume_lineage_hash(
         dataset_fence,
         source_ids,
         retained_source_ids,
         dataset_ids,
         source_contexts,
+        has_existing_artifacts=has_existing_artifacts,
+        batch_plan=batch_plan,
     )
-    return source_ids, retained_source_ids, dataset_ids, resume_lineage_hash
+    return (
+        source_ids,
+        retained_source_ids,
+        dataset_ids,
+        resume_lineage_hash,
+        batch_plan,
+    )
 
 
 def _is_profile_build_checkpoint_lineage_matching(
@@ -14673,6 +15044,10 @@ def _is_profile_build_checkpoint_lineage_matching(
             checkpoint_map.get("profile_target_oid"),
             profile_build_fence.target_oid,
         )
+        and _is_profile_checkpoint_geometry_matching(
+            checkpoint_map,
+            source_count=len(build.source_ids),
+        )
     )
 
 
@@ -14682,13 +15057,20 @@ async def _resolve_provider_directory_profile_build(
     dataset_fence: ProviderDirectoryArtifactDatasetFence,
     evidence_build_fence: ProviderDirectoryArtifactBuildFence,
     profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    *,
+    has_existing_artifacts: bool = False,
 ) -> _ProviderDirectoryProfileBuild:
     """Resolve a deterministic build and preserve a valid retry as-of date."""
-    source_ids, retained_source_ids, dataset_ids, resume_lineage_hash = (
-        await _profile_build_identity_inputs(
-            schema,
-            dataset_fence,
-        )
+    (
+        source_ids,
+        retained_source_ids,
+        dataset_ids,
+        resume_lineage_hash,
+        batch_plan,
+    ) = await _profile_build_identity_inputs(
+        schema,
+        dataset_fence,
+        has_existing_artifacts=has_existing_artifacts,
     )
     build_id = "pdpb_" + resume_lineage_hash[:32]
     evidence_stage = profile_artifact.profile_evidence_stage_table_name(
@@ -14718,6 +15100,7 @@ async def _resolve_provider_directory_profile_build(
         resume_lineage_hash=resume_lineage_hash,
         build_id=build_id,
         owner_run_id=_clean_text(run_id),
+        batch_plan=batch_plan,
     )
     is_checkpoint_lineage_matching = (
         _is_profile_build_checkpoint_lineage_matching(
@@ -14947,16 +15330,15 @@ async def _claim_provider_directory_profile_build_checkpoint(
     has_existing_artifacts: bool,
     evidence_build_fence: ProviderDirectoryArtifactBuildFence,
     profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    batch_plan: _ProviderDirectoryProfileBatchPlan | None = None,
 ) -> _ProviderDirectoryProfileBuildCheckpointState:
     """Claim a valid resumable build or atomically initialize logged stages."""
-    evidence_batches = _provider_directory_profile_evidence_batches(
+    resolved_batch_plan = batch_plan or _provider_directory_profile_build_plan(
         build,
         has_existing_artifacts=has_existing_artifacts,
     )
-    profile_batches = _provider_directory_profile_compact_batches(
-        has_existing_artifacts=has_existing_artifacts,
-        npi_batch_size=profile_artifact.PROFILE_NPI_BATCH_SIZE,
-    )
+    evidence_batches = resolved_batch_plan.evidence_batches
+    profile_batches = resolved_batch_plan.compact_batches
     checkpoint_ref = _provider_directory_profile_checkpoint_ref(build.schema)
     build_id = _provider_directory_profile_build_id(build)
     async with db.transaction():
@@ -15075,17 +15457,35 @@ async def _claim_provider_directory_profile_build_checkpoint(
         checkpoint_state = _provider_directory_profile_checkpoint_state(
             checkpoint_map
         )
-        claimed_state = (
-            "ready"
-            if checkpoint_state.profile_next_batch
-            == checkpoint_state.profile_total_batches
-            else (
-                "building_profile"
-                if checkpoint_state.evidence_next_batch
-                == checkpoint_state.evidence_total_batches
-                else "building_evidence"
-            )
+        failed_from_state = (
+            (_clean_text(checkpoint_map.get("last_error")) or "")
+            .rpartition("[checkpoint_state=")[2]
+            .removesuffix("]")
         )
+        is_evidence_finalized = checkpoint_state.state in {
+            "evidence_complete",
+            "building_profile",
+            "ready",
+        } or (
+            checkpoint_state.state == "failed"
+            and failed_from_state
+            in {"evidence_complete", "building_profile", "ready"}
+        )
+        claimed_state = "building_evidence"
+        if (
+            checkpoint_state.profile_next_batch
+            == checkpoint_state.profile_total_batches
+        ):
+            claimed_state = "ready"
+        elif (
+            checkpoint_state.evidence_next_batch
+            == checkpoint_state.evidence_total_batches
+            and (
+                checkpoint_state.profile_next_batch > 0
+                or is_evidence_finalized
+            )
+        ):
+            claimed_state = "building_profile"
         claimed_count = await db.status(
             f"""
             UPDATE {checkpoint_ref}
@@ -15214,7 +15614,8 @@ async def _mark_profile_build_checkpoint_failed(
             f"""
             UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
                SET state = 'failed',
-                   last_error = :last_error,
+                   last_error = :last_error
+                       || ' [checkpoint_state=' || state || ']',
                    updated_at = now()
              WHERE build_id = :build_id
                AND owner_run_id IS NOT DISTINCT FROM :owner_run_id;
@@ -15497,6 +15898,113 @@ async def _reap_stale_provider_directory_profile_builds(
     return reaped_count
 
 
+def _provider_directory_profile_bucket_relations(
+    fact_type: str | None,
+) -> tuple[str, ...]:
+    role_relation = ProviderDirectoryPractitionerRole.__tablename__
+    affiliation_relation = (
+        ProviderDirectoryOrganizationAffiliation.__tablename__
+    )
+    if fact_type == "affiliation":
+        return (role_relation,)
+    if fact_type == "organization":
+        return (role_relation, affiliation_relation)
+    if fact_type == "plan_membership":
+        return (affiliation_relation,)
+    return ()
+
+
+def _provider_directory_profile_bucket_expression() -> str:
+    return (
+        "MOD(hashtextextended("
+        f"{_q('resource_id')}, 0) & 9223372036854775807, "
+        f"{profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS})"
+    )
+
+
+def _provider_directory_profile_bucket_index_sql(
+    schema: str,
+    scope_table: str,
+) -> tuple[str, str]:
+    index_name = profile_artifact.profile_index_name(
+        scope_table,
+        "profile_bucket_idx",
+    )
+    return (
+        index_name,
+        f"CREATE INDEX IF NOT EXISTS {_q(index_name)} "
+        f"ON {_unscoped_qt(schema, scope_table)} "
+        f"({_q('source_id')}, "
+        f"({_provider_directory_profile_bucket_expression()}));",
+    )
+
+
+async def _provider_directory_profile_temp_bytes() -> int | None:
+    try:
+        raw_value = await db.scalar(
+            "SELECT temp_bytes::bigint FROM pg_stat_database "
+            "WHERE datname = current_database();"
+        )
+        return int(raw_value) if raw_value is not None else None
+    except Exception:
+        LOGGER.debug(
+            "Provider Directory Profile temp-byte stats unavailable",
+            exc_info=True,
+        )
+        return None
+
+
+async def _prepare_provider_directory_profile_bucket_index(
+    schema: str,
+    relation_name: str,
+) -> dict[str, Any] | None:
+    scope_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
+        relation_name
+    )
+    if scope_table is None:
+        return None
+    if not scope_table.startswith(f"{relation_name}_artifact_"):
+        raise RuntimeError(
+            "provider_directory_profile_bucket_scope_relation_invalid"
+        )
+    index_name, index_sql = (
+        _provider_directory_profile_bucket_index_sql(schema, scope_table)
+    )
+    started_at = time.monotonic()
+    temp_bytes_before = await _provider_directory_profile_temp_bytes()
+    await db.status(index_sql)
+    temp_bytes_after = await _provider_directory_profile_temp_bytes()
+    index_bytes = await db.scalar(
+        "SELECT pg_relation_size(to_regclass(:index_ref));",
+        index_ref=_unscoped_qt(schema, index_name),
+    )
+    temp_bytes_delta = (
+        max(temp_bytes_after - temp_bytes_before, 0)
+        if temp_bytes_before is not None and temp_bytes_after is not None
+        else None
+    )
+    metrics_by_name = {
+        "relation_name": relation_name,
+        "scope_table": scope_table,
+        "index_name": index_name,
+        "index_bytes": int(index_bytes or 0),
+        "temp_bytes_delta": temp_bytes_delta,
+        "elapsed_seconds": time.monotonic() - started_at,
+    }
+    LOGGER.info(
+        "Prepared Provider Directory Profile bucket index "
+        "relation=%s scope_table=%s index=%s index_bytes=%d "
+        "temp_bytes_delta=%s elapsed_seconds=%.3f",
+        relation_name,
+        scope_table,
+        index_name,
+        metrics_by_name["index_bytes"],
+        temp_bytes_delta if temp_bytes_delta is not None else "unavailable",
+        metrics_by_name["elapsed_seconds"],
+    )
+    return metrics_by_name
+
+
 async def _execute_profile_evidence_batch(
     build: _ProviderDirectoryProfileBuild,
     batch: _ProviderDirectoryProfileEvidenceBatch,
@@ -15514,9 +16022,10 @@ async def _execute_profile_evidence_batch(
             )
         )
     if (
-        batch.kind != "source"
+        batch.kind != "fact"
         or not batch.source_id
         or not batch.dataset_id
+        or not batch.fact_type
     ):
         raise RuntimeError(
             "provider_directory_profile_evidence_batch_invalid"
@@ -15537,10 +16046,136 @@ async def _execute_profile_evidence_batch(
         await db.status(
             profile_artifact.profile_evidence_insert_sql(
                 **evidence_sql_refs_by_name,
+                fact_type=batch.fact_type,
+                role_bucket_count=batch.role_bucket_count,
+                role_bucket=batch.role_bucket,
             ),
             **insert_params_by_name,
         )
     )
+
+
+async def _prepare_profile_evidence_bucket_indexes(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+    prepared_relations: set[str],
+) -> None:
+    """Prepare each scoped bucket index once for one evidence plan."""
+    if batch.role_bucket_count <= 1:
+        return
+    for relation_name in _provider_directory_profile_bucket_relations(
+        batch.fact_type
+    ):
+        if relation_name in prepared_relations:
+            continue
+        await _prepare_provider_directory_profile_bucket_index(
+            build.schema,
+            relation_name,
+        )
+        prepared_relations.add(relation_name)
+
+
+def _log_profile_evidence_batch_started(
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+    batch_number: int,
+    total_batches: int,
+) -> None:
+    """Log the exact bounded evidence coordinate before execution."""
+    LOGGER.info(
+        "Starting Provider Directory Profile evidence batch "
+        "%d/%d kind=%s source_id=%s fact_type=%s role_bucket=%d/%d",
+        batch_number + 1,
+        total_batches,
+        batch.kind,
+        batch.source_id or "-",
+        batch.fact_type or "-",
+        batch.role_bucket + 1,
+        batch.role_bucket_count,
+    )
+
+
+async def _advance_profile_evidence_batch_progress(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+    *,
+    batch_number: int,
+    total_batches: int,
+    start_batch: int,
+) -> None:
+    """Advance the durable checkpoint and publish committed progress."""
+    await _advance_provider_directory_profile_build_checkpoint(
+        build,
+        phase="evidence",
+        expected_batch=batch_number,
+        total_batches=total_batches,
+    )
+    await _mark_provider_directory_profile_batch_progress(
+        build,
+        phase="evidence",
+        completed_batches=batch_number + 1,
+        total_batches=total_batches,
+        resumed_from_batch=start_batch,
+        batch=batch,
+    )
+
+
+async def _execute_bounded_profile_evidence_plan(
+    build: _ProviderDirectoryProfileBuild,
+    batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...],
+    *,
+    start_batch: int,
+    checkpointed: bool,
+    copy_evidence_sql: Any,
+    evidence_sql_refs_by_name: Mapping[str, str],
+) -> None:
+    """Execute one bounded evidence plan from its durable checkpoint."""
+    if start_batch < 0 or start_batch > len(batches):
+        raise RuntimeError(
+            "provider_directory_profile_evidence_checkpoint_invalid"
+        )
+    if checkpointed:
+        await _mark_provider_directory_profile_batch_progress(
+            build,
+            phase="evidence",
+            completed_batches=start_batch,
+            total_batches=len(batches),
+            resumed_from_batch=start_batch,
+        )
+    prepared_relations: set[str] = set()
+    for batch_number, batch in enumerate(batches[start_batch:], start_batch):
+        batch_started_at = time.monotonic()
+        _log_profile_evidence_batch_started(
+            batch,
+            batch_number,
+            len(batches),
+        )
+        await _prepare_profile_evidence_bucket_indexes(
+            build,
+            batch,
+            prepared_relations,
+        )
+        affected_rows = await _execute_profile_evidence_batch(
+            build,
+            batch,
+            copy_evidence_sql,
+            evidence_sql_refs_by_name,
+        )
+        if checkpointed:
+            await _advance_profile_evidence_batch_progress(
+                build,
+                batch,
+                batch_number=batch_number,
+                total_batches=len(batches),
+                start_batch=start_batch,
+            )
+        LOGGER.info(
+            "Completed Provider Directory Profile evidence batch "
+            "%d/%d rows=%d elapsed_seconds=%.3f",
+            batch_number + 1,
+            len(batches),
+            affected_rows,
+            time.monotonic() - batch_started_at,
+        )
 
 
 async def _populate_provider_directory_profile_evidence_stage(
@@ -15550,8 +16185,14 @@ async def _populate_provider_directory_profile_evidence_stage(
     bounded: bool = False,
     start_batch: int = 0,
     checkpointed: bool = False,
+    batch_plan: _ProviderDirectoryProfileBatchPlan | None = None,
 ) -> None:
     """Populate one registered evidence stage and build serving indexes."""
+    include_copy_batch = _is_profile_copy_batch_required(
+        source_ids=build.source_ids,
+        retained_source_ids=build.retained_source_ids,
+        has_existing_artifacts=has_evidence_target,
+    )
     evidence_stage_ref = _provider_directory_profile_build_ref(
         build, build.evidence_stage
     )
@@ -15598,7 +16239,7 @@ async def _populate_provider_directory_profile_evidence_stage(
         ),
     }
     if not bounded:
-        if has_evidence_target:
+        if include_copy_batch:
             await db.status(
                 copy_evidence_sql,
                 source_ids=list(build.source_ids),
@@ -15614,50 +16255,22 @@ async def _populate_provider_directory_profile_evidence_stage(
             profile_as_of=build.profile_as_of,
         )
     else:
-        batches = _provider_directory_profile_evidence_batches(
-            build,
-            has_existing_artifacts=has_evidence_target,
-        )
-        if start_batch < 0 or start_batch > len(batches):
-            raise RuntimeError(
-                "provider_directory_profile_evidence_checkpoint_invalid"
-            )
-        for batch_number, batch in enumerate(batches):
-            if batch_number < start_batch:
-                continue
-            batch_started_at = time.monotonic()
-            LOGGER.info(
-                "Starting Provider Directory Profile evidence batch "
-                "%d/%d kind=%s source_id=%s fact_type=%s role_bucket=%d/%d",
-                batch_number + 1,
-                len(batches),
-                batch.kind,
-                batch.source_id or "-",
-                batch.fact_type or "-",
-                batch.role_bucket + 1,
-                batch.role_bucket_count,
-            )
-            affected_rows = await _execute_profile_evidence_batch(
+        evidence_batches = (
+            batch_plan.evidence_batches
+            if batch_plan is not None
+            else _provider_directory_profile_evidence_batches(
                 build,
-                batch,
-                copy_evidence_sql,
-                evidence_sql_refs_by_name,
+                has_existing_artifacts=has_evidence_target,
             )
-            if checkpointed:
-                await _advance_provider_directory_profile_build_checkpoint(
-                    build,
-                    phase="evidence",
-                    expected_batch=batch_number,
-                    total_batches=len(batches),
-                )
-            LOGGER.info(
-                "Completed Provider Directory Profile evidence batch "
-                "%d/%d rows=%d elapsed_seconds=%.3f",
-                batch_number + 1,
-                len(batches),
-                affected_rows,
-                time.monotonic() - batch_started_at,
-            )
+        )
+        await _execute_bounded_profile_evidence_plan(
+            build,
+            evidence_batches,
+            start_batch=start_batch,
+            checkpointed=checkpointed,
+            copy_evidence_sql=copy_evidence_sql,
+            evidence_sql_refs_by_name=evidence_sql_refs_by_name,
+        )
     index_started_at = time.monotonic()
     LOGGER.info(
         "Starting Provider Directory Profile evidence indexes stage=%s",
@@ -15689,6 +16302,7 @@ async def _populate_provider_directory_profile_compact_stage(
     npi_batch_size: int | None = None,
     start_batch: int = 0,
     checkpointed: bool = False,
+    batch_plan: _ProviderDirectoryProfileBatchPlan | None = None,
 ) -> None:
     """Populate compact profiles while preserving unaffected NPIs."""
     if npi_batch_size is not None and npi_batch_size < 1:
@@ -15705,6 +16319,13 @@ async def _populate_provider_directory_profile_compact_stage(
         profile_artifact.PROFILE_EVIDENCE_TABLE,
     )
     should_rebuild_all_profiles = not has_existing_artifacts
+    should_copy_unaffected_profiles = (
+        _is_profile_copy_batch_required(
+            source_ids=build.source_ids,
+            retained_source_ids=build.retained_source_ids,
+            has_existing_artifacts=has_existing_artifacts,
+        )
+    )
     copy_profiles_sql = profile_artifact.copy_unaffected_profiles_sql(
         profile_source_ref=_provider_directory_profile_build_ref(
             build,
@@ -15729,7 +16350,7 @@ async def _populate_provider_directory_profile_compact_stage(
         "generation_id": build.generation_id,
     }
     if npi_batch_size is None:
-        if has_existing_artifacts:
+        if should_copy_unaffected_profiles:
             await db.status(
                 copy_profiles_sql,
                 source_ids=list(build.source_ids),
@@ -15741,13 +16362,28 @@ async def _populate_provider_directory_profile_compact_stage(
             **profile_params_by_name,
         )
     else:
-        batches = _provider_directory_profile_compact_batches(
-            has_existing_artifacts=has_existing_artifacts,
-            npi_batch_size=npi_batch_size,
+        batches = (
+            batch_plan.compact_batches
+            if batch_plan is not None
+            else _provider_directory_profile_compact_batches(
+                source_ids=build.source_ids,
+                retained_source_ids=build.retained_source_ids,
+                dataset_ids=build.dataset_ids,
+                has_existing_artifacts=has_existing_artifacts,
+                npi_batch_size=npi_batch_size,
+            )
         )
         if start_batch < 0 or start_batch > len(batches):
             raise RuntimeError(
                 "provider_directory_profile_compact_checkpoint_invalid"
+            )
+        if checkpointed:
+            await _mark_provider_directory_profile_batch_progress(
+                build,
+                phase="profile",
+                completed_batches=start_batch,
+                total_batches=len(batches),
+                resumed_from_batch=start_batch,
             )
         for batch_number, batch in enumerate(batches):
             if batch_number < start_batch:
@@ -15771,13 +16407,21 @@ async def _populate_provider_directory_profile_compact_stage(
                         profile_as_of=build.profile_as_of,
                     )
                 )
-            elif batch.kind == "affected":
+            elif (
+                batch.kind == "npi"
+                and batch.npi_start is not None
+                and batch.npi_end is not None
+            ):
                 affected_rows = _coerce_rowcount(
                     await db.status(
                         profile_artifact.profile_insert_sql(
                             **profile_sql_args_by_name,
+                            npi_start=batch.npi_start,
+                            npi_end=batch.npi_end,
                         ),
                         **profile_params_by_name,
+                        profile_npi_start=batch.npi_start,
+                        profile_npi_end=batch.npi_end,
                     )
                 )
             else:
@@ -15790,6 +16434,14 @@ async def _populate_provider_directory_profile_compact_stage(
                     phase="profile",
                     expected_batch=batch_number,
                     total_batches=len(batches),
+                )
+                await _mark_provider_directory_profile_batch_progress(
+                    build,
+                    phase="profile",
+                    completed_batches=batch_number + 1,
+                    total_batches=len(batches),
+                    resumed_from_batch=start_batch,
+                    batch=batch,
                 )
             LOGGER.info(
                 "Completed Provider Directory Profile compact batch "
@@ -15976,6 +16628,7 @@ async def _populate_claimed_provider_directory_profile_stages(
     has_existing_artifacts: bool,
     evidence_build_fence: ProviderDirectoryArtifactBuildFence,
     profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    batch_plan: _ProviderDirectoryProfileBatchPlan,
 ) -> tuple[
     dict[str, Any],
     tuple[
@@ -15987,6 +16640,7 @@ async def _populate_claimed_provider_directory_profile_stages(
     if (
         checkpoint_state.evidence_next_batch
         < checkpoint_state.evidence_total_batches
+        or checkpoint_state.state == "building_evidence"
     ):
         await _populate_provider_directory_profile_evidence_stage(
             build,
@@ -15994,6 +16648,7 @@ async def _populate_claimed_provider_directory_profile_stages(
             bounded=True,
             start_batch=checkpoint_state.evidence_next_batch,
             checkpointed=True,
+            batch_plan=batch_plan,
         )
     await _populate_provider_directory_profile_compact_stage(
         build,
@@ -16001,6 +16656,7 @@ async def _populate_claimed_provider_directory_profile_stages(
         npi_batch_size=profile_artifact.PROFILE_NPI_BATCH_SIZE,
         start_batch=checkpoint_state.profile_next_batch,
         checkpointed=True,
+        batch_plan=batch_plan,
     )
     metrics = await _provider_directory_profile_metrics(
         build,
@@ -16018,6 +16674,8 @@ async def _build_provider_directory_profile_stages(
     build: _ProviderDirectoryProfileBuild,
     evidence_build_fence: ProviderDirectoryArtifactBuildFence,
     profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    *,
+    has_existing_artifacts: bool | None = None,
 ) -> tuple[
     dict[str, Any],
     tuple[
@@ -16026,8 +16684,13 @@ async def _build_provider_directory_profile_stages(
     ],
 ]:
     """Build the bounded profile evidence and compact stages."""
-    has_existing_artifacts = await _has_provider_directory_profile_artifacts(
-        build.schema
+    if has_existing_artifacts is None:
+        has_existing_artifacts = (
+            await _has_provider_directory_profile_artifacts(build.schema)
+        )
+    batch_plan = _provider_directory_profile_build_plan(
+        build,
+        has_existing_artifacts=has_existing_artifacts,
     )
     checkpoint_state = (
         await _claim_provider_directory_profile_build_checkpoint(
@@ -16035,6 +16698,7 @@ async def _build_provider_directory_profile_stages(
             has_existing_artifacts=has_existing_artifacts,
             evidence_build_fence=evidence_build_fence,
             profile_build_fence=profile_build_fence,
+            batch_plan=batch_plan,
         )
     )
     try:
@@ -16044,6 +16708,7 @@ async def _build_provider_directory_profile_stages(
             has_existing_artifacts,
             evidence_build_fence,
             profile_build_fence,
+            batch_plan,
         )
     except BaseException as exc:
         with contextlib.suppress(BaseException):
@@ -16086,12 +16751,16 @@ async def publish_provider_directory_profile(
                 profile_artifact.PROFILE_TABLE,
             )
         )
+        has_existing_artifacts = (
+            await _has_provider_directory_profile_artifacts(schema)
+        )
         build = await _resolve_provider_directory_profile_build(
             schema,
             run_id,
             dataset_fence,
             evidence_build_fence,
             profile_build_fence,
+            has_existing_artifacts=has_existing_artifacts,
         )
         await _reap_stale_provider_directory_profile_builds(
             schema,
@@ -16101,6 +16770,7 @@ async def publish_provider_directory_profile(
             build,
             evidence_build_fence,
             profile_build_fence,
+            has_existing_artifacts=has_existing_artifacts,
         )
         return await _finalize_provider_directory_profile_stages(
             metrics,
@@ -33094,6 +33764,7 @@ async def _mark_provider_directory_progress(
     phase: str,
     done: int,
     total: int,
+    unit: str = "steps",
     message: str,
     details: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
@@ -33103,7 +33774,7 @@ async def _mark_provider_directory_progress(
     total = max(total, 1)
     done = max(0, min(done, total))
     progress_by_name = {
-        "unit": "steps",
+        "unit": unit,
         "done": done,
         "total": total,
         "pct": round((done / total) * 100, 2),

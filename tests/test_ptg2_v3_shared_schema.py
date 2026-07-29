@@ -223,6 +223,72 @@ def test_candidate_audit_hold_migration_matches_runtime_digest():
     )
 
 
+def _fresh_v3_migration_statements(schema_name):
+    original = _load_migration()
+    followup = _load_migration(FOLLOWUP_MIGRATION_PATH)
+    original_recorder = _OpRecorder()
+    followup_recorder = _OpRecorder()
+    original.op = original_recorder
+    followup.op = followup_recorder
+    original._schema = lambda: schema_name
+    followup._schema = lambda: schema_name
+    original.upgrade()
+    followup.upgrade()
+    return original_recorder.executed + followup_recorder.executed
+
+
+async def _assert_v3_gc_schema_columns(database, schema_name):
+    assert await database.scalar(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM pg_indexes
+             WHERE schemaname = :schema_name
+               AND tablename = 'ptg2_v3_candidate_audit_attestation'
+               AND indexname =
+                   'ptg2_v3_candidate_audit_attestation_snapshot_key_idx'
+        )
+        """,
+        schema_name=schema_name,
+    )
+    assert await database.scalar(
+        """
+        SELECT COUNT(*)
+          FROM information_schema.columns
+         WHERE table_schema = :schema_name
+           AND data_type = 'jsonb'
+           AND (table_name, column_name) IN (
+                ('ptg2_v3_snapshot_layout', 'layout_manifest'),
+                ('ptg2_v3_candidate_audit_attestation', 'report')
+           )
+        """,
+        schema_name=schema_name,
+    ) == 2
+
+
+async def _assert_v3_gc_foreign_keys(database, schema_name):
+    fk_rows = await database.all(
+        """
+        SELECT constraint_name, delete_rule
+          FROM information_schema.referential_constraints
+         WHERE constraint_schema = :schema_name
+           AND constraint_name IN (
+                'ptg2_v3_snapshot_binding_snapshot_id_fkey',
+                'ptg2_v3_snapshot_scope_snapshot_id_fkey',
+                'ptg2_v3_candidate_audit_attestation_snapshot_id_fkey',
+                'ptg2_v3_candidate_audit_attestation_snapshot_key_fkey'
+           )
+        """,
+        schema_name=schema_name,
+    )
+    assert {str(row[0]): str(row[1]) for row in fk_rows} == {
+        "ptg2_v3_snapshot_binding_snapshot_id_fkey": "CASCADE",
+        "ptg2_v3_snapshot_scope_snapshot_id_fkey": "CASCADE",
+        "ptg2_v3_candidate_audit_attestation_snapshot_id_fkey": "CASCADE",
+        "ptg2_v3_candidate_audit_attestation_snapshot_key_fkey": "RESTRICT",
+    }
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_fresh_v3_migrations_have_gc_contract():
     """Verify real postgres fresh v3 migrations have gc contract."""
@@ -234,76 +300,18 @@ async def test_real_postgres_fresh_v3_migrations_have_gc_contract():
 
     schema_name = f"ptg2_v3_schema_{uuid.uuid4().hex}"
     schema = f'"{schema_name}"'
-    original = _load_migration()
-    followup = _load_migration(FOLLOWUP_MIGRATION_PATH)
-    original_recorder = _OpRecorder()
-    followup_recorder = _OpRecorder()
-    original.op = original_recorder
-    followup.op = followup_recorder
-    original._schema = lambda: schema_name
-    followup._schema = lambda: schema_name
-    original.upgrade()
-    followup.upgrade()
+    migration_statements = _fresh_v3_migration_statements(schema_name)
 
     database = Database()
     await database.connect()
     try:
         await database.execute_ddl(f"CREATE SCHEMA {schema}")
-        for statement in original_recorder.executed:
-            await database.execute_ddl(statement)
-        for statement in followup_recorder.executed:
+        for statement in migration_statements:
             await database.execute_ddl(statement)
 
         await require_migration_owned_tables(database, schema_name)
-        assert await database.scalar(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                  FROM pg_indexes
-                 WHERE schemaname = :schema_name
-                   AND tablename = 'ptg2_v3_candidate_audit_attestation'
-                   AND indexname =
-                       'ptg2_v3_candidate_audit_attestation_snapshot_key_idx'
-            )
-            """,
-            schema_name=schema_name,
-        )
-        assert await database.scalar(
-            """
-            SELECT COUNT(*)
-              FROM information_schema.columns
-             WHERE table_schema = :schema_name
-               AND data_type = 'jsonb'
-               AND (table_name, column_name) IN (
-                    ('ptg2_v3_snapshot_layout', 'layout_manifest'),
-                    ('ptg2_v3_candidate_audit_attestation', 'report')
-               )
-            """,
-            schema_name=schema_name,
-        ) == 2
-        fk_rows = await database.all(
-            """
-            SELECT constraint_name, delete_rule
-              FROM information_schema.referential_constraints
-             WHERE constraint_schema = :schema_name
-               AND constraint_name IN (
-                    'ptg2_v3_snapshot_binding_snapshot_id_fkey',
-                    'ptg2_v3_snapshot_scope_snapshot_id_fkey',
-                    'ptg2_v3_candidate_audit_attestation_snapshot_id_fkey',
-                    'ptg2_v3_candidate_audit_attestation_snapshot_key_fkey'
-               )
-            """,
-            schema_name=schema_name,
-        )
-        assert {
-            str(constraint_row[0]): str(constraint_row[1])
-            for constraint_row in fk_rows
-        } == {
-            "ptg2_v3_snapshot_binding_snapshot_id_fkey": "CASCADE",
-            "ptg2_v3_snapshot_scope_snapshot_id_fkey": "CASCADE",
-            "ptg2_v3_candidate_audit_attestation_snapshot_id_fkey": "CASCADE",
-            "ptg2_v3_candidate_audit_attestation_snapshot_key_fkey": "RESTRICT",
-        }
+        await _assert_v3_gc_schema_columns(database, schema_name)
+        await _assert_v3_gc_foreign_keys(database, schema_name)
     finally:
         try:
             await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")

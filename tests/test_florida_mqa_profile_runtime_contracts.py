@@ -302,20 +302,12 @@ async def test_projection_batches_emit_empty_loaded_categories_without_facts(
     assert batches[0][0]["evidence_json"]["records"] == []
 
 
-@pytest.mark.asyncio
-async def test_post_success_retention_protects_live_and_rollback_generations(
-    monkeypatch,
-    tmp_path,
+def _retention_database_responses(
+    *, live_run, rollback_run, completed_run, expired_failed_run, current_run
 ):
-    """Verify post success retention protects live and rollback generations."""
-    live_run = "b" * 32
-    rollback_run = "c" * 32
-    completed_run = "a" * 32
-    expired_failed_run = "d" * 32
-    current_run = "e" * 32
     old_finished_at = florida._utcnow() - timedelta(days=30)
     live_name = ProviderProfileProjection.__tablename__
-    responses = iter(
+    return iter(
         (
             [_Row(tablename=live_name), _Row(tablename=f"{live_name}_old")],
             [_Row(generation_id=live_run)],
@@ -343,6 +335,26 @@ async def test_post_success_retention_protects_live_and_rollback_generations(
                 ),
             ],
         )
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_success_retention_protects_live_and_rollback_generations(
+    monkeypatch,
+    tmp_path,
+):
+    """Verify post success retention protects live and rollback generations."""
+    live_run = "b" * 32
+    rollback_run = "c" * 32
+    completed_run = "a" * 32
+    expired_failed_run = "d" * 32
+    current_run = "e" * 32
+    responses = _retention_database_responses(
+        live_run=live_run,
+        rollback_run=rollback_run,
+        completed_run=completed_run,
+        expired_failed_run=expired_failed_run,
+        current_run=current_run,
     )
 
     class RetentionDb:

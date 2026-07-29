@@ -304,42 +304,44 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
     ) in redis.sets[process_initial._mrf_state_key("run_test_123", "done_work")]
 
 
+class _UniqueWorkRedis:
+    def __init__(self):
+        self.calls = []
+        self.values = {}
+        self.sets = {}
+        self.hashes = {}
+
+    async def enqueue_job(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return SimpleNamespace()
+
+    async def incrby(self, key, value):
+        self.values[key] = int(self.values.get(key, 0)) + int(value)
+
+    async def expire(self, *_args, **_kwargs):
+        is_expiration_set = True
+        return is_expiration_set
+
+    async def hsetnx(self, key, field, value):
+        values = self.hashes.setdefault(key, {})
+        if field in values:
+            return 0
+        values[field] = value
+        return 1
+
+    async def hdel(self, key, field):
+        return int(self.hashes.get(key, {}).pop(field, None) is not None)
+
+    async def sadd(self, key, value):
+        values = self.sets.setdefault(key, set())
+        before = len(values)
+        values.add(value)
+        return 1 if len(values) > before else 0
+
+
 @pytest.mark.asyncio
 async def test_process_json_index_test_limit_counts_unique_registered_jobs(monkeypatch):
     """Verify process json index test limit counts unique registered jobs."""
-    class FakeRedis:
-        def __init__(self):
-            self.calls = []
-            self.values = {}
-            self.sets = {}
-            self.hashes = {}
-
-        async def enqueue_job(self, *args, **kwargs):
-            self.calls.append((args, kwargs))
-            return SimpleNamespace()
-
-        async def incrby(self, key, value):
-            self.values[key] = int(self.values.get(key, 0)) + int(value)
-
-        async def expire(self, *_args, **_kwargs):
-            is_expiration_set = True
-            return is_expiration_set
-
-        async def hsetnx(self, key, field, value):
-            values = self.hashes.setdefault(key, {})
-            if field in values:
-                return 0
-            values[field] = value
-            return 1
-
-        async def hdel(self, key, field):
-            return int(self.hashes.get(key, {}).pop(field, None) is not None)
-
-        async def sadd(self, key, value):
-            values = self.sets.setdefault(key, set())
-            before = len(values)
-            values.add(value)
-            return 1 if len(values) > before else 0
 
     async def fake_download(_url, filename, **_kwargs):
         payload = {
@@ -358,7 +360,7 @@ async def test_process_json_index_test_limit_counts_unique_registered_jobs(monke
     monkeypatch.setattr(process_initial, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_initial, "make_class", lambda *_args, **_kwargs: SimpleNamespace())
 
-    redis = FakeRedis()
+    redis = _UniqueWorkRedis()
     context_by_field = {
         "redis": redis,
         "context": {

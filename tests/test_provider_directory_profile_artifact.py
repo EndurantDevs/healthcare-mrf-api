@@ -65,11 +65,8 @@ def _patch_fresh_profile_stage_identity(monkeypatch) -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_profile_build_identity_resumes_original_as_of_across_days(
-    monkeypatch,
-):
-    """Keep a valid logged checkpoint resumable after the calendar day changes."""
+def _profile_build_identity_fixture():
+    """Return the immutable dataset and target fences used by resume tests."""
     dataset = importer.ProviderDirectoryArtifactDataset(
         source_id="source_a",
         endpoint_id="endpoint_a",
@@ -78,11 +75,46 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
         selected_resources=("Practitioner",),
         expected_resources=("Practitioner",),
     )
-    dataset_fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
-    evidence_fence = importer.ProviderDirectoryArtifactBuildFence(
-        target_oid=11
+    return (
+        importer.ProviderDirectoryArtifactDatasetFence((dataset,)),
+        importer.ProviderDirectoryArtifactBuildFence(target_oid=11),
+        importer.ProviderDirectoryArtifactBuildFence(target_oid=12),
     )
-    profile_fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=12)
+
+
+def _resumable_profile_checkpoint(
+    build: importer._ProviderDirectoryProfileBuild,
+) -> dict[str, object]:
+    """Describe the exact logged checkpoint expected to resume."""
+    return {
+        "build_id": build.build_id,
+        "strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
+        "schema_version": profile.PROFILE_SCHEMA_VERSION,
+        "resume_lineage_hash": build.resume_lineage_hash,
+        "profile_as_of": "2026-07-19",
+        "source_ids": ["source_a"],
+        "retained_source_ids": ["source_a"],
+        "dataset_ids": ["dataset_a"],
+        "evidence_stage": build.evidence_stage,
+        "profile_stage": build.profile_stage,
+        "evidence_stage_oid": 21,
+        "profile_stage_oid": 22,
+        "evidence_target_oid": 11,
+        "profile_target_oid": 12,
+        "has_existing_artifacts": False,
+        "evidence_total_batches": 83,
+        "profile_total_batches": 400,
+    }
+
+
+@pytest.mark.asyncio
+async def test_profile_build_identity_resumes_original_as_of_across_days(
+    monkeypatch,
+):
+    """Keep a valid logged checkpoint resumable after the calendar day changes."""
+    dataset_fence, evidence_fence, profile_fence = (
+        _profile_build_identity_fixture()
+    )
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_scope_source_ids",
@@ -103,22 +135,7 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
         evidence_fence,
         profile_fence,
     )
-    checkpoint.return_value = {
-        "build_id": initial_build.build_id,
-        "strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
-        "schema_version": profile.PROFILE_SCHEMA_VERSION,
-        "resume_lineage_hash": initial_build.resume_lineage_hash,
-        "profile_as_of": "2026-07-19",
-        "source_ids": ["source_a"],
-        "retained_source_ids": ["source_a"],
-        "dataset_ids": ["dataset_a"],
-        "evidence_stage": initial_build.evidence_stage,
-        "profile_stage": initial_build.profile_stage,
-        "evidence_stage_oid": 21,
-        "profile_stage_oid": 22,
-        "evidence_target_oid": 11,
-        "profile_target_oid": 12,
-    }
+    checkpoint.return_value = _resumable_profile_checkpoint(initial_build)
     stage_identity = AsyncMock(
         side_effect=[(21, "r", "p"), (22, "r", "p")]
     )
@@ -665,12 +682,41 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
     ]
 
 
+def _assert_profile_fact_population_calls(insert_calls, build):
+    """Require every source/fact/role partition exactly once."""
+    assert len(insert_calls) == 83 * len(build.source_ids)
+    assert all(len(call.kwargs["source_ids"]) == 1 for call in insert_calls)
+    assert {
+        (call.kwargs["source_ids"][0], call.kwargs["dataset_ids"][0])
+        for call in insert_calls
+    } == {("source_a", "dataset_a"), ("source_b", "dataset_b")}
+    role_bucket_calls = [
+        call
+        for call in insert_calls
+        if "profile_role_bucket" in call.kwargs
+    ]
+    assert len(role_bucket_calls) == (
+        len(build.source_ids)
+        * 2
+        * profile.PROFILE_AFFILIATION_ROLE_BUCKETS
+    )
+    assert {
+        fact_type
+        for call in role_bucket_calls
+        for fact_type in ("affiliation", "organization")
+        if f"fact_type = '{fact_type}'" in str(call.args[0])
+    } == {"affiliation", "organization"}
+    assert {
+        call.kwargs["profile_role_bucket"] for call in role_bucket_calls
+    } == set(range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS))
+
+
 @pytest.mark.asyncio
-async def test_profile_evidence_population_scans_each_source_once(
+async def test_profile_evidence_population_bounds_each_fact_and_role_bucket(
     monkeypatch,
     caplog,
 ):
-    """Emit every fact branch in one checkpointed scan per source."""
+    """Emit one checkpointed statement per source/fact/role bucket."""
     status = AsyncMock(return_value=1)
     create_indexes = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
@@ -702,17 +748,10 @@ async def test_profile_evidence_population_scans_each_source_once(
         for call in status.await_args_list
         if "dataset_ids" in call.kwargs
     ]
-    assert len(insert_calls) == len(build.source_ids)
-    assert all(len(call.kwargs["source_ids"]) == 1 for call in insert_calls)
-    assert {
-        (call.kwargs["source_ids"][0], call.kwargs["dataset_ids"][0])
-        for call in insert_calls
-    } == {("source_a", "dataset_a"), ("source_b", "dataset_b")}
-    assert all("profile_role_bucket" not in call.kwargs for call in insert_calls)
-    assert all("'affiliation'" in call.args[0] for call in insert_calls)
+    _assert_profile_fact_population_calls(insert_calls, build)
     log_messages = [log_record.getMessage() for log_record in caplog.records]
     assert any(
-        "kind=source source_id=source_a fact_type=- role_bucket=1/1"
+        "kind=fact source_id=source_a fact_type=name role_bucket=1/1"
         in message
         for message in log_messages
     )
@@ -724,6 +763,47 @@ async def test_profile_evidence_population_scans_each_source_once(
     assert any(
         "Completed Provider Directory Profile evidence indexes" in message
         for message in log_messages
+    )
+
+
+def _profile_write_calls(status):
+    """Return artifact writes without maintenance statements."""
+    return [
+        call
+        for call in status.await_args_list
+        if "ANALYZE" not in str(call.args[0])
+    ]
+
+
+def _assert_incremental_evidence_writes(write_calls):
+    """Assert one retained-source copy plus bounded evidence writes."""
+    assert len(write_calls) == 84
+    assert "source_id <> ALL" in write_calls[0].args[0]
+    assert write_calls[0].kwargs["retained_source_ids"] == [
+        "source_a",
+        "source_b",
+    ]
+    assert all(
+        call.kwargs["dataset_ids"] == ["dataset_a"]
+        for call in write_calls[1:]
+    )
+    assert all(
+        "profile_role_bucket" in call.kwargs
+        for call in write_calls[1:]
+        if any(
+            f"fact_type = '{fact_type}'" in call.args[0]
+            for fact_type in ("affiliation", "organization")
+        )
+    )
+
+
+def _assert_incremental_compact_writes(write_calls):
+    """Assert one affected-NPI copy plus bounded compact writes."""
+    assert len(write_calls) == 401
+    assert "affected_npis" in write_calls[0].args[0]
+    assert all("generation_id" in call.kwargs for call in write_calls[1:])
+    assert all(
+        "profile_npi_start" in call.kwargs for call in write_calls[1:]
     )
 
 
@@ -756,38 +836,18 @@ async def test_profile_refresh_copies_unaffected_global_rows_before_source(
         bounded=True,
     )
 
-    write_calls = [
-        call
-        for call in status.await_args_list
-        if "ANALYZE" not in str(call.args[0])
-    ]
-    assert len(write_calls) == 2
-    assert "source_id <> ALL" in write_calls[0].args[0]
-    assert write_calls[0].kwargs["retained_source_ids"] == [
-        "source_a",
-        "source_b",
-    ]
-    assert write_calls[1].kwargs["dataset_ids"] == ["dataset_a"]
-
+    _assert_incremental_evidence_writes(_profile_write_calls(status))
     status.reset_mock()
     await importer._populate_provider_directory_profile_compact_stage(
         build,
         has_existing_artifacts=True,
         npi_batch_size=profile.PROFILE_NPI_BATCH_SIZE,
     )
-    write_calls = [
-        call
-        for call in status.await_args_list
-        if "ANALYZE" not in str(call.args[0])
-    ]
-    assert len(write_calls) == 2
-    assert "affected_npis" in write_calls[0].args[0]
-    assert "generation_id" in write_calls[1].kwargs
-    assert "profile_npi_start" not in write_calls[1].kwargs
+    _assert_incremental_compact_writes(_profile_write_calls(status))
 
 
 @pytest.mark.asyncio
-async def test_profile_compact_population_scans_affected_npis_once(
+async def test_profile_compact_population_batches_affected_npi_ranges(
     monkeypatch,
     caplog,
 ):
@@ -819,14 +879,20 @@ async def test_profile_compact_population_scans_affected_npis_once(
     batch_calls = [
         call
         for call in status.await_args_list
-        if "generation_id" in call.kwargs
+        if "profile_npi_start" in call.kwargs
     ]
-    assert len(batch_calls) == 1
-    assert "profile_npi_start" not in batch_calls[0].kwargs
-    assert "profile_npi_end" not in batch_calls[0].kwargs
+    assert [
+        (call.kwargs["profile_npi_start"], call.kwargs["profile_npi_end"])
+        for call in batch_calls
+    ] == [
+        (1_000_000_000, 1_500_000_000),
+        (1_500_000_000, 2_000_000_000),
+        (2_000_000_000, 2_500_000_000),
+        (2_500_000_000, 3_000_000_000),
+    ]
     log_messages = [log_record.getMessage() for log_record in caplog.records]
     assert any(
-        "kind=affected npi_start=- npi_end=-" in message
+        "kind=npi npi_start=1000000000 npi_end=1500000000" in message
         for message in log_messages
     )
     assert any(

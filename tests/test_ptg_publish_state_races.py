@@ -52,16 +52,7 @@ def _run_source_import():
     )
 
 
-def test_deterministic_rerun_returns_already_published_without_table_work(monkeypatch):
-    """Verify deterministic rerun returns already published without table work."""
-    calls = []
-    create_stage = AsyncMock()
-    cleanup = AsyncMock()
-    finalize_terminal_retry = AsyncMock()
-    publish_pointers = AsyncMock(
-        return_value={"status": "promoted", "global_pointer": "reconciled"}
-    )
-
+def _published_snapshot_push(calls):
     async def push(object_entries, cls, **_kwargs):
         calls.append((cls, object_entries[0]))
         assert cls is process_ptg.PTG2Snapshot
@@ -75,6 +66,18 @@ def test_deterministic_rerun_returns_already_published_without_table_work(monkey
             },
         }
 
+    return push
+
+
+def _patch_already_published_rerun(monkeypatch):
+    calls = []
+    create_stage = AsyncMock()
+    cleanup = AsyncMock()
+    finalize_terminal_retry = AsyncMock()
+    publish_pointers = AsyncMock(
+        return_value={"status": "promoted", "global_pointer": "reconciled"}
+    )
+
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(
@@ -82,7 +85,7 @@ def test_deterministic_rerun_returns_already_published_without_table_work(monkey
         "_current_source_snapshot_id",
         AsyncMock(return_value="snap_previous"),
     )
-    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", _published_snapshot_push(calls))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", publish_pointers)
     monkeypatch.setattr(
         process_ptg.db,
@@ -110,6 +113,24 @@ def test_deterministic_rerun_returns_already_published_without_table_work(monkey
         "_finalize_resumed_terminal_attempt",
         finalize_terminal_retry,
     )
+    return (
+        calls,
+        create_stage,
+        cleanup,
+        finalize_terminal_retry,
+        publish_pointers,
+    )
+
+
+def test_deterministic_rerun_returns_already_published_without_table_work(monkeypatch):
+    """Verify deterministic rerun returns already published without table work."""
+    (
+        calls,
+        create_stage,
+        cleanup,
+        finalize_terminal_retry,
+        publish_pointers,
+    ) = _patch_already_published_rerun(monkeypatch)
 
     rerun_result = _run_source_import()
 

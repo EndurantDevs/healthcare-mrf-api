@@ -20,76 +20,82 @@ class _Recorder:
         self.calls.append((args, kwargs))
 
 
-async def test_canonical_resolve_failure_marks_run_failed(monkeypatch):
-    """Verify canonical resolve failure marks run failed."""
-    run_statuses = []
-    control_statuses = []
-    snapshot_statuses = []
+async def _successful_state_import(*_args, **_kwargs):
+    """Return one deterministic successful state-file result."""
+    return pharmacy_license.StateImportStats(
+        supported=True,
+        status="imported",
+        source_url="https://example.test/source.zip",
+        unsupported_reason=None,
+        error_text=None,
+        row_count_parsed=5,
+        row_count_matched=5,
+        row_count_dropped=0,
+        row_count_inserted=0,
+        metadata={},
+    )
 
+
+async def _fail_license_materialization(*_args, **_kwargs):
+    raise pharmacy_license.PharmacyLicenseCanonicalAddressError(
+        "pharmacy_license canonical address resolve failed"
+    )
+
+
+async def _async_noop(*_args, **_kwargs):
+    return None
+
+
+def _install_failing_license_run(monkeypatch, status_by_name):
+    """Install a complete run whose canonical materialization fails."""
     async def fake_upsert_run(payload):
-        run_statuses.append((payload.get("status"), payload.get("error_text")))
+        status_by_name["run"].append(
+            (payload.get("status"), payload.get("error_text"))
+        )
 
     async def fake_mark_control_run(run_id, **kwargs):
-        control_statuses.append(kwargs.get("status"))
+        status_by_name["control"].append(kwargs.get("status"))
 
     async def fake_upsert_snapshot(payload):
-        snapshot_statuses.append(payload.get("status"))
-
-    async def fake_import_state_source(session, source, **kwargs):
-        return pharmacy_license.StateImportStats(
-            supported=True,
-            status="imported",
-            source_url="https://example.test/source.zip",
-            unsupported_reason=None,
-            error_text=None,
-            row_count_parsed=5,
-            row_count_matched=5,
-            row_count_dropped=0,
-            row_count_inserted=0,
-            metadata={},
-        )
-
-    async def fake_materialize_snapshot(schema, snapshot_id, run_id):
-        raise pharmacy_license.PharmacyLicenseCanonicalAddressError(
-            "pharmacy_license canonical address resolve failed"
-        )
+        status_by_name["snapshot"].append(payload.get("status"))
 
     async def fake_ensure_tables():
         return "mrf"
 
-    async def fake_async_noop(*args, **kwargs):
-        return None
-
     async def fake_download_it(*args, **kwargs):
         return "<html></html>"
 
-    monkeypatch.setattr(pharmacy_license, "_upsert_run", fake_upsert_run)
-    monkeypatch.setattr(pharmacy_license, "mark_control_run", fake_mark_control_run)
-    monkeypatch.setattr(pharmacy_license, "_upsert_snapshot", fake_upsert_snapshot)
-    monkeypatch.setattr(pharmacy_license, "_upsert_coverage", _Recorder())
-    monkeypatch.setattr(pharmacy_license, "_import_state_source", fake_import_state_source)
-    monkeypatch.setattr(pharmacy_license, "_materialize_snapshot", fake_materialize_snapshot)
-    monkeypatch.setattr(pharmacy_license, "ensure_database", fake_async_noop)
-    monkeypatch.setattr(pharmacy_license, "_ensure_tables", fake_ensure_tables)
-    monkeypatch.setattr(pharmacy_license, "_truncate_stage_table", fake_async_noop)
-    monkeypatch.setattr(pharmacy_license, "_drop_secondary_indexes", fake_async_noop)
-    monkeypatch.setattr(pharmacy_license, "_ensure_secondary_indexes", fake_async_noop)
-    monkeypatch.setattr(pharmacy_license, "_analyze_tables", fake_async_noop)
-    monkeypatch.setattr(pharmacy_license, "download_it", fake_download_it)
-    monkeypatch.setattr(
-        pharmacy_license,
-        "_parse_fda_state_sources",
-        lambda html: [
+    replacement_map = {
+        "_upsert_run": fake_upsert_run,
+        "mark_control_run": fake_mark_control_run,
+        "_upsert_snapshot": fake_upsert_snapshot,
+        "_upsert_coverage": _Recorder(),
+        "_import_state_source": _successful_state_import,
+        "_materialize_snapshot": _fail_license_materialization,
+        "ensure_database": _async_noop,
+        "_ensure_tables": fake_ensure_tables,
+        "_truncate_stage_table": _async_noop,
+        "_drop_secondary_indexes": _async_noop,
+        "_ensure_secondary_indexes": _async_noop,
+        "_analyze_tables": _async_noop,
+        "download_it": fake_download_it,
+        "_parse_fda_state_sources": lambda _html: [
             pharmacy_license.StateSource(
                 state_code="ZZ",
                 state_name="Teststate",
                 board_url="https://example.test/board",
             )
         ],
-    )
-    monkeypatch.setattr(
-        pharmacy_license, "enqueue_live_progress", lambda *args, **kwargs: None
-    )
+        "enqueue_live_progress": lambda *_args, **_kwargs: None,
+    }
+    for name, replacement in replacement_map.items():
+        monkeypatch.setattr(pharmacy_license, name, replacement)
+
+
+async def test_canonical_resolve_failure_marks_run_failed(monkeypatch):
+    """Verify canonical resolve failure marks run failed."""
+    status_by_name = {"run": [], "control": [], "snapshot": []}
+    _install_failing_license_run(monkeypatch, status_by_name)
 
     with pytest.raises(pharmacy_license.PharmacyLicenseCanonicalAddressError):
         await pharmacy_license.pharmacy_license_start(
@@ -98,13 +104,14 @@ async def test_canonical_resolve_failure_marks_run_failed(monkeypatch):
 
     # The run must be recorded as failed in both registries, with the typed
     # error preserved, and must never reach the completed/succeeded path.
+    run_statuses = status_by_name["run"]
     assert ("failed" in [status for status, _ in run_statuses]), run_statuses
     assert "completed" not in [status for status, _ in run_statuses], run_statuses
     failed_errors = [err for status, err in run_statuses if status == "failed"]
     assert any(
         err and "canonical address resolve failed" in err for err in failed_errors
     ), run_statuses
-    assert "failed" in control_statuses, control_statuses
-    assert "succeeded" not in control_statuses, control_statuses
+    assert "failed" in status_by_name["control"], status_by_name["control"]
+    assert "succeeded" not in status_by_name["control"], status_by_name["control"]
     # The state's snapshot is individually marked failed as well.
-    assert "failed" in snapshot_statuses, snapshot_statuses
+    assert "failed" in status_by_name["snapshot"], status_by_name["snapshot"]
