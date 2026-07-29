@@ -76,6 +76,51 @@ def _import_task(kind: str):
     }
 
 
+async def _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pushed):
+    """Assert plan import rows."""
+    outcome = await initial.process_plan(_import_context(), _import_task("plans"))
+
+    assert outcome == 1
+    plan_rows = [
+        plan_row
+        for label, row_dicts in pushed + duplicate_tolerant
+        for plan_row in row_dicts
+        if label == "Plan"
+    ]
+    benefit_rows = [
+        benefit_row
+        for label, row_dicts in pushed + duplicate_tolerant
+        for benefit_row in row_dicts
+        if label == "PlanBenefitsMarketplace"
+    ]
+    formulary_rows = [
+        formulary_row
+        for label, row_dicts in duplicate_tolerant
+        for formulary_row in row_dicts
+        if label == "PlanFormulary"
+    ]
+    assert {
+        (plan_row["plan_id"], plan_row["year"]) for plan_row in plan_rows
+    } == {
+        (plan_id, 2026),
+        (plan_id, 2027),
+        ("54321BB0000000", 2026),
+    }
+    assert {benefit_row["benefit_name"] for benefit_row in benefit_rows} >= {
+        "virtual_visit",
+        "deductible",
+        "benefit_2",
+    }
+    assert any(
+        formulary_row["pharmacy_type"] == "RETAIL"
+        and formulary_row["copay_amount"] == 12.5
+        and formulary_row["coinsurance_rate"] == 0.2
+        for formulary_row in formulary_rows
+    )
+    assert initial.log_error.await_count >= 4
+    initial._mark_mrf_work_done.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_plan_import_preserves_year_benefit_and_cost_sharing_contracts(
     monkeypatch,
@@ -134,47 +179,7 @@ async def test_plan_import_preserves_year_benefit_and_cost_sharing_contracts(
     )
     monkeypatch.setattr(initial, "_mrf_plan_flush_rows", lambda _test_mode: 0)
 
-    outcome = await initial.process_plan(_import_context(), _import_task("plans"))
-
-    assert outcome == 1
-    plan_rows = [
-        plan_row
-        for label, row_dicts in pushed + duplicate_tolerant
-        for plan_row in row_dicts
-        if label == "Plan"
-    ]
-    benefit_rows = [
-        benefit_row
-        for label, row_dicts in pushed + duplicate_tolerant
-        for benefit_row in row_dicts
-        if label == "PlanBenefitsMarketplace"
-    ]
-    formulary_rows = [
-        formulary_row
-        for label, row_dicts in duplicate_tolerant
-        for formulary_row in row_dicts
-        if label == "PlanFormulary"
-    ]
-    assert {
-        (plan_row["plan_id"], plan_row["year"]) for plan_row in plan_rows
-    } == {
-        (plan_id, 2026),
-        (plan_id, 2027),
-        ("54321BB0000000", 2026),
-    }
-    assert {benefit_row["benefit_name"] for benefit_row in benefit_rows} >= {
-        "virtual_visit",
-        "deductible",
-        "benefit_2",
-    }
-    assert any(
-        formulary_row["pharmacy_type"] == "RETAIL"
-        and formulary_row["copay_amount"] == 12.5
-        and formulary_row["coinsurance_rate"] == 0.2
-        for formulary_row in formulary_rows
-    )
-    assert initial.log_error.await_count >= 4
-    initial._mark_mrf_work_done.assert_awaited_once()
+    await _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pushed)
 
 
 @pytest.mark.asyncio
@@ -291,6 +296,32 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
     initial._mark_mrf_work_done.assert_awaited_once()
 
 
+def _assert_formulary_import_rows(duplicate_tolerant):
+    """Assert formulary import rows."""
+    drug_rows = [
+        drug_row
+        for label, row_dicts in duplicate_tolerant
+        for drug_row in row_dicts
+        if label == "PlanDrugRaw"
+    ]
+    assert len(drug_rows) == 2
+    first, second = drug_rows
+    assert first["drug_tier"] == "GENERIC"
+    assert (
+        first["prior_authorization"],
+        first["step_therapy"],
+        first["quantity_limit"],
+    ) == (True, False, None)
+    assert second["last_updated_on"] is None
+    assert (
+        second["prior_authorization"],
+        second["step_therapy"],
+        second["quantity_limit"],
+    ) == (True, False, False)
+    assert initial.log_error.await_count == 2
+    initial._mark_mrf_work_done.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_formulary_import_normalizes_flags_and_rejects_incomplete_rows(
     monkeypatch,
@@ -345,28 +376,7 @@ async def test_formulary_import_normalizes_flags_and_rejects_incomplete_rows(
     )
 
     assert outcome == 1
-    drug_rows = [
-        drug_row
-        for label, row_dicts in duplicate_tolerant
-        for drug_row in row_dicts
-        if label == "PlanDrugRaw"
-    ]
-    assert len(drug_rows) == 2
-    first, second = drug_rows
-    assert first["drug_tier"] == "GENERIC"
-    assert (
-        first["prior_authorization"],
-        first["step_therapy"],
-        first["quantity_limit"],
-    ) == (True, False, None)
-    assert second["last_updated_on"] is None
-    assert (
-        second["prior_authorization"],
-        second["step_therapy"],
-        second["quantity_limit"],
-    ) == (True, False, False)
-    assert initial.log_error.await_count == 2
-    initial._mark_mrf_work_done.assert_awaited_once()
+    _assert_formulary_import_rows(duplicate_tolerant)
 
 
 @pytest.mark.parametrize(

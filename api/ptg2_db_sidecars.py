@@ -80,6 +80,28 @@ _PROVIDER_CODE_DECODED_BUCKET_BYTES = 160
 _PROVIDER_CODE_DECODED_MEMBERSHIP_BYTES = 16
 
 
+def forward_price_row_retention_upper_bound(rate_count: int) -> int:
+    """Bound broad forward row/index retention from sealed cardinality."""
+
+    if type(rate_count) is not int or rate_count < 0:
+        raise ValueError("forward rate count must not be negative")
+    parse_and_mutable_bytes = (
+        _FORWARD_FANOUT_ROW_RETAINED_BYTES
+        + _FORWARD_OCCURRENCE_RETAINED_BYTES
+        + _FORWARD_PRICE_KEY_RETAINED_BYTES
+    )
+    frozen_peak_bytes = (
+        _FORWARD_OCCURRENCE_RETAINED_BYTES
+        + _FORWARD_PRICE_KEY_RETAINED_BYTES
+        + _FORWARD_RESULT_OCCURRENCE_RETAINED_BYTES
+        + _FORWARD_RESULT_PRICE_KEY_RETAINED_BYTES
+    )
+    return _FORWARD_RESULT_MAP_RETAINED_BYTES + rate_count * max(
+        parse_and_mutable_bytes,
+        frozen_peak_bytes,
+    )
+
+
 @dataclass(frozen=True)
 class _ValidatedProviderCodeRequests:
     """One normalized, bounded provider-to-code request map."""

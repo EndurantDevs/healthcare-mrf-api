@@ -46,8 +46,11 @@ def _persisted_occurrence() -> PersistedAuditOccurrence:
 
 def _code_index() -> CandidateCodeIndex:
     return CandidateCodeIndex(
-        by_pair={("CPT", "99213"): ({"code_key": 7},)},
-        by_key={7: {"code_key": 7}, 8: {"code_key": 8}},
+        by_pair={("CPT", "99213"): ({"code_key": 7, "rate_count": 1},)},
+        by_key={
+            7: {"code_key": 7, "rate_count": 1},
+            8: {"code_key": 8, "rate_count": 1},
+        },
     )
 
 

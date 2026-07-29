@@ -697,6 +697,15 @@ async def test_mapping_summary_rejects_missing_raw_asyncpg_copy_support():
         )
 
 
+async def _assert_mapping_summary_rejected(session, message):
+    with pytest.raises(RuntimeError, match=message):
+        await summarize_shared_snapshot_mappings(
+            session,
+            schema_name="mrf",
+            snapshot_key=41,
+        )
+
+
 @pytest.mark.asyncio
 async def test_mapping_summary_rejects_join_and_copy_count_anomalies():
     """Reject inconsistent aggregate, join, and COPY mapping counts."""
@@ -714,12 +723,10 @@ async def test_mapping_summary_rejects_join_and_copy_count_anomalies():
         ],
         _MappingCopyDriver({}),
     )
-    with pytest.raises(RuntimeError, match="unique_block_count exceeds"):
-        await summarize_shared_snapshot_mappings(
-            invalid_unique_session,
-            schema_name="mrf",
-            snapshot_key=41,
-        )
+    await _assert_mapping_summary_rejected(
+        invalid_unique_session,
+        "unique_block_count exceeds",
+    )
 
     unresolved_driver = _MappingCopyDriver({})
     unresolved_session = _MappingCopySession(
@@ -735,12 +742,10 @@ async def test_mapping_summary_rejects_join_and_copy_count_anomalies():
         ],
         unresolved_driver,
     )
-    with pytest.raises(RuntimeError, match="resolve every block_hash"):
-        await summarize_shared_snapshot_mappings(
-            unresolved_session,
-            schema_name="mrf",
-            snapshot_key=41,
-        )
+    await _assert_mapping_summary_rejected(
+        unresolved_session,
+        "resolve every block_hash",
+    )
 
     reference = SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
     changed_driver = _MappingCopyDriver({"a": _binary_copy_stream([_mapping_record(reference)])})
@@ -757,12 +762,10 @@ async def test_mapping_summary_rejects_join_and_copy_count_anomalies():
         ],
         changed_driver,
     )
-    with pytest.raises(RuntimeError, match="count changed during binary COPY"):
-        await summarize_shared_snapshot_mappings(
-            changed_session,
-            schema_name="mrf",
-            snapshot_key=41,
-        )
+    await _assert_mapping_summary_rejected(
+        changed_session,
+        "count changed during binary COPY",
+    )
 
 
 def test_support_digest_is_order_stable_and_context_sensitive():
@@ -3000,11 +3003,8 @@ async def test_reservation_reuses_sealed_semantic_layout():
     assert "lease_until" in session.calls[2][0]
 
 
-@pytest.mark.asyncio
-async def test_reservation_resumes_only_the_same_build_token():
-    """Ensure only the owning build token can resume a building layout."""
-
-    matching = _ScriptedSession(
+def _building_layout_session(*tail_results):
+    return _ScriptedSession(
         [
             _Result(),
             _Result(
@@ -3017,12 +3017,21 @@ async def test_reservation_resumes_only_the_same_build_token():
                     }
                 ]
             ),
-            _Result(scalar_value=23),
-            _Result(),
-            _Result(),
-            *[_Result() for _ in PTG2_V3_DENSE_LAYOUT_TABLES],
-            _Result(),
+            *tail_results,
         ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_reservation_resumes_only_the_same_build_token():
+    """Ensure only the owning build token can resume a building layout."""
+
+    matching = _building_layout_session(
+        _Result(scalar_value=23),
+        _Result(),
+        _Result(),
+        *[_Result() for _ in PTG2_V3_DENSE_LAYOUT_TABLES],
+        _Result(),
     )
     reservation = await reserve_shared_layout(
         matching,
@@ -3043,21 +3052,7 @@ async def test_reservation_resumes_only_the_same_build_token():
         for table_name in PTG2_V3_DENSE_LAYOUT_TABLES
     )
 
-    conflicting = _ScriptedSession(
-        [
-            _Result(),
-            _Result(
-                rows=[
-                    {
-                        "snapshot_key": 23,
-                        "state": "building",
-                        "generation": "shared_blocks_v3",
-                        "build_token": "run-23",
-                    }
-                ]
-            ),
-        ]
-    )
+    conflicting = _building_layout_session()
     with pytest.raises(RuntimeError, match="already building"):
         await reserve_shared_layout(
             conflicting,

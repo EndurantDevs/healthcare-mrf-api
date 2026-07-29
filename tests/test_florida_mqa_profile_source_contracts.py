@@ -191,6 +191,47 @@ def test_education_adapter_preserves_human_dates_and_meaning():
     assert fact["effective_end"] == "2010-05-31"
 
 
+def _assert_profile_indicator_visibility(profile):
+    """Assert profile indicator visibility."""
+    public_profile = compose_provider_profile(
+        _NPI,
+        state_projection={
+            "profile": profile,
+            "generation_id": "synthetic-generation",
+        },
+        fhir_profile=None,
+        requested_categories=[
+            "professional_experience",
+            "criminal_disclosures",
+            "regulatory_actions",
+        ],
+    )
+    sensitive_profile = compose_provider_profile(
+        _NPI,
+        state_projection={
+            "profile": profile,
+            "generation_id": "synthetic-generation",
+        },
+        fhir_profile=None,
+        include_sensitive=True,
+        requested_categories=[
+            "professional_experience",
+            "criminal_disclosures",
+            "regulatory_actions",
+        ],
+    )
+
+    assert public_profile["categories"]["professional_experience"]["total"] == 1
+    assert public_profile["categories"]["criminal_disclosures"][
+        "availability"
+    ] == "restricted"
+    assert public_profile["categories"]["regulatory_actions"][
+        "availability"
+    ] == "restricted"
+    assert sensitive_profile["categories"]["criminal_disclosures"]["total"] == 1
+    assert sensitive_profile["categories"]["regulatory_actions"]["total"] == 1
+
+
 def test_profile_indicators_keep_email_raw_only_and_disclosures_restricted():
     """Verify profile indicators keep email raw only and disclosures restricted."""
     source_row_by_key = {
@@ -247,43 +288,7 @@ def test_profile_indicators_keep_email_raw_only_and_disclosures_restricted():
             "regulatory_actions",
         },
     )
-    public_profile = compose_provider_profile(
-        _NPI,
-        state_projection={
-            "profile": profile,
-            "generation_id": "synthetic-generation",
-        },
-        fhir_profile=None,
-        requested_categories=[
-            "professional_experience",
-            "criminal_disclosures",
-            "regulatory_actions",
-        ],
-    )
-    sensitive_profile = compose_provider_profile(
-        _NPI,
-        state_projection={
-            "profile": profile,
-            "generation_id": "synthetic-generation",
-        },
-        fhir_profile=None,
-        include_sensitive=True,
-        requested_categories=[
-            "professional_experience",
-            "criminal_disclosures",
-            "regulatory_actions",
-        ],
-    )
-
-    assert public_profile["categories"]["professional_experience"]["total"] == 1
-    assert public_profile["categories"]["criminal_disclosures"][
-        "availability"
-    ] == "restricted"
-    assert public_profile["categories"]["regulatory_actions"][
-        "availability"
-    ] == "restricted"
-    assert sensitive_profile["categories"]["criminal_disclosures"]["total"] == 1
-    assert sensitive_profile["categories"]["regulatory_actions"]["total"] == 1
+    _assert_profile_indicator_visibility(profile)
 
 
 def test_profile_indicator_parser_recovers_shifted_raw_only_email(tmp_path):
@@ -546,6 +551,23 @@ def test_pipe_parser_quarantines_multiple_trailing_empty_fields(tmp_path):
     }
 
 
+def _assert_licensure_email_visibility(normalized, profile_source, source_key):
+    """Assert licensure email visibility."""
+    public_facts = florida._facts_for_row(
+        profile_source,
+        normalized,
+        run_id="synthetic-run",
+        record_id=f"synthetic-{source_key}",
+        npi=_NPI,
+        artifact=_ARTIFACT,
+    )
+    assert "first@example.invalid" not in json.dumps(
+        public_facts,
+        sort_keys=True,
+        default=str,
+    )
+
+
 @pytest.mark.parametrize(
     "source_key",
     ["licensure_current", "licensure_all_statuses"],
@@ -604,19 +626,7 @@ def test_licensure_parser_recovers_embedded_email_delimiter_as_raw_only(
         "trailing_empty_fields": 1,
         "recovered_rows": 1,
     }
-    public_facts = florida._facts_for_row(
-        profile_source,
-        normalized,
-        run_id="synthetic-run",
-        record_id=f"synthetic-{source_key}",
-        npi=_NPI,
-        artifact=_ARTIFACT,
-    )
-    assert "first@example.invalid" not in json.dumps(
-        public_facts,
-        sort_keys=True,
-        default=str,
-    )
+    _assert_licensure_email_visibility(normalized, profile_source, source_key)
 
 
 def test_licensure_parser_quarantines_ambiguous_extra_field(tmp_path):
@@ -697,6 +707,17 @@ def test_unrecognized_width_mismatch_is_retained_for_quarantine(tmp_path):
     assert metrics_by_key == {"quarantined_rows": 1}
 
 
+def _assert_license_status_continuation(metrics_by_key, raw_row):
+    """Assert license status continuation."""
+    assert len(
+        raw_row["_source_parse_metadata"]["physical_row_sha256"]
+    ) == 3
+    assert metrics_by_key == {
+        "recovered_rows": 1,
+        "continuation_physical_rows": 3,
+    }
+
+
 def test_license_status_parser_recovers_fixed_width_name_continuation(
     tmp_path,
 ):
@@ -754,13 +775,7 @@ def test_license_status_parser_recovers_fixed_width_name_continuation(
         2,
         3,
     ]
-    assert len(
-        raw_row["_source_parse_metadata"]["physical_row_sha256"]
-    ) == 3
-    assert metrics_by_key == {
-        "recovered_rows": 1,
-        "continuation_physical_rows": 3,
-    }
+    _assert_license_status_continuation(metrics_by_key, raw_row)
 
 
 def test_license_status_parser_does_not_swallow_invalid_continuation(

@@ -236,6 +236,7 @@ async def _load_proven_v4_provider_sets(
     retention_budget: CandidateAuditDecodedRetentionBudget,
     *,
     schema_name: str,
+    coordinate_observer: Callable[[int], None] | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Prove each independent NPI within one shared final-result budget."""
 
@@ -259,6 +260,8 @@ async def _load_proven_v4_provider_sets(
             )
             provider_set_keys_by_npi[npi] = provider_set_keys
             retained_result_bytes += retained_coordinate_bytes
+            if coordinate_observer is not None:
+                coordinate_observer(npi)
     except BaseException:
         retention_budget.release(retained_result_bytes)
         raise

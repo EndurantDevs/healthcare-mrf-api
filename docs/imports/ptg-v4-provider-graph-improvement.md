@@ -262,8 +262,29 @@ forward occurrence payloads are read. `pattern_v1` proves
 NPI-to-pattern-to-set membership first and supplies those exact provider-set
 keys as the forward-read filter. If the graph proof cannot fit the existing
 decoded-retention and physical-read limits, the request fails closed; it does
-not switch to code/source-first after reading graph blocks. `direct_v1`
-remains code/source-first in this release.
+not switch to code/source-first after reading graph blocks.
+
+`direct_v1` is adaptive before forward I/O. The authenticated code dictionary
+supplies the exact sealed `rate_count` for every selected code key. The reader
+sums each distinct key once and applies the versioned decoded-row/index
+retention coefficients to that cardinality. If the broad code/source-first
+forward result cannot fit the remaining request budget, the audit proves the
+requested challenge and persisted-sample NPIs through the direct graph first,
+then supplies those exact provider-set and occurrence coordinates to one
+filtered forward read. Small direct partitions retain the existing
+code/source-first path.
+
+Only a typed graph-capacity outcome on the first requested NPI may fall back
+to one code/source-first attempt, and that decision occurs before any forward
+block or earlier NPI graph result is retained. A capacity failure on a later
+NPI after an earlier coordinate was proven remains fail-closed, preventing a
+retry from processing the earlier graph coordinate twice. Graph integrity,
+manifest, authentication, or mapping errors remain fail-closed.
+Missing, boolean, string, or negative sealed rate cardinalities also fail
+before traversal. Both orders must preserve exact price atoms, occurrence
+identity, provenance, persisted-sample proof, and result ordering; the
+request-scoped physical-read ledger must prove the selected forward block is
+read and decoded once.
 
 The selector does not widen a byte, member, request, or process cap and does
 not change a stored relation, packed map, block, layout, or manifest identity.
@@ -277,6 +298,11 @@ partition failure must retain the exact immutable request identity:
 `plan_digest`, zero-based `partition_index`, `partition_count`,
 `partition_digest`, and `request_digest`. This makes one failing partition
 reproducible without relabeling the last completed count as its index.
+Traversal selection is internal to that partition and does not introduce an
+extra progress phase. If both admissible direct traversal orders exceed their
+existing limits, the terminal failure retains the same partition identity and
+the exact capacity classification; it is never reported as a successful
+completed partition.
 
 The attestation persists `activation_intent` and a digest binding that intent
 to the audited report. Generic promotion and attestation consumption accept

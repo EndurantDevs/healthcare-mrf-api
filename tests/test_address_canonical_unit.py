@@ -810,6 +810,38 @@ async def test_stamp_address_keys_clamps_concurrency_to_db_pool(monkeypatch):
     assert concurrency_by_metric["max_active"] == 2
 
 
+async def _assert_tiger_restore_state_contract(concurrency_by_metric, progress, statements):
+    """Assert tiger restore state contract."""
+    restored = await address_canon.restore_missing_zip_from_tiger_zcta(
+        "address_stage",
+        {
+            "state": "state_name",
+            "zip": "postal_code",
+            "country": "'US'",
+        },
+        schema="mrf",
+        shards=4,
+        concurrency=2,
+    )
+
+    assert restored == 8
+    assert len(statements) == 4
+    assert concurrency_by_metric["max_active"] == 2
+    sql = statements[0][0]
+    assert 'UPDATE "mrf"."address_stage" AS target' in sql
+    assert 'SET "postal_code" = unique_matches.zip5' in sql
+    assert "ST_Covers(" in sql
+    assert "JOIN tiger.zcta5 AS z" in sql
+    assert 'JOIN "mrf".geo_zip_lookup AS zip_lookup' in sql
+    assert "zip_lookup.state = normalized.state_code" in sql
+    assert "HAVING count(DISTINCT zip5) = 1" in sql
+    assert "s.address_key IS NULL" in sql
+    assert "target.address_key IS NULL" in sql
+    assert sorted(kwargs["shard"] for _sql, kwargs in statements) == [0, 1, 2, 3]
+    assert progress[-1]["phase"] == "address ZIP restore"
+    assert progress[-1]["pct"] == 100.0
+
+
 @pytest.mark.asyncio
 async def test_tiger_zip_restore_checks_state(monkeypatch):
     """Coordinate ZIP restoration requires one state-consistent ZCTA match."""
@@ -859,34 +891,7 @@ async def test_tiger_zip_restore_checks_state(monkeypatch):
     monkeypatch.setattr(address_canon, "db", _FakeDB())
     monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: progress.append(payload))
 
-    restored = await address_canon.restore_missing_zip_from_tiger_zcta(
-        "address_stage",
-        {
-            "state": "state_name",
-            "zip": "postal_code",
-            "country": "'US'",
-        },
-        schema="mrf",
-        shards=4,
-        concurrency=2,
-    )
-
-    assert restored == 8
-    assert len(statements) == 4
-    assert concurrency_by_metric["max_active"] == 2
-    sql = statements[0][0]
-    assert 'UPDATE "mrf"."address_stage" AS target' in sql
-    assert 'SET "postal_code" = unique_matches.zip5' in sql
-    assert "ST_Covers(" in sql
-    assert "JOIN tiger.zcta5 AS z" in sql
-    assert 'JOIN "mrf".geo_zip_lookup AS zip_lookup' in sql
-    assert "zip_lookup.state = normalized.state_code" in sql
-    assert "HAVING count(DISTINCT zip5) = 1" in sql
-    assert "s.address_key IS NULL" in sql
-    assert "target.address_key IS NULL" in sql
-    assert sorted(kwargs["shard"] for _sql, kwargs in statements) == [0, 1, 2, 3]
-    assert progress[-1]["phase"] == "address ZIP restore"
-    assert progress[-1]["pct"] == 100.0
+    await _assert_tiger_restore_state_contract(concurrency_by_metric, progress, statements)
 
 
 @pytest.mark.asyncio
@@ -932,6 +937,25 @@ async def test_stamp_address_keys_rejects_invalid_env_concurrency(monkeypatch, o
             },
             schema="mrf",
         )
+
+
+def _assert_child_address_propagation_contract(calls, clear_sql, create_sql, events, propagate_sql):
+    """Assert child address propagation contract."""
+    assert 'FROM "mrf"."mrf_address_evidence_20260612" AS child' in create_sql
+    assert 'JOIN "mrf"."mrf_address_20260612" AS parent' in create_sql
+    assert "UNION ALL" in create_sql
+    assert "AND NOT (" in create_sql
+    assert "child.npi = parent.npi" in create_sql
+    assert "child.type = parent.type" in create_sql
+    assert "child.checksum = parent.checksum" in create_sql
+    assert "child.first_line IS NOT DISTINCT FROM parent.first_line" in create_sql
+    assert "child.ctid::text" in create_sql
+    assert "SET address_key = NULL" in clear_sql
+    assert "SET address_key = pending.address_key" in propagate_sql
+    assert "child.ctid = pending.child_ctid" in propagate_sql
+    assert sorted(kwargs["shard"] for _sql, kwargs in calls if "shard" in kwargs) == [0, 1, 2, 3]
+    assert events[-1]["phase"] == "address key propagation"
+    assert events[-1]["pct"] == 100.0
 
 
 @pytest.mark.asyncio
@@ -992,21 +1016,7 @@ async def test_propagate_child_address_keys_uses_parent_join_and_concurrency(mon
     clear_sql = next(sql for sql, _kwargs in calls if "WITH cleared AS" in sql)
     propagate_sql = next(sql for sql, _kwargs in calls if "WITH propagated AS" in sql)
     assert '"address_key_propagation_pending"' in create_sql
-    assert 'FROM "mrf"."mrf_address_evidence_20260612" AS child' in create_sql
-    assert 'JOIN "mrf"."mrf_address_20260612" AS parent' in create_sql
-    assert "UNION ALL" in create_sql
-    assert "AND NOT (" in create_sql
-    assert "child.npi = parent.npi" in create_sql
-    assert "child.type = parent.type" in create_sql
-    assert "child.checksum = parent.checksum" in create_sql
-    assert "child.first_line IS NOT DISTINCT FROM parent.first_line" in create_sql
-    assert "child.ctid::text" in create_sql
-    assert "SET address_key = NULL" in clear_sql
-    assert "SET address_key = pending.address_key" in propagate_sql
-    assert "child.ctid = pending.child_ctid" in propagate_sql
-    assert sorted(kwargs["shard"] for _sql, kwargs in calls if "shard" in kwargs) == [0, 1, 2, 3]
-    assert events[-1]["phase"] == "address key propagation"
-    assert events[-1]["pct"] == 100.0
+    _assert_child_address_propagation_contract(calls, clear_sql, create_sql, events, propagate_sql)
 
 
 @pytest.mark.asyncio
@@ -1459,6 +1469,60 @@ def test_entity_address_unified_integer_ranges_are_half_open():
     assert entity_address_unified._integer_ranges(20, 19, 3) == []
 
 
+def _assert_unified_address_sql_contract(enrich_sql, insert_sql, materialize_sql, monkeypatch):
+    """Assert unified address sql contract."""
+    sharded_enrich_sql = entity_address_unified._enrich_raw_stage_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        evidence_shards=24,
+    )
+    assert "evidence_shard =" in sharded_enrich_sql
+    assert "COALESCE(k.entity_type" in sharded_enrich_sql
+    assert "% 24) + 24) % 24)::int" in sharded_enrich_sql
+    assert "location_key = encode(sha256(convert_to" in enrich_sql
+    assert "address_key::uuid AS address_key" in insert_sql
+    assert "ptg_plan_array," in insert_sql
+    assert "COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in insert_sql
+    assert "address_key," in materialize_sql
+    assert "location_key," in materialize_sql
+    assert "archive_identity_version," in materialize_sql
+    assert "confidence_score," in materialize_sql
+    assert "ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC" in materialize_sql
+    assert "ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC" in materialize_sql
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2", "1")
+    flagged_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+    )
+    assert "GROUP BY entity_type, entity_id, type, location_key" in flagged_sql
+    sharded_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+        checksum_modulo=24,
+        checksum_remainder=7,
+    )
+    assert "hashtext(location_key)" in sharded_sql
+    assert "% 24 + 24) % 24) = 7" in sharded_sql
+    sharded_index_sql = entity_address_unified._raw_aggregate_group_index_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        aggregate_shards=24,
+    )
+    assert "entity_address_unified_raw_idx_aggregate_shard_group" in sharded_index_sql
+    assert "((hashtext(location_key) % 24 + 24) % 24)" in sharded_index_sql
+    assert "entity_type, entity_id, type, location_key" in sharded_index_sql
+    unsharded_index_sql = entity_address_unified._raw_aggregate_group_index_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        aggregate_shards=1,
+    )
+    assert "entity_address_unified_raw_idx_group_key" in unsharded_index_sql
+    assert "idx_aggregate_shard_group" not in unsharded_index_sql
+
+
 def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     """Unified address projection preserves the canonical address key."""
     raw_sql = entity_address_unified._prepare_raw_stage_sql("mrf", "entity_address_unified_raw")
@@ -1512,56 +1576,7 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "long = COALESCE(k.archive_long, r.long)" in enrich_sql
     assert "place_id = COALESCE(k.archive_place_id, r.place_id)" in enrich_sql
     assert "evidence_shard =" not in enrich_sql
-    sharded_enrich_sql = entity_address_unified._enrich_raw_stage_sql(
-        "mrf",
-        "entity_address_unified_raw",
-        evidence_shards=24,
-    )
-    assert "evidence_shard =" in sharded_enrich_sql
-    assert "COALESCE(k.entity_type" in sharded_enrich_sql
-    assert "% 24) + 24) % 24)::int" in sharded_enrich_sql
-    assert "location_key = encode(sha256(convert_to" in enrich_sql
-    assert "address_key::uuid AS address_key" in insert_sql
-    assert "ptg_plan_array," in insert_sql
-    assert "COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in insert_sql
-    assert "address_key," in materialize_sql
-    assert "location_key," in materialize_sql
-    assert "archive_identity_version," in materialize_sql
-    assert "confidence_score," in materialize_sql
-    assert "ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC" in materialize_sql
-    assert "ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC" in materialize_sql
-
-    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2", "1")
-    flagged_sql = entity_address_unified._materialize_from_raw_sql(
-        "mrf",
-        "entity_address_unified_stage",
-        "entity_address_unified_raw",
-    )
-    assert "GROUP BY entity_type, entity_id, type, location_key" in flagged_sql
-    sharded_sql = entity_address_unified._materialize_from_raw_sql(
-        "mrf",
-        "entity_address_unified_stage",
-        "entity_address_unified_raw",
-        checksum_modulo=24,
-        checksum_remainder=7,
-    )
-    assert "hashtext(location_key)" in sharded_sql
-    assert "% 24 + 24) % 24) = 7" in sharded_sql
-    sharded_index_sql = entity_address_unified._raw_aggregate_group_index_sql(
-        "mrf",
-        "entity_address_unified_raw",
-        aggregate_shards=24,
-    )
-    assert "entity_address_unified_raw_idx_aggregate_shard_group" in sharded_index_sql
-    assert "((hashtext(location_key) % 24 + 24) % 24)" in sharded_index_sql
-    assert "entity_type, entity_id, type, location_key" in sharded_index_sql
-    unsharded_index_sql = entity_address_unified._raw_aggregate_group_index_sql(
-        "mrf",
-        "entity_address_unified_raw",
-        aggregate_shards=1,
-    )
-    assert "entity_address_unified_raw_idx_group_key" in unsharded_index_sql
-    assert "idx_aggregate_shard_group" not in unsharded_index_sql
+    _assert_unified_address_sql_contract(enrich_sql, insert_sql, materialize_sql, monkeypatch)
 
 
 def test_entity_address_unified_can_inline_source_evidence():
@@ -2323,6 +2338,19 @@ def test_entity_address_unified_support_statements_can_skip_optional_serving_tab
     assert not any(label.startswith("facility anchor npi candidate") for label in labels)
 
 
+def _assert_evidence_stage_location_key_contract(apply_sql, evidence_table, index_sql):
+    """Assert evidence stage location key contract."""
+    assert f"FROM mrf.{evidence_table} AS e" in apply_sql
+    assert "e.evidence_shard = 7" in apply_sql
+    assert "t.location_key = e.location_key" in apply_sql
+    assert "t.checksum =" not in apply_sql
+    assert "IS DISTINCT FROM e.evidence_sources" in apply_sql
+    assert "IS DISTINCT FROM e.evidence_record_ids" in apply_sql
+    assert "source_count = COALESCE(CARDINALITY(e.evidence_sources), 0)::int" in apply_sql
+    assert "independent_source_count = COALESCE(CARDINALITY(e.evidence_sources), 0)::int" in apply_sql
+    assert "multi_source_confirmed = COALESCE(CARDINALITY(e.evidence_sources), 0) > 1" in apply_sql
+
+
 def test_entity_address_unified_evidence_stage_updates_by_location_key():
     """Evidence staging joins provider records through stable location keys."""
     evidence_table = entity_address_unified._evidence_stage_table_name("entity_address_unified_stage")
@@ -2380,15 +2408,7 @@ def test_entity_address_unified_evidence_stage_updates_by_location_key():
     assert "UPDATE mrf." in insert_sql
     assert "CREATE INDEX IF NOT EXISTS" in index_sql
     assert f"ON mrf.{evidence_table} (evidence_shard, location_key)" in index_sql
-    assert f"FROM mrf.{evidence_table} AS e" in apply_sql
-    assert "e.evidence_shard = 7" in apply_sql
-    assert "t.location_key = e.location_key" in apply_sql
-    assert "t.checksum =" not in apply_sql
-    assert "IS DISTINCT FROM e.evidence_sources" in apply_sql
-    assert "IS DISTINCT FROM e.evidence_record_ids" in apply_sql
-    assert "source_count = COALESCE(CARDINALITY(e.evidence_sources), 0)::int" in apply_sql
-    assert "independent_source_count = COALESCE(CARDINALITY(e.evidence_sources), 0)::int" in apply_sql
-    assert "multi_source_confirmed = COALESCE(CARDINALITY(e.evidence_sources), 0) > 1" in apply_sql
+    _assert_evidence_stage_location_key_contract(apply_sql, evidence_table, index_sql)
 
 
 def test_entity_address_unified_evidence_base_can_scope_to_affected_groups():
@@ -3616,6 +3636,51 @@ def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
     assert entity_address_unified._should_keep_raw_stage() is True
 
 
+def _assert_unified_address_index_contract(index_by_name):
+    """Assert unified address index contract."""
+    assert index_by_name["service_phone_number_npi"] == {
+        "index_elements": ("phone_number", "npi"),
+        "name": "service_phone_number_npi",
+        "where": (
+            "type IN ('primary', 'secondary', 'practice', 'site') "
+            "AND phone_number IS NOT NULL AND phone_number <> ''"
+        ),
+    }
+    assert index_by_name["service_address_key_npi"] == {
+        "index_elements": ("address_key", "npi"),
+        "name": "service_address_key_npi",
+        "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
+    }
+    assert index_by_name["service_premise_key_npi"] == {
+        "index_elements": ("premise_key", "npi"),
+        "name": "service_premise_key_npi",
+        "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
+    }
+    assert index_by_name["primary_state_city_npi"] == {
+        "index_elements": ("state_name", "city_name", "npi"),
+        "name": "primary_state_city_npi",
+        "where": "type='primary'",
+    }
+    assert index_by_name["taxonomy_plans_network"]["where"] == "type='primary'"
+    assert index_by_name["procedures_array"]["where"] == "type='primary'"
+    assert index_by_name["medications_array"]["where"] == "type='primary'"
+    assert index_by_name["geo_idx"]["where"] == (
+        "type IN ('primary', 'secondary', 'practice', 'site') "
+        "AND COALESCE(address_precision, '') <> 'city_zip' "
+        "AND lat IS NOT NULL AND long IS NOT NULL"
+    )
+    assert index_by_name["geo_bbox"] == {
+        "index_elements": ("lat", "long"),
+        "include": ("npi", "address_key"),
+        "name": "geo_bbox",
+        "where": (
+            "type IN ('primary', 'secondary', 'practice', 'site') "
+            "AND COALESCE(address_precision, '') <> 'city_zip' "
+            "AND lat IS NOT NULL AND long IS NOT NULL"
+        ),
+    }
+
+
 def test_entity_address_unified_indexes_cover_primary_serving_queries():
     """Unified address indexes cover the primary API lookup predicates."""
     index_by_name = {
@@ -3667,47 +3732,7 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
             "AND regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g') <> ''"
         ),
     }
-    assert index_by_name["service_phone_number_npi"] == {
-        "index_elements": ("phone_number", "npi"),
-        "name": "service_phone_number_npi",
-        "where": (
-            "type IN ('primary', 'secondary', 'practice', 'site') "
-            "AND phone_number IS NOT NULL AND phone_number <> ''"
-        ),
-    }
-    assert index_by_name["service_address_key_npi"] == {
-        "index_elements": ("address_key", "npi"),
-        "name": "service_address_key_npi",
-        "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
-    }
-    assert index_by_name["service_premise_key_npi"] == {
-        "index_elements": ("premise_key", "npi"),
-        "name": "service_premise_key_npi",
-        "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
-    }
-    assert index_by_name["primary_state_city_npi"] == {
-        "index_elements": ("state_name", "city_name", "npi"),
-        "name": "primary_state_city_npi",
-        "where": "type='primary'",
-    }
-    assert index_by_name["taxonomy_plans_network"]["where"] == "type='primary'"
-    assert index_by_name["procedures_array"]["where"] == "type='primary'"
-    assert index_by_name["medications_array"]["where"] == "type='primary'"
-    assert index_by_name["geo_idx"]["where"] == (
-        "type IN ('primary', 'secondary', 'practice', 'site') "
-        "AND COALESCE(address_precision, '') <> 'city_zip' "
-        "AND lat IS NOT NULL AND long IS NOT NULL"
-    )
-    assert index_by_name["geo_bbox"] == {
-        "index_elements": ("lat", "long"),
-        "include": ("npi", "address_key"),
-        "name": "geo_bbox",
-        "where": (
-            "type IN ('primary', 'secondary', 'practice', 'site') "
-            "AND COALESCE(address_precision, '') <> 'city_zip' "
-            "AND lat IS NOT NULL AND long IS NOT NULL"
-        ),
-    }
+    _assert_unified_address_index_contract(index_by_name)
 
 
 def test_entity_address_unified_disables_autovacuum_on_disposable_tables():
