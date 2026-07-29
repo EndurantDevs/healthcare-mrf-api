@@ -326,3 +326,62 @@ async def test_direct_selector_proves_dense_code_page_from_first_prefix(
         "schema_name": "mrf",
         "max_members": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_direct_prefix_growth_releases_old_rows_and_keeps_candidates(
+    monkeypatch,
+) -> None:
+    first_rows = [_rate_row(1)]
+    final_rows = [_rate_row(1), _rate_row(2)]
+    final_prefix = serving._V4DirectPrefix(
+        serving_rows=final_rows,
+        selected_occurrences=((0, 11), (1, 12)),
+        is_candidate_prefix_exhausted=False,
+        is_source_exhausted=True,
+    )
+    candidate_scope_ids: list[int] = []
+
+    async def read_window(
+        _session,
+        _serving_tables,
+        _context,
+        rate_window,
+        candidate_npi_keys_by_set,
+    ):
+        candidate_scope_ids.append(id(candidate_npi_keys_by_set))
+        if rate_window == 64:
+            candidate_npi_keys_by_set[1] = (11,)
+            return serving._V4DirectPrefix(
+                serving_rows=first_rows,
+                selected_occurrences=((0, 11),),
+                is_candidate_prefix_exhausted=False,
+                is_source_exhausted=False,
+            )
+        assert rate_window == 128
+        assert first_rows == []
+        assert candidate_npi_keys_by_set == {1: (11,)}
+        candidate_npi_keys_by_set[2] = (12,)
+        return final_prefix
+
+    monkeypatch.setattr(serving, "_v4_direct_read_window", read_window)
+    context = type(
+        "DirectContext",
+        (),
+        {
+            "request": type("DirectRequest", (), {"target_count": 2})(),
+            "maximum_occurrences": 128,
+            "declared_occurrences": 128,
+        },
+    )()
+
+    prefix = await serving._v4_direct_ranked_prefix(
+        object(),
+        object(),
+        context,
+    )
+
+    assert prefix is final_prefix
+    assert prefix.serving_rows == final_rows
+    assert prefix.selected_occurrences == ((0, 11), (1, 12))
+    assert len(set(candidate_scope_ids)) == 1

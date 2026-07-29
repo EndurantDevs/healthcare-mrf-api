@@ -13419,6 +13419,7 @@ async def _v4_direct_ranked_prefix(
             raise PTG2ManifestArtifactError(
                 "PTG2 V4 inferred-taxonomy rate prefix did not make progress"
             )
+        prefix.serving_rows.clear()
         rate_window = next_window
 
 
