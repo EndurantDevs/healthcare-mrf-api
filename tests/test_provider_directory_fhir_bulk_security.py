@@ -328,30 +328,19 @@ async def test_bulk_worker_guard_conflict_prevents_fetch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bulk_worker_guard_serializes_probes_but_not_download_work(
-    monkeypatch,
-):
+async def test_bulk_worker_guard_serializes_probes_but_not_download_work(monkeypatch):
     """One guard connection serializes probes without serializing downloads."""
     identity = importer.BulkExportCheckpointIdentity(
-        checkpoint_id="checkpoint-guard-serialization",
+        checkpoint_id="checkpoint-guard-serialization", resource_type="Practitioner",
         canonical_api_base=importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
-        resource_type="Practitioner",
-        source_scope_hash="scope-security",
+        source_scope_hash="scope-security", acquisition_root_run_id="root-security",
         strategy_version=importer.BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION,
-        acquisition_root_run_id="root-security",
-        owner_run_id="run-security",
-        retry_of_run_id=None,
-        endpoint_id="endpoint-security",
-        dataset_id="dataset-security",
-        start_url="https://providerdirectory.api.aetna.com/fhir/$export",
+        owner_run_id="run-security", retry_of_run_id=None, endpoint_id="endpoint-security",
+        dataset_id="dataset-security", start_url="https://providerdirectory.api.aetna.com/fhir/$export",
         start_url_hash="a" * 64,
     )
-    concurrency_by_name = {
-        "probe_active": 0,
-        "probe_maximum": 0,
-        "download_active": 0,
-        "download_maximum": 0,
-    }
+    concurrency_by_name = {"probe_active": 0, "probe_maximum": 0,
+                           "download_active": 0, "download_maximum": 0}
 
     class GuardConnection:
         def execution_options(self, **_options):
@@ -363,8 +352,7 @@ async def test_bulk_worker_guard_serializes_probes_but_not_download_work(
                 return True
             concurrency_by_name["probe_active"] += 1
             concurrency_by_name["probe_maximum"] = max(
-                concurrency_by_name["probe_maximum"],
-                concurrency_by_name["probe_active"],
+                concurrency_by_name["probe_maximum"], concurrency_by_name["probe_active"]
             )
             try:
                 await asyncio.sleep(0.005)
@@ -388,8 +376,7 @@ async def test_bulk_worker_guard_serializes_probes_but_not_download_work(
             await probe()
             concurrency_by_name["download_active"] += 1
             concurrency_by_name["download_maximum"] = max(
-                concurrency_by_name["download_maximum"],
-                concurrency_by_name["download_active"],
+                concurrency_by_name["download_maximum"], concurrency_by_name["download_active"]
             )
             try:
                 await asyncio.sleep(0.03)

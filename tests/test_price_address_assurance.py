@@ -597,13 +597,10 @@ def test_price_address_assurance_accepts_payer_confirmed_with_direct_location_so
                         "rate_network_binding": "tic_provider_group_npi_tin",
                         "address_network_binding": "payer_confirmed_location",
                         "address_evidence_level": "payer_confirmed_location",
-                        "requires_location_confirmation": False,
-                        "displayed_address_present": True,
-                        "network_bound_address": True,
-                        "location_source": "payer_provider_group_location",
+                        "requires_location_confirmation": False, "displayed_address_present": True,
+                        "network_bound_address": True, "location_source": "payer_provider_group_location",
                         "address_verification_evidence": {
-                            "source": "payer_provider_group_location",
-                            "provider_group_id": 1662,
+                            "source": "payer_provider_group_location", "provider_group_id": 1662,
                             "json_pointer": "/provider_references/0/provider_groups/0/address",
                         },
                     },
@@ -1195,6 +1192,46 @@ def test_price_address_assurance_rejects_mismatched_network_bound_address():
     } in summary["issues"]
 
 
+def _payer_confirmed_price_payload(source_file_version_id):
+    """Build one payer-confirmed item with exact raw-source trace lineage."""
+    return {"data": {"items": [{
+        "source_trace": [{"source_file_version_id": source_file_version_id}],
+        "address": {"first_line": "900 W Temple Ave"},
+        "address_verification": {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "payer_confirmed_location",
+            "address_evidence_level": "payer_confirmed_location",
+            "requires_location_confirmation": False,
+            "displayed_address_present": True,
+            "network_bound_address": True,
+            "location_source": "payer_provider_group_location",
+            "address_verification_evidence": {
+                "source": "payer_provider_group_location",
+                "provider_group_id": 1662,
+                "json_pointer": "/provider_references/0/provider_groups/0/address",
+            },
+        },
+    }]}}
+
+
+def _write_provider_group_artifact(raw_artifact, *, include_address):
+    """Write one traced provider group with optional displayable location fields."""
+    provider_group_map = {
+        "tin": {"type": "ein", "value": "123456789"},
+        "npi": [1679524805],
+    }
+    if include_address:
+        provider_group_map["address"] = {
+            "street": "900 W Temple Ave", "city": "Effingham", "state": "IL",
+        }
+    _write_json(raw_artifact, {
+        "provider_references": [{
+            "provider_group_id": 1662, "provider_groups": [provider_group_map],
+        }],
+        "in_network": [],
+    })
+
+
 def test_price_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_address(tmp_path):
     """Verify price address assurance rejects payer confirmed when traced raw lacks address."""
     raw_artifact = tmp_path / "rates.json"
@@ -1259,52 +1296,8 @@ def test_price_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_a
 
 def test_price_address_assurance_accepts_payer_confirmed_when_traced_raw_has_address(tmp_path):
     raw_artifact = tmp_path / "rates.json"
-    _write_json(
-        raw_artifact,
-        {
-            "provider_references": [
-                {
-                    "provider_group_id": 1662,
-                    "provider_groups": [
-                        {
-                            "tin": {"type": "ein", "value": "123456789"},
-                            "npi": [1679524805],
-                            "address": {
-                                "street": "900 W Temple Ave",
-                                "city": "Effingham",
-                                "state": "IL",
-                            },
-                        }
-                    ],
-                }
-            ],
-            "in_network": [],
-        },
-    )
-    api_payload_by_field = {
-        "data": {
-            "items": [
-                {
-                    "source_trace": [{"source_file_version_id": "version-a"}],
-                    "address": {"first_line": "900 W Temple Ave"},
-                    "address_verification": {
-                        "rate_network_binding": "tic_provider_group_npi_tin",
-                        "address_network_binding": "payer_confirmed_location",
-                        "address_evidence_level": "payer_confirmed_location",
-                        "requires_location_confirmation": False,
-                        "displayed_address_present": True,
-                        "network_bound_address": True,
-                        "location_source": "payer_provider_group_location",
-                        "address_verification_evidence": {
-                            "source": "payer_provider_group_location",
-                            "provider_group_id": 1662,
-                            "json_pointer": "/provider_references/0/provider_groups/0/address",
-                        },
-                    },
-                }
-            ]
-        }
-    }
+    _write_provider_group_artifact(raw_artifact, include_address=True)
+    api_payload_by_field = _payer_confirmed_price_payload("version-a")
 
     report = build_price_address_assurance_report(
         api_payload=api_payload_by_field,
@@ -1320,52 +1313,8 @@ def test_price_address_assurance_accepts_payer_confirmed_when_traced_raw_has_add
 def test_price_address_assurance_rejects_payer_confirmed_when_source_trace_unresolved(tmp_path):
     """Verify price address assurance rejects payer confirmed when source trace unresolved."""
     raw_artifact = tmp_path / "rates.json"
-    _write_json(
-        raw_artifact,
-        {
-            "provider_references": [
-                {
-                    "provider_group_id": 1662,
-                    "provider_groups": [
-                        {
-                            "tin": {"type": "ein", "value": "123456789"},
-                            "npi": [1679524805],
-                            "address": {
-                                "street": "900 W Temple Ave",
-                                "city": "Effingham",
-                                "state": "IL",
-                            },
-                        }
-                    ],
-                }
-            ],
-            "in_network": [],
-        },
-    )
-    api_payload_by_field = {
-        "data": {
-            "items": [
-                {
-                    "source_trace": [{"source_file_version_id": "version-missing"}],
-                    "address": {"first_line": "900 W Temple Ave"},
-                    "address_verification": {
-                        "rate_network_binding": "tic_provider_group_npi_tin",
-                        "address_network_binding": "payer_confirmed_location",
-                        "address_evidence_level": "payer_confirmed_location",
-                        "requires_location_confirmation": False,
-                        "displayed_address_present": True,
-                        "network_bound_address": True,
-                        "location_source": "payer_provider_group_location",
-                        "address_verification_evidence": {
-                            "source": "payer_provider_group_location",
-                            "provider_group_id": 1662,
-                            "json_pointer": "/provider_references/0/provider_groups/0/address",
-                        },
-                    },
-                }
-            ]
-        }
-    }
+    _write_provider_group_artifact(raw_artifact, include_address=True)
+    api_payload_by_field = _payer_confirmed_price_payload("version-missing")
 
     report = build_price_address_assurance_report(
         api_payload=api_payload_by_field,
@@ -1659,6 +1608,56 @@ def test_price_address_assurance_cli_can_require_resolved_raw_artifacts():
     )
 
 
+class _RawArtifactResolutionConnection:
+    def __init__(self, raw_artifact, missing_artifact, captured_by_field):
+        self.raw_artifact = raw_artifact
+        self.missing_artifact = missing_artifact
+        self.captured_by_field = captured_by_field
+
+    async def fetch(self, sql, source_file_version_ids):
+        self.captured_by_field["sql"] = sql
+        self.captured_by_field["source_file_version_ids"] = source_file_version_ids
+        return [
+            {
+                "source_file_version_id": "version-a", "raw_sha256": "a" * 64,
+                "raw_storage_uri": self.raw_artifact.as_uri(), "content_length": 2,
+            },
+            {
+                "source_file_version_id": "version-b", "raw_sha256": "b" * 64,
+                "raw_storage_uri": self.missing_artifact.as_uri(), "content_length": 10,
+            },
+            {
+                "source_file_version_id": "version-c", "raw_sha256": "c" * 64,
+                "raw_storage_uri": "s3://bucket/raw-rates.json.gz", "content_length": 20,
+            },
+        ]
+
+    async def close(self):
+        self.captured_by_field["closed"] = True
+
+
+def _expected_raw_artifact_resolutions(raw_artifact, missing_artifact):
+    """Return exact local, missing, remote, and absent resolution outcomes."""
+    return [
+        {
+            "source_file_version_id": "version-a", "raw_storage_uri": raw_artifact.as_uri(),
+            "raw_artifact_path": str(raw_artifact), "raw_sha256": "a" * 64,
+            "content_length": 2, "status": "resolved",
+        },
+        {
+            "source_file_version_id": "version-b", "raw_storage_uri": missing_artifact.as_uri(),
+            "raw_artifact_path": str(missing_artifact), "raw_sha256": "b" * 64,
+            "content_length": 10, "status": "missing_file",
+        },
+        {
+            "source_file_version_id": "version-c",
+            "raw_storage_uri": "s3://bucket/raw-rates.json.gz", "raw_artifact_path": None,
+            "raw_sha256": "c" * 64, "content_length": 20, "status": "non_file_uri",
+        },
+        {"source_file_version_id": "version-d", "status": "not_found"},
+    ]
+
+
 def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch, tmp_path):
     """Verify price address assurance cli resolves raw artifacts from db."""
     script = _load_cli_module()
@@ -1667,37 +1666,11 @@ def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch,
     missing_artifact = tmp_path / "missing-rates.json.gz"
     captured_by_field = {}
 
-    class FakeConnection:
-        async def fetch(self, sql, source_file_version_ids):
-            captured_by_field["sql"] = sql
-            captured_by_field["source_file_version_ids"] = source_file_version_ids
-            return [
-                {
-                    "source_file_version_id": "version-a",
-                    "raw_storage_uri": raw_artifact.as_uri(),
-                    "raw_sha256": "a" * 64,
-                    "content_length": 2,
-                },
-                {
-                    "source_file_version_id": "version-b",
-                    "raw_storage_uri": missing_artifact.as_uri(),
-                    "raw_sha256": "b" * 64,
-                    "content_length": 10,
-                },
-                {
-                    "source_file_version_id": "version-c",
-                    "raw_storage_uri": "s3://bucket/raw-rates.json.gz",
-                    "raw_sha256": "c" * 64,
-                    "content_length": 20,
-                },
-            ]
-
-        async def close(self):
-            captured_by_field["closed"] = True
-
     async def fake_connect(**kwargs):
         captured_by_field["connect_kwargs"] = kwargs
-        return FakeConnection()
+        return _RawArtifactResolutionConnection(
+            raw_artifact, missing_artifact, captured_by_field
+        )
 
     monkeypatch.setitem(sys.modules, "asyncpg", types.SimpleNamespace(connect=fake_connect))
 
@@ -1723,36 +1696,7 @@ def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch,
     assert '"mrf_custom".ptg2_source_file_version' in captured_by_field["sql"]
     assert captured_by_field["source_file_version_ids"] == ["version-a", "version-b", "version-c", "version-d"]
     assert captured_by_field["closed"] is True
-    assert resolutions == [
-        {
-            "source_file_version_id": "version-a",
-            "raw_storage_uri": raw_artifact.as_uri(),
-            "raw_artifact_path": str(raw_artifact),
-            "raw_sha256": "a" * 64,
-            "content_length": 2,
-            "status": "resolved",
-        },
-        {
-            "source_file_version_id": "version-b",
-            "raw_storage_uri": missing_artifact.as_uri(),
-            "raw_artifact_path": str(missing_artifact),
-            "raw_sha256": "b" * 64,
-            "content_length": 10,
-            "status": "missing_file",
-        },
-        {
-            "source_file_version_id": "version-c",
-            "raw_storage_uri": "s3://bucket/raw-rates.json.gz",
-            "raw_artifact_path": None,
-            "raw_sha256": "c" * 64,
-            "content_length": 20,
-            "status": "non_file_uri",
-        },
-        {
-            "source_file_version_id": "version-d",
-            "status": "not_found",
-        },
-    ]
+    assert resolutions == _expected_raw_artifact_resolutions(raw_artifact, missing_artifact)
 
 
 def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch, tmp_path, capsys):

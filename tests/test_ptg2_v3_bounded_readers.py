@@ -428,22 +428,8 @@ async def test_provider_filtered_read_uses_manifest_provider_shard_span(
     assert fetch.await_args.kwargs["block_keys"] == (block_zero, block_one)
 
 
-@pytest.mark.asyncio
-async def test_sparse_batch_reads_multiple_codes_from_exact_provider_shards(
-    monkeypatch,
-):
-    """Ensure sparse multi-code reads fetch only the requested provider shards."""
-
-    expected_block_keys = tuple(
-        sorted(
-            {
-                _shard_block_key(code_key, provider_set_key)
-                for code_key in (7, 8)
-                for provider_set_key in (5, 1025)
-            }
-        )
-    )
-    returned_fragments = [
+def _two_code_sparse_fragments():
+    return [
         _fragment_row(
             _fragment(
                 _grouped_payload(2, [(5, [(8, 0)])]),
@@ -459,10 +445,41 @@ async def test_sparse_batch_reads_multiple_codes_from_exact_provider_shards(
             )
         ),
     ]
+
+
+def _two_code_sparse_block_keys():
+    return tuple(
+        sorted(
+            {
+                _shard_block_key(code_key, provider_set_key)
+                for code_key in (7, 8)
+                for provider_set_key in (5, 1025)
+            }
+        )
+    )
+
+
+def _assert_two_code_sparse_rows(rows_by_code):
+    decoded_row_map = {
+        code_key: [
+            (row.provider_set_key, row.price_key)
+            for row in rows_by_code[code_key]
+        ]
+        for code_key in (7, 8)
+    }
+    assert decoded_row_map == {7: [(5, 8)], 8: [(1025, 2)]}
+
+
+@pytest.mark.asyncio
+async def test_sparse_batch_reads_multiple_codes_from_exact_provider_shards(
+    monkeypatch,
+):
+    """Ensure sparse multi-code reads fetch only the requested provider shards."""
+
     discover = AsyncMock(
         side_effect=AssertionError("sparse batch reads must not discover code ranges")
     )
-    fetch = AsyncMock(return_value=returned_fragments)
+    fetch = AsyncMock(return_value=_two_code_sparse_fragments())
     monkeypatch.setattr(
         ptg2_db_sidecars,
         "_discover_forward_shard_keys",
@@ -485,19 +502,8 @@ async def test_sparse_batch_reads_multiple_codes_from_exact_provider_shards(
         price_dictionary_block_bytes=2048,
     )
 
-    assert [
-        (decoded_row.provider_set_key, decoded_row.price_key)
-        for decoded_row in rows_by_code[7]
-    ] == [
-        (5, 8)
-    ]
-    assert [
-        (decoded_row.provider_set_key, decoded_row.price_key)
-        for decoded_row in rows_by_code[8]
-    ] == [
-        (1025, 2)
-    ]
-    assert fetch.await_args.kwargs["block_keys"] == expected_block_keys
+    _assert_two_code_sparse_rows(rows_by_code)
+    assert fetch.await_args.kwargs["block_keys"] == _two_code_sparse_block_keys()
     assert fetch.await_args.kwargs["require_all"] is False
     discover.assert_not_awaited()
 

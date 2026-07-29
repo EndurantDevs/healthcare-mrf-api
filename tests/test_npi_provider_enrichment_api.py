@@ -194,53 +194,11 @@ async def test_get_npi_includes_provider_enrichment(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_npi_filters_non_street_addresses_unless_extra_info(monkeypatch):
     """Verify get npi filters non street addresses unless extra info."""
-    async def fake_build(_npi, **_kwargs):
-        return {
-            "npi": _npi,
-            "taxonomy_list": [],
-            "taxonomy_group_list": [],
-            "address_list": [
-                {
-                    "type": "primary",
-                    "first_line": "1200 1ST ST NE",
-                    "city_name": "WASHINGTON",
-                    "state_name": "DC",
-                    "postal_code": "20002",
-                    "address_key": "3a47e595-03bf-597d-8825-04b75d783fc9",
-                    "address_precision": "street",
-                    "address_sources": ["nppes"],
-                    "source_count": 1,
-                    "lat": 38.0,
-                    "long": -77.0,
-                },
-                {
-                    "type": "practice",
-                    "first_line": "1200 First Street, NE",
-                    "city_name": "WASHINGTON",
-                    "state_name": "DC",
-                    "postal_code": "20002",
-                    "address_key": "3a47e595-03bf-597d-8825-04b75d783fc9",
-                    "address_precision": "street",
-                    "address_sources": ["mrf"],
-                    "source_count": 1,
-                    "lat": 38.0,
-                    "long": -77.0,
-                },
-                {
-                    "type": "secondary",
-                    "first_line": None,
-                    "city_name": "WASHINGTON",
-                    "state_name": "DC",
-                    "postal_code": "20002",
-                    "address_precision": "city_zip",
-                    "lat": 38.0,
-                    "long": -77.0,
-                },
-            ],
-            "do_business_as": [],
-        }
-
-    monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(
+        npi_module,
+        "_build_npi_details",
+        _build_npi_street_city_details,
+    )
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         npi_module,
@@ -386,3 +344,30 @@ async def test_get_all_can_include_chain_provider_enrichment(monkeypatch):
 
     assert response_payload["rows"][0]["provider_enrichment_summary"]["status"] == "enriched"
     fetch_summary.assert_awaited_once_with([1234567890], include_chain=True, session=None)
+async def _build_npi_street_city_details(npi, **_kwargs):
+    """Return the address fixture used to check default and expanded output."""
+    return {
+        "npi": npi, "taxonomy_list": [], "taxonomy_group_list": [],
+        "do_business_as": [],
+        "address_list": [
+            {
+                "type": "primary", "first_line": "1200 1ST ST NE",
+                "city_name": "WASHINGTON", "state_name": "DC", "postal_code": "20002",
+                "address_key": "3a47e595-03bf-597d-8825-04b75d783fc9",
+                "address_precision": "street", "address_sources": ["nppes"],
+                "source_count": 1, "lat": 38.0, "long": -77.0,
+            },
+            {
+                "type": "practice", "first_line": "1200 First Street, NE",
+                "city_name": "WASHINGTON", "state_name": "DC", "postal_code": "20002",
+                "address_key": "3a47e595-03bf-597d-8825-04b75d783fc9",
+                "address_precision": "street", "address_sources": ["mrf"],
+                "source_count": 1, "lat": 38.0, "long": -77.0,
+            },
+            {
+                "type": "secondary", "first_line": None, "city_name": "WASHINGTON",
+                "state_name": "DC", "postal_code": "20002", "address_precision": "city_zip",
+                "lat": 38.0, "long": -77.0,
+            },
+        ],
+    }

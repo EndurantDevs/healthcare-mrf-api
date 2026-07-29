@@ -1176,13 +1176,8 @@ async def test_slow_sql_stage_reports_exact_bounded_rows_before_completion(
     )
 
 
-@pytest.mark.asyncio
-async def test_v4_cas_stage_publishes_exact_totals_without_snapshot_mappings(
-    monkeypatch,
-):
-    """Prove V4 publishes deduplicated CAS totals without legacy mappings."""
-
-    session = SimpleNamespace(
+def _v4_cas_publication_session():
+    return SimpleNamespace(
         execute=AsyncMock(
             side_effect=[
                 None,
@@ -1207,6 +1202,32 @@ async def test_v4_cas_stage_publishes_exact_totals_without_snapshot_mappings(
         )
     )
 
+
+def _assert_v4_cas_publication(publication, session):
+    assert publication.object_kinds == ("a_kind", "z_kind")
+    assert publication.staged_row_count == 3
+    assert publication.staged_entry_count == 18
+    assert publication.unique_block_count == 2
+    assert publication.logical_byte_count == 30
+    assert publication.stored_byte_count == 20
+    assert publication.unique_logical_byte_count == 20
+    assert publication.unique_stored_byte_count == 14
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert "FOR KEY SHARE OF stored" in statements[0]
+    assert 'INSERT INTO "mrf".ptg2_v3_block' in statements[1]
+    assert "WITH canonical AS MATERIALIZED" in statements[2]
+    assert 'DELETE FROM "mrf".ptg2_v3_gc_candidate' in statements[3]
+    assert not any("ptg2_v3_snapshot_block" in statement for statement in statements)
+
+
+@pytest.mark.asyncio
+async def test_v4_cas_stage_publishes_exact_totals_without_snapshot_mappings(
+    monkeypatch,
+):
+    """Prove V4 publishes deduplicated CAS totals without legacy mappings."""
+
+    session = _v4_cas_publication_session()
+
     @asynccontextmanager
     async def transaction():
         yield session
@@ -1228,20 +1249,7 @@ async def test_v4_cas_stage_publishes_exact_totals_without_snapshot_mappings(
         build_token="build-v4",
     )
 
-    assert publication.object_kinds == ("a_kind", "z_kind")
-    assert publication.staged_row_count == 3
-    assert publication.staged_entry_count == 18
-    assert publication.unique_block_count == 2
-    assert publication.logical_byte_count == 30
-    assert publication.stored_byte_count == 20
-    assert publication.unique_logical_byte_count == 20
-    assert publication.unique_stored_byte_count == 14
-    statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert "FOR KEY SHARE OF stored" in statements[0]
-    assert "INSERT INTO \"mrf\".ptg2_v3_block" in statements[1]
-    assert "WITH canonical AS MATERIALIZED" in statements[2]
-    assert "DELETE FROM \"mrf\".ptg2_v3_gc_candidate" in statements[3]
-    assert not any("ptg2_v3_snapshot_block" in statement for statement in statements)
+    _assert_v4_cas_publication(publication, session)
     layout_lock.assert_awaited_once_with(
         session,
         schema_name="mrf",

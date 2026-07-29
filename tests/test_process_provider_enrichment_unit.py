@@ -61,9 +61,7 @@ async def test_discover_sources_returns_registered_and_unmapped(monkeypatch):
     assert "Unknown Provider Enrollments" in unmapped
 
 
-@pytest.mark.asyncio
-async def test_discover_sources_includes_latest_ffs_resource_bundle(monkeypatch):
-    """Verify discover sources includes latest ffs resource bundle."""
+def _latest_ffs_resource_catalogs():
     catalog_map = {
         "dataset": [
             {
@@ -112,6 +110,13 @@ async def test_discover_sources_includes_latest_ffs_resource_bundle(monkeypatch)
             },
         ]
     }
+    return catalog_map, resource_map
+
+
+@pytest.mark.asyncio
+async def test_discover_sources_includes_latest_ffs_resource_bundle(monkeypatch):
+    """Verify discover sources includes latest ffs resource bundle."""
+    catalog_map, resource_map = _latest_ffs_resource_catalogs()
 
     async def fake_download(url: str):
         if url == provider_enrichment.CATALOG_URL:

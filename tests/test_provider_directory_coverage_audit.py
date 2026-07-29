@@ -3173,10 +3173,8 @@ def test_provider_directory_coverage_audit_gap_includes_practitioner_role_reimpo
     )
 
 
-def test_provider_directory_coverage_audit_markdown_includes_source_resource_coverage():
-    """Verify provider directory coverage audit markdown includes source resource coverage."""
-    markdown = audit.render_markdown(
-        {
+def _source_resource_coverage_report():
+    return {
             "generated_at": "2026-06-28T00:00:00Z",
             "schema": "mrf",
             "source_resource_coverage_summary": {
@@ -3231,7 +3229,11 @@ def test_provider_directory_coverage_audit_markdown_includes_source_resource_cov
                 ],
             },
         }
-    )
+
+
+def test_provider_directory_coverage_audit_markdown_includes_source_resource_coverage():
+    """Verify provider directory coverage audit markdown includes source resource coverage."""
+    markdown = audit.render_markdown(_source_resource_coverage_report())
 
     assert "- source/resource coverage: `4` / `10` source(s) have resource rows (40.0%); Location sources `3` (30.0%)" in markdown
     assert "- organization-address coverage: `2` source(s), `996` valid-NPI address row(s)" in markdown

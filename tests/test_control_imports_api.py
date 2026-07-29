@@ -3413,9 +3413,11 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     runnable_items = [entry for entry in catalog["items"] if entry["runnable"]]
     probe_items = [entry for entry in catalog["items"] if not entry["runnable"]]
 
-    assert catalog["entry_count"] == 38
-    assert catalog["runnable_count"] == 24
-    assert catalog["profile_source_count"] == 24
+    assert (
+        catalog["entry_count"],
+        catalog["runnable_count"],
+        catalog["profile_source_count"],
+    ) == (38, 24, 24)
     assert len(catalog["catalog_digest"]) == 64
     assert len(runnable_items) == 24
     assert all(entry["profile_enabled"] for entry in runnable_items)
@@ -3429,46 +3431,33 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
     assert probe_by_id["capital-blue-cross"]["resources"] == []
     assert probe_by_id["capital-blue-cross"]["supported_resources"] == [
-        "InsurancePlan",
-        "PractitionerRole",
-        "Practitioner",
-        "Organization",
-        "Location",
-        "HealthcareService",
-        "OrganizationAffiliation",
-        "Endpoint",
+        "InsurancePlan", "PractitionerRole", "Practitioner", "Organization",
+        "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint",
     ]
-    assert len(runnable_by_id["devoted-health"]["resources"]) == 7
-    assert len(runnable_by_id["simpra-advantage"]["resources"]) == 6
-    assert len(runnable_by_id["san-bernardino-county-dbh"]["resources"]) == 8
-    assert len(runnable_by_id["san-mateo-county-bhrs"]["resources"]) == 8
+    assert {
+        entry_id: len(runnable_by_id[entry_id]["resources"])
+        for entry_id in (
+            "devoted-health", "simpra-advantage", "san-bernardino-county-dbh",
+            "san-mateo-county-bhrs",
+        )
+    } == {
+        "devoted-health": 7, "simpra-advantage": 6,
+        "san-bernardino-county-dbh": 8, "san-mateo-county-bhrs": 8,
+    }
     assert runnable_by_id["uhc-provider-files"]["resource_profile"] == "A6"
     assert runnable_by_id["uhc-provider-files"]["resources"] == [
-        "InsurancePlan",
-        "Location",
-        "Organization",
-        "OrganizationAffiliation",
-        "Practitioner",
-        "PractitionerRole",
+        "InsurancePlan", "Location", "Organization", "OrganizationAffiliation",
+        "Practitioner", "PractitionerRole",
     ]
     assert probe_by_id["michigan"]["resources"] == []
     assert probe_by_id["michigan"]["supported_resources"] == [
-        "Location",
-        "Organization",
-        "OrganizationAffiliation",
-        "Practitioner",
+        "Location", "Organization", "OrganizationAffiliation", "Practitioner",
         "PractitionerRole",
     ]
     assert probe_by_id["scan"]["resources"] == []
     assert probe_by_id["scan"]["supported_resources"] == [
-        "InsurancePlan",
-        "PractitionerRole",
-        "Practitioner",
-        "Organization",
-        "Location",
-        "HealthcareService",
-        "OrganizationAffiliation",
-        "Endpoint",
+        "InsurancePlan", "PractitionerRole", "Practitioner", "Organization",
+        "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint",
     ]
     assert {entry["entry_id"] for entry in runnable_items} >= {
         "aetna-commercial-medicare",

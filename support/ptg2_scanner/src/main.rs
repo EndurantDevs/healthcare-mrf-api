@@ -35924,6 +35924,80 @@ mod tests {
     }
 
     #[test]
+    fn pg_binary_copy_header_accepts_extensions_and_rejects_invalid_boundaries() {
+        let mut with_extension = b"PGCOPY\n\xff\r\n\0".to_vec();
+        with_extension.extend_from_slice(&0i32.to_be_bytes());
+        with_extension.extend_from_slice(&2i32.to_be_bytes());
+        with_extension.extend_from_slice(b"ok");
+        read_pg_binary_copy_header(&mut Cursor::new(with_extension)).unwrap();
+
+        let invalid_signature = read_pg_binary_copy_header(&mut Cursor::new(b"not-pg-copy\n"));
+        assert!(invalid_signature
+            .unwrap_err()
+            .to_string()
+            .contains("invalid header"));
+
+        let mut negative_extension = b"PGCOPY\n\xff\r\n\0".to_vec();
+        negative_extension.extend_from_slice(&0i32.to_be_bytes());
+        negative_extension.extend_from_slice(&(-1i32).to_be_bytes());
+        assert!(
+            read_pg_binary_copy_header(&mut Cursor::new(negative_extension))
+                .unwrap_err()
+                .to_string()
+                .contains("negative extension length")
+        );
+
+        let mut truncated_extension = b"PGCOPY\n\xff\r\n\0".to_vec();
+        truncated_extension.extend_from_slice(&0i32.to_be_bytes());
+        truncated_extension.extend_from_slice(&2i32.to_be_bytes());
+        truncated_extension.push(b'o');
+        assert_eq!(
+            read_pg_binary_copy_header(&mut Cursor::new(truncated_extension))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn pg_binary_copy_rows_reject_truncated_and_invalid_boundaries() {
+        let partial_field = read_exact_optional(&mut Cursor::new(vec![b'x']), &mut [0_u8; 2]);
+        assert_eq!(
+            partial_field.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let missing_trailer =
+            read_pg_binary_copy_row(&mut Cursor::new(Vec::<u8>::new()), 1, "test");
+        assert_eq!(
+            missing_trailer.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let wrong_field_count =
+            read_pg_binary_copy_row(&mut Cursor::new(2i16.to_be_bytes().to_vec()), 1, "test");
+        assert!(wrong_field_count
+            .unwrap_err()
+            .to_string()
+            .contains("must have 1 fields, got 2"));
+
+        let mut invalid_length = 1i16.to_be_bytes().to_vec();
+        invalid_length.extend_from_slice(&(-2i32).to_be_bytes());
+        assert!(
+            read_pg_binary_copy_row(&mut Cursor::new(invalid_length), 1, "test")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid length")
+        );
+
+        assert_eq!(
+            read_pg_binary_copy_row(&mut Cursor::new((-1i16).to_be_bytes().to_vec()), 1, "test")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn worker_copy_reader_orders_shards_and_refuses_absent_output() {
         let temporary = tempfile::tempdir().unwrap();
         let copy_path = temporary.path().join("provider-members.copy");

@@ -403,13 +403,7 @@ def test_finalizer_summary_must_echo_invoked_resource_configuration(tmp_path):
         )
 
 
-@pytest.mark.asyncio
-async def test_finalizer_invocation_passes_and_reports_resource_contract(
-    tmp_path,
-    monkeypatch,
-):
-    """Pass aggregate limits to Rust and retain them in progress/report data."""
-
+def _successful_finalizer_invocation(tmp_path, monkeypatch):
     _set_resource_environment(monkeypatch)
     monkeypatch.setattr(
         finalizer_module,
@@ -423,47 +417,31 @@ async def test_finalizer_invocation_passes_and_reports_resource_contract(
     )
     output_directory = tmp_path / "work" / "finalized"
     invocation_by_key = {}
-    subprocess_factory = _successful_subprocess(
-        _framed_summary(_summary_metadata(output_directory)), invocation_by_key
-    )
     monkeypatch.setattr(
         finalizer_module.asyncio,
         "create_subprocess_exec",
-        subprocess_factory,
+        _successful_subprocess(
+            _framed_summary(_summary_metadata(output_directory)),
+            invocation_by_key,
+        ),
     )
-    (
-        serving_entries,
-        code_entries,
-        provider_metadata_entries,
-        price_key_map_path,
-    ) = _finalizer_inputs(tmp_path)
+    return invocation_by_key, _finalizer_inputs(tmp_path)
 
-    summary_metadata = await run_v3_direct_finalizer(
-        work_directory=tmp_path / "work",
-        serving_run_entries=serving_entries,
-        code_dictionary_entries=code_entries,
-        provider_set_metadata_entries=provider_metadata_entries,
-        expected_source_identities=[_physical_identity()],
-        price_key_map_input=price_key_map_path,
-        price_key_map_row_count=1,
-        scratch_durability="ephemeral",
-    )
 
-    command_arguments = invocation_by_key["command_arguments"]
-    assert command_arguments[command_arguments.index("--workers") + 1] == "4"
-    assert command_arguments[
-        command_arguments.index("--identity-map-max-bytes") + 1
-    ] == str(8 * _GIB)
-    assert command_arguments[
-        command_arguments.index("--total-sort-memory-bytes") + 1
-    ] == str(4 * _GIB)
-    assert command_arguments[
-        command_arguments.index("--price-key-map-row-count") + 1
-    ] == "1"
-    assert command_arguments[
-        command_arguments.index("--scratch-durability") + 1
-    ] == "ephemeral"
+def _assert_resource_contract_arguments(command_arguments):
+    expected_value_map = {
+        "--workers": "4",
+        "--identity-map-max-bytes": str(8 * _GIB),
+        "--total-sort-memory-bytes": str(4 * _GIB),
+        "--price-key-map-row-count": "1",
+        "--scratch-durability": "ephemeral",
+    }
+    for argument, expected_value in expected_value_map.items():
+        assert command_arguments[command_arguments.index(argument) + 1] == expected_value
     assert "--memory-records" not in command_arguments
+
+
+def _assert_reported_resource_contract(tmp_path, summary_metadata):
     manifest_metadata = json.loads(
         (tmp_path / "work" / "scanner-summary.json").read_text()
     )
@@ -477,3 +455,36 @@ async def test_finalizer_invocation_passes_and_reports_resource_contract(
     assert summary_metadata["resource_validation"][
         "configured_memory_budget_bytes"
     ] == 12 * _GIB
+
+
+@pytest.mark.asyncio
+async def test_finalizer_invocation_passes_and_reports_resource_contract(
+    tmp_path,
+    monkeypatch,
+):
+    """Pass aggregate limits to Rust and retain them in progress/report data."""
+
+    invocation_by_key, finalizer_inputs = _successful_finalizer_invocation(
+        tmp_path,
+        monkeypatch,
+    )
+    (
+        serving_entries,
+        code_entries,
+        provider_metadata_entries,
+        price_key_map_path,
+    ) = finalizer_inputs
+
+    summary_metadata = await run_v3_direct_finalizer(
+        work_directory=tmp_path / "work",
+        serving_run_entries=serving_entries,
+        code_dictionary_entries=code_entries,
+        provider_set_metadata_entries=provider_metadata_entries,
+        expected_source_identities=[_physical_identity()],
+        price_key_map_input=price_key_map_path,
+        price_key_map_row_count=1,
+        scratch_durability="ephemeral",
+    )
+
+    _assert_resource_contract_arguments(invocation_by_key["command_arguments"])
+    _assert_reported_resource_contract(tmp_path, summary_metadata)

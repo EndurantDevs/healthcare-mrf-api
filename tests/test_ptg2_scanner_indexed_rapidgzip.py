@@ -288,8 +288,7 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
                 summary["indexed_ranges"], summary["indexed_ranges"][1:]
             )
         )
-def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
-    """Verify delayed indexed range emits object coverage progress."""
+def _run_delayed_indexed_scanner(tmp_path):
     fixture_document = _mixed_inline_referenced_payload()
     artifact = tmp_path / "delayed-reversed.json.gz"
     _write_gzip_json(
@@ -313,7 +312,7 @@ def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
         return completed
 
     with mock.patch.object(subprocess, "run", side_effect=capture_scanner_run):
-        run = _run_parallel_scanner(
+        scanner_run = _run_parallel_scanner(
             scanner_binary,
             artifact,
             tmp_path / "delayed-output",
@@ -328,14 +327,13 @@ def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
                 "FAKE_RAPIDGZIP_DELAY_FIRST_OBJECT_RANGE_SECONDS": "1.0",
             },
         )
+    return scanner_run, scanner_completions
 
-    assert _single_frame(run, "scanner_summary")[
-        "indexed_range_decoder_threads_selected"
-    ] == 4
-    assert len(scanner_completions) == 1
+
+def _indexed_object_progress(scanner_completion):
     progress_payloads = []
     progress_lines = []
-    for line in scanner_completions[0].stderr.decode("utf-8").splitlines():
+    for line in scanner_completion.stderr.decode("utf-8").splitlines():
         if not line.startswith("PTG2_SCANNER_PROGRESS\t"):
             continue
         progress_lines.append(line)
@@ -344,6 +342,19 @@ def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
         )
         if progress_fields_by_name.get("progress_basis") == "indexed_objects":
             progress_payloads.append(progress_fields_by_name)
+    return progress_lines, progress_payloads
+
+
+def test_delayed_indexed_range_emits_object_coverage_progress(tmp_path):
+    """Verify delayed indexed range emits object coverage progress."""
+    scanner_run, scanner_completions = _run_delayed_indexed_scanner(tmp_path)
+    assert _single_frame(scanner_run, "scanner_summary")[
+        "indexed_range_decoder_threads_selected"
+    ] == 4
+    assert len(scanner_completions) == 1
+    progress_lines, progress_payloads = _indexed_object_progress(
+        scanner_completions[0]
+    )
 
     assert progress_lines
     assert all("progress_basis=indexed_objects" in line for line in progress_lines)

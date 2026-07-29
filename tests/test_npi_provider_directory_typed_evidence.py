@@ -3,10 +3,25 @@
 from api.endpoint import npi as npi_module
 
 
+def _typed_role_fhir_metadata() -> dict[str, object]:
+    """Build the large FHIR metadata payload used by typed-role evidence."""
+    profiles = [f"https://example.test/profile/{number}" for number in range(40)]
+    return {
+        "versionId": "7",
+        "source": "https://user:secret@example.test/fhir?_token=secret",
+        "profile": profiles,
+        "security": [{
+            "system": "https://example.test/security", "code": "restricted",
+            "display": "x" * 4096, "ignored": "not exposed",
+        }] * 40,
+        "tag": [{"code": "directory", "userSelected": True}],
+        "ignored": "not exposed",
+    }
+
+
 def _typed_role_evidence_map():
     """Build one exact keyed PractitionerRole evidence row."""
-    profiles = [f"https://example.test/profile/{number}" for number in range(40)]
-    role_evidence_map = {
+    return {
         "source_id": "pdfhir_aetna",
         "role_id": "role-100",
         "evidence_type": "role",
@@ -45,9 +60,7 @@ def _typed_role_evidence_map():
                 "status": "active",
                 "connection_type_code": "hl7-fhir-rest",
                 "address": "https://user:secret@example.test/fhir?_token=secret",
-                "fhir_meta": {
-                    "source": "https://user:secret@example.test/fhir?_token=secret"
-                },
+                "fhir_meta": {"source": "https://user:secret@example.test/fhir?_token=secret"},
             }
         ],
         "role_healthcare_services": [
@@ -58,21 +71,7 @@ def _typed_role_evidence_map():
                 "accepting_patients": [{"code": "newpt"}],
             }
         ],
-        "role_fhir_meta": {
-            "versionId": "7",
-            "source": "https://user:secret@example.test/fhir?_token=secret",
-            "profile": profiles,
-            "security": [
-                {
-                    "system": "https://example.test/security",
-                    "code": "restricted",
-                    "display": "x" * 4096,
-                    "ignored": "not exposed",
-                }
-            ] * 40,
-            "tag": [{"code": "directory", "userSelected": True}],
-            "ignored": "not exposed",
-        },
+        "role_fhir_meta": _typed_role_fhir_metadata(),
         "role_fhir_self_url": "https://example.test/fhir/PractitionerRole/role-100",
         "role_fhir_fetch_mode": "bundle",
         "plan_returned": 1,
@@ -80,7 +79,6 @@ def _typed_role_evidence_map():
         "plan_truncated": False,
         "catalog_complete": True,
     }
-    return role_evidence_map
 
 
 def _typed_plan_evidence_map():
