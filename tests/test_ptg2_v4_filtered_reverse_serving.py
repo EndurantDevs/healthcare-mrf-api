@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -24,6 +24,28 @@ def _projection_fixture() -> tuple[
     taxonomy.V4InferredTaxonomyCandidates,
 ]:
     return _projection_fixture_for(tuple(range(22)), {})
+
+
+def _candidate_projection_fields(
+    candidates: taxonomy.V4InferredTaxonomyCandidates,
+    member_keys: bytes,
+    pattern_payload: bytes,
+) -> dict[str, object]:
+    return {
+        "rule_digest": candidates.rule_digest,
+        "catalog_contract": taxonomy.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT,
+        "catalog_digest": candidates.catalog_digest,
+        "vector_format": taxonomy.PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT,
+        "member_count": candidates.member_count,
+        "member_digest": candidates.member_digest,
+        "member_keys": member_keys,
+        "representation": candidates.representation,
+        "pattern_count": candidates.pattern_count,
+        "pattern_member_count": candidates.pattern_member_count,
+        "pattern_member_bytes": candidates.pattern_member_bytes,
+        "pattern_member_digest": candidates.pattern_member_digest,
+        "pattern_member_payload": pattern_payload,
+    }
 
 
 def _projection_fixture_for(
@@ -66,24 +88,6 @@ def _projection_fixture_for(
         pattern_member_count=pattern_member_count,
         packed_pattern_payload=pattern_payload,
     )
-    projection_by_field = {
-        "rule_digest": rule_digest,
-        "catalog_contract": taxonomy.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT,
-        "catalog_digest": catalog_digest,
-        "vector_format": taxonomy.PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT,
-        "member_count": len(npi_keys),
-        "member_digest": member_digest,
-        "member_keys": member_keys,
-        "representation": representation,
-        "pattern_count": len(npi_keys_by_pattern),
-        "pattern_member_count": pattern_member_count,
-        "pattern_member_bytes": len(pattern_payload),
-        "pattern_member_digest": pattern_member_digest,
-        "pattern_member_payload": pattern_payload,
-    }
-    projection_manifest = taxonomy._candidate_projection_manifest(
-        (projection_by_field,)
-    )
     candidates = taxonomy.V4InferredTaxonomyCandidates(
         rule_digest=rule_digest,
         catalog_digest=catalog_digest,
@@ -96,6 +100,9 @@ def _projection_fixture_for(
         pattern_member_bytes=len(pattern_payload),
         pattern_member_digest=pattern_member_digest,
         npi_keys_by_pattern=npi_keys_by_pattern,
+    )
+    projection_manifest = taxonomy._candidate_projection_manifest(
+        (_candidate_projection_fields(candidates, member_keys, pattern_payload),)
     )
     return projection_manifest, candidates
 
@@ -239,6 +246,42 @@ def _exact_reverse_fixture():
     return projection_manifest, candidates, candidate_npis, memberships_by_npi, matching_keys
 
 
+def _exact_reverse_provider_rows(matching_provider_set_keys):
+    async def provider_rows(
+        *_args,
+        npis,
+        provider_set_ids_by_npi,
+        **_kwargs,
+    ):
+        return {
+            _provider_set_id(provider_set_key): [
+                {"npi": npi, "provider_name": f"Provider {npi}"}
+                for npi in npis
+                if _provider_set_id(provider_set_key)
+                in provider_set_ids_by_npi[npi]
+            ]
+            for provider_set_key in matching_provider_set_keys
+        }
+
+    return provider_rows
+
+
+def _exact_reverse_candidate_scope(candidate_npis, memberships_by_npi):
+    candidate_key_by_npi = {
+        npi: npi_key for npi_key, npi in enumerate(candidate_npis)
+    }
+    return AsyncMock(
+        side_effect=lambda *_args, provider_set_keys, **_kwargs: {
+            provider_set_key: tuple(
+                candidate_key_by_npi[npi]
+                for npi, membership_keys in memberships_by_npi.items()
+                if provider_set_key in membership_keys
+            )
+            for provider_set_key in provider_set_keys
+        }
+    )
+
+
 def _patch_exact_reverse_dependencies(
     monkeypatch,
     candidates,
@@ -246,26 +289,25 @@ def _patch_exact_reverse_dependencies(
     memberships_by_npi,
     matching_provider_set_keys,
 ):
-    merge_calls: list[tuple[int, ...] | None] = []
+    """Install exact reverse collaborators and return their witnesses."""
 
-    async def merge_rows(*_args, provider_set_keys, **_kwargs):
+    merge_calls: list[tuple[int, tuple[int, ...] | None]] = []
+
+    async def merge_rows(*_args, provider_set_keys, limit, **_kwargs):
         normalized_keys = None if provider_set_keys is None else tuple(sorted(provider_set_keys))
-        merge_calls.append(normalized_keys)
+        merge_calls.append((limit, normalized_keys))
         selected_keys = tuple(range(1, 261)) if normalized_keys is None else normalized_keys
-        return [_rate_row(provider_set_key) for provider_set_key in selected_keys]
-
-    async def provider_rows(*_args, npis, provider_set_ids_by_npi, **_kwargs):
-        return {
-            _provider_set_id(provider_set_key): [
-                {"npi": npi, "provider_name": f"Provider {npi}"}
-                for npi in npis
-                if _provider_set_id(provider_set_key) in provider_set_ids_by_npi[npi]
-            ]
-            for provider_set_key in matching_provider_set_keys
-        }
+        return [
+            _rate_row(provider_set_key)
+            for provider_set_key in selected_keys[:limit]
+        ]
 
     candidate_loader = AsyncMock(return_value=candidates)
     graph_lookup = AsyncMock(return_value=memberships_by_npi)
+    candidate_scope = _exact_reverse_candidate_scope(
+        candidate_npis,
+        memberships_by_npi,
+    )
     taxonomy_scope_calls: list[dict[str, int]] = []
 
     @contextmanager
@@ -275,12 +317,29 @@ def _patch_exact_reverse_dependencies(
 
     forward_prefix = AsyncMock(side_effect=AssertionError("forward provider prefix must not run"))
     monkeypatch.setattr(serving, "load_v4_inferred_taxonomy_candidates", candidate_loader)
-    monkeypatch.setattr(serving, "v4_npi_values_for_keys", AsyncMock(return_value=dict(enumerate(candidate_npis))))
+    monkeypatch.setattr(
+        serving,
+        "v4_npi_values_for_keys",
+        AsyncMock(
+            side_effect=lambda *_args, npi_keys, **_kwargs: {
+                npi_key: candidate_npis[npi_key] for npi_key in npi_keys
+            }
+        ),
+    )
     monkeypatch.setattr(serving, "_shared_forward_entries_for_code_rows", AsyncMock(side_effect=AssertionError("direct code scope must use the bounded rate merge")))
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
+    monkeypatch.setattr(
+        serving,
+        "_v4_direct_set_candidates",
+        candidate_scope,
+    )
     monkeypatch.setattr(serving, "v4_graph_taxonomy_projection_scope", taxonomy_scope)
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge_rows)
-    monkeypatch.setattr(serving, "_selected_provider_rows_by_set", provider_rows)
+    monkeypatch.setattr(
+        serving,
+        "_selected_provider_rows_by_set",
+        _exact_reverse_provider_rows(matching_provider_set_keys),
+    )
     monkeypatch.setattr(serving, "_filtered_provider_npis_for_expansion_set", forward_prefix)
     return candidate_loader, graph_lookup, taxonomy_scope_calls, forward_prefix, merge_calls
 
@@ -301,12 +360,14 @@ async def test_inferred_taxonomy_v4_uses_exact_scoped_reverse_selection(
     assert selection.total_lower_bound == 21
     assert selection.exhausted is True
     assert len(selection.row_data) == 14
-    assert merge_calls == [None]
+    assert merge_calls == [
+        (64, None),
+        (128, None),
+        (256, None),
+        (260, None),
+    ]
     assert candidate_loader.await_args.kwargs["projection_manifest"] == (
         projection_manifest
-    )
-    assert graph_lookup.await_args.kwargs["allowed_provider_set_keys"] == tuple(
-        range(1, 261)
     )
     assert graph_lookup.await_args.kwargs["max_members"] == 65_536
     assert taxonomy_scope_calls == [
@@ -318,6 +379,44 @@ async def test_inferred_taxonomy_v4_uses_exact_scoped_reverse_selection(
         }
     ]
     assert forward_prefix.await_count == 0
+
+
+def _patch_direct_budget_dependencies(
+    monkeypatch,
+    candidates,
+    provider_set_keys,
+) -> tuple[AsyncMock, AsyncMock]:
+    graph_lookup = AsyncMock(
+        side_effect=AssertionError("over-budget graph work must not start")
+    )
+    bounded_merge = AsyncMock(
+        side_effect=lambda *_args, limit, **_kwargs: [
+            _rate_row(provider_set_key)
+            for provider_set_key in provider_set_keys[:limit]
+        ]
+    )
+    candidate_scope = AsyncMock(
+        side_effect=lambda *_args, provider_set_keys, **_kwargs: {
+            provider_set_key: () for provider_set_key in provider_set_keys
+        }
+    )
+    monkeypatch.setattr(
+        serving,
+        "load_v4_inferred_taxonomy_candidates",
+        AsyncMock(return_value=candidates),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        bounded_merge,
+    )
+    monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
+    monkeypatch.setattr(
+        serving,
+        "_v4_direct_set_candidates",
+        candidate_scope,
+    )
+    return graph_lookup, bounded_merge
 
 
 @pytest.mark.asyncio
@@ -336,46 +435,11 @@ async def test_direct_v1_admits_occurrences_and_distinct_sets_separately(
     """Do not let duplicate occurrences consume the distinct-set budget."""
 
     projection_manifest, candidates = _projection_fixture()
-    candidate_npis = tuple(1_000_000_001 + index for index in range(22))
-    graph_lookup = AsyncMock(
-        side_effect=AssertionError("over-budget graph work must not start")
+    graph_lookup, bounded_merge = _patch_direct_budget_dependencies(
+        monkeypatch,
+        candidates,
+        provider_set_keys,
     )
-    bounded_merge = AsyncMock(
-        return_value=[
-            _rate_row(provider_set_key)
-            for provider_set_key in provider_set_keys
-        ]
-    )
-    monkeypatch.setattr(
-        serving,
-        "load_v4_inferred_taxonomy_candidates",
-        AsyncMock(return_value=candidates),
-    )
-    monkeypatch.setattr(
-        serving,
-        "v4_npi_values_for_keys",
-        AsyncMock(
-            return_value={
-                npi_key: candidate_npis[npi_key]
-                for npi_key in candidates.npi_keys
-            }
-        ),
-    )
-    monkeypatch.setattr(
-        serving,
-        "_merge_manifest_code_variant_rows",
-        bounded_merge,
-    )
-    monkeypatch.setattr(
-        serving,
-        "_shared_forward_entries_for_code_rows",
-        AsyncMock(
-            side_effect=AssertionError(
-                "direct code scope must use the bounded rate merge"
-            )
-        ),
-    )
-    monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
     with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
         await _select_provider_expansion(
             projection_manifest,
@@ -384,9 +448,19 @@ async def test_direct_v1_admits_occurrences_and_distinct_sets_separately(
 
     assert exc_info.value.dimension == expected_dimension
     assert graph_lookup.await_count == 0
-    assert bounded_merge.await_count == 1
+    assert bounded_merge.await_count == 3
     assert bounded_merge.await_args.kwargs["provider_set_keys"] is None
-    assert bounded_merge.await_args.kwargs["limit"] == 6_701
+    assert bounded_merge.await_args.kwargs["limit"] == min(
+        len(provider_set_keys),
+        6_700,
+    )
+    assert [
+        call.kwargs["limit"] for call in bounded_merge.await_args_list
+    ] == [
+        64,
+        1_664,
+        min(len(provider_set_keys), 6_700),
+    ]
 
 
 def test_pattern_v1_retained_membership_budget_failure_is_typed() -> None:
@@ -402,12 +476,18 @@ def test_pattern_v1_retained_membership_budget_failure_is_typed() -> None:
     assert exc_info.value.dimension == "retained_memberships"
 
 
-@pytest.mark.asyncio
-async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
-    monkeypatch,
-) -> None:
-    """Fill the page from the sealed 64-row prefix without a broad reverse."""
+@dataclass(frozen=True)
+class _PatternReferenceFixture:
+    projection_manifest: dict[str, object]
+    candidates: taxonomy.V4InferredTaxonomyCandidates
+    serving_rows: list[dict[str, object]]
+    pattern_keys_by_set: dict[int, tuple[int, ...]]
+    expected_selected_npi_keys: tuple[int, ...]
+    pattern_count: int
+    rate_occurrence_count: int
 
+
+def _pattern_reference_fixture() -> _PatternReferenceFixture:
     candidate_count = 36_224
     provider_set_count = 6_448
     rate_occurrence_count = 6_561
@@ -440,11 +520,20 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
         provider_set_key: ((provider_set_key - 1) % pattern_count,)
         for provider_set_key in range(1, provider_set_count + 1)
     }
-    selected_value_lookup = AsyncMock(
-        side_effect=lambda *_args, npi_keys, **_kwargs: {
-            npi_key: 1_000_000_001 + npi_key for npi_key in npi_keys
-        }
+    return _PatternReferenceFixture(
+        projection_manifest=projection_manifest,
+        candidates=candidates,
+        serving_rows=serving_rows,
+        pattern_keys_by_set=pattern_keys_by_set,
+        expected_selected_npi_keys=tuple(
+            range(0, 26 * pattern_count, pattern_count)
+        ),
+        pattern_count=pattern_count,
+        rate_occurrence_count=rate_occurrence_count,
     )
+
+
+def _pattern_rate_merge(serving_rows):
     async def merge_rate_rows(
         *_args,
         provider_set_keys,
@@ -452,19 +541,24 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
         offset,
         **_kwargs,
     ):
-        eligible_rows = (
-            serving_rows
+        selected_provider_sets = (
+            None
             if provider_set_keys is None
-            else [
-                serving_row
-                for serving_row in serving_rows
-                if int(serving_row["_ptg_provider_set_key"])
-                in set(provider_set_keys)
-            ]
+            else frozenset(provider_set_keys)
         )
+        eligible_rows = [
+            serving_row
+            for serving_row in serving_rows
+            if selected_provider_sets is None
+            or int(serving_row["_ptg_provider_set_key"])
+            in selected_provider_sets
+        ]
         return eligible_rows[offset : offset + limit]
 
-    merge_rows = AsyncMock(side_effect=merge_rate_rows)
+    return AsyncMock(side_effect=merge_rate_rows)
+
+
+def _pattern_relation_lookups(pattern_keys_by_set):
     set_pattern_lookup = AsyncMock(
         side_effect=lambda *_args, owner_keys, **_kwargs: {
             provider_set_key: pattern_keys_by_set[provider_set_key]
@@ -475,14 +569,16 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
         side_effect=lambda *_args, owner_keys, **_kwargs: {
             pattern_key: tuple(
                 provider_set_key
-                for provider_set_key, set_pattern_keys in (
-                    pattern_keys_by_set.items()
-                )
+                for provider_set_key, set_pattern_keys in pattern_keys_by_set.items()
                 if pattern_key in set_pattern_keys
             )
             for pattern_key in owner_keys
         }
     )
+    return set_pattern_lookup, pattern_set_lookup
+
+
+def _patch_pattern_guards(monkeypatch):
     generic_candidate_reverse = AsyncMock(
         side_effect=AssertionError("broad candidate reverse must not run")
     )
@@ -492,8 +588,38 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
     provider_rows = AsyncMock(return_value={})
     monkeypatch.setattr(
         serving,
+        "_v4_sets_by_npi",
+        generic_candidate_reverse,
+    )
+    monkeypatch.setattr(
+        serving,
+        "_shared_forward_entries_for_code_rows",
+        broad_code_scope,
+    )
+    monkeypatch.setattr(
+        serving,
+        "_selected_provider_rows_by_set",
+        provider_rows,
+    )
+    return generic_candidate_reverse, broad_code_scope, provider_rows
+
+
+def _patch_pattern_reference_dependencies(monkeypatch, fixture):
+    selected_value_lookup = AsyncMock(
+        side_effect=lambda *_args, npi_keys, **_kwargs: {
+            npi_key: 1_000_000_001 + npi_key for npi_key in npi_keys
+        }
+    )
+    merge_rows = _pattern_rate_merge(fixture.serving_rows)
+    set_pattern_lookup, pattern_set_lookup = _pattern_relation_lookups(
+        fixture.pattern_keys_by_set
+    )
+    guard_mocks = _patch_pattern_guards(monkeypatch)
+    generic_candidate_reverse, broad_code_scope, provider_rows = guard_mocks
+    monkeypatch.setattr(
+        serving,
         "load_v4_inferred_taxonomy_candidates",
-        AsyncMock(return_value=candidates),
+        AsyncMock(return_value=fixture.candidates),
     )
     monkeypatch.setattr(
         serving,
@@ -515,27 +641,39 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
         "lookup_v4_relation_members",
         pattern_set_lookup,
     )
-    monkeypatch.setattr(
-        serving,
-        "_v4_sets_by_npi",
+    return (
+        selected_value_lookup,
+        merge_rows,
+        set_pattern_lookup,
+        pattern_set_lookup,
         generic_candidate_reverse,
-    )
-    monkeypatch.setattr(
-        serving,
-        "_shared_forward_entries_for_code_rows",
         broad_code_scope,
-    )
-    monkeypatch.setattr(
-        serving,
-        "_selected_provider_rows_by_set",
         provider_rows,
     )
+
+
+@pytest.mark.asyncio
+async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
+    monkeypatch,
+) -> None:
+    """Fill the page from the sealed 64-row prefix without a broad reverse."""
+
+    fixture = _pattern_reference_fixture()
+    witnesses = _patch_pattern_reference_dependencies(monkeypatch, fixture)
+    (
+        selected_value_lookup,
+        merge_rows,
+        set_pattern_lookup,
+        pattern_set_lookup,
+        generic_candidate_reverse,
+        broad_code_scope,
+        provider_rows,
+    ) = witnesses
     selection = await _select_provider_expansion(
-        projection_manifest,
-        rate_count=rate_occurrence_count,
+        fixture.projection_manifest,
+        rate_count=fixture.rate_occurrence_count,
     )
 
-    expected_selected_npi_keys = tuple(range(0, 26 * pattern_count, pattern_count))
     assert selection.total_lower_bound == 26
     assert selection.exhausted is False
     assert merge_rows.await_count == 2
@@ -549,19 +687,19 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
     assert set_pattern_lookup.await_args.kwargs["relation"] == "set_patterns"
     assert len(set_pattern_lookup.await_args.kwargs["owner_keys"]) == 64
     assert set_pattern_lookup.await_args.kwargs["allowed_member_keys"] == tuple(
-        range(pattern_count)
+        range(fixture.pattern_count)
     )
     assert pattern_set_lookup.await_args.kwargs["owner_keys"] == (0,)
     assert selected_value_lookup.await_count == 1
     assert selected_value_lookup.await_args.kwargs["npi_keys"] == (
-        expected_selected_npi_keys
+        fixture.expected_selected_npi_keys
     )
     assert len(selected_value_lookup.await_args.kwargs["npi_keys"]) == 26
     assert generic_candidate_reverse.await_count == 0
     assert broad_code_scope.await_count == 0
     assert provider_rows.await_count == 1
     assert len(provider_rows.await_args.kwargs["npis"]) == 26
-    assert len(selection.row_data) < len(serving_rows)
+    assert len(selection.row_data) < len(fixture.serving_rows)
 
 
 @pytest.mark.asyncio
@@ -1471,7 +1609,7 @@ async def test_pattern_selector_rejects_short_authenticated_prefix(
         ("missing_rows", PTG2ManifestArtifactError, "rate rows are unavailable", None),
         ("member_budget", serving.PTG2OnlineWorkBudgetExceeded, None, "retained_memberships"),
         ("graph_error", PTG2SharedBlockError, "different graph error", None),
-        ("escaped_scope", PTG2ManifestArtifactError, "escaped its exact code scope", None),
+        ("escaped_scope", PTG2ManifestArtifactError, "lost its exact provider-set membership", None),
         ("missing_enrichment", PTG2ManifestArtifactError, "enrichment is unavailable", None),
     ),
 )
@@ -1516,6 +1654,11 @@ async def test_direct_selector_rejects_broken_sealed_boundaries(
         "_merge_manifest_code_variant_rows",
         AsyncMock(return_value=serving_rows),
     )
+    monkeypatch.setattr(
+        serving,
+        "_v4_direct_set_candidates",
+        AsyncMock(return_value={1: (1,)}),
+    )
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
     monkeypatch.setattr(
         serving,
@@ -1533,15 +1676,13 @@ async def test_direct_selector_rejects_broken_sealed_boundaries(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("empty_stage", ("rate_scope", "graph_scope"))
 async def test_direct_selector_returns_exact_empty_selection(
     monkeypatch,
-    empty_stage,
 ) -> None:
     projection_manifest, candidates = _projection_fixture_for((1,), {})
     npi = 1_000_000_001
-    serving_rows = [] if empty_stage == "rate_scope" else [_rate_row(1)]
     graph_lookup = AsyncMock(return_value={npi: ()})
+    dictionary_lookup = AsyncMock(return_value={1: npi})
     monkeypatch.setattr(
         serving,
         "load_v4_inferred_taxonomy_candidates",
@@ -1550,14 +1691,19 @@ async def test_direct_selector_returns_exact_empty_selection(
     monkeypatch.setattr(
         serving,
         "v4_npi_values_for_keys",
-        AsyncMock(return_value={1: npi}),
+        dictionary_lookup,
     )
     monkeypatch.setattr(
         serving,
         "_merge_manifest_code_variant_rows",
-        AsyncMock(return_value=serving_rows),
+        AsyncMock(return_value=[_rate_row(1)]),
     )
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
+    monkeypatch.setattr(
+        serving,
+        "_v4_direct_set_candidates",
+        AsyncMock(return_value={1: ()}),
+    )
 
     selection = await _select_direct_fixture(
         projection_manifest,
@@ -1566,4 +1712,5 @@ async def test_direct_selector_returns_exact_empty_selection(
 
     assert selection.row_data == []
     assert selection.exhausted is True
-    assert graph_lookup.await_count == (0 if empty_stage == "rate_scope" else 1)
+    assert graph_lookup.await_count == 0
+    assert dictionary_lookup.await_count == 0

@@ -12328,6 +12328,209 @@ def _v4_pattern_candidate_prefix(
     return tuple(selected_occurrences), True
 
 
+def _v4_direct_candidate_prefix(
+    serving_rows: list[dict[str, Any]],
+    candidate_npi_keys_by_set: Mapping[int, tuple[int, ...]],
+    *,
+    target_count: int,
+) -> tuple[tuple[tuple[int, int], ...], bool]:
+    """Rank one direct-layout candidate prefix without broad reverse work."""
+
+    normalized_target = max(int(target_count), 1)
+    selected_occurrences: list[tuple[int, int]] = []
+    seen_npi_keys_by_signature: dict[
+        tuple[str, str, str, str], set[int]
+    ] = defaultdict(set)
+    for row_index, serving_row in enumerate(serving_rows):
+        try:
+            provider_set_key = int(serving_row["_ptg_provider_set_key"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 filtered reverse row is missing its provider-set key"
+            ) from exc
+        signature = _v4_dense_provider_expansion_key(serving_row, 0)[1:]
+        seen_npi_keys = seen_npi_keys_by_signature[signature]
+        for npi_key in candidate_npi_keys_by_set.get(provider_set_key, ()):
+            normalized_npi_key = int(npi_key)
+            if normalized_npi_key in seen_npi_keys:
+                continue
+            seen_npi_keys.add(normalized_npi_key)
+            selected_occurrences.append((row_index, normalized_npi_key))
+            if len(selected_occurrences) >= normalized_target:
+                return tuple(selected_occurrences), False
+    return tuple(selected_occurrences), True
+
+
+def _v4_direct_group_keys(
+    groups_by_set: Mapping[int, tuple[int, ...]],
+    provider_set_keys: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Validate the visited-set projection and return its distinct groups."""
+
+    if set(groups_by_set) != set(provider_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy set-group projection is incomplete"
+        )
+    return tuple(
+        sorted(
+            {
+                int(group_key)
+                for set_group_keys in groups_by_set.values()
+                for group_key in set_group_keys
+            }
+        )
+    )
+
+
+def _v4_direct_set_candidate_map(
+    groups_by_set: Mapping[int, tuple[int, ...]],
+    candidate_keys_by_group: Mapping[int, tuple[int, ...]],
+    candidate_npi_keys: tuple[int, ...],
+) -> dict[int, tuple[int, ...]]:
+    """Project candidate NPI keys back to each visited provider set."""
+
+    candidate_npi_key_set = frozenset(candidate_npi_keys)
+    if any(
+        not set(group_npi_keys).issubset(candidate_npi_key_set)
+        for group_npi_keys in candidate_keys_by_group.values()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy group-NPI projection escaped its "
+            "sealed candidate scope"
+        )
+    return {
+        provider_set_key: tuple(
+            sorted(
+                {
+                    int(npi_key)
+                    for group_key in set_group_keys
+                    for npi_key in candidate_keys_by_group.get(
+                        int(group_key),
+                        (),
+                    )
+                }
+            )
+        )
+        for provider_set_key, set_group_keys in groups_by_set.items()
+    }
+
+
+async def _v4_direct_set_candidates(
+    session,
+    *,
+    snapshot_key: int,
+    provider_set_keys: tuple[int, ...],
+    candidate_npi_keys: tuple[int, ...],
+) -> dict[int, tuple[int, ...]]:
+    """Intersect visited direct-layout sets with the sealed candidate vector."""
+
+    groups_by_set = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation="set_groups_direct",
+        owner_keys=provider_set_keys,
+        schema_name=PTG2_SCHEMA,
+        max_members=None,
+    )
+    group_keys = _v4_direct_group_keys(groups_by_set, provider_set_keys)
+    if not group_keys:
+        return {provider_set_key: () for provider_set_key in provider_set_keys}
+    candidate_npi_keys_by_group = await lookup_v4_relation_intersections(
+        session,
+        snapshot_key=snapshot_key,
+        relation="group_npis_exact",
+        owner_keys=group_keys,
+        allowed_member_keys=candidate_npi_keys,
+        schema_name=PTG2_SCHEMA,
+        max_members=None,
+    )
+    if set(candidate_npi_keys_by_group) != set(group_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy group-NPI projection is incomplete"
+        )
+    return _v4_direct_set_candidate_map(
+        groups_by_set,
+        candidate_npi_keys_by_group,
+        candidate_npi_keys,
+    )
+
+
+async def _v4_direct_npi_memberships(
+    session,
+    serving_tables: PTG2ServingTables,
+    selected_npis: tuple[int, ...],
+    *,
+    max_members: int,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve all exact memberships for only the selected provider NPIs."""
+
+    try:
+        return await _v4_sets_by_npi(
+            session,
+            serving_tables,
+            selected_npis,
+            max_members=max_members,
+        )
+    except PTG2SharedBlockError as exc:
+        if str(exc) != "PTG V4 graph selection exceeds max_members":
+            raise
+        raise PTG2OnlineWorkBudgetExceeded(
+            "retained_memberships"
+        ) from exc
+
+
+def _v4_direct_set_ids(
+    selected_npis: tuple[int, ...],
+    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    provider_set_id_by_key: Mapping[int, str],
+) -> dict[int, tuple[str, ...]]:
+    """Retain selected-NPI memberships that have an exact-code rate witness."""
+
+    provider_set_ids_by_npi = {
+        npi: tuple(
+            provider_set_id_by_key[provider_set_key]
+            for provider_set_key in provider_set_keys_by_npi.get(npi, ())
+            if provider_set_key in provider_set_id_by_key
+        )
+        for npi in selected_npis
+    }
+    if any(
+        not provider_set_ids
+        for provider_set_ids in provider_set_ids_by_npi.values()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy selected candidate lost its exact "
+            "provider-set membership"
+        )
+    return provider_set_ids_by_npi
+
+
+def _validate_v4_direct_ranked_memberships(
+    selected_occurrences: tuple[tuple[int, int], ...],
+    prefix_rows: Sequence[Mapping[str, Any]],
+    npi_by_key: Mapping[int, int],
+    provider_set_ids_by_npi: Mapping[int, tuple[str, ...]],
+    provider_set_id_by_key: Mapping[int, str],
+) -> None:
+    """Require direct completion to retain every ranked set witness."""
+
+    for row_index, npi_key in selected_occurrences:
+        witness_provider_set_key = int(
+            prefix_rows[row_index]["_ptg_provider_set_key"]
+        )
+        witness_provider_set_id = provider_set_id_by_key.get(
+            witness_provider_set_key
+        )
+        if (
+            witness_provider_set_id is None
+            or witness_provider_set_id
+            not in provider_set_ids_by_npi.get(int(npi_by_key[npi_key]), ())
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 inferred-taxonomy completion lost a ranked membership"
+            )
+
+
 def _is_v4_rate_prefix_exhausted(
     code_rows: Iterable[Mapping[str, Any]],
     serving_rows: Sequence[Mapping[str, Any]],
@@ -12541,6 +12744,41 @@ class _V4TaxonomyRequest(_ProviderExpansionRequest):
 
     projection_manifest: Mapping[str, Any]
     projection_rule: V4InferredTaxonomyProjectionRule
+
+
+@dataclass(frozen=True)
+class _V4DirectContext:
+    """Immutable caps and source coordinates for one direct-layout request."""
+
+    request: _V4TaxonomyRequest
+    candidates: Any
+    snapshot_key: int
+    maximum_occurrences: int
+    maximum_code_sets: int
+    declared_occurrences: int
+    scan_budget: ForwardReadBudget
+    candidate_npi_keys: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _V4DirectPrefix:
+    """One authenticated direct-layout rate prefix and its ranked candidates."""
+
+    serving_rows: list[dict[str, Any]]
+    selected_occurrences: tuple[tuple[int, int], ...]
+    is_candidate_prefix_exhausted: bool
+    is_source_exhausted: bool
+
+
+@dataclass(frozen=True)
+class _V4DirectResolved:
+    """Selected NPI identities and exact memberships from one ranked prefix."""
+
+    prefix: _V4DirectPrefix
+    selected_npi_keys: tuple[int, ...]
+    selected_npis: tuple[int, ...]
+    npi_by_key: dict[int, int]
+    provider_set_keys_by_npi: dict[int, tuple[int, ...]]
 
 
 async def _v4_pattern_completion_rate_rows(
@@ -12923,6 +13161,377 @@ _select_v4_pattern_inferred_taxonomy_provider_expansion = (
 )
 
 
+def _v4_direct_context(
+    serving_tables: PTG2ServingTables,
+    request: _V4TaxonomyRequest,
+    candidates: Any,
+) -> _V4DirectContext:
+    maximum_occurrences = int(
+        request.projection_rule.max_online_filtered_reverse_code_occurrences
+    )
+    if maximum_occurrences <= 0:
+        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+    declared_occurrences = sum(
+        max(int(code_row.get("rate_count") or 0), 0)
+        for code_row in request.code_rows
+    )
+    scan_budget = ForwardReadBudget(
+        maximum_fragments=int(
+            request.projection_rule.max_online_inferred_taxonomy_graph_pages
+        ),
+        maximum_raw_payload_bytes=int(
+            request.projection_rule.max_online_inferred_taxonomy_graph_bytes
+        ),
+        maximum_row_capacity=maximum_occurrences + 1,
+    )
+    return _V4DirectContext(
+        request=request,
+        candidates=candidates,
+        snapshot_key=_required_shared_snapshot_key(serving_tables),
+        maximum_occurrences=maximum_occurrences,
+        maximum_code_sets=int(
+            request.projection_rule.max_online_filtered_reverse_code_sets
+        ),
+        declared_occurrences=declared_occurrences,
+        scan_budget=scan_budget,
+        candidate_npi_keys=tuple(sorted(candidates.npi_keys)),
+    )
+
+
+async def _v4_direct_read_window(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4DirectContext,
+    rate_window: int,
+    candidate_npi_keys_by_set: dict[int, tuple[int, ...]],
+) -> _V4DirectPrefix:
+    """Read, authenticate, and rank one bounded direct-layout rate prefix."""
+
+    request = context.request
+    serving_rows = await _merge_manifest_code_variant_rows(
+        session,
+        serving_tables,
+        code_rows=request.code_rows,
+        provider_set_keys=None,
+        source_trace_set_hash=request.source_trace_set_hash,
+        network_names=request.network_names,
+        limit=rate_window,
+        offset=0,
+        descending=request.descending,
+        scan_budget=context.scan_budget,
+    )
+    if serving_rows is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 filtered reverse rate rows are unavailable"
+        )
+    await _v4_direct_update_candidates(
+        session,
+        context,
+        serving_rows,
+        candidate_npi_keys_by_set,
+    )
+    selected_occurrences, is_candidate_prefix_exhausted = (
+        _v4_direct_candidate_prefix(
+            serving_rows,
+            candidate_npi_keys_by_set,
+            target_count=max(int(request.target_count), 1),
+        )
+    )
+    return _V4DirectPrefix(
+        serving_rows=serving_rows,
+        selected_occurrences=selected_occurrences,
+        is_candidate_prefix_exhausted=is_candidate_prefix_exhausted,
+        is_source_exhausted=_is_v4_rate_prefix_exhausted(
+            request.code_rows,
+            serving_rows,
+            rate_window=rate_window,
+        ),
+    )
+
+
+async def _v4_direct_update_candidates(
+    session,
+    context: _V4DirectContext,
+    serving_rows: list[dict[str, Any]],
+    candidate_npi_keys_by_set: dict[int, tuple[int, ...]],
+) -> None:
+    """Project only newly visited rate sets into the sealed candidate scope."""
+
+    provider_set_keys = tuple(
+        sorted(_v4_rate_scope_set_ids(serving_rows, None))
+    )
+    if len(provider_set_keys) > context.maximum_code_sets:
+        raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    new_provider_set_keys = tuple(
+        provider_set_key
+        for provider_set_key in provider_set_keys
+        if provider_set_key not in candidate_npi_keys_by_set
+    )
+    if new_provider_set_keys:
+        candidate_npi_keys_by_set.update(
+            await _v4_direct_set_candidates(
+                session,
+                snapshot_key=context.snapshot_key,
+                provider_set_keys=new_provider_set_keys,
+                candidate_npi_keys=context.candidate_npi_keys,
+            )
+        )
+
+
+async def _v4_direct_ranked_prefix(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4DirectContext,
+) -> _V4DirectPrefix:
+    target_count = max(int(context.request.target_count), 1)
+    rate_window = min(
+        context.maximum_occurrences,
+        PTG2_SERVING_BINARY_V3_PAGE_ROWS,
+        context.declared_occurrences,
+    )
+    candidate_npi_keys_by_set: dict[int, tuple[int, ...]] = {}
+    while True:
+        prefix = await _v4_direct_read_window(
+            session,
+            serving_tables,
+            context,
+            rate_window,
+            candidate_npi_keys_by_set,
+        )
+        if (
+            len(prefix.selected_occurrences) >= target_count
+            or prefix.is_source_exhausted
+        ):
+            return prefix
+        if rate_window >= context.maximum_occurrences:
+            raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+        next_window = _next_v4_taxonomy_rate_window(
+            rate_window,
+            target_count=target_count,
+            distinct_count=len(prefix.selected_occurrences),
+            declared_occurrences=context.declared_occurrences,
+            maximum_occurrences=context.maximum_occurrences,
+        )
+        if next_window <= rate_window:
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 inferred-taxonomy rate prefix did not make progress"
+            )
+        rate_window = next_window
+
+
+async def _v4_direct_resolve_prefix(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4DirectContext,
+    prefix: _V4DirectPrefix,
+) -> _V4DirectResolved:
+    selected_npi_keys = tuple(
+        dict.fromkeys(
+            npi_key
+            for _row_index, npi_key in prefix.selected_occurrences
+        )
+    )
+    npi_by_key = await v4_npi_values_for_keys(
+        session,
+        snapshot_key=context.snapshot_key,
+        npi_keys=selected_npi_keys,
+        schema_name=PTG2_SCHEMA,
+    )
+    if (
+        set(npi_by_key) != set(selected_npi_keys)
+        or len(set(npi_by_key.values())) != len(selected_npi_keys)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy NPI dictionary is incomplete"
+        )
+    selected_npis = tuple(
+        int(npi_by_key[npi_key]) for npi_key in selected_npi_keys
+    )
+    provider_set_keys_by_npi = await _v4_direct_npi_memberships(
+        session,
+        serving_tables,
+        selected_npis,
+        max_members=int(
+            context.request.projection_rule
+            .max_online_inferred_taxonomy_retained_memberships
+        ),
+    )
+    return _V4DirectResolved(
+        prefix=prefix,
+        selected_npi_keys=selected_npi_keys,
+        selected_npis=selected_npis,
+        npi_by_key=npi_by_key,
+        provider_set_keys_by_npi=provider_set_keys_by_npi,
+    )
+
+
+def _v4_direct_rank_by_key(
+    resolved: _V4DirectResolved,
+) -> dict[tuple[Any, ...], int]:
+    rank_by_key = {
+        _provider_expansion_key(
+            resolved.prefix.serving_rows[row_index],
+            npi=int(resolved.npi_by_key[npi_key]),
+        ): rank
+        for rank, (row_index, npi_key) in enumerate(
+            resolved.prefix.selected_occurrences
+        )
+    }
+    if len(rank_by_key) != len(resolved.prefix.selected_occurrences):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy dense ranking is not unique"
+        )
+    return rank_by_key
+
+
+async def _v4_direct_completion(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4DirectContext,
+    resolved: _V4DirectResolved,
+) -> tuple[list[dict[str, Any]], dict[int, tuple[str, ...]]]:
+    """Complete exact-code rates and memberships for selected providers only."""
+
+    completion_provider_set_keys = tuple(
+        sorted(
+            {
+                int(provider_set_key)
+                for provider_set_keys in (
+                    resolved.provider_set_keys_by_npi.values()
+                )
+                for provider_set_key in provider_set_keys
+            }
+        )
+    )
+    request = context.request
+    completion_rows, provider_set_id_by_key = await _v4_pattern_completion_rows(
+        session,
+        serving_tables,
+        _V4PatternCompletionRequest(
+            code_rows=request.code_rows,
+            prefix_rows=resolved.prefix.serving_rows,
+            candidate_provider_set_keys=completion_provider_set_keys,
+            source_trace_set_hash=request.source_trace_set_hash,
+            network_names=request.network_names,
+            descending=request.descending,
+            is_source_exhausted=resolved.prefix.is_source_exhausted,
+            maximum_occurrences=context.maximum_occurrences,
+            maximum_code_sets=context.maximum_code_sets,
+            scan_budget=context.scan_budget,
+        ),
+    )
+    provider_set_ids_by_npi = _v4_direct_set_ids(
+        resolved.selected_npis,
+        resolved.provider_set_keys_by_npi,
+        provider_set_id_by_key,
+    )
+    _validate_v4_direct_ranked_memberships(
+        resolved.prefix.selected_occurrences,
+        resolved.prefix.serving_rows,
+        resolved.npi_by_key,
+        provider_set_ids_by_npi,
+        provider_set_id_by_key,
+    )
+    retained_provider_set_ids = {
+        provider_set_id
+        for provider_set_ids in provider_set_ids_by_npi.values()
+        for provider_set_id in provider_set_ids
+    }
+    return (
+        _v4_direct_retained_rows(
+            completion_rows,
+            retained_provider_set_ids,
+        ),
+        provider_set_ids_by_npi,
+    )
+
+
+def _v4_direct_retained_rows(
+    completion_rows: list[dict[str, Any]],
+    retained_provider_set_ids: set[str],
+) -> list[dict[str, Any]]:
+    return [
+        serving_row
+        for serving_row in completion_rows
+        if _ptg2_manifest_id(
+            serving_row.get("provider_set_global_id_128")
+        )
+        in retained_provider_set_ids
+    ]
+
+
+def _v4_direct_projection_scope(context: _V4DirectContext):
+    rule = context.request.projection_rule
+    return v4_graph_taxonomy_projection_scope(
+        maximum_members=int(
+            rule.max_online_candidate_pattern_projection_members
+        ),
+        maximum_pages=int(
+            rule.max_online_inferred_taxonomy_graph_pages
+        ),
+        maximum_bytes=int(
+            rule.max_online_inferred_taxonomy_graph_bytes
+        ),
+        maximum_batches=int(
+            rule.max_online_inferred_taxonomy_graph_batches
+        ),
+    )
+
+
+async def _v4_direct_selection(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4DirectContext,
+) -> _ProviderExpansionSelection:
+    """Resolve and enrich one bounded direct-layout taxonomy result page."""
+
+    request = context.request
+    with (
+        v4_graph_request_scope(),
+        _v4_direct_projection_scope(context),
+    ):
+        prefix = await _v4_direct_ranked_prefix(
+            session,
+            serving_tables,
+            context,
+        )
+        if not prefix.selected_occurrences:
+            return _ProviderExpansionSelection([], {}, {}, True)
+        resolved = await _v4_direct_resolve_prefix(
+            session,
+            serving_tables,
+            context,
+            prefix,
+        )
+    completion_rows, provider_set_ids_by_npi = await _v4_direct_completion(
+        session,
+        serving_tables,
+        context,
+        resolved,
+    )
+    providers_by_set = await _selected_provider_rows_by_set(
+        session,
+        serving_tables,
+        npis=resolved.selected_npis,
+        provider_set_ids_by_npi=provider_set_ids_by_npi,
+        args=request.args,
+        snapshot_id=request.snapshot_id,
+    )
+    if providers_by_set is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 filtered reverse provider enrichment is unavailable"
+        )
+    return _ProviderExpansionSelection(
+        row_data=completion_rows,
+        providers_by_set=providers_by_set,
+        rank_by_key=_v4_direct_rank_by_key(resolved),
+        exhausted=(
+            prefix.is_source_exhausted
+            and prefix.is_candidate_prefix_exhausted
+        ),
+    )
+
+
 async def _select_v4_taxonomy_expansion(
     session,
     serving_tables: PTG2ServingTables,
@@ -12931,219 +13540,39 @@ async def _select_v4_taxonomy_expansion(
     """Serve one inferred-only CPT page through exact scoped reverse edges."""
 
     request = _V4TaxonomyRequest(**request_options)
-    (
-        code_rows,
-        args,
-        snapshot_id,
-        source_trace_set_hash,
-        network_names,
-        target_count,
-        descending,
-        projection_manifest,
-        projection_rule,
-    ) = (
-        request.code_rows,
-        request.args,
-        request.snapshot_id,
-        request.source_trace_set_hash,
-        request.network_names,
-        request.target_count,
-        request.descending,
-        request.projection_manifest,
-        request.projection_rule,
-    )
-    normalized_target_count = max(int(target_count), 1)
-    maximum_code_sets = int(
-        projection_rule.max_online_filtered_reverse_code_sets
-    )
     snapshot_key = _required_shared_snapshot_key(serving_tables)
     candidates = await load_v4_inferred_taxonomy_candidates(
         session,
         snapshot_key=snapshot_key,
-        rule_digest=projection_rule.rule_digest,
+        rule_digest=request.projection_rule.rule_digest,
         schema_name=PTG2_SCHEMA,
-        projection_manifest=projection_manifest,
+        projection_manifest=request.projection_manifest,
     )
-    _validate_v4_inferred_taxonomy_candidates(candidates, projection_rule)
+    _validate_v4_inferred_taxonomy_candidates(
+        candidates,
+        request.projection_rule,
+    )
     if candidates.representation == "pattern_v1":
         return await _select_v4_pattern_taxonomy_expansion(
             session,
             serving_tables,
-            code_rows=code_rows,
-            args=args,
-            snapshot_id=snapshot_id,
-            source_trace_set_hash=source_trace_set_hash,
-            network_names=network_names,
-            target_count=normalized_target_count,
-            descending=descending,
-            projection_rule=projection_rule,
+            code_rows=request.code_rows,
+            args=request.args,
+            snapshot_id=request.snapshot_id,
+            source_trace_set_hash=request.source_trace_set_hash,
+            network_names=request.network_names,
+            target_count=max(int(request.target_count), 1),
+            descending=request.descending,
+            projection_rule=request.projection_rule,
             candidates=candidates,
         )
-    npi_by_key = await v4_npi_values_for_keys(
-        session,
-        snapshot_key=snapshot_key,
-        npi_keys=candidates.npi_keys,
-        schema_name=PTG2_SCHEMA,
-    )
+    context = _v4_direct_context(serving_tables, request, candidates)
     if (
-        set(npi_by_key) != set(candidates.npi_keys)
-        or len(set(npi_by_key.values())) != len(candidates.npi_keys)
+        context.declared_occurrences == 0
+        or not context.candidate_npi_keys
     ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 inferred-taxonomy NPI dictionary is incomplete"
-        )
-    candidate_npis = tuple(sorted(int(npi) for npi in npi_by_key.values()))
-    maximum_occurrences = int(
-        projection_rule.max_online_filtered_reverse_code_occurrences
-    )
-    serving_rows = await _merge_manifest_code_variant_rows(
-        session,
-        serving_tables,
-        code_rows=code_rows,
-        provider_set_keys=None,
-        source_trace_set_hash=source_trace_set_hash,
-        network_names=network_names,
-        limit=maximum_occurrences + 1,
-        offset=0,
-        descending=descending,
-    )
-    if serving_rows is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 filtered reverse rate rows are unavailable"
-        )
-    if len(serving_rows) > maximum_occurrences:
-        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
-    provider_set_id_by_key = _v4_rate_scope_set_ids(
-        serving_rows,
-        None,
-    )
-    allowed_provider_set_keys = tuple(sorted(provider_set_id_by_key))
-    if len(allowed_provider_set_keys) > maximum_code_sets:
-        raise PTG2OnlineWorkBudgetExceeded("code_sets")
-    if not allowed_provider_set_keys:
         return _ProviderExpansionSelection([], {}, {}, True)
-    try:
-        with (
-            v4_graph_request_scope(),
-            v4_graph_taxonomy_projection_scope(
-                maximum_members=int(
-                    projection_rule.max_online_candidate_pattern_projection_members
-                ),
-                maximum_pages=int(
-                    projection_rule.max_online_inferred_taxonomy_graph_pages
-                ),
-                maximum_bytes=int(
-                    projection_rule.max_online_inferred_taxonomy_graph_bytes
-                ),
-                maximum_batches=int(
-                    projection_rule.max_online_inferred_taxonomy_graph_batches
-                ),
-            ),
-        ):
-            provider_set_keys_by_npi = await _v4_sets_by_npi(
-                session,
-                serving_tables,
-                candidate_npis,
-                allowed_provider_set_keys=allowed_provider_set_keys,
-                max_members=int(
-                    projection_rule.max_online_inferred_taxonomy_retained_memberships
-                ),
-            )
-    except PTG2SharedBlockError as exc:
-        if str(exc) != "PTG V4 graph selection exceeds max_members":
-            raise
-        raise PTG2OnlineWorkBudgetExceeded(
-            "retained_memberships"
-        ) from exc
-    if any(
-        not set(provider_set_keys).issubset(allowed_provider_set_keys)
-        for provider_set_keys in provider_set_keys_by_npi.values()
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 inferred-taxonomy graph escaped its exact code scope"
-        )
-    selected_candidate_npis = tuple(
-        npi
-        for npi in candidate_npis
-        if provider_set_keys_by_npi.get(npi)
-    )
-    matching_provider_set_keys = tuple(
-        sorted(
-            {
-                int(provider_set_key)
-                for npi in selected_candidate_npis
-                for provider_set_key in provider_set_keys_by_npi.get(npi, ())
-            }
-        )
-    )
-    if not matching_provider_set_keys:
-        return _ProviderExpansionSelection([], {}, {}, True)
-    matching_provider_set_key_set = frozenset(matching_provider_set_keys)
-    serving_rows = [
-        serving_row
-        for serving_row in serving_rows
-        if int(serving_row["_ptg_provider_set_key"])
-        in matching_provider_set_key_set
-    ]
-    provider_set_id_by_key = {
-        provider_set_key: provider_set_id_by_key[provider_set_key]
-        for provider_set_key in matching_provider_set_keys
-    }
-    observed_provider_set_keys = frozenset(provider_set_id_by_key)
-    provider_set_ids_by_npi = {
-        npi: tuple(
-            provider_set_id_by_key[int(provider_set_key)]
-            for provider_set_key in provider_set_keys_by_npi.get(npi, ())
-            if int(provider_set_key) in observed_provider_set_keys
-        )
-        for npi in selected_candidate_npis
-    }
-    selected_candidate_npis = tuple(
-        npi
-        for npi in selected_candidate_npis
-        if provider_set_ids_by_npi[npi]
-    )
-    provider_set_ids_by_npi = {
-        npi: provider_set_ids_by_npi[npi]
-        for npi in selected_candidate_npis
-    }
-    npis_by_set = {
-        provider_set_id_by_key[provider_set_key]: tuple(
-            npi
-            for npi in selected_candidate_npis
-            if provider_set_key in provider_set_keys_by_npi.get(npi, ())
-        )
-        for provider_set_key in sorted(observed_provider_set_keys)
-    }
-    rank_by_key, selected_npis, _selected_provider_set_ids = (
-        _rank_provider_expansion_prefix(
-            serving_rows,
-            npis_by_set,
-            target_count=normalized_target_count,
-        )
-    )
-    selected_provider_set_ids_by_npi = {
-        npi: provider_set_ids_by_npi[npi]
-        for npi in selected_npis
-    }
-    providers_by_set = await _selected_provider_rows_by_set(
-        session,
-        serving_tables,
-        npis=selected_npis,
-        provider_set_ids_by_npi=selected_provider_set_ids_by_npi,
-        args=args,
-        snapshot_id=snapshot_id,
-    )
-    if providers_by_set is None:
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 filtered reverse provider enrichment is unavailable"
-        )
-    return _ProviderExpansionSelection(
-        row_data=serving_rows,
-        providers_by_set=providers_by_set,
-        rank_by_key=rank_by_key,
-        exhausted=len(rank_by_key) < normalized_target_count,
-    )
+    return await _v4_direct_selection(session, serving_tables, context)
 
 
 _select_v4_inferred_taxonomy_provider_expansion = _select_v4_taxonomy_expansion
