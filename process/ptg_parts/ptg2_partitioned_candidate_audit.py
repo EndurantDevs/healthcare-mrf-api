@@ -6,9 +6,8 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-import logging
 import time
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import aiohttp
 
@@ -49,6 +48,13 @@ from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
     parse_partitioned_candidate_audit_result,
     validate_partitioned_candidate_audit_results,
 )
+from process.ptg_parts.ptg2_partition_failure_observability import (
+    PartitionFailureCallback,
+    PartitionProgressCallback,
+    bind_partition_failure,
+    publish_partition_failure,
+    publish_partition_progress,
+)
 from process.ptg_parts.ptg2_partitioned_candidate_audit_report import (
     PartitionedAuditHttpMetrics,
     PartitionedAuditReportInput,
@@ -63,9 +69,6 @@ from process.ptg_parts.ptg2_source_witness_contract import (
 
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
-logger = logging.getLogger(__name__)
-
-PartitionProgressCallback = Callable[[int, int], Awaitable[None]]
 
 
 class _RequestStartGate:
@@ -272,9 +275,12 @@ async def _post_partition(
                 raise BatchCandidateAuditContractError(
                     "batch_response_invalid"
                 ) from exc
-        except (BatchCandidateAuditContractError, BatchCandidateAuditTransportError):
+        except (
+            BatchCandidateAuditContractError,
+            BatchCandidateAuditTransportError,
+        ) as exc:
             metrics.failed()
-            raise
+            raise bind_partition_failure(exc, request) from exc
         except (TimeoutError, aiohttp.ClientError) as exc:
             metrics.failed()
             reason = (
@@ -282,7 +288,8 @@ async def _post_partition(
                 if isinstance(exc, TimeoutError)
                 else "batch_endpoint_transport_failed"
             )
-            raise BatchCandidateAuditTransportError(reason) from exc
+            transport_failure = BatchCandidateAuditTransportError(reason)
+            raise bind_partition_failure(transport_failure, request) from exc
         metrics.completed()
         return partition_result
 
@@ -292,6 +299,7 @@ async def _execute_partition_plan(
     plan: PartitionedCandidateAuditPlan,
     http_config: FastAuditHttpConfig,
     progress_callback: PartitionProgressCallback | None = None,
+    failure_callback: PartitionFailureCallback | None = None,
 ) -> tuple[Any, PartitionedAuditHttpMetrics]:
     """Execute every planned request once with bounded paced concurrency."""
 
@@ -334,14 +342,15 @@ async def _execute_partition_plan(
                 tasks=tasks,
                 metrics=metrics,
                 progress_callback=progress_callback,
+                failure_callback=failure_callback,
                 total=plan.request_count,
             )
     finally:
-        incomplete_tasks = [task for task in tasks if not task.done()]
-        for task in incomplete_tasks:
-            task.cancel()
-        if incomplete_tasks:
-            await asyncio.gather(*incomplete_tasks, return_exceptions=True)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
     return validate_partitioned_candidate_audit_results(plan, partition_results), metrics
 
 
@@ -377,10 +386,11 @@ async def _collect_partition_results(
     metrics: PartitionedAuditHttpMetrics,
     progress_callback: PartitionProgressCallback | None,
     total: int,
+    failure_callback: PartitionFailureCallback | None = None,
 ) -> list[PartitionedCandidateAuditResult]:
     """Collect completed requests while publishing monotonic exact counters."""
 
-    await _publish_partition_progress(
+    await publish_partition_progress(
         progress_callback,
         completed=0,
         total=total,
@@ -388,36 +398,29 @@ async def _collect_partition_results(
     partition_result_list: list[PartitionedCandidateAuditResult] = []
     last_reported_completed = 0
     for completed_task in asyncio.as_completed(tasks):
-        partition_result_list.append(await completed_task)
+        try:
+            partition_result_list.append(await completed_task)
+        except (
+            BatchCandidateAuditContractError,
+            BatchCandidateAuditTransportError,
+        ) as exc:
+            await publish_partition_failure(
+                failure_callback,
+                completed=metrics.completed_request_count,
+                total=total,
+                failure=exc,
+            )
+            raise
         completed_count = metrics.completed_request_count
         if completed_count <= last_reported_completed:
             continue
         last_reported_completed = completed_count
-        await _publish_partition_progress(
+        await publish_partition_progress(
             progress_callback,
             completed=completed_count,
             total=total,
         )
     return partition_result_list
-
-
-async def _publish_partition_progress(
-    progress_callback: PartitionProgressCallback | None,
-    *,
-    completed: int,
-    total: int,
-) -> None:
-    """Report bounded counters without making observability part of the gate."""
-
-    if progress_callback is None:
-        return
-    try:
-        await progress_callback(completed, total)
-    except Exception:
-        logger.debug(
-            "candidate audit partition progress callback failed",
-            exc_info=True,
-        )
 
 
 async def run_partitioned_candidate_audit(
@@ -427,6 +430,7 @@ async def run_partitioned_candidate_audit(
     persisted_sample: PersistedAuditSample,
     http_config: FastAuditHttpConfig,
     progress_callback: PartitionProgressCallback | None = None,
+    failure_callback: PartitionFailureCallback | None = None,
 ) -> dict[str, Any]:
     """Execute every exact partition once at two request starts per second."""
 
@@ -443,6 +447,7 @@ async def run_partitioned_candidate_audit(
         plan=plan,
         http_config=http_config,
         progress_callback=progress_callback,
+        failure_callback=failure_callback,
     )
     completed_at = datetime.datetime.now(datetime.timezone.utc)
     if (
@@ -473,6 +478,7 @@ async def run_partitioned_candidate_audit(
 __all__ = [
     "PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_IN_FLIGHT",
     "PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUESTS_PER_SECOND",
+    "PartitionFailureCallback",
     "PartitionProgressCallback",
     "PartitionedAuditHttpMetrics",
     "build_candidate_audit_partition_plan",

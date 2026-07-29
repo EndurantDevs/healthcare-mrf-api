@@ -257,6 +257,27 @@ ordered item ordinals, or cohort counts. Progress reports the resulting
 dynamic `partition_count` and exact completed count; it must not assume the
 older 50-item target.
 
+V4 audit traversal is selected from the sealed graph representation before
+forward occurrence payloads are read. `pattern_v1` proves
+NPI-to-pattern-to-set membership first and supplies those exact provider-set
+keys as the forward-read filter. If the graph proof cannot fit the existing
+decoded-retention and physical-read limits, the request fails closed; it does
+not switch to code/source-first after reading graph blocks. `direct_v1`
+remains code/source-first in this release.
+
+The selector does not widen a byte, member, request, or process cap and does
+not change a stored relation, packed map, block, layout, or manifest identity.
+Any mapping or block loaded while selecting or traversing is retained for its
+downstream consumer within the request; it is not decoded or logically
+processed a second time. The two traversal orders must produce the same
+matched occurrence and persisted-sample result.
+
+Concurrent completion progress is a count, not a partition ordinal. A
+partition failure must retain the exact immutable request identity:
+`plan_digest`, zero-based `partition_index`, `partition_count`,
+`partition_digest`, and `request_digest`. This makes one failing partition
+reproducible without relabeling the last completed count as its index.
+
 The attestation persists `activation_intent` and a digest binding that intent
 to the audited report. Generic promotion and attestation consumption accept
 only `audit_and_activate`; an `audit_only` attestation is a durable hold and

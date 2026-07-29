@@ -11,14 +11,9 @@ from api.ptg2_candidate_audit_capacity import (
 )
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
 from api.ptg2_candidate_audit_graph import (
-    ChallengeGraphScopeTooLarge,
     prove_provider_candidates_by_npi,
 )
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
-from api.ptg2_candidate_audit_v4 import (
-    V4CandidateBuilders,
-    load_v4_candidate_scope,
-)
 from api.ptg2_db_sidecars import (
     lookup_forward_price_index_from_db,
     lookup_shared_graph_members_from_db,
@@ -411,54 +406,21 @@ async def load_candidate_provider_scope(
     schema_name: str = PTG2_SCHEMA,
     retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> CandidateProviderScope:
-    """Select V4 code-first proof or the bounded V3 broad/reverse path."""
+    """Select the representation-aware bounded provider proof."""
 
-    if retention_budget is None:
-        retention_budget = CandidateAuditDecodedRetentionBudget()
-    if serving_tables.uses_v4_graph:
-        v4_scope = await load_v4_candidate_scope(
-            session,
-            serving_tables,
-            challenges,
-            persisted_audit_occurrences,
-            code_index,
-            builders=V4CandidateBuilders(
-                source_keys=_source_keys_by_code_key,
-                provider_candidates=_provider_candidates_by_npi,
-            ),
-            schema_name=schema_name,
-            retention_budget=retention_budget,
-        )
-        return CandidateProviderScope(
-            provider_set_keys_by_npi=v4_scope.provider_set_keys_by_npi,
-            price_keys_by_occurrence=v4_scope.price_keys_by_occurrence,
-        )
-    try:
-        provider_keys_by_npi = await broad_scope_lookup(
-            session,
-            serving_tables,
-            challenges,
-            persisted_audit_occurrences,
-            retention_budget=retention_budget,
-        )
-    except ChallengeGraphScopeTooLarge as exc:
-        reverse_scope = await load_reverse_source_candidate_scope(
-            session,
-            serving_tables,
-            challenges,
-            persisted_audit_occurrences,
-            code_index,
-            exc.group_keys_by_npi,
-            schema_name=schema_name,
-            retention_budget=retention_budget,
-        )
-        return CandidateProviderScope(
-            provider_set_keys_by_npi=reverse_scope.provider_set_keys_by_npi,
-            price_keys_by_occurrence=reverse_scope.price_keys_by_occurrence,
-        )
-    return CandidateProviderScope(
-        provider_set_keys_by_npi=provider_keys_by_npi,
-        price_keys_by_occurrence=None,
+    from api.ptg2_candidate_audit_scope_dispatch import (
+        load_candidate_provider_scope as load_provider_scope,
+    )
+
+    return await load_provider_scope(
+        broad_scope_lookup,
+        session,
+        serving_tables,
+        challenges,
+        persisted_audit_occurrences,
+        code_index,
+        schema_name=schema_name,
+        retention_budget=retention_budget,
     )
 
 

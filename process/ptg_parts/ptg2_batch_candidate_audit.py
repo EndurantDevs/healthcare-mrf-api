@@ -31,6 +31,10 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
 PTG2_BATCH_AUDIT_MAX_RESPONSE_BYTES = 256 * 1024
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _ALLOWLISTED_REJECTION_DETAIL_BY_MESSAGE = {
+    (
+        "PTG2 candidate audit decoded retention exceeds the byte limit "
+        "while retaining a forward occurrence lookup"
+    ): "forward_occurrence_retention_limit_exceeded",
     "PTG2 candidate exact provider-code matches exceed their bounded limit": (
         "provider_code_matches_limit_exceeded"
     ),
@@ -55,20 +59,64 @@ _ALLOWLISTED_REJECTION_DETAIL_BY_MESSAGE = {
 }
 
 
-class BatchCandidateAuditContractError(RuntimeError):
+class _BatchCandidateAuditError(RuntimeError):
+    """One stable failure reason with optional authenticated partition identity."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        partition_index: int | None = None,
+        partition_count: int | None = None,
+        partition_digest: str | None = None,
+        plan_digest: str | None = None,
+        request_digest: str | None = None,
+    ) -> None:
+        self.reason = reason
+        self.partition_index = partition_index
+        self.partition_count = partition_count
+        self.partition_digest = partition_digest
+        self.plan_digest = plan_digest
+        self.request_digest = request_digest
+        diagnostic_suffix = (
+            ""
+            if partition_index is None
+            else (
+                f" [partition_index={partition_index}, "
+                f"partition_count={partition_count}, "
+                f"partition_digest={partition_digest}, "
+                f"plan_digest={plan_digest}, request_digest={request_digest}]"
+            )
+        )
+        super().__init__(f"{reason}{diagnostic_suffix}")
+
+    def for_partition(
+        self,
+        *,
+        partition_index: int,
+        partition_count: int,
+        partition_digest: str,
+        plan_digest: str,
+        request_digest: str,
+    ) -> _BatchCandidateAuditError:
+        """Return the same stable failure bound to one authenticated request."""
+
+        return type(self)(
+            self.reason,
+            partition_index=partition_index,
+            partition_count=partition_count,
+            partition_digest=partition_digest,
+            plan_digest=plan_digest,
+            request_digest=request_digest,
+        )
+
+
+class BatchCandidateAuditContractError(_BatchCandidateAuditError):
     """A deterministic request, response, or release-contract mismatch."""
 
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
 
-
-class BatchCandidateAuditTransportError(RuntimeError):
+class BatchCandidateAuditTransportError(_BatchCandidateAuditError):
     """A transient transport failure eligible for orchestration-level retry."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
 
 
 def _event_loop_contract(*, require_uvloop: bool) -> str:

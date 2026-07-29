@@ -13,6 +13,11 @@ from tests.test_ptg2_batch_candidate_audit import _http_config
 
 ALLOWLISTED_REJECTION_REASONS = (
     (
+        "PTG2 candidate audit decoded retention exceeds the byte limit "
+        "while retaining a forward occurrence lookup",
+        "forward_occurrence_retention_limit_exceeded",
+    ),
+    (
         "PTG2 candidate exact provider-code matches exceed their bounded limit",
         "provider_code_matches_limit_exceeded",
     ),
@@ -194,6 +199,10 @@ def test_allowlisted_endpoint_message_adds_stable_rejection_detail(
         b'{"message":42}',
         b'{"description":"PTG2 candidate provider-code scope exceeds its bounded limit",'
         b'"status":400,"message":"private endpoint detail"}',
+        (
+            b'{"message":"PTG2 candidate audit decoded retention exceeds the '
+            b'byte limit while retaining a forward occurrence lookup: private"}'
+        ),
     ),
 )
 def test_unknown_or_malformed_rejection_body_is_not_classified(response_body):

@@ -1234,20 +1234,33 @@ async def test_release_audit_failure_is_deterministic_and_not_retryable(monkeypa
         "load_persisted_audit_sample",
         AsyncMock(return_value=object()),
     )
+    partition_failure = (
+        ptg_candidate_audit.BatchCandidateAuditContractError(
+            "source_witness_missing_from_api"
+        ).for_partition(
+            partition_index=7,
+            partition_count=12,
+            partition_digest="0" * 64,
+            plan_digest="1" * 64,
+            request_digest="2" * 64,
+        )
+    )
     monkeypatch.setattr(
         ptg_candidate_audit,
         "run_partitioned_candidate_audit",
-        AsyncMock(
-            side_effect=ptg_candidate_audit.BatchCandidateAuditContractError(
-                "source_witness_missing_from_api"
-            )
-        ),
+        AsyncMock(side_effect=partition_failure),
     )
 
     with pytest.raises(ptg_candidate_audit.CandidateAuditReleaseGateError) as exc_info:
         await ptg_candidate_audit.run_batch_release_audit(_target())
 
-    assert str(exc_info.value).endswith("source_witness_missing_from_api")
+    assert "source_witness_missing_from_api" in str(exc_info.value)
+    assert "partition_index=7" in str(exc_info.value)
+    assert exc_info.value.partition_index == 7
+    assert exc_info.value.partition_count == 12
+    assert exc_info.value.partition_digest == "0" * 64
+    assert exc_info.value.plan_digest == "1" * 64
+    assert exc_info.value.request_digest == "2" * 64
     assert exc_info.value.control_error_code == "ptg_candidate_audit_release_gate_failed"
     assert exc_info.value.retryable is False
 
@@ -1376,6 +1389,51 @@ async def test_partition_progress_without_control_run_is_a_noop(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_partition_failure_progress_retains_authenticated_request_identity(
+    monkeypatch,
+):
+    mark_control_run = AsyncMock()
+    monkeypatch.setattr(ptg_candidate_audit, "mark_control_run", mark_control_run)
+    failure = ptg_candidate_audit.BatchCandidateAuditContractError(
+        "batch_endpoint_rejected_400_forward_occurrence_retention_limit_exceeded"
+    ).for_partition(
+        partition_index=150,
+        partition_count=520,
+        partition_digest="0" * 64,
+        plan_digest="1" * 64,
+        request_digest="2" * 64,
+    )
+
+    await ptg_candidate_audit._partition_failure_progress(
+        "control-run",
+        snapshot_id="candidate-snapshot",
+        completed=150,
+        total=520,
+        failure=failure,
+    )
+
+    assert mark_control_run.await_args.kwargs["progress"] == {
+        "unit": "partition",
+        "done": 150,
+        "total": 520,
+        "pct": 38,
+        "message": (
+            "audit partition index 150 failed after 150 of 520 completed"
+        ),
+        "phase": "candidate release audit",
+        "failed_partition_index": 150,
+        "partition_count": 520,
+        "partition_digest": "0" * 64,
+        "plan_digest": "1" * 64,
+        "request_digest": "2" * 64,
+        "failure_reason": (
+            "batch_endpoint_rejected_400_"
+            "forward_occurrence_retention_limit_exceeded"
+        ),
+    }
+
+
+@pytest.mark.asyncio
 async def test_rolling_v3_writer_path_loads_witness_once(monkeypatch):
     witness = Mock(occurrence_records=(object(), object()))
     report = _passing_report()
@@ -1408,14 +1466,13 @@ async def test_rolling_v3_writer_path_loads_witness_once(monkeypatch):
     assert progress.await_count == 2
 
 
-@pytest.mark.asyncio
-async def test_default_v4_audit_attests_then_activates(
+def _install_activation_flow(
     monkeypatch,
+    events: list[str],
+    report,
 ):
-    events: list[str] = []
-    report = _passing_batch_report(
-        provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
-    )
+    """Install the exact audit, attestation, and promotion test flow."""
+
     witness_loader = AsyncMock()
     monkeypatch.setattr(ptg_candidate_audit, "_progress", AsyncMock())
     monkeypatch.setattr(
@@ -1424,11 +1481,18 @@ async def test_default_v4_audit_attests_then_activates(
         witness_loader,
     )
 
-    async def audit(target, *, http_config, progress_callback):
+    async def audit(
+        target,
+        *,
+        http_config,
+        progress_callback,
+        failure_callback,
+    ):
         events.append("audit")
         assert target.snapshot_key == 17
         assert http_config is None
         assert progress_callback is not None
+        assert failure_callback is not None
         return report
 
     monkeypatch.setattr(ptg_candidate_audit, "run_batch_release_audit", audit)
@@ -1448,6 +1512,22 @@ async def test_default_v4_audit_attests_then_activates(
 
     monkeypatch.setattr(ptg_candidate_audit, "record_candidate_audit_attestation", attest)
     monkeypatch.setattr(ptg_candidate_audit, "promote_ptg2_source_snapshot", promote)
+    return witness_loader
+
+
+@pytest.mark.asyncio
+async def test_default_v4_audit_attests_then_activates(
+    monkeypatch,
+):
+    events: list[str] = []
+    report = _passing_batch_report(
+        provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+    )
+    witness_loader = _install_activation_flow(
+        monkeypatch,
+        events,
+        report,
+    )
 
     activation_response = await ptg_candidate_audit._audit_and_activate(
         _target(
@@ -1482,21 +1562,23 @@ async def _record_audit_only_attestation(
     }
 
 
-@pytest.mark.asyncio
-async def test_audit_only_v4_audit_attests_without_promotion(monkeypatch):
-    """Attest an inactive V4 candidate without entering pointer promotion."""
+def _install_audit_only_flow(monkeypatch, events, report):
+    """Install an inactive attestation flow and forbidden promotion."""
 
-    events: list[str] = []
-    report = _passing_batch_report(
-        provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
-    )
     progress = AsyncMock()
     monkeypatch.setattr(ptg_candidate_audit, "_progress", progress)
 
-    async def audit(_target, *, http_config, progress_callback):
+    async def audit(
+        _target,
+        *,
+        http_config,
+        progress_callback,
+        failure_callback,
+    ):
         events.append("audit")
         assert http_config is None
         assert progress_callback is not None
+        assert failure_callback is not None
         return report
 
     promote = AsyncMock(side_effect=AssertionError("audit-only must not promote"))
@@ -1508,6 +1590,22 @@ async def test_audit_only_v4_audit_attests_without_promotion(monkeypatch):
     )
     monkeypatch.setattr(
         ptg_candidate_audit, "promote_ptg2_source_snapshot", promote
+    )
+    return progress, promote
+
+
+@pytest.mark.asyncio
+async def test_audit_only_v4_audit_attests_without_promotion(monkeypatch):
+    """Attest an inactive V4 candidate without entering pointer promotion."""
+
+    events: list[str] = []
+    report = _passing_batch_report(
+        provider_identifier_quarantine=NONEMPTY_PROVIDER_IDENTIFIER_QUARANTINE
+    )
+    progress, promote = _install_audit_only_flow(
+        monkeypatch,
+        events,
+        report,
     )
 
     audit_only_result = await ptg_candidate_audit._audit_and_activate(
@@ -1544,11 +1642,47 @@ async def test_audit_only_v4_audit_attests_without_promotion(monkeypatch):
     promote.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
-    expected_report = _passing_batch_report()
+async def _exercise_partition_callbacks(
+    batch_audit,
+    partition_progress,
+    partition_failure_progress,
+):
+    """Exercise callbacks captured by the mocked partition runner."""
+
+    progress_callback = batch_audit.await_args.kwargs["progress_callback"]
+    await progress_callback(2, 4)
+    partition_progress.assert_awaited_once_with(
+        "control-run",
+        snapshot_id="candidate-snapshot",
+        completed=2,
+        total=4,
+    )
+    failure = ptg_candidate_audit.BatchCandidateAuditContractError(
+        "batch_endpoint_rejected_400_forward_occurrence_retention_limit_exceeded"
+    ).for_partition(
+        partition_index=3,
+        partition_count=4,
+        partition_digest="0" * 64,
+        plan_digest="1" * 64,
+        request_digest="2" * 64,
+    )
+    failure_callback = batch_audit.await_args.kwargs["failure_callback"]
+    await failure_callback(2, 4, failure)
+    partition_failure_progress.assert_awaited_once_with(
+        "control-run",
+        snapshot_id="candidate-snapshot",
+        completed=2,
+        total=4,
+        failure=failure,
+    )
+
+
+def _install_writer_callbacks(monkeypatch, expected_report):
+    """Install partition progress callbacks and return their mocks."""
+
     batch_audit = AsyncMock(return_value=expected_report)
     partition_progress = AsyncMock()
+    partition_failure_progress = AsyncMock()
     progress = AsyncMock()
     witness_loader = AsyncMock()
     monkeypatch.setattr(ptg_candidate_audit, "_progress", progress)
@@ -1556,6 +1690,11 @@ async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
         ptg_candidate_audit,
         "_partition_progress",
         partition_progress,
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_partition_failure_progress",
+        partition_failure_progress,
     )
     monkeypatch.setattr(
         ptg_candidate_audit,
@@ -1567,6 +1706,25 @@ async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
         "load_shared_source_witness",
         witness_loader,
     )
+    return (
+        batch_audit,
+        partition_progress,
+        partition_failure_progress,
+        progress,
+        witness_loader,
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
+    expected_report = _passing_batch_report()
+    (
+        batch_audit,
+        partition_progress,
+        partition_failure_progress,
+        progress,
+        witness_loader,
+    ) = _install_writer_callbacks(monkeypatch, expected_report)
 
     report = await ptg_candidate_audit._execute_release_audit(
         _target(),
@@ -1580,13 +1738,10 @@ async def test_default_v4_writer_path_avoids_local_witness_load(monkeypatch):
         "10,000 sealed source occurrences"
     )
     batch_audit.assert_awaited_once()
-    progress_callback = batch_audit.await_args.kwargs["progress_callback"]
-    await progress_callback(2, 4)
-    partition_progress.assert_awaited_once_with(
-        "control-run",
-        snapshot_id="candidate-snapshot",
-        completed=2,
-        total=4,
+    await _exercise_partition_callbacks(
+        batch_audit,
+        partition_progress,
+        partition_failure_progress,
     )
     witness_loader.assert_not_awaited()
 

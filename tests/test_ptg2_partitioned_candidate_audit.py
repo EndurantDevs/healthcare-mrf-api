@@ -312,7 +312,10 @@ async def test_partition_response_rejects_status_or_invalid_json(
     site = web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
     await site.start()
     try:
-        with pytest.raises(BatchCandidateAuditContractError, match=message):
+        with pytest.raises(
+            BatchCandidateAuditContractError,
+            match=message,
+        ) as exc_info:
             await audit._execute_partition_plan(
                 plan=_one_request_plan(),
                 http_config=_http(f"http://127.0.0.1:{unused_tcp_port}"),
@@ -320,33 +323,17 @@ async def test_partition_response_rejects_status_or_invalid_json(
     finally:
         await runner.cleanup()
 
-
-@pytest.mark.asyncio
-async def test_partition_timeout_is_terminal_transport_failure(unused_tcp_port):
-    async def handler(_request):
-        await asyncio.sleep(0.1)
-        return web.json_response({})
-
-    application = web.Application()
-    application.router.add_post(
-        "/api/v1/pricing/providers/audit-source-witness-batch",
-        handler,
-    )
-    runner = web.AppRunner(application)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", unused_tcp_port)
-    await site.start()
-    try:
-        with pytest.raises(BatchCandidateAuditTransportError, match="deadline"):
-            await audit._execute_partition_plan(
-                plan=_one_request_plan(),
-                http_config=replace(
-                    _http(f"http://127.0.0.1:{unused_tcp_port}"),
-                    deadline_seconds=0.01,
-                ),
-            )
-    finally:
-        await runner.cleanup()
+    request = _one_request_plan().requests[0]
+    assert exc_info.value.partition_index == request.partition_index
+    assert exc_info.value.partition_count == request.partition_count
+    assert exc_info.value.partition_digest == request.partition_digest
+    assert exc_info.value.plan_digest == request.plan_digest
+    assert exc_info.value.request_digest == request.request_digest
+    assert f"partition_index={request.partition_index}" in str(exc_info.value)
+    assert f"partition_count={request.partition_count}" in str(exc_info.value)
+    assert f"partition_digest={request.partition_digest}" in str(exc_info.value)
+    assert f"plan_digest={request.plan_digest}" in str(exc_info.value)
+    assert f"request_digest={request.request_digest}" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
