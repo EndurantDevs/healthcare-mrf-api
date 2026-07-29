@@ -9,6 +9,10 @@ from typing import Any
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
+from process.ptg_parts.ptg2_candidate_attestation import (
+    CandidateAttestationApprovalConflict,
+    parse_candidate_attestation_digest,
+)
 from process.ptg_parts.ptg2_shared_gc import release_unbound_ptg2_shared_layouts
 from process.ptg_parts.snapshot_cleanup import is_shared_snapshot_control_manifest
 from process.ptg_parts.source_snapshot_control_policy import (
@@ -83,22 +87,34 @@ async def promote_ptg2_source_snapshot(
     source_key: str,
     snapshot_id: str,
     expected_current_snapshot_id: str | None = None,
+    expected_audit_only_attestation_digest: str | None = None,
 ) -> dict[str, Any]:
     """Activate one audited strict-V3 candidate and all of its live pointers."""
     source_key = str(source_key or "").strip().lower()
     snapshot_id = str(snapshot_id or "").strip()
     if not source_key or not snapshot_id:
         raise ValueError("source_key and snapshot_id are required")
+    approval_digest = (
+        parse_candidate_attestation_digest(
+            expected_audit_only_attestation_digest
+        )
+        if expected_audit_only_attestation_digest is not None
+        else None
+    )
     try:
-        result = await activate_ptg2_source_candidate(
+        promotion_by_field = await activate_ptg2_source_candidate(
             source_key=source_key,
             snapshot_id=snapshot_id,
             expected_current_snapshot_id=expected_current_snapshot_id,
+            expected_audit_only_attestation_digest=approval_digest,
         )
-    except PTG2SourcePointerConflict as exc:
+    except (
+        CandidateAttestationApprovalConflict,
+        PTG2SourcePointerConflict,
+    ) as exc:
         raise SourceSnapshotConflict(str(exc)) from exc
     _clear_ptg2_snapshot_cache()
-    return result
+    return promotion_by_field
 
 
 async def build_source_snapshot_remove_plan(

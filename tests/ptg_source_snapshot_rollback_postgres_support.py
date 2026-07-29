@@ -6,6 +6,9 @@ import datetime
 import json
 
 from db.connection import db
+from process.ptg_parts.ptg2_candidate_attestation import (
+    candidate_attestation_digest,
+)
 from process.ptg_parts.source_pointers import _plan_pointer_entry
 
 
@@ -92,19 +95,22 @@ async def _insert_plan_scope(snapshot_id: str) -> None:
 
 
 async def _insert_activated_attestation(snapshot_id: str) -> None:
+    report_digest = b"r" * 32
+    activation_intent = "audit_and_activate"
     await db.status(
         f"""
         INSERT INTO "{SCHEMA_NAME}".ptg2_v3_candidate_audit_attestation
             (snapshot_id, snapshot_key, source_key, plan_id, plan_market_type,
              coverage_scope_id, source_set_digest, audit_sample_digest,
              contract, tool_name, tool_version, report_digest, report,
-             attested_at, expires_at, activated_at)
+             attested_at, expires_at, activated_at, activation_intent,
+             attestation_digest)
         VALUES
             (:snapshot_id, :snapshot_key, :source_key, :plan_id, 'group',
              :coverage_scope_id, :source_set_digest, :audit_sample_digest,
              'ptg2_v3_release_audit_attestation_v3', 'synthetic-audit', '1',
              :report_digest, '{{}}'::jsonb, :attested_at, :expires_at,
-             :attested_at)
+             :attested_at, :activation_intent, :attestation_digest)
         """,
         snapshot_id=snapshot_id,
         snapshot_key=SNAPSHOT_KEY,
@@ -113,7 +119,12 @@ async def _insert_activated_attestation(snapshot_id: str) -> None:
         coverage_scope_id=b"c" * 32,
         source_set_digest=b"d" * 32,
         audit_sample_digest=b"a" * 32,
-        report_digest=b"r" * 32,
+        report_digest=report_digest,
+        activation_intent=activation_intent,
+        attestation_digest=candidate_attestation_digest(
+            report_digest,
+            activation_intent,
+        ),
         attested_at=datetime.datetime(
             2026,
             7,

@@ -30,11 +30,14 @@ from process.ptg_parts.ptg2_batch_candidate_audit_report import (
     BatchAuditReportTarget,
 )
 from process.ptg_parts.ptg2_candidate_attestation import (
+    PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE,
+    PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY,
     PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
     PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT,
     PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
     PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT,
     PTG2_VERIFIED_HTTPS_TRANSPORT,
+    load_held_candidate_audit_attestation,
     record_candidate_audit_attestation,
 )
 from process.ptg_parts.ptg2_candidate_layout_identity import (
@@ -75,6 +78,16 @@ from scripts.validation import ptg2_v3_source_api_audit
 IMPORTER_NAME = "ptg-candidate-audit"
 ARCH_VERSION = PTG2_CANDIDATE_ARCH_VERSION
 STORAGE_GENERATION = PTG2_CANDIDATE_V3_GENERATION
+CANDIDATE_AUDIT_MODE_AUDIT_AND_ACTIVATE = (
+    PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
+)
+CANDIDATE_AUDIT_MODE_AUDIT_ONLY = (
+    PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY
+)
+CANDIDATE_AUDIT_MODES = (
+    CANDIDATE_AUDIT_MODE_AUDIT_AND_ACTIVATE,
+    CANDIDATE_AUDIT_MODE_AUDIT_ONLY,
+)
 PTG2_BATCH_AUDIT_WRITER_ENABLED = (
     PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
     == PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
@@ -103,6 +116,7 @@ _CANDIDATE_TARGET_SQL = """
            current_pointer.snapshot_id AS current_snapshot_id,
            attestation.report_digest AS audit_report_digest,
            attestation.report AS audit_report,
+           attestation.activation_intent AS audit_activation_intent,
            attestation.activated_at AS audit_activated_at,
            frozen_binding.binding_payload AS frozen_binding_payload,
            current_snapshot.import_run_id AS current_import_run_id,
@@ -120,6 +134,8 @@ _CANDIDATE_TARGET_SQL = """
            current_v4_root.map_digest AS current_v4_root_map_digest,
            current_attestation.report_digest AS current_audit_report_digest,
            current_attestation.report AS current_audit_report,
+           current_attestation.activation_intent
+               AS current_audit_activation_intent,
            current_attestation.activated_at AS current_audit_activated_at,
            current_frozen_binding.binding_payload
                AS current_frozen_binding_payload
@@ -163,6 +179,13 @@ _CANDIDATE_TARGET_SQL = """
      WHERE snapshot.import_run_id = :candidate_run_id
      ORDER BY snapshot.snapshot_id
 """
+
+
+def _candidate_audit_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in CANDIDATE_AUDIT_MODES:
+        raise ValueError("candidate_audit_mode is unsupported")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -618,8 +641,23 @@ def _validated_activation_status(
     ).strip().lower()
     is_activated = status == "published" and activation_state == "activated"
     if is_activated:
+        expected_intent_by_mode = {
+            "audited_control": (
+                PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
+            ),
+            "reviewed_audit_only_control": (
+                PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY
+            ),
+        }
+        activation_mode = str(
+            evidence.activation_by_name.get("mode") or ""
+        ).strip()
+        activation_intent = str(
+            candidate_row.get("audit_activation_intent") or ""
+        ).strip()
         if (
-            evidence.activation_by_name.get("mode") != "audited_control"
+            expected_intent_by_mode.get(activation_mode)
+            != activation_intent
             or scope_state.current_snapshot_id != evidence.snapshot_id
             or candidate_row.get("audit_activated_at") is None
         ):
@@ -778,6 +816,9 @@ def _current_snapshot_row(candidate_row: Mapping[str, Any]) -> dict[str, Any] | 
             "current_audit_report_digest"
         ),
         "audit_report": candidate_row.get("current_audit_report"),
+        "audit_activation_intent": candidate_row.get(
+            "current_audit_activation_intent"
+        ),
         "audit_activated_at": candidate_row.get("current_audit_activated_at"),
         "frozen_binding_payload": candidate_row.get(
             "current_frozen_binding_payload"
@@ -1230,6 +1271,64 @@ def _success_result(
     }
 
 
+def _audit_only_result(
+    candidate_audit_target: CandidateAuditTarget,
+    *,
+    report: Mapping[str, Any],
+    report_digest: str,
+    attestation: Mapping[str, Any],
+    idempotent: bool = False,
+) -> dict[str, Any]:
+    summary = _audit_summary(report, report_digest)
+    audit_counts = _mapping(summary.get("audit_counts"))
+    terminal_count = next(
+        (
+            int(audit_counts[name])
+            for name in (
+                "batch_requests_executed",
+                "api_challenges_executed",
+                "source_witnesses",
+            )
+            if isinstance(audit_counts.get(name), int)
+            and not isinstance(audit_counts.get(name), bool)
+            and int(audit_counts[name]) >= 0
+        ),
+        0,
+    )
+    terminal_progress_by_field = {
+        "unit": "audit_requests",
+        "done": terminal_count,
+        "total": terminal_count,
+        "pct": 100,
+        "message": "retained passing attestation without promotion",
+        "phase": "candidate audit-only complete",
+    }
+    audit_metrics_by_name = {
+        "arch_version": ARCH_VERSION,
+        "storage_generation": candidate_audit_target.storage_generation,
+        "snapshot_status": "validated",
+        "activation_status": "deferred",
+        "snapshot_id": candidate_audit_target.snapshot_id,
+        "candidate_snapshot_id": candidate_audit_target.snapshot_id,
+        "import_run_id": candidate_audit_target.candidate_run_id,
+        "candidate_run_id": candidate_audit_target.candidate_run_id,
+        "candidate_audit_mode": CANDIDATE_AUDIT_MODE_AUDIT_ONLY,
+        "activation_mode": CANDIDATE_AUDIT_MODE_AUDIT_ONLY,
+        "equivalent_reuse": False,
+        "idempotent": idempotent,
+        "attestation_status": str(attestation.get("status") or "attested"),
+        "attestation_expires_at": attestation.get("expires_at"),
+        "attestation_digest": attestation.get("attestation_digest"),
+        "count": terminal_count,
+        "terminal_progress": terminal_progress_by_field,
+        **summary,
+    }
+    return {
+        **audit_metrics_by_name,
+        "metrics": dict(audit_metrics_by_name),
+    }
+
+
 async def _progress(
     run_id: str | None,
     *,
@@ -1386,14 +1485,56 @@ async def _audit_and_activate(
     *,
     control_run_id: str | None,
     http_config: FastAuditHttpConfig | None = None,
+    candidate_audit_mode: str = CANDIDATE_AUDIT_MODE_AUDIT_AND_ACTIVATE,
 ) -> dict[str, Any]:
     """Audit sealed source witnesses, attest the report, and promote."""
 
+    normalized_mode = _candidate_audit_mode(candidate_audit_mode)
     report = await _execute_release_audit(
         candidate_target,
         control_run_id=control_run_id,
         http_config=http_config,
     )
+    attestation, report_digest = await _record_passing_attestation(
+        candidate_target,
+        report=report,
+        control_run_id=control_run_id,
+        activation_intent=normalized_mode,
+    )
+    if normalized_mode == CANDIDATE_AUDIT_MODE_AUDIT_ONLY:
+        await _publish_audit_only_complete(
+            control_run_id,
+            snapshot_id=candidate_target.snapshot_id,
+            replay=False,
+        )
+        return _audit_only_result(
+            candidate_target,
+            report=report,
+            report_digest=report_digest,
+            attestation=attestation,
+            idempotent=False,
+        )
+    await _promote_audited_candidate(
+        candidate_target,
+        control_run_id=control_run_id,
+    )
+    return _success_result(
+        candidate_target,
+        report=report,
+        report_digest=report_digest,
+        idempotent=False,
+    )
+
+
+async def _record_passing_attestation(
+    candidate_target: CandidateAuditTarget,
+    *,
+    report: Mapping[str, Any],
+    control_run_id: str | None,
+    activation_intent: str,
+) -> tuple[dict[str, Any], str]:
+    """Persist one passing report with its durable activation intent."""
+
     await _progress(
         control_run_id,
         snapshot_id=candidate_target.snapshot_id,
@@ -1408,7 +1549,44 @@ async def _audit_and_activate(
         plan_market_type=candidate_target.plan_market_type,
         storage_generation=candidate_target.storage_generation,
         report=report,
+        activation_intent=activation_intent,
     )
+    report_digest = _normalized_digest(
+        attestation.get("report_digest"),
+        field="audit report digest",
+    )
+    return dict(attestation), report_digest
+
+
+async def _publish_audit_only_complete(
+    control_run_id: str | None,
+    *,
+    snapshot_id: str,
+    replay: bool,
+) -> None:
+    """Publish the terminal held-candidate progress phase."""
+
+    message = (
+        "reusing held passing attestation without promotion"
+        if replay
+        else "retaining passing attestation without promotion"
+    )
+    await _progress(
+        control_run_id,
+        snapshot_id=snapshot_id,
+        phase="candidate audit-only complete",
+        message=message,
+        pct=100,
+    )
+
+
+async def _promote_audited_candidate(
+    candidate_target: CandidateAuditTarget,
+    *,
+    control_run_id: str | None,
+) -> None:
+    """Promote one candidate whose attestation permits activation."""
+
     await _progress(
         control_run_id,
         snapshot_id=candidate_target.snapshot_id,
@@ -1425,37 +1603,54 @@ async def _audit_and_activate(
     )
     if promotion.get("status") != "promoted":
         raise RuntimeError("candidate promotion did not complete")
-    report_digest = _normalized_digest(
-        attestation.get("report_digest"),
-        field="audit report digest",
-    )
-    return _success_result(
-        candidate_target,
-        report=report,
-        report_digest=report_digest,
-        idempotent=False,
-    )
 
 
-async def _audit_candidate_under_guard(
-    normalized_candidate_run_id: str,
+async def _held_audit_only_result(
+    candidate_target: CandidateAuditTarget,
     *,
-    snapshot_id: str | None,
-    import_id: str | None,
     run_id: str | None,
-) -> dict[str, Any]:
-    await _progress(
+) -> dict[str, Any] | None:
+    """Return a current held attestation without release-audit I/O."""
+
+    held_attestation = await load_held_candidate_audit_attestation(
+        snapshot_id=candidate_target.snapshot_id,
+        source_key=candidate_target.source_key,
+        plan_id=candidate_target.plan_id,
+        plan_market_type=candidate_target.plan_market_type,
+        storage_generation=candidate_target.storage_generation,
+    )
+    if held_attestation is None:
+        return None
+    await _publish_audit_only_complete(
         run_id,
-        snapshot_id=None,
-        phase="candidate resolution",
-        message="loading candidate from PostgreSQL",
-        pct=10,
+        snapshot_id=candidate_target.snapshot_id,
+        replay=True,
     )
-    candidate_target = await load_candidate_audit_target(
-        candidate_run_id=normalized_candidate_run_id,
-        snapshot_id=snapshot_id,
-        import_id=import_id,
+    return _audit_only_result(
+        candidate_target,
+        report=_mapping(held_attestation["report"]),
+        report_digest=str(held_attestation["report_digest"]),
+        attestation=held_attestation,
+        idempotent=True,
     )
+
+
+async def _existing_candidate_audit_result(
+    candidate_target: CandidateAuditTarget,
+    *,
+    candidate_audit_mode: str,
+    run_id: str | None,
+) -> dict[str, Any] | None:
+    """Return an already active, equivalent, or held candidate result."""
+
+    if (
+        candidate_audit_mode == CANDIDATE_AUDIT_MODE_AUDIT_ONLY
+        and (
+            candidate_target.activated
+            or candidate_target.equivalent_current_snapshot_id is not None
+        )
+    ):
+        raise ValueError("audit-only candidate is already active or equivalent")
     if candidate_target.activated:
         assert candidate_target.audit_report is not None
         assert candidate_target.audit_report_digest is not None
@@ -1474,6 +1669,43 @@ async def _audit_candidate_under_guard(
             report_digest=candidate_target.equivalent_audit_report_digest,
             idempotent=True,
         )
+    if candidate_audit_mode == CANDIDATE_AUDIT_MODE_AUDIT_ONLY:
+        return await _held_audit_only_result(
+            candidate_target,
+            run_id=run_id,
+        )
+    return None
+
+
+async def _audit_candidate_under_guard(
+    normalized_candidate_run_id: str,
+    *,
+    snapshot_id: str | None,
+    import_id: str | None,
+    run_id: str | None,
+    candidate_audit_mode: str,
+) -> dict[str, Any]:
+    """Resolve one guarded candidate and execute only the required phase."""
+
+    await _progress(
+        run_id,
+        snapshot_id=None,
+        phase="candidate resolution",
+        message="loading candidate from PostgreSQL",
+        pct=10,
+    )
+    candidate_target = await load_candidate_audit_target(
+        candidate_run_id=normalized_candidate_run_id,
+        snapshot_id=snapshot_id,
+        import_id=import_id,
+    )
+    existing_result = await _existing_candidate_audit_result(
+        candidate_target,
+        candidate_audit_mode=candidate_audit_mode,
+        run_id=run_id,
+    )
+    if existing_result is not None:
+        return existing_result
     http_config = _audit_configuration(
         candidate_target.snapshot_id,
         batch_writer=PTG2_BATCH_AUDIT_WRITER_ENABLED,
@@ -1482,6 +1714,7 @@ async def _audit_candidate_under_guard(
         candidate_target,
         control_run_id=run_id,
         http_config=http_config,
+        candidate_audit_mode=candidate_audit_mode,
     )
 
 
@@ -1491,18 +1724,21 @@ async def run_ptg_candidate_audit_command(
     snapshot_id: str | None = None,
     import_id: str | None = None,
     run_id: str | None = None,
+    candidate_audit_mode: str = CANDIDATE_AUDIT_MODE_AUDIT_AND_ACTIVATE,
 ) -> dict[str, Any]:
     """Audit, attest, and atomically activate one strict V3 candidate."""
 
     normalized_candidate_run_id = str(candidate_run_id or "").strip()
     if not normalized_candidate_run_id:
         raise ValueError("candidate_run_id is required")
+    normalized_mode = _candidate_audit_mode(candidate_audit_mode)
     async with candidate_audit_guard(normalized_candidate_run_id):
         return await _audit_candidate_under_guard(
             normalized_candidate_run_id,
             snapshot_id=snapshot_id,
             import_id=import_id,
             run_id=run_id,
+            candidate_audit_mode=normalized_mode,
         )
 
 

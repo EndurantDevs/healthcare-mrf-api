@@ -38,6 +38,8 @@ async def create_writer_attestation_table(quoted_schema: str) -> None:
             tool_version text NOT NULL,
             report_digest bytea NOT NULL,
             report jsonb NOT NULL,
+            activation_intent text NOT NULL,
+            attestation_digest bytea NOT NULL,
             attested_at timestamptz NOT NULL,
             expires_at timestamptz NOT NULL,
             activated_at timestamptz

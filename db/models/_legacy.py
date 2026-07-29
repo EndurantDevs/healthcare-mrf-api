@@ -2797,6 +2797,14 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
             name="ptg2_v3_candidate_audit_attestation_report_check",
         ),
         CheckConstraint(
+            "activation_intent IN ('audit_and_activate', 'audit_only')",
+            name="ptg2_v3_candidate_audit_attestation_intent_check",
+        ),
+        CheckConstraint(
+            "octet_length(attestation_digest) = 32",
+            name="ptg2_v3_candidate_audit_attestation_digest_check",
+        ),
+        CheckConstraint(
             "expires_at > attested_at",
             name="ptg2_v3_candidate_audit_attestation_expiry_check",
         ),
@@ -2829,6 +2837,8 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
     tool_version = Column(String(32), nullable=False)
     report_digest = Column(LargeBinary, nullable=False)
     report = Column(JSONB, nullable=False)
+    activation_intent = Column(String(32), nullable=False)
+    attestation_digest = Column(LargeBinary, nullable=False)
     attested_at = Column(DateTime(timezone=True), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     activated_at = Column(DateTime(timezone=True))

@@ -1073,19 +1073,32 @@ def ptg(
 )
 @click.option("--snapshot-id", help="Optional snapshot id corroboration.")
 @click.option("--import-id", help="Optional PTG import id corroboration.")
+@click.option(
+    "--candidate-audit-mode",
+    type=click.Choice(("audit_and_activate", "audit_only")),
+    default="audit_and_activate",
+    show_default=True,
+    help="Audit and activate by default, or retain an inactive attested candidate.",
+)
 def ptg_candidate_audit(
     candidate_run_id: str,
     snapshot_id: str | None,
     import_id: str | None,
+    candidate_audit_mode: str,
 ):
     """Run the release audit that can activate one strict V3 candidate."""
 
-    _run(
-        initiate_ptg_candidate_audit(
-            candidate_run_id=candidate_run_id,
-            snapshot_id=snapshot_id,
-            import_id=import_id,
+    audit_parameters_by_name = {
+        "candidate_run_id": candidate_run_id,
+        "snapshot_id": snapshot_id,
+        "import_id": import_id,
+    }
+    if candidate_audit_mode == "audit_only":
+        audit_parameters_by_name["candidate_audit_mode"] = (
+            candidate_audit_mode
         )
+    _run(
+        initiate_ptg_candidate_audit(**audit_parameters_by_name)
     )
 
 

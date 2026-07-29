@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -82,6 +83,17 @@ PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV = (
     "HLTHPRT_PTG2_CANDIDATE_ATTESTATION_TTL_HOURS"
 )
 PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_DEFAULT = 24
+PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE = "audit_and_activate"
+PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY = "audit_only"
+PTG2_CANDIDATE_ACTIVATION_INTENTS = frozenset(
+    {
+        PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE,
+        PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY,
+    }
+)
+_PTG2_CANDIDATE_ATTESTATION_DIGEST_DOMAIN = (
+    b"PTG2CANDIDATEAUDITINTENT\x01"
+)
 PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_ENV = (
     "HLTHPRT_PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES"
 )
@@ -92,6 +104,10 @@ class CandidateAttestationWriterContractError(ValueError):
 
     control_error_code = "candidate_attestation_writer_contract_mismatch"
     retryable = False
+
+
+class CandidateAttestationApprovalConflict(RuntimeError):
+    """A reviewed audit-only approval no longer identifies a current hold."""
 
 
 PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_DEFAULT = 120
@@ -132,6 +148,60 @@ _REQUIRED_REDACTION_EXCLUSIONS = (
     "network_names",
     "arbitrary_source_and_API_strings",
 )
+
+
+def normalize_candidate_activation_intent(value: Any) -> str:
+    """Return one explicit durable attestation activation intent."""
+
+    normalized_value = str(value or "").strip().lower()
+    if normalized_value not in PTG2_CANDIDATE_ACTIVATION_INTENTS:
+        raise ValueError("candidate audit activation intent is invalid")
+    return normalized_value
+
+
+def candidate_attestation_digest(
+    report_digest: bytes,
+    activation_intent: str,
+) -> bytes:
+    """Bind one report digest to its immutable activation intent."""
+
+    normalized_report_digest = bytes(report_digest)
+    if len(normalized_report_digest) != 32:
+        raise ValueError("candidate audit report digest is invalid")
+    normalized_intent = normalize_candidate_activation_intent(
+        activation_intent
+    )
+    intent_bytes = normalized_intent.encode("ascii")
+    return hashlib.sha256(
+        _PTG2_CANDIDATE_ATTESTATION_DIGEST_DOMAIN
+        + normalized_report_digest
+        + len(intent_bytes).to_bytes(2, "big")
+        + intent_bytes
+    ).digest()
+
+
+def parse_candidate_attestation_digest(value: Any) -> bytes:
+    """Parse one full SHA-256 approval digest without accepting truncation."""
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        digest = bytes(value)
+    else:
+        digest_text = str(value or "").strip()
+        if len(digest_text) != 64:
+            raise ValueError(
+                "expected_audit_only_attestation_digest must be 64 hex characters"
+            )
+        try:
+            digest = bytes.fromhex(digest_text)
+        except ValueError as exc:
+            raise ValueError(
+                "expected_audit_only_attestation_digest must be 64 hex characters"
+            ) from exc
+    if len(digest) != 32:
+        raise ValueError(
+            "expected_audit_only_attestation_digest must be 64 hex characters"
+        )
+    return digest
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -818,28 +888,16 @@ def _validated_candidate_quarantine(
     return layout_quarantine_by_field
 
 
-def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate candidate bindings and return their immutable audit identity."""
+def _candidate_evidence_identity(
+    database_row: Mapping[str, Any],
+    *,
+    activation_by_field: Mapping[str, Any],
+    serving_index_by_field: Mapping[str, Any],
+    layout_serving_index_by_field: Mapping[str, Any],
+    storage_generation: str,
+) -> dict[str, Any]:
+    """Build immutable evidence fields after candidate contract validation."""
 
-    snapshot_by_field = _mapping(database_row.get("manifest"))
-    activation_by_field = _mapping(snapshot_by_field.get("activation"))
-    layout_manifest_by_field = _mapping(database_row.get("layout_manifest"))
-    serving_index_by_field = _mapping(snapshot_by_field.get("serving_index"))
-    if (
-        str(database_row.get("status") or "") != "validated"
-        or activation_by_field.get("contract")
-        != PTG2_CANDIDATE_ACTIVATION_CONTRACT
-        or activation_by_field.get("state") != "validated"
-    ):
-        raise ValueError("snapshot is not a strict validated candidate")
-    layout_serving_index_by_field = _mapping(
-        layout_manifest_by_field.get("serving_index")
-    )
-    storage_generation = validate_candidate_layout_identity(
-        database_row,
-        serving_index_by_field,
-        layout_serving_index_by_field,
-    )
     physical_identity = _validated_candidate_physical_identity(
         database_row,
         serving_index_by_field,
@@ -871,7 +929,9 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
             activation_by_field.get("source_key") or ""
         ).strip().lower(),
         "plan_id": str(database_row.get("plan_id") or "").strip(),
-        "plan_market_type": str(database_row.get("plan_market_type") or "").strip().lower(),
+        "plan_market_type": str(
+            database_row.get("plan_market_type") or ""
+        ).strip().lower(),
         "coverage_scope_id": physical_identity.coverage_scope_id,
         "source_set_digest": physical_identity.source_set_digest,
         "ordered_source_ordinal_digest": ordered_source_ordinal_digest(
@@ -886,6 +946,37 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
             provider_identifier_quarantine_evidence(quarantine_by_field)
         ),
     }
+
+
+def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate candidate bindings and return their immutable audit identity."""
+
+    snapshot_by_field = _mapping(database_row.get("manifest"))
+    activation_by_field = _mapping(snapshot_by_field.get("activation"))
+    layout_manifest_by_field = _mapping(database_row.get("layout_manifest"))
+    serving_index_by_field = _mapping(snapshot_by_field.get("serving_index"))
+    if (
+        str(database_row.get("status") or "") != "validated"
+        or activation_by_field.get("contract")
+        != PTG2_CANDIDATE_ACTIVATION_CONTRACT
+        or activation_by_field.get("state") != "validated"
+    ):
+        raise ValueError("snapshot is not a strict validated candidate")
+    layout_serving_index_by_field = _mapping(
+        layout_manifest_by_field.get("serving_index")
+    )
+    storage_generation = validate_candidate_layout_identity(
+        database_row,
+        serving_index_by_field,
+        layout_serving_index_by_field,
+    )
+    return _candidate_evidence_identity(
+        database_row,
+        activation_by_field=activation_by_field,
+        serving_index_by_field=serving_index_by_field,
+        layout_serving_index_by_field=layout_serving_index_by_field,
+        storage_generation=storage_generation,
+    )
 
 
 async def _locked_candidate_identity(
@@ -959,189 +1050,265 @@ async def _database_timestamp(session: Any) -> datetime.datetime:
     return timestamp.astimezone(datetime.timezone.utc)
 
 
-async def record_candidate_audit_attestation(
-    *,
-    snapshot_id: str,
-    source_key: str,
-    plan_id: str,
-    plan_market_type: str,
-    report: Mapping[str, Any],
-    storage_generation: str = PTG2_CANDIDATE_V3_GENERATION,
-) -> dict[str, Any]:
-    """Persist a passing release report against the candidate's immutable identity."""
+@dataclass(frozen=True)
+class _CandidateAttestationTarget:
+    snapshot_id: str
+    source_key: str
+    plan_id: str
+    plan_market_type: str
+    storage_generation: str
+    activation_intent: str
 
-    normalized_snapshot_id = str(snapshot_id or "").strip()
-    normalized_source_key = str(source_key or "").strip().lower()
-    normalized_plan_id = str(plan_id or "").strip()
-    normalized_market_type = str(plan_market_type or "").strip().lower()
-    normalized_storage_generation = normalize_candidate_storage_generation(
-        storage_generation
+
+def _candidate_attestation_target(
+    *,
+    snapshot_id: Any,
+    source_key: Any,
+    plan_id: Any,
+    plan_market_type: Any,
+    storage_generation: Any,
+    activation_intent: Any,
+) -> _CandidateAttestationTarget:
+    """Normalize the exact candidate target and immutable activation intent."""
+
+    attestation_target = _CandidateAttestationTarget(
+        snapshot_id=str(snapshot_id or "").strip(),
+        source_key=str(source_key or "").strip().lower(),
+        plan_id=str(plan_id or "").strip(),
+        plan_market_type=str(plan_market_type or "").strip().lower(),
+        storage_generation=normalize_candidate_storage_generation(
+            storage_generation
+        ),
+        activation_intent=normalize_candidate_activation_intent(
+            activation_intent
+        ),
     )
     if not all(
         (
-            normalized_snapshot_id,
-            normalized_source_key,
-            normalized_plan_id,
-            normalized_market_type,
+            attestation_target.snapshot_id,
+            attestation_target.source_key,
+            attestation_target.plan_id,
+            attestation_target.plan_market_type,
         )
     ):
         raise ValueError("snapshot, source, plan, and market are required")
-    preflight_now = datetime.datetime.now(datetime.timezone.utc)
+    return attestation_target
+
+
+def _validated_attestation_evidence(
+    report: Mapping[str, Any],
+    *,
+    attestation_target: _CandidateAttestationTarget,
+    evaluated_at: datetime.datetime,
+) -> dict[str, Any]:
+    """Validate one report against its normalized candidate target."""
+
     evidence = validate_candidate_release_audit_report(
         report,
-        snapshot_id=normalized_snapshot_id,
-        source_key=normalized_source_key,
-        plan_id=normalized_plan_id,
-        plan_market_type=normalized_market_type,
-        storage_generation=normalized_storage_generation,
-        evaluated_at=preflight_now,
+        snapshot_id=attestation_target.snapshot_id,
+        source_key=attestation_target.source_key,
+        plan_id=attestation_target.plan_id,
+        plan_market_type=attestation_target.plan_market_type,
+        storage_generation=attestation_target.storage_generation,
+        evaluated_at=evaluated_at,
     )
     _require_current_candidate_attestation_writer(evidence)
-    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    async with db.transaction() as session:
-        await acquire_ptg2_lifecycle_lock(session)
-        now = await _database_timestamp(session)
-        evidence = validate_candidate_release_audit_report(
-            report,
-            snapshot_id=normalized_snapshot_id,
-            source_key=normalized_source_key,
-            plan_id=normalized_plan_id,
-            plan_market_type=normalized_market_type,
-            storage_generation=normalized_storage_generation,
-            evaluated_at=now,
+    return evidence
+
+
+def _validate_attestation_identity_binding(
+    evidence: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    attestation_target: _CandidateAttestationTarget,
+) -> None:
+    """Cross-check report evidence against the locked sealed candidate."""
+
+    if (
+        identity["source_key"] != attestation_target.source_key
+        or identity["plan_id"] != attestation_target.plan_id
+        or identity["plan_market_type"] != attestation_target.plan_market_type
+        or identity["storage_generation"]
+        != attestation_target.storage_generation
+        or evidence["storage_generation"]
+        != attestation_target.storage_generation
+    ):
+        raise ValueError("audit target does not match the candidate bindings")
+    for evidence_name, identity_name, message in (
+        (
+            "audit_sample_digest",
+            "audit_sample_digest",
+            "audit report does not match the sealed candidate sample",
+        ),
+        (
+            "source_set_digest",
+            "source_set_digest",
+            "audit report does not match the sealed candidate sources",
+        ),
+        (
+            "source_witness_digest",
+            "source_witness_digest",
+            "audit report does not match the sealed source witnesses",
+        ),
+    ):
+        if evidence[evidence_name] != identity[identity_name]:
+            raise ValueError(message)
+    if evidence["contract"] == PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4:
+        _validate_v4_writer_identity_binding(evidence, identity)
+        is_quarantine_match = (
+            evidence.get("provider_identifier_quarantine_evidence")
+            == identity["provider_identifier_quarantine_evidence"]
         )
-        _require_current_candidate_attestation_writer(evidence)
-        expires_at = min(
-            now + datetime.timedelta(hours=_attestation_ttl_hours()),
-            evidence["completed_at"] + _audit_report_max_age(),
+    else:
+        is_quarantine_match = (
+            evidence["provider_identifier_quarantine"]
+            == identity["provider_identifier_quarantine"]
         )
-        if expires_at <= now:
-            raise ValueError("audit report is too old for candidate activation")
-        identity = await _locked_candidate_identity(
-            session,
-            schema_name=schema_name,
-            snapshot_id=normalized_snapshot_id,
+    if not is_quarantine_match:
+        raise ValueError(
+            "audit report provider identifier quarantine does not match the sealed candidate"
         )
-        if (
-            identity["source_key"] != normalized_source_key
-            or identity["plan_id"] != normalized_plan_id
-            or identity["plan_market_type"] != normalized_market_type
-            or identity["storage_generation"]
-            != normalized_storage_generation
-            or evidence["storage_generation"]
-            != normalized_storage_generation
-        ):
-            raise ValueError("audit target does not match the candidate bindings")
-        if evidence["audit_sample_digest"] != identity["audit_sample_digest"]:
-            raise ValueError("audit report does not match the sealed candidate sample")
-        if evidence["source_set_digest"] != identity["source_set_digest"]:
-            raise ValueError("audit report does not match the sealed candidate sources")
-        if (
-            evidence["contract"] == PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-            and evidence.get("ordered_source_ordinal_digest")
-            != identity["ordered_source_ordinal_digest"]
-        ):
-            raise ValueError(
-                "audit report does not match the sealed candidate source ordinals"
-            )
-        if evidence["contract"] == PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4 and (
-            evidence.get("source_witness_manifest")
-            != identity["source_witness_manifest"]
-            or evidence.get("audit_sample_public")
-            != identity["audit_sample_public"]
-        ):
-            raise ValueError(
-                "audit report metadata does not match the sealed candidate"
-            )
-        if evidence["source_witness_digest"] != identity["source_witness_digest"]:
-            raise ValueError("audit report does not match the sealed source witnesses")
-        if evidence["contract"] == PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4:
-            is_quarantine_match = (
-                evidence.get("provider_identifier_quarantine_evidence")
-                == identity["provider_identifier_quarantine_evidence"]
-            )
-        else:
-            is_quarantine_match = (
-                evidence["provider_identifier_quarantine"]
-                == identity["provider_identifier_quarantine"]
-            )
-        if not is_quarantine_match:
-            raise ValueError(
-                "audit report provider identifier quarantine does not match the sealed candidate"
-            )
-        insert_result = await session.execute(
-            db.text(
-                f"""
-                INSERT INTO {_quote_ident(schema_name)}.ptg2_v3_candidate_audit_attestation AS attestation
-                    (snapshot_id, snapshot_key, source_key, plan_id,
-                     plan_market_type, coverage_scope_id, source_set_digest,
-                     audit_sample_digest, source_witness_digest,
-                     contract, tool_name, tool_version, report_digest, report,
-                     attested_at, expires_at, activated_at)
-                VALUES
-                    (:snapshot_id, :snapshot_key, :source_key, :plan_id,
-                     :plan_market_type, :coverage_scope_id, :source_set_digest,
-                     :audit_sample_digest, :source_witness_digest,
-                     :contract, :tool_name, :tool_version, :report_digest,
-                     CAST(:report_json AS jsonb), :attested_at, :expires_at, NULL)
-                ON CONFLICT (snapshot_id) DO UPDATE SET
-                    contract = EXCLUDED.contract,
-                    tool_name = EXCLUDED.tool_name,
-                    tool_version = EXCLUDED.tool_version,
-                    report_digest = EXCLUDED.report_digest,
-                    report = EXCLUDED.report,
-                    attested_at = EXCLUDED.attested_at,
-                    expires_at = EXCLUDED.expires_at
-                WHERE attestation.snapshot_key = EXCLUDED.snapshot_key
-                  AND attestation.source_key = EXCLUDED.source_key
-                  AND attestation.plan_id = EXCLUDED.plan_id
-                  AND attestation.plan_market_type = EXCLUDED.plan_market_type
-                  AND attestation.coverage_scope_id = EXCLUDED.coverage_scope_id
-                  AND attestation.source_set_digest = EXCLUDED.source_set_digest
-                  AND attestation.audit_sample_digest = EXCLUDED.audit_sample_digest
-                  AND attestation.source_witness_digest = EXCLUDED.source_witness_digest
-                  AND attestation.activated_at IS NULL
-                  AND (
-                      (
-                          attestation.contract = EXCLUDED.contract
-                          AND attestation.tool_name = EXCLUDED.tool_name
-                      )
-                      OR (
-                          attestation.contract = :v3_contract
-                          AND attestation.tool_name = :v3_tool_name
-                          AND EXCLUDED.contract = :v4_contract
-                          AND EXCLUDED.tool_name = :v4_tool_name
-                      )
-                  )
-                RETURNING report_digest
-                """
-            ),
-            {
-                "snapshot_id": normalized_snapshot_id,
-                **identity,
-                "contract": evidence["contract"],
-                "tool_name": evidence["tool_name"],
-                "tool_version": evidence["tool_version"],
-                "report_digest": evidence["report_digest"],
-                "report_json": evidence["report_json"],
-                "audit_sample_digest": evidence["audit_sample_digest"],
-                "source_witness_digest": evidence["source_witness_digest"],
-                "attested_at": now,
-                "expires_at": expires_at,
-                "v3_contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
-                "v3_tool_name": PTG2_FAST_AUDIT_TOOL,
-                "v4_contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
-                "v4_tool_name": PTG2_BATCH_AUDIT_TOOL,
-            },
+
+
+def _validate_v4_writer_identity_binding(
+    evidence: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> None:
+    """Cross-check V4 ordinals and public audit metadata before persistence."""
+
+    if (
+        evidence.get("ordered_source_ordinal_digest")
+        != identity["ordered_source_ordinal_digest"]
+    ):
+        raise ValueError(
+            "audit report does not match the sealed candidate source ordinals"
         )
-        if insert_result.first() is None:
-            raise ValueError("candidate audit attestation conflicts with existing evidence")
-    attestation_result_by_field = {
+    if (
+        evidence.get("source_witness_manifest")
+        != identity["source_witness_manifest"]
+        or evidence.get("audit_sample_public")
+        != identity["audit_sample_public"]
+    ):
+        raise ValueError(
+            "audit report metadata does not match the sealed candidate"
+        )
+
+
+_CANDIDATE_ATTESTATION_UPSERT_SQL = """
+INSERT INTO {schema}.ptg2_v3_candidate_audit_attestation AS attestation
+    (snapshot_id, snapshot_key, source_key, plan_id,
+     plan_market_type, coverage_scope_id, source_set_digest,
+     audit_sample_digest, source_witness_digest,
+     contract, tool_name, tool_version, report_digest, report,
+     activation_intent, attestation_digest,
+     attested_at, expires_at, activated_at)
+VALUES
+    (:snapshot_id, :snapshot_key, :source_key, :plan_id,
+     :plan_market_type, :coverage_scope_id, :source_set_digest,
+     :audit_sample_digest, :source_witness_digest,
+     :contract, :tool_name, :tool_version, :report_digest,
+     CAST(:report_json AS jsonb), :activation_intent,
+     :attestation_digest, :attested_at, :expires_at, NULL)
+ON CONFLICT (snapshot_id) DO UPDATE SET
+    contract = EXCLUDED.contract,
+    tool_name = EXCLUDED.tool_name,
+    tool_version = EXCLUDED.tool_version,
+    report_digest = EXCLUDED.report_digest,
+    report = EXCLUDED.report,
+    attestation_digest = EXCLUDED.attestation_digest,
+    attested_at = EXCLUDED.attested_at,
+    expires_at = EXCLUDED.expires_at
+WHERE attestation.snapshot_key = EXCLUDED.snapshot_key
+  AND attestation.source_key = EXCLUDED.source_key
+  AND attestation.plan_id = EXCLUDED.plan_id
+  AND attestation.plan_market_type = EXCLUDED.plan_market_type
+  AND attestation.coverage_scope_id = EXCLUDED.coverage_scope_id
+  AND attestation.source_set_digest = EXCLUDED.source_set_digest
+  AND attestation.audit_sample_digest = EXCLUDED.audit_sample_digest
+  AND attestation.source_witness_digest = EXCLUDED.source_witness_digest
+  AND attestation.activation_intent = EXCLUDED.activation_intent
+  AND attestation.activated_at IS NULL
+  AND (
+      (
+          attestation.contract = EXCLUDED.contract
+          AND attestation.tool_name = EXCLUDED.tool_name
+      )
+      OR (
+          attestation.contract = :v3_contract
+          AND attestation.tool_name = :v3_tool_name
+          AND EXCLUDED.contract = :v4_contract
+          AND EXCLUDED.tool_name = :v4_tool_name
+      )
+  )
+RETURNING report_digest, activation_intent, attestation_digest
+"""
+
+
+async def _persist_candidate_attestation_row(
+    session: Any,
+    *,
+    schema_name: str,
+    attestation_target: _CandidateAttestationTarget,
+    identity: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    attested_at: datetime.datetime,
+    expires_at: datetime.datetime,
+) -> bytes:
+    """Upsert one still-unconsumed attestation with immutable intent."""
+
+    attestation_digest = candidate_attestation_digest(
+        evidence["report_digest"],
+        attestation_target.activation_intent,
+    )
+    insert_result = await session.execute(
+        db.text(
+            _CANDIDATE_ATTESTATION_UPSERT_SQL.format(
+                schema=_quote_ident(schema_name)
+            )
+        ),
+        {
+            "snapshot_id": attestation_target.snapshot_id,
+            **identity,
+            "contract": evidence["contract"],
+            "tool_name": evidence["tool_name"],
+            "tool_version": evidence["tool_version"],
+            "report_digest": evidence["report_digest"],
+            "report_json": evidence["report_json"],
+            "activation_intent": attestation_target.activation_intent,
+            "attestation_digest": attestation_digest,
+            "audit_sample_digest": evidence["audit_sample_digest"],
+            "source_witness_digest": evidence["source_witness_digest"],
+            "attested_at": attested_at,
+            "expires_at": expires_at,
+            "v3_contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+            "v3_tool_name": PTG2_FAST_AUDIT_TOOL,
+            "v4_contract": PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
+            "v4_tool_name": PTG2_BATCH_AUDIT_TOOL,
+        },
+    )
+    if insert_result.first() is None:
+        raise ValueError(
+            "candidate audit attestation conflicts with existing evidence"
+        )
+    return attestation_digest
+
+
+def _candidate_attestation_result(
+    *,
+    attestation_target: _CandidateAttestationTarget,
+    evidence: Mapping[str, Any],
+    attestation_digest: bytes,
+    expires_at: datetime.datetime,
+) -> dict[str, Any]:
+    """Build the stable attestation response including request metrics."""
+
+    result_by_field = {
         "status": "attested",
-        "snapshot_id": normalized_snapshot_id,
+        "snapshot_id": attestation_target.snapshot_id,
         "contract": evidence["contract"],
         "tool_version": evidence["tool_version"],
         "report_digest": evidence["report_digest"].hex(),
+        "activation_intent": attestation_target.activation_intent,
+        "attestation_digest": attestation_digest.hex(),
         "expires_at": expires_at.isoformat(),
         "checks": evidence["checks"],
     }
@@ -1150,46 +1317,118 @@ async def record_candidate_audit_attestation(
         "batch_api_actual_http_requests",
     ):
         if request_metric_name in evidence:
-            attestation_result_by_field[request_metric_name] = evidence[
+            result_by_field[request_metric_name] = evidence[
                 request_metric_name
             ]
-    return attestation_result_by_field
+    return result_by_field
 
 
-async def verify_candidate_audit_attestation_in_transaction(
+async def _record_candidate_attestation_in_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    attestation_target: _CandidateAttestationTarget,
+    report: Mapping[str, Any],
+) -> tuple[dict[str, Any], bytes, datetime.datetime]:
+    """Revalidate and persist evidence under the shared lifecycle lock."""
+
+    await acquire_ptg2_lifecycle_lock(session)
+    attested_at = await _database_timestamp(session)
+    evidence = _validated_attestation_evidence(
+        report,
+        attestation_target=attestation_target,
+        evaluated_at=attested_at,
+    )
+    expires_at = min(
+        attested_at + datetime.timedelta(hours=_attestation_ttl_hours()),
+        evidence["completed_at"] + _audit_report_max_age(),
+    )
+    if expires_at <= attested_at:
+        raise ValueError("audit report is too old for candidate activation")
+    identity = await _locked_candidate_identity(
+        session,
+        schema_name=schema_name,
+        snapshot_id=attestation_target.snapshot_id,
+    )
+    _validate_attestation_identity_binding(
+        evidence,
+        identity,
+        attestation_target,
+    )
+    attestation_digest = await _persist_candidate_attestation_row(
+        session,
+        schema_name=schema_name,
+        attestation_target=attestation_target,
+        identity=identity,
+        evidence=evidence,
+        attested_at=attested_at,
+        expires_at=expires_at,
+    )
+    return evidence, attestation_digest, expires_at
+
+
+async def record_candidate_audit_attestation(
+    *,
+    snapshot_id: str,
+    source_key: str,
+    plan_id: str,
+    plan_market_type: str,
+    report: Mapping[str, Any],
+    storage_generation: str = PTG2_CANDIDATE_V3_GENERATION,
+    activation_intent: str = (
+        PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
+    ),
+) -> dict[str, Any]:
+    """Persist a passing release report against the candidate's immutable identity."""
+
+    attestation_target = _candidate_attestation_target(
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+        plan_id=plan_id,
+        plan_market_type=plan_market_type,
+        storage_generation=storage_generation,
+        activation_intent=activation_intent,
+    )
+    preflight_now = datetime.datetime.now(datetime.timezone.utc)
+    evidence = _validated_attestation_evidence(
+        report,
+        attestation_target=attestation_target,
+        evaluated_at=preflight_now,
+    )
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    async with db.transaction() as session:
+        evidence, attestation_digest, expires_at = (
+            await _record_candidate_attestation_in_transaction(
+                session,
+                schema_name=schema_name,
+                attestation_target=attestation_target,
+                report=report,
+            )
+        )
+    return _candidate_attestation_result(
+        attestation_target=attestation_target,
+        evidence=evidence,
+        attestation_digest=attestation_digest,
+        expires_at=expires_at,
+    )
+
+
+async def _candidate_attestation_row(
     session: Any,
     *,
     schema_name: str,
     snapshot_id: str,
-    snapshot_key: int,
-    source_key: str,
-    plan_id: str,
-    plan_market_type: str,
-    coverage_scope_id: bytes,
-) -> bytes:
-    """Lock and verify unexpired evidence before atomic pointer activation."""
+    identity: Mapping[str, Any],
+) -> Any:
+    """Lock and return one attestation matching the sealed identity."""
 
-    identity = await _locked_candidate_identity(
-        session,
-        schema_name=schema_name,
-        snapshot_id=snapshot_id,
-    )
-    expected_identity_by_field = {
-        "snapshot_key": int(snapshot_key),
-        "source_key": str(source_key).strip().lower(),
-        "plan_id": str(plan_id).strip(),
-        "plan_market_type": str(plan_market_type).strip().lower(),
-        "coverage_scope_id": bytes(coverage_scope_id),
-    }
-    if any(
-        identity[key] != expected_value
-        for key, expected_value in expected_identity_by_field.items()
-    ):
-        raise ValueError("candidate identity changed after its release audit")
-    query_result = await session.execute(
+    attestation_query = await session.execute(
         db.text(
             f"""
-            SELECT report_digest, report
+            SELECT report_digest, report, activation_intent,
+                   attestation_digest, attested_at, expires_at,
+                   activated_at,
+                   expires_at > clock_timestamp() AS is_current
               FROM {_quote_ident(schema_name)}.ptg2_v3_candidate_audit_attestation
              WHERE snapshot_id = :snapshot_id
                AND snapshot_key = :snapshot_key
@@ -1201,18 +1440,18 @@ async def verify_candidate_audit_attestation_in_transaction(
                AND audit_sample_digest = :audit_sample_digest
                AND source_witness_digest = :source_witness_digest
                AND contract = ANY(CAST(:supported_contracts AS text[]))
-               AND activated_at IS NULL
-               AND expires_at > clock_timestamp()
              FOR UPDATE
             """
         ),
         {
             "snapshot_id": snapshot_id,
-            "snapshot_key": int(snapshot_key),
-            "source_key": str(source_key).strip().lower(),
-            "plan_id": str(plan_id).strip(),
-            "plan_market_type": str(plan_market_type).strip().lower(),
-            "coverage_scope_id": bytes(coverage_scope_id),
+            "snapshot_key": int(identity["snapshot_key"]),
+            "source_key": str(identity["source_key"]).strip().lower(),
+            "plan_id": str(identity["plan_id"]).strip(),
+            "plan_market_type": str(
+                identity["plan_market_type"]
+            ).strip().lower(),
+            "coverage_scope_id": bytes(identity["coverage_scope_id"]),
             "source_set_digest": identity["source_set_digest"],
             "audit_sample_digest": identity["audit_sample_digest"],
             "source_witness_digest": identity["source_witness_digest"],
@@ -1221,17 +1460,106 @@ async def verify_candidate_audit_attestation_in_transaction(
             ),
         },
     )
-    attestation_row = query_result.first()
+    return attestation_query.first()
+
+
+def _validated_attestation_binding(
+    attestation_row: Any,
+    *,
+    activation_intent: str,
+    allow_expired: bool,
+) -> tuple[bytes, dict[str, Any], str, bytes] | None:
+    """Validate the report-to-intent binding and current lifecycle state."""
+
+    normalized_activation_intent = normalize_candidate_activation_intent(
+        activation_intent
+    )
     if attestation_row is None:
-        raise ValueError("candidate has no current passing release audit attestation")
+        return None
     report_digest = bytes(attestation_row[0])
     if len(report_digest) != 32:
         raise ValueError("candidate audit attestation digest is invalid")
     stored_report = _mapping(attestation_row[1])
+    stored_activation_intent = normalize_candidate_activation_intent(
+        attestation_row[2]
+    )
+    if stored_activation_intent != normalized_activation_intent:
+        if (
+            stored_activation_intent
+            == PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY
+        ):
+            raise ValueError(
+                "candidate audit attestation is held for audit-only review"
+            )
+        raise ValueError("candidate audit attestation activation intent conflicts")
+    stored_attestation_digest = bytes(attestation_row[3])
+    expected_attestation_digest = candidate_attestation_digest(
+        report_digest,
+        stored_activation_intent,
+    )
+    if not hmac.compare_digest(
+        stored_attestation_digest,
+        expected_attestation_digest,
+    ):
+        raise ValueError("candidate audit attestation intent digest is invalid")
+    if attestation_row[6] is not None:
+        raise CandidateAttestationApprovalConflict(
+            "candidate audit attestation was already consumed"
+        )
+    if not bool(attestation_row[7]):
+        if allow_expired:
+            return None
+        raise ValueError(
+            "candidate has no current passing release audit attestation"
+        )
+    return (
+        report_digest,
+        stored_report,
+        stored_activation_intent,
+        stored_attestation_digest,
+    )
+
+
+def _validate_v4_attestation_metadata(
+    stored_report: Mapping[str, Any],
+    report_witness: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> None:
+    """Validate V4 ordinal, witness, and public sample evidence."""
+
+    report_batch = _required_report_mapping(stored_report, "batch")
+    if report_batch.get("ordered_source_ordinal_digest") != identity.get(
+        "ordered_source_ordinal_digest"
+    ):
+        raise ValueError(
+            "candidate source ordinals changed after its release audit"
+        )
+    report_audit_sample = validated_public_audit_sample_projection(
+        _required_report_mapping(stored_report, "api_audit_sample"),
+        expected_source_count=int(
+            identity["source_witness_manifest"]["source_count"]
+        ),
+    )
+    if (
+        report_witness != identity.get("source_witness_manifest")
+        or report_audit_sample != identity.get("audit_sample_public")
+    ):
+        raise ValueError(
+            "candidate audit metadata changed after its release audit"
+        )
+
+
+def _validate_attestation_report_identity(
+    stored_report: Mapping[str, Any],
+    report_digest: bytes,
+    identity: Mapping[str, Any],
+) -> None:
+    """Recompute report evidence against the locked candidate identity."""
+
     observed_report_digest = hashlib.sha256(
         _canonical_report_bytes(stored_report)
     ).digest()
-    if observed_report_digest != report_digest:
+    if not hmac.compare_digest(observed_report_digest, report_digest):
         raise ValueError("candidate audit attestation report changed after validation")
     report_source = _required_report_mapping(stored_report, "source")
     is_v4_report = (
@@ -1265,27 +1593,309 @@ async def verify_candidate_audit_attestation_in_transaction(
             "candidate source witness changed after its release audit"
         )
     if is_v4_report:
-        report_batch = _required_report_mapping(stored_report, "batch")
-        if report_batch.get("ordered_source_ordinal_digest") != identity.get(
-            "ordered_source_ordinal_digest"
-        ):
-            raise ValueError(
-                "candidate source ordinals changed after its release audit"
-            )
-        report_audit_sample = validated_public_audit_sample_projection(
-            _required_report_mapping(stored_report, "api_audit_sample"),
-            expected_source_count=int(
-                identity["source_witness_manifest"]["source_count"]
-            ),
+        _validate_v4_attestation_metadata(
+            stored_report,
+            report_witness,
+            identity,
         )
-        if (
-            report_witness != identity.get("source_witness_manifest")
-            or report_audit_sample != identity.get("audit_sample_public")
+
+
+async def _load_candidate_audit_attestation_in_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    identity: Mapping[str, Any],
+    activation_intent: str,
+    allow_expired: bool = False,
+) -> dict[str, Any] | None:
+    """Lock and validate one exact attestation and its durable intent."""
+
+    attestation_row = await _candidate_attestation_row(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        identity=identity,
+    )
+    validated_binding = _validated_attestation_binding(
+        attestation_row,
+        activation_intent=activation_intent,
+        allow_expired=allow_expired,
+    )
+    if validated_binding is None:
+        return None
+    (
+        report_digest,
+        stored_report,
+        stored_activation_intent,
+        stored_attestation_digest,
+    ) = validated_binding
+    _validate_attestation_report_identity(
+        stored_report,
+        report_digest,
+        identity,
+    )
+    return {
+        "status": "attested",
+        "snapshot_id": snapshot_id,
+        "report_digest": report_digest,
+        "report": stored_report,
+        "activation_intent": stored_activation_intent,
+        "attestation_digest": stored_attestation_digest,
+        "attested_at": attestation_row[4],
+        "expires_at": attestation_row[5],
+    }
+
+
+async def _verify_candidate_attestation_in_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    expected_identity_by_field: Mapping[str, Any],
+    activation_intent: str,
+    expected_attestation_digest: bytes | None = None,
+) -> bytes:
+    """Lock and verify one intent-bound attestation against sealed identity."""
+
+    identity = await _locked_candidate_identity(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+    )
+    if any(
+        identity[key] != expected_value
+        for key, expected_value in expected_identity_by_field.items()
+    ):
+        raise ValueError("candidate identity changed after its release audit")
+    attestation = await _load_candidate_audit_attestation_in_transaction(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        identity=identity,
+        activation_intent=activation_intent,
+    )
+    if attestation is None:
+        raise ValueError(
+            "candidate has no current passing release audit attestation"
+        )
+    if expected_attestation_digest is not None:
+        expected_digest = parse_candidate_attestation_digest(
+            expected_attestation_digest
+        )
+        if not hmac.compare_digest(
+            expected_digest,
+            bytes(attestation["attestation_digest"]),
+        ):
+            raise CandidateAttestationApprovalConflict(
+                "candidate audit-only approval digest does not match the held attestation"
+            )
+    return bytes(attestation["report_digest"])
+
+
+def _expected_candidate_attestation_identity(
+    *,
+    snapshot_key: Any,
+    source_key: Any,
+    plan_id: Any,
+    plan_market_type: Any,
+    coverage_scope_id: Any,
+) -> dict[str, Any]:
+    """Normalize the sealed identity fields compared under attestation lock."""
+
+    return {
+        "snapshot_key": int(snapshot_key),
+        "source_key": str(source_key).strip().lower(),
+        "plan_id": str(plan_id).strip(),
+        "plan_market_type": str(plan_market_type).strip().lower(),
+        "coverage_scope_id": bytes(coverage_scope_id),
+    }
+
+
+async def verify_candidate_audit_attestation_in_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    snapshot_key: int,
+    source_key: str,
+    plan_id: str,
+    plan_market_type: str,
+    coverage_scope_id: bytes,
+) -> bytes:
+    """Lock and verify default promotable evidence before pointer activation."""
+
+    expected_identity_by_field = _expected_candidate_attestation_identity(
+        snapshot_key=snapshot_key,
+        source_key=source_key,
+        plan_id=plan_id,
+        plan_market_type=plan_market_type,
+        coverage_scope_id=coverage_scope_id,
+    )
+    return await _verify_candidate_attestation_in_transaction(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        expected_identity_by_field=expected_identity_by_field,
+        activation_intent=(
+            PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
+        ),
+    )
+
+
+async def verify_held_candidate_attestation_in_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    expected_identity_by_field: Mapping[str, Any],
+    expected_attestation_digest: bytes,
+) -> bytes:
+    """Lock and verify one explicitly reviewed audit-only hold."""
+
+    normalized_identity_by_field = _expected_candidate_attestation_identity(
+        snapshot_key=expected_identity_by_field.get("snapshot_key"),
+        source_key=expected_identity_by_field.get("source_key"),
+        plan_id=expected_identity_by_field.get("plan_id"),
+        plan_market_type=expected_identity_by_field.get("plan_market_type"),
+        coverage_scope_id=expected_identity_by_field.get("coverage_scope_id"),
+    )
+    return await _verify_candidate_attestation_in_transaction(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        expected_identity_by_field=normalized_identity_by_field,
+        activation_intent=PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY,
+        expected_attestation_digest=expected_attestation_digest,
+    )
+
+
+def _held_attestation_target(
+    *,
+    snapshot_id: str,
+    source_key: str,
+    plan_id: str,
+    plan_market_type: str,
+    storage_generation: str,
+) -> dict[str, str]:
+    """Normalize the exact identity required for held-attestation reuse."""
+
+    target_by_field = {
+        "snapshot_id": str(snapshot_id or "").strip(),
+        "source_key": str(source_key or "").strip().lower(),
+        "plan_id": str(plan_id or "").strip(),
+        "plan_market_type": str(plan_market_type or "").strip().lower(),
+        "storage_generation": normalize_candidate_storage_generation(
+            storage_generation
+        ),
+    }
+    if not all(
+        target_by_field[name]
+        for name in (
+            "snapshot_id",
+            "source_key",
+            "plan_id",
+            "plan_market_type",
+        )
+    ):
+        raise ValueError("snapshot, source, plan, and market are required")
+    return target_by_field
+
+
+async def load_held_candidate_audit_attestation(
+    *,
+    snapshot_id: str,
+    source_key: str,
+    plan_id: str,
+    plan_market_type: str,
+    storage_generation: str,
+) -> dict[str, Any] | None:
+    """Return one current held attestation without audit or promotion I/O."""
+
+    target_by_field = _held_attestation_target(
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+        plan_id=plan_id,
+        plan_market_type=plan_market_type,
+        storage_generation=storage_generation,
+    )
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    async with db.transaction() as session:
+        await acquire_ptg2_lifecycle_lock(session)
+        identity = await _locked_candidate_identity(
+            session,
+            schema_name=schema_name,
+            snapshot_id=target_by_field["snapshot_id"],
+        )
+        expected_identity_by_field = {
+            name: target_by_field[name]
+            for name in (
+                "source_key",
+                "plan_id",
+                "plan_market_type",
+                "storage_generation",
+            )
+        }
+        if any(
+            identity[key] != expected_value
+            for key, expected_value in expected_identity_by_field.items()
         ):
             raise ValueError(
-                "candidate audit metadata changed after its release audit"
+                "candidate identity changed after its release audit"
             )
-    return report_digest
+        attestation = await _load_candidate_audit_attestation_in_transaction(
+            session,
+            schema_name=schema_name,
+            snapshot_id=target_by_field["snapshot_id"],
+            identity=identity,
+            activation_intent=PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY,
+            allow_expired=True,
+        )
+    if attestation is None:
+        return None
+    return {
+        **attestation,
+        "report_digest": bytes(attestation["report_digest"]).hex(),
+        "attestation_digest": bytes(
+            attestation["attestation_digest"]
+        ).hex(),
+        "attested_at": attestation["attested_at"].isoformat(),
+        "expires_at": attestation["expires_at"].isoformat(),
+    }
+
+
+def _consumed_attestation_binding(
+    *,
+    report_digest: bytes,
+    activation_intent: str,
+    expected_attestation_digest: bytes | None,
+) -> tuple[str, bytes]:
+    """Return the exact intent and digest admitted by the consume statement."""
+
+    normalized_activation_intent = normalize_candidate_activation_intent(
+        activation_intent
+    )
+    attestation_digest = candidate_attestation_digest(
+        bytes(report_digest),
+        normalized_activation_intent,
+    )
+    if expected_attestation_digest is not None:
+        expected_digest = parse_candidate_attestation_digest(
+            expected_attestation_digest
+        )
+        if not hmac.compare_digest(expected_digest, attestation_digest):
+            raise CandidateAttestationApprovalConflict(
+                "candidate audit-only approval digest changed during activation"
+            )
+        return normalized_activation_intent, expected_digest
+    if (
+        normalized_activation_intent
+        == PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY
+    ):
+        raise ValueError(
+            "audit-only attestation activation requires its exact approval digest"
+        )
+    return normalized_activation_intent, attestation_digest
 
 
 async def consume_candidate_audit_attestation_in_transaction(
@@ -1295,11 +1905,22 @@ async def consume_candidate_audit_attestation_in_transaction(
     snapshot_id: str,
     report_digest: bytes,
     activated_at: datetime.datetime,
+    activation_intent: str = (
+        PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
+    ),
+    expected_attestation_digest: bytes | None = None,
 ) -> None:
     """Mark the exact locked attestation consumed by the successful activation."""
 
     if activated_at.tzinfo is None:
         activated_at = activated_at.replace(tzinfo=datetime.timezone.utc)
+    normalized_activation_intent, attestation_digest = (
+        _consumed_attestation_binding(
+            report_digest=report_digest,
+            activation_intent=activation_intent,
+            expected_attestation_digest=expected_attestation_digest,
+        )
+    )
 
     update_result = await session.execute(
         db.text(
@@ -1308,6 +1929,8 @@ async def consume_candidate_audit_attestation_in_transaction(
                SET activated_at = :activated_at
              WHERE snapshot_id = :snapshot_id
                AND report_digest = :report_digest
+               AND activation_intent = :activation_intent
+               AND attestation_digest = :attestation_digest
                AND activated_at IS NULL
                AND expires_at > clock_timestamp()
             RETURNING snapshot_id
@@ -1316,8 +1939,12 @@ async def consume_candidate_audit_attestation_in_transaction(
         {
             "snapshot_id": snapshot_id,
             "report_digest": bytes(report_digest),
+            "activation_intent": normalized_activation_intent,
+            "attestation_digest": attestation_digest,
             "activated_at": activated_at,
         },
     )
     if update_result.first() is None:
-        raise RuntimeError("candidate audit attestation changed during activation")
+        raise CandidateAttestationApprovalConflict(
+            "candidate audit attestation changed during activation"
+        )

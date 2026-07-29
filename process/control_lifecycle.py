@@ -202,6 +202,16 @@ async def control_single_job_start(
         target_function,
         terminal_metrics or target_result,
     )
+    terminal_phase_detail = (
+        str(terminal_progress["phase"])
+        if terminal_progress is not None
+        else f"{target_function} succeeded"
+    )
+    terminal_progress_message = (
+        str(terminal_progress["message"])
+        if terminal_progress is not None
+        else "succeeded"
+    )
     preserve_finished_at = bool(
         run_shutdown
         and isinstance(ctx.get("context"), dict)
@@ -210,8 +220,8 @@ async def control_single_job_start(
     await mark_control_run(
         run_id,
         status="succeeded",
-        phase_detail=f"{target_function} succeeded",
-        progress_message="succeeded",
+        phase_detail=terminal_phase_detail,
+        progress_message=terminal_progress_message,
         metrics=terminal_metrics,
         progress=terminal_progress,
         preserve_finished_at=preserve_finished_at,
@@ -388,7 +398,52 @@ async def _stop_live_progress_heartbeat(task: asyncio.Task | None) -> None:
         await task
 
 
-def _terminal_progress_from_result(target_function: str, terminal_result: Any) -> dict[str, Any] | None:
+def _explicit_terminal_progress(
+    terminal_result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate one importer-owned terminal progress projection."""
+
+    progress_by_field = terminal_result.get("terminal_progress")
+    if not isinstance(progress_by_field, dict):
+        return None
+    done = progress_by_field.get("done")
+    total = progress_by_field.get("total")
+    pct = progress_by_field.get("pct")
+    unit = progress_by_field.get("unit")
+    message = progress_by_field.get("message")
+    phase = progress_by_field.get("phase")
+    is_valid = (
+        isinstance(done, int)
+        and not isinstance(done, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and 0 <= done <= total
+        and pct == 100
+        and isinstance(unit, str)
+        and bool(unit.strip())
+        and isinstance(message, str)
+        and bool(message.strip())
+        and isinstance(phase, str)
+        and bool(phase.strip())
+    )
+    if not is_valid:
+        raise ValueError("terminal progress result is invalid")
+    return {
+        "unit": unit.strip(),
+        "done": done,
+        "total": total,
+        "pct": 100,
+        "message": message.strip(),
+        "phase": phase.strip(),
+    }
+
+
+def _terminal_progress_from_result(
+    target_function: str,
+    terminal_result: Any,
+) -> dict[str, Any] | None:
+    """Return explicit or count-derived terminal progress."""
+
     if isinstance(terminal_result, int):
         return {
             "unit": "items",
@@ -400,6 +455,8 @@ def _terminal_progress_from_result(target_function: str, terminal_result: Any) -
         }
     if not isinstance(terminal_result, dict):
         return None
+    if (explicit_progress := _explicit_terminal_progress(terminal_result)) is not None:
+        return explicit_progress
     count_keys = (
         "rows",
         "row_count",

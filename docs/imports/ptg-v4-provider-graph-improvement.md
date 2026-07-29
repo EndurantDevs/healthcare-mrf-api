@@ -236,10 +236,36 @@ Other malformed NPI shapes remain fail-closed.
 
 ## Release gates
 
-The existing candidate audit completes exactness and integrity checks before
-activation. Dev-only operational latency and physical-storage gates run
-immediately after that audited activation; a failure reactivates the retained
-V3 snapshot and blocks promotion beyond dev.
+The candidate audit completes exactness and integrity checks before activation.
+Normal imports use `candidate_audit_mode=audit_and_activate`, preserving the
+existing audit-plus-promotion behavior. V4 comparison imports explicitly use
+`candidate_audit_mode=audit_only`: they record the same passing attestation but
+return a `validated` snapshot with `activation_status=deferred`, never enter
+the promotion phase, and leave every current pointer unchanged. The control
+plane must verify that the engine advertises this mode before enqueueing work.
+Unknown modes, missing audit-only result markers, an activated import ID, or an
+equivalent-layout reuse fail closed.
+
+The attestation persists `activation_intent` and a digest binding that intent
+to the audited report. Generic promotion and attestation consumption accept
+only `audit_and_activate`; an `audit_only` attestation is a durable hold and
+requires a separately reviewed release action. That action calls the existing
+source-snapshot promote control with the full
+`expected_audit_only_attestation_digest` returned by the candidate audit.
+Omitting the digest keeps the generic promotion fail-closed; malformed,
+mismatched, expired, or already-consumed approvals fail before pointer writes.
+An exact approval locks the candidate and held attestation, compares the full
+intent-bound digest in constant time, and consumes that exact hold atomically
+with publication and pointer activation. It does not mutate the intent or
+repeat the audit. Redelivery reuses an unexpired held attestation without
+public audit I/O or promotion. Its terminal progress is `candidate audit-only
+complete`, with exact request counts retained through the control wrapper
+instead of being replaced by a generic success phase.
+
+Dev-only operational latency, price-comparison, and physical-storage gates run
+against the inactive attested candidate. A separate reviewed activation step
+is required after those gates; an audit-only source import cannot enter the
+generic promotion or route/release reconciliation paths.
 
 1. Exact counts, digests, packed-map roots, relation manifests, prefix
    overrides, and diagnostics must reconcile against PostgreSQL.
