@@ -170,6 +170,24 @@ def _physical_identity():
     }
 
 
+def _provider_metadata_input(tmp_path, source_run_digest):
+    provider_metadata_path = tmp_path / "provider-metadata.copy"
+    provider_metadata_payload = b"00000000000000000000000000000001\t1\t{}\n"
+    provider_metadata_path.write_bytes(provider_metadata_payload)
+    return [
+        {
+            "path": str(provider_metadata_path),
+            "row_count": 1,
+            "bytes": len(provider_metadata_payload),
+            "sha256": hashlib.sha256(provider_metadata_payload).hexdigest(),
+            "format": "ptg2_v3_provider_set_metadata_copy",
+            "version": 1,
+            **_physical_identity(),
+            "source_run_contract_sha256": source_run_digest,
+        }
+    ]
+
+
 def _finalizer_inputs(tmp_path):
     """Create a complete one-source finalizer input set."""
 
@@ -219,23 +237,10 @@ def _finalizer_inputs(tmp_path):
             "serving_code_dictionary_bytes": 64,
         },
     )
-    provider_metadata_path = tmp_path / "provider-metadata.copy"
-    provider_metadata_payload = b"00000000000000000000000000000001\t1\t{}\n"
-    provider_metadata_path.write_bytes(provider_metadata_payload)
-    provider_metadata_entries = [
-        {
-            "path": str(provider_metadata_path),
-            "row_count": 1,
-            "bytes": len(provider_metadata_payload),
-            "sha256": hashlib.sha256(provider_metadata_payload).hexdigest(),
-            "format": "ptg2_v3_provider_set_metadata_copy",
-            "version": 1,
-            **_physical_identity(),
-            "source_run_contract_sha256": serving_entries[0][
-                "source_run_contract_sha256"
-            ],
-        }
-    ]
+    provider_metadata_entries = _provider_metadata_input(
+        tmp_path,
+        serving_entries[0]["source_run_contract_sha256"],
+    )
     price_key_map_path = tmp_path / "price-key-map.copy"
     price_key_map_path.write_bytes(b"map")
     return serving_entries, code_entries, provider_metadata_entries, price_key_map_path

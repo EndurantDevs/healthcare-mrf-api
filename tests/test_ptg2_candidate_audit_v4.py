@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_candidate_audit_reverse as reverse_scope
+from api import ptg2_candidate_audit_scope_dispatch as scope_dispatch
 from api import ptg2_candidate_audit_v4 as v4_scope
 from api import ptg2_serving as serving
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
@@ -165,24 +166,39 @@ def _install_v4_graph(
     return graph_calls
 
 
-@pytest.mark.parametrize(
-    ("representation", "first_relation", "second_relation"),
-    (
-        ("pattern_v1", "npi_patterns", "pattern_sets"),
-        ("direct_v1", "npi_groups_exact", "group_sets_direct"),
-    ),
-)
-@pytest.mark.asyncio
-async def test_v4_candidate_scope_uses_bounded_code_first_graph(
-    monkeypatch,
-    representation,
-    first_relation,
-    second_relation,
+def _assert_direct_scope(
+    observed_scope,
+    expected_price_index,
+    challenge,
+    persisted,
+    graph_calls,
 ):
-    """Prove pattern and direct V4 layouts without invoking the V3 graph."""
+    assert observed_scope.provider_set_keys_by_npi == {
+        challenge.npi: (5,),
+        persisted.npi: (7,),
+    }
+    assert observed_scope.price_keys_by_occurrence is expected_price_index
+    assert [call["relation"] for call in graph_calls] == [
+        "npi_groups_exact",
+        "group_sets_direct",
+        "npi_groups_exact",
+        "group_sets_direct",
+    ]
+    assert all(call["schema_name"] == "candidate_schema" for call in graph_calls)
+    assert all(int(call["max_members"]) > 0 for call in graph_calls)
+    assert all(len(tuple(call["owner_keys"])) == 1 for call in graph_calls)
+
+
+@pytest.mark.asyncio
+async def test_direct_v4_candidate_scope_preserves_code_first_graph(
+    monkeypatch,
+):
+    """Keep the established direct-layout forward-first proof unchanged."""
 
     challenge = _challenge()
     persisted = _persisted_occurrence()
+    first_relation = "npi_groups_exact"
+    second_relation = "group_sets_direct"
     expected_price_index = {
         (7, 5, 0): (10,),
         (7, 9, 0): (11,),
@@ -195,9 +211,20 @@ async def test_v4_candidate_scope_uses_bounded_code_first_graph(
         "lookup_forward_price_index_from_db",
         forward_lookup,
     )
+    monkeypatch.setattr(
+        scope_dispatch,
+        "load_v4_graph_root",
+        AsyncMock(
+            return_value=V4GraphRoot(
+                snapshot_key=43,
+                representation="direct_v1",
+                map_digest=b"m" * 32,
+            )
+        ),
+    )
     graph_calls = _install_v4_graph(
         monkeypatch,
-        representation=representation,
+        representation="direct_v1",
         first_relation=first_relation,
         second_relation=second_relation,
         challenge=challenge,
@@ -214,22 +241,15 @@ async def test_v4_candidate_scope_uses_bounded_code_first_graph(
         schema_name="candidate_schema",
     )
 
-    assert observed_scope.provider_set_keys_by_npi == {
-        challenge.npi: (5,),
-        persisted.npi: (7,),
-    }
-    assert observed_scope.price_keys_by_occurrence is expected_price_index
+    _assert_direct_scope(
+        observed_scope,
+        expected_price_index,
+        challenge,
+        persisted,
+        graph_calls,
+    )
     broad_scope_lookup.assert_not_awaited()
     assert forward_lookup.await_args.args[1] == {7: (0,), 8: (1,)}
-    assert [call["relation"] for call in graph_calls] == [
-        first_relation,
-        second_relation,
-        first_relation,
-        second_relation,
-    ]
-    assert all(call["schema_name"] == "candidate_schema" for call in graph_calls)
-    assert all(int(call["max_members"]) > 0 for call in graph_calls)
-    assert all(len(tuple(call["owner_keys"])) == 1 for call in graph_calls)
 
 
 @pytest.mark.asyncio

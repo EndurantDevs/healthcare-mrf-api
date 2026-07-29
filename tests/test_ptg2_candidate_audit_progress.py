@@ -49,7 +49,7 @@ async def test_partition_progress_callback_is_best_effort():
 
     callback = AsyncMock(side_effect=RuntimeError("status sink unavailable"))
 
-    await audit._publish_partition_progress(
+    await audit.publish_partition_progress(
         callback,
         completed=2,
         total=5,

@@ -54,6 +54,7 @@ from process.ptg_parts.ptg2_candidate_audit_plan_store import (
     load_persisted_audit_sample,
 )
 from process.ptg_parts.ptg2_partitioned_candidate_audit import (
+    PartitionFailureCallback,
     run_partitioned_candidate_audit,
 )
 from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
@@ -256,14 +257,45 @@ class _CandidateScopeState:
     current_snapshot_id: str | None
 
 
-class CandidateAuditReleaseGateError(RuntimeError):
+class _CandidateAuditProcessError(RuntimeError):
+    """Process failure retaining only authenticated partition diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partition_index: int | None = None,
+        partition_count: int | None = None,
+        partition_digest: str | None = None,
+        plan_digest: str | None = None,
+        request_digest: str | None = None,
+    ) -> None:
+        self.partition_index = partition_index
+        self.partition_count = partition_count
+        self.partition_digest = partition_digest
+        self.plan_digest = plan_digest
+        self.request_digest = request_digest
+        diagnostic_suffix = (
+            ""
+            if partition_index is None
+            else (
+                f" [partition_index={partition_index}, "
+                f"partition_count={partition_count}, "
+                f"partition_digest={partition_digest}, "
+                f"plan_digest={plan_digest}, request_digest={request_digest}]"
+            )
+        )
+        super().__init__(f"{message}{diagnostic_suffix}")
+
+
+class CandidateAuditReleaseGateError(_CandidateAuditProcessError):
     """A deterministic release-audit mismatch that must not be retried."""
 
     control_error_code = "ptg_candidate_audit_release_gate_failed"
     retryable = False
 
 
-class CandidateAuditTransportError(RuntimeError):
+class CandidateAuditTransportError(_CandidateAuditProcessError):
     """An audit transport failure that requires an explicit retry."""
 
     control_error_code = "ptg_candidate_audit_transport_failed"
@@ -1102,40 +1134,20 @@ async def run_batch_release_audit(
     *,
     http_config: FastAuditHttpConfig | None = None,
     progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+    failure_callback: PartitionFailureCallback | None = None,
 ) -> dict[str, Any]:
     """Load sealed evidence once, then run bounded API partitions."""
 
     try:
-        witness = await load_shared_source_witness(
-            schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
-            snapshot_key=candidate_target.snapshot_key,
-            expected_raw_source_sha256=(
-                candidate_target.raw_container_sha256
-            ),
-            expected_metadata=candidate_target.source_witness,
-        )
-        persisted_sample = await load_persisted_audit_sample(
-            schema_name=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
-            snapshot_key=candidate_target.snapshot_key,
-            expected_metadata=candidate_target.audit_sample,
+        witness, persisted_sample = await _load_partitioned_audit_evidence(
+            candidate_target
         )
         audit_report = await run_partitioned_candidate_audit(
-            audit_target=BatchAuditReportTarget(
-                snapshot_id=candidate_target.snapshot_id,
-                source_key=candidate_target.source_key,
-                plan_id=candidate_target.plan_id,
-                plan_market_type=candidate_target.plan_market_type,
-                raw_container_sha256=candidate_target.raw_container_sha256,
-                source_witness=candidate_target.source_witness,
-                audit_sample=candidate_target.audit_sample,
-                provider_identifier_quarantine=(
-                    candidate_target.provider_identifier_quarantine
-                ),
-                storage_generation=candidate_target.storage_generation,
-            ),
+            audit_target=_partitioned_audit_target(candidate_target),
             witness=witness,
             persisted_sample=persisted_sample,
             progress_callback=progress_callback,
+            failure_callback=failure_callback,
             http_config=(
                 http_config
                 if http_config is not None
@@ -1147,15 +1159,65 @@ async def run_batch_release_audit(
         )
     except BatchCandidateAuditContractError as exc:
         raise CandidateAuditReleaseGateError(
-            f"candidate release audit failed: {exc.reason}"
+            f"candidate release audit failed: {exc.reason}",
+            partition_index=exc.partition_index,
+            partition_count=exc.partition_count,
+            partition_digest=exc.partition_digest,
+            plan_digest=exc.plan_digest,
+            request_digest=exc.request_digest,
         ) from exc
     except BatchCandidateAuditTransportError as exc:
         raise CandidateAuditTransportError(
-            f"candidate release audit transport failed: {exc.reason}"
+            f"candidate release audit transport failed: {exc.reason}",
+            partition_index=exc.partition_index,
+            partition_count=exc.partition_count,
+            partition_digest=exc.partition_digest,
+            plan_digest=exc.plan_digest,
+            request_digest=exc.request_digest,
         ) from exc
     _require_v4_quarantine_match(audit_report, candidate_target)
     _require_passing_audit_report(audit_report)
     return audit_report
+
+
+async def _load_partitioned_audit_evidence(
+    candidate_target: CandidateAuditTarget,
+) -> tuple[Any, Any]:
+    """Load the sealed source and persisted samples for one V4 audit."""
+
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    witness = await load_shared_source_witness(
+        schema_name=schema_name,
+        snapshot_key=candidate_target.snapshot_key,
+        expected_raw_source_sha256=candidate_target.raw_container_sha256,
+        expected_metadata=candidate_target.source_witness,
+    )
+    persisted_sample = await load_persisted_audit_sample(
+        schema_name=schema_name,
+        snapshot_key=candidate_target.snapshot_key,
+        expected_metadata=candidate_target.audit_sample,
+    )
+    return witness, persisted_sample
+
+
+def _partitioned_audit_target(
+    candidate_target: CandidateAuditTarget,
+) -> BatchAuditReportTarget:
+    """Shape the immutable report target for partition execution."""
+
+    return BatchAuditReportTarget(
+        snapshot_id=candidate_target.snapshot_id,
+        source_key=candidate_target.source_key,
+        plan_id=candidate_target.plan_id,
+        plan_market_type=candidate_target.plan_market_type,
+        raw_container_sha256=candidate_target.raw_container_sha256,
+        source_witness=candidate_target.source_witness,
+        audit_sample=candidate_target.audit_sample,
+        provider_identifier_quarantine=(
+            candidate_target.provider_identifier_quarantine
+        ),
+        storage_generation=candidate_target.storage_generation,
+    )
 
 
 def _integer_metrics(mapping: Mapping[str, Any], keys: Sequence[str]) -> dict[str, int]:
@@ -1391,6 +1453,51 @@ async def _partition_progress(
     )
 
 
+async def _partition_failure_progress(
+    run_id: str | None,
+    *,
+    snapshot_id: str | None,
+    completed: int,
+    total: int,
+    failure: (
+        BatchCandidateAuditContractError
+        | BatchCandidateAuditTransportError
+    ),
+) -> None:
+    """Publish safe authenticated request identity for one failed partition."""
+
+    if not run_id or failure.partition_index is None:
+        return
+    bounded_total = max(int(total), 1)
+    bounded_completed = min(max(int(completed), 0), bounded_total)
+    partition_index = int(failure.partition_index)
+    message = (
+        f"audit partition index {partition_index} failed after "
+        f"{bounded_completed:,} of {bounded_total:,} completed"
+    )
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="candidate release audit",
+        progress_message=message,
+        snapshot_id=snapshot_id,
+        progress={
+            "unit": "partition",
+            "done": bounded_completed,
+            "total": bounded_total,
+            "pct": 20 + int((bounded_completed / bounded_total) * 64),
+            "message": message,
+            "phase": "candidate release audit",
+            "failed_partition_index": partition_index,
+            "partition_count": failure.partition_count,
+            "partition_digest": failure.partition_digest,
+            "plan_digest": failure.plan_digest,
+            "request_digest": failure.request_digest,
+            "failure_reason": failure.reason,
+        },
+    )
+
+
 @asynccontextmanager
 async def candidate_audit_guard(candidate_run_id: str) -> AsyncIterator[None]:
     """Serialize duplicate audits for one candidate across workers and nodes."""
@@ -1428,27 +1535,65 @@ async def _execute_release_audit(
     """Run the configured writer after its compatible readers are deployed."""
 
     if PTG2_BATCH_AUDIT_WRITER_ENABLED:
-        await _progress(
+        return await _execute_partitioned_release_audit(
+            candidate_target,
+            control_run_id=control_run_id,
+            http_config=http_config,
+        )
+    return await _execute_rolling_release_audit(
+        candidate_target,
+        control_run_id=control_run_id,
+        http_config=http_config,
+    )
+
+
+async def _execute_partitioned_release_audit(
+    candidate_target: CandidateAuditTarget,
+    *,
+    control_run_id: str | None,
+    http_config: FastAuditHttpConfig | None,
+) -> dict[str, Any]:
+    """Submit authenticated partitions with progress and failure diagnostics."""
+
+    await _progress(
+        control_run_id,
+        snapshot_id=candidate_target.snapshot_id,
+        phase="candidate release audit",
+        message=(
+            "submitting authenticated bounded API partitions for "
+            f"{int(candidate_target.source_witness['occurrence_witness_count']):,} "
+            "sealed source occurrences"
+        ),
+        pct=20,
+    )
+    return await run_batch_release_audit(
+        candidate_target,
+        http_config=http_config,
+        progress_callback=lambda completed, total: _partition_progress(
             control_run_id,
             snapshot_id=candidate_target.snapshot_id,
-            phase="candidate release audit",
-            message=(
-                "submitting authenticated bounded API partitions for "
-                f"{int(candidate_target.source_witness['occurrence_witness_count']):,} "
-                "sealed source occurrences"
-            ),
-            pct=20,
-        )
-        return await run_batch_release_audit(
-            candidate_target,
-            http_config=http_config,
-            progress_callback=lambda completed, total: _partition_progress(
+            completed=completed,
+            total=total,
+        ),
+        failure_callback=lambda completed, total, failure: (
+            _partition_failure_progress(
                 control_run_id,
                 snapshot_id=candidate_target.snapshot_id,
                 completed=completed,
                 total=total,
-            ),
-        )
+                failure=failure,
+            )
+        ),
+    )
+
+
+async def _execute_rolling_release_audit(
+    candidate_target: CandidateAuditTarget,
+    *,
+    control_run_id: str | None,
+    http_config: FastAuditHttpConfig | None,
+) -> dict[str, Any]:
+    """Run the compatibility writer against one locally loaded witness."""
 
     await _progress(
         control_run_id,

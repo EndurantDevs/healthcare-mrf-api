@@ -66,28 +66,23 @@ def _projection_fixture_for(
         pattern_member_count=pattern_member_count,
         packed_pattern_payload=pattern_payload,
     )
+    projection_by_field = {
+        "rule_digest": rule_digest,
+        "catalog_contract": taxonomy.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT,
+        "catalog_digest": catalog_digest,
+        "vector_format": taxonomy.PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT,
+        "member_count": len(npi_keys),
+        "member_digest": member_digest,
+        "member_keys": member_keys,
+        "representation": representation,
+        "pattern_count": len(npi_keys_by_pattern),
+        "pattern_member_count": pattern_member_count,
+        "pattern_member_bytes": len(pattern_payload),
+        "pattern_member_digest": pattern_member_digest,
+        "pattern_member_payload": pattern_payload,
+    }
     projection_manifest = taxonomy._candidate_projection_manifest(
-        (
-            {
-                "rule_digest": rule_digest,
-                "catalog_contract": (
-                    taxonomy.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT
-                ),
-                "catalog_digest": catalog_digest,
-                "vector_format": (
-                    taxonomy.PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT
-                ),
-                "member_count": len(npi_keys),
-                "member_digest": member_digest,
-                "member_keys": member_keys,
-                "representation": representation,
-                "pattern_count": len(npi_keys_by_pattern),
-                "pattern_member_count": pattern_member_count,
-                "pattern_member_bytes": len(pattern_payload),
-                "pattern_member_digest": pattern_member_digest,
-                "pattern_member_payload": pattern_payload,
-            },
-        )
+        (projection_by_field,)
     )
     candidates = taxonomy.V4InferredTaxonomyCandidates(
         rule_digest=rule_digest,
@@ -191,130 +186,17 @@ def _rate_row(provider_set_key: int) -> dict[str, object]:
     }
 
 
-@pytest.mark.asyncio
-async def test_inferred_taxonomy_v4_uses_exact_scoped_reverse_selection(
-    monkeypatch,
-) -> None:
-    """Resolve 21 matches from 22 candidates and 260 CPT sets exactly."""
-
-    projection_manifest, candidates = _projection_fixture()
-    candidate_npis = tuple(1_000_000_001 + index for index in range(22))
-    memberships_by_npi = {
-        npi: (
-            ((index % 14) + 1, ((index + 1) % 14) + 1)
-            if index < 19
-            else ((index % 14) + 1,)
-            if index < 21
-            else ()
-        )
-        for index, npi in enumerate(candidate_npis)
-    }
-    matching_provider_set_keys = tuple(
-        sorted(
-            {
-                provider_set_key
-                for provider_set_keys in memberships_by_npi.values()
-                for provider_set_key in provider_set_keys
-            }
-        )
-    )
-    assert len(matching_provider_set_keys) == 14
-    assert sum(map(len, memberships_by_npi.values())) == 40
-    merge_calls: list[tuple[int, ...] | None] = []
-
-    async def merge_rows(*_args, provider_set_keys, **_kwargs):
-        normalized_keys = (
-            None
-            if provider_set_keys is None
-            else tuple(sorted(provider_set_keys))
-        )
-        merge_calls.append(normalized_keys)
-        selected_keys = (
-            tuple(range(1, 261))
-            if normalized_keys is None
-            else normalized_keys
-        )
-        return [_rate_row(provider_set_key) for provider_set_key in selected_keys]
-
-    async def provider_rows(
-        *_args,
-        npis,
-        provider_set_ids_by_npi,
-        **_kwargs,
-    ):
-        return {
-            _provider_set_id(provider_set_key): [
-                {"npi": npi, "provider_name": f"Provider {npi}"}
-                for npi in npis
-                if _provider_set_id(provider_set_key)
-                in provider_set_ids_by_npi[npi]
-            ]
-            for provider_set_key in matching_provider_set_keys
-        }
-
-    candidate_loader = AsyncMock(return_value=candidates)
-    graph_lookup = AsyncMock(return_value=memberships_by_npi)
-    taxonomy_scope_calls: list[dict[str, int]] = []
-
-    @contextmanager
-    def taxonomy_scope(**limits):
-        taxonomy_scope_calls.append(limits)
-        yield
-
-    forward_prefix = AsyncMock(
-        side_effect=AssertionError("forward provider prefix must not run")
-    )
-    monkeypatch.setattr(
-        serving,
-        "load_v4_inferred_taxonomy_candidates",
-        candidate_loader,
-    )
-    monkeypatch.setattr(
-        serving,
-        "v4_npi_values_for_keys",
-        AsyncMock(
-            return_value={
-                npi_key: candidate_npis[npi_key]
-                for npi_key in candidates.npi_keys
-            }
-        ),
-    )
-    monkeypatch.setattr(
-        serving,
-        "_shared_forward_entries_for_code_rows",
-        AsyncMock(
-            side_effect=AssertionError(
-                "direct code scope must use the bounded rate merge"
-            )
-        ),
-    )
-    monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
-    monkeypatch.setattr(
-        serving,
-        "v4_graph_taxonomy_projection_scope",
-        taxonomy_scope,
-    )
-    monkeypatch.setattr(
-        serving,
-        "_merge_manifest_code_variant_rows",
-        merge_rows,
-    )
-    monkeypatch.setattr(
-        serving,
-        "_selected_provider_rows_by_set",
-        provider_rows,
-    )
-    monkeypatch.setattr(
-        serving,
-        "_filtered_provider_npis_for_expansion_set",
-        forward_prefix,
-    )
+async def _select_provider_expansion(
+    projection_manifest,
+    *,
+    rate_count,
+):
     serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
     try:
-        selection = await serving._strict_cost_provider_expansion_selection(
+        return await serving._strict_cost_provider_expansion_selection(
             object(),
             _tables(projection_manifest),
-            code_rows=[{"code_key": 4, "rate_count": 260}],
+            code_rows=[{"code_key": 4, "rate_count": rate_count}],
             args={
                 "plan_id": "synthetic-plan",
                 "code_system": "CPT",
@@ -328,6 +210,93 @@ async def test_inferred_taxonomy_v4_uses_exact_scoped_reverse_selection(
         )
     finally:
         serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
+
+
+def _exact_reverse_fixture():
+    projection_manifest, candidates = _projection_fixture()
+    candidate_npis = tuple(1_000_000_001 + index for index in range(22))
+    memberships_by_npi = {
+        npi: (
+            ((index % 14) + 1, ((index + 1) % 14) + 1)
+            if index < 19
+            else ((index % 14) + 1,)
+            if index < 21
+            else ()
+        )
+        for index, npi in enumerate(candidate_npis)
+    }
+    matching_keys = tuple(
+        sorted(
+            {
+                provider_set_key
+                for provider_set_keys in memberships_by_npi.values()
+                for provider_set_key in provider_set_keys
+            }
+        )
+    )
+    assert len(matching_keys) == 14
+    assert sum(map(len, memberships_by_npi.values())) == 40
+    return projection_manifest, candidates, candidate_npis, memberships_by_npi, matching_keys
+
+
+def _patch_exact_reverse_dependencies(
+    monkeypatch,
+    candidates,
+    candidate_npis,
+    memberships_by_npi,
+    matching_provider_set_keys,
+):
+    merge_calls: list[tuple[int, ...] | None] = []
+
+    async def merge_rows(*_args, provider_set_keys, **_kwargs):
+        normalized_keys = None if provider_set_keys is None else tuple(sorted(provider_set_keys))
+        merge_calls.append(normalized_keys)
+        selected_keys = tuple(range(1, 261)) if normalized_keys is None else normalized_keys
+        return [_rate_row(provider_set_key) for provider_set_key in selected_keys]
+
+    async def provider_rows(*_args, npis, provider_set_ids_by_npi, **_kwargs):
+        return {
+            _provider_set_id(provider_set_key): [
+                {"npi": npi, "provider_name": f"Provider {npi}"}
+                for npi in npis
+                if _provider_set_id(provider_set_key) in provider_set_ids_by_npi[npi]
+            ]
+            for provider_set_key in matching_provider_set_keys
+        }
+
+    candidate_loader = AsyncMock(return_value=candidates)
+    graph_lookup = AsyncMock(return_value=memberships_by_npi)
+    taxonomy_scope_calls: list[dict[str, int]] = []
+
+    @contextmanager
+    def taxonomy_scope(**limits):
+        taxonomy_scope_calls.append(limits)
+        yield
+
+    forward_prefix = AsyncMock(side_effect=AssertionError("forward provider prefix must not run"))
+    monkeypatch.setattr(serving, "load_v4_inferred_taxonomy_candidates", candidate_loader)
+    monkeypatch.setattr(serving, "v4_npi_values_for_keys", AsyncMock(return_value=dict(enumerate(candidate_npis))))
+    monkeypatch.setattr(serving, "_shared_forward_entries_for_code_rows", AsyncMock(side_effect=AssertionError("direct code scope must use the bounded rate merge")))
+    monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
+    monkeypatch.setattr(serving, "v4_graph_taxonomy_projection_scope", taxonomy_scope)
+    monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge_rows)
+    monkeypatch.setattr(serving, "_selected_provider_rows_by_set", provider_rows)
+    monkeypatch.setattr(serving, "_filtered_provider_npis_for_expansion_set", forward_prefix)
+    return candidate_loader, graph_lookup, taxonomy_scope_calls, forward_prefix, merge_calls
+
+
+@pytest.mark.asyncio
+async def test_inferred_taxonomy_v4_uses_exact_scoped_reverse_selection(
+    monkeypatch,
+) -> None:
+    """Resolve 21 matches from 22 candidates and 260 CPT sets exactly."""
+    fixture = _exact_reverse_fixture()
+    projection_manifest, candidates, candidate_npis, memberships_by_npi, matching_keys = fixture
+    patched = _patch_exact_reverse_dependencies(
+        monkeypatch, candidates, candidate_npis, memberships_by_npi, matching_keys
+    )
+    candidate_loader, graph_lookup, taxonomy_scope_calls, forward_prefix, merge_calls = patched
+    selection = await _select_provider_expansion(projection_manifest, rate_count=260)
 
     assert selection.total_lower_bound == 21
     assert selection.exhausted is True
@@ -407,30 +376,11 @@ async def test_direct_v1_admits_occurrences_and_distinct_sets_separately(
         ),
     )
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
-    serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
-    try:
-        with pytest.raises(
-            serving.PTG2OnlineWorkBudgetExceeded
-        ) as exc_info:
-            await serving._strict_cost_provider_expansion_selection(
-                object(),
-                _tables(projection_manifest),
-                code_rows=[
-                    {"code_key": 4, "rate_count": len(provider_set_keys)}
-                ],
-                args={
-                    "plan_id": "synthetic-plan",
-                    "code_system": "CPT",
-                    "code": "70553",
-                },
-                snapshot_id="ptg2:209901:filtered-reverse",
-                source_trace_set_hash=None,
-                network_names=[],
-                target_count=26,
-                descending=False,
-            )
-    finally:
-        serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+        await _select_provider_expansion(
+            projection_manifest,
+            rate_count=len(provider_set_keys),
+        )
 
     assert exc_info.value.dimension == expected_dimension
     assert graph_lookup.await_count == 0
@@ -580,27 +530,10 @@ async def test_pattern_v1_reference_shape_ranks_without_broad_npi_reverse(
         "_selected_provider_rows_by_set",
         provider_rows,
     )
-    serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
-    try:
-        selection = await serving._strict_cost_provider_expansion_selection(
-            object(),
-            _tables(projection_manifest),
-            code_rows=[
-                {"code_key": 4, "rate_count": rate_occurrence_count}
-            ],
-            args={
-                "plan_id": "synthetic-plan",
-                "code_system": "CPT",
-                "code": "70553",
-            },
-            snapshot_id="ptg2:209901:filtered-reverse",
-            source_trace_set_hash=None,
-            network_names=[],
-            target_count=26,
-            descending=False,
-        )
-    finally:
-        serving._PTG2_PROVIDER_EXPANSION_SELECTION_CACHE.clear()
+    selection = await _select_provider_expansion(
+        projection_manifest,
+        rate_count=rate_occurrence_count,
+    )
 
     expected_selected_npi_keys = tuple(range(0, 26 * pattern_count, pattern_count))
     assert selection.total_lower_bound == 26

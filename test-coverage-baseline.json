@@ -74,6 +74,7 @@
         "api/ptg2_candidate_audit_provider_code_sets.py",
         "api/ptg2_candidate_audit_provider_requests.py",
         "api/ptg2_candidate_audit_reverse.py",
+        "api/ptg2_candidate_audit_scope_dispatch.py",
         "api/ptg2_candidate_audit_selection.py",
         "api/ptg2_candidate_audit_v4.py",
         "api/ptg2_capacity_evidence.py",
@@ -329,6 +330,7 @@
         "process/ptg_parts/ptg2_lifecycle_lock.py",
         "process/ptg_parts/ptg2_manifest_artifacts.py",
         "process/ptg_parts/ptg2_manifest_publish.py",
+        "process/ptg_parts/ptg2_partition_failure_observability.py",
         "process/ptg_parts/ptg2_partitioned_candidate_audit.py",
         "process/ptg_parts/ptg2_partitioned_candidate_audit_contract.py",
         "process/ptg_parts/ptg2_partitioned_candidate_audit_report.py",
@@ -461,12 +463,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 36833,
-          "total": 41468
+          "covered": 36946,
+          "total": 41486
         },
         "lines": {
-          "covered": 116800,
-          "total": 123960
+          "covered": 117024,
+          "total": 124077
         }
       },
       "one_time_floor_reset": {

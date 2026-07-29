@@ -98,13 +98,12 @@ async def _assert_persisted_map_summary(
         )
 
 
-async def _assert_persisted_metadata_summary(
+def _patch_persisted_metadata_loaders(
     monkeypatch,
-    expected_summary,
+    expected_metadata,
     no_op,
+    taxonomy_calls,
 ) -> None:
-    """Assert persisted graph metadata is summarized without identity drift."""
-
     async def fake_aggregate(*_args, **_kwargs):
         return {
             "npi_count": 1,
@@ -120,16 +119,8 @@ async def _assert_persisted_metadata_summary(
             "heavy_owner_count": 0,
         }
 
-    async def fake_relations(*_args, **_kwargs):
+    async def fake_empty_mapping(*_args, **_kwargs):
         return {}
-
-    async def fake_counts(*_args, **_kwargs):
-        return {}
-
-    async def fake_owners(*_args, **_kwargs):
-        return {}
-
-    expected_metadata = _metadata(relation_count=0)
 
     async def fake_diagnostics(*_args, **_kwargs):
         return expected_metadata.provider_graph_diagnostics
@@ -137,16 +128,18 @@ async def _assert_persisted_metadata_summary(
     async def fake_resources(*_args, **_kwargs):
         return expected_metadata.provider_graph_resources
 
-    taxonomy_calls = []
-
     async def fake_taxonomy_candidates(*_args, **kwargs):
         taxonomy_calls.append(dict(kwargs))
         return expected_metadata.inferred_taxonomy_candidates
 
     monkeypatch.setattr(snapshot_maps, "_load_metadata_aggregate", fake_aggregate)
-    monkeypatch.setattr(snapshot_maps, "_load_relation_metadata", fake_relations)
-    monkeypatch.setattr(snapshot_maps, "_load_entry_counts_by_kind", fake_counts)
-    monkeypatch.setattr(snapshot_maps, "_load_heavy_owners", fake_owners)
+    monkeypatch.setattr(snapshot_maps, "_load_relation_metadata", fake_empty_mapping)
+    monkeypatch.setattr(
+        snapshot_maps,
+        "_load_entry_counts_by_kind",
+        fake_empty_mapping,
+    )
+    monkeypatch.setattr(snapshot_maps, "_load_heavy_owners", fake_empty_mapping)
     monkeypatch.setattr(snapshot_maps, "_validate_zero_heavy_locators", no_op)
     monkeypatch.setattr(
         snapshot_maps,
@@ -162,6 +155,22 @@ async def _assert_persisted_metadata_summary(
         snapshot_maps,
         "summarize_v4_inferred_taxonomy_candidates",
         fake_taxonomy_candidates,
+    )
+
+
+async def _assert_persisted_metadata_summary(
+    monkeypatch,
+    expected_summary,
+    no_op,
+) -> None:
+    """Assert persisted graph metadata is summarized without identity drift."""
+    expected_metadata = _metadata(relation_count=0)
+    taxonomy_calls = []
+    _patch_persisted_metadata_loaders(
+        monkeypatch,
+        expected_metadata,
+        no_op,
+        taxonomy_calls,
     )
     observed_metadata = await snapshot_maps.summarize_persisted_v4_snapshot_metadata(
         object(),

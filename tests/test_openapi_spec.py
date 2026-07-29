@@ -175,16 +175,13 @@ def _collect_query_params(node: ast.AST) -> set[str]:
 
 
 def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
-    """Support the collect spec routes test fixture."""
+    """Collect route parameters from the checked-in OpenAPI document."""
     routes_by_path: dict[tuple[str, str], dict[str, set[str]]] = {}
-    lines = OPENAPI_PATH.read_text().splitlines()
-    is_in_paths = False
-    current_path: str | None = None
-    current_method: str | None = None
-    is_in_parameters = False
+    is_in_paths = is_in_parameters = False
+    current_path = current_method = None
     current_parameter_by_field: dict[str, str] | None = None
 
-    for raw_line in lines:
+    for raw_line in OPENAPI_PATH.read_text().splitlines():
         if not is_in_paths:
             if raw_line.strip() == "paths:":
                 is_in_paths = True
@@ -213,8 +210,7 @@ def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
                 is_in_parameters = True
                 routes_by_path[("", current_path)][current_method] = []
                 continue
-            else:
-                is_in_parameters = False
+            is_in_parameters = False
         if indent == 8 and is_in_parameters and current_method:
             if stripped.startswith("- name:"):
                 name = stripped.split(":", 1)[1].strip().strip("'\"")
@@ -228,7 +224,6 @@ def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
         if indent <= 6:
             current_parameter_by_field = None
             is_in_parameters = is_in_parameters and stripped == "parameters:"
-
     spec_routes_by_operation: dict[tuple[str, str], dict[str, set[str]]] = {}
     for (_, path), methods in routes_by_path.items():
         for method, params in methods.items():

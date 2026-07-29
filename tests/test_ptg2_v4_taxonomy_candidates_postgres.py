@@ -86,6 +86,108 @@ async def _run_migration_action(
         await async_connection.run_sync(run_action)
 
 
+_PREREQUISITE_SQL = (
+    "CREATE SCHEMA {schema}",
+    """
+    CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
+        snapshot_key bigint PRIMARY KEY,
+        generation varchar(32) NOT NULL,
+        state varchar(16) NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v4_snapshot_map_root (
+        snapshot_key bigint PRIMARY KEY,
+        state varchar(16) NOT NULL,
+        CONSTRAINT ptg2_v4_taxonomy_test_root_layout_fkey
+            FOREIGN KEY (snapshot_key)
+            REFERENCES {schema}.ptg2_v3_snapshot_layout (snapshot_key)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE FUNCTION {schema}.guard_ptg2_v4_snapshot_metadata()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $function$
+    DECLARE
+        root_state varchar(16);
+        layout_generation varchar(32);
+        layout_state varchar(16);
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            SELECT candidate.state
+              INTO root_state
+              FROM {schema}.ptg2_v4_snapshot_map_root AS candidate
+             WHERE candidate.snapshot_key = OLD.snapshot_key;
+            IF root_state = 'complete' AND pg_trigger_depth() = 1 THEN
+                RAISE EXCEPTION 'ptg2_v4_snapshot_metadata_sealed_delete'
+                    USING ERRCODE = '55000';
+            END IF;
+            RETURN OLD;
+        END IF;
+        IF TG_OP = 'UPDATE' THEN
+            RAISE EXCEPTION 'ptg2_v4_snapshot_metadata_immutable'
+                USING ERRCODE = '55000';
+        END IF;
+        SELECT candidate.state, layout.generation, layout.state
+          INTO root_state, layout_generation, layout_state
+          FROM {schema}.ptg2_v4_snapshot_map_root AS candidate
+          JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+            ON layout.snapshot_key = candidate.snapshot_key
+         WHERE candidate.snapshot_key = NEW.snapshot_key
+         FOR UPDATE OF candidate, layout;
+        IF root_state IS NULL THEN
+            RAISE EXCEPTION 'ptg2_v4_snapshot_map_root_missing'
+                USING ERRCODE = '23503';
+        END IF;
+        IF root_state <> 'building'
+           OR layout_generation <> 'shared_blocks_v4'
+           OR layout_state <> 'building' THEN
+            RAISE EXCEPTION 'ptg2_v4_snapshot_metadata_not_building'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END;
+    $function$
+    """,
+    """
+    CREATE FUNCTION {schema}.guard_ptg2_v4_snapshot_map_root()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $function$
+    BEGIN
+        IF TG_OP = 'DELETE'
+           AND OLD.state = 'complete'
+           AND pg_trigger_depth() = 1 THEN
+            RAISE EXCEPTION 'ptg2_v4_snapshot_map_root_sealed_delete'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN OLD;
+    END;
+    $function$
+    """,
+    """
+    CREATE TRIGGER ptg2_v4_taxonomy_test_root_guard
+    BEFORE DELETE ON {schema}.ptg2_v4_snapshot_map_root
+    FOR EACH ROW
+    EXECUTE FUNCTION {schema}.guard_ptg2_v4_snapshot_map_root()
+    """,
+    """
+    INSERT INTO {schema}.ptg2_v3_snapshot_layout
+        (snapshot_key, generation, state)
+    VALUES
+        (11, 'shared_blocks_v4', 'building'),
+        (12, 'shared_blocks_v4', 'building')
+    """,
+    """
+    INSERT INTO {schema}.ptg2_v4_snapshot_map_root
+        (snapshot_key, state)
+    VALUES (11, 'building'), (12, 'complete')
+    """,
+)
+
+
 async def _create_prerequisites(
     engine: AsyncEngine,
     schema_name: str,
@@ -93,108 +195,9 @@ async def _create_prerequisites(
     """Create the minimal V4 root and NPI catalog for this lifecycle."""
 
     schema = _quoted(schema_name)
-    statements = (
-        f"CREATE SCHEMA {schema}",
-        f"""
-        CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
-            snapshot_key bigint PRIMARY KEY,
-            generation varchar(32) NOT NULL,
-            state varchar(16) NOT NULL
-        )
-        """,
-        f"""
-        CREATE TABLE {schema}.ptg2_v4_snapshot_map_root (
-            snapshot_key bigint PRIMARY KEY,
-            state varchar(16) NOT NULL,
-            CONSTRAINT ptg2_v4_taxonomy_test_root_layout_fkey
-                FOREIGN KEY (snapshot_key)
-                REFERENCES {schema}.ptg2_v3_snapshot_layout (snapshot_key)
-                ON DELETE CASCADE
-        )
-        """,
-        f"""
-        CREATE FUNCTION {schema}.guard_ptg2_v4_snapshot_metadata()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $function$
-        DECLARE
-            root_state varchar(16);
-            layout_generation varchar(32);
-            layout_state varchar(16);
-        BEGIN
-            IF TG_OP = 'DELETE' THEN
-                SELECT candidate.state
-                  INTO root_state
-                  FROM {schema}.ptg2_v4_snapshot_map_root AS candidate
-                 WHERE candidate.snapshot_key = OLD.snapshot_key;
-                IF root_state = 'complete' AND pg_trigger_depth() = 1 THEN
-                    RAISE EXCEPTION 'ptg2_v4_snapshot_metadata_sealed_delete'
-                        USING ERRCODE = '55000';
-                END IF;
-                RETURN OLD;
-            END IF;
-            IF TG_OP = 'UPDATE' THEN
-                RAISE EXCEPTION 'ptg2_v4_snapshot_metadata_immutable'
-                    USING ERRCODE = '55000';
-            END IF;
-            SELECT candidate.state, layout.generation, layout.state
-              INTO root_state, layout_generation, layout_state
-              FROM {schema}.ptg2_v4_snapshot_map_root AS candidate
-              JOIN {schema}.ptg2_v3_snapshot_layout AS layout
-                ON layout.snapshot_key = candidate.snapshot_key
-             WHERE candidate.snapshot_key = NEW.snapshot_key
-             FOR UPDATE OF candidate, layout;
-            IF root_state IS NULL THEN
-                RAISE EXCEPTION 'ptg2_v4_snapshot_map_root_missing'
-                    USING ERRCODE = '23503';
-            END IF;
-            IF root_state <> 'building'
-               OR layout_generation <> 'shared_blocks_v4'
-               OR layout_state <> 'building' THEN
-                RAISE EXCEPTION 'ptg2_v4_snapshot_metadata_not_building'
-                    USING ERRCODE = '55000';
-            END IF;
-            RETURN NEW;
-        END;
-        $function$
-        """,
-        f"""
-        CREATE FUNCTION {schema}.guard_ptg2_v4_snapshot_map_root()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $function$
-        BEGIN
-            IF TG_OP = 'DELETE'
-               AND OLD.state = 'complete'
-               AND pg_trigger_depth() = 1 THEN
-                RAISE EXCEPTION 'ptg2_v4_snapshot_map_root_sealed_delete'
-                    USING ERRCODE = '55000';
-            END IF;
-            RETURN OLD;
-        END;
-        $function$
-        """,
-        f"""
-        CREATE TRIGGER ptg2_v4_taxonomy_test_root_guard
-        BEFORE DELETE ON {schema}.ptg2_v4_snapshot_map_root
-        FOR EACH ROW
-        EXECUTE FUNCTION {schema}.guard_ptg2_v4_snapshot_map_root()
-        """,
-        f"""
-        INSERT INTO {schema}.ptg2_v3_snapshot_layout
-            (snapshot_key, generation, state)
-        VALUES
-            (11, 'shared_blocks_v4', 'building'),
-            (12, 'shared_blocks_v4', 'building')
-        """,
-        f"""
-        INSERT INTO {schema}.ptg2_v4_snapshot_map_root
-            (snapshot_key, state)
-        VALUES (11, 'building'), (12, 'complete')
-        """,
-    )
     async with engine.begin() as connection:
-        for statement in statements:
+        for statement_template in _PREREQUISITE_SQL:
+            statement = statement_template.format(schema=schema)
             await connection.exec_driver_sql(statement)
 
 
@@ -300,6 +303,186 @@ async def _drop_disposable_schema(
         )
 
 
+def _valid_candidate_cases():
+    return (
+        (
+            _insert_statement,
+            {
+                "snapshot_key": 11,
+                "rule_hex": "11",
+                "representation": "direct_v1",
+                "pattern_count": 0,
+                "pattern_member_count": 0,
+                "pattern_member_bytes": 0,
+                "pattern_payload_hex": "",
+            },
+        ),
+        (
+            _insert_statement,
+            {
+                "snapshot_key": 11,
+                "rule_hex": "77",
+                "representation": "pattern_v1",
+                "pattern_count": 1,
+                "pattern_member_count": 2,
+                "pattern_member_bytes": 40,
+                "pattern_payload_hex": _valid_pattern_payload_hex(),
+            },
+        ),
+        (
+            _observe_insert_statement,
+            {
+                "rule_hex": "88",
+                "member_count": 37_001,
+                "member_keys": b"\x00\x00\x00\x00" * 37_001,
+                "observe_reason": "candidate_cap_exceeded",
+                "observe_count_lower_bound": 37_001,
+            },
+        ),
+        (
+            _observe_insert_statement,
+            {
+                "rule_hex": "99",
+                "member_count": 2,
+                "member_keys": b"\x00\x00\x00\x00" * 2,
+                "observe_reason": "pattern_projection_cap_exceeded",
+                "observe_count_lower_bound": 131_073,
+            },
+        ),
+    )
+
+
+async def _insert_valid_candidates(engine, schema_name):
+    async with engine.begin() as connection:
+        for statement_factory, parameters in _valid_candidate_cases():
+            await connection.execute(
+                statement_factory(schema_name),
+                parameters,
+            )
+
+
+async def _assert_insert_rejected(
+    engine,
+    statement,
+    parameters,
+    error_match,
+):
+    with pytest.raises(DBAPIError, match=error_match):
+        async with engine.begin() as connection:
+            await connection.execute(statement, parameters)
+
+
+async def _assert_invalid_candidates_rejected(engine, schema_name):
+    invalid_cases = (
+        (
+            _observe_insert_statement(schema_name),
+            {
+                "rule_hex": "aa",
+                "member_count": 2,
+                "member_keys": b"\x00\x00\x00\x00" * 2,
+                "observe_reason": "pattern_projection_cap_exceeded",
+                "observe_count_lower_bound": 131_072,
+            },
+            "pattern_check",
+        ),
+        (
+            _insert_statement(schema_name),
+            {
+                "snapshot_key": 11,
+                "rule_hex": "55",
+                "representation": "pattern_v1",
+                "pattern_count": 1,
+                "pattern_member_count": 1,
+                "pattern_member_bytes": 25,
+                "pattern_payload_hex": "00" * 25,
+            },
+            "pattern_check",
+        ),
+        (
+            _insert_statement(schema_name),
+            {
+                "snapshot_key": 12,
+                "rule_hex": "66",
+                "representation": "direct_v1",
+                "pattern_count": 0,
+                "pattern_member_count": 0,
+                "pattern_member_bytes": 0,
+                "pattern_payload_hex": "",
+            },
+            "ptg2_v4_snapshot_metadata_not_building",
+        ),
+    )
+    for statement, parameters, error_match in invalid_cases:
+        await _assert_insert_rejected(
+            engine,
+            statement,
+            parameters,
+            error_match,
+        )
+
+
+async def _execute_schema_sql(engine, schema_name, statement):
+    async with engine.begin() as connection:
+        await connection.execute(sa.text(statement.format(schema=_quoted(schema_name))))
+
+
+async def _assert_schema_sql_rejected(engine, schema_name, statement, error_match):
+    with pytest.raises(DBAPIError, match=error_match):
+        await _execute_schema_sql(engine, schema_name, statement)
+
+
+async def _assert_seal_and_cascade(engine, schema_name):
+    await _assert_schema_sql_rejected(
+        engine,
+        schema_name,
+        "UPDATE {schema}.ptg2_v4_inferred_taxonomy_candidate "
+        "SET member_count = member_count WHERE snapshot_key = 11",
+        "ptg2_v4_snapshot_metadata_immutable",
+    )
+    await _execute_schema_sql(
+        engine,
+        schema_name,
+        "UPDATE {schema}.ptg2_v4_snapshot_map_root "
+        "SET state = 'complete' WHERE snapshot_key = 11",
+    )
+    await _execute_schema_sql(
+        engine,
+        schema_name,
+        "UPDATE {schema}.ptg2_v3_snapshot_layout "
+        "SET state = 'sealed' WHERE snapshot_key = 11",
+    )
+    await _assert_schema_sql_rejected(
+        engine,
+        schema_name,
+        "DELETE FROM {schema}.ptg2_v4_inferred_taxonomy_candidate "
+        "WHERE snapshot_key = 11",
+        "ptg2_v4_snapshot_metadata_sealed_delete",
+    )
+    await _assert_schema_sql_rejected(
+        engine,
+        schema_name,
+        "DELETE FROM {schema}.ptg2_v4_snapshot_map_root WHERE snapshot_key = 11",
+        "ptg2_v4_snapshot_map_root_sealed_delete",
+    )
+    await _execute_schema_sql(
+        engine,
+        schema_name,
+        "DELETE FROM {schema}.ptg2_v3_snapshot_layout WHERE snapshot_key = 11",
+    )
+    schema = _quoted(schema_name)
+    async with engine.connect() as connection:
+        remaining_candidates = await connection.scalar(
+            sa.text(f"SELECT COUNT(*) FROM {schema}.ptg2_v4_inferred_taxonomy_candidate")
+        )
+        remaining_roots = await connection.scalar(
+            sa.text(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root "
+                "WHERE snapshot_key = 11"
+            )
+        )
+    assert (remaining_candidates, remaining_roots) == (0, 0)
+
+
 @pytest.mark.asyncio
 async def test_taxonomy_sidecar_postgres_lifecycle(monkeypatch) -> None:
     """Prove real constraints, building guards, and root ownership cascade."""
@@ -318,192 +501,9 @@ async def test_taxonomy_sidecar_postgres_lifecycle(monkeypatch) -> None:
         await _create_prerequisites(engine, schema_name)
         is_schema_created = True
         await _run_migration_action(engine, migration, "upgrade")
-
-        async with engine.begin() as connection:
-            await connection.execute(
-                _insert_statement(schema_name),
-                {
-                    "snapshot_key": 11,
-                    "rule_hex": "11",
-                    "representation": "direct_v1",
-                    "pattern_count": 0,
-                    "pattern_member_count": 0,
-                    "pattern_member_bytes": 0,
-                    "pattern_payload_hex": "",
-                },
-            )
-            await connection.execute(
-                _insert_statement(schema_name),
-                {
-                    "snapshot_key": 11,
-                    "rule_hex": "77",
-                    "representation": "pattern_v1",
-                    "pattern_count": 1,
-                    "pattern_member_count": 2,
-                    "pattern_member_bytes": 40,
-                    "pattern_payload_hex": _valid_pattern_payload_hex(),
-                },
-            )
-            await connection.execute(
-                _observe_insert_statement(schema_name),
-                {
-                    "rule_hex": "88",
-                    "member_count": 37_001,
-                    "member_keys": b"\x00\x00\x00\x00" * 37_001,
-                    "observe_reason": "candidate_cap_exceeded",
-                    "observe_count_lower_bound": 37_001,
-                },
-            )
-            await connection.execute(
-                _observe_insert_statement(schema_name),
-                {
-                    "rule_hex": "99",
-                    "member_count": 2,
-                    "member_keys": b"\x00\x00\x00\x00" * 2,
-                    "observe_reason": "pattern_projection_cap_exceeded",
-                    "observe_count_lower_bound": 131_073,
-                },
-            )
-
-        with pytest.raises(DBAPIError, match="pattern_check"):
-            async with engine.begin() as connection:
-                await connection.execute(
-                    _observe_insert_statement(schema_name),
-                    {
-                        "rule_hex": "aa",
-                        "member_count": 2,
-                        "member_keys": b"\x00\x00\x00\x00" * 2,
-                        "observe_reason": "pattern_projection_cap_exceeded",
-                        "observe_count_lower_bound": 131_072,
-                    },
-                )
-
-        with pytest.raises(DBAPIError, match="pattern_check"):
-            async with engine.begin() as connection:
-                await connection.execute(
-                    _insert_statement(schema_name),
-                    {
-                        "snapshot_key": 11,
-                        "rule_hex": "55",
-                        "representation": "pattern_v1",
-                        "pattern_count": 1,
-                        "pattern_member_count": 1,
-                        "pattern_member_bytes": 25,
-                        "pattern_payload_hex": "00" * 25,
-                    },
-                )
-
-        with pytest.raises(
-            DBAPIError,
-            match="ptg2_v4_snapshot_metadata_not_building",
-        ):
-            async with engine.begin() as connection:
-                await connection.execute(
-                    _insert_statement(schema_name),
-                    {
-                        "snapshot_key": 12,
-                        "rule_hex": "66",
-                        "representation": "direct_v1",
-                        "pattern_count": 0,
-                        "pattern_member_count": 0,
-                        "pattern_member_bytes": 0,
-                        "pattern_payload_hex": "",
-                    },
-                )
-
-        schema = _quoted(schema_name)
-        with pytest.raises(
-            DBAPIError,
-            match="ptg2_v4_snapshot_metadata_immutable",
-        ):
-            async with engine.begin() as connection:
-                await connection.execute(
-                    sa.text(
-                        f"""
-                        UPDATE {schema}.ptg2_v4_inferred_taxonomy_candidate
-                           SET member_count = member_count
-                         WHERE snapshot_key = 11
-                        """
-                    )
-                )
-
-        async with engine.begin() as connection:
-            await connection.execute(
-                sa.text(
-                    f"""
-                    UPDATE {schema}.ptg2_v4_snapshot_map_root
-                       SET state = 'complete'
-                     WHERE snapshot_key = 11
-                    """
-                )
-            )
-            await connection.execute(
-                sa.text(
-                    f"""
-                    UPDATE {schema}.ptg2_v3_snapshot_layout
-                       SET state = 'sealed'
-                     WHERE snapshot_key = 11
-                    """
-                )
-            )
-
-        with pytest.raises(
-            DBAPIError,
-            match="ptg2_v4_snapshot_metadata_sealed_delete",
-        ):
-            async with engine.begin() as connection:
-                await connection.execute(
-                    sa.text(
-                        f"""
-                        DELETE FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
-                         WHERE snapshot_key = 11
-                        """
-                    )
-                )
-
-        with pytest.raises(
-            DBAPIError,
-            match="ptg2_v4_snapshot_map_root_sealed_delete",
-        ):
-            async with engine.begin() as connection:
-                await connection.execute(
-                    sa.text(
-                        f"""
-                        DELETE FROM {schema}.ptg2_v4_snapshot_map_root
-                         WHERE snapshot_key = 11
-                        """
-                    )
-                )
-
-        async with engine.begin() as connection:
-            await connection.execute(
-                sa.text(
-                    f"""
-                    DELETE FROM {schema}.ptg2_v3_snapshot_layout
-                     WHERE snapshot_key = 11
-                    """
-                )
-            )
-            remaining_candidates = await connection.scalar(
-                sa.text(
-                    f"""
-                    SELECT COUNT(*)
-                      FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
-                    """
-                )
-            )
-            remaining_roots = await connection.scalar(
-                sa.text(
-                    f"""
-                    SELECT COUNT(*)
-                      FROM {schema}.ptg2_v4_snapshot_map_root
-                     WHERE snapshot_key = 11
-                    """
-                )
-            )
-        assert remaining_candidates == 0
-        assert remaining_roots == 0
-
+        await _insert_valid_candidates(engine, schema_name)
+        await _assert_invalid_candidates_rejected(engine, schema_name)
+        await _assert_seal_and_cascade(engine, schema_name)
         await _run_migration_action(engine, migration, "downgrade")
     finally:
         if is_schema_created:

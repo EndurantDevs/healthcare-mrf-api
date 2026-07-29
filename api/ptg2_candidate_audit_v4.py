@@ -1,14 +1,16 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Bounded code-first provider proof for V4 candidate audits."""
+"""Representation-aware bounded provider proof for V4 candidate audits."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import chain
 from typing import Any, Callable, Mapping, Sequence
 
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
     CandidateAuditDecodedRetentionError,
+    retain_unique_integer_keys,
 )
 from api.ptg2_candidate_audit_codes import CandidateCodeIndex
 from api.ptg2_candidate_audit_integrity import PersistedAuditOccurrence
@@ -24,6 +26,7 @@ from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     AuditBatchChallenge,
 )
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
 _NPI_PROVIDER_MAP_BYTES = 224
@@ -111,22 +114,62 @@ def _reserve_v4_coordinate_projection(
     )
 
 
+def _reserve_v4_pattern_projection(
+    requested_npi_count: int,
+    retention_budget: CandidateAuditDecodedRetentionBudget,
+) -> _V4CoordinateReservation:
+    """Reserve one batched pattern projection beside its final result map."""
+
+    transient_fixed_bytes = (
+        _V4_GRAPH_TRANSIENT_MAP_BYTES
+        + (4 + int(requested_npi_count)) * _V4_GRAPH_TRANSIENT_OWNER_BYTES
+    )
+    available_bytes = (
+        retention_budget.maximum_bytes - retention_budget.retained_bytes
+    )
+    maximum_graph_members = (
+        available_bytes - transient_fixed_bytes
+    ) // _V4_GRAPH_PEAK_MEMBER_BYTES
+    if maximum_graph_members < 1:
+        raise CandidateAuditDecodedRetentionError(
+            "PTG2 candidate audit decoded retention exceeds the byte limit "
+            "while retaining the batched V4 pattern graph projection"
+        )
+    reservation_bytes = (
+        transient_fixed_bytes
+        + maximum_graph_members * _V4_GRAPH_PEAK_MEMBER_BYTES
+    )
+    retention_budget.claim(
+        reservation_bytes,
+        category="the batched V4 pattern graph projection",
+    )
+    return _V4CoordinateReservation(
+        maximum_graph_members=maximum_graph_members,
+        reservation_bytes=reservation_bytes,
+    )
+
+
 def _v4_result_fixed_bytes(
     candidate_keys_by_npi: Mapping[int, set[int]],
 ) -> int:
-    return (
-        _V4_RESULT_MAP_BYTES
-        + len(candidate_keys_by_npi) * _V4_RESULT_BUCKET_BYTES
-    )
+    return _result_bytes_for_npis(len(candidate_keys_by_npi))
+
+
+def _result_bytes_for_npis(npi_count: int) -> int:
+    """Return fixed retained bytes for one result map and its NPI buckets."""
+
+    return _V4_RESULT_MAP_BYTES + int(npi_count) * _V4_RESULT_BUCKET_BYTES
 
 
 def _filtered_v4_coordinate_provider_sets(
     raw_provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
     npi: int,
-    candidate_provider_set_keys: set[int],
+    candidate_provider_set_keys: set[int] | None,
 ) -> tuple[int, ...]:
     """Return one stable code/source-scoped NPI result."""
 
+    if candidate_provider_set_keys is None:
+        return tuple(raw_provider_set_keys_by_npi.get(npi, ()))
     return tuple(
         sorted(
             provider_set_key
@@ -140,17 +183,24 @@ async def _load_v4_coordinate_provider_sets(
     session: Any,
     serving_tables: PTG2ServingTables,
     npi: int,
-    candidate_provider_set_keys: set[int],
+    candidate_provider_set_keys: set[int] | None,
     retention_budget: CandidateAuditDecodedRetentionBudget,
     *,
     schema_name: str,
 ) -> tuple[tuple[int, ...], int]:
     """Prove one NPI while converting its transient reservation to output."""
 
-    if not candidate_provider_set_keys:
+    if (
+        candidate_provider_set_keys is not None
+        and not candidate_provider_set_keys
+    ):
         return (), 0
     reservation = _reserve_v4_coordinate_projection(
-        len(candidate_provider_set_keys),
+        (
+            0
+            if candidate_provider_set_keys is None
+            else len(candidate_provider_set_keys)
+        ),
         retention_budget,
     )
     try:
@@ -182,7 +232,7 @@ async def _load_v4_coordinate_provider_sets(
 async def _load_proven_v4_provider_sets(
     session: Any,
     serving_tables: PTG2ServingTables,
-    candidate_keys_by_npi: dict[int, set[int]],
+    candidate_keys_by_npi: Mapping[int, set[int] | None],
     retention_budget: CandidateAuditDecodedRetentionBudget,
     *,
     schema_name: str,
@@ -213,6 +263,92 @@ async def _load_proven_v4_provider_sets(
         retention_budget.release(retained_result_bytes)
         raise
     return provider_set_keys_by_npi
+
+
+async def _load_pattern_provider_sets(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    requested_npis: tuple[int, ...],
+    retention_budget: CandidateAuditDecodedRetentionBudget,
+    *,
+    schema_name: str,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve one complete pattern projection with exact retained accounting."""
+
+    retained_result_bytes = _result_bytes_for_npis(
+        len(requested_npis)
+    )
+    retention_budget.claim(
+        retained_result_bytes,
+        category="the V4 pattern provider result",
+    )
+    reservation: _V4CoordinateReservation | None = None
+    try:
+        reservation = _reserve_v4_pattern_projection(
+            len(requested_npis),
+            retention_budget,
+        )
+        provider_set_keys_by_npi = await _v4_sets_by_npi(
+            session,
+            serving_tables,
+            requested_npis,
+            allowed_provider_set_keys=None,
+            schema_name=schema_name,
+            max_members=reservation.maximum_graph_members,
+        )
+        if set(provider_set_keys_by_npi) != set(requested_npis):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 pattern graph omitted a requested NPI"
+            )
+        retained_membership_bytes = sum(
+            len(provider_set_keys) * _V4_RESULT_MEMBERSHIP_BYTES
+            for provider_set_keys in provider_set_keys_by_npi.values()
+        )
+        retention_budget.release(
+            reservation.reservation_bytes - retained_membership_bytes
+        )
+    except BaseException:
+        if reservation is not None:
+            retention_budget.release(reservation.reservation_bytes)
+        retention_budget.release(retained_result_bytes)
+        raise
+    return provider_set_keys_by_npi
+
+
+async def load_v4_pattern_provider_scope(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    challenges: Sequence[AuditBatchChallenge],
+    persisted_audit_occurrences: Sequence[PersistedAuditOccurrence],
+    *,
+    schema_name: str = PTG2_SCHEMA,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Load each requested NPI's complete bounded pattern provider scope."""
+
+    if retention_budget is None:
+        retention_budget = CandidateAuditDecodedRetentionBudget()
+    requested_npis, retained_npi_bytes = retain_unique_integer_keys(
+        chain(
+            (challenge.npi for challenge in challenges),
+            (
+                occurrence.npi
+                for occurrence in persisted_audit_occurrences
+            ),
+        ),
+        retention_budget,
+        category="V4 graph-first NPI",
+    )
+    try:
+        return await _load_pattern_provider_sets(
+            session,
+            serving_tables,
+            requested_npis,
+            retention_budget,
+            schema_name=schema_name,
+        )
+    finally:
+        retention_budget.release(retained_npi_bytes)
 
 
 async def prove_v4_candidate_sets(
@@ -297,5 +433,6 @@ __all__ = [
     "V4CandidateScope",
     "V4CandidateBuilders",
     "load_v4_candidate_scope",
+    "load_v4_pattern_provider_scope",
     "prove_v4_candidate_sets",
 ]

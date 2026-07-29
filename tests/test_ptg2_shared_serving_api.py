@@ -872,6 +872,33 @@ async def test_shared_code_and_provider_support_queries_are_snapshot_scoped():
     _assert_code_snapshot_scope(code_rows, code_session)
 
 
+def _assert_forward_logical_plan_scope(
+    session: _Session,
+    logical_snapshot_id: str,
+    plan_id: str,
+    shared_layout_key: int,
+) -> None:
+    code_sql, code_params = session.calls[0]
+    assert "FROM mrf.ptg2_v3_code code_metadata" in code_sql
+    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
+    assert "JOIN LATERAL (" in code_sql
+    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
+    assert (
+        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
+        in code_sql
+    )
+    assert "logical_scope.plan_id" in code_sql
+    assert "logical_scope.plan_market_type" in code_sql
+    assert "code_metadata.plan_id" not in code_sql
+    assert "COALESCE(plan_id" not in code_sql
+    assert code_params["logical_snapshot_id"] == logical_snapshot_id
+    assert code_params["shared_snapshot_key"] == shared_layout_key
+    assert code_params["plan_id"] == plan_id
+    assert code_params["plan_market_type"] == "group"
+
+
 @pytest.mark.asyncio
 async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
     monkeypatch,
@@ -917,25 +944,12 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
         )
 
         assert response is None
-        code_sql, code_params = session.calls[0]
-        assert "FROM mrf.ptg2_v3_code code_metadata" in code_sql
-        assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
-        assert "JOIN LATERAL (" in code_sql
-        assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
-        assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
-        assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
-        assert (
-            "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
-            in code_sql
+        _assert_forward_logical_plan_scope(
+            session,
+            logical_snapshot_id,
+            plan_id,
+            shared_layout_key,
         )
-        assert "logical_scope.plan_id" in code_sql
-        assert "logical_scope.plan_market_type" in code_sql
-        assert "code_metadata.plan_id" not in code_sql
-        assert "COALESCE(plan_id" not in code_sql
-        assert code_params["logical_snapshot_id"] == logical_snapshot_id
-        assert code_params["shared_snapshot_key"] == shared_layout_key
-        assert code_params["plan_id"] == plan_id
-        assert code_params["plan_market_type"] == "group"
 
     merged_plan_ids = [
         call.kwargs["code_rows"][0]["plan_id"] for call in merge_rows.await_args_list
@@ -1241,6 +1255,22 @@ async def test_explicit_npi_search_does_not_expand_other_provider_set_members(
     selected_provider_rows.assert_awaited_once()
 
 
+def _candidate_audit_source_provenance() -> dict[int, dict[str, object]]:
+    return {
+        0: {
+            "source_key": 0,
+            "source_type": "in_network",
+            "identity_kind": "raw_container_sha256_v1",
+            "identity_sha256": "1" * 64,
+            "raw_container_sha256": "1" * 64,
+            "logical_json_sha256": None,
+            "logical_hash_deferred": True,
+            "source_trace_set_hash": "2" * 64,
+            "source_trace": [],
+        }
+    }
+
+
 def _stub_candidate_audit_npi_without_address(
     monkeypatch,
     provider_set_id,
@@ -1287,21 +1317,7 @@ def _stub_candidate_audit_npi_without_address(
     monkeypatch.setattr(
         ptg2_serving,
         "_ptg2_source_provenance_for_rows",
-        AsyncMock(
-            return_value={
-                0: {
-                    "source_key": 0,
-                    "source_type": "in_network",
-                    "identity_kind": "raw_container_sha256_v1",
-                    "identity_sha256": "1" * 64,
-                    "raw_container_sha256": "1" * 64,
-                    "logical_json_sha256": None,
-                    "logical_hash_deferred": True,
-                    "source_trace_set_hash": "2" * 64,
-                    "source_trace": [],
-                }
-            }
-        ),
+        AsyncMock(return_value=_candidate_audit_source_provenance()),
     )
     return location_matches, broad_rows, enrichment
 
@@ -1372,55 +1388,31 @@ async def test_candidate_audit_exact_npi_does_not_require_an_address(
     assert all(not cache for cache in ptg_caches)
 
 
-@pytest.mark.asyncio
-async def test_default_forward_response_skips_exact_provenance_query(monkeypatch):
-    """Ensure default forward responses neither query nor expose source provenance."""
-
-    price_set_id = "01" * 16
-    provider_set_id = "02" * 16
-    response_row_by_field = {
-        "serving_content_hash_128": "03" * 16,
+def _forward_response_row(
+    source_key: int,
+    price_set_id: str,
+    *,
+    serving_content_hash: str | None = None,
+    provider_set_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "serving_content_hash_128": serving_content_hash or f"0{source_key}" * 16,
         "plan_id": "plan-a",
         "plan_market_type": "group",
         "reported_code_system": "CPT",
         "reported_code": "99213",
         "negotiation_arrangement": "FFS",
-        "provider_set_global_id_128": provider_set_id,
+        "provider_set_global_id_128": provider_set_id or f"1{source_key}" * 16,
         "provider_count": 1,
         "price_set_global_id_128": price_set_id,
-        "price_key": 9,
-        "source_key": 1,
+        "price_key": 8 + source_key,
+        "source_key": source_key,
         "network_names": [],
     }
-    provenance = AsyncMock(
-        side_effect=AssertionError("default responses must not query source provenance")
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_merge_manifest_code_variant_rows",
-        AsyncMock(return_value=[response_row_by_field]),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_hydrate_provider_set_network_names",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "fetch_snapshot_source_provenance",
-        provenance,
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_prices_for_price_sets",
-        AsyncMock(return_value={price_set_id: []}),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_procedure_details_for_rows",
-        AsyncMock(return_value={}),
-    )
-    session = _Session(
+
+
+def _forward_code_session(rate_count: int) -> _Session:
+    return _Session(
         [
             {
                 "code_key": 7,
@@ -1429,25 +1421,134 @@ async def test_default_forward_response_skips_exact_provenance_query(monkeypatch
                 "reported_code_system": "CPT",
                 "reported_code": "99213",
                 "negotiation_arrangement": "FFS",
-                "rate_count": 1,
+                "rate_count": rate_count,
             }
         ]
     )
 
-    response = await ptg2_serving._search_manifest_serving_table(
+
+def _forward_source_provenance(
+    source_key: int,
+    *,
+    logical_identity: bool,
+) -> dict[str, object]:
+    return {
+        "source_key": source_key,
+        "source_type": "in_network",
+        "identity_kind": (
+            "logical_json_sha256_v1"
+            if logical_identity
+            else "raw_container_sha256_v1"
+        ),
+        "identity_sha256": str(source_key) * 64,
+        "raw_container_sha256": (
+            str(source_key + 1) * 64 if logical_identity else str(source_key) * 64
+        ),
+        "logical_json_sha256": str(source_key + 2) * 64 if logical_identity else None,
+        "logical_hash_deferred": not logical_identity,
+        "source_trace_set_hash": (
+            str(source_key + 3) * 64
+            if logical_identity
+            else str(source_key + 2) * 64
+        ),
+        "source_trace": (
+            []
+            if logical_identity
+            else [{"source_file_version_id": f"source-file-{source_key}"}]
+        ),
+    }
+
+
+def _install_forward_response_stubs(
+    monkeypatch,
+    response_rows: list[dict[str, object]],
+    price_set_ids: tuple[str, ...],
+    *,
+    provenance_by_source: dict[int, dict[str, object]] | None = None,
+) -> None:
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(return_value=response_rows),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_hydrate_provider_set_network_names",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_prices_for_price_sets",
+        AsyncMock(return_value={price_set_id: [] for price_set_id in price_set_ids}),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_procedure_details_for_rows",
+        AsyncMock(return_value={}),
+    )
+    if provenance_by_source is not None:
+        monkeypatch.setattr(
+            ptg2_serving,
+            "_ptg2_source_provenance_for_rows",
+            AsyncMock(return_value=provenance_by_source),
+        )
+
+
+async def _search_forward_response(
+    session: _Session,
+    *,
+    include_sources: bool,
+):
+    query_by_name = {
+        "plan_id": "plan-a",
+        "plan_market_type": "group",
+        "code_system": "CPT",
+        "code": "99213",
+    }
+    if include_sources:
+        query_by_name.update(
+            source_key="logical-source",
+            include_sources=True,
+        )
+    return await ptg2_serving._search_manifest_serving_table(
         session,
         "logical-plan-a",
-        {
-            "plan_id": "plan-a",
-            "plan_market_type": "group",
-            "code_system": "CPT",
-            "code": "99213",
-        },
+        query_by_name,
         SimpleNamespace(limit=10, offset=0),
         _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
         "product_search",
     )
 
+
+@pytest.mark.asyncio
+async def test_default_forward_response_skips_exact_provenance_query(monkeypatch):
+    """Ensure default forward responses neither query nor expose source provenance."""
+
+    price_set_id = "01" * 16
+    provenance = AsyncMock(
+        side_effect=AssertionError("default responses must not query source provenance")
+    )
+    _install_forward_response_stubs(
+        monkeypatch,
+        [
+            _forward_response_row(
+                1,
+                price_set_id,
+                serving_content_hash="03" * 16,
+                provider_set_id="02" * 16,
+            )
+        ],
+        (price_set_id,),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "fetch_snapshot_source_provenance",
+        provenance,
+    )
+    response = await _search_forward_response(
+        _forward_code_session(1),
+        include_sources=False,
+    )
     provenance.assert_not_awaited()
     assert response is not None
     assert "source_key" not in response["items"][0]
@@ -1461,90 +1562,25 @@ async def test_source_enabled_forward_response_separates_logical_and_artifact_ke
     """Ensure source-enabled rows distinguish logical and artifact source keys."""
 
     price_set_id = "01" * 16
-    response_row_by_field = {
-        "serving_content_hash_128": "03" * 16,
-        "plan_id": "plan-a",
-        "plan_market_type": "group",
-        "reported_code_system": "CPT",
-        "reported_code": "99213",
-        "negotiation_arrangement": "FFS",
-        "provider_set_global_id_128": "02" * 16,
-        "provider_count": 1,
-        "price_set_global_id_128": price_set_id,
-        "price_key": 9,
-        "source_key": 1,
-        "network_names": [],
-    }
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_merge_manifest_code_variant_rows",
-        AsyncMock(return_value=[response_row_by_field]),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_hydrate_provider_set_network_names",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_source_provenance_for_rows",
-        AsyncMock(
-            return_value={
-                1: {
-                    "source_key": 1,
-                    "source_type": "in_network",
-                    "identity_kind": "logical_json_sha256_v1",
-                    "identity_sha256": "1" * 64,
-                    "raw_container_sha256": "2" * 64,
-                    "logical_json_sha256": "3" * 64,
-                    "logical_hash_deferred": False,
-                    "source_trace_set_hash": "4" * 64,
-                    "source_trace": [],
-                }
-            }
-        ),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_prices_for_price_sets",
-        AsyncMock(return_value={price_set_id: []}),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_procedure_details_for_rows",
-        AsyncMock(return_value={}),
-    )
-    session = _Session(
+    _install_forward_response_stubs(
+        monkeypatch,
         [
-            {
-                "code_key": 7,
-                "plan_id": "plan-a",
-                "plan_market_type": "group",
-                "reported_code_system": "CPT",
-                "reported_code": "99213",
-                "negotiation_arrangement": "FFS",
-                "rate_count": 1,
-            }
-        ]
+            _forward_response_row(
+                1,
+                price_set_id,
+                serving_content_hash="03" * 16,
+                provider_set_id="02" * 16,
+            )
+        ],
+        (price_set_id,),
+        provenance_by_source={
+            1: _forward_source_provenance(1, logical_identity=True)
+        },
     )
-    query_by_name = {
-        "plan_id": "plan-a",
-        "plan_market_type": "group",
-        "code_system": "CPT",
-        "code": "99213",
-        "source_key": "logical-source",
-        "include_sources": True,
-    }
-
-    response = await ptg2_serving._search_manifest_serving_table(
-        session,
-        "logical-plan-a",
-        query_by_name,
-        SimpleNamespace(limit=10, offset=0),
-        _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
-        "product_search",
+    response = await _search_forward_response(
+        _forward_code_session(1),
+        include_sources=True,
     )
-
     assert response is not None
     assert response["items"][0]["source_key"] == "logical-source"
     assert response["items"][0]["source_artifact_key"] == 1
@@ -1557,95 +1593,25 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
     """Ensure multi-file rows retain provenance for their exact source artifact."""
 
     price_set_ids = ("01" * 16, "02" * 16)
-    response_rows = [
-        {
-            "serving_content_hash_128": f"0{source_key}" * 16,
-            "plan_id": "plan-a",
-            "plan_market_type": "group",
-            "reported_code_system": "CPT",
-            "reported_code": "99213",
-            "negotiation_arrangement": "FFS",
-            "provider_set_global_id_128": f"1{source_key}" * 16,
-            "provider_count": 1,
-            "price_set_global_id_128": price_set_ids[source_key - 1],
-            "price_key": 8 + source_key,
-            "source_key": source_key,
-            "network_names": [],
-        }
-        for source_key in (1, 2)
-    ]
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_merge_manifest_code_variant_rows",
-        AsyncMock(return_value=response_rows),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_hydrate_provider_set_network_names",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_source_provenance_for_rows",
-        AsyncMock(
-            return_value={
-                source_key: {
-                    "source_key": source_key,
-                    "source_type": "in_network",
-                    "identity_kind": "raw_container_sha256_v1",
-                    "identity_sha256": str(source_key) * 64,
-                    "raw_container_sha256": str(source_key) * 64,
-                    "logical_json_sha256": None,
-                    "logical_hash_deferred": True,
-                    "source_trace_set_hash": str(source_key + 2) * 64,
-                    "source_trace": [
-                        {"source_file_version_id": f"source-file-{source_key}"}
-                    ],
-                }
-                for source_key in (1, 2)
-            }
-        ),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_prices_for_price_sets",
-        AsyncMock(return_value={price_set_id: [] for price_set_id in price_set_ids}),
-    )
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_procedure_details_for_rows",
-        AsyncMock(return_value={}),
-    )
-    session = _Session(
+    _install_forward_response_stubs(
+        monkeypatch,
         [
-            {
-                "code_key": 7,
-                "plan_id": "plan-a",
-                "plan_market_type": "group",
-                "reported_code_system": "CPT",
-                "reported_code": "99213",
-                "negotiation_arrangement": "FFS",
-                "rate_count": 2,
-            }
-        ]
-    )
-
-    response = await ptg2_serving._search_manifest_serving_table(
-        session,
-        "logical-plan-a",
-        {
-            "plan_id": "plan-a",
-            "plan_market_type": "group",
-            "code_system": "CPT",
-            "code": "99213",
-            "source_key": "logical-source",
-            "include_sources": True,
+            _forward_response_row(source_key, price_set_ids[source_key - 1])
+            for source_key in (1, 2)
+        ],
+        price_set_ids,
+        provenance_by_source={
+            source_key: _forward_source_provenance(
+                source_key,
+                logical_identity=False,
+            )
+            for source_key in (1, 2)
         },
-        SimpleNamespace(limit=10, offset=0),
-        _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
-        "product_search",
     )
-
+    response = await _search_forward_response(
+        _forward_code_session(2),
+        include_sources=True,
+    )
     assert response is not None
     assert {
         (
@@ -1861,24 +1827,12 @@ async def test_location_rate_provider_lookup_uses_logical_plan_scope(monkeypatch
     )
 
     assert candidates is expected_candidates
-    code_sql, code_params = session.calls[0]
-    assert "FROM mrf.ptg2_v3_code code_metadata" in code_sql
-    assert "JOIN mrf.ptg2_v3_snapshot_scope physical_scope" in code_sql
-    assert "JOIN LATERAL (" in code_sql
-    assert "mrf.ptg2_v3_snapshot_plan_scope plan_scope" in code_sql
-    assert "physical_scope.snapshot_id = :logical_snapshot_id" in code_sql
-    assert "plan_scope.snapshot_id = :logical_snapshot_id" in code_sql
-    assert (
-        "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in code_sql
+    _assert_forward_logical_plan_scope(
+        session,
+        "logical-plan-a",
+        "plan-a",
+        41,
     )
-    assert "logical_scope.plan_id" in code_sql
-    assert "logical_scope.plan_market_type" in code_sql
-    assert "code_metadata.plan_id" not in code_sql
-    assert "COALESCE(plan_id" not in code_sql
-    assert code_params["logical_snapshot_id"] == "logical-plan-a"
-    assert code_params["shared_snapshot_key"] == 41
-    assert code_params["plan_id"] == "plan-a"
-    assert code_params["plan_market_type"] == "group"
     graph_candidates.assert_awaited_once()
     assert graph_candidates.await_args.args[3] == frozenset({3})
 

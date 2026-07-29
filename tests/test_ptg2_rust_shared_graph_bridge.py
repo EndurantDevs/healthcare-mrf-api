@@ -288,6 +288,37 @@ async def test_native_shared_graph_bridge_rejects_trailing_stdout_and_cleans(
     assert not output_directory.exists()
 
 
+def _native_graph_artifacts(tmp_path, provider_set_id, provider_group_id):
+    npi_id = b"\0" * 8 + (1234567890).to_bytes(8, "big", signed=False)
+    graph_members_by_artifact = {
+        "provider_group_npi": {provider_group_id: (npi_id,)},
+        "provider_npi_group": {npi_id: (provider_group_id,)},
+        "provider_inverted": {provider_group_id: (provider_set_id,)},
+        "provider_forward": {provider_set_id: (provider_group_id,)},
+    }
+    artifact_directory = tmp_path / "artifacts"
+    artifact_directory.mkdir()
+    artifact_entries = []
+    for artifact_name, mapping in graph_members_by_artifact.items():
+        manifest = write_global_membership_sidecar(
+            artifact_directory,
+            artifact_name,
+            mapping,
+        )
+        sidecar_metadata_map = dict(manifest["sidecars"][0])
+        sidecar_metadata_map.update(
+            {
+                "name": artifact_name,
+                "path": str(
+                    artifact_directory / str(sidecar_metadata_map["path"])
+                ),
+                "source_shard_id": "shard-01",
+            }
+        )
+        artifact_entries.append(sidecar_metadata_map)
+    return artifact_entries
+
+
 @pytest.mark.asyncio
 async def test_native_shared_graph_bridge_matches_real_cli_when_built(
     tmp_path,
@@ -306,33 +337,9 @@ async def test_native_shared_graph_bridge_matches_real_cli_when_built(
         pytest.skip("build the PTG2 Rust scanner to run the native bridge integration")
     provider_set_id = bytes.fromhex("10" * 16)
     provider_group_id = bytes.fromhex("20" * 16)
-    npi_id = b"\0" * 8 + (1234567890).to_bytes(8, "big", signed=False)
-    graph_members_by_artifact = {
-        "provider_group_npi": {provider_group_id: (npi_id,)},
-        "provider_npi_group": {npi_id: (provider_group_id,)},
-        "provider_inverted": {provider_group_id: (provider_set_id,)},
-        "provider_forward": {provider_set_id: (provider_group_id,)},
-    }
-    artifact_entries = []
-    artifact_directory = tmp_path / "artifacts"
-    artifact_directory.mkdir()
-    for artifact_name, mapping in graph_members_by_artifact.items():
-        manifest = write_global_membership_sidecar(
-            artifact_directory,
-            artifact_name,
-            mapping,
-        )
-        sidecar_metadata_map = dict(manifest["sidecars"][0])
-        sidecar_metadata_map.update(
-            {
-                "name": artifact_name,
-                "path": str(
-                    artifact_directory / str(sidecar_metadata_map["path"])
-                ),
-                "source_shard_id": "shard-01",
-            }
-        )
-        artifact_entries.append(sidecar_metadata_map)
+    artifact_entries = _native_graph_artifacts(
+        tmp_path, provider_set_id, provider_group_id
+    )
     provider_map = tmp_path / "provider-set-map.tsv"
     provider_map.write_text(f"{provider_set_id.hex()}\t1\n", encoding="ascii")
     output_directory = tmp_path / "native-output"

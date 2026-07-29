@@ -335,24 +335,37 @@ async def test_v4_map_coordinates_reject_negative_identity_before_io() -> None:
         )
 
 
-@pytest.mark.asyncio
-async def test_v4_heavy_bitmap_fragments_use_physical_entry_counts(
-    monkeypatch,
-) -> None:
-    """Validate physical fragment counts before decoding a heavy bitmap."""
+class _HeavyBitmapFragmentCoordinate:
+    def __init__(self, fragment_no: int, entry_count: int) -> None:
+        self.block_key = 7
+        self.fragment_no = fragment_no
+        self.entry_count = entry_count
+        self.block_hash = bytes((fragment_no + 1,)) * 32
 
-    owner = graph.V4HeavyOwner(
-        relation="npi_groups_exact",
-        owner_key=7,
-        object_kind="v4_npi_groups_exact_heavy_bitmap_v1",
-        member_count=6,
-        member_base=100,
-        member_span=24,
-        fragment_count=2,
-    )
-    header = b"PTG2V4BM" + struct.pack("<IIII", 7, 100, 24, 6)
 
-    def frame(fragment_no, entry_count, payload):
+class _HeavyBitmapFragmentFixture:
+    def __init__(self) -> None:
+        self.owner = graph.V4HeavyOwner(
+            relation="npi_groups_exact",
+            owner_key=7,
+            object_kind="v4_npi_groups_exact_heavy_bitmap_v1",
+            member_count=6,
+            member_base=100,
+            member_span=24,
+            fragment_count=2,
+        )
+        header = b"PTG2V4BM" + struct.pack("<IIII", 7, 100, 24, 6)
+        self.fragment_payloads = (
+            self._frame(0, 3, header + bytes((0b00000111,))),
+            self._frame(1, 3, bytes((0b00000011, 0b00000001))),
+        )
+        self.coordinates_by_key = {
+            (7, 0): _HeavyBitmapFragmentCoordinate(0, 3),
+            (7, 1): _HeavyBitmapFragmentCoordinate(1, 3),
+        }
+
+    @staticmethod
+    def _frame(fragment_no: int, entry_count: int, payload: bytes) -> bytes:
         return struct.pack(
             "<8sIIIIII",
             b"PTG2V4BF",
@@ -364,40 +377,27 @@ async def test_v4_heavy_bitmap_fragments_use_physical_entry_counts(
             entry_count,
         ) + payload
 
-    fragment_payloads = (
-        frame(0, 3, header + bytes((0b00000111,))),
-        frame(1, 3, bytes((0b00000011, 0b00000001))),
-    )
+    async def coordinates(self, *_args, **_kwargs):
+        return self.coordinates_by_key
 
-    class Coordinate:
-        def __init__(self, fragment_no: int, entry_count: int) -> None:
-            self.block_key = 7
-            self.fragment_no = fragment_no
-            self.entry_count = entry_count
-            self.block_hash = bytes((fragment_no + 1,)) * 32
-
-    coordinates_by_key = {
-        (7, 0): Coordinate(0, 3),
-        (7, 1): Coordinate(1, 3),
-    }
-
-    async def fake_coordinates(*_args, **_kwargs):
-        return coordinates_by_key
-
-    async def fake_blocks(*_args, **_kwargs):
+    async def blocks(self, *_args, **_kwargs):
         return {
             coordinate.block_hash: graph._CachedPhysicalBlock(
                 coordinate.block_hash,
-                owner.object_kind,
+                self.owner.object_kind,
                 coordinate.entry_count,
-                fragment_payloads[coordinate.fragment_no],
+                self.fragment_payloads[coordinate.fragment_no],
             )
-            for coordinate in coordinates_by_key.values()
+            for coordinate in self.coordinates_by_key.values()
         }
 
-    monkeypatch.setattr(graph, "_load_map_coordinate_pairs", fake_coordinates)
-    monkeypatch.setattr(graph, "_load_physical_blocks", fake_blocks)
-    manifest = graph.V4RelationManifest(
+    def install(self, monkeypatch) -> None:
+        monkeypatch.setattr(graph, "_load_map_coordinate_pairs", self.coordinates)
+        monkeypatch.setattr(graph, "_load_physical_blocks", self.blocks)
+
+
+def _heavy_bitmap_relation_manifest() -> graph.V4RelationManifest:
+    return graph.V4RelationManifest(
         snapshot_key=17,
         relation="npi_groups_exact",
         member_object_kind="v4_npi_groups_exact_members_v1",
@@ -412,29 +412,11 @@ async def test_v4_heavy_bitmap_fragments_use_physical_entry_counts(
         locator_owner_span=2,
     )
 
-    with (
-        graph.v4_graph_request_scope(),
-        graph.v4_graph_taxonomy_projection_scope(
-            maximum_members=6,
-            maximum_pages=2,
-            maximum_bytes=64,
-            maximum_batches=0,
-        ) as taxonomy_work,
-    ):
-        assert await graph._lookup_v4_heavy_members(
-            object(),
-            snapshot_key=17,
-            schema_name="mrf",
-            relation_manifest=manifest,
-            heavy_owners={7: owner},
-        ) == {7: (100, 101, 102, 108, 109, 116)}
-    assert (
-        taxonomy_work.members,
-        taxonomy_work.pages,
-        taxonomy_work.bytes,
-        taxonomy_work.batches,
-    ) == (6, 2, 64, 0)
 
+async def _assert_heavy_bitmap_page_limit(
+    fixture: _HeavyBitmapFragmentFixture,
+    manifest: graph.V4RelationManifest,
+) -> None:
     with pytest.raises(
         graph.PTG2OnlineWorkBudgetExceeded,
         match="page limit",
@@ -453,12 +435,17 @@ async def test_v4_heavy_bitmap_fragments_use_physical_entry_counts(
                 snapshot_key=17,
                 schema_name="mrf",
                 relation_manifest=manifest,
-                heavy_owners={7: owner},
+                heavy_owners={7: fixture.owner},
                 allowed_member_keys=(100, 116),
             )
     assert budget_error.value.dimension == "graph_pages"
 
-    coordinates_by_key[(7, 0)].entry_count = 2
+
+async def _assert_heavy_bitmap_fragment_conflict(
+    fixture: _HeavyBitmapFragmentFixture,
+    manifest: graph.V4RelationManifest,
+) -> None:
+    fixture.coordinates_by_key[(7, 0)].entry_count = 2
     with pytest.raises(PTG2SharedBlockError, match="fragment conflicts"):
         with graph.v4_graph_request_scope():
             await graph._lookup_v4_heavy_members(
@@ -466,8 +453,43 @@ async def test_v4_heavy_bitmap_fragments_use_physical_entry_counts(
                 snapshot_key=17,
                 schema_name="mrf",
                 relation_manifest=manifest,
-                heavy_owners={7: owner},
+                heavy_owners={7: fixture.owner},
             )
+
+
+@pytest.mark.asyncio
+async def test_v4_heavy_bitmap_fragments_use_physical_entry_counts(
+    monkeypatch,
+) -> None:
+    """Validate physical fragment counts before decoding a heavy bitmap."""
+
+    fixture = _HeavyBitmapFragmentFixture()
+    fixture.install(monkeypatch)
+    manifest = _heavy_bitmap_relation_manifest()
+    with (
+        graph.v4_graph_request_scope(),
+        graph.v4_graph_taxonomy_projection_scope(
+            maximum_members=6,
+            maximum_pages=2,
+            maximum_bytes=64,
+            maximum_batches=0,
+        ) as taxonomy_work,
+    ):
+        assert await graph._lookup_v4_heavy_members(
+            object(),
+            snapshot_key=17,
+            schema_name="mrf",
+            relation_manifest=manifest,
+            heavy_owners={7: fixture.owner},
+        ) == {7: (100, 101, 102, 108, 109, 116)}
+    assert (
+        taxonomy_work.members,
+        taxonomy_work.pages,
+        taxonomy_work.bytes,
+        taxonomy_work.batches,
+    ) == (6, 2, 64, 0)
+    await _assert_heavy_bitmap_page_limit(fixture, manifest)
+    await _assert_heavy_bitmap_fragment_conflict(fixture, manifest)
 
 
 def _heavy_owner_row(
@@ -855,25 +877,14 @@ async def test_v4_relation_budget_rejects_huge_pattern_before_member_pages(
     ]
 
 
-@pytest.mark.asyncio
-async def test_v4_regular_relation_intersection_retains_only_allowed_members(
-    monkeypatch,
-) -> None:
-    """Authenticate a full regular vector while budgeting retained matches."""
+class _RegularIntersectionFixture:
+    def __init__(self) -> None:
+        self.member_payload = struct.pack("<III", 5, 7, 9)
 
-    class Coordinate:
-        def __init__(self, key: int, block_hash: bytes, entries: int) -> None:
-            self.block_key = key
-            self.fragment_no = 0
-            self.block_hash = block_hash
-            self.entry_count = entries
-
-    member_payloads = [struct.pack("<III", 5, 7, 9)]
-
-    async def fake_root(*_args, **_kwargs):
+    async def root(self, *_args, **_kwargs):
         return graph.V4GraphRoot(17, "direct_v1", b"r" * 32)
 
-    async def fake_manifest(*_args, **_kwargs):
+    async def manifest(self, *_args, **_kwargs):
         return graph.V4RelationManifest(
             snapshot_key=17,
             relation="group_sets_direct",
@@ -889,12 +900,12 @@ async def test_v4_regular_relation_intersection_retains_only_allowed_members(
             locator_owner_span=2,
         )
 
-    async def fake_coordinates(*_args, **kwargs):
+    async def coordinates(self, *_args, **kwargs):
         if kwargs["object_kind"].endswith("locators_v1"):
-            return {1: Coordinate(1, b"l" * 32, 2)}
-        return {0: Coordinate(0, b"m" * 32, 3)}
+            return {1: _GraphCoordinate(1, b"l" * 32, 2)}
+        return {0: _GraphCoordinate(0, b"m" * 32, 3)}
 
-    async def fake_blocks(*_args, **kwargs):
+    async def blocks(self, *_args, **kwargs):
         kind = kwargs["object_kind"]
         if kind.endswith("locators_v1"):
             payload = struct.pack("<QI", 0, 1) + struct.pack("<QI", 0, 3)
@@ -905,26 +916,19 @@ async def test_v4_regular_relation_intersection_retains_only_allowed_members(
             }
         return {
             b"m" * 32: graph._CachedPhysicalBlock(
-                b"m" * 32, kind, 3, member_payloads[0]
+                b"m" * 32, kind, 3, self.member_payload
             )
         }
 
-    monkeypatch.setattr(graph, "load_v4_graph_root", fake_root)
-    monkeypatch.setattr(graph, "load_v4_relation_manifest", fake_manifest)
-    monkeypatch.setattr(graph, "load_v4_heavy_owners", AsyncMock(return_value={}))
-    monkeypatch.setattr(graph, "_load_map_coordinates", fake_coordinates)
-    monkeypatch.setattr(graph, "_load_physical_blocks", fake_blocks)
+    def install(self, monkeypatch) -> None:
+        monkeypatch.setattr(graph, "load_v4_graph_root", self.root)
+        monkeypatch.setattr(graph, "load_v4_relation_manifest", self.manifest)
+        monkeypatch.setattr(graph, "load_v4_heavy_owners", AsyncMock(return_value={}))
+        monkeypatch.setattr(graph, "_load_map_coordinates", self.coordinates)
+        monkeypatch.setattr(graph, "_load_physical_blocks", self.blocks)
 
-    assert await graph.lookup_v4_relation_intersections(
-        object(),
-        snapshot_key=17,
-        relation="group_sets_direct",
-        owner_keys=(2,),
-        allowed_member_keys=(7, 11),
-        schema_name="mrf",
-        max_members=1,
-    ) == {2: (7,)}
 
+async def _assert_regular_intersection_member_limit() -> None:
     with pytest.raises(PTG2SharedBlockError, match="exceeds max_members"):
         await graph.lookup_v4_relation_intersections(
             object(),
@@ -936,7 +940,11 @@ async def test_v4_regular_relation_intersection_retains_only_allowed_members(
             max_members=1,
         )
 
-    member_payloads[0] = struct.pack("<III", 7, 5, 9)
+
+async def _assert_regular_intersection_ordering(
+    fixture: _RegularIntersectionFixture,
+) -> None:
+    fixture.member_payload = struct.pack("<III", 7, 5, 9)
     with pytest.raises(PTG2SharedBlockError, match="unique and ordered"):
         await graph.lookup_v4_relation_intersections(
             object(),
@@ -950,34 +958,35 @@ async def test_v4_regular_relation_intersection_retains_only_allowed_members(
 
 
 @pytest.mark.asyncio
-async def test_v4_heavy_relation_intersection_avoids_full_fanout(
+async def test_v4_regular_relation_intersection_retains_only_allowed_members(
     monkeypatch,
 ) -> None:
-    """Probe one allowed key without expanding a 100k-member heavy bitmap."""
+    """Authenticate a full regular vector while budgeting retained matches."""
 
-    owner = graph.V4HeavyOwner(
-        relation="pattern_sets",
-        owner_key=2,
-        object_kind="v4_pattern_sets_heavy_bitmap_v1",
-        member_count=100_001,
-        member_base=0,
-        member_span=100_001,
-        fragment_count=1,
-    )
-    manifest = graph.V4RelationManifest(
+    fixture = _RegularIntersectionFixture()
+    fixture.install(monkeypatch)
+    assert await graph.lookup_v4_relation_intersections(
+        object(),
         snapshot_key=17,
-        relation="pattern_sets",
-        member_object_kind="v4_pattern_sets_members_v1",
-        locator_object_kind="v4_pattern_sets_locators_v1",
-        owner_base=0,
-        owner_count=3,
-        logical_member_count=100_001,
-        vector_member_count=0,
-        member_width=4,
-        member_page_bytes=16_384,
-        locator_page_bytes=24,
-        locator_owner_span=2,
-    )
+        relation="group_sets_direct",
+        owner_keys=(2,),
+        allowed_member_keys=(7, 11),
+        schema_name="mrf",
+        max_members=1,
+    ) == {2: (7,)}
+    await _assert_regular_intersection_member_limit()
+    await _assert_regular_intersection_ordering(fixture)
+
+
+class _HeavyIntersectionCoordinate:
+    def __init__(self, entry_count: int) -> None:
+        self.block_key = 2
+        self.fragment_no = 0
+        self.block_hash = b"h" * 32
+        self.entry_count = entry_count
+
+
+def _heavy_intersection_fragment(owner: graph.V4HeavyOwner) -> bytes:
     bitmap = bytearray(b"\xff" * ((owner.member_span + 7) // 8))
     bitmap[-1] = 1
     logical_payload = (
@@ -991,7 +1000,7 @@ async def test_v4_heavy_relation_intersection_avoids_full_fanout(
         )
         + bytes(bitmap)
     )
-    fragment_payload = struct.pack(
+    return struct.pack(
         "<8sIIIIII",
         graph.PTG2_V4_HEAVY_BITMAP_FRAGMENT_MAGIC,
         owner.owner_key,
@@ -1002,49 +1011,99 @@ async def test_v4_heavy_relation_intersection_avoids_full_fanout(
         owner.member_count,
     ) + logical_payload
 
-    class Coordinate:
-        block_key = 2
-        fragment_no = 0
-        block_hash = b"h" * 32
-        entry_count = owner.member_count
 
-    async def fake_root(*_args, **_kwargs):
+class _HeavyRelationIntersectionFixture:
+    def __init__(self) -> None:
+        self.owner = graph.V4HeavyOwner(
+            relation="pattern_sets",
+            owner_key=2,
+            object_kind="v4_pattern_sets_heavy_bitmap_v1",
+            member_count=100_001,
+            member_base=0,
+            member_span=100_001,
+            fragment_count=1,
+        )
+        self.manifest = graph.V4RelationManifest(
+            snapshot_key=17,
+            relation="pattern_sets",
+            member_object_kind="v4_pattern_sets_members_v1",
+            locator_object_kind="v4_pattern_sets_locators_v1",
+            owner_base=0,
+            owner_count=3,
+            logical_member_count=100_001,
+            vector_member_count=0,
+            member_width=4,
+            member_page_bytes=16_384,
+            locator_page_bytes=24,
+            locator_owner_span=2,
+        )
+        self.fragment_payload = _heavy_intersection_fragment(self.owner)
+
+    async def root(self, *_args, **_kwargs):
         return graph.V4GraphRoot(17, "pattern_v1", b"r" * 32)
 
-    async def fake_coordinates(*_args, **_kwargs):
-        return {(owner.owner_key, 0): Coordinate()}
+    async def coordinates(self, *_args, **_kwargs):
+        coordinate = _HeavyIntersectionCoordinate(self.owner.member_count)
+        return {(self.owner.owner_key, 0): coordinate}
 
-    async def fake_blocks(*_args, **_kwargs):
+    async def blocks(self, *_args, **_kwargs):
         return {
             b"h" * 32: graph._CachedPhysicalBlock(
                 b"h" * 32,
-                owner.object_kind,
-                owner.member_count,
-                fragment_payload,
+                self.owner.object_kind,
+                self.owner.member_count,
+                self.fragment_payload,
             )
         }
 
-    monkeypatch.setattr(graph, "load_v4_graph_root", fake_root)
-    monkeypatch.setattr(
-        graph, "load_v4_relation_manifest", AsyncMock(return_value=manifest)
-    )
-    monkeypatch.setattr(
-        graph, "load_v4_heavy_owners", AsyncMock(return_value={2: owner})
-    )
-    monkeypatch.setattr(graph, "_load_map_coordinate_pairs", fake_coordinates)
-    monkeypatch.setattr(graph, "_load_physical_blocks", fake_blocks)
-    monkeypatch.setattr(
-        graph,
-        "_decode_heavy_bitmap",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("full heavy bitmap must not be enumerated")
-        ),
-    )
+    def install(self, monkeypatch) -> None:
+        monkeypatch.setattr(graph, "load_v4_graph_root", self.root)
+        monkeypatch.setattr(
+            graph,
+            "load_v4_relation_manifest",
+            AsyncMock(return_value=self.manifest),
+        )
+        monkeypatch.setattr(
+            graph,
+            "load_v4_heavy_owners",
+            AsyncMock(return_value={2: self.owner}),
+        )
+        monkeypatch.setattr(graph, "_load_map_coordinate_pairs", self.coordinates)
+        monkeypatch.setattr(graph, "_load_physical_blocks", self.blocks)
+        monkeypatch.setattr(
+            graph,
+            "_decode_heavy_bitmap",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("full heavy bitmap must not be enumerated")
+            ),
+        )
 
+
+async def _assert_heavy_intersection_member_limit() -> None:
+    with pytest.raises(PTG2SharedBlockError, match="exceeds max_members"):
+        await graph.lookup_v4_relation_intersections(
+            object(),
+            snapshot_key=17,
+            relation="pattern_sets",
+            owner_keys=(2,),
+            allowed_member_keys=(100_000,),
+            schema_name="mrf",
+            max_members=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_v4_heavy_relation_intersection_avoids_full_fanout(
+    monkeypatch,
+) -> None:
+    """Probe one allowed key without expanding a 100k-member heavy bitmap."""
+
+    fixture = _HeavyRelationIntersectionFixture()
+    fixture.install(monkeypatch)
     with graph.v4_graph_taxonomy_projection_scope(
-        maximum_members=owner.member_count,
+        maximum_members=fixture.owner.member_count,
         maximum_pages=1,
-        maximum_bytes=manifest.member_page_bytes,
+        maximum_bytes=fixture.manifest.member_page_bytes,
         maximum_batches=1,
     ) as taxonomy_work:
         assert await graph.lookup_v4_relation_intersections(
@@ -1061,18 +1120,8 @@ async def test_v4_heavy_relation_intersection_avoids_full_fanout(
         taxonomy_work.pages,
         taxonomy_work.bytes,
         taxonomy_work.batches,
-    ) == (owner.member_count, 1, manifest.member_page_bytes, 1)
-
-    with pytest.raises(PTG2SharedBlockError, match="exceeds max_members"):
-        await graph.lookup_v4_relation_intersections(
-            object(),
-            snapshot_key=17,
-            relation="pattern_sets",
-            owner_keys=(2,),
-            allowed_member_keys=(100_000,),
-            schema_name="mrf",
-            max_members=0,
-        )
+    ) == (fixture.owner.member_count, 1, fixture.manifest.member_page_bytes, 1)
+    await _assert_heavy_intersection_member_limit()
 
 
 def test_v4_sorted_intersection_python_fallback_is_exact(monkeypatch) -> None:
