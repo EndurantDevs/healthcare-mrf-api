@@ -65,6 +65,69 @@ PROJECTION_RELATIONS = (
     "provider_directory_physical_projection_source_summary",
     "provider_directory_physical_projection_reference",
 )
+CATALOG_RELATION_SQL = """
+    SELECT class_record.relname, class_record.oid::bigint,
+           class_record.relkind,
+           CASE WHEN class_record.relkind = 'i'
+                THEN pg_get_indexdef(class_record.oid)
+                ELSE NULL END
+      FROM pg_class AS class_record
+      JOIN pg_namespace AS namespace_record
+        ON namespace_record.oid = class_record.relnamespace
+     WHERE namespace_record.nspname = :schema
+       AND class_record.relkind IN ('r', 'p', 'i')
+     ORDER BY class_record.relname;
+"""
+CATALOG_CONSTRAINT_SQL = """
+    SELECT table_record.relname, constraint_record.conname,
+           constraint_record.oid::bigint,
+           pg_get_constraintdef(constraint_record.oid, true)
+      FROM pg_constraint AS constraint_record
+      JOIN pg_namespace AS namespace_record
+        ON namespace_record.oid = constraint_record.connamespace
+      JOIN pg_class AS table_record
+        ON table_record.oid = constraint_record.conrelid
+     WHERE namespace_record.nspname = :schema
+     ORDER BY table_record.relname, constraint_record.conname;
+"""
+CATALOG_TRIGGER_SQL = """
+    SELECT table_record.relname, trigger_record.tgname,
+           trigger_record.oid::bigint,
+           pg_get_triggerdef(trigger_record.oid, true)
+      FROM pg_trigger AS trigger_record
+      JOIN pg_class AS table_record
+        ON table_record.oid = trigger_record.tgrelid
+      JOIN pg_namespace AS namespace_record
+        ON namespace_record.oid = table_record.relnamespace
+     WHERE namespace_record.nspname = :schema
+       AND NOT trigger_record.tgisinternal
+     ORDER BY table_record.relname, trigger_record.tgname;
+"""
+CATALOG_FUNCTION_SQL = """
+    SELECT procedure_record.proname,
+           pg_get_function_identity_arguments(procedure_record.oid),
+           procedure_record.oid::bigint,
+           pg_get_functiondef(procedure_record.oid)
+      FROM pg_proc AS procedure_record
+      JOIN pg_namespace AS namespace_record
+        ON namespace_record.oid = procedure_record.pronamespace
+     WHERE namespace_record.nspname = :schema
+     ORDER BY procedure_record.proname,
+              pg_get_function_identity_arguments(procedure_record.oid);
+"""
+
+
+def _catalog_row_map(catalog_rows, *, compound_key: bool) -> dict[str, tuple]:
+    """Return one deterministic catalog section keyed by its identity fields."""
+    if compound_key:
+        return {
+            f"{catalog_row[0]}.{catalog_row[1]}": tuple(catalog_row[2:])
+            for catalog_row in catalog_rows
+        }
+    return {
+        str(catalog_row[0]): tuple(catalog_row[1:])
+        for catalog_row in catalog_rows
+    }
 
 
 def _load_migration(migration_path: Path = MIGRATION_PATH):
@@ -192,80 +255,25 @@ class ProjectionFoundationPostgres:
         """Return exact schema-owned relation, constraint, trigger, and function proof."""
 
         relation_rows = await self.database.all(
-            """
-            SELECT class_record.relname, class_record.oid::bigint,
-                   class_record.relkind,
-                   CASE WHEN class_record.relkind = 'i'
-                        THEN pg_get_indexdef(class_record.oid)
-                        ELSE NULL END
-              FROM pg_class AS class_record
-              JOIN pg_namespace AS namespace_record
-                ON namespace_record.oid = class_record.relnamespace
-             WHERE namespace_record.nspname = :schema
-               AND class_record.relkind IN ('r', 'p', 'i')
-             ORDER BY class_record.relname;
-            """,
+            CATALOG_RELATION_SQL,
             schema=self.schema,
         )
         constraint_rows = await self.database.all(
-            """
-            SELECT table_record.relname, constraint_record.conname,
-                   constraint_record.oid::bigint,
-                   pg_get_constraintdef(constraint_record.oid, true)
-              FROM pg_constraint AS constraint_record
-              JOIN pg_namespace AS namespace_record
-                ON namespace_record.oid = constraint_record.connamespace
-              JOIN pg_class AS table_record
-                ON table_record.oid = constraint_record.conrelid
-             WHERE namespace_record.nspname = :schema
-             ORDER BY table_record.relname, constraint_record.conname;
-            """,
+            CATALOG_CONSTRAINT_SQL,
             schema=self.schema,
         )
         trigger_rows = await self.database.all(
-            """
-            SELECT table_record.relname, trigger_record.tgname,
-                   trigger_record.oid::bigint,
-                   pg_get_triggerdef(trigger_record.oid, true)
-              FROM pg_trigger AS trigger_record
-              JOIN pg_class AS table_record
-                ON table_record.oid = trigger_record.tgrelid
-              JOIN pg_namespace AS namespace_record
-                ON namespace_record.oid = table_record.relnamespace
-             WHERE namespace_record.nspname = :schema
-               AND NOT trigger_record.tgisinternal
-             ORDER BY table_record.relname, trigger_record.tgname;
-            """,
+            CATALOG_TRIGGER_SQL,
             schema=self.schema,
         )
         function_rows = await self.database.all(
-            """
-            SELECT procedure_record.proname,
-                   pg_get_function_identity_arguments(procedure_record.oid),
-                   procedure_record.oid::bigint,
-                   pg_get_functiondef(procedure_record.oid)
-              FROM pg_proc AS procedure_record
-              JOIN pg_namespace AS namespace_record
-                ON namespace_record.oid = procedure_record.pronamespace
-             WHERE namespace_record.nspname = :schema
-             ORDER BY procedure_record.proname,
-                      pg_get_function_identity_arguments(procedure_record.oid);
-            """,
+            CATALOG_FUNCTION_SQL,
             schema=self.schema,
         )
         return {
-            "relations": {
-                str(catalog_row[0]): tuple(catalog_row[1:])
-                for catalog_row in relation_rows
-            },
-            "constraints": {
-                f"{catalog_row[0]}.{catalog_row[1]}": tuple(catalog_row[2:])
-                for catalog_row in constraint_rows
-            },
-            "triggers": {
-                f"{catalog_row[0]}.{catalog_row[1]}": tuple(catalog_row[2:])
-                for catalog_row in trigger_rows
-            },
+            "relations": _catalog_row_map(relation_rows, compound_key=False),
+            "constraints": _catalog_row_map(constraint_rows, compound_key=True),
+            "triggers": _catalog_row_map(trigger_rows, compound_key=True),
             "functions": {
                 f"{catalog_row[0]}({catalog_row[1]})": tuple(catalog_row[2:])
                 for catalog_row in function_rows

@@ -24,6 +24,87 @@ CANONICAL_MIGRATION_PATH = (
     / "versions"
     / "20260611100000_address_canonical_foundation.py"
 )
+PRACTITIONER_FIXTURE_ROWS = (
+    (
+        "source-target",
+        "practitioner-good",
+        1234567890,
+        True,
+        "run-current",
+        [
+            {
+                "line": ["100 Main Street", "Suite 200"],
+                "city": "Austin",
+                "state": "Texas",
+                "postalCode": "78701",
+            },
+            {"line": ["Missing City"], "state": "TX", "postalCode": "78701"},
+            {"city": "Austin", "state": "TX", "postalCode": "78701"},
+            {"line": ["Missing ZIP"], "city": "Austin", "state": "TX"},
+        ],
+        [
+            {"system": "phone", "value": "(312) 555-1212"},
+            {"system": "fax", "value": "+1 (312) 555-0199"},
+        ],
+    ),
+    (
+        "source-target",
+        "practitioner-old-run",
+        1234567891,
+        True,
+        "run-old",
+        [{"line": ["200 Old Run Road"], "city": "Austin", "state": "TX", "postalCode": "78702"}],
+        [],
+    ),
+    (
+        "source-other",
+        "practitioner-other-source",
+        1234567892,
+        True,
+        "run-current",
+        [
+            {
+                "line": ["300 Other Source Road"],
+                "city": "Austin",
+                "state": "TX",
+                "postalCode": "78703",
+            }
+        ],
+        [],
+    ),
+    (
+        "source-target",
+        "practitioner-invalid-npi",
+        123456789,
+        True,
+        "run-current",
+        [
+            {
+                "line": ["400 Invalid NPI Road"],
+                "city": "Austin",
+                "state": "TX",
+                "postalCode": "78704",
+            }
+        ],
+        [],
+    ),
+    (
+        "source-target",
+        "practitioner-inactive",
+        1234567893,
+        False,
+        "run-current",
+        [
+            {
+                "line": ["500 Inactive Road"],
+                "city": "Austin",
+                "state": "TX",
+                "postalCode": "78705",
+            }
+        ],
+        [],
+    ),
+)
 
 
 def _canonical_migration():
@@ -105,67 +186,7 @@ async def _create_fixture_tables(database: Database, schema: str, stage_table: s
 
 async def _insert_practitioner_rows(database: Database, schema: str) -> None:
     """Insert practitioner rows used by the overlay fixture."""
-    practitioner_fixture_rows = [
-        (
-            "source-target",
-            "practitioner-good",
-            1234567890,
-            True,
-            "run-current",
-            [
-                {
-                    "line": ["100 Main Street", "Suite 200"],
-                    "city": "Austin",
-                    "state": "Texas",
-                    "postalCode": "78701",
-                },
-                {"line": ["Missing City"], "state": "TX", "postalCode": "78701"},
-                {"city": "Austin", "state": "TX", "postalCode": "78701"},
-                {"line": ["Missing ZIP"], "city": "Austin", "state": "TX"},
-            ],
-            [
-                {"system": "phone", "value": "(312) 555-1212"},
-                {"system": "fax", "value": "+1 (312) 555-0199"},
-            ],
-        ),
-        (
-            "source-target",
-            "practitioner-old-run",
-            1234567891,
-            True,
-            "run-old",
-            [{"line": ["200 Old Run Road"], "city": "Austin", "state": "TX", "postalCode": "78702"}],
-            [],
-        ),
-        (
-            "source-other",
-            "practitioner-other-source",
-            1234567892,
-            True,
-            "run-current",
-            [{"line": ["300 Other Source Road"], "city": "Austin", "state": "TX", "postalCode": "78703"}],
-            [],
-        ),
-        (
-            "source-target",
-            "practitioner-invalid-npi",
-            123456789,
-            True,
-            "run-current",
-            [{"line": ["400 Invalid NPI Road"], "city": "Austin", "state": "TX", "postalCode": "78704"}],
-            [],
-        ),
-        (
-            "source-target",
-            "practitioner-inactive",
-            1234567893,
-            False,
-            "run-current",
-            [{"line": ["500 Inactive Road"], "city": "Austin", "state": "TX", "postalCode": "78705"}],
-            [],
-        ),
-    ]
-    for source_id, resource_id, npi, active, run_id, addresses, telecom in practitioner_fixture_rows:
+    for source_id, resource_id, npi, active, run_id, addresses, telecom in PRACTITIONER_FIXTURE_ROWS:
         await database.status(
             f"""
             INSERT INTO "{schema}"."provider_directory_practitioner" (

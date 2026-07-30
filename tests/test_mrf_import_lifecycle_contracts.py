@@ -182,19 +182,13 @@ async def test_plan_import_preserves_year_benefit_and_cost_sharing_contracts(
     await _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pushed)
 
 
-@pytest.mark.asyncio
-async def test_provider_import_preserves_person_facility_and_network_contracts(
-    monkeypatch,
-):
-    """Keep person and facility identity while filtering invalid plan links."""
-
-    current_year = datetime.datetime.now().year
+def _provider_contract_fixture(current_year):
     valid_plan_by_field = {
         "plan_id": "12345AA0000000",
         "network_tier": "PREFERRED",
         "years": [current_year, current_year + 1, current_year - 1],
     }
-    provider_source_records = [
+    return [
         {},
         {"npi": "bad", "plans": [valid_plan_by_field]},
         {
@@ -229,6 +223,41 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
             "last_updated_on": "2026-07-02",
         },
     ]
+
+
+def _assert_provider_contract_rows(duplicate_tolerant, current_year):
+    provider_rows = [
+        provider_row
+        for label, row_dicts in duplicate_tolerant
+        for provider_row in row_dicts
+        if label == "PlanNPIRaw"
+    ]
+    assert {provider_row["npi"] for provider_row in provider_rows} == {
+        1000000002,
+        1000000003,
+    }
+    assert any(
+        provider_row["name_or_facility_name"] == "Dr. Ada M Example III"
+        for provider_row in provider_rows
+    )
+    assert any(
+        provider_row["name_or_facility_name"] == "Synthetic Clinic"
+        for provider_row in provider_rows
+    )
+    assert {provider_row["year"] for provider_row in provider_rows} == {
+        current_year,
+        current_year + 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_provider_import_preserves_person_facility_and_network_contracts(
+    monkeypatch,
+):
+    """Keep person and facility identity while filtering invalid plan links."""
+
+    current_year = datetime.datetime.now().year
+    provider_source_records = _provider_contract_fixture(current_year)
     _pushed, duplicate_tolerant = _configure_import_boundary(
         monkeypatch, provider_source_records
     )
@@ -266,28 +295,7 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
     )
 
     assert outcome == 1
-    provider_rows = [
-        provider_row
-        for label, row_dicts in duplicate_tolerant
-        for provider_row in row_dicts
-        if label == "PlanNPIRaw"
-    ]
-    assert {provider_row["npi"] for provider_row in provider_rows} == {
-        1000000002,
-        1000000003,
-    }
-    assert any(
-        provider_row["name_or_facility_name"] == "Dr. Ada M Example III"
-        for provider_row in provider_rows
-    )
-    assert any(
-        provider_row["name_or_facility_name"] == "Synthetic Clinic"
-        for provider_row in provider_rows
-    )
-    assert {provider_row["year"] for provider_row in provider_rows} == {
-        current_year,
-        current_year + 1,
-    }
+    _assert_provider_contract_rows(duplicate_tolerant, current_year)
     initial._mark_mrf_provider_file_progress.assert_awaited_once_with(
         ANY,
         url="https://data.example.invalid/providers.json",
@@ -473,28 +481,22 @@ class _Workbook:
         return SimpleNamespace(rows=self._rows)
 
 
-@pytest.mark.asyncio
-async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_jobs(
-    monkeypatch,
-):
-    """Stage catalog records before enqueuing a bounded, deterministic URL set."""
-
-    transparency_headings = [
-        "State",
-        "Issuer_Name",
-        "Issuer_ID",
-        "Is_Issuer_New_to_Exchange? (Yes_or_No)",
-        "SADP_Only?",
-        "Plan_ID",
-        "QHP/SADP",
-        "Plan_Type",
-        "Metal_Level",
-        "URL_Claims_Payment_Policies",
-    ]
+def _initial_import_workbooks():
     transparency_rows = [
         [],
         [],
-        transparency_headings,
+        [
+            "State",
+            "Issuer_Name",
+            "Issuer_ID",
+            "Is_Issuer_New_to_Exchange? (Yes_or_No)",
+            "SADP_Only?",
+            "Plan_ID",
+            "QHP/SADP",
+            "Plan_Type",
+            "Metal_Level",
+            "URL_Claims_Payment_Policies",
+        ],
         [
             "aa",
             "Synthetic Issuer",
@@ -524,19 +526,22 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         ["bb", 23456, "https://data.example.invalid/index-c.json", ""],
         ["cc", 34567, "", ""],
     ]
-    workbook_by_path = {
+    return {
         "/tmp/transparency.xlsx": _Workbook("Transparency 2026", transparency_rows),
         "/tmp/mrf-index.xlsx": _Workbook("Index", index_rows),
     }
+
+
+def _install_initial_import_mocks(
+    monkeypatch,
+    workbook_by_path,
+    pushed_batches,
+    progress_events,
+):
     workbook_paths = iter(workbook_by_path)
-    pushed_batches = []
-    progress_events = []
 
     async def push(rows, stage, **_kwargs):
         pushed_batches.append((stage.__name__, [dict(row) for row in rows]))
-
-    async def has_registered_work(*_args, **_kwargs):
-        return True
 
     monkeypatch.setenv(
         "HLTHPRT_CMSGOV_MRF_URL_PUF",
@@ -552,16 +557,26 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         ),
     )
     monkeypatch.setenv("HLTHPRT_SAVE_PER_PACK", "0")
-    monkeypatch.setattr(initial, "ensure_database", AsyncMock())
-    monkeypatch.setattr(initial, "mark_control_run", AsyncMock())
-    monkeypatch.setattr(initial, "_prepare_import_tables", AsyncMock())
-    monkeypatch.setattr(initial, "download_it_and_save", AsyncMock())
-    monkeypatch.setattr(initial, "unzip", AsyncMock())
+    for name in (
+        "ensure_database",
+        "mark_control_run",
+        "_prepare_import_tables",
+        "download_it_and_save",
+        "unzip",
+        "_init_mrf_run_state",
+    ):
+        monkeypatch.setattr(initial, name, AsyncMock())
     monkeypatch.setattr(initial.glob, "glob", lambda _pattern: [next(workbook_paths)])
     monkeypatch.setattr(initial.xl, "readxl", lambda path: workbook_by_path[path])
     monkeypatch.setattr(initial.os, "unlink", lambda _path: None)
     monkeypatch.setattr(initial, "make_class", lambda model, *_args, **_kwargs: model)
     monkeypatch.setattr(initial, "push_objects", push)
+
+
+def _install_initial_import_catalog_mocks(monkeypatch, progress_events):
+    async def has_registered_work(*_args, **_kwargs):
+        return True
+
     monkeypatch.setattr(
         initial,
         "import_unknown_state_issuers_data",
@@ -576,12 +591,7 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
                         "mrf_url": "",
                     }
                 },
-                {
-                    "12345AA0000000_2026": {
-                        "plan_id": "12345AA0000000",
-                        "year": 2026,
-                    }
-                },
+                {"12345AA0000000_2026": {"plan_id": "12345AA0000000", "year": 2026}},
             )
         ),
     )
@@ -599,29 +609,19 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         ),
     )
     monkeypatch.setattr(initial.db, "scalar", AsyncMock(return_value="Catalog Issuer"))
-    monkeypatch.setattr(initial, "_init_mrf_run_state", AsyncMock())
-    monkeypatch.setattr(initial, "_has_registered_mrf_work", has_registered_work)
+    monkeypatch.setattr(
+        initial,
+        "_has_registered_mrf_work",
+        has_registered_work,
+    )
     monkeypatch.setattr(
         initial,
         "enqueue_live_progress",
         lambda **event: progress_events.append(event),
     )
 
-    redis = SimpleNamespace(enqueue_job=AsyncMock(return_value=SimpleNamespace()))
-    context_by_field = {
-        "redis": redis,
-        "context": {"import_date": "20260724", "run": 0},
-    }
 
-    await initial.init_file(
-        context_by_field,
-        {
-            "test_mode": True,
-            "run_id": "run-contract",
-            "mrf_file_chunking": "providers,formularies",
-        },
-    )
-
+def _assert_initial_import_catalog_result(context_by_field, pushed_batches):
     assert context_by_field["context"] == {
         "import_date": "20260724",
         "run": 1,
@@ -629,13 +629,13 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         "control_run_id": "run-contract",
         "mrf_file_chunking": "providers,formularies",
     }
-    transparency_row_dicts = [
-        transparency_row
+    transparency_rows = [
+        pushed_row
         for label, row_dicts in pushed_batches
-        for transparency_row in row_dicts
+        for pushed_row in row_dicts
         if label == "PlanTransparency"
     ]
-    assert transparency_row_dicts == [
+    assert transparency_rows == [
         {
             "state": "AA",
             "issuer_name": "Synthetic Issuer",
@@ -651,9 +651,9 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         }
     ]
     issuer_rows = [
-        issuer_row
+        pushed_row
         for label, row_dicts in pushed_batches
-        for issuer_row in row_dicts
+        for pushed_row in row_dicts
         if label == "Issuer"
     ]
     assert {issuer_row["issuer_id"] for issuer_row in issuer_rows} == {
@@ -670,6 +670,9 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         "data_contact_email": "data@example.invalid",
         "mrf_url": "https://data.example.invalid/index-b.json",
     }
+
+
+def _assert_initial_import_queue_result(progress_events, redis):
     index_calls = [
         call
         for call in redis.enqueue_job.await_args_list
@@ -679,7 +682,10 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         "https://data.example.invalid/index-a.json",
         "https://data.example.invalid/index-b.json",
     ]
-    assert all(call.kwargs["_queue_name"] == initial.MRF_QUEUE_NAME for call in index_calls)
+    assert all(
+        call.kwargs["_queue_name"] == initial.MRF_QUEUE_NAME
+        for call in index_calls
+    )
     shutdown_call = redis.enqueue_job.await_args_list[-1]
     assert shutdown_call.args[0] == "shutdown"
     assert shutdown_call.kwargs == {
@@ -691,6 +697,36 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
         "mrf index jobs enqueued",
         "mrf index jobs enqueued",
     ]
+
+
+@pytest.mark.asyncio
+async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_jobs(
+    monkeypatch,
+):
+    """Stage catalog records before enqueuing a bounded, deterministic URL set."""
+    workbook_by_path = _initial_import_workbooks()
+    pushed_batches = []
+    progress_events = []
+    _install_initial_import_mocks(
+        monkeypatch, workbook_by_path, pushed_batches, progress_events
+    )
+    _install_initial_import_catalog_mocks(monkeypatch, progress_events)
+    redis = SimpleNamespace(enqueue_job=AsyncMock(return_value=SimpleNamespace()))
+    context_by_field = {
+        "redis": redis,
+        "context": {"import_date": "20260724", "run": 0},
+    }
+
+    await initial.init_file(
+        context_by_field,
+        {
+            "test_mode": True,
+            "run_id": "run-contract",
+            "mrf_file_chunking": "providers,formularies",
+        },
+    )
+    _assert_initial_import_catalog_result(context_by_field, pushed_batches)
+    _assert_initial_import_queue_result(progress_events, redis)
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,84 @@ def _requires_test_database():
         pytest.skip("DB-backed MRF summary test requires a disposable test database")
 
 
+async def _insert_address_evidence_fixture(evidence_table):
+    await db.status(
+        f"""
+        INSERT INTO {evidence_table} (
+            evidence_checksum, npi, type, checksum, issuer_id, issuer_name,
+            year, checksum_network, network_tier, import_id, import_date,
+            address_source, source_table, source_url, source_record_id,
+            first_line, second_line, city_name, state_name, postal_code,
+            country_code, telephone_number, phone_number, phone_extension,
+            fax_number_digits, fax_extension, observed_at, address_key
+        )
+        VALUES
+            (
+                101, 3000000059, 'practice', 9001, 7, 'Issuer B',
+                2026, 7001, 'preferred', 'import-b', DATE '2026-06-16',
+                'network', 'plan_npi_raw', 'https://example.test/b', 'rec-b',
+                '22 Main Street', NULL, 'Boston', 'MA', '02108',
+                NULL, '6175550102', '6175550102', NULL, NULL, NULL,
+                TIMESTAMP '2026-06-16 12:05:00',
+                '00000000-0000-0000-0000-000000000002'
+            ),
+            (
+                100, 3000000059, 'practice', 9001, 3, 'Issuer A',
+                2026, 7001, 'preferred', 'import-a', DATE '2026-06-15',
+                'marketplace_provider', 'plan_npi_raw', 'https://example.test/a', 'rec-a',
+                '22 Main Street', 'Suite 3', 'Boston', 'MA', '02108',
+                'US', '6175550101', '6175550101', '45', '6175550199', '9',
+                TIMESTAMP '2026-06-15 09:00:00',
+                '00000000-0000-0000-0000-000000000001'
+            ),
+            (
+                200, 3000000059, 'billing', 9002, 5, 'Issuer C',
+                2026, 7002, NULL, 'import-c', DATE '2026-06-14',
+                'network', 'plan_npi_raw', 'https://example.test/c', 'rec-c',
+                'PO Box 9', NULL, 'Cambridge', 'MA', '02139',
+                'US', NULL, NULL, NULL, NULL, NULL,
+                TIMESTAMP '2026-06-14 08:00:00',
+                NULL
+            );
+        """
+    )
+
+
+def _assert_address_summaries(summaries_by_type):
+    practice = summaries_by_type["practice"]
+    assert practice["npi"] == 3000000059
+    assert practice["checksum"] == 9001
+    assert practice["first_line"] == "22 Main Street"
+    assert practice["second_line"] == "Suite 3"
+    assert practice["country_code"] == "US"
+    assert practice["telephone_number"] == "6175550101"
+    assert practice["phone_number"] == "6175550101"
+    assert practice["phone_extension"] == "45"
+    assert practice["fax_number_digits"] == "6175550199"
+    assert practice["fax_extension"] == "9"
+    assert practice["formatted_address"] == "22 Main Street Suite 3, Boston MA 02108"
+    assert str(practice["date_added"]) == "2026-06-15"
+    assert practice["address_key"] == "00000000-0000-0000-0000-000000000001"
+    assert practice["address_sources"] == ["marketplace_provider", "network"]
+    assert practice["source_record_ids"] == ["rec-a", "rec-b"]
+    assert practice["source_import_ids"] == ["import-a", "import-b"]
+    assert [str(import_date) for import_date in practice["source_import_dates"]] == [
+        "2026-06-15",
+        "2026-06-16",
+    ]
+    assert practice["source_issuer_ids"] == [3, 7]
+    assert practice["source_issuer_names"] == ["Issuer A", "Issuer B"]
+    assert practice["source_urls"] == [
+        "https://example.test/a",
+        "https://example.test/b",
+    ]
+    assert practice["source_count"] == 2
+    billing = summaries_by_type["billing"]
+    assert billing["first_line"] == "PO Box 9"
+    assert billing["source_count"] == 1
+    assert billing["address_key"] is None
+
+
 @pytest.mark.asyncio(loop_scope="module")
 async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(monkeypatch):
     """Verify refresh mrf address summary materializes grouped evidence rows."""
@@ -40,46 +118,7 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
     try:
         await db.create_table(address_cls.__table__, checkfirst=True)
         await db.create_table(evidence_cls.__table__, checkfirst=True)
-        await db.status(
-            f"""
-            INSERT INTO {evidence_table} (
-                evidence_checksum, npi, type, checksum, issuer_id, issuer_name,
-                year, checksum_network, network_tier, import_id, import_date,
-                address_source, source_table, source_url, source_record_id,
-                first_line, second_line, city_name, state_name, postal_code,
-                country_code, telephone_number, phone_number, phone_extension,
-                fax_number_digits, fax_extension, observed_at, address_key
-            )
-            VALUES
-                (
-                    101, 3000000059, 'practice', 9001, 7, 'Issuer B',
-                    2026, 7001, 'preferred', 'import-b', DATE '2026-06-16',
-                    'network', 'plan_npi_raw', 'https://example.test/b', 'rec-b',
-                    '22 Main Street', NULL, 'Boston', 'MA', '02108',
-                    NULL, '6175550102', '6175550102', NULL, NULL, NULL,
-                    TIMESTAMP '2026-06-16 12:05:00',
-                    '00000000-0000-0000-0000-000000000002'
-                ),
-                (
-                    100, 3000000059, 'practice', 9001, 3, 'Issuer A',
-                    2026, 7001, 'preferred', 'import-a', DATE '2026-06-15',
-                    'marketplace_provider', 'plan_npi_raw', 'https://example.test/a', 'rec-a',
-                    '22 Main Street', 'Suite 3', 'Boston', 'MA', '02108',
-                    'US', '6175550101', '6175550101', '45', '6175550199', '9',
-                    TIMESTAMP '2026-06-15 09:00:00',
-                    '00000000-0000-0000-0000-000000000001'
-                ),
-                (
-                    200, 3000000059, 'billing', 9002, 5, 'Issuer C',
-                    2026, 7002, NULL, 'import-c', DATE '2026-06-14',
-                    'network', 'plan_npi_raw', 'https://example.test/c', 'rec-c',
-                    'PO Box 9', NULL, 'Cambridge', 'MA', '02139',
-                    'US', NULL, NULL, NULL, NULL, NULL,
-                    TIMESTAMP '2026-06-14 08:00:00',
-                    NULL
-                );
-            """
-        )
+        await _insert_address_evidence_fixture(evidence_table)
 
         await process_initial._refresh_mrf_address_summary(suffix, schema)
 
@@ -102,35 +141,7 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
             for summary_row in summary_rows
         }
 
-        practice = summaries_by_type["practice"]
-        assert practice["npi"] == 3000000059
-        assert practice["checksum"] == 9001
-        assert practice["first_line"] == "22 Main Street"
-        assert practice["second_line"] == "Suite 3"
-        assert practice["country_code"] == "US"
-        assert practice["telephone_number"] == "6175550101"
-        assert practice["phone_number"] == "6175550101"
-        assert practice["phone_extension"] == "45"
-        assert practice["fax_number_digits"] == "6175550199"
-        assert practice["fax_extension"] == "9"
-        assert practice["formatted_address"] == "22 Main Street Suite 3, Boston MA 02108"
-        assert str(practice["date_added"]) == "2026-06-15"
-        assert practice["address_key"] == "00000000-0000-0000-0000-000000000001"
-        assert practice["address_sources"] == ["marketplace_provider", "network"]
-        assert practice["source_record_ids"] == ["rec-a", "rec-b"]
-        assert practice["source_import_ids"] == ["import-a", "import-b"]
-        assert [
-            str(import_date) for import_date in practice["source_import_dates"]
-        ] == ["2026-06-15", "2026-06-16"]
-        assert practice["source_issuer_ids"] == [3, 7]
-        assert practice["source_issuer_names"] == ["Issuer A", "Issuer B"]
-        assert practice["source_urls"] == ["https://example.test/a", "https://example.test/b"]
-        assert practice["source_count"] == 2
-
-        billing = summaries_by_type["billing"]
-        assert billing["first_line"] == "PO Box 9"
-        assert billing["source_count"] == 1
-        assert billing["address_key"] is None
+        _assert_address_summaries(summaries_by_type)
     finally:
         await db.status(f"DROP TABLE IF EXISTS {address_table};")
         await db.status(f"DROP TABLE IF EXISTS {evidence_table};")

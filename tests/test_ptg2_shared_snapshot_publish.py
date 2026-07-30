@@ -282,14 +282,18 @@ class _DenseDictionaryRangeDriver:
     async def read_range_scalar(self, statement, parameters):
         if str(statement).lstrip().startswith("SELECT COUNT"):
             return int(parameters["range_end"]) - int(parameters["range_start"])
-        return False
+        return None
+
+
+def _row_result(rows):
+    return SimpleNamespace(all=lambda: tuple(rows))
 
 
 def _dense_dictionary_progress_stage():
     return shared_snapshot_publish._V4DenseDictionaryStage(
         stage_table="group_stage",
         key_name="provider_group_key",
-        expected_count=20_001,
+        expected_count=200_001,
         target_table="ptg2_v3_provider_group",
         columns=("provider_group_key", "provider_group_global_id_128"),
         value_predicate="octet_length(provider_group_global_id_128) = 16",
@@ -392,9 +396,383 @@ async def test_dense_v4_dictionary_ranges_move_exact_progress_every_four_seconds
         later - earlier
         for earlier, later in zip(emitted_times, emitted_times[1:])
     ) <= 4.0
-    assert progress_events[-1][2]["validated_dictionary_rows"] == 20_001
-    assert progress_events[-1][2]["published_dictionary_rows"] == 20_001
+    assert progress_events[-1][2]["validated_dictionary_rows"] == 200_001
+    assert progress_events[-1][2]["published_dictionary_rows"] == 200_001
     _assert_dense_dictionary_range_statements(range_driver.statements)
+
+
+def test_v4_dictionary_default_ranges_are_exact_and_ten_times_coarser():
+    """One million dense rows need about one tenth of the former batches."""
+
+    expected_count = 1_000_001
+    ranges = tuple(
+        shared_snapshot_publish._v4_dictionary_ranges(expected_count)
+    )
+
+    assert len(ranges) == 11
+    assert len(range(0, expected_count, 10_000)) == 101
+    assert ranges[0] == (0, 100_000)
+    assert ranges[-1] == (1_000_000, 1_000_001)
+    assert all(
+        earlier_end == later_start
+        for (_earlier_start, earlier_end), (later_start, _later_end) in zip(
+            ranges,
+            ranges[1:],
+        )
+    )
+    assert sum(range_end - range_start for range_start, range_end in ranges) == (
+        expected_count
+    )
+
+
+def test_v4_dictionary_batch_sizer_enforces_bytes_and_adapts_time():
+    """Byte ceilings win, while slow batches shrink and fast batches recover."""
+
+    payload_budget = (
+        shared_snapshot_publish._V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES
+        - shared_snapshot_publish._V4_DICTIONARY_FIXED_WORK_OVERHEAD_BYTES
+    )
+    estimated_row_bytes = payload_budget // 40_000 + 1
+    sizer = shared_snapshot_publish._V4DictionaryBatchSizer(
+        estimated_row_bytes=estimated_row_bytes,
+    )
+
+    assert sizer.maximum_rows < 40_000
+    assert (
+        sizer.maximum_rows * estimated_row_bytes
+        + shared_snapshot_publish._V4_DICTIONARY_FIXED_WORK_OVERHEAD_BYTES
+        <= shared_snapshot_publish._V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES
+    )
+    initial_rows = sizer.current_rows
+    sizer.observe(
+        shared_snapshot_publish._V4_DICTIONARY_SLOW_STATEMENT_SECONDS
+    )
+    assert sizer.current_rows == max(sizer.fallback_rows, initial_rows // 2)
+    reduced_rows = sizer.current_rows
+    sizer.observe(
+        shared_snapshot_publish._V4_DICTIONARY_RECOVERY_STATEMENT_SECONDS
+    )
+    assert sizer.current_rows == min(sizer.maximum_rows, reduced_rows * 2)
+
+
+def test_v4_dictionary_batch_sizer_rejects_invalid_limits(monkeypatch):
+    """Invalid estimates and fixed-overhead budgets fail before publication."""
+
+    with pytest.raises(
+        ValueError,
+        match="row estimate must be positive",
+    ):
+        shared_snapshot_publish._V4DictionaryBatchSizer(
+            estimated_row_bytes=0,
+        )
+
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES",
+        shared_snapshot_publish._V4_DICTIONARY_FIXED_WORK_OVERHEAD_BYTES,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="row-work budget is invalid",
+    ):
+        shared_snapshot_publish._V4DictionaryBatchSizer(
+            estimated_row_bytes=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_v4_dictionary_ranges_shrink_then_recover(monkeypatch):
+    """Observed statement time changes only later contiguous boundaries."""
+
+    elapsed_seconds = [0.0]
+    durations = iter((5.0, 1.0, 1.0))
+    ranges = []
+
+    async def execute(_statement, parameters):
+        ranges.append((parameters["range_start"], parameters["range_end"]))
+        elapsed_seconds[0] += next(durations)
+        row_count = parameters["range_end"] - parameters["range_start"]
+        return SimpleNamespace(
+            one=lambda: (
+                row_count,
+                parameters["range_start"],
+                parameters["range_end"] - 1,
+                True,
+                0,
+            )
+        )
+
+    monkeypatch.setattr(
+        shared_snapshot_publish.time,
+        "monotonic",
+        lambda: elapsed_seconds[0],
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=execute),
+        scalar=AsyncMock(return_value=None),
+    )
+    stage = _dense_dictionary_progress_stage()
+    stage = shared_snapshot_publish._V4DenseDictionaryStage(
+        **{**stage.__dict__, "expected_count": 250_000}
+    )
+
+    await shared_snapshot_publish._validate_v4_dictionary_stage(
+        session,
+        schema='"mrf"',
+        stage=stage,
+        progress_callback=None,
+    )
+
+    assert ranges == [(0, 100_000), (100_000, 150_000), (150_000, 250_000)]
+
+
+@pytest.mark.asyncio
+async def test_v4_target_key_enumeration_adapts_without_full_count(monkeypatch):
+    """Persisted completeness uses indexed pages and observed statement time."""
+
+    elapsed_seconds = [0.0]
+    durations = iter((5.0, 1.0, 1.0))
+    pages = iter((((1,), (2,)), ((3,),), ()))
+    batch_rows = []
+    statements = []
+
+    async def execute(statement, parameters):
+        statements.append(str(statement))
+        batch_rows.append(parameters["batch_rows"])
+        elapsed_seconds[0] += next(durations)
+        return _row_result(next(pages))
+
+    monkeypatch.setattr(
+        shared_snapshot_publish.time,
+        "monotonic",
+        lambda: elapsed_seconds[0],
+    )
+    observed_count = await shared_snapshot_publish._count_v4_target_keys(
+        SimpleNamespace(execute=execute),
+        schema='"mrf"',
+        target_table='"target"',
+        key_name='"dictionary_key"',
+        snapshot_key=17,
+        initial_key=-1,
+        estimated_row_bytes=160,
+        heartbeat_callback=None,
+    )
+
+    assert observed_count == 3
+    assert batch_rows == [100_000, 50_000, 100_000]
+    assert all("ORDER BY" in statement for statement in statements)
+    assert all("LIMIT :batch_rows" in statement for statement in statements)
+    assert all("COUNT(" not in statement for statement in statements)
+
+
+def test_v4_dictionary_heartbeat_repeats_only_completed_counters():
+    """A long query heartbeat cannot claim an unfinished dictionary range."""
+
+    elapsed_seconds = [0.0]
+    snapshots = []
+    progress = shared_snapshot_publish._MeasuredPublicationProgress(
+        "dictionary",
+        lambda _stage, counters: snapshots.append(dict(counters)),
+        interval_seconds=4.0,
+        clock=lambda: elapsed_seconds[0],
+    )
+    progress.add("published_dictionary_rows", 100_000)
+    progress.flush()
+
+    elapsed_seconds[0] = 4.0
+    progress.heartbeat()
+
+    assert snapshots == [
+        {"published_dictionary_rows": 100_000},
+        {"published_dictionary_rows": 100_000},
+    ]
+
+
+def test_v4_dictionary_heartbeat_skips_unreportable_work():
+    """Heartbeat is inert without a callback or before its next cadence."""
+
+    progress_without_callback = (
+        shared_snapshot_publish._MeasuredPublicationProgress(
+            "dictionary",
+            None,
+        )
+    )
+    progress_without_callback.heartbeat()
+
+    elapsed_seconds = [0.0]
+    snapshots = []
+    progress = shared_snapshot_publish._MeasuredPublicationProgress(
+        "dictionary",
+        lambda _stage, counters: snapshots.append(dict(counters)),
+        interval_seconds=4.0,
+        clock=lambda: elapsed_seconds[0],
+    )
+    progress.add("published_dictionary_rows", 1)
+    progress.flush()
+    elapsed_seconds[0] = 3.9
+    progress.heartbeat()
+
+    assert snapshots == [{"published_dictionary_rows": 1}]
+
+
+@pytest.mark.asyncio
+async def test_v4_dictionary_statement_rejects_invalid_heartbeat():
+    """A nonpositive heartbeat cannot create an unmonitored SQL task."""
+
+    statement_result = asyncio.get_running_loop().create_future()
+    statement_result.set_result(None)
+
+    with pytest.raises(
+        ValueError,
+        match="heartbeat must be positive",
+    ):
+        await shared_snapshot_publish._await_v4_dictionary_statement(
+            statement_result,
+            heartbeat_callback=None,
+            heartbeat_seconds=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_v4_dictionary_statement_preserves_immediate_failure():
+    """A completed statement failure is returned without redundant cancellation."""
+
+    async def fail_statement():
+        raise RuntimeError("statement failed")
+
+    with pytest.raises(
+        RuntimeError,
+        match="statement failed",
+    ):
+        await shared_snapshot_publish._await_v4_dictionary_statement(
+            fail_statement(),
+            heartbeat_callback=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_v4_dictionary_statement_heartbeat_preserves_cancellation():
+    """Heartbeat polling re-raises cancellation and settles the SQL task."""
+
+    started = asyncio.Event()
+    canceled = asyncio.Event()
+    heartbeat_counts = [0]
+
+    async def pending_statement():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            canceled.set()
+
+    def heartbeat():
+        heartbeat_counts[0] += 1
+
+    task = asyncio.create_task(
+        shared_snapshot_publish._await_v4_dictionary_statement(
+            pending_statement(),
+            heartbeat_callback=heartbeat,
+            heartbeat_seconds=0.01,
+        )
+    )
+    await started.wait()
+    while heartbeat_counts[0] == 0:
+        await asyncio.sleep(0.005)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert canceled.is_set()
+    assert heartbeat_counts[0] >= 1
+
+
+def test_v4_dictionary_publication_contract_is_manifest_safe():
+    """The sealed runtime contract freezes every adaptive batch threshold."""
+
+    contract = shared_snapshot_publish._V4_DICTIONARY_BATCH_CONTRACT.as_dict()
+
+    assert contract == {
+        "contract": "ptg2_v4_dictionary_publication_adaptive_v1",
+        "default_range_rows": 100_000,
+        "fallback_range_rows": 10_000,
+        "max_estimated_row_work_bytes": 16 * 1024 * 1024,
+        "fixed_work_overhead_bytes": 64 * 1024,
+        "estimated_row_bytes": 160,
+        "slow_statement_millis": 4_000,
+        "recovery_statement_millis": 2_000,
+        "heartbeat_millis": 4_000,
+    }
+
+
+@pytest.mark.asyncio
+async def test_v4_dictionary_publication_rejects_extra_target_keys():
+    """An authenticated stage cannot leave keys outside its dense span."""
+
+    session = SimpleNamespace(scalar=AsyncMock(return_value=True))
+
+    with pytest.raises(RuntimeError, match="persisted dictionary rows changed"):
+        await shared_snapshot_publish._reject_v4_dictionary_extra_keys(
+            session,
+            schema='"mrf"',
+            target_table='"ptg2_v4_provider_group"',
+            key_name='"provider_group_key"',
+            snapshot_key=17,
+            expected_count=3,
+        )
+
+
+@pytest.mark.asyncio
+async def test_v4_sparse_publication_rejects_incomplete_target(monkeypatch):
+    """A sparse publication must authenticate the complete staged count."""
+
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_v4_sparse_batch_boundary",
+        AsyncMock(return_value=(0, None, 0.0)),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_count_v4_target_keys",
+        AsyncMock(return_value=0),
+    )
+    session = SimpleNamespace()
+    stage = _dense_dictionary_progress_stage()
+    stage = shared_snapshot_publish._V4DenseDictionaryStage(
+        **{**stage.__dict__, "expected_count": 1}
+    )
+
+    with pytest.raises(RuntimeError, match="persisted dictionary rows changed"):
+        await shared_snapshot_publish._publish_v4_sparse_ranges(
+            session,
+            schema='"mrf"',
+            snapshot_key=17,
+            stage=stage,
+            progress_callback=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_sealed_layout_requires_a_serving_index(monkeypatch):
+    """The post-seal readback fails closed when the index is absent."""
+
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(scalar=lambda: None),
+        )
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(shared_snapshot_publish.db, "transaction", transaction)
+
+    with pytest.raises(RuntimeError, match="missing its serving index"):
+        await shared_snapshot_publish._sealed_shared_serving_index(
+            schema_name="mrf",
+            snapshot_key=17,
+            expected_generation="shared_blocks_v4",
+        )
 
 
 def test_v4_reference_manifest_streams_exact_sorted_coordinates(tmp_path):
@@ -692,6 +1070,105 @@ def _tax_stage_contract():
         unsupported_type_count=1,
         content_digest=b"c" * 32,
     )
+
+
+@pytest.mark.asyncio
+async def test_v4_tax_group_lookup_is_bounded_and_heartbeated(monkeypatch):
+    """Tax completeness uses a bounded indexed join and completed counters."""
+
+    clock_seconds = [0.0]
+    snapshots = []
+    progress = shared_snapshot_publish._MeasuredPublicationProgress(
+        "tax relation proof",
+        lambda _stage, counters: snapshots.append(dict(counters)),
+        clock=lambda: clock_seconds[0],
+    )
+    progress.add("validated_dictionary_rows", 4)
+    progress.flush()
+
+    async def await_statement(statement_awaitable, **kwargs):
+        result = await statement_awaitable
+        clock_seconds[0] = 4.0
+        kwargs["heartbeat_callback"]()
+        return result, 5.0
+
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_row_result(())),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_await_v4_dictionary_statement",
+        await_statement,
+    )
+
+    tax_group_records, elapsed_seconds = (
+        await shared_snapshot_publish._v4_tax_group_rows_batch(
+            session,
+            schema='"mrf"',
+            group_tax_stage='"group_tax_stage"',
+            graph_group_stage='"group_stage"',
+            previous_group_id=b"",
+            batch_rows=100_000,
+            heartbeat_callback=progress.heartbeat,
+        )
+    )
+
+    statement = str(session.execute.await_args.args[0])
+    assert tax_group_records == ()
+    assert elapsed_seconds == 5.0
+    assert "LEFT JOIN" in statement
+    assert "ORDER BY sidecar.provider_group_global_id_128" in statement
+    assert "LIMIT :batch_rows" in statement
+    assert "COUNT(DISTINCT" not in statement
+    assert "NOT EXISTS" not in statement
+    assert snapshots == [
+        {"validated_dictionary_rows": 4},
+        {"validated_dictionary_rows": 4},
+    ]
+
+
+def test_v4_tax_group_reference_bitset_is_exact_and_group_bound():
+    """Duplicate references count once and every sidecar must bind a group."""
+
+    contract = _tax_stage_contract()
+    digest = hashlib.sha256()
+    count_by_state = {
+        name: 0
+        for name in (
+            "matched_ein",
+            "missing",
+            "malformed",
+            "unsupported_type",
+        )
+    }
+    group_rows = (
+        (b"\x01" * 16, "matched_ein", 0, b"\x01", True),
+        (b"\x02" * 16, "matched_ein", 0, b"\x01", True),
+    )
+
+    latest_group_id, new_reference_count = (
+        shared_snapshot_publish._consume_v4_tax_group_rows(
+            group_rows,
+            previous_group_id=b"",
+            contract=contract,
+            content_digest=digest,
+            count_by_state=count_by_state,
+            referenced_token_bits=bytearray(1),
+        )
+    )
+
+    assert latest_group_id == b"\x02" * 16
+    assert new_reference_count == 1
+    assert count_by_state["matched_ein"] == 2
+    with pytest.raises(
+        RuntimeError,
+        match="provider-group tax identity changed",
+    ):
+        shared_snapshot_publish._validated_v4_tax_group_row(
+            (b"\x03" * 16, "missing", None, b"\x01", False),
+            previous_group_id=b"\x02" * 16,
+            contract=contract,
+        )
 
 
 @pytest.mark.asyncio

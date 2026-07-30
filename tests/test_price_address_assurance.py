@@ -1699,11 +1699,7 @@ def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch,
     assert resolutions == _expected_raw_artifact_resolutions(raw_artifact, missing_artifact)
 
 
-def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch, tmp_path, capsys):
-    """Verify price address assurance cli main verifies traced raw artifact."""
-    script = _load_cli_module()
-    raw_artifact = tmp_path / "raw-rates.json"
-    api_payload = tmp_path / "api-payload.json"
+def _write_traced_raw_artifact_fixture(raw_artifact, api_payload):
     _write_json(
         raw_artifact,
         {
@@ -1762,6 +1758,14 @@ def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypat
             }
         },
     )
+
+
+def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch, tmp_path, capsys):
+    """Verify price address assurance cli main verifies traced raw artifact."""
+    script = _load_cli_module()
+    raw_artifact = tmp_path / "raw-rates.json"
+    api_payload = tmp_path / "api-payload.json"
+    _write_traced_raw_artifact_fixture(raw_artifact, api_payload)
     captured_by_field = {}
 
     class FakeConnection:

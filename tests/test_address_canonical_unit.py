@@ -154,8 +154,7 @@ def test_unit_keyword_does_not_steal_street_suffix():
     assert address_canon.street_norm(address[0], address[1]) == "4oddunitrddesknearlobby"
 
 
-def test_unit_extraction_uses_one_decision_for_street_and_unit():
-    """Street and unit normalization share one deterministic line decision."""
+def _assert_inline_unit_identity() -> None:
     assert address_canon.street_norm("100 Florida Ave Fl 2", "") == "100floridaave"
     assert address_canon.street_norm("100 Fleet St Fl 2", "") == "100fleetst"
     assert address_canon.address_key_v1("100 Florida Ave Fl 2", "", "Austin", "TX", "78701", "US") != (
@@ -182,6 +181,8 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
     assert ste_300_apt_5 == "v2|123mainstste300|apt5||TX|78701|US|street"
     assert address_canon.key_from_identity(ste_200_apt_5) != address_canon.key_from_identity(ste_300_apt_5)
 
+
+def _assert_duplicate_suite_unit_identity() -> None:
     duplicate_suite = address_canon.identity_key_v1(
         "123 Main St Suite 100",
         "Suite 100",
@@ -214,6 +215,9 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
         address_canon.identity_key_v1("123 Main St 1st Fl", "1st Floor", "Austin", "TX", "78701", "US")
         == "v2|123mainst|fl1||TX|78701|US|street"
     )
+
+
+def _assert_compound_unit_identity() -> None:
     assert address_canon.identity_key_v1(
         "7281 E EARLL DR STE 1 BLDG A",
         "Ste 1 Bldg A",
@@ -249,6 +253,8 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
     assert address_canon.street_norm("1623 3rd Ave Ste 201 Ofc 5", "Ste 201 Ofc 5") == "16233aveste201"
     assert address_canon.unit_norm("1623 3rd Ave Ste 201 Ofc 5", "Ste 201 Ofc 5") == "ofc5"
 
+
+def _assert_unit_identity_edge_cases() -> None:
     assert address_canon.identity_key_v1(
         "123 Main St Ste 200",
         "Suite",
@@ -295,6 +301,14 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
         str(address_canon.address_key_v1("27 Dr Mellichamp Dr\xa0Ste 100", "", "BLUFFTON", "SC", "29910", "US"))
         == "3e3ea29f-8c26-17ba-dcc8-74424e66fd32"
     )
+
+
+def test_unit_extraction_uses_one_decision_for_street_and_unit():
+    """Street and unit normalization share one deterministic line decision."""
+    _assert_inline_unit_identity()
+    _assert_duplicate_suite_unit_identity()
+    _assert_compound_unit_identity()
+    _assert_unit_identity_edge_cases()
 
 
 def test_unit_extraction_handles_high_confidence_free_text_variants():
@@ -3053,6 +3067,46 @@ async def test_entity_address_unified_support_code_location_indexes_can_be_enabl
     assert any("idx_code_location" in statement for statement in statements)
 
 
+def _assert_serving_stage_indexes(statements, index_context_map) -> None:
+    joined = "\n".join(statements)
+    assert index_context_map["stage_index_profile"] == "serving"
+    for index_name in (
+        "idx_npi",
+        "idx_procedures_array",
+        "idx_geo_bbox",
+        "idx_geo_idx",
+        "idx_primary_phone_npi",
+        "idx_service_phone_lookup_npi",
+        "idx_service_phone_digits_npi",
+        "idx_service_phone_number_npi",
+        "idx_service_address_key_npi",
+        "idx_service_premise_key_npi",
+        "idx_address_sources",
+    ):
+        assert index_name in joined
+    for index_name in (
+        "idx_primary_phone_digits_npi",
+        "idx_inferred_npi",
+        "idx_entity_type_coalesced_npi",
+        "idx_row_origin",
+        "idx_zip5",
+        "idx_ptg_plan_array",
+    ):
+        assert index_name not in joined
+    for skipped_name in (
+        "inferred_npi",
+        "entity_type_coalesced_npi",
+        "primary_phone_digits_npi",
+        "row_origin",
+        "zip5",
+        "ptg_plan_array",
+    ):
+        assert (
+            f"entity_address_unified_20260614.{skipped_name}"
+            in index_context_map["skipped_stage_indexes"]
+        )
+
+
 @pytest.mark.asyncio
 async def test_entity_address_unified_serving_stage_index_profile_skips_debug_indexes(monkeypatch):
     """Serving-stage index creation omits diagnostic-only indexes."""
@@ -3146,37 +3200,7 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
 
     await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=index_context_map)
 
-    joined = "\n".join(statements)
-    assert index_context_map["stage_index_profile"] == "serving"
-    assert "idx_npi" in joined
-    assert "idx_procedures_array" in joined
-    assert "idx_geo_bbox" in joined
-    assert "idx_geo_idx" in joined
-    assert "idx_primary_phone_npi" in joined
-    assert "idx_service_phone_lookup_npi" in joined
-    assert "idx_service_phone_digits_npi" in joined
-    assert "idx_service_phone_number_npi" in joined
-    assert "idx_service_address_key_npi" in joined
-    assert "idx_service_premise_key_npi" in joined
-    assert "idx_address_sources" in joined
-    assert "idx_primary_phone_digits_npi" not in joined
-    assert "idx_inferred_npi" not in joined
-    assert "idx_entity_type_coalesced_npi" not in joined
-    assert "idx_row_origin" not in joined
-    assert "idx_zip5" not in joined
-    assert "idx_ptg_plan_array" not in joined
-    assert "entity_address_unified_20260614.inferred_npi" in index_context_map["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.entity_type_coalesced_npi" in index_context_map[
-        "skipped_stage_indexes"
-    ]
-    assert "entity_address_unified_20260614.primary_phone_digits_npi" in index_context_map[
-        "skipped_stage_indexes"
-    ]
-    assert "entity_address_unified_20260614.row_origin" in index_context_map["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.zip5" in index_context_map["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.ptg_plan_array" in index_context_map[
-        "skipped_stage_indexes"
-    ]
+    _assert_serving_stage_indexes(statements, index_context_map)
 
 
 @pytest.mark.asyncio

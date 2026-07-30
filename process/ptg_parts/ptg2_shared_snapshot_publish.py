@@ -13,7 +13,7 @@ import struct
 import tempfile
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -136,7 +136,17 @@ _REQUIRED_PRICE_OBJECT_KINDS = _REQUIRED_OBJECT_KINDS - {
     "graph_group_provider_sets_v1",
     "graph_provider_set_groups_v1",
 }
-_V4_DICTIONARY_RANGE_ROWS = 10_000
+_V4_DICTIONARY_PUBLICATION_BATCH_CONTRACT = (
+    "ptg2_v4_dictionary_publication_adaptive_v1"
+)
+_V4_DICTIONARY_DEFAULT_RANGE_ROWS = 100_000
+_V4_DICTIONARY_FALLBACK_RANGE_ROWS = 10_000
+_V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES = 16 * 1024 * 1024
+_V4_DICTIONARY_FIXED_WORK_OVERHEAD_BYTES = 64 * 1024
+_V4_DICTIONARY_ESTIMATED_ROW_BYTES = 160
+_V4_DICTIONARY_SLOW_STATEMENT_SECONDS = 4.0
+_V4_DICTIONARY_RECOVERY_STATEMENT_SECONDS = 2.0
+_V4_DICTIONARY_HEARTBEAT_SECONDS = 4.0
 _V4_TAX_IDENTITY_MANIFEST_CONTRACT = "ptg2_provider_group_tax_identity_v1"
 _V4_TAX_IDENTITY_PROJECTION_CONTRACT = (
     "ptg2_provider_tax_identity_projection_v1"
@@ -256,6 +266,89 @@ class _V4DenseDictionaryStage:
     sum_expression: str = "0"
     expected_sum: int | None = None
     dense_keys: bool = True
+    estimated_row_bytes: int = _V4_DICTIONARY_ESTIMATED_ROW_BYTES
+
+
+@dataclass(frozen=True)
+class _V4DictionaryPublicationBatchContract:
+    """Authenticated runtime contract for bounded V4 dictionary row work."""
+
+    contract: str = _V4_DICTIONARY_PUBLICATION_BATCH_CONTRACT
+    default_range_rows: int = _V4_DICTIONARY_DEFAULT_RANGE_ROWS
+    fallback_range_rows: int = _V4_DICTIONARY_FALLBACK_RANGE_ROWS
+    max_estimated_row_work_bytes: int = (
+        _V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES
+    )
+    fixed_work_overhead_bytes: int = _V4_DICTIONARY_FIXED_WORK_OVERHEAD_BYTES
+    estimated_row_bytes: int = _V4_DICTIONARY_ESTIMATED_ROW_BYTES
+    slow_statement_millis: int = int(
+        _V4_DICTIONARY_SLOW_STATEMENT_SECONDS * 1_000
+    )
+    recovery_statement_millis: int = int(
+        _V4_DICTIONARY_RECOVERY_STATEMENT_SECONDS * 1_000
+    )
+    heartbeat_millis: int = int(_V4_DICTIONARY_HEARTBEAT_SECONDS * 1_000)
+
+    def as_dict(self) -> dict[str, int | str]:
+        """Return the exact manifest-safe publication policy."""
+
+        return {
+            "contract": self.contract,
+            "default_range_rows": self.default_range_rows,
+            "fallback_range_rows": self.fallback_range_rows,
+            "max_estimated_row_work_bytes": self.max_estimated_row_work_bytes,
+            "fixed_work_overhead_bytes": self.fixed_work_overhead_bytes,
+            "estimated_row_bytes": self.estimated_row_bytes,
+            "slow_statement_millis": self.slow_statement_millis,
+            "recovery_statement_millis": self.recovery_statement_millis,
+            "heartbeat_millis": self.heartbeat_millis,
+        }
+
+
+_V4_DICTIONARY_BATCH_CONTRACT = _V4DictionaryPublicationBatchContract()
+
+
+class _V4DictionaryBatchSizer:
+    """Adapt row ranges without weakening the estimated row-work ceiling."""
+
+    def __init__(self, *, estimated_row_bytes: int) -> None:
+        normalized_row_bytes = int(estimated_row_bytes)
+        if normalized_row_bytes <= 0:
+            raise ValueError("PTG V4 dictionary row estimate must be positive")
+        payload_budget = (
+            _V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES
+            - _V4_DICTIONARY_FIXED_WORK_OVERHEAD_BYTES
+        )
+        if payload_budget <= 0:
+            raise RuntimeError("PTG V4 dictionary row-work budget is invalid")
+        byte_limited_rows = max(1, payload_budget // normalized_row_bytes)
+        self.maximum_rows = min(
+            _V4_DICTIONARY_DEFAULT_RANGE_ROWS,
+            byte_limited_rows,
+        )
+        self.fallback_rows = min(
+            _V4_DICTIONARY_FALLBACK_RANGE_ROWS,
+            self.maximum_rows,
+        )
+        self.current_rows = self.maximum_rows
+
+    def observe(self, elapsed_seconds: float) -> None:
+        """Shrink slow ranges and recover fast ranges geometrically."""
+
+        normalized_elapsed = max(float(elapsed_seconds), 0.0)
+        if normalized_elapsed >= _V4_DICTIONARY_SLOW_STATEMENT_SECONDS:
+            self.current_rows = max(
+                self.fallback_rows,
+                self.current_rows // 2,
+            )
+        elif (
+            normalized_elapsed <= _V4_DICTIONARY_RECOVERY_STATEMENT_SECONDS
+            and self.current_rows < self.maximum_rows
+        ):
+            self.current_rows = min(
+                self.maximum_rows,
+                self.current_rows * 2,
+            )
 
 
 @dataclass(frozen=True)
@@ -332,6 +425,18 @@ class _MeasuredPublicationProgress:
         self._last_emitted = dict(self._totals)
         self._next_emit_at = observed_at + self._interval_seconds
 
+    def heartbeat(self) -> None:
+        """Re-emit only completed counters while one bounded query is active."""
+
+        if self._callback is None or not self._totals:
+            return
+        observed_at = self._clock()
+        if observed_at < self._next_emit_at:
+            return
+        self._callback(self.stage, dict(self._totals))
+        self._last_emitted = dict(self._totals)
+        self._next_emit_at = observed_at + self._interval_seconds
+
 
 def _progress_callback_kwargs(
     progress_callback: Callable[..., None] | None,
@@ -362,6 +467,7 @@ class _V4GraphPublication:
     map_summary: V4SnapshotMapSummary
     representation: str
     compiler_summary: Mapping[str, Any]
+    dictionary_publication: Mapping[str, Any]
     inferred_taxonomy_candidates: Mapping[str, Any]
     provider_tax_identity: Mapping[str, Any]
     audit_witness_path: Path
@@ -1239,13 +1345,21 @@ async def _queue_failed_v4_graph_blocks(
     await flush()
 
 
-def _v4_dictionary_ranges(expected_count: int) -> Iterable[tuple[int, int]]:
-    """Yield dense half-open key ranges small enough for observable SQL work."""
+def _v4_dictionary_ranges(
+    expected_count: int,
+    *,
+    estimated_row_bytes: int = _V4_DICTIONARY_ESTIMATED_ROW_BYTES,
+) -> Iterable[tuple[int, int]]:
+    """Yield default byte-bounded ranges for deterministic planning and tests."""
 
-    for range_start in range(0, int(expected_count), _V4_DICTIONARY_RANGE_ROWS):
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=estimated_row_bytes,
+    )
+    normalized_count = int(expected_count)
+    for range_start in range(0, normalized_count, sizer.current_rows):
         yield range_start, min(
-            range_start + _V4_DICTIONARY_RANGE_ROWS,
-            int(expected_count),
+            range_start + sizer.current_rows,
+            normalized_count,
         )
 
 
@@ -1274,23 +1388,79 @@ async def _has_out_of_range_dictionary_key(
     stage_table: str,
     key_name: str,
     expected_count: int,
+    heartbeat_callback: Callable[[], None] | None,
 ) -> bool:
-    """Return whether a dense dictionary stage contains an invalid key."""
-    result = await session.scalar(
-        db.text(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                  FROM {schema}.{stage_table}
-                 WHERE {key_name} < 0
-                    OR {key_name} >= :expected_count
-                 LIMIT 1
-            )
-            """
-        ),
-        {"expected_count": int(expected_count)},
+    """Probe indexed lower and upper dense-key boundaries."""
+
+    parameters_by_name = {"expected_count": int(expected_count)}
+    for predicate, ordering in (
+        (f"{key_name} < 0", f"{key_name} DESC"),
+        (f"{key_name} >= :expected_count", key_name),
+    ):
+        invalid_key, _elapsed_seconds = await _await_v4_dictionary_statement(
+            session.scalar(
+                db.text(
+                    f"""
+                    SELECT {key_name}
+                      FROM {schema}.{stage_table}
+                     WHERE {predicate}
+                     ORDER BY {ordering}
+                     LIMIT 1
+                    """
+                ),
+                parameters_by_name,
+            ),
+            heartbeat_callback=heartbeat_callback,
+        )
+        if invalid_key is not None:
+            return True
+    return False
+
+
+async def _await_v4_dictionary_statement(
+    statement_awaitable: Awaitable[Any],
+    *,
+    heartbeat_callback: Callable[[], None] | None,
+    heartbeat_seconds: float = _V4_DICTIONARY_HEARTBEAT_SECONDS,
+) -> tuple[Any, float]:
+    """Await one statement while repeating only already-completed progress."""
+
+    normalized_heartbeat = float(heartbeat_seconds)
+    if normalized_heartbeat <= 0:
+        raise ValueError("PTG V4 dictionary heartbeat must be positive")
+    started_at = time.monotonic()
+    statement_task = asyncio.ensure_future(statement_awaitable)
+    try:
+        while True:
+            try:
+                statement_result = await asyncio.wait_for(
+                    asyncio.shield(statement_task),
+                    timeout=normalized_heartbeat,
+                )
+                return statement_result, time.monotonic() - started_at
+            except asyncio.TimeoutError:
+                if heartbeat_callback is not None:
+                    heartbeat_callback()
+    except BaseException:
+        if not statement_task.done():
+            statement_task.cancel()
+        with suppress(BaseException):
+            await statement_task
+        raise
+
+
+def _v4_dictionary_range_end(
+    *,
+    range_start: int,
+    expected_count: int,
+    sizer: _V4DictionaryBatchSizer,
+) -> int:
+    """Return the next exclusive boundary under the current adaptive size."""
+
+    return min(
+        int(range_start) + int(sizer.current_rows),
+        int(expected_count),
     )
-    return bool(result)
 
 
 async def _validate_v4_dictionary_stage(
@@ -1299,6 +1469,7 @@ async def _validate_v4_dictionary_stage(
     schema: str,
     stage: _V4DenseDictionaryStage,
     progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None = None,
 ) -> None:
     """Validate dense stage keys and values in real bounded ranges."""
 
@@ -1308,24 +1479,75 @@ async def _validate_v4_dictionary_stage(
             schema=schema,
             stage=stage,
             progress_callback=progress_callback,
+            heartbeat_callback=heartbeat_callback,
         )
         return
     stage_table = _quote_ident(stage.stage_table)
     key_name = _quote_ident(stage.key_name)
+    observed_sum = await _validated_v4_dense_dictionary_sum(
+        session,
+        schema=schema,
+        stage=stage,
+        stage_table=stage_table,
+        key_name=key_name,
+        progress_callback=progress_callback,
+        heartbeat_callback=heartbeat_callback,
+    )
+    has_out_of_range_key = await _has_out_of_range_dictionary_key(
+        session,
+        schema=schema,
+        stage_table=stage_table,
+        key_name=key_name,
+        expected_count=stage.expected_count,
+        heartbeat_callback=heartbeat_callback,
+    )
+    if bool(has_out_of_range_key) or (
+        stage.expected_sum is not None
+        and observed_sum != int(stage.expected_sum)
+    ):
+        raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
+
+
+async def _validated_v4_dense_dictionary_sum(
+    session: Any,
+    *,
+    schema: str,
+    stage: _V4DenseDictionaryStage,
+    stage_table: str,
+    key_name: str,
+    progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None,
+) -> int:
+    """Validate bounded dense ranges and return their observed value sum."""
+
     observed_sum = 0
-    for range_start, range_end in _v4_dictionary_ranges(stage.expected_count):
-        range_summary_result = await session.execute(
-            db.text(
-                f"""
-                SELECT COUNT(*)::bigint, MIN({key_name}), MAX({key_name}),
-                       COALESCE(BOOL_AND({stage.value_predicate}), TRUE),
-                       COALESCE(SUM({stage.sum_expression}), 0)::bigint
-                  FROM {schema}.{stage_table}
-                 WHERE {key_name} >= :range_start
-                   AND {key_name} < :range_end
-                """
-            ),
-            {"range_start": range_start, "range_end": range_end},
+    range_start = 0
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=stage.estimated_row_bytes,
+    )
+    while range_start < int(stage.expected_count):
+        range_end = _v4_dictionary_range_end(
+            range_start=range_start,
+            expected_count=stage.expected_count,
+            sizer=sizer,
+        )
+        range_summary_result, elapsed_seconds = (
+            await _await_v4_dictionary_statement(
+                session.execute(
+                    db.text(
+                        f"""
+                        SELECT COUNT(*)::bigint, MIN({key_name}), MAX({key_name}),
+                               COALESCE(BOOL_AND({stage.value_predicate}), TRUE),
+                               COALESCE(SUM({stage.sum_expression}), 0)::bigint
+                          FROM {schema}.{stage_table}
+                         WHERE {key_name} >= :range_start
+                           AND {key_name} < :range_end
+                        """
+                    ),
+                    {"range_start": range_start, "range_end": range_end},
+                ),
+                heartbeat_callback=heartbeat_callback,
+            )
         )
         range_summary = range_summary_result.one()
         expected_rows = range_end - range_start
@@ -1337,18 +1559,48 @@ async def _validate_v4_dictionary_stage(
         if progress_callback is not None:
             progress_callback("validated_dictionary_rows", expected_rows)
             progress_callback("publish_batches", 1)
-    has_out_of_range_key = await _has_out_of_range_dictionary_key(
-        session,
-        schema=schema,
-        stage_table=stage_table,
-        key_name=key_name,
-        expected_count=stage.expected_count,
+        sizer.observe(elapsed_seconds)
+        range_start = range_end
+    return observed_sum
+
+
+async def _v4_sparse_dictionary_summary(
+    session: Any,
+    *,
+    schema: str,
+    stage_table: str,
+    key_name: str,
+    stage: _V4DenseDictionaryStage,
+    previous_key: int,
+    batch_rows: int,
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[Any, float]:
+    """Read one ordered sparse validation summary under the adaptive limit."""
+
+    return await _await_v4_dictionary_statement(
+        session.execute(
+            db.text(
+                f"""
+                WITH batch AS MATERIALIZED (
+                    SELECT *
+                      FROM {schema}.{stage_table}
+                     WHERE {key_name} > :previous_key
+                     ORDER BY {key_name}
+                     LIMIT :batch_rows
+                )
+                SELECT COUNT(*)::bigint, MIN({key_name}), MAX({key_name}),
+                       COALESCE(BOOL_AND({stage.value_predicate}), TRUE),
+                       COALESCE(SUM({stage.sum_expression}), 0)::bigint
+                  FROM batch
+                """
+            ),
+            {
+                "previous_key": previous_key,
+                "batch_rows": int(batch_rows),
+            },
+        ),
+        heartbeat_callback=heartbeat_callback,
     )
-    if bool(has_out_of_range_key) or (
-        stage.expected_sum is not None
-        and observed_sum != int(stage.expected_sum)
-    ):
-        raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
 
 
 async def _validate_v4_sparse_dictionary_stage(
@@ -1357,6 +1609,7 @@ async def _validate_v4_sparse_dictionary_stage(
     schema: str,
     stage: _V4DenseDictionaryStage,
     progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None = None,
 ) -> None:
     """Validate one sparse-key dictionary through ordered physical batches."""
 
@@ -1365,24 +1618,19 @@ async def _validate_v4_sparse_dictionary_stage(
     previous_key = -1
     observed_count = 0
     observed_sum = 0
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=stage.estimated_row_bytes,
+    )
     while True:
-        batch_result = await session.execute(
-            db.text(
-                f"""
-                WITH batch AS MATERIALIZED (
-                    SELECT *
-                      FROM {schema}.{stage_table}
-                     WHERE {key_name} > :previous_key
-                     ORDER BY {key_name}
-                     LIMIT {_V4_DICTIONARY_RANGE_ROWS}
-                )
-                SELECT COUNT(*)::bigint, MIN({key_name}), MAX({key_name}),
-                       COALESCE(BOOL_AND({stage.value_predicate}), TRUE),
-                       COALESCE(SUM({stage.sum_expression}), 0)::bigint
-                  FROM batch
-                """
-            ),
-            {"previous_key": previous_key},
+        batch_result, elapsed_seconds = await _v4_sparse_dictionary_summary(
+            session,
+            schema=schema,
+            stage_table=stage_table,
+            key_name=key_name,
+            stage=stage,
+            previous_key=previous_key,
+            batch_rows=sizer.current_rows,
+            heartbeat_callback=heartbeat_callback,
         )
         batch_summary = batch_result.one()
         batch_count = int(batch_summary[0])
@@ -1401,6 +1649,7 @@ async def _validate_v4_sparse_dictionary_stage(
         if progress_callback is not None:
             progress_callback("validated_dictionary_rows", batch_count)
             progress_callback("publish_batches", 1)
+        sizer.observe(elapsed_seconds)
     if observed_count != int(stage.expected_count) or (
         stage.expected_sum is not None
         and observed_sum != int(stage.expected_sum)
@@ -1415,6 +1664,7 @@ async def _publish_v4_dictionary_stage_ranges(
     snapshot_key: int,
     stage: _V4DenseDictionaryStage,
     progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None = None,
 ) -> None:
     """Publish one validated dictionary through bounded key-range statements."""
 
@@ -1425,6 +1675,7 @@ async def _publish_v4_dictionary_stage_ranges(
             snapshot_key=snapshot_key,
             stage=stage,
             progress_callback=progress_callback,
+            heartbeat_callback=heartbeat_callback,
         )
         return
     stage_table = _quote_ident(stage.stage_table)
@@ -1435,39 +1686,56 @@ async def _publish_v4_dictionary_stage_ranges(
     matching_columns = " AND ".join(
         f"stored.{column} = staged.{column}" for column in quoted_columns
     )
-    for range_start, range_end in _v4_dictionary_ranges(stage.expected_count):
+    range_start = 0
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=stage.estimated_row_bytes,
+    )
+    while range_start < int(stage.expected_count):
+        range_end = _v4_dictionary_range_end(
+            range_start=range_start,
+            expected_count=stage.expected_count,
+            sizer=sizer,
+        )
         range_parameters_by_name = {
             "snapshot_key": int(snapshot_key),
             "range_start": range_start,
             "range_end": range_end,
         }
-        await session.execute(
-            db.text(
-                f"""
-                INSERT INTO {schema}.{target_table} (snapshot_key, {columns})
-                SELECT :snapshot_key, {columns}
-                  FROM {schema}.{stage_table}
-                 WHERE {key_name} >= :range_start
-                   AND {key_name} < :range_end
-                 ORDER BY {key_name}
-                ON CONFLICT DO NOTHING
-                """
+        _, insert_seconds = await _await_v4_dictionary_statement(
+            session.execute(
+                db.text(
+                    f"""
+                    INSERT INTO {schema}.{target_table} (snapshot_key, {columns})
+                    SELECT :snapshot_key, {columns}
+                      FROM {schema}.{stage_table}
+                     WHERE {key_name} >= :range_start
+                       AND {key_name} < :range_end
+                     ORDER BY {key_name}
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                range_parameters_by_name,
             ),
-            range_parameters_by_name,
+            heartbeat_callback=heartbeat_callback,
         )
-        matching_count = await session.scalar(
-            db.text(
-                f"""
-                SELECT COUNT(*)::bigint
-                  FROM {schema}.{stage_table} AS staged
-                  JOIN {schema}.{target_table} AS stored
-                    ON stored.snapshot_key = :snapshot_key
-                   AND {matching_columns}
-                 WHERE staged.{key_name} >= :range_start
-                   AND staged.{key_name} < :range_end
-                """
-            ),
-            range_parameters_by_name,
+        matching_count, verification_seconds = (
+            await _await_v4_dictionary_statement(
+                session.scalar(
+                    db.text(
+                        f"""
+                        SELECT COUNT(*)::bigint
+                          FROM {schema}.{stage_table} AS staged
+                          JOIN {schema}.{target_table} AS stored
+                            ON stored.snapshot_key = :snapshot_key
+                           AND {matching_columns}
+                         WHERE staged.{key_name} >= :range_start
+                           AND staged.{key_name} < :range_end
+                        """
+                    ),
+                    range_parameters_by_name,
+                ),
+                heartbeat_callback=heartbeat_callback,
+            )
         )
         expected_rows = range_end - range_start
         if int(matching_count or 0) != expected_rows:
@@ -1475,6 +1743,8 @@ async def _publish_v4_dictionary_stage_ranges(
         if progress_callback is not None:
             progress_callback("published_dictionary_rows", expected_rows)
             progress_callback("publish_batches", 1)
+        sizer.observe(max(insert_seconds, verification_seconds))
+        range_start = range_end
     await _reject_v4_dictionary_extra_keys(
         session,
         schema=schema,
@@ -1482,6 +1752,7 @@ async def _publish_v4_dictionary_stage_ranges(
         key_name=key_name,
         snapshot_key=int(snapshot_key),
         expected_count=int(stage.expected_count),
+        heartbeat_callback=heartbeat_callback,
     )
 
 
@@ -1493,52 +1764,52 @@ async def _reject_v4_dictionary_extra_keys(
     key_name: str,
     snapshot_key: int,
     expected_count: int,
+    heartbeat_callback: Callable[[], None] | None = None,
 ) -> None:
-    """Reject target keys outside the authenticated dense stage span."""
+    """Reject indexed target keys outside the authenticated dense span."""
 
-    has_extra_target_key = await session.scalar(
-        db.text(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                  FROM {schema}.{target_table}
-                 WHERE snapshot_key = :snapshot_key
-                   AND ({key_name} < 0 OR {key_name} >= :expected_count)
-                 LIMIT 1
-            )
-            """
-        ),
-        {
-            "snapshot_key": snapshot_key,
-            "expected_count": expected_count,
-        },
-    )
-    if bool(has_extra_target_key):
-        raise RuntimeError("PTG V4 persisted dictionary rows changed")
+    parameters_by_name = {
+        "snapshot_key": snapshot_key,
+        "expected_count": expected_count,
+    }
+    for predicate, ordering in (
+        (f"{key_name} < 0", f"{key_name} DESC"),
+        (f"{key_name} >= :expected_count", key_name),
+    ):
+        invalid_key, _elapsed_seconds = await _await_v4_dictionary_statement(
+            session.scalar(
+                db.text(
+                    f"""
+                    SELECT {key_name}
+                      FROM {schema}.{target_table}
+                     WHERE snapshot_key = :snapshot_key
+                       AND {predicate}
+                     ORDER BY {ordering}
+                     LIMIT 1
+                    """
+                ),
+                parameters_by_name,
+            ),
+            heartbeat_callback=heartbeat_callback,
+        )
+        if invalid_key is not None:
+            raise RuntimeError("PTG V4 persisted dictionary rows changed")
 
 
-async def _publish_v4_sparse_ranges(
+async def _v4_sparse_batch_boundary(
     session: Any,
     *,
     schema: str,
-    snapshot_key: int,
-    stage: _V4DenseDictionaryStage,
-    progress_callback: Callable[[str, int], None] | None,
-) -> None:
-    """Publish one sparse dictionary using ordered, bounded key batches."""
+    stage_table: str,
+    key_name: str,
+    previous_key: int,
+    batch_rows: int,
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[int, int | None, float]:
+    """Read one sparse batch count and inclusive upper key."""
 
-    stage_table = _quote_ident(stage.stage_table)
-    target_table = _quote_ident(stage.target_table)
-    key_name = _quote_ident(stage.key_name)
-    quoted_columns = tuple(_quote_ident(column) for column in stage.columns)
-    columns = ", ".join(quoted_columns)
-    matching_columns = " AND ".join(
-        f"stored.{column} = staged.{column}" for column in quoted_columns
-    )
-    previous_key = -1
-    published_count = 0
-    while True:
-        batch_result = await session.execute(
+    batch_result, elapsed_seconds = await _await_v4_dictionary_statement(
+        session.execute(
             db.text(
                 f"""
                 SELECT COUNT(*)::bigint, MAX({key_name})
@@ -1547,23 +1818,40 @@ async def _publish_v4_sparse_ranges(
                           FROM {schema}.{stage_table}
                          WHERE {key_name} > :previous_key
                          ORDER BY {key_name}
-                         LIMIT {_V4_DICTIONARY_RANGE_ROWS}
+                         LIMIT :batch_rows
                        ) AS batch
                 """
             ),
-            {"previous_key": previous_key},
-        )
-        batch_count, raw_last_key = batch_result.one()
-        batch_count = int(batch_count)
-        if batch_count == 0:
-            break
-        last_key = int(raw_last_key)
-        batch_parameters_by_name = {
-            "snapshot_key": int(snapshot_key),
-            "previous_key": previous_key,
-            "last_key": last_key,
-        }
-        await session.execute(
+            {
+                "previous_key": previous_key,
+                "batch_rows": int(batch_rows),
+            },
+        ),
+        heartbeat_callback=heartbeat_callback,
+    )
+    batch_count, raw_last_key = batch_result.one()
+    return (
+        int(batch_count),
+        None if raw_last_key is None else int(raw_last_key),
+        elapsed_seconds,
+    )
+
+
+async def _insert_v4_sparse_batch(
+    session: Any,
+    *,
+    schema: str,
+    stage_table: str,
+    target_table: str,
+    key_name: str,
+    columns: str,
+    parameters_by_name: Mapping[str, int],
+    heartbeat_callback: Callable[[], None] | None,
+) -> float:
+    """Insert one exact sparse dictionary batch."""
+
+    _, insert_seconds = await _await_v4_dictionary_statement(
+        session.execute(
             db.text(
                 f"""
                 INSERT INTO {schema}.{target_table} (snapshot_key, {columns})
@@ -1575,21 +1863,197 @@ async def _publish_v4_sparse_ranges(
                 ON CONFLICT DO NOTHING
                 """
             ),
-            batch_parameters_by_name,
-        )
-        matching_count = await session.scalar(
-            db.text(
-                f"""
-                SELECT COUNT(*)::bigint
-                  FROM {schema}.{stage_table} AS staged
-                  JOIN {schema}.{target_table} AS stored
-                    ON stored.snapshot_key = :snapshot_key
-                   AND {matching_columns}
-                 WHERE staged.{key_name} > :previous_key
-                   AND staged.{key_name} <= :last_key
-                """
+            parameters_by_name,
+        ),
+        heartbeat_callback=heartbeat_callback,
+    )
+    return insert_seconds
+
+
+async def _matching_v4_sparse_batch_count(
+    session: Any,
+    *,
+    schema: str,
+    stage_table: str,
+    target_table: str,
+    key_name: str,
+    matching_columns: str,
+    parameters_by_name: Mapping[str, int],
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[int, float]:
+    """Count exact target rows for one sparse batch."""
+
+    matching_count, verification_seconds = (
+        await _await_v4_dictionary_statement(
+            session.scalar(
+                db.text(
+                    f"""
+                    SELECT COUNT(*)::bigint
+                      FROM {schema}.{stage_table} AS staged
+                      JOIN {schema}.{target_table} AS stored
+                        ON stored.snapshot_key = :snapshot_key
+                       AND {matching_columns}
+                     WHERE staged.{key_name} > :previous_key
+                       AND staged.{key_name} <= :last_key
+                    """
+                ),
+                parameters_by_name,
             ),
-            batch_parameters_by_name,
+            heartbeat_callback=heartbeat_callback,
+        )
+    )
+    return int(matching_count or 0), verification_seconds
+
+
+async def _publish_v4_sparse_batch(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    stage: _V4DenseDictionaryStage,
+    previous_key: int,
+    last_key: int,
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[int, float]:
+    """Insert and verify one exact sparse dictionary batch."""
+
+    stage_table = _quote_ident(stage.stage_table)
+    target_table = _quote_ident(stage.target_table)
+    key_name = _quote_ident(stage.key_name)
+    quoted_columns = tuple(_quote_ident(column) for column in stage.columns)
+    parameters_by_name = {
+        "snapshot_key": int(snapshot_key),
+        "previous_key": previous_key,
+        "last_key": last_key,
+    }
+    insert_seconds = await _insert_v4_sparse_batch(
+        session,
+        schema=schema,
+        stage_table=stage_table,
+        target_table=target_table,
+        key_name=key_name,
+        columns=", ".join(quoted_columns),
+        parameters_by_name=parameters_by_name,
+        heartbeat_callback=heartbeat_callback,
+    )
+    matching_count, verification_seconds = (
+        await _matching_v4_sparse_batch_count(
+            session,
+            schema=schema,
+            stage_table=stage_table,
+            target_table=target_table,
+            key_name=key_name,
+            matching_columns=" AND ".join(
+                f"stored.{column} = staged.{column}"
+                for column in quoted_columns
+            ),
+            parameters_by_name=parameters_by_name,
+            heartbeat_callback=heartbeat_callback,
+        )
+    )
+    return matching_count, max(insert_seconds, verification_seconds)
+
+
+def _normalized_v4_target_key(raw_key: Any, previous_key: int | bytes) -> int | bytes:
+    """Normalize one ordered target key without changing its key domain."""
+
+    if isinstance(previous_key, bytes):
+        return bytes(raw_key)
+    return int(raw_key)
+
+
+async def _count_v4_target_keys(
+    session: Any,
+    *,
+    schema: str,
+    target_table: str,
+    key_name: str,
+    snapshot_key: int,
+    initial_key: int | bytes,
+    estimated_row_bytes: int,
+    heartbeat_callback: Callable[[], None] | None,
+) -> int:
+    """Enumerate persisted keys through adaptive indexed pages."""
+
+    previous_key = initial_key
+    observed_count = 0
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=estimated_row_bytes,
+    )
+    while True:
+        key_result, elapsed_seconds = await _await_v4_dictionary_statement(
+            session.execute(
+                db.text(
+                    f"""
+                    SELECT {key_name}
+                      FROM {schema}.{target_table}
+                     WHERE snapshot_key = :snapshot_key
+                       AND {key_name} > :previous_key
+                     ORDER BY {key_name}
+                     LIMIT :batch_rows
+                    """
+                ),
+                {
+                    "snapshot_key": int(snapshot_key),
+                    "previous_key": previous_key,
+                    "batch_rows": int(sizer.current_rows),
+                },
+            ),
+            heartbeat_callback=heartbeat_callback,
+        )
+        key_records = _v4_tax_result_rows(key_result)
+        if not key_records:
+            return observed_count
+        for key_record in key_records:
+            key = _normalized_v4_target_key(key_record[0], previous_key)
+            if key <= previous_key:
+                raise RuntimeError("PTG V4 persisted dictionary rows changed")
+            previous_key = key
+        observed_count += len(key_records)
+        sizer.observe(elapsed_seconds)
+
+
+async def _publish_v4_sparse_ranges(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    stage: _V4DenseDictionaryStage,
+    progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None = None,
+) -> None:
+    """Publish one sparse dictionary using ordered, bounded key batches."""
+
+    stage_table = _quote_ident(stage.stage_table)
+    target_table = _quote_ident(stage.target_table)
+    key_name = _quote_ident(stage.key_name)
+    previous_key = -1
+    published_count = 0
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=stage.estimated_row_bytes,
+    )
+    while True:
+        batch_count, last_key, boundary_seconds = (
+            await _v4_sparse_batch_boundary(
+                session,
+                schema=schema,
+                stage_table=stage_table,
+                key_name=key_name,
+                previous_key=previous_key,
+                batch_rows=sizer.current_rows,
+                heartbeat_callback=heartbeat_callback,
+            )
+        )
+        if batch_count == 0 or last_key is None:
+            break
+        matching_count, publication_seconds = await _publish_v4_sparse_batch(
+            session,
+            schema=schema,
+            snapshot_key=snapshot_key,
+            stage=stage,
+            previous_key=previous_key,
+            last_key=last_key,
+            heartbeat_callback=heartbeat_callback,
         )
         if int(matching_count or 0) != batch_count:
             raise RuntimeError("PTG V4 persisted dictionary rows changed")
@@ -1598,15 +2062,16 @@ async def _publish_v4_sparse_ranges(
         if progress_callback is not None:
             progress_callback("published_dictionary_rows", batch_count)
             progress_callback("publish_batches", 1)
-    target_count = await session.scalar(
-        db.text(
-            f"""
-            SELECT COUNT(*)::bigint
-              FROM {schema}.{target_table}
-             WHERE snapshot_key = :snapshot_key
-            """
-        ),
-        {"snapshot_key": int(snapshot_key)},
+        sizer.observe(max(boundary_seconds, publication_seconds))
+    target_count = await _count_v4_target_keys(
+        session,
+        schema=schema,
+        target_table=target_table,
+        key_name=key_name,
+        snapshot_key=int(snapshot_key),
+        initial_key=-1,
+        estimated_row_bytes=stage.estimated_row_bytes,
+        heartbeat_callback=heartbeat_callback,
     )
     if (
         published_count != int(stage.expected_count)
@@ -1902,23 +2367,19 @@ def _v4_tax_result_rows(result: Any) -> tuple[Any, ...]:
     return tuple(rows)
 
 
-async def _validate_v4_tax_token_rows(
+async def _v4_tax_token_batch(
     session: Any,
     *,
     schema: str,
-    tax_identity_stage: str,
-    contract: _V4TaxIdentityContract,
-    content_digest: Any,
-    progress_callback: Callable[[str, int], None] | None,
-) -> None:
-    """Authenticate the dense token dictionary and append it to the digest."""
+    tax_stage: str,
+    range_start: int,
+    range_end: int,
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[tuple[Any, ...], float]:
+    """Read one dense token batch in canonical key order."""
 
-    tax_stage = _quote_ident(tax_identity_stage)
-    observed_token_count = 0
-    for range_start, range_end in _v4_dictionary_ranges(
-        contract.tax_identity_count
-    ):
-        token_result = await session.execute(
+    token_result, elapsed_seconds = await _await_v4_dictionary_statement(
+        session.execute(
             db.text(
                 f"""
                 SELECT tin_key, tin_id_128, tin_hmac_sha256
@@ -1929,35 +2390,84 @@ async def _validate_v4_tax_token_rows(
                 """
             ),
             {"range_start": range_start, "range_end": range_end},
+        ),
+        heartbeat_callback=heartbeat_callback,
+    )
+    return _v4_tax_result_rows(token_result), elapsed_seconds
+
+
+def _append_v4_tax_token_rows(
+    token_rows: Iterable[Any],
+    *,
+    range_start: int,
+    content_digest: Any,
+) -> int:
+    """Validate and append one canonical token batch."""
+
+    observed_count = 0
+    for expected_key, token_row in enumerate(token_rows, range_start):
+        tin_key = int(token_row[0])
+        tin_id_128 = bytes(token_row[1])
+        tin_hmac_sha256 = bytes(token_row[2])
+        if (
+            tin_key != expected_key
+            or len(tin_id_128) != 16
+            or len(tin_hmac_sha256) != 32
+            or not hmac.compare_digest(tin_id_128, tin_hmac_sha256[:16])
+        ):
+            raise RuntimeError("PTG V4 tax identity dictionary changed")
+        content_digest.update(tin_hmac_sha256)
+        observed_count += 1
+    return observed_count
+
+
+async def _validate_v4_tax_token_rows(
+    session: Any,
+    *,
+    schema: str,
+    tax_identity_stage: str,
+    contract: _V4TaxIdentityContract,
+    content_digest: Any,
+    progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None = None,
+) -> None:
+    """Authenticate the dense token dictionary and append it to the digest."""
+
+    tax_stage = _quote_ident(tax_identity_stage)
+    observed_token_count = 0
+    range_start = 0
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=_V4_DICTIONARY_ESTIMATED_ROW_BYTES,
+    )
+    while range_start < int(contract.tax_identity_count):
+        range_end = _v4_dictionary_range_end(
+            range_start=range_start,
+            expected_count=contract.tax_identity_count,
+            sizer=sizer,
         )
-        token_rows = _v4_tax_result_rows(token_result)
+        token_rows, elapsed_seconds = await _v4_tax_token_batch(
+            session,
+            schema=schema,
+            tax_stage=tax_stage,
+            range_start=range_start,
+            range_end=range_end,
+            heartbeat_callback=heartbeat_callback,
+        )
         if len(token_rows) != range_end - range_start:
             raise RuntimeError("PTG V4 tax identity dictionary changed")
-        for expected_key, token_row in enumerate(
+        observed_token_count += _append_v4_tax_token_rows(
             token_rows,
-            range_start,
-        ):
-            tin_key = int(token_row[0])
-            tin_id_128 = bytes(token_row[1])
-            tin_hmac_sha256 = bytes(token_row[2])
-            if (
-                tin_key != expected_key
-                or len(tin_id_128) != 16
-                or len(tin_hmac_sha256) != 32
-                or not hmac.compare_digest(
-                    tin_id_128,
-                    tin_hmac_sha256[:16],
-                )
-            ):
-                raise RuntimeError("PTG V4 tax identity dictionary changed")
-            content_digest.update(tin_hmac_sha256)
-        observed_token_count += len(token_rows)
+            range_start=range_start,
+            content_digest=content_digest,
+        )
         if progress_callback is not None:
             progress_callback(
                 "validated_dictionary_rows",
                 len(token_rows),
             )
             progress_callback("publish_batches", 1)
+        sizer.observe(elapsed_seconds)
+        range_start = range_end
     if observed_token_count != contract.tax_identity_count:
         raise RuntimeError("PTG V4 tax identity dictionary changed")
 
@@ -1974,10 +2484,12 @@ def _validated_v4_tax_group_row(
     tax_state = str(group_row[1])
     raw_tin_key = group_row[2]
     source_bitmap = bytes(group_row[3])
+    graph_group_present = bool(group_row[4])
     tin_key = None if raw_tin_key is None else int(raw_tin_key)
     if (
         len(group_id) != 16
         or group_id <= previous_group_id
+        or not graph_group_present
         or tax_state not in _V4_TAX_STATE_CODE
         or len(source_bitmap) != contract.source_bitmap_bytes
         or not any(source_bitmap)
@@ -2023,55 +2535,140 @@ def _append_v4_tax_group_digest(
     content_digest.update(source_bitmap)
 
 
+async def _v4_tax_group_rows_batch(
+    session: Any,
+    *,
+    schema: str,
+    group_tax_stage: str,
+    graph_group_stage: str,
+    previous_group_id: bytes,
+    batch_rows: int,
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[tuple[Any, ...], float]:
+    """Read one ordered provider-group tax sidecar batch."""
+
+    group_result, elapsed_seconds = await _await_v4_dictionary_statement(
+        session.execute(
+            db.text(
+                f"""
+                SELECT sidecar.provider_group_global_id_128,
+                       sidecar.tax_identity_state,
+                       sidecar.tin_key, sidecar.source_bitmap,
+                       graph_group.provider_group_global_id_128 IS NOT NULL
+                  FROM {schema}.{group_tax_stage} AS sidecar
+                  LEFT JOIN {schema}.{graph_group_stage} AS graph_group
+                    ON graph_group.provider_group_global_id_128 =
+                       sidecar.provider_group_global_id_128
+                 WHERE sidecar.provider_group_global_id_128 >
+                       :previous_group_id
+                 ORDER BY sidecar.provider_group_global_id_128
+                 LIMIT :batch_rows
+                """
+            ),
+            {
+                "previous_group_id": previous_group_id,
+                "batch_rows": int(batch_rows),
+            },
+        ),
+        heartbeat_callback=heartbeat_callback,
+    )
+    return _v4_tax_result_rows(group_result), elapsed_seconds
+
+
+def _consume_v4_tax_group_rows(
+    group_rows: Iterable[Any],
+    *,
+    previous_group_id: bytes,
+    contract: _V4TaxIdentityContract,
+    content_digest: Any,
+    count_by_state: dict[str, int],
+    referenced_token_bits: bytearray,
+) -> tuple[bytes, int]:
+    """Authenticate one sidecar batch and count newly referenced tokens."""
+
+    latest_group_id = previous_group_id
+    newly_referenced_tokens = 0
+    for group_row in group_rows:
+        group_id, tax_state, tin_key, source_bitmap = (
+            _validated_v4_tax_group_row(
+                group_row,
+                previous_group_id=latest_group_id,
+                contract=contract,
+            )
+        )
+        _append_v4_tax_group_digest(
+            content_digest,
+            group_id=group_id,
+            tax_state=tax_state,
+            tin_key=tin_key,
+            source_bitmap=source_bitmap,
+        )
+        count_by_state[tax_state] += 1
+        if tin_key is not None:
+            byte_index, bit_index = divmod(tin_key, 8)
+            bit_mask = 1 << bit_index
+            if not referenced_token_bits[byte_index] & bit_mask:
+                referenced_token_bits[byte_index] |= bit_mask
+                newly_referenced_tokens += 1
+        latest_group_id = group_id
+    return latest_group_id, newly_referenced_tokens
+
+
+def _tax_group_row_estimate(
+    contract: _V4TaxIdentityContract,
+) -> int:
+    """Estimate one group-tax validation row including its source bitmap."""
+
+    return (
+        _V4_DICTIONARY_ESTIMATED_ROW_BYTES
+        + int(contract.source_bitmap_bytes)
+    )
+
+
 async def _validate_v4_tax_group_rows(
     session: Any,
     *,
     schema: str,
+    group_dictionary_stage: str,
     group_tax_identity_stage: str,
     contract: _V4TaxIdentityContract,
     content_digest: Any,
     progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None = None,
 ) -> Mapping[str, int]:
     """Authenticate ordered provider-group sidecars in bounded batches."""
 
     group_tax_stage = _quote_ident(group_tax_identity_stage)
+    graph_group_stage = _quote_ident(group_dictionary_stage)
     previous_group_id = b""
     observed_group_count = 0
+    referenced_token_count = 0
+    referenced_token_bits = bytearray((contract.tax_identity_count + 7) // 8)
     count_by_state = {name: 0 for name in _V4_TAX_STATE_CODE}
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=_tax_group_row_estimate(contract),
+    )
     while True:
-        group_result = await session.execute(
-            db.text(
-                f"""
-                SELECT provider_group_global_id_128, tax_identity_state,
-                       tin_key, source_bitmap
-                  FROM {schema}.{group_tax_stage}
-                 WHERE provider_group_global_id_128 > :previous_group_id
-                 ORDER BY provider_group_global_id_128
-                 LIMIT {_V4_DICTIONARY_RANGE_ROWS}
-                """
-            ),
-            {"previous_group_id": previous_group_id},
+        group_rows, elapsed_seconds = await _v4_tax_group_rows_batch(
+            session,
+            schema=schema,
+            group_tax_stage=group_tax_stage,
+            graph_group_stage=graph_group_stage,
+            previous_group_id=previous_group_id,
+            batch_rows=sizer.current_rows,
+            heartbeat_callback=heartbeat_callback,
         )
-        group_rows = _v4_tax_result_rows(group_result)
         if not group_rows:
             break
-        for group_row in group_rows:
-            group_id, tax_state, tin_key, source_bitmap = (
-                _validated_v4_tax_group_row(
-                    group_row,
-                    previous_group_id=previous_group_id,
-                    contract=contract,
-                )
-            )
-            _append_v4_tax_group_digest(
-                content_digest,
-                group_id=group_id,
-                tax_state=tax_state,
-                tin_key=tin_key,
-                source_bitmap=source_bitmap,
-            )
-            count_by_state[tax_state] += 1
-            previous_group_id = group_id
+        previous_group_id, new_token_count = _consume_v4_tax_group_rows(
+            group_rows,
+            previous_group_id=previous_group_id,
+            contract=contract,
+            content_digest=content_digest,
+            count_by_state=count_by_state,
+            referenced_token_bits=referenced_token_bits,
+        )
+        referenced_token_count += new_token_count
         observed_group_count += len(group_rows)
         if progress_callback is not None:
             progress_callback(
@@ -2079,64 +2676,12 @@ async def _validate_v4_tax_group_rows(
                 len(group_rows),
             )
             progress_callback("publish_batches", 1)
+        sizer.observe(elapsed_seconds)
     return {
         **count_by_state,
         "provider_group_count": observed_group_count,
+        "referenced_tax_identity_count": referenced_token_count,
     }
-
-
-async def _validate_v4_tax_relations(
-    session: Any,
-    *,
-    schema: str,
-    group_dictionary_stage: str,
-    tax_identity_stage: str,
-    group_tax_identity_stage: str,
-    contract: _V4TaxIdentityContract,
-) -> None:
-    """Prove graph coverage and that every token is referenced."""
-
-    tax_stage = _quote_ident(tax_identity_stage)
-    group_tax_stage = _quote_ident(group_tax_identity_stage)
-    graph_group_stage = _quote_ident(group_dictionary_stage)
-    relation_result = await session.execute(
-        db.text(
-            f"""
-            SELECT
-                (SELECT COUNT(*)::bigint
-                   FROM {schema}.{graph_group_stage}),
-                (SELECT COUNT(*)::bigint
-                   FROM {schema}.{group_tax_stage} AS sidecar
-                   JOIN {schema}.{graph_group_stage} AS graph_group
-                     ON graph_group.provider_group_global_id_128 =
-                        sidecar.provider_group_global_id_128),
-                (SELECT COUNT(DISTINCT tin_key)::bigint
-                   FROM {schema}.{group_tax_stage}
-                  WHERE tax_identity_state = 'matched_ein'),
-                (SELECT COUNT(*)::bigint
-                   FROM {schema}.{tax_stage} AS token
-                  WHERE NOT EXISTS (
-                        SELECT 1
-                          FROM {schema}.{group_tax_stage} AS sidecar
-                         WHERE sidecar.tax_identity_state = 'matched_ein'
-                           AND sidecar.tin_key = token.tin_key
-                  ))
-            """
-        )
-    )
-    relation_summary = relation_result.one()
-    observed_relation_counts = tuple(
-        int(relation_count) for relation_count in relation_summary
-    )
-    if observed_relation_counts != (
-        contract.provider_group_count,
-        contract.provider_group_count,
-        contract.tax_identity_count,
-        0,
-    ):
-        raise RuntimeError(
-            "PTG V4 tax identity relational completeness changed"
-        )
 
 
 def _v4_tax_content_hasher(
@@ -2161,6 +2706,7 @@ async def _validate_v4_tax_identity_stages(
     group_tax_identity_stage: str,
     contract: _V4TaxIdentityContract,
     progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None = None,
 ) -> None:
     """Recompute content and relational completeness from staged COPY rows."""
 
@@ -2172,15 +2718,18 @@ async def _validate_v4_tax_identity_stages(
         contract=contract,
         content_digest=content_digest,
         progress_callback=progress_callback,
+        heartbeat_callback=heartbeat_callback,
     )
     content_digest.update(struct.pack(">Q", contract.provider_group_count))
     count_by_state = await _validate_v4_tax_group_rows(
         session,
         schema=schema,
+        group_dictionary_stage=group_dictionary_stage,
         group_tax_identity_stage=group_tax_identity_stage,
         contract=contract,
         content_digest=content_digest,
         progress_callback=progress_callback,
+        heartbeat_callback=heartbeat_callback,
     )
     expected_counts = (
         contract.provider_group_count,
@@ -2188,6 +2737,7 @@ async def _validate_v4_tax_identity_stages(
         contract.missing_count,
         contract.malformed_count,
         contract.unsupported_type_count,
+        contract.tax_identity_count,
     )
     observed_counts = (
         count_by_state["provider_group_count"],
@@ -2195,20 +2745,13 @@ async def _validate_v4_tax_identity_stages(
         count_by_state["missing"],
         count_by_state["malformed"],
         count_by_state["unsupported_type"],
+        count_by_state["referenced_tax_identity_count"],
     )
     if observed_counts != expected_counts or not hmac.compare_digest(
         content_digest.digest(),
         contract.content_digest,
     ):
         raise RuntimeError("PTG V4 tax identity content digest changed")
-    await _validate_v4_tax_relations(
-        session,
-        schema=schema,
-        group_dictionary_stage=group_dictionary_stage,
-        tax_identity_stage=tax_identity_stage,
-        group_tax_identity_stage=group_tax_identity_stage,
-        contract=contract,
-    )
 
 
 def _v4_tax_manifest_values(
@@ -2353,30 +2896,39 @@ async def _v4_tax_group_batch_boundary(
     schema: str,
     stage: str,
     previous_group_id: bytes,
-) -> tuple[int, bytes | None]:
+    batch_rows: int,
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[int, bytes | None, float]:
     """Return one bounded group batch count and inclusive upper key."""
 
-    batch_result = await session.execute(
-        db.text(
-            f"""
-            SELECT COUNT(*)::bigint,
-                   MAX(provider_group_global_id_128)
-              FROM (
-                    SELECT provider_group_global_id_128
-                      FROM {schema}.{stage}
-                     WHERE provider_group_global_id_128 >
-                           :previous_group_id
-                     ORDER BY provider_group_global_id_128
-                     LIMIT {_V4_DICTIONARY_RANGE_ROWS}
-                   ) AS batch
-            """
+    batch_result, elapsed_seconds = await _await_v4_dictionary_statement(
+        session.execute(
+            db.text(
+                f"""
+                SELECT COUNT(*)::bigint,
+                       MAX(provider_group_global_id_128)
+                  FROM (
+                        SELECT provider_group_global_id_128
+                          FROM {schema}.{stage}
+                         WHERE provider_group_global_id_128 >
+                               :previous_group_id
+                         ORDER BY provider_group_global_id_128
+                         LIMIT :batch_rows
+                       ) AS batch
+                """
+            ),
+            {
+                "previous_group_id": previous_group_id,
+                "batch_rows": int(batch_rows),
+            },
         ),
-        {"previous_group_id": previous_group_id},
+        heartbeat_callback=heartbeat_callback,
     )
     batch_count, raw_last_group_id = batch_result.one()
     return (
         int(batch_count),
         None if raw_last_group_id is None else bytes(raw_last_group_id),
+        elapsed_seconds,
     )
 
 
@@ -2386,80 +2938,128 @@ async def _publish_v4_tax_group_batch(
     schema: str,
     stage: str,
     parameters_by_name: Mapping[str, Any],
-) -> int:
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[int, float]:
     """Insert one group batch and return its exact replay match count."""
 
-    await session.execute(
-        db.text(
-            f"""
-            INSERT INTO {schema}.ptg2_provider_group_tax_identity
-                (snapshot_key, provider_group_global_id_128,
-                 tax_identity_state, tin_key, source_bitmap)
-            SELECT :snapshot_key, provider_group_global_id_128,
-                   tax_identity_state, tin_key, source_bitmap
-              FROM {schema}.{stage}
-             WHERE provider_group_global_id_128 > :previous_group_id
-               AND provider_group_global_id_128 <= :last_group_id
-             ORDER BY provider_group_global_id_128
-            ON CONFLICT DO NOTHING
-            """
+    _, insert_seconds = await _await_v4_dictionary_statement(
+        session.execute(
+            db.text(
+                f"""
+                INSERT INTO {schema}.ptg2_provider_group_tax_identity
+                    (snapshot_key, provider_group_global_id_128,
+                     tax_identity_state, tin_key, source_bitmap)
+                SELECT :snapshot_key, provider_group_global_id_128,
+                       tax_identity_state, tin_key, source_bitmap
+                  FROM {schema}.{stage}
+                 WHERE provider_group_global_id_128 > :previous_group_id
+                   AND provider_group_global_id_128 <= :last_group_id
+                 ORDER BY provider_group_global_id_128
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            parameters_by_name,
         ),
-        parameters_by_name,
+        heartbeat_callback=heartbeat_callback,
     )
-    matching_count = await session.scalar(
-        db.text(
-            f"""
-            SELECT COUNT(*)::bigint
-              FROM {schema}.{stage} AS staged
-              JOIN {schema}.ptg2_provider_group_tax_identity AS stored
-                ON stored.snapshot_key = :snapshot_key
-               AND stored.provider_group_global_id_128 =
-                   staged.provider_group_global_id_128
-               AND stored.tax_identity_state = staged.tax_identity_state
-               AND stored.tin_key IS NOT DISTINCT FROM staged.tin_key
-               AND stored.source_bitmap = staged.source_bitmap
-             WHERE staged.provider_group_global_id_128 > :previous_group_id
-               AND staged.provider_group_global_id_128 <= :last_group_id
-            """
-        ),
-        parameters_by_name,
+    matching_count, verification_seconds = (
+        await _await_v4_dictionary_statement(
+            session.scalar(
+                db.text(
+                    f"""
+                    SELECT COUNT(*)::bigint
+                      FROM {schema}.{stage} AS staged
+                      JOIN {schema}.ptg2_provider_group_tax_identity AS stored
+                        ON stored.snapshot_key = :snapshot_key
+                       AND stored.provider_group_global_id_128 =
+                           staged.provider_group_global_id_128
+                       AND stored.tax_identity_state = staged.tax_identity_state
+                       AND stored.tin_key IS NOT DISTINCT FROM staged.tin_key
+                       AND stored.source_bitmap = staged.source_bitmap
+                     WHERE staged.provider_group_global_id_128 > :previous_group_id
+                       AND staged.provider_group_global_id_128 <= :last_group_id
+                    """
+                ),
+                parameters_by_name,
+            ),
+            heartbeat_callback=heartbeat_callback,
+        )
     )
-    return int(matching_count or 0)
+    return (
+        int(matching_count or 0),
+        max(insert_seconds, verification_seconds),
+    )
 
 
-async def _publish_v4_tax_group_ranges(
+async def _reject_tax_group_count(
     session: Any,
     *,
     schema: str,
     snapshot_key: int,
-    stage_table: str,
     expected_count: int,
-    progress_callback: Callable[[str, int], None] | None,
+    published_count: int,
+    estimated_row_bytes: int,
+    heartbeat_callback: Callable[[], None] | None,
 ) -> None:
-    """Publish fixed-width group sidecars through bounded byte-key ranges."""
+    """Reject missing or extra sidecars through adaptive key enumeration."""
 
-    stage = _quote_ident(stage_table)
+    target_count = await _count_v4_target_keys(
+        session,
+        schema=schema,
+        target_table="ptg2_provider_group_tax_identity",
+        key_name="provider_group_global_id_128",
+        snapshot_key=int(snapshot_key),
+        initial_key=b"",
+        estimated_row_bytes=estimated_row_bytes,
+        heartbeat_callback=heartbeat_callback,
+    )
+    if (
+        int(published_count) != int(expected_count)
+        or int(target_count or 0) != int(expected_count)
+    ):
+        raise RuntimeError(
+            "PTG V4 persisted provider-group tax identity changed"
+        )
+
+
+async def _publish_tax_group_ranges(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    stage: str,
+    sizer: _V4DictionaryBatchSizer,
+    progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None,
+) -> int:
+    """Publish every ordered provider-group tax batch and return its row count."""
+
     previous_group_id = b""
     published_count = 0
     while True:
-        batch_count, last_group_id = await _v4_tax_group_batch_boundary(
-            session,
-            schema=schema,
-            stage=stage,
-            previous_group_id=previous_group_id,
+        batch_count, last_group_id, boundary_seconds = (
+            await _v4_tax_group_batch_boundary(
+                session,
+                schema=schema,
+                stage=stage,
+                previous_group_id=previous_group_id,
+                batch_rows=sizer.current_rows,
+                heartbeat_callback=heartbeat_callback,
+            )
         )
         if batch_count == 0 or last_group_id is None:
-            break
+            return published_count
         parameters_by_name = {
             "snapshot_key": int(snapshot_key),
             "previous_group_id": previous_group_id,
             "last_group_id": last_group_id,
         }
-        matching_count = await _publish_v4_tax_group_batch(
+        matching_count, publication_seconds = await _publish_v4_tax_group_batch(
             session,
             schema=schema,
             stage=stage,
             parameters_by_name=parameters_by_name,
+            heartbeat_callback=heartbeat_callback,
         )
         if matching_count != batch_count:
             raise RuntimeError(
@@ -2470,23 +3070,50 @@ async def _publish_v4_tax_group_ranges(
         if progress_callback is not None:
             progress_callback("published_dictionary_rows", batch_count)
             progress_callback("publish_batches", 1)
-    target_count = await session.scalar(
-        db.text(
-            f"""
-            SELECT COUNT(*)::bigint
-              FROM {schema}.ptg2_provider_group_tax_identity
-             WHERE snapshot_key = :snapshot_key
-            """
+        sizer.observe(max(boundary_seconds, publication_seconds))
+
+
+async def _publish_v4_tax_group_ranges(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    stage_table: str,
+    expected_count: int,
+    progress_callback: Callable[[str, int], None] | None,
+    source_bitmap_bytes: int = 0,
+    heartbeat_callback: Callable[[], None] | None = None,
+) -> None:
+    """Publish fixed-width group sidecars through bounded byte-key ranges."""
+
+    stage = _quote_ident(stage_table)
+    sizer = _V4DictionaryBatchSizer(
+        estimated_row_bytes=(
+            _V4_DICTIONARY_ESTIMATED_ROW_BYTES
+            + max(int(source_bitmap_bytes), 0)
         ),
-        {"snapshot_key": int(snapshot_key)},
     )
-    if (
-        published_count != int(expected_count)
-        or int(target_count or 0) != int(expected_count)
-    ):
-        raise RuntimeError(
-            "PTG V4 persisted provider-group tax identity changed"
-        )
+    published_count = await _publish_tax_group_ranges(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        stage=stage,
+        sizer=sizer,
+        progress_callback=progress_callback,
+        heartbeat_callback=heartbeat_callback,
+    )
+    await _reject_tax_group_count(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        expected_count=expected_count,
+        published_count=published_count,
+        estimated_row_bytes=(
+            _V4_DICTIONARY_ESTIMATED_ROW_BYTES
+            + max(int(source_bitmap_bytes), 0)
+        ),
+        heartbeat_callback=heartbeat_callback,
+    )
 
 
 async def _publish_v4_taxonomy_sidecar(
@@ -2540,6 +3167,7 @@ async def _publish_v4_dictionaries_and_maps(
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
     progress_callback: Callable[[str, int], None] | None = None,
+    heartbeat_callback: Callable[[], None] | None = None,
 ) -> tuple[
     V4SnapshotMapSummary,
     V4InferredTaxonomyPublication,
@@ -2789,12 +3417,14 @@ async def _publish_v4_dictionaries_and_maps(
                     schema=schema,
                     stage=dictionary_stage,
                     progress_callback=progress_callback,
+                    heartbeat_callback=heartbeat_callback,
                 )
             await _validate_v4_dictionary_stage(
                 session,
                 schema=schema,
                 stage=tax_dictionary_stage,
                 progress_callback=progress_callback,
+                heartbeat_callback=heartbeat_callback,
             )
             await _validate_v4_tax_identity_stages(
                 session,
@@ -2804,6 +3434,7 @@ async def _publish_v4_dictionaries_and_maps(
                 group_tax_identity_stage=group_tax_identity_stage,
                 contract=tax_identity_contract,
                 progress_callback=progress_callback,
+                heartbeat_callback=heartbeat_callback,
             )
 
             # Metadata tables are trigger-fenced by the building map root.
@@ -2838,6 +3469,7 @@ async def _publish_v4_dictionaries_and_maps(
                     snapshot_key=int(snapshot_key),
                     stage=dictionary_stage,
                     progress_callback=progress_callback,
+                    heartbeat_callback=heartbeat_callback,
                 )
             await _publish_v4_dictionary_stage_ranges(
                 session,
@@ -2845,6 +3477,7 @@ async def _publish_v4_dictionaries_and_maps(
                 snapshot_key=int(snapshot_key),
                 stage=tax_dictionary_stage,
                 progress_callback=progress_callback,
+                heartbeat_callback=heartbeat_callback,
             )
             await _publish_v4_tax_group_ranges(
                 session,
@@ -2853,6 +3486,8 @@ async def _publish_v4_dictionaries_and_maps(
                 stage_table=group_tax_identity_stage,
                 expected_count=tax_identity_contract.provider_group_count,
                 progress_callback=progress_callback,
+                source_bitmap_bytes=tax_identity_contract.source_bitmap_bytes,
+                heartbeat_callback=heartbeat_callback,
             )
 
             diagnostic_parameters_by_name = {
@@ -3267,6 +3902,7 @@ async def _publish_v4_graph(
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
     progress_callback: Callable[[str, int], None] | None = None,
+    heartbeat_callback: Callable[[], None] | None = None,
 ) -> _V4GraphPublication:
     """Publish graph blocks only to CAS, then make packed maps authoritative."""
 
@@ -3307,6 +3943,7 @@ async def _publish_v4_graph(
                     empty_npi_tin_only_normalization_count
                 ),
                 **_progress_callback_kwargs(progress_callback),
+                heartbeat_callback=heartbeat_callback,
             )
         )
     except BaseException:
@@ -3387,6 +4024,7 @@ async def _publish_v4_graph(
             "pattern_v1" if compilation.selected_layout == "pattern" else "direct_v1"
         ),
         compiler_summary=dict(compilation.summary),
+        dictionary_publication=_V4_DICTIONARY_BATCH_CONTRACT.as_dict(),
         inferred_taxonomy_candidates=dict(taxonomy_publication.manifest),
         provider_tax_identity=dict(tax_identity_publication.manifest),
         audit_witness_path=compilation.provider_set_audit_npi_copy_path,
@@ -3425,6 +4063,23 @@ async def _sealed_shared_serving_index(
     if not isinstance(serving_index, Mapping):
         raise RuntimeError("sealed shared PTG layout is missing its serving index")
     return dict(serving_index)
+
+
+def _attach_v4_dictionary_publication_contract(
+    serving_index: dict[str, Any],
+    graph_publication: Any,
+) -> None:
+    """Attach the non-semantic adaptive policy only when V4 supplied it."""
+
+    publication_contract = getattr(
+        graph_publication,
+        "dictionary_publication",
+        None,
+    )
+    if isinstance(publication_contract, Mapping) and publication_contract:
+        serving_index["provider_graph"]["dictionary_publication"] = dict(
+            publication_contract
+        )
 
 
 def _physical_serving_index(
@@ -3534,6 +4189,10 @@ def _physical_serving_index(
         "storage_bytes": int(stored_byte_count),
         "timings": dict(finalizer_summary.get("timings") or {}),
     }
+    _attach_v4_dictionary_publication_contract(
+        serving_index,
+        graph_publication,
+    )
     normalized_rebuild_digest = normalized_full_rebuild_scope_digest(
         full_rebuild_scope_digest
     )
@@ -3901,6 +4560,11 @@ async def _publish_prepared_shared_layout(
                         ),
                         **_progress_callback_kwargs(
                             lane_progress.add
+                            if progress_callback is not None
+                            else None
+                        ),
+                        heartbeat_callback=(
+                            lane_progress.heartbeat
                             if progress_callback is not None
                             else None
                         ),
