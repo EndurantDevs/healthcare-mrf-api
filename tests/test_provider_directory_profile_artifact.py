@@ -102,7 +102,7 @@ def _resumable_profile_checkpoint(
         "evidence_target_oid": 11,
         "profile_target_oid": 12,
         "has_existing_artifacts": False,
-        "evidence_total_batches": 83,
+        "evidence_total_batches": 115,
         "profile_total_batches": 400,
     }
 
@@ -683,8 +683,8 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
 
 
 def _assert_profile_fact_population_calls(insert_calls, build):
-    """Require every source/fact/role partition exactly once."""
-    assert len(insert_calls) == 83 * len(build.source_ids)
+    """Require every source/fact/resource partition exactly once."""
+    assert len(insert_calls) == 115 * len(build.source_ids)
     assert all(len(call.kwargs["source_ids"]) == 1 for call in insert_calls)
     assert {
         (call.kwargs["source_ids"][0], call.kwargs["dataset_ids"][0])
@@ -697,15 +697,15 @@ def _assert_profile_fact_population_calls(insert_calls, build):
     ]
     assert len(role_bucket_calls) == (
         len(build.source_ids)
-        * 2
+        * 3
         * profile.PROFILE_AFFILIATION_ROLE_BUCKETS
     )
     assert {
         fact_type
         for call in role_bucket_calls
-        for fact_type in ("affiliation", "organization")
+        for fact_type in ("affiliation", "organization", "plan_membership")
         if f"fact_type = '{fact_type}'" in str(call.args[0])
-    } == {"affiliation", "organization"}
+    } == {"affiliation", "organization", "plan_membership"}
     assert {
         call.kwargs["profile_role_bucket"] for call in role_bucket_calls
     } == set(range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS))
@@ -777,7 +777,7 @@ def _profile_write_calls(status):
 
 def _assert_incremental_evidence_writes(write_calls):
     """Assert one retained-source copy plus bounded evidence writes."""
-    assert len(write_calls) == 84
+    assert len(write_calls) == 116
     assert "source_id <> ALL" in write_calls[0].args[0]
     assert write_calls[0].kwargs["retained_source_ids"] == [
         "source_a",
@@ -792,7 +792,7 @@ def _assert_incremental_evidence_writes(write_calls):
         for call in write_calls[1:]
         if any(
             f"fact_type = '{fact_type}'" in call.args[0]
-            for fact_type in ("affiliation", "organization")
+            for fact_type in ("affiliation", "organization", "plan_membership")
         )
     )
 

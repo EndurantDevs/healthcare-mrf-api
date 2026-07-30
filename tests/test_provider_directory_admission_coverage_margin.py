@@ -79,8 +79,11 @@ def _projection_proof(context, *, resource_count=0) -> ProjectionProofShard:
 
 
 def test_admission_normalizers_retain_blank_preset_and_scalar_source() -> None:
-    task = {"refresh_preset": "  ", "import_resources": True}
-    assert apply_provider_directory_refresh_preset(task) is task
+    refresh_options_map = {"refresh_preset": "  ", "import_resources": True}
+    assert (
+        apply_provider_directory_refresh_preset(refresh_options_map)
+        is refresh_options_map
+    )
     assert _requested_source_ids({"source_id": 123}) == {"123"}
 
 
@@ -220,7 +223,7 @@ async def test_projection_partition_retries_and_census_fail_closed(
             context.claim,
             _StatusDatabase(first_result=None),
         )
-    invalid_count = {
+    invalid_census_map = {
         "resource_count": True,
         "resource_count_map": {},
         "first_identity": None,
@@ -230,7 +233,7 @@ async def test_projection_partition_retries_and_census_fail_closed(
         await projection_stage._stage_partition_census(
             context.stage,
             context.claim,
-            _StatusDatabase(first_result=invalid_count),
+            _StatusDatabase(first_result=invalid_census_map),
         )
 
 
@@ -435,12 +438,12 @@ async def test_uhc_download_admission_uses_the_selected_connection_path(
         catalog_set_sha256="b" * 64,
         staged_paths=set(),
     )
-    result = await uhc_acquisition._acquire_missing_catalog_file(
+    acquired_file = await uhc_acquisition._acquire_missing_catalog_file(
         context,
         {"file_id": "file-1"},
     )
 
-    assert result[1:] == (artifact_path, "a" * 64, 1)
+    assert acquired_file[1:] == (artifact_path, "a" * 64, 1)
     expected_connection = (
         "worker-connection" if use_factory else "shared-connection"
     )

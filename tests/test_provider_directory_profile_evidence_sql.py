@@ -66,6 +66,64 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
     assert "ON CONFLICT (evidence_key) DO NOTHING" in sql
 
 
+def test_profile_evidence_sql_preserves_uhc_facility_semantics():
+    """UHC profile evidence is dataset-bound, TIN-safe, and non-ownership."""
+    sql = _render_profile_evidence_sql()
+
+    assert "'plan_membership'" in sql
+    assert "affiliation_edge.dataset_id = source_context.dataset_id" in sql
+    assert (
+        "affiliation.relationship_type =\n"
+        "                   'payer_reported_provider_plan_membership'"
+    ) in sql
+    assert "affiliation.ownership_status = 'not_asserted'" in sql
+    assert "'candidate_addresses'," in sql
+    assert "'payer_directory_candidate'" in sql
+    assert "'tin_status', organization.tin_status" in sql
+    assert "jsonb_build_object('tax_id', NULL)" in sql
+    assert "jsonb_build_object('tax_id', organization.tax_id)" not in sql
+    assert "organization.tax_id IS NULL" in sql
+    assert (
+        "NULLIF(BTRIM(affiliation.organization_ref), '') IS NULL"
+    ) in sql
+    assert "jsonb_typeof(\n                       affiliation.plan_scope::jsonb" in sql
+    assert (
+        "affiliation.plan_scope::jsonb\n"
+        "                       ->> 'logical_scope_id' ="
+    ) in sql
+    assert "ELSE '[]'::jsonb" in sql
+    assert (
+        "THEN affiliation.insurance_plan_refs::jsonb ->> 0"
+    ) in sql
+    assert (
+        "jsonb_array_length(\n"
+        "                       affiliation.insurance_plan_refs::jsonb"
+    ) not in sql
+    assert "'InsurancePlan/uhcplan-'" in sql
+    assert (
+        "organization.source_lineage::jsonb =\n"
+        "                   affiliation.source_lineage::jsonb"
+    ) in sql
+    for lineage_field in (
+        "catalog_set_sha256",
+        "source_file_id",
+        "artifact_sha256",
+        "logical_scope_id",
+        "record_ordinal",
+        "file_name",
+    ):
+        assert f"->> '{lineage_field}'" in sql
+    assert "FROM organization_rows AS organization" not in sql
+    assert (
+        "FROM plan_membership_rows AS membership\n"
+        "             WHERE TRUE"
+    ) in sql
+    assert (
+        "COALESCE(organization.tin_status, '') <>\n"
+        "                   'unavailable_from_uhc_source'"
+    ) in sql
+
+
 def test_profile_evidence_sql_filters_current_normalized_references():
     sql = _render_profile_evidence_sql()
 
@@ -101,6 +159,25 @@ def test_profile_evidence_sql_supports_bounded_fact_and_role_scopes():
     assert "hashtextextended(role.resource_id, 0)" in sql
     assert "CAST(:profile_role_bucket_count AS bigint)" in sql
     assert "CAST(:profile_role_bucket AS bigint)" in sql
+
+
+def test_profile_evidence_sql_partitions_direct_organization_memberships():
+    sql = profile.profile_evidence_insert_sql(
+        target_ref='"fixture"."evidence"',
+        source_ref='"fixture"."source"',
+        practitioner_ref='"fixture"."practitioner"',
+        role_ref='"fixture"."role"',
+        organization_ref='"fixture"."organization"',
+        service_ref='"fixture"."service"',
+        endpoint_ref='"fixture"."endpoint"',
+        fact_type="plan_membership",
+        role_bucket_count=32,
+        role_bucket=7,
+    )
+
+    assert "fact_type = 'plan_membership'" in sql
+    assert "hashtextextended(affiliation.resource_id, 0)" in sql
+    assert "hashtextextended(organization.resource_id, 0)" not in sql
 
 
 def test_profile_evidence_sql_accepts_exact_dataset_scoped_affiliations():

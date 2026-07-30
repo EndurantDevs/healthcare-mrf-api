@@ -17,6 +17,7 @@ from process.uhc_retained_source_registry import (
 from process.uhc_retained_types import UHCRetainedAdmissionError
 from tests.uhc_retained_registry_test_support import (
     FakeRegistryConnection,
+    assert_first_binding_reference_layouts,
     install_fake_native,
     native_summary,
     native_verified_source,
@@ -42,23 +43,6 @@ async def _fresh_source(fixture):
         expected_byte_count=fixture["artifact_byte_count"],
         range_count=fixture["range_count"],
     )
-
-
-def _assert_first_binding_reference_layouts(connection, first_binding) -> None:
-    reference_layouts = {
-        (key[2], key[3], key[4])
-        for key in connection.rows_by_table["reference"]
-        if key[:2]
-        == (
-            first_binding.catalog_set_sha256,
-            first_binding.source_file_id,
-        )
-    }
-    assert reference_layouts == {
-        ("raw", 0, 0),
-        ("manifest", 2, 4),
-        ("manifest", 2, 8),
-    }
 
 
 @pytest.mark.asyncio
@@ -209,7 +193,7 @@ async def test_same_raw_supports_two_layouts_and_two_catalog_bindings(
     assert len(connection.rows_by_table["range"]) == 12
     assert len(connection.rows_by_table["binding"]) == 2
     assert len(connection.rows_by_table["reference"]) == 5
-    _assert_first_binding_reference_layouts(connection, first_binding)
+    assert_first_binding_reference_layouts(connection, first_binding)
 
 
 @pytest.mark.parametrize(

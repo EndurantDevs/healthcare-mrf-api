@@ -73,3 +73,36 @@ materializes the six registered resource families, stores content-proof shards,
 and atomically promotes one source-local dataset. Runtime success and
 downstream readiness remain separate evidence and must be verified after
 deployment.
+
+## Facility organization and TIN semantics
+
+An official UHC `FACILITY` record becomes a normal Provider Directory
+`Organization`. The canonical resource preserves its reported NPI, name,
+facility types, phones, and candidate addresses together with the exact catalog
+set, source-file ID and public basename, retained artifact SHA-256, record
+ordinal, and reviewed logical-scope ID. Profile evidence adds the exact
+published `dataset_id` and endpoint identity; neither value is inferred from a
+newer catalog.
+
+The official UHC provider-file schema does not publish a TIN or EIN. UHC
+Organizations therefore expose `tax_id: null` and
+`tin_status: unavailable_from_uhc_source`. “Unavailable” means unknown from
+this source, not that the organization has no TIN. The importer must not derive
+a TIN from an NPI, address, plan identifier, organization name, another
+provider, or a PTG/TiC billing group.
+
+A facility-to-plan edge is represented as
+`payer_reported_provider_plan_membership`. Its
+`participating_organization_ref` points to the facility Organization, its
+`insurance_plan_refs` and reviewed plan scope remain explicit, and
+`organization_ref` is null instead of self-referential. The edge carries
+`ownership_status: not_asserted`: plan membership does not establish legal
+ownership, control, employment, billing-group or TIN ownership, an exact
+network-bound office, or current appointment acceptance.
+
+UHC addresses are payer-directory candidate locations. They can support
+provider discovery and corroboration, but they are not the exact office for a
+negotiated rate and do not become network-bound merely because the same record
+lists a plan. Any future cross-source TIN evidence must retain its own source,
+snapshot, plan, billing-group, and match provenance and remain separate from
+this UHC membership assertion.

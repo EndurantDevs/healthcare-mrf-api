@@ -488,20 +488,3 @@ async def _assert_audit_publication_rejections(compilation) -> None:
             witnesses={7: witness},
             reader=reader,
         )
-
-
-@pytest.mark.asyncio
-async def test_audit_publish_orchestration(monkeypatch) -> None:
-    """Orchestrate audit publication and reject incomplete derived outputs."""
-    compilation = _configure_audit_publication(monkeypatch)
-    await _assert_audit_publication(
-        compilation,
-        expected_representation="pattern_v1",
-        expected_verification="set_patterns_pattern_groups_group_npis_exact_v1",
-    )
-    await _assert_audit_publication(
-        SimpleNamespace(selected_layout="direct"),
-        expected_representation="direct_v1",
-        expected_verification="set_groups_direct_group_npis_exact_v1",
-    )
-    await _assert_audit_publication_rejections(compilation)

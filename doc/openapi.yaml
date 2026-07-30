@@ -9085,6 +9085,163 @@ components:
             - multiple_source_language_codes
           description: Source language representations conflict; inspect evidence.
       additionalProperties: false
+    ProviderProfileUhcSourceLineage:
+      type: object
+      description: |
+        Immutable lineage for one record in an admitted official UHC provider
+        file. The selected Provider Directory dataset is reported separately in
+        the fact evidence and profile source entry.
+      required:
+        - catalog_set_sha256
+        - source_file_id
+        - file_name
+        - artifact_sha256
+        - record_ordinal
+        - logical_scope_id
+      properties:
+        catalog_set_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        source_file_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        file_name:
+          type: string
+          description: Public source basename; never a local retained-file path.
+        artifact_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        record_ordinal:
+          type: integer
+          minimum: 0
+        logical_scope_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      additionalProperties: false
+    ProviderProfileUhcOrganizationValue:
+      type: object
+      description: |
+        Facility Organization evidence reported by an official UHC Provider
+        Directory file. Addresses are payer-directory candidate locations, not
+        proof that an exact office is network-bound. UHC files do not publish a
+        TIN, so `tin_status=unavailable_from_uhc_source` requires `tax_id` to
+        remain null; unavailable means unknown, not that the organization has
+        no TIN.
+      required:
+        - resource_id
+        - npi
+        - name
+        - candidate_addresses
+        - address_status
+        - tax_id
+        - tin_status
+        - source_lineage
+      properties:
+        resource_id:
+          type: string
+        npi:
+          type: integer
+          minimum: 1000000000
+          maximum: 9999999999
+        name:
+          type: string
+        type_codes:
+          type: array
+          items:
+            type: string
+        candidate_addresses:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        address_status:
+          type: string
+          enum: [payer_directory_candidate]
+        tax_id:
+          type: string
+          nullable: true
+          description: Always null when `tin_status` is unavailable from UHC.
+        tin_status:
+          type: string
+          enum: [unavailable_from_uhc_source]
+        source_lineage:
+          $ref: '#/components/schemas/ProviderProfileUhcSourceLineage'
+      additionalProperties: true
+    ProviderProfilePlanMembershipValue:
+      type: object
+      description: |
+        Payer-reported provider-to-plan membership. This is not evidence of
+        legal ownership, control, employment, billing-group/TIN ownership, an
+        exact network-bound office, or current appointment acceptance.
+      required:
+        - participating_organization
+        - insurance_plan_refs
+        - plan_scope
+        - relationship_type
+        - ownership_status
+        - source_lineage
+      properties:
+        participating_organization:
+          type: object
+          required: [resource_id, npi, name]
+          properties:
+            resource_id:
+              type: string
+            npi:
+              type: integer
+              minimum: 1000000000
+              maximum: 9999999999
+            name:
+              type: string
+            type_codes:
+              type: array
+              items:
+                type: string
+          additionalProperties: true
+        insurance_plan_refs:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        plan_scope:
+          type: object
+          description: Exact reviewed UHC logical plan key and plan year.
+          additionalProperties: true
+        network_tier:
+          type: string
+          description: Payer-reported network tier from the exact UHC plan record.
+        network_key_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Deterministic reviewed plan and network-tier identity.
+        location_refs:
+          type: array
+          items:
+            type: string
+        specialty_codes:
+          type: array
+          items:
+            type: string
+        membership_codes:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        period_start:
+          type: string
+        period_end:
+          type: string
+        active:
+          type: boolean
+        relationship_type:
+          type: string
+          enum: [payer_reported_provider_plan_membership]
+        ownership_status:
+          type: string
+          enum: [not_asserted]
+        source_lineage:
+          $ref: '#/components/schemas/ProviderProfileUhcSourceLineage'
+      additionalProperties: true
     ProviderProfileFact:
       type: object
       required:
@@ -9111,11 +9268,15 @@ components:
             Concise human-readable rendering of the normalized fact. Structured
             details stay in `value`; this field never contains serialized JSON.
         value:
-          type: object
           description: |
             Category-specific structured value. A fact in `languages` uses
-            `ProviderLanguageValue`.
-          additionalProperties: true
+            `ProviderLanguageValue`; UHC `organization` and `plan_membership`
+            facts use their named evidence schemas.
+          anyOf:
+            - $ref: '#/components/schemas/ProviderProfileUhcOrganizationValue'
+            - $ref: '#/components/schemas/ProviderProfilePlanMembershipValue'
+            - type: object
+              additionalProperties: true
         assertion_type:
           type: string
         verification_status:
@@ -9247,7 +9408,7 @@ components:
           enum: [provider-profile/v1]
         composer_version:
           type: string
-          example: provider-profile-composer/v3
+          example: provider-profile-composer/v4
         npi:
           type: integer
           minimum: 1000000000
@@ -9269,6 +9430,24 @@ components:
           type: array
           items:
             type: object
+            description: |
+              Provider Directory entries retain `endpoint_id` and `dataset_id`
+              so facts can be traced to the exact published dataset.
+            properties:
+              source_key:
+                type: string
+              source_kind:
+                type: string
+              endpoint_id:
+                type: string
+              dataset_id:
+                type: string
+              organization:
+                type: string
+              plan_name:
+                type: string
+              api_base:
+                type: string
             additionalProperties: true
         important_context:
           type: array

@@ -6,6 +6,826 @@ from scripts.research import provider_directory_coverage_audit as audit
 from scripts.research import provider_directory_endpoint_acquisition_harness as acquisition
 
 
+def _retest_result(classification, org_name, api_base=None, **details):
+    return {
+        "classification": classification,
+        "org_name": org_name,
+        "api_base": api_base,
+        **details,
+    }
+
+
+def _catalog_source(source_id, org_name, api_base, **details):
+    return {
+        "source_id": source_id,
+        "org_name": org_name,
+        "api_base": api_base,
+        "canonical_api_base": api_base,
+        "metadata_json": {},
+        **details,
+    }
+
+
+def _unchecked_retest_sources():
+    return [
+        _catalog_source(
+            "pdfhir_molina",
+            "Molina Healthcare",
+            "https://api.interop.molinahealthcare.com/providerdirectory",
+            metadata_json={
+                "provider_directory_confirmed_base": "https://api.interop.molinahealthcare.com/providerdirectory",
+                "provider_directory_equivalent_api_bases": ["https://fhir.molinahealthcare.com/provider-directory"],
+            },
+        ),
+        _catalog_source(
+            "pdfhir_health_partners_plans",
+            "Health Partners Plans",
+            "https://providerfhirapi.healthpartnersplans.com",
+        ),
+        _catalog_source(
+            "pdfhir_amerihealth_caritas_pa",
+            "AmeriHealth Caritas",
+            "https://api-ext.amerihealthcaritas.com/0500/provider-api",
+            metadata_json={
+                "provider_directory_replaces_stale_generic_api_bases": [
+                    "https://fhir.amerihealthcaritas.com/provider-directory"
+                ]
+            },
+        ),
+        _catalog_source(
+            "pdfhir_centene",
+            "Centene Corporation",
+            "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory",
+            metadata_json={
+                "provider_directory_replaces_stale_generic_api_bases": [
+                    "https://fhir.centene.com/provider-directory"
+                ]
+            },
+        ),
+        _catalog_source(
+            "pdfhir_cms_sma_alaska",
+            "State of Alaska",
+            "https://api.alaskafhir.com/r4",
+            metadata_json={
+                "provider_directory_equivalent_api_bases": ["https://api.alaskafhir.com/r4/public/Practitioner"]
+            },
+        ),
+        _catalog_source(
+            "pdfhir_bcbsil",
+            "Blue Cross and Blue Shield of Illinois",
+            "https://apps.availity.com/availity/public-fhir/fhir/v1/bcbsil/r4",
+            last_validated_status="valid",
+        ),
+        _catalog_source(
+            "pdfhir_first_medical_blocked",
+            "First Medical Health Plan, Inc.",
+            None,
+            last_validated_status="catalog_blocked",
+            metadata_json={"provider_directory_blocked": True},
+        ),
+    ]
+
+
+def _current_retest_inputs():
+    results = [
+        _retest_result("valid", "Cigna", "https://fhir.cigna.com/ProviderDirectory/v1", status_code=200, payer_id=62),
+        _retest_result("valid", "Aetna R4", "https://fhir-ehr.cerner.com/r4/aetna", status_code=200, payer_id=299),
+        _retest_result(
+            "valid_non_fhir",
+            "Missing Public Provider App",
+            "https://public-directory.example/providers",
+            status_code=200,
+            payer_id=999,
+        ),
+        _retest_result(
+            "auth_required", "Ignored Auth Payer", "https://auth.example/fhir", status_code=403, payer_id=1000
+        ),
+    ]
+    sources = [
+        _catalog_source("pdfhir_cigna", "Cigna", "https://fhir.cigna.com/ProviderDirectory/v1"),
+        _catalog_source(
+            "pdfhir_aetna",
+            "Aetna R4",
+            "https://apif1.aetna.com/fhir/v1/providerdirectory",
+            metadata_json={
+                "provider_directory_previous_api_base": "https://fhir-ehr.cerner.com/r4/aetna",
+                "provider_directory_confirmed_base": "https://apif1.aetna.com/fhir/v1/providerdirectory",
+            },
+        ),
+        _catalog_source("pdfhir_auth", "Ignored Auth Payer", "https://auth.example/fhir"),
+    ]
+    return results, sources
+
+
+def _credential_report(groups, **details):
+    return {
+        "generated_at": "2026-06-29T00:00:00Z",
+        "schema": "mrf",
+        "credential_onboarding_backlog": {
+            "available": True,
+            "groups": groups,
+            **details,
+        },
+    }
+
+
+def _credential_group(source_host, auth_type, **details):
+    return {
+        "source_host": source_host,
+        "probe_status": "auth_required",
+        "auth_type": auth_type,
+        "reason": "auth_required",
+        **details,
+    }
+
+
+def _sample_source(source_id, payer, api_base):
+    return {"source_id": source_id, "payer": payer, "api_base": api_base}
+
+
+def _credential_backlog_report():
+    sample = _sample_source("pdfhir_123", "Example Payer / Medicare Advantage", "https://api.payer.example/fhir")
+    group = _credential_group(
+        "api.payer.example",
+        "OAuth2 Client Credentials",
+        source_count=12,
+        credential_configured_source_count=2,
+        credential_config_missing_source_count=10,
+        credential_secret_ready_source_count=1,
+        credential_secret_missing_source_count=1,
+        credential_rule_candidate_source_count=12,
+        endpoint_discovery_needed_source_count=0,
+        medicare_advantage_source_count=7,
+        medicaid_mco_source_count=3,
+        chip_source_count=1,
+        qhp_source_count=2,
+        sample_payers=[sample["payer"]],
+        sample_missing_credential_payers=[sample["payer"]],
+        sample_missing_secret_payers=[sample["payer"]],
+        sample_missing_secret_env_vars=["PAYER_DIRECTORY_CLIENT_ID"],
+        sample_source_ids=[sample["source_id"]],
+        sample_api_bases=[sample["api_base"]],
+        sample_sources=[{**sample, "markets": {"medicare_advantage": True}}],
+        sample_missing_credential_sources=[sample],
+        sample_missing_secret_sources=[sample],
+        api_base_count=1,
+        sample_api_base_count=1,
+        api_base_sample_complete=True,
+    )
+    return _credential_report(
+        [group],
+        blocked_source_count=12,
+        credential_config_available=False,
+        credential_config_source="argument_file",
+        credential_configured_source_count=2,
+        credential_config_missing_source_count=10,
+        credential_secret_ready_source_count=1,
+        credential_secret_missing_source_count=1,
+        credential_rule_candidate_source_count=12,
+        endpoint_discovery_needed_source_count=0,
+        credential_missing_secret_env_vars=["PAYER_DIRECTORY_CLIENT_ID"],
+        group_count=1,
+    )
+
+
+def _api_base_target(api_base, source_id, payer, source_count, **market_counts):
+    return {
+        "api_base": api_base,
+        "source_count": source_count,
+        "credential_configured_source_count": 0,
+        "credential_config_missing_source_count": source_count,
+        "credential_secret_ready_source_count": 0,
+        "credential_secret_missing_source_count": 0,
+        "credential_rule_candidate_source_count": source_count,
+        "endpoint_discovery_needed_source_count": 0,
+        "sample_payers": [payer],
+        "sample_source_ids": [source_id],
+        "sample_missing_credential_payers": [payer],
+        "sample_missing_secret_payers": [],
+        "sample_missing_secret_env_vars": [],
+        **market_counts,
+    }
+
+
+def _credential_api_targets_report():
+    base = "https://apps.availity.com/availity/public-fhir/fhir/v1"
+    oauth_target = _api_base_target(
+        f"{base}/a/r4",
+        "pdfhir_oauth",
+        "Availity OAuth payer",
+        2,
+        medicare_advantage_source_count=1,
+        medicaid_mco_source_count=1,
+        chip_source_count=0,
+        qhp_source_count=1,
+    )
+    api_key_target = _api_base_target(
+        f"{base}/b/r4",
+        "pdfhir_api_key",
+        "Availity API key payer",
+        1,
+        medicare_advantage_source_count=0,
+        medicaid_mco_source_count=1,
+        chip_source_count=0,
+        qhp_source_count=0,
+    )
+    groups = [
+        _credential_group(
+            "apps.availity.com",
+            "OAuth2 Client Credentials",
+            credential_rule_candidate_source_count=2,
+            endpoint_discovery_needed_source_count=0,
+            api_base_targets=[oauth_target],
+        ),
+        _credential_group(
+            "apps.availity.com",
+            "API Key",
+            credential_rule_candidate_source_count=1,
+            endpoint_discovery_needed_source_count=0,
+            api_base_targets=[api_key_target],
+        ),
+    ]
+    return _credential_report(
+        groups,
+        blocked_source_count=30,
+        credential_config_available=False,
+        credential_config_source="argument_file",
+        credential_configured_source_count=0,
+        credential_config_missing_source_count=30,
+        credential_secret_ready_source_count=0,
+        credential_secret_missing_source_count=0,
+        credential_rule_candidate_source_count=3,
+        endpoint_discovery_needed_source_count=0,
+        credential_missing_secret_env_vars=[],
+    )
+
+
+def _template_group(auth_type, source_id, payer, api_base, source_count, **market_counts):
+    return _credential_group(
+        "apps.availity.com",
+        auth_type,
+        source_count=source_count,
+        credential_configured_source_count=0,
+        credential_config_missing_source_count=source_count,
+        credential_rule_candidate_source_count=source_count,
+        endpoint_discovery_needed_source_count=0,
+        sample_missing_credential_payers=[payer],
+        sample_source_ids=[source_id],
+        sample_api_bases=[api_base],
+        api_base_count=3 if auth_type == "OAuth2 Client Credentials" else 2,
+        sample_api_base_count=1,
+        api_base_sample_complete=False,
+        **market_counts,
+    )
+
+
+def _credential_template_report():
+    base = "https://apps.availity.com/availity/public-fhir/fhir/v1"
+    groups = [
+        _template_group(
+            "OAuth2 Client Credentials",
+            "pdfhir_oauth",
+            "Availity OAuth payer",
+            f"{base}/a/r4",
+            30,
+            medicare_advantage_source_count=18,
+            medicaid_mco_source_count=8,
+            chip_source_count=2,
+            qhp_source_count=4,
+        ),
+        _template_group(
+            "API Key",
+            "pdfhir_api_key",
+            "Availity API key payer",
+            f"{base}/b/r4",
+            12,
+            medicare_advantage_source_count=0,
+            medicaid_mco_source_count=11,
+            chip_source_count=1,
+            qhp_source_count=0,
+        ),
+    ]
+    return _credential_report(
+        groups,
+        blocked_source_count=42,
+        credential_config_available=False,
+        credential_config_source="argument_file",
+        credential_configured_source_count=0,
+        credential_config_missing_source_count=42,
+        credential_rule_candidate_source_count=42,
+        endpoint_discovery_needed_source_count=0,
+        group_count=2,
+    )
+
+
+def _priority_group(source_host, auth_type, source_id, payer, api_base, **details):
+    sample = _sample_source(source_id, payer, api_base)
+    return _credential_group(
+        source_host,
+        auth_type,
+        sample_missing_credential_payers=[payer],
+        sample_source_ids=[source_id],
+        sample_api_bases=[api_base],
+        sample_sources=[sample],
+        sample_missing_credential_sources=[sample],
+        sample_api_base_count=1,
+        api_base_sample_complete=False,
+        **details,
+    )
+
+
+def _oneup_priority_group():
+    return _priority_group(
+        "api.1up.health",
+        "OAuth2 Client Credentials",
+        "pdfhir_1up",
+        "1up payer",
+        "https://api.1up.health/fhir-r4/payer",
+        source_count=50,
+        credential_configured_source_count=0,
+        credential_config_missing_source_count=50,
+        credential_secret_ready_source_count=0,
+        credential_secret_missing_source_count=0,
+        credential_rule_candidate_source_count=50,
+        endpoint_discovery_needed_source_count=0,
+        regulated_market_source_count=50,
+        medicare_advantage_source_count=20,
+        medicaid_mco_source_count=27,
+        chip_source_count=3,
+        qhp_source_count=6,
+        api_base_count=50,
+    )
+
+
+def _availity_oauth_priority_group():
+    return _priority_group(
+        "apps.availity.com",
+        "OAuth2 Client Credentials",
+        "pdfhir_oauth",
+        "Availity OAuth payer",
+        "https://apps.availity.com/availity/public-fhir/fhir/v1/a/r4",
+        source_count=30,
+        credential_configured_source_count=0,
+        credential_config_missing_source_count=30,
+        credential_secret_ready_source_count=0,
+        credential_secret_missing_source_count=0,
+        credential_rule_candidate_source_count=30,
+        endpoint_discovery_needed_source_count=0,
+        regulated_market_source_count=25,
+        medicare_advantage_source_count=18,
+        medicaid_mco_source_count=8,
+        chip_source_count=2,
+        qhp_source_count=4,
+        api_base_count=30,
+    )
+
+
+def _availity_api_key_priority_group():
+    group = _priority_group(
+        "apps.availity.com",
+        "API Key",
+        "pdfhir_api_key",
+        "Availity API key payer",
+        "https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4",
+        source_count=12,
+        credential_configured_source_count=1,
+        credential_config_missing_source_count=11,
+        credential_secret_ready_source_count=0,
+        credential_secret_missing_source_count=1,
+        credential_rule_candidate_source_count=12,
+        endpoint_discovery_needed_source_count=0,
+        regulated_market_source_count=12,
+        medicare_advantage_source_count=0,
+        medicaid_mco_source_count=11,
+        chip_source_count=1,
+        qhp_source_count=0,
+        api_base_count=12,
+    )
+    group.update(
+        sample_missing_secret_payers=["Availity configured payer"],
+        sample_missing_secret_env_vars=["AVAILITY_API_KEY"],
+        sample_missing_secret_sources=[
+            _sample_source(
+                "pdfhir_api_key",
+                "Availity configured payer",
+                "https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4",
+            )
+        ],
+    )
+    return group
+
+
+def _credential_priority_report():
+    return _credential_report(
+        [_oneup_priority_group(), _availity_oauth_priority_group(), _availity_api_key_priority_group()],
+        blocked_source_count=92,
+        credential_config_available=False,
+        credential_config_source="argument_file",
+        credential_configured_source_count=1,
+        credential_config_missing_source_count=91,
+        credential_secret_ready_source_count=0,
+        credential_secret_missing_source_count=1,
+        credential_rule_candidate_source_count=92,
+        endpoint_discovery_needed_source_count=0,
+        credential_missing_secret_env_vars=["AVAILITY_API_KEY"],
+        group_count=3,
+    )
+
+
+def _assert_fields(actual, expected):
+    assert {key: actual[key] for key in expected} == expected
+
+
+def _assert_priority_rollup(priority):
+    _assert_fields(
+        priority,
+        {
+            "credential_config_missing_source_count": 91,
+            "credential_rule_candidate_source_count": 92,
+            "endpoint_discovery_needed_source_count": 0,
+            "host_count": 2,
+        },
+    )
+    assert [host["source_host"] for host in priority["hosts"]] == ["api.1up.health", "apps.availity.com"]
+    assert [host["host"] for host in priority["hosts"]] == ["api.1up.health", "apps.availity.com"]
+    oneup = priority["hosts"][0]
+    _assert_fields(
+        oneup,
+        {
+            "priority_rank": 1,
+            "credential_config_missing_source_count": 50,
+            "credential_rule_candidate_source_count": 50,
+            "endpoint_discovery_needed_source_count": 0,
+            "regulated_market_source_count": 50,
+            "api_base_group_count": 50,
+            "sample_api_base_count": 1,
+            "cumulative_credential_config_missing_source_count": 50,
+            "cumulative_credential_rule_candidate_source_count": 50,
+            "cumulative_regulated_market_source_count": 50,
+            "cumulative_missing_source_pct": 54.95,
+            "cumulative_candidate_source_pct": 54.35,
+        },
+    )
+
+
+def _assert_availity_priority(availity):
+    _assert_fields(
+        availity,
+        {
+            "priority_rank": 2,
+            "source_count": 42,
+            "credential_config_missing_source_count": 41,
+            "credential_configured_source_count": 1,
+            "credential_secret_missing_source_count": 1,
+            "credential_rule_candidate_source_count": 42,
+            "endpoint_discovery_needed_source_count": 0,
+            "regulated_market_source_count": 37,
+            "medicaid_mco_source_count": 19,
+            "market_flag_source_mentions": 44,
+            "api_base_group_count": 42,
+            "sample_api_base_count": 2,
+            "cumulative_credential_config_missing_source_count": 91,
+            "cumulative_credential_rule_candidate_source_count": 92,
+            "cumulative_regulated_market_source_count": 87,
+            "cumulative_missing_source_pct": 100.0,
+            "cumulative_candidate_source_pct": 100.0,
+            "auth_types": ["API Key", "OAuth2 Client Credentials"],
+            "sample_missing_secret_env_vars": ["AVAILITY_API_KEY"],
+        },
+    )
+    assert {"oauth2", "api_key"} <= availity["credential_rule_template"].keys()
+    assert availity["credential_rule_template"]["_review"] == [
+        "This host has several known or sampled FHIR path variants; verify one host-level credential is valid for every path before enabling.",
+        "This host has both OAuth2 and API-key credential groups; avoid a single host-level rule unless the payer portal confirms both credentials are required together for every path. Prefer api_bases or sources rules for payer-specific auth.",
+    ]
+    assert len(availity["groups"]) == 2
+    _assert_fields(availity["groups"][0], {"api_base_count": 30, "api_base_sample_complete": False})
+
+
+def _assert_priority_samples(priority):
+    oneup, availity = priority["hosts"]
+    assert oneup["sample_sources"][0]["source_id"] == "pdfhir_1up"
+    assert availity["sample_sources"] == [
+        _sample_source(
+            "pdfhir_oauth",
+            "Availity OAuth payer",
+            "https://apps.availity.com/availity/public-fhir/fhir/v1/a/r4",
+        ),
+        _sample_source(
+            "pdfhir_api_key",
+            "Availity API key payer",
+            "https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4",
+        ),
+    ]
+    assert availity["groups"][0]["sample_sources"][0]["source_id"] == "pdfhir_oauth"
+    assert availity["sample_missing_secret_sources"][0]["source_id"] == "pdfhir_api_key"
+    assert priority["top_host_coverage"] == [
+        {
+            "top_n": 1,
+            "host_count": 1,
+            "credential_config_missing_source_count": 50,
+            "credential_rule_candidate_source_count": 50,
+            "endpoint_discovery_needed_source_count": 0,
+            "regulated_market_source_count": 50,
+            "missing_source_pct": 54.95,
+            "candidate_source_pct": 54.35,
+            "endpoint_discovery_source_pct": 0.0,
+            "hosts": ["api.1up.health"],
+        },
+        {
+            "top_n": 2,
+            "host_count": 2,
+            "credential_config_missing_source_count": 91,
+            "credential_rule_candidate_source_count": 92,
+            "endpoint_discovery_needed_source_count": 0,
+            "regulated_market_source_count": 87,
+            "missing_source_pct": 100.0,
+            "candidate_source_pct": 100.0,
+            "endpoint_discovery_source_pct": 0.0,
+            "hosts": ["api.1up.health", "apps.availity.com"],
+        },
+    ]
+
+
+def _markdown_credential_backlog():
+    return {
+        "available": True,
+        "blocked_source_count": 592,
+        "credential_configured_source_count": 11,
+        "credential_config_missing_source_count": 581,
+        "credential_secret_ready_source_count": 9,
+        "credential_secret_missing_source_count": 2,
+        "credential_rule_candidate_source_count": 263,
+        "endpoint_discovery_needed_source_count": 329,
+        "group_count": 2,
+        "groups": [
+            _credential_group(
+                "apps.availity.com",
+                "OAuth2/SMART",
+                probe_status="valid_non_fhir",
+                reason="onboarding_gateway",
+                source_count=263,
+                credential_configured_source_count=10,
+                credential_config_missing_source_count=253,
+                credential_secret_ready_source_count=9,
+                credential_secret_missing_source_count=1,
+                credential_rule_candidate_source_count=263,
+                endpoint_discovery_needed_source_count=0,
+                medicare_advantage_source_count=121,
+                medicaid_mco_source_count=88,
+                chip_source_count=0,
+                qhp_source_count=44,
+                api_base_count=263,
+                sample_api_base_count=2,
+                sample_payers=["Aetna / Provider Directory", "Availity payer"],
+                sample_missing_credential_payers=["Availity payer"],
+                sample_missing_secret_env_vars=["AVAILITY_CLIENT_SECRET"],
+            ),
+            _credential_group(
+                "partners.centene.com",
+                "token",
+                source_count=329,
+                credential_configured_source_count=1,
+                credential_config_missing_source_count=328,
+                credential_secret_ready_source_count=0,
+                credential_secret_missing_source_count=1,
+                credential_rule_candidate_source_count=0,
+                endpoint_discovery_needed_source_count=329,
+                medicare_advantage_source_count=0,
+                medicaid_mco_source_count=329,
+                chip_source_count=21,
+                qhp_source_count=0,
+                api_base_count=329,
+                sample_api_base_count=1,
+                sample_payers=["Centene"],
+                sample_missing_credential_payers=["Centene"],
+                sample_missing_secret_env_vars=["CENTENE_CLIENT_SECRET"],
+            ),
+        ],
+    }
+
+
+def _markdown_advertised_resource_summary():
+    return {
+        "available": True,
+        "advertised_without_rows": 2,
+        "advertised_auth_blocked_without_rows": 0,
+        "advertised_source_resources": 5,
+        "advertised_with_rows_pct": 60.0,
+        "resources": [
+            {
+                "resource_type": resource_type,
+                "advertised_source_count": advertised_count,
+                "source_with_rows_count": 1 if resource_type == "Endpoint" else 2,
+                "advertised_without_rows_count": 1,
+                "auth_blocked_without_rows_count": 0,
+                "resource_error_counts": {},
+            }
+            for resource_type, advertised_count in [("Location", 3), ("Endpoint", 2)]
+        ],
+    }
+
+
+def _markdown_alias_fanout_summary():
+    return {
+        "available": True,
+        "resource_count": 1,
+        "excess_source_resource_rows": 2720000,
+        "resources": [
+            {
+                "resource_type": "Practitioner",
+                "excess_source_resource_rows": 2720000,
+                "samples": [
+                    {
+                        "api_base": "https://fhir.humana.com/api",
+                        "sample_org_name": "Humana Inc.",
+                        "sample_plan_name": "Humana Choice PPO",
+                        "source_count": 18,
+                        "source_resource_rows": 2880000,
+                        "distinct_resource_ids": 160000,
+                        "excess_source_resource_rows": 2720000,
+                        "fanout_ratio": 18.0,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _markdown_canonical_resource_summary():
+    return {
+        "available": True,
+        "canonical_rows": 160000,
+        "source_edge_rows": 2880000,
+        "edge_surplus_rows": 2720000,
+        "source_count": 18,
+        "canonical_api_base_count": 1,
+        "resources": [
+            {
+                "resource_type": "Practitioner",
+                "canonical_rows": 160000,
+                "source_edge_rows": 2880000,
+                "edge_surplus_rows": 2720000,
+                "source_count": 18,
+                "canonical_api_base_count": 1,
+            }
+        ],
+    }
+
+
+def _country_count_markdown_report():
+    return {
+        "generated_at": "2026-06-28T00:00:00Z",
+        "schema": "mrf",
+        "ptg_plan_filter": None,
+        "source_summary": {
+            "available": True,
+            "source_count": 734,
+            "live_valid_count": 68,
+            "live_valid_pct": 9.26,
+            "live_auth_required_count": 329,
+            "auth_required_pct": 44.82,
+            "live_credential_or_gateway_non_fhir_count": 263,
+            "live_valid_non_fhir_count": 299,
+            "api_base_count": 728,
+            "api_base_pct": 99.18,
+        },
+        "credential_onboarding_backlog": _markdown_credential_backlog(),
+        "unified_summary": {
+            "available": True,
+            "provider_directory_rows": 282912,
+            "provider_directory_keyed_rows": 282912,
+            "provider_directory_keyed_pct": 100.0,
+            "provider_directory_phone_rows": 282000,
+            "provider_directory_phone_pct": 99.68,
+            "provider_directory_source_record_id_rows": 282912,
+            "provider_directory_source_record_id_pct": 100.0,
+            "provider_directory_country_001_rows": 0,
+        },
+        "ptg_summary": audit._skipped_ptg_summary(),
+        "advertised_resource_gap_summary": _markdown_advertised_resource_summary(),
+        "alias_fanout_summary": _markdown_alias_fanout_summary(),
+        "canonical_resource_summary": _markdown_canonical_resource_summary(),
+    }
+
+
+async def _is_resource_relation_available(_conn, _schema, name):
+    return name in {
+        "provider_directory_source",
+        "provider_directory_location",
+        "provider_directory_practitioner",
+        "provider_directory_organization",
+        "provider_directory_practitioner_role",
+        "provider_directory_healthcare_service",
+        "provider_directory_organization_affiliation",
+        "entity_address_unified",
+    }
+
+
+async def _is_resource_column_available(_conn, _schema, table, column):
+    return (table, column) in {
+        ("provider_directory_location", "address_key"),
+        ("provider_directory_organization", "address_json"),
+        ("entity_address_unified", "address_sources"),
+        ("entity_address_unified", "source_record_ids"),
+        ("entity_address_unified", "address_key"),
+        ("entity_address_unified", "telephone_number"),
+    }
+
+
+class _SourceResourceCoverageConnection:
+    def __init__(self):
+        self.fetch_calls = 0
+
+    async def fetchrow(self, _sql):
+        return {
+            "source_count": 10,
+            "sources_with_resource_rows": 4,
+            "catalog_only_source_count": 6,
+            "sources_with_location_rows": 3,
+            "sources_with_keyed_location_rows": 2,
+            "sources_with_location_rows_without_keys": 1,
+            "location_rows": 30,
+            "keyed_location_rows": 20,
+            "sources_with_organization_address_rows": 2,
+            "sources_with_valid_npi_organization_address_rows": 1,
+            "sources_with_valid_npi_organization_address_rows_without_unified_rows": 1,
+            "organization_address_rows": 12,
+            "valid_npi_organization_address_rows": 9,
+            "sources_with_unified_rows": 2,
+            "sources_with_keyed_unified_rows": 1,
+            "sources_with_phone_unified_rows": 1,
+            "sources_with_location_rows_without_unified_rows": 1,
+            "unified_rows": 12,
+            "keyed_unified_rows": 10,
+            "phone_unified_rows": 8,
+        }
+
+    async def fetch(self, sql, *_args):
+        if "resource_diagnostics" in sql:
+            return []
+        self.fetch_calls += 1
+        if self.fetch_calls == 1:
+            return [_catalog_only_resource_sample()]
+        if self.fetch_calls == 2:
+            _assert_location_projection_sql(sql)
+            return [_location_projection_gap_sample()]
+        return [_organization_projection_gap_sample()]
+
+
+def _catalog_only_resource_sample():
+    return {
+        "source_id": "pdfhir_catalog_only",
+        "org_name": "Catalog Only",
+        "plan_name": None,
+        "canonical_api_base": "https://catalog.example/fhir",
+        "last_probe_status": "auth_required",
+        "last_validated_status": "auth_required",
+        "auth_type": "OAuth2 Client Credentials",
+    }
+
+
+def _assert_location_projection_sql(sql):
+    assert "provider_directory_healthcare_service" in sql
+    assert "COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)" in sql
+    assert "COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)" in sql
+    assert "COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)" in sql
+
+
+def _location_projection_gap_sample():
+    return {
+        "source_id": "pdfhir_no_projection",
+        "org_name": "No Projection",
+        "plan_name": None,
+        "canonical_api_base": "https://projection.example/fhir",
+        "last_probe_status": "valid",
+        "auth_type": "none",
+        "location_rows": 9,
+        "keyed_location_rows": 9,
+        "role_healthcare_service_location_refs": 3,
+        "role_healthcare_service_valid_npi_refs": 3,
+        "role_healthcare_service_matching_location_refs": 3,
+        "role_healthcare_service_projectable_location_refs": 3,
+        "affiliation_healthcare_service_location_refs": 2,
+        "affiliation_healthcare_service_valid_npi_refs": 0,
+        "affiliation_healthcare_service_matching_location_refs": 2,
+        "affiliation_healthcare_service_projectable_location_refs": 0,
+    }
+
+
+def _organization_projection_gap_sample():
+    return {
+        "source_id": "pdfhir_org_no_projection",
+        "org_name": "Org No Projection",
+        "plan_name": None,
+        "canonical_api_base": "https://org-projection.example/fhir",
+        "last_probe_status": "valid",
+        "auth_type": "none",
+        "organization_address_rows": 12,
+        "valid_npi_organization_address_rows": 9,
+    }
+
+
 def test_provider_directory_coverage_audit_parse_args_accepts_ptg_plan_filter():
     args = audit.parse_args(["--ptg-plan-id", "TESTPLAN001"])
 
@@ -277,83 +1097,32 @@ def test_provider_directory_coverage_audit_accepts_retest_results_path():
 
 def test_provider_directory_coverage_audit_retest_coverage_counts_current_redirected_and_missing():
     """Verify provider directory coverage audit retest coverage counts current redirected and missing."""
+    retest_results, catalog_sources = _current_retest_inputs()
     coverage = audit._source_catalog_retest_coverage(
-        {
-            "tested_at": "2026-06-03T17:43:09Z",
-            "results": [
-                {
-                    "classification": "valid",
-                    "org_name": "Cigna",
-                    "api_base": "https://fhir.cigna.com/ProviderDirectory/v1",
-                    "status_code": 200,
-                    "payer_id": 62,
-                },
-                {
-                    "classification": "valid",
-                    "org_name": "Aetna R4",
-                    "api_base": "https://fhir-ehr.cerner.com/r4/aetna",
-                    "status_code": 200,
-                    "payer_id": 299,
-                },
-                {
-                    "classification": "valid_non_fhir",
-                    "org_name": "Missing Public Provider App",
-                    "api_base": "https://public-directory.example/providers",
-                    "status_code": 200,
-                    "payer_id": 999,
-                },
-                {
-                    "classification": "auth_required",
-                    "org_name": "Ignored Auth Payer",
-                    "api_base": "https://auth.example/fhir",
-                    "status_code": 403,
-                    "payer_id": 1000,
-                },
-            ],
-        },
-        [
-            {
-                "source_id": "pdfhir_cigna",
-                "org_name": "Cigna",
-                "api_base": "https://fhir.cigna.com/ProviderDirectory/v1",
-                "canonical_api_base": "https://fhir.cigna.com/ProviderDirectory/v1",
-                "metadata_json": {},
-            },
-            {
-                "source_id": "pdfhir_aetna",
-                "org_name": "Aetna R4",
-                "api_base": "https://apif1.aetna.com/fhir/v1/providerdirectory",
-                "canonical_api_base": "https://apif1.aetna.com/fhir/v1/providerdirectory",
-                "metadata_json": {
-                    "provider_directory_previous_api_base": "https://fhir-ehr.cerner.com/r4/aetna",
-                    "provider_directory_confirmed_base": "https://apif1.aetna.com/fhir/v1/providerdirectory",
-                },
-            },
-            {
-                "source_id": "pdfhir_auth",
-                "org_name": "Ignored Auth Payer",
-                "api_base": "https://auth.example/fhir",
-                "canonical_api_base": "https://auth.example/fhir",
-                "metadata_json": {},
-            },
-        ],
+        {"tested_at": "2026-06-03T17:43:09Z", "results": retest_results},
+        catalog_sources,
         sample_limit=3,
     )
 
-    assert coverage["available"] is True
-    assert coverage["tested_at"] == "2026-06-03T17:43:09Z"
-    assert coverage["checked_result_count"] == 4
-    assert coverage["covered_current_base"] == 2
-    assert coverage["covered_by_redirect"] == 1
-    assert coverage["missing_result_count"] == 1
-    assert coverage["covered_count"] == 3
-    assert coverage["classification_counts"] == {"auth_required": 1, "valid": 2, "valid_non_fhir": 1}
-    assert coverage["importable_checked_result_count"] == 3
-    assert coverage["importable_covered_count"] == 2
-    assert coverage["importable_missing_result_count"] == 1
-    assert coverage["credential_gated_checked_result_count"] == 1
-    assert coverage["credential_gated_covered_count"] == 1
-    assert coverage["credential_gated_missing_result_count"] == 0
+    _assert_fields(
+        coverage,
+        {
+            "available": True,
+            "tested_at": "2026-06-03T17:43:09Z",
+            "checked_result_count": 4,
+            "covered_current_base": 2,
+            "covered_by_redirect": 1,
+            "missing_result_count": 1,
+            "covered_count": 3,
+            "classification_counts": {"auth_required": 1, "valid": 2, "valid_non_fhir": 1},
+            "importable_checked_result_count": 3,
+            "importable_covered_count": 2,
+            "importable_missing_result_count": 1,
+            "credential_gated_checked_result_count": 1,
+            "credential_gated_covered_count": 1,
+            "credential_gated_missing_result_count": 0,
+        },
+    )
     assert coverage["redirected_samples"] == [
         {
             "classification": "valid",
@@ -376,127 +1145,30 @@ def test_provider_directory_coverage_audit_retest_coverage_counts_current_redire
 
 def test_provider_directory_coverage_audit_retest_coverage_groups_unchecked_backlog():
     """Verify provider directory coverage audit retest coverage groups unchecked backlog."""
+    retest_results = [
+        _retest_result("unreachable", "Molina Healthcare", "https://fhir.molinahealthcare.com/provider-directory/"),
+        _retest_result("unreachable", "Centene", "https://fhir.centene.com/provider-directory/"),
+        _retest_result("unreachable", "WellCare", "https://fhir.centene.com/provider-directory/"),
+        _retest_result("no_api", "Health Partners Plans"),
+        _retest_result("no_api", "Still Missing Payer"),
+        _retest_result("no_api", "First Medical Health Plan, Inc."),
+        _retest_result(
+            "not_found",
+            "AmeriHealth Caritas",
+            "https://fhir.amerihealthcaritas.com/provider-directory/",
+            status_code=404,
+        ),
+        _retest_result("unreachable", "State of Alaska", "https://api.alaskafhir.com/r4/public/Practitioner"),
+        _retest_result(
+            "timeout",
+            "Blue Cross and Blue Shield of Illinois",
+            "https://api.bcbsil.com/fhir/provider-directory/",
+        ),
+    ]
+    catalog_sources = _unchecked_retest_sources()
     coverage = audit._source_catalog_retest_coverage(
-        {
-            "results": [
-                {
-                    "classification": "unreachable",
-                    "org_name": "Molina Healthcare",
-                    "api_base": "https://fhir.molinahealthcare.com/provider-directory/",
-                },
-                {
-                    "classification": "unreachable",
-                    "org_name": "Centene",
-                    "api_base": "https://fhir.centene.com/provider-directory/",
-                },
-                {
-                    "classification": "unreachable",
-                    "org_name": "WellCare",
-                    "api_base": "https://fhir.centene.com/provider-directory/",
-                },
-                {
-                    "classification": "no_api",
-                    "org_name": "Health Partners Plans",
-                    "api_base": None,
-                },
-                {
-                    "classification": "no_api",
-                    "org_name": "Still Missing Payer",
-                    "api_base": None,
-                },
-                {
-                    "classification": "no_api",
-                    "org_name": "First Medical Health Plan, Inc.",
-                    "api_base": None,
-                },
-                {
-                    "classification": "not_found",
-                    "org_name": "AmeriHealth Caritas",
-                    "api_base": "https://fhir.amerihealthcaritas.com/provider-directory/",
-                    "status_code": 404,
-                },
-                {
-                    "classification": "unreachable",
-                    "org_name": "State of Alaska",
-                    "api_base": "https://api.alaskafhir.com/r4/public/Practitioner",
-                },
-                {
-                    "classification": "timeout",
-                    "org_name": "Blue Cross and Blue Shield of Illinois",
-                    "api_base": "https://api.bcbsil.com/fhir/provider-directory/",
-                },
-            ],
-        },
-        [
-            {
-                "source_id": "pdfhir_molina",
-                "org_name": "Molina Healthcare",
-                "api_base": "https://api.interop.molinahealthcare.com/providerdirectory",
-                "canonical_api_base": "https://api.interop.molinahealthcare.com/providerdirectory",
-                "metadata_json": {
-                    "provider_directory_confirmed_base": "https://api.interop.molinahealthcare.com/providerdirectory",
-                    "provider_directory_equivalent_api_bases": [
-                        "https://fhir.molinahealthcare.com/provider-directory"
-                    ],
-                },
-            },
-            {
-                "source_id": "pdfhir_health_partners_plans",
-                "org_name": "Health Partners Plans",
-                "api_base": "https://providerfhirapi.healthpartnersplans.com",
-                "canonical_api_base": "https://providerfhirapi.healthpartnersplans.com",
-                "metadata_json": {},
-            },
-            {
-                "source_id": "pdfhir_amerihealth_caritas_pa",
-                "org_name": "AmeriHealth Caritas",
-                "api_base": "https://api-ext.amerihealthcaritas.com/0500/provider-api",
-                "canonical_api_base": "https://api-ext.amerihealthcaritas.com/0500/provider-api",
-                "metadata_json": {
-                    "provider_directory_replaces_stale_generic_api_bases": [
-                        "https://fhir.amerihealthcaritas.com/provider-directory"
-                    ]
-                },
-            },
-            {
-                "source_id": "pdfhir_centene",
-                "org_name": "Centene Corporation",
-                "api_base": "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory",
-                "canonical_api_base": "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory",
-                "metadata_json": {
-                    "provider_directory_replaces_stale_generic_api_bases": [
-                        "https://fhir.centene.com/provider-directory"
-                    ]
-                },
-            },
-            {
-                "source_id": "pdfhir_cms_sma_alaska",
-                "org_name": "State of Alaska",
-                "api_base": "https://api.alaskafhir.com/r4",
-                "canonical_api_base": "https://api.alaskafhir.com/r4",
-                "metadata_json": {
-                    "provider_directory_equivalent_api_bases": [
-                        "https://api.alaskafhir.com/r4/public/Practitioner"
-                    ]
-                },
-            },
-            {
-                "source_id": "pdfhir_bcbsil",
-                "org_name": "Blue Cross and Blue Shield of Illinois",
-                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/bcbsil/r4",
-                "canonical_api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/bcbsil/r4",
-                "last_validated_status": "valid",
-                "metadata_json": {},
-            },
-            {
-                "source_id": "pdfhir_first_medical_blocked",
-                "org_name": "First Medical Health Plan, Inc.",
-                "api_base": None,
-                "canonical_api_base": None,
-                "last_validated_status": "catalog_blocked",
-                "metadata_json": {"provider_directory_blocked": True},
-            },
-        ],
+        {"results": retest_results},
+        catalog_sources,
         sample_limit=3,
     )
 
@@ -681,76 +1353,7 @@ def test_provider_directory_coverage_audit_invalid_candidate_credential_file_is_
 
 def test_provider_directory_coverage_audit_credential_backlog_export_is_non_secret():
     """Verify provider directory coverage audit credential backlog export is non secret."""
-    export = audit._credential_backlog_export(
-        {
-            "generated_at": "2026-06-29T00:00:00Z",
-            "schema": "mrf",
-            "credential_onboarding_backlog": {
-                "available": True,
-                "blocked_source_count": 12,
-                "credential_config_available": False,
-                "credential_config_source": "argument_file",
-                "credential_configured_source_count": 2,
-                "credential_config_missing_source_count": 10,
-                "credential_secret_ready_source_count": 1,
-                "credential_secret_missing_source_count": 1,
-                "credential_rule_candidate_source_count": 12,
-                "endpoint_discovery_needed_source_count": 0,
-                "credential_missing_secret_env_vars": ["PAYER_DIRECTORY_CLIENT_ID"],
-                "group_count": 1,
-                "groups": [
-                    {
-                        "source_host": "api.payer.example",
-                        "probe_status": "auth_required",
-                        "auth_type": "OAuth2 Client Credentials",
-                        "reason": "auth_required",
-                        "source_count": 12,
-                        "credential_configured_source_count": 2,
-                        "credential_config_missing_source_count": 10,
-                        "credential_secret_ready_source_count": 1,
-                        "credential_secret_missing_source_count": 1,
-                        "credential_rule_candidate_source_count": 12,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "medicare_advantage_source_count": 7,
-                        "medicaid_mco_source_count": 3,
-                        "chip_source_count": 1,
-                        "qhp_source_count": 2,
-                        "sample_payers": ["Example Payer / Medicare Advantage"],
-                        "sample_missing_credential_payers": ["Example Payer / Medicare Advantage"],
-                        "sample_missing_secret_payers": ["Example Payer / Medicare Advantage"],
-                        "sample_missing_secret_env_vars": ["PAYER_DIRECTORY_CLIENT_ID"],
-                        "sample_source_ids": ["pdfhir_123"],
-                        "sample_api_bases": ["https://api.payer.example/fhir"],
-                        "sample_sources": [
-                            {
-                                "source_id": "pdfhir_123",
-                                "payer": "Example Payer / Medicare Advantage",
-                                "api_base": "https://api.payer.example/fhir",
-                                "markets": {"medicare_advantage": True},
-                            }
-                        ],
-                        "sample_missing_credential_sources": [
-                            {
-                                "source_id": "pdfhir_123",
-                                "payer": "Example Payer / Medicare Advantage",
-                                "api_base": "https://api.payer.example/fhir",
-                            }
-                        ],
-                        "sample_missing_secret_sources": [
-                            {
-                                "source_id": "pdfhir_123",
-                                "payer": "Example Payer / Medicare Advantage",
-                                "api_base": "https://api.payer.example/fhir",
-                            }
-                        ],
-                        "api_base_count": 1,
-                        "sample_api_base_count": 1,
-                        "api_base_sample_complete": True,
-                    }
-                ],
-            },
-        }
-    )
+    export = audit._credential_backlog_export(_credential_backlog_report())
 
     assert export["credential_config_missing_source_count"] == 10
     assert export["credential_config_source"] == "argument_file"
@@ -795,85 +1398,7 @@ def test_provider_directory_coverage_audit_credential_backlog_export_is_non_secr
 
 def test_provider_directory_coverage_audit_credential_api_base_targets_export_is_actionable():
     """Verify provider directory coverage audit credential api base targets export is actionable."""
-    export = audit._credential_api_base_targets_export(
-        {
-            "generated_at": "2026-06-29T00:00:00Z",
-            "schema": "mrf",
-            "credential_onboarding_backlog": {
-                "available": True,
-                "blocked_source_count": 30,
-                "credential_config_available": False,
-                "credential_config_source": "argument_file",
-                "credential_configured_source_count": 0,
-                "credential_config_missing_source_count": 30,
-                "credential_secret_ready_source_count": 0,
-                "credential_secret_missing_source_count": 0,
-                "credential_rule_candidate_source_count": 3,
-                "endpoint_discovery_needed_source_count": 0,
-                "credential_missing_secret_env_vars": [],
-                "groups": [
-                    {
-                        "source_host": "apps.availity.com",
-                        "probe_status": "auth_required",
-                        "auth_type": "OAuth2 Client Credentials",
-                        "reason": "auth_required",
-                        "credential_rule_candidate_source_count": 2,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "api_base_targets": [
-                            {
-                                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/a/r4",
-                                "source_count": 2,
-                                "credential_configured_source_count": 0,
-                                "credential_config_missing_source_count": 2,
-                                "credential_secret_ready_source_count": 0,
-                                "credential_secret_missing_source_count": 0,
-                                "credential_rule_candidate_source_count": 2,
-                                "endpoint_discovery_needed_source_count": 0,
-                                "medicare_advantage_source_count": 1,
-                                "medicaid_mco_source_count": 1,
-                                "chip_source_count": 0,
-                                "qhp_source_count": 1,
-                                "sample_payers": ["Availity OAuth payer"],
-                                "sample_source_ids": ["pdfhir_oauth"],
-                                "sample_missing_credential_payers": ["Availity OAuth payer"],
-                                "sample_missing_secret_payers": [],
-                                "sample_missing_secret_env_vars": [],
-                            }
-                        ],
-                    },
-                    {
-                        "source_host": "apps.availity.com",
-                        "probe_status": "auth_required",
-                        "auth_type": "API Key",
-                        "reason": "auth_required",
-                        "credential_rule_candidate_source_count": 1,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "api_base_targets": [
-                            {
-                                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4",
-                                "source_count": 1,
-                                "credential_configured_source_count": 0,
-                                "credential_config_missing_source_count": 1,
-                                "credential_secret_ready_source_count": 0,
-                                "credential_secret_missing_source_count": 0,
-                                "credential_rule_candidate_source_count": 1,
-                                "endpoint_discovery_needed_source_count": 0,
-                                "medicare_advantage_source_count": 0,
-                                "medicaid_mco_source_count": 1,
-                                "chip_source_count": 0,
-                                "qhp_source_count": 0,
-                                "sample_payers": ["Availity API key payer"],
-                                "sample_source_ids": ["pdfhir_api_key"],
-                                "sample_missing_credential_payers": ["Availity API key payer"],
-                                "sample_missing_secret_payers": [],
-                                "sample_missing_secret_env_vars": [],
-                            }
-                        ],
-                    },
-                ],
-            },
-        }
-    )
+    export = audit._credential_api_base_targets_export(_credential_api_targets_report())
 
     assert export["api_base_target_count"] == 2
     assert export["credential_rule_candidate_source_count"] == 3
@@ -896,67 +1421,7 @@ def test_provider_directory_coverage_audit_credential_api_base_targets_export_is
 
 def test_provider_directory_coverage_audit_credential_config_template_groups_by_host():
     """Verify provider directory coverage audit credential config template groups by host."""
-    template = audit._credential_config_template_export(
-        {
-            "generated_at": "2026-06-29T00:00:00Z",
-            "schema": "mrf",
-            "credential_onboarding_backlog": {
-                "available": True,
-                "blocked_source_count": 42,
-                "credential_config_available": False,
-                "credential_config_source": "argument_file",
-                "credential_configured_source_count": 0,
-                "credential_config_missing_source_count": 42,
-                "credential_rule_candidate_source_count": 42,
-                "endpoint_discovery_needed_source_count": 0,
-                "group_count": 2,
-                "groups": [
-                    {
-                        "source_host": "apps.availity.com",
-                        "probe_status": "auth_required",
-                        "auth_type": "OAuth2 Client Credentials",
-                        "reason": "auth_required",
-                        "source_count": 30,
-                        "credential_configured_source_count": 0,
-                        "credential_config_missing_source_count": 30,
-                        "credential_rule_candidate_source_count": 30,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "medicare_advantage_source_count": 18,
-                        "medicaid_mco_source_count": 8,
-                        "chip_source_count": 2,
-                        "qhp_source_count": 4,
-                        "sample_missing_credential_payers": ["Availity OAuth payer"],
-                        "sample_source_ids": ["pdfhir_oauth"],
-                        "sample_api_bases": ["https://apps.availity.com/availity/public-fhir/fhir/v1/a/r4"],
-                        "api_base_count": 3,
-                        "sample_api_base_count": 1,
-                        "api_base_sample_complete": False,
-                    },
-                    {
-                        "source_host": "apps.availity.com",
-                        "probe_status": "auth_required",
-                        "auth_type": "API Key",
-                        "reason": "auth_required",
-                        "source_count": 12,
-                        "credential_configured_source_count": 0,
-                        "credential_config_missing_source_count": 12,
-                        "credential_rule_candidate_source_count": 12,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "medicare_advantage_source_count": 0,
-                        "medicaid_mco_source_count": 11,
-                        "chip_source_count": 1,
-                        "qhp_source_count": 0,
-                        "sample_missing_credential_payers": ["Availity API key payer"],
-                        "sample_source_ids": ["pdfhir_api_key"],
-                        "sample_api_bases": ["https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4"],
-                        "api_base_count": 2,
-                        "sample_api_base_count": 1,
-                        "api_base_sample_complete": False,
-                    },
-                ],
-            },
-        }
-    )
+    template = audit._credential_config_template_export(_credential_template_report())
 
     rule = template["credential_config_template"]["hosts"]["apps.availity.com"]
     api_base_rules = template["credential_config_template"]["api_bases"]
@@ -1013,240 +1478,11 @@ def test_provider_directory_coverage_audit_credential_config_template_groups_by_
 
 def test_provider_directory_coverage_audit_credential_priority_export_rolls_up_hosts():
     """Verify provider directory coverage audit credential priority export rolls up hosts."""
-    priority = audit._credential_priority_export(
-        {
-            "generated_at": "2026-06-29T00:00:00Z",
-            "schema": "mrf",
-            "credential_onboarding_backlog": {
-                "available": True,
-                "blocked_source_count": 92,
-                "credential_config_available": False,
-                "credential_config_source": "argument_file",
-                "credential_configured_source_count": 1,
-                "credential_config_missing_source_count": 91,
-                "credential_secret_ready_source_count": 0,
-                "credential_secret_missing_source_count": 1,
-                "credential_rule_candidate_source_count": 92,
-                "endpoint_discovery_needed_source_count": 0,
-                "credential_missing_secret_env_vars": ["AVAILITY_API_KEY"],
-                "group_count": 3,
-                "groups": [
-                    {
-                        "source_host": "api.1up.health",
-                        "probe_status": "auth_required",
-                        "auth_type": "OAuth2 Client Credentials",
-                        "reason": "auth_required",
-                        "source_count": 50,
-                        "credential_configured_source_count": 0,
-                        "credential_config_missing_source_count": 50,
-                        "credential_secret_ready_source_count": 0,
-                        "credential_secret_missing_source_count": 0,
-                        "credential_rule_candidate_source_count": 50,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "regulated_market_source_count": 50,
-                        "medicare_advantage_source_count": 20,
-                        "medicaid_mco_source_count": 27,
-                        "chip_source_count": 3,
-                        "qhp_source_count": 6,
-                        "sample_missing_credential_payers": ["1up payer"],
-                        "sample_source_ids": ["pdfhir_1up"],
-                        "sample_api_bases": ["https://api.1up.health/fhir-r4/payer"],
-                        "sample_sources": [
-                            {
-                                "source_id": "pdfhir_1up",
-                                "payer": "1up payer",
-                                "api_base": "https://api.1up.health/fhir-r4/payer",
-                            }
-                        ],
-                        "sample_missing_credential_sources": [
-                            {
-                                "source_id": "pdfhir_1up",
-                                "payer": "1up payer",
-                                "api_base": "https://api.1up.health/fhir-r4/payer",
-                            }
-                        ],
-                        "api_base_count": 50,
-                        "sample_api_base_count": 1,
-                        "api_base_sample_complete": False,
-                    },
-                    {
-                        "source_host": "apps.availity.com",
-                        "probe_status": "auth_required",
-                        "auth_type": "OAuth2 Client Credentials",
-                        "reason": "auth_required",
-                        "source_count": 30,
-                        "credential_configured_source_count": 0,
-                        "credential_config_missing_source_count": 30,
-                        "credential_secret_ready_source_count": 0,
-                        "credential_secret_missing_source_count": 0,
-                        "credential_rule_candidate_source_count": 30,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "regulated_market_source_count": 25,
-                        "medicare_advantage_source_count": 18,
-                        "medicaid_mco_source_count": 8,
-                        "chip_source_count": 2,
-                        "qhp_source_count": 4,
-                        "sample_missing_credential_payers": ["Availity OAuth payer"],
-                        "sample_source_ids": ["pdfhir_oauth"],
-                        "sample_api_bases": ["https://apps.availity.com/availity/public-fhir/fhir/v1/a/r4"],
-                        "sample_sources": [
-                            {
-                                "source_id": "pdfhir_oauth",
-                                "payer": "Availity OAuth payer",
-                                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/a/r4",
-                            }
-                        ],
-                        "sample_missing_credential_sources": [
-                            {
-                                "source_id": "pdfhir_oauth",
-                                "payer": "Availity OAuth payer",
-                                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/a/r4",
-                            }
-                        ],
-                        "api_base_count": 30,
-                        "sample_api_base_count": 1,
-                        "api_base_sample_complete": False,
-                    },
-                    {
-                        "source_host": "apps.availity.com",
-                        "probe_status": "auth_required",
-                        "auth_type": "API Key",
-                        "reason": "auth_required",
-                        "source_count": 12,
-                        "credential_configured_source_count": 1,
-                        "credential_config_missing_source_count": 11,
-                        "credential_secret_ready_source_count": 0,
-                        "credential_secret_missing_source_count": 1,
-                        "credential_rule_candidate_source_count": 12,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "regulated_market_source_count": 12,
-                        "medicare_advantage_source_count": 0,
-                        "medicaid_mco_source_count": 11,
-                        "chip_source_count": 1,
-                        "qhp_source_count": 0,
-                        "sample_missing_credential_payers": ["Availity API key payer"],
-                        "sample_missing_secret_payers": ["Availity configured payer"],
-                        "sample_missing_secret_env_vars": ["AVAILITY_API_KEY"],
-                        "sample_source_ids": ["pdfhir_api_key"],
-                        "sample_api_bases": ["https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4"],
-                        "sample_sources": [
-                            {
-                                "source_id": "pdfhir_api_key",
-                                "payer": "Availity API key payer",
-                                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4",
-                            }
-                        ],
-                        "sample_missing_credential_sources": [
-                            {
-                                "source_id": "pdfhir_api_key",
-                                "payer": "Availity API key payer",
-                                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4",
-                            }
-                        ],
-                        "sample_missing_secret_sources": [
-                            {
-                                "source_id": "pdfhir_api_key",
-                                "payer": "Availity configured payer",
-                                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4",
-                            }
-                        ],
-                        "api_base_count": 12,
-                        "sample_api_base_count": 1,
-                        "api_base_sample_complete": False,
-                    },
-                ],
-            },
-        }
-    )
+    priority = audit._credential_priority_export(_credential_priority_report())
 
-    assert priority["credential_config_missing_source_count"] == 91
-    assert priority["credential_rule_candidate_source_count"] == 92
-    assert priority["endpoint_discovery_needed_source_count"] == 0
-    assert priority["host_count"] == 2
-    assert [host["source_host"] for host in priority["hosts"]] == ["api.1up.health", "apps.availity.com"]
-    assert [host["host"] for host in priority["hosts"]] == ["api.1up.health", "apps.availity.com"]
-    oneup, availity = priority["hosts"]
-    assert oneup["priority_rank"] == 1
-    assert oneup["credential_config_missing_source_count"] == 50
-    assert oneup["credential_rule_candidate_source_count"] == 50
-    assert oneup["endpoint_discovery_needed_source_count"] == 0
-    assert oneup["regulated_market_source_count"] == 50
-    assert oneup["api_base_group_count"] == 50
-    assert oneup["sample_api_base_count"] == 1
-    assert oneup["cumulative_credential_config_missing_source_count"] == 50
-    assert oneup["cumulative_credential_rule_candidate_source_count"] == 50
-    assert oneup["cumulative_regulated_market_source_count"] == 50
-    assert oneup["cumulative_missing_source_pct"] == 54.95
-    assert oneup["cumulative_candidate_source_pct"] == 54.35
-    assert availity["priority_rank"] == 2
-    assert availity["source_count"] == 42
-    assert availity["credential_config_missing_source_count"] == 41
-    assert availity["credential_configured_source_count"] == 1
-    assert availity["credential_secret_missing_source_count"] == 1
-    assert availity["credential_rule_candidate_source_count"] == 42
-    assert availity["endpoint_discovery_needed_source_count"] == 0
-    assert availity["regulated_market_source_count"] == 37
-    assert availity["medicaid_mco_source_count"] == 19
-    assert availity["market_flag_source_mentions"] == 44
-    assert availity["api_base_group_count"] == 42
-    assert availity["sample_api_base_count"] == 2
-    assert availity["cumulative_credential_config_missing_source_count"] == 91
-    assert availity["cumulative_credential_rule_candidate_source_count"] == 92
-    assert availity["cumulative_regulated_market_source_count"] == 87
-    assert availity["cumulative_missing_source_pct"] == 100.0
-    assert availity["cumulative_candidate_source_pct"] == 100.0
-    assert availity["auth_types"] == ["API Key", "OAuth2 Client Credentials"]
-    assert availity["sample_missing_secret_env_vars"] == ["AVAILITY_API_KEY"]
-    assert "oauth2" in availity["credential_rule_template"]
-    assert "api_key" in availity["credential_rule_template"]
-    assert availity["credential_rule_template"]["_review"] == [
-        "This host has several known or sampled FHIR path variants; verify one host-level credential is valid for every path before enabling.",
-        "This host has both OAuth2 and API-key credential groups; avoid a single host-level rule unless the payer portal confirms both credentials are required together for every path. Prefer api_bases or sources rules for payer-specific auth."
-    ]
-    assert len(availity["groups"]) == 2
-    assert availity["groups"][0]["api_base_count"] == 30
-    assert availity["groups"][0]["api_base_sample_complete"] is False
-    assert oneup["sample_sources"][0]["source_id"] == "pdfhir_1up"
-    assert availity["sample_sources"] == [
-        {
-            "source_id": "pdfhir_oauth",
-            "payer": "Availity OAuth payer",
-            "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/a/r4",
-        },
-        {
-            "source_id": "pdfhir_api_key",
-            "payer": "Availity API key payer",
-            "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/b/r4",
-        },
-    ]
-    assert availity["groups"][0]["sample_sources"][0]["source_id"] == "pdfhir_oauth"
-    assert availity["sample_missing_secret_sources"][0]["source_id"] == "pdfhir_api_key"
-    assert priority["top_host_coverage"] == [
-        {
-            "top_n": 1,
-            "host_count": 1,
-            "credential_config_missing_source_count": 50,
-            "credential_rule_candidate_source_count": 50,
-            "endpoint_discovery_needed_source_count": 0,
-            "regulated_market_source_count": 50,
-            "missing_source_pct": 54.95,
-            "candidate_source_pct": 54.35,
-            "endpoint_discovery_source_pct": 0.0,
-            "hosts": ["api.1up.health"],
-        },
-        {
-            "top_n": 2,
-            "host_count": 2,
-            "credential_config_missing_source_count": 91,
-            "credential_rule_candidate_source_count": 92,
-            "endpoint_discovery_needed_source_count": 0,
-            "regulated_market_source_count": 87,
-            "missing_source_pct": 100.0,
-            "candidate_source_pct": 100.0,
-            "endpoint_discovery_source_pct": 0.0,
-            "hosts": ["api.1up.health", "apps.availity.com"],
-        },
-    ]
+    _assert_priority_rollup(priority)
+    _assert_availity_priority(priority["hosts"][1])
+    _assert_priority_samples(priority)
     assert "secret-value" not in str(priority)
 
 
@@ -2303,160 +2539,7 @@ def test_provider_directory_coverage_audit_markdown_includes_plan_network_contex
 
 def test_markdown_includes_source_country_counts():
     """Verify provider directory coverage audit markdown includes unified source id and country counts."""
-    markdown = audit.render_markdown(
-        {
-            "generated_at": "2026-06-28T00:00:00Z",
-            "schema": "mrf",
-            "ptg_plan_filter": None,
-            "source_summary": {
-                "available": True,
-                "source_count": 734,
-                "live_valid_count": 68,
-                "live_valid_pct": 9.26,
-                "live_auth_required_count": 329,
-                "auth_required_pct": 44.82,
-                "live_credential_or_gateway_non_fhir_count": 263,
-                "live_valid_non_fhir_count": 299,
-                "api_base_count": 728,
-                "api_base_pct": 99.18,
-            },
-            "credential_onboarding_backlog": {
-                "available": True,
-                "blocked_source_count": 592,
-                "credential_configured_source_count": 11,
-                "credential_config_missing_source_count": 581,
-                "credential_secret_ready_source_count": 9,
-                "credential_secret_missing_source_count": 2,
-                "credential_rule_candidate_source_count": 263,
-                "endpoint_discovery_needed_source_count": 329,
-                "group_count": 2,
-                "groups": [
-                    {
-                        "source_host": "apps.availity.com",
-                        "probe_status": "valid_non_fhir",
-                        "auth_type": "OAuth2/SMART",
-                        "reason": "onboarding_gateway",
-                        "source_count": 263,
-                        "credential_configured_source_count": 10,
-                        "credential_config_missing_source_count": 253,
-                        "credential_secret_ready_source_count": 9,
-                        "credential_secret_missing_source_count": 1,
-                        "credential_rule_candidate_source_count": 263,
-                        "endpoint_discovery_needed_source_count": 0,
-                        "medicare_advantage_source_count": 121,
-                        "medicaid_mco_source_count": 88,
-                        "chip_source_count": 0,
-                        "qhp_source_count": 44,
-                        "api_base_count": 263,
-                        "sample_api_base_count": 2,
-                        "sample_payers": ["Aetna / Provider Directory", "Availity payer"],
-                        "sample_missing_credential_payers": ["Availity payer"],
-                        "sample_missing_secret_env_vars": ["AVAILITY_CLIENT_SECRET"],
-                    },
-                    {
-                        "source_host": "partners.centene.com",
-                        "probe_status": "auth_required",
-                        "auth_type": "token",
-                        "reason": "auth_required",
-                        "source_count": 329,
-                        "credential_configured_source_count": 1,
-                        "credential_config_missing_source_count": 328,
-                        "credential_secret_ready_source_count": 0,
-                        "credential_secret_missing_source_count": 1,
-                        "credential_rule_candidate_source_count": 0,
-                        "endpoint_discovery_needed_source_count": 329,
-                        "medicare_advantage_source_count": 0,
-                        "medicaid_mco_source_count": 329,
-                        "chip_source_count": 21,
-                        "qhp_source_count": 0,
-                        "api_base_count": 329,
-                        "sample_api_base_count": 1,
-                        "sample_payers": ["Centene"],
-                        "sample_missing_credential_payers": ["Centene"],
-                        "sample_missing_secret_env_vars": ["CENTENE_CLIENT_SECRET"],
-                    },
-                ],
-            },
-            "unified_summary": {
-                "available": True,
-                "provider_directory_rows": 282912,
-                "provider_directory_keyed_rows": 282912,
-                "provider_directory_keyed_pct": 100.0,
-                "provider_directory_phone_rows": 282000,
-                "provider_directory_phone_pct": 99.68,
-                "provider_directory_source_record_id_rows": 282912,
-                "provider_directory_source_record_id_pct": 100.0,
-                "provider_directory_country_001_rows": 0,
-            },
-            "ptg_summary": audit._skipped_ptg_summary(),
-            "advertised_resource_gap_summary": {
-                "available": True,
-                "advertised_without_rows": 2,
-                "advertised_auth_blocked_without_rows": 0,
-                "advertised_source_resources": 5,
-                "advertised_with_rows_pct": 60.0,
-                "resources": [
-                    {
-                        "resource_type": "Location",
-                        "advertised_source_count": 3,
-                        "source_with_rows_count": 2,
-                        "advertised_without_rows_count": 1,
-                        "auth_blocked_without_rows_count": 0,
-                        "resource_error_counts": {},
-                    },
-                    {
-                        "resource_type": "Endpoint",
-                        "advertised_source_count": 2,
-                        "source_with_rows_count": 1,
-                        "advertised_without_rows_count": 1,
-                        "auth_blocked_without_rows_count": 0,
-                        "resource_error_counts": {},
-                    },
-                ],
-            },
-            "alias_fanout_summary": {
-                "available": True,
-                "resource_count": 1,
-                "excess_source_resource_rows": 2720000,
-                "resources": [
-                    {
-                        "resource_type": "Practitioner",
-                        "excess_source_resource_rows": 2720000,
-                        "samples": [
-                            {
-                                "api_base": "https://fhir.humana.com/api",
-                                "sample_org_name": "Humana Inc.",
-                                "sample_plan_name": "Humana Choice PPO",
-                                "source_count": 18,
-                                "source_resource_rows": 2880000,
-                                "distinct_resource_ids": 160000,
-                                "excess_source_resource_rows": 2720000,
-                                "fanout_ratio": 18.0,
-                            }
-                        ],
-                    }
-                ],
-            },
-            "canonical_resource_summary": {
-                "available": True,
-                "canonical_rows": 160000,
-                "source_edge_rows": 2880000,
-                "edge_surplus_rows": 2720000,
-                "source_count": 18,
-                "canonical_api_base_count": 1,
-                "resources": [
-                    {
-                        "resource_type": "Practitioner",
-                        "canonical_rows": 160000,
-                        "source_edge_rows": 2880000,
-                        "edge_surplus_rows": 2720000,
-                        "source_count": 18,
-                        "canonical_api_base_count": 1,
-                    }
-                ],
-            },
-        }
-    )
+    markdown = audit.render_markdown(_country_count_markdown_report())
 
     assert "- Provider Directory rows with source record IDs: `282912` (100.0%)" in markdown
     assert "- non-FHIR credential/gateway responses: `263` / `299` valid_non_fhir" in markdown
@@ -2527,141 +2610,37 @@ def test_provider_directory_coverage_audit_markdown_caps_credential_groups_witho
 @pytest.mark.asyncio
 async def test_provider_directory_coverage_audit_source_resource_coverage_summary(monkeypatch):
     """Verify provider directory coverage audit source resource coverage summary."""
-    async def is_relation_available(_conn, _schema, name):
-        return name in {
-            "provider_directory_source",
-            "provider_directory_location",
-            "provider_directory_practitioner",
-            "provider_directory_organization",
-            "provider_directory_practitioner_role",
-            "provider_directory_healthcare_service",
-            "provider_directory_organization_affiliation",
-            "entity_address_unified",
-        }
-
-    async def is_column_available(_conn, _schema, table, column):
-        return (table, column) in {
-            ("provider_directory_location", "address_key"),
-            ("provider_directory_organization", "address_json"),
-            ("entity_address_unified", "address_sources"),
-            ("entity_address_unified", "source_record_ids"),
-            ("entity_address_unified", "address_key"),
-            ("entity_address_unified", "telephone_number"),
-        }
-
-    class FakeConn:
-        def __init__(self):
-            self.fetch_calls = 0
-
-        async def fetchrow(self, _sql):
-            return {
-                "source_count": 10,
-                "sources_with_resource_rows": 4,
-                "catalog_only_source_count": 6,
-                "sources_with_location_rows": 3,
-                "sources_with_keyed_location_rows": 2,
-                "sources_with_location_rows_without_keys": 1,
-                "location_rows": 30,
-                "keyed_location_rows": 20,
-                "sources_with_organization_address_rows": 2,
-                "sources_with_valid_npi_organization_address_rows": 1,
-                "sources_with_valid_npi_organization_address_rows_without_unified_rows": 1,
-                "organization_address_rows": 12,
-                "valid_npi_organization_address_rows": 9,
-                "sources_with_unified_rows": 2,
-                "sources_with_keyed_unified_rows": 1,
-                "sources_with_phone_unified_rows": 1,
-                "sources_with_location_rows_without_unified_rows": 1,
-                "unified_rows": 12,
-                "keyed_unified_rows": 10,
-                "phone_unified_rows": 8,
-            }
-
-        async def fetch(self, _sql, *_args):
-            if "resource_diagnostics" in _sql:
-                return []
-            self.fetch_calls += 1
-            if self.fetch_calls == 1:
-                return [
-                    {
-                        "source_id": "pdfhir_catalog_only",
-                        "org_name": "Catalog Only",
-                        "plan_name": None,
-                        "canonical_api_base": "https://catalog.example/fhir",
-                        "last_probe_status": "auth_required",
-                        "last_validated_status": "auth_required",
-                        "auth_type": "OAuth2 Client Credentials",
-                }
-            ]
-            if self.fetch_calls == 2:
-                assert "provider_directory_healthcare_service" in _sql
-                assert "COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)" in _sql
-                assert "COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)" in _sql
-                assert "COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)" in _sql
-                return [
-                    {
-                        "source_id": "pdfhir_no_projection",
-                        "org_name": "No Projection",
-                        "plan_name": None,
-                        "canonical_api_base": "https://projection.example/fhir",
-                        "last_probe_status": "valid",
-                        "auth_type": "none",
-                        "location_rows": 9,
-                        "keyed_location_rows": 9,
-                        "role_healthcare_service_location_refs": 3,
-                        "role_healthcare_service_valid_npi_refs": 3,
-                        "role_healthcare_service_matching_location_refs": 3,
-                        "role_healthcare_service_projectable_location_refs": 3,
-                        "affiliation_healthcare_service_location_refs": 2,
-                        "affiliation_healthcare_service_valid_npi_refs": 0,
-                        "affiliation_healthcare_service_matching_location_refs": 2,
-                        "affiliation_healthcare_service_projectable_location_refs": 0,
-                    }
-                ]
-            return [
-                {
-                    "source_id": "pdfhir_org_no_projection",
-                    "org_name": "Org No Projection",
-                    "plan_name": None,
-                    "canonical_api_base": "https://org-projection.example/fhir",
-                    "last_probe_status": "valid",
-                    "auth_type": "none",
-                    "organization_address_rows": 12,
-                    "valid_npi_organization_address_rows": 9,
-                }
-            ]
-
-    monkeypatch.setattr(audit, "_has_relation", is_relation_available)
-    monkeypatch.setattr(audit, "_has_column", is_column_available)
+    monkeypatch.setattr(audit, "_has_relation", _is_resource_relation_available)
+    monkeypatch.setattr(audit, "_has_column", _is_resource_column_available)
 
     summary = await audit._source_resource_coverage_summary(
-        FakeConn(),
+        _SourceResourceCoverageConnection(),
         "mrf",
         sample_limit=5,
         include_unified=True,
     )
 
-    assert summary["available"] is True
-    assert summary["unified_available"] is True
-    assert summary["resource_source_pct"] == 40.0
-    assert summary["location_source_pct"] == 30.0
-    assert summary["keyed_location_source_pct"] == 66.67
-    assert summary["sources_with_valid_npi_organization_address_rows"] == 1
-    assert summary["valid_npi_organization_address_rows"] == 9
-    assert summary["unified_source_pct"] == 20.0
-    assert summary["keyed_unified_source_pct"] == 50.0
-    assert summary["phone_unified_source_pct"] == 50.0
+    _assert_fields(
+        summary,
+        {
+            "available": True,
+            "unified_available": True,
+            "resource_source_pct": 40.0,
+            "location_source_pct": 30.0,
+            "keyed_location_source_pct": 66.67,
+            "sources_with_valid_npi_organization_address_rows": 1,
+            "valid_npi_organization_address_rows": 9,
+            "unified_source_pct": 20.0,
+            "keyed_unified_source_pct": 50.0,
+            "phone_unified_source_pct": 50.0,
+        },
+    )
     assert summary["catalog_only_samples"][0]["source_id"] == "pdfhir_catalog_only"
-    assert summary["location_without_unified_samples"][0]["source_id"] == "pdfhir_no_projection"
-    assert (
-        summary["location_without_unified_samples"][0]["projection_gap_reason"]
-        == "linked_healthcare_service_location_projection_pending"
-    )
-    assert summary["location_without_unified_samples"][0]["role_healthcare_service_location_refs"] == 3
-    assert (
-        summary["organization_address_without_unified_samples"][0]["source_id"]
-        == "pdfhir_org_no_projection"
-    )
+    location_gap = summary["location_without_unified_samples"][0]
+    assert location_gap["source_id"] == "pdfhir_no_projection"
+    assert location_gap["projection_gap_reason"] == "linked_healthcare_service_location_projection_pending"
+    assert location_gap["role_healthcare_service_location_refs"] == 3
+    assert summary["organization_address_without_unified_samples"][0]["source_id"] == "pdfhir_org_no_projection"
 
 
 def test_provider_directory_coverage_audit_semantic_readiness_sql_is_bounded_and_typed():

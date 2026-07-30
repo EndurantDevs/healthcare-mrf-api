@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -47,6 +48,28 @@ def _compact_batches():
         )
         for batch_number in range(3)
     )
+
+
+def _production_profile_build():
+    evidence_batch = importer._ProviderDirectoryProfileEvidenceBatch(
+        kind="fact",
+        source_id="source-a",
+        dataset_id="dataset-a",
+        fact_type="name",
+    )
+    compact_batch = importer._ProviderDirectoryProfileCompactBatch(
+        kind="npi",
+        npi_start=1_000_000_000,
+        npi_end=1_005_000_000,
+    )
+    batch_plan = importer._ProviderDirectoryProfileBatchPlan(
+        has_existing_artifacts=True,
+        include_copy_batch=False,
+        evidence_batches=(evidence_batch,) * 2_185,
+        compact_batches=(compact_batch,) * 400,
+        fingerprint="f" * 64,
+    )
+    return replace(_build(), batch_plan=batch_plan)
 
 
 def _patch_population_dependencies(monkeypatch) -> AsyncMock:
@@ -94,11 +117,11 @@ async def test_profile_progress_uses_existing_control_run_contract(
     monkeypatch,
 ):
     """Expose batch state through the existing import-run projection."""
-    mark_progress = AsyncMock()
+    mark_control_run = AsyncMock()
     monkeypatch.setattr(
         importer,
-        "_mark_provider_directory_progress",
-        mark_progress,
+        "mark_control_run",
+        mark_control_run,
     )
     batch = importer._ProviderDirectoryProfileEvidenceBatch(
         kind="fact",
@@ -118,13 +141,88 @@ async def test_profile_progress_uses_existing_control_run_contract(
         batch=batch,
     )
 
-    progress = mark_progress.await_args.kwargs
+    progress = mark_control_run.await_args.kwargs["progress"]
     assert progress["phase"] == importer._PROFILE_EVIDENCE_PROGRESS_PHASE
     assert (progress["done"], progress["total"]) == (8, 52)
     assert progress["unit"] == "batches"
-    assert progress["details"]["profile_batch_phase"] == "evidence"
-    assert progress["details"]["role_bucket"] == 7
-    assert progress["details"]["resumed_from_batch"] == 4
+    assert progress["detail"]["profile_batch_phase"] == "evidence"
+    assert progress["detail"]["role_bucket"] == 7
+    assert progress["detail"]["resource_bucket"] == 7
+    assert progress["detail"]["bucket_schemes"] == [
+        importer._PROFILE_ROLE_RESOURCE_BUCKET_SCHEME,
+    ]
+    assert progress["detail"]["stage_pct"] == 15.38
+    assert progress["detail"]["resumed_from_batch"] == 4
+    assert progress["pct"] == 58.24
+
+
+async def _emit_nested_profile_progress(build) -> None:
+    await importer._mark_provider_directory_progress(
+        build.owner_run_id,
+        phase="provider-directory publishing artifacts",
+        done=4,
+        total=7,
+        message="published address artifacts",
+    )
+    await importer._mark_provider_directory_profile_batch_progress(
+        build,
+        phase="evidence",
+        completed_batches=1,
+        total_batches=2_185,
+        resumed_from_batch=0,
+    )
+    await importer._mark_provider_directory_profile_batch_progress(
+        build,
+        phase="evidence",
+        completed_batches=2_185,
+        total_batches=2_185,
+        resumed_from_batch=0,
+    )
+    await importer._mark_provider_directory_profile_batch_progress(
+        build,
+        phase="profile",
+        completed_batches=0,
+        total_batches=400,
+        resumed_from_batch=0,
+    )
+    await importer._mark_provider_directory_profile_batch_progress(
+        build,
+        phase="profile",
+        completed_batches=400,
+        total_batches=400,
+        resumed_from_batch=0,
+    )
+    await importer._mark_provider_directory_progress(
+        build.owner_run_id,
+        phase="provider-directory publishing artifacts",
+        done=5,
+        total=7,
+        message="published Provider Directory Profile",
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_progress_preserves_outer_publish_envelope(monkeypatch):
+    """Never let inner batch percentages regress the outer 4/7 progress."""
+    mark_control_run = AsyncMock()
+    monkeypatch.setattr(importer, "mark_control_run", mark_control_run)
+    await _emit_nested_profile_progress(_production_profile_build())
+
+    percentages = [
+        call.kwargs["progress"]["pct"]
+        for call in mark_control_run.await_args_list
+    ]
+    assert percentages == [
+        57.14,
+        57.15,
+        69.22,
+        69.22,
+        71.43,
+        71.43,
+    ]
+    assert percentages == sorted(percentages)
+    assert mark_control_run.await_args_list[1].kwargs["progress"]["done"] == 1
+    assert mark_control_run.await_args_list[1].kwargs["progress"]["total"] == 2_185
 
 
 @pytest.mark.asyncio

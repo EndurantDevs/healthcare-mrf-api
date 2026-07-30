@@ -7,7 +7,12 @@ import json
 
 import pytest
 
-from db.models import ProviderDirectoryLocation
+from db.models import (
+    ProviderDirectoryLocation,
+    ProviderDirectoryOrganization,
+    ProviderDirectoryOrganizationAffiliation,
+    ProviderDirectoryPractitionerRole,
+)
 from process.provider_directory_dataset_rehydrate import (
     DatasetRehydrationError,
     RehydrationCheckpoint,
@@ -38,6 +43,75 @@ def _hash(mapped_payload: dict[str, object]) -> str:
 def test_retained_payload_accepts_exact_mapped_typed_shape():
     payload = _payload()
     assert _validate_payload(ProviderDirectoryLocation, "location-1", _hash(payload), payload) is None
+
+
+@pytest.mark.parametrize(
+    ("model", "resource_id", "payload"),
+    (
+        (
+            ProviderDirectoryOrganization,
+            "uhc-facility",
+            {
+                "resource_id": "uhc-facility",
+                "npi": 1000000491,
+                "tax_id": None,
+                "tin_status": "unavailable_from_uhc_source",
+                "name": "Example UHC Facility",
+                "type_codes": ["Clinic"],
+                "address_json": [{"city": "Chicago"}],
+                "source_lineage": {
+                    "source_file_id": "f" * 64,
+                    "record_ordinal": 17,
+                },
+            },
+        ),
+        (
+            ProviderDirectoryOrganizationAffiliation,
+            "uhc-membership",
+            {
+                "resource_id": "uhc-membership",
+                "organization_ref": None,
+                "participating_organization_ref": (
+                    "Organization/uhc-facility"
+                ),
+                "insurance_plan_refs": ["InsurancePlan/uhc-plan"],
+                "plan_scope": {"plan_id": "12345IL0010001"},
+                "network_tier": "PREFERRED",
+                "network_key_id": "a" * 64,
+                "relationship_type": (
+                    "payer_reported_provider_plan_membership"
+                ),
+                "ownership_status": "not_asserted",
+                "source_lineage": {
+                    "source_file_id": "f" * 64,
+                    "record_ordinal": 17,
+                },
+            },
+        ),
+        (
+            ProviderDirectoryPractitionerRole,
+            "uhc-role",
+            {
+                "resource_id": "uhc-role",
+                "insurance_plan_refs": ["InsurancePlan/uhc-plan"],
+                "plan_scope": {"plan_id": "12345IL0010001"},
+                "network_tier": "PREFERRED",
+                "network_key_id": "a" * 64,
+            },
+        ),
+    ),
+)
+def test_uhc_retained_payload_accepts_organization_plan_evidence(
+    model,
+    resource_id,
+    payload,
+):
+    assert _validate_payload(
+        model,
+        resource_id,
+        _hash(payload),
+        payload,
+    ) is None
 
 
 @pytest.mark.parametrize(

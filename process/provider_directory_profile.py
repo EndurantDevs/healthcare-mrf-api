@@ -30,7 +30,7 @@ PROFILE_SPEC_PATH = (
 PROFILE_SQL_PATH = Path(__file__).resolve().parent / "sql"
 PROFILE_SCHEMA_VERSION = 1
 PROFILE_BUILD_STRATEGY_VERSION = (
-    "source-fact-role32-org32-npi5m-v3"
+    "source-fact-role32-org32-membership32-npi5m-v4"
 )
 PROFILE_FACT_LIMIT = 100
 PROFILE_FACT_EVIDENCE_LIMIT = 25
@@ -54,6 +54,7 @@ PROFILE_EVIDENCE_FACT_TYPES = (
     "accepting_medicaid",
     "organization",
     "affiliation",
+    "plan_membership",
     "service",
     "endpoint",
 )
@@ -576,6 +577,9 @@ def profile_evidence_insert_sql(
             ),
             "ORGANIZATION_FACT_SCOPE_SQL": branch_scope_sql("organization"),
             "AFFILIATION_FACT_SCOPE_SQL": branch_scope_sql("affiliation"),
+            "PLAN_MEMBERSHIP_FACT_SCOPE_SQL": branch_scope_sql(
+                "plan_membership"
+            ),
             "SERVICE_FACT_SCOPE_SQL": branch_scope_sql("service"),
             "ENDPOINT_FACT_SCOPE_SQL": branch_scope_sql("endpoint"),
             "FACT_TYPE_SCOPE_SQL": (
@@ -589,6 +593,17 @@ def profile_evidence_insert_sql(
                 else (
                     "MOD("
                     "hashtextextended(role.resource_id, 0) "
+                    "& 9223372036854775807, "
+                    "CAST(:profile_role_bucket_count AS bigint)"
+                    ") = CAST(:profile_role_bucket AS bigint)"
+                )
+            ),
+            "AFFILIATION_BUCKET_SQL": (
+                "TRUE"
+                if role_bucket_count == 1
+                else (
+                    "MOD("
+                    "hashtextextended(affiliation.resource_id, 0) "
                     "& 9223372036854775807, "
                     "CAST(:profile_role_bucket_count AS bigint)"
                     ") = CAST(:profile_role_bucket AS bigint)"

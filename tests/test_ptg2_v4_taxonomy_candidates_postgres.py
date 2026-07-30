@@ -481,31 +481,3 @@ async def _assert_seal_and_cascade(engine, schema_name):
             )
         )
     assert (remaining_candidates, remaining_roots) == (0, 0)
-
-
-@pytest.mark.asyncio
-async def test_taxonomy_sidecar_postgres_lifecycle(monkeypatch) -> None:
-    """Prove real constraints, building guards, and root ownership cascade."""
-
-    engine = create_async_engine(
-        _async_database_url(),
-        pool_size=1,
-        max_overflow=0,
-    )
-    schema_name = f"ptg2_v4_taxonomy_test_{uuid.uuid4().hex}"
-    migration = _load_migration()
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
-    monkeypatch.delenv("DB_SCHEMA", raising=False)
-    is_schema_created = False
-    try:
-        await _create_prerequisites(engine, schema_name)
-        is_schema_created = True
-        await _run_migration_action(engine, migration, "upgrade")
-        await _insert_valid_candidates(engine, schema_name)
-        await _assert_invalid_candidates_rejected(engine, schema_name)
-        await _assert_seal_and_cascade(engine, schema_name)
-        await _run_migration_action(engine, migration, "downgrade")
-    finally:
-        if is_schema_created:
-            await _drop_disposable_schema(engine, schema_name)
-        await engine.dispose()

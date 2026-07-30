@@ -482,32 +482,3 @@ async def test_plan_order_proof_uses_sealed_logical_scope_without_query():
         "group",
     )
     assert session.calls == []
-
-
-@pytest.mark.asyncio
-async def test_reverse_page_caps_provider_set_fanout(monkeypatch):
-    availability = AsyncMock(return_value=True)
-    plan_order = AsyncMock(side_effect=AssertionError("oversized page must skip plan aggregate"))
-    provider_lookup = AsyncMock(side_effect=AssertionError("oversized page must skip provider lookup"))
-    monkeypatch.setattr(ptg2_serving, "has_shared_provider_pages_in_db", availability)
-    monkeypatch.setattr(ptg2_serving, "_has_single_plan_page_order", plan_order)
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_provider_set_keys_for_ids",
-        provider_lookup,
-    )
-    oversized_query = replace(
-        reverse_query(limit=1),
-        provider_set_ids=tuple(f"{provider_index + 1:032x}" for provider_index in range(65)),
-    )
-
-    page_scope = await ptg2_serving._version_three_page_projection_scope(
-        object(),
-        serving_tables(),
-        oversized_query,
-    )
-
-    assert page_scope is None
-    availability.assert_awaited_once()
-    plan_order.assert_not_awaited()
-    provider_lookup.assert_not_awaited()

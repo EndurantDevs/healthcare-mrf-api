@@ -172,6 +172,65 @@ def _endpoint_display(value: Mapping[str, Any]) -> str:
     return " — ".join(part for part in (name, connection, address) if part)
 
 
+def _organization_display(value: Mapping[str, Any]) -> str:
+    name = _direct_label(value)
+    if not name:
+        return ""
+    context_parts = []
+    if value.get("address_status") == "payer_directory_candidate":
+        context_parts.append("payer-directory candidate location")
+    if value.get("tin_status") == "unavailable_from_uhc_source":
+        context_parts.append("TIN unavailable from UHC source")
+    if context_parts:
+        return f"{name} — {'; '.join(context_parts)}"
+    code = _text(value.get("code"))
+    return (
+        f"{name} ({code})"
+        if code and name.casefold() != code.casefold()
+        else name
+    )
+
+
+def _plan_membership_display(
+    membership_by_field: Mapping[str, Any],
+) -> str:
+    organization = membership_by_field.get("participating_organization")
+    organization_name = (
+        _direct_label(organization)
+        if isinstance(organization, Mapping)
+        else ""
+    )
+    plan_scope = membership_by_field.get("plan_scope")
+    plan_id = (
+        _text(plan_scope.get("plan_id"))
+        if isinstance(plan_scope, Mapping)
+        else ""
+    )
+    plan_year = (
+        _text(plan_scope.get("plan_year"))
+        if isinstance(plan_scope, Mapping)
+        else ""
+    )
+    plan_label = plan_id
+    if plan_label and plan_year:
+        plan_label = f"{plan_label} ({plan_year})"
+    if not plan_label:
+        plan_label = _list_summary(
+            membership_by_field.get("insurance_plan_refs") or []
+        )
+    subject = " for ".join(
+        part for part in (organization_name, plan_label) if part
+    )
+    prefix = (
+        f"Payer-reported plan membership: {subject}"
+        if subject
+        else "Payer-reported plan membership"
+    )
+    if membership_by_field.get("ownership_status") == "not_asserted":
+        return f"{prefix}; ownership not asserted"
+    return prefix
+
+
 def _mapping_summary(value: Mapping[str, Any]) -> str:
     direct = _direct_label(value)
     if direct:
@@ -223,6 +282,8 @@ def display_value(fact_type: str, fact_value: Any) -> str:
         "role_context": _role_context_display,
         "service": _service_display,
         "endpoint": _endpoint_display,
+        "organization": _organization_display,
+        "plan_membership": _plan_membership_display,
     }
     specialized_formatter = specialized_display_by_type.get(fact_type)
     if specialized_formatter:

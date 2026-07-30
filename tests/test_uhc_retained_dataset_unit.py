@@ -49,7 +49,7 @@ def _provider_record(provider_type: str) -> dict[str, object]:
     is_individual = provider_type == "INDIVIDUAL"
     return {
         "type": provider_type,
-        "npi": "1003821380" if is_individual else "1999999999",
+        "npi": "1003821380" if is_individual else "1000000491",
         "name": (
             {"first": "Ada", "middle": None, "last": "Lovelace"}
             if is_individual
@@ -115,20 +115,81 @@ def _assert_individual_plan_payload(logical_scope) -> None:
     assert plan["plan_json"]["detail_available"] is True
 
 
+def _provider_lineage_by_field(
+    logical_scope,
+    source_file_id: str,
+    artifact_sha256: str,
+) -> dict[str, object]:
+    return {
+        "catalog_set_sha256": "c" * 64,
+        "source_file_id": source_file_id,
+        "file_name": "JSON_Providers_ILIEX.json",
+        "artifact_sha256": artifact_sha256,
+        "record_ordinal": 0,
+        "logical_scope_id": logical_scope.logical_scope_id,
+    }
+
+
+def _assert_facility_evidence(
+    payload_by_type: dict[str, object],
+    facility_lineage_by_field: dict[str, object],
+) -> None:
+    organization = payload_by_type["Organization"]
+    affiliation = payload_by_type["OrganizationAffiliation"]
+    assert organization["name"] == "Example Clinic"
+    assert organization["npi"] == 1000000491
+    assert organization["type_codes"] == ["Clinic"]
+    assert organization["address_json"] == [
+        {
+            "city": "Chicago",
+            "country": "US",
+            "line": ["1 Main St"],
+            "postalCode": "60601",
+            "state": "IL",
+        }
+    ]
+    assert organization["tax_id"] is None
+    assert organization["tin_status"] == "unavailable_from_uhc_source"
+    assert organization["source_lineage"] == facility_lineage_by_field
+    assert affiliation["organization_ref"] is None
+    assert affiliation[
+        "participating_organization_ref"
+    ].startswith("Organization/")
+    assert affiliation["insurance_plan_refs"]
+    assert (
+        affiliation["relationship_type"]
+        == "payer_reported_provider_plan_membership"
+    )
+    assert affiliation["ownership_status"] == "not_asserted"
+    assert affiliation["source_lineage"] == facility_lineage_by_field
+
+
 def test_provider_semantics_emit_profile_ready_six_family_relationships():
     """Provider semantics emit all six profile-ready resource families."""
     logical_scope = _individual_exchange_scope()
+    individual_lineage_by_field = _provider_lineage_by_field(
+        logical_scope,
+        "a" * 64,
+        "d" * 64,
+    )
+    facility_lineage_by_field = _provider_lineage_by_field(
+        logical_scope,
+        "b" * 64,
+        "e" * 64,
+    )
     individual_rows, individual_keys = _provider_resource_rows(
         _provider_record("INDIVIDUAL"),
         source_file_id="a" * 64,
         ordinal=0,
         logical_scope=logical_scope,
+        source_lineage=individual_lineage_by_field,
     )
     facility_rows, facility_keys = _provider_resource_rows(
         _provider_record("FACILITY"),
         source_file_id="b" * 64,
         ordinal=0,
         logical_scope=logical_scope,
+        source_lineage=facility_lineage_by_field,
     )
     payload_by_type = {
         resource_type: json.loads(payload_json)
@@ -146,10 +207,10 @@ def test_provider_semantics_emit_profile_ready_six_family_relationships():
     }
     assert payload_by_type["Practitioner"]["full_name"] == "Ada Lovelace"
     assert payload_by_type["PractitionerRole"]["insurance_plan_refs"]
-    assert payload_by_type["Organization"]["name"] == "Example Clinic"
-    assert payload_by_type["OrganizationAffiliation"][
-        "participating_organization_ref"
-    ].startswith("Organization/")
+    _assert_facility_evidence(
+        payload_by_type,
+        facility_lineage_by_field,
+    )
     assert payload_by_type["Location"]["name"] == "Example Clinic"
     assert individual_keys == facility_keys
     _assert_individual_plan_payload(logical_scope)
@@ -994,7 +1055,7 @@ def test_retained_resource_shape_guards():
     ) == [{"system": "phone", "value": "3125551212"}]
     assert retained._provider_name({"name": []}) == ([], None, [], None)
     with pytest.raises(UhcRetainedDatasetError, match="invalid shape"):
-        retained._provider_resource_context({}, "a" * 64, 0)
+        retained._provider_resource_context({}, "a" * 64, 0, {})
 
 
 @pytest.mark.asyncio

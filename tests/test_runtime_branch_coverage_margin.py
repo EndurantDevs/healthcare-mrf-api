@@ -8,7 +8,7 @@ import asyncio
 import datetime as dt
 import importlib
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -37,8 +37,7 @@ class _ContendedRedis:
 
 
 class _UnavailableLockRedis:
-    def set(self, *_args, **_kwargs):
-        return False
+    set = Mock(return_value=False)
 
 
 def test_live_progress_contention_and_lock_timeout_fail_closed(
@@ -103,16 +102,19 @@ def test_live_progress_equal_attempts_and_empty_confidence_are_rejected() -> Non
         },
     ) == live_progress._ATTEMPT_REJECT
 
-    merged = {
+    merged_progress_map = {
         "source": "engine-heartbeat",
         "confidence": "heartbeat",
     }
     live_progress._preserve_progress_for_heartbeat(
-        merged,
+        merged_progress_map,
         {"source": "scanner", "confidence": ""},
         now=dt.datetime(2026, 7, 29),
     )
-    assert merged == {"source": "scanner", "confidence": "heartbeat"}
+    assert merged_progress_map == {
+        "source": "scanner",
+        "confidence": "heartbeat",
+    }
 
 
 @pytest.mark.asyncio
@@ -350,7 +352,7 @@ async def test_ptg_admission_returns_existing_idempotent_run(
     async def acquire():
         yield _Connection()
 
-    existing_run = {"run_id": "run-existing"}
+    existing_run_map = {"run_id": "run-existing"}
     monkeypatch.setattr(control_imports.db, "acquire", acquire)
     monkeypatch.setattr(
         control_imports,
@@ -360,7 +362,7 @@ async def test_ptg_admission_returns_existing_idempotent_run(
     monkeypatch.setattr(
         control_imports,
         "_active_idempotency_run",
-        AsyncMock(return_value=existing_run),
+        AsyncMock(return_value=existing_run_map),
     )
     request_payload = control._validated_control_import_payload(
         protected_control_payload()
@@ -374,17 +376,17 @@ async def test_ptg_admission_returns_existing_idempotent_run(
             "idempotency_key": "idempotency-key",
         }
     )
-    assert admitted_run == existing_run
+    assert admitted_run == existing_run_map
 
 
 def test_classification_only_semijoin_allows_subspecialties() -> None:
-    params: dict[str, object] = {}
+    query_params_map: dict[str, object] = {}
     specialty_filter = provider_specialty_filters.ProviderSpecialtyFilter(
         classification="Internal Medicine",
         include_subspecialties=True,
     )
     query = provider_specialty_filters.provider_specialty_taxonomy_semijoin_sql(
-        params,
+        query_params_map,
         "specialty",
         specialty_filter,
         schema="mrf",

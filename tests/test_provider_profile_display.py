@@ -166,6 +166,46 @@ from api.provider_profile_display import display_value
             "Example Clinic (ORG)",
         ),
         ("organization", {"name": "Example Clinic", "code": "Example Clinic"}, "Example Clinic"),
+        ("organization", {}, "Organization"),
+        (
+            "organization",
+            {
+                "name": "Example UHC Facility",
+                "address_status": "payer_directory_candidate",
+                "tin_status": "unavailable_from_uhc_source",
+            },
+            (
+                "Example UHC Facility — payer-directory candidate location; "
+                "TIN unavailable from UHC source"
+            ),
+        ),
+        (
+            "plan_membership",
+            {
+                "participating_organization": {
+                    "name": "Example UHC Facility"
+                },
+                "plan_scope": {
+                    "plan_id": "12345IL0010001",
+                    "plan_year": 2026,
+                },
+                "ownership_status": "not_asserted",
+            },
+            (
+                "Payer-reported plan membership: Example UHC Facility for "
+                "12345IL0010001 (2026); ownership not asserted"
+            ),
+        ),
+        (
+            "plan_membership",
+            {"insurance_plan_refs": ["InsurancePlan/plan-key"]},
+            "Payer-reported plan membership: InsurancePlan/plan-key",
+        ),
+        (
+            "plan_membership",
+            {},
+            "Payer-reported plan membership",
+        ),
         (
             "provider_detail",
             {
@@ -242,7 +282,7 @@ def test_composer_formats_fhir_facts_for_people():
     )
 
     assert profile is not None
-    assert PROFILE_COMPOSER_VERSION == "provider-profile-composer/v3"
+    assert PROFILE_COMPOSER_VERSION == "provider-profile-composer/v4"
     assert profile["composer_version"] == PROFILE_COMPOSER_VERSION
     expected_displays_by_category = {
         "certifications": ["Doctor of Medicine (MD)"],
@@ -297,3 +337,113 @@ def test_composer_preserves_values_and_stable_item_ids():
     assert profile["categories"]["services"]["items"][0]["value"] == (
         fhir_facts_by_type["role_context"]["items"][0]["value"]
     )
+
+
+def _uhc_organization_value_by_field():
+    return {
+        "resource_id": "uhc-facility",
+        "npi": 1000000491,
+        "name": "Example UHC Facility",
+        "type_codes": ["Clinic"],
+        "candidate_addresses": [
+            {
+                "line": ["1 Main St"],
+                "city": "Chicago",
+                "state": "IL",
+                "postalCode": "60601",
+            }
+        ],
+        "address_status": "payer_directory_candidate",
+        "tax_id": None,
+        "tin_status": "unavailable_from_uhc_source",
+        "source_lineage": {
+            "catalog_set_sha256": "c" * 64,
+            "source_file_id": "f" * 64,
+            "file_name": "JSON_Providers_ILIEX.json",
+            "artifact_sha256": "a" * 64,
+            "record_ordinal": 17,
+            "logical_scope_id": "b" * 64,
+        },
+    }
+
+
+def _uhc_membership_value_by_field(source_lineage_by_field):
+    return {
+        "participating_organization": {
+            "resource_id": "uhc-facility",
+            "npi": 1000000491,
+            "name": "Example UHC Facility",
+        },
+        "insurance_plan_refs": ["InsurancePlan/uhc-plan"],
+        "plan_scope": {
+            "plan_id": "12345IL0010001",
+            "plan_year": 2026,
+            "plan_key_id": "d" * 64,
+        },
+        "relationship_type": "payer_reported_provider_plan_membership",
+        "ownership_status": "not_asserted",
+        "source_lineage": source_lineage_by_field,
+    }
+
+
+def _uhc_profile_by_field():
+    organization_value_by_field = _uhc_organization_value_by_field()
+    membership_value_by_field = _uhc_membership_value_by_field(
+        organization_value_by_field["source_lineage"]
+    )
+    return {
+        "generation_id": "fhir-generation",
+        "sources": [
+            {
+                "source_id": "uhc-provider-files",
+                "endpoint_id": "uhc-endpoint",
+                "dataset_id": "uhc-dataset",
+                "org_name": "UnitedHealthcare",
+                "plan_name": "Official provider files",
+                "api_base": "https://providermrf.uhc.com",
+            }
+        ],
+        "facts": {
+            "organization": {
+                "items": [{"value": organization_value_by_field}],
+                "total": 1,
+            },
+            "plan_membership": {
+                "items": [{"value": membership_value_by_field}],
+                "total": 1,
+            },
+        },
+    }
+
+
+def test_composer_serves_uhc_organization_membership_and_exact_lineage():
+    """Composer preserves nullable TIN and exact Provider Directory lineage."""
+    composed = compose_provider_profile(
+        1000000491,
+        state_projection=None,
+        fhir_profile=_uhc_profile_by_field(),
+    )
+
+    assert composed is not None
+    organization_item = composed["categories"]["organizations"]["items"][0]
+    membership_item = composed["categories"]["network_participation"][
+        "items"
+    ][0]
+    assert organization_item["value"]["tax_id"] is None
+    assert (
+        organization_item["value"]["tin_status"]
+        == "unavailable_from_uhc_source"
+    )
+    assert membership_item["type"] == "plan_membership"
+    assert membership_item["value"]["ownership_status"] == "not_asserted"
+    assert composed["sources"] == [
+        {
+            "source_key": "uhc-provider-files",
+            "source_kind": "provider_directory_fhir",
+            "endpoint_id": "uhc-endpoint",
+            "dataset_id": "uhc-dataset",
+            "organization": "UnitedHealthcare",
+            "plan_name": "Official provider files",
+            "api_base": "https://providermrf.uhc.com",
+        }
+    ]

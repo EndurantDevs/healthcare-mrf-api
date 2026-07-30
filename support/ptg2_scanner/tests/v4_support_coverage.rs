@@ -6,8 +6,8 @@ use ptg2_scanner::dedupe::{
     dedupe_summary_payload, emit_dedupe_summary, ProviderIdentifierQuarantine, SharedDedupe,
 };
 use ptg2_scanner::hashing::{
-    price_set_entry_key, provider_entry_component_key, provider_set_component_key,
-    provider_set_entry_key,
+    hash_text_key, price_set_entry_key, provider_entry_component_key, provider_set_component_key,
+    provider_set_entry_key, xxh3_63,
 };
 use ptg2_scanner::input::open_plain_range_json_reader;
 use ptg2_scanner::manifest::{DenseIdMap, GlobalId128};
@@ -116,6 +116,7 @@ fn provider_identifier_quarantine_rejects_valid_and_unbounded_values() {
 
 #[test]
 fn v4_coordinate_helpers_cover_empty_invalid_and_escaped_inputs() {
+    assert_eq!(hash_text_key("not-hex"), xxh3_63(b"not-hex"));
     let pair = canonicalize_contact_pair(None, Some("   "), Some("US"));
     assert!(pair.phone.number.is_none());
     assert!(pair.fax.number.is_none());

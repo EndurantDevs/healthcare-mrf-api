@@ -342,19 +342,18 @@ fn within_integer_bound(parts: &DecimalParts, bound: i64) -> bool {
     let split = usize::try_from(integer_digits).unwrap_or(usize::MAX);
     let integer = &parts.digits[..split];
     integer < bound_text.as_str()
-        || (integer == bound_text && parts.digits[split..].bytes().all(|byte| byte == b'0'))
+        || (integer == bound_text && parts.digits[split..].bytes().max().unwrap_or(b'0') == b'0')
 }
 
 fn rounded_scaled_integer(parts: &DecimalParts, scale_delta: i64) -> io::Result<i64> {
     if parts.digits == "0" {
         return Ok(0);
     }
-    let target_scale = parts
-        .scale
-        .checked_sub(scale_delta)
-        .ok_or_else(|| invalid_field("position"))?;
+    let Some(target_scale) = parts.scale.checked_sub(scale_delta) else {
+        return Err(invalid_field("position"));
+    };
     let magnitude = if target_scale <= 0 {
-        let zero_count = usize::try_from(-target_scale).map_err(|_| invalid_field("position"))?;
+        let zero_count = usize::try_from(-target_scale).unwrap_or(usize::MAX);
         if zero_count > 32 {
             return Err(invalid_field("position"));
         }
@@ -364,6 +363,9 @@ fn rounded_scaled_integer(parts: &DecimalParts, scale_delta: i64) -> io::Result<
             .parse::<i64>()
             .map_err(|_| invalid_field("position"))?
     } else {
+        #[cfg(target_pointer_width = "64")]
+        let removed = target_scale as usize;
+        #[cfg(not(target_pointer_width = "64"))]
         let removed = usize::try_from(target_scale).map_err(|_| invalid_field("position"))?;
         if removed > parts.digits.len() {
             return Ok(0);
@@ -379,10 +381,8 @@ fn rounded_scaled_integer(parts: &DecimalParts, scale_delta: i64) -> io::Result<
             .map_err(|_| invalid_field("position"))?;
         let remainder = &parts.digits[split..];
         let first = remainder.as_bytes().first().copied().unwrap_or(b'0');
-        let round_up = first > b'5'
-            || (first == b'5'
-                && (remainder.as_bytes()[1..].iter().any(|digit| *digit != b'0')
-                    || quotient % 2 == 1));
+        let nonzero_tail = remainder[1..].bytes().max().unwrap_or(b'0') != b'0';
+        let round_up = first > b'5' || (first == b'5' && (nonzero_tail || quotient % 2 == 1));
         quotient + i64::from(round_up)
     };
     Ok(if parts.negative && magnitude != 0 {
