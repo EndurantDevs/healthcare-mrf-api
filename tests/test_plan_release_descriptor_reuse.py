@@ -2,7 +2,6 @@
 """Request-local reuse contracts for validated release descriptors."""
 
 import asyncio
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 from api import plan_release_serving, ptg2_serving
@@ -166,14 +165,6 @@ def test_single_release_query_rejects_descriptor_for_another_snapshot(
 
 
 def _install_multi_descriptor_spies(monkeypatch, search_calls):
-    opened_sessions = []
-
-    @asynccontextmanager
-    async def network_session():
-        session = object()
-        opened_sessions.append(session)
-        yield session
-
     async def fail_descriptor_reload(*_args, **_kwargs):
         raise AssertionError("validated descriptors must satisfy this request")
 
@@ -187,6 +178,7 @@ def _install_multi_descriptor_spies(monkeypatch, search_calls):
     ):
         search_calls.append(
             (
+                _session,
                 snapshot_id,
                 args["source_key"],
                 args["plan_id"],
@@ -200,13 +192,11 @@ def _install_multi_descriptor_spies(monkeypatch, search_calls):
         "_network_tables_by_snapshot_id",
         fail_descriptor_reload,
     )
-    monkeypatch.setattr(ptg2_serving.sa_db, "session", network_session)
     monkeypatch.setattr(
         ptg2_serving,
         "_search_one_ptg2_snapshot",
         search_snapshot,
     )
-    return opened_sessions
 
 
 def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
@@ -235,11 +225,12 @@ def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
         ),
     )
     search_calls = []
-    opened_sessions = _install_multi_descriptor_spies(monkeypatch, search_calls)
+    _install_multi_descriptor_spies(monkeypatch, search_calls)
+    request_session = object()
 
     responses = asyncio.run(
         ptg2_serving._read_multi_ptg2_snapshots(
-            object(),
+            request_session,
             [(binding.source_key, binding.snapshot_id) for binding in bindings],
             {"plan_release_id": PLAN_RELEASE_ID},
             SimpleNamespace(limit=25, offset=0, page=1, source="page"),
@@ -249,6 +240,7 @@ def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
 
     assert search_calls == [
         (
+            request_session,
             binding.snapshot_id,
             binding.source_key,
             binding.plan_id,
@@ -260,7 +252,6 @@ def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
         (binding.source_key, binding.snapshot_id, None)
         for binding in bindings
     ]
-    assert len({id(session) for session in opened_sessions}) == 2
 
 
 def _mixed_representation_release():
@@ -280,11 +271,7 @@ def _mixed_representation_release():
 
 
 def _install_mixed_representation_search(monkeypatch):
-    """Install a slower direct read so completion differs from binding order."""
-
-    @asynccontextmanager
-    async def network_session():
-        yield object()
+    """Install exact direct and pattern payloads for ordered reuse."""
 
     async def search_snapshot(
         _session,
@@ -294,9 +281,6 @@ def _install_mixed_representation_search(monkeypatch):
         *,
         serving_tables,
     ):
-        await asyncio.sleep(
-            0.02 if serving_tables.representation == "direct_v1" else 0.001
-        )
         return {
             "items": [
                 {
@@ -308,7 +292,6 @@ def _install_mixed_representation_search(monkeypatch):
             "query": {"snapshot_id": snapshot_id},
         }
 
-    monkeypatch.setattr(ptg2_serving.sa_db, "session", network_session)
     monkeypatch.setattr(
         ptg2_serving,
         "_search_one_ptg2_snapshot",
@@ -317,7 +300,7 @@ def _install_mixed_representation_search(monkeypatch):
 
 
 def test_multi_release_query_preserves_direct_and_pattern_payloads(monkeypatch):
-    """Keep exact V4 prices and provenance stable across concurrent completion."""
+    """Keep exact V4 prices and provenance stable in binding order."""
 
     bindings, selection = _mixed_representation_release()
     _install_mixed_representation_search(monkeypatch)

@@ -463,6 +463,55 @@ def _baseline_with_readability_reset(snapshot, reference):
     return baseline_by_field
 
 
+def _assert_reset_ratchet(
+    snapshot,
+    baseline,
+    reference_path,
+    expected_status,
+    required_reduction=1,
+):
+    assert (
+        readability_cli._check_readability_ratchet(
+            snapshot,
+            baseline,
+            reference_path,
+            required_reduction,
+        )
+        == expected_status
+    )
+
+
+def _assert_stale_reset_anchors(
+    boundary_snapshot,
+    reference_baseline,
+    reference_path,
+):
+    stale_anchor_baseline = _baseline_with_readability_reset(
+        boundary_snapshot,
+        reference_baseline,
+    )
+    stale_anchor_baseline["one_time_debt_reset"][
+        "reference_baseline_sha256"
+    ] = "0" * 64
+    _assert_reset_ratchet(
+        boundary_snapshot,
+        stale_anchor_baseline,
+        reference_path,
+        2,
+    )
+    stale_total_baseline = _baseline_with_readability_reset(
+        boundary_snapshot,
+        reference_baseline,
+    )
+    stale_total_baseline["one_time_debt_reset"]["reference_total"] = 49
+    _assert_reset_ratchet(
+        boundary_snapshot,
+        stale_total_baseline,
+        reference_path,
+        2,
+    )
+
+
 def test_readability_reset_is_two_percent_base_anchored_and_non_repeatable(tmp_path):
     """Reject stale, repeated, or incorrectly sized readability resets."""
 
@@ -476,14 +525,11 @@ def test_readability_reset_is_two_percent_base_anchored_and_non_repeatable(tmp_p
         boundary_snapshot,
         reference_baseline,
     )
-    assert (
-        readability_cli._check_readability_ratchet(
-            boundary_snapshot,
-            boundary_baseline,
-            reference_path,
-            1,
-        )
-        == 0
+    _assert_reset_ratchet(
+        boundary_snapshot,
+        boundary_baseline,
+        reference_path,
+        0,
     )
 
     over_limit_snapshot = _synthetic_readability_snapshot(52)
@@ -491,45 +537,17 @@ def test_readability_reset_is_two_percent_base_anchored_and_non_repeatable(tmp_p
         over_limit_snapshot,
         reference_baseline,
     )
-    assert (
-        readability_cli._check_readability_ratchet(
-            over_limit_snapshot,
-            over_limit_baseline,
-            reference_path,
-            1,
-        )
-        == 1
+    _assert_reset_ratchet(
+        over_limit_snapshot,
+        over_limit_baseline,
+        reference_path,
+        1,
     )
 
-    stale_anchor_baseline = _baseline_with_readability_reset(
+    _assert_stale_reset_anchors(
         boundary_snapshot,
         reference_baseline,
-    )
-    stale_anchor_baseline["one_time_debt_reset"][
-        "reference_baseline_sha256"
-    ] = "0" * 64
-    assert (
-        readability_cli._check_readability_ratchet(
-            boundary_snapshot,
-            stale_anchor_baseline,
-            reference_path,
-            1,
-        )
-        == 2
-    )
-    stale_total_baseline = _baseline_with_readability_reset(
-        boundary_snapshot,
-        reference_baseline,
-    )
-    stale_total_baseline["one_time_debt_reset"]["reference_total"] = 49
-    assert (
-        readability_cli._check_readability_ratchet(
-            boundary_snapshot,
-            stale_total_baseline,
-            reference_path,
-            1,
-        )
-        == 2
+        reference_path,
     )
 
     reference_path.write_text(json.dumps(boundary_baseline), encoding="utf-8")
@@ -537,14 +555,12 @@ def test_readability_reset_is_two_percent_base_anchored_and_non_repeatable(tmp_p
     repeated_baseline["one_time_debt_reset"] = boundary_baseline[
         "one_time_debt_reset"
     ]
-    assert (
-        readability_cli._check_readability_ratchet(
-            over_limit_snapshot,
-            repeated_baseline,
-            reference_path,
-            0,
-        )
-        == 1
+    _assert_reset_ratchet(
+        over_limit_snapshot,
+        repeated_baseline,
+        reference_path,
+        1,
+        required_reduction=0,
     )
 
 

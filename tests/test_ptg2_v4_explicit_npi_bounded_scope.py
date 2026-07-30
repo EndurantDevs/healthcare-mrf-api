@@ -26,10 +26,10 @@ def _explicit_args() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_direct_exact_npi_bounds_graph_before_dense_code_scope(
+async def test_direct_exact_npi_defers_code_intersection_to_final_read(
     monkeypatch,
 ) -> None:
-    """Use bounded NPI membership before touching a dense code projection."""
+    """Return bounded NPI membership without a preliminary forward scan."""
 
     events: list[tuple[str, object]] = []
 
@@ -39,12 +39,9 @@ async def test_direct_exact_npi_bounds_graph_before_dense_code_scope(
         assert kwargs["max_members"] == 64
         return {_NPI: (_PROVIDER_SET_KEY,)}
 
-    async def targeted_rate_scope(*_args, **kwargs):
-        events.append(("rate", dict(kwargs)))
-        if kwargs.get("provider_set_keys") is None:
-            raise AssertionError("would enumerate 31,902 code occurrences")
-        assert tuple(kwargs["provider_set_keys"]) == (_PROVIDER_SET_KEY,)
-        return (_PROVIDER_SET_KEY,)
+    rate_scope = AsyncMock(
+        side_effect=AssertionError("exact NPI scope must not scan code rows")
+    )
 
     monkeypatch.setattr(
         serving,
@@ -55,7 +52,7 @@ async def test_direct_exact_npi_bounds_graph_before_dense_code_scope(
     monkeypatch.setattr(
         serving,
         "_shared_rate_provider_set_keys",
-        targeted_rate_scope,
+        rate_scope,
     )
 
     observed = await serving._version_three_explicit_npi_graph_scope(
@@ -68,10 +65,8 @@ async def test_direct_exact_npi_bounds_graph_before_dense_code_scope(
         _NPI,
         (_PROVIDER_SET_KEY,),
     )
-    assert [event_name for event_name, _payload in events] == [
-        "graph",
-        "rate",
-    ]
+    assert [event_name for event_name, _payload in events] == ["graph"]
+    rate_scope.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -207,20 +202,17 @@ async def test_direct_exact_npi_integrity_failure_does_not_fallback(
 
 @pytest.mark.parametrize("membership_count", (37, 299, 512))
 @pytest.mark.asyncio
-async def test_pattern_exact_npi_bounds_graph_before_dense_code_scope(
+async def test_pattern_exact_npi_defers_code_intersection_to_final_read(
     monkeypatch,
     membership_count,
 ) -> None:
-    """Use NPI-to-pattern-to-set before touching a dense code projection."""
+    """Use bounded pattern membership without a preliminary forward scan."""
 
     events: list[tuple[str, object]] = []
     provider_set_keys = tuple(range(1, membership_count + 1))
-    matching_provider_set_keys = provider_set_keys[-2:]
-
-    async def rate_scope(*_args, **kwargs):
-        events.append(("rate", dict(kwargs)))
-        assert tuple(kwargs["provider_set_keys"]) == provider_set_keys
-        return matching_provider_set_keys
+    rate_scope = AsyncMock(
+        side_effect=AssertionError("exact NPI scope must not scan code rows")
+    )
 
     async def graph_lookup(*_args, **kwargs):
         events.append(("graph", dict(kwargs)))
@@ -249,20 +241,21 @@ async def test_pattern_exact_npi_bounds_graph_before_dense_code_scope(
 
     assert observed == serving._ExplicitNpiGraphScope(
         _NPI,
-        matching_provider_set_keys,
+        provider_set_keys,
     )
-    assert [event_name for event_name, _payload in events] == [
-        "graph",
-        "rate",
-    ]
+    assert [event_name for event_name, _payload in events] == ["graph"]
+    rate_scope.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_pattern_exact_npi_rejects_rate_scope_outside_bounded_membership(
+async def test_pattern_exact_npi_never_reads_code_scope_during_graph_resolution(
     monkeypatch,
 ) -> None:
-    """Fail closed if the targeted forward read escapes the NPI membership."""
+    """Leave code intersection to the provider-filtered serving read."""
 
+    rate_scope = AsyncMock(
+        side_effect=AssertionError("exact NPI scope must not scan code rows")
+    )
     monkeypatch.setattr(
         serving,
         "load_v4_graph_root",
@@ -276,18 +269,20 @@ async def test_pattern_exact_npi_rejects_rate_scope_outside_bounded_membership(
     monkeypatch.setattr(
         serving,
         "_shared_rate_provider_set_keys",
-        AsyncMock(return_value=(38,)),
+        rate_scope,
     )
 
-    with pytest.raises(
-        serving.PTG2ManifestArtifactError,
-        match="code scope escaped its bounded graph",
-    ):
-        await serving._version_three_explicit_npi_graph_scope(
-            object(),
-            _tables(),
-            _explicit_args(),
-        )
+    observed = await serving._version_three_explicit_npi_graph_scope(
+        object(),
+        _tables(),
+        _explicit_args(),
+    )
+
+    assert observed == serving._ExplicitNpiGraphScope(
+        _NPI,
+        tuple(range(1, 38)),
+    )
+    rate_scope.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

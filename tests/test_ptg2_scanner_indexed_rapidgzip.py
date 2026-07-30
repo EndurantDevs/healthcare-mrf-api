@@ -177,8 +177,7 @@ def test_scanner_indexes_reversed_top_level_arrays_for_parallel_workers(tmp_path
     assert list(indexed_temp_dir.glob("ptg2-rapidgzip-index-*")) == []
 
 
-def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
-    """Verify indexed range producers preserve rows and digests."""
+def _indexed_range_runs(tmp_path):
     fixture_document = _mixed_inline_referenced_payload()
     artifact = tmp_path / "mixed-reversed.json.gz"
     _write_gzip_json(
@@ -211,7 +210,66 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
         )
         for producer_count in (1, 4)
     }
+    return fixture_document, runs_by_producer_count
 
+
+def _assert_indexed_range_run(producer_count: int, run: dict) -> None:
+    config = _single_frame(run, "scanner_config")
+    summary = _single_frame(run, "scanner_summary")
+    assert config["indexed_range_producers_requested"] == producer_count
+    assert config["indexed_range_producers_selected"] == producer_count
+    assert config["indexed_range_decoder_threads_selected"] == 4
+    assert config["indexed_range_count"] == producer_count
+    assert len(config["indexed_ranges"]) == producer_count
+    assert sum(
+        range_info["decoder_threads"] for range_info in config["indexed_ranges"]
+    ) == 4
+    assert summary["indexed_range_producers_requested"] == producer_count
+    assert summary["indexed_range_producers_selected"] == producer_count
+    assert summary["indexed_range_decoder_threads_selected"] == 4
+    assert len(summary["indexed_ranges"]) == producer_count
+    assert sum(
+        range_info["decoder_threads"] for range_info in summary["indexed_ranges"]
+    ) == 4
+    assert summary["indexed_range_peer_cancellation_can_interrupt_external_read"] is False
+    assert "cannot interrupt" in summary["indexed_range_cancellation_limitation"]
+    assert sum(
+        range_info["object_count"] for range_info in summary["indexed_ranges"]
+    ) == 24
+    assert sum(
+        range_info["rate_count"] for range_info in summary["indexed_ranges"]
+    ) == 24 * 8
+    assert sum(
+        range_info["length"] for range_info in summary["indexed_ranges"]
+    ) == summary["indexed_range_coverage_bytes"]
+    assert summary["indexed_range_coverage_object_count"] == 24
+    assert summary["indexed_range_completed_object_count"] == 24
+    assert summary["indexed_range_completed_rate_count"] == 24 * 8
+    assert summary["indexed_range_completed_raw_bytes"] > 0
+    if producer_count == 4:
+        assert summary["raw_buffer_reuses"] > 0
+    assert all(
+        range_info["length"] > 0 for range_info in summary["indexed_ranges"]
+    )
+    assert all(
+        range_info["elapsed_seconds"] >= 0
+        for range_info in summary["indexed_ranges"]
+    )
+    assert all(
+        range_info["blocked_seconds"] >= 0
+        for range_info in summary["indexed_ranges"]
+    )
+    assert all(
+        left["offset"] + left["length"] < right["offset"]
+        for left, right in zip(
+            summary["indexed_ranges"], summary["indexed_ranges"][1:]
+        )
+    )
+
+
+def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
+    """Verify indexed range producers preserve rows and digests."""
+    fixture_document, runs_by_producer_count = _indexed_range_runs(tmp_path)
     assert runs_by_producer_count[4]["copy_rows"] == runs_by_producer_count[1]["copy_rows"]
     assert runs_by_producer_count[4]["copy_digests"] == runs_by_producer_count[1]["copy_digests"]
     assert runs_by_producer_count[4]["serving_records"] == runs_by_producer_count[1]["serving_records"]
@@ -230,64 +288,9 @@ def test_indexed_range_producers_preserve_rows_and_digests(tmp_path):
     assert source_rate_occurrences == 192
     assert len(runs_by_producer_count[4]["serving_records"]) == source_rate_occurrences
     for producer_count, run in runs_by_producer_count.items():
-        config = _single_frame(run, "scanner_config")
-        summary = _single_frame(run, "scanner_summary")
-        assert config["indexed_range_producers_requested"] == producer_count
-        assert config["indexed_range_producers_selected"] == producer_count
-        assert config["indexed_range_decoder_threads_selected"] == 4
-        assert config["indexed_range_count"] == producer_count
-        assert len(config["indexed_ranges"]) == producer_count
-        assert sum(
-            range_info["decoder_threads"]
-            for range_info in config["indexed_ranges"]
-        ) == 4
-        assert summary["indexed_range_producers_requested"] == producer_count
-        assert summary["indexed_range_producers_selected"] == producer_count
-        assert summary["indexed_range_decoder_threads_selected"] == 4
-        assert len(summary["indexed_ranges"]) == producer_count
-        assert sum(
-            range_info["decoder_threads"]
-            for range_info in summary["indexed_ranges"]
-        ) == 4
-        assert summary[
-            "indexed_range_peer_cancellation_can_interrupt_external_read"
-        ] is False
-        assert "cannot interrupt" in summary["indexed_range_cancellation_limitation"]
-        assert sum(
-            range_info["object_count"] for range_info in summary["indexed_ranges"]
-        ) == 24
-        assert sum(
-            range_info["rate_count"] for range_info in summary["indexed_ranges"]
-        ) == 24 * 8
-        assert sum(
-            range_info["length"] for range_info in summary["indexed_ranges"]
-        ) == summary[
-            "indexed_range_coverage_bytes"
-        ]
-        assert summary["indexed_range_coverage_object_count"] == 24
-        assert summary["indexed_range_completed_object_count"] == 24
-        assert summary["indexed_range_completed_rate_count"] == 24 * 8
-        assert summary["indexed_range_completed_raw_bytes"] > 0
-        if producer_count == 4:
-            assert summary["raw_buffer_reuses"] > 0
-        assert all(
-            range_info["length"] > 0
-            for range_info in summary["indexed_ranges"]
-        )
-        assert all(
-            range_info["elapsed_seconds"] >= 0
-            for range_info in summary["indexed_ranges"]
-        )
-        assert all(
-            range_info["blocked_seconds"] >= 0
-            for range_info in summary["indexed_ranges"]
-        )
-        assert all(
-            left["offset"] + left["length"] < right["offset"]
-            for left, right in zip(
-                summary["indexed_ranges"], summary["indexed_ranges"][1:]
-            )
-        )
+        _assert_indexed_range_run(producer_count, run)
+
+
 def _run_delayed_indexed_scanner(tmp_path):
     fixture_document = _mixed_inline_referenced_payload()
     artifact = tmp_path / "delayed-reversed.json.gz"
