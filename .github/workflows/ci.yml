@@ -200,8 +200,9 @@ jobs:
       - name: Download PostgreSQL coverage data
         uses: actions/download-artifact@v8
         with:
-          name: mrf-python-coverage-postgres
+          pattern: mrf-python-coverage-postgres-*
           path: coverage-data/postgres
+          merge-multiple: true
       - name: Combine coverage data
         run: |
           python -m coverage combine \
@@ -424,9 +425,15 @@ jobs:
         run: timeout --foreground 295s python -m pytest -q tests/test_control_workers.py tests/test_control_imports_api.py tests/test_control_cancel.py
 
   address-canonical-db-tests:
-    name: postgres18 postgis address canonical tests
+    name: postgres18 postgis tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - core
+          - provider-directory
     services:
       postgres:
         image: postgis/postgis:18-3.6
@@ -441,7 +448,7 @@ jobs:
           --health-timeout 5s
           --health-retries 25
     env:
-      COVERAGE_FILE: .coverage.postgres
+      COVERAGE_FILE: .coverage.postgres.${{ matrix.shard }}
       PYTEST_ADDOPTS: >-
         --cov-config=test-coverage.ini
         --cov=api --cov=db --cov=process --cov=service --cov=main
@@ -494,6 +501,7 @@ jobs:
           alembic stamp 20260610143000_address_checksums_bigint
           alembic upgrade head
       - name: Run Provider Directory migration adoption and repair cycle
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
           HLTHPRT_MRF_FILE_CURSOR_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
@@ -503,6 +511,7 @@ jobs:
           tests/test_provider_directory_caresource_census_db.py
           tests/test_mrf_file_source_cursor_migration.py
       - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
           HLTHPRT_PTG2_ROLLBACK_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
@@ -511,6 +520,7 @@ jobs:
           tests/test_ptg2_v3_migrated_lifecycle_postgres.py
           tests/test_ptg_source_snapshot_rollback_postgres.py
       - name: Run candidate attestation reader/writer compatibility gate
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST: "1"
         run: >
@@ -518,10 +528,12 @@ jobs:
           tests/test_ptg2_attestation_contract_compat_postgres.py
           tests/test_ptg2_candidate_v4_attestation_postgres.py
       - name: Run MRF discovery checkpoint PostgreSQL gate
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_MRF_DISCOVERY_CHECKPOINT_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
         run: timeout --foreground 295s python -m pytest -q tests/test_mrf_discovery_checkpoints_postgres.py
       - name: Run control import admission PostgreSQL gate
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_DB_DATABASE: control_imports_test_ci_runner
           PGPASSWORD: ${{ env.HLTHPRT_DB_PASSWORD }}
@@ -543,6 +555,7 @@ jobs:
             tests/test_control_imports_db.py \
             tests/test_control_import_attempt_fence_db.py
       - name: Run retained UHC admission PostgreSQL gate
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_UHC_RETAINED_ADMISSION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/uhc_retained_admission_test_ci_runner"
           HLTHPRT_PTG2_RUST_SCANNER_BIN: "${{ github.workspace }}/support/ptg2_scanner/target/debug/ptg2_scanner"
@@ -565,6 +578,7 @@ jobs:
             tests/test_uhc_retained_admission_postgres.py \
             tests/test_uhc_retained_admission_concurrency_postgres.py
       - name: Run immutable frozen multipart binding PostgreSQL gate
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_PTG_FROZEN_BINDING_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/ptg_frozen_binding_test_ci_runner"
           PGPASSWORD: ${{ env.HLTHPRT_DB_PASSWORD }}
@@ -584,6 +598,7 @@ jobs:
             ptg_frozen_binding_test_ci_runner
           timeout --foreground 295s python -m pytest -q tests/test_ptg_frozen_binding_postgres.py
       - name: Run retained UHC semantic publication PostgreSQL gate
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_DB_DATABASE: uhc_semantic_test_ci_runner
           HLTHPRT_UHC_SEMANTIC_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/uhc_semantic_test_ci_runner"
@@ -606,6 +621,7 @@ jobs:
             tests/test_uhc_semantic_build_postgres.py \
             tests/test_uhc_retained_dataset_postgres.py
       - name: Run strict shared PTG PostgreSQL publish, graph, and cold-read smoke
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST: "1"
           HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST: "1"
@@ -616,6 +632,7 @@ jobs:
           tests/test_ptg2_shared_price_postgres.py
           tests/test_ptg2_shared_snapshot_publish_postgres.py
       - name: Run packed PTG V4 PostgreSQL publication gate
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST: "1"
           HLTHPRT_PTG2_V4_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
@@ -644,6 +661,7 @@ jobs:
           tests/test_ptg2_v4_attempt_migration_downgrade_postgres.py
           tests/test_ptg2_v4_attempt_model_autogenerate_postgres.py
       - name: Run strict shared PTG PostgreSQL GC and removal tests
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST: "1"
         run: >
@@ -661,10 +679,12 @@ jobs:
           tests/test_ptg_source_snapshot_removal_v3.py
           tests/test_ptg_source_snapshot_removal_v4.py
       - name: Run strict shared PTG PostgreSQL cross-plan reuse tests
+        if: matrix.shard == 'core'
         env:
           HLTHPRT_PTG2_CROSS_PLAN_POSTGRES_TEST: "1"
         run: timeout --foreground 295s python -m pytest -q tests/test_ptg2_v3_cross_plan_reuse.py
       - name: Run address and Provider Directory DB tests
+        if: matrix.shard == 'provider-directory'
         env:
           HLTHPRT_RETAINED_ARTIFACT_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
           HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
@@ -721,7 +741,7 @@ jobs:
       - name: Upload PostgreSQL coverage data
         uses: actions/upload-artifact@v7
         with:
-          name: mrf-python-coverage-postgres
-          path: .coverage.postgres
+          name: mrf-python-coverage-postgres-${{ matrix.shard }}
+          path: .coverage.postgres.${{ matrix.shard }}
           include-hidden-files: true
           retention-days: 1

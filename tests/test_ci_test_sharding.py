@@ -90,6 +90,11 @@ def test_workflow_uses_two_unique_main_coverage_artifacts_and_timeouts() -> None
     assert "scripts/ci/shard_pytest_nodeids.py" in workflow
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
+    assert "name: postgres18 postgis tests (${{ matrix.shard }})" in workflow
+    assert "mrf-python-coverage-postgres-${{ matrix.shard }}" in workflow
+    assert "pattern: mrf-python-coverage-postgres-*" in workflow
+    assert "if: matrix.shard == 'core'" in workflow
+    assert "if: matrix.shard == 'provider-directory'" in workflow
     assert "python -m pytest -q -n 1 --dist loadscope" in workflow
     assert "timeout --foreground 295s python -m pytest" in workflow
     assert "timeout --foreground 295s cargo llvm-cov" in workflow
