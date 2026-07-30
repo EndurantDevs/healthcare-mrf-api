@@ -573,17 +573,12 @@ async def _claim_shard_row(
     )
 
 
-async def claim_projection_shard(
-    lease: ProjectionLease,
-    *,
+def _validate_projection_shard_claim(
     admission_id: str,
-    lease_seconds: int = 300,
-    partition_id: str | None = None,
-    database: Any = db,
-    schema: str = "mrf",
-) -> ProjectionShardClaim | None:
-    """Claim one pending, expired, or superseded shard with SKIP LOCKED."""
-
+    partition_id: str | None,
+    lease_seconds: int,
+) -> None:
+    """Validate bounded shard-claim coordinates before opening a transaction."""
     if not 30 <= lease_seconds <= 3600:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_shard_lease_seconds_invalid"
@@ -599,6 +594,19 @@ async def claim_projection_shard(
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_partition_id_invalid"
         )
+
+
+async def claim_projection_shard(
+    lease: ProjectionLease,
+    *,
+    admission_id: str,
+    lease_seconds: int = 300,
+    partition_id: str | None = None,
+    database: Any = db,
+    schema: str = "mrf",
+) -> ProjectionShardClaim | None:
+    """Claim one pending, expired, or superseded shard with SKIP LOCKED."""
+    _validate_projection_shard_claim(admission_id, partition_id, lease_seconds)
     shard_table = table_ref(schema, "provider_directory_projection_proof_shard")
     token = secrets.token_hex(32)
     async with database.transaction():

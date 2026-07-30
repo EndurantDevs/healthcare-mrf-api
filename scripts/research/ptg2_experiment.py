@@ -3576,6 +3576,33 @@ def gate_results_overall(case_results: dict[str, list[dict[str, Any]]]) -> str:
     return "failed" if failed_results else "not_evaluated" if not_evaluated_results else "passed"
 
 
+def _candidate_gate_precondition(
+    baseline: dict[str, Any] | None,
+    candidate: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return a terminal gate result when comparison cannot be evaluated."""
+    if not baseline:
+        return {
+            "variant_id": candidate.get("variant_id"),
+            "overall": "unknown",
+            "checks": {"baseline": "missing"},
+        }
+    if candidate.get("status") not in {"dry_run", "skipped"} and baseline.get(
+        "status"
+    ) not in {"dry_run", "skipped"}:
+        return None
+    return {
+        "variant_id": candidate.get("variant_id"),
+        "overall": "not_evaluated",
+        "checks": {
+            "status": {
+                "baseline": baseline.get("status"),
+                "candidate": candidate.get("status"),
+            }
+        },
+    }
+
+
 def evaluate_candidate(
     baseline: dict[str, Any] | None,
     candidate: dict[str, Any],
@@ -3588,20 +3615,11 @@ def evaluate_candidate(
     gate_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a candidate against required correctness and resource gates."""
+    precondition_result = _candidate_gate_precondition(baseline, candidate)
+    if precondition_result is not None:
+        return precondition_result
+    assert baseline is not None
     gate_checks_by_name: dict[str, Any] = {}
-    if not baseline:
-        return {"variant_id": candidate.get("variant_id"), "overall": "unknown", "checks": {"baseline": "missing"}}
-    if candidate.get("status") in {"dry_run", "skipped"} or baseline.get("status") in {"dry_run", "skipped"}:
-        return {
-            "variant_id": candidate.get("variant_id"),
-            "overall": "not_evaluated",
-            "checks": {
-                "status": {
-                    "baseline": baseline.get("status"),
-                    "candidate": candidate.get("status"),
-                }
-            },
-        }
     gate_checks_by_name["status"] = "passed" if candidate.get("status") == baseline.get("status") == "succeeded" else "failed"
     gate_checks_by_name["copy_outputs"] = compare_copy_outputs(baseline.get("copy_outputs") or {}, candidate.get("copy_outputs") or {})
     gate_checks_by_name["dedupe"] = compare_dedupe(baseline.get("dedupe_summary") or {}, candidate.get("dedupe_summary") or {})

@@ -4810,6 +4810,23 @@ async def lookup_shared_code_page_from_db(
     )
 
 
+def _provider_page_for_alias(representative_page: Any, block_key: int) -> Any:
+    """Copy one decoded provider page under an authenticated logical alias."""
+    return type(representative_page)(
+        entries=tuple(
+            type(page_entry)(
+                code_key=page_entry.code_key,
+                provider_set_key=block_key,
+                provider_count=page_entry.provider_count,
+                price_key=page_entry.price_key,
+                source_key=page_entry.source_key,
+            )
+            for page_entry in representative_page.entries
+        ),
+        total_row_count=representative_page.total_row_count,
+    )
+
+
 async def lookup_shared_provider_pages_from_db(
     session: Any,
     shared_snapshot_key: int,
@@ -4862,18 +4879,9 @@ async def lookup_shared_provider_pages_from_db(
         for block_key, _alias_block in physical_aliases:
             if block_key not in requested_key_set:
                 continue
-            pages_by_provider_key[block_key] = type(representative_page)(
-                entries=tuple(
-                    type(page_entry)(
-                        code_key=page_entry.code_key,
-                        provider_set_key=block_key,
-                        provider_count=page_entry.provider_count,
-                        price_key=page_entry.price_key,
-                        source_key=page_entry.source_key,
-                    )
-                    for page_entry in representative_page.entries
-                ),
-                total_row_count=representative_page.total_row_count,
+            pages_by_provider_key[block_key] = _provider_page_for_alias(
+                representative_page,
+                block_key,
             )
     return pages_by_provider_key
 
