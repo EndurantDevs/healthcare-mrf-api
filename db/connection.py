@@ -40,11 +40,14 @@ try:
 except ImportError:  # pragma: no cover - SQLAlchemy < 1.4 fallback
     from sqlalchemy.ext.declarative import declarative_base
 
-    Base = declarative_base()
+    DatabaseModelBase = declarative_base()
 else:
 
-    class Base(DeclarativeBase):
+    class DatabaseModelBase(DeclarativeBase):
         __abstract__ = True
+
+
+Base = DatabaseModelBase
 
 
 def _wrap_statement(db: "Database", stmt: Any) -> Any:

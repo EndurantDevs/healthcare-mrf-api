@@ -2795,7 +2795,14 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("budget_dimension", ("graph_pages", "forward_scan"))
+@pytest.mark.parametrize(
+    "budget_dimension",
+    (
+        "graph_pages",
+        "forward_scan",
+        "inferred_taxonomy_projection",
+    ),
+)
 async def test_plan_pricing_translates_only_online_work_budget_to_503(
     monkeypatch,
     budget_dimension,

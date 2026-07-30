@@ -14454,3 +14454,32 @@ def test_refactored_frame_collector_rejects_invalid_and_duplicate_sources():
         base_url="https://example.test/landing",
     ) == ["https://example.test/mrf/transparency"]
     assert discovery._is_html_label_fileish(None, "/mrf/file.json")
+
+
+@pytest.mark.parametrize(
+    ("path", "text", "expected"),
+    [
+        ("/mrf/company-index.json", "machine-readable files", True),
+        ("/files/rates.json", "table of contents", True),
+        ("/files/rates.json", "ordinary download", False),
+    ],
+)
+def test_html_json_toc_classifier_requires_toc_context(path, text, expected):
+    assert discovery._is_html_json_mrf_toc(path, text) is expected
+
+
+@pytest.mark.parametrize(
+    ("path", "text", "expected"),
+    [
+        ("/downloads/company-index", "MRF transparency", True),
+        ("/downloads/company-toc", "table of contents", True),
+        ("/downloads/company-toc.json", "table of contents", False),
+        ("/downloads/company", "table of contents", False),
+    ],
+)
+def test_extensionless_toc_classifier_requires_a_supported_suffix(
+    path,
+    text,
+    expected,
+):
+    assert discovery._is_extensionless_html_mrf_toc(path, text) is expected
