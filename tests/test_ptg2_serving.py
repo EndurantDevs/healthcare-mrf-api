@@ -2742,10 +2742,11 @@ async def test_network_descriptor_revalidation_accepts_supported_attestations():
 
 
 @pytest.mark.asyncio
-async def test_multi_network_forward_reads_share_request_session_sequentially(
+async def test_multi_network_forward_reads_use_independent_concurrent_sessions(
     monkeypatch,
 ):
     request_session = object()
+    session_factory = ConcurrentSessionFactory()
     search_sessions = []
 
     async def fake_snapshot_tables(_session, snapshot_id):
@@ -2757,13 +2758,14 @@ async def test_multi_network_forward_reads_share_request_session_sequentially(
 
     async def fake_search(_session, snapshot_id, _args, _pagination, **_kwargs):
         search_sessions.append(_session)
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02 if snapshot_id == "snapshot-a" else 0.01)
         return {
             "items": [{"provider_name": snapshot_id, "prices": []}],
             "pagination": {"total": 1},
             "query": {"snapshot_id": snapshot_id},
         }
 
+    monkeypatch.setattr(ptg2_serving.sa_db, "session", session_factory.session)
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot_tables)
     monkeypatch.setattr(ptg2_serving, "_has_snapshot_plan_code", has_fake_plan_code)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_search)
@@ -2775,7 +2777,9 @@ async def test_multi_network_forward_reads_share_request_session_sequentially(
         FakePagination(),
     )
 
-    assert search_sessions == [request_session, request_session]
+    assert request_session not in search_sessions
+    assert session_factory.maximum_active == 2
+    assert len({id(session) for session in search_sessions}) == 2
     assert merged_response["query"]["snapshots"] == ["snapshot-a", "snapshot-b"]
     assert {network_item["network"] for network_item in merged_response["items"]} == {
         "network-a",
@@ -2786,6 +2790,7 @@ async def test_multi_network_forward_reads_share_request_session_sequentially(
 @pytest.mark.asyncio
 async def test_multi_network_forward_failure_never_returns_partial_union(monkeypatch):
     request_session = object()
+    session_factory = ConcurrentSessionFactory()
     searched_snapshot_ids = []
 
     async def fake_snapshot_tables(_session, snapshot_id):
@@ -2796,13 +2801,14 @@ async def test_multi_network_forward_failure_never_returns_partial_union(monkeyp
         return True
 
     async def fake_search(_session, snapshot_id, _args, _pagination, **_kwargs):
-        assert _session is request_session
+        assert _session is not request_session
         searched_snapshot_ids.append(snapshot_id)
         await asyncio.sleep(0.01)
         if snapshot_id == "snapshot-b":
             raise RuntimeError("network read failed")
         return {"items": [], "pagination": {"total": 0}, "query": {}}
 
+    monkeypatch.setattr(ptg2_serving.sa_db, "session", session_factory.session)
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot_tables)
     monkeypatch.setattr(ptg2_serving, "_has_snapshot_plan_code", has_fake_plan_code)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_search)
@@ -2816,6 +2822,50 @@ async def test_multi_network_forward_failure_never_returns_partial_union(monkeyp
         )
 
     assert searched_snapshot_ids == ["snapshot-a", "snapshot-b"]
+    assert session_factory.maximum_active == 2
+    assert session_factory.active == 0
+
+
+@pytest.mark.asyncio
+async def test_multi_network_forward_reads_respect_configured_concurrency(
+    monkeypatch,
+):
+    """Bound forward fan-out without changing its deterministic result order."""
+
+    request_session = object()
+    session_factory = ConcurrentSessionFactory()
+    network_snapshots = [
+        ("network-a", "snapshot-a"),
+        ("network-b", "snapshot-b"),
+        ("network-c", "snapshot-c"),
+    ]
+
+    async def fake_snapshot_tables(_session, snapshot_id):
+        assert _session is request_session
+        return _strict_v3_tables(snapshot_id=snapshot_id)
+
+    async def fake_search(_session, snapshot_id, *_args, **_kwargs):
+        await asyncio.sleep(0.01)
+        return {"items": [], "pagination": {"total": 0}, "query": {}}
+
+    monkeypatch.setenv(ptg2_serving._PTG2_MULTI_NETWORK_CONCURRENCY_ENV, "1")
+    monkeypatch.setattr(ptg2_serving.sa_db, "session", session_factory.session)
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot_tables)
+    monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_search)
+
+    responses = await ptg2_serving._read_multi_ptg2_snapshots(
+        request_session,
+        network_snapshots,
+        {"plan_id": "TEST-PLAN-001"},
+        FakePagination(),
+        None,
+    )
+
+    assert session_factory.maximum_active == 1
+    assert [
+        (source_key, snapshot_id)
+        for source_key, snapshot_id, _response in responses
+    ] == network_snapshots
 
 
 @pytest.mark.asyncio
