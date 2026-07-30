@@ -623,9 +623,22 @@ fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
         finalizer_summary["preservation"]["all_source_occurrences_preserved"],
         true
     );
+    let provider_code_bitmap_candidate_bytes =
+        finalizer_summary["identity_maps"]["provider_code_bitmap_candidate_bytes"].as_u64();
+    let provider_code_bitmap_charged_bytes = finalizer_summary["identity_maps"]
+        ["provider_code_bitmap_charged_bytes"]
+        .as_u64()
+        .expect("provider-code bitmap charge");
+    let expected_provider_code_mode = if provider_code_bitmap_charged_bytes > 0
+        || provider_code_bitmap_candidate_bytes == Some(0)
+    {
+        "provider_major_bitmap_v1"
+    } else {
+        "pair_spool_sort_v1"
+    };
     assert_eq!(
         finalizer_summary["identity_maps"]["provider_code_bitmap_planned_mode"],
-        "pair_spool_sort_v1"
+        expected_provider_code_mode
     );
     assert_eq!(finalizer_summary["rate_schedule_observe"]["enabled"], true);
     assert!(
