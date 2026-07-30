@@ -214,10 +214,8 @@ def _configure_disposable_database(monkeypatch: pytest.MonkeyPatch, dsn: str) ->
     return database_name
 
 
-async def _assert_migrated_empty_target(database_name: str) -> None:
-    """Support the assert migrated empty target test fixture."""
-    selected_database = await db.scalar("SELECT current_database()")
-    assert selected_database == database_name
+async def _assert_migration_heads() -> None:
+    """Require the disposable schema to be at every repository head."""
 
     alembic_config = Config(str(ROOT / "alembic.ini"))
     expected_heads = set(ScriptDirectory.from_config(alembic_config).get_heads())
@@ -231,6 +229,10 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
         "the disposable database must have migration head applied: "
         f"expected={sorted(expected_heads)}, observed={sorted(observed_heads)}"
     )
+
+
+async def _assert_required_migration_tables() -> None:
+    """Require every lifecycle relation and the attestation lookup index."""
 
     observed_tables = {
         str(table_record[0])
@@ -260,6 +262,11 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
         """,
         schema_name=SCHEMA_NAME,
     )
+
+
+async def _assert_required_jsonb_columns() -> None:
+    """Require migrated manifest and audit payloads to retain JSONB typing."""
+
     jsonb_columns = {
         (str(column_record[0]), str(column_record[1]))
         for column_record in await db.all(
@@ -280,6 +287,15 @@ async def _assert_migrated_empty_target(database_name: str) -> None:
         ("ptg2_v3_snapshot_layout", "layout_manifest"),
         ("ptg2_v3_candidate_audit_attestation", "report"),
     }
+
+
+async def _assert_migrated_empty_target(database_name: str) -> None:
+    """Require an exact migrated and empty disposable lifecycle database."""
+
+    assert await db.scalar("SELECT current_database()") == database_name
+    await _assert_migration_heads()
+    await _assert_required_migration_tables()
+    await _assert_required_jsonb_columns()
     for table_name in EMPTY_BEFORE_WRITE_TABLES:
         assert await _count(table_name) == 0, (
             f"refusing to use non-empty disposable table {SCHEMA_NAME}.{table_name}"
@@ -430,9 +446,8 @@ def _graph_artifacts(
     return entries
 
 
-async def _release_report(
+def _release_audit_contract(
     *,
-    client,
     snapshot_id: str,
     source_key: str,
     plan_id: str,
@@ -440,8 +455,8 @@ async def _release_report(
     audit_sample: Mapping[str, Any],
     source_witness: Mapping[str, Any],
     provider_identifier_quarantine: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Execute the real one-request batch gate and build its V4 report."""
+):
+    """Build the immutable target and request for one release audit."""
 
     audit_target = BatchAuditReportTarget(
         snapshot_id=snapshot_id,
@@ -467,6 +482,31 @@ async def _release_report(
                 source_witness["occurrence_witness_count"]
             ),
         ),
+    )
+    return audit_target, audit_request
+
+
+async def _release_report(
+    *,
+    client,
+    snapshot_id: str,
+    source_key: str,
+    plan_id: str,
+    raw_container_sha256: str,
+    audit_sample: Mapping[str, Any],
+    source_witness: Mapping[str, Any],
+    provider_identifier_quarantine: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Execute the real one-request batch gate and build its V4 report."""
+
+    audit_target, audit_request = _release_audit_contract(
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+        plan_id=plan_id,
+        raw_container_sha256=raw_container_sha256,
+        audit_sample=audit_sample,
+        source_witness=source_witness,
+        provider_identifier_quarantine=provider_identifier_quarantine,
     )
     started_at = datetime.datetime.now(datetime.timezone.utc)
     response = await _asgi_request(

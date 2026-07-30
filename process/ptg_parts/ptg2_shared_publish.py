@@ -118,6 +118,10 @@ SELECT COUNT(*)::bigint,
            FALSE
        ),
        COALESCE(
+           BOOL_OR(staged.payload IS NULL AND stored.block_hash IS NULL),
+           FALSE
+       ),
+       COALESCE(
            BOOL_OR(
                stored.block_hash IS NULL
                OR stored.format_version <> staged.format_version
@@ -367,9 +371,13 @@ class _BatchedBlockStageSummary:
             )
         if bool(aggregate_row[5]):
             raise RuntimeError(
-                "strict V3 shared block conflicts with stored content metadata"
+                "strict V3 shared block stage has no payload or durable CAS row"
             )
         if bool(aggregate_row[6]):
+            raise RuntimeError(
+                "strict V3 shared block conflicts with stored content metadata"
+            )
+        if bool(aggregate_row[7]):
             raise RuntimeError(
                 "strict V3 shared layout mapping conflicts with staged output"
             )
@@ -764,6 +772,204 @@ def _shared_block_copy_metrics(
     )
 
 
+@dataclass(frozen=True)
+class _SharedBlockCopyRequest:
+    path: Path
+    schema_name: str
+    stage_table: str
+    expected_copy_bytes: int | None
+    expected_copy_sha256: str | None
+    progress_callback: Callable[[str, int], None] | None
+
+
+def _validated_shared_block_copy_request(
+    copy_path: str | Path,
+    *,
+    schema_name: str,
+    stage_table: str,
+    expected_copy_bytes: int | None,
+    expected_copy_sha256: str | None,
+    reuse_existing: bool,
+    progress_callback: Callable[[str, int], None] | None,
+) -> _SharedBlockCopyRequest:
+    """Validate immutable source expectations before opening the COPY."""
+
+    path = Path(copy_path)
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise RuntimeError(
+            f"strict V3 shared-block COPY is missing or empty: {path}"
+        )
+    if (expected_copy_bytes is None) != (expected_copy_sha256 is None):
+        raise RuntimeError(
+            "strict V3 shared-block COPY requires both byte and digest expectations"
+        )
+    if expected_copy_bytes is not None:
+        if isinstance(expected_copy_bytes, bool) or int(expected_copy_bytes) <= 0:
+            raise RuntimeError(
+                "strict V3 shared-block COPY has invalid expected bytes"
+            )
+        if path.stat().st_size != int(expected_copy_bytes):
+            raise RuntimeError(
+                "strict V3 shared-block COPY byte count changed before COPY"
+            )
+        if (
+            not isinstance(expected_copy_sha256, str)
+            or len(expected_copy_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_copy_sha256
+            )
+        ):
+            raise RuntimeError(
+                "strict V3 shared-block COPY has invalid expected digest"
+            )
+    if reuse_existing and expected_copy_bytes is None:
+        raise RuntimeError(
+            "strict V3 reused shared-block COPY requires byte and digest expectations"
+        )
+    return _SharedBlockCopyRequest(
+        path=path,
+        schema_name=schema_name,
+        stage_table=stage_table,
+        expected_copy_bytes=expected_copy_bytes,
+        expected_copy_sha256=expected_copy_sha256,
+        progress_callback=progress_callback,
+    )
+
+
+async def _scan_shared_block_reuse(
+    request: _SharedBlockCopyRequest,
+    *,
+    reuse_existing: bool,
+) -> tuple[Any | None, set[bytes], dict[str, float]]:
+    """Scan metadata and resolve durable reuse targets when requested."""
+
+    timing_by_name = {
+        "metadata_scan_seconds": 0.0,
+        "existence_lookup_seconds": 0.0,
+        "copy_seconds": 0.0,
+    }
+    if not reuse_existing:
+        return None, set(), timing_by_name
+    scan_started_at = time.monotonic()
+    scanned_copy = scan_shared_block_copy(request.path)
+    timing_by_name["metadata_scan_seconds"] = (
+        time.monotonic() - scan_started_at
+    )
+    lookup_started_at = time.monotonic()
+    existing_hashes = await _existing_shared_block_hashes(
+        schema_name=request.schema_name,
+        requested_hashes=scanned_copy.block_hashes,
+    )
+    timing_by_name["existence_lookup_seconds"] = (
+        time.monotonic() - lookup_started_at
+    )
+    return scanned_copy, existing_hashes, timing_by_name
+
+
+def _shared_copy_source(
+    source_file: Any,
+    *,
+    request: _SharedBlockCopyRequest,
+    scanned_copy: Any | None,
+    existing_hashes: set[bytes],
+) -> Any:
+    """Choose a selective or digesting source reader for one COPY."""
+
+    has_duplicate_hashes = (
+        scanned_copy is not None
+        and scanned_copy.row_count != len(scanned_copy.block_hashes)
+    )
+    if existing_hashes or has_duplicate_hashes:
+        return SelectiveSharedBlockCopyReader(
+            source_file,
+            existing_hashes=existing_hashes,
+            expected_source_bytes=int(request.expected_copy_bytes),
+            expected_source_sha256=str(request.expected_copy_sha256),
+        )
+    return _DigestingReader(source_file)
+
+
+def _validate_completed_shared_copy(
+    copy_source: Any,
+    *,
+    request: _SharedBlockCopyRequest,
+    scanned_copy: Any | None,
+) -> int:
+    """Require copied bytes, digest, rows, and payload totals to remain exact."""
+
+    selective = isinstance(copy_source, SelectiveSharedBlockCopyReader)
+    observed_byte_count = (
+        copy_source.source_byte_count if selective else copy_source.byte_count
+    )
+    observed_sha256 = (
+        copy_source.source_sha256 if selective else copy_source.sha256
+    )
+    if request.expected_copy_bytes is not None and (
+        observed_byte_count != int(request.expected_copy_bytes)
+        or observed_sha256 != request.expected_copy_sha256
+    ):
+        raise RuntimeError(
+            "strict V3 shared-block COPY content changed during publication"
+        )
+    if selective and (
+        scanned_copy is None
+        or copy_source.row_count != scanned_copy.row_count
+        or copy_source.reused_payload_bytes + copy_source.copied_payload_bytes
+        != scanned_copy.stored_payload_bytes
+    ):
+        raise RuntimeError(
+            "strict V3 shared-block COPY filtering changed source aggregates"
+        )
+    return observed_byte_count
+
+
+async def _copy_shared_block_request(
+    request: _SharedBlockCopyRequest,
+    *,
+    scanned_copy: Any | None,
+    existing_hashes: set[bytes],
+) -> tuple[Any, int]:
+    """Stream one validated binary source into its staging relation."""
+
+    async with db.acquire() as connection:
+        raw_connection = connection.raw_connection
+        driver_connection = getattr(
+            raw_connection,
+            "driver_connection",
+            raw_connection,
+        )
+        copy_to_table = getattr(driver_connection, "copy_to_table", None)
+        if copy_to_table is None:
+            raise NotImplementedError(
+                "active database driver does not expose binary COPY"
+            )
+        with request.path.open("rb") as source_file:
+            copy_source = _shared_copy_source(
+                source_file,
+                request=request,
+                scanned_copy=scanned_copy,
+                existing_hashes=existing_hashes,
+            )
+            measured_source = (
+                _MeasuredReader(copy_source, request.progress_callback)
+                if request.progress_callback is not None
+                else copy_source
+            )
+            await copy_to_table(
+                _safe_identifier(request.stage_table),
+                source=measured_source,
+                schema_name=_safe_identifier(request.schema_name),
+                columns=list(_SHARED_BLOCK_STAGE_COLUMNS),
+                format="binary",
+            )
+            return copy_source, _validate_completed_shared_copy(
+                copy_source,
+                request=request,
+                scanned_copy=scanned_copy,
+            )
+
+
 async def copy_shared_block_binary_file(
     copy_path: str | Path,
     *,
@@ -776,109 +982,27 @@ async def copy_shared_block_binary_file(
 ) -> SharedBlockCopyMetrics | None:
     """Validate and binary-COPY a shared-block file into the staging table."""
 
-    path = Path(copy_path)
-    if not path.is_file() or path.stat().st_size <= 0:
-        raise RuntimeError(f"strict V3 shared-block COPY is missing or empty: {path}")
-    if (expected_copy_bytes is None) != (expected_copy_sha256 is None):
-        raise RuntimeError(
-            "strict V3 shared-block COPY requires both byte and digest expectations"
+    request = _validated_shared_block_copy_request(
+        copy_path,
+        schema_name=schema_name,
+        stage_table=stage_table,
+        expected_copy_bytes=expected_copy_bytes,
+        expected_copy_sha256=expected_copy_sha256,
+        reuse_existing=reuse_existing,
+        progress_callback=progress_callback,
+    )
+    scanned_copy, existing_hashes, timing_by_name = (
+        await _scan_shared_block_reuse(
+            request,
+            reuse_existing=reuse_existing,
         )
-    if expected_copy_bytes is not None:
-        if isinstance(expected_copy_bytes, bool) or int(expected_copy_bytes) <= 0:
-            raise RuntimeError("strict V3 shared-block COPY has invalid expected bytes")
-        if path.stat().st_size != int(expected_copy_bytes):
-            raise RuntimeError("strict V3 shared-block COPY byte count changed before COPY")
-        if (
-            not isinstance(expected_copy_sha256, str)
-            or len(expected_copy_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in expected_copy_sha256
-            )
-        ):
-            raise RuntimeError("strict V3 shared-block COPY has invalid expected digest")
-    if reuse_existing and expected_copy_bytes is None:
-        raise RuntimeError(
-            "strict V3 reused shared-block COPY requires byte and digest expectations"
-        )
-    existing_hashes: set[bytes] = set()
-    scanned_copy = None
-    timing_by_name = {
-        "metadata_scan_seconds": 0.0,
-        "existence_lookup_seconds": 0.0,
-        "copy_seconds": 0.0,
-    }
-    if reuse_existing:
-        scan_started_at = time.monotonic()
-        scanned_copy = scan_shared_block_copy(path)
-        timing_by_name["metadata_scan_seconds"] = time.monotonic() - scan_started_at
-        lookup_started_at = time.monotonic()
-        existing_hashes = await _existing_shared_block_hashes(
-            schema_name=schema_name,
-            requested_hashes=scanned_copy.block_hashes,
-        )
-        timing_by_name["existence_lookup_seconds"] = (
-            time.monotonic() - lookup_started_at
-        )
+    )
     copy_started_at = time.monotonic()
-    async with db.acquire() as conn:
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
-        copy_to_table = getattr(driver_conn, "copy_to_table", None)
-        if copy_to_table is None:
-            raise NotImplementedError("active database driver does not expose binary COPY")
-        with path.open("rb") as source_file:
-            copy_source: Any
-            if existing_hashes or (
-                scanned_copy is not None
-                and scanned_copy.row_count != len(scanned_copy.block_hashes)
-            ):
-                copy_source = SelectiveSharedBlockCopyReader(
-                    source_file,
-                    existing_hashes=existing_hashes,
-                    expected_source_bytes=int(expected_copy_bytes),
-                    expected_source_sha256=str(expected_copy_sha256),
-                )
-            else:
-                copy_source = _DigestingReader(source_file)
-            measured_source = (
-                _MeasuredReader(copy_source, progress_callback)
-                if progress_callback is not None
-                else copy_source
-            )
-            await copy_to_table(
-                _safe_identifier(stage_table),
-                source=measured_source,
-                schema_name=_safe_identifier(schema_name),
-                columns=list(_SHARED_BLOCK_STAGE_COLUMNS),
-                format="binary",
-            )
-            observed_byte_count = (
-                copy_source.source_byte_count
-                if isinstance(copy_source, SelectiveSharedBlockCopyReader)
-                else copy_source.byte_count
-            )
-            observed_sha256 = (
-                copy_source.source_sha256
-                if isinstance(copy_source, SelectiveSharedBlockCopyReader)
-                else copy_source.sha256
-            )
-            if expected_copy_bytes is not None and (
-                observed_byte_count != int(expected_copy_bytes)
-                or observed_sha256 != expected_copy_sha256
-            ):
-                raise RuntimeError(
-                    "strict V3 shared-block COPY content changed during publication"
-                )
-            if isinstance(copy_source, SelectiveSharedBlockCopyReader) and (
-                scanned_copy is None
-                or copy_source.row_count != scanned_copy.row_count
-                or copy_source.reused_payload_bytes + copy_source.copied_payload_bytes
-                != scanned_copy.stored_payload_bytes
-            ):
-                raise RuntimeError(
-                    "strict V3 shared-block COPY filtering changed source aggregates"
-                )
+    copy_source, observed_byte_count = await _copy_shared_block_request(
+        request,
+        scanned_copy=scanned_copy,
+        existing_hashes=existing_hashes,
+    )
     timing_by_name["copy_seconds"] = time.monotonic() - copy_started_at
     if scanned_copy is None:
         return None
@@ -1382,26 +1506,31 @@ async def publish_shared_finalizer_dictionaries(
         )
 
 
-async def _upsert_shared_block_mappings(
+async def _staged_shared_mapping_count(
     session: Any,
     *,
-    schema_name: str,
-    stage_table: str,
-    snapshot_key: int,
-    expected_count: int | None = None,
-    progress_callback: Callable[[str, int], None] | None = None,
-) -> None:
-    """Insert mappings once, reconciling only when the fast path conflicts."""
+    schema: str,
+    stage: str,
+) -> int:
+    """Return the exact staged mapping count."""
 
-    schema = _quote_ident(_safe_identifier(schema_name))
-    stage = _quote_ident(_safe_identifier(stage_table))
-    if expected_count is None:
-        expected_count = int(
-            await session.scalar(db.text(f"SELECT COUNT(*) FROM {schema}.{stage}"))
-            or 0
+    return int(
+        await session.scalar(
+            db.text(f"SELECT COUNT(*) FROM {schema}.{stage}")
         )
-    if expected_count < 0:
-        raise RuntimeError("strict V3 shared layout mapping count is invalid")
+        or 0
+    )
+
+
+async def _insert_shared_mapping_rows(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    snapshot_key: int,
+) -> int:
+    """Insert conflict-free snapshot mappings and return the applied count."""
+
     insert_result = await session.execute(
         db.text(
             f"""
@@ -1415,12 +1544,19 @@ async def _upsert_shared_block_mappings(
             DO NOTHING
             """
         ),
-        {"snapshot_key": int(snapshot_key)},
+        {"snapshot_key": snapshot_key},
     )
-    _report_publish_work(progress_callback, "publish_batches")
-    inserted_count = int(insert_result.rowcount or 0)
-    if inserted_count == expected_count:
-        return
+    return int(insert_result.rowcount or 0)
+
+
+async def _reconciled_shared_mapping_count(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    snapshot_key: int,
+) -> int:
+    """Count staged coordinates already applied with identical content."""
 
     reconciliation_result = await session.execute(
         db.text(
@@ -1444,10 +1580,48 @@ async def _upsert_shared_block_mappings(
                AND mapping.fragment_no = canonical_mapping.fragment_no
             """
         ),
-        {"snapshot_key": int(snapshot_key)},
+        {"snapshot_key": snapshot_key},
+    )
+    return int(reconciliation_result.scalar() or 0)
+
+
+async def _upsert_shared_block_mappings(
+    session: Any,
+    *,
+    schema_name: str,
+    stage_table: str,
+    snapshot_key: int,
+    expected_count: int | None = None,
+    progress_callback: Callable[[str, int], None] | None = None,
+) -> None:
+    """Insert mappings once, reconciling only when the fast path conflicts."""
+
+    schema = _quote_ident(_safe_identifier(schema_name))
+    stage = _quote_ident(_safe_identifier(stage_table))
+    if expected_count is None:
+        expected_count = await _staged_shared_mapping_count(
+            session,
+            schema=schema,
+            stage=stage,
+        )
+    if expected_count < 0:
+        raise RuntimeError("strict V3 shared layout mapping count is invalid")
+    inserted_count = await _insert_shared_mapping_rows(
+        session,
+        schema=schema,
+        stage=stage,
+        snapshot_key=int(snapshot_key),
     )
     _report_publish_work(progress_callback, "publish_batches")
-    applied_count = int(reconciliation_result.scalar() or 0)
+    if inserted_count == expected_count:
+        return
+    applied_count = await _reconciled_shared_mapping_count(
+        session,
+        schema=schema,
+        stage=stage,
+        snapshot_key=int(snapshot_key),
+    )
+    _report_publish_work(progress_callback, "publish_batches")
     if applied_count != expected_count:
         raise RuntimeError("strict V3 shared layout mapping conflicts with staged output")
 
@@ -1547,8 +1721,19 @@ async def _publish_shared_block_batch(
         "seen_coordinate": seen_coordinate,
     }
     await session.execute(
+        db.text(_V4_BATCH_LOCK_SQL.format(**template_name_map))
+    )
+    await session.execute(
         db.text(_BATCH_INSERT_BLOCK_SQL.format(**template_name_map)),
         format_parameter_map,
+    )
+    block_validation_result = await session.execute(
+        db.text(_V4_BATCH_AGGREGATE_SQL.format(**template_name_map)),
+        format_parameter_map,
+    )
+    _validate_shared_block_batch(block_validation_result.one())
+    await session.execute(
+        db.text(_V4_BATCH_DELETE_GC_SQL.format(**template_name_map))
     )
     await session.execute(
         db.text(_BATCH_INSERT_MAPPING_SQL.format(**template_name_map)),
@@ -1568,6 +1753,23 @@ async def _publish_shared_block_batch(
         },
     )
     return aggregate_result.one(), int(new_hashes or 0), int(new_coordinates or 0)
+
+
+def _validate_shared_block_batch(block_validation: Sequence[Any]) -> None:
+    """Reject an invalid batch before GC cancellation or snapshot mapping."""
+
+    if bool(block_validation[5]):
+        raise RuntimeError(
+            "strict V3 shared-block stage uses an incompatible format version"
+        )
+    if bool(block_validation[6]):
+        raise RuntimeError(
+            "strict V3 shared block stage has no payload or durable CAS row"
+        )
+    if bool(block_validation[7]):
+        raise RuntimeError(
+            "strict V3 shared block conflicts with stored content metadata"
+        )
 
 
 def _validated_batched_stage_publication(
@@ -1792,6 +1994,23 @@ async def publish_shared_block_stage(
                     snapshot_key=int(snapshot_key),
                     progress_callback=progress_callback,
                 )
+            # Protect every durable reuse target before a concurrent sweep can
+            # remove it. The lock is held until its GC candidacy is canceled
+            # and the snapshot mapping commits.
+            await session.execute(
+                db.text(
+                    f"""
+                    SELECT stored.block_hash
+                      FROM {schema}.ptg2_v3_block AS stored
+                      JOIN (
+                           SELECT DISTINCT block_hash
+                             FROM {schema}.{stage}
+                      ) AS staged
+                        ON staged.block_hash = stored.block_hash
+                     FOR KEY SHARE OF stored
+                    """
+                )
+            )
             await session.execute(
                 db.text(
                     f"""
@@ -1840,6 +2059,13 @@ async def publish_shared_block_stage(
                            ),
                            COALESCE(
                                BOOL_OR(
+                                   staged.payload IS NULL
+                                   AND stored.block_hash IS NULL
+                               ),
+                               FALSE
+                           ),
+                           COALESCE(
+                               BOOL_OR(
                                    stored.block_hash IS NULL
                                    OR stored.format_version <> staged.format_version
                                    OR stored.object_kind <> staged.object_kind
@@ -1864,10 +2090,27 @@ async def publish_shared_block_stage(
                 raise RuntimeError(
                     "strict V3 shared-block stage uses an incompatible format version"
                 )
-            mismatch = bool(aggregate_row[6])
+            missing_durable_block = bool(aggregate_row[6])
+            if missing_durable_block:
+                raise RuntimeError(
+                    "strict V3 shared block stage has no payload or durable CAS row"
+                )
+            mismatch = bool(aggregate_row[7])
             if mismatch:
                 raise RuntimeError("strict V3 shared block conflicts with stored content metadata")
             mapping_count = int(aggregate_row[0])
+            await session.execute(
+                db.text(
+                    f"""
+                    DELETE FROM {schema}.ptg2_v3_gc_candidate AS candidate
+                     USING (
+                           SELECT DISTINCT block_hash
+                             FROM {schema}.{stage}
+                     ) AS staged
+                     WHERE candidate.block_hash = staged.block_hash
+                    """
+                )
+            )
             await _upsert_shared_block_mappings(
                 session,
                 schema_name=schema_name,

@@ -72,6 +72,13 @@ async def test_real_postgres_graph_binary_copy_publish_and_reads(tmp_path):
             )
             """,
             f"""
+            CREATE TABLE {schema}.ptg2_v3_gc_candidate (
+                block_hash bytea PRIMARY KEY,
+                eligible_at timestamptz NOT NULL,
+                queued_at timestamptz NOT NULL
+            )
+            """,
+            f"""
             CREATE TABLE {schema}.ptg2_v3_snapshot_block (
                 snapshot_key bigint NOT NULL,
                 object_kind varchar(64) NOT NULL,

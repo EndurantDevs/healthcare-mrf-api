@@ -402,6 +402,7 @@
         "process/ptg_parts/source_download.py",
         "process/ptg_parts/source_files.py",
         "process/ptg_parts/source_jobs.py",
+        "process/ptg_parts/source_pointer_reviewed_activation.py",
         "process/ptg_parts/source_pointers.py",
         "process/ptg_parts/source_snapshot_control.py",
         "process/ptg_parts/source_snapshot_control_policy.py",
@@ -482,12 +483,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 38038,
-          "total": 42122
+          "covered": 38195,
+          "total": 42264
         },
         "lines": {
-          "covered": 120291,
-          "total": 126610
+          "covered": 120754,
+          "total": 127047
         }
       },
       "one_time_floor_reset": {

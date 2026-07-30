@@ -3310,10 +3310,32 @@ def test_toc_limit_merges_shared_file_plan_scopes(monkeypatch):
     ]
 
 
-def test_ptg2_toc_repairs_missing_array_commas_and_ignores_unsupported_files(
-    monkeypatch, tmp_path
-):
-    """Verify this PTG import regression contract."""
+def _install_toc_path_mocks(
+    monkeypatch,
+    toc_path: Path,
+    pushed_file_rows: list,
+) -> None:
+    """Route TOC materialization and persistence through one local fixture."""
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path=toc_path)
+        return artifact, artifact
+
+    async def fake_push_objects(rows, _cls, **_kwargs):
+        pushed_file_rows.extend(rows)
+
+    monkeypatch.setattr(
+        process_ptg,
+        "materialize_json_source",
+        fake_materialize,
+    )
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+
+def _write_missing_comma_toc(tmp_path) -> Path:
+    """Write malformed adjacent file objects for comma-repair coverage."""
+
     toc_path = tmp_path / "issuer_toc.json"
     toc_path.write_text(
         """
@@ -3357,18 +3379,17 @@ def test_ptg2_toc_repairs_missing_array_commas_and_ignores_unsupported_files(
         """,
         encoding="utf-8",
     )
+    return toc_path
+
+
+def test_ptg2_toc_repairs_missing_array_commas_and_ignores_unsupported_files(
+    monkeypatch, tmp_path
+):
+    """Verify this PTG import regression contract."""
+
+    toc_path = _write_missing_comma_toc(tmp_path)
     pushed_file_rows = []
-
-    async def fake_materialize(*_args, **_kwargs):
-        artifact = SimpleNamespace(logical_path=toc_path)
-        return artifact, artifact
-
-    async def fake_push_objects(rows, _cls, **_kwargs):
-        pushed_file_rows.extend(rows)
-
-    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
-    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
-    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    _install_toc_path_mocks(monkeypatch, toc_path, pushed_file_rows)
 
     jobs = asyncio.run(
         process_ptg._process_table_of_contents(
@@ -3626,8 +3647,9 @@ def test_ptg2_toc_targeted_file_filter_skips_full_catalog_expansion(monkeypatch,
     assert pushed_ptg_file_rows[1]["url"] == target_source_url
 
 
-def test_ptg2_toc_jobs_skip_non_mrf_body_locations(monkeypatch, tmp_path):
-    """Verify this PTG import regression contract."""
+def _write_mixed_body_location_toc(tmp_path) -> Path:
+    """Write HTTP MRF and unsupported body locations in one TOC."""
+
     toc_path = tmp_path / "toc.json"
     toc_path.write_text(
         json.dumps(
@@ -3669,18 +3691,15 @@ def test_ptg2_toc_jobs_skip_non_mrf_body_locations(monkeypatch, tmp_path):
         ),
         encoding="utf-8",
     )
+    return toc_path
+
+
+def test_ptg2_toc_jobs_skip_non_mrf_body_locations(monkeypatch, tmp_path):
+    """Verify this PTG import regression contract."""
+
+    toc_path = _write_mixed_body_location_toc(tmp_path)
     pushed_file_rows = []
-
-    async def fake_materialize(*_args, **_kwargs):
-        artifact = SimpleNamespace(logical_path=toc_path)
-        return artifact, artifact
-
-    async def fake_push_objects(rows, _cls, **_kwargs):
-        pushed_file_rows.extend(rows)
-
-    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
-    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
-    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    _install_toc_path_mocks(monkeypatch, toc_path, pushed_file_rows)
 
     jobs = asyncio.run(
         process_ptg._process_table_of_contents(
@@ -4816,16 +4835,11 @@ def test_cancel_and_wait_tasks_joins_cancelled_children():
     asyncio.run(scenario())
 
 
-def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypatch):
-    """Verify this PTG import regression contract."""
-    pushed_list = []
-    concurrency_map = {"active": 0, "max_active": 0}
-    processed_jobs = []
-    publish_call_kwargs_by_name = {}
-
+def _concurrent_file_import_callbacks(state):
+    """Build deterministic callbacks for the concurrent-file import probe."""
     async def fake_push(rows, cls, **_kwargs):
-        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
-
+        class_name = getattr(cls, "__name__", str(cls))
+        state.pushed_list.extend((class_name, import_row) for import_row in rows)
     async def fake_toc(*_args, **_kwargs):
         return [
             {"type": "in_network", "url": "https://example.test/rates-a.json.gz"},
@@ -4838,28 +4852,31 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
 
     async def fake_process(context, *_args, **_kwargs):
         job = context.job
-        processed_jobs.append(dict(job))
-        concurrency_map["active"] += 1
-        concurrency_map["max_active"] = max(concurrency_map["max_active"], concurrency_map["active"])
+        state.processed_jobs.append(dict(job))
+        state.concurrency_map["active"] += 1
+        state.concurrency_map["max_active"] = max(
+            state.concurrency_map["max_active"],
+            state.concurrency_map["active"],
+        )
         await asyncio.sleep(0.05)
-        concurrency_map["active"] -= 1
+        state.concurrency_map["active"] -= 1
         return process_ptg.PTG2FileProcessResult(
             "in_network",
             job["url"],
-                True,
-                file_id=len(job["url"]),
-                summary={
-                    "serving_rates": 1,
-                    "manifest": {
-                        "copy_files": {},
-                        "source_trace_hash": "a" * 64,
-                    },
-                    **_empty_provider_identifier_quarantine_scanner_summary(),
+            True,
+            file_id=len(job["url"]),
+            summary={
+                "serving_rates": 1,
+                "manifest": {
+                    "copy_files": {},
+                    "source_trace_hash": "a" * 64,
                 },
+                **_empty_provider_identifier_quarantine_scanner_summary(),
+            },
         )
 
     async def fake_publish(*_args, **kwargs):
-        publish_call_kwargs_by_name.update(kwargs)
+        state.publish_call_kwargs_by_name.update(kwargs)
         return SimpleNamespace(
             snapshot_key=7,
             serving_index={
@@ -4876,20 +4893,10 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     @asynccontextmanager
     async def fake_transaction():
         yield object()
+    return fake_push, fake_toc, fake_downloaded_jobs, fake_process, fake_publish, fake_transaction
 
-    refresh_mock = AsyncMock(return_value={"status": "queued", "run_id": "run-refresh"})
 
-    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
-    monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
-    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", AsyncMock(return_value="manifest_stage"))
-    monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
-    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
-    monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
-    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(process_ptg.db, "transaction", fake_transaction)
+def _install_concurrent_layout_mocks(monkeypatch, publish):
     monkeypatch.setattr(
         process_ptg,
         "reserve_shared_layout",
@@ -4925,12 +4932,25 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
             }
         ),
     )
-    monkeypatch.setattr(
-        process_ptg,
-        "publish_strict_shared_v3_layout",
-        fake_publish,
-    )
+    monkeypatch.setattr(process_ptg, "publish_strict_shared_v3_layout", publish)
     _install_candidate_stage_mock(monkeypatch)
+
+
+def _install_concurrent_file_import_mocks(monkeypatch, state):
+    callbacks = _concurrent_file_import_callbacks(state)
+    fake_push, fake_toc, downloaded_jobs, process_file, publish, transaction = callbacks
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
+    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", downloaded_jobs)
+    monkeypatch.setattr(process_ptg, "_process_in_network_file", process_file)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(process_ptg.db, "transaction", transaction)
+    _install_concurrent_layout_mocks(monkeypatch, publish)
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
@@ -4938,7 +4958,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     monkeypatch.setattr(
         process_ptg,
         "_enqueue_address_refresh_after_import",
-        refresh_mock,
+        state.refresh_mock,
     )
     monkeypatch.setenv(process_ptg.PTG2_FILE_PROCESS_CONCURRENCY_ENV, "2")
     monkeypatch.setattr(
@@ -4947,6 +4967,54 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
         lambda: True,
     )
 
+
+def _assert_concurrent_file_import(import_result, state):
+    assert state.concurrency_map["max_active"] == 2
+    assert [job["source_network_names"] for job in state.processed_jobs] == [
+        ["C2"],
+        ["C2"],
+    ]
+    assert import_result["files_processed"] == 2
+    assert import_result["address_refresh"] == {
+        "status": "queued",
+        "run_id": "run-refresh",
+    }
+    assert (
+        "empty_npi_tin_only_normalization_count"
+        not in state.publish_call_kwargs_by_name
+    )
+    state.refresh_mock.assert_awaited_once()
+    refresh_kwargs = state.refresh_mock.await_args.kwargs
+    assert refresh_kwargs["source_key"] == "file_concurrency_test"
+    assert refresh_kwargs["snapshot_id"] == import_result["snapshot_id"]
+    assert refresh_kwargs["import_run_id"] == "ptg2:file_concurrency_test"
+    assert refresh_kwargs["has_serving_files"] is True
+    assert refresh_kwargs["source_scoped_compact"] is True
+    assert refresh_kwargs["test_mode"] is False
+    import_run_rows = [
+        import_row
+        for cls_name, import_row in state.pushed_list
+        if cls_name == "PTG2ImportRun"
+    ]
+    assert import_run_rows[-1]["report"]["files_processed"] == 2
+    assert import_run_rows[-1]["report"]["address_refresh"] == {
+        "status": "queued",
+        "run_id": "run-refresh",
+    }
+
+
+def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypatch):
+    """Verify this PTG import regression contract."""
+    state = SimpleNamespace(
+        pushed_list=[],
+        concurrency_map={"active": 0, "max_active": 0},
+        processed_jobs=[],
+        publish_call_kwargs_by_name={},
+        refresh_mock=AsyncMock(
+            return_value={"status": "queued", "run_id": "run-refresh"}
+        ),
+    )
+    _install_concurrent_file_import_mocks(monkeypatch, state)
     import_result = asyncio.run(
         process_ptg.main(
             toc_urls=["https://example.test/index.json"],
@@ -4956,26 +5024,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
             source_network_names=["C2"],
         )
     )
-
-    assert concurrency_map["max_active"] in {2}
-    assert [job["source_network_names"] for job in processed_jobs] == [["C2"], ["C2"]]
-    assert import_result["files_processed"] == 2
-    assert import_result["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
-    assert (
-        "empty_npi_tin_only_normalization_count"
-        not in publish_call_kwargs_by_name
-    )
-    refresh_mock.assert_awaited_once()
-    refresh_kwargs = refresh_mock.await_args.kwargs
-    assert refresh_kwargs["source_key"] == "file_concurrency_test"
-    assert refresh_kwargs["snapshot_id"] == import_result["snapshot_id"]
-    assert refresh_kwargs["import_run_id"] == "ptg2:file_concurrency_test"
-    assert refresh_kwargs["has_serving_files"] is True
-    assert refresh_kwargs["source_scoped_compact"] is True
-    assert refresh_kwargs["test_mode"] is False
-    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
-    assert import_run_rows[-1]["report"]["files_processed"] == 2
-    assert import_run_rows[-1]["report"]["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
+    _assert_concurrent_file_import(import_result, state)
 
 
 def test_ptg2_main_rolls_back_claim_when_import_run_start_fails(monkeypatch):
@@ -6106,25 +6155,18 @@ def test_ptg2_mixed_import_fails_before_negotiated_stage_on_partial_evidence(
     publish_allowed_pointer.assert_not_awaited()
 
 
-def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
-    """Mixed evidence succeeds, then one failed negotiated file blocks publish."""
-    pushed_list = []
-    process_allowed_lane = AsyncMock(
-        return_value=[
-            {
-                "source_type": "allowed_amounts",
-                "source_url": "https://example.test/allowed.json.gz",
-                "success": True,
-                "summary": {
-                    "allowed_amount_payments": 1,
-                    "allowed_amount_provider_payments": 1,
-                },
-            }
-        ]
-    )
+def _install_partial_publish_mocks(
+    monkeypatch,
+    pushed_rows: list,
+    process_allowed_lane: AsyncMock,
+) -> None:
+    """Install one successful and one failed negotiated-file workflow."""
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
+        pushed_rows.extend(
+            (getattr(cls, "__name__", str(cls)), import_row)
+            for import_row in rows
+        )
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -6157,12 +6199,45 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
             summary={"serving_rates": 1, "manifest": {"copy_files": {}}},
         )
 
+    _patch_partial_publish_dependencies(
+        monkeypatch,
+        fake_push=fake_push,
+        fake_toc=fake_toc,
+        fake_downloaded_jobs=fake_downloaded_jobs,
+        fake_in_network=fake_in_network,
+        process_allowed_lane=process_allowed_lane,
+    )
+
+
+def _patch_partial_publish_dependencies(
+    monkeypatch,
+    *,
+    fake_push,
+    fake_toc,
+    fake_downloaded_jobs,
+    fake_in_network,
+    process_allowed_lane,
+) -> None:
+    """Patch the orchestration boundary for partial-publication behavior."""
+
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        process_ptg,
+        "_current_source_snapshot_id",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
-    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(
+        process_ptg,
+        "_prepare_ptg_tables",
+        AsyncMock(return_value={"ImportLog": "log"}),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_create_serving_stage_table",
+        AsyncMock(return_value="manifest_stage"),
+    )
     monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
     monkeypatch.setattr(
         process_ptg,
@@ -6172,11 +6247,38 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_in_network)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg,
+        "_drop_ptg2_snapshot_tables_for_manifest",
+        AsyncMock(),
+    )
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
     monkeypatch.setattr(process_ptg, "delete_ptg2_artifacts_for_snapshot", AsyncMock())
     _install_strict_v3_publish_mocks(monkeypatch, serving_rates=1)
 
+
+def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
+    """Mixed evidence succeeds, then one failed negotiated file blocks publish."""
+
+    pushed_rows = []
+    process_allowed_lane = AsyncMock(
+        return_value=[
+            {
+                "source_type": "allowed_amounts",
+                "source_url": "https://example.test/allowed.json.gz",
+                "success": True,
+                "summary": {
+                    "allowed_amount_payments": 1,
+                    "allowed_amount_provider_payments": 1,
+                },
+            }
+        ]
+    )
+    _install_partial_publish_mocks(
+        monkeypatch,
+        pushed_rows,
+        process_allowed_lane,
+    )
     with pytest.raises(RuntimeError, match="failed 1 of 2 attempted"):
         asyncio.run(
             process_ptg.main(
@@ -6187,8 +6289,16 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
             )
         )
 
-    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
-    current_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2CurrentSnapshot"]
+    import_run_rows = [
+        import_row
+        for class_name, import_row in pushed_rows
+        if class_name == "PTG2ImportRun"
+    ]
+    current_rows = [
+        import_row
+        for class_name, import_row in pushed_rows
+        if class_name == "PTG2CurrentSnapshot"
+    ]
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert "failed 1 of 2 attempted" in import_run_rows[-1]["error"]
@@ -7759,48 +7869,93 @@ def test_manifest_copy_entry_cleanup_removes_registered_v3_runs(tmp_path):
     assert not dictionary_path.exists()
 
 
+class _SourceLockScalarResult:
+    def __init__(self, scalar_value):
+        self.scalar_value = scalar_value
+
+    def scalar(self):
+        return self.scalar_value
+
+
+class _SourceLockConnection:
+    def __init__(self, lock_state_by_name):
+        self.lock_state_by_name = lock_state_by_name
+
+    async def execute(self, statement, _params):
+        sql = str(statement)
+        if "pg_try_advisory_lock" in sql:
+            if self.lock_state_by_name["held"]:
+                return _SourceLockScalarResult(False)
+            self.lock_state_by_name["held"] = True
+            return _SourceLockScalarResult(True)
+        if "pg_advisory_unlock" in sql:
+            assert self.lock_state_by_name["held"]
+            self.lock_state_by_name["held"] = False
+            return _SourceLockScalarResult(True)
+        raise AssertionError(sql)
+
+    async def commit(self):
+        return None
+
+
+class _SourceLockConnectionContext:
+    def __init__(self, lock_state_by_name):
+        self.lock_state_by_name = lock_state_by_name
+
+    async def __aenter__(self):
+        return _SourceLockConnection(self.lock_state_by_name)
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class _SourceLockEngine:
+    def __init__(self, lock_state_by_name):
+        self.lock_state_by_name = lock_state_by_name
+
+    def connect(self):
+        return _SourceLockConnectionContext(self.lock_state_by_name)
+
+
+async def _assert_serial_source_imports(
+    lock_state_by_name,
+    real_sleep,
+) -> None:
+    """Require a second source import to wait until the first releases."""
+
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    entered_sources: list[str] = []
+
+    async def first_import():
+        async with process_ptg._ptg2_source_import_lock("source-a"):
+            entered_sources.append("first")
+            first_entered.set()
+            await release_first.wait()
+
+    async def second_import():
+        await first_entered.wait()
+        async with process_ptg._ptg2_source_import_lock("source-a"):
+            entered_sources.append("second")
+
+    first_task = asyncio.create_task(first_import())
+    second_task = asyncio.create_task(second_import())
+    await first_entered.wait()
+    await real_sleep(0.01)
+    assert entered_sources == ["first"]
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+    assert entered_sources == ["first", "second"]
+    assert lock_state_by_name["held"] is False
+
+
 def test_source_import_lock_serializes_different_snapshots_for_one_source(monkeypatch):
     """Verify source import lock serializes different snapshots for one source."""
-    lock_state_map = {"held": False}
+
+    lock_state_by_name = {"held": False}
     real_sleep = asyncio.sleep
-
-    class _Result:
-        def __init__(self, value):
-            self.value = value
-
-        def scalar(self):
-            return self.value
-
-    class _Connection:
-        async def execute(self, statement, _params):
-            sql = str(statement)
-            if "pg_try_advisory_lock" in sql:
-                if lock_state_map["held"]:
-                    return _Result(False)
-                lock_state_map["held"] = True
-                return _Result(True)
-            if "pg_advisory_unlock" in sql:
-                assert lock_state_map["held"]
-                lock_state_map["held"] = False
-                return _Result(True)
-            raise AssertionError(sql)
-
-        async def commit(self):
-            return None
-
-    class _ConnectionContext:
-        async def __aenter__(self):
-            return _Connection()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class _Engine:
-        def connect(self):
-            return _ConnectionContext()
-
     fake_db = SimpleNamespace(
-        engine=_Engine(),
+        engine=_SourceLockEngine(lock_state_by_name),
         text=lambda statement: statement,
     )
 
@@ -7811,34 +7966,7 @@ def test_source_import_lock_serializes_different_snapshots_for_one_source(monkey
     monkeypatch.setenv(process_ptg.PTG2_SOURCE_IMPORT_LOCK_ENABLED_ENV, "true")
     monkeypatch.setattr(process_ptg.asyncio, "sleep", fast_sleep)
     monkeypatch.setattr(process_ptg, "write_live_progress", Mock())
-
-    async def scenario():
-        first_entered = asyncio.Event()
-        release_first = asyncio.Event()
-        entered_list: list[str] = []
-
-        async def first_import():
-            async with process_ptg._ptg2_source_import_lock("source-a"):
-                entered_list.append("first")
-                first_entered.set()
-                await release_first.wait()
-
-        async def second_import():
-            await first_entered.wait()
-            async with process_ptg._ptg2_source_import_lock("source-a"):
-                entered_list.append("second")
-
-        first_task = asyncio.create_task(first_import())
-        second_task = asyncio.create_task(second_import())
-        await first_entered.wait()
-        await real_sleep(0.01)
-        assert entered_list == ["first"]
-        release_first.set()
-        await asyncio.gather(first_task, second_task)
-        assert entered_list == ["first", "second"]
-        assert lock_state_map["held"] is False
-
-    asyncio.run(scenario())
+    asyncio.run(_assert_serial_source_imports(lock_state_by_name, real_sleep))
 
 
 def test_ptg2_source_plan_rows_uses_strict_plan_month_rows(monkeypatch):
@@ -7897,28 +8025,7 @@ def _build_published_snapshot_fields(import_month, updated_at):
     }
 
 
-def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkeypatch):
-    """Verify ptg2 candidate stage binds layout without mutating live pointers."""
-    executed_list = []
-    updated_at = process_ptg._utcnow()
-    import_month = process_ptg.normalize_import_month("2026-04")
-    base_snapshot = _build_published_snapshot_fields(import_month, updated_at)
-    bind_layout = AsyncMock()
-
-    async def fake_source_plan_rows(**_kwargs):
-        return [
-            {
-                "plan_source_key": "plan-source-key",
-                "plan_id": "TESTPLAN001",
-                "plan_market_type": "group",
-                "import_month": import_month,
-                "source_key": "example_dental",
-                "snapshot_id": "snap",
-                "previous_snapshot_id": "prev",
-                "updated_at": updated_at,
-            }
-        ]
-
+def _candidate_stage_transaction(executed_list):
     class FakeSession:
         async def execute(self, statement, params=None):
             sql = str(statement)
@@ -7947,9 +8054,59 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
+    return FakeTransaction()
+
+
+def _assert_candidate_stage_result(stage_result, executed_list, bind_layout):
+    candidate = stage_result["candidate_attributes"]
+    assert stage_result["status"] == "validated"
+    assert candidate["status"] == "validated"
+    assert candidate["published_at"] is None
+    assert candidate["manifest"]["activation"] == {
+        "contract": "ptg2_candidate_activation_v1",
+        "state": "validated",
+        "source_key": "example_dental",
+        "expected_previous_snapshot_id": "prev",
+    }
+    bind_layout.assert_awaited_once()
+    joined = "\n".join(statement for statement, _params in executed_list)
+    assert "ptg2_v3_snapshot_scope" in joined
+    assert "ptg2_v3_snapshot_plan_scope" in joined
+    assert "UPDATE \"mrf\".ptg2_snapshot" in joined
+    assert "ptg2_current_source_snapshot" not in joined
+    assert "ptg2_current_plan_source" not in joined
+    assert "ptg2_current_snapshot" not in joined
+
+
+def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkeypatch):
+    """Verify ptg2 candidate stage binds layout without mutating live pointers."""
+    executed_list = []
+    updated_at = process_ptg._utcnow()
+    import_month = process_ptg.normalize_import_month("2026-04")
+    base_snapshot = _build_published_snapshot_fields(import_month, updated_at)
+    bind_layout = AsyncMock()
+
+    async def fake_source_plan_rows(**_kwargs):
+        return [
+            {
+                "plan_source_key": "plan-source-key",
+                "plan_id": "TESTPLAN001",
+                "plan_market_type": "group",
+                "import_month": import_month,
+                "source_key": "example_dental",
+                "snapshot_id": "snap",
+                "previous_snapshot_id": "prev",
+                "updated_at": updated_at,
+            }
+        ]
+
     monkeypatch.setattr(ptg_source_pointers, "bind_snapshot_to_shared_layout", bind_layout)
     monkeypatch.setattr(ptg_source_pointers, "_source_plan_rows", fake_source_plan_rows)
-    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
+    monkeypatch.setattr(
+        ptg_source_pointers.db,
+        "transaction",
+        lambda: _candidate_stage_transaction(executed_list),
+    )
 
     stage_result = asyncio.run(
         ptg_source_pointers._stage_ptg2_source_candidate(
@@ -7970,24 +8127,7 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
         )
     )
 
-    candidate = stage_result["candidate_attributes"]
-    assert stage_result["status"] == "validated"
-    assert candidate["status"] == "validated"
-    assert candidate["published_at"] is None
-    assert candidate["manifest"]["activation"] == {
-        "contract": "ptg2_candidate_activation_v1",
-        "state": "validated",
-        "source_key": "example_dental",
-        "expected_previous_snapshot_id": "prev",
-    }
-    bind_layout.assert_awaited_once()
-    joined = "\n".join(statement for statement, _params in executed_list)
-    assert "ptg2_v3_snapshot_scope" in joined
-    assert "ptg2_v3_snapshot_plan_scope" in joined
-    assert "UPDATE \"mrf\".ptg2_snapshot" in joined
-    assert "ptg2_current_source_snapshot" not in joined
-    assert "ptg2_current_plan_source" not in joined
-    assert "ptg2_current_snapshot" not in joined
+    _assert_candidate_stage_result(stage_result, executed_list, bind_layout)
 
 
 def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionally(monkeypatch):
@@ -9266,12 +9406,12 @@ def test_reused_v3_mixed_deferred_activation_preserves_and_promotes_allowed(
     } == {"in_network", "allowed_amounts"}
 
 
-def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
-    """Verify this PTG import regression contract."""
-    pushed_list = []
-    publish_source_pointers = AsyncMock()
-    publish_source_dictionary = AsyncMock()
-
+def _install_source_report_count_mocks(
+    monkeypatch,
+    pushed_list,
+    publish_source_pointers,
+    publish_source_dictionary,
+):
     async def fake_push(rows, cls, **_kwargs):
         pushed_list.extend((getattr(cls, "__name__", str(cls)), report_row) for report_row in rows)
 
@@ -9322,6 +9462,49 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     )
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
 
+
+def _assert_source_report_counts(
+    pushed_list,
+    publish_source_pointers,
+    publish_source_dictionary,
+):
+    import_run_rows = [
+        report_row
+        for cls_name, report_row in pushed_list
+        if cls_name == "PTG2ImportRun"
+    ]
+    final_report = import_run_rows[-1]["report"]
+    assert final_report["serving_rates"] == 987
+    assert final_report["rate_count"] == 987
+    assert final_report["serving_index"]["serving_rates"] == 987
+    source_set = final_report["serving_index"]["source_set"]
+    assert source_set["contract"] == "sorted_raw_container_sha256_bytes_v1"
+    assert source_set["source_count"] == 1
+    assert len(source_set["raw_container_sha256_digest"]) == 64
+    assert final_report["successful_files"][0]["summary"]["serving_rates"] == 111
+    published_snapshot = publish_source_pointers.await_args.kwargs[
+        "snapshot_attributes"
+    ]
+    assert published_snapshot["manifest"]["serving_rates"] == 987
+    assert published_snapshot["manifest"]["serving_index"]["source_set"] == (
+        source_set
+    )
+    assert publish_source_dictionary.await_args.kwargs["expected_source_set"] == (
+        source_set
+    )
+
+
+def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
+    """Verify this PTG import regression contract."""
+    pushed_list = []
+    publish_source_pointers = AsyncMock()
+    publish_source_dictionary = AsyncMock()
+    _install_source_report_count_mocks(
+        monkeypatch,
+        pushed_list,
+        publish_source_pointers,
+        publish_source_dictionary,
+    )
     asyncio.run(
         process_ptg.main(
             in_network_url="https://example.test/rates.json.gz",
@@ -9332,41 +9515,19 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
             plan_market_types=["Group"],
         )
     )
-
-    import_run_rows = [report_row for cls_name, report_row in pushed_list if cls_name == "PTG2ImportRun"]
-    final_report = import_run_rows[-1]["report"]
-    assert final_report["serving_rates"] == 987
-    assert final_report["rate_count"] == 987
-    assert final_report["serving_index"]["serving_rates"] == 987
-    assert final_report["serving_index"]["source_set"]["contract"] == (
-        "sorted_raw_container_sha256_bytes_v1"
-    )
-    assert final_report["serving_index"]["source_set"]["source_count"] == 1
-    assert len(
-        final_report["serving_index"]["source_set"][
-            "raw_container_sha256_digest"
-        ]
-    ) == 64
-    assert final_report["successful_files"][0]["summary"]["serving_rates"] == 111
-    published_snapshot = publish_source_pointers.await_args.kwargs["snapshot_attributes"]
-    assert published_snapshot["manifest"]["serving_rates"] == 987
-    assert published_snapshot["manifest"]["serving_index"]["source_set"] == (
-        final_report["serving_index"]["source_set"]
-    )
-    assert publish_source_dictionary.await_args.kwargs["expected_source_set"] == (
-        final_report["serving_index"]["source_set"]
+    _assert_source_report_counts(
+        pushed_list,
+        publish_source_pointers,
+        publish_source_dictionary,
     )
 
 
-def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
-    """Verify ptg2 import defers live pointer mutation by default."""
-    pushed_list = []
-    publish_source_pointers = AsyncMock()
-    cleanup_old_source_tables = AsyncMock()
-    address_refresh = AsyncMock()
-
+def _deferred_candidate_callbacks(state):
     async def fake_push(rows, cls, **_kwargs):
-        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
+        state.pushed_list.extend(
+            (getattr(cls, "__name__", str(cls)), import_row)
+            for import_row in rows
+        )
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -9387,6 +9548,13 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
             },
         )
 
+    return fake_push, fake_downloaded_jobs, fake_process
+
+
+def _install_deferred_candidate_mocks(monkeypatch, state):
+    fake_push, fake_downloaded_jobs, fake_process = (
+        _deferred_candidate_callbacks(state)
+    )
     monkeypatch.delenv("HLTHPRT_PTG2_AUTO_ACTIVATE_CANDIDATES", raising=False)
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
@@ -9414,7 +9582,6 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
         "_should_auto_activate_ptg2_candidates",
         lambda: False,
     )
-    candidate_stage = process_ptg._stage_ptg2_source_candidate
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -9423,37 +9590,34 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
     monkeypatch.setattr(
         process_ptg,
         "_publish_ptg2_source_pointers",
-        publish_source_pointers,
+        state.publish_source_pointers,
     )
     monkeypatch.setattr(
         process_ptg,
         "_cleanup_old_ptg2_source_tables",
-        cleanup_old_source_tables,
+        state.cleanup_old_source_tables,
     )
     monkeypatch.setattr(
         process_ptg,
         "_enqueue_address_refresh_after_import",
-        address_refresh,
+        state.address_refresh,
     )
 
-    import_result = asyncio.run(
-        process_ptg.main(
-            in_network_url="https://example.test/rates.json.gz",
-            import_month="2026-04",
-            import_id="deferred_candidate",
-            source_key="example_dental",
-        )
-    )
 
+def _assert_deferred_candidate_result(import_result, state, candidate_stage):
     assert import_result["arch_version"] == "postgres_binary_v3"
     assert import_result["storage_generation"] == "shared_blocks_v3"
     assert import_result["activation_status"] == "deferred"
     assert import_result["snapshot_status"] == process_ptg.PTG2_STATUS_VALIDATED
     candidate_stage.assert_awaited_once()
-    publish_source_pointers.assert_not_awaited()
-    cleanup_old_source_tables.assert_not_awaited()
-    address_refresh.assert_not_awaited()
-    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
+    state.publish_source_pointers.assert_not_awaited()
+    state.cleanup_old_source_tables.assert_not_awaited()
+    state.address_refresh.assert_not_awaited()
+    import_run_rows = [
+        import_row
+        for cls_name, import_row in state.pushed_list
+        if cls_name == "PTG2ImportRun"
+    ]
     final_report = import_run_rows[-1]["report"]
     assert final_report["activation_status"] == "deferred"
     assert final_report["address_refresh"] == {
@@ -9462,15 +9626,30 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
     }
 
 
-def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
-    """Verify ptg2 completion timing ends after post publish work."""
-    clock_map = {"seconds": 0.0}
-    pushed_list: list[tuple[str, dict]] = []
-    completion_events: list[tuple[str, float]] = []
-    validated_write_count_list = [0]
+def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
+    """Verify ptg2 import defers live pointer mutation by default."""
+    state = SimpleNamespace(
+        pushed_list=[],
+        publish_source_pointers=AsyncMock(),
+        cleanup_old_source_tables=AsyncMock(),
+        address_refresh=AsyncMock(),
+    )
+    _install_deferred_candidate_mocks(monkeypatch, state)
+    candidate_stage = process_ptg._stage_ptg2_source_candidate
+    import_result = asyncio.run(
+        process_ptg.main(
+            in_network_url="https://example.test/rates.json.gz",
+            import_month="2026-04",
+            import_id="deferred_candidate",
+            source_key="example_dental",
+        )
+    )
+    _assert_deferred_candidate_result(import_result, state, candidate_stage)
 
+
+def _completion_timing_callbacks(state):
     def advance(seconds: float) -> None:
-        clock_map["seconds"] += seconds
+        state.clock_map["seconds"] += seconds
 
     async def fake_push(rows, cls, **_kwargs):
         class_name = getattr(cls, "__name__", str(cls))
@@ -9479,12 +9658,13 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
                 class_name == "PTG2ImportRun"
                 and import_row.get("status") == process_ptg.PTG2_STATUS_VALIDATED
             ):
-                validated_write_count_list[0] += 1
-                advance(13.0 if validated_write_count_list[0] == 1 else 2.0)
-                completion_events.append(
-                    (f"validated_write_{validated_write_count_list[0]}", clock_map["seconds"])
+                state.validated_write_count_list[0] += 1
+                write_count = state.validated_write_count_list[0]
+                advance(13.0 if write_count == 1 else 2.0)
+                state.completion_events.append(
+                    (f"validated_write_{write_count}", state.clock_map["seconds"])
                 )
-            pushed_list.append((class_name, copy.deepcopy(import_row)))
+            state.pushed_list.append((class_name, copy.deepcopy(import_row)))
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -9516,7 +9696,72 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
         advance(7.0)
         return {"status": "disabled"}
 
-    monkeypatch.setattr(process_ptg, "_ptg2_monotonic", lambda: clock_map["seconds"])
+    return (
+        advance,
+        fake_push,
+        fake_downloaded_jobs,
+        fake_process,
+        publish_source_pointers,
+        cleanup_old_source_tables,
+        enqueue_address_refresh,
+    )
+
+
+def _install_completion_post_publish_mocks(monkeypatch, state, callbacks):
+    (
+        _advance,
+        _fake_push,
+        _downloaded_jobs,
+        _process_file,
+        publish_source_pointers,
+        cleanup_old_source_tables,
+        enqueue_address_refresh,
+    ) = callbacks
+    monkeypatch.setattr(
+        process_ptg,
+        "_current_source_snapshot_id",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_publish_ptg2_source_pointers",
+        publish_source_pointers,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_cleanup_old_ptg2_source_tables",
+        cleanup_old_source_tables,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_enqueue_address_refresh_after_import",
+        enqueue_address_refresh,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_emit_screen_line",
+        lambda line: state.completion_events.append(
+            (line, state.clock_map["seconds"])
+        ),
+    )
+
+
+def _install_completion_timing_mocks(monkeypatch, state):
+    callbacks = _completion_timing_callbacks(state)
+    (
+        advance,
+        fake_push,
+        fake_downloaded_jobs,
+        fake_process,
+        publish_source_pointers,
+        cleanup_old_source_tables,
+        enqueue_address_refresh,
+    ) = callbacks
+    monkeypatch.setattr(
+        process_ptg,
+        "_ptg2_monotonic",
+        lambda: state.clock_map["seconds"],
+    )
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
@@ -9543,44 +9788,13 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
         return publication
 
     publish.side_effect = timed_publish
-    monkeypatch.setattr(
-        process_ptg,
-        "_current_source_snapshot_id",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        process_ptg,
-        "_publish_ptg2_source_pointers",
-        publish_source_pointers,
-    )
-    monkeypatch.setattr(
-        process_ptg,
-        "_cleanup_old_ptg2_source_tables",
-        cleanup_old_source_tables,
-    )
-    monkeypatch.setattr(
-        process_ptg,
-        "_enqueue_address_refresh_after_import",
-        enqueue_address_refresh,
-    )
-    monkeypatch.setattr(
-        process_ptg,
-        "_emit_screen_line",
-        lambda line: completion_events.append((line, clock_map["seconds"])),
-    )
+    _install_completion_post_publish_mocks(monkeypatch, state, callbacks)
 
-    import_result = asyncio.run(
-        process_ptg.main(
-            in_network_url="https://example.test/rates.json.gz",
-            import_month="2026-04",
-            import_id="completion_timing_test",
-            source_key="completion_timing_test",
-        )
-    )
 
+def _assert_completion_timing(import_result, state):
     validated_rows = [
         import_row
-        for class_name, import_row in pushed_list
+        for class_name, import_row in state.pushed_list
         if class_name == "PTG2ImportRun"
         and import_row["status"] == process_ptg.PTG2_STATUS_VALIDATED
     ]
@@ -9606,19 +9820,41 @@ def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
     assert import_result["timings"]["total_seconds"] == pytest.approx(58.0)
 
     done_events = [
-        event for event in completion_events if event[0].startswith("PTG2_IMPORT_DONE")
+        event
+        for event in state.completion_events
+        if event[0].startswith("PTG2_IMPORT_DONE")
     ]
     assert len(done_events) == 1
     done_total_match = re.search(r"\ttotal_seconds=([0-9.]+)", done_events[0][0])
     assert done_total_match is not None
     assert float(done_total_match.group(1)) == pytest.approx(58.0)
-    completion_labels = [event[0] for event in completion_events]
+    completion_labels = [event[0] for event in state.completion_events]
     assert completion_labels.index("validated_write_2") < next(
         index
         for index, label in enumerate(completion_labels)
         if label.startswith("PTG2_IMPORT_DONE")
     )
     assert done_events[0][1] == pytest.approx(60.0)
+
+
+def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
+    """Verify ptg2 completion timing ends after post publish work."""
+    state = SimpleNamespace(
+        clock_map={"seconds": 0.0},
+        pushed_list=[],
+        completion_events=[],
+        validated_write_count_list=[0],
+    )
+    _install_completion_timing_mocks(monkeypatch, state)
+    import_result = asyncio.run(
+        process_ptg.main(
+            in_network_url="https://example.test/rates.json.gz",
+            import_month="2026-04",
+            import_id="completion_timing_test",
+            source_key="completion_timing_test",
+        )
+    )
+    _assert_completion_timing(import_result, state)
 
 
 def _publish_failure_cleanup_mocks(failure_events):
@@ -9818,8 +10054,42 @@ def test_failed_v4_layout_abandonment_uses_exact_owned_gc_path(monkeypatch):
     abandonment.assert_awaited_once_with(
         snapshot_key=491,
         build_token="owned-v4-attempt",
+        progress_callback=None,
     )
     legacy_abandonment.assert_not_awaited()
+
+
+def test_failed_v4_layout_abandonment_defers_without_retry(monkeypatch):
+    progress_events: list[tuple[str, int]] = []
+    abandonment = AsyncMock(
+        side_effect=process_ptg.PTG2SharedLayoutAbandonmentDeferred(
+            "bounded cleanup timed out"
+        )
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(
+        process_ptg,
+        "abandon_owned_v4_layout",
+        abandonment,
+    )
+    monkeypatch.setattr(process_ptg.asyncio, "sleep", sleep)
+
+    is_abandoned = asyncio.run(
+        process_ptg._is_failed_shared_layout_abandoned(
+            SimpleNamespace(snapshot_key=491, reused=False),
+            build_token="owned-v4-attempt",
+            expected_generation=process_ptg.PTG2_V4_SHARED_GENERATION,
+            progress_callback=lambda metric, amount: progress_events.append(
+                (metric, amount)
+            ),
+        )
+    )
+
+    assert is_abandoned is None
+    abandonment.assert_awaited_once()
+    assert abandonment.await_args.kwargs["progress_callback"] is not None
+    assert progress_events == []
+    sleep.assert_not_awaited()
 
 
 def _manifest_push_mock(pushed_list):
@@ -10259,20 +10529,7 @@ def test_materialize_zip_when_deferred(tmp_path, monkeypatch):
     assert Path(logical.logical_path).read_bytes() == expected
 
 
-def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, monkeypatch):
-    """Count only genuinely unreported worker files during recovery."""
-    artifact_dir = tmp_path / "artifacts"
-    recovered_paths_by_kind = {}
-    graph_input_paths = []
-    row_counted_paths = []
-    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
-
-    async def fake_push_ptg2_objects(*_args, **_kwargs):
-        return None
-
-    async def fake_flush_error_log(*_args, **_kwargs):
-        return None
-
+def _serving_only_recovery_callbacks(state):
     async def fake_scanner(*_args, **kwargs):
         price_worker = Path(f"{kwargs['manifest_price_atom_copy_path']}.worker0003")
         summary_worker = Path(
@@ -10282,7 +10539,7 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
         price_worker.write_text("price-1\n")
         summary_worker.write_text("price-set-1\t1.25\n")
         member_worker.write_text("member-1\n")
-        recovered_paths_by_kind.update(
+        state.recovered_paths_by_kind.update(
             price=str(price_worker),
             summary=str(summary_worker),
             member=str(member_worker),
@@ -10299,7 +10556,7 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
     original_copy_file_row_count = process_ptg._ptg2_copy_file_row_count
 
     def tracked_copy_file_row_count(copy_path):
-        row_counted_paths.append(str(copy_path))
+        state.row_counted_paths.append(str(copy_path))
         return original_copy_file_row_count(copy_path)
 
     async def fake_build_membership_sidecars(
@@ -10309,29 +10566,86 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
         provider_npi_scope_copy_path,
         input_paths,
     ):
-        graph_input_paths.extend(input_paths)
+        state.graph_input_paths.extend(input_paths)
         empty_dense_graph = struct.pack("<8sIQQ", b"PTG2MNDS", 1, 0, 0)
         provider_group_npi_path.write_bytes(empty_dense_graph)
         provider_npi_group_path.write_bytes(empty_dense_graph)
         provider_npi_scope_copy_path.write_text("scope-1\n")
         return {"edge_count": 1}
 
+    return (
+        fake_scanner,
+        tracked_copy_file_row_count,
+        fake_build_membership_sidecars,
+    )
+
+
+def _install_serving_only_recovery_mocks(monkeypatch, tmp_path, state):
+    callbacks = _serving_only_recovery_callbacks(state)
+    scanner, row_counter, membership_builder = callbacks
+    async_noop = AsyncMock(return_value=None)
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
     monkeypatch.setattr(process_ptg, "ptg2_temp_parent", lambda: tmp_path)
-    monkeypatch.setattr(process_ptg, "resolve_ptg2_artifact_dir", lambda: artifact_dir)
-    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push_ptg2_objects)
-    monkeypatch.setattr(process_ptg, "flush_error_log", fake_flush_error_log)
-    monkeypatch.setattr(process_ptg, "_aiter_compact_serving_records_rust", fake_scanner)
+    monkeypatch.setattr(
+        process_ptg,
+        "resolve_ptg2_artifact_dir",
+        lambda: tmp_path / "artifacts",
+    )
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", async_noop)
+    monkeypatch.setattr(process_ptg, "flush_error_log", async_noop)
+    monkeypatch.setattr(process_ptg, "_aiter_compact_serving_records_rust", scanner)
     monkeypatch.setattr(
         process_ptg,
         "_ptg2_copy_file_row_count",
-        tracked_copy_file_row_count,
+        row_counter,
     )
     monkeypatch.setattr(
         process_ptg,
         "_build_ptg2_provider_membership_sidecars",
-        fake_build_membership_sidecars,
+        membership_builder,
     )
 
+
+def _assert_serving_only_recovery(summary, state):
+    recovered = state.recovered_paths_by_kind
+    assert summary["serving_rates"] == 2
+    assert summary["manifest"]["serving_rows"] == 2
+    assert summary["manifest"]["copy_files"]["price_atom"] == [
+        {"path": recovered["price"], "row_count": 1}
+    ]
+    assert summary["manifest"]["copy_files"]["price_set_summary"] == [
+        {"path": recovered["summary"], "row_count": 1}
+    ]
+    assert summary["manifest"]["copy_files"]["provider_group_member"] == []
+    assert state.graph_input_paths == [Path(recovered["member"])]
+    assert not Path(recovered["member"]).exists()
+    assert set(state.row_counted_paths) == {
+        recovered["summary"],
+        recovered["member"],
+    }
+    assert summary["manifest"]["copy_file_accounting"] == {
+        "scanner_reported_files": 1,
+        "scanner_duplicate_files": 0,
+        "recovery_candidates": 8,
+        "recovery_already_reported_files": 1,
+        "recovered_unreported_files": 2,
+        "fallback_row_count_files": 2,
+        "fallback_row_count_bytes": len("price-set-1\t1.25\nmember-1\n"),
+    }
+    assert set(summary["manifest"]["sidecars"]) == {
+        "provider_group_npi",
+        "provider_npi_group",
+    }
+
+
+def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, monkeypatch):
+    """Count only genuinely unreported worker files during recovery."""
+    state = SimpleNamespace(
+        recovered_paths_by_kind={},
+        graph_input_paths=[],
+        row_counted_paths=[],
+    )
+    _install_serving_only_recovery_mocks(monkeypatch, tmp_path, state)
     summary = asyncio.run(
         process_ptg._parse_in_network_file_strict_v3(
             str(tmp_path / "rates.json.gz"),
@@ -10354,35 +10668,7 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
             ptg2_manifest_stage_table="ptg2_stage_test",
         )
     )
-
-    assert summary["serving_rates"] == 2
-    assert summary["manifest"]["serving_rows"] == 2
-    assert summary["manifest"]["copy_files"]["price_atom"] == [
-        {"path": recovered_paths_by_kind["price"], "row_count": 1}
-    ]
-    assert summary["manifest"]["copy_files"]["price_set_summary"] == [
-        {"path": recovered_paths_by_kind["summary"], "row_count": 1}
-    ]
-    assert summary["manifest"]["copy_files"]["provider_group_member"] == []
-    assert graph_input_paths == [Path(recovered_paths_by_kind["member"])]
-    assert not Path(recovered_paths_by_kind["member"]).exists()
-    assert set(row_counted_paths) == {
-        recovered_paths_by_kind["summary"],
-        recovered_paths_by_kind["member"],
-    }
-    assert summary["manifest"]["copy_file_accounting"] == {
-        "scanner_reported_files": 1,
-        "scanner_duplicate_files": 0,
-        "recovery_candidates": 8,
-        "recovery_already_reported_files": 1,
-        "recovered_unreported_files": 2,
-        "fallback_row_count_files": 2,
-        "fallback_row_count_bytes": len("price-set-1\t1.25\nmember-1\n"),
-    }
-    assert set(summary["manifest"]["sidecars"]) == {
-        "provider_group_npi",
-        "provider_npi_group",
-    }
+    _assert_serving_only_recovery(summary, state)
 
 
 def test_scanner_error_labels_sigterm():

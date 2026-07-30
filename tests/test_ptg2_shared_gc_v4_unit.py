@@ -23,7 +23,20 @@ class _Executor:
 
     async def status(self, statement: str, **params):
         self.status_calls.append((statement, params))
-        return "SELECT 1"
+        return 1
+
+
+def _abandonment_context():
+    return shared_gc._OwnedV4AbandonmentContext(
+        schema_name="mrf",
+        snapshot_key=1,
+        build_token="token",
+        batch_rows=2,
+        deadline=10.0,
+        statement_timeout_seconds=1.0,
+        monotonic=lambda: 0.0,
+        grace_seconds=60,
+    )
 
 
 @pytest.mark.asyncio
@@ -136,22 +149,18 @@ async def test_owned_v4_fingerprint_validation():
 
 
 @pytest.mark.asyncio
-async def test_owned_v4_layout_lock_fences(monkeypatch):
+async def test_owned_v4_layout_lock_validation_fences(monkeypatch):
+    """Validation rejects absent, bound, and completed layouts without claiming."""
+
     fingerprint = AsyncMock(return_value=None)
     monkeypatch.setattr(shared_gc, "_owned_v4_layout_fingerprint", fingerprint)
     assert not await shared_gc._is_owned_v4_layout_locked(
-        _Executor(),
-        schema_name="mrf",
-        snapshot_key=1,
-        build_token="token",
+        _Executor(), schema_name="mrf", snapshot_key=1, build_token="token"
     )
 
     fingerprint.return_value = b"a" * 32
     assert not await shared_gc._is_owned_v4_layout_locked(
-        _Executor([]),
-        schema_name="mrf",
-        snapshot_key=1,
-        build_token="token",
+        _Executor([]), schema_name="mrf", snapshot_key=1, build_token="token"
     )
     for owner, message in (
         ({"is_bound": True, "root_state": "building"}, "bound"),
@@ -164,14 +173,262 @@ async def test_owned_v4_layout_lock_fences(monkeypatch):
                 snapshot_key=1,
                 build_token="token",
             )
-    locked_executor = _Executor([{"is_bound": False, "root_state": None}])
+    validated_executor = _Executor([
+        {"build_token": "token", "is_bound": False, "root_state": None}
+    ])
+    assert await shared_gc._is_owned_v4_layout_locked(
+        validated_executor,
+        schema_name="mrf",
+        snapshot_key=1,
+        build_token="token",
+    )
+    assert len(validated_executor.status_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_layout_lock_claims_and_resumes(monkeypatch):
+    """Claim an owned layout once and resume only its exact durable marker."""
+
+    monkeypatch.setattr(
+        shared_gc,
+        "_owned_v4_layout_fingerprint",
+        AsyncMock(return_value=b"a" * 32),
+    )
+    locked_executor = _Executor([
+        {"build_token": "token", "is_bound": False, "root_state": None}
+    ])
     assert await shared_gc._is_owned_v4_layout_locked(
         locked_executor,
         schema_name="mrf",
         snapshot_key=1,
         build_token="token",
+        claim_abandonment=True,
     )
     assert "pg_advisory_xact_lock" in locked_executor.status_calls[0][0]
+    assert "SET build_token = :abandonment_token" in (
+        locked_executor.status_calls[1][0]
+    )
+
+    abandonment_token = shared_gc._owned_v4_abandonment_token("token")
+    resumed_executor = _Executor([{
+        "build_token": abandonment_token,
+        "is_bound": False,
+        "root_state": "building",
+    }])
+    assert await shared_gc._is_owned_v4_layout_locked(
+        resumed_executor,
+        schema_name="mrf",
+        snapshot_key=1,
+        build_token="token",
+        claim_abandonment=True,
+    )
+    assert len(resumed_executor.status_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_layout_lock_rejects_unknown_owner_marker(monkeypatch):
+    monkeypatch.setattr(
+        shared_gc,
+        "_owned_v4_layout_fingerprint",
+        AsyncMock(return_value=b"a" * 32),
+    )
+    executor = _Executor(
+        [
+            {
+                "build_token": "different-owner",
+                "is_bound": False,
+                "root_state": "building",
+            }
+        ]
+    )
+    with pytest.raises(RuntimeError, match="marker is invalid"):
+        await shared_gc._is_owned_v4_layout_locked(
+            executor,
+            schema_name="mrf",
+            snapshot_key=1,
+            build_token="token",
+            claim_abandonment=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_mapping_inventory_rejects_invalid_rows():
+    context = _abandonment_context()
+    assert await shared_gc._owned_v4_mapping_hashes(
+        _Executor([]),
+        context=context,
+    ) == set()
+
+    with pytest.raises(RuntimeError, match="hash order is invalid"):
+        await shared_gc._owned_v4_mapping_hashes(
+            _Executor([{"block_hash": b"short"}]),
+            context=context,
+        )
+
+    with pytest.raises(RuntimeError, match="missing CAS block"):
+        await shared_gc._owned_v4_stored_bytes(
+            _Executor([]),
+            context=context,
+            block_hashes=(b"a" * 32,),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("shared_tables_available", "map_tables_available", "message"),
+    (
+        (False, True, "requires shared tables"),
+        (True, False, "requires V4 map tables"),
+    ),
+)
+async def test_owned_v4_inventory_requires_complete_schema(
+    monkeypatch,
+    shared_tables_available,
+    map_tables_available,
+    message,
+):
+    monkeypatch.setattr(
+        shared_gc,
+        "_has_shared_tables",
+        AsyncMock(return_value=shared_tables_available),
+    )
+    monkeypatch.setattr(
+        shared_gc,
+        "_has_v4_map_tables",
+        AsyncMock(return_value=map_tables_available),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        await shared_gc._checked_owned_v4_inventory(
+            object(),
+            _abandonment_context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_candidate_batch_fences_owner_and_cas(monkeypatch):
+    owner_lock = AsyncMock(return_value=False)
+    monkeypatch.setattr(shared_gc, "_is_owned_v4_layout_locked", owner_lock)
+    with pytest.raises(RuntimeError, match="layout changed"):
+        await shared_gc._queue_owned_v4_candidate_batch(
+            _Executor([]),
+            context=_abandonment_context(),
+            block_hashes=(b"a" * 32,),
+        )
+
+    owner_lock.return_value = True
+    with pytest.raises(RuntimeError, match="missing CAS block"):
+        await shared_gc._queue_owned_v4_candidate_batch(
+            _Executor([], []),
+            context=_abandonment_context(),
+            block_hashes=(b"a" * 32,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_dense_batch_fences_owner(monkeypatch):
+    monkeypatch.setattr(
+        shared_gc,
+        "_is_owned_v4_layout_locked",
+        AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(RuntimeError, match="layout changed"):
+        await shared_gc._delete_owned_v4_dense_batch(
+            _Executor([]),
+            context=_abandonment_context(),
+            table_name="ptg2_v3_serving_rate",
+        )
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_finalization_rejects_incomplete_cleanup(monkeypatch):
+    context = _abandonment_context()
+    block_hash = b"a" * 32
+    with pytest.raises(RuntimeError, match="candidate queue is incomplete"):
+        await shared_gc._assert_owned_v4_candidates_complete(
+            _Executor([]),
+            context=context,
+            block_hashes=(block_hash,),
+        )
+    with pytest.raises(RuntimeError, match="dense cleanup is incomplete"):
+        await shared_gc._require_owned_v4_dense_cleanup(
+            _Executor([{"table_name": "dense", "row_count": 1}]),
+            context=context,
+        )
+
+    failed_delete = _Executor()
+    failed_delete.status = AsyncMock(return_value=0)
+    with pytest.raises(RuntimeError, match="layout changed"):
+        await shared_gc._delete_owned_v4_layout(
+            failed_delete,
+            context=context,
+            abandonment_token="abandon-token",
+        )
+
+    owner_lock = AsyncMock(return_value=False)
+    monkeypatch.setattr(shared_gc, "_is_owned_v4_layout_locked", owner_lock)
+    with pytest.raises(RuntimeError, match="layout changed"):
+        await shared_gc._finalize_owned_v4_abandonment(
+            _Executor([]),
+            context=context,
+            inventory=shared_gc._OwnedV4AbandonmentInventory(
+                block_hashes=(block_hash,),
+                stored_bytes=1,
+                abandonment_token="abandon-token",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_finalization_rejects_reachability_drift(monkeypatch):
+    monkeypatch.setattr(
+        shared_gc,
+        "_is_owned_v4_layout_locked",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        shared_gc,
+        "_current_owned_v4_hashes",
+        AsyncMock(return_value=(b"b" * 32,)),
+    )
+
+    with pytest.raises(RuntimeError, match="reachability changed"):
+        await shared_gc._finalize_owned_v4_abandonment(
+            _Executor([]),
+            context=_abandonment_context(),
+            inventory=shared_gc._OwnedV4AbandonmentInventory(
+                block_hashes=(b"a" * 32,),
+                stored_bytes=1,
+                abandonment_token="abandon-token",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_statement_timeout_becomes_deferred(monkeypatch):
+    class OperationalError(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        shared_gc,
+        "_run_owned_v4_step",
+        AsyncMock(side_effect=OperationalError("statement timeout")),
+    )
+
+    with pytest.raises(
+        shared_gc.PTG2SharedLayoutAbandonmentDeferred,
+        match="statement timed out",
+    ):
+        await shared_gc.abandon_owned_v4_layout(
+            snapshot_key=1,
+            build_token="token",
+            executor=object(),
+            options=shared_gc.PTG2V4AbandonmentOptions(
+                timeout_seconds=10,
+                monotonic=lambda: 0.0,
+            ),
+        )
 
 
 @pytest.mark.asyncio
