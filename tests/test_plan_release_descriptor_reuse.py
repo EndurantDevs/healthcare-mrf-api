@@ -2,6 +2,7 @@
 """Request-local reuse contracts for validated release descriptors."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 from api import plan_release_serving, ptg2_serving
@@ -165,6 +166,14 @@ def test_single_release_query_rejects_descriptor_for_another_snapshot(
 
 
 def _install_multi_descriptor_spies(monkeypatch, search_calls):
+    opened_sessions = []
+
+    @asynccontextmanager
+    async def network_session():
+        session = object()
+        opened_sessions.append(session)
+        yield session
+
     async def fail_descriptor_reload(*_args, **_kwargs):
         raise AssertionError("validated descriptors must satisfy this request")
 
@@ -191,11 +200,13 @@ def _install_multi_descriptor_spies(monkeypatch, search_calls):
         "_network_tables_by_snapshot_id",
         fail_descriptor_reload,
     )
+    monkeypatch.setattr(ptg2_serving.sa_db, "session", network_session)
     monkeypatch.setattr(
         ptg2_serving,
         "_search_one_ptg2_snapshot",
         search_snapshot,
     )
+    return opened_sessions
 
 
 def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
@@ -224,7 +235,7 @@ def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
         ),
     )
     search_calls = []
-    _install_multi_descriptor_spies(monkeypatch, search_calls)
+    opened_sessions = _install_multi_descriptor_spies(monkeypatch, search_calls)
 
     responses = asyncio.run(
         ptg2_serving._read_multi_ptg2_snapshots(
@@ -247,6 +258,95 @@ def test_multi_release_query_reuses_every_validated_descriptor(monkeypatch):
     ]
     assert responses == [
         (binding.source_key, binding.snapshot_id, None)
+        for binding in bindings
+    ]
+    assert len({id(session) for session in opened_sessions}) == 2
+
+
+def _mixed_representation_release():
+    bindings = (
+        _network_binding(0, "snapshot-direct", "source-direct"),
+        _network_binding(1, "snapshot-pattern", "source-pattern"),
+    )
+    descriptor_by_snapshot_id = {
+        bindings[0].snapshot_id: SimpleNamespace(representation="direct_v1"),
+        bindings[1].snapshot_id: SimpleNamespace(representation="pattern_v1"),
+    }
+    selection = _release_selection(
+        *bindings,
+        validated_serving_tables=tuple(descriptor_by_snapshot_id.items()),
+    )
+    return bindings, selection
+
+
+def _install_mixed_representation_search(monkeypatch):
+    """Install a slower direct read so completion differs from binding order."""
+
+    @asynccontextmanager
+    async def network_session():
+        yield object()
+
+    async def search_snapshot(
+        _session,
+        snapshot_id,
+        _args,
+        _pagination,
+        *,
+        serving_tables,
+    ):
+        await asyncio.sleep(
+            0.02 if serving_tables.representation == "direct_v1" else 0.001
+        )
+        return {
+            "items": [
+                {
+                    "provider_npi": 1234567890,
+                    "prices": [{"negotiated_rate": "125.00"}],
+                    "source_trace": [{"snapshot_id": snapshot_id}],
+                }
+            ],
+            "query": {"snapshot_id": snapshot_id},
+        }
+
+    monkeypatch.setattr(ptg2_serving.sa_db, "session", network_session)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_search_one_ptg2_snapshot",
+        search_snapshot,
+    )
+
+
+def test_multi_release_query_preserves_direct_and_pattern_payloads(monkeypatch):
+    """Keep exact V4 prices and provenance stable across concurrent completion."""
+
+    bindings, selection = _mixed_representation_release()
+    _install_mixed_representation_search(monkeypatch)
+    responses = asyncio.run(
+        ptg2_serving._read_multi_ptg2_snapshots(
+            object(),
+            [(binding.source_key, binding.snapshot_id) for binding in bindings],
+            {"plan_release_id": PLAN_RELEASE_ID},
+            SimpleNamespace(limit=25, offset=0, page=1, source="page"),
+            selection,
+        )
+    )
+
+    assert [
+        (source_key, snapshot_id)
+        for source_key, snapshot_id, _payload in responses
+    ] == [
+        (binding.source_key, binding.snapshot_id)
+        for binding in bindings
+    ]
+    assert [
+        network_response["items"][0]["prices"]
+        for _, _, network_response in responses
+    ] == [[{"negotiated_rate": "125.00"}]] * 2
+    assert [
+        network_response["items"][0]["source_trace"]
+        for _, _, network_response in responses
+    ] == [
+        [{"snapshot_id": binding.snapshot_id}]
         for binding in bindings
     ]
 

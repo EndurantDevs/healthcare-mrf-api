@@ -16458,7 +16458,7 @@ async def _read_multi_ptg2_snapshots(
         serving_tables_by_snapshot_id = (
             validated_serving_tables_by_snapshot_id
         )
-    network_responses = []
+    query_args_by_network: dict[tuple[str, str], dict[str, Any]] = {}
     for source_key, snapshot_id in network_snapshots:
         network_args = args
         if release_selection is not None:
@@ -16466,17 +16466,25 @@ async def _read_multi_ptg2_snapshots(
             if binding is None:
                 return None
             network_args = binding_query_args(args, binding)
-        network_response = await _search_one_ptg2_snapshot(
-            session,
-            snapshot_id,
-            network_args,
-            sub_pagination,
-            serving_tables=serving_tables_by_snapshot_id[snapshot_id],
-        )
-        network_responses.append(
-            (source_key, snapshot_id, network_response)
-        )
-    return network_responses
+        query_args_by_network[(source_key, snapshot_id)] = network_args
+
+    async def read_network(source_key: str, snapshot_id: str):
+        """Read one frozen forward network through an independent DB session."""
+
+        async with sa_db.session() as network_session:
+            network_response = await _search_one_ptg2_snapshot(
+                network_session,
+                snapshot_id,
+                query_args_by_network[(source_key, snapshot_id)],
+                sub_pagination,
+                serving_tables=serving_tables_by_snapshot_id[snapshot_id],
+            )
+        return source_key, snapshot_id, network_response
+
+    return await _gather_ptg2_network_reads(
+        list(network_snapshots),
+        read_network,
+    )
 
 
 async def _search_plan_release_index(
